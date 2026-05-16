@@ -27,3 +27,7 @@ dist-ssr
 .nlm-local/
 tmp/nlm/
 .agents/skills/nlm-skill/SKILL.md
+
+# Local AI workspace settings
+.agents/
+.claude/skills/
