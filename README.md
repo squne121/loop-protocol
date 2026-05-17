@@ -70,11 +70,9 @@ pnpm preview
 
 より詳細な制約は `CLAUDE.md` と `docs/adr/0001-architecture-baseline.md` にあります。
 
-## AI / NotebookLM 運用
+## AI 運用
 
 - Claude Code を前提に、壊れにくい責務分離と小さな差分で開発します。
-- NotebookLM は外部の調査、README 構成レビュー、ディレクトリ構造レビュー用途で使います。
-- NotebookLM のローカル資産は Git 管理しません。
 - 実装変更は Issue / PR 単位で扱い、`main` には直接積まず PR 経由で統合します。
 
 ## 今後の予定

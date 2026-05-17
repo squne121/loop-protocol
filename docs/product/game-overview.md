@@ -1,6 +1,7 @@
 # Game Overview
 
 トップビューのアクション RTS として必要な体験、主要ループ、画面要件を整理するための文書。
+この文書は体験概要の説明であり、全体要件の正本は `docs/product/requirements.md` とする。
 
 ## MVP Loop
 
