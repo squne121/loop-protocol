@@ -30,4 +30,6 @@ tmp/nlm/
 
 # Local AI workspace settings
 .agents/
-.claude/skills/
+# 外部ツール由来の skill は除外、プロジェクト固有 skill はリポジトリで管理する
+.claude/skills/nlm-skill/
+.claude/skills/*-workspace/
