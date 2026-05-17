@@ -12,6 +12,14 @@
 - `assets/`: 人手管理アセット。AI は直接編集しない。
 - `LICENSES/`: ライセンス分離。
 
+## Docs Roles
+
+- `docs/product/requirements.md`: 全体要件と非ゴールの正本。
+- `docs/product/features/<feature>.md`: 個別機能の stable な仕様置き場。
+- `docs/product/game-overview.md`: 体験とループの概要説明。
+- `docs/dev/current-focus.md`: 現在のフェーズと優先順位を示す一時メモ。
+- `docs/adr/`: 設計判断の理由を残す場所。
+
 ## Runtime Layers
 
 - `src/state/`: `GameState` と snapshot。描画や DOM に依存しない。
