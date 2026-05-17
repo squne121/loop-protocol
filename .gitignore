@@ -30,4 +30,10 @@ tmp/nlm/
 
 # Local AI workspace settings
 .agents/
-.claude/skills/
+# .claude/skills/ のうち外部ツール由来は除外、プロジェクト固有はリポジトリで管理する
+.claude/skills/nlm-skill/
+.claude/skills/*-workspace/
+# worktree は .claude/worktrees/ 配下に作成し Git 管理から外す（workflow.md 参照）
+.claude/worktrees/
+# サブエージェントへのハンドオフ用一時ファイル
+.claude/plans/

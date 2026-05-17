@@ -1,0 +1,92 @@
+name: 実装 Issue
+description: AI エージェントに実装依頼する Issue。必須項目を埋めることが skill のガードレール検知を通過する前提。
+title: "[Impl] "
+labels: ["implementation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        この Issue は `scripts/check-issue-contract.sh` により必須項目の充足が機械判定されます。
+        未記入項目があると `issue-driven-dev` skill が実装着手をブロックします。
+
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: なぜこの Issue が必要か。問題状況・前提・関連する過去の経緯。
+      placeholder: 例：MovementSystem に境界クランプがなく、自機が画面外へ消える事象が発生している。
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: 目的
+      description: この Issue で達成したい状態。1 文で書く。
+      placeholder: 例：自機が Canvas 境界内に常に収まるようにする。
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: 受け入れ条件
+      description: |
+        完了判定のチェックリスト。具体的・検証可能な記述で。
+        各項目は `- [ ] ...` の形式で書く。
+      placeholder: |
+        - [ ] WASD 入力で自機が Canvas 範囲 [0, width] × [0, height] にクランプされる
+        - [ ] クランプ処理のユニットテストが追加されている
+        - [ ] 既存テストが破壊されていない
+    validations:
+      required: true
+
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: 非ゴール
+      description: この Issue でやらないこと。スコープ肥大化防止のため明示する。
+      placeholder: |
+        - 当たり判定の実装
+        - Projectile 関連の変更
+        - 描画レイヤーの修正
+    validations:
+      required: true
+
+  - type: textarea
+    id: test-perspective
+    attributes:
+      label: テスト観点
+      description: |
+        BDD（振る舞い駆動開発）の GIVEN/WHEN/THEN で振る舞いを記述する。
+        境界値・異常系も含めること。
+      placeholder: |
+        GIVEN 自機が Canvas 右端付近にある
+        WHEN 右方向への移動入力が継続する
+        THEN 自機の x 座標は width - radius を超えない
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope-files
+    attributes:
+      label: 変更許可領域
+      description: |
+        変更してよいファイル・ディレクトリを明示する。
+        CLAUDE.md で保護されている `assets/` `LICENSES/` は記載しても遮断される。
+      placeholder: |
+        - src/systems/MovementSystem.ts
+        - tests/systems/MovementSystem.test.ts
+    validations:
+      required: true
+
+  - type: textarea
+    id: related
+    attributes:
+      label: 関連 Issue / PR
+      description: 関連する Issue 番号・PR 番号・ドキュメントへのリンク（任意）。
+      placeholder: |
+        - #1 自機移動と Projectile 射撃システム
+        - docs/product/mvp-spec.md
+    validations:
+      required: false
