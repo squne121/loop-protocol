@@ -108,18 +108,11 @@ body:
     id: child-issues
     attributes:
       label: Child Issues
+      description: 着手順に並べる（リストの順序がそのまま依存順を表す）。前提となる Issue が後続より上に来るように記載する。
       placeholder: |
-        - [ ] #...
-    validations:
-      required: true
-
-  - type: textarea
-    id: dependency-order
-    attributes:
-      label: Dependency Order
-      placeholder: |
-        1. #...
-        2. #...
+        - [ ] #101 — 前提となる research
+        - [ ] #102 — それを使う implementation
+        - [ ] #103 — 後続の cleanup
     validations:
       required: true
 

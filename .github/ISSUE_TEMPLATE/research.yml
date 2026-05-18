@@ -13,7 +13,7 @@ body:
 
         **AC に実装変更（`src/` 改修・`tests/` 追加）を含む場合は `Implementation` テンプレートを使用してください。**
 
-        本テンプレートの **既定の成果物は「次の Issue（implementation / human-confirm 等）が起票可能になる状態」** です。
+        本テンプレートの **既定の成果物は「次の implementation Issue が起票可能になる状態」** です。
         リポジトリ資産（`docs/research/<topic>.md` 等）への出力は、品質調査など特別な目的のときのみ任意で行います。
 
   - type: textarea
@@ -47,7 +47,7 @@ body:
       label: Outcome
       description: |
         調査ゴールのコンテクストが明確になり、**次のアクションに進める状態** になることを 1 文で書く。
-        揮発的な比較表だけ作って閉じる、では受け入れない。次に何が起こるか（どの implementation Issue が起票可能になるか、どの human-confirm が解消されるか等）を明示する。
+        揮発的な比較表だけ作って閉じる、では受け入れない。次に何が起こるか（どの implementation Issue が起票可能になるか等）を明示する。
       placeholder: 自機 / 敵キャラの当たり判定アルゴリズム候補を比較し、採用案を選定して implementation Issue が起票可能な状態
     validations:
       required: true
@@ -77,12 +77,11 @@ body:
     attributes:
       label: Acceptance Criteria
       description: |
-        調査完了時に **次のアクションに進める** ことを検証可能にする。例:
-        「結論をもとに implementation Issue が起票され、本 Issue がその issue を link している」
-        「採用案について human-confirm Issue が起票され、人間判断待ちになっている」
+        調査完了時に **次のアクションに進める** ことを検証可能にする。例: 「結論をもとに implementation Issue が起票され、本 Issue がその issue を link している」
       placeholder: |
         - [ ] 比較結果が本 Issue 本文に記載されている
         - [ ] 採用案を実装する implementation Issue が起票され、本 Issue がそれを link している
+        - [ ] 本 Issue は close 可能、もしくは追加調査要件が明示されている
     validations:
       required: true
 
@@ -126,7 +125,7 @@ body:
     id: handoff-contract
     attributes:
       label: Handoff Contract
-      description: research 完了時に implementation / human-confirm child issue へ引き継ぐ場合の構造。
+      description: research 完了時に implementation child issue へ引き継ぐ場合の構造。
       value: |
         - `Current Objective`
         - `Bounded Current Context`
