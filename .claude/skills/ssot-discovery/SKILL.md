@@ -1,105 +1,103 @@
 ---
 name: ssot-discovery
-description: LOOP_PROTOCOL の docs/ 配下を Single Source of Truth (SSOT) として扱い、Issue / PR / タスクのキーワードから関連 SSOT ドキュメントを再現可能に発見するスキル。実装エージェント・レビューエージェントがタスク着手前のコンテクスト収集に必ず使う。「関連ドキュメント探して」「該当する仕様書は」「ssot 探索」「SSOT 確認」「docs 検索」などのトリガーで使用。.agents/rules/ に分散していた SSOT 参照ルールを単一エージェントスキルに集約する。
+description: LOOP_PROTOCOL の docs/ 配下を Single Source of Truth として扱い、Issue / PR / タスク記述から関連 SSOT を機械的に発見する。実装やレビュー前に「関連ドキュメントを探す」「該当 ADR を確認する」「workflow ルールはどこ」「テンプレ仕様は」など SSOT 参照が必要なあらゆる場面で使うこと。AI が docs/ を都度全文 grep して見落とすパターンを防ぐため、人間が「ssot」「SSOT」と明示しなくても、Issue 番号や変更対象パスが言及される作業着手フェーズでは積極的にトリガーする。
 ---
 
-# ssot-discovery — SSOT ドキュメント探索
+# ssot-discovery
 
 LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情報源（SSOT）** である。
-本スキルは、任意のタスク（Issue 番号 / PR 番号 / 自然言語クエリ / 変更対象ファイルパス）から関連 SSOT を発見し、それらの場所と要点をメインセッション / SubAgent へ返す。
+本スキルは任意の入力（Issue / PR 番号、キーワード、変更対象パス）から関連 SSOT を機械的に発見し、その場所と関連度を構造化して返す。
 
-## Use When
+## Why this skill exists
 
-- 実装エージェント / レビューエージェント / orchestrator skill がタスク着手前に SSOT を収集したい時
-- 「該当する仕様書は？」「関連 ADR は？」「workflow ルールはどこに書いてある？」
-- skill / agent が `required_rules:` 相当の参照を行いたい時（旧 `.agents/rules/index.md` の代替）
+各エージェントが独自に「関連しそうな doc を grep する」と、見落としと冗長な探索が積み重なる。SSOT 探索を 1 つのスキルに集約することで、
 
-## Do Not Use When
+- カタログ更新時に各エージェント側を直さなくていい（[references/ssot-catalog.md](references/ssot-catalog.md) を 1 箇所修正）
+- 結果フォーマットが固定（[references/output-contract.md](references/output-contract.md)）で、呼び出し側が確実にパースできる
+- マッチ判定スクリプトを通すので、人間が再現できる（同入力 → 同出力）
 
-- 即時に既知のファイル 1 つだけ読むなら直接 `Read` で済む
-- `src/` 配下のコード探索は本スキルの対象外（`docs/` 限定）
+ことを保証する。各層特有の不変条件は各ディレクトリの `CLAUDE.md` に集約されているため、本スキルでそれらを再説明しない。
 
-## Input
+## Inputs
 
-以下のいずれかを受ける（複数可）:
+以下のいずれか（複数可）:
 
-- `task_keywords`（自然言語キーワードのリスト）— 例: `["worktree", "issue contract"]`
-- `target_paths`（変更対象のファイル/ディレクトリ）— 例: `["src/systems/MovementSystem.ts"]`
-- `issue_number` / `pr_number`（gh CLI 経由で本文を取得して keyword 抽出）
+| 入力 | 例 |
+|---|---|
+| `task_keywords` | `["worktree", "issue contract"]` |
+| `target_paths` | `["src/systems/MovementSystem.ts"]` |
+| `issue_number` / `pr_number` | `42`（gh CLI で本文取得 → キーワード化） |
 
 ## Output
 
-`SSOT_DISCOVERY_RESULT_V1` YAML 形式で返す（[references/output-contract.md](references/output-contract.md) 参照）:
-
-```yaml
-SSOT_DISCOVERY_RESULT_V1:
-  status: ok | partial | failed
-  matched_documents:
-    - path: docs/dev/workflow.md
-      relevance: high | medium | low
-      reason: "worktree 運用フローの正本"
-      sections:
-        - "## Worktree 配置"
-  unmatched_keywords: []
-  notes: []
-```
+`SSOT_DISCOVERY_RESULT_V1` YAML（詳細は [references/output-contract.md](references/output-contract.md)）。
+`matched_documents` は relevance 順（high → medium → low）、`unmatched_keywords` は SSOT 未整備の示唆として返す。
 
 ## Procedure
 
-### Step 1: SSOT カタログを把握する
+1. [references/ssot-catalog.md](references/ssot-catalog.md) で SSOT カタログを確認する。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
+2. 入力からキーワードを抽出する：
+   - `task_keywords` はそのまま
+   - `target_paths` はディレクトリ名・ファイル名語幹を切り出す
+   - `issue_number` / `pr_number` は `gh issue view <N> --json title,body --jq '.title+"\n"+.body'` で取得して見出し・固有名詞を拾う
+3. [scripts/match-ssot.sh](scripts/match-ssot.sh) を呼ぶ：
+   ```bash
+   .claude/skills/ssot-discovery/scripts/match-ssot.sh \
+     --keywords "<comma,separated>" \
+     --paths "<comma,separated>"
+   ```
+4. 出力 YAML をそのまま呼び出し側に返す（散文での再要約はしない — 出力契約が崩れる）
 
-LOOP_PROTOCOL の SSOT カタログは [references/ssot-catalog.md](references/ssot-catalog.md) で固定している。本スキル内で `docs/` 配下をスキャンする際は本カタログを最初に読む。
+## Examples
 
-カタログは以下を持つ（例）:
-- `docs/dev/workflow.md` — Issue 駆動開発フロー全体（最も汎用的）
-- `docs/dev/directory-structure.md` — ディレクトリ責務
-- `docs/dev/current-focus.md` — 現在のフェーズ・優先項目
-- `docs/dev/imported-harness-triage.md` — 流用 agent/skill の判定表
-- `docs/adr/*.md` — アーキテクチャ決定記録
-- `docs/product/*.md` — プロダクト仕様
+**Example 1 — 変更対象パスから SSOT を引く**
 
-### Step 2: 入力からキーワードを抽出する
+呼び出し：
+```bash
+.claude/skills/ssot-discovery/scripts/match-ssot.sh --paths "src/systems/MovementSystem.ts"
+```
+返却（抜粋）：
+```yaml
+SSOT_DISCOVERY_RESULT_V1:
+  status: ok
+  matched_documents:
+    - path: "docs/adr/0001-architecture-baseline.md"
+      relevance: "low"
+      reason: "directory mapping from src/systems"
+```
+呼び出し側はこの ADR を Read してから systems 変更に着手する。
 
-- `task_keywords` をそのまま使う
-- `target_paths` から「ディレクトリ名」「ファイル名語幹」をキーワード化
-- `issue_number` / `pr_number` がある場合は `gh issue view <番号> --json title,body --jq '.title + "\n" + .body'` で取得し、見出し・コード参照・固有名詞を抽出
+**Example 2 — キーワードから運用ルールを引く**
 
-### Step 3: マッチ判定
+呼び出し：
+```bash
+.claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "worktree,1 issue 1 pr"
+```
+返却（抜粋）：
+```yaml
+SSOT_DISCOVERY_RESULT_V1:
+  status: partial
+  matched_documents:
+    - path: "docs/dev/imported-harness-triage.md"
+      relevance: "medium"
+      reason: "body match for 'worktree'"
+  unmatched_keywords: ["1 issue 1 pr"]
+```
+`unmatched_keywords` は SSOT 未整備のサインとして人間レビューに残す（勝手に新 SSOT を作らない）。
 
-[scripts/match-ssot.sh](scripts/match-ssot.sh) を呼んで、キーワードと SSOT カタログのマッチを取る。
+**Example 3 — Issue 番号から探索**
 
 ```bash
-.claude/skills/ssot-discovery/scripts/match-ssot.sh \
-  --keywords "worktree,issue contract" \
-  --paths "src/systems/"
+KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:punct:][:space:]' ',' | head -c 200)
+.claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "$KW"
 ```
-
-スクリプトは以下を返す:
-- `docs/` 配下で本文に該当キーワードを含むファイル
-- ディレクトリ → SSOT のマッピング（例: `src/systems/` → `docs/adr/0001-architecture-baseline.md`）
-- relevance スコア（high: タイトル/見出しに含む、medium: 本文一致、low: 関連推定）
-
-### Step 4: 結果整形
-
-スクリプト出力を `SSOT_DISCOVERY_RESULT_V1` YAML に整形して返す。
-不一致キーワードは `unmatched_keywords` に列挙し、SSOT 未整備の論点を可視化する。
 
 ## Guard Rails
 
-- `docs/` 配下のみを対象（`src/` のコード探索は別タスク）
-- マッチしないキーワードがあっても fail せず `partial` で返す（SSOT 未整備のヒントとして残す）
-- 大量出力にならないよう、relevance high のみ詳細表示、medium/low は path 列挙のみ
+- `docs/` 配下のみが探索対象。`src/` のコード探索は本スキルの対象外
+- マッチしないキーワードがあっても fail にせず `partial` で返す（SSOT 未整備のヒントを潰さない）
+- 出力は YAML 構造のまま渡す（散文サマリで上書きしない）
 
-## ディレクトリごとの CLAUDE.md との関係
+## カタログ更新
 
-- 本スキルは **横断的な SSOT 探索** を担う
-- **特定ディレクトリ配下の不変条件** は各 `<dir>/CLAUDE.md`（Claude Code が自動ロード）に集約されている
-- 重複する内容は CLAUDE.md を正本とし、本スキルは SSOT 探索手順のみを定義する
-
-## 関連
-
-- ルート `CLAUDE.md`
-- `docs/CLAUDE.md`
-- [references/ssot-catalog.md](references/ssot-catalog.md)
-- [references/output-contract.md](references/output-contract.md)
-- [scripts/match-ssot.sh](scripts/match-ssot.sh)
+`docs/` に新規 SSOT を追加・削除したら、必ず [references/ssot-catalog.md](references/ssot-catalog.md) のエントリと `match-ssot.sh` の `DIR_MAP`（パス → SSOT マッピング）も同 PR で更新する。これを忘れると本スキルが古い世界観で動き続ける。
