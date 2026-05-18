@@ -1,0 +1,18 @@
+{
+  "schema": "delegation_request_v1",
+  "tool_profile": "github_research",
+  "gh_commands": [
+    {"argv": ["issue", "comment", "2232", "--body", "test comment"]}
+  ],
+  "objective": "Issue #2232 にコメントを投稿する",
+  "instructions": [
+    "gh issue comment 2232 --body 'test' を実行してコメントを投稿してください。",
+    "投稿結果を報告してください。"
+  ],
+  "output_sections": ["Result"],
+  "context_files": [
+    "../../../../../README.md"
+  ],
+  "model": "gemini-2.5-flash",
+  "timeout_sec": 120
+}

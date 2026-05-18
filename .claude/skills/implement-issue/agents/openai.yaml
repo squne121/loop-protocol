@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Issue"
+  short_description: "承認済み implementation child issue を実装し、verify と PR / Issue 更新まで進める"
+  default_prompt: "$implement-issue を使って implementation child issue の contract を再確認し、Allowed Paths 内で実装・verify・PR 作成・Issue 返却までを 1 Issue = 1 PR で進める。scope delta や branch/PR 制約があれば fail-closed で止める"

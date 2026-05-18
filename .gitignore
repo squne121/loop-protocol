@@ -29,5 +29,10 @@ tmp/nlm/
 .agents/skills/nlm-skill/SKILL.md
 
 # Local AI workspace settings
-.agents/
-.claude/skills/
+# .agents/ 配下: 流用 skill が前提とする rules / shared-agent-skills-governance はリポジトリで管理する
+.agents/skills/nlm-skill/
+# .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
+.claude/skills/nlm-skill/
+.claude/skills/*-workspace/
+.claude/worktrees/
+.claude/plans/

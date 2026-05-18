@@ -1,0 +1,2 @@
+# Test fixture log files are intentionally tracked despite root *.log rule
+!*.log

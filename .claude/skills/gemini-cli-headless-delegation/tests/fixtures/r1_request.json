@@ -1,0 +1,17 @@
+{
+  "schema": "delegation_request_v1",
+  "objective": "run_gemini_headless.py の _build_raw_command 関数に対する pytest テストスケルトンを生成する",
+  "instructions": [
+    "既存の test_run_gemini_headless.py のパターン（import 構造、monkeypatch 使用法、assert 記法）に従ってください。",
+    "テスト名は test_ prefix で始め、各テストは単一の観点を検証してください。",
+    "実際のアサーション内容は placeholder でよいが、構造（import、fixture、assert 文）は完全なものにしてください。"
+  ],
+  "tool_profile": "no_tools",
+  "output_sections": ["Draft", "Notes"],
+  "context_files": [
+    "r1_context/test_run_gemini_headless.py",
+    "r1_context/run_gemini_headless.py"
+  ],
+  "model": "gemini-3-flash-preview",
+  "timeout_sec": 120
+}

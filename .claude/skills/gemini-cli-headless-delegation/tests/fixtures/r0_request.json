@@ -1,0 +1,14 @@
+{
+  "schema": "delegation_request_v1",
+  "objective": "ビルドログ logs/build.log の失敗原因を特定し根拠を列挙する",
+  "instructions": [
+    "ビルド失敗の主因を 1 文で要約してください。",
+    "失敗の根拠となる行を 5 件以上、行番号付きで列挙してください。",
+    "context_files 以外の情報源を参照しないでください。"
+  ],
+  "tool_profile": "no_tools",
+  "output_sections": ["Summary", "Findings", "Evidence"],
+  "context_files": ["r0_build.log"],
+  "model": "gemini-3-flash-preview",
+  "timeout_sec": 120
+}

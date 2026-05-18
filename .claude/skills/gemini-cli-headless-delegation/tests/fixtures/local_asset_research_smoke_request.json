@@ -1,0 +1,17 @@
+{
+  "schema": "delegation_request_v1",
+  "objective": "repo root の .gemini/settings.json を確認し、Serena MCP の mcp.allowed と mcpServers.serena.includeTools が local_asset_research read-only contract と一致しているかを検証する",
+  "instructions": [
+    ".gemini/settings.json の mcp.allowed フィールドの値を読み取り、[\"serena\"] と一致するか確認してください。",
+    ".gemini/settings.json の mcpServers.serena.includeTools に含まれるツール名をすべて列挙し、read-only allowlist（find_file, find_referencing_symbols, find_symbol, get_symbols_overview, list_dir, search_for_pattern）と比較してください。",
+    ".gemini/settings.json の mcpServers.serena.trust フィールドが false であることを確認してください。",
+    "確認結果を ok: true または fail-closed reason として構造化して出力してください。"
+  ],
+  "tool_profile": "local_asset_research",
+  "output_sections": ["SettingsVerification", "ReadOnlyToolCheck", "Conclusion"],
+  "context_files": [
+    "../../../../../.gemini/settings.json"
+  ],
+  "model": "gemini-2.5-flash",
+  "timeout_sec": 120
+}

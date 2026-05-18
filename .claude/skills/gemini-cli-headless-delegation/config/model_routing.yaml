@@ -1,0 +1,45 @@
+# model_routing.yaml — optional override for DEFAULT_MODEL_ROUTING in run_gemini_headless.py
+#
+# When this file exists, its values are deep-merged into DEFAULT_MODEL_ROUTING.
+# Keys not listed here fall back to the Python-side defaults.
+# Edit model IDs here when stable Gemini model names change — no code change needed.
+#
+# Schema:
+#   default_chain: list[str]          # tried in order when no role / no explicit model
+#   roles:
+#     <role_name>:
+#       model_chain: list[str]        # tried in order for this role
+#
+# Supported role names (see references/model-routing.md for full table):
+#   code_research, web_research, github_research, implementation, issue_authoring
+#
+# NOTE: model IDs below are placeholders matching DEFAULT_MODEL_ROUTING.
+# Replace with verified stable IDs when Gemini releases official aliases.
+
+default_chain:
+  - gemini-3-flash-preview
+  - gemini-2.5-flash
+
+roles:
+  code_research:
+    model_chain:
+      - gemini-3-flash-preview
+      - gemini-2.5-flash
+  web_research:
+    model_chain:
+      - gemini-3-flash-preview
+      - gemini-2.5-flash
+  github_research:
+    model_chain:
+      - gemini-3-flash-preview
+      - gemini-2.5-flash
+  implementation:
+    model_chain:
+      - gemini-3-pro-preview
+      - gemini-3-flash-preview
+      - gemini-2.5-flash
+  issue_authoring:
+    model_chain:
+      - gemini-3-pro-preview
+      - gemini-3-flash-preview
+      - gemini-2.5-flash
