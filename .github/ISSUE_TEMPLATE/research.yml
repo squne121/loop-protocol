@@ -1,0 +1,137 @@
+name: Research
+description: 仕様調査・比較検討用の child issue。次のアクションに進める状態を成果物とする。
+title: "調査: "
+labels:
+  - phase/research
+  - state/queued
+  - agent/research
+body:
+  - type: markdown
+    attributes:
+      value: |
+        必須項目を埋めてから submit してください。skill 側で本テンプレの見出しを正規表現で機械判定します。
+
+        **AC に実装変更（`src/` 改修・`tests/` 追加）を含む場合は `Implementation` テンプレートを使用してください。**
+
+        本テンプレートの **既定の成果物は「次の Issue（implementation / human-confirm 等）が起票可能になる状態」** です。
+        リポジトリ資産（`docs/research/<topic>.md` 等）への出力は、品質調査など特別な目的のときのみ任意で行います。
+
+  - type: textarea
+    id: machine-readable-contract
+    attributes:
+      label: Machine-Readable Contract
+      description: skill 側の preflight で parse される YAML 契約。値だけ書き換える。
+      value: |
+        ```yaml
+        contract_schema_version: v1
+        issue_kind: research
+        parent_issue: "#<parent-issue-number>|none"
+        goal_ref: "<調査が前進させる目的>"
+        change_kind: research-only
+        ```
+    validations:
+      required: true
+
+  - type: input
+    id: parent-issue
+    attributes:
+      label: Parent Issue
+      description: 親 Issue 番号（無ければ "none"）
+      placeholder: "#42 または none"
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: |
+        調査ゴールのコンテクストが明確になり、**次のアクションに進める状態** になることを 1 文で書く。
+        揮発的な比較表だけ作って閉じる、では受け入れない。次に何が起こるか（どの implementation Issue が起票可能になるか、どの human-confirm が解消されるか等）を明示する。
+      placeholder: 自機 / 敵キャラの当たり判定アルゴリズム候補を比較し、採用案を選定して implementation Issue が起票可能な状態
+    validations:
+      required: true
+
+  - type: textarea
+    id: in-scope
+    attributes:
+      label: In Scope
+      placeholder: |
+        - 候補アルゴリズム 3 件の比較
+        - 各候補の性能オーダーと実装複雑度
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of Scope
+      placeholder: |
+        - 実装コード
+        - テスト追加
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: |
+        調査完了時に **次のアクションに進める** ことを検証可能にする。例:
+        「結論をもとに implementation Issue が起票され、本 Issue がその issue を link している」
+        「採用案について human-confirm Issue が起票され、人間判断待ちになっている」
+      placeholder: |
+        - [ ] 比較結果が本 Issue 本文に記載されている
+        - [ ] 採用案を実装する implementation Issue が起票され、本 Issue がそれを link している
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification-commands
+    attributes:
+      label: Verification Commands
+      description: |
+        成果物の検証コマンドを列挙する。次 Issue 起票がゴールの場合は `gh issue list` で起票確認、
+        リポジトリ出力がある場合は `test -f <path>` 等で存在確認。
+      placeholder: |
+        - `gh issue view <new-implementation-issue-number>` — 後続 Issue が起票されている
+    validations:
+      required: true
+
+  - type: textarea
+    id: allowed-paths
+    attributes:
+      label: Allowed Paths
+      description: |
+        **既定: 読み取り専用（リポジトリ変更なし）**。成果物は次 Issue 本文・コメント・link で表現する。
+        品質調査などで成果物をリポジトリ資産として書き出す必要がある場合のみ、具体パスを記載する（例: `docs/research/<topic>.md`）。
+      value: |
+        - 読み取り専用。リポジトリ変更なし（既定）
+    validations:
+      required: true
+
+  - type: textarea
+    id: stop-conditions
+    attributes:
+      label: Stop Conditions
+      value: |
+        - Outcome / Scope / AC が検索可能な形で記載されていない場合は即停止
+        - Allowed Paths 外への書き込みを試みた場合は即停止
+        - 権限不足（permission denied）により操作が完了できない場合は即停止
+        - 成果物の書き込みに失敗した場合（I/O エラー等）は即停止
+    validations:
+      required: true
+
+  - type: textarea
+    id: handoff-contract
+    attributes:
+      label: Handoff Contract
+      description: research 完了時に implementation / human-confirm child issue へ引き継ぐ場合の構造。
+      value: |
+        - `Current Objective`
+        - `Bounded Current Context`
+        - `Open Questions`
+        - `Next Action`
+        - `Artifact Refs`
+    validations:
+      required: true
