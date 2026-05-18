@@ -1,0 +1,18 @@
+{
+  "schema": "delegation_request_v1",
+  "tool_profile": "github_research",
+  "gh_commands": [
+    {"argv": ["issue", "view", "2232", "--json", "title,state"]}
+  ],
+  "objective": "Issue #2232 のタイトルとステートを確認する",
+  "instructions": [
+    "gh コマンドの実行結果（inline_context に記載）を確認し、Issue #2232 のタイトルとステートを報告してください。",
+    "結果を JSON 形式で要約してください。"
+  ],
+  "output_sections": ["IssueInfo"],
+  "context_files": [
+    "../../../../../README.md"
+  ],
+  "model": "gemini-2.5-flash",
+  "timeout_sec": 120
+}

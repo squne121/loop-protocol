@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gemini CLI Headless Delegation"
+  short_description: "Gemini CLI を wrapper 経由で non-interactive delegation する shared skill"
+  default_prompt: "$gemini-cli-headless-delegation を使って、Gemini CLI を ad hoc に直叩きせず、wrapper と structured request contract 経由で headless delegation を実行する。既定 model は gemini-3-flash-preview、既定モードは --approval-mode plan、tool_profile は必ず明示する。"

@@ -1,0 +1,17 @@
+[2026-04-05 09:00:00] Starting CI build pipeline...
+[2026-04-05 09:00:01] Installing dependencies...
+[2026-04-05 09:00:10] Running pytest...
+FAILED tests/test_importer.py::test_import_bar - ImportError: No module named 'bar'
+FAILED tests/test_importer.py::test_import_baz - ImportError: No module named 'baz'
+FAILED tests/test_database.py::test_connection - ConnectionRefusedError: [Errno 111] Connection refused
+FAILED tests/test_database.py::test_query - psycopg2.OperationalError: could not connect to server
+FAILED tests/test_database.py::test_transaction - psycopg2.InterfaceError: connection already closed
+ERROR tests/test_syntax.py - SyntaxError: invalid syntax (syntax_error.py, line 42)
+FAILED tests/test_api.py::test_endpoint_200 - AssertionError: assert 500 == 200
+FAILED tests/test_api.py::test_endpoint_404 - AssertionError: assert 200 == 404
+FAILED tests/test_integration.py::test_e2e_flow - RuntimeError: expected status 200, got 503
+FAILED tests/test_integration.py::test_cleanup - FileNotFoundError: [Errno 2] No such file or directory: '/tmp/work/output.json'
+FAILED tests/test_integration.py::test_setup_teardown - PermissionError: [Errno 13] Permission denied: '/var/run/test.pid'
+FAILED tests/test_utils.py::test_parse_config - KeyError: 'database.host'
+2 passed, 12 failed, 1 error in 45.3s
+[2026-04-05 09:00:55] Build FAILED with exit code 1

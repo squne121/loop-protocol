@@ -1,0 +1,17 @@
+{
+  "schema": "delegation_request_v1",
+  "objective": "run_gemini_headless.py の _build_raw_command を build_raw_command にリネームする patch draft を作成する",
+  "instructions": [
+    "対象ファイルのみの変更に限定し、それ以外のファイルへの影響を列挙してください。",
+    "リネームに伴う呼び出し元の変更箇所を全て列挙してください。",
+    "検証のために実行すべきコマンドを提示してください。"
+  ],
+  "tool_profile": "no_tools",
+  "output_sections": ["PatchDraft", "ImpactScope", "ValidationCommands"],
+  "context_files": [
+    "r2_context/run_gemini_headless.py",
+    "r2_context/test_run_gemini_headless.py"
+  ],
+  "model": "gemini-3-flash-preview",
+  "timeout_sec": 120
+}
