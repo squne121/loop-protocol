@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdversarialReviewOutput",
+  "description": "adversarial-review スキルの structured output schema。verdict / summary / findings / next_steps を必須フィールドとする。",
+  "type": "object",
+  "required": ["verdict", "summary", "findings", "next_steps"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "needs-attention"],
+      "description": "レビュー判定。実質的な adversarial finding が一切ない場合のみ approve。それ以外は needs-attention。"
+    },
+    "summary": {
+      "type": "string",
+      "description": "ship / no-ship の簡潔な判定文。中立的な要約ではなく、明確な判定として記述すること。"
+    },
+    "findings": {
+      "type": "array",
+      "description": "発見された material finding の配列。style / naming / cleanup は含めない。",
+      "items": {
+        "type": "object",
+        "required": [
+          "severity",
+          "title",
+          "body",
+          "file",
+          "line_start",
+          "line_end",
+          "confidence",
+          "recommendation"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"],
+            "description": "所見の重大度。critical: 即時ブロッカー / high: 高リスク / medium: 対応推奨 / low: 改善推奨"
+          },
+          "title": {
+            "type": "string",
+            "description": "所見の簡潔なタイトル（1行）"
+          },
+          "body": {
+            "type": "string",
+            "description": "所見の詳細説明。何が問題か・なぜ脆弱か・影響範囲の3点を含むこと。"
+          },
+          "file": {
+            "type": "string",
+            "description": "問題が存在するファイルのパス。特定できない場合は空文字列。"
+          },
+          "line_start": {
+            "type": ["integer", "null"],
+            "description": "問題箇所の開始行番号。特定できない場合は null。",
+            "minimum": 1
+          },
+          "line_end": {
+            "type": ["integer", "null"],
+            "description": "問題箇所の終了行番号。特定できない場合は null。",
+            "minimum": 1
+          },
+          "confidence": {
+            "type": "number",
+            "description": "所見の確信度（0.0 〜 1.0）。推論を含む場合は正直に下げること。",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "recommendation": {
+            "type": "string",
+            "description": "リスクを低減するための具体的な改善策。"
+          },
+          "finding_id": {
+            "type": ["string", "null"],
+            "description": "所見の安定ID（オーケストレータ生成）。形式: [title-slug]--[content-hash]。content-hash は title + \"|\" + severity + \"|\" + file_path を SHA-1 先頭8文字で生成。adversarial-reviewer が出力する場合はプレースホルダー（null または空文字列）を出力し、オーケストレータが後補。"
+          },
+          "scope_classification": {
+            "type": ["string", "null"],
+            "enum": ["in_scope", "out_of_scope", "wip_downgraded", "contradiction", null],
+            "description": "所見の scope 分類（オーケストレータ付与）。adversarial-reviewer が出力する場合はプレースホルダー（null）を出力。in_scope: 実装スコープ内 / out_of_scope: スコープ外 / wip_downgraded: WIP から格下げ / contradiction: 矛盾・抵触所見。"
+          }
+        }
+      }
+    },
+    "out_of_scope_followups": {
+      "type": "array",
+      "description": "findings と独立した top-level 配列。必要時は省略可、必要なければ空配列を推奨。",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_steps": {
+      "type": "array",
+      "description": "レビュー後に取るべき対応アクションのリスト。",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

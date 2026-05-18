@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Review Judge"
+  short_description: "linked issue の contract と PR evidence を照合し、self-approve 失敗時は top-level PR comment へ fallback する"
+  default_prompt: "$pr-review-judge を使って linked issue の Acceptance Criteria と PR evidence を照合し、blocker / non-blocker を分類したうえで APPROVE または REQUEST_CHANGES を返す。自分が author の PR で APPROVE が GitHub API に拒否された場合だけ top-level PR comment へ fallback する。"
