@@ -29,5 +29,17 @@ tmp/nlm/
 .agents/skills/nlm-skill/SKILL.md
 
 # Local AI workspace settings
-.agents/
-.claude/skills/
+# .agents/ 配下: rules / shared-agent-skills-governance はリポジトリ管理。nlm-skill のみ除外
+.agents/skills/nlm-skill/
+# .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
+.claude/skills/nlm-skill/
+.claude/skills/*-workspace/
+.claude/worktrees/
+.claude/plans/
+
+# Python bytecode (scripts/github_ops/)
+__pycache__/
+*.pyc
+
+# tmp/ scratch
+tmp/
