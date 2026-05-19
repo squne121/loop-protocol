@@ -1,78 +1,107 @@
 # Agent / Skill 責務境界
 
-LOOP_PROTOCOL の Issue 駆動開発で使う各 skill / SubAgent の責務境界を、開発者が運用上参照するためのドキュメント。
-SKILL.md 本文には書かず（コンテクスト汚染を避けるため）、本ドキュメントを正本とする。
+LOOP_PROTOCOL の Issue 駆動開発で使う各 SubAgent / Skill の責務境界を、開発者が運用上参照するためのドキュメント。
+SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、本ドキュメントを正本とする。
+
+## 基本モデル
+
+```
+SubAgent（役割）── Skill（作業手順）
+        │              │
+        │              └─ references/（補助ドキュメント）
+        │
+        └─ 必要な複数の Skill を **使う**
+```
+
+- **SubAgent = 役割**: 「何を担当する人物か」。隔離されたコンテクストで動く実行者
+- **Skill = 作業手順**: 「どう作業するか」の再現可能な手順書
+- **関係**: SubAgent が Skill を使う。SubAgent と Skill は責務分離するものではなく、役割と手順の関係
+
+### アンチパターン
+
+- SubAgent 定義に詳細な作業手順を埋める（手順は Skill 側に書く）
+- 複数 Skill が共有する説明・概念を独立 Skill にする（references/ または本ドキュメントに置く）
+- 「Why this SubAgent exists」のような普遍的説明を SubAgent 定義に書く（普遍は本ドキュメントに集約）
 
 ## Issue 管理系
 
-| skill / agent | 役割 | 入力 | 出力 |
-|---|---|---|---|
-| `create-issue` skill | 新規 Issue 起票 | ユーザー要求 | 新規 Issue（`gh issue create`） |
-| `issue-author` SubAgent | 既存 Issue 本文の更新 | issue_number + reviewer_feedback_url | 更新後の Issue 本文（`gh issue edit`） |
-| `review-issue` skill | Issue 本文の構造的品質チェック | issue_number | 修正差分提案 + verdict（approve / needs-fix） |
-| `issue-contract-review` skill | 実装着手前の contract 確認（AC / Allowed Paths / 1 PR 判定） | issue_number | contract-snapshot + execution-plan、または split / blocked 提案 |
-| `issue-refinement-loop` skill | Issue 改善 4 段ループのオーケストレーター | issue_number | iteration 終了状態 |
+| SubAgent | 役割 | 使う Skill |
+|---|---|---|
+| `issue-author` | Issue を **起票・修正** する役割 | `create-issue`（新規起票）、`edit-issue`（既存修正）|
+
+| Skill | 手順 | 呼び出し元の例 |
+|---|---|---|
+| `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-author` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
+| `edit-issue` | 既存 Issue 本文更新の手順（バックアップ / Guard / 差分閾値 / `gh issue edit --body-file`）| `issue-author` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
+| `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-refinement-loop` |
+| `issue-contract-review` | 実装着手直前に作業計画・コンテクスト・開発フロー適合性を preflight | main session、`implement-issue` の手前 |
+| `issue-refinement-loop` | Issue 改善 4 段ループのオーケストレーター | main session |
+
+共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
+（VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-author` も参照する）
 
 ## 実装系（C-2 で適合予定）
 
-| skill / agent | 役割 |
+| SubAgent | 役割 | 使う Skill |
+|---|---|---|
+| `implementation-worker` | 実装作業の役割 | `implement-issue` |
+| `test-runner` | Verification Commands 実行・AC 達成確認の役割 | （他 skill から委譲） |
+
+| Skill | 手順 |
 |---|---|
-| `implement-issue` skill | 承認済み implementation issue を 1 PR で完了させる |
-| `implementation-worker` SubAgent | 実装 worker（implement-issue から委譲） |
-| `test-runner` SubAgent | Verification Commands を実行して AC ごとに PASS/FAIL 報告 |
+| `implement-issue` | 承認済み implementation issue を 1 PR で完了させる手順 |
 
 ## レビュー系（C-3 で適合予定）
 
-| skill / agent | 役割 |
+| SubAgent | 役割 | 使う Skill |
+|---|---|---|
+| `pr-reviewer` | PR レビューの役割 | `pr-review-judge` |
+
+| Skill | 手順 |
 |---|---|
-| `pr-review-judge` skill | PR の review 判定（APPROVE / REQUEST_CHANGES） |
-| `pr-reviewer` SubAgent | PR review worker |
+| `pr-review-judge` | PR の review verdict（APPROVE / REQUEST_CHANGES）を決定する手順 |
 
 ## オーケストレーション系（C-4 で適合予定）
 
-| skill / agent | 役割 |
+| SubAgent | 役割 | 使う Skill |
+|---|---|---|
+| `post-merge-cleanup-worker` | PR マージ後 cleanup の役割 | `post-merge-cleanup` |
+
+| Skill | 手順 |
 |---|---|
-| `impl-review-loop` skill | 実装→検証→PR レビュー の 4 段ループ |
-| `open-pr` skill | PR 起票 |
-| `post-merge-cleanup` skill | PR マージ後の cleanup |
-| `post-merge-cleanup-worker` SubAgent | cleanup worker |
+| `impl-review-loop` | 実装→検証→PR レビュー の 4 段ループ手順 |
+| `open-pr` | PR 起票手順 |
+| `post-merge-cleanup` | PR マージ後の cleanup 手順 |
 
 ## 補助系
 
-| skill / agent | 役割 |
+| SubAgent | 役割 |
 |---|---|
-| `ssot-discovery` skill | `docs/` 配下を SSOT として横断探索 |
-| `codebase-investigator` SubAgent | 大規模コードベース調査 |
-| `gemini-cli-headless-delegation` skill | Gemini CLI への headless 委譲 |
-| `nlm-skill` skill | NotebookLM CLI / MCP 操作（既存導入） |
+| `codebase-investigator` | 大規模コードベース調査の役割 |
 
-## 設計原則
+| Skill | 手順 |
+|---|---|
+| `ssot-discovery` | `docs/` 配下を SSOT として横断探索する手順 |
+| `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順 |
+| `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
+
+## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け
 
-- `review-issue`: Issue 本文の **構造的品質**（AC が検証可能か、Outcome に成果物形式があるか、Required Skills 意味論を満たすか等）
-- `issue-contract-review`: 着手直前の **contract 確認**（Allowed Paths と AC の整合、1 PR 判定、execution plan 固定）
-- 順序: `review-issue`（本文整備）→ `issue-contract-review`（実装着手前 preflight）→ `implement-issue`（実装）
-
-### create-issue と issue-author の使い分け
-
-- `create-issue` skill: **新規** Issue を起票する。`gh issue create` を呼ぶ
-- `issue-author` SubAgent: **既存** Issue の本文を更新する。`gh issue edit` を呼ぶ
-- 2 つは入力も出力も異なり、相互呼び出しもしない（issue-author は create-issue を使わない）
-
-### SubAgent vs Skill の責務分離
-
-| 区分 | Skill | SubAgent |
+| skill | 何を見るか | いつ呼ぶか |
 |---|---|---|
-| **責務** | 再現可能な作業手順 | 隔離コンテクストでの実行 |
-| **格納先** | `.claude/skills/<name>/SKILL.md` | `.claude/agents/<name>.md` |
-| **記述内容** | 手順・guard・テンプレ | モデル指定・権限制約・出力契約・SubAgent description |
-| **作業手順の所在** | SKILL.md 本体に書く | SubAgent は SKILL.md を参照する形を取る |
+| `review-issue` | Issue 本文の構造的品質（テンプレ準拠・AC 検証可能性・Outcome 具体性等） | Issue 起票後 / 改善ループ中 |
+| `issue-contract-review` | 作業計画・コンテクストが指定通りで開発フローに沿って AI が安全着手できるか（VC preflight・AC 検証可能性・worktree/branch 命名） | 人間承認後・実装着手直前 |
 
-SubAgent 定義に作業手順を厚く書きすぎると skill とのコンテクスト重複が発生する。SubAgent は「どの skill のどの手順を、どのモデル・権限・出力契約で実行するか」を定義する場所とする。
+責務が重なる項目（AC 検証可能性等）はあるが、**呼ぶタイミング**と **判定後の next action** が異なる。
 
-### shared reference は references/ に置く
+### shared reference の置き場所
 
-複数 skill / agent が共通参照するガイドライン（VC 作成・Anchor Verification 等）は、独立 skill にせず、最も主体的に使う skill の `references/<topic>.md` に配置する。他からは相対パスで参照する。
+複数 skill が共通参照するガイドライン（VC 作成・Anchor Verification 等）は以下の順で配置を検討する:
 
-例: VC 作成ガイダンス は `.claude/skills/create-issue/references/body-authoring.md` に置き、`issue-author` SubAgent から相対パスで参照する。
+1. 主体的に使う 1 つの Skill の `references/` 配下に置き、他 Skill から相対パスで参照
+2. プロジェクト全体に関わる方針なら `docs/dev/` に置く
+3. 独立 Skill にはしない（Skill は「何かを実行する手順」であり、共有参照は手順ではないため）
+
+例: VC 作成ガイダンスは `create-issue/references/body-authoring.md` に置き、`edit-issue` / `issue-author` SubAgent から参照する。

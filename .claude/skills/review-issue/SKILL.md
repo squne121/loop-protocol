@@ -1,186 +1,119 @@
 ---
 name: review-issue
-description: Issue が Terminal AI Agent にとって「作業に迷わない・ハーネスエンジニアリング観点で再現可能」かを決定論的に判定するスキル。AC が検証可能か / Outcome に成果物形式と完了条件があるか / Verification Commands が実在コマンドのみ参照しているか / Stop Conditions 6 定型を満たすか / Required Skills の意味論を満たすか、を構造的にチェックする。issue-contract-review の前段として Issue 品質を整える。
+description: GitHub Issue 本文が AI Agent にとって作業に迷わない品質か（コンテクスト・ハーネスエンジニアリング観点）を、決定論的チェック + 軽量な構造評価で判定し修正差分提案を生成する skill。VC の動作検証はしない（それは pr-review-judge / test-runner の責務）。「Issue ◯◯ レビュー」「review issue」のトリガーで使う。
 ---
 
 # Review Issue
 
-GitHub Issue が Terminal AI Agent にとって**作業に迷わない**か（コンテクスト・ハーネスエンジニアリング観点）を、決定論的に判定して修正差分提案を生成する。
-
-評価の対象は **Issue 本文の構造的品質**であり、AC の動作検証や実装内容そのものは判定しない（それらは `pr-review-judge` / test-runner の責務）。
+Issue 本文を読んで以下を **決定論的に** 判定し、`approve` / `needs-fix` の verdict と修正差分提案を返す。
 
 ## Use When
 
-- Issue を Terminal AI Agent が作業しやすいようレビューしたいとき
-- 「Issue ◯◯ レビューして」「review issue」「Issue 確認して」などの短文トリガー
-- `issue-contract-review`（実装前 contract 確認）の前段として Issue 品質を整えたいとき
-- 新規 Issue の構造を整備したいとき
+- Issue を AI Agent が作業しやすいようレビューしたいとき
+- 「Issue ◯◯ レビューして」「review issue」のトリガー
+- `issue-contract-review`（実装着手 preflight）の前段として本文品質を整えたいとき
 
-> 本 skill と `issue-contract-review` の使い分け（プロジェクトドキュメント `docs/dev/agent-skill-boundaries.md` に詳細）は、開発者が運用上参照するもので、本 SKILL.md 本文での再説明はコンテクスト汚染になるため省略している。
+## Input
 
-## Critical Guard: Issue refinement フェーズでは AC を実行しない
-
-本 skill は **Issue refinement フェーズ（実装前の Issue 本文品質確認）** で呼び出される。以下を厳守する。
-
-- **AC の Verification Commands を現行ファイル（実装前 baseline）に対して実行してはならない**
-- AC は refinement 設計上「実装前 baseline で fail し、実装後に pass する」ことを前提とした検証スクリプトである。実装前に実行すれば fail するのが**正常動作**であり、これを「実装未着手」「needs-fix」と判定するのは**誤判定**
-- レビュワーは **Issue refinement 観点（AC の検証可能性・baseline 失敗性・実装後 pass 可能性）のみ** を構造的に評価する:
-  - AC が検証可能な形式（チェックボックス + 合否基準）で書かれているか
-  - AC に対応する Verification Commands が「実装前 baseline で fail し、実装後に pass する」構造になっているか
-  - Verification Commands が実在のコマンド・ファイルのみを参照しているか（静的検証のみ）
-
-### アンチパターン（絶対に行わない）
-
-- AC baseline fail を needs-fix と誤判定する（baseline fail は正常動作）
-- AC を動作検証する（refinement では「検証可能性」を構造的に評価するのみ）
-- baseline fail を理由に追加 iteration を要求する
+- `issue_number`（必須）
+- `invoked_as_loop`（任意、bool）: `issue-refinement-loop` から呼ばれた場合 `true`、人間直起動なら `false`
 
 ## Procedure
 
-### 事前判定: state/needs-human ラベル
+### 1. Issue 本文と種別を取得
 
-`state/needs-human` ラベルが付いている Issue は人間判断待ちで AI 着手不可。本 skill では以下のみ判定:
+```bash
+gh issue view <番号> --json title,body,labels --jq '.title + "\n---LABELS---\n" + (.labels | map(.name) | join(",")) + "\n---BODY---\n" + .body'
+```
 
-- 人間が判断するための論点が `## Notes for Reviewer` / `## Stop Conditions` 等で明示されているか
-- 上記以外は本文構造の品質チェックを軽量に行うのみで、AC/VC 詳細評価はスキップする（人間判断後に本文更新→再レビューする想定）
+Issue 種別の判定は **テンプレート SSOT に委ねる**:
+- title prefix（`実装:` / `調査:` / `導入:`）
+- labels（`phase/implementation` / `phase/research` / `tracking`）
+- いずれかから `.github/ISSUE_TEMPLATE/{種別}.yml` を選び、その `body[].attributes.label` を必須セクション一覧として取得する
 
-人間判断は別 Issue 化せず元 Issue 内で対応する運用のため（`human-confirm` テンプレは廃止済み）、種別は `parent` / `research` / `implementation` のいずれかとして判定する。
+### 2. state ラベルによる事前判定
 
-### レビュー手順
+`state/needs-human` が付いている Issue は人間判断待ちで AI 着手不可。本 skill では構造チェックを軽量に行い、本文の品質詳細評価はスキップする（人間判断後に本文更新→再レビュー想定）。
 
-1. Issue 本文を読む:
-   - Issue 種別（parent / research / implementation）を判定する
-   - 対応するテンプレート `.github/ISSUE_TEMPLATE/{種別}.yml` を読み、必須セクション一覧（textarea labels）を取得する
-   - 取得した必須セクション一覧の有無を Issue 本文で確認する
-   - `## Required Skills` がある場合、エントリを以下のカテゴリに静的分類する:
-     1. ワークフロー skill（`issue-contract-review` / `implement-issue` / `pr-review-judge` / `ssot-discovery` 等） — **Required Skills に書くべきではない**
-     2. document / path reference（`docs/adr/...`, repo 内ファイルパス） — `Required Skills` ではなく `## Background` / `## In Scope` に書く
-     3. ドメイン知識 skill（TypeScript / ECS / Canvas / Vitest BDD 等） — 適切
+### 3. 決定論的チェック（Blocking）
 
-2. 確認項目を評価する（AI Agent が作業に迷わない・ハーネス engineering 観点）:
+各チェックを `grep` / `awk` / 数値比較で機械判定する。1 つでも fail なら verdict は `needs-fix`。
 
-   以下はすべて **本文の構造を見て決定論的に判定** できる項目。AC の動作検証や実装内容の妥当性判定は本 skill のスコープ外。
+| ID | チェック | 機械判定 |
+|---|---|---|
+| C1 | 必須セクション存在 | `grep -qF "## <label>"` を ISSUE_TEMPLATE 由来の各 label に対して |
+| C2 | Stop Conditions 6 項目（implementation のみ） | `## Stop Conditions` 配下の `^- ` 行数 ≥ 6 |
+| C3 | AC が `- [ ]` 形式 | `## Acceptance Criteria` 配下に `^- \[.\]` 行が 1 件以上 |
+| C4 | VC コマンド存在 | `## Verification Commands` 配下に `^[\-\$]` 始まり行が 1 件以上 |
+| C5 | AC ⇔ VC 番号一致 | `^- \[.\] AC[0-9]+` 件数 = `# AC[0-9]+` 件数 |
+| C6 | 主観表現の混入 | AC / VC 本文に「適切に動作」「品質を改善」「最適化」等が **含まれない** |
+| C7 | Required Skills 意味論 | ワークフロー skill（`implement-issue` / `pr-review-judge` / `ssot-discovery` 等）/ document path（`docs/...` / `.md` / `/`）を **含まない** |
+| C8 | Outcome 抽象パターン除外 | `## Outcome` 配下に「〜が決定される」「〜を検討する」「〜を改善する」等の動作状態のみ表現が **含まれない** |
 
-   **構造・テンプレ整合**
-   - **テンプレート準拠性**（Blocking）: 必須セクション（`.github/ISSUE_TEMPLATE/{種別}.yml` の textarea labels）がすべて存在するか
-   - **Stop Conditions 妥当性**（Blocking、implementation 種別のみ）: `## Stop Conditions` が存在し、6 定型項目が記載され、プレースホルダが未記入の空欄がないか
+### 4. 軽量構造評価（non-blocking improvement 候補）
 
-   **Outcome 品質**（AI が成果物を生成できる粒度か）
-   - **Outcome Abstraction**（Blocking）: Outcome が動作状態のみで成果物形式を完全に欠き、書き換え案の具体化に追加情報が必要なほど抽象的な場合（「〜を検討する」「〜を改善する」等）は blocking
-   - **non-blocking improvement**: 成果物形式への参照が部分的にあり、軽微な具体化で適合できる場合
-   - 不適合パターン例: 「〜が決定される」「〜が整理される」「〜を検討する」「〜を改善する」等、動作状態のみで成果物形式を欠く表現
-   - **境界判定の目安**: AI が Issue 本文と既存文脈のみから書き換え案を自律生成できない場合は blocking、自律生成できる場合は non-blocking improvement
+機械判定だけでは捕まらない構造的観点。**情報提示のみ** で blocking しない。
 
-   **AC / VC 検証可能性**（AI が verify を機械実行できるか）
-   - **AC 検証可能性**（Blocking）: チェックボックス形式で、合否が機械判定できる記述になっているか（「適切に動作する」等の主観表現は blocking）
-   - **Verification 具体性**（Blocking）: ターミナルで実際に実行可能なコマンドが列挙されているか
-   - **AC/VC 番号一致**（Blocking）: `# AC<N>` コメント番号が AC 番号と一致しているか
+- **PR スコープのまとまり**: Allowed Paths が 1 つの Outcome のためだけに必要かを目視確認。例外：別レイヤーに **接続する** 要素を変更する場合（API 境界変更等）は、文脈整合を保つため 1 PR にまとめるのが妥当。レイヤー独立に分けると Issue 間で文脈が分断される
+- **類似 Issue 重複**: `gh issue list --search "<keyword>" --state open` で OPEN Issue を列挙し、同一・類似 Outcome 候補があれば提示
 
-   **PR スコープ妥当性**（1 PR で完結し、レビュー・ロールバック可能か）
-   - **単一意図**: Allowed Paths が 1 つの Outcome のためだけに必要なファイル群に閉じているか
-   - **アーキ層のまとまり**: Allowed Paths が `src/state` / `src/render` / `src/systems` / `src/data` のいずれか 1 層に閉じているか、または層境界変更そのものが Outcome か
-   - **ロールバック単位**: 1 PR を revert すれば Outcome が完全に元に戻るか
-   - **In/Out Scope 衝突**: In Scope と Out of Scope に矛盾・重複がないか
+### 5. Verdict 決定
 
-   **Required Skills 意味論**（Blocking）
-   - ワークフロー skill（`implement-issue`・`issue-contract-review`・`pr-review-judge`・`ssot-discovery` 等）が `## Required Skills` に含まれていない
-   - document / path reference（`docs/adr/...`、repo 内ファイルパス）が `## Required Skills` に含まれていない
-   - 実在しない skill 名が含まれていない
-   - ドメイン知識 skill（TypeScript / ECS / Canvas / Vitest BDD 等）のみが列挙されている
+- `approve`: C1〜C8 すべて pass
+- `needs-fix`: C1〜C8 のいずれかが fail
 
-   **その他**
-   - **確認専用 Issue の禁止**（Blocking）: Outcome / AC / Stop Conditions を見て「確認する」「決める」「可否を調査する」だけが主目的で、実際にどの運用資産をどう更新して完了するかが書かれていない場合は `needs-fix`
-   - **類似 Issue の重複**（non-blocking improvement）: 同一・類似 Outcome の OPEN Issue を `gh issue list --search "<keyword>" --state open` で確認し、重複候補があれば人間が方針を決定できるよう情報を提示
+### 6. 差分提案生成
 
-3. 判定する:
-   - `approve`: AI Agent がそのまま着手できる
-   - `needs-fix`: Blocking issues がある（修正が必要）
+`needs-fix` の場合のみ。`追加すべき文` / `削除すべき文` / `書き換え案` の形式で具体的に示す（抽象論で終わらせない）。
 
-4. 差分提案を生成する:
-   - `needs-fix` のときは、抽象評価で終わらせず Issue にそのまま反映できる本文更新案を出す
-   - `approve` のときは本文更新提案や `gh issue edit` 実行前提の差分提案へ進まない。改善余地は `Non-blocking improvements` に任意提案として残す
-   - 本文更新案は `追加すべき文` / `削除すべき文` / `書き換え案` の形式で示す
+### 7. 本文書き戻し（条件分岐）
 
-5. 本文更新の実施主体を分岐する:
-   - `Verdict: approve` の場合は `invoked_as_loop` の値に関わらず本文更新へ進まない。レビュー結果のみ返して終了
-   - `Verdict: needs-fix` かつ `invoked_as_loop: true`: 本文更新提案だけを返し、Issue 本文の更新は `issue-refinement-loop` / `issue-author` SubAgent 側へ委ねる
-   - `Verdict: needs-fix` かつ `invoked_as_loop: false`: ユーザーに適用確認を行う
+| Verdict | invoked_as_loop | アクション |
+|---|---|---|
+| `approve` | * | レビュー結果のみ返して終了 |
+| `needs-fix` | `true` | 差分提案を返し、本文更新は呼び出し元（`issue-refinement-loop`）に委ねる。本 skill では `gh issue edit` しない |
+| `needs-fix` | `false` | ユーザーに「この差分を Issue 本文に適用しますか？（yes/no）」と明示確認。承認時のみ `edit-issue` skill を呼ぶ |
 
-6. ユーザーに適用確認を行う（needs-fix + invoked_as_loop: false のみ）:
-   - 差分提案を提示し、「この差分を Issue 本文に適用しますか？（yes/no）」と明示的に確認
-   - ユーザーが承認するまで次のステップへ進まない
-   - 拒否時は Issue 本文を変更せず skill を終了
+## Output (REVIEW_ISSUE_RESULT_V1)
 
-7. 承認された差分を Issue 本文に適用する:
-   - repo 配下 `tmp/` に修正後本文全体を書き出し、以下の guard を通してから `gh issue edit --body-file` を実行:
-     ```bash
-     mkdir -p tmp
-     BODY_FILE="tmp/review-issue-<番号>-body.md"
-     # 修正後の本文全体を $BODY_FILE に保存してから続行
-     wc -c "$BODY_FILE"
-     if [ "$(wc -c < "$BODY_FILE")" -le 1 ]; then
-       echo "body-file が空または 1 byte です: $BODY_FILE" >&2
-       exit 1
-     fi
-     if grep -Pn '\\(?:\"|\$)' "$BODY_FILE"; then
-       echo "HEREDOC 由来のエスケープ混入か、正当な文字列リテラルの可能性があります" >&2
-       exit 1
-     fi
-     gh issue edit <番号> --body-file "$BODY_FILE"
-     ```
-   - `--body-file` には修正後の本文全体を渡す（差分ではなく完全な本文）
-
-8. 変更経緯を Issue にコメント投稿する:
-   - 本文書き換え直後に以下を含むコメントを投稿:
-     - 変更前箇所（セクション名と元の文面）
-     - 変更後箇所（変更後の文面）
-     - 変更理由（review-issue が指摘した理由）
-     - 変更日時（ISO 8601）
-
-## Output
-
-- **Verdict**: `approve` / `needs-fix`
-- **Blocking issues**: 修正しなければ着手できない問題（番号付き）
-- **Non-blocking improvements**: あると良い改善（任意）
-- **修正差分提案**: 追加すべき文 / 削除すべき文 / 書き換え案
-- **人間への確認事項**: AI が判断できない点
-- **適用結果**（承認・適用後）: 承認された差分と適用されたセクション一覧
-- **コメント URL**（承認・適用後）: 投稿した変更経緯コメントの URL
-
-## Validation Coverage Guard
-
-E2E / live verification / research Issue をレビューする際、以下の 4 観点を分けて評価する。いずれかが欠落していれば `needs-fix`。
-
-### 1. artifact 存在確認（verification）
-- スクリーンショット・ログ・JSON 等の artifact が出力されることが確認可能か
-- artifact の存在確認コマンドが AC / Verification Commands に含まれているか
-
-### 2. 実行環境の確認（validation）
-- 実行環境（Node / pnpm / Vite バージョン、ブラウザ等）が AC または Stop Conditions に明記されているか
-- 環境依存の前提（ブラウザ表示・Canvas サポート等）が In Scope または Stop Conditions に記載されているか
-
-### 3. 後続処理ハンドオフの確認（validation）
-- 後続処理への引き渡し契約（出力ファイル名・データ形式等）が AC に含まれているか
-- 中間 artifact だけでなく、後続コマンドへの接続まで確認できるか
-
-### 4. 補助ツール vs 正規エントリポイントの確認（validation）
-- AC・In Scope・Outcome の主体エントリポイントが `src/` 配下の正規モジュールになっているか
-- 補助ツールが主体になっていないか（補助ツールは「開発補助として使用」と In Scope に記載）
+```yaml
+REVIEW_ISSUE_RESULT_V1:
+  status: ok | failed
+  generated_at: <ISO 8601>
+  generated_by: review-issue
+  issue_url: https://github.com/<owner>/<repo>/issues/<番号>
+  verdict: approve | needs-fix
+  deterministic_checks:
+    C1_required_sections: pass | fail | n/a
+    C2_stop_conditions_6: pass | fail | n/a
+    C3_ac_checkbox_format: pass | fail | n/a
+    C4_vc_commands_present: pass | fail | n/a
+    C5_ac_vc_number_alignment: pass | fail | n/a
+    C6_no_subjective_phrasing: pass | fail | n/a
+    C7_required_skills_semantics: pass | fail | n/a
+    C8_outcome_concreteness: pass | fail | n/a
+  blocking_issues: []
+  non_blocking_improvements: []
+  diff_proposal:
+    add: []
+    remove: []
+    rewrite: []
+  update_applied: true | false
+  comment_url: <変更経緯コメント URL、適用時のみ>
+```
 
 ## Guardrails
 
-- 抽象論（「不明確です」）だけで終わらせず、必ず編集可能な文面（修正差分）を示す
-- `issue-contract-review` の責務（実装前の contract 詳細確認）には踏み込まない
-- Verdict が `approve` でも、Non-blocking improvements があれば提示する
-- `approve` 判定時は `invoked_as_loop` の値に関わらず、本文更新提案・適用確認・`gh issue edit` 実行へ進まない
-- `needs-fix` でも `invoked_as_loop: true` の場合は、本文更新提案だけを返し、本文更新は `issue-refinement-loop` / `issue-author` SubAgent 側へ委ねる
-- 人間の明示的承認なく本文を書き換えない。承認後は必ず変更経緯コメントをセットで投稿する
-- `gh issue edit` で本文を書き換える場合は repo 配下 `tmp/` の `--body-file` を使い、空/1 byte と HEREDOC 由来エスケープを事前 guard する
+- **VC を実装後の動作確認に使わない**（baseline fail の構造を見るのみ。動作検証は `pr-review-judge` / `test-runner` の責務）
+- 本文更新は `edit-issue` skill 経由で行い、本 skill から直接 `gh issue edit` しない
+- `approve` 判定時は `invoked_as_loop` の値に関わらず本文更新へ進まない
+- `needs-fix` + `invoked_as_loop: true` の場合は差分提案だけ返し、本文更新を呼び出し元に委ねる
+- 人間の明示的承認なく本文を書き換えない
 
 ## Related
 
-- [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — Issue 本文更新の共通参照
-- `.claude/skills/issue-refinement-loop/SKILL.md` — Issue 改善ループ（review-issue → issue-author への委譲先）
-- `.claude/skills/issue-contract-review/SKILL.md` — 実装前 contract 確認
-- `.claude/skills/ssot-discovery/SKILL.md` — Issue 関連 SSOT の探索
-- `.github/ISSUE_TEMPLATE/implementation.yml` — 必須セクション一覧の正本
+- `.claude/skills/issue-contract-review/SKILL.md` — 着手直前の preflight（本 skill の次段）
+- `.claude/skills/edit-issue/SKILL.md` — `needs-fix` 結果を本文に反映する手順
+- `.claude/skills/issue-refinement-loop/SKILL.md` — Issue 改善ループ（本 skill を中で呼ぶ）
+- [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification 等の共通ガイドライン
+- `.github/ISSUE_TEMPLATE/implementation.yml` / `research.yml` / `parent.yml` — 必須セクションの SSOT
