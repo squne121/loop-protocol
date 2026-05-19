@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""setup_check.py — Runtime setup checker for gemini-cli-headless-delegation skill.
+
+Usage:
+    uv run python3 setup_check.py [--json]
+
+Exit codes:
+    0  All checks passed (fully ready)
+    1  Dependency missing or misconfigured (recoverable)
+    2  Execution environment error (unexpected failure)
+
+Test execution note:
+    Run tests with dependencies pre-installed:
+        uv run --with pytest --with pyyaml python -m pytest tests/
+
+This script uses only the standard library (subprocess, json, pathlib, sys, os)
+to minimise external dependencies.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SERENA_MCP_SERVER_NAME = "serena"
+SERENA_MCP_PACKAGE = "git+https://github.com/oraios/serena"
+SERENA_READ_ONLY_TOOLS = [
+    "find_file",
+    "find_referencing_symbols",
+    "find_symbol",
+    "get_symbols_overview",
+    "list_dir",
+    "search_for_pattern",
+]
+
+REQUIRED_TOOLS = ["node", "gemini", "python3", "uv", "uvx"]
+
+# Timeout for Serena MCP availability check (seconds).
+SERENA_CHECK_TIMEOUT = 30
+# Timeout for smoke prompt (seconds).
+SMOKE_PROMPT_TIMEOUT = 20
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _run(command: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _git_repo_root() -> Path | None:
+    """Return the absolute repo root via git rev-parse, or None on failure."""
+    try:
+        result = _run(["git", "rev-parse", "--show-toplevel"])
+        if result.returncode == 0:
+            return Path(result.stdout.strip()).resolve()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _tool_version(tool: str) -> str | None:
+    """Return the version string for a tool, or None if not found."""
+    try:
+        result = _run([tool, "--version"], timeout=10)
+        if result.returncode == 0:
+            return (result.stdout.strip() or result.stderr.strip()).splitlines()[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Check: dependency tools
+# ---------------------------------------------------------------------------
+
+
+def check_tools() -> dict[str, Any]:
+    """Check that all required tools are present and record versions."""
+    versions: dict[str, str | None] = {}
+    missing: list[str] = []
+    for tool in REQUIRED_TOOLS:
+        ver = _tool_version(tool)
+        versions[tool] = ver
+        if ver is None:
+            missing.append(tool)
+
+    ok = len(missing) == 0
+    result: dict[str, Any] = {"ok": ok, "versions": versions}
+    if missing:
+        result["missing"] = missing
+        result["recovery"] = [
+            f"Install missing tool(s): {', '.join(missing)}",
+            "  node/gemini: npm install -g @google/gemini-cli (requires node >= 18)",
+            "  uv/uvx:      curl -LsSf https://astral.sh/uv/install.sh | sh",
+        ]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Check: trustedFolders.json
+# ---------------------------------------------------------------------------
+
+
+def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
+    """Programmatically register repo root in ~/.gemini/trustedFolders.json.
+
+    Logic:
+    - If the repo root (TRUST_FOLDER) or a parent directory (TRUST_PARENT) is
+      already present, perform no-op (idempotent).
+    - Otherwise append the repo root and persist.
+    - Creates the file if absent.
+    """
+    root = repo_root or _git_repo_root()
+    if root is None:
+        return {
+            "ok": False,
+            "status": "error",
+            "detail": "Could not determine repository root via git rev-parse --show-toplevel.",
+            "recovery": ["Run setup_check.py from inside the LOOP_PROTOCOL git repository."],
+        }
+
+    trusted_path = Path.home() / ".gemini" / "trustedFolders.json"
+    trust_folder = str(root)
+
+    # Load existing list.
+    existing: list[str] = []
+    if trusted_path.exists():
+        try:
+            data = json.loads(trusted_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = [str(p) for p in data]
+        except (json.JSONDecodeError, OSError):
+            pass  # Treat as empty; will overwrite below.
+
+    # Check for TRUST_FOLDER (exact match) or TRUST_PARENT (ancestor directory).
+    for entry in existing:
+        entry_path = Path(entry)
+        if entry_path == root:
+            # TRUST_FOLDER already present — no-op.
+            return {"ok": True, "status": "already_trusted", "path": trust_folder}
+        try:
+            root.relative_to(entry_path)
+            # TRUST_PARENT present — no-op.
+            return {"ok": True, "status": "parent_trusted", "path": trust_folder, "parent": entry}
+        except ValueError:
+            pass
+
+    # Append and persist.
+    updated = existing + [trust_folder]
+    try:
+        trusted_path.parent.mkdir(parents=True, exist_ok=True)
+        trusted_path.write_text(
+            json.dumps(updated, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return {
+            "ok": False,
+            "status": "write_error",
+            "detail": str(exc),
+            "recovery": [f"Manually add '{trust_folder}' to {trusted_path}"],
+        }
+
+    return {"ok": True, "status": "added", "path": trust_folder}
+
+
+# ---------------------------------------------------------------------------
+# Check: Serena MCP availability
+# ---------------------------------------------------------------------------
+
+
+def check_serena_mcp() -> dict[str, Any]:
+    """Verify that Serena MCP can be invoked via uvx (without full install)."""
+    cmd = [
+        "uvx",
+        "--from",
+        SERENA_MCP_PACKAGE,
+        "serena-mcp-server",
+        "--help",
+    ]
+    try:
+        result = _run(cmd, timeout=SERENA_CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "detail": f"uvx serena-mcp-server --help timed out after {SERENA_CHECK_TIMEOUT}s.",
+            "recovery": [
+                "Check network connectivity to https://github.com/oraios/serena",
+                "Pre-cache with: uvx --from git+https://github.com/oraios/serena serena-mcp-server --help",
+            ],
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "status": "uvx_not_found",
+            "detail": "uvx not found in PATH.",
+            "recovery": ["Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"],
+        }
+
+    if result.returncode == 0 or "Usage" in (result.stdout + result.stderr):
+        return {"ok": True, "status": "available"}
+
+    return {
+        "ok": False,
+        "status": "unavailable",
+        "returncode": result.returncode,
+        "stderr": result.stderr[:500],
+        "recovery": [
+            "Verify internet access to github.com/oraios/serena",
+            "Check that uvx is up-to-date: uv self update",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check: .gemini/settings.json
+# ---------------------------------------------------------------------------
+
+_SETTINGS_TEMPLATE: dict[str, Any] = {
+    "mcp": {
+        "allowed": [SERENA_MCP_SERVER_NAME],
+    },
+    "mcpServers": {
+        SERENA_MCP_SERVER_NAME: {
+            "command": "uvx",
+            "args": [
+                "--from",
+                SERENA_MCP_PACKAGE,
+                "serena-mcp-server",
+                "--project-from-cwd",
+            ],
+            "trust": False,
+            "includeTools": SERENA_READ_ONLY_TOOLS,
+        }
+    },
+}
+
+
+def check_gemini_settings(repo_root: Path | None = None) -> dict[str, Any]:
+    """Generate .gemini/settings.json template when absent.
+
+    Never overwrites an existing file.
+    """
+    root = repo_root or _git_repo_root()
+    if root is None:
+        return {
+            "ok": False,
+            "status": "error",
+            "detail": "Could not determine repository root.",
+            "recovery": ["Run setup_check.py from inside the LOOP_PROTOCOL git repository."],
+        }
+
+    settings_path = root / ".gemini" / "settings.json"
+    if settings_path.exists():
+        return {"ok": True, "status": "exists", "path": str(settings_path)}
+
+    # Generate template.
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps(_SETTINGS_TEMPLATE, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return {
+            "ok": False,
+            "status": "write_error",
+            "detail": str(exc),
+            "recovery": [f"Manually create {settings_path} with the Serena MCP template."],
+        }
+
+    return {"ok": True, "status": "created", "path": str(settings_path)}
+
+
+# ---------------------------------------------------------------------------
+# Check: account authentication (smoke prompt)
+# ---------------------------------------------------------------------------
+
+
+def check_auth() -> dict[str, Any]:
+    """Run a short smoke prompt to verify Gemini CLI authentication.
+
+    Authentication itself is a human responsibility (pre-requisite).
+    This check only verifies that cached credentials are working.
+    """
+    try:
+        result = _run(
+            ["gemini", "--prompt", "ok", "--model", "gemini-2.0-flash"],
+            timeout=SMOKE_PROMPT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "detail": f"gemini --prompt 'ok' timed out after {SMOKE_PROMPT_TIMEOUT}s.",
+            "recovery": [
+                "Run: gemini auth login",
+                "Ensure Google account credentials are cached.",
+            ],
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "status": "gemini_not_found",
+            "detail": "gemini CLI not found.",
+            "recovery": ["npm install -g @google/gemini-cli"],
+        }
+
+    if result.returncode == 0:
+        return {"ok": True, "status": "authenticated"}
+
+    combined = (result.stdout + result.stderr).lower()
+    if any(kw in combined for kw in ("auth", "login", "credential", "sign in", "not logged")):
+        return {
+            "ok": False,
+            "status": "unauthenticated",
+            "detail": (result.stderr or result.stdout)[:300],
+            "recovery": [
+                "Run: gemini auth login",
+                "Authentication is a human pre-requisite; setup_check cannot automate OAuth login.",
+            ],
+        }
+
+    return {
+        "ok": False,
+        "status": "failed",
+        "returncode": result.returncode,
+        "stderr": result.stderr[:300],
+        "recovery": [
+            "Run: gemini auth login",
+            "Check: gemini --version",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def run_all_checks(repo_root: Path | None = None) -> dict[str, Any]:
+    """Execute all checks and return a consolidated result dict."""
+    root = repo_root or _git_repo_root()
+
+    tools_result = check_tools()
+    trusted_result = check_trusted_folders(root)
+    serena_result = check_serena_mcp()
+    settings_result = check_gemini_settings(root)
+    auth_result = check_auth()
+
+    all_ok = all(
+        r["ok"]
+        for r in [tools_result, trusted_result, serena_result, settings_result, auth_result]
+    )
+
+    # Determine exit code.
+    # 0 = all ok; 1 = recoverable dependency issue; 2 = env error
+    if all_ok:
+        exit_code = 0
+    elif any(
+        r.get("status") in ("error", "write_error")
+        for r in [trusted_result, settings_result, serena_result]
+    ):
+        exit_code = 2
+    else:
+        exit_code = 1
+
+    return {
+        "ok": all_ok,
+        "exit_code": exit_code,
+        "tools": tools_result,
+        "trusted_folders": trusted_result,
+        "serena_mcp": serena_result,
+        "gemini_settings": settings_result,
+        "auth": auth_result,
+    }
+
+
+def _human_readable(result: dict[str, Any]) -> str:
+    lines: list[str] = []
+    overall = "PASS" if result["ok"] else "FAIL"
+    lines.append(f"setup_check: {overall} (exit_code={result['exit_code']})")
+    lines.append("")
+
+    # Tools
+    tools = result["tools"]
+    lines.append("[tools]")
+    for tool, ver in tools["versions"].items():
+        status = ver if ver else "MISSING"
+        lines.append(f"  {tool}: {status}")
+    if not tools["ok"]:
+        for hint in tools.get("recovery", []):
+            lines.append(f"  recovery: {hint}")
+
+    lines.append("")
+
+    # Trusted folders
+    tf = result["trusted_folders"]
+    lines.append(f"[trusted_folders] ok={tf['ok']} status={tf.get('status', '?')}")
+    if "path" in tf:
+        lines.append(f"  path: {tf['path']}")
+    if not tf["ok"]:
+        for hint in tf.get("recovery", []):
+            lines.append(f"  recovery: {hint}")
+
+    lines.append("")
+
+    # Serena MCP
+    sm = result["serena_mcp"]
+    lines.append(f"[serena_mcp] ok={sm['ok']} status={sm.get('status', '?')}")
+    if not sm["ok"]:
+        for hint in sm.get("recovery", []):
+            lines.append(f"  recovery: {hint}")
+
+    lines.append("")
+
+    # Settings
+    gs = result["gemini_settings"]
+    lines.append(f"[gemini_settings] ok={gs['ok']} status={gs.get('status', '?')}")
+    if "path" in gs:
+        lines.append(f"  path: {gs['path']}")
+    if not gs["ok"]:
+        for hint in gs.get("recovery", []):
+            lines.append(f"  recovery: {hint}")
+
+    lines.append("")
+
+    # Auth
+    auth = result["auth"]
+    lines.append(f"[auth] ok={auth['ok']} status={auth.get('status', '?')}")
+    if not auth["ok"]:
+        for hint in auth.get("recovery", []):
+            lines.append(f"  recovery: {hint}")
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Check runtime prerequisites for gemini-cli-headless-delegation."
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output results as JSON (machine-readable).",
+    )
+    args = parser.parse_args()
+
+    try:
+        result = run_all_checks()
+    except Exception as exc:  # pylint: disable=broad-except
+        err = {"ok": False, "exit_code": 2, "error": str(exc)}
+        if args.json_output:
+            print(json.dumps(err, ensure_ascii=False, indent=2))
+        else:
+            print(f"setup_check: ERROR — {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.json_output:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(_human_readable(result))
+
+    sys.exit(result["exit_code"])
+
+
+if __name__ == "__main__":
+    main()
