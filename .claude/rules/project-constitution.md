@@ -66,6 +66,7 @@
   - `uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py`
 - docs-only 変更でも cheap で安定しているため、可能なら同じ品質ゲートを通す。
 - 失敗した場合は握りつぶさず、未解決のまま報告する。
+- 動作検証 AC（`runtime-verification: true`）を含む Issue は `docs/dev/runtime-verification-policy.md` の SKIP 規約・証跡保存・Stop Condition 連動に従う。
 
 ## スコープ管理
 
