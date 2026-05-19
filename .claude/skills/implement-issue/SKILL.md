@@ -13,12 +13,6 @@ description: 承認済みの implementation child issue（`issue-contract-review
 - `Issue番号` または `Issue URL`（必須）
 - `issue-contract-review` の contract-snapshot comment URL（必須）
 
-## Use When
-
-- `issue-contract-review` が完了し、人間が Go を返した後
-- implementation child issue を Allowed Paths 内で実装したい
-- PR 本文と linked issue comment を primary surface にしたい
-
 ## Procedure
 
 ### 1. Issue contract を再取得
@@ -118,40 +112,23 @@ EOF
 - `--no-verify` 禁止（Git Hooks をすり抜けない）
 - WIP コミットを push しない（push 前に rebase / squash で整理）
 
-### 7. push & Draft PR 作成
+### 7. push & PR 起票（`open-pr` skill に委譲）
+
+PR 起票は本 skill の責務外。`open-pr` skill に委譲する。
 
 ```bash
 git push -u origin "$BRANCH"
-
-gh pr create --repo "$REPO" --base main --draft \
-  --title "<type>: <subject>" \
-  --body-file /tmp/pr-body-${ISSUE_NUMBER}.md
 ```
 
-PR 本文テンプレ（`/tmp/pr-body-${ISSUE_NUMBER}.md` に書き出す）:
+push 完了後、以下を `open-pr` skill に渡して起票させる:
 
-```markdown
-## Summary
-- <変更内容の要点 1>
-- <変更内容の要点 2>
+- `linked_issue`: `$ISSUE_NUMBER`
+- `pr_title`: `<type>: <subject>`
+- `contract_snapshot_url`: 受け取った contract-snapshot comment URL
+- `verification_summary`: ステップ 5 で記録した PASS / FAIL サマリ
+- `allowed_paths_compliance`: true / false
 
-## 受け入れ条件の達成状況
-- [x] AC1: <達成（根拠）>
-- [x] AC2: <達成（根拠）>
-
-## 検証コマンド結果
-- `pnpm typecheck`: ✅ 通過
-- `pnpm lint`: ✅ 通過
-- `pnpm test`: ✅ 通過（X files / Y tests）
-- `pnpm build`: ✅ 通過
-
-## Allowed Paths 遵守
-- 変更ファイルがすべて Allowed Paths 内であることを確認済み
-
-## 関連
-Closes #<ISSUE_NUMBER>
-Contract Snapshot: <comment URL>
-```
+PR 本文テンプレ・publish ゲート・idempotency チェック・`Closes`/`Refs` の使い分けは `open-pr` 側の責務。本 skill では `gh pr create` を直接呼ばない。
 
 ### 8. Issue コメントへの結果報告
 
