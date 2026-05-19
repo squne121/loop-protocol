@@ -1,5 +1,28 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(pnpm typecheck)",
+      "Bash(pnpm lint)",
+      "Bash(pnpm test)",
+      "Bash(pnpm build *)",
+      "Bash(uv run python3 .claude/skills/edit-issue/scripts/*.py *)",
+      "Bash(python3 .claude/skills/edit-issue/scripts/*.py *)",
+      "Bash(uv run python3 .claude/skills/post-merge-cleanup/scripts/*.py *)",
+      "Bash(python3 .claude/skills/post-merge-cleanup/scripts/*.py *)",
+      "Bash(uv run python3 .claude/skills/create-issue/scripts/*.py *)",
+      "Bash(python3 .claude/skills/create-issue/scripts/*.py *)",
+      "Bash(.claude/skills/create-issue/scripts/*.sh *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git branch *)",
+      "Bash(git log *)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git commit *)",
+      "Bash(gh issue edit *)",
+      "Bash(gh pr merge *)"
+    ],
     "deny": [
       "Write(assets/**)",
       "Edit(assets/**)",
