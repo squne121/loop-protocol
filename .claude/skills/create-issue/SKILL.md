@@ -26,8 +26,8 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 ### 1. 要求を分析する
 
 - ユーザーの要求から Outcome（達成したい状態）を抽出する
-- **anchor 主張を含む Issue**: Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合は、起票前に `issue-body-authoring` の Anchor Verification Preflight を参照し、`git grep` / `rg` で hit 件数を確認してから起票する
-- **follow-up Issue の場合（post-merge-cleanup / issue-refinement-loop から委譲）**: `issue-body-authoring` の「ワークフロー不具合検出時の修正方針起案ガイダンス」セクションを参照し、決定論的修正と workaround を明示比較してから Outcome を起案する
+- **anchor 主張を含む Issue**: Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合は、起票前に [`references/body-authoring.md`](references/body-authoring.md) の Anchor Verification Preflight を参照し、`git grep` / `rg` で hit 件数を確認してから起票する
+- **follow-up Issue の場合（post-merge-cleanup / issue-refinement-loop から委譲）**: [`references/body-authoring.md`](references/body-authoring.md) の「ワークフロー不具合検出時の修正方針起案ガイダンス」セクションを参照し、決定論的修正と workaround を明示比較してから Outcome を起案する
 - 実装案だけでなく、運用で解決できる案も比較し、採用方針を明示する
 - 要件が曖昧な場合は Issue を確定させず、`## Notes for Reviewer` に記載するか blocking stop として扱う（推測で埋めない）
 - **タイトル prefix と AC の性質のセルフチェック**: `research` / `調査` を名乗る Issue に `src/` や `tests/` の実装変更が AC として入っていないか確認する。入っている場合は `implementation` / `実装` に切り替えるか、Scope を分割して別 Issue にする
@@ -72,9 +72,18 @@ orchestrator（`issue-refinement-loop` / `post-merge-cleanup` 等）から follo
 
 ### 2. Scope を判定する
 
-- `1 Issue = 1 PR` で完結する Scope かを確認する
-- AC は検証可能な記述にし、実装か調査かを自分で確認する。研究寄りなら `調査:`、実装寄りなら `実装:` をタイトル先頭に置く
-- Scope が複数に分かれる場合は、分割案と各 Issue の Outcome を提示して人間に確認する
+「良い PR スコープ」は以下の基準で判断する。最初の 3 つは決定論的に判定可能、4 番目は人間判断が残る。
+
+| 基準 | 判定方法 |
+|---|---|
+| **単一意図** | 変更ファイル群が 1 つの Outcome のためだけに必要 / 別 Outcome 用の修正が混入していない |
+| **アーキテクチャ層のまとまり** | Allowed Paths が 1 つの層（`src/state` / `src/render` / `src/systems` / `src/data` のいずれか、または同一機能領域）に閉じている。複数層をまたぐ場合は層境界の変更そのものが Outcome である |
+| **ロールバック単位** | 1 PR を revert すれば Outcome が完全に元に戻る（部分 revert が不要） |
+| **AC の独立性** | 各 AC が他の AC に依存せず、相互に独立に検証可能 |
+
+これらを満たさない場合は分割を提案する。複数に分かれる場合は、分割案と各 Issue の Outcome を提示して人間に確認する。
+
+AC は検証可能な記述にし、実装か調査かを自分で確認する。研究寄りなら `調査:`、実装寄りなら `実装:` をタイトル先頭に置く。
 
 ### 2.5. `proposal_only` で Issue 本文案を受ける場合の境界
 
@@ -168,7 +177,7 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
 
 - OPEN Issue が 1 件以上 → false positive 除外を先に行い、本文への literal 含有を確認:
   ```bash
-  gh issue view <N> --json body | python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print('found' if '<file_path>' in b else 'not found')"
+  gh issue view <N> --json body | uv run python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print('found' if '<file_path>' in b else 'not found')"
   ```
 - literal 含有ありで scope 重複あり → 即座に停止し 3 択を提示
 - scope 重複なし → 重複なし旨を人間確認事項に添えて次へ
@@ -258,7 +267,7 @@ gh api repos/{owner}/{repo}/issues/{parent_number}/sub_issues -X POST -F sub_iss
 ### 設定方法
 
 ```bash
-python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
+uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
   --repo <owner>/<repo> \
   --title "実装: <タイトル>" \
   --blocked-by <blocker_issue_number> \
@@ -310,7 +319,7 @@ comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idem
 
 ## Related
 
-- `.claude/skills/issue-body-authoring/SKILL.md` — 本文編集の shared skill（schema 定義・VC 作成ガイダンス）
+- [`references/body-authoring.md`](references/body-authoring.md) — 本文編集の共通参照（schema 定義・VC 作成ガイダンス・Anchor Verification・Blocker 検出）
 - `.claude/skills/review-issue/SKILL.md` — Issue 品質レビュー
 - `.claude/skills/issue-contract-review/SKILL.md` — 着手前 contract 確認
 - `.claude/skills/ssot-discovery/SKILL.md` — 関連 SSOT の探索

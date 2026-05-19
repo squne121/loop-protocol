@@ -1,11 +1,13 @@
 ---
 name: review-issue
-description: Issue を Terminal AI Agent が安全・再現可能に着手できるか確認するときに使う。Outcome 確認・In/Out Scope 衝突検知・AC 検証可能性・差分提案生成を行う。issue-contract-review の前段として Issue 本文品質を整える。
+description: Issue が Terminal AI Agent にとって「作業に迷わない・ハーネスエンジニアリング観点で再現可能」かを決定論的に判定するスキル。AC が検証可能か / Outcome に成果物形式と完了条件があるか / Verification Commands が実在コマンドのみ参照しているか / Stop Conditions 6 定型を満たすか / Required Skills の意味論を満たすか、を構造的にチェックする。issue-contract-review の前段として Issue 品質を整える。
 ---
 
 # Review Issue
 
-GitHub Issue の品質・Agent-friendliness を確認し、修正差分提案を生成するスキル。
+GitHub Issue が Terminal AI Agent にとって**作業に迷わない**か（コンテクスト・ハーネスエンジニアリング観点）を、決定論的に判定して修正差分提案を生成する。
+
+評価の対象は **Issue 本文の構造的品質**であり、AC の動作検証や実装内容そのものは判定しない（それらは `pr-review-judge` / test-runner の責務）。
 
 ## Use When
 
@@ -14,9 +16,7 @@ GitHub Issue の品質・Agent-friendliness を確認し、修正差分提案を
 - `issue-contract-review`（実装前 contract 確認）の前段として Issue 品質を整えたいとき
 - 新規 Issue の構造を整備したいとき
 
-> **責務分離**:
-> - `review-issue`（本 skill）: Issue 自体の品質・Agent-friendliness を確認する
-> - `issue-contract-review`: 実装前の contract（AC / Allowed Paths / 1 PR 判定）を確認する
+> 本 skill と `issue-contract-review` の使い分け（プロジェクトドキュメント `docs/dev/agent-skill-boundaries.md` に詳細）は、開発者が運用上参照するもので、本 SKILL.md 本文での再説明はコンテクスト汚染になるため省略している。
 
 ## Critical Guard: Issue refinement フェーズでは AC を実行しない
 
@@ -37,20 +37,14 @@ GitHub Issue の品質・Agent-friendliness を確認し、修正差分提案を
 
 ## Procedure
 
-### Decision issue 専用判定（必須）
+### 事前判定: state/needs-human ラベル
 
-`implementation` ではない `decision-only issue` も検出して判定する。以下を満たした場合のみ decision-only と扱う:
+`state/needs-human` ラベルが付いている Issue は人間判断待ちで AI 着手不可。本 skill では以下のみ判定:
 
-- `state/needs-human` が本文に含まれる、または `decision-only` / `意思決定 issue` の明示文が `Outcome` / `In Scope` / `Out of Scope` / `Handoff Contract` のいずれかにある
-- `## Next Action` が 1 つの実行可能アクションとして明記されている
-- `## Handoff Contract` が `記録先` / `参照先` / `次接続先` の 3 点を 1 箇所で明記している
+- 人間が判断するための論点が `## Notes for Reviewer` / `## Stop Conditions` 等で明示されているか
+- 上記以外は本文構造の品質チェックを軽量に行うのみで、AC/VC 詳細評価はスキップする（人間判断後に本文更新→再レビューする想定）
 
-判定後の扱い:
-- **次に何をするかが不明確**（Next Action 不足）なら `needs-fix`（blocking）
-- **Handoff Contract 不足**（参照先/記録先不明）なら `needs-fix`（blocking）
-- **decision-only 解釈時の判定緩和**: decision-only と判定した場合、`## Next Action` と 3 点セット `## Handoff Contract` が揃っていれば `Stop Conditions` 欠如のみで単体 blocking としない
-- **decision intent ありだが契約不足**: `state/needs-human` または明示ワードがあるのに 3 点セットが欠ける場合は `implementation` へフォールバックせず必ず `needs-fix`（blocking）
-- **decision-only 判定不足**: `state/needs-human` と明示ワードの両方がない場合のみ `implementation` ルートで再評価する
+人間判断は別 Issue 化せず元 Issue 内で対応する運用のため（`human-confirm` テンプレは廃止済み）、種別は `parent` / `research` / `implementation` のいずれかとして判定する。
 
 ### レビュー手順
 
@@ -63,35 +57,40 @@ GitHub Issue の品質・Agent-friendliness を確認し、修正差分提案を
      2. document / path reference（`docs/adr/...`, repo 内ファイルパス） — `Required Skills` ではなく `## Background` / `## In Scope` に書く
      3. ドメイン知識 skill（TypeScript / ECS / Canvas / Vitest BDD 等） — 適切
 
-2. 確認項目を評価する:
-   - **テンプレート準拠性**: 必須セクションがすべて存在するか
-   - **Outcome 明確性**: 1 文で達成状態が伝わるか
-   - **Outcome 抽象性（Outcome Abstraction）**: 成果物形式（何が出来上がるか）と完了条件（何をもって完了とするか）を明確に含むか
-     - **blocking（needs-fix）昇格条件**: Outcome が動作状態のみで成果物形式を完全に欠き、書き換え案の具体化に追加情報が必要なほど抽象的な場合（「〜を検討する」「〜を改善する」等）は blocking
-     - **non-blocking improvement**: 成果物形式への参照が部分的にあり、軽微な具体化で適合できる場合
-     - 不適合パターン: 「〜が決定される」「〜が整理される」「〜を検討する」「〜を改善する」等、動作状態のみで成果物形式を欠く表現
-     - **境界判定の目安**: AI が Issue 本文と既存文脈のみから書き換え案を自律生成できない場合は blocking、自律生成できる場合は non-blocking improvement
-   - **In/Out Scope 衝突**: 矛盾・重複がないか
-   - **1 Issue = 1 PR Scope**: 単一の目的・受入判定・ロールバック単位に収まるか
-   - **AC 検証可能性**: チェックボックス形式で、合否が明確に判定できるか
-   - **Verification 具体性**: ターミナルで実際に実行可能なコマンドか
-   - **Allowed Paths 十分性**: 必要なファイルパスが網羅されているか
-   - **Stop Conditions 妥当性（Blocking）**: implementation 種別で以下のいずれかは `needs-fix`:
-     - `## Stop Conditions` セクションが欠落
-     - 記載項目が 1 項目のみ（6 定型項目が未記載）
-     - 定型項目のプレースホルダが未記入のまま（プレースホルダ残存は許容、空欄はブロック）
-   - **確認専用 Issue の禁止（Blocking）**: Outcome / AC / Stop Conditions を見て「確認する」「決める」「可否を調査する」だけが主目的で、実際にどの運用資産をどう更新して完了するかが書かれていない場合は `needs-fix`
-   - **曖昧さ**: 推測が必要な語句・条件が残っていないか
-   - **類似 Issue の重複確認（non-blocking improvement）**: 同一・類似の Outcome を持つ OPEN Issue を確認:
-     ```bash
-     gh issue list --search "<keyword>" --state open --json number,title,url
-     ```
-     - 重複候補があれば重複クローズ候補として明示、または既存 Issue への追記提案
-     - 重複確認は `needs-fix` ではなく **non-blocking improvement** とし、人間が方針を決定できるよう情報を提示
-   - **Required Skills 意味論（Blocking）**: 以下のいずれかは `needs-fix`:
-     - ワークフロー skill（`implement-issue`・`issue-contract-review`・`pr-review-judge`・`ssot-discovery` など）が `## Required Skills` に含まれている
-     - document / path reference（`docs/adr/...`、repo 内ファイルパス）が `## Required Skills` に含まれている
-     - 実在しない skill 名が含まれている
+2. 確認項目を評価する（AI Agent が作業に迷わない・ハーネス engineering 観点）:
+
+   以下はすべて **本文の構造を見て決定論的に判定** できる項目。AC の動作検証や実装内容の妥当性判定は本 skill のスコープ外。
+
+   **構造・テンプレ整合**
+   - **テンプレート準拠性**（Blocking）: 必須セクション（`.github/ISSUE_TEMPLATE/{種別}.yml` の textarea labels）がすべて存在するか
+   - **Stop Conditions 妥当性**（Blocking、implementation 種別のみ）: `## Stop Conditions` が存在し、6 定型項目が記載され、プレースホルダが未記入の空欄がないか
+
+   **Outcome 品質**（AI が成果物を生成できる粒度か）
+   - **Outcome Abstraction**（Blocking）: Outcome が動作状態のみで成果物形式を完全に欠き、書き換え案の具体化に追加情報が必要なほど抽象的な場合（「〜を検討する」「〜を改善する」等）は blocking
+   - **non-blocking improvement**: 成果物形式への参照が部分的にあり、軽微な具体化で適合できる場合
+   - 不適合パターン例: 「〜が決定される」「〜が整理される」「〜を検討する」「〜を改善する」等、動作状態のみで成果物形式を欠く表現
+   - **境界判定の目安**: AI が Issue 本文と既存文脈のみから書き換え案を自律生成できない場合は blocking、自律生成できる場合は non-blocking improvement
+
+   **AC / VC 検証可能性**（AI が verify を機械実行できるか）
+   - **AC 検証可能性**（Blocking）: チェックボックス形式で、合否が機械判定できる記述になっているか（「適切に動作する」等の主観表現は blocking）
+   - **Verification 具体性**（Blocking）: ターミナルで実際に実行可能なコマンドが列挙されているか
+   - **AC/VC 番号一致**（Blocking）: `# AC<N>` コメント番号が AC 番号と一致しているか
+
+   **PR スコープ妥当性**（1 PR で完結し、レビュー・ロールバック可能か）
+   - **単一意図**: Allowed Paths が 1 つの Outcome のためだけに必要なファイル群に閉じているか
+   - **アーキ層のまとまり**: Allowed Paths が `src/state` / `src/render` / `src/systems` / `src/data` のいずれか 1 層に閉じているか、または層境界変更そのものが Outcome か
+   - **ロールバック単位**: 1 PR を revert すれば Outcome が完全に元に戻るか
+   - **In/Out Scope 衝突**: In Scope と Out of Scope に矛盾・重複がないか
+
+   **Required Skills 意味論**（Blocking）
+   - ワークフロー skill（`implement-issue`・`issue-contract-review`・`pr-review-judge`・`ssot-discovery` 等）が `## Required Skills` に含まれていない
+   - document / path reference（`docs/adr/...`、repo 内ファイルパス）が `## Required Skills` に含まれていない
+   - 実在しない skill 名が含まれていない
+   - ドメイン知識 skill（TypeScript / ECS / Canvas / Vitest BDD 等）のみが列挙されている
+
+   **その他**
+   - **確認専用 Issue の禁止**（Blocking）: Outcome / AC / Stop Conditions を見て「確認する」「決める」「可否を調査する」だけが主目的で、実際にどの運用資産をどう更新して完了するかが書かれていない場合は `needs-fix`
+   - **類似 Issue の重複**（non-blocking improvement）: 同一・類似 Outcome の OPEN Issue を `gh issue list --search "<keyword>" --state open` で確認し、重複候補があれば人間が方針を決定できるよう情報を提示
 
 3. 判定する:
    - `approve`: AI Agent がそのまま着手できる
@@ -104,7 +103,7 @@ GitHub Issue の品質・Agent-friendliness を確認し、修正差分提案を
 
 5. 本文更新の実施主体を分岐する:
    - `Verdict: approve` の場合は `invoked_as_loop` の値に関わらず本文更新へ進まない。レビュー結果のみ返して終了
-   - `Verdict: needs-fix` かつ `invoked_as_loop: true`: 本文更新提案だけを返し、Issue 本文の更新は `issue-refinement-loop` / `issue-body-authoring` 側へ委ねる
+   - `Verdict: needs-fix` かつ `invoked_as_loop: true`: 本文更新提案だけを返し、Issue 本文の更新は `issue-refinement-loop` / `issue-author` SubAgent 側へ委ねる
    - `Verdict: needs-fix` かつ `invoked_as_loop: false`: ユーザーに適用確認を行う
 
 6. ユーザーに適用確認を行う（needs-fix + invoked_as_loop: false のみ）:
@@ -174,13 +173,13 @@ E2E / live verification / research Issue をレビューする際、以下の 4 
 - `issue-contract-review` の責務（実装前の contract 詳細確認）には踏み込まない
 - Verdict が `approve` でも、Non-blocking improvements があれば提示する
 - `approve` 判定時は `invoked_as_loop` の値に関わらず、本文更新提案・適用確認・`gh issue edit` 実行へ進まない
-- `needs-fix` でも `invoked_as_loop: true` の場合は、本文更新提案だけを返し、本文更新は `issue-refinement-loop` / `issue-body-authoring` 側へ委ねる
+- `needs-fix` でも `invoked_as_loop: true` の場合は、本文更新提案だけを返し、本文更新は `issue-refinement-loop` / `issue-author` SubAgent 側へ委ねる
 - 人間の明示的承認なく本文を書き換えない。承認後は必ず変更経緯コメントをセットで投稿する
 - `gh issue edit` で本文を書き換える場合は repo 配下 `tmp/` の `--body-file` を使い、空/1 byte と HEREDOC 由来エスケープを事前 guard する
 
 ## Related
 
-- `.claude/skills/issue-body-authoring/SKILL.md` — Issue 本文更新案と issue-author handoff の参照
+- [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — Issue 本文更新の共通参照
 - `.claude/skills/issue-refinement-loop/SKILL.md` — Issue 改善ループ（review-issue → issue-author への委譲先）
 - `.claude/skills/issue-contract-review/SKILL.md` — 実装前 contract 確認
 - `.claude/skills/ssot-discovery/SKILL.md` — Issue 関連 SSOT の探索
