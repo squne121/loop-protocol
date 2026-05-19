@@ -1,7 +1,5 @@
 # Context Protocol（作業手順）
 
-設計原則（control-plane / data-plane / LOOP_STATE / Context 効率 / 無限ループ防止 / 冪等性 / ループ内の人間承認）は `docs/dev/agent-skill-boundaries.md` の「オーケストレーター設計原則」セクションを正本とする。本ファイルは loop 実行中の手順詳細だけ書く。
-
 ## LOOP_STATE 更新タイミング
 
 **各 Step 完了直後** に LOOP_STATE YAML を会話履歴へ明示記録する。次イテレーション開始時に最新値を読み戻す。
