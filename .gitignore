@@ -46,3 +46,8 @@ tmp/edit_issue_*.md
 .claude/plans/
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す
 .claude/settings.local.json
+
+# Python runtime artifacts
+.venv/
+__pycache__/
+.pytest_cache/

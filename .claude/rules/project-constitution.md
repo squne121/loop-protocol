@@ -63,6 +63,7 @@
   - `pnpm lint`
   - `pnpm test`
   - `pnpm build`
+  - `uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py`
 - docs-only 変更でも cheap で安定しているため、可能なら同じ品質ゲートを通す。
 - 失敗した場合は握りつぶさず、未解決のまま報告する。
 
