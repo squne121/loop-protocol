@@ -151,6 +151,7 @@ CONTRACT_REVIEW_RESULT_V1:
 
 ## Related
 
+- `docs/dev/dor.md` — Implementation Issue の Definition of Ready (DoR) 基準。本 skill の各チェック項目の正本定義先。
 - `.claude/skills/review-issue/SKILL.md` — Issue 本文の構造的品質レビュー（本 skill の前段）
 - `.claude/skills/issue-refinement-loop/SKILL.md` — 不適合時に提案する改善ループ
 - `.claude/skills/implement-issue/SKILL.md` — `status: go` 時の handoff 先
