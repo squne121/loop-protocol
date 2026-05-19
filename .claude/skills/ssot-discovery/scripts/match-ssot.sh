@@ -49,9 +49,10 @@ declare -A DIR_MAP=(
   ["src/ui"]="docs/adr/0001-architecture-baseline.md"
   ["src/data"]="docs/dev/workflow.md"
   ["tests"]="docs/dev/workflow.md"
-  [".claude/skills"]="docs/dev/imported-harness-triage.md"
-  [".claude/agents"]="docs/dev/imported-harness-triage.md"
+  [".claude/skills"]="docs/dev/agent-skill-boundaries.md"
+  [".claude/agents"]="docs/dev/agent-skill-boundaries.md"
   [".github/workflows"]="docs/dev/workflow.md"
+  [".github"]="docs/dev/github-ops.md"
   ["scripts"]="docs/dev/workflow.md"
 )
 

@@ -1,0 +1,169 @@
+# LOOP_PROTOCOL 開発運用ワークフロー（SSOT）
+
+LOOP_PROTOCOL における Issue 駆動開発の **単一の真実の情報源（SSOT）**。
+個別 skill / agent / docs はこの文書を運用ルールの正本として参照する。
+
+## 全体像（3 階層構造）
+
+```
+[SSOT]                  ← 開発運用ドキュメント（docs/dev/, docs/adr/, docs/product/）
+   ↓
+[確率論的プロンプト]    ← CLAUDE.md / Skill / Subagent 定義（AI に振る舞いを伝える）
+   ↓
+[決定論的ガードレール]  ← Claude Hooks / Git Hooks / GitHub Actions CI（物理強制）
+```
+
+| 階層 | 役割 | 実体 |
+|---|---|---|
+| SSOT | プロジェクトルールの正本（人間可読） | `docs/dev/workflow.md`（本ドキュメント）, `docs/dev/agent-skill-boundaries.md`, `docs/dev/github-ops.md`, `docs/adr/`, `docs/product/` |
+| 確率論的プロンプト | AI 向け実行コンテキスト | ルート / per-directory `CLAUDE.md`, `.claude/skills/`, `.claude/agents/` |
+| 決定論的ガードレール | AI 逸脱時の物理強制 | Claude Hooks（Issue #9）、Git Hooks（Issue #10）、`.github/workflows/ci.yml` |
+
+SSOT を編集したら、対応する確率論的プロンプト層・決定論的ガードレール層を必ず同 PR で更新する。
+
+## Issue 駆動開発フロー
+
+```
+[1] Issue 起票
+       ↓ create-issue (issue-author SubAgent)
+[2] Issue refinement (任意)
+       ↓ issue-refinement-loop オーケストレーター
+[3] 着手前 preflight
+       ↓ issue-contract-review
+[4] 実装 → 検証 → PR レビュー
+       ↓ impl-review-loop オーケストレーター
+[5] 人間レビュー → マージ
+[6] post-merge cleanup
+       ↓ post-merge-cleanup (post-merge-cleanup-worker SubAgent)
+```
+
+各フェーズで使う Skill / SubAgent の詳細は `docs/dev/agent-skill-boundaries.md` を参照。
+
+### Phase 別の入口
+
+| Phase | 起動方法 | 主要 Skill / SubAgent |
+|---|---|---|
+| Issue 起票 | 「Issue 起票して」「create issue」 | `create-issue` (via `issue-author`) |
+| Issue 改善ループ | 「Issue ◯◯ を磨いて」「refinement loop」 | `issue-refinement-loop` |
+| 着手前 preflight | 「Issue ◯◯ 実装の前確認」「contract review」 | `issue-contract-review` |
+| 実装ループ | 「Issue ◯◯ をループで実装して」「`/impl-review-loop <N>`」 | `impl-review-loop` |
+| 個別実装（loop なし） | 「Issue ◯◯ を実装して」「implement issue」 | `implement-issue` (via `implementation-worker`) |
+| PR レビュー | 「PR ◯◯ レビューして」「review PR」 | `pr-review-judge` (via `pr-reviewer`) |
+| マージ後 cleanup | 「クリーンアップして」「post merge」 | `post-merge-cleanup` (via `post-merge-cleanup-worker`) |
+
+## テスト戦略（3 層責務分離 — Defense in Depth）
+
+| レイヤー | 実行手段 | 実行内容 | 目的 |
+|---|---|---|---|
+| 1. AI 自己修復 | Claude Hooks (`PostToolUse`) | 編集ファイルの lint / typecheck | AI への即時フィードバック。CI 消費前のローカル fail-fast |
+| 2. 履歴の保護 | Git Hooks (`pre-commit` / `pre-push`) | 高速検証 (typecheck / lint / unit test) | 壊れたコードが Git 履歴に刻まれるのを物理防止。E2E など重いテストは含めない |
+| 3. 最終品質保証 | GitHub Actions CI | typecheck + lint + unit + E2E + build | クリーン環境での再現可能な最終確定。PR マージをシステムブロック |
+
+同じテストを複数レイヤーで実行するのは **Defense in Depth（多層防御）**。
+
+### テストスタイル
+
+- **TDD（テスト駆動開発）**: 実装前に Vitest テストを書く
+- **BDD（振る舞い駆動開発 = Behavior-Driven Development）**: テスト名・記述は GIVEN/WHEN/THEN 命名規則
+- 実装詳細でなく入出力の振る舞いをアサーションする
+
+## 1 Issue = 1 PR ルール
+
+- 1 つの Issue に対して必ず 1 つの PR を作る
+- 実装中に別の問題を発見した場合は新規 Issue を起票し、現 Issue のスコープを保つ
+- 複数 Issue を 1 PR にまとめることは原則禁止
+- skill 内・サブエージェント内でこのルールを物理強制する
+
+良い PR スコープの判定基準（`create-issue` Scope 判定で使う）:
+
+| 基準 | 判定方法 |
+|---|---|
+| 単一意図 | 変更ファイル群が 1 つの Outcome のためだけに必要 |
+| アーキ層のまとまり | Allowed Paths が 1 つの層（`src/state` / `src/render` / `src/systems` / `src/data` 等）に閉じている。複数層をまたぐ場合は層境界の変更そのものが Outcome |
+| ロールバック単位 | 1 PR を revert すれば Outcome が完全に元に戻る |
+| AC の独立性 | 各 AC が他の AC に依存せず、相互に独立に検証可能 |
+
+## Worktree 配置規約
+
+- 配置先: `.claude/worktrees/issue-<番号>-<slug>/` または `.claude/worktrees/<task-name>/`（リポジトリ内）
+- `.gitignore` で除外済み
+- `git worktree add` CLI を直接利用（特定エージェント専用機能には依存しない）
+- リポジトリ外配置は禁止（Claude Code の workspace trust prompt が再発し承認マシーン化）
+
+### マージ後クリーンアップ
+
+PR マージ後は `post-merge-cleanup` skill 経由で自動的に:
+
+```bash
+git worktree remove .claude/worktrees/<slug>
+git branch -d worktree-<slug>
+```
+
+## Issue / PR 種別とテンプレート
+
+### Issue テンプレート（`.github/ISSUE_TEMPLATE/`）
+
+| テンプレ | 用途 | 自動付与ラベル |
+|---|---|---|
+| `implementation.yml` | 実装作業 | `phase/implementation`, `state/queued`, `agent/implementer` |
+| `research.yml` | 仕様調査・比較検討 | `phase/research`, `state/queued`, `agent/research` |
+| `parent.yml` | parent tracker（複数 child を束ねる） | `tracking`, `state/in-progress` |
+| `bug-report.yml` | エンドユーザーバグ報告 | `bug` |
+| `feature-request.yml` | エンドユーザー機能要望 | `enhancement` |
+
+`human-confirm.yml` は不採用（PR #16）。人間判断は元 Issue 内でブロッカー扱い + 本文修正の運用とする。
+
+### PR テンプレート
+
+`implement-issue` が生成する PR 本文の必須セクション（`open-pr` の Template Guard で強制）:
+- `## Summary`
+- `## 受け入れ条件の達成状況`
+- `## 検証コマンド結果`
+- `## Allowed Paths 遵守`
+
+## Human Decision が必要な条件
+
+以下に該当する場合、AI に丸投げせず人間が判断する:
+
+- `src/state` ↔ `src/render` の境界変更
+- 新しい外部依存（パッケージ）追加
+- `assets/` / `LICENSES/` への変更（AI 編集禁止領域）
+- 複数 Issue にまたがる仕様変更
+- `CLAUDE.md` の制約変更
+- 本ドキュメント（SSOT）の変更
+
+ループ内では「ユーザーがループ起動した時点で routine 操作は承認済み」。詳細は `docs/dev/agent-skill-boundaries.md` の「ループ内の人間承認原則」を参照。
+
+## docs 更新が必要な条件
+
+| 変更内容 | 更新が必要なドキュメント |
+|---|---|
+| 開発フロー自体の変更 | 本ドキュメント（`docs/dev/workflow.md`） |
+| アーキテクチャ境界の変更 | `docs/adr/` に ADR を追加 |
+| 新機能の仕様追加 | `docs/product/` の仕様書を更新 |
+| ディレクトリ構造の変更 | `docs/dev/directory-structure.md` |
+| AI 向け実行手順の変更 | `.claude/skills/` / `.claude/agents/` |
+| SubAgent / Skill 責務境界の変更 | `docs/dev/agent-skill-boundaries.md` |
+| GitHub 運用ルールの変更 | `docs/dev/github-ops.md` |
+| 物理強制ルールの追加 | `.claude/settings.json` のフック定義 + 該当スクリプト |
+
+## 関連ドキュメント
+
+- `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界、オーケストレーター設計原則、ループ内人間承認原則
+- `docs/dev/github-ops.md` — `gh` CLI 利用規約、Parent Mode、コメント記録テンプレ
+- `docs/dev/directory-structure.md` — リポジトリ構造
+- `docs/dev/current-focus.md` — 現在のフェーズ・優先項目
+- `docs/adr/` — アーキテクチャ決定記録
+- `docs/product/` — プロダクト仕様
+- ルート `CLAUDE.md` — プロジェクト憲法（自動ロード）
+- per-directory `CLAUDE.md` — 各層の不変条件
+
+## 関連 Skill / SubAgent インデックス
+
+詳細は `docs/dev/agent-skill-boundaries.md` を参照。
+
+- Issue 管理系: `create-issue`, `edit-issue`, `review-issue`, `issue-contract-review`, `issue-refinement-loop`, `issue-author` (SubAgent)
+- 実装系: `implement-issue`, `implementation-worker` (SubAgent), `test-runner` (SubAgent)
+- レビュー系: `pr-review-judge`, `pr-reviewer` (SubAgent)
+- オーケストレーション系: `impl-review-loop`, `open-pr`, `post-merge-cleanup`, `post-merge-cleanup-worker` (SubAgent)
+- 補助系: `ssot-discovery`, `gemini-cli-headless-delegation`, `nlm-skill`, `codebase-investigator` (SubAgent)

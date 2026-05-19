@@ -40,7 +40,7 @@ SubAgent（役割）── Skill（作業手順）
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
 （VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-author` も参照する）
 
-## 実装系（C-2 で適合予定）
+## 実装系
 
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
@@ -51,7 +51,7 @@ SubAgent（役割）── Skill（作業手順）
 |---|---|
 | `implement-issue` | 承認済み implementation issue を 1 PR で完了させる手順 |
 
-## レビュー系（C-3 で適合予定）
+## レビュー系
 
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
@@ -61,7 +61,7 @@ SubAgent（役割）── Skill（作業手順）
 |---|---|
 | `pr-review-judge` | PR の review verdict（APPROVE / REQUEST_CHANGES）を決定する手順 |
 
-## オーケストレーション系（C-4 で適合予定）
+## オーケストレーション系
 
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
@@ -77,7 +77,7 @@ SubAgent（役割）── Skill（作業手順）
 
 | SubAgent | 役割 |
 |---|---|
-| `codebase-investigator` | 大規模コードベース調査の役割 |
+| `codebase-investigator` | 大規模コードベース調査の役割（常に `gemini-cli-headless-delegation` skill に委譲して大規模文脈読み取りを行う） |
 
 | Skill | 手順 |
 |---|---|
