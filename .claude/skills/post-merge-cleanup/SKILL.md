@@ -45,11 +45,14 @@ main thread は以下の手順で SubAgent に委譲する:
 ### 1. 未コミット変更と未追跡ファイルを分類
 
 ```bash
-git status
+uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
 ```
 
-- **削除可能**: リモート削除済みブランチ / 対応 worktree（ステップ 3 で処理）
-- **報告対象（削除しない）**: staged / unstaged 変更、未追跡ファイル、意図不明ファイル
+`classify-git-state.py` は `git status --short` / `git stash list` / `git branch -vv` / `git worktree list --porcelain` を subprocess 配列形式で実行し、YAML 構造化出力を返す。
+
+分類結果の読み方:
+- **削除可能**: `branches[*].gone == true` のブランチ / 対応 worktree（ステップ 3 で処理）
+- **報告対象（削除しない）**: `status.staged` / `status.unstaged` / `status.untracked` に値があるもの
 - この時点では削除しない。分類結果はステップ 6 のレポートで返す
 
 ### 2. main を origin/main に整合
@@ -69,9 +72,10 @@ git pull origin main
 
 ### 3. worktree / branch を整理
 
-リモート削除済みブランチ:
+リモート削除済みブランチ（ステップ 1 の classify-git-state.py 出力から `gone: true` を抽出）:
 ```bash
-git branch -vv | grep ': gone]'
+uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format json \
+  | uv run python3 -c "import json,sys; [print(b['name']) for b in json.load(sys.stdin)['branches'] if b.get('gone')]"
 ```
 
 **branch 削除条件**:
@@ -171,6 +175,9 @@ POST_MERGE_CLEANUP_REPORT_V1:
 - follow-up 起票は SubAgent 内で実行しない（候補列挙のみ）
 - parent issue close / superseded PR close は SubAgent 内で実行しない（候補列挙のみ）
 - worktree / branch の削除は確定条件を満たすもののみ。曖昧なら `unresolved_cleanup_items` に記録
+- **scripts entrypoint 経由統一**: git 状態の分類は必ず `.claude/skills/post-merge-cleanup/scripts/classify-git-state.py` 経由で実行する
+- **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: ステップ 1 の git 状態分類での inline bash パイプラインは使用しない
+- **スクリプトは `subprocess.run([...])` 配列形式のみ**: `shell=True` 禁止
 
 ## Related
 

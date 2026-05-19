@@ -26,6 +26,14 @@ dist-ssr
 # NotebookLM local assets
 .nlm-local/
 tmp/nlm/
+
+# Project-local tmp working files (issue backups / intermediate body / reviewer feedback など)
+# `tmp/` 自体は create-issue / edit-issue / post-merge-cleanup の作業領域として使うが、
+# 中身（バックアップ・中間ファイル）はコミットしない
+tmp/issue_*_backup_*.md
+tmp/issue_*_new_*.md
+tmp/reviewer_feedback.md
+tmp/edit_issue_*.md
 .agents/skills/nlm-skill/SKILL.md
 
 # Local AI workspace settings
