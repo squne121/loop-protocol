@@ -1,16 +1,18 @@
 ---
 name: review-issue
-description: Issue の品質・Agent-friendliness を確認する SubAgent。Bash で gh issue view を自ら実行して Issue 本文を取得し、`review-issue` Skill の手順に従ってレビュー・修正差分提案を生成し、ユーザー承認後のみ repo 配下 `tmp/` の body-file と `gh issue edit --body-file` で本文を書き換える。ファイル編集は disallowedTools で禁止。
+description: Issue の品質・Agent-friendliness を確認する SubAgent。Bash で gh issue view を自ら実行して Issue 本文を取得し、`review-issue` Skill の手順に従ってレビュー・修正差分提案を生成し、自動承認（acceptEdits）で repo 配下 `tmp/` の body-file と `gh issue edit --body-file` で本文を書き換える。リポジトリ追跡ファイルへの Edit / MultiEdit は disallowedTools で禁止。
 model: sonnet
+# Bash 用途: gh issue view/edit/comment および tmp/ 配下の body-file 操作のみ。それ以外は ask に残す。
+# Write 用途: tmp/ 配下の一時 body-file 書き出しのみ。リポジトリ追跡ファイルは編集しない。
 tools:
   - Bash
   - Read
   - Grep
   - Glob
-permissionMode: dontAsk
+  - Write
+permissionMode: acceptEdits
 disallowedTools:
   - Edit
-  - Write
   - MultiEdit
 skills:
   - review-issue

@@ -11,8 +11,8 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 |---|---|---|---|---|
 | `codebase-investigator` | read-only | `dontAsk` | Bash, Read | Edit, Write, MultiEdit, Grep, Glob |
 | `pr-reviewer` | read-only | `dontAsk` | Bash, Read, Grep, Glob | Edit, Write, MultiEdit |
-| `review-issue` | read-only | `dontAsk` | Bash, Read, Grep, Glob | Edit, Write, MultiEdit |
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
+| `review-issue` | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
 | `issue-author` | write | `acceptEdits` | Bash, Read, Write | Agent, Edit, MultiEdit |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
