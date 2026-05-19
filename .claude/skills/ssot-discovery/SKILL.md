@@ -78,7 +78,7 @@ SSOT_DISCOVERY_RESULT_V1:
 SSOT_DISCOVERY_RESULT_V1:
   status: partial
   matched_documents:
-    - path: "docs/dev/imported-harness-triage.md"
+    - path: "docs/dev/workflow.md"
       relevance: "medium"
       reason: "body match for 'worktree'"
   unmatched_keywords: ["1 issue 1 pr"]

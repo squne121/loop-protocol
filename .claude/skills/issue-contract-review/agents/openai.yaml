@@ -1,4 +1,0 @@
-interface:
-  display_name: "Issue Contract Review"
-  short_description: "implementation child issue の contract 不足確認と 1 Issue = 1 PR 判定を行う"
-  default_prompt: "$issue-contract-review を使って implementation child issue の contract を確認し、Allowed Paths、Required Skills、Verification Commands、split 必要性、execution plan を固定してから承認待ちで止める"

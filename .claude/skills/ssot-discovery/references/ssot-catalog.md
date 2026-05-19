@@ -7,10 +7,11 @@
 
 | パス | 主題 | 主要キーワード |
 |---|---|---|
-| `docs/dev/workflow.md` | Issue 駆動開発フロー全体（SSOT） | workflow, ssot, hooks, ci, worktree, issue, pr, テスト戦略 |
+| `docs/dev/workflow.md` | Issue 駆動開発フロー全体（SSOT） | workflow, ssot, hooks, ci, worktree, issue, pr, テスト戦略, フロー |
+| `docs/dev/agent-skill-boundaries.md` | SubAgent / Skill 責務境界・オーケストレーター設計原則・ループ内人間承認原則 | agent, skill, subagent, 責務, role, control-plane, data-plane, loop_state, 人間承認 |
+| `docs/dev/github-ops.md` | `gh` CLI 利用規約・body-file guard・Parent Mode・コメント記録テンプレ | gh, github, ops, body-file, parent_mode, comment, label |
 | `docs/dev/directory-structure.md` | ディレクトリ責務 | directory, structure, src, layer, 分離 |
 | `docs/dev/current-focus.md` | 現在のフェーズ・優先項目 | current, focus, phase, mvp, milestone |
-| `docs/dev/imported-harness-triage.md` | 流用 agent/skill 群の判定表 | triage, agent, skill, 流用, adapt |
 
 ## アーキテクチャ決定記録 (`docs/adr/`)
 
@@ -40,8 +41,9 @@
 | `src/storage/**` | `docs/adr/0001-architecture-baseline.md` |
 | `src/ui/**` | `docs/adr/0001-architecture-baseline.md` |
 | `tests/**` | `docs/dev/workflow.md`（テスト戦略 3 層） |
-| `.claude/skills/**` | `docs/dev/imported-harness-triage.md`、`docs/dev/workflow.md` |
-| `.claude/agents/**` | `docs/dev/imported-harness-triage.md` |
+| `.claude/skills/**` | `docs/dev/agent-skill-boundaries.md`、`docs/dev/workflow.md` |
+| `.claude/agents/**` | `docs/dev/agent-skill-boundaries.md` |
+| `.github/**` | `docs/dev/github-ops.md`、`docs/dev/workflow.md` |
 | `.github/workflows/**` | `docs/dev/workflow.md`（CI 層） |
 | `scripts/**` | `docs/dev/workflow.md` |
 
