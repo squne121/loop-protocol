@@ -19,7 +19,12 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 ### 1. 要求を分析する
 
 - ユーザーの要求から Outcome（達成したい状態）を抽出する
-- **anchor 主張を含む Issue**: Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合は、起票前に [`references/body-authoring.md`](references/body-authoring.md) の Anchor Verification Preflight を参照し、`git grep` / `rg` で hit 件数を確認してから起票する
+- **anchor 主張を含む Issue**: Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合は、起票前に [`references/body-authoring.md`](references/body-authoring.md) の Anchor Verification Preflight を参照し、以下のスクリプトで一括検証してから起票する:
+  ```bash
+  # anchor_list.txt に 1 行 1 anchor を記載（# コメント行は無視される）
+  .claude/skills/create-issue/scripts/verify-anchors.sh anchor_list.txt
+  ```
+  スクリプトは `git grep -lF -- <anchor>` を配列形式で実行し、PASS/FAIL を出力する。exit 1 が返った場合は起票しない
 - **follow-up Issue の場合（post-merge-cleanup / issue-refinement-loop から委譲）**: [`references/body-authoring.md`](references/body-authoring.md) の「ワークフロー不具合検出時の修正方針起案ガイダンス」セクションを参照し、決定論的修正と workaround を明示比較してから Outcome を起案する
 - 実装案だけでなく、運用で解決できる案も比較し、採用方針を明示する
 - 要件が曖昧な場合は Issue を確定させず、`## Notes for Reviewer` に記載するか blocking stop として扱う（推測で埋めない）
@@ -309,6 +314,9 @@ comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idem
 - サブ Issue を起票・追加するとき、親 Issue 本文にタスクが残っていれば停止して移行案を提示する
 - Outcome が動作状態のみで成果物形式を欠く Issue を確定させない（Outcome Quality Guard 参照）
 - 未解決の追加調査が残る状態で、「確認する」「決める」だけを Outcome にした Issue を起票しない
+- **scripts entrypoint 経由統一**: anchor preflight は必ず `.claude/skills/create-issue/scripts/verify-anchors.sh` 経由で実行する
+- **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: anchor preflight での inline bash パイプラインは使用しない
+- **スクリプトは配列形式の `git grep` のみ実行**: `eval` 禁止、入力 anchor は `^[A-Za-z0-9._/: #-]+$` で validation 済み
 
 ## Related
 
