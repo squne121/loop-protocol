@@ -1117,6 +1117,17 @@ def run_delegation(
     request_path: Path | None = None,
     _routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # --- transport dispatcher: acp branch ---
+    # When transport="acp" is specified, delegate to run_gemini_acp.run_acp().
+    # The acp transport handles: JSON-RPC lifecycle, HeartbeatWatchdog,
+    # permission proxy, structured_events collection, and headless_json fallback.
+    # This dispatcher is re-entrant: acp fallback calls run_delegation() back
+    # with transport="headless_json" (or absent), which skips this branch.
+    if request.get("transport") == "acp":
+        from run_gemini_acp import run_acp  # type: ignore[import]
+        approve_edits = bool(request.get("approve_edits", False))
+        return run_acp(dict(request), request_path=request_path, approve_edits=approve_edits)
+
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
     tool_profile = str(request.get("tool_profile", "unknown"))

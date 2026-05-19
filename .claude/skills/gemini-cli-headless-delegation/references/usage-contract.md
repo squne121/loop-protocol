@@ -571,6 +571,54 @@ return {
 - `local_asset_research` と `proposal_only` の `gh_commands` 対応は Issue #2255 で仕様設計を確定し、Issue #2309 で完全実装した（PR #2309）。
 - `local_asset_research` / `proposal_only` の request に `gh_commands` を指定した場合、wrapper は argv を allowlist 検証し、許可されたコマンドを事前実行して結果を `inline_context` に prepend する。allowlist 外の argv は `warnings` に記録してスキップする（`github_research` と異なり validation error にして fail-close しない）。フォーマット不正な entry（dict でない / argv が文字列リストでない）も同様に `warnings` に記録してスキップする。
 
+## `transport` Field (ACP Transport)
+
+The optional `transport` field selects the delegation transport:
+
+| Value | Behavior |
+|---|---|
+| absent or `"headless_json"` | Default. Standard `gemini --output-format json` pathway. |
+| `"acp"` | ACP (Agent Client Protocol) transport via `gemini --acp`. JSON-RPC lifecycle with structured events. |
+
+### `transport: acp` — additional fields
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `transport` | `"acp"` | Select ACP transport. |
+| `approve_edits` | boolean (optional, default `false`) | When `true`, allow write operations (write_file, edit_file, etc.) via permission proxy. |
+
+### ACP result fields (added when `transport: acp`)
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `schema` | `"acp_result_v1"` | Schema identifier for ACP results. |
+| `transport` | `"acp"` | Confirms ACP transport was used. |
+| `structured_events` | list | AgentMessageChunk / AgentThoughtChunk / ToolCallStart events collected during the session. |
+| `_acp_fallback` | boolean (optional) | Present and `true` when fallback to headless_json occurred. |
+
+### Example request with `transport: acp`
+
+```json
+{
+  "schema": "delegation_request_v1",
+  "transport": "acp",
+  "objective": "Summarize the architecture of this project",
+  "instructions": [
+    "Focus on the key components and their relationships.",
+    "Keep the response under 300 words."
+  ],
+  "tool_profile": "no_tools",
+  "output_sections": ["Summary"],
+  "context_files": ["/absolute/path/to/README.md"],
+  "model": "gemini-2.5-flash",
+  "timeout_sec": 300
+}
+```
+
+### ACP transport lifecycle
+
+See `references/transport-acp.md` for full lifecycle, timeout design, permission proxy, and fallback documentation.
+
 ## Failure Modes
 - `invalid_request`
 - `missing_context_file`
