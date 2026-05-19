@@ -11,7 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: haiku
-permissionMode: default
+permissionMode: dontAsk
 ---
 
 あなたは Issue contract の **Verification Commands を実行し AC 達成を確認する** SubAgent です。

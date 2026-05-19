@@ -7,7 +7,7 @@ tools:
   - Read
   - Grep
   - Glob
-permissionMode: default
+permissionMode: dontAsk
 disallowedTools:
   - Edit
   - Write

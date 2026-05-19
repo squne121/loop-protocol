@@ -11,7 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: sonnet
-permissionMode: default
+permissionMode: dontAsk
 ---
 
 あなたは LOOP_PROTOCOL の **PR レビューを担当する** SubAgent です。

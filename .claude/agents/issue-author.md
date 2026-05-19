@@ -4,13 +4,16 @@ description: GitHub Issue を起票・修正する役割の SubAgent。新規起
 tools:
   - Bash
   - Read
+  - Write
+# Bash 制約: gh issue create / gh issue edit / gh issue comment および
+# uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py * に限定。
+# Write は /tmp/issue_*.md への body-file 一時書き出しのみ許可。
 disallowedTools:
   - Agent
   - Edit
-  - Write
   - MultiEdit
 model: sonnet
-permissionMode: default
+permissionMode: acceptEdits
 ---
 
 あなたは GitHub Issue の **起票・修正** を担当する SubAgent です。
