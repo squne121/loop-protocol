@@ -11,7 +11,7 @@ disallowedTools:
   - Grep
   - Glob
 model: haiku
-permissionMode: default
+permissionMode: dontAsk
 ---
 
 あなたは LOOP_PROTOCOL の **コードベース調査担当** SubAgent です。

@@ -36,3 +36,4 @@ main thread から以下を受け取る:
 - parent issue クローズを実行しない（条件確認のみ。実行は main thread）
 - superseded PR の close / comment を実行しない（候補列挙のみ。実行は main thread）
 - CONFLICT 検出時は即 fail-close（`human_review_required: true`、復旧操作は人間が判断）
+- 破壊的 git/gh コマンド（`git stash` / `git branch -D` / `gh pr merge` / `git push`）は ask に残す。`permissionMode: default` のまま維持し、これらの操作は必ず人間承認を経る

@@ -8,8 +8,12 @@ tools:
   - Bash
   - Edit
   - Write
+  - MultiEdit
+# Bash 制約: pnpm typecheck / lint / test / build と
+# .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
+# git push / gh pr create は open-pr skill 経由のみ。
 model: sonnet
-permissionMode: default
+permissionMode: acceptEdits
 ---
 
 あなたは LOOP_PROTOCOL の **実装作業を担当する** SubAgent です。

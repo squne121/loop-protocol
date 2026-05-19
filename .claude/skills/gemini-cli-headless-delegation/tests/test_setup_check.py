@@ -6,13 +6,16 @@ Test execution (with dependencies):
 Cases covered:
     1. All checks pass → exit 0
     2. node missing → exit != 0
-    3. trustedFolders.json existing TRUST_FOLDER → no-op (values preserved)
-    4. trustedFolders.json existing TRUST_PARENT → no-op (values preserved)
-    5. trustedFolders.json absent → file created with repo root
+    3. trustedFolders.json existing TRUST_FOLDER (dict) → no-op (values preserved)
+    4. trustedFolders.json existing TRUST_PARENT (dict) → no-op (values preserved)
+    5. trustedFolders.json absent → file created with repo root in dict format
     6. .gemini/settings.json absent → template created
     7. .gemini/settings.json present → not overwritten
     8. Serena MCP available → ok True
     9. Serena MCP unavailable → recovery hint present
+    10. trustedFolders.json dict existing entries preserved after adding new entry (AC3)
+    11. New entry appended as dict {path: TRUST_FOLDER} (AC4)
+    12. TRUST_PARENT ancestor in dict form → no-op (AC5)
 """
 from __future__ import annotations
 
@@ -75,13 +78,13 @@ def test_all_checks_pass_exit_code_zero(tmp_path):
         json.dumps({"mcp": {"allowed": ["serena"]}}), encoding="utf-8"
     )
 
-    # Pre-create trustedFolders.json with repo root already trusted.
+    # Pre-create trustedFolders.json with repo root already trusted (dict schema).
     home_dir = tmp_path / "fakehome"
     home_dir.mkdir()
     gemini_home = home_dir / ".gemini"
     gemini_home.mkdir()
     trusted_path = gemini_home / "trustedFolders.json"
-    trusted_path.write_text(json.dumps([str(repo_root)]), encoding="utf-8")
+    trusted_path.write_text(json.dumps({str(repo_root): "TRUST_FOLDER"}), encoding="utf-8")
 
     def _run_side_effect(command: list[str], timeout: int | None = None):
         tool = command[0] if command else ""
@@ -96,8 +99,8 @@ def test_all_checks_pass_exit_code_zero(tmp_path):
         }
         if tool in version_map and "--version" in command:
             return _make_completed(0, stdout=version_map[tool])
-        if "serena-mcp-server" in command:
-            return _make_completed(0, stdout="Usage: serena-mcp-server")
+        if "serena" in command and "--help" in command:
+            return _make_completed(0, stdout="Usage: serena [OPTIONS]")
         if tool == "gemini" and "--prompt" in command:
             return _make_completed(0, stdout="ok")
         return _make_completed(0)
@@ -170,8 +173,8 @@ def test_node_missing_run_all_exit_nonzero(tmp_path):
         }
         if tool in version_map:
             return _make_completed(0, stdout=version_map[tool])
-        if "serena-mcp-server" in command:
-            return _make_completed(0, stdout="Usage: serena-mcp-server")
+        if "serena" in command and "--help" in command:
+            return _make_completed(0, stdout="Usage: serena [OPTIONS]")
         if tool == "gemini" and "--prompt" in command:
             return _make_completed(0, stdout="ok")
         return _make_completed(0)
@@ -188,14 +191,14 @@ def test_node_missing_run_all_exit_nonzero(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# AC2: trustedFolders.json — TRUST_FOLDER exact match → no-op
+# AC2: trustedFolders.json — TRUST_FOLDER exact match → no-op (dict schema)
 # ---------------------------------------------------------------------------
 
 
 def test_trusted_folders_exact_match_noop(tmp_path):
-    """GIVEN trustedFolders.json already contains the exact repo root (TRUST_FOLDER)
+    """GIVEN trustedFolders.json already contains the exact repo root as TRUST_FOLDER (dict schema)
     WHEN check_trusted_folders is called
-    THEN no-op — status is already_trusted and existing entries are not modified."""
+    THEN no-op — status is already_trusted and existing dict entries are not modified."""
     sc = load_setup_check()
 
     repo_root = tmp_path / "repo"
@@ -206,7 +209,8 @@ def test_trusted_folders_exact_match_noop(tmp_path):
     gemini_dir = home_dir / ".gemini"
     gemini_dir.mkdir()
     trusted_file = gemini_dir / "trustedFolders.json"
-    initial_entries = [str(repo_root), "/some/other/path"]
+    # Use dict schema matching the real gemini CLI format.
+    initial_entries = {str(repo_root): "TRUST_FOLDER", "/some/other/path": "TRUST_FOLDER"}
     trusted_file.write_text(json.dumps(initial_entries), encoding="utf-8")
 
     with patch.object(Path, "home", return_value=home_dir):
@@ -214,13 +218,13 @@ def test_trusted_folders_exact_match_noop(tmp_path):
 
     assert result["ok"] is True
     assert result["status"] == "already_trusted"
-    # File must not have changed.
+    # File must not have changed — existing dict entries are preserved.
     after = json.loads(trusted_file.read_text(encoding="utf-8"))
-    assert after == initial_entries, "Existing entries must not be modified (idempotent)"
+    assert after == initial_entries, "Existing dict entries must not be modified (idempotent)"
 
 
 def test_trusted_folders_parent_match_noop(tmp_path):
-    """GIVEN trustedFolders.json contains a parent directory (TRUST_PARENT)
+    """GIVEN trustedFolders.json contains a parent directory as TRUST_PARENT (dict schema)
     WHEN check_trusted_folders is called
     THEN no-op — status is parent_trusted and no new entry is appended."""
     sc = load_setup_check()
@@ -235,7 +239,8 @@ def test_trusted_folders_parent_match_noop(tmp_path):
     gemini_dir = home_dir / ".gemini"
     gemini_dir.mkdir()
     trusted_file = gemini_dir / "trustedFolders.json"
-    initial_entries = [str(parent)]
+    # Use dict schema with TRUST_PARENT for parent directory.
+    initial_entries = {str(parent): "TRUST_PARENT"}
     trusted_file.write_text(json.dumps(initial_entries), encoding="utf-8")
 
     with patch.object(Path, "home", return_value=home_dir):
@@ -250,7 +255,7 @@ def test_trusted_folders_parent_match_noop(tmp_path):
 def test_trusted_folders_absent_creates_file(tmp_path):
     """GIVEN trustedFolders.json does not exist
     WHEN check_trusted_folders is called
-    THEN file is created with repo root as entry."""
+    THEN file is created with repo root as dict entry {path: TRUST_FOLDER}."""
     sc = load_setup_check()
 
     repo_root = tmp_path / "repo"
@@ -266,8 +271,11 @@ def test_trusted_folders_absent_creates_file(tmp_path):
     assert result["status"] == "added"
     trusted_file = home_dir / ".gemini" / "trustedFolders.json"
     assert trusted_file.exists()
-    entries = json.loads(trusted_file.read_text(encoding="utf-8"))
-    assert str(repo_root) in entries
+    # File should be a dict with the repo root mapped to TRUST_FOLDER.
+    data = json.loads(trusted_file.read_text(encoding="utf-8"))
+    assert isinstance(data, dict), "trustedFolders.json must be a dict (not a list)"
+    assert str(repo_root) in data
+    assert data[str(repo_root)] == "TRUST_FOLDER"
 
 
 # ---------------------------------------------------------------------------
@@ -318,20 +326,22 @@ def test_gemini_settings_created_when_absent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# AC3: Serena MCP check
+# AC7: Serena MCP check — uses 'serena' executable (not 'serena-mcp-server')
 # ---------------------------------------------------------------------------
 
 
 def test_serena_mcp_available(tmp_path):
-    """GIVEN uvx is available and serena responds to --help
+    """GIVEN uvx is available and serena executable responds to --help
     WHEN check_serena_mcp is called
-    THEN ok is True."""
+    THEN ok is True.
+    (serena package provides 'serena' executable, not 'serena-mcp-server')"""
     sc = load_setup_check()
 
     def _run_side_effect(command: list[str], timeout: int | None = None):
-        if "serena-mcp-server" in command:
-            return _make_completed(0, stdout="Usage: serena-mcp-server [OPTIONS]")
-        return _make_completed(0)
+        # Correct command: uvx --from <package> serena --help
+        if "serena" in command and "--help" in command and "serena-mcp-server" not in command:
+            return _make_completed(0, stdout="Usage: serena [OPTIONS]")
+        return _make_completed(1, stderr="unexpected command")
 
     with patch.object(sc, "_run", side_effect=_run_side_effect):
         result = sc.check_serena_mcp()
@@ -341,13 +351,13 @@ def test_serena_mcp_available(tmp_path):
 
 
 def test_serena_mcp_unavailable_has_recovery(tmp_path):
-    """GIVEN serena-mcp-server command fails
+    """GIVEN serena command fails
     WHEN check_serena_mcp is called
     THEN ok is False and recovery hints are present."""
     sc = load_setup_check()
 
     def _run_side_effect(command: list[str], timeout: int | None = None):
-        if "serena-mcp-server" in command:
+        if "serena" in command and "--help" in command:
             return _make_completed(1, stderr="error: package not found")
         return _make_completed(0)
 
@@ -357,3 +367,137 @@ def test_serena_mcp_unavailable_has_recovery(tmp_path):
     assert result["ok"] is False
     assert "recovery" in result
     assert len(result["recovery"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# AC3: dict existing entries are preserved when new entry is added
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_folders_dict_existing_preserved(tmp_path):
+    """GIVEN trustedFolders.json has 3 existing dict entries (preserve existing data)
+    WHEN check_trusted_folders is called with a new repo root
+    THEN all 3 existing dict entries are preserved in the output dict.
+
+    This verifies that setup_check preserves existing dict entries and does not
+    destroy data when adding new TRUST_FOLDER entries.
+    """
+    sc = load_setup_check()
+
+    repo_root = tmp_path / "new_repo"
+    repo_root.mkdir()
+
+    home_dir = tmp_path / "fakehome_preserve"
+    home_dir.mkdir()
+    gemini_dir = home_dir / ".gemini"
+    gemini_dir.mkdir()
+    trusted_file = gemini_dir / "trustedFolders.json"
+
+    # 3 existing entries that must be preserved.
+    existing_entries = {
+        "/home/user/KindleAudiobookMakeSystem": "TRUST_FOLDER",
+        "/home/user/claw-ecosystem_Deploy": "TRUST_FOLDER",
+        "/home/user/projects": "TRUST_PARENT",
+    }
+    trusted_file.write_text(json.dumps(existing_entries), encoding="utf-8")
+
+    with patch.object(Path, "home", return_value=home_dir):
+        result = sc.check_trusted_folders(repo_root=repo_root)
+
+    assert result["ok"] is True
+    assert result["status"] == "added"
+
+    after = json.loads(trusted_file.read_text(encoding="utf-8"))
+    assert isinstance(after, dict), "Output must be dict format to preserve existing entries"
+    # All 3 original entries must still be present (preserve semantics).
+    for key, value in existing_entries.items():
+        assert key in after, f"Existing entry '{key}' must be preserved"
+        assert after[key] == value, f"Value for '{key}' must be preserved as '{value}'"
+    # New entry is also present.
+    assert str(repo_root) in after
+
+
+# ---------------------------------------------------------------------------
+# AC4: new entry is appended as dict {path: "TRUST_FOLDER"}
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_folders_append_as_dict_entry(tmp_path):
+    """GIVEN trustedFolders.json exists but does not contain repo root
+    WHEN check_trusted_folders is called
+    THEN new entry is appended as {repo_root: "TRUST_FOLDER"} in dict format.
+
+    Verifies that the trust_folder_added entry uses the correct dict schema,
+    not the deprecated list schema.
+    """
+    sc = load_setup_check()
+
+    repo_root = tmp_path / "append_repo"
+    repo_root.mkdir()
+
+    home_dir = tmp_path / "fakehome_append"
+    home_dir.mkdir()
+    gemini_dir = home_dir / ".gemini"
+    gemini_dir.mkdir()
+    trusted_file = gemini_dir / "trustedFolders.json"
+
+    # Start with one unrelated entry.
+    initial = {"/other/path": "TRUST_FOLDER"}
+    trusted_file.write_text(json.dumps(initial), encoding="utf-8")
+
+    with patch.object(Path, "home", return_value=home_dir):
+        result = sc.check_trusted_folders(repo_root=repo_root)
+
+    assert result["ok"] is True
+    assert result["status"] == "added"
+
+    after = json.loads(trusted_file.read_text(encoding="utf-8"))
+    assert isinstance(after, dict), "Output must be dict (not list) after trust_folder_added"
+    assert str(repo_root) in after, "New repo root must appear in dict"
+    assert after[str(repo_root)] == "TRUST_FOLDER", (
+        "New entry value must be 'TRUST_FOLDER' (not appended to a list)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC5: TRUST_PARENT ancestor in dict form → no-op
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_folders_parent_trust_noop_dict(tmp_path):
+    """GIVEN trustedFolders.json contains a parent directory with value TRUST_PARENT (dict schema)
+    WHEN check_trusted_folders is called for a child repo
+    THEN no-op — status is parent_trusted and the dict is not modified.
+
+    Tests that the TRUST_PARENT ancestor check works correctly with dict format,
+    preserving dict schema integrity without adding a redundant TRUST_FOLDER entry.
+    """
+    sc = load_setup_check()
+
+    grandparent = tmp_path / "workspace"
+    grandparent.mkdir()
+    parent = grandparent / "projects"
+    parent.mkdir()
+    repo_root = parent / "LOOP_PROTOCOL"
+    repo_root.mkdir()
+
+    home_dir = tmp_path / "fakehome_parent_noop"
+    home_dir.mkdir()
+    gemini_dir = home_dir / ".gemini"
+    gemini_dir.mkdir()
+    trusted_file = gemini_dir / "trustedFolders.json"
+
+    # parent directory has TRUST_PARENT in dict schema.
+    initial = {str(parent): "TRUST_PARENT", "/unrelated/path": "TRUST_FOLDER"}
+    trusted_file.write_text(json.dumps(initial), encoding="utf-8")
+
+    with patch.object(Path, "home", return_value=home_dir):
+        result = sc.check_trusted_folders(repo_root=repo_root)
+
+    assert result["ok"] is True
+    assert result["status"] == "parent_trusted"
+    # Dict must be completely unchanged — no new entry added.
+    after = json.loads(trusted_file.read_text(encoding="utf-8"))
+    assert after == initial, (
+        "Dict must not be modified when TRUST_PARENT ancestor covers the repo root"
+    )
