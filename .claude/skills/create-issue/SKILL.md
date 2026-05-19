@@ -7,13 +7,6 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 
 ユーザーの要求を分析し、Terminal AI Agent が安全・再現可能に着手できる GitHub Issue を生成するスキル。
 
-## Use When
-
-- ユーザーが要求を GitHub Issue として起票したいとき
-- 「Issue 起票して」「Issue 作って」「Issue にまとめて」「create issue」などの短文トリガー
-- 要求を `1 Issue = 1 PR` で完結する Scope に整理したいとき
-- `research` / `implementation` のどちらかを見分けてテンプレートを選びたいとき
-
 ## Procedure
 
 ### 0. テンプレートを読み込む（Issue Template Guard）
