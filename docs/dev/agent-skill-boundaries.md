@@ -105,3 +105,59 @@ SubAgent（役割）── Skill（作業手順）
 3. 独立 Skill にはしない（Skill は「何かを実行する手順」であり、共有参照は手順ではないため）
 
 例: VC 作成ガイダンスは `create-issue/references/body-authoring.md` に置き、`edit-issue` / `issue-author` SubAgent から参照する。
+
+## オーケストレーター設計原則（impl-review-loop / issue-refinement-loop）
+
+### control-plane / data-plane の分離
+
+- **オーケストレーター** は **control-plane**（state tracking + routing）のみを担当する
+- **data-plane 操作**（push / `gh pr edit` / マージ / Issue 本文編集 等）は対応する **SubAgent に委譲** する
+- オーケストレーターが直接 `git push` / `gh pr create` / `gh issue edit` を呼ばない
+
+| 操作 | 担当 |
+|---|---|
+| state tracking（LOOP_STATE 更新） | オーケストレーター（control-plane） |
+| routing（次の Step / SubAgent 決定） | オーケストレーター（control-plane） |
+| 実装 / conflict resolve / push | `implementation-worker` SubAgent（data-plane） |
+| Verification Commands 実行 | `test-runner` SubAgent（data-plane） |
+| PR レビュー verdict 投稿 | `pr-reviewer` SubAgent（data-plane） |
+| Issue 本文編集 | `issue-author` SubAgent + `edit-issue` skill（data-plane） |
+
+### ループ内の人間承認原則
+
+**ユーザーがループを起動した時点でループ全体の実行が承認されている。** ループ内の以下の決定では追加の人間承認を求めない:
+
+- イテレーションの継続判断（REQUEST_CHANGES → 次イテレーション）
+- Issue 本文の修正適用（refinement loop 中の改善ライト書き戻し）
+- 各 Step 間の SubAgent 委譲
+
+**例外**（人間判断を仰ぐ）:
+- `max_iterations` 超過 → fail-close
+- SubAgent から `human_review_required: true` を受けた場合（CONFLICT / blocked / 連続失敗 等）
+- 想定外のエラー（DIRTY / BLOCKED の永続、verdict YAML 不正 等）
+
+ループ内の routine な書き込み・コメント投稿は SubAgent 経由で自動進行する。
+
+### LOOP_STATE による状態管理
+
+ループの全状態は YAML 構造の LOOP_STATE で表現し、各 Step 完了直後に会話履歴へ明示記録する。
+
+- LOOP_STATE は **次イテレーション開始時に最新値を読み戻す前提**
+- 口頭サマリで上書きしない（Context Rot 防止）
+- 全 SubAgent の出力（IMPLEMENT_RESULT_V1 / TEST_VERDICT / LOOP_VERDICT / REVIEW_ISSUE_RESULT_V1 / ISSUE_EDIT_RESULT_V1 等）を構造化フォーマットで受け取り、LOOP_STATE に反映する
+
+### Context 効率（既存コンテクスト最大活用）
+
+- **既存の GitHub state（Issue / PR / コメント）を最大限活用** し、メインセッションでの新規出力を最小限に抑える
+- 各 SubAgent への inputs は既存 GitHub state の **参照**（Issue 番号 / PR 番号 / comment URL）で渡し、本文を main session に展開しない
+- SubAgent の詳細な実行ログをメインに引き上げない（要約 + 構造化結果のみ）
+- 「過去 iteration で言及済み」「Issue 本文に書いてある」を再展開しない
+
+### 無限ループ防止と冪等性
+
+- `max_iterations` 超過時は必ず fail-close（デフォルト: impl-review-loop 5 / issue-refinement-loop 3）
+- 連続 conflict は 2 回までで自動 escalation
+- SubAgent から `human_review_required: true` を受けたら即停止
+- 同一 PR / Issue に対して同じ Step を複数回呼んでも壊れないこと（冪等性）
+- LOOP_STATE.iteration を厳密に追跡し、退行しない
+- pr-reviewer は `reviewed_head_sha` で stale review を検出する
