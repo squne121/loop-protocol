@@ -1,8 +1,10 @@
 {
   "permissions": {
     "deny": [
-      "assets/**",
-      "LICENSES/**"
+      "Write(assets/**)",
+      "Edit(assets/**)",
+      "Write(LICENSES/**)",
+      "Edit(LICENSES/**)"
     ]
   }
 }
