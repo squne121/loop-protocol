@@ -45,7 +45,7 @@ main thread は以下の手順で SubAgent に委譲する:
 ### 1. 未コミット変更と未追跡ファイルを分類
 
 ```bash
-python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
+uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
 ```
 
 `classify-git-state.py` は `git status --short` / `git stash list` / `git branch -vv` / `git worktree list --porcelain` を subprocess 配列形式で実行し、YAML 構造化出力を返す。
@@ -74,8 +74,8 @@ git pull origin main
 
 リモート削除済みブランチ（ステップ 1 の classify-git-state.py 出力から `gone: true` を抽出）:
 ```bash
-python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format json \
-  | python3 -c "import json,sys; [print(b['name']) for b in json.load(sys.stdin)['branches'] if b.get('gone')]"
+uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format json \
+  | uv run python3 -c "import json,sys; [print(b['name']) for b in json.load(sys.stdin)['branches'] if b.get('gone')]"
 ```
 
 **branch 削除条件**:

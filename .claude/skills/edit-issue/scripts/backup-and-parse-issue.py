@@ -3,9 +3,10 @@
 backup-and-parse-issue.py
 
 Issue 本文をバックアップし、JSON で stdout に返す。
+バックアップはリポジトリルート配下の `tmp/` に保存する（システム /tmp/ は使わない）。
 
 Usage:
-    python3 backup-and-parse-issue.py <issue_number>
+    uv run python3 backup-and-parse-issue.py <issue_number>
 
 Output (stdout):
     {"issue_number": <int>, "backup_file": "<path>", "body": "<body text>"}
@@ -43,6 +44,14 @@ def get_repo() -> str:
     return url
 
 
+def get_repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=True
+    )
+    return Path(result.stdout.strip())
+
+
 def fetch_body(issue_number: int, repo: str) -> str:
     result = subprocess.run(
         ["gh", "issue", "view", str(issue_number),
@@ -65,7 +74,10 @@ def main() -> None:
 
     issue_number: int = args.issue_number
     ts = int(time.time())
-    backup_file = Path(f"/tmp/issue_{issue_number}_backup_{ts}.md")
+    repo_root = get_repo_root()
+    backup_dir = repo_root / "tmp"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_file = backup_dir / f"issue_{issue_number}_backup_{ts}.md"
 
     repo = get_repo()
     body = fetch_body(issue_number, repo)
