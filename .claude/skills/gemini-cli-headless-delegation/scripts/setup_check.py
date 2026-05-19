@@ -123,9 +123,10 @@ def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
     """Programmatically register repo root in ~/.gemini/trustedFolders.json.
 
     Logic:
+    - trustedFolders.json uses a dict schema: {path: "TRUST_FOLDER" | "TRUST_PARENT"}.
     - If the repo root (TRUST_FOLDER) or a parent directory (TRUST_PARENT) is
-      already present, perform no-op (idempotent).
-    - Otherwise append the repo root and persist.
+      already present, perform no-op (idempotent). Existing entries are preserved.
+    - Otherwise append the repo root as {repo_root: "TRUST_FOLDER"} and persist.
     - Creates the file if absent.
     """
     root = repo_root or _git_repo_root()
@@ -140,35 +141,36 @@ def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
     trusted_path = Path.home() / ".gemini" / "trustedFolders.json"
     trust_folder = str(root)
 
-    # Load existing list.
-    existing: list[str] = []
+    # Load existing dict. The gemini CLI schema is {path: "TRUST_FOLDER" | "TRUST_PARENT"}.
+    existing: dict[str, str] = {}
     if trusted_path.exists():
         try:
             data = json.loads(trusted_path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                existing = [str(p) for p in data]
+            if isinstance(data, dict):
+                existing = {str(k): str(v) for k, v in data.items()}
         except (json.JSONDecodeError, OSError):
             pass  # Treat as empty; will overwrite below.
 
     # Check for TRUST_FOLDER (exact match) or TRUST_PARENT (ancestor directory).
-    for entry in existing:
+    for entry, trust_type in existing.items():
         entry_path = Path(entry)
-        if entry_path == root:
-            # TRUST_FOLDER already present — no-op.
+        if entry_path == root and trust_type == "TRUST_FOLDER":
+            # TRUST_FOLDER already present — no-op. Existing entries are preserved.
             return {"ok": True, "status": "already_trusted", "path": trust_folder}
-        try:
-            root.relative_to(entry_path)
-            # TRUST_PARENT present — no-op.
-            return {"ok": True, "status": "parent_trusted", "path": trust_folder, "parent": entry}
-        except ValueError:
-            pass
+        if trust_type == "TRUST_PARENT":
+            try:
+                root.relative_to(entry_path)
+                # TRUST_PARENT present — no-op. Existing entries are preserved.
+                return {"ok": True, "status": "parent_trusted", "path": trust_folder, "parent": entry}
+            except ValueError:
+                pass
 
-    # Append and persist.
-    updated = existing + [trust_folder]
+    # Append new entry and persist. Existing entries are preserved.
+    existing[trust_folder] = "TRUST_FOLDER"
     try:
         trusted_path.parent.mkdir(parents=True, exist_ok=True)
         trusted_path.write_text(
-            json.dumps(updated, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(existing, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     except OSError as exc:
@@ -188,12 +190,16 @@ def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
 
 
 def check_serena_mcp() -> dict[str, Any]:
-    """Verify that Serena MCP can be invoked via uvx (without full install)."""
+    """Verify that Serena MCP can be invoked via uvx (without full install).
+
+    The serena package exposes the 'serena' executable (not the old 'serena-mcp' command).
+    We invoke 'serena --help' to verify availability.
+    """
     cmd = [
         "uvx",
         "--from",
         SERENA_MCP_PACKAGE,
-        "serena-mcp-server",
+        "serena",
         "--help",
     ]
     try:
@@ -202,10 +208,10 @@ def check_serena_mcp() -> dict[str, Any]:
         return {
             "ok": False,
             "status": "timeout",
-            "detail": f"uvx serena-mcp-server --help timed out after {SERENA_CHECK_TIMEOUT}s.",
+            "detail": f"uvx serena --help timed out after {SERENA_CHECK_TIMEOUT}s.",
             "recovery": [
                 "Check network connectivity to https://github.com/oraios/serena",
-                "Pre-cache with: uvx --from git+https://github.com/oraios/serena serena-mcp-server --help",
+                "Pre-cache with: uvx --from git+https://github.com/oraios/serena serena --help",
             ],
         }
     except FileNotFoundError:
@@ -245,7 +251,7 @@ _SETTINGS_TEMPLATE: dict[str, Any] = {
             "args": [
                 "--from",
                 SERENA_MCP_PACKAGE,
-                "serena-mcp-server",
+                "serena",
                 "--project-from-cwd",
             ],
             "trust": False,
