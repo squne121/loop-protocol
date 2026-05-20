@@ -42,9 +42,10 @@ permissionMode: dontAsk
 3. Bash で wrapper を起動:
    ```bash
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
-     --request /tmp/codebase-investigator-<timestamp>.json
+     --request-file /tmp/codebase-investigator-<timestamp>.json \
+     --output-file /tmp/codebase-investigator-result-<timestamp>.json
    ```
-4. wrapper の返却（`result_surface`）を Read で読み、本 SubAgent の報告形式に整形
+4. `--output-file` の JSON を Read で読み、`result_surface` を本 SubAgent の報告形式に整形
 
 ### リクエスト雛形
 
@@ -122,4 +123,4 @@ permissionMode: dontAsk
 - 失敗の理由（preflight result / wrapper の `failure_reason` / `warnings`）
 - 推奨次アクション（人間判断 / 環境セットアップ / 代替手段）
 
-> Gemini CLI の認証は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` 等の API key は使わない。委譲可否は必ず `gemini-cli-headless-delegation` Workflow の setup_check / preflight 実行結果で判断し、preflight 未実行のまま「委譲不可」と推測しない。
+> 本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。`GEMINI_API_KEY` 未設定だけを根拠に委譲不可と判断しない。委譲可否は必ず `gemini-cli-headless-delegation` Workflow の setup_check / preflight 実行結果で判断し、preflight 未実行のまま「委譲不可」と推測しない。
