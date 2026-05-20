@@ -51,22 +51,33 @@ reviewer feedback に基づき以下を満たす形で本文を更新:
 
 本文を書き換える前に、対象 ISSUE_TEMPLATE の `validations.required: true` ラベルを動的に列挙して、必須セクションの網羅性を確認する。
 
+`guard-issue-body.py` の `load_required_labels()` 関数が `.github/ISSUE_TEMPLATE/{issue_kind}.yml` を `yaml.safe_load()` でパースし、`type: markdown` 要素を除外したうえで `validations.required: true` の `attributes.label` を返す。issue_kind は以下の優先順で解決する:
+
+1. `--issue-kind` CLI 引数（`implementation` / `research` / `parent`）
+2. 本文の Machine-Readable Contract fenced yaml 内の `issue_kind` フィールド
+3. どちらも解決不能なら `template_guard` を fail（pass にしない）
+
 ```bash
 # yq を使う場合（利用可能なら優先）
-yq '.body[] | select(.validations.required == true) | .attributes.label' \
+yq '.body[] | select(.type != "markdown") | select(.validations.required == true) | .attributes.label' \
   .github/ISSUE_TEMPLATE/<種別>.yml
 
-# python3 を使う場合
-uv run --with pyyaml python3 -c "
+# python3 を使う場合（guard-issue-body.py の load_required_labels と同等）
+uv run python3 -c "
 import yaml
 with open('.github/ISSUE_TEMPLATE/<種別>.yml') as f:
     t = yaml.safe_load(f)
-required = [i['attributes']['label'] for i in t.get('body', []) if i.get('validations', {}).get('required')]
+required = [
+    i['attributes']['label'] for i in t.get('body', [])
+    if i.get('type') != 'markdown' and i.get('validations', {}).get('required')
+]
 print('\n'.join(required))
 "
 ```
 
 列挙した全ラベルが更新後の本文に `## <ラベル>` として存在することを確認すること。
+
+対応する `.yml` が存在しない種別を渡された場合、`guard_template()` は pass ではなく fail を返す。
 
 #### 3b. AC 番号と VC コメント # AC<n> の照合
 
@@ -126,18 +137,21 @@ NEW_BODY="tmp/issue_${ISSUE_NUMBER}_new_$(date +%s).md"
 
 以下のスクリプト呼び出し 1 回で全ガードを適用する。1 つでも fail なら abort してバックアップから復旧。
 
+`--issue-kind` 引数で issue_kind を明示する。指定しない場合は本文の Machine-Readable Contract の `issue_kind` フィールドから自動取得する。
+
 ```bash
 uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY" \
   --orig-file "$BACKUP_FILE" \
+  --issue-kind <implementation|research|parent> \
   --format yaml
 ```
 
 `guard-issue-body.py` は以下を順に検証する:
 
-- **Template Guard**: 必須セクション（`## Outcome` / `## In Scope` / `## Out of Scope` / `## Acceptance Criteria` / `## Verification Commands` / `## Allowed Paths` / `## Stop Conditions`）が存在するか
+- **Template Guard**: `.github/ISSUE_TEMPLATE/{issue_kind}.yml` の `validations.required: true` ラベルを動的に取得し、`## <ラベル>` 形式で本文に存在するか確認する。`type: markdown` 要素は除外する。対応 `.yml` が存在しない種別は pass ではなく fail。
 - **Outcome Quality Guard**: Outcome が成果物形式と完了条件を含むか（動作状態のみパターンを検出）
 - **差分閾値（削減率 50% 超で abort）**: `--orig-file` 指定時のみ適用
-- **AC/VC 番号一致**: AC 件数と VC の `# AC<N>` コメント件数が一致するか
+- **AC/VC 番号一致**: AC 件数と VC の `# AC<N>` コメント件数が一致するか。ただし issue_kind が `Verification Commands` を必須セクションに持たない種別（例: `parent`）では自動的に `skipped: true` を返して pass 扱いにする（ハードコードではなく ISSUE_TEMPLATE の required ラベルで動的判定）。
 
 スクリプトが exit 2 を返した場合は abort し、ステップ 7 の復旧処理へ進む。
 
