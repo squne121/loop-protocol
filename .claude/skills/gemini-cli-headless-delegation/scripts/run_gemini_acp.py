@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,7 @@ def handle_request_permission(
     params: dict[str, Any],
     approve_edits: bool,
 ) -> dict[str, Any]:
-    """Handle a request_permission RPC call.
+    """Handle a request_permission RPC call (legacy / non-ACP schema).
 
     When approve_edits is False, deny all write-type operations.
     Returns the JSON-RPC result payload.
@@ -172,6 +173,33 @@ def handle_request_permission(
             ),
         }
     return {"granted": True}
+
+
+def handle_session_request_permission(
+    params: dict[str, Any],
+    approve_edits: bool,
+) -> dict[str, Any]:
+    """Handle session/request_permission RPC (ACP protocol schema).
+
+    Selects an option from the provided options list and returns an outcome.
+    When approve_edits is False, selects the reject/cancel option.
+    Returns the JSON-RPC result payload with an outcome selection.
+    """
+    options: list[dict[str, Any]] = params.get("options") or []
+    if approve_edits:
+        selected = (
+            next((o for o in options if o.get("kind") == "allow_once"), None)
+            or next((o for o in options if o.get("kind") == "allow_always"), None)
+        )
+    else:
+        selected = (
+            next((o for o in options if o.get("kind") == "reject_once"), None)
+            or next((o for o in options if o.get("kind") == "reject_always"), None)
+            or next((o for o in options if o.get("optionId") == "cancel"), None)
+        )
+    if selected:
+        return {"outcome": {"outcome": "selected", "optionId": selected["optionId"]}}
+    return {"outcome": {"outcome": "cancelled"}}
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +224,13 @@ def detect_known_bug_from_stderr(stderr_chunk: str) -> str | None:
 # ACP session — async core
 # ---------------------------------------------------------------------------
 
-STRUCTURED_EVENT_TYPES = frozenset(
-    {"AgentMessageChunk", "AgentThoughtChunk", "ToolCallStart"}
-)
+# Legacy names kept for backward compatibility with existing tests and callers.
+# Actual ACP events use snake_case via session/update.sessionUpdate.
+STRUCTURED_EVENT_TYPES = frozenset({
+    "AgentMessageChunk", "AgentThoughtChunk", "ToolCallStart",          # legacy
+    "agent_message_chunk", "agent_thought_chunk", "tool_call",          # ACP actual
+    "tool_call_update", "session/request_permission",                   # ACP actual
+})
 
 
 async def _cleanup_proc(
@@ -237,6 +269,7 @@ async def _run_acp_session(
     model: str,
     approve_edits: bool,
     timeout_sec: int,
+    gemini_bin: str = "gemini",
 ) -> dict[str, Any]:
     """Run a full ACP session against `gemini --acp`.
 
@@ -252,17 +285,17 @@ async def _run_acp_session(
         "failure_reason": None,
     }
 
-    # Launch gemini --acp
+    # Launch gemini --acp — honour GEMINI_BIN so callers can inject a custom binary
     try:
         proc = await asyncio.create_subprocess_exec(
-            "gemini",
+            gemini_bin,
             "--acp",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
-        result["failure_reason"] = "gemini CLI not found in PATH"
+        result["failure_reason"] = f"gemini CLI not found: {gemini_bin!r}"
         result["warnings"].append(result["failure_reason"])
         return result
     except Exception as exc:
@@ -337,17 +370,16 @@ async def _run_acp_session(
         return await early_exit(f"initialize error: {init_msg['error']}")
 
     # ------------------------------------------------------------------
-    # session/new
+    # session/new — "default" approvalMode so tools and permission requests are active
     # ------------------------------------------------------------------
-    import os as _os
     req_id += 1
     await send(
         _rpc_request(
             "session/new",
             {
                 "model": model,
-                "approvalMode": "plan",
-                "cwd": _os.getcwd(),
+                "approvalMode": "default",
+                "cwd": os.getcwd(),
                 "mcpServers": [],
             },
             req_id,
@@ -446,39 +478,31 @@ async def _run_acp_session(
 
         method = msg.get("method", "")
 
-        # -- Collect structured events from notifications
-        if "id" not in msg:
-            event_type = method.split("/")[-1] if "/" in method else method
-            if event_type in STRUCTURED_EVENT_TYPES or method in STRUCTURED_EVENT_TYPES:
-                structured_events.append(
-                    {
-                        "type": event_type,
-                        "params": msg.get("params", {}),
-                    }
-                )
+        # -- ACP notifications: session/update carries all agent events
+        if method == "session/update":
+            update = (msg.get("params") or {}).get("update") or {}
+            kind = update.get("sessionUpdate", "")
+            if kind:
+                structured_events.append({"type": kind, "params": msg.get("params", {})})
                 watchdog.mark_first_result()
-            elif method == "AgentMessageChunk" or (
-                isinstance(msg.get("params"), dict)
-                and msg["params"].get("type") in STRUCTURED_EVENT_TYPES
-            ):
-                structured_events.append(
-                    {
-                        "type": msg.get("params", {}).get("type", method),
-                        "params": msg.get("params", {}),
-                    }
-                )
-                watchdog.mark_first_result()
-            # Accumulate text chunks for response_text
-            if isinstance(msg.get("params"), dict):
-                chunk_text = msg["params"].get("text") or msg["params"].get("content")
-                if isinstance(chunk_text, str):
-                    response_parts.append(chunk_text)
-                    watchdog.mark_first_result()
+            if kind == "agent_message_chunk":
+                content = update.get("content") or {}
+                if isinstance(content, dict) and content.get("type") == "text":
+                    text = content.get("text")
+                    if isinstance(text, str):
+                        response_parts.append(text)
 
-        # -- Handle permission requests from the model
-        elif method == "request_permission":
+        # -- ACP permission requests: session/request_permission (has id, expects response)
+        elif method == "session/request_permission":
             params = msg.get("params") or {}
-            permission_result = handle_request_permission(params, approve_edits)
+            permission_result = handle_session_request_permission(params, approve_edits)
+            # Record permission event in structured_events for verification
+            structured_events.append({
+                "type": "session/request_permission",
+                "params": params,
+                "outcome": permission_result,
+            })
+            watchdog.mark_first_result()
             resp = {
                 "jsonrpc": "2.0",
                 "id": msg["id"],
@@ -589,6 +613,8 @@ def run_acp(
 
     model = str(request.get("model", "gemini-2.5-flash"))
     timeout_sec = int(request.get("timeout_sec", TOTAL_TIMEOUT_SEC))
+    # GEMINI_BIN: request field takes precedence, then env var, then default
+    gemini_bin = str(request.get("gemini_bin") or os.environ.get("GEMINI_BIN") or "gemini")
 
     try:
         try:
@@ -604,6 +630,7 @@ def run_acp(
                             model=model,
                             approve_edits=approve_edits,
                             timeout_sec=timeout_sec,
+                            gemini_bin=gemini_bin,
                         )
                     )
                 )
@@ -616,6 +643,7 @@ def run_acp(
                     model=model,
                     approve_edits=approve_edits,
                     timeout_sec=timeout_sec,
+                    gemini_bin=gemini_bin,
                 )
             )
     except Exception as exc:
