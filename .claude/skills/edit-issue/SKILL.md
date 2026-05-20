@@ -47,6 +47,85 @@ reviewer feedback に基づき以下を満たす形で本文を更新:
 - Machine-Readable Contract block の YAML key を破壊しない（値のみ更新）
 - 削除確認パターン、決定論的 VC の原則を適用
 
+#### 3a. ISSUE_TEMPLATE を読み込んで required ラベルを列挙する
+
+本文を書き換える前に、対象 ISSUE_TEMPLATE の `validations.required: true` ラベルを動的に列挙して、必須セクションの網羅性を確認する。
+
+`guard-issue-body.py` の `load_required_labels()` 関数が `.github/ISSUE_TEMPLATE/{issue_kind}.yml` を `yaml.safe_load()` でパースし、`type: markdown` 要素を除外したうえで `validations.required: true` の `attributes.label` を返す。issue_kind は以下の優先順で解決する:
+
+1. `--issue-kind` CLI 引数（`implementation` / `research` / `parent`）
+2. 本文の Machine-Readable Contract fenced yaml 内の `issue_kind` フィールド
+3. どちらも解決不能なら `template_guard` を fail（pass にしない）
+
+```bash
+# yq を使う場合（利用可能なら優先）
+yq '.body[] | select(.type != "markdown") | select(.validations.required == true) | .attributes.label' \
+  .github/ISSUE_TEMPLATE/<種別>.yml
+
+# python3 を使う場合（guard-issue-body.py の load_required_labels と同等）
+uv run python3 -c "
+import yaml
+with open('.github/ISSUE_TEMPLATE/<種別>.yml') as f:
+    t = yaml.safe_load(f)
+required = [
+    i['attributes']['label'] for i in t.get('body', [])
+    if i.get('type') != 'markdown' and i.get('validations', {}).get('required')
+]
+print('\n'.join(required))
+"
+```
+
+列挙した全ラベルが更新後の本文に `## <ラベル>` として存在することを確認すること。
+
+対応する `.yml` が存在しない種別を渡された場合、`guard_template()` は pass ではなく fail を返す。
+
+#### 3b. AC 番号と VC コメント # AC<n> の照合
+
+AC 件数と VC の `# AC<n>` コメント件数が一致しているかを確認する（`guard-issue-body.py` の AC/VC alignment check と同じロジックを手動で事前確認）。
+
+```bash
+# 更新後の本文ファイルに対して実行する
+AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' "$NEW_BODY" | wc -l)
+VC_AC_COUNT=$(rg -c "# AC[0-9]" "$NEW_BODY" || echo 0)
+[ "$AC_COUNT" -eq "$VC_AC_COUNT" ] \
+  && echo "PASS: AC/VC 番号一致 ($AC_COUNT 件)" \
+  || echo "FAIL: AC=$AC_COUNT / VC AC コメント=$VC_AC_COUNT"
+```
+
+不一致の場合は本文を修正してから次へ進む。
+
+#### 3c. rg を用いた VC 構築
+
+VC コマンドを作成または更新する場合は `rg` を使う。Perl 互換正規表現が必要な場合は `-P` フラグを付ける（`grep -P` は GNU grep 限定だが `rg -P` は ripgrep 組み込みのため移植性が高い）。
+
+```bash
+# 基本形: 特定パターンが存在することを確認
+rg -n "<pattern>" <file>
+
+# Perl 互換正規表現が必要な場合
+rg -Pn "<perl-compatible-pattern>" <file>
+
+# 見出し配下の内容確認（2 段パイプ）
+rg -nA 20 "^## <見出し>" <file> | rg "<content-pattern>"
+```
+
+`grep` は GNU 拡張差や Perl 互換構文の扱いが環境によって分かれるため、VC での使用を避ける。
+
+#### 3d. baseline で全 VC が fail することを確認
+
+本文を書き戻す前に、実装前の状態（baseline）で VC が fail することを確認する。fail しない VC は「実装によって変化しない」ため VC として意味がない。
+
+```bash
+# 各 VC コマンドを実行して exit code を確認する
+# exit code 非ゼロ（fail）であれば baseline check 通過
+<VC コマンド>; echo "Exit: $?"
+
+# rg を使う VC の場合、マッチなし = exit 1 = fail = baseline 確認 OK
+rg -n "<pattern>" <file>; echo "Exit: $?"  # 0 なら実装済みの可能性
+```
+
+baseline で pass する VC が存在する場合は、VC のコンテキスト見出し固定が不足している可能性がある（ex. 別セクションの既存記述に誤マッチ）。VC パターンを tighten してから proceed すること。
+
 更新後の本文全体を tmp ファイルに保存:
 ```bash
 mkdir -p tmp
@@ -58,18 +137,21 @@ NEW_BODY="tmp/issue_${ISSUE_NUMBER}_new_$(date +%s).md"
 
 以下のスクリプト呼び出し 1 回で全ガードを適用する。1 つでも fail なら abort してバックアップから復旧。
 
+`--issue-kind` 引数で issue_kind を明示する。指定しない場合は本文の Machine-Readable Contract の `issue_kind` フィールドから自動取得する。
+
 ```bash
 uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY" \
   --orig-file "$BACKUP_FILE" \
+  --issue-kind <implementation|research|parent> \
   --format yaml
 ```
 
 `guard-issue-body.py` は以下を順に検証する:
 
-- **Template Guard**: 必須セクション（`## Outcome` / `## In Scope` / `## Out of Scope` / `## Acceptance Criteria` / `## Verification Commands` / `## Allowed Paths` / `## Stop Conditions`）が存在するか
+- **Template Guard**: `.github/ISSUE_TEMPLATE/{issue_kind}.yml` の `validations.required: true` ラベルを動的に取得し、`## <ラベル>` 形式で本文に存在するか確認する。`type: markdown` 要素は除外する。対応 `.yml` が存在しない種別は pass ではなく fail。
 - **Outcome Quality Guard**: Outcome が成果物形式と完了条件を含むか（動作状態のみパターンを検出）
 - **差分閾値（削減率 50% 超で abort）**: `--orig-file` 指定時のみ適用
-- **AC/VC 番号一致**: AC 件数と VC の `# AC<N>` コメント件数が一致するか
+- **AC/VC 番号一致**: AC 件数と VC の `# AC<N>` コメント件数が一致するか。ただし issue_kind が `Verification Commands` を必須セクションに持たない種別（例: `parent`）では自動的に `skipped: true` を返して pass 扱いにする（ハードコードではなく ISSUE_TEMPLATE の required ラベルで動的判定）。
 
 スクリプトが exit 2 を返した場合は abort し、ステップ 7 の復旧処理へ進む。
 
