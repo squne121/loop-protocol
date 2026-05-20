@@ -274,7 +274,13 @@ async def _run_acp_session(
     """Run a full ACP session against `gemini --acp`.
 
     Returns a result dict with keys:
-      ok, structured_events, response_text, stderr, warnings, failure_reason
+      ok, structured_events, response_text, stderr, warnings, failure_reason,
+      failure_class
+
+    ``failure_class`` is a structured classifier for the failure point (or
+    ``None`` on success). Recognised values:
+      gemini_not_found, launch_failed, initialize_failed, session_new_failed,
+      prompt_error, protocol_error, timeout, watchdog
     """
     result: dict[str, Any] = {
         "ok": False,
@@ -283,6 +289,7 @@ async def _run_acp_session(
         "stderr": None,
         "warnings": [],
         "failure_reason": None,
+        "failure_class": None,
     }
 
     # Launch gemini --acp — honour GEMINI_BIN so callers can inject a custom binary
@@ -296,10 +303,12 @@ async def _run_acp_session(
         )
     except FileNotFoundError:
         result["failure_reason"] = f"gemini CLI not found: {gemini_bin!r}"
+        result["failure_class"] = "gemini_not_found"
         result["warnings"].append(result["failure_reason"])
         return result
     except Exception as exc:
         result["failure_reason"] = f"failed to launch gemini --acp: {exc}"
+        result["failure_class"] = "launch_failed"
         result["warnings"].append(result["failure_reason"])
         return result
 
@@ -314,6 +323,9 @@ async def _run_acp_session(
     stderr_buf: list[str] = [""]
     response_parts: list[str] = []
     session_id: str | None = None
+    # B5: track whether the final session/prompt response was actually received.
+    # EOF / process death before this is reached must NOT be treated as success.
+    final_response_received: bool = False
 
     async def read_stderr_task() -> None:
         assert proc.stderr is not None
@@ -336,9 +348,10 @@ async def _run_acp_session(
         proc.stdin.write(payload)  # type: ignore[union-attr]
         await proc.stdin.drain()  # type: ignore[union-attr]
 
-    async def early_exit(reason: str) -> dict[str, Any]:
+    async def early_exit(reason: str, failure_class: str) -> dict[str, Any]:
         """Kill proc, drain stderr (bounded), and return partial result."""
         result["failure_reason"] = reason
+        result["failure_class"] = failure_class
         result["warnings"].append(reason)
         result["stderr"] = await _cleanup_proc(proc, stderr_reader, stderr_buf)
         return result
@@ -347,8 +360,19 @@ async def _run_acp_session(
     # initialize
     # ------------------------------------------------------------------
     req_id += 1
-    # protocolVersion must be a number (int); gemini-cli 0.42.0+ rejects strings
-    await send(_rpc_request("initialize", {"protocolVersion": 1}, req_id))
+    # protocolVersion must be a number (int); gemini-cli 0.42.0+ rejects strings.
+    # clientCapabilities declares a read-only transport: this client provides no
+    # filesystem proxy (readTextFile/writeTextFile) and no terminal proxy. This is
+    # the primary safety boundary — the agent cannot perform host fs/terminal I/O
+    # through this client. The permission handler below is a best-effort secondary
+    # defence, not the boundary.
+    await send(_rpc_request("initialize", {
+        "protocolVersion": 1,
+        "clientCapabilities": {
+            "fs": {"readTextFile": False, "writeTextFile": False},
+            "terminal": False,
+        },
+    }, req_id))
 
     init_timeout = float(watchdog.CONNECT)
     try:
@@ -356,18 +380,22 @@ async def _run_acp_session(
     except asyncio.TimeoutError:
         return await early_exit(
             f"connect timeout ({watchdog.CONNECT}s) waiting for initialize response "
-            f"— possible bugs: {INITIALIZE_HANG_BUG}, {AUTH_HANG_BUG}, {SETTINGS_HANG_BUG}"
+            f"— possible bugs: {INITIALIZE_HANG_BUG}, {AUTH_HANG_BUG}, {SETTINGS_HANG_BUG}",
+            "initialize_failed",
         )
 
     watchdog.heartbeat()
     init_msg = _parse_rpc_line(raw_init.decode(errors="replace"))
     if not init_msg or init_msg.get("id") != req_id:
         return await early_exit(
-            f"unexpected response to initialize: {raw_init!r}"
+            f"unexpected response to initialize: {raw_init!r}",
+            "initialize_failed",
         )
 
     if "error" in init_msg:
-        return await early_exit(f"initialize error: {init_msg['error']}")
+        return await early_exit(
+            f"initialize error: {init_msg['error']}", "initialize_failed"
+        )
 
     # ------------------------------------------------------------------
     # session/new — "default" approvalMode so tools and permission requests are active
@@ -396,7 +424,8 @@ async def _run_acp_session(
         if remaining_st <= 0:
             return await early_exit(
                 f"connect timeout ({watchdog.CONNECT}s) waiting for session/new response "
-                f"— possible bug: {INITIALIZE_HANG_BUG}"
+                f"— possible bug: {INITIALIZE_HANG_BUG}",
+                "session_new_failed",
             )
         try:
             raw_session = await asyncio.wait_for(
@@ -405,7 +434,9 @@ async def _run_acp_session(
         except asyncio.TimeoutError:
             continue
         if not raw_session:
-            return await early_exit("EOF waiting for session/new response")
+            return await early_exit(
+                "EOF waiting for session/new response", "session_new_failed"
+            )
         watchdog.heartbeat()
         parsed = _parse_rpc_line(raw_session.decode(errors="replace"))
         if parsed is None:
@@ -416,7 +447,9 @@ async def _run_acp_session(
         # Any other message (notification) is dropped here — session/prompt loop handles them
 
     if "error" in session_msg:
-        return await early_exit(f"session/new error: {session_msg['error']}")
+        return await early_exit(
+            f"session/new error: {session_msg['error']}", "session_new_failed"
+        )
 
     session_result_data = session_msg.get("result", {})
     # gemini-cli returns sessionId (not id) in session/new result
@@ -444,6 +477,7 @@ async def _run_acp_session(
         remaining = deadline - now
         if remaining <= 0:
             result["failure_reason"] = f"total timeout exceeded ({timeout_sec}s)"
+            result["failure_class"] = "timeout"
             result["warnings"].append(result["failure_reason"])
             proc.kill()
             break
@@ -452,6 +486,7 @@ async def _run_acp_session(
         watchdog_reason = watchdog.check()
         if watchdog_reason:
             result["failure_reason"] = watchdog_reason
+            result["failure_class"] = "watchdog"
             result["warnings"].append(result["failure_reason"])
             try:
                 proc.kill()
@@ -512,8 +547,12 @@ async def _run_acp_session(
 
         # -- session/prompt final response (id matches)
         elif msg.get("id") == req_id:
+            # The final session/prompt response was received — record this so a
+            # subsequent EOF/process exit is not misclassified (B5).
+            final_response_received = True
             if "error" in msg:
                 result["failure_reason"] = f"session/prompt error: {msg['error']}"
+                result["failure_class"] = "prompt_error"
                 result["warnings"].append(result["failure_reason"])
             else:
                 # Extract text from final result if present
@@ -530,13 +569,17 @@ async def _run_acp_session(
         proc.stdin.close()
     except Exception:
         pass
+    proc_returncode: int | None = None
     try:
         await asyncio.wait_for(proc.wait(), timeout=5.0)
+        proc_returncode = proc.returncode
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
+        # Process did not exit cleanly within the drain window.
+        proc_returncode = proc.returncode
     try:
         await asyncio.wait_for(asyncio.shield(stderr_reader), timeout=5.0)
     except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -550,8 +593,21 @@ async def _run_acp_session(
     result["response_text"] = "".join(response_parts) or None
     result["stderr"] = stderr_buf[0] or None
 
-    if result["failure_reason"] is None:
-        result["ok"] = True
+    # B5: the loop may have exited on EOF before the final session/prompt
+    # response was received. That is a protocol-level failure, not success.
+    if result["failure_reason"] is None and not final_response_received:
+        result["failure_reason"] = "EOF before final session/prompt response"
+        result["failure_class"] = "protocol_error"
+        result["warnings"].append(result["failure_reason"])
+
+    # B5: success requires no failure, the final response received, a clean
+    # process exit, and a valid session id.
+    result["ok"] = (
+        result["failure_reason"] is None
+        and final_response_received
+        and proc_returncode == 0
+        and bool(session_id)
+    )
 
     return result
 
@@ -594,6 +650,8 @@ def run_acp(
     request: dict[str, Any],
     request_path: "Path | None" = None,
     approve_edits: bool = False,
+    prepared_prompt: str | None = None,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """Run a delegation request using ACP transport.
 
@@ -603,15 +661,32 @@ def run_acp(
     Falls back to headless_json transport if initialize or session/new fails
     (see fallback comment in _fallback_to_headless_json).
 
-    Returns a dict with at least: ok, structured_events, response_text,
-    stderr, warnings, failure_reason, schema, transport.
-    """
-    prompt = request.get("objective", "")
-    instructions = request.get("instructions", [])
-    if instructions:
-        prompt = prompt + "\n\n" + "\n".join(f"{i + 1}. {instr}" for i, instr in enumerate(instructions))
+    ``prepared_prompt``: when provided, this exact prompt string is sent to the
+    ACP session and the objective/instructions assembly is skipped. This is how
+    ``run_delegation()`` routes through ACP: the prompt has already been built by
+    ``build_prompt()`` after ``validate_request()`` and context loading, so the
+    ACP path honours the same delegation contract as headless_json.
 
-    model = str(request.get("model", "gemini-2.5-flash"))
+    ``model_override``: when provided, this model is used instead of
+    ``request["model"]`` (the resolved model chain head from ``run_delegation``).
+
+    Returns a dict with at least: ok, structured_events, response_text,
+    stderr, warnings, failure_reason, failure_class, schema, transport.
+    """
+    if prepared_prompt is not None:
+        prompt = prepared_prompt
+    else:
+        prompt = request.get("objective", "")
+        instructions = request.get("instructions", [])
+        if instructions:
+            prompt = prompt + "\n\n" + "\n".join(
+                f"{i + 1}. {instr}" for i, instr in enumerate(instructions)
+            )
+
+    if model_override:
+        model = str(model_override)
+    else:
+        model = str(request.get("model", "gemini-2.5-flash"))
     timeout_sec = int(request.get("timeout_sec", TOTAL_TIMEOUT_SEC))
     # GEMINI_BIN: request field takes precedence, then env var, then default
     gemini_bin = str(request.get("gemini_bin") or os.environ.get("GEMINI_BIN") or "gemini")
@@ -654,29 +729,28 @@ def run_acp(
             "stderr": None,
             "warnings": [str(exc)],
             "failure_reason": str(exc),
+            "failure_class": "launch_failed",
         }
 
     result["schema"] = "acp_result_v1"
     result["transport"] = "acp"
+    result.setdefault("failure_class", None)
 
-    # Fallback: if initialize or session/new failed, try headless_json
-    if not result["ok"] and result.get("failure_reason"):
-        failure = result["failure_reason"]
-        is_early_failure = any(
-            keyword in failure
-            for keyword in [
-                "initialize",
-                "session/new",
-                "connect timeout",
-                "not found in PATH",
-                "failed to launch",
-            ]
-        )
-        if is_early_failure:
-            try:
-                return _fallback_to_headless_json(request, request_path, failure)
-            except Exception as fb_exc:
-                result["warnings"].append(f"fallback to headless_json also failed: {fb_exc}")
+    # Fallback: if the ACP path failed before producing a usable session, try
+    # headless_json. The decision is driven by the structured failure_class
+    # (B4) rather than fragile substring matching on failure_reason.
+    EARLY_FAILURE_CLASSES = {
+        "gemini_not_found",
+        "launch_failed",
+        "initialize_failed",
+        "session_new_failed",
+    }
+    if not result["ok"] and result.get("failure_class") in EARLY_FAILURE_CLASSES:
+        failure = result.get("failure_reason") or result.get("failure_class")
+        try:
+            return _fallback_to_headless_json(request, request_path, str(failure))
+        except Exception as fb_exc:
+            result["warnings"].append(f"fallback to headless_json also failed: {fb_exc}")
 
     return result
 
@@ -698,17 +772,29 @@ def main(argv: list[str] | None = None) -> int:
     req_raw = args.request_file.read_text(encoding="utf-8")
     request = json.loads(req_raw)
 
-    result = run_acp(request, request_path=args.request_file, approve_edits=args.approve_edits)
+    # Route through run_delegation() so the standalone CLI entry point also
+    # passes validate_request() / model chain resolution / context loading /
+    # build_prompt() before reaching the ACP session (B1). transport="acp" is
+    # forced and approve_edits is injected into the request dict so the
+    # dispatcher in run_gemini_headless.run_delegation() picks them up.
+    from run_gemini_headless import run_delegation  # type: ignore[import]
+
+    delegation_request = dict(request)
+    delegation_request["transport"] = "acp"
+    if args.approve_edits:
+        delegation_request["approve_edits"] = True
+
+    result = run_delegation(delegation_request, request_path=args.request_file)
 
     output = json.dumps(result, ensure_ascii=False, indent=2)
     args.output_file.write_text(output, encoding="utf-8")
 
-    if result["ok"]:
+    if result.get("ok"):
         print(result.get("response_text") or "[acp] ok: session completed")
     else:
         print(result.get("failure_reason") or "[acp] error: session failed")
     print(f"[acp] result saved to: {args.output_file}")
-    return 0 if result["ok"] else 1
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

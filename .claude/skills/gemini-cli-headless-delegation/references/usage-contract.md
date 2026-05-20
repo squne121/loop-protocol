@@ -571,21 +571,33 @@ return {
 - `local_asset_research` と `proposal_only` の `gh_commands` 対応は Issue #2255 で仕様設計を確定し、Issue #2309 で完全実装した（PR #2309）。
 - `local_asset_research` / `proposal_only` の request に `gh_commands` を指定した場合、wrapper は argv を allowlist 検証し、許可されたコマンドを事前実行して結果を `inline_context` に prepend する。allowlist 外の argv は `warnings` に記録してスキップする（`github_research` と異なり validation error にして fail-close しない）。フォーマット不正な entry（dict でない / argv が文字列リストでない）も同様に `warnings` に記録してスキップする。
 
-## `transport` Field (ACP Transport)
+## `transport` Field (ACP Transport — experimental, read-only)
 
 The optional `transport` field selects the delegation transport:
 
 | Value | Behavior |
 |---|---|
 | absent or `"headless_json"` | Default. Standard `gemini --output-format json` pathway. |
-| `"acp"` | ACP (Agent Client Protocol) transport via `gemini --acp`. JSON-RPC lifecycle with structured events. |
+| `"acp"` | **Experimental, read-only** ACP (Agent Client Protocol) transport via `gemini --acp`. JSON-RPC lifecycle with structured events. |
+
+`transport: acp` requests are validated and prompt-built by the **same
+delegation contract** as headless_json: `run_delegation()` runs
+`validate_request()`, model chain resolution, context loading, and
+`build_prompt()` *before* dispatching to the ACP session. An invalid
+`delegation_request_v1` fails at validation and never reaches the ACP path.
+
+The ACP transport is **read-only**: at `initialize` it declares
+`clientCapabilities` with no filesystem proxy and no terminal proxy
+(`fs.readTextFile: false`, `fs.writeTextFile: false`, `terminal: false`). The
+agent cannot perform host filesystem or terminal I/O through this client. There
+is no `fs` / `terminal` proxy. See `references/transport-acp.md`.
 
 ### `transport: acp` — additional fields
 
 | フィールド | 型 | 説明 |
 |---|---|---|
 | `transport` | `"acp"` | Select ACP transport. |
-| `approve_edits` | boolean (optional, default `false`) | When `true`, allow write operations (write_file, edit_file, etc.) via permission proxy. |
+| `approve_edits` | boolean (optional, default `false`) | Controls the **best-effort** permission handler. When `false`, write-type permission requests are denied. This is defence in depth — the read-only `clientCapabilities` declaration is the actual safety boundary, not this flag. |
 
 ### ACP result fields (added when `transport: acp`)
 
@@ -593,8 +605,9 @@ The optional `transport` field selects the delegation transport:
 |---|---|---|
 | `schema` | `"acp_result_v1"` | Schema identifier for ACP results. |
 | `transport` | `"acp"` | Confirms ACP transport was used. |
-| `structured_events` | list | AgentMessageChunk / AgentThoughtChunk / ToolCallStart events collected during the session. |
-| `_acp_fallback` | boolean (optional) | Present and `true` when fallback to headless_json occurred. |
+| `structured_events` | list | `session/update` events (snake_case: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) and `session/request_permission` entries collected during the session. |
+| `failure_class` | string \| null | Structured failure classifier: `gemini_not_found`, `launch_failed`, `initialize_failed`, `session_new_failed`, `prompt_error`, `protocol_error`, `timeout`, `watchdog`, or `null` on success. Drives fallback selection. |
+| `_acp_fallback` | boolean (optional) | Present and `true` when fallback to headless_json occurred. The verification script `verify_acp_roundtrip.sh` SKIPs with exit 77 when `gemini`/`jq` are absent. |
 
 ### Example request with `transport: acp`
 

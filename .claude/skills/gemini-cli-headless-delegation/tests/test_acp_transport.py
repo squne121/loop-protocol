@@ -238,7 +238,7 @@ class TestFallbackToHeadlessJson:
         assert any("fell back to headless_json" in w for w in result["warnings"])
 
     def test_fallback_invoked_on_early_failure(self) -> None:
-        """GIVEN run_acp with initialize failure, WHEN fallback is available, THEN fallback result returned."""
+        """GIVEN run_acp with initialize failure (failure_class), WHEN fallback is available, THEN fallback result returned."""
         fake_headless_result: dict[str, Any] = {
             "ok": True,
             "response_text": "headless response",
@@ -259,6 +259,7 @@ class TestFallbackToHeadlessJson:
                 "stderr": None,
                 "warnings": ["connect timeout"],
                 "failure_reason": "connect timeout (60s) waiting for initialize response",
+                "failure_class": "initialize_failed",
             }
 
         with patch.object(acp, "_run_acp_session", side_effect=_failing_session):
@@ -271,8 +272,9 @@ class TestFallbackToHeadlessJson:
         assert result["ok"] is True
 
     def test_fallback_not_invoked_on_late_failure(self) -> None:
-        """GIVEN run_acp with a late session failure (not early), THEN fallback is NOT invoked."""
-        # Late failure: failure_reason doesn't contain early-failure keywords
+        """GIVEN run_acp with a late session failure (prompt_error), THEN fallback is NOT invoked."""
+        # B4: fallback is driven by failure_class, not substring matching.
+        # prompt_error is a late failure → no fallback.
 
         async def _late_failing_session(**kwargs: Any) -> dict[str, Any]:
             return {
@@ -282,6 +284,7 @@ class TestFallbackToHeadlessJson:
                 "stderr": None,
                 "warnings": ["session/prompt error"],
                 "failure_reason": "session/prompt error: model refused",
+                "failure_class": "prompt_error",
             }
 
         with patch.object(acp, "_run_acp_session", side_effect=_late_failing_session):
@@ -291,6 +294,66 @@ class TestFallbackToHeadlessJson:
 
         assert result.get("_acp_fallback") is None or result.get("_acp_fallback") is False
         assert result["ok"] is False
+        assert result.get("failure_class") == "prompt_error"
+
+    def test_fallback_driven_by_failure_class_not_keyword(self) -> None:
+        """GIVEN a failure_reason mentioning 'initialize' but failure_class=prompt_error, THEN no fallback (B4)."""
+        # Regression: old code matched the substring "initialize" anywhere in
+        # failure_reason and wrongly fell back. With failure_class routing this
+        # late failure must NOT fall back even though the reason text mentions
+        # the word "initialize".
+        async def _misleading_session(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "structured_events": [],
+                "response_text": None,
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": "session/prompt error: model failed to initialize its plan",
+                "failure_class": "prompt_error",
+            }
+
+        with patch.object(acp, "_run_acp_session", side_effect=_misleading_session):
+            result = acp.run_acp(
+                request={"schema": "delegation_request_v1", "objective": "test"},
+            )
+
+        assert result.get("_acp_fallback") is None or result.get("_acp_fallback") is False
+        assert result["ok"] is False
+
+    def test_fallback_classes_for_each_early_failure(self) -> None:
+        """GIVEN each early failure_class, THEN fallback is invoked (B4)."""
+        for fclass in (
+            "gemini_not_found",
+            "launch_failed",
+            "initialize_failed",
+            "session_new_failed",
+        ):
+            fake_headless_result: dict[str, Any] = {
+                "ok": True,
+                "response_text": "headless",
+                "warnings": [],
+            }
+            mock_module = types.ModuleType("run_gemini_headless")
+            mock_module.run_delegation = MagicMock(return_value=fake_headless_result)  # type: ignore[attr-defined]
+
+            async def _failing(**kwargs: Any) -> dict[str, Any]:
+                return {
+                    "ok": False,
+                    "structured_events": [],
+                    "response_text": None,
+                    "stderr": None,
+                    "warnings": [],
+                    "failure_reason": f"failed at {fclass}",
+                    "failure_class": fclass,
+                }
+
+            with patch.object(acp, "_run_acp_session", side_effect=_failing):
+                with patch.dict(sys.modules, {"run_gemini_headless": mock_module}):
+                    result = acp.run_acp(
+                        request={"schema": "delegation_request_v1", "objective": "x"},
+                    )
+            assert result.get("_acp_fallback") is True, f"{fclass} should fall back"
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +399,7 @@ class TestRunAcpResult:
                 "stderr": None,
                 "warnings": ["gemini CLI not found in PATH"],
                 "failure_reason": "gemini CLI not found in PATH",
+                "failure_class": "gemini_not_found",
             }
 
         # Patch fallback to also fail so we get the raw acp failure
@@ -367,3 +431,333 @@ class TestRunAcpResult:
         assert "schema" in result
         assert "transport" in result
         assert result["transport"] == "acp"
+
+
+# ---------------------------------------------------------------------------
+# B1: prepared_prompt / model_override — delegation contract routing
+# ---------------------------------------------------------------------------
+
+
+class TestPreparedPromptAndModelOverride:
+    """GIVEN run_acp with prepared_prompt / model_override, THEN they are honoured."""
+
+    def test_prepared_prompt_is_used_verbatim(self) -> None:
+        """GIVEN prepared_prompt, WHEN run_acp is called, THEN the session receives it unchanged."""
+        captured: dict[str, Any] = {}
+
+        async def _capturing_session(**kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "ok": True,
+                "structured_events": [],
+                "response_text": "ok",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+            }
+
+        prepared = "FULLY BUILT PROMPT FROM build_prompt()"
+        with patch.object(acp, "_run_acp_session", side_effect=_capturing_session):
+            acp.run_acp(
+                {"objective": "ignored", "instructions": ["ignored too"]},
+                prepared_prompt=prepared,
+            )
+
+        assert captured["prompt"] == prepared
+
+    def test_model_override_takes_precedence(self) -> None:
+        """GIVEN model_override, WHEN run_acp is called, THEN session model uses the override."""
+        captured: dict[str, Any] = {}
+
+        async def _capturing_session(**kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "ok": True,
+                "structured_events": [],
+                "response_text": "ok",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+            }
+
+        with patch.object(acp, "_run_acp_session", side_effect=_capturing_session):
+            acp.run_acp(
+                {"objective": "x", "model": "request-model"},
+                model_override="resolved-chain-model",
+            )
+
+        assert captured["model"] == "resolved-chain-model"
+
+    def test_no_prepared_prompt_falls_back_to_objective(self) -> None:
+        """GIVEN no prepared_prompt, THEN objective+instructions are assembled (legacy behaviour)."""
+        captured: dict[str, Any] = {}
+
+        async def _capturing_session(**kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "ok": True,
+                "structured_events": [],
+                "response_text": "ok",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+            }
+
+        with patch.object(acp, "_run_acp_session", side_effect=_capturing_session):
+            acp.run_acp({"objective": "do thing", "instructions": ["step a"]})
+
+        assert "do thing" in captured["prompt"]
+        assert "step a" in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# B1: ACP path goes through validate_request — invalid requests fail before ACP
+# ---------------------------------------------------------------------------
+
+
+class TestAcpRoutesThroughDelegationContract:
+    """GIVEN transport=acp via run_delegation, THEN validate_request runs before any ACP session."""
+
+    def test_invalid_acp_request_fails_validation_before_acp(self) -> None:
+        """GIVEN an invalid acp request, WHEN run_delegation is called, THEN it fails at validation and never reaches run_acp."""
+        import run_gemini_headless as headless
+
+        # Missing tool_profile / output_sections / context_files — invalid.
+        invalid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "do something specific and clear here",
+        }
+
+        with patch("run_gemini_acp.run_acp") as mock_run_acp:
+            result = headless.run_delegation(invalid_request)
+
+        # run_acp must NOT have been reached — validation failed first.
+        mock_run_acp.assert_not_called()
+        assert result["ok"] is False
+        assert result["schema"] == "delegation_result/v1"
+        assert result.get("failure_reason")
+
+    def test_valid_acp_request_reaches_run_acp_after_build_prompt(self, tmp_path: Path) -> None:
+        """GIVEN a valid acp request, WHEN run_delegation is called, THEN run_acp receives a prepared_prompt."""
+        import run_gemini_headless as headless
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Summarize the provided context file in two sentences",
+            "instructions": ["Be concise.", "Do not invent facts."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Summary"],
+            "context_files": [str(ctx)],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 120,
+        }
+
+        captured: dict[str, Any] = {}
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            captured["request"] = request
+            return {"ok": True, "schema": "acp_result_v1", "transport": "acp"}
+
+        with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp) as mock_run_acp:
+            result = headless.run_delegation(valid_request, request_path=ctx)
+
+        mock_run_acp.assert_called_once()
+        # prepared_prompt was built by build_prompt() and passed through.
+        assert captured.get("prepared_prompt")
+        assert isinstance(captured["prepared_prompt"], str)
+        # context content reached the prompt — proof the ACP path honoured context_files.
+        assert "context content" in captured["prepared_prompt"]
+        assert captured.get("model_override")
+        assert result["transport"] == "acp"
+
+
+# ---------------------------------------------------------------------------
+# B5: EOF / process failure must not be treated as success
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_acp_agent(tmp_path: Path, body: str) -> Path:
+    """Write an executable fake ACP agent python script and return its path."""
+    script = tmp_path / "fake_acp_agent.py"
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+# A fake agent that completes the full lifecycle and exits cleanly.
+_FAKE_AGENT_OK = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, sys, uuid
+    def send(o):
+        sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+    def main():
+        sid = str(uuid.uuid4())
+        for _ in range(50):
+            raw = sys.stdin.readline().strip()
+            if not raw:
+                break
+            msg = json.loads(raw)
+            method = msg.get("method", "")
+            mid = msg.get("id")
+            if method == "initialize":
+                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1}})
+            elif method == "session/new":
+                send({"jsonrpc":"2.0","id":mid,"result":{"sessionId":sid}})
+            elif method == "session/prompt":
+                send({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":sid,
+                    "update":{"sessionUpdate":"agent_message_chunk",
+                              "content":{"type":"text","text":"PONG"}}}})
+                send({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}})
+                return
+    if __name__ == "__main__":
+        main()
+    """
+)
+
+# A fake agent that dies after session/new WITHOUT sending the final
+# session/prompt response (EOF before final response).
+_FAKE_AGENT_EOF = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, sys, uuid
+    def send(o):
+        sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+    def main():
+        sid = str(uuid.uuid4())
+        for _ in range(50):
+            raw = sys.stdin.readline().strip()
+            if not raw:
+                break
+            msg = json.loads(raw)
+            method = msg.get("method", "")
+            mid = msg.get("id")
+            if method == "initialize":
+                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1}})
+            elif method == "session/new":
+                send({"jsonrpc":"2.0","id":mid,"result":{"sessionId":sid}})
+            elif method == "session/prompt":
+                # Send a chunk then exit WITHOUT the final id-matching response.
+                send({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":sid,
+                    "update":{"sessionUpdate":"agent_message_chunk",
+                              "content":{"type":"text","text":"partial"}}}})
+                sys.exit(3)
+    if __name__ == "__main__":
+        main()
+    """
+)
+
+
+class TestEofNotSuccess:
+    """GIVEN an ACP agent that dies before the final response, THEN run_acp reports failure (B5)."""
+
+    def test_clean_lifecycle_is_success(self, tmp_path: Path) -> None:
+        """GIVEN a fake agent completing the full lifecycle, THEN ok=true."""
+        agent = _write_fake_acp_agent(tmp_path, _FAKE_AGENT_OK)
+        result = asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=30,
+                gemini_bin=str(agent),
+            )
+        )
+        assert result["ok"] is True
+        assert result["failure_reason"] is None
+        assert result["failure_class"] is None
+        assert result["response_text"] == "PONG"
+
+    def test_eof_before_final_response_is_failure(self, tmp_path: Path) -> None:
+        """GIVEN a fake agent that exits before the final session/prompt response, THEN ok=false."""
+        agent = _write_fake_acp_agent(tmp_path, _FAKE_AGENT_EOF)
+        result = asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=30,
+                gemini_bin=str(agent),
+            )
+        )
+        assert result["ok"] is False
+        assert result["failure_class"] == "protocol_error"
+        assert result["failure_reason"] == "EOF before final session/prompt response"
+
+    def test_gemini_not_found_failure_class(self) -> None:
+        """GIVEN a nonexistent gemini binary, THEN failure_class=gemini_not_found (B4)."""
+        result = asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=10,
+                gemini_bin="/nonexistent/gemini-absent-binary",
+            )
+        )
+        assert result["ok"] is False
+        assert result["failure_class"] == "gemini_not_found"
+
+
+# ---------------------------------------------------------------------------
+# B2: read-only clientCapabilities declared in initialize
+# ---------------------------------------------------------------------------
+
+
+class TestReadOnlyClientCapabilities:
+    """GIVEN an ACP session, THEN the initialize request declares a read-only transport (B2)."""
+
+    def test_initialize_declares_readonly_capabilities(self, tmp_path: Path) -> None:
+        """GIVEN a fake agent that records the initialize params, THEN clientCapabilities are read-only."""
+        recorder = tmp_path / "init_params.json"
+        agent_body = textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json, sys, uuid
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+            def main():
+                sid = str(uuid.uuid4())
+                for _ in range(50):
+                    raw = sys.stdin.readline().strip()
+                    if not raw:
+                        break
+                    msg = json.loads(raw)
+                    method = msg.get("method", "")
+                    mid = msg.get("id")
+                    if method == "initialize":
+                        with open({str(recorder)!r}, "w") as fh:
+                            json.dump(msg.get("params", {{}}), fh)
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"protocolVersion":1}}}})
+                    elif method == "session/new":
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"sessionId":sid}}}})
+                    elif method == "session/prompt":
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"stopReason":"end_turn"}}}})
+                        return
+            if __name__ == "__main__":
+                main()
+            """
+        )
+        agent = _write_fake_acp_agent(tmp_path, agent_body)
+        asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=30,
+                gemini_bin=str(agent),
+            )
+        )
+        params = json.loads(recorder.read_text(encoding="utf-8"))
+        caps = params.get("clientCapabilities", {})
+        assert caps.get("fs", {}).get("readTextFile") is False
+        assert caps.get("fs", {}).get("writeTextFile") is False
+        assert caps.get("terminal") is False

@@ -1117,17 +1117,15 @@ def run_delegation(
     request_path: Path | None = None,
     _routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # --- transport dispatcher: acp branch ---
-    # When transport="acp" is specified, delegate to run_gemini_acp.run_acp().
-    # The acp transport handles: JSON-RPC lifecycle, HeartbeatWatchdog,
-    # permission proxy, structured_events collection, and headless_json fallback.
-    # This dispatcher is re-entrant: acp fallback calls run_delegation() back
-    # with transport="headless_json" (or absent), which skips this branch.
-    if request.get("transport") == "acp":
-        from run_gemini_acp import run_acp  # type: ignore[import]
-        approve_edits = bool(request.get("approve_edits", False))
-        return run_acp(dict(request), request_path=request_path, approve_edits=approve_edits)
-
+    # --- transport dispatcher note ---
+    # When transport="acp" is specified, the request still flows through the
+    # full delegation contract below (validate_request, model chain resolution,
+    # context loading, build_prompt) and the ACP branch is taken AFTER
+    # build_prompt() so the ACP path cannot bypass tool_profile / context_files
+    # / output_sections / GitHub-Serena constraints. See the acp dispatch block
+    # after build_prompt() further down. The dispatcher is re-entrant: ACP
+    # fallback calls run_delegation() with transport="headless_json", which
+    # does not re-enter the ACP branch.
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
     tool_profile = str(request.get("tool_profile", "unknown"))
@@ -1319,6 +1317,24 @@ def run_delegation(
     context_documents = _read_context_files(list(request["context_files"]), base_dir)
     prompt = build_prompt(merged_request, context_documents)
     timeout_sec = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
+
+    # --- transport dispatcher: acp branch ---
+    # Taken only after validate_request(), model chain resolution, context
+    # loading, and build_prompt() have all run, so the ACP path honours the
+    # exact same delegation contract as headless_json. The fully-built prompt
+    # is handed to run_acp() as prepared_prompt; the resolved model chain head
+    # is passed as model_override. The ACP fallback re-invokes run_delegation()
+    # with transport="headless_json", which does not re-enter this branch.
+    if request.get("transport") == "acp":
+        from run_gemini_acp import run_acp  # type: ignore[import]
+        approve_edits = bool(request.get("approve_edits", False))
+        return run_acp(
+            dict(merged_request),
+            request_path=request_path,
+            approve_edits=approve_edits,
+            prepared_prompt=prompt,
+            model_override=model_chain[0] if model_chain else requested_model,
+        )
 
     # --- Model chain loop ---
     warnings: list[str] = request_warnings[:]

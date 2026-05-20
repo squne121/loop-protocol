@@ -169,31 +169,31 @@ if [ -f "$SCENARIO_RESULT_FILE" ]; then
   else
     S1_OK="$(echo "$S1_OUTPUT" | jq -r '.ok' 2>/dev/null || echo "null")"
     S1_EVENTS="$(echo "$S1_OUTPUT" | jq '.structured_events | length' 2>/dev/null || echo "0")"
-    # structured_events > 0 required: proves ACP event stream (agent_message_chunk etc.) was parsed
-    if [ "$S1_OK" = "true" ] && [ "$S1_EVENTS" -gt 0 ] 2>/dev/null; then
-      echo "PASS: scenario 1 — ok=true, structured_events=$S1_EVENTS"
+    S1_TRANSPORT="$(echo "$S1_OUTPUT" | jq -r '.transport // "null"' 2>/dev/null || echo "null")"
+    # response_text trimmed of leading/trailing whitespace, must equal exactly PONG
+    S1_RESPONSE="$(echo "$S1_OUTPUT" | jq -r '.response_text // ""' 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # Collect all FAIL reasons; PASS requires every check to pass.
+    S1_FAIL_REASONS=""
+    [ "$S1_OK" != "true" ] && S1_FAIL_REASONS="${S1_FAIL_REASONS}ok=$S1_OK; "
+    # structured_events > 0 required: proves ACP event stream was parsed
+    { [ "$S1_EVENTS" -gt 0 ]; } 2>/dev/null || S1_FAIL_REASONS="${S1_FAIL_REASONS}structured_events=$S1_EVENTS (need >0); "
+    [ "$S1_TRANSPORT" != "acp" ] && S1_FAIL_REASONS="${S1_FAIL_REASONS}transport=$S1_TRANSPORT (need acp — fallback or wrong path); "
+    [ "$S1_RESPONSE" != "PONG" ] && S1_FAIL_REASONS="${S1_FAIL_REASONS}response_text=\"$S1_RESPONSE\" (need exactly PONG); "
+    if [ -z "$S1_FAIL_REASONS" ]; then
+      echo "PASS: scenario 1 — ok=true, transport=acp, structured_events=$S1_EVENTS, response_text=PONG"
       S1_VERDICT="PASS"
       log_scenario "AC7 scenario 1 (normal PONG)" \
         "objective=Reply with exactly PONG, transport=acp, model=gemini-2.5-flash" \
         "$S1_OUTPUT" \
         "PASS" "0"
-    elif [ "$S1_OK" = "true" ] && [ "$S1_EVENTS" -eq 0 ] 2>/dev/null; then
-      echo "FAIL: scenario 1 — ok=true but structured_events=0 (ACP event stream not parsed)"
-      S1_VERDICT="FAIL"
-      OVERALL_RESULT=1
-      log_scenario "AC7 scenario 1 (normal PONG)" \
-        "objective=Reply with exactly PONG, transport=acp, model=gemini-2.5-flash" \
-        "$S1_OUTPUT" \
-        "FAIL" "1" "structured_events=0 — session/update events not parsed"
     else
-      S1_FAIL_REASON="$(echo "$S1_OUTPUT" | jq -r '.failure_reason // "unknown"' 2>/dev/null || echo "unknown")"
-      echo "FAIL: scenario 1 — ok=$S1_OK, failure_reason=$S1_FAIL_REASON"
+      echo "FAIL: scenario 1 — $S1_FAIL_REASONS"
       S1_VERDICT="FAIL"
       OVERALL_RESULT=1
       log_scenario "AC7 scenario 1 (normal PONG)" \
         "objective=Reply with exactly PONG, transport=acp, model=gemini-2.5-flash" \
         "$S1_OUTPUT" \
-        "FAIL" "1" "ok=false — $S1_FAIL_REASON"
+        "FAIL" "1" "$S1_FAIL_REASONS"
     fi
   fi
 else
@@ -302,6 +302,10 @@ CONTEXT_FILE_2="$WORK_DIR/context2.txt"
 REQUEST_FILE_2="$WORK_DIR/request2.json"
 echo "This is a permission-deny verification context." > "$CONTEXT_FILE_2"
 
+# tool_profile is required for validate_request() — run_delegation() now routes
+# the ACP path through the full delegation contract, so this request must be a
+# valid delegation_request_v1. no_tools keeps the request schema-valid; the
+# fake ACP agent drives the permission-deny path regardless of tool_profile.
 cat > "$REQUEST_FILE_2" <<REQEOF
 {
   "schema": "delegation_request_v1",
@@ -312,6 +316,7 @@ cat > "$REQUEST_FILE_2" <<REQEOF
     "If permission is denied, reply with: PERMISSION_DENIED_OK",
     "If the command succeeds, reply with: WRITE_SUCCEEDED"
   ],
+  "tool_profile": "no_tools",
   "output_sections": ["Response"],
   "context_files": ["$CONTEXT_FILE_2"],
   "model": "gemini-2.5-flash",
@@ -323,9 +328,13 @@ S2_OUTPUT=""
 S2_VERDICT=""
 S2_RC=0
 
-# Run WITHOUT --approve-edits using the fake ACP agent as GEMINI_BIN
-GEMINI_BIN="$WORK_DIR/fake_acp_agent.py" run_scenario "s2" "$REQUEST_FILE_2"
-S2_RC=$?
+# Run WITHOUT --approve-edits using the fake ACP agent as GEMINI_BIN.
+# Wrap in `if` so a non-zero exit does not abort the script under `set -e`.
+if GEMINI_BIN="$WORK_DIR/fake_acp_agent.py" run_scenario "s2" "$REQUEST_FILE_2"; then
+  S2_RC=0
+else
+  S2_RC=$?
+fi
 
 if [ -f "$SCENARIO_RESULT_FILE" ]; then
   S2_OUTPUT="$(cat "$SCENARIO_RESULT_FILE")"
