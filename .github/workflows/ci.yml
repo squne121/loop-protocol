@@ -75,4 +75,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --group dev
-      - run: uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py
+      - run: uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
