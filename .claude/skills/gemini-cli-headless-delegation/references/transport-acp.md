@@ -121,3 +121,71 @@ Known gemini-cli bugs that trigger early failure detection (preflight signals):
 - Bug #18423 (settings hang): stderr contains `"reading settings"` or `"loading settings"`
 
 When a known bug is detected in stderr, the process is killed immediately (fail-closed).
+
+---
+
+## Operational Verification (動作検証)
+
+Script: `.claude/skills/gemini-cli-headless-delegation/scripts/verify_acp_roundtrip.sh`
+Policy: `docs/dev/runtime-verification-policy.md`
+Related: Issue #85, Issue #26 AC7
+
+### Exit Code Convention
+
+| Exit Code | Meaning |
+|-----------|---------|
+| 0 | All scenarios PASS |
+| 1 | At least one scenario FAIL or `_acp_fallback: true` detected |
+| 77 | Execution environment unavailable (gemini CLI or jq not found) — SKIP |
+
+### GEMINI_BIN Override
+
+The verification script respects the `GEMINI_BIN` environment variable to allow deterministic testing in environments without a real `gemini` binary:
+
+```bash
+# Test SKIP behaviour without installing gemini CLI
+GEMINI_BIN=/nonexistent/gemini-absent bash verify_acp_roundtrip.sh
+# → stdout: "SKIP: gemini CLI not found ...", exit 77
+
+# Use a custom binary path
+GEMINI_BIN=/usr/local/bin/gemini-dev bash verify_acp_roundtrip.sh
+```
+
+If `GEMINI_BIN` is not set, the default is `gemini` (resolved via `command -v`).
+
+### Scenarios
+
+**scenario 1 — normal (PONG roundtrip)**
+
+Delegates `"Reply with exactly: PONG"` via ACP transport with `tool_profile: no_tools`.
+Verifies:
+- `ok: true`
+- `_acp_fallback` is absent or `false`
+
+**scenario 2 — permission deny (write tool without --approve-edits)**
+
+Attempts a write-file operation without passing `--approve-edits`. The permission proxy
+(see Permission section above) denies the write. Verifies:
+- Session completes without fallback (`_acp_fallback` absent or `false`)
+- `ok: true` (session-level success even when write is denied by permission proxy)
+
+Note: Whether the model issues a `write_file` tool call depends on model behaviour at runtime.
+The scenario is structurally present; human manual verification (AC5) covers the case where
+the model actually issues a write request.
+
+### Fallback Detection
+
+If the result JSON contains `_acp_fallback: true`, the script outputs a FAIL message and
+exits 1. The fallback detection block does not contain any `exit 0` or `PASS` statement
+between detection and `exit 1`. This aligns with `runtime-verification-policy.md` §3.
+
+### Artifact Output
+
+Each scenario's input and output are appended to:
+
+```
+artifacts/runtime-verification-AC7-<ISO8601 UTC>.log
+```
+
+Format follows `runtime-verification-policy.md` §4 (AC / Timestamp / Environment / Input / Output / Verdict).
+The `artifacts/` directory is created with `mkdir -p` and is **not committed** (worktree-local work area).
