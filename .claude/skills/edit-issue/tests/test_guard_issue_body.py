@@ -32,6 +32,7 @@ guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
+validate_issue_kind = _mod.validate_issue_kind
 
 
 # ---------------------------------------------------------------------------
@@ -677,5 +678,318 @@ issue_kind: implementation
 """
         result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
         assert result["skipped"] is False
+        assert result["passed"] is True
+        assert result["ac_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: validate_issue_kind のテスト（パストラバーサル対策）
+# ---------------------------------------------------------------------------
+
+class TestValidateIssueKind:
+    def test_valid_kind_passes(self):
+        """GIVEN 有効な issue_kind WHEN validate_issue_kind THEN 例外なし"""
+        # 例外が出なければ OK
+        validate_issue_kind("implementation")
+        validate_issue_kind("research")
+        validate_issue_kind("parent")
+        validate_issue_kind("my-kind")
+        validate_issue_kind("kind_123")
+
+    def test_path_traversal_rejected(self):
+        """GIVEN '../etc' のようなパストラバーサル文字列 WHEN validate_issue_kind THEN ValueError"""
+        with pytest.raises(ValueError, match="Invalid issue_kind"):
+            validate_issue_kind("../etc")
+
+    def test_slash_rejected(self):
+        """GIVEN スラッシュを含む文字列 WHEN validate_issue_kind THEN ValueError"""
+        with pytest.raises(ValueError, match="Invalid issue_kind"):
+            validate_issue_kind("a/b")
+
+    def test_dot_prefix_rejected(self):
+        """GIVEN ドットで始まる文字列 WHEN validate_issue_kind THEN ValueError"""
+        with pytest.raises(ValueError, match="Invalid issue_kind"):
+            validate_issue_kind(".hidden")
+
+    def test_empty_string_rejected(self):
+        """GIVEN 空文字列 WHEN validate_issue_kind THEN ValueError"""
+        with pytest.raises(ValueError, match="Invalid issue_kind"):
+            validate_issue_kind("")
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: extract_issue_kind_from_body の仕様一致テスト
+# ---------------------------------------------------------------------------
+
+class TestExtractIssueKindFromBodyFinding3:
+    def test_no_contract_schema_version_returns_none(self):
+        """GIVEN contract_schema_version がない yaml ブロック WHEN extract_issue_kind_from_body THEN None"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+issue_kind: implementation
+```
+"""
+        result = extract_issue_kind_from_body(body)
+        assert result is None
+
+    def test_wrong_schema_version_returns_none(self):
+        """GIVEN contract_schema_version が v1 以外 WHEN extract_issue_kind_from_body THEN None"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v2
+issue_kind: implementation
+```
+"""
+        result = extract_issue_kind_from_body(body)
+        assert result is None
+
+    def test_yaml_outside_mrc_section_not_extracted(self):
+        """GIVEN MRC セクション外の yaml ブロックのみ WHEN extract_issue_kind_from_body THEN None"""
+        body = """\
+## Some Other Section
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Machine-Readable Contract
+
+（MRC セクションに yaml ブロックなし）
+"""
+        result = extract_issue_kind_from_body(body)
+        assert result is None
+
+    def test_mrc_section_with_v1_and_issue_kind_extracted(self):
+        """GIVEN MRC セクション内に contract_schema_version: v1 + issue_kind WHEN extract THEN 正しく返す"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: research
+parent_issue: none
+```
+"""
+        result = extract_issue_kind_from_body(body)
+        assert result == "research"
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: Template Guard の fenced code block 内偽陽性テスト
+# ---------------------------------------------------------------------------
+
+class TestGuardTemplateFinding4:
+    def test_outcome_in_fenced_block_not_mistaken_as_section(self, template_dir):
+        """GIVEN fenced code block 内に ## Outcome がある WHEN guard_template THEN 見出しと誤認しない"""
+        # fenced code block 内に ## Outcome があるが、実際の ## Outcome セクションはない body
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Parent Issue
+
+none
+
+## Parent Goal Ref
+
+- Goal: テスト
+
+## Current Validated Scope
+
+テスト
+
+## Remaining Parent Gaps
+
+なし
+
+```markdown
+## Outcome
+
+ここは fenced block 内の偽見出し
+```
+
+## In Scope
+
+- テスト
+
+## Out of Scope
+
+- 対象外
+
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# AC1
+pnpm test
+```
+
+## Allowed Paths
+
+- tests/
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合
+
+## Required Skills
+
+- pytest
+"""
+        result = guard_template(body, "implementation", template_dir=template_dir)
+        # fenced block 内の ## Outcome は実際のセクションではないため missing に含まれる
+        assert result["passed"] is False
+        assert "## Outcome" in result["missing_sections"]
+
+    def test_real_outcome_section_passes(self, template_dir):
+        """GIVEN 行頭の正規 ## Outcome セクションがある WHEN guard_template THEN pass する"""
+        body = make_implementation_body()
+        result = guard_template(body, "implementation", template_dir=template_dir)
+        assert result["passed"] is True
+
+    def test_outcome_in_blockquote_not_counted(self, template_dir):
+        """GIVEN fenced block 内の ## Outcome のみで実際のセクションがない WHEN guard_template THEN fail"""
+        # fenced code block 内に ## Outcome があるだけで実際のセクションがない
+        body_without_outcome = make_implementation_body().replace("## Outcome\n", "## REMOVED\n")
+        # fenced block に ## Outcome を追加
+        body_with_fake = body_without_outcome + "\n```\n## Outcome\nfake\n```\n"
+        result = guard_template(body_with_fake, "implementation", template_dir=template_dir)
+        assert result["passed"] is False
+        assert "## Outcome" in result["missing_sections"]
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: AC/VC alignment の集合一致テスト
+# ---------------------------------------------------------------------------
+
+class TestGuardAcVcAlignmentFinding5:
+    def test_duplicate_vc_ac1_causes_failure(self, template_dir):
+        """GIVEN # AC1 が VC に 2 回ある WHEN guard_ac_vc_alignment THEN AC 番号集合と不一致で fail"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Acceptance Criteria
+
+- [ ] AC1 テスト1
+
+## Verification Commands
+
+```bash
+# AC1
+pnpm test
+# AC1
+pnpm test --watch
+```
+"""
+        result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
+        assert result["skipped"] is False
+        # AC: [1], VC: [1, 1] → sorted([1]) != sorted([1, 1]) → fail
+        assert result["passed"] is False
+
+    def test_vc_ac_outside_vc_section_not_counted(self, template_dir):
+        """GIVEN ## Verification Commands セクション外の # AC1 WHEN guard_ac_vc_alignment THEN カウントしない"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Acceptance Criteria
+
+- [ ] AC1 テスト1
+
+## Some Other Section
+
+```bash
+# AC1
+echo "this should not be counted"
+```
+
+## Verification Commands
+
+```bash
+# AC1
+pnpm test
+```
+"""
+        # VC セクション内に # AC1 が 1 つ → AC 番号 [1] と一致 → pass
+        result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
+        assert result["skipped"] is False
+        assert result["passed"] is True
+
+    def test_ac1_and_ac2_matching_passes(self, template_dir):
+        """GIVEN AC1/AC2 と VC # AC1/# AC2 が対応 WHEN guard_ac_vc_alignment THEN pass"""
+        body = make_implementation_body()
+        result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
+        assert result["passed"] is True
+
+    def test_ac1_missing_in_vc_fails(self, template_dir):
+        """GIVEN AC1/AC2 があるが VC は # AC2 のみ WHEN guard_ac_vc_alignment THEN fail"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Acceptance Criteria
+
+- [ ] AC1 テスト1
+- [ ] AC2 テスト2
+
+## Verification Commands
+
+```bash
+# AC2
+pnpm test
+```
+"""
+        result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
+        assert result["skipped"] is False
+        assert result["passed"] is False
+
+    def test_vc_ac_numbers_outside_section_ignored(self, template_dir):
+        """GIVEN AC なし VC セクション外に # AC1 WHEN guard_ac_vc_alignment THEN AC=0 で pass"""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Acceptance Criteria
+
+なし
+
+## Other Section
+
+```bash
+# AC1
+not in VC section
+```
+"""
+        result = guard_ac_vc_alignment(body, "implementation", template_dir=template_dir)
+        # AC が 0 件なので pass
         assert result["passed"] is True
         assert result["ac_count"] == 0

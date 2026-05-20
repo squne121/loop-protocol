@@ -8,7 +8,7 @@ Guards:
   1. Template Guard         — 必須セクションが存在するか（ISSUE_TEMPLATE 動的取得）
   2. Outcome Quality Guard  — Outcome が成果物形式・完了条件を含むか
   3. Diff Threshold         — 削減率が 50% 以下か（--orig-file 指定時）
-  4. AC-VC Alignment        — AC 番号と VC の # AC<N> コメントの件数が一致するか
+  4. AC-VC Alignment        — AC 番号集合と VC の # AC<N> 番号集合が一致するか
                               （issue_kind 別 skip: VC セクションが不要な種別ではスキップ）
 
 Usage:
@@ -42,11 +42,11 @@ _OUTCOME_NG_RE = re.compile(
     re.MULTILINE
 )
 
-# Machine-Readable Contract block の issue_kind を抽出する正規表現
-_MRC_BLOCK_RE = re.compile(
-    r'```yaml\s*(.*?)```',
-    re.DOTALL
-)
+# issue_kind の安全な文字のみ許可（パストラバーサル対策）
+_ISSUE_KIND_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+# fenced code block を除去するための正規表現
+_FENCED_CODE_BLOCK_RE = re.compile(r'```.*?```', re.DOTALL)
 
 
 def validate_path(value: str) -> Path:
@@ -60,11 +60,30 @@ def validate_path(value: str) -> Path:
     return p
 
 
+def validate_issue_kind(issue_kind: str) -> None:
+    """
+    issue_kind がパストラバーサルに利用できない安全な文字列であることを検証する。
+
+    Raises:
+        ValueError: 不正な文字が含まれる場合
+    """
+    if not _ISSUE_KIND_RE.fullmatch(issue_kind):
+        raise ValueError(
+            f"Invalid issue_kind: {issue_kind!r}. "
+            "Must match ^[A-Za-z0-9_-]+$ (no path traversal characters allowed)"
+        )
+
+
 def load_required_labels(template_dir: Path, issue_kind: str) -> list:
     """
     .github/ISSUE_TEMPLATE/{issue_kind}.yml をパースし、
     validations.required: true の要素の attributes.label を返す。
     type: markdown 要素は除外する。
+
+    スコープ: 本リポジトリの implementation / research / parent テンプレートの
+    validations.required: true の attributes.label に限定した照合を行う。
+    GitHub Forms schema 全体（checkboxes の option 単位 required 等）への
+    一般対応ではない。
 
     Args:
         template_dir: ISSUE_TEMPLATE ディレクトリのパス
@@ -74,10 +93,21 @@ def load_required_labels(template_dir: Path, issue_kind: str) -> list:
         必須ラベルのリスト（`## <label>` 形式で本文内の見出しと照合する）
 
     Raises:
+        ValueError: issue_kind に不正な文字が含まれる場合、または
+                    テンプレートの構造が不正な場合（dict でない、body が配列でない等）
         FileNotFoundError: テンプレートファイルが存在しない場合
-        ValueError: attributes.label が無い/文字列でない場合
     """
+    # パストラバーサル対策: issue_kind の文字列を検証
+    validate_issue_kind(issue_kind)
+
     template_path = template_dir / f"{issue_kind}.yml"
+
+    # パス解決後にテンプレートディレクトリ外を参照していないか確認
+    if template_path.resolve().parent != template_dir.resolve():
+        raise ValueError(
+            f"Resolved template path escapes template_dir: {template_path.resolve()}"
+        )
+
     if not template_path.exists():
         raise FileNotFoundError(
             f"ISSUE_TEMPLATE not found for kind '{issue_kind}': {template_path}"
@@ -86,7 +116,20 @@ def load_required_labels(template_dir: Path, issue_kind: str) -> list:
     with template_path.open(encoding="utf-8") as f:
         template = yaml.safe_load(f)
 
+    # テンプレート構造の検証
+    if not isinstance(template, dict):
+        raise ValueError(
+            f"Template file '{issue_kind}.yml' must be a YAML mapping (dict), "
+            f"got {type(template).__name__!r}"
+        )
+
     body_items = template.get("body", [])
+    if not isinstance(body_items, list):
+        raise ValueError(
+            f"'body' in '{issue_kind}.yml' must be a list, "
+            f"got {type(body_items).__name__!r}"
+        )
+
     required_labels = []
 
     for item in body_items:
@@ -115,22 +158,58 @@ def load_required_labels(template_dir: Path, issue_kind: str) -> list:
     return required_labels
 
 
+def _extract_mrc_section(body: str) -> str:
+    """
+    本文から `## Machine-Readable Contract` セクションのテキストを返す。
+    次の `## ` 見出しまでを切り出す。
+
+    Returns:
+        str: MRC セクションのテキスト（セクションが存在しない場合は空文字列）
+    """
+    lines = body.splitlines()
+    in_section = False
+    section_lines = []
+    for line in lines:
+        if re.match(r'^##[ \t]+Machine-Readable Contract[ \t]*$', line):
+            in_section = True
+            continue
+        if in_section:
+            if re.match(r'^##[ \t]+', line):
+                break
+            section_lines.append(line)
+    return "\n".join(section_lines)
+
+
 def extract_issue_kind_from_body(body: str):
     """
-    本文の Machine-Readable Contract fenced yaml 内の issue_kind フィールドを抽出する。
-    複数の ```yaml ブロックがある場合は最初に contract_schema_version を含むものを使う。
+    本文の `## Machine-Readable Contract` セクション配下にある fenced yaml ブロックから
+    issue_kind フィールドを抽出する。
+
+    抽出条件（すべてを満たす場合のみ issue_kind を返す）:
+    - ブロックが `## Machine-Readable Contract` セクション配下にある
+    - yaml.safe_load() が dict を返す
+    - `contract_schema_version` が "v1" である
+    - `issue_kind` が str である
 
     Returns:
         str | None: issue_kind 文字列、または見つからなかった場合 None
     """
-    for match in _MRC_BLOCK_RE.finditer(body):
+    mrc_section = _extract_mrc_section(body)
+    if not mrc_section:
+        return None
+
+    # MRC セクション内の fenced yaml ブロックを検索
+    for match in re.finditer(r'```yaml\s*(.*?)```', mrc_section, re.DOTALL):
         block_text = match.group(1)
         try:
             data = yaml.safe_load(block_text)
-            if isinstance(data, dict) and "issue_kind" in data:
-                issue_kind = data["issue_kind"]
-                if isinstance(issue_kind, str) and issue_kind.strip():
-                    return issue_kind.strip()
+            if not isinstance(data, dict):
+                continue
+            if data.get("contract_schema_version") != "v1":
+                continue
+            issue_kind = data.get("issue_kind")
+            if isinstance(issue_kind, str) and issue_kind.strip():
+                return issue_kind.strip()
         except yaml.YAMLError:
             continue
     return None
@@ -161,10 +240,20 @@ def resolve_template_dir() -> Path:
     )
 
 
+def _strip_fenced_code_blocks(text: str) -> str:
+    """
+    テキストから fenced code block（``` で囲まれた範囲）を除去して返す。
+    """
+    return _FENCED_CODE_BLOCK_RE.sub('', text)
+
+
 def guard_template(body: str, issue_kind: str, template_dir=None) -> dict:
     """
     ISSUE_TEMPLATE の validations.required: true ラベルを動的に取得して
     本文に `## <label>` 形式で存在するか確認する。
+
+    コードブロック・引用内の偽陽性を防ぐため、fenced code block を除去した
+    本文に対して行頭 Markdown 見出しとして正規表現でマッチする。
 
     Args:
         body: Issue 本文
@@ -191,12 +280,16 @@ def guard_template(body: str, issue_kind: str, template_dir=None) -> dict:
             "missing_sections": [],
         }
 
-    # `## <label>` 形式で本文内に存在するか確認
+    # fenced code block を除去した本文で行頭見出しを確認
+    stripped_body = _strip_fenced_code_blocks(body)
     missing = []
     for label in required_labels:
-        section_header = f"## {label}"
-        if section_header not in body:
-            missing.append(section_header)
+        pattern = re.compile(
+            rf'^##[ \t]+{re.escape(label)}[ \t]*$',
+            re.MULTILINE
+        )
+        if not pattern.search(stripped_body):
+            missing.append(f"## {label}")
 
     return {
         "name": "template_guard",
@@ -246,13 +339,39 @@ def guard_diff_threshold(orig_text: str, new_text: str) -> dict:
     }
 
 
+def _extract_vc_section(body: str) -> str:
+    """
+    本文から `## Verification Commands` セクションのテキストを返す。
+    次の `## ` 見出しまでを切り出す。
+
+    Returns:
+        str: VC セクションのテキスト（セクションが存在しない場合は空文字列）
+    """
+    lines = body.splitlines()
+    in_section = False
+    section_lines = []
+    for line in lines:
+        if re.match(r'^##[ \t]+Verification Commands[ \t]*$', line):
+            in_section = True
+            continue
+        if in_section:
+            if re.match(r'^##[ \t]+', line):
+                break
+            section_lines.append(line)
+    return "\n".join(section_lines)
+
+
 def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict:
     """
-    AC 番号と VC の # AC<N> コメントの件数が一致するか確認する。
+    AC 番号集合と VC の # AC<N> 番号集合が一致するか確認する。
     issue_kind が VC セクションを必須に持たない種別（parent 等）では skipped: true を返す。
 
     「VC セクションを必須に持つ種別か」は ISSUE_TEMPLATE の required label に
     'Verification Commands' が含まれるかで動的に判定する（ハードコードしない）。
+
+    AC 番号は `- [x] AC<N>` 形式から抽出し、VC 番号は `## Verification Commands`
+    セクション配下の `# AC<N>` コメントから抽出する。
+    重複番号がある場合も集合一致で判定するため偽陽性を防ぐ。
     """
     if template_dir is None:
         try:
@@ -279,9 +398,20 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
             "reason": f"issue_kind '{issue_kind}' does not require Verification Commands section",
         }
 
-    ac_count = len(re.findall(r'^- \[.\] AC\d+', body, re.MULTILINE))
-    vc_ac_count = len(re.findall(r'# AC\d+', body))
-    passed = (ac_count == 0) or (ac_count == vc_ac_count)
+    # AC 番号を Acceptance Criteria から抽出（集合で管理）
+    ac_numbers = re.findall(r'^- \[.\] AC(\d+)\b', body, re.MULTILINE)
+    # VC 番号を Verification Commands セクション配下からのみ抽出（集合で管理）
+    vc_section = _extract_vc_section(body)
+    vc_numbers = re.findall(r'# AC(\d+)\b', vc_section)
+
+    ac_count = len(ac_numbers)
+    vc_ac_count = len(vc_numbers)
+
+    if ac_count == 0:
+        passed = True
+    else:
+        passed = sorted(ac_numbers) == sorted(vc_numbers)
+
     return {
         "name": "ac_vc_alignment",
         "passed": passed,
@@ -349,9 +479,15 @@ def main() -> None:
             results.append(guard_diff_threshold(orig_body, body))
 
         # ac_vc_alignment は issue_kind 不明のためスキップしない（安全側）
-        ac_count = len(re.findall(r'^- \[.\] AC\d+', body, re.MULTILINE))
-        vc_ac_count = len(re.findall(r'# AC\d+', body))
-        passed = (ac_count == 0) or (ac_count == vc_ac_count)
+        ac_numbers = re.findall(r'^- \[.\] AC(\d+)\b', body, re.MULTILINE)
+        vc_section = _extract_vc_section(body)
+        vc_numbers = re.findall(r'# AC(\d+)\b', vc_section)
+        ac_count = len(ac_numbers)
+        vc_ac_count = len(vc_numbers)
+        if ac_count == 0:
+            passed = True
+        else:
+            passed = sorted(ac_numbers) == sorted(vc_numbers)
         results.append({
             "name": "ac_vc_alignment",
             "passed": passed,
