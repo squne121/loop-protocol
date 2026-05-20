@@ -294,6 +294,20 @@ query {
 
 `create_issue_txn.py` がいずれかのステージで失敗した場合、Issue に partial-failure audit comment が自動投稿される。
 
+### sub-issue-readback の bounded retry 契約
+
+`create_issue_txn.py` は parent issue への sub-issue 登録 POST 成功後に parent readback（`GET repos/{owner}/{repo}/issues/{child}/parent`）を行う。GitHub Sub-issues API の eventual-consistency ラグにより、POST 直後の GET が期待する parent 番号を返さない transient failure が発生することがある。
+
+この transient failure を吸収するため、`_readback_parent_issue_with_retry` helper が **bounded semantic retry** を行う:
+
+- **成功条件（retry 期間内に確認できた場合）**: transaction は `success` または `dedupe` を返す
+- **全試行失敗条件（全試行で親を確認できなかった場合のみ）**: transaction は `partial_failure`、`failure_stage = "sub-issue-readback"` を返す
+- **retry 遅延**: `_PARENT_READBACK_RETRY_DELAYS`（module-level 定数 `tuple[float, ...]`）で定義。合計待機時間は常に 2 秒以下
+- **sleep_fn 注入**: helper は `sleep_fn` を引数で受け取り、単体テストでは fake sleep を渡すことで実時間 `time.sleep` を発生させない
+- **両経路で共有**: 新規 Issue 作成経路（`run_transaction` 内）と dedupe reconcile 経路（`_reconcile_issue_links` 内）の双方が同一 helper・同一定数を使う
+
+`partial_failure` stage = `sub-issue-readback` を受け取った場合は、実際には parent 登録済みの可能性が高い。下記 Recovery 手順で関係を確認してから manual 対応する。
+
 ### 失敗ステージ別の補正手順
 
 | failed_stage | 補正手順 | idempotent |

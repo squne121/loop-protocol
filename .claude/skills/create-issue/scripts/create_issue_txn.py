@@ -63,11 +63,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--body", default="")
     parser.add_argument("--body-file", default="")
     parser.add_argument("--label", action="append", default=[])
+    parser.add_argument("--issue-kind", default="", help="issue kind: implementation | research | parent | (empty)")
     parser.add_argument("--parent-issue", type=int, default=0)
     parser.add_argument("--dependency", action="append", dest="dependency", type=int, default=[])
     parser.add_argument("--blocked-by", action="append", dest="dependency", type=int)
     parser.add_argument("--gh", default="gh")
     return parser.parse_args(argv)
+
+
+def _resolve_labels(labels: list[str], issue_kind: str) -> list[str]:
+    """Return the effective label list, prepending standard labels for implementation kind.
+
+    Standard labels (_IMPLEMENTATION_STANDARD_LABELS) are merged at the front of the
+    explicit label list when issue_kind == "implementation". Duplicates are deduplicated
+    while preserving order (standard labels first, then caller-supplied extras).
+    For any other issue_kind (or empty string), labels are returned unchanged.
+    """
+    if issue_kind != "implementation":
+        return list(labels)
+    merged: list[str] = list(_IMPLEMENTATION_STANDARD_LABELS)
+    for label in labels:
+        if label not in merged:
+            merged.append(label)
+    return merged
 
 
 def _normalize_dependency_numbers(dependency_issue_numbers: list[int | str]) -> list[int]:
@@ -181,6 +199,19 @@ def _find_open_issues_by_title(repo: str, title: str, gh_bin: str) -> list[int]:
             issue_numbers.append(int(item["number"]))
     return issue_numbers
 
+
+# Retry delays for parent readback (sub-issue-readback stage).
+# Absorbs GitHub Sub-issues API eventual-consistency lag after POST success.
+# Total worst-case wall time = sum(_PARENT_READBACK_RETRY_DELAYS) ≤ 2 seconds.
+_PARENT_READBACK_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+# Standard labels auto-assigned when issue_kind is "implementation".
+_IMPLEMENTATION_STANDARD_LABELS: tuple[str, ...] = (
+    "state/queued",
+    "phase/implementation",
+    "agent/implementer",
+    "enhancement",
+)
 
 # Default polling parameters for post-create race detection.
 # Sized to cover GitHub search index propagation delay (typically 5-30 seconds).
@@ -390,12 +421,18 @@ def _readback_labels(repo: str, issue_number: int, labels: list[str], gh_bin: st
 
 
 def _readback_parent_issue(repo: str, issue_number: int, parent_issue_number: int, gh_bin: str) -> bool:
+    # GET repos/{owner}/{repo}/issues/{issue_number}/parent.
+    # `gh api` switches the default method to POST as soon as any -f/-F request
+    # parameter is supplied, so the Accept value must be passed as a header (-H),
+    # not as a request parameter, and the method must be pinned to GET explicitly.
     args = [
         gh_bin,
         "api",
         f"repos/{repo}/issues/{issue_number}/parent",
-        "-F",
-        "accept=application/vnd.github+json",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
     ]
     cp = run_command(args)
     if cp.returncode != 0:
@@ -405,6 +442,30 @@ def _readback_parent_issue(repo: str, issue_number: int, parent_issue_number: in
         return int(data.get("number", -1)) == int(parent_issue_number)
     except (json.JSONDecodeError, TypeError, ValueError):
         return False
+
+
+def _readback_parent_issue_with_retry(
+    repo: str,
+    issue_number: int,
+    parent_issue_number: int,
+    gh_bin: str,
+    *,
+    delays: tuple[float, ...] = _PARENT_READBACK_RETRY_DELAYS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Read back parent issue, retrying on transient failure with bounded delays.
+
+    Absorbs GitHub Sub-issues API eventual-consistency lag after POST success.
+    Returns True if parent is confirmed within the retry budget, False otherwise.
+    Total wait = sum(delays) which must remain ≤ 2 seconds per AC1 contract.
+    """
+    if _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin):
+        return True
+    for delay in delays:
+        sleep_fn(delay)
+        if _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin):
+            return True
+    return False
 
 
 def _readback_dependencies(repo: str, issue_number: int, dependency_issue_numbers: list[int], gh_bin: str) -> bool:
@@ -478,9 +539,9 @@ def _recovery_hint_for_stage(
             "  Verify:\n"
             f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number}){{blockedBy(first:10){{nodes{{number}}}}}}}}}}'"
         )
-    if failed_stage == "label-readback":
+    if failed_stage in ("label-readback", "dedupe-label-readback"):
         return (
-            f"Recovery hint: label-readback failed for #{issue_number}.\n"
+            f"Recovery hint: {failed_stage} failed for #{issue_number}.\n"
             "  Manual re-apply command (idempotent: yes):\n"
             f"    gh issue edit {issue_number} --repo {owner_repo} --add-label <labels>\n"
             "  Verify:\n"
@@ -636,11 +697,9 @@ def _reconcile_issue_links(
         completed.append("label-readback")
 
     if parent_issue_number:
-        parent_verified = _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin)
-        if not parent_verified:
-            # Retry once after a brief delay (GitHub API propagation)
-            sleep_fn(2.0)
-            parent_verified = _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin)
+        parent_verified = _readback_parent_issue_with_retry(
+            repo, issue_number, parent_issue_number, gh_bin, sleep_fn=sleep_fn
+        )
         if not parent_verified:
             raise TransactionError(stage="sub-issue-readback", message="parent read-back mismatch")
         completed.append("sub-issue-readback")
@@ -665,11 +724,13 @@ def run_transaction(
     body: str,
     body_file: str,
     labels: list[str],
+    issue_kind: str = "",
     parent_issue_number: int,
     dependency_issue_numbers: list[int | str],
     gh_bin: str,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> TransactionResult:
+    labels = _resolve_labels(labels, issue_kind)
     normalized_dependency_issue_numbers = _normalize_dependency_numbers(dependency_issue_numbers)
     completed: list[str] = []
     try:
@@ -856,11 +917,9 @@ def run_transaction(
 
         parent_verified = True
         if parent_issue_number:
-            parent_verified = _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin)
-            if not parent_verified:
-                # Retry once after a brief delay (GitHub API propagation)
-                sleep_fn(2.0)
-                parent_verified = _readback_parent_issue(repo, issue_number, parent_issue_number, gh_bin)
+            parent_verified = _readback_parent_issue_with_retry(
+                repo, issue_number, parent_issue_number, gh_bin, sleep_fn=sleep_fn
+            )
             if not parent_verified:
                 raise TransactionError(
                     stage="sub-issue-readback",
@@ -907,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
         body=args.body,
         body_file=args.body_file,
         labels=args.label,
+        issue_kind=args.issue_kind,
         parent_issue_number=args.parent_issue,
         dependency_issue_numbers=args.dependency,
         gh_bin=args.gh,
