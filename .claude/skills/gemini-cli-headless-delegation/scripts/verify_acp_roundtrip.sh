@@ -100,12 +100,16 @@ run_scenario() {
   SCENARIO_RESULT_FILE="$WORK_DIR/result-${label}.json"
   set +e
   # shellcheck disable=SC2086
-  uv run python3 "$SCRIPT_DIR/run_gemini_acp.py" \
+  timeout 180 uv run python3 "$SCRIPT_DIR/run_gemini_acp.py" \
     --request-file "$request_file" \
     --output-file "$SCENARIO_RESULT_FILE" \
     $extra_args
   local rc=$?
   set -e
+  if [ "$rc" -eq 124 ]; then
+    echo "TIMEOUT: run_gemini_acp.py exceeded 180s for scenario $label"
+    return 1
+  fi
   return $rc
 }
 

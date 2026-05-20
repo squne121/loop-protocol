@@ -201,6 +201,37 @@ STRUCTURED_EVENT_TYPES = frozenset(
 )
 
 
+async def _cleanup_proc(
+    proc: "asyncio.subprocess.Process",
+    stderr_reader: "asyncio.Future[None]",
+    stderr_accumulated_ref: list[str],
+    drain_timeout: float = 5.0,
+) -> str | None:
+    """Kill proc, drain stderr with a timeout, cancel the reader task.
+
+    Returns accumulated stderr text (may be partial if drain timed out).
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    # Wait for the process to fully exit so the pipes get EOF
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=drain_timeout)
+    except asyncio.TimeoutError:
+        pass
+    # Drain remaining stderr with a bounded timeout
+    try:
+        await asyncio.wait_for(asyncio.shield(stderr_reader), timeout=drain_timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        stderr_reader.cancel()
+        try:
+            await stderr_reader
+        except asyncio.CancelledError:
+            pass
+    return stderr_accumulated_ref[0] or None
+
+
 async def _run_acp_session(
     prompt: str,
     model: str,
@@ -246,143 +277,131 @@ async def _run_acp_session(
     watchdog = HeartbeatWatchdog()
     req_id = 0
     structured_events: list[dict[str, Any]] = []
-    stderr_accumulated = ""
+    # Use a list as a mutable ref so _cleanup_proc can see updates from the task
+    stderr_buf: list[str] = [""]
     response_parts: list[str] = []
     session_id: str | None = None
 
     async def read_stderr_task() -> None:
-        nonlocal stderr_accumulated
         assert proc.stderr is not None
         async for line in proc.stderr:
             chunk = line.decode(errors="replace")
-            stderr_accumulated += chunk
+            stderr_buf[0] += chunk
             bug = detect_known_bug_from_stderr(chunk)
             if bug:
                 result["warnings"].append(
                     f"known gemini-cli bug detected in stderr: {bug}; aborting"
                 )
-                proc.kill()
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
 
-    stderr_reader = asyncio.ensure_future(read_stderr_task())
+    stderr_reader: asyncio.Future[None] = asyncio.ensure_future(read_stderr_task())
 
     async def send(payload: bytes) -> None:
         proc.stdin.write(payload)  # type: ignore[union-attr]
         await proc.stdin.drain()  # type: ignore[union-attr]
 
-    async def read_message() -> dict[str, Any] | None:
-        assert proc.stdout is not None
-        try:
-            raw = await asyncio.wait_for(
-                proc.stdout.readline(),
-                timeout=float(watchdog.CONNECT),
-            )
-        except asyncio.TimeoutError:
-            return None
-        if not raw:
-            return None
-        watchdog.heartbeat()
-        return _parse_rpc_line(raw.decode(errors="replace"))
+    async def early_exit(reason: str) -> dict[str, Any]:
+        """Kill proc, drain stderr (bounded), and return partial result."""
+        result["failure_reason"] = reason
+        result["warnings"].append(reason)
+        result["stderr"] = await _cleanup_proc(proc, stderr_reader, stderr_buf)
+        return result
 
     # ------------------------------------------------------------------
     # initialize
     # ------------------------------------------------------------------
     req_id += 1
-    await send(_rpc_request("initialize", {"protocolVersion": "2024-11-05"}, req_id))
+    # protocolVersion must be a number (int); gemini-cli 0.42.0+ rejects strings
+    await send(_rpc_request("initialize", {"protocolVersion": 1}, req_id))
 
     init_timeout = float(watchdog.CONNECT)
     try:
         raw_init = await asyncio.wait_for(proc.stdout.readline(), timeout=init_timeout)
     except asyncio.TimeoutError:
-        result["failure_reason"] = (
+        return await early_exit(
             f"connect timeout ({watchdog.CONNECT}s) waiting for initialize response "
             f"— possible bugs: {INITIALIZE_HANG_BUG}, {AUTH_HANG_BUG}, {SETTINGS_HANG_BUG}"
         )
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
 
     watchdog.heartbeat()
     init_msg = _parse_rpc_line(raw_init.decode(errors="replace"))
     if not init_msg or init_msg.get("id") != req_id:
-        result["failure_reason"] = (
+        return await early_exit(
             f"unexpected response to initialize: {raw_init!r}"
         )
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
 
     if "error" in init_msg:
-        err = init_msg["error"]
-        result["failure_reason"] = f"initialize error: {err}"
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
+        return await early_exit(f"initialize error: {init_msg['error']}")
 
     # ------------------------------------------------------------------
     # session/new
     # ------------------------------------------------------------------
+    import os as _os
     req_id += 1
     await send(
         _rpc_request(
             "session/new",
-            {"model": model, "approvalMode": "plan"},
+            {
+                "model": model,
+                "approvalMode": "plan",
+                "cwd": _os.getcwd(),
+                "mcpServers": [],
+            },
             req_id,
         )
     )
 
+    # session/new may be preceded by notifications (e.g. session/update);
+    # skip them and wait for the response with the matching id.
     session_timeout = float(watchdog.CONNECT)
-    try:
-        raw_session = await asyncio.wait_for(
-            proc.stdout.readline(), timeout=session_timeout
-        )
-    except asyncio.TimeoutError:
-        result["failure_reason"] = (
-            f"connect timeout ({watchdog.CONNECT}s) waiting for session/new response "
-            f"— possible bug: {INITIALIZE_HANG_BUG}"
-        )
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
-
-    watchdog.heartbeat()
-    session_msg = _parse_rpc_line(raw_session.decode(errors="replace"))
-    if not session_msg or session_msg.get("id") != req_id:
-        result["failure_reason"] = (
-            f"unexpected response to session/new: {raw_session!r}"
-        )
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
+    session_deadline = asyncio.get_event_loop().time() + session_timeout
+    session_msg: dict[str, Any] | None = None
+    while True:
+        remaining_st = session_deadline - asyncio.get_event_loop().time()
+        if remaining_st <= 0:
+            return await early_exit(
+                f"connect timeout ({watchdog.CONNECT}s) waiting for session/new response "
+                f"— possible bug: {INITIALIZE_HANG_BUG}"
+            )
+        try:
+            raw_session = await asyncio.wait_for(
+                proc.stdout.readline(), timeout=min(5.0, remaining_st)
+            )
+        except asyncio.TimeoutError:
+            continue
+        if not raw_session:
+            return await early_exit("EOF waiting for session/new response")
+        watchdog.heartbeat()
+        parsed = _parse_rpc_line(raw_session.decode(errors="replace"))
+        if parsed is None:
+            continue  # skip non-JSON lines
+        if parsed.get("id") == req_id:
+            session_msg = parsed
+            break
+        # Any other message (notification) is dropped here — session/prompt loop handles them
 
     if "error" in session_msg:
-        err = session_msg["error"]
-        result["failure_reason"] = f"session/new error: {err}"
-        result["warnings"].append(result["failure_reason"])
-        proc.kill()
-        await stderr_reader
-        result["stderr"] = stderr_accumulated or None
-        return result
+        return await early_exit(f"session/new error: {session_msg['error']}")
 
     session_result_data = session_msg.get("result", {})
-    session_id = session_result_data.get("id") if isinstance(session_result_data, dict) else None
+    # gemini-cli returns sessionId (not id) in session/new result
+    session_id = (
+        session_result_data.get("sessionId") or session_result_data.get("id")
+    ) if isinstance(session_result_data, dict) else None
 
     # ------------------------------------------------------------------
     # session/prompt — event stream
     # ------------------------------------------------------------------
     req_id += 1
-    prompt_params: dict[str, Any] = {"prompt": prompt}
-    if session_id:
-        prompt_params["sessionId"] = session_id
+    # prompt must be an array of parts: [{"type": "text", "text": "..."}]
+    # sessionId is required (from session/new result)
+    prompt_params: dict[str, Any] = {
+        "prompt": [{"type": "text", "text": prompt}],
+        "sessionId": session_id or "",
+    }
 
     await send(_rpc_request("session/prompt", prompt_params, req_id))
 
@@ -402,7 +421,10 @@ async def _run_acp_session(
         if watchdog_reason:
             result["failure_reason"] = watchdog_reason
             result["warnings"].append(result["failure_reason"])
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             break
 
         try:
@@ -479,24 +501,33 @@ async def _run_acp_session(
                 watchdog.mark_first_result()
             break
 
-    await stderr_reader
+    # Drain stderr with a bounded timeout — never await without a deadline
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(asyncio.shield(stderr_reader), timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        stderr_reader.cancel()
+        try:
+            await stderr_reader
+        except asyncio.CancelledError:
+            pass
 
     result["structured_events"] = structured_events
     result["response_text"] = "".join(response_parts) or None
-    result["stderr"] = stderr_accumulated or None
+    result["stderr"] = stderr_buf[0] or None
 
     if result["failure_reason"] is None:
         result["ok"] = True
-
-    # Terminate cleanly
-    try:
-        proc.stdin.close()
-        await asyncio.wait_for(proc.wait(), timeout=5.0)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
 
     return result
 
