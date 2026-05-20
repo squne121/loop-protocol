@@ -116,8 +116,10 @@ permissionMode: dontAsk
 
 ## 例外: 委譲不可時の fail-close
 
-`gemini-cli-headless-delegation` wrapper が `ok: false` を返した場合や、preflight で `gh` CLI / `uv` / Gemini API key の不在を検出した場合は、本 SubAgent は **自力での代替調査を行わず** fail-close する。呼び出し元に以下を報告して停止:
+`gemini-cli-headless-delegation` wrapper が `ok: false` を返した場合や、preflight が `ok: false`（trusted workspace 未成立、OAuth credential 不足、`gh` CLI / `uv` の不在 等）を返した場合は、本 SubAgent は **自力での代替調査（Read / Bash / 推測）を行わず** fail-close する。呼び出し元に以下を報告して停止:
 
 - `status: failed`
-- 失敗の理由（preflight result / wrapper の `error` フィールド）
+- 失敗の理由（preflight result / wrapper の `failure_reason` / `warnings`）
 - 推奨次アクション（人間判断 / 環境セットアップ / 代替手段）
+
+> Gemini CLI の認証は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` 等の API key は使わない。委譲可否は必ず `gemini-cli-headless-delegation` Workflow の setup_check / preflight 実行結果で判断し、preflight 未実行のまま「委譲不可」と推測しない。
