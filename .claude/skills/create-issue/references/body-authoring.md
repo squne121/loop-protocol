@@ -111,6 +111,263 @@ grep -q "<field>" <file> && echo "PASS: AC2" || echo "FAIL: AC2"
 
 VC に `rg` が含まれる場合、`rg "foo\|bar"` の `\|` は `|` に修正する（rg の OR 演算子）。
 
+### rg を用いた VC 作成コマンド構築
+
+VC 内でファイルのパターン存在確認を行う際は `grep` より `rg` を優先する。`grep` は GNU 拡張差や Perl 互換構文の扱いが環境によって分かれるため、決定論性が低い。
+
+基本形式（行番号付きで 1 行以上マッチすれば exit 0）:
+
+```bash
+# 特定の見出しが存在することを確認する例
+rg -n "^## VC 作成ガイダンス" .claude/skills/create-issue/references/body-authoring.md
+
+# 特定のコマンド例が記述されていることを確認する例
+rg -n "uv run --with" .claude/skills/create-issue/references/body-authoring.md
+
+# 見出し配下のコンテキストを含めて確認する例（見出し + 20 行以内に内容が存在）
+rg -nA 20 "^## VC 作成ガイダンス" .claude/skills/create-issue/references/body-authoring.md | rg "rg -n"
+```
+
+Perl 互換正規表現（後読み / 先読み / Unicode property 等）が必要な場合は `-P` フラグを優先する。
+`grep -P` は GNU grep 限定だが `rg -P` は ripgrep 組み込みのため移植性が高い:
+
+```bash
+# アンチパターンを含む行を検出（Perl 互換後読み）
+rg -Pn "アンチパターン|anti.pattern" .claude/skills/create-issue/references/body-authoring.md
+
+# cd + python3 パターンを Perl 互換で検出
+rg -Pn "cd .+python3 -m pytest" .claude/skills/create-issue/references/body-authoring.md
+```
+
+**VC 作成時の rg チェックリスト**:
+1. パターンが Perl 互換構文（`\K` / `(?<=...)` / `\p{...}` 等）を含む → `-P` を付ける
+2. OR 演算子は `|`（`\|` ではない）
+3. 見出し配下の存在確認は `rg -nA <N> "^## <見出し>" <file> | rg "<内容>"` の 2 段パイプを使う
+
+### Python テスト系 VC の依存明示
+
+Python テストを VC に含める場合、実行時の依存パッケージが不在で fail しないよう `uv run --with` で依存を明示する。
+
+**推奨パターン**（依存を明示して実行）:
+
+```bash
+uv run --with pytest --with pyyaml python -m pytest tests/
+```
+
+**アンチパターン 1**: 依存未明示（パッケージ不在時に ImportError で fail）
+
+```bash
+# BAD: pytest / pyyaml がプロジェクト依存に含まれていない環境で fail する
+uv run python -m pytest tests/
+```
+
+**アンチパターン 2**: `cd` + `python3` 直接実行
+
+```bash
+# BAD: PATH 依存・venv 未整備・cwd 前提が絡み合い環境依存が高い
+cd .claude/skills/some-skill && python3 -m pytest tests/
+```
+
+`uv run` を使う理由:
+- プロジェクトの `.python-version` / `pyproject.toml` を自動参照する
+- 仮想環境を自動作成・再利用する
+- `--with` で追加依存をインライン指定できる（グローバル汚染なし）
+
+### pytest 実行 VC の推奨パターン
+
+pytest を VC に含める場合は以下の順で選択する。
+
+**第一推奨**: `uv run --with pytest` で依存明示
+
+```bash
+uv run --with pytest python -m pytest .claude/skills/some-skill/tests/
+```
+
+**第二推奨**: `uv run python -m pytest`（プロジェクト依存に pytest が含まれる場合）
+
+```bash
+uv run python -m pytest .claude/skills/some-skill/tests/
+```
+
+**アンチパターン**: `cd <dir> && python3 -m pytest`
+
+```bash
+# BAD: 以下の理由で決定論性が低い
+# - cwd 変更が後続コマンドに副作用を与える
+# - python3 コマンドの PATH は環境依存
+# - venv が有効化されていない場合、依存パッケージが見つからず fail
+cd .claude/skills/some-skill && python3 -m pytest tests/
+```
+
+### SubAgent frontmatter YAML 検証
+
+SubAgent / Skill ファイルの frontmatter（YAML ブロック）が正しいフィールドを持つかを VC で確認する場合、`yaml.safe_load` を使うスクリプトを推奨する。
+
+**推奨パターン**: `yaml.safe_load` で parse して値を検証
+
+```bash
+# name フィールドが存在し空でないことを確認
+python3 -c "
+import yaml, sys
+with open('.claude/agents/some-agent.md') as f:
+    content = f.read()
+# frontmatter は --- で囲まれたブロック
+fm_text = content.split('---')[1]
+fm = yaml.safe_load(fm_text)
+assert fm.get('name'), 'name field missing or empty'
+print('PASS: name field exists')
+"
+
+# uv run --with pyyaml で依存を明示する場合
+uv run --with pyyaml python3 -c "
+import yaml
+with open('.claude/agents/some-agent.md') as f:
+    fm = yaml.safe_load(f.read().split('---')[1])
+assert fm.get('description'), 'description field missing'
+print('PASS')
+"
+```
+
+**アンチパターン**: `grep "^<field>:"` による擬似マッチ
+
+```bash
+# BAD: 以下の問題がある
+# 1. コメントアウトされた行 (# name: foo) にも誤マッチする
+# 2. YAML の multiline value や anchor を正しく扱えない
+# 3. フィールド値の内容（空文字 / null）を検証できない
+grep "^name:" .claude/agents/some-agent.md
+```
+
+## 必須セクション列挙手順
+
+Issue 本文を起票・更新する前に、対象テンプレートの `required: true` ラベルを動的に列挙する。ハードコードした列挙は ISSUE_TEMPLATE の変更追従が遅れるため、以下の動的取得手順を使う。
+
+### yq を用いた列挙
+
+```bash
+# 例: improvement テンプレートの required ラベルを列挙
+yq '.body[] | select(.validations.required == true) | .attributes.label' \
+  .github/ISSUE_TEMPLATE/improvement.yml
+```
+
+### Python を用いた列挙
+
+`yq` が利用できない環境では `python3` で代替する:
+
+```python
+import yaml
+
+with open(".github/ISSUE_TEMPLATE/improvement.yml") as f:
+    template = yaml.safe_load(f)
+
+required_labels = [
+    item["attributes"]["label"]
+    for item in template.get("body", [])
+    if item.get("validations", {}).get("required") is True
+]
+print("\n".join(required_labels))
+```
+
+`uv run` で実行する場合:
+
+```bash
+uv run --with pyyaml python3 -c "
+import yaml
+with open('.github/ISSUE_TEMPLATE/improvement.yml') as f:
+    t = yaml.safe_load(f)
+required = [i['attributes']['label'] for i in t.get('body',[]) if i.get('validations',{}).get('required')]
+print('\n'.join(required))
+"
+```
+
+### 利用タイミング
+
+- 新規 Issue 起票前（`create-issue`）: 必須セクションのもれを防ぐ
+- 既存 Issue 更新前（`edit-issue`）: Template Guard 通過を事前確認する
+- template を参照せずにハードコードした列挙は、ISSUE_TEMPLATE 変更追従が遅れるため使わない
+
+## AC ⇔ VC 番号整合手順
+
+AC の番号（`- [ ] AC<n>`）と VC の行末コメント（`# AC<n>`）が一致しているかを起票・更新前に照合する。
+
+### awk による AC 件数カウント
+
+```bash
+# Acceptance Criteria セクションの AC 件数を数える
+awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l
+```
+
+### rg による VC の # AC<n> コメント件数カウント
+
+```bash
+# VC セクション内の # AC<n> コメント件数を数える
+rg -c "# AC[0-9]" issue_body.md
+```
+
+### 照合の判定ルール
+
+AC 件数と VC の `# AC<n>` 件数が一致しなければ起票・更新しない。
+`edit-issue` の guard-issue-body.py も同様の整合チェックを実施するが、起票前に手動照合しておくと手戻りを減らせる。
+
+```bash
+AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l)
+VC_AC_COUNT=$(rg -c "# AC[0-9]" issue_body.md || echo 0)
+[ "$AC_COUNT" -eq "$VC_AC_COUNT" ] && echo "PASS: AC/VC 番号一致 ($AC_COUNT 件)" || echo "FAIL: AC=$AC_COUNT / VC AC コメント=$VC_AC_COUNT"
+```
+
+## 単独 implementation Issue 向け Parent 系セクション scaffold
+
+単独改善（parent Issue を持たない）の implementation Issue を起票する場合、review-issue C1（必須セクション存在チェック）と整合させるために ISSUE_TEMPLATE の `validations.required: true` 全セクションを埋める必要がある。Parent Issue / Parent Goal Ref / Current Validated Scope / Remaining Parent Gaps / Scope Delta の各セクションも required に含まれる場合は以下の placeholder で埋める。
+
+> review-issue C1 は「必須セクションが存在すること」を判定する。Parent 系セクションを省略すると C1 fail となるため、単独改善でも必ず scaffold を記述する。
+
+### 推奨 scaffold
+
+```markdown
+## Parent Issue
+
+なし（単独改善）
+
+## Parent Goal Ref
+
+- Goal: <この Issue が解決しようとしている目標を 1 文で>
+- Desired Destination: N/A（単独改善 Issue のため）
+
+## Current Validated Scope
+
+- <実装・変更の対象ファイル/機能を箇条書きで列挙>
+
+## Remaining Parent Gaps
+
+なし（単独改善 Issue のため）
+
+## Scope Delta
+
+- 追加: <今回追加する内容>
+- 削除: なし
+- 変更: <今回変更する内容>
+```
+
+### Machine-Readable Contract の parent_issue フィールド
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: none
+goal_ref: "<この Issue の goal を 1 文で>"
+change_kind: workflow
+```
+
+`parent_issue: none` は「parent Issue が存在しない単独改善」を明示する値。空文字や省略は invalid。
+
+### Scope Delta セクションとの関係
+
+`## Scope Delta` セクションは `pr-review-judge` が「この PR が当初スコープからどう変化したか」を判定するために使う。単独改善でも省略しないこと。
+
+### 関連 Issue を複数 close する場合
+
+`Closes #25 Closes #42 ...` のように複数 linked Issue がある PR では、PR 本文に各 Issue の AC を列挙し、全件を検証したことを `pr-review-judge` が確認できるようにする。
+
 ## Anchor Verification Preflight
 
 Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合、起票前にプリフライトを実施する。
