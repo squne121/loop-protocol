@@ -54,3 +54,4 @@
 - 現在の優先順位: `docs/dev/current-focus.md`
 - 構成ルール: `docs/dev/directory-structure.md`
 - アーキテクチャ理由: `docs/adr/0001-architecture-baseline.md`
+- 動作検証 AC の運用規約: `docs/dev/runtime-verification-policy.md`

@@ -57,6 +57,9 @@ prompt 注記による SubAgent 委譲・運用ルール追加は次点オプシ
 
 ## VC 作成ガイダンス
 
+> 動作検証 AC（`runtime-verification: true`）を含む VC の設計は `docs/dev/runtime-verification-policy.md` を参照すること。
+> SKIP 規約（exit 77）・証跡保存フォーマット・テストシナリオ最小セット・Stop Condition 連動が定義されている。
+
 ### 決定論的 VC と意味的評価 AC の分離
 
 VC はすべて **決定論的（deterministic）** な形式で作成する。意味的評価は PR レビュアーの責務であり、test-runner が実行可能な VC 内で行わせない。
