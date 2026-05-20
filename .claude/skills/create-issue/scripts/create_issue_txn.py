@@ -421,12 +421,18 @@ def _readback_labels(repo: str, issue_number: int, labels: list[str], gh_bin: st
 
 
 def _readback_parent_issue(repo: str, issue_number: int, parent_issue_number: int, gh_bin: str) -> bool:
+    # GET repos/{owner}/{repo}/issues/{issue_number}/parent.
+    # `gh api` switches the default method to POST as soon as any -f/-F request
+    # parameter is supplied, so the Accept value must be passed as a header (-H),
+    # not as a request parameter, and the method must be pinned to GET explicitly.
     args = [
         gh_bin,
         "api",
         f"repos/{repo}/issues/{issue_number}/parent",
-        "-F",
-        "accept=application/vnd.github+json",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
     ]
     cp = run_command(args)
     if cp.returncode != 0:
@@ -533,9 +539,9 @@ def _recovery_hint_for_stage(
             "  Verify:\n"
             f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number}){{blockedBy(first:10){{nodes{{number}}}}}}}}}}'"
         )
-    if failed_stage == "label-readback":
+    if failed_stage in ("label-readback", "dedupe-label-readback"):
         return (
-            f"Recovery hint: label-readback failed for #{issue_number}.\n"
+            f"Recovery hint: {failed_stage} failed for #{issue_number}.\n"
             "  Manual re-apply command (idempotent: yes):\n"
             f"    gh issue edit {issue_number} --repo {owner_repo} --add-label <labels>\n"
             "  Verify:\n"

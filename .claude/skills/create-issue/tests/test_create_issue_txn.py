@@ -8,6 +8,8 @@ Covers:
 - AC7: this file itself is the artifact that must PASS under uv run pytest
 - AC8/AC9: issue_kind == "implementation" adds 4 standard labels; other kinds do not
 - AC10: label auto-assign for implementation vs non-implementation kinds
+- _readback_parent_issue issues an HTTP GET with an Accept header (not -F params)
+- dedupe-label-readback maps to an actionable recovery hint
 """
 
 from __future__ import annotations
@@ -117,6 +119,29 @@ class TestParentReadbackRetryTransientFalse:
         assert result is True
         assert len(fake_sleep.calls) == 1, "Exactly one sleep before second attempt"
         assert fake_sleep.calls[0] == txn._PARENT_READBACK_RETRY_DELAYS[0]
+
+    def test_succeeds_on_final_retry_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """False on every attempt but the last -> success still wins within budget.
+
+        Exercises the full retry budget (initial check + every delay in
+        _PARENT_READBACK_RETRY_DELAYS) and pins that a confirmation arriving on
+        the final attempt is treated as success.
+        """
+        fake_sleep = FakeSleep()
+        delays = txn._PARENT_READBACK_RETRY_DELAYS
+        outcomes = iter([False] * len(delays) + [True])
+        monkeypatch.setattr(txn, "_readback_parent_issue", lambda *_a, **_kw: next(outcomes))
+
+        result = txn._readback_parent_issue_with_retry(
+            repo="owner/repo",
+            issue_number=99,
+            parent_issue_number=40,
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result is True
+        assert fake_sleep.calls == list(delays), "Every retry delay must be consumed"
 
 
 # ---------------------------------------------------------------------------
@@ -432,3 +457,65 @@ class TestRetryDelaysContract:
         assert hasattr(txn, "_IMPLEMENTATION_STANDARD_LABELS")
         expected = {"state/queued", "phase/implementation", "agent/implementer", "enhancement"}
         assert set(txn._IMPLEMENTATION_STANDARD_LABELS) == expected
+
+
+# ---------------------------------------------------------------------------
+# Blocker: _readback_parent_issue must call `gh api` as an HTTP GET with an
+# Accept header. A -F request parameter would flip `gh api` to POST, which the
+# GET-only /parent sub-resource rejects -> readback would always fail.
+# ---------------------------------------------------------------------------
+
+class TestReadbackParentIssueGhApiContract:
+    """_readback_parent_issue issues a GET with an Accept header, not -F params."""
+
+    @staticmethod
+    def _capture_args(monkeypatch: pytest.MonkeyPatch, captured: dict[str, list[str]]) -> None:
+        def fake_run_command(args: list[str], **_kwargs: Any) -> Any:
+            captured["args"] = args
+            return _make_gh_result(stdout='{"number": 40}', returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", fake_run_command)
+
+    def test_uses_get_method_and_accept_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, list[str]] = {}
+        self._capture_args(monkeypatch, captured)
+
+        assert txn._readback_parent_issue("owner/repo", 99, 40, "gh") is True
+
+        args = captured["args"]
+        assert "--method" in args
+        assert args[args.index("--method") + 1] == "GET"
+        assert "-H" in args
+        assert "Accept: application/vnd.github+json" in args
+        # `gh api` switches to POST when any -f/-F request parameter is present.
+        assert "-F" not in args
+        assert "accept=application/vnd.github+json" not in args
+
+    def test_endpoint_targets_parent_subresource(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, list[str]] = {}
+        self._capture_args(monkeypatch, captured)
+
+        txn._readback_parent_issue("owner/repo", 99, 40, "gh")
+
+        assert "repos/owner/repo/issues/99/parent" in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# dedupe-label-readback recovery hint: the dedupe reconcile path raises
+# stage="dedupe-label-readback", which must map to an actionable hint.
+# ---------------------------------------------------------------------------
+
+class TestRecoveryHintDedupeLabelReadback:
+    """dedupe-label-readback yields the same actionable label re-apply hint."""
+
+    def test_dedupe_label_readback_hint_is_actionable(self) -> None:
+        hint = txn._recovery_hint_for_stage("dedupe-label-readback", "owner/repo", 99, 0, [])
+
+        assert "dedupe-label-readback" in hint
+        assert "gh issue edit 99" in hint
+        assert "--add-label" in hint
+
+    def test_unknown_stage_falls_back_to_generic_hint(self) -> None:
+        hint = txn._recovery_hint_for_stage("totally-unknown-stage", "owner/repo", 99, 0, [])
+
+        assert "totally-unknown-stage" in hint
