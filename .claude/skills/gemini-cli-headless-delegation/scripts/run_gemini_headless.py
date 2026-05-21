@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1112,6 +1113,21 @@ def _log_model_downgrade_event(from_model: str, to_model: str, reason: str) -> N
     print(f"[gemini-headless] {event}", file=sys.stderr)
 
 
+def _resolve_acp_raw_command() -> list[str]:
+    """Build the ACP ``raw_command`` reflecting the actually-resolved binary.
+
+    Non-blocker fix: the ACP transport launches ``$GEMINI_BIN --acp`` (default
+    ``gemini``), so the normalized ``raw_command`` must reflect the real binary
+    rather than a hard-coded ``["gemini", "--acp"]``. When ``GEMINI_BIN`` is an
+    absolute / relative path, only the basename is surfaced so a secret install
+    path is not leaked into the result surface.
+    """
+    gemini_bin = str(os.environ.get("GEMINI_BIN") or "gemini")
+    if os.sep in gemini_bin or (os.altsep and os.altsep in gemini_bin):
+        gemini_bin = os.path.basename(gemini_bin) or "gemini"
+    return [gemini_bin, "--acp"]
+
+
 def _normalize_acp_result(
     raw_acp: dict[str, Any],
     *,
@@ -1119,6 +1135,7 @@ def _normalize_acp_result(
     actual_model: str,
     tool_profile: str,
     request_warnings: list[str],
+    model_chain: list[str] | None = None,
 ) -> dict[str, Any]:
     """Normalize a ``run_acp()`` result into a ``delegation_result/v1`` shape.
 
@@ -1126,6 +1143,10 @@ def _normalize_acp_result(
     expect ``delegation_result/v1`` (``result_surface`` / ``requested_model`` /
     ``actual_model`` / ``exit_code`` / ``model_chain`` etc.). This converts the
     former into the latter so the artifact-first contract is honoured.
+
+    ``model_chain``: the model chain computed by ``run_delegation()``. When
+    provided, the computed chain is surfaced verbatim instead of a
+    ``[actual_model]`` stub so the downstream contract carries the real chain.
 
     Fallback-produced results (``_acp_fallback == True``) are already
     ``delegation_result/v1`` shaped because they come back through a re-entrant
@@ -1139,6 +1160,10 @@ def _normalize_acp_result(
     ok = bool(raw_acp.get("ok"))
     response_text = raw_acp.get("response_text")
     warnings = request_warnings[:] + list(raw_acp.get("warnings") or [])
+    # Non-blocker: surface the computed chain. The ACP transport does not run
+    # the headless model-chain loop, so no chain downgrades occur — an empty
+    # model_downgrades list is the accurate value, not a stub.
+    resolved_chain = list(model_chain) if model_chain else [actual_model]
 
     normalized: dict[str, Any] = {
         "schema": "delegation_result/v1",
@@ -1153,9 +1178,9 @@ def _normalize_acp_result(
         "stderr": raw_acp.get("stderr"),
         "warnings": warnings,
         "failure_reason": raw_acp.get("failure_reason"),
-        "model_chain": [actual_model],
+        "model_chain": resolved_chain,
         "model_downgrades": [],
-        "raw_command": ["gemini", "--acp"],
+        "raw_command": _resolve_acp_raw_command(),
         "transport_details": {
             "schema": raw_acp.get("schema", "acp_result_v1"),
             "structured_events": raw_acp.get("structured_events") or [],
@@ -1397,6 +1422,9 @@ def run_delegation(
             prepared_prompt=prompt,
             model_override=acp_model,
             cwd_override=acp_cwd,
+            # B2: thread the resolved tool_profile so the ACP permission
+            # handler enforces the no_tools / read-class policy.
+            tool_profile=tool_profile,
         )
         return _normalize_acp_result(
             raw_acp,
@@ -1404,6 +1432,9 @@ def run_delegation(
             actual_model=acp_model,
             tool_profile=tool_profile,
             request_warnings=request_warnings,
+            # Non-blocker: pass the computed model chain so the normalized
+            # result carries the real chain, not a [actual_model] stub.
+            model_chain=list(model_chain),
         )
 
     # --- Model chain loop ---

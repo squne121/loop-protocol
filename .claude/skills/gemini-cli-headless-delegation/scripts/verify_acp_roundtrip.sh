@@ -3,7 +3,7 @@
 #
 # Verifies ACP transport end-to-end by delegating short tasks to gemini CLI
 # via transport: acp. Implements:
-#   - SKIP exit 77 when gemini (GEMINI_BIN) or jq is absent
+#   - SKIP exit 77 when gemini (GEMINI_BIN), jq, or uv is absent
 #   - FAIL exit 1 when _acp_fallback: true or failure_class=auth_required is detected
 #   - scenario 1 (normal): PONG roundtrip
 #   - scenario 2 (controlled experiment): permission outcome controls a side
@@ -19,7 +19,7 @@
 # Exit codes:
 #   0   All scenarios PASS
 #   1   At least one scenario FAIL or fallback detected
-#   77  Execution environment unavailable (gemini or jq not found)
+#   77  Execution environment unavailable (gemini, jq, or uv not found)
 #
 # Environment:
 #   GEMINI_BIN   Override the gemini CLI binary path (default: gemini)
@@ -41,6 +41,15 @@ fi
 # --- SKIP guard: jq not available ---
 if ! command -v jq >/dev/null 2>&1; then
   echo "SKIP: jq not installed (required for result validation)"
+  exit 77
+fi
+
+# --- SKIP guard: uv not installed ---
+# The scenario body runs the ACP script via `uv run python3 ...`; without uv
+# the execution environment is unavailable, which is a SKIP condition, not a
+# scenario failure.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "SKIP: uv not installed (required to run run_gemini_acp.py via uv run)"
   exit 77
 fi
 

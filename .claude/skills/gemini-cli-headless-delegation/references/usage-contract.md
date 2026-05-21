@@ -609,7 +609,7 @@ unchanged.
 | フィールド | 型 | 説明 |
 |---|---|---|
 | `transport` | `"acp"` | Select ACP transport. |
-| `approve_edits` | boolean (optional, default `false`) | Controls the **best-effort** permission handler. When `false`, write-type permission requests routed through `session/request_permission` are denied. This is defence in depth only — it does not gate Gemini CLI's native tools / MCP. The end-to-end safety boundary is deferred to #112. |
+| `approve_edits` | boolean (optional, default `false`) | Legacy flag passed to the **best-effort** ACP permission handler. The `session/request_permission` policy is driven by `tool_profile` + ACP `toolCall.kind`: `no_tools` rejects every kind; read-class profiles allow `read`/`search`/`fetch`/`think` and reject `edit`/`delete`/`move`/`execute`/`other`. `approve_edits=True` does **not** widen this — no `tool_profile` in this skill is write-capable. This is defence in depth only — it does not gate Gemini CLI's native tools / MCP. The end-to-end safety boundary is deferred to #112. |
 
 > `gemini_bin` は request JSON フィールドからは読まない。カスタムバイナリの指定は `GEMINI_BIN` 環境変数のみで行う。
 

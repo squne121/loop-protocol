@@ -79,11 +79,17 @@ result and the client can call `authenticate` to establish credentials.
 To keep this honest:
 
 - the `initialize` result's `authMethods` (if present) is captured into the
-  session result (`auth_methods`) for diagnostics;
-- if `session/new` fails with an error that signals authentication is required
-  (`auth` / `authenticate` / `unauthorized` / `authMethods` / `not
-  authenticated` and similar signals), the failure is classified
-  `failure_class = "auth_required"` instead of the generic
+  session result (`auth_methods`) **for diagnostics only** — it does **not**
+  drive failure classification. Gemini CLI advertises `authMethods`
+  unconditionally on every `initialize`, so keying off it would misclassify
+  every non-auth `session/new` failure (model not found, invalid params, …) as
+  `auth_required` and suppress the early-failure fallback;
+- if `session/new` fails, classification is based **solely on the
+  `session/new` error object**: when that error signals authentication is
+  required (`auth` / `authenticate` / `unauthorized` / an `authMethods` key
+  inside the *error payload* / `not authenticated` and similar signals), the
+  failure is classified `failure_class = "auth_required"`. Any other
+  `session/new` error (including model-not-found / invalid-params) stays
   `session_new_failed`;
 - `auth_required` is **excluded** from the headless_json fallback set (see
   "Fallback" below). An auth failure is surfaced as a real ACP transport
@@ -185,23 +191,36 @@ agent may attempt tool calls and the host may issue `session/request_permission`
 requests. Changing `approvalMode` (e.g. to a plan-only / read-only mode) is in
 scope for **#112**, not this PR.
 
-### Permission handler — best-effort secondary defence
+### Permission handler — `tool_profile` + `toolCall.kind` policy
 
-`run_gemini_acp.py` additionally implements `handle_request_permission()` /
-`handle_session_request_permission()`, controlled by the `approve_edits` flag
-(`--approve-edits` CLI flag or `approve_edits=True` API arg). When `approve_edits`
-is false these handlers select the reject/cancel option for write-type
-permission requests.
+`run_gemini_acp.py` implements `handle_session_request_permission()` for the ACP
+`session/request_permission` RPC. It decides allow/reject from the delegation
+**`tool_profile`** and the ACP **`params.toolCall.kind`** (the ACP tool-kind
+taxonomy: `read` / `edit` / `delete` / `move` / `search` / `execute` / `think` /
+`fetch` / `other`):
 
-This permission handler is **best-effort defence in depth**. It only sees the
-permission requests the agent actually routes through `session/request_permission`;
-it does not gate the native tool registry or MCP servers directly. It provides a
-clear deny signal in `structured_events` and is retained because removing it
-would break existing tests and callers.
+- `tool_profile == "no_tools"` → **reject every `toolCall.kind`** unconditionally;
+- read-class profiles (everything else — `grounded_research`,
+  `github_research`, `local_asset_research`, `proposal_only`, …) → **allow**
+  read-class kinds (`read` / `search` / `fetch` / `think`) and **reject**
+  write/effect kinds (`edit` / `delete` / `move` / `execute` / `other`);
+- `approve_edits=True` does **not** widen this — no `tool_profile` in this skill
+  is write-capable, so write-class kinds stay rejected and `no_tools` stays
+  fully rejected regardless of `approve_edits`;
+- a missing / unknown `toolCall.kind` or an empty `options` list → reject /
+  cancel (fail-safe).
 
-Write operation types the handler recognises (`WRITE_PERMISSION_TYPES`):
-`write_file`, `edit_file`, `create_file`, `delete_file`, `run_shell_command`,
-`execute_code`.
+This is a best-effort alignment of the **experimental ACP transport's
+permission handler** with the delegation tool-profile contract — **not** the
+gating of Gemini CLI's own native tool registry / MCP servers / `approvalMode`.
+That native-tool safety boundary is **deferred to follow-up #112**. The handler
+only sees the permission requests the agent actually routes through
+`session/request_permission`; it records each decision in `structured_events`.
+
+`handle_request_permission()` (the legacy non-ACP schema, keyed by a flat
+`type` field against `WRITE_PERMISSION_TYPES`: `write_file`, `edit_file`,
+`create_file`, `delete_file`, `run_shell_command`, `execute_code`) is retained
+only for backward compatibility with callers that still use that schema.
 
 ### Known limitations / non-goals (この PR の非ゴール)
 

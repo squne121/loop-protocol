@@ -23,6 +23,15 @@ from typing import Any
 # HeartbeatWatchdog — 4-stage timeout constants
 # ---------------------------------------------------------------------------
 
+# clientInfo advertised in the ACP `initialize` request so the agent can
+# identify this transport. The version is a fixed marker — the skill carries no
+# machine-readable version field and a git SHA is not reliably available at
+# runtime, so a stable string is used.
+ACP_CLIENT_INFO: dict[str, str] = {
+    "name": "loop-protocol-gemini-cli-headless-delegation",
+    "version": "0.1.0",
+}
+
 CONNECT_TIMEOUT_SEC: int = 60       # Time to first JSON-RPC message after launch
 INITIAL_IDLE_TIMEOUT_SEC: int = 300 # Idle before first session/prompt response arrives
 SUBSEQUENT_IDLE_TIMEOUT_SEC: int = 120  # Idle between subsequent events
@@ -191,18 +200,66 @@ def handle_request_permission(
     return {"granted": True}
 
 
+# ACP toolCall.kind taxonomy (per ACP spec): read / edit / delete / move /
+# search / execute / think / fetch / other. The permission policy below maps
+# each kind to allow/reject based on the delegation tool_profile.
+#
+# Read-class kinds: safe, side-effect-free observation / reasoning.
+_READ_CLASS_TOOL_KINDS = frozenset({"read", "search", "fetch", "think"})
+# Write/effect-class kinds: mutate state or execute code. No tool_profile in
+# this skill is write-capable, so these are always rejected.
+_WRITE_CLASS_TOOL_KINDS = frozenset({"edit", "delete", "move", "execute", "other"})
+
+
 def handle_session_request_permission(
     params: dict[str, Any],
     approve_edits: bool,
+    tool_profile: str | None = None,
 ) -> dict[str, Any]:
     """Handle session/request_permission RPC (ACP protocol schema).
 
-    Selects an option from the provided options list and returns an outcome.
-    When approve_edits is False, selects the reject/cancel option.
-    Returns the JSON-RPC result payload with an outcome selection.
+    Decides allow/reject from a tool_profile + ``params.toolCall.kind`` policy,
+    then selects a matching option from the provided ``options`` list and
+    returns an outcome.
+
+    NB: This is a best-effort alignment of the *experimental ACP transport's
+    permission handler* with the delegation tool-profile contract — NOT the
+    gating of Gemini CLI's own native tool registry / MCP servers / approvalMode.
+    That native-tool safety boundary is out of scope here and deferred to
+    follow-up #112; this handler is defence in depth, not a complete sandbox.
+
+    Policy (by tool_profile and ``toolCall.kind``):
+      * ``no_tools`` → reject every kind unconditionally.
+      * read-class profiles (everything else: grounded_research,
+        github_research, local_asset_research, proposal_only, …) → allow
+        read-class kinds (read / search / fetch / think); reject write/effect
+        kinds (edit / delete / move / execute / other).
+      * ``approve_edits=True`` does NOT widen this: no tool_profile in this
+        skill is write-capable, so write-class kinds stay rejected and
+        ``no_tools`` stays fully rejected regardless of ``approve_edits``.
+      * Unknown / missing ``toolCall.kind`` or empty ``options`` → reject
+        (fail-safe).
     """
     options: list[dict[str, Any]] = params.get("options") or []
-    if approve_edits:
+    tool_call = params.get("toolCall")
+    kind = ""
+    if isinstance(tool_call, dict):
+        raw_kind = tool_call.get("kind")
+        if isinstance(raw_kind, str):
+            kind = raw_kind.strip().lower()
+
+    # --- Decide allow vs reject ---
+    if tool_profile == "no_tools":
+        # no_tools: reject every kind, regardless of approve_edits.
+        allow = False
+    elif kind in _READ_CLASS_TOOL_KINDS:
+        # read-class profile + read-class kind → allow.
+        allow = True
+    else:
+        # Write/effect kinds, and unknown/missing kinds → reject (fail-safe).
+        allow = False
+
+    if allow:
         selected = (
             next((o for o in options if o.get("kind") == "allow_once"), None)
             or next((o for o in options if o.get("kind") == "allow_always"), None)
@@ -215,6 +272,8 @@ def handle_session_request_permission(
         )
     if selected:
         return {"outcome": {"outcome": "selected", "optionId": selected["optionId"]}}
+    # No matching option (e.g. empty options list) → cancel, which is the
+    # fail-safe outcome for both allow and reject decisions.
     return {"outcome": {"outcome": "cancelled"}}
 
 
@@ -330,6 +389,7 @@ async def _run_acp_session(
     timeout_sec: int,
     gemini_bin: str = "gemini",
     cwd_override: str | None = None,
+    tool_profile: str | None = None,
 ) -> dict[str, Any]:
     """Run a full ACP session against `gemini --acp`.
 
@@ -453,6 +513,7 @@ async def _run_acp_session(
     # depth, not a complete sandbox.
     await send(_rpc_request("initialize", {
         "protocolVersion": 1,
+        "clientInfo": dict(ACP_CLIENT_INFO),
         "clientCapabilities": {
             "fs": {"readTextFile": False, "writeTextFile": False},
             "terminal": False,
@@ -542,12 +603,20 @@ async def _run_acp_session(
 
     if "error" in session_msg:
         session_error = session_msg["error"]
-        # B2: an auth-required session/new failure must be classified as
+        # B1: an auth-required session/new failure must be classified as
         # `auth_required` (not `session_new_failed`) so run_acp() surfaces it
         # honestly instead of masking it behind a headless_json fallback. This
         # transport assumes a pre-authenticated Gemini CLI / OAuth session and
         # does not implement the ACP `authenticate` handshake.
-        if is_auth_required_error(session_error) or result.get("auth_methods"):
+        #
+        # The classification is based ONLY on `is_auth_required_error(session_error)`.
+        # `result["auth_methods"]` must NOT participate: Gemini CLI's `initialize`
+        # advertises `authMethods` unconditionally, so keying off it would
+        # misclassify every non-auth `session/new` failure (model not found,
+        # invalid params, etc.) as `auth_required`, suppressing the
+        # `session_new_failed` early-failure fallback. `auth_methods` is retained
+        # purely as a diagnostic on the result.
+        if is_auth_required_error(session_error):
             return await early_exit(
                 f"session/new requires authentication "
                 f"(ACP authenticate handshake not implemented; "
@@ -637,7 +706,9 @@ async def _run_acp_session(
         # -- ACP permission requests: session/request_permission (has id, expects response)
         elif method == "session/request_permission":
             params = msg.get("params") or {}
-            permission_result = handle_session_request_permission(params, approve_edits)
+            permission_result = handle_session_request_permission(
+                params, approve_edits, tool_profile=tool_profile
+            )
             # Record permission event in structured_events for verification
             structured_events.append({
                 "type": "session/request_permission",
@@ -782,6 +853,7 @@ def run_acp(
     prepared_prompt: str | None = None,
     model_override: str | None = None,
     cwd_override: str | None = None,
+    tool_profile: str | None = None,
 ) -> dict[str, Any]:
     """Run a delegation request using ACP transport.
 
@@ -802,6 +874,11 @@ def run_acp(
 
     ``cwd_override``: when provided, the deterministic working directory used for
     both the ``gemini --acp`` subprocess and the ``session/new`` ``cwd``.
+
+    ``tool_profile``: the delegation tool profile, threaded into the
+    ``session/request_permission`` handler so the permission policy can be
+    ``no_tools`` (reject all) vs read-class (allow read/search/fetch/think only).
+    Falls back to ``request["tool_profile"]`` when not passed explicitly.
 
     Returns a dict with at least: ok, structured_events, response_text,
     stderr, warnings, failure_reason, failure_class, schema, transport.
@@ -834,6 +911,12 @@ def run_acp(
     # NB2: GEMINI_BIN is honoured only via the environment variable. Reading it
     # from the request JSON would let an untrusted request swap the binary.
     gemini_bin = str(os.environ.get("GEMINI_BIN") or "gemini")
+    # Resolve the tool_profile for the permission policy: explicit arg first,
+    # else fall back to the request payload.
+    effective_tool_profile = tool_profile
+    if effective_tool_profile is None:
+        req_profile = request.get("tool_profile")
+        effective_tool_profile = req_profile if isinstance(req_profile, str) else None
 
     try:
         try:
@@ -851,6 +934,7 @@ def run_acp(
                             timeout_sec=timeout_sec,
                             gemini_bin=gemini_bin,
                             cwd_override=cwd_override,
+                            tool_profile=effective_tool_profile,
                         )
                     )
                 )
@@ -865,6 +949,7 @@ def run_acp(
                     timeout_sec=timeout_sec,
                     gemini_bin=gemini_bin,
                     cwd_override=cwd_override,
+                    tool_profile=effective_tool_profile,
                 )
             )
     except Exception as exc:

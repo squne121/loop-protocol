@@ -160,6 +160,154 @@ class TestPermissionProxy:
 
 
 # ---------------------------------------------------------------------------
+# B2: session/request_permission handler — tool_profile + toolCall.kind policy
+# ---------------------------------------------------------------------------
+
+
+def _permission_params(kind: str | None) -> dict[str, Any]:
+    """Build session/request_permission params with the standard allow/reject
+    options and an optional toolCall.kind."""
+    tool_call: dict[str, Any] = {"toolCallId": "tc-1"}
+    if kind is not None:
+        tool_call["kind"] = kind
+    return {
+        "toolCall": tool_call,
+        "options": [
+            {"optionId": "allow", "kind": "allow_once", "name": "Allow once"},
+            {"optionId": "reject", "kind": "reject_once", "name": "Reject"},
+        ],
+    }
+
+
+def _is_allow(outcome: dict[str, Any]) -> bool:
+    return (
+        outcome.get("outcome", {}).get("outcome") == "selected"
+        and outcome["outcome"].get("optionId") == "allow"
+    )
+
+
+def _is_reject(outcome: dict[str, Any]) -> bool:
+    inner = outcome.get("outcome", {})
+    # Reject = selected the reject option, or cancelled (fail-safe).
+    if inner.get("outcome") == "cancelled":
+        return True
+    return inner.get("outcome") == "selected" and inner.get("optionId") == "reject"
+
+
+class TestSessionRequestPermissionPolicy:
+    """GIVEN handle_session_request_permission, WHEN tool_profile + toolCall.kind
+    vary, THEN the allow/reject policy matches the delegation contract (B2)."""
+
+    def test_no_tools_rejects_every_kind(self) -> None:
+        """GIVEN tool_profile=no_tools, THEN every toolCall.kind is rejected."""
+        for kind in ("read", "search", "fetch", "think", "edit", "delete",
+                     "move", "execute", "other"):
+            outcome = acp.handle_session_request_permission(
+                _permission_params(kind), approve_edits=False, tool_profile="no_tools"
+            )
+            assert _is_reject(outcome), f"no_tools must reject kind={kind}"
+
+    def test_no_tools_rejects_even_with_approve_edits(self) -> None:
+        """GIVEN tool_profile=no_tools AND approve_edits=True, THEN still all reject."""
+        for kind in ("read", "execute"):
+            outcome = acp.handle_session_request_permission(
+                _permission_params(kind), approve_edits=True, tool_profile="no_tools"
+            )
+            assert _is_reject(outcome), f"no_tools+approve_edits must reject kind={kind}"
+
+    @pytest.mark.parametrize(
+        "tool_profile",
+        ["grounded_research", "github_research", "local_asset_research",
+         "proposal_only"],
+    )
+    @pytest.mark.parametrize("kind", ["read", "search", "fetch", "think"])
+    def test_read_class_profile_allows_read_class_kinds(
+        self, tool_profile: str, kind: str
+    ) -> None:
+        """GIVEN a read-class profile AND a read-class kind, THEN allowed."""
+        outcome = acp.handle_session_request_permission(
+            _permission_params(kind), approve_edits=False, tool_profile=tool_profile
+        )
+        assert _is_allow(outcome), f"{tool_profile} must allow kind={kind}"
+
+    @pytest.mark.parametrize(
+        "tool_profile",
+        ["grounded_research", "github_research", "local_asset_research",
+         "proposal_only"],
+    )
+    @pytest.mark.parametrize("kind", ["edit", "delete", "move", "execute", "other"])
+    def test_read_class_profile_rejects_write_class_kinds(
+        self, tool_profile: str, kind: str
+    ) -> None:
+        """GIVEN a read-class profile AND a write/effect kind, THEN rejected."""
+        outcome = acp.handle_session_request_permission(
+            _permission_params(kind), approve_edits=False, tool_profile=tool_profile
+        )
+        assert _is_reject(outcome), f"{tool_profile} must reject kind={kind}"
+
+    @pytest.mark.parametrize("kind", ["edit", "delete", "execute"])
+    def test_approve_edits_does_not_widen_write_kinds(self, kind: str) -> None:
+        """GIVEN a read-class profile AND approve_edits=True, THEN write/effect
+        kinds are still rejected (no write-capable profile exists in this skill)."""
+        outcome = acp.handle_session_request_permission(
+            _permission_params(kind), approve_edits=True,
+            tool_profile="grounded_research",
+        )
+        assert _is_reject(outcome), f"approve_edits must not allow kind={kind}"
+
+    def test_missing_tool_call_kind_is_rejected(self) -> None:
+        """GIVEN a read-class profile AND a missing toolCall.kind, THEN rejected
+        (fail-safe)."""
+        outcome = acp.handle_session_request_permission(
+            _permission_params(None), approve_edits=False,
+            tool_profile="grounded_research",
+        )
+        assert _is_reject(outcome)
+
+    def test_missing_tool_call_object_is_rejected(self) -> None:
+        """GIVEN no toolCall object at all, THEN rejected (fail-safe)."""
+        params = {
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject_once"},
+            ],
+        }
+        outcome = acp.handle_session_request_permission(
+            params, approve_edits=False, tool_profile="grounded_research"
+        )
+        assert _is_reject(outcome)
+
+    def test_unknown_kind_is_rejected(self) -> None:
+        """GIVEN an unrecognized toolCall.kind, THEN rejected (fail-safe)."""
+        outcome = acp.handle_session_request_permission(
+            _permission_params("teleport"), approve_edits=False,
+            tool_profile="grounded_research",
+        )
+        assert _is_reject(outcome)
+
+    def test_empty_options_yields_cancel_for_allow_decision(self) -> None:
+        """GIVEN a read-class allow decision BUT empty options, THEN cancelled
+        (fail-safe — no option to select)."""
+        params = {"toolCall": {"kind": "read"}, "options": []}
+        outcome = acp.handle_session_request_permission(
+            params, approve_edits=False, tool_profile="grounded_research"
+        )
+        assert outcome["outcome"]["outcome"] == "cancelled"
+
+    def test_none_tool_profile_rejects_write_allows_read(self) -> None:
+        """GIVEN tool_profile=None (treated as read-class, not no_tools), THEN
+        read-class kinds allowed and write kinds rejected."""
+        allow_outcome = acp.handle_session_request_permission(
+            _permission_params("read"), approve_edits=False, tool_profile=None
+        )
+        assert _is_allow(allow_outcome)
+        reject_outcome = acp.handle_session_request_permission(
+            _permission_params("execute"), approve_edits=False, tool_profile=None
+        )
+        assert _is_reject(reject_outcome)
+
+
+# ---------------------------------------------------------------------------
 # Known bug detection tests
 # ---------------------------------------------------------------------------
 
@@ -766,6 +914,54 @@ class TestReadOnlyClientCapabilities:
         assert caps.get("fs", {}).get("writeTextFile") is False
         assert caps.get("terminal") is False
 
+    def test_initialize_declares_client_info(self, tmp_path: Path) -> None:
+        """Non-blocker: GIVEN a fake agent that records the initialize params,
+        THEN clientInfo identifies this transport with a name and version."""
+        recorder = tmp_path / "init_params_clientinfo.json"
+        agent_body = textwrap.dedent(
+            f"""\
+            #!/usr/bin/env python3
+            import json, sys, uuid
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+            def main():
+                sid = str(uuid.uuid4())
+                for _ in range(50):
+                    raw = sys.stdin.readline().strip()
+                    if not raw:
+                        break
+                    msg = json.loads(raw)
+                    method = msg.get("method", "")
+                    mid = msg.get("id")
+                    if method == "initialize":
+                        with open({str(recorder)!r}, "w") as fh:
+                            json.dump(msg.get("params", {{}}), fh)
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"protocolVersion":1}}}})
+                    elif method == "session/new":
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"sessionId":sid}}}})
+                    elif method == "session/prompt":
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{"stopReason":"end_turn"}}}})
+                        return
+            if __name__ == "__main__":
+                main()
+            """
+        )
+        agent = _write_fake_acp_agent(tmp_path, agent_body)
+        asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=30,
+                gemini_bin=str(agent),
+            )
+        )
+        params = json.loads(recorder.read_text(encoding="utf-8"))
+        client_info = params.get("clientInfo", {})
+        assert client_info.get("name") == "loop-protocol-gemini-cli-headless-delegation"
+        assert isinstance(client_info.get("version"), str)
+        assert client_info["version"]
+
 
 # A fake agent that records the session/new params (model + cwd) for B2.
 def _fake_agent_record_session_new(recorder: Path) -> str:
@@ -1137,6 +1333,148 @@ class TestAcpResultNormalizedToDelegationResult:
         assert result["transport"] == "headless_json"
         assert result["result_surface"]["summary"] == "from headless"
 
+    def test_normalized_result_carries_computed_model_chain(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-blocker: GIVEN a role-routed ACP request, THEN the normalized
+        result's model_chain is the computed chain (>1 entry), not a
+        [actual_model] stub; model_downgrades stays []."""
+        import run_gemini_headless as headless
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Summarize the provided context file in two sentences",
+            "instructions": ["Be concise.", "Do not invent facts."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Summary"],
+            "context_files": [str(ctx)],
+            # role drives a multi-entry model_chain via model routing.
+            "role": "implementation",
+            "timeout_sec": 120,
+        }
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "transport_ok": True,
+                "stop_reason": "end_turn",
+                "schema": "acp_result_v1",
+                "transport": "acp",
+                "structured_events": [],
+                "response_text": "Summary.",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+                "failure_class": None,
+            }
+
+        with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp):
+            result = headless.run_delegation(valid_request, request_path=ctx)
+
+        # The computed chain has more than one model; the normalized result
+        # must carry it verbatim, not collapse it to [actual_model].
+        assert len(result["model_chain"]) > 1
+        assert result["model_chain"][0] == result["actual_model"]
+        assert result["model_downgrades"] == []
+
+    def test_normalized_raw_command_reflects_gemini_bin(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """Non-blocker: GIVEN GEMINI_BIN set to a path, THEN the normalized
+        raw_command reflects the resolved binary basename (no secret path leak)
+        followed by --acp."""
+        import run_gemini_headless as headless
+
+        monkeypatch.setenv("GEMINI_BIN", "/opt/secret/install/gemini-custom")
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Summarize the provided context file in two sentences",
+            "instructions": ["Be concise.", "Do not invent facts."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Summary"],
+            "context_files": [str(ctx)],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 120,
+        }
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "transport_ok": True,
+                "stop_reason": "end_turn",
+                "schema": "acp_result_v1",
+                "transport": "acp",
+                "structured_events": [],
+                "response_text": "Summary.",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+                "failure_class": None,
+            }
+
+        with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp):
+            result = headless.run_delegation(valid_request, request_path=ctx)
+
+        assert result["raw_command"] == ["gemini-custom", "--acp"]
+        # The full secret path must NOT appear anywhere in raw_command.
+        assert "/opt/secret/install" not in " ".join(result["raw_command"])
+
+    def test_normalized_raw_command_default_binary(self, tmp_path: Path) -> None:
+        """Non-blocker: GIVEN no GEMINI_BIN override, THEN raw_command is the
+        default ["gemini", "--acp"]."""
+        import os as _os
+
+        import run_gemini_headless as headless
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Summarize the provided context file in two sentences",
+            "instructions": ["Be concise.", "Do not invent facts."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Summary"],
+            "context_files": [str(ctx)],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 120,
+        }
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "transport_ok": True,
+                "stop_reason": "end_turn",
+                "schema": "acp_result_v1",
+                "transport": "acp",
+                "structured_events": [],
+                "response_text": "Summary.",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+                "failure_class": None,
+            }
+
+        saved = _os.environ.pop("GEMINI_BIN", None)
+        try:
+            with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp):
+                result = headless.run_delegation(valid_request, request_path=ctx)
+        finally:
+            if saved is not None:
+                _os.environ["GEMINI_BIN"] = saved
+
+        assert result["raw_command"] == ["gemini", "--acp"]
+
 
 # ---------------------------------------------------------------------------
 # 3rd-round B1: verify_acp_roundtrip.sh must read structured_events from the
@@ -1314,6 +1652,109 @@ class TestAuthRequiredClassification:
         assert result["ok"] is False
         assert result["failure_class"] == "auth_required"
         assert "authenticat" in (result["failure_reason"] or "").lower()
+
+    @pytest.mark.parametrize(
+        "session_error",
+        [
+            {"code": -32602, "message": "Invalid params"},
+            {"code": -32603, "message": "model not found: fake-model"},
+            {"code": -32000, "message": "the requested model is unavailable"},
+        ],
+    )
+    def test_initialize_authmethods_does_not_misclassify_session_new_error(
+        self, tmp_path: Path, session_error: dict[str, Any]
+    ) -> None:
+        """B1 regression: GIVEN an `initialize` result that advertises
+        `authMethods` (Gemini CLI does this unconditionally) AND a `session/new`
+        error that is NOT auth-related (model not found / invalid params),
+        THEN failure_class is `session_new_failed` — NOT `auth_required` — so the
+        early-failure fallback can fire."""
+        agent_body = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, sys
+            SESSION_ERROR = {session_error_json}
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+            def main():
+                for _ in range(50):
+                    raw = sys.stdin.readline().strip()
+                    if not raw:
+                        break
+                    msg = json.loads(raw)
+                    method = msg.get("method", "")
+                    mid = msg.get("id")
+                    if method == "initialize":
+                        # initialize advertises authMethods unconditionally.
+                        send({{"jsonrpc":"2.0","id":mid,"result":{{
+                            "protocolVersion":1,
+                            "authMethods":[{{"id":"oauth","name":"Google OAuth"}}]}}}})
+                    elif method == "session/new":
+                        send({{"jsonrpc":"2.0","id":mid,"error":SESSION_ERROR}})
+                        return
+            if __name__ == "__main__":
+                main()
+            """
+        ).format(session_error_json=json.dumps(session_error))
+        agent = _write_fake_acp_agent(tmp_path, agent_body)
+        result = asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=20,
+                gemini_bin=str(agent),
+            )
+        )
+        assert result["ok"] is False
+        # authMethods present in initialize must NOT flip this to auth_required.
+        assert result["failure_class"] == "session_new_failed"
+        # auth_methods is still captured as a diagnostic on the result.
+        assert result["auth_methods"] == [{"id": "oauth", "name": "Google OAuth"}]
+
+    def test_session_new_failed_with_authmethods_is_in_fallback_set(self) -> None:
+        """B1 regression: GIVEN a run_acp result with failure_class
+        `session_new_failed` (the agent advertised authMethods but the real
+        error was non-auth), THEN the early-failure fallback IS invoked."""
+
+        async def _session_new_failing(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "structured_events": [],
+                "response_text": None,
+                "stderr": None,
+                "warnings": ["session/new error: model not found"],
+                "failure_reason": "session/new error: model not found",
+                "failure_class": "session_new_failed",
+                "auth_methods": [{"id": "oauth"}],
+            }
+
+        fallback_calls: list[str] = []
+
+        def _recording_fallback(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            fallback_calls.append("called")
+            return {
+                "schema": "delegation_result/v1",
+                "transport": "headless_json",
+                "_acp_fallback": True,
+                "ok": True,
+                "response_text": "from headless fallback",
+                "warnings": [],
+            }
+
+        with patch.object(acp, "_run_acp_session", side_effect=_session_new_failing):
+            with patch.object(
+                acp, "_fallback_to_headless_json", side_effect=_recording_fallback
+            ):
+                result = acp.run_acp(
+                    request={"schema": "delegation_request_v1", "objective": "x"},
+                    prepared_prompt="built prompt",
+                )
+
+        assert fallback_calls == ["called"], (
+            "session_new_failed must trigger the early-failure fallback"
+        )
+        assert result.get("_acp_fallback") is True
 
     def test_auth_required_is_not_in_fallback_set(self, tmp_path: Path) -> None:
         """GIVEN run_acp with an auth_required session, THEN no fallback fires
