@@ -36,11 +36,98 @@ REQUIRED_PR_SECTIONS = [
     "Allowed Paths 遵守",
 ]
 
+# safety-sensitive PR の判定パターン（changed path の部分一致）
+SAFETY_SENSITIVE_PATH_PATTERNS = [
+    "transport",
+    "permission",
+    "sandbox",
+    "auth",
+    "mcp",
+    ".claude/skills/",
+    ".github/workflows/",
+]
+
+# Safety Claim Matrix の必須列ヘッダー
+SAFETY_CLAIM_MATRIX_REQUIRED_COLS = [
+    "Claim",
+    "Implemented?",
+    "Not controlled",
+    "Evidence",
+    "Follow-up",
+]
+
 # エラーコード（skill SKILL.md と一致させる）
 E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_TEMPLATE_GUARD = "E_PR_TEMPLATE_GUARD"
+E_SAFETY_CLAIM_MATRIX_MISSING = "E_SAFETY_CLAIM_MATRIX_MISSING"
 E_LINKED_ISSUE_STATE_UNKNOWN = "E_LINKED_ISSUE_STATE_UNKNOWN"
 E_GH_FAILURE = "E_GH_FAILURE"
+
+
+def is_safety_sensitive(changed_paths: list[str]) -> bool:
+    """changed paths のいずれかが safety-sensitive パターンに部分一致するか確認。"""
+    for path in changed_paths:
+        for pattern in SAFETY_SENSITIVE_PATH_PATTERNS:
+            if pattern in path:
+                return True
+    return False
+
+
+def check_safety_claim_matrix(body: str) -> list[str]:
+    """Safety Claim Matrix セクションと必須列の存在を確認。問題リストを返す。
+
+    Returns:
+        空リスト: 問題なし
+        非空リスト: 問題の説明一覧
+    """
+    issues: list[str] = []
+
+    # Safety Claim Matrix セクションの存在確認
+    if not re.search(r"^##\s+Safety Claim Matrix\b", body, re.MULTILINE):
+        issues.append("## Safety Claim Matrix セクションが存在しません")
+        return issues  # セクションがなければ列チェックは不要
+
+    # 必須列ヘッダーの存在確認
+    for col in SAFETY_CLAIM_MATRIX_REQUIRED_COLS:
+        if col not in body:
+            issues.append(f"Safety Claim Matrix に必須列 '{col}' が見つかりません")
+
+    # Not controlled が非空の場合、Follow-up に Issue 番号（#N）が必要
+    # テーブル行から Not controlled と Follow-up 列を抽出して確認
+    # テーブル行のパターン: | ... | ... | <not_controlled> | ... | <follow-up> |
+    # ヘッダー行とセパレータ行をスキップし、データ行のみ確認
+    table_section = re.search(
+        r"\|.*Claim.*\|.*Implemented.*\|.*Not controlled.*\|.*Evidence.*\|.*Follow-up.*\|(.*?)(?=\n##|\Z)",
+        body,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if table_section:
+        table_text = table_section.group(0)
+        # ヘッダー行とセパレータ行（---|---）以外のデータ行を解析
+        for line in table_text.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) < 5:
+                continue
+            # セパレータ行をスキップ
+            if re.match(r"^[-\s]+$", cells[0]):
+                continue
+            # ヘッダー行をスキップ
+            if cells[0].lower() in ("claim",):
+                continue
+            not_controlled = cells[2] if len(cells) > 2 else ""
+            follow_up = cells[4] if len(cells) > 4 else ""
+            # Not controlled が空でなく（N/A や空文字でない）、Follow-up に #N がない場合
+            if not_controlled and not_controlled.lower() not in ("", "n/a", "-"):
+                if not re.search(r"#\d+", follow_up):
+                    issues.append(
+                        f"Not controlled が非空の行（'{not_controlled[:30]}...' 等）に "
+                        f"Follow-up の open Issue 番号（#N 形式）が必要です"
+                    )
+                    break  # 1 件報告すれば十分
+
+    return issues
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +140,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--branch", help="head branch 名 (省略時は現在の HEAD)")
     p.add_argument("--repo", help="owner/repo (省略時は git remote から取得)")
     p.add_argument("--dry-run", action="store_true", help="gh pr create を実行しない")
+    p.add_argument(
+        "--changed-paths",
+        nargs="*",
+        default=[],
+        help="変更ファイルパスのリスト（safety-sensitive 判定に使用）。省略時は Safety Claim Matrix Guard をスキップ",
+    )
     return p.parse_args()
 
 
@@ -171,6 +264,14 @@ def main() -> int:
         emit_error(E_PR_TEMPLATE_GUARD, f"欠落セクション: {missing}")
         emit_kv("MISSING_SECTIONS", ",".join(missing))
         return 2
+
+    # 2.5. Safety Claim Matrix Guard（changed_paths が指定されている場合のみ）
+    if args.changed_paths and is_safety_sensitive(args.changed_paths):
+        scm_issues = check_safety_claim_matrix(body)
+        if scm_issues:
+            emit_error(E_SAFETY_CLAIM_MATRIX_MISSING, "; ".join(scm_issues))
+            emit_kv("SAFETY_CLAIM_MATRIX_ISSUES", " | ".join(scm_issues))
+            return 2
 
     # repo / branch を解決
     repo = args.repo or resolve_repo()
