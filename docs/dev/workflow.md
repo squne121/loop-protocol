@@ -121,6 +121,18 @@ git branch -d worktree-<slug>
 - `## 検証コマンド結果`
 - `## Allowed Paths 遵守`
 
+## Issue contract を作業計画の正本として扱う条件
+
+`impl-review-loop` が GitHub Issue contract を作業計画の正本として扱い、追加の実装計画承認を要求しないための着手条件。以下をすべて満たした場合のみ着手する。
+
+- `issue-contract-review` が `status: go` を返していること
+  - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
+- Allowed Paths が現在 OPEN な他 Implementation Issue の Allowed Paths と重複しないこと（マージコンフリクトリスクなし、`issue-contract-review` では現時点で未判定のため独立条件として明示）
+
+いずれか 1 つでも欠けた場合は着手を停止し、人間判断を仰ぐ。
+
+> Claude Code の plan permission mode（`--permission-mode plan` / `Shift+Tab` / `/plan` で人間が選ぶセッション制御）は人間がセッション単位で選択する UI 制御であり、本ルールの対象外である。plan permission mode の有無は上記着手条件判定に影響しない。
+
 ## Human Decision が必要な条件
 
 以下に該当する場合、AI に丸投げせず人間が判断する:
