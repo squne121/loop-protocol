@@ -46,6 +46,8 @@
 - `pnpm lint`
 - `pnpm test`
 - `pnpm build`
+- Python テスト: `uv run pytest <テストパス>`（推奨既定）
+  - 例外: POSIX shell 互換性・CI イメージ制約・ツール未導入環境では `python3 -m pytest` を許容。その場合は VC または PR 本文に理由を明記する
 
 ## 詳細ルールの置き場
 
