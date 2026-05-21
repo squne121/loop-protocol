@@ -65,9 +65,11 @@
   - `pnpm test`
   - `pnpm build`
   - `uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py`
+- VC でのテキスト検索は `rg`（ripgrep）を優先する。POSIX 互換性・CI イメージ制約・ツール未導入環境では `grep` を許容するが、その場合は理由を VC または PR 本文に明記する。
 - docs-only 変更でも cheap で安定しているため、可能なら同じ品質ゲートを通す。
 - 失敗した場合は握りつぶさず、未解決のまま報告する。
-- 動作検証 AC（`runtime-verification: true`）を含む Issue は `docs/dev/runtime-verification-policy.md` の SKIP 規約・証跡保存・Stop Condition 連動に従う。
+- Runtime Verification Applicability が `immediate` の Issue は `docs/dev/runtime-verification-policy.md` の SKIP 規約・証跡保存・Stop Condition 連動に従う（適用判定スキーマは policy.md の「Runtime Verification Applicability」を参照）。
+- 既存 OPEN Issue（特に #26 等）の VC が `immediate` / `deferred` / `not_applicable` のどれに該当するかは、policy.md の適用判定スキーマを基準に確認する。
 
 ## スコープ管理
 

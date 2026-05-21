@@ -43,6 +43,9 @@ Issue 種別の判定は **テンプレート SSOT に委ねる**:
 | C6 | 主観表現の混入 | AC / VC 本文に「適切に動作」「品質を改善」「最適化」等が **含まれない** |
 | C7 | Required Skills 意味論 | ワークフロー skill（`implement-issue` / `pr-review-judge` / `ssot-discovery` 等）/ document path（`docs/...` / `.md` / `/`）を **含まない** |
 | C8 | Outcome 抽象パターン除外 | `## Outcome` 配下に「〜が決定される」「〜を検討する」「〜を改善する」等の動作状態のみ表現が **含まれない** |
+| C9 | 適用判定不在 | `## Runtime Verification Applicability` セクションが存在しない。**implementation Issue は blocker**（`status: needs-fix`）。ただしスキーマ導入（#77）以前に作成された legacy Issue は `legacy_missing_applicability` 状態として扱い、着手前に人間確認を仰ぐことを推奨（blocker 猶予あり）。research / tracking Issue は warning（approve を妨げない） |
+| C10 | deferred の検証先不明 | `decision: deferred` が宣言されているが、`deferred_destination`（destination_type + destination_ref）または `deferred_verification_condition` が **1 つでも欠けている**（blocker）。自由記述のみで半構造化フォーマットが未使用の場合も blocker |
+| C11 | decision と runtime-verification タグの整合 | `decision: immediate` なのに AC に `<!-- runtime-verification: true -->` タグが 1 つもない（blocker）、または `decision: not_applicable` / `deferred` なのに `<!-- runtime-verification: true -->` タグが存在する（矛盾 blocker） |
 
 ### 4. 軽量構造評価（non-blocking improvement 候補）
 
@@ -53,8 +56,9 @@ Issue 種別の判定は **テンプレート SSOT に委ねる**:
 
 ### 5. Verdict 決定
 
-- `approve`: C1〜C8 すべて pass
-- `needs-fix`: C1〜C8 のいずれかが fail
+- `approve`: C1〜C11 すべて pass（research / tracking Issue の C9 warn は approve を妨げない）
+- `needs-fix`: C1〜C11 のいずれかが fail（implementation Issue の C9 fail / C11 fail を含む）
+- `legacy_missing_applicability`: implementation Issue で C9 fail かつ legacy Issue（スキーマ導入 #77 以前に作成）の場合は `needs-fix` にしつつ、修正提案コメントに「legacy Issue のため blocker 猶予あり、着手前に適用判定セクションを追加することを推奨」と付記する
 
 ### 6. 差分提案生成
 
@@ -86,6 +90,9 @@ REVIEW_ISSUE_RESULT_V1:
     C6_no_subjective_phrasing: pass | fail | n/a
     C7_required_skills_semantics: pass | fail | n/a
     C8_outcome_concreteness: pass | fail | n/a
+    C9_runtime_applicability_present: pass | fail | warn | legacy_missing_applicability | n/a
+    C10_deferred_destination_present: pass | fail | n/a
+    C11_decision_tag_consistency: pass | fail | n/a
   blocking_issues: []
   non_blocking_improvements: []
   diff_proposal:

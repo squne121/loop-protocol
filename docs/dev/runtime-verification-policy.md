@@ -1,7 +1,72 @@
 # 動作検証 AC 運用ポリシー
 
 > SSOT: このファイルは動作検証 AC の設計・実装・検証・PR レビュー時に参照される唯一の正本。
-> 関連 Issue: #84（policy 新規作成）、#77（動作検証 AC 必須化）、#83（SubAgent SKIP 検知実装）
+> 関連 Issue: #84（policy 新規作成）、#77（適用判定スキーマ追加）、#83（SubAgent SKIP 検知実装）
+
+---
+
+## Runtime Verification Applicability
+
+全 Issue は動作検証の適用判定（`not_applicable | immediate | deferred`）を明示する。
+
+```markdown
+## Runtime Verification Applicability
+
+- decision: not_applicable | immediate | deferred
+- reason: <判定理由>
+- if immediate: 対応 AC / VC / 証跡要件
+- if deferred: 後続 Issue / 統合フェーズ / 検証条件
+```
+
+| decision | 意味 |
+|---|---|
+| `not_applicable` | 静的検証（typecheck / lint / unit test / build）のみで完結し、プロセス起動・通信・I/O は不要 |
+| `immediate` | 本 Issue の実装範囲内で動作検証が成立する（runtime AC / VC / 証跡 / SKIP exit 77 / fallback FAIL を要求する） |
+| `deferred` | 複数機能の統合が前提で、後続 Issue / プレイアブルスライス / system test フェーズで初めて成立する（後続検証先を明示する） |
+
+### ゲーム開発における deferred の例
+
+単独 Issue の変更が「入力処理」「描画」「敵 AI」「当たり判定」「ゲームループ」などの一部分であり、単独での実動作検証が意味を持たない場合は `deferred` が適切。
+ゲームテストは状態空間・相互作用が大きく、単独 Issue での網羅的な動作検証設計が困難なケースがある。
+
+### decision ごとの要求事項
+
+- `not_applicable`: runtime AC / VC / 証跡は不要。静的検証のみ。
+- `immediate`: 動作検証 AC に `<!-- runtime-verification: true -->` タグを付与。VC に SKIP exit 77 / fallback FAIL の実装を含める。証跡を PR に添付する。
+- `deferred`: 後続 Issue 番号・統合フェーズ名・検証条件を明記する。証跡は後続 Issue / フェーズで提出する。
+
+### deferred 記述の必須フィールド
+
+`decision: deferred` を宣言する場合、以下のフィールドをすべて記載することが必須。不完全な場合は `review-issue` の C10 blocker となる。
+
+```markdown
+## Runtime Verification Applicability
+
+- decision: deferred
+- reason: <deferred にする判定理由>
+- deferred_destination:
+    - destination_type: issue | phase | milestone
+    - destination_ref: <Issue番号 / フェーズ名 / マイルストーン名>
+- deferred_verification_condition: <検証が成立するために必要な条件の説明>
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `decision` | enum | `deferred` 固定 |
+| `reason` | string | なぜ本 Issue では動作検証が成立しないかの理由 |
+| `deferred_destination.destination_type` | `issue \| phase \| milestone` | 後続検証先の種別 |
+| `deferred_destination.destination_ref` | string | Issue 番号（例: `#123`）/ フェーズ名 / マイルストーン名 |
+| `deferred_verification_condition` | string | 後続の何が完了すれば動作検証が成立するかの条件説明 |
+
+### decision と runtime-verification タグの整合ルール
+
+以下の整合ルールを `issue-contract-review` および `review-issue` が検出する:
+
+| 状態 | 判定 |
+|---|---|
+| `decision: immediate` かつ AC に `<!-- runtime-verification: true -->` タグが 1 つ以上ある | 整合（正常） |
+| `decision: immediate` かつ `<!-- runtime-verification: true -->` タグが 1 つもない | **blocker**（タグ付与を要求） |
+| `decision: not_applicable` または `decision: deferred` かつ `<!-- runtime-verification: true -->` タグがある | **blocker**（decision と矛盾。タグ削除または decision 変更を要求） |
 
 ---
 
@@ -13,7 +78,7 @@ SKIP exit 0 / `_fallback: true` 等による「検証の骨抜き」を防止し
 
 ### スコープ
 
-- 動作検証 AC（`runtime-verification: true` タグを持つ AC）を含む全 Issue
+- Runtime Verification Applicability が `immediate` の Issue
 - 動作検証 AC に対応する Verification Commands（VC）
 - test-runner SubAgent による VC 実行と証跡保存
 - pr-review-judge による PR レビュー判定
@@ -150,7 +215,7 @@ Reason: <判定理由（FAIL/SKIP の場合は必須）>
 
 ## 5. テストシナリオ最小セット
 
-動作検証 AC を含む Issue は、以下の最小セットを満たすテストシナリオを VC に含める必要がある。
+Runtime Verification Applicability が `immediate` の Issue は、以下の最小セットを満たすテストシナリオを VC に含める必要がある。
 
 ### 必須: 正常系 ≥ 1
 
@@ -217,7 +282,7 @@ impl-review-loop / main session が Stop Condition を発火
 
 ### Issue Stop Conditions への反映
 
-動作検証 AC を含む Issue は `## Stop Conditions` に以下を追加する。
+Runtime Verification Applicability が `immediate` の Issue は `## Stop Conditions` に以下を追加する。
 
 ```markdown
 ## Stop Conditions
@@ -238,7 +303,7 @@ pr-review-judge は PR の証跡セクションを確認し、以下のいずれ
 
 ## 7. PR 本文への証跡引用テンプレ
 
-動作検証 AC を含む PR の本文には以下のセクションを追加する。
+Runtime Verification Applicability が `immediate` の PR の本文には以下のセクションを追加する。
 
 ```markdown
 ## Runtime Verification Evidence
