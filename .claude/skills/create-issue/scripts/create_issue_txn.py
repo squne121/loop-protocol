@@ -399,8 +399,21 @@ def _issue_graphql_ids(repo: str, issue_number: int, gh_bin: str) -> tuple[str, 
     return str(node_id), int(database_id)
 
 
-# Values that indicate "no parent" for body extraction.
-_PARENT_NONE: frozenset[str] = frozenset({"", "none", "n/a", "null", "なし", "単独改善", "0"})
+# ---------------------------------------------------------------------------
+# Parent-none detection helpers (Blocker 1)
+# ---------------------------------------------------------------------------
+
+# Regex-based "no parent" detection: matches bare keywords and those with
+# parenthetical annotations like "none（単独改善）" or "none (standalone)".
+_PARENT_NONE_RE = re.compile(
+    r"^(?:none|null|n/a|なし|単独改善|0)(?:\s*[（(][^）)]*[）)])?$",
+    re.IGNORECASE,
+)
+
+
+def _is_explicit_none(raw: str) -> bool:
+    """Return True if raw (stripped) represents an explicit 'no parent' declaration."""
+    return bool(_PARENT_NONE_RE.match(raw.strip()))
 
 
 def _collect_parent_candidates(body: str) -> list[ParentCandidate]:
@@ -437,8 +450,7 @@ def _collect_parent_candidates(body: str) -> list[ParentCandidate]:
           Markdown context (not strict YAML) we treat `#N` as a parent reference.
         """
         raw = raw_full.strip().strip("\"'").strip()
-        raw_lower = raw.lower()
-        if raw_lower in _PARENT_NONE:
+        if _is_explicit_none(raw):
             return ParentCandidate(source=source, raw=raw, value=None)
         # Try to parse as number (with optional leading #)
         m_num = re.match(r'^#?(\d+)$', raw.strip())
@@ -573,6 +585,23 @@ def _extract_parent_issue_number_from_body(body: str) -> int | None:
     return None
 
 
+def _extract_field_from_body(body: str, field_name: str) -> str | None:
+    """Extract a machine-readable contract field value from issue body.
+
+    Looks for YAML-style ``field_name: value`` lines (optionally quoted).
+    Returns the stripped value string, or None if not found or unparseable.
+    This is a best-effort helper; None means "skip the gate".
+    """
+    pattern = re.compile(
+        r'(?im)^[ \t]*' + re.escape(field_name) + r'\s*:\s*(.+?)\s*$',
+    )
+    m = pattern.search(body)
+    if not m:
+        return None
+    value = m.group(1).strip().strip("\"'").strip()
+    return value if value else None
+
+
 def _resolve_parent_issue_number(parent_arg: int, body_resolution: ParentResolution) -> int:
     """Resolve the effective parent issue number from CLI arg and body-derived resolution.
 
@@ -691,7 +720,7 @@ def _issue_register_sub_issue_idempotent(
     rb_combined = rb_stdout + ("\n" + rb_stderr if rb_stderr else "")
     rb_http_status = _extract_http_status(rb_combined)
 
-    if rb_cp.returncode == 0 and rb_http_status not in (404, None) or (rb_cp.returncode == 0 and rb_http_status is None):
+    if rb_cp.returncode == 0 and rb_http_status == 200:
         # Strip HTTP headers from body for JSON parsing (--include prepends headers before blank line)
         rb_body = rb_stdout
         if "\r\n\r\n" in rb_body:
@@ -1182,10 +1211,13 @@ def run_transaction(
         dependency_verified = None
         dedupe_issue_url = f"https://github.com/{repo}/issues/{dedupe_number}"
 
-        # --- Blocker 3 + 4: dedupe body read-back for parent identity check (fail-closed) ---
-        # Read the existing issue's body and verify its parent doesn't conflict with resolved_parent.
-        if parent_issue_number:
-            # Blocker 3: dedupe body read failure is fail-closed (not best-effort).
+        # --- Blocker 3 + 4 + iteration 3: dedupe body read for identity checks ---
+        # Always read existing body when parent or issue_kind checks are needed.
+        # Body read failure is fail-closed only when parent_issue_number is set;
+        # for issue_kind (best-effort) we silently skip on read failure.
+        _dedupe_read_needed = bool(parent_issue_number) or bool(_body_text_for_parent)
+        existing_body = ""
+        if _dedupe_read_needed:
             try:
                 dedupe_issue_data = _run_gh_json(
                     [
@@ -1201,22 +1233,26 @@ def run_transaction(
                     ],
                     stage="dedupe-body-read",
                 )
+                existing_body = dedupe_issue_data.get("body") or ""
             except TransactionError as exc:
-                # Blocker 3 fix: fail-closed on dedupe body read failure.
-                return TransactionResult(
-                    status="failure",
-                    issue_number=dedupe_number,
-                    issue_url=dedupe_issue_url,
-                    completed_steps=dedupe_completed,
-                    failure_stage="dedupe-body-read",
-                    failure_message=exc.message,
-                )
-            existing_body = dedupe_issue_data.get("body") or ""
+                if parent_issue_number:
+                    # Fail-closed when parent checks are required.
+                    return TransactionResult(
+                        status="failure",
+                        issue_number=dedupe_number,
+                        issue_url=dedupe_issue_url,
+                        completed_steps=dedupe_completed,
+                        failure_stage="dedupe-body-read",
+                        failure_message=exc.message,
+                    )
+                # For issue_kind-only check: best-effort; skip on read failure.
+                existing_body = ""
+
+        if parent_issue_number and existing_body is not None:
             # Blocker 4: existing body parse error is fail-closed (not silenced).
             try:
                 existing_body_resolution = _extract_parent_resolution_from_body(existing_body)
             except TransactionError as exc:
-                # Blocker 4 fix: fail-closed on malformed existing body parent.
                 return TransactionResult(
                     status="failure",
                     issue_number=dedupe_number,
@@ -1225,27 +1261,57 @@ def run_transaction(
                     failure_stage="dedupe-parent-body-parse",
                     failure_message=exc.message,
                 )
-            # If existing issue body has a conflicting parent, fail-closed.
-            existing_body_parent = existing_body_resolution.value if existing_body_resolution.state == "number" else None
-            if existing_body_parent is not None and existing_body_parent != parent_issue_number:
-                mismatch_exc = TransactionError(
-                    stage="dedupe-parent-mismatch",
-                    message=(
-                        f"dedupe issue #{dedupe_number} body declares parent #{existing_body_parent} "
-                        f"but current transaction resolved parent #{parent_issue_number}; "
-                        "failing closed to avoid link mutation."
-                    ),
-                    output=f"dedupe_number={dedupe_number} existing_body_parent={existing_body_parent} resolved_parent={parent_issue_number}",
-                )
+            # Blocker 2 (iteration 3): existing body declares explicit_none but current
+            # transaction resolved a parent -> fail-closed to avoid silent link mutation.
+            if existing_body_resolution.state == "explicit_none":
                 return TransactionResult(
                     status="failure",
                     issue_number=dedupe_number,
                     issue_url=dedupe_issue_url,
                     completed_steps=dedupe_completed,
-                    failure_stage=mismatch_exc.stage,
-                    failure_message=mismatch_exc.message,
+                    failure_stage="dedupe-parent-mismatch",
+                    failure_message=(
+                        f"dedupe issue #{dedupe_number} explicitly declares no parent, "
+                        f"but current transaction resolved parent #{parent_issue_number}; "
+                        "failing closed to avoid link mutation."
+                    ),
                 )
-        # --- End Blocker 3 + 4 ---
+            # If existing issue body has a conflicting numeric parent, fail-closed.
+            if existing_body_resolution.state == "number":
+                existing_body_parent = existing_body_resolution.value
+                if existing_body_parent != parent_issue_number:
+                    return TransactionResult(
+                        status="failure",
+                        issue_number=dedupe_number,
+                        issue_url=dedupe_issue_url,
+                        completed_steps=dedupe_completed,
+                        failure_stage="dedupe-parent-mismatch",
+                        failure_message=(
+                            f"dedupe issue #{dedupe_number} body declares parent #{existing_body_parent} "
+                            f"but current transaction resolved parent #{parent_issue_number}; "
+                            "failing closed to avoid link mutation."
+                        ),
+                    )
+
+        # High (iteration 3): identity gate — issue_kind mismatch check (best-effort).
+        # Skip if existing body could not be read (best-effort: None means skip the gate).
+        if existing_body:
+            existing_issue_kind = _extract_field_from_body(existing_body, "issue_kind")
+            expected_issue_kind = _extract_field_from_body(_body_text_for_parent, "issue_kind")
+            if existing_issue_kind and expected_issue_kind and existing_issue_kind != expected_issue_kind:
+                return TransactionResult(
+                    status="failure",
+                    issue_number=dedupe_number,
+                    issue_url=dedupe_issue_url,
+                    completed_steps=dedupe_completed,
+                    failure_stage="dedupe-kind-mismatch",
+                    failure_message=(
+                        f"dedupe issue #{dedupe_number} has issue_kind={existing_issue_kind!r} "
+                        f"but current transaction expects issue_kind={expected_issue_kind!r}; "
+                        "failing closed to avoid identity collision."
+                    ),
+                )
+        # --- End Blocker 3 + 4 + iteration 3 ---
 
         try:
             reconcile_steps, parent_verified, dependency_verified = _reconcile_issue_links(

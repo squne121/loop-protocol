@@ -1385,3 +1385,284 @@ class TestExtractHttpStatusLastMatch:
         """Multiple status lines, last is 422."""
         text = "HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 422 Unprocessable Entity\r\n\r\n{}"
         assert txn._extract_http_status(text) == 422
+
+
+# ---------------------------------------------------------------------------
+# Iteration 3 test cases: Blocker 1, Blocker 2, High (422 readback), High (issue_kind)
+# ---------------------------------------------------------------------------
+
+
+class TestParentNoneWithAnnotation:
+    """Blocker 1 (iteration 3): none with parenthetical annotation is explicit_none."""
+
+    def test_parent_heading_none_with_annotation_is_explicit_none(self) -> None:
+        """## Parent Issue + 'none（単独改善）' -> explicit_none."""
+        body = 'parent_issue: "none"\n\n## Parent Issue\n\nnone（単独改善）'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_parent_issue_standalone_annotation_is_explicit_none(self) -> None:
+        """## Parent Issue + '単独改善（no parent）' -> explicit_none."""
+        body = "## Parent Issue\n\n単独改善（no parent）"
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_none_with_latin_annotation_is_explicit_none(self) -> None:
+        """'none (standalone)' in machine contract -> explicit_none."""
+        body = 'parent_issue: "none (standalone)"'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_is_explicit_none_bare_none(self) -> None:
+        assert txn._is_explicit_none("none")
+
+    def test_is_explicit_none_none_with_annotation(self) -> None:
+        assert txn._is_explicit_none("none（単独改善）")
+
+    def test_is_explicit_none_standalone_kanji(self) -> None:
+        assert txn._is_explicit_none("単独改善")
+
+    def test_is_explicit_none_not_number(self) -> None:
+        assert not txn._is_explicit_none("42")
+
+    def test_is_explicit_none_not_arbitrary_text(self) -> None:
+        assert not txn._is_explicit_none("some text")
+
+
+class TestDedupeExistingBodyExplicitNoneWithParent:
+    """Blocker 2 (iteration 3): dedupe existing body explicit_none + resolved parent -> failure."""
+
+    def test_dedupe_existing_body_explicit_none_with_resolved_parent_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Existing issue body: parent_issue: none. Current resolved parent: 42.
+        -> failure_stage == "dedupe-parent-mismatch"."""
+        existing_issue_body = "parent_issue: none\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+    def test_dedupe_existing_body_none_annotation_with_resolved_parent_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Existing issue body: 'none（単独改善）'. Current resolved parent: 42.
+        -> failure_stage == "dedupe-parent-mismatch"."""
+        existing_issue_body = "## Parent Issue\n\nnone（単独改善）\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+
+class TestSubIssueReadback422OnlyHttp200:
+    """High (iteration 3): 422 post-readback succeeds ONLY when rb_http_status == 200."""
+
+    def test_readback_http_200_is_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rb_http_status == 200 after 422 POST -> already_registered."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    def test_readback_http_404_is_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rb_http_status == 404 after 422 POST -> TransactionError (not success)."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # HTTP 404 in status line, returncode 0 (edge case)
+            return _make_gh_result(
+                stdout="HTTP/1.1 404 Not Found\r\n\r\n{}",
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_readback_no_http_status_is_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No HTTP status in read-back output -> TransactionError (not success)."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # returncode 0 but no HTTP status line (e.g., raw JSON without --include)
+            return _make_gh_result(
+                stdout='{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+
+class TestDedupeIssueKindMismatch:
+    """High (iteration 3): dedupe identity gate rejects issue_kind mismatch."""
+
+    def test_dedupe_issue_kind_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Existing issue: issue_kind: research. Current: issue_kind: implementation.
+        -> failure_stage == "dedupe-kind-mismatch"."""
+        existing_issue_body = "issue_kind: research\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-kind-mismatch"
+
+    def test_dedupe_issue_kind_match_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same issue_kind in both bodies -> no kind mismatch failure."""
+        existing_issue_body = "issue_kind: implementation\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        # Should not fail due to kind mismatch (kind matches)
+        assert result.failure_stage != "dedupe-kind-mismatch"
+
+    def test_dedupe_issue_kind_absent_in_existing_skips_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Existing body has no issue_kind field -> gate is skipped (best-effort)."""
+        existing_issue_body = "## Outcome\nTest (no issue_kind)"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.failure_stage != "dedupe-kind-mismatch"
