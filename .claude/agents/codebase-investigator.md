@@ -67,6 +67,37 @@ permissionMode: dontAsk
 }
 ```
 
+**`context_files` 規約（必読）**:
+
+- `context_files` に指定できるのは **ファイルパスのみ**。ディレクトリパスは受け付けない。
+  - 存在しないパスを渡すと `missing context file` エラーで fail する。
+  - 存在するディレクトリパスを渡すと `context file is not a file` 相当のエラーで fail する。
+- ディレクトリ単位の調査が必要な場合は、`context_files` にディレクトリを渡すのではなく、`objective` または `instructions` 側で調査範囲（対象ディレクトリのパス、再帰の深さ、除外パターン等）を指定すること。Serena MCP の `list_dir` / `find_file` / `search_for_pattern` ツールが範囲を受け取って内部で走査する。
+
+**github_research 使用前の準備（issue 系入力がある場合）**:
+
+`issue_number` / `focus_topics` / `anchor_comment` / `objective` などを使う場合は、必ず以下の手順で一時 context ファイルを作成し、`context_files` に渡すこと:
+
+```bash
+CONTEXT_FILE="/tmp/codebase-investigator-context-$(date +%s).md"
+cat > "$CONTEXT_FILE" <<CTXEOF
+# 調査コンテキスト
+## 目的
+<purpose>
+
+## Issue 本文
+<issue_body または gh issue view の出力>
+
+## フォーカストピック
+<focus_topics>
+
+## anchor comment（あれば）
+<anchor_comment 内容>
+CTXEOF
+```
+
+wrapper は `context_files` を 1 件以上必須とするため、context ファイルなしでの呼び出しは `missing context file` エラーになる。
+
 **gh 調査モード** (`tool_profile: github_research`, `role: github_research`):
 ```json
 {
@@ -80,13 +111,15 @@ permissionMode: dontAsk
   "tool_profile": "github_research",
   "role": "github_research",
   "output_sections": ["対象", "発見事項", "影響範囲", "参照先"],
-  "context_files": ["<空でなければ補助 context のパス>"],
+  "context_files": ["/tmp/codebase-investigator-context-<timestamp>.md"],
   "gh_commands": [
     {"argv": ["issue", "list", "--state", "open", "--search", "<keywords>"]}
   ],
   "timeout_sec": 300
 }
 ```
+
+> **注意**: `context_files` には必ず上記で事前作成した context ファイルのパスを指定すること。空・省略・ダミーパスは不可（`missing context file` エラーで fail する）。
 
 ## 報告形式
 
@@ -123,4 +156,27 @@ permissionMode: dontAsk
 - 失敗の理由（preflight result / wrapper の `failure_reason` / `warnings`）
 - 推奨次アクション（人間判断 / 環境セットアップ / 代替手段）
 
-> 本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。`GEMINI_API_KEY` 未設定だけを根拠に委譲不可と判断しない。委譲可否は必ず `gemini-cli-headless-delegation` Workflow の setup_check / preflight 実行結果で判断し、preflight 未実行のまま「委譲不可」と推測しない。
+**MUST NOT（絶対禁止）**:
+
+- wrapper が `ok: false` を返した後、Read / Grep / Glob / Bash などの直接ツールで代替調査を行ってはならない。`disallowedTools` で技術的にブロック済みだが、Bash 経由での grep 等も同様に禁止する。
+- wrapper を呼ばずに「delegation 不要」「直接調査の方が早い」などと自己判断して、`gemini-cli-headless-delegation` を経由せず直接調査を行ってはならない。delegation は本 SubAgent の唯一の調査経路であり、その判断を SubAgent 側で変更することは禁止する。
+
+**`GEMINI_API_KEY` について**:
+
+> 本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。環境変数の有無だけを根拠に委譲不可と判断することを禁止する（`GEMINI_API_KEY` の設定状態は委譲可否の判断基準に含めない）。委譲可否は必ず `gemini-cli-headless-delegation` Workflow の setup_check / preflight 実行結果で判断し、preflight 未実行のまま「委譲不可」と推測しない。
+
+### Serena MCP 依存失敗の切り分け手順（`local_asset_research` モード）
+
+`local_asset_research` モードで wrapper が `ok: false` を返し、Serena MCP 依存の失敗が疑われる場合は以下の手順で切り分けてから呼び出し元に報告する:
+
+1. `setup_check.py --json` を実行して `serena_mcp` フィールドを確認する:
+   ```bash
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+   ```
+2. 出力 JSON の `serena_mcp` フィールドを確認する:
+   - `serena_mcp.ok: false` の場合: Serena MCP の設定・インストール問題が疑われる。`serena_mcp.recovery` フィールドに従って対処方法を呼び出し元に報告する。
+   - `serena_mcp.ok: true` の場合: Serena MCP 以外の要因（OAuth、trusted workspace 等）が原因の可能性が高い。wrapper の `failure_reason` / `warnings` を呼び出し元に報告する。
+3. 呼び出し元への報告内容:
+   - `setup_check.py --json` の出力（特に `serena_mcp` フィールドの値）
+   - wrapper の `failure_reason` と `warnings`
+   - `serena_mcp.ok` の真偽値と `recovery` フィールドの内容（存在する場合）
