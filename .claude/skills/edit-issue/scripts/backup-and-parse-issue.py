@@ -2,14 +2,20 @@
 """
 backup-and-parse-issue.py
 
-Issue 本文をバックアップし、JSON で stdout に返す。
+Issue 本文をバックアップし、metadata を JSON ファイルに保存する。
 バックアップはリポジトリルート配下の `tmp/` に保存する（システム /tmp/ は使わない）。
 
 Usage:
     uv run python3 backup-and-parse-issue.py <issue_number>
 
 Output (stdout):
-    {"issue_number": <int>, "backup_file": "<path>", "body": "<body text>"}
+    {"metadata_file": "tmp/issue_<N>_backup_<ts>.json"}
+
+Files written:
+    tmp/issue_<N>_backup_<ts>.md   — Issue body（全文）
+    tmp/issue_<N>_backup_<ts>.json — metadata {"issue_number": N, "repo": "owner/repo",
+                                      "backup_file": "tmp/...", "title": "..."}
+                                      ※ body フィールドは含まない（argv/shell サイズ制限回避）
 """
 
 import argparse
@@ -52,18 +58,20 @@ def get_repo_root() -> Path:
     return Path(result.stdout.strip())
 
 
-def fetch_body(issue_number: int, repo: str) -> str:
+def fetch_title_and_body(issue_number: int, repo: str) -> tuple[str, str]:
+    """Fetch both title and body in a single gh call to avoid extra round-trips."""
     result = subprocess.run(
         ["gh", "issue", "view", str(issue_number),
-         "--repo", repo, "--json", "body", "--jq", ".body"],
+         "--repo", repo, "--json", "title,body"],
         capture_output=True, text=True, check=True
     )
-    return result.stdout
+    data = json.loads(result.stdout)
+    return data["title"], data["body"]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backup GitHub Issue body and return as JSON"
+        description="Backup GitHub Issue body (and title) and return as JSON"
     )
     parser.add_argument(
         "issue_number",
@@ -80,19 +88,25 @@ def main() -> None:
     backup_file = backup_dir / f"issue_{issue_number}_backup_{ts}.md"
 
     repo = get_repo()
-    body = fetch_body(issue_number, repo)
+    title, body = fetch_title_and_body(issue_number, repo)
 
     backup_file.write_text(body, encoding="utf-8")
     if not backup_file.stat().st_size:
         print("[ERROR] Backup file is empty", file=sys.stderr)
         sys.exit(1)
 
-    output = {
+    # metadata ファイル（body は含まない — argv/shell サイズ制限回避）
+    metadata_file = backup_dir / f"issue_{issue_number}_backup_{ts}.json"
+    metadata = {
         "issue_number": issue_number,
+        "repo": repo,
         "backup_file": str(backup_file),
-        "body": body,
+        "title": title,
     }
-    print(json.dumps(output, ensure_ascii=False))
+    metadata_file.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+
+    # stdout には metadata_file パスのみ出力
+    print(json.dumps({"metadata_file": str(metadata_file)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
