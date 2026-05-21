@@ -225,7 +225,34 @@ helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--depende
 - sibling issue 間で「どちらを先にマージしないと次へ進めないか」を表したい場合は `issue dependencies` を使う
 - 単なる参考参照・closed precedent・将来候補の destination mapping だけで十分な場合は `sub-issues` / `issue dependencies` を増やさず、Issue 本文または comment に routing を残す
 
-**sub-issue 登録手順**:
+**`create_issue_txn.py` による自動 sub-issue 登録（スクリプト正本）**:
+
+`.claude/skills/create-issue/scripts/create_issue_txn.py` が sub-issue 登録の **script 正本** である。
+以下の規約に従って親子登録を自動実行する:
+
+1. **body-derived parent 抽出**: `--body-file` で渡された body の以下パターンから parent issue number を抽出する:
+   - `parent_issue: "#N"` / `parent_issue: "N"` / `parent_issue: N`（YAML front-matter 形式）
+   - `## Parent Issue\n\n#N` / `## Parent Issue\n\nN`（Markdown 見出し形式）
+   - `parent: #N` / `parent: N`（短縮形）
+   - `none` / `null` / `なし` / `N/A` は「親なし」として None を返す
+
+2. **`Depends on #N` は parent として解釈しない**: `Depends on #N` は dependency/blocker 表現であり、
+   MUST NOT parent issue として解釈すること。dependency 登録には `--dependency` / `--blocked-by` 引数を使う。
+
+3. **body と `--parent-issue` の照合（fail-closed）**: `--parent-issue` と body 内 parent が **矛盾した場合**、
+   issue 作成・dedupe reconcile の前に `TransactionError(stage="parent-arg-body-mismatch")` で **fail-closed** する。
+   矛盾 = 両方が指定されており、かつ番号が異なる場合。
+
+4. **422 idempotency（read-back 同一 parent のみ PASS）**: sub-issue POST が 422 を返した場合は、
+   `GET repos/{owner}/{repo}/issues/{child}/parent` で read-back を行い、
+   read-back の parent number == requested parent number の場合のみ `already_registered` として PASS。
+   それ以外（404・別 parent・empty）は `partial_failure` とする。
+   `replace_parent=true` は使わない。
+
+5. **dedupe 経路でも body 由来 parent を使用**: dedupe（同一タイトルの既存 issue が見つかった場合）でも、
+   body 由来 parent に基づく sub-issue 登録（idempotent）と parent read-back / reconcile が実行される。
+
+**sub-issue 登録手順（手動実行が必要な場合）**:
 
 ```bash
 # 1. child issue の整数 databaseId を GraphQL で取得
@@ -239,18 +266,18 @@ CHILD_DB_ID=$(gh api graphql -f query='
 }' --jq '.data.repository.issue.databaseId')
 
 # 2. parent issue に sub-issue として登録
-gh api repos/{owner}/{repo}/issues/{parent_number}/sub_issues -X POST -F sub_issue_id=$CHILD_DB_ID
+gh api repos/{owner}/{repo}/issues/{parent_number}/sub_issues --method POST -F sub_issue_id=$CHILD_DB_ID
 ```
 
 - `databaseId` 取得失敗時は POST に進まず fail-closed で停止
 - 既存 child issue の親が一致しているかを read-back で確認:
   ```bash
-  gh api repos/{owner}/{repo}/issues/{child_number}/parent --jq '.number'
+  gh api repos/{owner}/{repo}/issues/{child_number}/parent --method GET -H "Accept: application/vnd.github+json"
   ```
 - read-back が別の親を返した場合は `replace_parent=true` を使わず fail-closed で停止
 
 **責務分担**:
-- sub-issue の「登録手順」は本セクション（`create-issue`）が正本
+- sub-issue の「登録手順」と「body/arg 照合・422 idempotency」は本セクション（`create-issue`）が正本
 - sub-issue として「登録済みかを確認する方法（read-back 確認）」は `issue-contract-review` が正本
 
 ## Blocker / Blocked-by 設定手順
