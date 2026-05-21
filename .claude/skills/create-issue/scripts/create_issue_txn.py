@@ -26,8 +26,23 @@ from typing import Any, Literal
 
 
 # ---------------------------------------------------------------------------
-# Parent candidate dataclass (Blocker 1)
+# Parent resolution types (Blocker 1 tri-state)
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ParentResolution:
+    """Tri-state result of parent resolution from issue body.
+
+    state:
+      "absent"        — no parent_issue field found in body (treat like no input)
+      "explicit_none" — parent_issue declared as none/null/N/A/0 (no parent wanted)
+      "number"        — parent_issue declared as a positive integer
+    value: set only when state == "number"
+    """
+
+    state: Literal["absent", "explicit_none", "number"]
+    value: int | None = None  # state=="number" のときのみセット
+
 
 @dataclass(frozen=True)
 class ParentCandidate:
@@ -46,9 +61,13 @@ _HTTP_STATUS_RE = re.compile(r"(?im)^HTTP/\S+\s+(\d{3})\b")
 
 
 def _extract_http_status(text: str) -> int | None:
-    """Return the first HTTP status code found in text (from --include output)."""
-    m = _HTTP_STATUS_RE.search(text)
-    return int(m.group(1)) if m else None
+    """Return the last HTTP status code found in text (from --include output).
+
+    Uses the last match to handle redirect chains (e.g., 301 -> 201) where the
+    final response status is the authoritative one.
+    """
+    matches = list(_HTTP_STATUS_RE.finditer(text))
+    return int(matches[-1].group(1)) if matches else None
 
 
 class TransactionError(Exception):
@@ -399,74 +418,89 @@ def _collect_parent_candidates(body: str) -> list[ParentCandidate]:
 
     candidates: list[ParentCandidate] = []
 
-    # Pattern 1 (machine_contract): parent_issue: "#N" / parent_issue: "N" / parent_issue: N
-    for m in re.finditer(
-        r'(?i)^[ \t]*parent_issue\s*:\s*"?#?(\w+)"?\s*$',
-        body,
-        re.MULTILINE,
-    ):
-        raw = m.group(1).strip()
+    def _parse_raw_parent(raw_full: str, source: str) -> ParentCandidate:
+        """Parse a raw parent value string into a ParentCandidate.
+
+        Normalisation steps:
+          1. strip surrounding whitespace
+          2. strip surrounding quotes (single or double)
+          3. strip surrounding whitespace again
+
+        Numeric resolution:
+          - Bare `#N` or quoted `"#N"` -> strip `#` prefix and parse as integer.
+          - Bare `N` or quoted `"N"` -> parse as integer.
+          - Values in _PARENT_NONE (case-insensitive) -> explicit none (value=None).
+          - Otherwise -> malformed sentinel (value=-1).
+
+        Note on YAML comment ambiguity:
+          `#133` unquoted could be interpreted as a YAML comment, but in body
+          Markdown context (not strict YAML) we treat `#N` as a parent reference.
+        """
+        raw = raw_full.strip().strip("\"'").strip()
         raw_lower = raw.lower()
         if raw_lower in _PARENT_NONE:
-            candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=None))
-        else:
-            try:
-                candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=int(raw)))
-            except ValueError:
-                candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=-1))  # sentinel for malformed
+            return ParentCandidate(source=source, raw=raw, value=None)
+        # Try to parse as number (with optional leading #)
+        m_num = re.match(r'^#?(\d+)$', raw.strip())
+        if m_num:
+            return ParentCandidate(source=source, raw=raw, value=int(m_num.group(1)))
+        return ParentCandidate(source=source, raw=raw, value=-1)  # sentinel for malformed
+
+    # Pattern 1 (machine_contract): parent_issue: "#N" / parent_issue: "N/A" / parent_issue: N
+    # Regex captures the full value to end-of-line (after stripping YAML-comment portion for
+    # unquoted values). For quoted values, we capture up to the closing quote.
+    for m in re.finditer(
+        r'(?im)^[ \t]*parent_issue\s*:\s*(.+?)\s*$',
+        body,
+    ):
+        raw_full = m.group(1).strip()
+        # Strip inline YAML comment for unquoted values (e.g. "42 # comment" -> "42")
+        # But do NOT strip for quoted values (e.g. '"#133"' stays as-is).
+        if raw_full and raw_full[0] not in ('"', "'"):
+            # Remove YAML comment: everything from ` #` onward that is NOT part of a number
+            # Preserve bare `#N` patterns (treated as issue references).
+            comment_match = re.match(r'^(#?\d+|[^\s#].*?)\s*(#.*)?$', raw_full)
+            if comment_match:
+                raw_full = comment_match.group(1)
+        candidates.append(_parse_raw_parent(raw_full, "machine_contract"))
 
     # Pattern 2 (parent_heading): ## Parent Issue\n\n#N  or  ## Parent Issue\n\nN
     for m in re.finditer(
-        r'(?i)^##\s*Parent Issue\s*\n(?:\s*\n)*\s*#?(\w+)',
+        r'(?im)^##\s*Parent Issue\s*\n(?:\s*\n)*\s*(.+?)[ \t]*$',
         body,
-        re.MULTILINE,
     ):
-        raw = m.group(1).strip()
-        raw_lower = raw.lower()
-        if raw_lower in _PARENT_NONE:
-            candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=None))
-        else:
-            try:
-                candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=int(raw)))
-            except ValueError:
-                candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=-1))
+        raw_full = m.group(1).strip()
+        candidates.append(_parse_raw_parent(raw_full, "parent_heading"))
 
     # Pattern 3 (shorthand): parent: #N / parent: N  (but NOT "Depends on" lines)
     for line in body.splitlines():
         if re.search(r'(?i)depends\s+on', line):
             continue
-        m = re.match(r'(?i)^[ \t]*parent\s*:\s*#?(\w+)\s*$', line)
+        m = re.match(r'(?i)^[ \t]*parent\s*:\s*(.+?)\s*$', line)
         if m:
-            raw = m.group(1).strip()
-            raw_lower = raw.lower()
-            if raw_lower in _PARENT_NONE:
-                candidates.append(ParentCandidate(source="shorthand", raw=raw, value=None))
-            else:
-                try:
-                    candidates.append(ParentCandidate(source="shorthand", raw=raw, value=int(raw)))
-                except ValueError:
-                    candidates.append(ParentCandidate(source="shorthand", raw=raw, value=-1))
+            raw_full = m.group(1).strip()
+            candidates.append(_parse_raw_parent(raw_full, "shorthand"))
 
     return candidates
 
 
-def _extract_parent_issue_number_from_body(body: str) -> int | None:
-    """Extract parent issue number from issue body text.
+def _extract_parent_resolution_from_body(body: str) -> ParentResolution:
+    """Extract parent issue resolution (tri-state) from issue body text.
 
     Uses candidate collection (_collect_parent_candidates) and applies conflict
     detection rules:
-      - 0 candidates -> None (body_parent_absent)
-      - 1 candidate, valid number -> that number
-      - 1 candidate, explicit none/null -> None
+      - 0 candidates -> ParentResolution(state="absent")
+      - 1 candidate, valid number -> ParentResolution(state="number", value=N)
+      - 1 candidate, explicit none/null/N/A -> ParentResolution(state="explicit_none")
       - 1 candidate, malformed (non-integer, non-none) -> TransactionError(stage="parent-body-parse")
-      - Multiple candidates, all same number -> PASS (that number)
+      - Multiple candidates, all same number -> PASS (state="number", value=N)
       - explicit none + number mixed -> TransactionError(stage="parent-body-conflict")
       - multiple numbers that differ -> TransactionError(stage="parent-body-conflict")
     """
     candidates = _collect_parent_candidates(body)
 
     if not candidates:
-        return None
+        return ParentResolution(state="absent")
 
     if len(candidates) == 1:
         c = candidates[0]
@@ -476,7 +510,9 @@ def _extract_parent_issue_number_from_body(body: str) -> int | None:
                 message=f"parent expression in body is malformed (not a valid number): {c.raw!r}",
                 output=f"source={c.source} raw={c.raw!r}",
             )
-        return c.value  # None (explicit none) or int
+        if c.value is None:
+            return ParentResolution(state="explicit_none")
+        return ParentResolution(state="number", value=c.value)
 
     # Multiple candidates: check for conflicts.
     # Partition into "explicit none" and "numeric" groups (malformed = -1 is also a conflict).
@@ -514,34 +550,71 @@ def _extract_parent_issue_number_from_body(body: str) -> int | None:
                 ),
                 output=str([(c.source, c.raw, c.value) for c in candidates]),
             )
-        return number_candidates[0].value
+        return ParentResolution(state="number", value=number_candidates[0].value)
 
     # All candidates are explicit none -> no parent.
+    return ParentResolution(state="explicit_none")
+
+
+def _extract_parent_issue_number_from_body(body: str) -> int | None:
+    """Backward-compatible wrapper around _extract_parent_resolution_from_body.
+
+    Returns:
+      - None for absent or explicit_none states
+      - int for number state
+
+    NOTE: This wrapper loses the tri-state distinction. Use
+    _extract_parent_resolution_from_body() directly when you need to distinguish
+    "absent" from "explicit_none" (e.g. for CLI arg conflict detection).
+    """
+    resolution = _extract_parent_resolution_from_body(body)
+    if resolution.state == "number":
+        return resolution.value
     return None
 
 
-def _resolve_parent_issue_number(parent_arg: int, body_parent: int | None) -> int:
-    """Resolve the effective parent issue number from CLI arg and body-derived parent.
+def _resolve_parent_issue_number(parent_arg: int, body_resolution: ParentResolution) -> int:
+    """Resolve the effective parent issue number from CLI arg and body-derived resolution.
 
-    Rules:
-      - If both are provided and they disagree -> raise TransactionError (fail-closed).
-      - If only parent_arg is provided -> return parent_arg.
-      - If only body_parent is provided -> return body_parent.
-      - Neither -> return 0 (no parent).
+    Rules (tri-state):
+      body absent + parent_arg > 0  -> parent_arg (absent is neutral; CLI wins)
+      body absent + parent_arg == 0 -> 0 (no parent)
+      body explicit_none + parent_arg == 0  -> 0 (no parent; explicit none honoured)
+      body explicit_none + parent_arg > 0   -> TransactionError(stage="parent-arg-body-mismatch")
+      body number N + parent_arg == 0  -> N (body wins)
+      body number N + parent_arg == N  -> N (agreement)
+      body number N + parent_arg != N (and != 0) -> TransactionError(stage="parent-arg-body-mismatch")
     """
-    if parent_arg > 0 and body_parent is not None and parent_arg != body_parent:
-        raise TransactionError(
-            stage="parent-arg-body-mismatch",
-            message=(
-                f"--parent-issue {parent_arg} contradicts body parent #{body_parent}; "
-                "failing closed. Fix the body or omit --parent-issue."
-            ),
-            output=f"parent_arg={parent_arg} body_parent={body_parent}",
-        )
+    if body_resolution.state == "explicit_none":
+        if parent_arg > 0:
+            raise TransactionError(
+                stage="parent-arg-body-mismatch",
+                message=(
+                    f"--parent-issue {parent_arg} contradicts body parent_issue: none; "
+                    "failing closed. Remove --parent-issue or update body to declare a parent."
+                ),
+                output=f"parent_arg={parent_arg} body_resolution=explicit_none",
+            )
+        return 0
+
+    if body_resolution.state == "number":
+        body_number = body_resolution.value
+        if parent_arg > 0 and parent_arg != body_number:
+            raise TransactionError(
+                stage="parent-arg-body-mismatch",
+                message=(
+                    f"--parent-issue {parent_arg} contradicts body parent #{body_number}; "
+                    "failing closed. Fix the body or omit --parent-issue."
+                ),
+                output=f"parent_arg={parent_arg} body_parent={body_number}",
+            )
+        if parent_arg > 0:
+            return parent_arg
+        return body_number  # type: ignore[return-value]
+
+    # state == "absent": body has no parent declaration; CLI arg takes precedence
     if parent_arg > 0:
         return parent_arg
-    if body_parent is not None:
-        return body_parent
     return 0
 
 
@@ -1046,7 +1119,7 @@ def run_transaction(
 
     # --- Body-derived parent resolution (fail-closed before any GitHub mutation) ---
     try:
-        body_parent = _extract_parent_issue_number_from_body(_body_text_for_parent)
+        body_resolution = _extract_parent_resolution_from_body(_body_text_for_parent)
     except TransactionError as exc:
         return TransactionResult(
             status="failure",
@@ -1057,7 +1130,7 @@ def run_transaction(
             failure_message=exc.message,
         )
     try:
-        parent_issue_number = _resolve_parent_issue_number(parent_issue_number, body_parent)
+        parent_issue_number = _resolve_parent_issue_number(parent_issue_number, body_resolution)
     except TransactionError as exc:
         return TransactionResult(
             status="failure",
@@ -1109,9 +1182,10 @@ def run_transaction(
         dependency_verified = None
         dedupe_issue_url = f"https://github.com/{repo}/issues/{dedupe_number}"
 
-        # --- Blocker 4: dedupe body read-back for parent identity check ---
+        # --- Blocker 3 + 4: dedupe body read-back for parent identity check (fail-closed) ---
         # Read the existing issue's body and verify its parent doesn't conflict with resolved_parent.
         if parent_issue_number:
+            # Blocker 3: dedupe body read failure is fail-closed (not best-effort).
             try:
                 dedupe_issue_data = _run_gh_json(
                     [
@@ -1127,34 +1201,51 @@ def run_transaction(
                     ],
                     stage="dedupe-body-read",
                 )
-                existing_body = dedupe_issue_data.get("body") or ""
-                try:
-                    existing_body_parent = _extract_parent_issue_number_from_body(existing_body)
-                except TransactionError:
-                    existing_body_parent = None
-                # If existing issue body has a conflicting parent, fail-closed.
-                if existing_body_parent is not None and existing_body_parent != parent_issue_number:
-                    mismatch_exc = TransactionError(
-                        stage="dedupe-parent-mismatch",
-                        message=(
-                            f"dedupe issue #{dedupe_number} body declares parent #{existing_body_parent} "
-                            f"but current transaction resolved parent #{parent_issue_number}; "
-                            "failing closed to avoid link mutation."
-                        ),
-                        output=f"dedupe_number={dedupe_number} existing_body_parent={existing_body_parent} resolved_parent={parent_issue_number}",
-                    )
-                    return TransactionResult(
-                        status="failure",
-                        issue_number=dedupe_number,
-                        issue_url=dedupe_issue_url,
-                        completed_steps=dedupe_completed,
-                        failure_stage=mismatch_exc.stage,
-                        failure_message=mismatch_exc.message,
-                    )
-            except TransactionError:
-                # If we can't read the issue body, proceed conservatively (body check best-effort).
-                pass
-        # --- End Blocker 4 ---
+            except TransactionError as exc:
+                # Blocker 3 fix: fail-closed on dedupe body read failure.
+                return TransactionResult(
+                    status="failure",
+                    issue_number=dedupe_number,
+                    issue_url=dedupe_issue_url,
+                    completed_steps=dedupe_completed,
+                    failure_stage="dedupe-body-read",
+                    failure_message=exc.message,
+                )
+            existing_body = dedupe_issue_data.get("body") or ""
+            # Blocker 4: existing body parse error is fail-closed (not silenced).
+            try:
+                existing_body_resolution = _extract_parent_resolution_from_body(existing_body)
+            except TransactionError as exc:
+                # Blocker 4 fix: fail-closed on malformed existing body parent.
+                return TransactionResult(
+                    status="failure",
+                    issue_number=dedupe_number,
+                    issue_url=dedupe_issue_url,
+                    completed_steps=dedupe_completed,
+                    failure_stage="dedupe-parent-body-parse",
+                    failure_message=exc.message,
+                )
+            # If existing issue body has a conflicting parent, fail-closed.
+            existing_body_parent = existing_body_resolution.value if existing_body_resolution.state == "number" else None
+            if existing_body_parent is not None and existing_body_parent != parent_issue_number:
+                mismatch_exc = TransactionError(
+                    stage="dedupe-parent-mismatch",
+                    message=(
+                        f"dedupe issue #{dedupe_number} body declares parent #{existing_body_parent} "
+                        f"but current transaction resolved parent #{parent_issue_number}; "
+                        "failing closed to avoid link mutation."
+                    ),
+                    output=f"dedupe_number={dedupe_number} existing_body_parent={existing_body_parent} resolved_parent={parent_issue_number}",
+                )
+                return TransactionResult(
+                    status="failure",
+                    issue_number=dedupe_number,
+                    issue_url=dedupe_issue_url,
+                    completed_steps=dedupe_completed,
+                    failure_stage=mismatch_exc.stage,
+                    failure_message=mismatch_exc.message,
+                )
+        # --- End Blocker 3 + 4 ---
 
         try:
             reconcile_steps, parent_verified, dependency_verified = _reconcile_issue_links(

@@ -286,6 +286,8 @@ class TestBothPathsUseHelper:
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
         monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        # Mock _run_gh_json for dedupe-body-read stage (Blocker 3/4 fix requires this)
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": "", "number": 55})
 
         helper_calls: list[tuple[Any, ...]] = []
         original_helper = txn._readback_parent_issue_with_retry
@@ -622,34 +624,49 @@ class TestDependsOnNotParent:
 
 
 # ---------------------------------------------------------------------------
-# Issue #157 AC2: _resolve_parent_issue_number — fail-closed on mismatch
+# Issue #157 AC2: _resolve_parent_issue_number — fail-closed on mismatch (tri-state)
 # ---------------------------------------------------------------------------
 
 class TestResolveParentIssueNumber:
-    """AC2: CLI arg vs body parent mismatch triggers fail-closed TransactionError."""
+    """AC2: CLI arg vs body parent tri-state resolution triggers fail-closed TransactionError."""
 
-    def test_arg_only_returns_arg(self) -> None:
-        assert txn._resolve_parent_issue_number(42, None) == 42
+    def test_arg_only_absent_body_returns_arg(self) -> None:
+        # body absent + CLI 42 -> 42
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="absent")) == 42
 
-    def test_body_only_returns_body(self) -> None:
-        assert txn._resolve_parent_issue_number(0, 42) == 42
+    def test_body_number_only_returns_body(self) -> None:
+        # body number 42 + CLI 0 -> 42
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="number", value=42)) == 42
 
     def test_matching_arg_and_body_returns_arg(self) -> None:
-        assert txn._resolve_parent_issue_number(42, 42) == 42
+        # body number 42 + CLI 42 -> 42 (agreement)
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=42)) == 42
 
     def test_neither_returns_zero(self) -> None:
-        assert txn._resolve_parent_issue_number(0, None) == 0
+        # body absent + CLI 0 -> 0
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="absent")) == 0
 
     def test_mismatch_raises_transaction_error(self) -> None:
+        # body number 99 + CLI 42 -> mismatch
         with pytest.raises(txn.TransactionError) as exc_info:
-            txn._resolve_parent_issue_number(42, 99)
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=99))
         assert exc_info.value.stage == "parent-arg-body-mismatch"
 
     def test_mismatch_error_mentions_both_numbers(self) -> None:
         with pytest.raises(txn.TransactionError) as exc_info:
-            txn._resolve_parent_issue_number(10, 20)
+            txn._resolve_parent_issue_number(10, txn.ParentResolution(state="number", value=20))
         assert "10" in exc_info.value.message
         assert "20" in exc_info.value.message
+
+    def test_explicit_none_and_cli_zero_ok(self) -> None:
+        # body explicit_none + CLI 0 -> 0 (no parent; Blocker 1 case)
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="explicit_none")) == 0
+
+    def test_explicit_none_and_cli_parent_fails_closed(self) -> None:
+        # body explicit_none + CLI 42 -> mismatch (Blocker 1 case)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="explicit_none"))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +860,8 @@ class TestDedupePathParentReconcile:
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _capture_register)
         monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+        # Mock _run_gh_json for dedupe-body-read to return existing body with matching parent
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": 'parent_issue: "#42"', "number": 55})
 
         fake_sleep = FakeSleep()
         result = txn.run_transaction(
@@ -1216,3 +1235,153 @@ class TestCommandVectorChecks:
 
         post_args = captured_args[0]
         assert "replace_parent" not in " ".join(post_args), "POST must NOT include replace_parent"
+
+
+# ---------------------------------------------------------------------------
+# Iteration 2 new test cases
+# ---------------------------------------------------------------------------
+
+
+class TestParentResolutionTriState:
+    """Blocker 1 (iteration 2): tri-state ParentResolution distinguishes absent vs explicit_none."""
+
+    def test_explicit_none_and_cli_parent_fails_closed(self) -> None:
+        """body: parent_issue: none + --parent-issue 42 -> TransactionError(stage="parent-arg-body-mismatch")."""
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="explicit_none"))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+    def test_explicit_none_and_cli_zero_ok(self) -> None:
+        """body: parent_issue: none + --parent-issue 0 (omitted) -> 0 (no parent)."""
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="explicit_none")) == 0
+
+    def test_absent_and_cli_parent_uses_cli(self) -> None:
+        """body absent + --parent-issue 42 -> 42 (CLI wins; absent is neutral)."""
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="absent")) == 42
+
+    def test_number_and_cli_zero_uses_body(self) -> None:
+        """body number 42 + --parent-issue 0 (omitted) -> 42 (body wins)."""
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_number_and_cli_agree(self) -> None:
+        """body number 42 + --parent-issue 42 -> 42 (agreement)."""
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_number_and_cli_conflict_fails_closed(self) -> None:
+        """body number 42 + --parent-issue 99 -> mismatch error."""
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(99, txn.ParentResolution(state="number", value=42))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+
+class TestNAValueAsExplicitNone:
+    """Blocker 2 (iteration 2): N/A is recognized as explicit none."""
+
+    def test_na_value_is_explicit_none(self) -> None:
+        """body: parent_issue: "N/A" -> ParentResolution(state="explicit_none")."""
+        body = 'parent_issue: "N/A"'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_na_lowercase_is_explicit_none(self) -> None:
+        """body: parent_issue: n/a -> explicit_none."""
+        body = "parent_issue: n/a"
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_na_unquoted_returns_none_from_body(self) -> None:
+        """_extract_parent_issue_number_from_body with N/A returns None."""
+        body = 'parent_issue: "N/A"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_na_and_number_conflict_raises_body_conflict(self) -> None:
+        """body: parent_issue: "N/A" + ## Parent Issue #133 -> TransactionError(stage="parent-body-conflict")."""
+        body = 'parent_issue: "N/A"\n## Parent Issue\n\n#133'
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_resolution_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+
+class TestDedupeBodyReadFailClosed:
+    """Blocker 3 (iteration 2): dedupe body-read TransactionError fails closed."""
+
+    def test_dedupe_body_read_failure_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """dedupe-body-read TransactionError -> result.failure_stage == "dedupe-body-read"."""
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fail_on_body_read(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                raise txn.TransactionError(stage="dedupe-body-read", message="body read failed")
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fail_on_body_read)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-body-read"
+
+
+class TestDedupeExistingBodyMalformedParentFailClosed:
+    """Blocker 4 (iteration 2): dedupe existing body parse error fails closed."""
+
+    def test_dedupe_existing_body_malformed_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """existing body: parent_issue: "#abc" -> result.failure_stage in parent-body-parse / dedupe-parent-body-parse."""
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        # Return a body with malformed parent (#abc cannot be parsed as int)
+        monkeypatch.setattr(
+            txn,
+            "_run_gh_json",
+            lambda *_a, stage, **_k: {"body": 'parent_issue: "#abc"\n', "number": 55},
+        )
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage in {"parent-body-parse", "dedupe-parent-body-parse"}
+
+
+class TestExtractHttpStatusLastMatch:
+    """High (iteration 2): _extract_http_status returns the last status line."""
+
+    def test_extract_http_status_returns_last_match(self) -> None:
+        """Redirect chain: 301 -> 201 -> returns 201 (the last status)."""
+        text = "HTTP/2 301 Moved Permanently\r\n\r\nHTTP/2 201 Created\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 201
+
+    def test_extract_http_status_single_match(self) -> None:
+        """Single status line returns that status."""
+        text = "HTTP/1.1 200 OK\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 200
+
+    def test_extract_http_status_no_match_returns_none(self) -> None:
+        """No status line returns None."""
+        assert txn._extract_http_status("no status here") is None
+
+    def test_extract_http_status_422_last(self) -> None:
+        """Multiple status lines, last is 422."""
+        text = "HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 422 Unprocessable Entity\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 422
