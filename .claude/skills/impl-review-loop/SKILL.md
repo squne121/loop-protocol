@@ -1,6 +1,6 @@
 ---
 name: impl-review-loop
-description: implementation child issue を **実装→検証→PR レビュー** の 3 ステップループで自律完了させるオーケストレーター。Issue 番号を受け取り、pr-reviewer の LOOP_VERDICT が APPROVE になるまで反復する。`/impl-review-loop <N>` または「Issue ◯◯ をループで実装して」のトリガーで使う。issue-contract-review が完了した後に呼ぶ前提。
+description: implementation child issue を **実装→検証→PR レビュー** の 3 ステップループで自律完了させるオーケストレーター。Issue 番号を受け取り、pr-reviewer の LOOP_VERDICT が APPROVE になるまで反復する。`/impl-review-loop <N>` または「Issue ◯◯ をループで実装して」のトリガーで使う。着手条件（`issue-contract-review` の `status: go` / blocker・dependency 全 close / Allowed Paths 衝突なし / human escalation 条件非該当）を `docs/dev/workflow.md` の「Issue contract を作業計画の正本として扱う条件」セクションで確認してから呼ぶ。
 ---
 
 # Impl Review Loop
