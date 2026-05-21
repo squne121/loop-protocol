@@ -82,6 +82,7 @@ LOOP_STATE:
     required: false          # Step 1b のトリガー条件を満たしたか
     status: null             # ok | failed | skipped
     failure_class: null      # null | auth_error | capability_unavailable | query_error（status=failed 時のみ設定）
+    verification_route: null # null | grounded_research | direct_web | direct_cli | none
     result: null             # WEB_RESEARCH_RESULT_V1 または null
     failure_reason: null     # 失敗時のみ
     critical_claims: []      # Outcome / In Scope / AC を左右すると判断した主張リスト
@@ -271,7 +272,7 @@ inputs:
 SubAgent は `gemini-cli-headless-delegation`（`tool_profile: grounded_research`）経由で一次情報を事実確認し、`WEB_RESEARCH_RESULT_V1` 形式で返す。結果は Step 2 のレビュー材料および Step 4 の本文改善（誤った前提の訂正）に渡す。
 
 `WEB_RESEARCH_RESULT_V1` 受信後:
-1. `LOOP_STATE.web_research.status`、`failure_class`、`result` を更新する
+1. `LOOP_STATE.web_research.status`、`failure_class`、`verification_route`、`result` を更新する（`verification_route` は `WEB_RESEARCH_RESULT_V1.verification_route` の値をそのまま設定する）
 2. `web-researcher` が `status: ok` を返した場合: Step 2 へ進む
 3. `web-researcher` が `status: failed` を返した場合:
    - `LOOP_STATE.web_research.failure_class` に `WEB_RESEARCH_RESULT_V1.failure_class`（`auth_error | capability_unavailable | query_error`）を記録する
