@@ -81,6 +81,7 @@ LOOP_STATE:
   web_research:
     required: false          # Step 1b のトリガー条件を満たしたか
     status: null             # ok | failed | skipped
+    failure_class: null      # null | auth_error | capability_unavailable | query_error（status=failed 時のみ設定）
     result: null             # WEB_RESEARCH_RESULT_V1 または null
     failure_reason: null     # 失敗時のみ
     critical_claims: []      # Outcome / In Scope / AC を左右すると判断した主張リスト
@@ -270,10 +271,12 @@ inputs:
 SubAgent は `gemini-cli-headless-delegation`（`tool_profile: grounded_research`）経由で一次情報を事実確認し、`WEB_RESEARCH_RESULT_V1` 形式で返す。結果は Step 2 のレビュー材料および Step 4 の本文改善（誤った前提の訂正）に渡す。
 
 `WEB_RESEARCH_RESULT_V1` 受信後:
-1. `LOOP_STATE.web_research.status` と `result` を更新する
-2. `web-researcher` が `status: failed` を返した場合:
+1. `LOOP_STATE.web_research.status`、`failure_class`、`result` を更新する
+2. `web-researcher` が `status: ok` を返した場合: Step 2 へ進む
+3. `web-researcher` が `status: failed` を返した場合:
+   - `LOOP_STATE.web_research.failure_class` に `WEB_RESEARCH_RESULT_V1.failure_class`（`auth_error | capability_unavailable | query_error`）を記録する
    - **non-critical**（`LOOP_STATE.web_research.critical_claims` が空）: その旨を LOOP_STATE に記録し、外部仕様の事実確認なしで Step 2 へ進む
-   - **critical**（`critical_claims` に 1 件以上）: `termination_reason: human_escalation` で停止する（Outcome / In Scope / AC を左右する主張の裏付けなしに改善を続けない）
+   - **critical**（`critical_claims` に 1 件以上）: `termination_reason: human_escalation` で停止する（Outcome / In Scope / AC を左右する主張の裏付けなしに改善を続けない。`query_error` または fallback 失敗の場合も同様）
 
 > これは採用しない「spec document review」（= リポジトリ内 `docs/` の網羅レビュー）とは別物であり、外部 web 一次情報の事実確認に限定する。
 
