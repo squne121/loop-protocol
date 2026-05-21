@@ -18,6 +18,7 @@ AI エージェント・人間レビュアー双方が参照する。
 ### この文書が持たないもの
 
 - 個別 Issue のスコープ判断（各 Issue 本文・feature spec が正本）
+- 個別 Issue の Milestone 割り当て理由（parent issue comment・対象 milestone description・割当 Issue コメントに記録する。本文書に追記しない）
 - ラベル運用規約（`docs/dev/github-ops.md` が正本）
 - PR レビュー・マージ手順（`docs/dev/workflow.md` が正本）
 - ブランチ保護・権限設定（`docs/dev/github-ops.md` が正本）
@@ -45,7 +46,7 @@ AI エージェント・人間レビュアー双方が参照する。
 
 | 単位 | 責務 | 関係 |
 |---|---|---|
-| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は「割り当てた Issue がすべて close」または明示的な人間判断。 | Issue を `milestone` フィールドで紐づける |
+| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は「割り当てた Issue/PR が open 0 件」**かつ**人間の明示判断。 | Issue を `milestone` フィールドで紐づける |
 | **Parent Issue** | 機能・テーマ単位の追跡。child implementation issues を束ねる。`closure_mode` に従って close する。 | Milestone に割り当てられる / child issues を持つ |
 | **Implementation Issue** | 1 PR に対応する具体的な実装タスク。`## Allowed Paths` / `## Acceptance Criteria` を持つ。 | Parent Issue の sub-issue / Milestone に間接的に紐づく |
 | **PR** | Implementation Issue の成果物。`Closes #N` で Issue を close する。Milestone には直接紐づけない。 | Implementation Issue を close する |
@@ -85,10 +86,13 @@ AI エージェント・人間レビュアー双方が参照する。
 
 ## Close 条件
 
-Milestone を close するには以下の条件をすべて満たすこと:
+Milestone を close するには以下の条件を**すべて**満たすこと（AND 条件。OR ではない）:
 
-1. **割り当てた Issue がすべて close されている**  
-   `gh api repos/{owner}/{repo}/milestones/{milestone_number}` の `open_issues` が `0` であること
+1. **割り当てた Issue と直接紐づいた PR がすべて close されている**  
+   `gh api repos/{owner}/{repo}/milestones/{milestone_number}` の `open_issues` が `0` であること。  
+   かつ、PR 混入チェック（[3] 参照）で Milestone に直接紐づいた PR が存在しないこと。
+
+   > **例外**: open item を残して close する場合は、Milestone description または parent issue comment に除外理由を明示的に記録すること。この例外は人間のみ適用できる。
 
 2. **人間による意図的な判断がある**  
    Milestone の close は `scope` や `目標達成` の判断を含むため、AI エージェントが自動で close しない。  
@@ -108,17 +112,18 @@ Milestone の close は **人間の意思決定が必要** であり、AI エー
 
 ### RACI 定義
 
-| 操作 | AI エージェント（R/A） | 人間（A/C） |
-|---|---|---|
-| Milestone 作成 | **R**: `gh api` で作成を実行 | **A**: 目標・scope・命名の最終承認 |
-| Issue を Milestone に割り当て | **R**: `gh issue edit --milestone` で実行 | **C**: 割り当て方針の確認（例外時） |
-| Milestone 進捗 readback | **R**: API で `open_issues` / `closed_issues` を取得・報告 | **C**: 内容確認 |
-| 進捗 rollup コメント投稿 | **R**: Issue / PR にコメント投稿 | **I**: 通知受信 |
-| Milestone close | **I**: close 可能条件を人間に通知 | **A**: 最終判断・close 実行 |
-| Scope 変更（Issue の追加・除外） | **C**: 影響分析・提案 | **A**: 最終判断・実行 |
-| 破壊的変更（milestone 削除・rename） | **I**: 変更の影響を報告 | **A**: 実行・承認 |
+| 操作 | Responsible（実行者） | Accountable（最終責任者） | Consulted（相談先） | Informed（通知先） |
+|---|---|---|---|---|
+| Milestone 作成 | AI エージェント | 人間（目標・scope・命名の最終承認） | — | — |
+| Issue を Milestone に割り当て | AI エージェント | 人間 | 人間（例外時） | — |
+| Milestone 進捗 readback | AI エージェント | AI エージェント | 人間 | — |
+| 進捗 rollup コメント投稿 | AI エージェント | AI エージェント | — | 人間 |
+| Milestone close | 人間 | 人間 | AI エージェント | AI エージェント |
+| Scope 変更（Issue の追加・除外） | 人間（承認後） | 人間 | AI エージェント（影響分析） | — |
+| 破壊的変更（milestone 削除・rename） | 人間 | 人間 | — | AI エージェント |
 
 > R = Responsible（実行者）, A = Accountable（最終責任者）, C = Consulted（相談先）, I = Informed（通知先）
+> **Milestone close は人間が Responsible かつ Accountable。AI エージェントは close しない。**
 
 ### AI エージェント操作フロー（通常時）
 
@@ -131,12 +136,23 @@ Milestone の close は **人間の意思決定が必要** であり、AI エー
     └─ readback: 返却された number・id を記録
 
 [2] Issue を Milestone に割り当て
-    └─ gh issue edit {issue_number} --milestone {milestone_number} --repo {owner}/{repo}
+    # gh CLI 経由: --milestone は milestone の title/name を受け取る（number 不可）
+    └─ gh issue edit {issue_number} \
+         --milestone "<milestone_title>" \
+         --repo {owner}/{repo}
+    # REST API 経由: milestone フィールドは milestone の number（integer）を渡す
+    └─ gh api --method PATCH repos/{owner}/{repo}/issues/{issue_number} \
+         -f milestone={milestone_number}
     └─ readback: gh issue view {issue_number} --json milestone で確認
+    └─ readback で milestone が null の場合は silent drop — human escalation
 
 [3] 進捗 rollup
     └─ gh api repos/{owner}/{repo}/milestones/{milestone_number}
     └─ open_issues / closed_issues を取得
+    └─ PR 混入チェック: Milestone に PR が直接紐づいていないことを確認
+       gh api "repos/{owner}/{repo}/issues?milestone={milestone_number}&state=all&per_page=100" \
+         --jq '.[] | select(.pull_request != null) | {number, title, state, html_url}'
+       出力が非空の場合は human escalation（PR 直接紐づけ禁止の運用不変条件違反）
     └─ 関連 Issue にコメント投稿（github-ops.md の Body File Guidance に従う）
 
 [4] open_issues: 0 を検知したら人間に通知
@@ -195,8 +211,14 @@ gh api --method POST repos/{owner}/{repo}/milestones \
   -f title="M1: Foundation Gate (v0.1.x)" \
   -f description="開発基盤・運用ルール・最小仕様正本を固めるフェーズ"
 
-# Issue を Milestone に割り当て（gh issue edit 経由）
-gh issue edit {issue_number} --milestone {milestone_number} --repo {owner}/{repo}
+# Issue を Milestone に割り当て（gh CLI 経由: --milestone は title/name を渡す）
+gh issue edit {issue_number} \
+  --milestone "<milestone_title>" \
+  --repo {owner}/{repo}
+
+# Issue を Milestone に割り当て（REST API 経由: milestone フィールドは number を渡す）
+gh api --method PATCH repos/{owner}/{repo}/issues/{issue_number} \
+  -f milestone={milestone_number}
 
 # Milestone 進捗確認
 gh api repos/{owner}/{repo}/milestones/{milestone_number} \
