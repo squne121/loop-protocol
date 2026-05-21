@@ -31,14 +31,56 @@ fix_delta:
 # LOOP_STATE を最終 YAML として会話履歴に記録
 # PR は人間がマージ判断（orchestrator はマージしない）
 
-# Issue コメントで終了報告
+# Issue コメントで終了報告（機械可読フィールドを含む）
 gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +%Y-%m-%dT%H:%M:%SZ))
 
 - iteration: <最終 iteration 数>
 - verdict: APPROVE
 - PR: <PR URL>
-- 次アクション: 人間レビュー → マージ → post-merge-cleanup"
+- 次アクション: 人間レビュー → マージ → post-merge-cleanup
+
+\`\`\`yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: \"...\"
+      issue_number: 123
+      issue_url: \"https://github.com/...\"
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+
+  note_only_observations:
+    - dedupe_key: \"...\"
+      source_url: \"...\"
+      source_note_id: \"...\"
+      summary: \"...\"
+\`\`\`"
 ```
+
+### APPROVE 時の follow-up Issue 自動起票
+
+`LOOP_VERDICT.follow_up_issue_requests` が空でない場合、main thread は APPROVE 確定直後に各リクエストを `issue-author` SubAgent に委譲して `create-issue` 経由で **即時自動起票** する。
+
+**mandatory_follow_up の処理タイミング**: `severity: mandatory_follow_up` のリクエストは APPROVE 確定**前**に create/reuse する。未 materialize の状態で APPROVE してはならない。
+
+pr-review-judge が `LOOP_VERDICT` の `follow_up_issue_requests` フィールドに格納した non-blocker NOTE（任意改善提案・観察事項）が起票対象となる。詳細スキーマは `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照。
+
+```
+for each req in LOOP_VERDICT.follow_up_issue_requests:
+  - severity: mandatory_follow_up → APPROVE 前に必ず起票（dedupe_key チェック後）
+  - severity: optional_follow_up → APPROVE 後に dedupe_key チェック後、重複なければ起票
+  - severity: note_only → 起票せず、終了報告コメントの note_only_observations に記録
+
+  dedupe チェック（severity: mandatory_follow_up / optional_follow_up）:
+    gh issue list --repo squne121/loop-protocol --state all \
+      --search '"<req.dedupe_key>"' --json number,title,url,state,stateReason,labels
+    重複あり（open）→ スキップ（既存 Issue 番号を記録、status: reused_open）
+    重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
+    重複あり（closed / completed）→ 起票せずスキップ（status: skipped_closed_completed）
+    重複あり（closed / duplicate）→ 起票せずスキップ（status: skipped_closed_duplicate）
+    重複なし → 起票（## Source セクションに dedupe_key を含める）
+    ※ closed Issue を open に差し戻す場合は human escalation が必要（自動起票不可）
+```
+
+起票・スキップした follow-up Issue の情報を終了報告コメントの `follow_up_issues` フィールドに列挙する。
 
 ## 終了処理（max_iterations）
 

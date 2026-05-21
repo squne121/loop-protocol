@@ -284,6 +284,20 @@ blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
+follow_up_issue_requests:
+  - title: "<follow-up タイトル>"
+    issue_kind: implementation | research | parent
+    severity: mandatory_follow_up | optional_follow_up | note_only
+    source:
+      kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
+      url: "<PR コメント URL または PR URL>"
+      note_id: "<Non-blockers セクション内の通し番号（1-indexed）>"
+    dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+    desired_destination: "<この Issue を解決したあとの状態（Outcome 1文）>"
+    validated_scope_delta: "<create-issue に渡す In Scope の概要>"
+    origin_skill: pr-review-judge
+    labels:
+      - triage-required
 ```
 ````
 
@@ -292,6 +306,7 @@ reviewed_head_sha: <SHA>
 1. `reviewed_head_sha` は YAML ブロック **内** に記載する（外側は禁止）
 2. コメント本文全体で `reviewed_head_sha:` 行は 1 つだけ（複数だと parse が最初の行のみ採用）
 3. コードフェンス（` ``` `）は `\` でエスケープしない（heredoc 内でもそのまま書く）
+4. `follow_up_issue_requests` は non-blocker observations を構造化したフィールド。pr-review-judge は **起票を実行しない**。起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
 
 ## Stop Conditions
 
@@ -306,6 +321,22 @@ reviewed_head_sha: <SHA>
 - Evidence 不足を「雰囲気」で通さない
 - self-authored PR では `gh pr review --approve` / `--request-changes` を使わない（必ず `--comment`）
 - 曖昧な場合は APPROVE せず REQUEST_CHANGES（fail-closed）
+
+### mandatory_follow_up_gate
+
+```yaml
+mandatory_follow_up_gate:
+  rule: |
+    LOOP_VERDICT.follow_up_issue_requests に severity: mandatory_follow_up が含まれ、
+    かつ materialization.status: missing の場合は APPROVE を出力しない。
+    代わりに REQUEST_CHANGES を出力し、blocker として記録する。
+  action: REQUEST_CHANGES
+  blocker_message: |
+    mandatory_follow_up Issue が未 materialize です。
+    APPROVE 確定前に該当 Issue を create または reuse してください（impl-review-loop Step 5 が担当）。
+```
+
+pr-review-judge 自身は **Issue 起票を実行しない**。`follow_up_issue_requests` を `LOOP_VERDICT` に出力し、起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
 
 ## Output Contract
 

@@ -126,6 +126,158 @@ SubAgent（役割）── Skill（作業手順）
 | `test-runner` | `immediate` の VC スクリプトを実行し、exit code と証跡を `TEST_VERDICT_MACHINE` に統合する。SKIP exit 77 を検知して `stop_condition_triggered: true` を返す |
 | `pr-reviewer` | `immediate` で証跡なし / SKIP のみ / fallback PASS の場合は APPROVE しない。`deferred` は後続 Issue 参照の有無を確認する |
 
+## Issue / PR を主インターフェースとする原則
+
+AI エージェントと人間のコミュニケーションは **Issue / PR を主インターフェース（primary interface）** として行う。
+
+- エージェントのアクション（起票・コメント・ラベル更新）は Issue / PR 上に記録され、人間が追跡・取消可能。
+- Skill / SubAgent が生成した観察・提案は、最終的に **Issue として具体化（materialize）** することで人間可視な形で管理する。
+- 不要な Issue は **triage モデル** に従って処理する（後述）。
+
+### triage モデル（不要なら close）
+
+自動起票した follow-up Issue はすべて `triage-required` ラベルを付与して起票する。
+人間または AI エージェントが triage した後、不要と判断した Issue は `not planned` で close する。
+triage せずに積まれた Issue は定期 triage セッション（または `state/needs-human` エスカレーション）で処理する。
+
+| triage 結果 | アクション |
+|---|---|
+| 有効な改善 | `triage-required` を外し、適切な `phase/` ラベルを付与して `state/queued` に移行 |
+| 重複 | 既存 Issue にコメントして close（`duplicate` ラベル） |
+| 不要 | `not planned` で close（理由をコメントに記録） |
+| 判断保留 | `state/needs-human` を付与して人間判断を仰ぐ |
+
+## Follow-up Materialization Policy
+
+### FOLLOW_UP_ISSUE_REQUEST_V1
+
+Skill / SubAgent が「後で Issue にすべき観察」を main thread に返す際に使う構造化スキーマ。
+main thread（impl-review-loop Step 5 / post-merge-cleanup 等）が受け取り、`issue-author` / `create-issue` 経由で起票責務を担う。
+
+```yaml
+FOLLOW_UP_ISSUE_REQUEST_V1:
+  title: "<起票する Issue のタイトル候補>"
+  issue_kind: implementation | research | parent
+  severity: mandatory_follow_up | optional_follow_up | note_only
+  source:
+    kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
+    url: "<観察元の PR / コメント / Issue URL>"
+    note_id: "<観察元ドキュメント内の通し番号（1-indexed）>"
+  dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+  desired_destination: "<この Issue を解決したあとの状態（Outcome 1文）>"
+  validated_scope_delta: "<create-issue に渡す In Scope の概要>"
+  origin_skill: impl-review-loop | post-merge-cleanup | issue-refinement-loop | pr-review-judge
+  labels:
+    - triage-required  # 必須
+    # 追加ラベル（docs, chore 等はここに入れる）
+  initial_label_profile: triage_only | standard  # デフォルト: triage_only
+  materialization:
+    required_before_approve: true | false  # severity: mandatory_follow_up の場合 true
+    existing_issue_url: null | "https://github.com/..."
+    status: already_materialized | missing
+```
+
+**フィールド定義**:
+
+| フィールド | 説明 |
+|---|---|
+| `title` | 起票候補タイトル（main thread が調整してよい） |
+| `issue_kind` | `implementation`（実装）/ `research`（調査）/ `parent`（サブ Issue 親）。`docs`/`chore` 等は `labels` に入れる |
+| `severity` | `mandatory_follow_up`（必ず起票）/ `optional_follow_up`（重複なければ起票）/ `note_only`（起票せず終了報告コメントに記録のみ） |
+| `source.kind` | 観察元の種別（`pr_body` / `pr_review` / `issue_comment` / `post_merge_cleanup` / `refinement`） |
+| `source.url` | 観察元の URL（PR URL、コメント URL 等） |
+| `source.note_id` | 観察元ドキュメント内での通し番号（dedupe_key 生成に使用） |
+| `dedupe_key` | 重複起票防止キー。形式: `follow-up:<repo>:<source-url-or-pr>:<note-id-or-hash>` |
+| `desired_destination` | create-issue skill の handoff で必須。Outcome 1 文で書く |
+| `validated_scope_delta` | create-issue の handoff で必須。変更範囲の概要 |
+| `origin_skill` | どの skill が生成したかを追跡するためのフィールド |
+| `labels` | `triage-required` を必ず含める。`docs`/`chore` 等はここに追加 |
+| `initial_label_profile` | `triage_only`（デフォルト）: `triage-required` のみ付与し `state/queued` / `phase/implementation` / `agent/implementer` は付けない。`gh issue create` を直接使う。`standard`: create-issue skill の標準フローを使う（implementation Issue の通常起票） |
+| `materialization.required_before_approve` | `severity: mandatory_follow_up` の場合 `true`。APPROVE 確定前に Issue を create または reuse する必要があることを示す |
+| `materialization.existing_issue_url` | 既に materialize 済みの Issue URL。`null` は未 materialize |
+| `materialization.status` | `already_materialized`（起票済み）/ `missing`（未起票・APPROVE 不可） |
+
+**initial_label_profile に応じた起票フロー**:
+
+```
+initial_label_profile: triage_only（デフォルト）の場合:
+  - create_issue_txn.py は使わず gh issue create を直接実行
+  - 付与ラベル: triage-required + labels フィールドの内容のみ
+  - state/queued / phase/implementation / agent/implementer は付与しない
+
+initial_label_profile: standard の場合:
+  - create-issue skill を通常フローで実行
+  - create_issue_txn.py を通じた標準ラベル付与を行う
+```
+
+> NOTE: `triage_only` が自動起票の標準プロファイルである。`create_issue_txn.py` は現時点で `--label-profile triage-only` オプションを持たないため、`triage_only` の場合は `gh issue create` を直接使う。将来的に `create_issue_txn.py` に `--label-profile triage-only` を追加することが mandatory_follow_up Issue として起票予定である。
+
+**severity に応じた action**:
+
+```yaml
+severity_actions:
+  mandatory_follow_up:
+    action: create_or_reuse_issue_before_approve
+    note: "APPROVE 確定前に Issue を create または reuse する。未 materialize の場合は APPROVE しない"
+  optional_follow_up:
+    action: create_or_reuse_issue_at_loop_termination
+    note: "ループ終了時（APPROVE 後）に dedupe チェックして起票"
+  note_only:
+    action: record_only_no_issue
+    note: "起票せず終了コメントの note_only_observations に記録"
+```
+
+**follow-up Issue 本文の `## Source` セクション（自動起票 Issue 必須）**:
+
+```markdown
+## Source（自動起票 Issue 必須セクション）
+
+- origin_skill: <origin_skill>
+- source_url: <source.url>
+- source_note_id: <source.note_id>
+- dedupe_key: <dedupe_key>
+```
+
+**dedupe フロー**:
+
+```
+for each request:
+  1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
+     gh issue list --repo <owner>/<repo> --state all \
+       --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
+  2. 重複なし → issue-author SubAgent に委譲して create-issue 経由で起票
+     ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
+  3. 重複あり（open）→ スキップ（既存 Issue 番号をレポートに記録、status: reused_open）
+  4. 重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
+  5. 重複あり（closed / completed）→ 起票せずスキップ（status: skipped_closed_completed）
+  6. 重複あり（closed / duplicate）→ 起票せずスキップ（status: skipped_closed_duplicate）
+  ※ closed Issue を open に差し戻して再利用する場合は human escalation が必要（自動起票不可）
+```
+
+**FOLLOW_UP_MATERIALIZATION_RESULT_V1**（各 skill の終了コメントで共通参照するスキーマ）:
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+      issue_number: 123 | null
+      issue_url: "https://github.com/..." | null
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+  note_only_observations:
+    - dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+      source_url: "<観察元の URL>"
+      source_note_id: "<note_id>"
+      summary: "<観察内容の要約>"
+```
+
+各 skill（`impl-review-loop` Step 5 / `post-merge-cleanup` / `issue-refinement-loop`）の終了コメントは本スキーマを参照して `follow_up_issues` と `note_only_observations` を報告する。
+
+**責務境界**:
+
+- `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。
+- `post-merge-cleanup-worker`: `follow_up_issue_requests` を `FOLLOW_UP_ISSUE_REQUEST_V1[]` として列挙して返す。**Issue 起票は行わない**。
+- main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
+
 ## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け
