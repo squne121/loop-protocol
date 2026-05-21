@@ -167,6 +167,28 @@ branch protection が設定されている限り、エージェントが `git pu
 これらのコマンドが毎回確認プロンプトを要求すると worktree 作成フローが中断される。
 副作用リスクは低く（ローカル git 操作のみ）、`allow` で問題ない。
 
+## main ブランチ branch protection 設定状況
+
+確認日時: 2026-05-21
+
+確認コマンド:
+
+```bash
+gh api repos/squne121/loop-protocol/branches/main/protection
+```
+
+設定済み項目:
+
+| 項目 | 値 |
+|---|---|
+| `required_pull_request_reviews.dismiss_stale_reviews` | `true` |
+| `required_pull_request_reviews.required_approving_review_count` | `0` |
+| `allow_force_pushes.enabled` | `false` |
+| `required_status_checks` | `typecheck` / `lint` / `test` / `build`（strict: true） |
+| `allow_deletions.enabled` | `false` |
+
+`git push --force` は GitHub 側でブロックされる。これは `.claude/settings.json` の `git push *` を allow 設定しても、GitHub リモートが force push を拒否することを意味する。AI エージェントが誤って force push を試みた場合でも、リポジトリ保護が維持される。
+
 ## .claude/settings.local.json 個人用設定例
 
 `.claude/settings.local.json` は **個人ローカル設定** であり、リポジトリには含めない（`.gitignore` で除外済み）。下記を個人用に配置することで Bash 系の追加許可を適用できる。
