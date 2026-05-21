@@ -12,14 +12,25 @@
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git branch *)",
-      "Bash(git log *)"
-    ],
-    "ask": [
+      "Bash(git log *)",
       "Bash(git push *)",
       "Bash(git commit *)",
+      "Bash(git worktree *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
       "Bash(gh issue edit *)",
-      "Bash(gh pr merge *)"
+      "Bash(gh issue create *)",
+      "Bash(gh issue close *)",
+      "Bash(gh issue comment *)",
+      "Bash(gh issue view *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr review *)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr view *)",
+      "Bash(gh api *)"
     ],
+    "ask": [],
     "deny": [
       "Write(assets/**)",
       "Edit(assets/**)",
