@@ -1,15 +1,18 @@
-# ACP Transport Reference (experimental — read-only)
+# ACP Transport Reference (experimental)
 
 ACP (Agent Client Protocol) transport for gemini-cli-headless-delegation.
 Implementation: `.claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_acp.py`
 
 Reference: https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md
 
-**Status: experimental, read-only transport.** This transport declares a
-read-only `clientCapabilities` (no filesystem proxy, no terminal proxy) at
-`initialize` time — see "Capability / Safety boundary" below. It does **not**
-implement an `fs` / `terminal` proxy. The agent cannot perform host filesystem
-or terminal I/O through this client.
+**Status: experimental.** This transport declares `clientCapabilities` with
+`fs=false` / `terminal=false` at `initialize` time. The precise meaning is
+narrow: **this ACP client does not provide an ACP client-side `fs` / `terminal`
+proxy** (no `readTextFile` / `writeTextFile` / terminal RPC handlers). It does
+**not** mean that Gemini CLI is unable to touch the host: Gemini CLI's own
+native tool registry, `cwd`-resolved MCP servers from `.gemini/settings.json`,
+and `approvalMode` are **not controlled by this transport**. See
+"Capability scope" and "Known limitations" below.
 
 ---
 
@@ -69,10 +72,20 @@ whose `params.update.sessionUpdate` field carries a snake_case event name
 (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`).
 These are collected into the result's `structured_events` list.
 
-A session is only `ok: true` when the final id-matching `session/prompt`
-response was received, the process exited with returncode 0, and a `sessionId`
-was obtained. An EOF or process death before the final response is reported as
-`failure_class: "protocol_error"` — it is never treated as success.
+A session is only `ok: true` when **all** of the following hold:
+
+1. transport-level success (`transport_ok`): the final id-matching
+   `session/prompt` response was received, the process exited with returncode
+   `0`, and a `sessionId` was obtained;
+2. the final response's `stopReason` is `"end_turn"`;
+3. `response_text` (whitespace-trimmed) is non-empty.
+
+An EOF or process death before the final response is reported as
+`failure_class: "protocol_error"` — never success. A transport-level success
+that ends with a non-`end_turn` `stopReason` or an empty response is reported as
+`failure_class: "incomplete_response"` — also not a success. The result carries
+both `transport_ok` (condition 1 only) and `stop_reason` so callers can tell the
+two apart.
 
 ---
 
@@ -100,10 +113,9 @@ activating the `subsequent_idle` stage.
 
 ---
 
-## Capability / Safety boundary (capability / 安全境界)
+## Capability scope (capability scope / 能力範囲)
 
-**The safety boundary is the read-only `clientCapabilities` declaration**, not
-the permission handler. At `initialize` the client sends:
+At `initialize` the client sends:
 
 ```json
 {
@@ -115,35 +127,65 @@ the permission handler. At `initialize` the client sends:
 }
 ```
 
-This tells the agent that the client provides **no filesystem proxy** and **no
-terminal proxy**. Host filesystem reads/writes and terminal command execution
-through the client are not available. This is the authoritative boundary of the
-read-only ACP transport.
+**What this declaration means (and only this):** this ACP **client** does not
+provide an ACP client-side filesystem proxy (`fs.readTextFile` /
+`fs.writeTextFile`) and does not provide an ACP client-side terminal proxy
+(`terminal`). The agent cannot ask *this client* to read/write host files or run
+host terminal commands *on its behalf via the ACP fs/terminal RPCs*.
+
+**What this declaration does NOT mean:** it does **not** disable Gemini CLI's own
+host I/O. Gemini CLI still has:
+
+- its **native tool registry** (file tools, shell tool, etc.), which is not
+  governed by ACP `clientCapabilities`;
+- **MCP servers** loaded from the settings discovered at `cwd`
+  (`.gemini/settings.json`), which can grant additional capabilities;
+- an **`approvalMode`** that this transport currently sends as `"default"`
+  (see "session/new" below) — tools are therefore **active**, not disabled.
+
+In other words, `fs=false` / `terminal=false` removes one specific path
+(client-provided proxies); it is **not** a complete sandbox for the agent's host
+access. The end-to-end safety boundary design for ACP delegation
+(native-tool gating, MCP allowlist, `approvalMode` policy) is **deferred to
+follow-up #112** and is **not** finalized in this PR.
+
+### `session/new` sends `approvalMode: "default"`
+
+This transport currently sends `approvalMode: "default"` in `session/new`. Under
+`"default"`, Gemini CLI's tools and permission requests are **active** — the
+agent may attempt tool calls and the host may issue `session/request_permission`
+requests. Changing `approvalMode` (e.g. to a plan-only / read-only mode) is in
+scope for **#112**, not this PR.
 
 ### Permission handler — best-effort secondary defence
 
 `run_gemini_acp.py` additionally implements `handle_request_permission()` /
 `handle_session_request_permission()`, controlled by the `approve_edits` flag
-(`--approve-edits` CLI flag, `approve_edits=True` API arg, or
-`"approve_edits": true` in the request JSON). When `approve_edits` is false
-these handlers select the reject/cancel option for write-type permission
-requests.
+(`--approve-edits` CLI flag or `approve_edits=True` API arg). When `approve_edits`
+is false these handlers select the reject/cancel option for write-type
+permission requests.
 
-This permission handler is **best-effort defence in depth, not the safety
-boundary**. It is retained because removing it would break existing tests and
-callers, and because it provides a clear deny signal in
-`structured_events`. It must not be relied on as the mechanism that prevents
-writes — the read-only `clientCapabilities` declaration does that.
+This permission handler is **best-effort defence in depth**. It only sees the
+permission requests the agent actually routes through `session/request_permission`;
+it does not gate the native tool registry or MCP servers directly. It provides a
+clear deny signal in `structured_events` and is retained because removing it
+would break existing tests and callers.
 
 Write operation types the handler recognises (`WRITE_PERMISSION_TYPES`):
 `write_file`, `edit_file`, `create_file`, `delete_file`, `run_shell_command`,
 `execute_code`.
 
-### Non-goal
+### Known limitations / non-goals (この PR の非ゴール)
 
-An `fs` / `terminal` proxy that would let the agent perform host I/O through
-this client is explicitly **out of scope** for this transport. The transport is
-read-only by design.
+- An ACP client-side `fs` / `terminal` proxy is **out of scope** for this
+  transport — declared `false` by design.
+- **Native tool registry / MCP `cwd` resolution / `approvalMode` design** are
+  **not** controlled by this transport. A coherent safety-boundary design for
+  ACP delegation is deferred to **follow-up #112**.
+- **Real Gemini CLI runtime verification evidence** (live scenario 1 against a
+  real `gemini` binary, captured artifacts) is deferred to **follow-up #113**.
+  CI runs `verify_acp_roundtrip.sh` as SKIP (exit 77) when `gemini` is absent;
+  deterministic coverage uses a fake ACP agent.
 
 ---
 
@@ -165,8 +207,10 @@ site sets a `failure_class`:
 | `session_new_failed` | session/new timeout / EOF / error | yes |
 | `prompt_error` | session/prompt returned an error | no (late) |
 | `protocol_error` | EOF before final session/prompt response | no (late) |
+| `incomplete_response` | transport ok but non-`end_turn` stopReason / empty response | no (late) |
 | `timeout` | total timeout exceeded | no (late) |
 | `watchdog` | heartbeat watchdog tripped | no (late) |
+| `contract_bypass` | `run_acp()` called without `prepared_prompt` | no (refused) |
 
 `run_acp()` falls back when `failure_class` is one of
 `{gemini_not_found, launch_failed, initialize_failed, session_new_failed}`. The
@@ -175,7 +219,11 @@ site sets a `failure_class`:
 Non-fallback failures (late failures, treated as final):
 - `prompt_error` — the agent responded but returned an error.
 - `protocol_error` — EOF / process death before the final response.
+- `incomplete_response` — transport succeeded but the session ended with a
+  non-`end_turn` `stopReason` or an empty `response_text`.
 - `timeout` / `watchdog` — stalls after the session was established.
+- `contract_bypass` — `run_acp()` was called without a `prepared_prompt`; the
+  call is refused before any session starts (always route via `run_delegation()`).
 
 When fallback fires:
 1. `_fallback_to_headless_json(request, request_path, failure_reason)` is called.
@@ -187,10 +235,13 @@ The dispatcher in `run_gemini_headless.py` is re-entrant: the fallback call uses
 `transport="headless_json"` (or absent), which skips the acp branch and runs the
 standard headless_json pathway without recursion.
 
-Known gemini-cli bugs that trigger early failure detection (preflight signals):
-- Bug #12042 (auth hang): stderr contains `"refreshing credentials"` or `"waiting for auth"`
-- Bug #22782 (initialize hang): no initialize response within CONNECT_TIMEOUT_SEC
-- Bug #18423 (settings hang): stderr contains `"reading settings"` or `"loading settings"`
+Known gemini-cli bugs that trigger early failure detection (preflight signals).
+Each stderr signature is deliberately specific — the bug number or a distinctive
+multi-word phrase — so normal logs that merely mention `initialize` or
+`settings.json` do not misfire:
+- Bug #12042 (auth hang): stderr contains `#12042`, `"refreshing credentials timed out"`, or `"waiting for auth token refresh"`
+- Bug #22782 (initialize hang): stderr contains `#22782`, `"initialize request never returned"`, or `"protocol handshake stalled"` (also: no initialize response within CONNECT_TIMEOUT_SEC)
+- Bug #18423 (settings hang): stderr contains `#18423`, `"settings.json parsing hang"`, or `"loading settings never completed"`
 
 When a known bug is detected in stderr, the process is killed immediately (fail-closed).
 
@@ -254,9 +305,11 @@ It issues a `session/request_permission` request and the run is executed without
 The scenario 2 invocation is wrapped in an `if` so a non-zero exit does not
 abort the script under `set -e`.
 
-Note: scenario 2 exercises the best-effort permission handler. The authoritative
-safety boundary is the read-only `clientCapabilities` declaration (see the
-Capability / Safety boundary section).
+Note: scenario 2 exercises the best-effort permission handler only. It does not
+prove a complete sandbox — the `clientCapabilities` declaration only disables
+ACP client-provided fs/terminal proxies, not Gemini CLI's native tools / MCP /
+`approvalMode`. See the "Capability scope" and "Known limitations / non-goals"
+sections; the full safety-boundary design is deferred to follow-up #112.
 
 ### Fallback Detection
 

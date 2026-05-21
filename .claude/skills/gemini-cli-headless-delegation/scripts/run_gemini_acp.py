@@ -44,11 +44,27 @@ INITIALIZE_HANG_BUG = "#22782"
 # Symptom: no output at all, settings load never completes
 SETTINGS_HANG_BUG = "#18423"
 
-# stderr patterns that indicate each known bug
+# stderr patterns that indicate each known bug.
+# Patterns must be specific enough not to misfire on normal logs: a bare word
+# like "initialize" or "settings.json" appears in healthy output too, so each
+# signature uses the bug number or a distinctive multi-word phrase instead.
 _KNOWN_BUG_STDERR_PATTERNS: dict[str, list[str]] = {
-    AUTH_HANG_BUG: ["refreshing credentials", "waiting for auth", "oauth token"],
-    INITIALIZE_HANG_BUG: ["initialize", "protocol handshake"],
-    SETTINGS_HANG_BUG: ["reading settings", "loading settings", "settings.json"],
+    AUTH_HANG_BUG: [
+        AUTH_HANG_BUG,
+        "refreshing credentials timed out",
+        "waiting for auth token refresh",
+        "oauth token refresh hang",
+    ],
+    INITIALIZE_HANG_BUG: [
+        INITIALIZE_HANG_BUG,
+        "initialize request never returned",
+        "protocol handshake stalled",
+    ],
+    SETTINGS_HANG_BUG: [
+        SETTINGS_HANG_BUG,
+        "settings.json parsing hang",
+        "loading settings never completed",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -270,20 +286,32 @@ async def _run_acp_session(
     approve_edits: bool,
     timeout_sec: int,
     gemini_bin: str = "gemini",
+    cwd_override: str | None = None,
 ) -> dict[str, Any]:
     """Run a full ACP session against `gemini --acp`.
 
     Returns a result dict with keys:
-      ok, structured_events, response_text, stderr, warnings, failure_reason,
-      failure_class
+      ok, transport_ok, stop_reason, structured_events, response_text, stderr,
+      warnings, failure_reason, failure_class
+
+    ``cwd_override``: when provided, this directory is used as both the
+    ``session/new`` ``cwd`` and the ``asyncio.create_subprocess_exec`` ``cwd``,
+    making the session deterministic. When ``None`` the legacy ``os.getcwd()``
+    is used for both.
 
     ``failure_class`` is a structured classifier for the failure point (or
     ``None`` on success). Recognised values:
       gemini_not_found, launch_failed, initialize_failed, session_new_failed,
-      prompt_error, protocol_error, timeout, watchdog
+      prompt_error, protocol_error, timeout, watchdog, incomplete_response
+
+    ``transport_ok`` is the transport-level success (final response received,
+    clean exit, valid session id, no failure). ``ok`` additionally requires the
+    final ``stopReason`` to be ``end_turn`` and ``response_text`` to be non-empty.
     """
     result: dict[str, Any] = {
         "ok": False,
+        "transport_ok": False,
+        "stop_reason": None,
         "structured_events": [],
         "response_text": None,
         "stderr": None,
@@ -291,6 +319,10 @@ async def _run_acp_session(
         "failure_reason": None,
         "failure_class": None,
     }
+
+    # Resolve a deterministic cwd: cwd_override when provided, else os.getcwd().
+    # The same value is used for the subprocess cwd and the session/new cwd.
+    session_cwd = cwd_override if cwd_override is not None else os.getcwd()
 
     # Launch gemini --acp — honour GEMINI_BIN so callers can inject a custom binary
     try:
@@ -300,6 +332,7 @@ async def _run_acp_session(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=session_cwd,
         )
     except FileNotFoundError:
         result["failure_reason"] = f"gemini CLI not found: {gemini_bin!r}"
@@ -361,11 +394,13 @@ async def _run_acp_session(
     # ------------------------------------------------------------------
     req_id += 1
     # protocolVersion must be a number (int); gemini-cli 0.42.0+ rejects strings.
-    # clientCapabilities declares a read-only transport: this client provides no
-    # filesystem proxy (readTextFile/writeTextFile) and no terminal proxy. This is
-    # the primary safety boundary — the agent cannot perform host fs/terminal I/O
-    # through this client. The permission handler below is a best-effort secondary
-    # defence, not the boundary.
+    # clientCapabilities fs=false / terminal=false means only that this ACP
+    # *client* provides no client-side fs/terminal proxy (readTextFile/
+    # writeTextFile/terminal RPCs). It does NOT disable Gemini CLI's own native
+    # tool registry, cwd-resolved MCP servers, or approvalMode — those are not
+    # controlled by this transport and their safety-boundary design is deferred
+    # to follow-up #112. The permission handler below is best-effort defence in
+    # depth, not a complete sandbox.
     await send(_rpc_request("initialize", {
         "protocolVersion": 1,
         "clientCapabilities": {
@@ -407,7 +442,7 @@ async def _run_acp_session(
             {
                 "model": model,
                 "approvalMode": "default",
-                "cwd": os.getcwd(),
+                "cwd": session_cwd,
                 "mcpServers": [],
             },
             req_id,
@@ -555,12 +590,15 @@ async def _run_acp_session(
                 result["failure_class"] = "prompt_error"
                 result["warnings"].append(result["failure_reason"])
             else:
-                # Extract text from final result if present
+                # Extract text and stopReason from final result if present
                 final_result = msg.get("result", {})
                 if isinstance(final_result, dict):
                     text = final_result.get("text") or final_result.get("response")
                     if isinstance(text, str) and text:
                         response_parts.append(text)
+                    stop_reason = final_result.get("stopReason")
+                    if isinstance(stop_reason, str):
+                        result["stop_reason"] = stop_reason
                 watchdog.mark_first_result()
             break
 
@@ -600,14 +638,33 @@ async def _run_acp_session(
         result["failure_class"] = "protocol_error"
         result["warnings"].append(result["failure_reason"])
 
-    # B5: success requires no failure, the final response received, a clean
-    # process exit, and a valid session id.
-    result["ok"] = (
+    # B5: transport-level success requires no failure, the final response
+    # received, a clean process exit, and a valid session id.
+    transport_ok = (
         result["failure_reason"] is None
         and final_response_received
         and proc_returncode == 0
         and bool(session_id)
     )
+    result["transport_ok"] = transport_ok
+
+    # B4: a transport-level success is not enough. The session may have ended
+    # with a non-`end_turn` stopReason (cancel/refusal/max_tokens) or an empty
+    # response. Treat those as incomplete responses, not successes.
+    stop_reason = result.get("stop_reason")
+    response_clean = (result.get("response_text") or "").strip()
+    result["ok"] = (
+        transport_ok
+        and stop_reason == "end_turn"
+        and bool(response_clean)
+    )
+
+    if transport_ok and not result["ok"] and result["failure_reason"] is None:
+        result["failure_reason"] = (
+            f"session ended with stopReason={stop_reason!r} and/or empty response"
+        )
+        result["failure_class"] = "incomplete_response"
+        result["warnings"].append(result["failure_reason"])
 
     return result
 
@@ -652,6 +709,7 @@ def run_acp(
     approve_edits: bool = False,
     prepared_prompt: str | None = None,
     model_override: str | None = None,
+    cwd_override: str | None = None,
 ) -> dict[str, Any]:
     """Run a delegation request using ACP transport.
 
@@ -661,35 +719,49 @@ def run_acp(
     Falls back to headless_json transport if initialize or session/new fails
     (see fallback comment in _fallback_to_headless_json).
 
-    ``prepared_prompt``: when provided, this exact prompt string is sent to the
-    ACP session and the objective/instructions assembly is skipped. This is how
-    ``run_delegation()`` routes through ACP: the prompt has already been built by
-    ``build_prompt()`` after ``validate_request()`` and context loading, so the
-    ACP path honours the same delegation contract as headless_json.
+    ``prepared_prompt``: **required** — the exact prompt string to send to the
+    ACP session. The prompt must already have been built by ``build_prompt()``
+    after ``validate_request()`` and context loading so the ACP path honours the
+    same delegation contract as headless_json. Passing ``None`` is a contract
+    bypass and returns a ``failure_class="contract_bypass"`` failure result.
 
     ``model_override``: when provided, this model is used instead of
     ``request["model"]`` (the resolved model chain head from ``run_delegation``).
 
+    ``cwd_override``: when provided, the deterministic working directory used for
+    both the ``gemini --acp`` subprocess and the ``session/new`` ``cwd``.
+
     Returns a dict with at least: ok, structured_events, response_text,
     stderr, warnings, failure_reason, failure_class, schema, transport.
     """
-    if prepared_prompt is not None:
-        prompt = prepared_prompt
-    else:
-        prompt = request.get("objective", "")
-        instructions = request.get("instructions", [])
-        if instructions:
-            prompt = prompt + "\n\n" + "\n".join(
-                f"{i + 1}. {instr}" for i, instr in enumerate(instructions)
-            )
+    # NB1: prepared_prompt is required. Building the prompt here from
+    # objective/instructions bypasses validate_request()/build_prompt() and the
+    # delegation contract — fail closed instead.
+    if prepared_prompt is None:
+        return {
+            "ok": False,
+            "structured_events": [],
+            "response_text": None,
+            "stderr": None,
+            "warnings": [
+                "run_acp() requires prepared_prompt; call via run_delegation() "
+                "so the request passes validate_request()/build_prompt()"
+            ],
+            "failure_reason": "run_acp() called without prepared_prompt (contract bypass)",
+            "failure_class": "contract_bypass",
+            "schema": "acp_result_v1",
+            "transport": "acp",
+        }
+    prompt = prepared_prompt
 
     if model_override:
         model = str(model_override)
     else:
         model = str(request.get("model", "gemini-2.5-flash"))
     timeout_sec = int(request.get("timeout_sec", TOTAL_TIMEOUT_SEC))
-    # GEMINI_BIN: request field takes precedence, then env var, then default
-    gemini_bin = str(request.get("gemini_bin") or os.environ.get("GEMINI_BIN") or "gemini")
+    # NB2: GEMINI_BIN is honoured only via the environment variable. Reading it
+    # from the request JSON would let an untrusted request swap the binary.
+    gemini_bin = str(os.environ.get("GEMINI_BIN") or "gemini")
 
     try:
         try:
@@ -706,6 +778,7 @@ def run_acp(
                             approve_edits=approve_edits,
                             timeout_sec=timeout_sec,
                             gemini_bin=gemini_bin,
+                            cwd_override=cwd_override,
                         )
                     )
                 )
@@ -719,11 +792,14 @@ def run_acp(
                     approve_edits=approve_edits,
                     timeout_sec=timeout_sec,
                     gemini_bin=gemini_bin,
+                    cwd_override=cwd_override,
                 )
             )
     except Exception as exc:
         result = {
             "ok": False,
+            "transport_ok": False,
+            "stop_reason": None,
             "structured_events": [],
             "response_text": None,
             "stderr": None,

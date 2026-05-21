@@ -1112,6 +1112,60 @@ def _log_model_downgrade_event(from_model: str, to_model: str, reason: str) -> N
     print(f"[gemini-headless] {event}", file=sys.stderr)
 
 
+def _normalize_acp_result(
+    raw_acp: dict[str, Any],
+    *,
+    requested_model: str,
+    actual_model: str,
+    tool_profile: str,
+    request_warnings: list[str],
+) -> dict[str, Any]:
+    """Normalize a ``run_acp()`` result into a ``delegation_result/v1`` shape.
+
+    The ACP session produces an ``acp_result_v1`` dict; downstream callers
+    expect ``delegation_result/v1`` (``result_surface`` / ``requested_model`` /
+    ``actual_model`` / ``exit_code`` / ``model_chain`` etc.). This converts the
+    former into the latter so the artifact-first contract is honoured.
+
+    Fallback-produced results (``_acp_fallback == True``) are already
+    ``delegation_result/v1`` shaped because they come back through a re-entrant
+    ``run_delegation()`` call — those are passed through unchanged (only the
+    ``transport`` / ``_acp_fallback`` markers are preserved).
+    """
+    # Fallback results are already delegation_result/v1 — do not double-normalize.
+    if raw_acp.get("_acp_fallback"):
+        return raw_acp
+
+    ok = bool(raw_acp.get("ok"))
+    response_text = raw_acp.get("response_text")
+    warnings = request_warnings[:] + list(raw_acp.get("warnings") or [])
+
+    normalized: dict[str, Any] = {
+        "schema": "delegation_result/v1",
+        "transport": "acp",
+        "ok": ok,
+        "requested_model": requested_model,
+        "actual_model": actual_model,
+        "tool_profile": tool_profile,
+        "exit_code": 0 if ok else 1,
+        "result_surface": _build_result_surface(ok=ok, response_text=response_text),
+        "response_text": response_text,
+        "stderr": raw_acp.get("stderr"),
+        "warnings": warnings,
+        "failure_reason": raw_acp.get("failure_reason"),
+        "model_chain": [actual_model],
+        "model_downgrades": [],
+        "raw_command": ["gemini", "--acp"],
+        "transport_details": {
+            "schema": raw_acp.get("schema", "acp_result_v1"),
+            "structured_events": raw_acp.get("structured_events") or [],
+            "failure_class": raw_acp.get("failure_class"),
+            "stop_reason": raw_acp.get("stop_reason"),
+        },
+    }
+    return normalized
+
+
 def run_delegation(
     request: Mapping[str, Any],
     request_path: Path | None = None,
@@ -1328,12 +1382,28 @@ def run_delegation(
     if request.get("transport") == "acp":
         from run_gemini_acp import run_acp  # type: ignore[import]
         approve_edits = bool(request.get("approve_edits", False))
-        return run_acp(
+        # B2: resolve a deterministic cwd instead of letting the ACP session
+        # default to the process launch directory. Repo-relative profiles run
+        # at the repo root; the rest run at the request directory (base_dir).
+        if tool_profile in (LOCAL_ASSET_RESEARCH_PROFILE, GITHUB_RESEARCH_PROFILE):
+            acp_cwd = str(_repo_root())
+        else:
+            acp_cwd = str(base_dir)
+        acp_model = model_chain[0] if model_chain else requested_model
+        raw_acp = run_acp(
             dict(merged_request),
             request_path=request_path,
             approve_edits=approve_edits,
             prepared_prompt=prompt,
-            model_override=model_chain[0] if model_chain else requested_model,
+            model_override=acp_model,
+            cwd_override=acp_cwd,
+        )
+        return _normalize_acp_result(
+            raw_acp,
+            requested_model=requested_model,
+            actual_model=acp_model,
+            tool_profile=tool_profile,
+            request_warnings=request_warnings,
         )
 
     # --- Model chain loop ---
