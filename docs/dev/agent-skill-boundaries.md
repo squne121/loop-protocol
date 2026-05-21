@@ -157,13 +157,19 @@ main thread（impl-review-loop Step 5 / post-merge-cleanup 等）が受け取り
 ```yaml
 FOLLOW_UP_ISSUE_REQUEST_V1:
   title: "<起票する Issue のタイトル候補>"
-  issue_kind: implementation | research | docs
+  issue_kind: implementation | research | parent
   severity: mandatory_follow_up | optional_follow_up | note_only
   source:
+    kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
     url: "<観察元の PR / コメント / Issue URL>"
     note_id: "<観察元ドキュメント内の通し番号（1-indexed）>"
   dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
-  labels: []
+  desired_destination: "<この Issue を解決したあとの状態（Outcome 1文）>"
+  validated_scope_delta: "<create-issue に渡す In Scope の概要>"
+  origin_skill: impl-review-loop | post-merge-cleanup | issue-refinement-loop | pr-review-judge
+  labels:
+    - triage-required  # 必須
+    # 追加ラベル（docs, chore 等はここに入れる）
 ```
 
 **フィールド定義**:
@@ -171,18 +177,60 @@ FOLLOW_UP_ISSUE_REQUEST_V1:
 | フィールド | 説明 |
 |---|---|
 | `title` | 起票候補タイトル（main thread が調整してよい） |
-| `issue_kind` | `implementation`（実装タスク）/ `research`（調査）/ `docs`（ドキュメント更新） |
+| `issue_kind` | `implementation`（実装）/ `research`（調査）/ `parent`（サブ Issue 親）。`docs`/`chore` 等は `labels` に入れる |
 | `severity` | `mandatory_follow_up`（必ず起票）/ `optional_follow_up`（重複なければ起票）/ `note_only`（起票せず終了報告コメントに記録のみ） |
+| `source.kind` | 観察元の種別（`pr_body` / `pr_review` / `issue_comment` / `post_merge_cleanup` / `refinement`） |
 | `source.url` | 観察元の URL（PR URL、コメント URL 等） |
 | `source.note_id` | 観察元ドキュメント内での通し番号（dedupe_key 生成に使用） |
 | `dedupe_key` | 重複起票防止キー。形式: `follow-up:<repo>:<source-url-or-pr>:<note-id-or-hash>` |
-| `labels` | 起票時に付与するラベル候補（`triage-required` は main thread が自動追加） |
+| `desired_destination` | create-issue skill の handoff で必須。Outcome 1 文で書く |
+| `validated_scope_delta` | create-issue の handoff で必須。変更範囲の概要 |
+| `origin_skill` | どの skill が生成したかを追跡するためのフィールド |
+| `labels` | `triage-required` を必ず含める。`docs`/`chore` 等はここに追加 |
+
+**severity に応じた action**:
+
+```yaml
+severity_actions:
+  mandatory_follow_up:
+    action: create_or_reuse_issue_before_approve
+    note: "APPROVE 確定前に Issue を create または reuse する。未 materialize の場合は APPROVE しない"
+  optional_follow_up:
+    action: create_or_reuse_issue_at_loop_termination
+    note: "ループ終了時（APPROVE 後）に dedupe チェックして起票"
+  note_only:
+    action: record_only_no_issue
+    note: "起票せず終了コメントの note_only_observations に記録"
+```
+
+**follow-up Issue 本文の `## Source` セクション（自動起票 Issue 必須）**:
+
+```markdown
+## Source（自動起票 Issue 必須セクション）
+
+- origin_skill: <origin_skill>
+- source_url: <source.url>
+- source_note_id: <source.note_id>
+- dedupe_key: <dedupe_key>
+```
+
+**dedupe フロー**:
+
+```
+for each request:
+  1. dedupe チェック: dedupe_key で既存 OPEN Issue を検索
+     gh issue list --repo <owner>/<repo> --state open \
+       --search '"<dedupe_key>"' --json number,title,url
+  2. 重複なし → issue-author SubAgent に委譲して create-issue 経由で起票
+     ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
+  3. 重複あり → スキップ（既存 Issue 番号をレポートに記録）
+```
 
 **責務境界**:
 
 - `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。
-- `post-merge-cleanup-worker`: follow_up_candidates を列挙して返す。**Issue 起票は行わない**。
-- main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
+- `post-merge-cleanup-worker`: `follow_up_issue_requests` を `FOLLOW_UP_ISSUE_REQUEST_V1[]` として列挙して返す。**Issue 起票は行わない**。
+- main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
 
 ## 設計原則の補足
 

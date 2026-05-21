@@ -22,20 +22,22 @@ main thread は以下の手順で SubAgent に委譲する:
 
 3. main thread が返却された YAML に応じて以下を実行:
    - `human_review_required: true` → 不明事項を人間に判断委ね
-   - `follow_up_candidates` あり → main thread が **即時** `issue-author` / `create-issue` 経由で自動起票する（SubAgent 内では起票しない。候補列挙のみ）
+   - `follow_up_issue_requests` あり → main thread が **即時** `issue-author` SubAgent に委譲して `create-issue` 経由で自動起票する（dedupe_key ベースで重複チェック。SubAgent 内では起票しない。候補列挙のみ）
    - `superseded_prs` あり → `gh pr close` / `gh pr comment` を実行
    - `parent_issue_status.recommended_action` あり → `gh issue close` を実行
    - `stash_restored: false` → `stash_entry_ref` を確認、人間判断
 
-### follow_up_candidates の自動起票フロー
+### follow_up_issue_requests の自動起票フロー
 
-`follow_up_candidates` が空でない場合、main thread は SubAgent から YAML を受け取った直後に以下を実行する:
+`follow_up_issue_requests` が空でない場合、main thread は SubAgent から YAML を受け取った直後に以下を実行する:
 
 ```
-for each candidate in follow_up_candidates:
-  1. dedupe チェック: 同一 source.url + title で既存 OPEN Issue がないか確認
-     gh issue list --search "<title>" --state open --json number,title
+for each request in follow_up_issue_requests:
+  1. dedupe チェック: dedupe_key で既存 OPEN Issue を検索
+     gh issue list --repo squne121/loop-protocol --state open \
+       --search '"<dedupe_key>"' --json number,title,url
   2. 重複なし → issue-author SubAgent に委譲して create-issue skill 経由で起票
+     ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
   3. 重複あり → スキップ（既存 Issue 番号をレポートに記録）
 ```
 
@@ -141,7 +143,7 @@ merged PR の本文 / コメントから以下を抽出:
 - `## Follow-ups Intentionally Deferred` セクション（あれば）
 - レビューコメントで follow-up 化が示唆された項目
 
-候補を `follow_up_candidates` に列挙（起票実行は main thread が `create-issue` / `edit-issue` に委譲）。
+候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-author` SubAgent / `create-issue` 経由で実行）。
 
 ### 7. Stash の復帰
 
@@ -171,11 +173,20 @@ POST_MERGE_CLEANUP_REPORT_V1:
     all_children_closed: true | false
     recommended_action: close | keep_open | n/a
   superseded_prs: []
-  follow_up_candidates:
-    - title: "<候補タイトル>"
-      kind: implementation | research
-      source: "<出典: PR コメント等>"
-      recommended_routing: create-issue | edit-issue
+  follow_up_issue_requests:
+    - title: "..."
+      issue_kind: implementation
+      severity: optional_follow_up
+      source:
+        kind: post_merge_cleanup
+        url: "https://github.com/..."
+        note_id: "1"
+      dedupe_key: "follow-up:squne121/loop-protocol:pr/<PR番号>:1"
+      desired_destination: "..."
+      validated_scope_delta: "..."
+      origin_skill: post-merge-cleanup
+      labels:
+        - triage-required
   stash_restored: true | false | n/a
   stash_entry_ref: "<stash@{N} or null>"
   warnings: []

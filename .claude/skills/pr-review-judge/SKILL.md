@@ -286,13 +286,18 @@ mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
 follow_up_issue_requests:
   - title: "<follow-up タイトル>"
-    issue_kind: implementation | research | docs
+    issue_kind: implementation | research | parent
     severity: mandatory_follow_up | optional_follow_up | note_only
     source:
+      kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
       url: "<PR コメント URL または PR URL>"
       note_id: "<Non-blockers セクション内の通し番号（1-indexed）>"
     dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
-    labels: []
+    desired_destination: "<この Issue を解決したあとの状態（Outcome 1文）>"
+    validated_scope_delta: "<create-issue に渡す In Scope の概要>"
+    origin_skill: pr-review-judge
+    labels:
+      - triage-required
 ```
 ````
 

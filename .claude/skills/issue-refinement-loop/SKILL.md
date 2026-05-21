@@ -618,7 +618,12 @@ gh issue comment <issue_number> --body "## issue-refinement-loop: 完了 ($(date
 refinement ループ中に codebase-investigator / web-researcher / review-issue が「この Issue スコープ外だが改善すべき事項」を発見した場合、main thread は `termination_reason: approved` 確定後に以下を実行する:
 
 - `LOOP_STATE.improvements_applied` または各 SubAgent の出力中に含まれる **派生改善候補**（scope 外の改善提案・技術的負債・関連 docs 更新等）を `issue-author` / `create-issue` 経由で**自動起票**する。
-- 起票前に dedupe チェック（同一キーワードで OPEN Issue 存在確認）を行い、重複する場合はスキップする。
+- 起票前に **dedupe チェックを dedupe_key ベースで実施する**（title 検索ではなく `FOLLOW_UP_ISSUE_REQUEST_V1.dedupe_key` で既存 OPEN Issue を検索して重複を確認）:
+  ```
+  gh issue list --repo squne121/loop-protocol --state open \
+    --search '"<dedupe_key>"' --json number,title,url
+  ```
+  重複が見つかった場合はスキップ。重複なしの場合は `## Source` セクション（`dedupe_key` を含む）を Issue 本文に付与して起票する。
 - 起票した Issue 番号を終了報告コメントに列挙する（`follow_up_issues` フィールド）。
 
 **派生改善候補の自動起票は Out of Scope 拡大ではない**。本 Issue の refinement スコープを変えず、観察された改善を別 Issue として分離することで `1 Issue = 1 PR` 原則を維持する。
