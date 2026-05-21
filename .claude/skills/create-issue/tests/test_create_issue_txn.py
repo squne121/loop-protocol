@@ -190,7 +190,7 @@ class TestRunTransactionParentReadbackAllFail:
             "_issue_graphql_ids",
             lambda *_a, **_k: ("node-child", 9901),
         )
-        monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        # _issue_register_sub_issue was removed (High: cleanup); stub idempotent variant only.
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
 
@@ -238,7 +238,7 @@ class TestRunTransactionParentReadbackRecovery:
             "_issue_graphql_ids",
             lambda *_a, **_k: ("node-child", 9901),
         )
-        monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        # _issue_register_sub_issue was removed (High: cleanup); stub idempotent variant only.
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
 
     def test_success_after_transient_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -745,10 +745,17 @@ class TestIssueRegisterSubIssueIdempotent:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # POST sub_issues -> 422
-                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
-            # GET parent read-back
-            return _make_gh_result(stdout='{"number": 10}', returncode=0)
+                # POST sub_issues -> HTTP 422 (--include format: HTTP status line in stdout)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # GET parent read-back: also uses --include format
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
 
         monkeypatch.setattr(txn, "run_command", _fake_run)
         result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
@@ -761,10 +768,17 @@ class TestIssueRegisterSubIssueIdempotent:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # POST sub_issues -> 422
-                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
+                # POST sub_issues -> HTTP 422 (--include format)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
             # GET parent read-back returns a DIFFERENT parent
-            return _make_gh_result(stdout='{"number": 99}', returncode=0)
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"number": 99}',
+                returncode=0,
+            )
 
         monkeypatch.setattr(txn, "run_command", _fake_run)
         with pytest.raises(txn.TransactionError) as exc_info:
@@ -778,7 +792,11 @@ class TestIssueRegisterSubIssueIdempotent:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
             # read-back returns 404 (not found)
             return _make_gh_result(stdout="", returncode=1)
 
@@ -789,8 +807,13 @@ class TestIssueRegisterSubIssueIdempotent:
 
     def test_non_422_error_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            txn, "run_command",
-            lambda *_a, **_k: _make_gh_result(stdout="", stderr="HTTP 500 Internal Server Error", returncode=1)
+            txn,
+            "run_command",
+            lambda *_a, **_k: _make_gh_result(
+                stdout="HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{}",
+                stderr="",
+                returncode=1,
+            ),
         )
         with pytest.raises(txn.TransactionError) as exc_info:
             txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
@@ -869,3 +892,327 @@ class TestDedupePathParentReconcile:
         assert result.status == "failure"
         assert result.failure_stage == "parent-arg-body-mismatch"
         assert search_called == []
+
+
+# ---------------------------------------------------------------------------
+# Iteration 1 adversarial test cases (Blocker 1-4 + command vector)
+# ---------------------------------------------------------------------------
+
+
+class TestParentBodyConflictDetection:
+    """Blocker 1: body-internal parent conflicts trigger TransactionError."""
+
+    # Case 1: explicit none + numeric in same body -> conflict
+    def test_none_and_number_mixed_raises_conflict(self) -> None:
+        body = "parent_issue: none\n## Parent Issue\n\n#133"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+    # Case 2: malformed parent (#abc) -> parse error
+    def test_malformed_parent_raises_parse_error(self) -> None:
+        body = "parent_issue: #abc"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-parse"
+
+    # Case 3: same number in two formats -> PASS
+    def test_same_number_in_two_formats_passes(self) -> None:
+        body = "parent_issue: #133\n## Parent Issue\n\n#133"
+        result = txn._extract_parent_issue_number_from_body(body)
+        assert result == 133
+
+    # Case 4: two different numbers -> conflict
+    def test_two_different_numbers_raises_conflict(self) -> None:
+        body = "parent_issue: #133\n## Parent Issue\n\n#200"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+
+class TestBodyFileFailClosed:
+    """Blocker 2: body_file not found / unreadable causes failure before GitHub API calls."""
+
+    # Case 5: body_file not found -> failure before API
+    def test_body_file_not_found_returns_failure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        nonexistent = str(tmp_path / "does_not_exist.md")
+        api_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            api_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=nonexistent,
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "body-file-read"
+        assert "not found" in result.failure_message  # type: ignore[operator]
+        assert api_called == [], "GitHub API must NOT be called when body_file is missing"
+
+    # Case 6: body_file OSError -> failure before API
+    def test_body_file_oserror_returns_failure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        body_file = tmp_path / "body.md"
+        body_file.write_text("parent_issue: 42")
+
+        original_read_text = Path.read_text
+
+        def _raise_oserror(self: Path, *_a: Any, **_k: Any) -> str:
+            if self == body_file:
+                raise OSError("Permission denied")
+            return original_read_text(self, *_a, **_k)
+
+        api_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            api_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+        monkeypatch.setattr(Path, "read_text", _raise_oserror)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "body-file-read"
+        assert api_called == [], "GitHub API must NOT be called when body_file is unreadable"
+
+
+class TestHttp422StatusParsing:
+    """Blocker 3: 422 detection via HTTP status line, not string search."""
+
+    # Case 7: POST returns HTTP 422 status line -> idempotent path
+    def test_post_http_422_triggers_idempotent_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST: HTTP 422 in status line (--include format)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # Read-back: same parent -> idempotent PASS
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    # Case 8: error text contains "422" but HTTP status is 200 -> NOT treated as 422
+    def test_error_text_with_422_but_http_200_not_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # returncode=1 but HTTP status 200 in output (edge case where gh exits 1 but HTTP 200)
+        # In practice this is an unusual scenario, but we must confirm HTTP status drives logic.
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # The error message mentions 422 in text but HTTP status line says 200
+                return _make_gh_result(
+                    stdout="HTTP/1.1 200 OK\r\n\r\nerror 422 in body text",
+                    stderr="",
+                    returncode=1,
+                )
+            return _make_gh_result(stdout="", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        # HTTP 200 != 422, so treated as non-422 error
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 9: POST HTTP 422 + read-back 404 -> partial_failure
+    def test_post_422_readback_404_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # read-back 404
+            return _make_gh_result(stdout="", returncode=1)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 10: POST HTTP 422 + read-back returns different parent -> partial_failure
+    def test_post_422_readback_different_parent_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # read-back: different parent
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 999}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 11: POST HTTP 422 + read-back same parent -> already_registered PASS
+    def test_post_422_readback_same_parent_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+
+class TestDedupeParentMismatch:
+    """Blocker 4: dedupe path reads existing issue body and rejects conflicting parent."""
+
+    # Case 12: dedupe issue body has different parent -> failure
+    def test_dedupe_existing_body_different_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Existing issue (#55) body declares parent #99, but we're creating with parent #42
+        existing_issue_body = "parent_issue: #99\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+
+class TestCommandVectorChecks:
+    """Cases 13-15: verify command vectors for POST and GET include required flags."""
+
+    # Case 13: POST to sub_issues includes --include, Accept, X-GitHub-Api-Version
+    def test_post_command_vector_has_required_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            captured_args.append(list(args))
+            if not captured_args or len(captured_args) == 1:
+                # First call: POST -> success
+                return _make_gh_result(stdout="HTTP/1.1 201 Created\r\n\r\n{}", returncode=0)
+            return _make_gh_result(stdout="{}", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        post_args = captured_args[0]
+        assert "--include" in post_args, "POST must include --include flag"
+        assert "Accept: application/vnd.github+json" in post_args, "POST must include Accept header"
+        assert "X-GitHub-Api-Version: 2022-11-28" in post_args, "POST must include X-GitHub-Api-Version header"
+        assert "--method" in post_args and post_args[post_args.index("--method") + 1] == "POST"
+
+    # Case 14: GET read-back includes --method GET, Accept, X-GitHub-Api-Version
+    def test_get_readback_command_vector_has_required_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            captured_args.append(list(args))
+            if call_count == 1:
+                # POST -> 422 to trigger read-back
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # Read-back -> confirm parent
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        # Second call is the GET read-back
+        assert len(captured_args) >= 2, "Expected POST + GET calls"
+        get_args = captured_args[1]
+        assert "--include" in get_args, "GET read-back must include --include flag"
+        assert "--method" in get_args and get_args[get_args.index("--method") + 1] == "GET"
+        assert "Accept: application/vnd.github+json" in get_args, "GET read-back must include Accept header"
+        assert "X-GitHub-Api-Version: 2022-11-28" in get_args, "GET read-back must include X-GitHub-Api-Version header"
+
+    # Case 15: POST command does NOT include replace_parent
+    def test_post_command_does_not_include_replace_parent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            captured_args.append(list(args))
+            return _make_gh_result(stdout="HTTP/1.1 201 Created\r\n\r\n{}", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        post_args = captured_args[0]
+        assert "replace_parent" not in " ".join(post_args), "POST must NOT include replace_parent"

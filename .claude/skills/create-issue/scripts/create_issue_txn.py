@@ -25,6 +25,32 @@ from pathlib import Path
 from typing import Any, Literal
 
 
+# ---------------------------------------------------------------------------
+# Parent candidate dataclass (Blocker 1)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ParentCandidate:
+    """A single parent-issue reference extracted from an issue body."""
+
+    source: str  # "machine_contract" | "parent_heading" | "shorthand"
+    raw: str
+    value: int | None  # explicit none/null is None
+
+
+# ---------------------------------------------------------------------------
+# HTTP status extraction helper (Blocker 3)
+# ---------------------------------------------------------------------------
+
+_HTTP_STATUS_RE = re.compile(r"(?im)^HTTP/\S+\s+(\d{3})\b")
+
+
+def _extract_http_status(text: str) -> int | None:
+    """Return the first HTTP status code found in text (from --include output)."""
+    m = _HTTP_STATUS_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
 class TransactionError(Exception):
     def __init__(self, stage: str, message: str, *, command: str | None = None, output: str | None = None) -> None:
         super().__init__(message)
@@ -354,69 +380,143 @@ def _issue_graphql_ids(repo: str, issue_number: int, gh_bin: str) -> tuple[str, 
     return str(node_id), int(database_id)
 
 
-def _extract_parent_issue_number_from_body(body: str) -> int | None:
-    """Extract parent issue number from issue body text.
+# Values that indicate "no parent" for body extraction.
+_PARENT_NONE: frozenset[str] = frozenset({"", "none", "n/a", "null", "なし", "単独改善", "0"})
+
+
+def _collect_parent_candidates(body: str) -> list[ParentCandidate]:
+    """Collect all parent-issue references from body as ParentCandidate objects.
 
     Recognises the following patterns (case-insensitive for keywords):
-      - YAML front-matter style: parent_issue: "#N" / parent_issue: "N" / parent_issue: N
-      - Markdown heading style: ## Parent Issue\\n\\n#N or ## Parent Issue\\n\\nN
-      - Shorthand: parent: #N / parent: N
+      - machine_contract: parent_issue: "#N" / parent_issue: "N" / parent_issue: N
+      - parent_heading: ## Parent Issue\\n\\n#N or ## Parent Issue\\n\\nN
+      - shorthand: parent: #N / parent: N
 
-    ``Depends on #N`` is explicitly NOT treated as a parent; it is a
-    dependency/blocker expression and must be ignored here.
-
-    Values that indicate "no parent" (none, null, なし, N/A, 0) return None.
+    ``Depends on #N`` is explicitly NOT treated as a parent.
     """
-    _NO_PARENT_VALUES = {"none", "null", "なし", "n/a", "0", ""}
-
     # Normalise line endings
     body = body.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Pattern 1: parent_issue: "#N" / parent_issue: "N" / parent_issue: N
-    m = re.search(
+    candidates: list[ParentCandidate] = []
+
+    # Pattern 1 (machine_contract): parent_issue: "#N" / parent_issue: "N" / parent_issue: N
+    for m in re.finditer(
         r'(?i)^[ \t]*parent_issue\s*:\s*"?#?(\w+)"?\s*$',
         body,
         re.MULTILINE,
-    )
-    if m:
-        raw = m.group(1).strip().lower()
-        if raw in _NO_PARENT_VALUES:
-            return None
-        try:
-            return int(raw)
-        except ValueError:
-            return None
+    ):
+        raw = m.group(1).strip()
+        raw_lower = raw.lower()
+        if raw_lower in _PARENT_NONE:
+            candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=None))
+        else:
+            try:
+                candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=int(raw)))
+            except ValueError:
+                candidates.append(ParentCandidate(source="machine_contract", raw=raw, value=-1))  # sentinel for malformed
 
-    # Pattern 2: ## Parent Issue\n\n#N  or  ## Parent Issue\n\nN  (optional blank lines)
-    m = re.search(
+    # Pattern 2 (parent_heading): ## Parent Issue\n\n#N  or  ## Parent Issue\n\nN
+    for m in re.finditer(
         r'(?i)^##\s*Parent Issue\s*\n(?:\s*\n)*\s*#?(\w+)',
         body,
         re.MULTILINE,
-    )
-    if m:
-        raw = m.group(1).strip().lower()
-        if raw in _NO_PARENT_VALUES:
-            return None
-        try:
-            return int(raw)
-        except ValueError:
-            return None
+    ):
+        raw = m.group(1).strip()
+        raw_lower = raw.lower()
+        if raw_lower in _PARENT_NONE:
+            candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=None))
+        else:
+            try:
+                candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=int(raw)))
+            except ValueError:
+                candidates.append(ParentCandidate(source="parent_heading", raw=raw, value=-1))
 
-    # Pattern 3: parent: #N / parent: N  (but NOT "Depends on" lines)
+    # Pattern 3 (shorthand): parent: #N / parent: N  (but NOT "Depends on" lines)
     for line in body.splitlines():
-        # Skip "Depends on #N" lines — these are dependency expressions, not parent
         if re.search(r'(?i)depends\s+on', line):
             continue
         m = re.match(r'(?i)^[ \t]*parent\s*:\s*#?(\w+)\s*$', line)
         if m:
-            raw = m.group(1).strip().lower()
-            if raw in _NO_PARENT_VALUES:
-                return None
-            try:
-                return int(raw)
-            except ValueError:
-                return None
+            raw = m.group(1).strip()
+            raw_lower = raw.lower()
+            if raw_lower in _PARENT_NONE:
+                candidates.append(ParentCandidate(source="shorthand", raw=raw, value=None))
+            else:
+                try:
+                    candidates.append(ParentCandidate(source="shorthand", raw=raw, value=int(raw)))
+                except ValueError:
+                    candidates.append(ParentCandidate(source="shorthand", raw=raw, value=-1))
 
+    return candidates
+
+
+def _extract_parent_issue_number_from_body(body: str) -> int | None:
+    """Extract parent issue number from issue body text.
+
+    Uses candidate collection (_collect_parent_candidates) and applies conflict
+    detection rules:
+      - 0 candidates -> None (body_parent_absent)
+      - 1 candidate, valid number -> that number
+      - 1 candidate, explicit none/null -> None
+      - 1 candidate, malformed (non-integer, non-none) -> TransactionError(stage="parent-body-parse")
+      - Multiple candidates, all same number -> PASS (that number)
+      - explicit none + number mixed -> TransactionError(stage="parent-body-conflict")
+      - multiple numbers that differ -> TransactionError(stage="parent-body-conflict")
+    """
+    candidates = _collect_parent_candidates(body)
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        c = candidates[0]
+        if c.value == -1:
+            raise TransactionError(
+                stage="parent-body-parse",
+                message=f"parent expression in body is malformed (not a valid number): {c.raw!r}",
+                output=f"source={c.source} raw={c.raw!r}",
+            )
+        return c.value  # None (explicit none) or int
+
+    # Multiple candidates: check for conflicts.
+    # Partition into "explicit none" and "numeric" groups (malformed = -1 is also a conflict).
+    has_malformed = any(c.value == -1 for c in candidates)
+    if has_malformed:
+        raise TransactionError(
+            stage="parent-body-parse",
+            message=f"parent expression in body is malformed (not a valid number): {[c.raw for c in candidates if c.value == -1]}",
+            output=str([(c.source, c.raw) for c in candidates]),
+        )
+
+    none_candidates = [c for c in candidates if c.value is None]
+    number_candidates = [c for c in candidates if c.value is not None]
+
+    if none_candidates and number_candidates:
+        raise TransactionError(
+            stage="parent-body-conflict",
+            message=(
+                "body contains both explicit-none parent and numeric parent references; "
+                f"none-sources={[c.source for c in none_candidates]} "
+                f"number-sources={[c.source for c in number_candidates]} "
+                f"number-values={[c.value for c in number_candidates]}"
+            ),
+            output=str([(c.source, c.raw, c.value) for c in candidates]),
+        )
+
+    if number_candidates:
+        unique_numbers = {c.value for c in number_candidates}
+        if len(unique_numbers) > 1:
+            raise TransactionError(
+                stage="parent-body-conflict",
+                message=(
+                    f"body contains conflicting parent numbers: {sorted(unique_numbers)}; "
+                    f"sources={[(c.source, c.value) for c in number_candidates]}"
+                ),
+                output=str([(c.source, c.raw, c.value) for c in candidates]),
+            )
+        return number_candidates[0].value
+
+    # All candidates are explicit none -> no parent.
     return None
 
 
@@ -455,58 +555,78 @@ def _issue_register_sub_issue_idempotent(
     """Register child as sub-issue of parent, treating 422 as idempotent when already registered.
 
     Returns:
-        "registered"        — POST succeeded (HTTP 201/200).
-        "already_registered" — POST returned 422 and read-back confirmed same parent.
+        "registered"         — POST succeeded (HTTP 201/200).
+        "already_registered" — POST returned HTTP 422 and read-back confirmed same parent.
 
     Raises:
         TransactionError(stage="sub-issue-register") — POST failed for reasons
             other than 422, or 422 but read-back showed a *different* parent
             (or no parent at all).  This is treated as partial_failure.
     """
-    endpoint = f"repos/{repo}/issues/{parent_issue_number}/sub_issues"
     args = [
         gh_bin,
         "api",
-        endpoint,
         "--method",
         "POST",
+        "--include",  # include HTTP response headers in output for status parsing
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        f"/repos/{repo}/issues/{parent_issue_number}/sub_issues",
         "-F",
         f"sub_issue_id={child_database_id}",
     ]
     cp = run_command(args)
+
+    # Collect combined output (stdout contains headers + body when --include is used)
+    stdout_out = (cp.stdout or "").strip()
+    stderr_out = (cp.stderr or "").strip()
+    combined_output = stdout_out + ("\n" + stderr_out if stderr_out else "")
+
     if cp.returncode == 0:
         return "registered"
 
-    # Determine if the failure is a 422
-    stderr_out = (cp.stderr or "").strip()
-    stdout_out = (cp.stdout or "").strip()
-    combined = stderr_out or stdout_out
-
-    # gh CLI surfaces HTTP status in stderr as "HTTP 422" or similar
-    is_422 = bool(re.search(r'422', combined))
+    # Determine if the failure is an HTTP 422 using the parsed status line.
+    http_status = _extract_http_status(combined_output)
+    is_422 = http_status == 422
 
     if not is_422:
         raise TransactionError(
             stage="sub-issue-register",
             message="sub-issue POST failed with non-422 error",
             command=" ".join(args),
-            output=combined,
+            output=combined_output,
         )
 
-    # 422: read-back to check if already registered with the same parent
+    # HTTP 422: read-back to check if already registered with the same parent
     readback_args = [
         gh_bin,
         "api",
-        f"repos/{repo}/issues/{child_issue_number}/parent",
         "--method",
         "GET",
+        "--include",
         "-H",
         "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        f"/repos/{repo}/issues/{child_issue_number}/parent",
     ]
     rb_cp = run_command(readback_args)
-    if rb_cp.returncode == 0:
+    rb_stdout = (rb_cp.stdout or "").strip()
+    rb_stderr = (rb_cp.stderr or "").strip()
+    rb_combined = rb_stdout + ("\n" + rb_stderr if rb_stderr else "")
+    rb_http_status = _extract_http_status(rb_combined)
+
+    if rb_cp.returncode == 0 and rb_http_status not in (404, None) or (rb_cp.returncode == 0 and rb_http_status is None):
+        # Strip HTTP headers from body for JSON parsing (--include prepends headers before blank line)
+        rb_body = rb_stdout
+        if "\r\n\r\n" in rb_body:
+            rb_body = rb_body.split("\r\n\r\n", 1)[1]
+        elif "\n\n" in rb_body:
+            rb_body = rb_body.split("\n\n", 1)[1]
         try:
-            data = json.loads((rb_cp.stdout or "").strip() or "{}")
+            data = json.loads(rb_body.strip() or "{}")
             if int(data.get("number", -1)) == int(parent_issue_number):
                 return "already_registered"
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -515,26 +635,12 @@ def _issue_register_sub_issue_idempotent(
     raise TransactionError(
         stage="sub-issue-register",
         message=(
-            f"sub-issue POST returned 422 but read-back did not confirm parent #{parent_issue_number} "
+            f"sub-issue POST returned HTTP 422 but read-back did not confirm parent #{parent_issue_number} "
             f"for child #{child_issue_number}; treating as partial_failure."
         ),
         command=" ".join(args),
-        output=combined,
+        output=combined_output,
     )
-
-
-def _issue_register_sub_issue(repo: str, parent_issue_number: int, child_database_id: int, gh_bin: str) -> None:
-    endpoint = f"repos/{repo}/issues/{parent_issue_number}/sub_issues"
-    args = [
-        gh_bin,
-        "api",
-        endpoint,
-        "--method",
-        "POST",
-        "-F",
-        f"sub_issue_id={child_database_id}",
-    ]
-    _run_gh_text(args, stage="sub-issue-register")
 
 
 def _issue_register_dependency(repo: str, child_node_id: str, dependency_node_id: str, gh_bin: str) -> None:
@@ -911,13 +1017,45 @@ def run_transaction(
     normalized_dependency_issue_numbers = _normalize_dependency_numbers(dependency_issue_numbers)
     completed: list[str] = []
 
-    # --- Body-derived parent resolution (fail-closed before any GitHub mutation) ---
-    _body_text = body
+    # --- Blocker 2: body_file fail-closed check (before any GitHub mutation) ---
     if body_file:
-        _path = Path(body_file)
-        if _path.is_file():
-            _body_text = _path.read_text(encoding="utf-8")
-    body_parent = _extract_parent_issue_number_from_body(_body_text)
+        _bf_path = Path(body_file)
+        if not _bf_path.is_file():
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage="body-file-read",
+                failure_message=f"body_file not found: {body_file}",
+            )
+        try:
+            _body_text_for_parent = _bf_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage="body-file-read",
+                failure_message=str(exc),
+            )
+    else:
+        _body_text_for_parent = body
+    # --- End Blocker 2 ---
+
+    # --- Body-derived parent resolution (fail-closed before any GitHub mutation) ---
+    try:
+        body_parent = _extract_parent_issue_number_from_body(_body_text_for_parent)
+    except TransactionError as exc:
+        return TransactionResult(
+            status="failure",
+            issue_number=None,
+            issue_url=None,
+            completed_steps=[],
+            failure_stage=exc.stage,
+            failure_message=exc.message,
+        )
     try:
         parent_issue_number = _resolve_parent_issue_number(parent_issue_number, body_parent)
     except TransactionError as exc:
@@ -970,6 +1108,54 @@ def run_transaction(
         parent_verified = None
         dependency_verified = None
         dedupe_issue_url = f"https://github.com/{repo}/issues/{dedupe_number}"
+
+        # --- Blocker 4: dedupe body read-back for parent identity check ---
+        # Read the existing issue's body and verify its parent doesn't conflict with resolved_parent.
+        if parent_issue_number:
+            try:
+                dedupe_issue_data = _run_gh_json(
+                    [
+                        gh_bin,
+                        "api",
+                        "--method",
+                        "GET",
+                        "-H",
+                        "Accept: application/vnd.github+json",
+                        "-H",
+                        "X-GitHub-Api-Version: 2022-11-28",
+                        f"/repos/{repo}/issues/{dedupe_number}",
+                    ],
+                    stage="dedupe-body-read",
+                )
+                existing_body = dedupe_issue_data.get("body") or ""
+                try:
+                    existing_body_parent = _extract_parent_issue_number_from_body(existing_body)
+                except TransactionError:
+                    existing_body_parent = None
+                # If existing issue body has a conflicting parent, fail-closed.
+                if existing_body_parent is not None and existing_body_parent != parent_issue_number:
+                    mismatch_exc = TransactionError(
+                        stage="dedupe-parent-mismatch",
+                        message=(
+                            f"dedupe issue #{dedupe_number} body declares parent #{existing_body_parent} "
+                            f"but current transaction resolved parent #{parent_issue_number}; "
+                            "failing closed to avoid link mutation."
+                        ),
+                        output=f"dedupe_number={dedupe_number} existing_body_parent={existing_body_parent} resolved_parent={parent_issue_number}",
+                    )
+                    return TransactionResult(
+                        status="failure",
+                        issue_number=dedupe_number,
+                        issue_url=dedupe_issue_url,
+                        completed_steps=dedupe_completed,
+                        failure_stage=mismatch_exc.stage,
+                        failure_message=mismatch_exc.message,
+                    )
+            except TransactionError:
+                # If we can't read the issue body, proceed conservatively (body check best-effort).
+                pass
+        # --- End Blocker 4 ---
+
         try:
             reconcile_steps, parent_verified, dependency_verified = _reconcile_issue_links(
                 repo=repo,
