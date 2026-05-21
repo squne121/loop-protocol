@@ -577,16 +577,64 @@ inputs:
 
 Step 4 は raw anchor comment（`LOOP_STATE.anchor_comment.snapshot`）を直接受け取らない。main thread が `final_classification` を確定した後に正規化した `anchor_comment_feedback` のみを受け取る。
 
+`edit-issue` skill の Inputs に渡す際は、`title_update` を top-level フィールドとして渡す（`anchor_comment_feedback.title_update` ではなく top-level `title_update`）。
+
 ```yaml
 # anchor_comment_url が指定されており、
 # final_classification が feedback_update_required / reframe_in_place の場合、以下を追加する
 Step 4 inputs（anchor_comment が feedback_update_required / reframe_in_place の場合）:
   reviewer_feedback_text: <review-issue diff_proposal + anchor_comment の正規化フィードバック>
+  current_issue_title: <現在の GitHub Issue タイトル（title_update.required 判定に使用）>
   anchor_comment_feedback:
     # final_classification 後の正規化済み情報のみ渡す。raw anchor comment snapshot は含めない。
+    # raw anchor comment snapshot を title 生成・reviewer_feedback_text に直接使ってはならない（MUST NOT）。
+    # main thread が final_classification 確定後に生成した正規化済み anchor_comment_feedback のみを渡す。
     classification: reframe_in_place | feedback_update_required   # main thread が確定した final_classification
     required_edits: <final_classification から導いた必要編集内容>
     scope_impact: <LOOP_STATE.anchor_comment.scope_impact>
+  # edit-issue skill への top-level 入力として渡す（anchor_comment_feedback のネスト内ではない）
+  edit_issue_inputs:
+    issue_number: <LOOP_STATE.issue_number>
+    reviewer_feedback_text: <normalized feedback>
+    title_update: <anchor_comment_feedback から導出した title_update — top-level として渡す>
+      # required: true | false
+      # proposed_title: <新しいタイトル文字列 | null>   # required=true の場合のみ設定
+      # reason: <タイトル変更が必要な理由 | null>       # required=true の場合のみ設定
+```
+
+**title_update の設定規則**:
+
+```yaml
+title_update.required:
+  # current_issue_title（Step 4 inputs に含む）を参照して判定する
+  true_if_any:
+    - final_classification == reframe_in_place かつ Goal / Outcome / In Scope の意味が変わる場合
+    - final_classification == feedback_update_required かつ Goal / Outcome / In Scope の意味が変わる場合
+    - body 更新後の Outcome / In Scope が current_issue_title の主要語と矛盾する場合
+    - anchor_comment が明示的にタイトル変更を要求している場合
+  false_if_all:  # すべての条件を満たす場合のみ false にする
+    - Goal / Outcome / In Scope の意味が変わらない
+    - structural-only needs-fix または AC/VC 整形のみ
+```
+
+**title_update 対象外ケース（title_update.required を false にする）**:
+- `superseded_by_decision`: タイトル更新対象外。元 Issue はクローズし、代替 Issue 起票で対応する
+- title に影響しない structural-only `needs-fix`（AC/VC 整形のみ、In Scope・Outcome の実質変更なし）: タイトル更新対象外
+- AC/VC の整形・番号付けのみの変更: タイトル更新対象外
+
+**title 品質基準**（`title_update.required == true` の場合、`proposed_title` は以下を満たすこと）:
+
+```yaml
+title_quality:
+  must:
+    - 更新後の Goal / Outcome / In Scope を反映する
+    - 旧スコープ固有語（意味が変わった用語）を残さない
+    - 既存の prefix（例: "実装:" / "改善:" / "fix:" 等）を維持する
+    - AC/VC の細部ではなく成果物・運用上の到達点を表す
+  must_not:
+    - body 更新後の Outcome / In Scope と矛盾する旧主要語を含む
+  escalate_if:
+    - proposed_title の判断が不能な場合 → human_escalation または non-blocking note にする
 ```
 
 SubAgent は `edit-issue` skill の Procedure を実行し、バックアップ → guards → 本文書き戻し → 変更経緯コメント投稿。
