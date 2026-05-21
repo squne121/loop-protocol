@@ -571,6 +571,85 @@ return {
 - `local_asset_research` と `proposal_only` の `gh_commands` 対応は Issue #2255 で仕様設計を確定し、Issue #2309 で完全実装した（PR #2309）。
 - `local_asset_research` / `proposal_only` の request に `gh_commands` を指定した場合、wrapper は argv を allowlist 検証し、許可されたコマンドを事前実行して結果を `inline_context` に prepend する。allowlist 外の argv は `warnings` に記録してスキップする（`github_research` と異なり validation error にして fail-close しない）。フォーマット不正な entry（dict でない / argv が文字列リストでない）も同様に `warnings` に記録してスキップする。
 
+## `transport` Field (ACP Transport — experimental)
+
+The optional `transport` field selects the delegation transport:
+
+| Value | Behavior |
+|---|---|
+| absent or `"headless_json"` | Default. Standard `gemini --output-format json` pathway. |
+| `"acp"` | **Experimental** ACP (Agent Client Protocol) transport via `gemini --acp`. JSON-RPC lifecycle with structured events. |
+
+`transport: acp` requests are validated and prompt-built by the **same
+delegation contract** as headless_json: `run_delegation()` runs
+`validate_request()`, model chain resolution, context loading, and
+`build_prompt()` *before* dispatching to the ACP session. An invalid
+`delegation_request_v1` fails at validation and never reaches the ACP path.
+
+At `initialize` the ACP transport declares `clientCapabilities` with
+`fs.readTextFile: false`, `fs.writeTextFile: false`, `terminal: false`. This
+means only that **this ACP client provides no client-side fs/terminal proxy** —
+it does **not** disable Gemini CLI's own native tool registry, `cwd`-resolved
+MCP servers, or `approvalMode` (currently sent as `"default"`, so tools are
+active). The end-to-end safety-boundary design for ACP delegation is deferred to
+**follow-up #112**; real Gemini CLI runtime verification evidence is deferred to
+**follow-up #113**. See `references/transport-acp.md` "Capability scope" and
+"Known limitations / non-goals".
+
+`transport: acp` results are normalized by `run_delegation()` into the standard
+`delegation_result/v1` shape (`result_surface`, `requested_model`,
+`actual_model`, `exit_code`, `model_chain`, etc.); ACP-specific detail is kept
+under a `transport_details` object (`schema: "acp_result_v1"`,
+`structured_events`, `failure_class`, `stop_reason`). Fallback results
+(`_acp_fallback: true`) are already `delegation_result/v1` and pass through
+unchanged.
+
+### `transport: acp` — additional fields
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `transport` | `"acp"` | Select ACP transport. |
+| `approve_edits` | boolean (optional, default `false`) | Legacy flag passed to the **best-effort** ACP permission handler. The `session/request_permission` policy is driven by `tool_profile` + ACP `toolCall.kind`: `no_tools` rejects every kind; read-class profiles allow `read`/`search`/`fetch`/`think` and reject `edit`/`delete`/`move`/`execute`/`other`. `approve_edits=True` does **not** widen this — no `tool_profile` in this skill is write-capable. This is defence in depth only — it does not gate Gemini CLI's native tools / MCP. The end-to-end safety boundary is deferred to #112. |
+
+> `gemini_bin` は request JSON フィールドからは読まない。カスタムバイナリの指定は `GEMINI_BIN` 環境変数のみで行う。
+
+### ACP result fields (when `transport: acp`)
+
+`transport: acp` results are returned as `delegation_result/v1` (same core
+fields as headless_json). The following are ACP-specific:
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `schema` | `"delegation_result/v1"` | Normalized result schema (same as headless_json). |
+| `transport` | `"acp"` | Confirms ACP transport was used. |
+| `transport_details` | object | ACP-specific detail: `schema` (`"acp_result_v1"`), `structured_events` (list of `session/update` events — snake_case `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update` — and `session/request_permission` entries), `failure_class`, `stop_reason`. |
+| `transport_details.failure_class` | string \| null | Structured failure classifier: `gemini_not_found`, `launch_failed`, `initialize_failed`, `session_new_failed`, `auth_required`, `prompt_error`, `protocol_error`, `timeout`, `watchdog`, `incomplete_response`, `contract_bypass`, or `null` on success. Drives fallback selection. `auth_required` (the Gemini CLI / OAuth session is not pre-authenticated; the ACP `authenticate` handshake is not implemented) is **excluded** from the headless_json fallback set so the auth failure is surfaced honestly rather than masked behind a fallback success. |
+| `transport_details.stop_reason` | string \| null | The `stopReason` from the final `session/prompt` response. `ok: true` requires `stop_reason == "end_turn"` and a non-empty `response_text`. |
+| `_acp_fallback` | boolean (optional) | Present and `true` when fallback to headless_json occurred. In that case the result keeps the `headless_json` shape and is **not** re-normalized. The verification script `verify_acp_roundtrip.sh` SKIPs with exit 77 when `gemini`/`jq` are absent. |
+
+### Example request with `transport: acp`
+
+```json
+{
+  "schema": "delegation_request_v1",
+  "transport": "acp",
+  "objective": "Summarize the architecture of this project",
+  "instructions": [
+    "Focus on the key components and their relationships.",
+    "Keep the response under 300 words."
+  ],
+  "tool_profile": "no_tools",
+  "output_sections": ["Summary"],
+  "context_files": ["/absolute/path/to/README.md"],
+  "model": "gemini-2.5-flash",
+  "timeout_sec": 300
+}
+```
+
+### ACP transport lifecycle
+
+See `references/transport-acp.md` for full lifecycle, timeout design, permission proxy, and fallback documentation.
+
 ## Failure Modes
 - `invalid_request`
 - `missing_context_file`

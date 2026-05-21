@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1112,11 +1113,98 @@ def _log_model_downgrade_event(from_model: str, to_model: str, reason: str) -> N
     print(f"[gemini-headless] {event}", file=sys.stderr)
 
 
+def _resolve_acp_raw_command() -> list[str]:
+    """Build the ACP ``raw_command`` reflecting the actually-resolved binary.
+
+    Non-blocker fix: the ACP transport launches ``$GEMINI_BIN --acp`` (default
+    ``gemini``), so the normalized ``raw_command`` must reflect the real binary
+    rather than a hard-coded ``["gemini", "--acp"]``. When ``GEMINI_BIN`` is an
+    absolute / relative path, only the basename is surfaced so a secret install
+    path is not leaked into the result surface.
+    """
+    gemini_bin = str(os.environ.get("GEMINI_BIN") or "gemini")
+    if os.sep in gemini_bin or (os.altsep and os.altsep in gemini_bin):
+        gemini_bin = os.path.basename(gemini_bin) or "gemini"
+    return [gemini_bin, "--acp"]
+
+
+def _normalize_acp_result(
+    raw_acp: dict[str, Any],
+    *,
+    requested_model: str,
+    actual_model: str,
+    tool_profile: str,
+    request_warnings: list[str],
+    model_chain: list[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize a ``run_acp()`` result into a ``delegation_result/v1`` shape.
+
+    The ACP session produces an ``acp_result_v1`` dict; downstream callers
+    expect ``delegation_result/v1`` (``result_surface`` / ``requested_model`` /
+    ``actual_model`` / ``exit_code`` / ``model_chain`` etc.). This converts the
+    former into the latter so the artifact-first contract is honoured.
+
+    ``model_chain``: the model chain computed by ``run_delegation()``. When
+    provided, the computed chain is surfaced verbatim instead of a
+    ``[actual_model]`` stub so the downstream contract carries the real chain.
+
+    Fallback-produced results (``_acp_fallback == True``) are already
+    ``delegation_result/v1`` shaped because they come back through a re-entrant
+    ``run_delegation()`` call — those are passed through unchanged (only the
+    ``transport`` / ``_acp_fallback`` markers are preserved).
+    """
+    # Fallback results are already delegation_result/v1 — do not double-normalize.
+    if raw_acp.get("_acp_fallback"):
+        return raw_acp
+
+    ok = bool(raw_acp.get("ok"))
+    response_text = raw_acp.get("response_text")
+    warnings = request_warnings[:] + list(raw_acp.get("warnings") or [])
+    # Non-blocker: surface the computed chain. The ACP transport does not run
+    # the headless model-chain loop, so no chain downgrades occur — an empty
+    # model_downgrades list is the accurate value, not a stub.
+    resolved_chain = list(model_chain) if model_chain else [actual_model]
+
+    normalized: dict[str, Any] = {
+        "schema": "delegation_result/v1",
+        "transport": "acp",
+        "ok": ok,
+        "requested_model": requested_model,
+        "actual_model": actual_model,
+        "tool_profile": tool_profile,
+        "exit_code": 0 if ok else 1,
+        "result_surface": _build_result_surface(ok=ok, response_text=response_text),
+        "response_text": response_text,
+        "stderr": raw_acp.get("stderr"),
+        "warnings": warnings,
+        "failure_reason": raw_acp.get("failure_reason"),
+        "model_chain": resolved_chain,
+        "model_downgrades": [],
+        "raw_command": _resolve_acp_raw_command(),
+        "transport_details": {
+            "schema": raw_acp.get("schema", "acp_result_v1"),
+            "structured_events": raw_acp.get("structured_events") or [],
+            "failure_class": raw_acp.get("failure_class"),
+            "stop_reason": raw_acp.get("stop_reason"),
+        },
+    }
+    return normalized
+
+
 def run_delegation(
     request: Mapping[str, Any],
     request_path: Path | None = None,
     _routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # --- transport dispatcher note ---
+    # When transport="acp" is specified, the request still flows through the
+    # full delegation contract below (validate_request, model chain resolution,
+    # context loading, build_prompt) and the ACP branch is taken AFTER
+    # build_prompt() so the ACP path cannot bypass tool_profile / context_files
+    # / output_sections / GitHub-Serena constraints. See the acp dispatch block
+    # after build_prompt() further down. The dispatcher is re-entrant: ACP
+    # fallback calls run_delegation() with transport="headless_json", which
+    # does not re-enter the ACP branch.
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
     tool_profile = str(request.get("tool_profile", "unknown"))
@@ -1308,6 +1396,46 @@ def run_delegation(
     context_documents = _read_context_files(list(request["context_files"]), base_dir)
     prompt = build_prompt(merged_request, context_documents)
     timeout_sec = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
+
+    # --- transport dispatcher: acp branch ---
+    # Taken only after validate_request(), model chain resolution, context
+    # loading, and build_prompt() have all run, so the ACP path honours the
+    # exact same delegation contract as headless_json. The fully-built prompt
+    # is handed to run_acp() as prepared_prompt; the resolved model chain head
+    # is passed as model_override. The ACP fallback re-invokes run_delegation()
+    # with transport="headless_json", which does not re-enter this branch.
+    if request.get("transport") == "acp":
+        from run_gemini_acp import run_acp  # type: ignore[import]
+        approve_edits = bool(request.get("approve_edits", False))
+        # B2: resolve a deterministic cwd instead of letting the ACP session
+        # default to the process launch directory. Repo-relative profiles run
+        # at the repo root; the rest run at the request directory (base_dir).
+        if tool_profile in (LOCAL_ASSET_RESEARCH_PROFILE, GITHUB_RESEARCH_PROFILE):
+            acp_cwd = str(_repo_root())
+        else:
+            acp_cwd = str(base_dir)
+        acp_model = model_chain[0] if model_chain else requested_model
+        raw_acp = run_acp(
+            dict(merged_request),
+            request_path=request_path,
+            approve_edits=approve_edits,
+            prepared_prompt=prompt,
+            model_override=acp_model,
+            cwd_override=acp_cwd,
+            # B2: thread the resolved tool_profile so the ACP permission
+            # handler enforces the no_tools / read-class policy.
+            tool_profile=tool_profile,
+        )
+        return _normalize_acp_result(
+            raw_acp,
+            requested_model=requested_model,
+            actual_model=acp_model,
+            tool_profile=tool_profile,
+            request_warnings=request_warnings,
+            # Non-blocker: pass the computed model chain so the normalized
+            # result carries the real chain, not a [actual_model] stub.
+            model_chain=list(model_chain),
+        )
 
     # --- Model chain loop ---
     warnings: list[str] = request_warnings[:]
