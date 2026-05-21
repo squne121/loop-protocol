@@ -28,7 +28,7 @@
 - Plan 承認前に repo-tracked file を書き換えない。
 - Issue コメントは永久仕様にしない。恒久判断は `requirements`、feature spec、ADR のいずれかへ反映する。
 - Issue のスコープ外に広げる必要が出たら、同一 PR に押し込まず follow-up Issue を切る。
-- Issue contract を作業計画の正本として扱う着手条件（4 点）は `docs/dev/workflow.md` の「Issue contract を作業計画の正本として扱う条件」セクションを参照。
+- ただし `docs/dev/workflow.md` の「Issue contract を作業計画の正本として扱う条件」を満たす Implementation Issue では、Issue contract を実装計画の正本として扱い、追加の実装計画承認を要求しない（詳細条件は同セクション参照）。
 
 ## docs の優先順位
 

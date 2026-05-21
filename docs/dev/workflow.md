@@ -123,16 +123,15 @@ git branch -d worktree-<slug>
 
 ## Issue contract を作業計画の正本として扱う条件
 
-`impl-review-loop` が GitHub Issue contract を作業計画の正本として扱い、追加の実装計画承認を要求しないための着手条件。4 点すべてを満たした場合のみ着手する。
+`impl-review-loop` が GitHub Issue contract を作業計画の正本として扱い、追加の実装計画承認を要求しないための着手条件。以下をすべて満たした場合のみ着手する。
 
-- `issue-contract-review` が `status: go` を返していること（前段 preflight が完了済みであること）
-- blocker / dependency ラベルの付いた Issue がすべて close されていること（未解決の依存関係がないこと）
-- Allowed Paths が現在 OPEN な他 Implementation Issue の Allowed Paths と重複しないこと（マージコンフリクトリスクなし）
-- human escalation 条件（後述の「Human Decision が必要な条件」セクション参照）に該当しないこと
+- `issue-contract-review` が `status: go` を返していること
+  - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
+- Allowed Paths が現在 OPEN な他 Implementation Issue の Allowed Paths と重複しないこと（マージコンフリクトリスクなし、`issue-contract-review` では現時点で未判定のため独立条件として明示）
 
-4 点いずれか 1 つでも欠けた場合は着手を停止し、人間判断を仰ぐ。
+いずれか 1 つでも欠けた場合は着手を停止し、人間判断を仰ぐ。
 
-> Claude Code の plan permission mode（`--permission-mode plan` / `Shift+Tab` / `/plan` で人間が選ぶセッション制御）は人間がセッション単位で選択する UI 制御であり、本ルールの対象外である。plan permission mode の有無は上記 4 点の着手条件判定に影響しない。
+> Claude Code の plan permission mode（`--permission-mode plan` / `Shift+Tab` / `/plan` で人間が選ぶセッション制御）は人間がセッション単位で選択する UI 制御であり、本ルールの対象外である。plan permission mode の有無は上記着手条件判定に影響しない。
 
 ## Human Decision が必要な条件
 
