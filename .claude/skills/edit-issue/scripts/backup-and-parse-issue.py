@@ -52,18 +52,20 @@ def get_repo_root() -> Path:
     return Path(result.stdout.strip())
 
 
-def fetch_body(issue_number: int, repo: str) -> str:
+def fetch_title_and_body(issue_number: int, repo: str) -> tuple[str, str]:
+    """Fetch both title and body in a single gh call to avoid extra round-trips."""
     result = subprocess.run(
         ["gh", "issue", "view", str(issue_number),
-         "--repo", repo, "--json", "body", "--jq", ".body"],
+         "--repo", repo, "--json", "title,body"],
         capture_output=True, text=True, check=True
     )
-    return result.stdout
+    data = json.loads(result.stdout)
+    return data["title"], data["body"]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backup GitHub Issue body and return as JSON"
+        description="Backup GitHub Issue body (and title) and return as JSON"
     )
     parser.add_argument(
         "issue_number",
@@ -80,7 +82,7 @@ def main() -> None:
     backup_file = backup_dir / f"issue_{issue_number}_backup_{ts}.md"
 
     repo = get_repo()
-    body = fetch_body(issue_number, repo)
+    title, body = fetch_title_and_body(issue_number, repo)
 
     backup_file.write_text(body, encoding="utf-8")
     if not backup_file.stat().st_size:
@@ -90,6 +92,7 @@ def main() -> None:
     output = {
         "issue_number": issue_number,
         "backup_file": str(backup_file),
+        "title": title,
         "body": body,
     }
     print(json.dumps(output, ensure_ascii=False))
