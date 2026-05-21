@@ -49,6 +49,30 @@ gh issue view <番号> --json title,body,labels,comments
 
 BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement-loop` の起動を **人間に提案** する（自動起動しない）。
 
+#### VC failure root cause 分類
+
+各 VC が fail した場合、以下の 5 分類で root cause を判定する（正規表現マッチ + exit code の組み合わせ）:
+
+| 分類 | 条件 | 判定 |
+|---|---|---|
+| `file_not_found_expected` | `test -f` / `test -d` 等の存在確認コマンド + exit 1 + stderr 空 | 期待通り baseline fail → GO |
+| `file_not_found_unrunnable` | `No such file or directory` を含む + 実行対象ファイル/コマンドが missing | 想定外 → BLOCKED |
+| `env_missing_dep` | stderr に `No module named`/`ModuleNotFoundError`/`ImportError`/`command not found`/`not found`/`ERR_MODULE_NOT_FOUND`/`Permission denied`/`is not executable` を含む、または exit code 126/127 | 想定外（env 不備）→ BLOCKED |
+| `expected_baseline_fail` | grep/rg 系コマンドの exit 1 + no match、count assertion が threshold 未満 | 期待通り baseline fail → GO |
+| `unknown` | 上記いずれにも該当しない | `human_judgment`（自動 GO しない）|
+
+分類例:
+- `uv run python -m pytest tests/` が `ModuleNotFoundError: No module named 'yaml'` で exit 1 → `env_missing_dep` → BLOCKED
+- `rg -n "pattern" file` が exit 1 + no output → `expected_baseline_fail` → GO
+- `python missing_script.py` が `No such file or directory` で exit 1 → `file_not_found_unrunnable` → BLOCKED
+- `test -f new_feature.py` が exit 1 → `file_not_found_expected` → GO
+
+`unknown` 判定時は自動 GO しない。`human_judgment` として扱い、人間に確認を求める。
+
+- `env_missing_dep` 分類時は **BLOCKED** 判定とする（env_missing_dep → BLOCKED）。
+- `file_not_found_unrunnable` 分類時は **BLOCKED** 判定とする（file_not_found_unrunnable → BLOCKED）。
+- `unknown` 分類時は `human_judgment`（自動 GO しない）として人間の判断を求める（unknown → human_judgment）。
+
 ### 4. AC 検証可能性チェック（決定論的）
 
 | 確認項目 | 判定 |
@@ -92,6 +116,16 @@ CONTRACT_REVIEW_RESULT_V1:
       vc_failed_as_expected: <count>
       vc_passed_unexpectedly: <count>
       vc_unrunnable: <count>
+      classifications:
+        - ac: <AC番号>
+          command: "<実行したコマンド>"
+          exit_code: <int>
+          category: file_not_found_expected | file_not_found_unrunnable | env_missing_dep | expected_baseline_fail | unknown
+          confidence: high | medium | low
+          evidence:
+            stdout_excerpt: "<stdout の抜粋>"
+            stderr_excerpt: "<stderr の抜粋>"
+          decision: go | blocked | human_judgment
     ac_verifiability: pass | fail
     worktree_branch_collision: clear | conflict
   next_action: implement_issue | propose_refinement_loop | human_judgment
