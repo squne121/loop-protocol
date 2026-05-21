@@ -190,7 +190,8 @@ class TestRunTransactionParentReadbackAllFail:
             "_issue_graphql_ids",
             lambda *_a, **_k: ("node-child", 9901),
         )
-        monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        # _issue_register_sub_issue was removed (High: cleanup); stub idempotent variant only.
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
 
     def test_partial_failure_stage_sub_issue_readback(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,7 +238,8 @@ class TestRunTransactionParentReadbackRecovery:
             "_issue_graphql_ids",
             lambda *_a, **_k: ("node-child", 9901),
         )
-        monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        # _issue_register_sub_issue was removed (High: cleanup); stub idempotent variant only.
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
 
     def test_success_after_transient_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._patch_successful_create(monkeypatch)
@@ -282,6 +284,10 @@ class TestBothPathsUseHelper:
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        # Mock _run_gh_json for dedupe-body-read stage (Blocker 3/4 fix requires this)
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": "", "number": 55})
 
         helper_calls: list[tuple[Any, ...]] = []
         original_helper = txn._readback_parent_issue_with_retry
@@ -519,3 +525,1144 @@ class TestRecoveryHintDedupeLabelReadback:
         hint = txn._recovery_hint_for_stage("totally-unknown-stage", "owner/repo", 99, 0, [])
 
         assert "totally-unknown-stage" in hint
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC1: _extract_parent_issue_number_from_body — format coverage
+# ---------------------------------------------------------------------------
+
+class TestExtractParentIssueNumberFromBody:
+    """AC1: body parser extracts parent from various formats."""
+
+    def test_yaml_style_with_hash_quoted(self) -> None:
+        body = 'parent_issue: "#42"'
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_without_hash_quoted(self) -> None:
+        body = 'parent_issue: "42"'
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_bare_number(self) -> None:
+        body = "parent_issue: 42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_with_hash_unquoted(self) -> None:
+        body = "parent_issue: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_with_hash(self) -> None:
+        body = "## Parent Issue\n\n#42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_without_hash(self) -> None:
+        body = "## Parent Issue\n\n42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_with_blank_lines(self) -> None:
+        body = "## Parent Issue\n\n\n#42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_shorthand_parent_with_hash(self) -> None:
+        body = "parent: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_shorthand_parent_without_hash(self) -> None:
+        body = "parent: 42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_none_value_returns_none(self) -> None:
+        body = 'parent_issue: "none"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_null_value_returns_none(self) -> None:
+        body = "parent_issue: null"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_na_value_returns_none(self) -> None:
+        body = 'parent_issue: "N/A"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_zero_value_returns_none(self) -> None:
+        body = "parent_issue: 0"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_nashi_value_returns_none(self) -> None:
+        body = "parent_issue: なし"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_no_parent_section_returns_none(self) -> None:
+        body = "## Outcome\n\nSome outcome text."
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_empty_body_returns_none(self) -> None:
+        assert txn._extract_parent_issue_number_from_body("") is None
+
+    def test_multiline_body_with_yaml_style(self) -> None:
+        body = "## Outcome\n\nDo something.\n\nparent_issue: \"#99\"\n\n## AC\n\n- AC1"
+        assert txn._extract_parent_issue_number_from_body(body) == 99
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC3: Depends on #N is NOT treated as parent
+# ---------------------------------------------------------------------------
+
+class TestDependsOnNotParent:
+    """AC3: 'Depends on #N' MUST NOT be interpreted as a parent."""
+
+    def test_depends_on_not_interpreted_as_parent(self) -> None:
+        body = "Depends on #42\nDepends on #10"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_depends_on_with_parent_sibling(self) -> None:
+        """When both 'Depends on' and 'parent:' exist, only parent: is used."""
+        body = "Depends on #10\nparent: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_depends_on_in_body_text_not_extracted(self) -> None:
+        body = "## Background\n\nThis issue depends on #5 completing first.\nDepends on #5"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC2: _resolve_parent_issue_number — fail-closed on mismatch (tri-state)
+# ---------------------------------------------------------------------------
+
+class TestResolveParentIssueNumber:
+    """AC2: CLI arg vs body parent tri-state resolution triggers fail-closed TransactionError."""
+
+    def test_arg_only_absent_body_returns_arg(self) -> None:
+        # body absent + CLI 42 -> 42
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="absent")) == 42
+
+    def test_body_number_only_returns_body(self) -> None:
+        # body number 42 + CLI 0 -> 42
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_matching_arg_and_body_returns_arg(self) -> None:
+        # body number 42 + CLI 42 -> 42 (agreement)
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_neither_returns_zero(self) -> None:
+        # body absent + CLI 0 -> 0
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="absent")) == 0
+
+    def test_mismatch_raises_transaction_error(self) -> None:
+        # body number 99 + CLI 42 -> mismatch
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=99))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+    def test_mismatch_error_mentions_both_numbers(self) -> None:
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(10, txn.ParentResolution(state="number", value=20))
+        assert "10" in exc_info.value.message
+        assert "20" in exc_info.value.message
+
+    def test_explicit_none_and_cli_zero_ok(self) -> None:
+        # body explicit_none + CLI 0 -> 0 (no parent; Blocker 1 case)
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="explicit_none")) == 0
+
+    def test_explicit_none_and_cli_parent_fails_closed(self) -> None:
+        # body explicit_none + CLI 42 -> mismatch (Blocker 1 case)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="explicit_none"))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC2 (integration): run_transaction fails before create on mismatch
+# ---------------------------------------------------------------------------
+
+class TestRunTransactionParentArgBodyMismatch:
+    """AC2 (integration): run_transaction returns failure status when arg/body mismatch."""
+
+    def test_mismatch_returns_failure_before_any_create(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        # Body declares parent #42, but --parent-issue says 99
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        create_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            create_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=99,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "parent-arg-body-mismatch"
+        assert create_called == [], "_find_open_issues_by_title must NOT be called before fail-closed"
+
+    def test_body_parent_used_when_arg_absent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        """When --parent-issue is 0 (absent) and body declares parent #42, parent=42 is used."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        resolved_parents: list[int] = []
+
+        def _capture_register(repo: str, parent: int, db_id: int, child: int, gh: str) -> str:
+            resolved_parents.append(parent)
+            return "registered"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/50")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [50]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-50", 5001))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _capture_register)
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "success"
+        assert resolved_parents == [42], f"Expected parent 42 from body, got {resolved_parents}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC4: _issue_register_sub_issue_idempotent — 422 handling
+# ---------------------------------------------------------------------------
+
+class TestIssueRegisterSubIssueIdempotent:
+    """AC4: 422 idempotency — PASS only when read-back confirms same parent."""
+
+    def test_success_on_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(txn, "run_command", lambda *_a, **_k: _make_gh_result(stdout="ok", returncode=0))
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "registered"
+
+    def test_422_same_parent_returns_already_registered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST sub_issues -> HTTP 422 (--include format: HTTP status line in stdout)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # GET parent read-back: also uses --include format
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    def test_422_different_parent_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST sub_issues -> HTTP 422 (--include format)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # GET parent read-back returns a DIFFERENT parent
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"number": 99}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_422_empty_readback_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # read-back returns 404 (not found)
+            return _make_gh_result(stdout="", returncode=1)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_non_422_error_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            txn,
+            "run_command",
+            lambda *_a, **_k: _make_gh_result(
+                stdout="HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{}",
+                stderr="",
+                returncode=1,
+            ),
+        )
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC5: dedupe path registers and reads back parent (body-derived)
+# ---------------------------------------------------------------------------
+
+class TestDedupePathParentReconcile:
+    """AC5: dedupe path uses body-derived parent for registration + read-back."""
+
+    def test_dedupe_path_registers_and_readbacks_parent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        register_calls: list[tuple[Any, ...]] = []
+
+        def _capture_register(repo: str, parent: int, db_id: int, child: int, gh: str) -> str:
+            register_calls.append((parent, child))
+            return "registered"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _capture_register)
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+        # Mock _run_gh_json for dedupe-body-read to return existing body with matching parent
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": 'parent_issue: "#42"', "number": 55})
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Title",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "dedupe"
+        assert len(register_calls) == 1
+        parent_used, child_used = register_calls[0]
+        assert parent_used == 42, f"Expected body-derived parent 42, got {parent_used}"
+        assert child_used == 55
+
+    def test_dedupe_path_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        """Body says parent #42, arg says #99 -> fail-closed before dedupe search."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        search_called: list[bool] = []
+
+        def _should_not_search(*_a: Any, **_k: Any) -> Any:
+            search_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_search)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Title",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=99,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "parent-arg-body-mismatch"
+        assert search_called == []
+
+
+# ---------------------------------------------------------------------------
+# Iteration 1 adversarial test cases (Blocker 1-4 + command vector)
+# ---------------------------------------------------------------------------
+
+
+class TestParentBodyConflictDetection:
+    """Blocker 1: body-internal parent conflicts trigger TransactionError."""
+
+    # Case 1: explicit none + numeric in same body -> conflict
+    def test_none_and_number_mixed_raises_conflict(self) -> None:
+        body = "parent_issue: none\n## Parent Issue\n\n#133"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+    # Case 2: malformed parent (#abc) -> parse error
+    def test_malformed_parent_raises_parse_error(self) -> None:
+        body = "parent_issue: #abc"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-parse"
+
+    # Case 3: same number in two formats -> PASS
+    def test_same_number_in_two_formats_passes(self) -> None:
+        body = "parent_issue: #133\n## Parent Issue\n\n#133"
+        result = txn._extract_parent_issue_number_from_body(body)
+        assert result == 133
+
+    # Case 4: two different numbers -> conflict
+    def test_two_different_numbers_raises_conflict(self) -> None:
+        body = "parent_issue: #133\n## Parent Issue\n\n#200"
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_issue_number_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+
+class TestBodyFileFailClosed:
+    """Blocker 2: body_file not found / unreadable causes failure before GitHub API calls."""
+
+    # Case 5: body_file not found -> failure before API
+    def test_body_file_not_found_returns_failure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        nonexistent = str(tmp_path / "does_not_exist.md")
+        api_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            api_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=nonexistent,
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "body-file-read"
+        assert "not found" in result.failure_message  # type: ignore[operator]
+        assert api_called == [], "GitHub API must NOT be called when body_file is missing"
+
+    # Case 6: body_file OSError -> failure before API
+    def test_body_file_oserror_returns_failure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        body_file = tmp_path / "body.md"
+        body_file.write_text("parent_issue: 42")
+
+        original_read_text = Path.read_text
+
+        def _raise_oserror(self: Path, *_a: Any, **_k: Any) -> str:
+            if self == body_file:
+                raise OSError("Permission denied")
+            return original_read_text(self, *_a, **_k)
+
+        api_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            api_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+        monkeypatch.setattr(Path, "read_text", _raise_oserror)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "body-file-read"
+        assert api_called == [], "GitHub API must NOT be called when body_file is unreadable"
+
+
+class TestHttp422StatusParsing:
+    """Blocker 3: 422 detection via HTTP status line, not string search."""
+
+    # Case 7: POST returns HTTP 422 status line -> idempotent path
+    def test_post_http_422_triggers_idempotent_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST: HTTP 422 in status line (--include format)
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    stderr="",
+                    returncode=1,
+                )
+            # Read-back: same parent -> idempotent PASS
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    # Case 8: error text contains "422" but HTTP status is 200 -> NOT treated as 422
+    def test_error_text_with_422_but_http_200_not_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # returncode=1 but HTTP status 200 in output (edge case where gh exits 1 but HTTP 200)
+        # In practice this is an unusual scenario, but we must confirm HTTP status drives logic.
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # The error message mentions 422 in text but HTTP status line says 200
+                return _make_gh_result(
+                    stdout="HTTP/1.1 200 OK\r\n\r\nerror 422 in body text",
+                    stderr="",
+                    returncode=1,
+                )
+            return _make_gh_result(stdout="", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        # HTTP 200 != 422, so treated as non-422 error
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 9: POST HTTP 422 + read-back 404 -> partial_failure
+    def test_post_422_readback_404_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # read-back 404
+            return _make_gh_result(stdout="", returncode=1)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 10: POST HTTP 422 + read-back returns different parent -> partial_failure
+    def test_post_422_readback_different_parent_raises_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # read-back: different parent
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 999}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    # Case 11: POST HTTP 422 + read-back same parent -> already_registered PASS
+    def test_post_422_readback_same_parent_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+
+class TestDedupeParentMismatch:
+    """Blocker 4: dedupe path reads existing issue body and rejects conflicting parent."""
+
+    # Case 12: dedupe issue body has different parent -> failure
+    def test_dedupe_existing_body_different_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Existing issue (#55) body declares parent #99, but we're creating with parent #42
+        existing_issue_body = "parent_issue: #99\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+
+class TestCommandVectorChecks:
+    """Cases 13-15: verify command vectors for POST and GET include required flags."""
+
+    # Case 13: POST to sub_issues includes --include, Accept, X-GitHub-Api-Version
+    def test_post_command_vector_has_required_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            captured_args.append(list(args))
+            if not captured_args or len(captured_args) == 1:
+                # First call: POST -> success
+                return _make_gh_result(stdout="HTTP/1.1 201 Created\r\n\r\n{}", returncode=0)
+            return _make_gh_result(stdout="{}", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        post_args = captured_args[0]
+        assert "--include" in post_args, "POST must include --include flag"
+        assert "Accept: application/vnd.github+json" in post_args, "POST must include Accept header"
+        assert "X-GitHub-Api-Version: 2022-11-28" in post_args, "POST must include X-GitHub-Api-Version header"
+        assert "--method" in post_args and post_args[post_args.index("--method") + 1] == "POST"
+
+    # Case 14: GET read-back includes --method GET, Accept, X-GitHub-Api-Version
+    def test_get_readback_command_vector_has_required_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            captured_args.append(list(args))
+            if call_count == 1:
+                # POST -> 422 to trigger read-back
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # Read-back -> confirm parent
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        # Second call is the GET read-back
+        assert len(captured_args) >= 2, "Expected POST + GET calls"
+        get_args = captured_args[1]
+        assert "--include" in get_args, "GET read-back must include --include flag"
+        assert "--method" in get_args and get_args[get_args.index("--method") + 1] == "GET"
+        assert "Accept: application/vnd.github+json" in get_args, "GET read-back must include Accept header"
+        assert "X-GitHub-Api-Version: 2022-11-28" in get_args, "GET read-back must include X-GitHub-Api-Version header"
+
+    # Case 15: POST command does NOT include replace_parent
+    def test_post_command_does_not_include_replace_parent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_args: list[list[str]] = []
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            captured_args.append(list(args))
+            return _make_gh_result(stdout="HTTP/1.1 201 Created\r\n\r\n{}", returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+
+        post_args = captured_args[0]
+        assert "replace_parent" not in " ".join(post_args), "POST must NOT include replace_parent"
+
+
+# ---------------------------------------------------------------------------
+# Iteration 2 new test cases
+# ---------------------------------------------------------------------------
+
+
+class TestParentResolutionTriState:
+    """Blocker 1 (iteration 2): tri-state ParentResolution distinguishes absent vs explicit_none."""
+
+    def test_explicit_none_and_cli_parent_fails_closed(self) -> None:
+        """body: parent_issue: none + --parent-issue 42 -> TransactionError(stage="parent-arg-body-mismatch")."""
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, txn.ParentResolution(state="explicit_none"))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+    def test_explicit_none_and_cli_zero_ok(self) -> None:
+        """body: parent_issue: none + --parent-issue 0 (omitted) -> 0 (no parent)."""
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="explicit_none")) == 0
+
+    def test_absent_and_cli_parent_uses_cli(self) -> None:
+        """body absent + --parent-issue 42 -> 42 (CLI wins; absent is neutral)."""
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="absent")) == 42
+
+    def test_number_and_cli_zero_uses_body(self) -> None:
+        """body number 42 + --parent-issue 0 (omitted) -> 42 (body wins)."""
+        assert txn._resolve_parent_issue_number(0, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_number_and_cli_agree(self) -> None:
+        """body number 42 + --parent-issue 42 -> 42 (agreement)."""
+        assert txn._resolve_parent_issue_number(42, txn.ParentResolution(state="number", value=42)) == 42
+
+    def test_number_and_cli_conflict_fails_closed(self) -> None:
+        """body number 42 + --parent-issue 99 -> mismatch error."""
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(99, txn.ParentResolution(state="number", value=42))
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+
+class TestNAValueAsExplicitNone:
+    """Blocker 2 (iteration 2): N/A is recognized as explicit none."""
+
+    def test_na_value_is_explicit_none(self) -> None:
+        """body: parent_issue: "N/A" -> ParentResolution(state="explicit_none")."""
+        body = 'parent_issue: "N/A"'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_na_lowercase_is_explicit_none(self) -> None:
+        """body: parent_issue: n/a -> explicit_none."""
+        body = "parent_issue: n/a"
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_na_unquoted_returns_none_from_body(self) -> None:
+        """_extract_parent_issue_number_from_body with N/A returns None."""
+        body = 'parent_issue: "N/A"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_na_and_number_conflict_raises_body_conflict(self) -> None:
+        """body: parent_issue: "N/A" + ## Parent Issue #133 -> TransactionError(stage="parent-body-conflict")."""
+        body = 'parent_issue: "N/A"\n## Parent Issue\n\n#133'
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._extract_parent_resolution_from_body(body)
+        assert exc_info.value.stage == "parent-body-conflict"
+
+
+class TestDedupeBodyReadFailClosed:
+    """Blocker 3 (iteration 2): dedupe body-read TransactionError fails closed."""
+
+    def test_dedupe_body_read_failure_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """dedupe-body-read TransactionError -> result.failure_stage == "dedupe-body-read"."""
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fail_on_body_read(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                raise txn.TransactionError(stage="dedupe-body-read", message="body read failed")
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fail_on_body_read)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-body-read"
+
+
+class TestDedupeExistingBodyMalformedParentFailClosed:
+    """Blocker 4 (iteration 2): dedupe existing body parse error fails closed."""
+
+    def test_dedupe_existing_body_malformed_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """existing body: parent_issue: "#abc" -> result.failure_stage in parent-body-parse / dedupe-parent-body-parse."""
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        # Return a body with malformed parent (#abc cannot be parsed as int)
+        monkeypatch.setattr(
+            txn,
+            "_run_gh_json",
+            lambda *_a, stage, **_k: {"body": 'parent_issue: "#abc"\n', "number": 55},
+        )
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage in {"parent-body-parse", "dedupe-parent-body-parse"}
+
+
+class TestExtractHttpStatusLastMatch:
+    """High (iteration 2): _extract_http_status returns the last status line."""
+
+    def test_extract_http_status_returns_last_match(self) -> None:
+        """Redirect chain: 301 -> 201 -> returns 201 (the last status)."""
+        text = "HTTP/2 301 Moved Permanently\r\n\r\nHTTP/2 201 Created\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 201
+
+    def test_extract_http_status_single_match(self) -> None:
+        """Single status line returns that status."""
+        text = "HTTP/1.1 200 OK\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 200
+
+    def test_extract_http_status_no_match_returns_none(self) -> None:
+        """No status line returns None."""
+        assert txn._extract_http_status("no status here") is None
+
+    def test_extract_http_status_422_last(self) -> None:
+        """Multiple status lines, last is 422."""
+        text = "HTTP/1.1 200 OK\r\n\r\nHTTP/1.1 422 Unprocessable Entity\r\n\r\n{}"
+        assert txn._extract_http_status(text) == 422
+
+
+# ---------------------------------------------------------------------------
+# Iteration 3 test cases: Blocker 1, Blocker 2, High (422 readback), High (issue_kind)
+# ---------------------------------------------------------------------------
+
+
+class TestParentNoneWithAnnotation:
+    """Blocker 1 (iteration 3): none with parenthetical annotation is explicit_none."""
+
+    def test_parent_heading_none_with_annotation_is_explicit_none(self) -> None:
+        """## Parent Issue + 'none（単独改善）' -> explicit_none."""
+        body = 'parent_issue: "none"\n\n## Parent Issue\n\nnone（単独改善）'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_parent_issue_standalone_annotation_is_explicit_none(self) -> None:
+        """## Parent Issue + '単独改善（no parent）' -> explicit_none."""
+        body = "## Parent Issue\n\n単独改善（no parent）"
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_none_with_latin_annotation_is_explicit_none(self) -> None:
+        """'none (standalone)' in machine contract -> explicit_none."""
+        body = 'parent_issue: "none (standalone)"'
+        resolution = txn._extract_parent_resolution_from_body(body)
+        assert resolution.state == "explicit_none"
+
+    def test_is_explicit_none_bare_none(self) -> None:
+        assert txn._is_explicit_none("none")
+
+    def test_is_explicit_none_none_with_annotation(self) -> None:
+        assert txn._is_explicit_none("none（単独改善）")
+
+    def test_is_explicit_none_standalone_kanji(self) -> None:
+        assert txn._is_explicit_none("単独改善")
+
+    def test_is_explicit_none_not_number(self) -> None:
+        assert not txn._is_explicit_none("42")
+
+    def test_is_explicit_none_not_arbitrary_text(self) -> None:
+        assert not txn._is_explicit_none("some text")
+
+
+class TestDedupeExistingBodyExplicitNoneWithParent:
+    """Blocker 2 (iteration 3): dedupe existing body explicit_none + resolved parent -> failure."""
+
+    def test_dedupe_existing_body_explicit_none_with_resolved_parent_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Existing issue body: parent_issue: none. Current resolved parent: 42.
+        -> failure_stage == "dedupe-parent-mismatch"."""
+        existing_issue_body = "parent_issue: none\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+    def test_dedupe_existing_body_none_annotation_with_resolved_parent_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Existing issue body: 'none（単独改善）'. Current resolved parent: 42.
+        -> failure_stage == "dedupe-parent-mismatch"."""
+        existing_issue_body = "## Parent Issue\n\nnone（単独改善）\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="parent_issue: #42\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=42,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-parent-mismatch"
+
+
+class TestSubIssueReadback422OnlyHttp200:
+    """High (iteration 3): 422 post-readback succeeds ONLY when rb_http_status == 200."""
+
+    def test_readback_http_200_is_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rb_http_status == 200 after 422 POST -> already_registered."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            return _make_gh_result(
+                stdout='HTTP/1.1 200 OK\r\n\r\n{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    def test_readback_http_404_is_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rb_http_status == 404 after 422 POST -> TransactionError (not success)."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # HTTP 404 in status line, returncode 0 (edge case)
+            return _make_gh_result(
+                stdout="HTTP/1.1 404 Not Found\r\n\r\n{}",
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_readback_no_http_status_is_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No HTTP status in read-back output -> TransactionError (not success)."""
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(
+                    stdout="HTTP/1.1 422 Unprocessable Entity\r\n\r\n{}",
+                    returncode=1,
+                )
+            # returncode 0 but no HTTP status line (e.g., raw JSON without --include)
+            return _make_gh_result(
+                stdout='{"number": 10}',
+                returncode=0,
+            )
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+
+class TestDedupeIssueKindMismatch:
+    """High (iteration 3): dedupe identity gate rejects issue_kind mismatch."""
+
+    def test_dedupe_issue_kind_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Existing issue: issue_kind: research. Current: issue_kind: implementation.
+        -> failure_stage == "dedupe-kind-mismatch"."""
+        existing_issue_body = "issue_kind: research\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "dedupe-kind-mismatch"
+
+    def test_dedupe_issue_kind_match_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same issue_kind in both bodies -> no kind mismatch failure."""
+        existing_issue_body = "issue_kind: implementation\n## Outcome\nTest"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        # Should not fail due to kind mismatch (kind matches)
+        assert result.failure_stage != "dedupe-kind-mismatch"
+
+    def test_dedupe_issue_kind_absent_in_existing_skips_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Existing body has no issue_kind field -> gate is skipped (best-effort)."""
+        existing_issue_body = "## Outcome\nTest (no issue_kind)"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            if stage == "dedupe-body-read":
+                return {"body": existing_issue_body, "number": 55}
+            raise AssertionError(f"Unexpected _run_gh_json stage: {stage}")
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Issue Title",
+            body="issue_kind: implementation\n## Outcome\nTest",
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.failure_stage != "dedupe-kind-mismatch"
