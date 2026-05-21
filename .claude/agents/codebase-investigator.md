@@ -74,6 +74,30 @@ permissionMode: dontAsk
   - 存在するディレクトリパスを渡すと `context file is not a file` 相当のエラーで fail する。
 - ディレクトリ単位の調査が必要な場合は、`context_files` にディレクトリを渡すのではなく、`objective` または `instructions` 側で調査範囲（対象ディレクトリのパス、再帰の深さ、除外パターン等）を指定すること。Serena MCP の `list_dir` / `find_file` / `search_for_pattern` ツールが範囲を受け取って内部で走査する。
 
+**github_research 使用前の準備（issue 系入力がある場合）**:
+
+`issue_number` / `focus_topics` / `anchor_comment` / `objective` などを使う場合は、必ず以下の手順で一時 context ファイルを作成し、`context_files` に渡すこと:
+
+```bash
+CONTEXT_FILE="/tmp/codebase-investigator-context-$(date +%s).md"
+cat > "$CONTEXT_FILE" <<CTXEOF
+# 調査コンテキスト
+## 目的
+<purpose>
+
+## Issue 本文
+<issue_body または gh issue view の出力>
+
+## フォーカストピック
+<focus_topics>
+
+## anchor comment（あれば）
+<anchor_comment 内容>
+CTXEOF
+```
+
+wrapper は `context_files` を 1 件以上必須とするため、context ファイルなしでの呼び出しは `missing context file` エラーになる。
+
 **gh 調査モード** (`tool_profile: github_research`, `role: github_research`):
 ```json
 {
@@ -87,13 +111,15 @@ permissionMode: dontAsk
   "tool_profile": "github_research",
   "role": "github_research",
   "output_sections": ["対象", "発見事項", "影響範囲", "参照先"],
-  "context_files": ["<空でなければ補助 context のパス>"],
+  "context_files": ["/tmp/codebase-investigator-context-<timestamp>.md"],
   "gh_commands": [
     {"argv": ["issue", "list", "--state", "open", "--search", "<keywords>"]}
   ],
   "timeout_sec": 300
 }
 ```
+
+> **注意**: `context_files` には必ず上記で事前作成した context ファイルのパスを指定すること。空・省略・ダミーパスは不可（`missing context file` エラーで fail する）。
 
 ## 報告形式
 
