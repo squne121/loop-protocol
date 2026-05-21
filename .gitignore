@@ -25,6 +25,7 @@ dist-ssr
 
 # NotebookLM local assets
 .nlm-local/
+tmp/
 tmp/nlm/
 
 # Project-local tmp working files (issue backups / intermediate body / reviewer feedback など)
