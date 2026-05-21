@@ -65,7 +65,11 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 - decision: not_applicable | immediate | deferred
 - reason: <判定理由>
 - if immediate: 対応 AC / VC / 証跡要件（policy.md の decision ごとの要求事項を参照）
-- if deferred: 後続 Issue / 統合フェーズ / 検証条件
+- if deferred:
+    - deferred_destination:
+        - destination_type: issue | phase | milestone
+        - destination_ref: <Issue番号 / フェーズ名 / マイルストーン名>
+    - deferred_verification_condition: <検証が成立するために必要な条件の説明>
 ```
 
 | decision | 意味 | 実動作検証 AC の要否 |
@@ -74,7 +78,8 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 | `immediate` | 本 Issue 内で動作検証が成立する | 必要 |
 | `deferred` | 統合フェーズ・後続 Issue で初めて成立する | 不要（後続で提出） |
 
-- `deferred` の場合は後続 Issue 番号・統合フェーズ名・検証条件を必ず明記する。
+- `deferred` の場合は `deferred_destination`（destination_type + destination_ref）と `deferred_verification_condition` の **両方を必ず記載する**（`review-issue` C10 blocker）。
+- 自由記述の「後続 Issue で検証する」だけでは不完全。機械的に検出できる半構造化フォーマットで記述すること。
 - 適用判定の詳細基準は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
 
 ## VC 作成ガイダンス

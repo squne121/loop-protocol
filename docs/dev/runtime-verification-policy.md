@@ -35,6 +35,39 @@
 - `immediate`: 動作検証 AC に `<!-- runtime-verification: true -->` タグを付与。VC に SKIP exit 77 / fallback FAIL の実装を含める。証跡を PR に添付する。
 - `deferred`: 後続 Issue 番号・統合フェーズ名・検証条件を明記する。証跡は後続 Issue / フェーズで提出する。
 
+### deferred 記述の必須フィールド
+
+`decision: deferred` を宣言する場合、以下のフィールドをすべて記載することが必須。不完全な場合は `review-issue` の C10 blocker となる。
+
+```markdown
+## Runtime Verification Applicability
+
+- decision: deferred
+- reason: <deferred にする判定理由>
+- deferred_destination:
+    - destination_type: issue | phase | milestone
+    - destination_ref: <Issue番号 / フェーズ名 / マイルストーン名>
+- deferred_verification_condition: <検証が成立するために必要な条件の説明>
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `decision` | enum | `deferred` 固定 |
+| `reason` | string | なぜ本 Issue では動作検証が成立しないかの理由 |
+| `deferred_destination.destination_type` | `issue \| phase \| milestone` | 後続検証先の種別 |
+| `deferred_destination.destination_ref` | string | Issue 番号（例: `#123`）/ フェーズ名 / マイルストーン名 |
+| `deferred_verification_condition` | string | 後続の何が完了すれば動作検証が成立するかの条件説明 |
+
+### decision と runtime-verification タグの整合ルール
+
+以下の整合ルールを `issue-contract-review` および `review-issue` が検出する:
+
+| 状態 | 判定 |
+|---|---|
+| `decision: immediate` かつ AC に `<!-- runtime-verification: true -->` タグが 1 つ以上ある | 整合（正常） |
+| `decision: immediate` かつ `<!-- runtime-verification: true -->` タグが 1 つもない | **blocker**（タグ付与を要求） |
+| `decision: not_applicable` または `decision: deferred` かつ `<!-- runtime-verification: true -->` タグがある | **blocker**（decision と矛盾。タグ削除または decision 変更を要求） |
+
 ---
 
 ## 1. 目的とスコープ
