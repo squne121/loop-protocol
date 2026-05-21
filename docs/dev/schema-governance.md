@@ -27,15 +27,20 @@ related_issue: "#135"
 
 ## Initial Known Schemas（初期 schema リスト）
 
-| Schema ID | 定義場所 | Producer | Consumer |
-|---|---|---|---|
-| `issue_contract/v1` | GitHub Issue 本文（`## Machine-Readable Contract` YAML ブロック） | issue-author skill | issue-contract-review, implement-issue, pr-review-judge |
-| `delegation_request_v1` | `.claude/skills/gemini-cli-headless-delegation/` | implement-issue, codebase-investigator | gemini-cli 実行 wrapper |
-| `delegation_result/v1` | `.claude/skills/gemini-cli-headless-delegation/` | gemini-cli 実行 wrapper | web-researcher, codebase-investigator, impl-review-loop |
-| `LOOP_VERDICT` | `.claude/skills/pr-review-judge/SKILL.md` Verdict コメントテンプレート | pr-review-judge | impl-review-loop |
-| `TEST_VERDICT_MACHINE v1` | `.claude/skills/test-runner/`（または test-runner SubAgent） | test-runner SubAgent | pr-review-judge, impl-review-loop |
-| `IMPLEMENT_RESULT_V1` | `.claude/skills/implement-issue/SKILL.md` | implement-issue | impl-review-loop |
-| `contract_schema_version: v1` | GitHub Issue 本文（`## Machine-Readable Contract`） | issue-author skill | issue-contract-review |
+| Schema ID | 定義場所 | Producer | Consumer | Detection patterns |
+|---|---|---|---|---|
+| `issue_contract/v1` | GitHub Issue 本文（`## Machine-Readable Contract` YAML ブロック） | issue-author skill | issue-contract-review, implement-issue, pr-review-judge | `rg -n "issue_contract\|Machine-Readable Contract\|contract_schema_version" .` |
+| `delegation_request_v1` | `.claude/skills/gemini-cli-headless-delegation/` | implement-issue, codebase-investigator | gemini-cli 実行 wrapper | `rg -n "delegation_request_v1\|delegation_request" .claude` |
+| `delegation_result/v1` | `.claude/skills/gemini-cli-headless-delegation/` | gemini-cli 実行 wrapper | web-researcher, codebase-investigator, impl-review-loop | `rg -n "delegation_result/v1\|result_surface\|transport_details\|failure_class\|structured_events" .` |
+| `acp_result_v1` | `.claude/skills/gemini-cli-headless-delegation/`（delegation_result/v1 正規化前 internal transport） | gemini-cli 実行 wrapper | delegation_result/v1 正規化処理（PR #81 の事故対象） | `rg -n "acp_result_v1\|acp_result\|--acp" .` |
+| `LOOP_VERDICT` | `.claude/skills/pr-review-judge/SKILL.md` Verdict コメントテンプレート | pr-review-judge | impl-review-loop | `rg -n "LOOP_VERDICT\|verdict:\|reviewed_head_sha" .` |
+| `TEST_VERDICT_MACHINE v1` | `.claude/skills/test-runner/`（または test-runner SubAgent） | test-runner SubAgent | pr-review-judge, impl-review-loop | `rg -n "TEST_VERDICT_MACHINE\|verification_commands_pass\|verification_commands_fail" .` |
+| `IMPLEMENT_RESULT_V1` | `.claude/skills/implement-issue/SKILL.md` | implement-issue | impl-review-loop | `rg -n "IMPLEMENT_RESULT_V1\|IMPLEMENT_RESULT" .claude` |
+| `contract_schema_version: v1` | GitHub Issue 本文（`## Machine-Readable Contract`） | issue-author skill | issue-contract-review | `rg -n "contract_schema_version" .` |
+| `Runtime Verification Applicability` | `docs/dev/runtime-verification-policy.md` | issue-author skill / human | implement-issue, pr-review-judge, impl-review-loop | `rg -n "Runtime Verification Applicability\|runtime_verification_applicability\|decision: immediate\|decision: deferred\|decision: not_applicable" .` |
+| `Safety Claim Matrix` | `.github/pull_request_template.md`, `.claude/skills/open-pr/SKILL.md` | PR 作成者 | open-pr, pr-review-judge | `rg -n "Safety Claim Matrix\|Not controlled\|E_SAFETY_CLAIM_MATRIX_MISSING" .claude .github docs` |
+| `model_routing.yaml` | `.claude/skills/gemini-cli-headless-delegation/model_routing.yaml`（推定） | model routing 設定管理者 | gemini-cli 実行 wrapper, test_model_routing.py | `rg -n "model_routing\|model_routing\.yaml\|routing_config" .` |
+| `runtime-verification artifact log` | `docs/dev/runtime-verification-policy.md` | implement-issue（runtime verification 実行時） | pr-review-judge（Runtime Verification Evidence 確認） | `rg -n "runtime.verification.artifact\|Runtime Verification Evidence\|verification_route" .` |
 
 ## schema_change_applicability 判定基準
 

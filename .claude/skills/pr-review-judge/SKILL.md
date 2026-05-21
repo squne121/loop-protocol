@@ -148,6 +148,15 @@ Schema Consumer Inventory の必須項目:
 
 `schema_change_applicability: not_schema_change` を明示し、その根拠が diff と一致している場合は Schema Consumer Inventory の提出を不要とする。
 
+#### Compatibility Decision の判定ルール（APPROVE 禁止条件）
+
+Schema Consumer Inventory 内の `### Compatibility Decision` セクションを確認する:
+
+| 条件 | 判定 |
+|---|---|
+| `compatibility: breaking` または `uncertain` なのに `migration` 欄が空欄、かつ follow-up Issue 参照もない | **APPROVE 禁止** |
+| `compatibility: breaking` なのに consumer 更新状況テーブルに「未対応」が残存している | **APPROVE 禁止** |
+
 #### Schema Consumer Inventory の確認コマンド例
 
 ```bash

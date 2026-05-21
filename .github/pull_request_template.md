@@ -48,6 +48,14 @@ rg -l "<schema-id-or-key>" .
 |---|---|---|
 | （rg で列挙したファイル） | 更新済み / 不要（理由） / 未対応 |  |
 
+### Compatibility Decision
+
+> schema 変更の互換性を明示してください。`not_schema_change` の場合は `N/A` と記載してください。
+
+- compatibility: `backward_compatible` | `breaking` | `additive` | `uncertain` | `N/A`
+- migration: （breaking の場合、migration 手順または follow-up Issue 番号を記載。`N/A` 可）
+- notes: （互換性判断の根拠）
+
 ## Safety Claim Matrix
 
 > このセクションは安全境界・権限・サンドボックス・transport・auth・MCP・native tools・approvalMode・runtime verification・workflow gate に触れる PR で必須です。
