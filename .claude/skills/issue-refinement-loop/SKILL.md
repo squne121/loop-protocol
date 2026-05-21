@@ -680,16 +680,7 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 refinement ループ中に codebase-investigator / web-researcher / review-issue が「この Issue スコープ外だが改善すべき事項」を発見した場合、main thread は `termination_reason: approved` 確定後に以下を実行する:
 
-- `LOOP_STATE.improvements_applied` または各 SubAgent の出力中に含まれる **派生改善候補**（scope 外の改善提案・技術的負債・関連 docs 更新等）を、以下の **即時実行 vs Issue 起票の判断基準** に従って処理する。
-
-**即時実行 vs Issue 起票の判断基準（MUST）**:
-
-| 種別 | 判定条件 | アクション |
-|---|---|---|
-| 即時実行 | `gh issue edit` / `gh issue comment` のみで完結する既存 Issue 本文・コメントの修正 | main thread が直接実行。Issue 起票しない |
-| Issue 起票 | docs / コード / スクリプト / skill ファイルへの変更を伴う、または新規 Issue 作成が必要 | `issue-author` / `create-issue` 経由で自動起票 |
-
-例：既存 Issue 本文の SSOT 矛盾修正（数行 `gh issue edit`）→ 即時実行。新しいガイドラインを `body-authoring.md` に追記する → Issue 起票。
+- `LOOP_STATE.improvements_applied` または各 SubAgent の出力中に含まれる **派生改善候補**（scope 外の改善提案・技術的負債・関連 docs 更新等）を `issue-author` / `create-issue` 経由で**自動起票**する。
 - 起票前に **dedupe チェックを dedupe_key ベースで実施する**（title 検索ではなく `FOLLOW_UP_ISSUE_REQUEST_V1.dedupe_key` で既存 Issue（open / closed すべて）を検索して重複を確認）:
   ```
   gh issue list --repo squne121/loop-protocol --state all \
