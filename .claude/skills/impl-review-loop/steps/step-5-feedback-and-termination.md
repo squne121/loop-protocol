@@ -40,17 +40,18 @@ gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +
 - 次アクション: 人間レビュー → マージ → post-merge-cleanup
 
 \`\`\`yaml
-follow_up_issues:
-  - request_dedupe_key: \"...\"
-    issue_number: 123
-    issue_url: \"https://github.com/...\"
-    status: created | reused | skipped_duplicate
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: \"...\"
+      issue_number: 123
+      issue_url: \"https://github.com/...\"
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
 
-note_only_observations:
-  - dedupe_key: \"...\"
-    source_url: \"...\"
-    source_note_id: \"...\"
-    summary: \"...\"
+  note_only_observations:
+    - dedupe_key: \"...\"
+      source_url: \"...\"
+      source_note_id: \"...\"
+      summary: \"...\"
 \`\`\`"
 ```
 
@@ -69,10 +70,14 @@ for each req in LOOP_VERDICT.follow_up_issue_requests:
   - severity: note_only → 起票せず、終了報告コメントの note_only_observations に記録
 
   dedupe チェック（severity: mandatory_follow_up / optional_follow_up）:
-    gh issue list --repo squne121/loop-protocol --state open \
-      --search '"<req.dedupe_key>"' --json number,title,url
-    重複あり → スキップ（既存 Issue 番号を記録）
+    gh issue list --repo squne121/loop-protocol --state all \
+      --search '"<req.dedupe_key>"' --json number,title,url,state,stateReason,labels
+    重複あり（open）→ スキップ（既存 Issue 番号を記録、status: reused_open）
+    重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
+    重複あり（closed / completed）→ 起票せずスキップ（status: skipped_closed_completed）
+    重複あり（closed / duplicate）→ 起票せずスキップ（status: skipped_closed_duplicate）
     重複なし → 起票（## Source セクションに dedupe_key を含める）
+    ※ closed Issue を open に差し戻す場合は human escalation が必要（自動起票不可）
 ```
 
 起票・スキップした follow-up Issue の情報を終了報告コメントの `follow_up_issues` フィールドに列挙する。

@@ -322,6 +322,22 @@ follow_up_issue_requests:
 - self-authored PR では `gh pr review --approve` / `--request-changes` を使わない（必ず `--comment`）
 - 曖昧な場合は APPROVE せず REQUEST_CHANGES（fail-closed）
 
+### mandatory_follow_up_gate
+
+```yaml
+mandatory_follow_up_gate:
+  rule: |
+    LOOP_VERDICT.follow_up_issue_requests に severity: mandatory_follow_up が含まれ、
+    かつ materialization.status: missing の場合は APPROVE を出力しない。
+    代わりに REQUEST_CHANGES を出力し、blocker として記録する。
+  action: REQUEST_CHANGES
+  blocker_message: |
+    mandatory_follow_up Issue が未 materialize です。
+    APPROVE 確定前に該当 Issue を create または reuse してください（impl-review-loop Step 5 が担当）。
+```
+
+pr-review-judge 自身は **Issue 起票を実行しない**。`follow_up_issue_requests` を `LOOP_VERDICT` に出力し、起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
+
 ## Output Contract
 
 GitHub surface:

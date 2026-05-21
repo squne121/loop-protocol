@@ -33,15 +33,43 @@ main thread は以下の手順で SubAgent に委譲する:
 
 ```
 for each request in follow_up_issue_requests:
-  1. dedupe チェック: dedupe_key で既存 OPEN Issue を検索
-     gh issue list --repo squne121/loop-protocol --state open \
-       --search '"<dedupe_key>"' --json number,title,url
+  1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
+     gh issue list --repo squne121/loop-protocol --state all \
+       --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
   2. 重複なし → issue-author SubAgent に委譲して create-issue skill 経由で起票
      ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
-  3. 重複あり → スキップ（既存 Issue 番号をレポートに記録）
+  3. 重複あり（open）→ スキップ（既存 Issue 番号をレポートに記録、status: reused_open）
+  4. 重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
+  5. 重複あり（closed / completed）→ 起票せずスキップ（status: skipped_closed_completed）
+  6. 重複あり（closed / duplicate）→ 起票せずスキップ（status: skipped_closed_duplicate）
+  ※ closed Issue を open に差し戻して再利用する場合は human escalation が必要（自動起票不可）
 ```
 
-起票したすべての follow-up Issue を `## post-merge-cleanup: 完了` コメントに列挙する。
+起票・スキップした follow-up Issue の情報を終了コメントの `follow_up_issues` フィールドに列挙する（`FOLLOW_UP_MATERIALIZATION_RESULT_V1` 形式。詳細スキーマは `docs/dev/agent-skill-boundaries.md` 参照）。
+
+終了コメントのテンプレート（`FOLLOW_UP_MATERIALIZATION_RESULT_V1` を含む）:
+
+````markdown
+## post-merge-cleanup: 完了 (<timestamp>)
+
+- status: ok | partial | failed
+- 次アクション: <親 Issue クローズ / 人間判断 等>
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: "..."
+      issue_number: 123
+      issue_url: "https://github.com/..."
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+
+  note_only_observations:
+    - dedupe_key: "..."
+      source_url: "..."
+      source_note_id: "..."
+      summary: "..."
+```
+````
 
 ## 責務分界
 
@@ -49,7 +77,7 @@ for each request in follow_up_issue_requests:
 |---|---|
 | git / gh 出力分類・cleanup 実行 | SubAgent（fail-close） |
 | CONFLICT 検出時の即時停止 | SubAgent |
-| follow-up Issue 起票 | main thread（`create-issue` / `edit-issue` 経由）|
+| follow-up Issue 起票 | main thread（`create-issue` 経由。dedupe ヒット時はスキップ）|
 | parent issue クローズ実行 | main thread |
 | superseded PR close / comment 実行 | main thread |
 | 人間判断が必要な事象の最終判断 | 人間 |
@@ -208,5 +236,4 @@ POST_MERGE_CLEANUP_REPORT_V1:
 
 - `.claude/agents/post-merge-cleanup-worker.md` — 本 skill を実行する SubAgent
 - `.claude/skills/create-issue/SKILL.md` — follow-up 起票委譲先
-- `.claude/skills/edit-issue/SKILL.md` — 既存 Issue 更新委譲先
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界
