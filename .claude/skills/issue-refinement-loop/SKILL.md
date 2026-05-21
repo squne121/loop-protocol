@@ -72,6 +72,7 @@ LOOP_STATE:
     verified_claims: []                # B3: 検証済み主張
     unresolved_claims: []              # B3: 未解決の主張
     scope_impact: null                 # B3: none | amend | replace | ambiguous
+    requires_fact_check: false         # true の場合のみ Step 1 で codebase-investigator に anchor comment を注入する（classification 種別非依存）
   superseded_decision:                 # B3: superseded_by_decision 分岐用
     decision_summary: null
     alternative_issue_number: null
@@ -226,25 +227,52 @@ inputs:
   focus_topics: <Issue タイトル + Outcome から抽出したキーワード>
 ```
 
-**B2: anchor_comment_url 指定時の追加入力**:
+**B2: anchor comment 注入条件（`requires_fact_check == true` の場合のみ）**:
+
+`LOOP_STATE.anchor_comment.snapshot != null` かつ `LOOP_STATE.anchor_comment.requires_fact_check == true` の場合、以下を追加入力として渡す。この条件は classification 種別（`reframe_in_place` / `feedback_update_required` / `superseded_by_decision`）に非依存であり、`requires_fact_check` フラグのみで制御する。
+
+注入する入力は `ANCHOR_COMMENT_CONTEXT_V1` 形式で渡す:
 
 ```yaml
-# anchor_comment_url が指定されており、preliminary_classification が
-# reframe_in_place / feedback_update_required の場合、以下を追加する
-Step 1 inputs（anchor_comment_url 指定時）:
-  anchor_comment:
+ANCHOR_COMMENT_CONTEXT_V1:
+  source:
     url: <LOOP_STATE.anchor_comment.url>
-    snapshot: <LOOP_STATE.anchor_comment.snapshot>
-    classification: <LOOP_STATE.anchor_comment.preliminary_classification>
-    required_checks:
-      - コメントが Outcome / In Scope / AC を無効化しているか検証する
-      - 事実誤りと scope 置換を区別する
+    comment_id: <LOOP_STATE.anchor_comment.id>
+    issue_number: <LOOP_STATE.anchor_comment.issue_number>
+  issue_snapshot:
+    title: <Issue タイトル>
+    outcome: <Issue Outcome セクション>
+    in_scope: <Issue In Scope セクション>
+    acceptance_criteria: <Issue AC リスト>
+  anchor_comment_snapshot: <LOOP_STATE.anchor_comment.snapshot>
+  preliminary_classification: <LOOP_STATE.anchor_comment.preliminary_classification>
+  required_checks:
+    - コメントが Outcome / In Scope / AC を無効化しているか検証する
+    - 事実誤りと scope 置換を区別する
+    - repo 実装事実・既存 Issue / PR の事実を主張している claim を列挙する
 ```
+
+`codebase-investigator` は上記入力を受け取り、claim ごとの verdict と evidence のみを返す。**mutation（Issue/PR の編集・クローズ・作成）を行ってはいけない（MUST NOT）**。
+
+`codebase-investigator` の出力は `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` 形式で返す:
+
+```yaml
+ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
+  claims:
+    - claim: <検証対象の主張テキスト>
+      verdict: confirmed | refuted | inconclusive
+      evidence: <根拠となるファイルパス / Issue番号 / PR番号 / コードスニペット>
+      scope_impact: none | amend | replace | ambiguous
+  recommended_final_classification: superseded_by_decision | reframe_in_place | feedback_update_required | human_escalation
+  unresolved_risks: []
+```
+
+**main thread の責務**: `codebase-investigator` から `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を受け取った後、`recommended_final_classification` を参考に main thread / orchestrator が `LOOP_STATE.anchor_comment.final_classification` を確定する。`final_classification` の確定責務は main thread にあり、SubAgent に委譲してはならない。
 
 SubAgent は Issue 本文に関連するコードベース・既存 ADR・関連 Issue / PR を調査し、構造化レポートを返す。
 LOOP_PROTOCOL では `ssot-discovery` skill を併用して `docs/` 配下の関連ドキュメントも列挙する。
 
-Step 1 完了後、anchor comment の事実確認が必要だった場合は `LOOP_STATE.anchor_comment.final_classification` を確定し、`verified_claims` と `unresolved_claims` を更新する。
+Step 1 完了後、`requires_fact_check == true` だった場合は main thread が `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を統合して `LOOP_STATE.anchor_comment.final_classification` を確定し、`verified_claims` と `unresolved_claims` を更新する。
 
 ### Step 1b: 外部仕様の事実確認（条件付き、`web-researcher` SubAgent）
 
@@ -329,16 +357,20 @@ inputs:
   reviewer_feedback_text: <review-issue が返した diff_proposal を整形した文字列>
 ```
 
-**B2: anchor_comment が feedback_update_required の場合の追加入力**:
+**B2: anchor_comment が feedback_update_required / reframe_in_place の場合の追加入力**:
+
+Step 4 は raw anchor comment（`LOOP_STATE.anchor_comment.snapshot`）を直接受け取らない。main thread が `final_classification` を確定した後に正規化した `anchor_comment_feedback` のみを受け取る。
 
 ```yaml
 # anchor_comment_url が指定されており、
 # final_classification が feedback_update_required / reframe_in_place の場合、以下を追加する
-Step 4 inputs（anchor_comment が feedback_update_required の場合）:
+Step 4 inputs（anchor_comment が feedback_update_required / reframe_in_place の場合）:
   reviewer_feedback_text: <review-issue diff_proposal + anchor_comment の正規化フィードバック>
   anchor_comment_feedback:
-    classification: reframe_in_place | feedback_update_required
-    required_edits: <分類から導いた必要編集内容>
+    # final_classification 後の正規化済み情報のみ渡す。raw anchor comment snapshot は含めない。
+    classification: reframe_in_place | feedback_update_required   # main thread が確定した final_classification
+    required_edits: <final_classification から導いた必要編集内容>
+    scope_impact: <LOOP_STATE.anchor_comment.scope_impact>
 ```
 
 SubAgent は `edit-issue` skill の Procedure を実行し、バックアップ → guards → 本文書き戻し → 変更経緯コメント投稿。
@@ -406,6 +438,10 @@ iteration 中に Issue 本文へ以下が新規追加された場合は、refine
 - `## Allowed Paths` に新規ディレクトリが追加された（既存と異なるアーキテクチャ層への拡大）
 - `## Acceptance Criteria` に新規の検証可能性が低い項目が追加された
 
+## Out of Scope
+
+- **Agent SDK 化**: `ANCHOR_COMMENT_CONTEXT_V1` / `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を Agent SDK の typed tool として実装することは別 Issue で扱う。本 Issue #127 では Skill 上の protocol contract 固定に限定し、SDK 化は行わない。
+
 ## Verification Commands
 
 ```bash
@@ -423,6 +459,27 @@ rg "Idempotency|冪等|既存.*代替 Issue|alternative.*existing" .claude/skill
 
 # B7: ALTERNATIVE_ISSUE_DRAFT_V1 の記述確認
 rg "ALTERNATIVE_ISSUE_DRAFT_V1" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: B7 contract" || echo "FAIL: B7 contract"
+
+# AC1: ANCHOR_COMMENT_CONTEXT_V1 の記述確認
+rg "ANCHOR_COMMENT_CONTEXT_V1" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC1" || echo "FAIL: AC1"
+
+# AC2: requires_fact_check の記述確認
+rg "requires_fact_check" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC2" || echo "FAIL: AC2"
+
+# AC3: ANCHOR_COMMENT_FACT_CHECK_RESULT_V1 の記述確認
+rg "ANCHOR_COMMENT_FACT_CHECK_RESULT_V1" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC3" || echo "FAIL: AC3"
+
+# AC4: codebase-investigator の mutation 禁止記述確認
+rg "codebase-investigator.*(mutation|edit|close|create|してはいけない|MUST NOT)" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC4" || echo "FAIL: AC4"
+
+# AC5: final_classification 確定責務が main thread にあることの確認
+rg "final_classification.*main thread|main thread.*final_classification|orchestrator.*final_classification" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC5" || echo "FAIL: AC5"
+
+# AC6: anchor_comment_feedback / 正規化済み feedback の記述確認
+rg "anchor_comment_feedback|正規化.*feedback|final_classification.*feedback" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC6" || echo "FAIL: AC6"
+
+# AC7: Agent SDK Out of Scope の記述確認
+rg "Agent SDK" .claude/skills/issue-refinement-loop/SKILL.md && echo "PASS: AC7" || echo "FAIL: AC7"
 ```
 
 ## Related
