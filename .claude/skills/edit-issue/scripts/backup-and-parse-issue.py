@@ -2,14 +2,20 @@
 """
 backup-and-parse-issue.py
 
-Issue 本文をバックアップし、JSON で stdout に返す。
+Issue 本文をバックアップし、metadata を JSON ファイルに保存する。
 バックアップはリポジトリルート配下の `tmp/` に保存する（システム /tmp/ は使わない）。
 
 Usage:
     uv run python3 backup-and-parse-issue.py <issue_number>
 
 Output (stdout):
-    {"issue_number": <int>, "backup_file": "<path>", "body": "<body text>"}
+    {"metadata_file": "tmp/issue_<N>_backup_<ts>.json"}
+
+Files written:
+    tmp/issue_<N>_backup_<ts>.md   — Issue body（全文）
+    tmp/issue_<N>_backup_<ts>.json — metadata {"issue_number": N, "repo": "owner/repo",
+                                      "backup_file": "tmp/...", "title": "..."}
+                                      ※ body フィールドは含まない（argv/shell サイズ制限回避）
 """
 
 import argparse
@@ -89,13 +95,18 @@ def main() -> None:
         print("[ERROR] Backup file is empty", file=sys.stderr)
         sys.exit(1)
 
-    output = {
+    # metadata ファイル（body は含まない — argv/shell サイズ制限回避）
+    metadata_file = backup_dir / f"issue_{issue_number}_backup_{ts}.json"
+    metadata = {
         "issue_number": issue_number,
+        "repo": repo,
         "backup_file": str(backup_file),
         "title": title,
-        "body": body,
     }
-    print(json.dumps(output, ensure_ascii=False))
+    metadata_file.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+
+    # stdout には metadata_file パスのみ出力
+    print(json.dumps({"metadata_file": str(metadata_file)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
