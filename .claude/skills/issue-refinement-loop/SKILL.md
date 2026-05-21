@@ -658,8 +658,41 @@ gh issue comment <issue_number> --body "## issue-refinement-loop: 完了 ($(date
 - verdict: <approve | needs-fix>
 - termination_reason: <approved | max_iterations | human_escalation>
 - 改善履歴: <improvements_applied の要約>
-- 次アクション: <issue-contract-review 起動 / 人間レビュー / 追加 iteration 等>"
+- 次アクション: <issue-contract-review 起動 / 人間レビュー / 追加 iteration 等>
+
+\`\`\`yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: \"...\"
+      issue_number: 123
+      issue_url: \"https://github.com/...\"
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+
+  note_only_observations:
+    - dedupe_key: \"...\"
+      source_url: \"...\"
+      source_note_id: \"...\"
+      summary: \"...\"
+\`\`\`"
 ```
+
+### 派生改善候補の自動起票
+
+refinement ループ中に codebase-investigator / web-researcher / review-issue が「この Issue スコープ外だが改善すべき事項」を発見した場合、main thread は `termination_reason: approved` 確定後に以下を実行する:
+
+- `LOOP_STATE.improvements_applied` または各 SubAgent の出力中に含まれる **派生改善候補**（scope 外の改善提案・技術的負債・関連 docs 更新等）を `issue-author` / `create-issue` 経由で**自動起票**する。
+- 起票前に **dedupe チェックを dedupe_key ベースで実施する**（title 検索ではなく `FOLLOW_UP_ISSUE_REQUEST_V1.dedupe_key` で既存 Issue（open / closed すべて）を検索して重複を確認）:
+  ```
+  gh issue list --repo squne121/loop-protocol --state all \
+    --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
+  ```
+  - open の重複が見つかった場合はスキップ（`status: reused_open`）
+  - closed（not_planned / completed / duplicate）の重複が見つかった場合は起票せずスキップ（`status: skipped_closed_*`）
+  - closed Issue を open に差し戻す場合は human escalation が必要（自動起票不可）
+  - 重複なしの場合は `## Source` セクション（`dedupe_key` を含む）を Issue 本文に付与して起票する
+- 起票・スキップした情報を終了報告コメントに列挙する（`FOLLOW_UP_MATERIALIZATION_RESULT_V1` 形式、詳細スキーマは `docs/dev/agent-skill-boundaries.md` 参照）。
+
+**派生改善候補の自動起票は Out of Scope 拡大ではない**。本 Issue の refinement スコープを変えず、観察された改善を別 Issue として分離することで `1 Issue = 1 PR` 原則を維持する。
 
 ## Critical Guard: 実装前の状態に関する誤検知パターン
 

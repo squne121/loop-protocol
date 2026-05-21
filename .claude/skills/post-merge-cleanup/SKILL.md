@@ -22,10 +22,54 @@ main thread は以下の手順で SubAgent に委譲する:
 
 3. main thread が返却された YAML に応じて以下を実行:
    - `human_review_required: true` → 不明事項を人間に判断委ね
-   - `follow_up_candidates` あり → `create-issue` / `edit-issue` に委譲して起票
+   - `follow_up_issue_requests` あり → main thread が **即時** `issue-author` SubAgent に委譲して `create-issue` 経由で自動起票する（dedupe_key ベースで重複チェック。SubAgent 内では起票しない。候補列挙のみ）
    - `superseded_prs` あり → `gh pr close` / `gh pr comment` を実行
    - `parent_issue_status.recommended_action` あり → `gh issue close` を実行
    - `stash_restored: false` → `stash_entry_ref` を確認、人間判断
+
+### follow_up_issue_requests の自動起票フロー
+
+`follow_up_issue_requests` が空でない場合、main thread は SubAgent から YAML を受け取った直後に以下を実行する:
+
+```
+for each request in follow_up_issue_requests:
+  1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
+     gh issue list --repo squne121/loop-protocol --state all \
+       --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
+  2. 重複なし → issue-author SubAgent に委譲して create-issue skill 経由で起票
+     ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
+  3. 重複あり（open）→ スキップ（既存 Issue 番号をレポートに記録、status: reused_open）
+  4. 重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
+  5. 重複あり（closed / completed）→ 起票せずスキップ（status: skipped_closed_completed）
+  6. 重複あり（closed / duplicate）→ 起票せずスキップ（status: skipped_closed_duplicate）
+  ※ closed Issue を open に差し戻して再利用する場合は human escalation が必要（自動起票不可）
+```
+
+起票・スキップした follow-up Issue の情報を終了コメントの `follow_up_issues` フィールドに列挙する（`FOLLOW_UP_MATERIALIZATION_RESULT_V1` 形式。詳細スキーマは `docs/dev/agent-skill-boundaries.md` 参照）。
+
+終了コメントのテンプレート（`FOLLOW_UP_MATERIALIZATION_RESULT_V1` を含む）:
+
+````markdown
+## post-merge-cleanup: 完了 (<timestamp>)
+
+- status: ok | partial | failed
+- 次アクション: <親 Issue クローズ / 人間判断 等>
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  follow_up_issues:
+    - request_dedupe_key: "..."
+      issue_number: 123
+      issue_url: "https://github.com/..."
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+
+  note_only_observations:
+    - dedupe_key: "..."
+      source_url: "..."
+      source_note_id: "..."
+      summary: "..."
+```
+````
 
 ## 責務分界
 
@@ -33,7 +77,7 @@ main thread は以下の手順で SubAgent に委譲する:
 |---|---|
 | git / gh 出力分類・cleanup 実行 | SubAgent（fail-close） |
 | CONFLICT 検出時の即時停止 | SubAgent |
-| follow-up Issue 起票 | main thread（`create-issue` / `edit-issue` 経由）|
+| follow-up Issue 起票 | main thread（`create-issue` 経由。dedupe ヒット時はスキップ）|
 | parent issue クローズ実行 | main thread |
 | superseded PR close / comment 実行 | main thread |
 | 人間判断が必要な事象の最終判断 | 人間 |
@@ -127,7 +171,7 @@ merged PR の本文 / コメントから以下を抽出:
 - `## Follow-ups Intentionally Deferred` セクション（あれば）
 - レビューコメントで follow-up 化が示唆された項目
 
-候補を `follow_up_candidates` に列挙（起票実行は main thread が `create-issue` / `edit-issue` に委譲）。
+候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-author` SubAgent / `create-issue` 経由で実行）。
 
 ### 7. Stash の復帰
 
@@ -157,11 +201,20 @@ POST_MERGE_CLEANUP_REPORT_V1:
     all_children_closed: true | false
     recommended_action: close | keep_open | n/a
   superseded_prs: []
-  follow_up_candidates:
-    - title: "<候補タイトル>"
-      kind: implementation | research
-      source: "<出典: PR コメント等>"
-      recommended_routing: create-issue | edit-issue
+  follow_up_issue_requests:
+    - title: "..."
+      issue_kind: implementation
+      severity: optional_follow_up
+      source:
+        kind: post_merge_cleanup
+        url: "https://github.com/..."
+        note_id: "1"
+      dedupe_key: "follow-up:squne121/loop-protocol:pr/<PR番号>:1"
+      desired_destination: "..."
+      validated_scope_delta: "..."
+      origin_skill: post-merge-cleanup
+      labels:
+        - triage-required
   stash_restored: true | false | n/a
   stash_entry_ref: "<stash@{N} or null>"
   warnings: []
@@ -183,5 +236,4 @@ POST_MERGE_CLEANUP_REPORT_V1:
 
 - `.claude/agents/post-merge-cleanup-worker.md` — 本 skill を実行する SubAgent
 - `.claude/skills/create-issue/SKILL.md` — follow-up 起票委譲先
-- `.claude/skills/edit-issue/SKILL.md` — 既存 Issue 更新委譲先
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界
