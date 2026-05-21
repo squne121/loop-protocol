@@ -103,6 +103,70 @@ gh pr diff <PR番号> --name-only
 
 placeholder のままの行（例: `[x] AC1: <達成（根拠）>` の `<...>` が残存）は証跡として数えず blocker。
 
+### 4.5. Safety Claim Gate（安全境界 PR の追加検査）
+
+#### Safety-sensitive PR の判定（fail-closed）
+
+以下のいずれかに該当する PR は safety-sensitive と判定し、Safety Claim Matrix の検査を必須とする。判定は PR 本文キーワードだけでなく、changed paths / diff keywords / linked issue text に基づく fail-closed 条件で行う。
+
+```
+Safety-sensitive PR if any of:
+
+1. changed path matches（部分一致）:
+   - *transport*, *permission*, *sandbox*, *auth*, *mcp*, *tool*
+   - .github/workflows/**
+   - .claude/skills/**
+   - docs/dev/runtime-verification-policy.md
+
+2. diff または PR 本文に以下のキーワードが含まれる:
+   safe, safety, read-only, sandbox, isolated, permission, approvalMode,
+   MCP, tool registry, native tool, capability, auth, trust, execute
+
+3. linked issue の labels または本文に以下が含まれる:
+   safety boundary, permission, sandbox, transport, workflow, runtime verification
+```
+
+判定が疑わしい場合は safety-sensitive と判定する（fail-closed）。
+
+#### Safety Claim Matrix の必須確認
+
+safety-sensitive と判定された PR は、PR 本文に **Safety Claim Matrix** セクションが存在することを確認する。
+
+```bash
+gh pr view <PR番号> --json body --jq '.body' | grep -A 20 "Safety Claim Matrix"
+```
+
+Safety Claim Matrix の必須列: `Claim` / `Implemented?` / `Not controlled` / `Evidence` / `Follow-up`
+
+#### Safety Claim Matrix の判定ルール（APPROVE 禁止条件）
+
+以下のいずれかに該当する場合は **APPROVE 禁止（REQUEST_CHANGES）**:
+
+| 条件 | 判定 |
+|---|---|
+| safety-sensitive PR なのに Safety Claim Matrix セクションが存在しない | **APPROVE 禁止** |
+| `Not controlled` 列が非空なのに、PR title / summary / docs が無限定の `safe` / `read-only` / `sandboxed` / `isolated` / `complete` を使用している | **APPROVE 禁止** |
+| `Not controlled` 列が非空なのに、`Follow-up` 列に open な follow-up Issue の参照がない | **APPROVE 禁止** |
+| `Evidence` 列が、linked issue の Verification Commands または PR の Verification Results と対応していない | **APPROVE 禁止** |
+
+以下の場合は APPROVE 禁止しない（bounded claim として許可）:
+
+- `Not controlled` が非空でも、claim の射程が閉じた経路に限定されている（例: 「ACP client-side の fs/terminal proxy を提供しない」は許可。「read-only ACP transport」は禁止）
+- `Not controlled` が空で、Evidence がすべての閉じた経路と対応している
+
+#### Safety Claim Matrix の確認コマンド例
+
+```bash
+PR_BODY=$(gh pr view <PR番号> --json body --jq '.body')
+
+# Safety Claim Matrix の存在確認
+echo "$PR_BODY" | grep -c "Safety Claim Matrix"
+
+# Not controlled が非空かつ無限定安全主張の確認
+# （not_controlled 列に値があり、かつ無限定 safe/read-only 等が PR title や本文にないかチェック）
+gh pr view <PR番号> --json title --jq '.title' | grep -iE "\bsafe\b|\bread-only\b|\bsandboxed\b|\bisolated\b|\bcomplete\b"
+```
+
 ### 5. verdict 決定
 
 - Step 2-4 のいずれかで blocker → `REQUEST_CHANGES`
