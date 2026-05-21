@@ -33,6 +33,8 @@ gh issue view <番号> --json title,body,labels,comments
 
 1 つでも fail なら **BLOCKED**。issue comment に「contract 不備」を投稿し、`issue-refinement-loop` を呼ぶことを提案する。
 
+注: state ラベルは補助的な開発フロー適合性チェックであり、AI 着手可否の primary signal ではない。着手可否は Step 3 の blocker / dependency 判定を優先する。
+
 ### 3. blocker / dependency 全 close 確認（決定論的）
 
 ```bash

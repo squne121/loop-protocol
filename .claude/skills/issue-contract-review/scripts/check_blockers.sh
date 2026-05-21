@@ -4,15 +4,21 @@
 #
 # Exit codes:
 #   0 — blocker が 0 件、または全て closed（go 判定へ継続）
-#   1 — blocker が 1 件以上 open、または native / fallback 不一致（human_escalation）
+#   1 — blocker が 1 件以上 open、または native / fallback 不一致、
+#       または native API 失敗 + fallback なし（human_escalation）
+#
+# 環境変数:
+#   GH_BIN — gh コマンドのパス（デフォルト: gh）。fake gh に差し替え可能。
 
 set -euo pipefail
+
+GH_BIN="${GH_BIN:-gh}"
 
 ISSUE_NUMBER="${1:?Usage: check_blockers.sh <issue_number> [<owner>/<repo>]}"
 REPO="${2:-}"
 
 if [[ -z "$REPO" ]]; then
-  REPO=$(git remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]//' | sed 's/\.git$//')
+  REPO=$(git remote get-url origin 2>/dev/null | sed 's/.*github.com[:/]//' | sed 's/\.git$//') || true
 fi
 
 if [[ -z "$REPO" ]]; then
@@ -23,25 +29,34 @@ fi
 # ---------- helper: get issue state ----------
 get_issue_state() {
   local num="$1"
-  gh issue view "$num" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN"
+  "${GH_BIN}" issue view "$num" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN"
+}
+
+# ---------- helper: sort and deduplicate numeric list ----------
+sort_unique() {
+  printf '%s\n' "$@" | sed '/^$/d' | sort -n | uniq
 }
 
 # ---------- 1. native dependency API (primary) ----------
 native_blockers=()
 native_api_available=false
+native_api_failed=false
 
-raw=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/dependencies/blocked_by" --paginate 2>/dev/null) || true
+native_api_err_file=$(mktemp)
+trap 'rm -f "$native_api_err_file"' EXIT
 
-if [[ -n "$raw" ]]; then
+if raw="$("${GH_BIN}" api "repos/${REPO}/issues/${ISSUE_NUMBER}/dependencies/blocked_by" --paginate 2>"$native_api_err_file")"; then
   native_api_available=true
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
     native_blockers+=("$num")
   done < <(echo "$raw" | jq -r '.[].number // empty' 2>/dev/null || true)
+else
+  native_api_failed=true
 fi
 
 # ---------- 2. Depends on #N fallback ----------
-issue_body=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+issue_body=$("${GH_BIN}" issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
 
 fallback_blockers=()
 while IFS= read -r num; do
@@ -49,33 +64,32 @@ while IFS= read -r num; do
   fallback_blockers+=("$num")
 done < <(echo "$issue_body" | grep -oP '(?i)Depends on #\K[0-9]+' || true)
 
-# ---------- 3. mismatch check (native available かつ fallback も存在する場合) ----------
+# ---------- 3. native API 失敗時の処理 ----------
+if $native_api_failed; then
+  if [[ ${#fallback_blockers[@]} -eq 0 ]]; then
+    echo "human_escalation: native dependency API unavailable and no 'Depends on #N' fallback found." >&2
+    cat "$native_api_err_file" >&2
+    exit 1
+  else
+    echo "WARNING: native dependency API unavailable. Falling back to 'Depends on #N' in issue body." >&2
+    cat "$native_api_err_file" >&2
+  fi
+fi
+
+# ---------- 4. mismatch check（双方向・集合一致） ----------
 if $native_api_available && [[ ${#fallback_blockers[@]} -gt 0 ]]; then
-  # native に含まれていない fallback blocker が存在するか確認
-  mismatch=false
-  for fb in "${fallback_blockers[@]}"; do
-    found=false
-    for nb in "${native_blockers[@]}"; do
-      if [[ "$fb" == "$nb" ]]; then
-        found=true
-        break
-      fi
-    done
-    if ! $found; then
-      mismatch=true
-      echo "human_escalation: native dependency と 'Depends on #N' が不一致です。" >&2
-      echo "  native blockers : ${native_blockers[*]:-<none>}" >&2
-      echo "  fallback (body) : ${fallback_blockers[*]}" >&2
-      echo "  不一致 issue    : #${fb}" >&2
-      break
-    fi
-  done
-  if $mismatch; then
+  native_sorted=$(sort_unique "${native_blockers[@]+"${native_blockers[@]}"}")
+  fallback_sorted=$(sort_unique "${fallback_blockers[@]}")
+
+  if [[ "$native_sorted" != "$fallback_sorted" ]]; then
+    echo "human_escalation: native dependency と 'Depends on #N' が不一致です。" >&2
+    echo "  native blockers : $(echo "$native_sorted" | tr '\n' ' ')" >&2
+    echo "  fallback (body) : $(echo "$fallback_sorted" | tr '\n' ' ')" >&2
     exit 1
   fi
 fi
 
-# ---------- 4. 判定対象 blocker リストを決定 ----------
+# ---------- 5. 判定対象 blocker リストを決定 ----------
 if $native_api_available; then
   blockers=("${native_blockers[@]+"${native_blockers[@]}"}")
 else
@@ -87,7 +101,7 @@ if [[ ${#blockers[@]} -eq 0 ]]; then
   exit 0
 fi
 
-# ---------- 5. 各 blocker の state を確認 ----------
+# ---------- 6. 各 blocker の state を確認 ----------
 open_blockers=()
 for num in "${blockers[@]}"; do
   state=$(get_issue_state "$num")
