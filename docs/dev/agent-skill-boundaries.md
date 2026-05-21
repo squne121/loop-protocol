@@ -354,3 +354,291 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 - 同一 PR / Issue に対して同じ Step を複数回呼んでも壊れないこと（冪等性）
 - LOOP_STATE.iteration を厳密に追跡し、退行しない
 - pr-reviewer は `reviewed_head_sha` で stale review を検出する
+
+## Loop Sequencing & Preconditions
+
+impl-review-loop が期待する実行フェーズの順序・必須入出力・停止条件・引き継ぎ契約を示す。
+各フェーズの **実際の実行証跡** は SubAgent Execution Ledger（後述）で記録する。
+
+| phase | required_subagent_or_skill | required_input | required_output | stop_condition | handoff_contract | ledger_key |
+|---|---|---|---|---|---|---|
+| `issue_contract_preflight` | `issue-contract-review` skill | Issue 番号・contract_snapshot_url | `CONTRACT_REVIEW_RESULT_V1`（status: go） | status が `go` 以外 / Allowed Paths 不明 / VC preflight fail | `status: go` + worktree/branch 確定 | `contract_preflight` |
+| `runtime_preflight` | `issue-contract-review` skill（runtime_verification_applicability: immediate のとき） | Issue の Runtime Verification Applicability セクション | SKIP 規約・証跡保存・Stop Condition 連動の設計確認 | `decision: immediate` で未設計 | 設計確認済み注釈 または deferred 宣言 | `runtime_preflight` |
+| `implementation` | `implementation-worker` SubAgent | `CONTRACT_REVIEW_RESULT_V1`・Allowed Paths・worktree/branch | `IMPLEMENT_RESULT_V1`（status: ok） | Allowed Paths 外の変更が必要 / Stop Conditions に該当 | `IMPLEMENT_RESULT_V1` を次フェーズへ渡す | `implementation` |
+| `post_commit_verification` | `test-runner` SubAgent | コミット済み HEAD sha・Verification Commands | `TEST_VERDICT_MACHINE/v1`（pass または partial） | test-runner 未実行 / SKIP-only / fallback PASS / stale head_sha | `TEST_VERDICT_MACHINE/v1` + head_sha を ledger に記録 | `post_commit_verification` |
+| `pr_body_update` | `implementation-worker` SubAgent（`open-pr` skill 経由） | `IMPLEMENT_RESULT_V1`・`TEST_VERDICT_MACHINE/v1`・ledger summary | PR 本文（Closes/Refs・検証結果・ledger summary 含む） | PR 本文必須セクションの欠落 | PR URL を次フェーズへ渡す | `pr_body_update` |
+| `semantic_review` | `pr-reviewer` SubAgent（`pr-review-judge` skill） | PR URL・head_sha・`TEST_VERDICT_MACHINE/v1` | `LOOP_VERDICT`（APPROVE または REQUEST_CHANGES + blockers） | 証跡なし / SKIP-only / fallback PASS で APPROVE 禁止 / stale head_sha | `LOOP_VERDICT` を loop オーケストレーターへ返す | `semantic_review` |
+| `pre_merge_judgment` | `pr-reviewer` SubAgent（`pr-review-judge` skill） + ledger completeness gate | `LOOP_VERDICT`・ledger entries（required phases 完了確認） | APPROVE（全必須フェーズ完了かつ ledger 整合） | APPROVE 禁止条件のいずれかに該当（次セクション参照） | マージ可能状態を loop に通知 | `pre_merge_judgment` |
+
+### フェーズ間の前提依存まとめ
+
+```
+issue_contract_preflight
+        ↓ status: go
+runtime_preflight（immediate のとき）
+        ↓ 設計確認
+implementation
+        ↓ IMPLEMENT_RESULT_V1
+post_commit_verification（material delta 後）
+        ↓ TEST_VERDICT_MACHINE/v1
+pr_body_update
+        ↓ PR URL
+semantic_review
+        ↓ LOOP_VERDICT
+pre_merge_judgment（ledger completeness gate）
+        ↓ APPROVE
+```
+
+material delta とは: ソースコード変更 / 検証スクリプト変更 / schema・contract 変更 / runtime 動作変更 / 依存・設定・権限境界変更。
+docs-only・merge-only・PR-body-only コミットは原則 test-runner をスキップできるが、ledger に `skip_reason` を記録する。
+ただし以下の normative docs は material delta とみなし、skip 不可または明示的な human_review_required を伴う:
+- `.claude/skills/**/SKILL.md`
+- `.claude/agents/*.md`
+- `CLAUDE.md`
+- `.claude/rules/**`
+- `docs/dev/*policy*.md`
+- schema / contract / gate / permission / verification を定義する docs
+
+## Mandatory SubAgent Contract
+
+各フェーズで必須の SubAgent または skill と、それらが満たすべき契約を定義する。
+
+### 必須 SubAgent / skill 一覧
+
+| フェーズ | 必須 SubAgent / skill | 役割 |
+|---|---|---|
+| 実装着手直前 | `issue-contract-review` | VC preflight・Allowed Paths 確認・worktree 命名・status: go 判定 |
+| runtime あり の preflight | `issue-contract-review`（runtime 審査） | SKIP 規約・証跡保存・Stop Condition 連動の設計審査 |
+| 実装 | `implementation-worker` | Allowed Paths 内の実装・コミット・push |
+| material delta 後の検証 | `test-runner` | Verification Commands 実行・exit code 記録・`TEST_VERDICT_MACHINE/v1` 返却 |
+| PR 本文更新 | `implementation-worker`（`open-pr` skill） | ledger summary・検証結果・Closes/Refs の PR 本文組み込み |
+| semantic レビュー | `pr-reviewer`（`pr-review-judge` skill） | AC coverage・Allowed Paths 遵守・証跡確認・APPROVE / REQUEST_CHANGES 判定 |
+| merge 直前最終判定 | `pr-reviewer` + ledger completeness gate | 全必須フェーズが ledger に記録済みか確認してから APPROVE |
+
+### APPROVE 禁止条件
+
+以下のいずれかに該当する場合、`pr-review-judge` は APPROVE を返してはならない:
+
+1. **test-runner 未実行**: PR の head_sha に対応する `post_commit_verification` ledger エントリが存在しない
+2. **SKIP-only**: test-runner の全 VC が SKIP（exit 77）であり、明示的な `deferred` 契約が存在しない
+3. **fallback PASS**: `_acp_fallback: true` 等のフォールバックフラグが立った状態で exit 0 を返した証跡がある
+4. **stale head_sha**: `TEST_VERDICT_MACHINE/v1` または ledger の `head_sha` が、レビュー対象 PR の最新 head_sha と一致しない
+5. **ledger 不完全**: `required: true` の全 phase
+   (issue_contract_preflight, implementation, post_commit_verification,
+   pr_body_update, semantic_review, pre_merge_judgment)
+   が `status: pass` または明示的に許可された `status: skip` / `partial` になっていない場合。
+   `runtime_preflight` は Runtime Verification Applicability が `immediate` のときのみ required とする。
+6. **PR 本文必須セクション欠落**: PR 本文から `## Verification Commands 結果` または `## SubAgent Execution Ledger` セクションが消失している
+7. **evidence 不足**: Required phase の ledger エントリに `evidence.source_kind` が `github_comment` / `ci_check` / `hook_jsonl` / `transcript` / `artifact` のいずれか（PR 本文以外）の証拠源が少なくとも 1 つ存在しない
+
+> **APPROVE requires at least one non-PR-body evidence source for every required phase.**
+> PR body ledger is a summary, not the authoritative record.
+
+## SubAgent Execution Ledger
+
+### 設計目的
+
+Loop Sequencing が **設計上の期待順序** を示すのに対し、SubAgent Execution Ledger は **実際に実行された証跡** を記録する。
+PR 本文への自己申告だけでなく、hook / transcript / GitHub comment / artifact から再構成できる形にする。
+
+### YAML Schema 定義
+
+```yaml
+schema: subagent_execution_ledger/v1
+pr: <PR番号>
+head_sha: "<reviewed_head_sha>"
+entries:
+  - phase: issue_contract_preflight
+    required: true
+    agent: issue-contract-review
+    status: pass          # pass | partial | skip | fail | blocked
+    evidence:
+      source_kind: github_comment  # github_comment | ci_check | hook_jsonl | transcript | artifact
+      source_ref: "<contract snapshot comment URL>"
+      observed_head_sha: "<sha>"
+      produced_at: "<ISO8601>"
+      source_sha256: "<optional-for-local-artifact>"
+  - phase: runtime_preflight
+    required: false       # decision: not_applicable のとき false
+    agent: issue-contract-review
+    status: skip
+    skip_reason: "decision: not_applicable"
+  - phase: implementation
+    required: true
+    agent: implementation-worker
+    status: pass
+    commit_sha: "<sha>"
+    evidence:
+      source_kind: hook_jsonl      # github_comment | ci_check | hook_jsonl | transcript | artifact
+      source_ref: "<path-or-url>"
+      observed_head_sha: "<sha>"
+      produced_at: "<ISO8601>"
+  - phase: post_commit_verification
+    required: true
+    agent: test-runner | ci
+    verification_source: subagent | ci_check | manual
+    status: pass          # pass | partial | skip | fail | blocked
+    commit_sha: "<sha>"
+    verdict_ref: "TEST_VERDICT_MACHINE/v1"
+    ci_check_ref: "<optional GitHub check URL>"
+    evidence:
+      source_kind: ci_check        # github_comment | ci_check | hook_jsonl | transcript | artifact
+      source_ref: "<GitHub check URL or artifact path>"
+      observed_head_sha: "<sha>"
+      produced_at: "<ISO8601>"
+    runtime_verification:
+      applicability: not_applicable | immediate | deferred
+      verification_skipped_count: 0
+      fallback_detected: false
+      runtime_ac_results:
+        - ac: AC7
+          verdict: pass | skip | fail
+          exit_code: 0
+          artifact_ref: "<path-or-url>"
+  - phase: pr_body_update
+    required: true
+    agent: implementation-worker
+    status: pass
+    pr_url: "<PR URL>"
+  - phase: semantic_review
+    required: true
+    agent: pr-reviewer
+    status: pass
+    loop_verdict: APPROVE
+    reviewed_head_sha: "<sha>"
+    evidence:
+      source_kind: github_comment  # github_comment | ci_check | hook_jsonl | transcript | artifact
+      source_ref: "<PR review comment URL>"
+      observed_head_sha: "<sha>"
+      produced_at: "<ISO8601>"
+  - phase: pre_merge_judgment
+    required: true
+    agent: pr-reviewer
+    status: pass
+    ledger_complete: true
+```
+
+### status 値の定義
+
+| status | 意味 |
+|---|---|
+| `pass` | 正常完了 |
+| `partial` | 一部スキップ（SKIP exit 77）または一部 fail あり。`human_review_required: true` を伴う |
+| `skip` | phase 全体をスキップ（`skip_reason` 必須） |
+| `fail` | 明確な失敗（exit 1 / blocker あり） |
+| `blocked` | 外部依存・権限不足等でそもそも実行できなかった |
+
+### waiver schema（skip / partial 時の免除申告）
+
+`required: true` の phase で `status: skip` または `status: partial` の場合、`waiver` フィールドが必須。
+waiver なしの skip / partial は APPROVE 禁止条件（条件 5 の延長）として扱う。
+
+```yaml
+waiver:
+  required_when: "status in [skip, partial] and required == true"
+  decision: allow_merge | defer_to_followup | block
+  approver: human | pr-review-judge | ci_policy
+  reason: "<why this is safe>"
+  evidence_ref: "<url-or-artifact>"
+  followup_issue: "<required if decision: defer_to_followup>"
+  expires_at: "<optional ISO8601>"
+```
+
+APPROVE 条件（waiver 追加分）:
+> Required phase の `skip` / `partial` は、`waiver.decision: allow_merge` または
+> `waiver.decision: defer_to_followup` かつ `followup_issue` が存在する場合のみ merge 許容とする。
+> `human_review_required: true` が残っている場合、`pre_merge_judgment` は `pass` にしてはならない。
+
+### PR 本文への summary 方針
+
+PR 本文に以下の形式で ledger summary を置く。正本は hook / transcript / GitHub comment / artifact から再構成可能にする。
+self-reported ledger のみで完結した PR に対して APPROVE してはならない。
+
+```yaml
+## SubAgent Execution Ledger
+schema: subagent_execution_ledger/v1
+pr: <番号>
+head_sha: "<sha>"
+summary:
+  total_phases: 7
+  required_total: 6
+  required_pass: <int>
+  required_pending: <int>
+  required_blocked: 0
+  required_skipped_with_waiver: 0
+  human_review_required: true  # pending > 0 の場合は必ず true
+entries:
+  - { phase: issue_contract_preflight, status: pass, evidence: "<comment URL>" }
+  - { phase: runtime_preflight, status: skip, skip_reason: "not_applicable" }
+  - { phase: implementation, status: pass, commit_sha: "<sha>" }
+  - { phase: post_commit_verification, status: pass, verdict_ref: "TEST_VERDICT_MACHINE/v1" }
+  - { phase: pr_body_update, status: pass }
+  - { phase: semantic_review, status: pass, loop_verdict: APPROVE }
+  - { phase: pre_merge_judgment, status: pass, ledger_complete: true }
+```
+
+## Hook-based Ledger Optional Design
+
+Claude Code の hooks を使って SubAgent の開始・終了・結果を自動記録する設計概要。
+**実装は別 Issue で行う**（本 Issue スコープ外）。
+
+### 対象 hook と役割
+
+| hook | タイミング | 役割 | 実装先 |
+|---|---|---|---|
+| `SubagentStart` | SubAgent 起動直後 | agent_id・agent_type を ledger に記録開始 | `.claude/hooks/subagent-ledger.sh start` |
+| `SubagentStop` | SubAgent 終了直後 | agent_transcript_path・last_assistant_message を記録 | `.claude/hooks/subagent-ledger.sh stop` |
+| `PostToolUse(Agent)` | 親セッションが Agent ツール結果を受け取った後 | SubAgent の最終結果を PR ledger 用 JSONL に追記 | `.claude/hooks/subagent-ledger.sh parent-agent-result` |
+| `Stop`（ledger completeness gate） | セッション終了前 | required phases の ledger エントリが存在するか検査し、不完全ならブロック | `.claude/hooks/subagent-ledger.sh check-completeness` |
+
+### 推奨 hook 設定例
+
+```json
+{
+  "hooks": {
+    "SubagentStart": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": ".claude/hooks/subagent-ledger.sh start" }] }
+    ],
+    "SubagentStop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": ".claude/hooks/subagent-ledger.sh stop" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Agent", "hooks": [{ "type": "command", "command": ".claude/hooks/subagent-ledger.sh parent-agent-result" }] }
+    ]
+  }
+}
+```
+
+### 出力先
+
+```text
+.claude/worktrees/issue-<番号>-*/.agent-ledger/subagents.jsonl
+.claude/worktrees/issue-<番号>-*/.agent-ledger/ledger.yaml
+```
+
+transcript path・prompt 断片・ローカルパス等の機微情報が含まれるため、repo 本体には常時コミットしない。
+PR 本文には **ledger summary + head_sha + artifact path** までに留める。
+
+### hook の用途範囲
+
+| 用途 | hooks で行うべきか | 理由 |
+|---|---|---|
+| SubAgent 開始・終了の記録 | Yes | `SubagentStart` / `SubagentStop` がある |
+| Agent tool 実行結果の PR ledger 化 | Yes | `PostToolUse` on `Agent` で拾える |
+| Bash / gh / git の危険操作ブロック | Yes | `PreToolUse` は permissionMode より前に走り deny できる |
+| test-runner 未実行時の Stop ブロック | 条件付き Yes | Stop hook で ledger completeness を検査可能 |
+| 実装→検証→レビューの本体オーケストレーション | No | hook は slash command / tool call を直接起動できず、agent hook は experimental |
+| Agent hook による検査用 SubAgent 起動 | 原則 No / experimental | `type: "agent"` hook は SubAgent を spawn できるが experimental。production workflow では command hook による記録・検査・deny と、CI / pr-review-judge / Agent SDK による hard gate を優先する |
+| 複数 SubAgent の厳密なワークフロー制御 | Agent SDK 寄り | 状態管理・再試行・権限・セッションをコードで扱うべき |
+
+### Stop hook の位置づけ
+
+Stop hook は in-session soft gate であり、GitHub 上の APPROVE / merge を単独では保証しない。
+**Stop hook のブロックは Claude Code セッション内の継続制御であり、GitHub 上の APPROVE / merge を防ぐ hard gate ではない。**
+hard gate は pr-review-judge、CI check、または pre-merge script / GitHub branch protection に置く。
+Stop hook は「不足を検出して作業継続を促す」ための補助層とする。
+
+### Agent SDK との境界
+
+hook は「決定論的なシェルコマンド実行・記録・ブロック」に向く。
+`impl-review-loop` を外部の決定論的オーケストレーターに寄せたい場合は、Agent SDK 化を別 Issue で検討する。
