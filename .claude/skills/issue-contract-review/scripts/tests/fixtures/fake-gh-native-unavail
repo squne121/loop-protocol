@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# fake-gh-native-unavail: native dependency API が利用不可で fallback もないスタブ
+# api サブコマンドは exit 1 で失敗し、issue body には Depends on が含まれない
+
+set -euo pipefail
+
+# api サブコマンド: 常に失敗
+if [[ "$1" == "api" ]]; then
+  echo "HTTP 404: Not Found (dependency API not available for this repository)" >&2
+  exit 1
+fi
+
+# issue view サブコマンド
+if [[ "$1" == "issue" && "$2" == "view" ]]; then
+  # --json body の場合 — fallback なし
+  if [[ "$*" == *"--json body"* ]]; then
+    echo '{"body":"This is the issue body with no dependency information."}'
+    exit 0
+  fi
+  # --json state の場合
+  if [[ "$*" == *"--json state"* ]]; then
+    echo "OPEN"
+    exit 0
+  fi
+fi
+
+echo "fake-gh-native-unavail: unhandled: $*" >&2
+exit 1

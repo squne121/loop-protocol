@@ -33,7 +33,27 @@ gh issue view <番号> --json title,body,labels,comments
 
 1 つでも fail なら **BLOCKED**。issue comment に「contract 不備」を投稿し、`issue-refinement-loop` を呼ぶことを提案する。
 
-### 3. VC preflight（決定論的）
+注: state ラベルは補助的な開発フロー適合性チェックであり、AI 着手可否の primary signal ではない。着手可否は Step 3 の blocker / dependency 判定を優先する。
+
+### 3. blocker / dependency 全 close 確認（決定論的）
+
+```bash
+bash .claude/skills/issue-contract-review/scripts/check_blockers.sh <issue_number> <owner>/<repo>
+```
+
+| 結果 | 判定 |
+|---|---|
+| exit 0 / blocker なし | OK — 次ステップへ |
+| exit 0 / 全 blocker closed | OK — 次ステップへ |
+| exit 1 / blocker open あり | **BLOCKED** — human_escalation |
+| exit 1 / native と `Depends on #N` 不一致 | **BLOCKED** — human_escalation |
+
+- native dependency API (`/issues/<N>/dependencies/blocked_by`) を primary として使用する。
+- native API が取得不可の場合のみ、Issue 本文の `Depends on #N` を fallback として使用する。
+- native と `Depends on #N` が不一致の場合は自動判断せず human escalation とする。
+- BLOCKED 時は issue comment に open blocker 番号・不一致内容を記載し、人間による確認を依頼する。go 判定は出さない。
+
+### 4. VC preflight（決定論的）
 
 **前提**: AC は「実装前 baseline で fail し、実装後に pass する」検証スクリプトとして書かれている。
 
@@ -73,7 +93,7 @@ BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement
 - `file_not_found_unrunnable` 分類時は **BLOCKED** 判定とする（file_not_found_unrunnable → BLOCKED）。
 - `unknown` 分類時は `human_judgment`（自動 GO しない）として人間の判断を求める（unknown → human_judgment）。
 
-### 4. AC 検証可能性チェック（決定論的）
+### 5. AC 検証可能性チェック（決定論的）
 
 | 確認項目 | 判定 |
 |---|---|
@@ -84,7 +104,7 @@ BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement
 
 1 つでも fail → BLOCKED。`issue-refinement-loop` を提案。
 
-### 5. Worktree / Branch 命名 preflight
+### 6. Worktree / Branch 命名 preflight
 
 ```bash
 EXPECTED_WORKTREE=".claude/worktrees/issue-<番号>-<slug>"
@@ -97,7 +117,7 @@ EXPECTED_BRANCH="worktree-issue-<番号>-<slug>"
 
 衝突時は人間判断を求めて停止。
 
-### 6. 出力契約（CONTRACT_REVIEW_RESULT_V1）
+### 7. 出力契約（CONTRACT_REVIEW_RESULT_V1）
 
 ```yaml
 CONTRACT_REVIEW_RESULT_V1:
