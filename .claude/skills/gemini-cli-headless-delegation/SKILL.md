@@ -52,7 +52,8 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
 wrapper は **isolated temp cwd** から実行されるため、リポジトリ相対パスは解決されない。
 
 - **推奨**: 絶対パスを使う（例: `/home/user/project/logs/build.log`）
-- **注意**: `logs/build.log` のようなリポジトリ相対パスは、isolated temp cwd から見つからず `missing_context_file` で失敗する
+- **注意**: `logs/build.log` のようなリポジトリ相対パスは、isolated temp cwd から見つからず `missing context file` で失敗する
+- **ディレクトリ不可**: `context_files` にディレクトリパスを渡すと `context file is not a file` 相当のエラーで fail する。ディレクトリ単位の調査が必要な場合は `objective` または `instructions` 側で調査範囲を指定すること（Serena MCP の `list_dir` / `find_file` / `search_for_pattern` がディレクトリを走査する）。
 - **代替**: `request.json` と同じディレクトリに context ファイルをコピーして相対パスを使う（`request_path.parent` 基準で解決される）
 - テスト時の `validate_request` / `request_path` の扱いは `references/usage-contract.md` の「`request_path` と相対パス解決」セクションを参照
 
