@@ -43,6 +43,8 @@ Issue 種別の判定は **テンプレート SSOT に委ねる**:
 | C6 | 主観表現の混入 | AC / VC 本文に「適切に動作」「品質を改善」「最適化」等が **含まれない** |
 | C7 | Required Skills 意味論 | ワークフロー skill（`implement-issue` / `pr-review-judge` / `ssot-discovery` 等）/ document path（`docs/...` / `.md` / `/`）を **含まない** |
 | C8 | Outcome 抽象パターン除外 | `## Outcome` 配下に「〜が決定される」「〜を検討する」「〜を改善する」等の動作状態のみ表現が **含まれない** |
+| C9 | 適用判定不在 | `## Runtime Verification Applicability` セクションが存在しない（warning。blocker ではない。記載を推奨する） |
+| C10 | deferred の検証先不明 | `decision: deferred` が宣言されているが、後続 Issue 番号・統合フェーズ名・検証条件が **記載されていない**（blocker） |
 
 ### 4. 軽量構造評価（non-blocking improvement 候補）
 
@@ -53,8 +55,8 @@ Issue 種別の判定は **テンプレート SSOT に委ねる**:
 
 ### 5. Verdict 決定
 
-- `approve`: C1〜C8 すべて pass
-- `needs-fix`: C1〜C8 のいずれかが fail
+- `approve`: C1〜C8 + C10 すべて pass（C9 warn は approve を妨げない）
+- `needs-fix`: C1〜C8 / C10 のいずれかが fail
 
 ### 6. 差分提案生成
 
@@ -86,6 +88,8 @@ REVIEW_ISSUE_RESULT_V1:
     C6_no_subjective_phrasing: pass | fail | n/a
     C7_required_skills_semantics: pass | fail | n/a
     C8_outcome_concreteness: pass | fail | n/a
+    C9_runtime_applicability_present: pass | warn | n/a
+    C10_deferred_destination_present: pass | fail | n/a
   blocking_issues: []
   non_blocking_improvements: []
   diff_proposal:

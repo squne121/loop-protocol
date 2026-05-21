@@ -98,6 +98,8 @@ gh pr diff <PR番号> --name-only
 | **Allowed Paths 遵守** | `gh pr diff --name-only` の出力がすべて linked issue の `## Allowed Paths` に含まれる | blocker |
 | **検証コマンド結果** | linked issue の `## Verification Commands` 各コマンドが PR 本文で結果記録されている（`✅ 通過` 等の具体記述） | blocker（雰囲気で通さない） |
 | **scope 混入** | PR diff にスコープ外の修正・refactoring が混入していない | blocker |
+| **Runtime Verification Evidence（immediate のみ）** | linked issue の `decision: immediate` で、PR 本文に `## Runtime Verification Evidence` セクションが存在し、SKIP のみ・fallback PASS の証跡を含まない | blocker（APPROVE 禁止）: 証跡なし / SKIP のみ / fallback PASS は APPROVE しない |
+| **deferred 検証先確認** | linked issue の `decision: deferred` で、PR 本文に後続 Issue / 統合フェーズ / 検証条件の参照が存在する | blocker（参照がない場合） |
 
 placeholder のままの行（例: `[x] AC1: <達成（根拠）>` の `<...>` が残存）は証跡として数えず blocker。
 
