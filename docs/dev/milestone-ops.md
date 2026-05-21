@@ -46,7 +46,7 @@ AI エージェント・人間レビュアー双方が参照する。
 
 | 単位 | 責務 | 関係 |
 |---|---|---|
-| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は「割り当てた Issue/PR が open 0 件」**かつ**人間の明示判断。 | Issue を `milestone` フィールドで紐づける |
+| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は「割り当てた Issue の open 件数が 0」**かつ**「Milestone に直接紐づいた PR が 0（PR 直接紐づけ禁止）」**かつ**人間の明示判断。 | Issue を `milestone` フィールドで紐づける |
 | **Parent Issue** | 機能・テーマ単位の追跡。child implementation issues を束ねる。`closure_mode` に従って close する。 | Milestone に割り当てられる / child issues を持つ |
 | **Implementation Issue** | 1 PR に対応する具体的な実装タスク。`## Allowed Paths` / `## Acceptance Criteria` を持つ。 | Parent Issue の sub-issue / Milestone に間接的に紐づく |
 | **PR** | Implementation Issue の成果物。`Closes #N` で Issue を close する。Milestone には直接紐づけない。 | Implementation Issue を close する |
@@ -88,11 +88,14 @@ AI エージェント・人間レビュアー双方が参照する。
 
 Milestone を close するには以下の条件を**すべて**満たすこと（AND 条件。OR ではない）:
 
-1. **割り当てた Issue と直接紐づいた PR がすべて close されている**  
-   `gh api repos/{owner}/{repo}/milestones/{milestone_number}` の `open_issues` が `0` であること。  
-   かつ、PR 混入チェック（[3] 参照）で Milestone に直接紐づいた PR が存在しないこと。
+1. **割り当てた Issue の open 件数が 0 であること**  
+   `gh api repos/{owner}/{repo}/milestones/{milestone_number}` の `open_issues` が `0` であること
 
-   > **例外**: open item を残して close する場合は、Milestone description または parent issue comment に除外理由を明示的に記録すること。この例外は人間のみ適用できる。
+2. **Milestone に直接紐づいた PR が 0 であること**  
+   PR 混入チェック（[3] 参照）で `pull_request != null` の item が存在しないこと。  
+   PR を Milestone に直接紐づける運用は許可しない。
+
+   > **例外（1 または 2 を満たさず close する場合）**: Milestone description または parent issue comment に除外理由を明示的に記録すること。この例外は人間のみ適用できる。
 
 2. **人間による意図的な判断がある**  
    Milestone の close は `scope` や `目標達成` の判断を含むため、AI エージェントが自動で close しない。  
@@ -125,6 +128,15 @@ Milestone の close は **人間の意思決定が必要** であり、AI エー
 > R = Responsible（実行者）, A = Accountable（最終責任者）, C = Consulted（相談先）, I = Informed（通知先）
 > **Milestone close は人間が Responsible かつ Accountable。AI エージェントは close しない。**
 
+### Milestone 作成における「人間承認」の定義
+
+Milestone 作成の「人間承認」は、次の条件を満たした時点で充足されたものとする:
+
+- 対応する implementation issue contract（例: #145 等）に `title` / `description` / `due_on` 方針が明記されている
+- その issue contract に対して `issue-contract-review` が `status: go` を返している
+
+> **逸脱時の escalation**: title / description / due_on を issue contract から逸脱して変更する場合は、AI エージェントは作成を停止し human escalation とする。
+
 ### AI エージェント操作フロー（通常時）
 
 ```
@@ -150,9 +162,11 @@ Milestone の close は **人間の意思決定が必要** であり、AI エー
     └─ gh api repos/{owner}/{repo}/milestones/{milestone_number}
     └─ open_issues / closed_issues を取得
     └─ PR 混入チェック: Milestone に PR が直接紐づいていないことを確認
-       gh api "repos/{owner}/{repo}/issues?milestone={milestone_number}&state=all&per_page=100" \
+       gh api --paginate \
+         "repos/{owner}/{repo}/issues?milestone={milestone_number}&state=all&per_page=100" \
          --jq '.[] | select(.pull_request != null) | {number, title, state, html_url}'
        出力が非空の場合は human escalation（PR 直接紐づけ禁止の運用不変条件違反）
+       ※ --paginate で全ページを列挙する（per_page=100 のみでは 101 件目以降が未検査になる）
     └─ 関連 Issue にコメント投稿（github-ops.md の Body File Guidance に従う）
 
 [4] open_issues: 0 を検知したら人間に通知
@@ -223,6 +237,12 @@ gh api --method PATCH repos/{owner}/{repo}/issues/{issue_number} \
 # Milestone 進捗確認
 gh api repos/{owner}/{repo}/milestones/{milestone_number} \
   --jq '{title: .title, open: .open_issues, closed: .closed_issues, state: .state}'
+
+# Milestone 内の PR 混入チェック（全ページ列挙 — PR 直接紐づけ禁止の検証）
+gh api --paginate \
+  "repos/{owner}/{repo}/issues?milestone={milestone_number}&state=all&per_page=100" \
+  --jq '.[] | select(.pull_request != null) | {number, title, state, html_url}'
+# 出力が非空の場合は human escalation
 
 # Milestone close
 gh api --method PATCH repos/{owner}/{repo}/milestones/{milestone_number} \
