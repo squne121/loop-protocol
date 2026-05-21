@@ -76,7 +76,11 @@ LOOP_STATE:
     url: null
     id: null
     issue_number: null
+    html_url: null
+    author_association: null
     snapshot: null
+    captured_at: null    # このループが snapshot を固定した時刻（GitHub の created_at ではない）
+    fetched_at: null
     preliminary_classification: null   # B3: 暫定分類
     final_classification: null         # B3: 事実確認後の最終分類
     classification_reason: null        # B3: 分類根拠
@@ -141,7 +145,18 @@ test "$comment_issue_number" = "<issue_number>" || {
 
 所属検証に失敗した場合は `termination_reason: human_escalation` で停止する。
 
-取得した本文を `LOOP_STATE.anchor_comment.url`、`LOOP_STATE.anchor_comment.id`、`LOOP_STATE.anchor_comment.issue_number`、`LOOP_STATE.anchor_comment.snapshot` に格納して Step 0b へ進む。取得失敗（404 等）の場合は `termination_reason: human_escalation` で停止する。
+取得したコメント情報を以下の順で `LOOP_STATE.anchor_comment` に格納して Step 0b へ進む。取得失敗（404 等）の場合は `termination_reason: human_escalation` で停止する。
+
+```bash
+LOOP_STATE.anchor_comment.url             = "<anchor_comment_url>"
+LOOP_STATE.anchor_comment.id              = "$COMMENT_ID"
+LOOP_STATE.anchor_comment.issue_number    = "$comment_issue_number"
+LOOP_STATE.anchor_comment.html_url        = comment_json.html_url
+LOOP_STATE.anchor_comment.author_association = comment_json.author_association
+LOOP_STATE.anchor_comment.snapshot        = comment_json.body
+LOOP_STATE.anchor_comment.captured_at     = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LOOP_STATE.anchor_comment.fetched_at      = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
 
 #### Step 0b: 暫定分類（preliminary classification）（`anchor_comment_url` 指定時のみ）
 
@@ -150,8 +165,8 @@ test "$comment_issue_number" = "<issue_number>" || {
 | 分類 | 条件（人間 Decision シグナル） | 分岐 |
 |---|---|---|
 | `superseded_by_decision` | 人間が明示的に「close」「この Issue は実装しない」「前提不採用」「代替方針へ置換」と宣言しており、かつ以下の AND 条件をすべて満たす | Step 0c（Decision 分岐）へ（事実確認不要と判断できる場合のみ即時確定） |
-| `reframe_in_place` | 前提の一部は誤りだが Issue 目的は維持可能（部分的修正・誤解の訂正） | anchor comment 内容を注入して通常ループへ（Step 1 で最終分類） |
-| `feedback_update_required` | コメントが AC/VC/In Scope の追加・修正を要求している（否決ではなく更新指示） | close せず anchor comment を注入して本文更新ループへ（Step 1 で最終分類） |
+| `reframe_in_place` | 前提の一部は誤りだが Issue 目的は維持可能（部分的修正・誤解の訂正） | requires_fact_check 判定後、必要な場合は ANCHOR_COMMENT_CONTEXT_V1 を Step 1 へ渡して通常ループへ（Step 1 で最終分類） |
+| `feedback_update_required` | コメントが AC/VC/In Scope の追加・修正を要求している（否決ではなく更新指示） | close せず requires_fact_check 判定後、必要な場合は ANCHOR_COMMENT_CONTEXT_V1 を Step 1 へ渡して本文更新ループへ（Step 1 で最終分類） |
 | `human_escalation` | close か修正か判定不能、または複合シグナル | 人間判断で停止 |
 
 **`superseded_by_decision` の確定条件（AND 条件）**:
@@ -165,6 +180,20 @@ superseded_by_decision:
 ```
 
 上記 AND 条件を満たさない場合、`superseded_by_decision` に暫定分類してよいが、Step 1 の codebase/web 検証を経て最終分類を確定する。
+
+**Step 0b 処理順序（ordering）**:
+
+```yaml
+Step 0b ordering:
+  1. preliminary_classification を決める
+  2. classification_reason を記録する
+  3. requires_fact_check を true/false に確定する（true_if_any / false_only_if 規則適用）
+  4. requires_fact_check == true なら Step 0c に進まず Step 1/1b へ
+  5. Step 0c に進めるのは final_classification == superseded_by_decision が確定済みの場合のみ
+     （requires_fact_check == false かつ preliminary_classification == superseded_by_decision）
+```
+
+fail-closed: `requires_fact_check` が不明瞭な場合は `true` とみなして Step 1/1b へ進む。
 
 暫定分類根拠と判定した分類を `LOOP_STATE.anchor_comment.preliminary_classification` および `LOOP_STATE.anchor_comment.classification_reason` に記録してから分岐する。
 
@@ -345,6 +374,33 @@ inputs:
 ```
 
 SubAgent は `gemini-cli-headless-delegation`（`tool_profile: grounded_research`）経由で一次情報を事実確認し、`WEB_RESEARCH_RESULT_V1` 形式で返す。結果は Step 2 のレビュー材料および Step 4 の本文改善（誤った前提の訂正）に渡す。
+
+**external_spec claim のルーティング規則**:
+
+```yaml
+external_spec routing:
+  if ANCHOR_COMMENT_CONTEXT_V1.required_checks[].type == external_spec:
+    pass the same claim_id / description / critical to web-researcher as WEB_RESEARCH_REQUEST
+  final_classification:
+    wait_for:
+      - ANCHOR_COMMENT_FACT_CHECK_RESULT_V1 (repo_fact / issue_pr_fact / human_decision)
+      - WEB_RESEARCH_RESULT_V1 (external_spec)
+    fail_closed_if:
+      - any critical external_spec claim is inconclusive or failed in WEB_RESEARCH_RESULT_V1
+```
+
+`WEB_RESEARCH_RESULT_V1` の最小 schema（`claim_id` を持つ claims 配列）:
+
+```yaml
+WEB_RESEARCH_RESULT_V1:
+  claims:
+    - claim_id: C3
+      verdict: supported | contradicted | inconclusive
+      evidence:
+        - kind: web
+          ref: <citation>
+          summary: <string>
+```
 
 `WEB_RESEARCH_RESULT_V1` 受信後:
 1. `LOOP_STATE.web_research.status`、`failure_class`、`verification_route`、`result` を更新する（`verification_route` は `WEB_RESEARCH_RESULT_V1.verification_route` の値をそのまま設定する）
