@@ -50,11 +50,13 @@ rg -l "<schema-id-or-key>" .
 
 ### Compatibility Decision
 
-> schema 変更の互換性を明示してください。`not_schema_change` の場合は `N/A` と記載してください。
+> schema 変更の互換性を明示してください。`not_schema_change` の場合は各フィールドに `N/A` と記載してください。
 
-- compatibility: `backward_compatible` | `breaking` | `additive` | `uncertain` | `N/A`
-- migration: （breaking の場合、migration 手順または follow-up Issue 番号を記載。`N/A` 可）
-- notes: （互換性判断の根拠）
+- change_type: `additive` | `rename` | `remove` | `type_change` | `semantic_change` | `N/A`
+- compatibility: `backward_compatible` | `breaking` | `uncertain` | `N/A`
+- migration_required: `yes` | `no` | `N/A`
+- migration_or_followup: #N or `N/A`
+- reason:
 
 ## Safety Claim Matrix
 
