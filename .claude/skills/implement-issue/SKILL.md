@@ -62,6 +62,17 @@ cd "$WORKTREE"
 
 worktree 内で Edit / Write する際は **必ず worktree 内の絶対パス**を指定する。main の絶対パスを指定すると main のファイルが変更される事故が起きる。
 
+### 3.5. Runtime Verification Applicability の確認
+
+Issue 本文の `## Runtime Verification Applicability` を確認する。
+
+- `decision: not_applicable` → runtime AC / VC / 証跡は不要。静的検証のみで実装を完結させる。
+- `decision: immediate` → 動作検証 AC に対応する VC スクリプト（bash / pytest 等）と `artifacts/` 出力ロジックを実装する。証跡を PR 本文に添付する。実行環境が不可なら SKIP exit 77 を返す（SKIP = PASS ではない）。`deferred` の動作検証を捏造しない。
+- `decision: deferred` → 後続 Issue / 統合フェーズ / 検証条件を PR 本文に引用するのみ。`deferred` の動作検証を本 Issue の実装中に捏造しない。証跡の提出は後続 Issue / フェーズで行う。
+- `## Runtime Verification Applicability` セクション自体が存在しない場合は、`issue-contract-review` が go 判定を出す前に確認済みのはずだが、万が一セクションが存在しない状態で本 skill に到達した場合は **実装を開始せず人間にエスカレーション**する（`issue-refinement-loop` 経由で Issue 本文を更新させるか、呼び出し元に `status: blocked` を返す）。`not_applicable` と推定して実装を進めてはならない。
+
+詳細は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
+
 ### 4. TDD + BDD で実装
 
 LOOP_PROTOCOL のテスト戦略に従う:

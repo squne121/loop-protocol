@@ -55,6 +55,33 @@ prompt 注記による SubAgent 委譲・運用ルール追加は次点オプシ
 
 ワークフロー不具合を起票する follow-up Issue（post-merge-cleanup / issue-refinement-loop から自動抽出されるもの）に適用する。単純なバグ fix や軽微な改善 Issue では本ステップ 3 の明示比較を省略してよい。
 
+## Runtime Verification Applicability
+
+Issue 起票時に動作検証の適用判定セクションを記載する。`runtime-verification: true` タグ付き AC の起票は `decision: immediate` のときのみ必要。
+
+```markdown
+## Runtime Verification Applicability
+
+- decision: not_applicable | immediate | deferred
+- reason: <判定理由>
+- if immediate: 対応 AC / VC / 証跡要件（policy.md の decision ごとの要求事項を参照）
+- if deferred:
+    - deferred_destination:
+        - destination_type: issue | phase | milestone
+        - destination_ref: <Issue番号 / フェーズ名 / マイルストーン名>
+    - deferred_verification_condition: <検証が成立するために必要な条件の説明>
+```
+
+| decision | 意味 | 実動作検証 AC の要否 |
+|---|---|---|
+| `not_applicable` | 静的検証のみで完結 | 不要 |
+| `immediate` | 本 Issue 内で動作検証が成立する | 必要 |
+| `deferred` | 統合フェーズ・後続 Issue で初めて成立する | 不要（後続で提出） |
+
+- `deferred` の場合は `deferred_destination`（destination_type + destination_ref）と `deferred_verification_condition` の **両方を必ず記載する**（`review-issue` C10 blocker）。
+- 自由記述の「後続 Issue で検証する」だけでは不完全。機械的に検出できる半構造化フォーマットで記述すること。
+- 適用判定の詳細基準は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
+
 ## VC 作成ガイダンス
 
 > 動作検証 AC（`runtime-verification: true`）を含む VC の設計は `docs/dev/runtime-verification-policy.md` を参照すること。
