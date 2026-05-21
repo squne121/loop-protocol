@@ -284,6 +284,15 @@ blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
+follow_up_issue_requests:
+  - title: "<follow-up タイトル>"
+    issue_kind: implementation | research | docs
+    severity: mandatory_follow_up | optional_follow_up | note_only
+    source:
+      url: "<PR コメント URL または PR URL>"
+      note_id: "<Non-blockers セクション内の通し番号（1-indexed）>"
+    dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+    labels: []
 ```
 ````
 
@@ -292,6 +301,7 @@ reviewed_head_sha: <SHA>
 1. `reviewed_head_sha` は YAML ブロック **内** に記載する（外側は禁止）
 2. コメント本文全体で `reviewed_head_sha:` 行は 1 つだけ（複数だと parse が最初の行のみ採用）
 3. コードフェンス（` ``` `）は `\` でエスケープしない（heredoc 内でもそのまま書く）
+4. `follow_up_issue_requests` は non-blocker observations を構造化したフィールド。pr-review-judge は **起票を実行しない**。起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
 
 ## Stop Conditions
 

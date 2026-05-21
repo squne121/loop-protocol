@@ -126,6 +126,64 @@ SubAgent（役割）── Skill（作業手順）
 | `test-runner` | `immediate` の VC スクリプトを実行し、exit code と証跡を `TEST_VERDICT_MACHINE` に統合する。SKIP exit 77 を検知して `stop_condition_triggered: true` を返す |
 | `pr-reviewer` | `immediate` で証跡なし / SKIP のみ / fallback PASS の場合は APPROVE しない。`deferred` は後続 Issue 参照の有無を確認する |
 
+## Issue / PR を主インターフェースとする原則
+
+AI エージェントと人間のコミュニケーションは **Issue / PR を主インターフェース（primary interface）** として行う。
+
+- エージェントのアクション（起票・コメント・ラベル更新）は Issue / PR 上に記録され、人間が追跡・取消可能。
+- Skill / SubAgent が生成した観察・提案は、最終的に **Issue として具体化（materialize）** することで人間可視な形で管理する。
+- 不要な Issue は **triage モデル** に従って処理する（後述）。
+
+### triage モデル（不要なら close）
+
+自動起票した follow-up Issue はすべて `triage-required` ラベルを付与して起票する。
+人間または AI エージェントが triage した後、不要と判断した Issue は `not planned` で close する。
+triage せずに積まれた Issue は定期 triage セッション（または `state/needs-human` エスカレーション）で処理する。
+
+| triage 結果 | アクション |
+|---|---|
+| 有効な改善 | `triage-required` を外し、適切な `phase/` ラベルを付与して `state/queued` に移行 |
+| 重複 | 既存 Issue にコメントして close（`duplicate` ラベル） |
+| 不要 | `not planned` で close（理由をコメントに記録） |
+| 判断保留 | `state/needs-human` を付与して人間判断を仰ぐ |
+
+## Follow-up Materialization Policy
+
+### FOLLOW_UP_ISSUE_REQUEST_V1
+
+Skill / SubAgent が「後で Issue にすべき観察」を main thread に返す際に使う構造化スキーマ。
+main thread（impl-review-loop Step 5 / post-merge-cleanup 等）が受け取り、`issue-author` / `create-issue` 経由で起票責務を担う。
+
+```yaml
+FOLLOW_UP_ISSUE_REQUEST_V1:
+  title: "<起票する Issue のタイトル候補>"
+  issue_kind: implementation | research | docs
+  severity: mandatory_follow_up | optional_follow_up | note_only
+  source:
+    url: "<観察元の PR / コメント / Issue URL>"
+    note_id: "<観察元ドキュメント内の通し番号（1-indexed）>"
+  dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+  labels: []
+```
+
+**フィールド定義**:
+
+| フィールド | 説明 |
+|---|---|
+| `title` | 起票候補タイトル（main thread が調整してよい） |
+| `issue_kind` | `implementation`（実装タスク）/ `research`（調査）/ `docs`（ドキュメント更新） |
+| `severity` | `mandatory_follow_up`（必ず起票）/ `optional_follow_up`（重複なければ起票）/ `note_only`（起票せず終了報告コメントに記録のみ） |
+| `source.url` | 観察元の URL（PR URL、コメント URL 等） |
+| `source.note_id` | 観察元ドキュメント内での通し番号（dedupe_key 生成に使用） |
+| `dedupe_key` | 重複起票防止キー。形式: `follow-up:<repo>:<source-url-or-pr>:<note-id-or-hash>` |
+| `labels` | 起票時に付与するラベル候補（`triage-required` は main thread が自動追加） |
+
+**責務境界**:
+
+- `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。
+- `post-merge-cleanup-worker`: follow_up_candidates を列挙して返す。**Issue 起票は行わない**。
+- main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
+
 ## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け

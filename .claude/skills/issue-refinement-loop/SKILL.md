@@ -613,6 +613,16 @@ gh issue comment <issue_number> --body "## issue-refinement-loop: 完了 ($(date
 - 次アクション: <issue-contract-review 起動 / 人間レビュー / 追加 iteration 等>"
 ```
 
+### 派生改善候補の自動起票
+
+refinement ループ中に codebase-investigator / web-researcher / review-issue が「この Issue スコープ外だが改善すべき事項」を発見した場合、main thread は `termination_reason: approved` 確定後に以下を実行する:
+
+- `LOOP_STATE.improvements_applied` または各 SubAgent の出力中に含まれる **派生改善候補**（scope 外の改善提案・技術的負債・関連 docs 更新等）を `issue-author` / `create-issue` 経由で**自動起票**する。
+- 起票前に dedupe チェック（同一キーワードで OPEN Issue 存在確認）を行い、重複する場合はスキップする。
+- 起票した Issue 番号を終了報告コメントに列挙する（`follow_up_issues` フィールド）。
+
+**派生改善候補の自動起票は Out of Scope 拡大ではない**。本 Issue の refinement スコープを変えず、観察された改善を別 Issue として分離することで `1 Issue = 1 PR` 原則を維持する。
+
 ## Critical Guard: 実装前の状態に関する誤検知パターン
 
 refinement フェーズでは Issue 本文の **構造的品質** だけを判定する。以下のパターンは誤検知として除外する。

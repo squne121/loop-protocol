@@ -22,10 +22,24 @@ main thread は以下の手順で SubAgent に委譲する:
 
 3. main thread が返却された YAML に応じて以下を実行:
    - `human_review_required: true` → 不明事項を人間に判断委ね
-   - `follow_up_candidates` あり → `create-issue` / `edit-issue` に委譲して起票
+   - `follow_up_candidates` あり → main thread が **即時** `issue-author` / `create-issue` 経由で自動起票する（SubAgent 内では起票しない。候補列挙のみ）
    - `superseded_prs` あり → `gh pr close` / `gh pr comment` を実行
    - `parent_issue_status.recommended_action` あり → `gh issue close` を実行
    - `stash_restored: false` → `stash_entry_ref` を確認、人間判断
+
+### follow_up_candidates の自動起票フロー
+
+`follow_up_candidates` が空でない場合、main thread は SubAgent から YAML を受け取った直後に以下を実行する:
+
+```
+for each candidate in follow_up_candidates:
+  1. dedupe チェック: 同一 source.url + title で既存 OPEN Issue がないか確認
+     gh issue list --search "<title>" --state open --json number,title
+  2. 重複なし → issue-author SubAgent に委譲して create-issue skill 経由で起票
+  3. 重複あり → スキップ（既存 Issue 番号をレポートに記録）
+```
+
+起票したすべての follow-up Issue を `## post-merge-cleanup: 完了` コメントに列挙する。
 
 ## 責務分界
 

@@ -40,6 +40,22 @@ gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +
 - 次アクション: 人間レビュー → マージ → post-merge-cleanup"
 ```
 
+### APPROVE 時の follow-up Issue 自動起票
+
+`LOOP_VERDICT.follow_up_issue_requests` が空でない場合、main thread は APPROVE 確定直後に各リクエストを `issue-author` / `create-issue` 経由で **即時自動起票** する。
+
+pr-review-judge が `LOOP_VERDICT` の `follow_up_issue_requests` フィールドに格納した non-blocker NOTE（任意改善提案・観察事項）が起票対象となる。詳細スキーマは `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照。
+
+```
+for each req in LOOP_VERDICT.follow_up_issue_requests:
+  - severity: mandatory_follow_up → 必ず起票（dedupe チェック後）
+  - severity: optional_follow_up → dedupe チェック後、重複なければ起票
+  - severity: note_only → 起票せず、終了報告コメント内に観察事項として記録
+  dedupe: req.dedupe_key で既存 OPEN Issue がないか確認してから起票
+```
+
+起票した follow-up Issue の番号を終了報告コメントの `follow_up_issues` フィールドに列挙する。
+
 ## 終了処理（max_iterations）
 
 ```bash
