@@ -1136,3 +1136,263 @@ class TestAcpResultNormalizedToDelegationResult:
         assert result["_acp_fallback"] is True
         assert result["transport"] == "headless_json"
         assert result["result_surface"]["summary"] == "from headless"
+
+
+# ---------------------------------------------------------------------------
+# 3rd-round B1: verify_acp_roundtrip.sh must read structured_events from the
+# normalized delegation_result/v1 schema (transport_details.structured_events).
+# Regression: B3 (round-2) moved structured_events under transport_details, but
+# the verify script still read top-level → structured_events always 0 → FAIL.
+# ---------------------------------------------------------------------------
+
+
+def _jq_structured_events_count(result: dict[str, Any]) -> int:
+    """Replicate the exact jq expression verify_acp_roundtrip.sh uses.
+
+    The shell uses:
+      (.transport_details.structured_events // .structured_events // []) | length
+    This Python port must stay byte-for-byte equivalent in semantics so the
+    test fails if the script and the schema drift apart again.
+    """
+    td = result.get("transport_details")
+    events = None
+    if isinstance(td, dict):
+        events = td.get("structured_events")
+    if events is None:
+        events = result.get("structured_events")
+    if events is None:
+        events = []
+    return len(events)
+
+
+class TestVerifyScriptReadsNormalizedStructuredEvents:
+    """GIVEN a normalized ACP delegation_result/v1, THEN the verify script's jq
+    expression for structured_events still finds the events (3rd-round B1)."""
+
+    def test_structured_events_reachable_under_transport_details(
+        self, tmp_path: Path
+    ) -> None:
+        """GIVEN run_delegation() with transport=acp, THEN structured_events are
+        countable via the verify script's transport_details jq expression."""
+        import run_gemini_headless as headless
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Reply with exactly PONG and nothing else",
+            "instructions": ["Do not add any explanation.", "Reply with PONG only."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Response"],
+            "context_files": [str(ctx)],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 120,
+        }
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "transport_ok": True,
+                "stop_reason": "end_turn",
+                "schema": "acp_result_v1",
+                "transport": "acp",
+                "structured_events": [
+                    {"type": "agent_message_chunk", "params": {}},
+                    {"type": "agent_message_chunk", "params": {}},
+                ],
+                "response_text": "PONG",
+                "stderr": None,
+                "warnings": [],
+                "failure_reason": None,
+                "failure_class": None,
+            }
+
+        with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp):
+            result = headless.run_delegation(valid_request, request_path=ctx)
+
+        # The normalized result puts structured_events under transport_details.
+        assert result["schema"] == "delegation_result/v1"
+        assert "structured_events" not in result  # NOT at the top level
+        assert "structured_events" in result["transport_details"]
+        # The verify script's jq expression must still count them correctly.
+        assert _jq_structured_events_count(result) == 2
+
+    def test_jq_expression_falls_back_to_top_level(self) -> None:
+        """GIVEN a raw acp_result_v1 (top-level structured_events), THEN the
+        verify script's fallback jq expression still counts them."""
+        raw = {
+            "schema": "acp_result_v1",
+            "transport": "acp",
+            "ok": True,
+            "structured_events": [{"type": "agent_message_chunk"}],
+        }
+        assert _jq_structured_events_count(raw) == 1
+
+
+# ---------------------------------------------------------------------------
+# 3rd-round B2: auth-required session/new failures are classified
+# `auth_required` and are NOT masked by a headless_json fallback.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthRequiredClassification:
+    """GIVEN an auth-signalling session/new error, THEN failure_class is
+    auth_required and run_acp does not fall back (3rd-round B2)."""
+
+    @pytest.mark.parametrize(
+        "error_obj",
+        [
+            {"code": -32000, "message": "Authentication required"},
+            {"code": -32001, "message": "session is not authenticated"},
+            {"message": "unauthorized: please run gemini login"},
+            {"message": "auth error", "data": {"authMethods": ["oauth"]}},
+            {"message": "must authenticate before session/new"},
+        ],
+    )
+    def test_is_auth_required_error_detects_signals(
+        self, error_obj: dict[str, Any]
+    ) -> None:
+        """GIVEN an error object with an auth signal, THEN is_auth_required_error is True."""
+        assert acp.is_auth_required_error(error_obj) is True
+
+    @pytest.mark.parametrize(
+        "error_obj",
+        [
+            {"code": -32603, "message": "internal error"},
+            {"message": "model not found"},
+            {"message": "session/new timed out"},
+        ],
+    )
+    def test_is_auth_required_error_ignores_non_auth(
+        self, error_obj: dict[str, Any]
+    ) -> None:
+        """GIVEN a non-auth error object, THEN is_auth_required_error is False."""
+        assert acp.is_auth_required_error(error_obj) is False
+
+    def test_session_new_auth_error_classified_auth_required(
+        self, tmp_path: Path
+    ) -> None:
+        """GIVEN a fake agent whose session/new returns an auth error, THEN
+        failure_class is auth_required (not session_new_failed)."""
+        agent_body = textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, sys
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\\n"); sys.stdout.flush()
+            def main():
+                for _ in range(50):
+                    raw = sys.stdin.readline().strip()
+                    if not raw:
+                        break
+                    msg = json.loads(raw)
+                    method = msg.get("method", "")
+                    mid = msg.get("id")
+                    if method == "initialize":
+                        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":1}})
+                    elif method == "session/new":
+                        send({"jsonrpc":"2.0","id":mid,"error":{
+                            "code":-32000,
+                            "message":"Authentication required: not authenticated"}})
+                        return
+            if __name__ == "__main__":
+                main()
+            """
+        )
+        agent = _write_fake_acp_agent(tmp_path, agent_body)
+        result = asyncio.run(
+            acp._run_acp_session(
+                prompt="ping",
+                model="fake",
+                approve_edits=False,
+                timeout_sec=20,
+                gemini_bin=str(agent),
+            )
+        )
+        assert result["ok"] is False
+        assert result["failure_class"] == "auth_required"
+        assert "authenticat" in (result["failure_reason"] or "").lower()
+
+    def test_auth_required_is_not_in_fallback_set(self, tmp_path: Path) -> None:
+        """GIVEN run_acp with an auth_required session, THEN no fallback fires
+        and the result keeps failure_class=auth_required."""
+
+        async def _auth_failing_session(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "structured_events": [],
+                "response_text": None,
+                "stderr": None,
+                "warnings": ["session/new requires authentication"],
+                "failure_reason": "session/new requires authentication: ...",
+                "failure_class": "auth_required",
+            }
+
+        # If fallback were wrongly invoked it would import run_gemini_headless;
+        # make that fail loudly so an accidental fallback is detectable.
+        def _exploding_fallback(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("auth_required must NOT trigger a fallback")
+
+        with patch.object(acp, "_run_acp_session", side_effect=_auth_failing_session):
+            with patch.object(
+                acp, "_fallback_to_headless_json", side_effect=_exploding_fallback
+            ):
+                result = acp.run_acp(
+                    request={"schema": "delegation_request_v1", "objective": "x"},
+                    prepared_prompt="built prompt",
+                )
+
+        assert result.get("_acp_fallback") is None or result.get("_acp_fallback") is False
+        assert result["ok"] is False
+        assert result["failure_class"] == "auth_required"
+
+    def test_auth_required_propagates_through_run_delegation(
+        self, tmp_path: Path
+    ) -> None:
+        """GIVEN run_delegation(transport=acp) with an auth_required result,
+        THEN the normalized result surfaces failure_class=auth_required and is
+        NOT a fallback (verify_acp_roundtrip.sh keys off this)."""
+        import run_gemini_headless as headless
+
+        ctx = tmp_path / "ctx.txt"
+        ctx.write_text("context content", encoding="utf-8")
+
+        valid_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "Reply with exactly PONG and nothing else",
+            "instructions": ["Do not add any explanation.", "Reply with PONG only."],
+            "tool_profile": "no_tools",
+            "output_sections": ["Response"],
+            "context_files": [str(ctx)],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 120,
+        }
+
+        def _fake_run_acp(request: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "transport_ok": False,
+                "stop_reason": None,
+                "schema": "acp_result_v1",
+                "transport": "acp",
+                "structured_events": [],
+                "response_text": None,
+                "stderr": None,
+                "warnings": ["session/new requires authentication"],
+                "failure_reason": "session/new requires authentication",
+                "failure_class": "auth_required",
+            }
+
+        with patch("run_gemini_acp.run_acp", side_effect=_fake_run_acp):
+            result = headless.run_delegation(valid_request, request_path=ctx)
+
+        assert result.get("_acp_fallback") is None or result.get("_acp_fallback") is False
+        assert result["transport"] == "acp"
+        # verify_acp_roundtrip.sh reads (.transport_details.failure_class // .failure_class)
+        fclass = result.get("transport_details", {}).get("failure_class") or result.get(
+            "failure_class"
+        )
+        assert fclass == "auth_required"

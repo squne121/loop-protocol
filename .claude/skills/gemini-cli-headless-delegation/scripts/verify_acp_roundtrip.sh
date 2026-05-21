@@ -4,10 +4,17 @@
 # Verifies ACP transport end-to-end by delegating short tasks to gemini CLI
 # via transport: acp. Implements:
 #   - SKIP exit 77 when gemini (GEMINI_BIN) or jq is absent
-#   - FAIL exit 1 when _acp_fallback: true is detected
+#   - FAIL exit 1 when _acp_fallback: true or failure_class=auth_required is detected
 #   - scenario 1 (normal): PONG roundtrip
-#   - scenario 2 (error): permission deny on write tool request
+#   - scenario 2 (controlled experiment): permission outcome controls a side
+#     effect — 2a deny → no file, 2b approve → file created
 #   - Artifact output to artifacts/runtime-verification-AC7-<ISO8601>.log
+#
+# Result schema note: run_delegation() normalizes ACP results to
+# delegation_result/v1. ACP-specific fields (structured_events, failure_class)
+# live under .transport_details; this script reads them with a top-level
+# fallback. .ok / .transport / .response_text / ._acp_fallback / .warnings
+# remain at the top level.
 #
 # Exit codes:
 #   0   All scenarios PASS
@@ -168,8 +175,26 @@ if [ -f "$SCENARIO_RESULT_FILE" ]; then
     exit 1
   else
     S1_OK="$(echo "$S1_OUTPUT" | jq -r '.ok' 2>/dev/null || echo "null")"
-    S1_EVENTS="$(echo "$S1_OUTPUT" | jq '.structured_events | length' 2>/dev/null || echo "0")"
+    # B1: run_delegation() normalizes the ACP result to delegation_result/v1, so
+    # ACP-specific structured_events now live under transport_details. Read with
+    # a fallback to top-level for forward/backward compatibility.
+    S1_EVENTS="$(echo "$S1_OUTPUT" | jq '(.transport_details.structured_events // .structured_events // []) | length' 2>/dev/null || echo "0")"
     S1_TRANSPORT="$(echo "$S1_OUTPUT" | jq -r '.transport // "null"' 2>/dev/null || echo "null")"
+    # B2: surface auth-required failures explicitly — they must NOT be masked by
+    # a headless_json fallback. failure_class lives under transport_details after
+    # normalization (top-level fallback retained for safety).
+    S1_FAILURE_CLASS="$(echo "$S1_OUTPUT" | jq -r '(.transport_details.failure_class // .failure_class) // "null"' 2>/dev/null || echo "null")"
+    if [ "$S1_FAILURE_CLASS" = "auth_required" ]; then
+      echo "FAIL: scenario 1 — failure_class=auth_required. ACP session/new requires authentication."
+      echo "      The Gemini CLI / OAuth session is not pre-authenticated. This transport does"
+      echo "      not implement the ACP authenticate handshake (see references/transport-acp.md)."
+      log_scenario "AC7 scenario 1 (normal PONG)" \
+        "objective=Reply with exactly PONG, transport=acp, model=gemini-2.5-flash" \
+        "$S1_OUTPUT" \
+        "FAIL" "1" "failure_class=auth_required — pre-authenticated session required"
+      echo "FAIL: verify_acp_roundtrip — auth_required in scenario 1"
+      exit 1
+    fi
     # response_text trimmed of leading/trailing whitespace, must equal exactly PONG
     S1_RESPONSE="$(echo "$S1_OUTPUT" | jq -r '.response_text // ""' 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     # Collect all FAIL reasons; PASS requires every check to pass.
@@ -207,34 +232,49 @@ else
 fi
 
 # ============================================================
-# scenario 2: permission deny — deterministic fake ACP agent
-#   A minimal Python ACP server replaces gemini for this scenario.
-#   It immediately sends a session/request_permission notification and
-#   verifies that our permission proxy denies it.
-#   PASS requires:
-#     - ok=true, _acp_fallback != true
-#     - structured_events contains a session/request_permission entry
-#     - the outcome in that entry is "cancelled" or optionId "cancel" (deny)
-#     - response_text contains PERMISSION_DENIED_OK
-#     - /tmp/acp-verify-permission-test.txt does NOT exist
+# scenario 2: permission outcome controls a side effect
+#   (deterministic fake ACP agent — controlled experiment)
+#
+#   B3: a passive "the file was not written" check does not prove the
+#   permission proxy denied anything — it could just mean nothing tried to
+#   write. This scenario is therefore a *controlled experiment*: the fake ACP
+#   agent produces a real, observable side effect (creating a unique file)
+#   *iff* the permission outcome it received is an approval. Running both the
+#   deny case and the approve case proves the permission proxy's branch
+#   actually controls the side effect:
+#
+#     case (a)  no --approve-edits  → proxy rejects → file NOT created
+#                                                   → response PERMISSION_DENIED_OK
+#     case (b)  --approve-edits     → proxy approves → file IS created
+#                                                   → response PERMISSION_GRANTED_OK
+#
+#   This is a deterministic fake-agent test. It proves the permission proxy
+#   *branch* controls side effects; it does NOT prove gating of Gemini's
+#   native tool registry — that is follow-up #112.
 # ============================================================
 echo ""
-echo "=== verify_acp_roundtrip: scenario 2 (permission deny — deterministic fake ACP agent) ==="
-
-# Remove any leftover target file from a previous run
-rm -f /tmp/acp-verify-permission-test.txt
+echo "=== verify_acp_roundtrip: scenario 2 (permission outcome controls a side effect — controlled experiment) ==="
 
 FAKE_ACP_BIN="$WORK_DIR/fake_acp_agent.py"
 cat > "$FAKE_ACP_BIN" <<'FAKEACP'
 #!/usr/bin/env python3
-"""Minimal deterministic ACP agent for permission-deny testing.
+"""Deterministic ACP agent for the permission-outcome controlled experiment.
 
 Lifecycle:
   1. initialize → result
   2. session/new → result (with fake sessionId)
-  3. session/prompt → send session/request_permission, then reply with PERMISSION_DENIED_OK
+  3. session/prompt → send session/request_permission, inspect the proxy's
+     outcome, and produce a side effect ONLY when the outcome is an approval.
+
+Side effect contract (this is what makes it a controlled experiment):
+  - outcome == approval → create the file at ACP_PERM_SIDEEFFECT_FILE and
+    reply PERMISSION_GRANTED_OK.
+  - outcome == reject/cancel → create NOTHING and reply PERMISSION_DENIED_OK.
+
+The target path is read from the ACP_PERM_SIDEEFFECT_FILE environment variable
+so the harness can use a unique, work-dir-local path per sub-case.
 """
-import json, sys, uuid
+import json, os, sys, uuid
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -244,6 +284,7 @@ def read_line():
     return sys.stdin.readline().strip()
 
 def main():
+    sideeffect_path = os.environ.get("ACP_PERM_SIDEEFFECT_FILE", "")
     session_id = str(uuid.uuid4())
     for _ in range(100):
         raw = read_line()
@@ -264,7 +305,7 @@ def main():
 
         elif method == "session/prompt":
             perm_id = mid + 1000
-            # Send a permission request for run_shell_command (write attempt)
+            # Request permission for a write-type operation.
             send({"jsonrpc":"2.0","method":"session/request_permission","id":perm_id,"params":{
                 "sessionId": session_id,
                 "options": [
@@ -272,24 +313,30 @@ def main():
                     {"optionId":"cancel","name":"Reject","kind":"reject_once"}
                 ]
             }})
-            # Read the permission response from the proxy
+            # Read the permission response produced by our proxy.
             raw_perm = read_line()
             perm_resp = json.loads(raw_perm) if raw_perm else {}
             outcome = (perm_resp.get("result") or {}).get("outcome") or {}
-            outcome_value = outcome.get("outcome","?")
-            option_id = outcome.get("optionId","?")
+            outcome_value = outcome.get("outcome", "?")
+            option_id = outcome.get("optionId", "?")
 
-            denied = (outcome_value in ("cancelled","selected") and option_id in ("cancel","reject_once","reject_always")) \
-                     or outcome_value == "cancelled"
+            # Approval == an option was selected AND it is an allow_* option.
+            approved = outcome_value == "selected" and option_id in ("proceed_once",)
 
-            reply_text = "PERMISSION_DENIED_OK" if denied else "PERMISSION_GRANTED_UNEXPECTED"
+            if approved:
+                # Real, observable side effect — created ONLY on approval.
+                if sideeffect_path:
+                    with open(sideeffect_path, "w") as fh:
+                        fh.write("ACP_PERMISSION_SIDE_EFFECT\n")
+                reply_text = "PERMISSION_GRANTED_OK"
+            else:
+                # Rejected/cancelled — no side effect at all.
+                reply_text = "PERMISSION_DENIED_OK"
 
-            # Send agent_message_chunk
             send({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId": session_id,
                 "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":reply_text}}
             }})
-            # Final response
             send({"jsonrpc":"2.0","id":mid,"result":{"stopReason":"end_turn"}})
             return
 
@@ -300,21 +347,21 @@ chmod +x "$FAKE_ACP_BIN"
 
 CONTEXT_FILE_2="$WORK_DIR/context2.txt"
 REQUEST_FILE_2="$WORK_DIR/request2.json"
-echo "This is a permission-deny verification context." > "$CONTEXT_FILE_2"
+echo "This is a permission-outcome verification context." > "$CONTEXT_FILE_2"
 
-# tool_profile is required for validate_request() — run_delegation() now routes
-# the ACP path through the full delegation contract, so this request must be a
+# tool_profile is required for validate_request() — run_delegation() routes the
+# ACP path through the full delegation contract, so this request must be a
 # valid delegation_request_v1. no_tools keeps the request schema-valid; the
-# fake ACP agent drives the permission-deny path regardless of tool_profile.
+# fake ACP agent drives the permission path regardless of tool_profile.
 cat > "$REQUEST_FILE_2" <<REQEOF
 {
   "schema": "delegation_request_v1",
   "transport": "acp",
-  "objective": "Run: echo TEST > /tmp/acp-verify-permission-test.txt",
+  "objective": "Attempt a write-type operation and report the permission outcome",
   "instructions": [
-    "Execute the shell command to write the file.",
+    "Attempt the write operation.",
     "If permission is denied, reply with: PERMISSION_DENIED_OK",
-    "If the command succeeds, reply with: WRITE_SUCCEEDED"
+    "If permission is granted, reply with: PERMISSION_GRANTED_OK"
   ],
   "tool_profile": "no_tools",
   "output_sections": ["Response"],
@@ -324,71 +371,133 @@ cat > "$REQUEST_FILE_2" <<REQEOF
 }
 REQEOF
 
-S2_OUTPUT=""
 S2_VERDICT=""
-S2_RC=0
 
-# Run WITHOUT --approve-edits using the fake ACP agent as GEMINI_BIN.
-# Wrap in `if` so a non-zero exit does not abort the script under `set -e`.
-if GEMINI_BIN="$WORK_DIR/fake_acp_agent.py" run_scenario "s2" "$REQUEST_FILE_2"; then
-  S2_RC=0
+# ------------------------------------------------------------
+# run_permission_subcase — run one controlled-experiment sub-case
+#   $1 label                e.g. "s2a-deny"
+#   $2 sideeffect file path unique per sub-case
+#   $3 expected response    PERMISSION_DENIED_OK | PERMISSION_GRANTED_OK
+#   $4 expect file created  0 = must NOT exist, 1 = must exist
+#   $5 extra run_scenario args (e.g. "--approve-edits")
+# Sets the global SUBCASE_REASONS to "" on PASS or a non-empty reason
+# string on FAIL. (A global is used instead of stdout capture because
+# run_scenario itself prints to stdout — capturing it via $(...) would
+# pollute the reason string.)
+# ------------------------------------------------------------
+SUBCASE_REASONS=""
+run_permission_subcase() {
+  local label="$1"
+  local sideeffect_file="$2"
+  local expect_response="$3"
+  local expect_file="$4"
+  local extra_args="${5:-}"
+  SUBCASE_REASONS=""
+
+  rm -f "$sideeffect_file"
+
+  local sub_rc=0
+  # Wrap in `if` so a non-zero exit does not abort the script under `set -e`.
+  if GEMINI_BIN="$FAKE_ACP_BIN" ACP_PERM_SIDEEFFECT_FILE="$sideeffect_file" \
+       run_scenario "$label" "$REQUEST_FILE_2" "$extra_args"; then
+    sub_rc=0
+  else
+    sub_rc=$?
+  fi
+
+  if [ ! -f "$SCENARIO_RESULT_FILE" ]; then
+    SUBCASE_REASONS="result file not created (run exit=$sub_rc); "
+    return 0
+  fi
+
+  local out
+  out="$(cat "$SCENARIO_RESULT_FILE")"
+
+  local fallback
+  fallback="$(echo "$out" | jq -r '._acp_fallback // false' 2>/dev/null || echo "false")"
+  if [ "$fallback" = "true" ]; then
+    SUBCASE_REASONS="_acp_fallback: true detected (ACP transport did not execute directly); "
+    return 0
+  fi
+
+  local fclass
+  fclass="$(echo "$out" | jq -r '(.transport_details.failure_class // .failure_class) // "null"' 2>/dev/null || echo "null")"
+  if [ "$fclass" = "auth_required" ]; then
+    SUBCASE_REASONS="failure_class=auth_required (pre-authenticated session required); "
+    return 0
+  fi
+
+  local ok perm_count response file_exists
+  ok="$(echo "$out" | jq -r '.ok' 2>/dev/null || echo "null")"
+  # B1: structured_events live under transport_details after normalization.
+  perm_count="$(echo "$out" | jq '[(.transport_details.structured_events // .structured_events // [])[]? | select(.type == "session/request_permission")] | length' 2>/dev/null || echo "0")"
+  response="$(echo "$out" | jq -r '.response_text // ""' 2>/dev/null || echo "")"
+  file_exists=0
+  [ -f "$sideeffect_file" ] && file_exists=1
+
+  local reasons=""
+  [ "$ok" != "true" ] && reasons="${reasons}ok=$ok; "
+  { [ "$perm_count" -ge 1 ]; } 2>/dev/null || reasons="${reasons}permission_request_count=$perm_count (need >=1); "
+  echo "$response" | grep -q "$expect_response" || reasons="${reasons}response_text missing $expect_response (got: ${response}); "
+  if [ "$expect_file" -eq 1 ]; then
+    [ "$file_exists" -eq 1 ] || reasons="${reasons}side-effect file NOT created (approval did not produce a write); "
+  else
+    [ "$file_exists" -eq 1 ] && reasons="${reasons}side-effect file WAS created (deny did not block the write); "
+  fi
+
+  SUBCASE_REASONS="$reasons"
+}
+
+# --- sub-case (a): deny — no --approve-edits → file NOT created ---
+echo ""
+echo "--- scenario 2a: permission DENY (no --approve-edits) — expect no side effect ---"
+S2A_SIDEEFFECT="$WORK_DIR/acp-perm-sideeffect-deny.txt"
+run_permission_subcase "s2a-deny" "$S2A_SIDEEFFECT" "PERMISSION_DENIED_OK" 0 ""
+S2A_REASONS="$SUBCASE_REASONS"
+if [ -z "$S2A_REASONS" ]; then
+  echo "PASS: scenario 2a (deny) — response=PERMISSION_DENIED_OK, side-effect file not created"
+  S2A_VERDICT="PASS"
+  log_scenario "AC7 scenario 2a (permission deny controls side effect)" \
+    "fake-acp-agent, no --approve-edits" \
+    "$(cat "$SCENARIO_RESULT_FILE" 2>/dev/null || echo '(no result file)')" \
+    "PASS" "0"
 else
-  S2_RC=$?
+  echo "FAIL: scenario 2a (deny) — $S2A_REASONS"
+  S2A_VERDICT="FAIL"
+  OVERALL_RESULT=1
+  log_scenario "AC7 scenario 2a (permission deny controls side effect)" \
+    "fake-acp-agent, no --approve-edits" \
+    "$(cat "$SCENARIO_RESULT_FILE" 2>/dev/null || echo '(no result file)')" \
+    "FAIL" "1" "$S2A_REASONS"
 fi
 
-if [ -f "$SCENARIO_RESULT_FILE" ]; then
-  S2_OUTPUT="$(cat "$SCENARIO_RESULT_FILE")"
-
-  # --- Fallback detection (must come before any PASS) ---
-  S2_FALLBACK="$(echo "$S2_OUTPUT" | jq -r '._acp_fallback // false' 2>/dev/null || echo "false")"
-  if [ "$S2_FALLBACK" = "true" ]; then
-    S2_REASON="$(echo "$S2_OUTPUT" | jq -r '.warnings[0] // "unknown"' 2>/dev/null || echo "unknown")"
-    echo "FAIL: scenario 2 — _acp_fallback: true detected."
-    echo "      First warning: $S2_REASON"
-    log_scenario "AC7 scenario 2 (permission deny)" \
-      "fake-acp-agent, no --approve-edits" \
-      "$S2_OUTPUT" \
-      "FAIL" "1" "_acp_fallback: true — $S2_REASON"
-    echo "FAIL: verify_acp_roundtrip — _acp_fallback detected in scenario 2"
-    exit 1
-  fi
-
-  S2_OK="$(echo "$S2_OUTPUT" | jq -r '.ok' 2>/dev/null || echo "null")"
-  S2_PERM_COUNT="$(echo "$S2_OUTPUT" | jq '[.structured_events[]? | select(.type == "session/request_permission")] | length' 2>/dev/null || echo "0")"
-  S2_RESPONSE_TEXT="$(echo "$S2_OUTPUT" | jq -r '.response_text // ""' 2>/dev/null || echo "")"
-  S2_FILE_EXISTS=0
-  [ -f /tmp/acp-verify-permission-test.txt ] && S2_FILE_EXISTS=1
-
-  S2_FAIL_REASONS=""
-  [ "$S2_OK" != "true" ] && S2_FAIL_REASONS="${S2_FAIL_REASONS}ok=$S2_OK; "
-  [ "$S2_PERM_COUNT" -lt 1 ] 2>/dev/null && S2_FAIL_REASONS="${S2_FAIL_REASONS}permission_request_count=$S2_PERM_COUNT (need >=1); "
-  echo "$S2_RESPONSE_TEXT" | grep -q "PERMISSION_DENIED_OK" || S2_FAIL_REASONS="${S2_FAIL_REASONS}response_text missing PERMISSION_DENIED_OK (got: ${S2_RESPONSE_TEXT}); "
-  [ "$S2_FILE_EXISTS" -eq 1 ] && S2_FAIL_REASONS="${S2_FAIL_REASONS}/tmp/acp-verify-permission-test.txt exists (write was NOT denied); "
-
-  if [ -z "$S2_FAIL_REASONS" ]; then
-    echo "PASS: scenario 2 — permission_request_count=$S2_PERM_COUNT, response=PERMISSION_DENIED_OK, file not created"
-    S2_VERDICT="PASS"
-    log_scenario "AC7 scenario 2 (permission deny)" \
-      "fake-acp-agent, no --approve-edits, permission_request_count=$S2_PERM_COUNT" \
-      "$S2_OUTPUT" \
-      "PASS" "0"
-  else
-    echo "FAIL: scenario 2 — $S2_FAIL_REASONS"
-    S2_VERDICT="FAIL"
-    OVERALL_RESULT=1
-    log_scenario "AC7 scenario 2 (permission deny)" \
-      "fake-acp-agent, no --approve-edits" \
-      "$S2_OUTPUT" \
-      "FAIL" "1" "$S2_FAIL_REASONS"
-  fi
+# --- sub-case (b): approve — --approve-edits → file IS created ---
+echo ""
+echo "--- scenario 2b: permission APPROVE (--approve-edits) — expect side effect ---"
+S2B_SIDEEFFECT="$WORK_DIR/acp-perm-sideeffect-approve.txt"
+run_permission_subcase "s2b-approve" "$S2B_SIDEEFFECT" "PERMISSION_GRANTED_OK" 1 "--approve-edits"
+S2B_REASONS="$SUBCASE_REASONS"
+if [ -z "$S2B_REASONS" ]; then
+  echo "PASS: scenario 2b (approve) — response=PERMISSION_GRANTED_OK, side-effect file created"
+  S2B_VERDICT="PASS"
+  log_scenario "AC7 scenario 2b (permission approve controls side effect)" \
+    "fake-acp-agent, --approve-edits" \
+    "$(cat "$SCENARIO_RESULT_FILE" 2>/dev/null || echo '(no result file)')" \
+    "PASS" "0"
 else
-  echo "FAIL: scenario 2 — result file not created"
-  S2_VERDICT="FAIL"
+  echo "FAIL: scenario 2b (approve) — $S2B_REASONS"
+  S2B_VERDICT="FAIL"
   OVERALL_RESULT=1
-  log_scenario "AC7 scenario 2 (permission deny)" \
-    "objective=write /tmp/acp-verify-permission-test.txt, no --approve-edits, model=gemini-2.5-flash" \
-    "(no result file)" \
-    "FAIL" "1" "result file not created (run exit=$S2_RC)"
+  log_scenario "AC7 scenario 2b (permission approve controls side effect)" \
+    "fake-acp-agent, --approve-edits" \
+    "$(cat "$SCENARIO_RESULT_FILE" 2>/dev/null || echo '(no result file)')" \
+    "FAIL" "1" "$S2B_REASONS"
+fi
+
+if [ "$S2A_VERDICT" = "PASS" ] && [ "$S2B_VERDICT" = "PASS" ]; then
+  S2_VERDICT="PASS"
+else
+  S2_VERDICT="FAIL"
 fi
 
 # ============================================================
@@ -397,7 +506,9 @@ fi
 echo ""
 echo "=== Summary ==="
 echo "scenario 1 (normal PONG): $S1_VERDICT"
-echo "scenario 2 (permission deny): $S2_VERDICT"
+echo "scenario 2 (permission outcome controls side effect): $S2_VERDICT"
+echo "  - scenario 2a (deny — no side effect): $S2A_VERDICT"
+echo "  - scenario 2b (approve — side effect): $S2B_VERDICT"
 echo "Artifact: $LOG_FILE"
 echo ""
 

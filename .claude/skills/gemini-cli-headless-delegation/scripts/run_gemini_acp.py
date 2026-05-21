@@ -223,6 +223,49 @@ def handle_session_request_permission(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Auth-required detection
+# ---------------------------------------------------------------------------
+
+# Substrings that, when present in a session/new error message or in the error
+# object, indicate the ACP agent is rejecting the request because the Gemini
+# CLI / OAuth session is not authenticated. This transport does NOT implement
+# the ACP `authenticate` handshake (a pre-authenticated session is assumed);
+# such failures must be surfaced as `auth_required`, never masked by a
+# headless_json fallback.
+_AUTH_REQUIRED_SIGNALS: tuple[str, ...] = (
+    "authenticate",
+    "auth_required",
+    "auth required",
+    "authmethods",
+    "unauthorized",
+    "not authenticated",
+    "not signed in",
+    "requires authentication",
+    "authentication required",
+    "login required",
+)
+
+
+def is_auth_required_error(error: Any) -> bool:
+    """Return True if a JSON-RPC error object signals an auth-required failure.
+
+    Inspects the error ``message`` and ``code`` and any ``data`` payload for the
+    auth signals in ``_AUTH_REQUIRED_SIGNALS`` (case-insensitive). A presence of
+    an ``authMethods`` key anywhere in the error payload also counts.
+    """
+    if not isinstance(error, dict):
+        text = str(error).lower()
+        return any(sig in text for sig in _AUTH_REQUIRED_SIGNALS)
+    # An explicit authMethods key in the error payload is a strong signal.
+    if "authMethods" in error or (
+        isinstance(error.get("data"), dict) and "authMethods" in error["data"]
+    ):
+        return True
+    blob = json.dumps(error, ensure_ascii=False).lower()
+    return any(sig in blob for sig in _AUTH_REQUIRED_SIGNALS)
+
+
 def detect_known_bug_from_stderr(stderr_chunk: str) -> str | None:
     """Check a stderr chunk for known-bug signals.
 
@@ -302,7 +345,13 @@ async def _run_acp_session(
     ``failure_class`` is a structured classifier for the failure point (or
     ``None`` on success). Recognised values:
       gemini_not_found, launch_failed, initialize_failed, session_new_failed,
-      prompt_error, protocol_error, timeout, watchdog, incomplete_response
+      auth_required, prompt_error, protocol_error, timeout, watchdog,
+      incomplete_response
+
+    ``auth_required`` is a session/new failure whose error signals the Gemini
+    CLI / OAuth session is not authenticated. This transport does not implement
+    the ACP ``authenticate`` handshake; ``auth_required`` is surfaced as a hard
+    failure and is **not** subject to the headless_json fallback.
 
     ``transport_ok`` is the transport-level success (final response received,
     clean exit, valid session id, no failure). ``ok`` additionally requires the
@@ -318,6 +367,7 @@ async def _run_acp_session(
         "warnings": [],
         "failure_reason": None,
         "failure_class": None,
+        "auth_methods": None,
     }
 
     # Resolve a deterministic cwd: cwd_override when provided, else os.getcwd().
@@ -432,6 +482,15 @@ async def _run_acp_session(
             f"initialize error: {init_msg['error']}", "initialize_failed"
         )
 
+    # Capture authMethods advertised by the agent in the initialize result.
+    # This transport does not implement the ACP `authenticate` handshake; the
+    # value is retained for diagnostics and to disambiguate auth failures.
+    init_result_data = init_msg.get("result", {})
+    if isinstance(init_result_data, dict):
+        auth_methods = init_result_data.get("authMethods")
+        if auth_methods:
+            result["auth_methods"] = auth_methods
+
     # ------------------------------------------------------------------
     # session/new — "default" approvalMode so tools and permission requests are active
     # ------------------------------------------------------------------
@@ -482,8 +541,21 @@ async def _run_acp_session(
         # Any other message (notification) is dropped here — session/prompt loop handles them
 
     if "error" in session_msg:
+        session_error = session_msg["error"]
+        # B2: an auth-required session/new failure must be classified as
+        # `auth_required` (not `session_new_failed`) so run_acp() surfaces it
+        # honestly instead of masking it behind a headless_json fallback. This
+        # transport assumes a pre-authenticated Gemini CLI / OAuth session and
+        # does not implement the ACP `authenticate` handshake.
+        if is_auth_required_error(session_error) or result.get("auth_methods"):
+            return await early_exit(
+                f"session/new requires authentication "
+                f"(ACP authenticate handshake not implemented; "
+                f"pre-authenticated session expected): {session_error}",
+                "auth_required",
+            )
         return await early_exit(
-            f"session/new error: {session_msg['error']}", "session_new_failed"
+            f"session/new error: {session_error}", "session_new_failed"
         )
 
     session_result_data = session_msg.get("result", {})
@@ -815,6 +887,11 @@ def run_acp(
     # Fallback: if the ACP path failed before producing a usable session, try
     # headless_json. The decision is driven by the structured failure_class
     # (B4) rather than fragile substring matching on failure_reason.
+    #
+    # `auth_required` is deliberately EXCLUDED from this set: an auth-required
+    # failure means the Gemini CLI / OAuth session is not pre-authenticated.
+    # Falling back to headless_json would mask the ACP transport failure behind
+    # an apparent "fallback success" — the auth failure must surface honestly.
     EARLY_FAILURE_CLASSES = {
         "gemini_not_found",
         "launch_failed",

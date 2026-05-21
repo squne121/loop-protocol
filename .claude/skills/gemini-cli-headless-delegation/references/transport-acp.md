@@ -65,6 +65,34 @@ caller
   +--[close stdin]--> wait for process exit
 ```
 
+### Authentication — `authenticate` handshake is NOT implemented
+
+The ACP protocol defines an optional `authenticate` phase between `initialize`
+and `session/new`: the agent advertises `authMethods` in the `initialize`
+result and the client can call `authenticate` to establish credentials.
+
+**This transport does not implement the `authenticate` handshake.** It assumes a
+**pre-authenticated** Gemini CLI / OAuth session (the operator has already run
+`gemini` interactively / completed OAuth). The lifecycle goes directly
+`initialize → session/new → session/prompt`.
+
+To keep this honest:
+
+- the `initialize` result's `authMethods` (if present) is captured into the
+  session result (`auth_methods`) for diagnostics;
+- if `session/new` fails with an error that signals authentication is required
+  (`auth` / `authenticate` / `unauthorized` / `authMethods` / `not
+  authenticated` and similar signals), the failure is classified
+  `failure_class = "auth_required"` instead of the generic
+  `session_new_failed`;
+- `auth_required` is **excluded** from the headless_json fallback set (see
+  "Fallback" below). An auth failure is surfaced as a real ACP transport
+  failure and is **never** masked behind an apparent "fallback success";
+- `verify_acp_roundtrip.sh` treats `failure_class = auth_required` as an
+  explicit FAIL (exit 1) with a clear message.
+
+Implementing the `authenticate` handshake itself is **out of scope** for this PR.
+
 `protocolVersion` is the integer `1` (gemini-cli 0.42.0+ rejects string
 versions such as `"2024-11-05"`). Each step uses `asyncio.create_subprocess_exec`
 + stdin/stdout pipes. All agent events arrive as `session/update` notifications
@@ -204,7 +232,8 @@ site sets a `failure_class`:
 | `gemini_not_found` | `FileNotFoundError` launching `gemini --acp` | yes |
 | `launch_failed` | other subprocess launch error | yes |
 | `initialize_failed` | initialize timeout / unexpected / error | yes |
-| `session_new_failed` | session/new timeout / EOF / error | yes |
+| `session_new_failed` | session/new timeout / EOF / non-auth error | yes |
+| `auth_required` | session/new error signalling authentication is required | **no** (surfaced honestly) |
 | `prompt_error` | session/prompt returned an error | no (late) |
 | `protocol_error` | EOF before final session/prompt response | no (late) |
 | `incomplete_response` | transport ok but non-`end_turn` stopReason / empty response | no (late) |
@@ -216,7 +245,13 @@ site sets a `failure_class`:
 `{gemini_not_found, launch_failed, initialize_failed, session_new_failed}`. The
 `failure_class` value is preserved on the returned result.
 
-Non-fallback failures (late failures, treated as final):
+Non-fallback failures (treated as final):
+- `auth_required` — `session/new` failed because the Gemini CLI / OAuth session
+  is not authenticated. This transport does not implement the ACP
+  `authenticate` handshake and assumes a pre-authenticated session.
+  `auth_required` is deliberately **excluded** from the fallback set: falling
+  back to headless_json would mask the ACP failure behind a "fallback success".
+  The failure is surfaced as-is so the operator fixes authentication.
 - `prompt_error` — the agent responded but returned an error.
 - `protocol_error` — EOF / process death before the final response.
 - `incomplete_response` — transport succeeded but the session ended with a
@@ -258,8 +293,22 @@ Related: Issue #85, Issue #26 AC7
 | Exit Code | Meaning |
 |-----------|---------|
 | 0 | All scenarios PASS |
-| 1 | At least one scenario FAIL or `_acp_fallback: true` detected |
+| 1 | At least one scenario FAIL, `_acp_fallback: true`, or `failure_class=auth_required` detected |
 | 77 | Execution environment unavailable (gemini CLI or jq not found) — SKIP |
+
+### Result schema the script reads
+
+`run_delegation()` normalizes ACP results to `delegation_result/v1`. The
+verification script reads:
+
+- `.ok`, `.transport`, `.response_text`, `._acp_fallback`, `.warnings` — at the
+  **top level**;
+- `.transport_details.structured_events` and `.transport_details.failure_class`
+  — under `transport_details` (with a top-level fallback for safety:
+  `(.transport_details.structured_events // .structured_events // [])`).
+
+A `failure_class` of `auth_required` is an explicit FAIL (exit 1): the ACP
+session requires a pre-authenticated Gemini CLI / OAuth session.
 
 ### GEMINI_BIN Override
 
@@ -290,26 +339,41 @@ PASS requires **all** of:
 
 Any mismatch is a FAIL with exit 1.
 
-**scenario 2 — permission deny (deterministic fake ACP agent)**
+**scenario 2 — permission outcome controls a side effect (controlled experiment)**
 
-A minimal deterministic fake ACP agent replaces `gemini` (`GEMINI_BIN` override).
-It issues a `session/request_permission` request and the run is executed without
-`--approve-edits`. The request JSON is a valid `delegation_request_v1`
-(`tool_profile: no_tools`) so it passes `validate_request()`. PASS requires:
-- no fallback (`_acp_fallback` absent or `false`)
-- `ok: true`
-- `structured_events` contains a `session/request_permission` entry
-- `response_text` contains `PERMISSION_DENIED_OK`
-- `/tmp/acp-verify-permission-test.txt` does not exist
+A deterministic fake ACP agent replaces `gemini` (`GEMINI_BIN` override) and the
+request JSON is a valid `delegation_request_v1` (`tool_profile: no_tools`).
 
-The scenario 2 invocation is wrapped in an `if` so a non-zero exit does not
-abort the script under `set -e`.
+This scenario is a **controlled experiment**, not a passive check. A passive
+"the file was not written" assertion does not prove the permission proxy denied
+anything — it could just mean nothing tried to write. Instead, the fake agent
+produces a **real, observable side effect** (creating a unique file at
+`$WORK_DIR/acp-perm-sideeffect-*.txt`, path passed via the
+`ACP_PERM_SIDEEFFECT_FILE` env var) **iff** the permission outcome it received
+from the proxy is an approval. The scenario runs **two sub-cases**:
 
-Note: scenario 2 exercises the best-effort permission handler only. It does not
-prove a complete sandbox — the `clientCapabilities` declaration only disables
-ACP client-provided fs/terminal proxies, not Gemini CLI's native tools / MCP /
-`approvalMode`. See the "Capability scope" and "Known limitations / non-goals"
-sections; the full safety-boundary design is deferred to follow-up #112.
+- **2a (deny)** — no `--approve-edits` → the proxy rejects → the agent creates
+  **no** file and replies `PERMISSION_DENIED_OK`. PASS requires `ok: true`, a
+  `session/request_permission` entry in `structured_events`, response
+  `PERMISSION_DENIED_OK`, and the side-effect file **absent**.
+- **2b (approve)** — `--approve-edits` → the proxy approves → the agent
+  **creates** the file and replies `PERMISSION_GRANTED_OK`. PASS requires
+  `ok: true`, a `session/request_permission` entry, response
+  `PERMISSION_GRANTED_OK`, and the side-effect file **present**.
+
+Running both sub-cases proves deterministically that the permission proxy's
+approve/reject **branch actually controls the side effect** — the deny case is
+contrasted against an approve case that does produce the write. Each sub-case
+invocation is wrapped in an `if` so a non-zero exit does not abort the script
+under `set -e`, and each sub-case verdict is tracked separately.
+
+Note: scenario 2 is a deterministic **fake-agent** test. It proves the
+permission proxy *branch* controls side effects; it does **not** prove gating of
+Gemini CLI's **native tool registry** — the `clientCapabilities` declaration
+only disables ACP client-provided fs/terminal proxies, not Gemini CLI's native
+tools / MCP / `approvalMode`. Native-tool gating verification against a real
+`gemini` binary is **follow-up #112**. See also the "Capability scope" and
+"Known limitations / non-goals" sections.
 
 ### Fallback Detection
 
