@@ -191,6 +191,7 @@ class TestRunTransactionParentReadbackAllFail:
             lambda *_a, **_k: ("node-child", 9901),
         )
         monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
 
     def test_partial_failure_stage_sub_issue_readback(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,6 +239,7 @@ class TestRunTransactionParentReadbackRecovery:
             lambda *_a, **_k: ("node-child", 9901),
         )
         monkeypatch.setattr(txn, "_issue_register_sub_issue", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
 
     def test_success_after_transient_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._patch_successful_create(monkeypatch)
@@ -282,6 +284,8 @@ class TestBothPathsUseHelper:
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
 
         helper_calls: list[tuple[Any, ...]] = []
         original_helper = txn._readback_parent_issue_with_retry
@@ -519,3 +523,349 @@ class TestRecoveryHintDedupeLabelReadback:
         hint = txn._recovery_hint_for_stage("totally-unknown-stage", "owner/repo", 99, 0, [])
 
         assert "totally-unknown-stage" in hint
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC1: _extract_parent_issue_number_from_body — format coverage
+# ---------------------------------------------------------------------------
+
+class TestExtractParentIssueNumberFromBody:
+    """AC1: body parser extracts parent from various formats."""
+
+    def test_yaml_style_with_hash_quoted(self) -> None:
+        body = 'parent_issue: "#42"'
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_without_hash_quoted(self) -> None:
+        body = 'parent_issue: "42"'
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_bare_number(self) -> None:
+        body = "parent_issue: 42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_yaml_style_with_hash_unquoted(self) -> None:
+        body = "parent_issue: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_with_hash(self) -> None:
+        body = "## Parent Issue\n\n#42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_without_hash(self) -> None:
+        body = "## Parent Issue\n\n42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_markdown_heading_with_blank_lines(self) -> None:
+        body = "## Parent Issue\n\n\n#42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_shorthand_parent_with_hash(self) -> None:
+        body = "parent: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_shorthand_parent_without_hash(self) -> None:
+        body = "parent: 42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_none_value_returns_none(self) -> None:
+        body = 'parent_issue: "none"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_null_value_returns_none(self) -> None:
+        body = "parent_issue: null"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_na_value_returns_none(self) -> None:
+        body = 'parent_issue: "N/A"'
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_zero_value_returns_none(self) -> None:
+        body = "parent_issue: 0"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_nashi_value_returns_none(self) -> None:
+        body = "parent_issue: なし"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_no_parent_section_returns_none(self) -> None:
+        body = "## Outcome\n\nSome outcome text."
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_empty_body_returns_none(self) -> None:
+        assert txn._extract_parent_issue_number_from_body("") is None
+
+    def test_multiline_body_with_yaml_style(self) -> None:
+        body = "## Outcome\n\nDo something.\n\nparent_issue: \"#99\"\n\n## AC\n\n- AC1"
+        assert txn._extract_parent_issue_number_from_body(body) == 99
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC3: Depends on #N is NOT treated as parent
+# ---------------------------------------------------------------------------
+
+class TestDependsOnNotParent:
+    """AC3: 'Depends on #N' MUST NOT be interpreted as a parent."""
+
+    def test_depends_on_not_interpreted_as_parent(self) -> None:
+        body = "Depends on #42\nDepends on #10"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+    def test_depends_on_with_parent_sibling(self) -> None:
+        """When both 'Depends on' and 'parent:' exist, only parent: is used."""
+        body = "Depends on #10\nparent: #42"
+        assert txn._extract_parent_issue_number_from_body(body) == 42
+
+    def test_depends_on_in_body_text_not_extracted(self) -> None:
+        body = "## Background\n\nThis issue depends on #5 completing first.\nDepends on #5"
+        assert txn._extract_parent_issue_number_from_body(body) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC2: _resolve_parent_issue_number — fail-closed on mismatch
+# ---------------------------------------------------------------------------
+
+class TestResolveParentIssueNumber:
+    """AC2: CLI arg vs body parent mismatch triggers fail-closed TransactionError."""
+
+    def test_arg_only_returns_arg(self) -> None:
+        assert txn._resolve_parent_issue_number(42, None) == 42
+
+    def test_body_only_returns_body(self) -> None:
+        assert txn._resolve_parent_issue_number(0, 42) == 42
+
+    def test_matching_arg_and_body_returns_arg(self) -> None:
+        assert txn._resolve_parent_issue_number(42, 42) == 42
+
+    def test_neither_returns_zero(self) -> None:
+        assert txn._resolve_parent_issue_number(0, None) == 0
+
+    def test_mismatch_raises_transaction_error(self) -> None:
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(42, 99)
+        assert exc_info.value.stage == "parent-arg-body-mismatch"
+
+    def test_mismatch_error_mentions_both_numbers(self) -> None:
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._resolve_parent_issue_number(10, 20)
+        assert "10" in exc_info.value.message
+        assert "20" in exc_info.value.message
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC2 (integration): run_transaction fails before create on mismatch
+# ---------------------------------------------------------------------------
+
+class TestRunTransactionParentArgBodyMismatch:
+    """AC2 (integration): run_transaction returns failure status when arg/body mismatch."""
+
+    def test_mismatch_returns_failure_before_any_create(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        # Body declares parent #42, but --parent-issue says 99
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        create_called: list[bool] = []
+
+        def _should_not_be_called(*_a: Any, **_k: Any) -> Any:
+            create_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_be_called)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=99,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "parent-arg-body-mismatch"
+        assert create_called == [], "_find_open_issues_by_title must NOT be called before fail-closed"
+
+    def test_body_parent_used_when_arg_absent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        """When --parent-issue is 0 (absent) and body declares parent #42, parent=42 is used."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        resolved_parents: list[int] = []
+
+        def _capture_register(repo: str, parent: int, db_id: int, child: int, gh: str) -> str:
+            resolved_parents.append(parent)
+            return "registered"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/50")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [50]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-50", 5001))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _capture_register)
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "success"
+        assert resolved_parents == [42], f"Expected parent 42 from body, got {resolved_parents}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC4: _issue_register_sub_issue_idempotent — 422 handling
+# ---------------------------------------------------------------------------
+
+class TestIssueRegisterSubIssueIdempotent:
+    """AC4: 422 idempotency — PASS only when read-back confirms same parent."""
+
+    def test_success_on_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(txn, "run_command", lambda *_a, **_k: _make_gh_result(stdout="ok", returncode=0))
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "registered"
+
+    def test_422_same_parent_returns_already_registered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST sub_issues -> 422
+                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
+            # GET parent read-back
+            return _make_gh_result(stdout='{"number": 10}', returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        result = txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert result == "already_registered"
+
+    def test_422_different_parent_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # POST sub_issues -> 422
+                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
+            # GET parent read-back returns a DIFFERENT parent
+            return _make_gh_result(stdout='{"number": 99}', returncode=0)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_422_empty_readback_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        call_count = 0
+
+        def _fake_run(args: list[str], **_k: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_gh_result(stdout="", stderr="HTTP 422 Unprocessable Entity", returncode=1)
+            # read-back returns 404 (not found)
+            return _make_gh_result(stdout="", returncode=1)
+
+        monkeypatch.setattr(txn, "run_command", _fake_run)
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+    def test_non_422_error_raises_transaction_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            txn, "run_command",
+            lambda *_a, **_k: _make_gh_result(stdout="", stderr="HTTP 500 Internal Server Error", returncode=1)
+        )
+        with pytest.raises(txn.TransactionError) as exc_info:
+            txn._issue_register_sub_issue_idempotent("owner/repo", 10, 9999, 50, "gh")
+        assert exc_info.value.stage == "sub-issue-register"
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 AC5: dedupe path registers and reads back parent (body-derived)
+# ---------------------------------------------------------------------------
+
+class TestDedupePathParentReconcile:
+    """AC5: dedupe path uses body-derived parent for registration + read-back."""
+
+    def test_dedupe_path_registers_and_readbacks_parent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        register_calls: list[tuple[Any, ...]] = []
+
+        def _capture_register(repo: str, parent: int, db_id: int, child: int, gh: str) -> str:
+            register_calls.append((parent, child))
+            return "registered"
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _capture_register)
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Title",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "dedupe"
+        assert len(register_calls) == 1
+        parent_used, child_used = register_calls[0]
+        assert parent_used == 42, f"Expected body-derived parent 42, got {parent_used}"
+        assert child_used == 55
+
+    def test_dedupe_path_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        """Body says parent #42, arg says #99 -> fail-closed before dedupe search."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+
+        search_called: list[bool] = []
+
+        def _should_not_search(*_a: Any, **_k: Any) -> Any:
+            search_called.append(True)
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _should_not_search)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Existing Title",
+            body="",
+            body_file=str(body_file),
+            labels=[],
+            issue_kind="",
+            parent_issue_number=99,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert result.status == "failure"
+        assert result.failure_stage == "parent-arg-body-mismatch"
+        assert search_called == []

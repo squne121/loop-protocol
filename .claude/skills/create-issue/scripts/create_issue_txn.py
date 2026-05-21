@@ -354,6 +354,175 @@ def _issue_graphql_ids(repo: str, issue_number: int, gh_bin: str) -> tuple[str, 
     return str(node_id), int(database_id)
 
 
+def _extract_parent_issue_number_from_body(body: str) -> int | None:
+    """Extract parent issue number from issue body text.
+
+    Recognises the following patterns (case-insensitive for keywords):
+      - YAML front-matter style: parent_issue: "#N" / parent_issue: "N" / parent_issue: N
+      - Markdown heading style: ## Parent Issue\\n\\n#N or ## Parent Issue\\n\\nN
+      - Shorthand: parent: #N / parent: N
+
+    ``Depends on #N`` is explicitly NOT treated as a parent; it is a
+    dependency/blocker expression and must be ignored here.
+
+    Values that indicate "no parent" (none, null, なし, N/A, 0) return None.
+    """
+    _NO_PARENT_VALUES = {"none", "null", "なし", "n/a", "0", ""}
+
+    # Normalise line endings
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Pattern 1: parent_issue: "#N" / parent_issue: "N" / parent_issue: N
+    m = re.search(
+        r'(?i)^[ \t]*parent_issue\s*:\s*"?#?(\w+)"?\s*$',
+        body,
+        re.MULTILINE,
+    )
+    if m:
+        raw = m.group(1).strip().lower()
+        if raw in _NO_PARENT_VALUES:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    # Pattern 2: ## Parent Issue\n\n#N  or  ## Parent Issue\n\nN  (optional blank lines)
+    m = re.search(
+        r'(?i)^##\s*Parent Issue\s*\n(?:\s*\n)*\s*#?(\w+)',
+        body,
+        re.MULTILINE,
+    )
+    if m:
+        raw = m.group(1).strip().lower()
+        if raw in _NO_PARENT_VALUES:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    # Pattern 3: parent: #N / parent: N  (but NOT "Depends on" lines)
+    for line in body.splitlines():
+        # Skip "Depends on #N" lines — these are dependency expressions, not parent
+        if re.search(r'(?i)depends\s+on', line):
+            continue
+        m = re.match(r'(?i)^[ \t]*parent\s*:\s*#?(\w+)\s*$', line)
+        if m:
+            raw = m.group(1).strip().lower()
+            if raw in _NO_PARENT_VALUES:
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+
+    return None
+
+
+def _resolve_parent_issue_number(parent_arg: int, body_parent: int | None) -> int:
+    """Resolve the effective parent issue number from CLI arg and body-derived parent.
+
+    Rules:
+      - If both are provided and they disagree -> raise TransactionError (fail-closed).
+      - If only parent_arg is provided -> return parent_arg.
+      - If only body_parent is provided -> return body_parent.
+      - Neither -> return 0 (no parent).
+    """
+    if parent_arg > 0 and body_parent is not None and parent_arg != body_parent:
+        raise TransactionError(
+            stage="parent-arg-body-mismatch",
+            message=(
+                f"--parent-issue {parent_arg} contradicts body parent #{body_parent}; "
+                "failing closed. Fix the body or omit --parent-issue."
+            ),
+            output=f"parent_arg={parent_arg} body_parent={body_parent}",
+        )
+    if parent_arg > 0:
+        return parent_arg
+    if body_parent is not None:
+        return body_parent
+    return 0
+
+
+def _issue_register_sub_issue_idempotent(
+    repo: str,
+    parent_issue_number: int,
+    child_database_id: int,
+    child_issue_number: int,
+    gh_bin: str,
+) -> str:
+    """Register child as sub-issue of parent, treating 422 as idempotent when already registered.
+
+    Returns:
+        "registered"        — POST succeeded (HTTP 201/200).
+        "already_registered" — POST returned 422 and read-back confirmed same parent.
+
+    Raises:
+        TransactionError(stage="sub-issue-register") — POST failed for reasons
+            other than 422, or 422 but read-back showed a *different* parent
+            (or no parent at all).  This is treated as partial_failure.
+    """
+    endpoint = f"repos/{repo}/issues/{parent_issue_number}/sub_issues"
+    args = [
+        gh_bin,
+        "api",
+        endpoint,
+        "--method",
+        "POST",
+        "-F",
+        f"sub_issue_id={child_database_id}",
+    ]
+    cp = run_command(args)
+    if cp.returncode == 0:
+        return "registered"
+
+    # Determine if the failure is a 422
+    stderr_out = (cp.stderr or "").strip()
+    stdout_out = (cp.stdout or "").strip()
+    combined = stderr_out or stdout_out
+
+    # gh CLI surfaces HTTP status in stderr as "HTTP 422" or similar
+    is_422 = bool(re.search(r'422', combined))
+
+    if not is_422:
+        raise TransactionError(
+            stage="sub-issue-register",
+            message="sub-issue POST failed with non-422 error",
+            command=" ".join(args),
+            output=combined,
+        )
+
+    # 422: read-back to check if already registered with the same parent
+    readback_args = [
+        gh_bin,
+        "api",
+        f"repos/{repo}/issues/{child_issue_number}/parent",
+        "--method",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github+json",
+    ]
+    rb_cp = run_command(readback_args)
+    if rb_cp.returncode == 0:
+        try:
+            data = json.loads((rb_cp.stdout or "").strip() or "{}")
+            if int(data.get("number", -1)) == int(parent_issue_number):
+                return "already_registered"
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    raise TransactionError(
+        stage="sub-issue-register",
+        message=(
+            f"sub-issue POST returned 422 but read-back did not confirm parent #{parent_issue_number} "
+            f"for child #{child_issue_number}; treating as partial_failure."
+        ),
+        command=" ".join(args),
+        output=combined,
+    )
+
+
 def _issue_register_sub_issue(repo: str, parent_issue_number: int, child_database_id: int, gh_bin: str) -> None:
     endpoint = f"repos/{repo}/issues/{parent_issue_number}/sub_issues"
     args = [
@@ -697,6 +866,14 @@ def _reconcile_issue_links(
         completed.append("label-readback")
 
     if parent_issue_number:
+        # Attempt idempotent sub-issue registration for dedupe path.
+        # If already registered, _issue_register_sub_issue_idempotent returns "already_registered" (PASS).
+        # If registration fails non-idempotently, it raises TransactionError.
+        _, child_db_id = _issue_graphql_ids(repo, issue_number, gh_bin)
+        _issue_register_sub_issue_idempotent(
+            repo, parent_issue_number, child_db_id, issue_number, gh_bin
+        )
+        completed.append("sub_issue")
         parent_verified = _readback_parent_issue_with_retry(
             repo, issue_number, parent_issue_number, gh_bin, sleep_fn=sleep_fn
         )
@@ -733,6 +910,27 @@ def run_transaction(
     labels = _resolve_labels(labels, issue_kind)
     normalized_dependency_issue_numbers = _normalize_dependency_numbers(dependency_issue_numbers)
     completed: list[str] = []
+
+    # --- Body-derived parent resolution (fail-closed before any GitHub mutation) ---
+    _body_text = body
+    if body_file:
+        _path = Path(body_file)
+        if _path.is_file():
+            _body_text = _path.read_text(encoding="utf-8")
+    body_parent = _extract_parent_issue_number_from_body(_body_text)
+    try:
+        parent_issue_number = _resolve_parent_issue_number(parent_issue_number, body_parent)
+    except TransactionError as exc:
+        return TransactionResult(
+            status="failure",
+            issue_number=None,
+            issue_url=None,
+            completed_steps=[],
+            failure_stage=exc.stage,
+            failure_message=exc.message,
+        )
+    # --- End parent resolution ---
+
     try:
         dedupe_issue_numbers = _find_open_issues_by_title(repo, title, gh_bin)
     except TransactionError as exc:
@@ -878,7 +1076,9 @@ def run_transaction(
         if parent_issue_number:
             if child_db_id is None:
                 _, child_db_id = _issue_graphql_ids(repo, issue_number, gh_bin)
-            _issue_register_sub_issue(repo, parent_issue_number, child_db_id, gh_bin)
+            _issue_register_sub_issue_idempotent(
+                repo, parent_issue_number, child_db_id, issue_number, gh_bin
+            )
             completed.append("sub_issue")
 
         dependency_registered = True
