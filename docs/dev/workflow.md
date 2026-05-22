@@ -158,6 +158,34 @@ git branch -d worktree-<slug>
 | SubAgent / Skill 責務境界の変更 | `docs/dev/agent-skill-boundaries.md` |
 | GitHub 運用ルールの変更 | `docs/dev/github-ops.md` |
 | 物理強制ルールの追加 | `.claude/settings.json` のフック定義 + 該当スクリプト |
+| GitHub Milestone 操作 | `docs/dev/milestone-ops.md` |
+
+## SSOT Routing Table
+
+SSOT 追加時の参照先を集約した索引。AI エージェントは実装着手前に対象トピックの SSOT を本表から確認する。
+カタログの正本は `docs/dev/ssot-registry.md` を参照すること。
+
+| トピック | 参照先 SSOT |
+|---|---|
+| Issue 駆動開発フロー・1 Issue 1 PR | `docs/dev/workflow.md`（本ドキュメント） |
+| SubAgent / Skill 責務境界 | `docs/dev/agent-skill-boundaries.md` |
+| `gh` CLI 利用規約・ラベル運用 | `docs/dev/github-ops.md` |
+| GitHub Milestone 作成・割当・close・rollup | `docs/dev/milestone-ops.md` |
+| アーキテクチャ分離原則・60Hz タイムステップ | `docs/adr/0001-architecture-baseline.md` |
+| 全体要件・非ゴール | `docs/product/requirements.md` |
+| 現在のフェーズ・優先項目 | `docs/dev/current-focus.md` |
+| SSOT カタログ全体 | `docs/dev/ssot-registry.md` |
+
+### 新規 SSOT 追加時の必須更新セット
+
+新しい SSOT 文書（`docs/` 配下）を追加する場合は、**同一 PR で以下をすべて更新する**こと:
+
+1. **本表（SSOT Routing Table）** にエントリ追加
+2. **`docs/dev/ssot-registry.md`**（SSOT カタログ正本）にエントリ追加
+3. **`.claude/skills/ssot-discovery/references/ssot-catalog.md`** にエントリ追加（ssot-registry.md から派生）
+4. **`.claude/skills/ssot-discovery/SKILL.md`** の説明・例を必要に応じて更新
+
+上記を同一 PR で更新しない場合、AI エージェントが新 SSOT を見落として古い情報で誤実行するリスクが生じる。
 
 ## 関連ドキュメント
 

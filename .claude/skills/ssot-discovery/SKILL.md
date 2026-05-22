@@ -12,11 +12,15 @@ LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情
 
 各エージェントが独自に「関連しそうな doc を grep する」と、見落としと冗長な探索が積み重なる。SSOT 探索を 1 つのスキルに集約することで、
 
-- カタログ更新時に各エージェント側を直さなくていい（[references/ssot-catalog.md](references/ssot-catalog.md) を 1 箇所修正）
+- カタログ更新時に各エージェント側を直さなくていい（`docs/dev/ssot-registry.md` を 1 箇所修正）
 - 結果フォーマットが固定（[references/output-contract.md](references/output-contract.md)）で、呼び出し側が確実にパースできる
 - マッチ判定スクリプトを通すので、人間が再現できる（同入力 → 同出力）
 
 ことを保証する。各層特有の不変条件は各ディレクトリの `CLAUDE.md` に集約されているため、本スキルでそれらを再説明しない。
+
+> **SSOT カタログの正本**: SSOT エントリのカタログは `docs/dev/ssot-registry.md`（docs 層の正本）を参照すること。
+> [references/ssot-catalog.md](references/ssot-catalog.md) は Skill 層からの参照用に維持されるキャッシュ（`derived_from: docs/dev/ssot-registry.md`）であり、
+> 正本ではない。新規エントリ追加時は `docs/dev/ssot-registry.md` を先に更新すること。
 
 ## Inputs
 
@@ -35,7 +39,7 @@ LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情
 
 ## Procedure
 
-1. [references/ssot-catalog.md](references/ssot-catalog.md) で SSOT カタログを確認する。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
+1. `docs/dev/ssot-registry.md` で SSOT カタログを確認する（正本）。または Skill 層の参照として [references/ssot-catalog.md](references/ssot-catalog.md) を使う。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
 2. 入力からキーワードを抽出する：
    - `task_keywords` はそのまま
    - `target_paths` はディレクトリ名・ファイル名語幹を切り出す
@@ -100,4 +104,8 @@ KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:p
 
 ## カタログ更新
 
-`docs/` に新規 SSOT を追加・削除したら、必ず [references/ssot-catalog.md](references/ssot-catalog.md) のエントリと `match-ssot.sh` の `DIR_MAP`（パス → SSOT マッピング）も同 PR で更新する。これを忘れると本スキルが古い世界観で動き続ける。
+`docs/` に新規 SSOT を追加・削除したら、必ず以下を同 PR で更新する。これを忘れると本スキルが古い世界観で動き続ける。
+
+1. `docs/dev/ssot-registry.md`（SSOT カタログの正本）にエントリ追加
+2. [references/ssot-catalog.md](references/ssot-catalog.md) に同期（`derived_from: docs/dev/ssot-registry.md` のキャッシュ）
+3. `match-ssot.sh` は `docs/dev/ssot-registry.md` を動的に読むため、エントリ追加で自動反映される
