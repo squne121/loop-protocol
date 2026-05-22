@@ -1,7 +1,15 @@
-# SSOT カタログ
+# SSOT カタログ（派生キャッシュ）
 
-`docs/` 配下を SSOT として扱う際の **正本リスト**。
-本カタログを更新したら `match-ssot.sh` のマッピングも合わせて更新する。
+<!--
+derived_from: docs/dev/ssot-registry.md
+このファイルは docs/dev/ssot-registry.md から派生するキャッシュである。
+SSOT カタログの正本は docs/dev/ssot-registry.md を参照すること。
+新規エントリ追加・削除は docs/dev/ssot-registry.md を先に更新し、本ファイルを同期すること。
+-->
+
+`docs/` 配下を SSOT として扱う際のキャッシュ。
+カタログの正本は `docs/dev/ssot-registry.md` であり、本ファイルは Skill 層からの参照用に維持される。
+本カタログを更新したら `docs/dev/ssot-registry.md` と `match-ssot.sh` も合わせて更新する。
 
 ## 開発運用 (`docs/dev/`)
 
@@ -10,6 +18,7 @@
 | `docs/dev/workflow.md` | Issue 駆動開発フロー全体（SSOT） | workflow, ssot, hooks, ci, worktree, issue, pr, テスト戦略, フロー |
 | `docs/dev/agent-skill-boundaries.md` | SubAgent / Skill 責務境界・オーケストレーター設計原則・ループ内人間承認原則 | agent, skill, subagent, 責務, role, control-plane, data-plane, loop_state, 人間承認 |
 | `docs/dev/github-ops.md` | `gh` CLI 利用規約・body-file guard・Parent Mode・コメント記録テンプレ | gh, github, ops, body-file, parent_mode, comment, label |
+| `docs/dev/milestone-ops.md` | GitHub Milestone 作成・割当・close・rollup の正本 | milestone, github-milestone, milestone-ops, milestone作成, milestone割当, milestone-close, milestone-rollup |
 | `docs/dev/directory-structure.md` | ディレクトリ責務 | directory, structure, src, layer, 分離 |
 | `docs/dev/current-focus.md` | 現在のフェーズ・優先項目 | current, focus, phase, mvp, milestone |
 

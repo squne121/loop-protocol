@@ -3,6 +3,10 @@
 `gh` CLI を介した GitHub 操作の共通規約。AI エージェント・人間レビュアー双方が参照する。
 個別の skill / SubAgent はこのルールに従って Issue / PR / コメントを更新する。
 
+> **GitHub Milestone 操作の正本**: GitHub Milestone の作成・割当・close・rollup に関する運用規約は
+> `docs/dev/milestone-ops.md` が正本である。本ドキュメントは `gh` CLI の共通規約を扱い、
+> Milestone 固有の判断基準・命名規則・AI 操作フローは `docs/dev/milestone-ops.md` を参照すること。
+
 ## Body File Guidance（`gh issue edit` / `gh pr edit` / `gh issue comment` 共通）
 
 Issue / PR 本文の長文・多行更新時は **必ず body-file 経由** で操作する。inline `--body "..."` はクォート崩壊・HEREDOC 由来エスケープ混入を招くため使わない。

@@ -113,6 +113,20 @@ SubAgent（役割）── Skill（作業手順）
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
 
+### ssot-discovery 発動タイミング
+
+以下の操作・コンテキストで `ssot-discovery` を積極的にトリガーする:
+
+| 発動タイミング | 例 |
+|---|---|
+| 実装 Issue 着手前 | Issue に変更対象パスが含まれる場合、関連 SSOT を事前確認 |
+| 開発フロー・ワークフロー変更 | workflow / CI / hooks / worktree 操作に関するキーワードが含まれる場合 |
+| SubAgent / Skill 設計変更 | agent, skill, subagent, 責務, control-plane に関する操作 |
+| GitHub 操作（Issue / PR 共通） | gh, github, ops, label, comment に関する操作 |
+| **GitHub metadata / Milestone 操作** | milestone, github-milestone, milestone 作成・割当・close・rollup に関する操作。正本は `docs/dev/milestone-ops.md` |
+| アーキテクチャ境界変更 | src/state, src/render, src/systems 等のレイヤー変更 |
+| 新規 SSOT 追加時 | docs/ への新規文書作成時に既存カタログとの整合確認 |
+
 ## Runtime Verification 責務分担
 
 詳細なポリシーは `docs/dev/runtime-verification-policy.md` を SSOT とする。本セクションは各 Agent / Skill の役割分担のみを記載する。
