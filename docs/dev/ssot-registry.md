@@ -120,21 +120,49 @@
 ## ディレクトリ → SSOT マッピング
 
 `target_paths` 入力時に「ディレクトリと関連する SSOT」を引くための索引。
+`match-ssot.sh` がこのブロックを `yaml.safe_load` で読み取る（機械可読 YAML）。
 
-| 対象パス | 関連 SSOT |
-|---|---|
-| `src/state/**` | `docs/adr/0001-architecture-baseline.md` |
-| `src/render/**` | `docs/adr/0001-architecture-baseline.md` |
-| `src/systems/**` | `docs/adr/0001-architecture-baseline.md` |
-| `src/data/**` | ルート `CLAUDE.md`、`src/data/README.md` |
-| `src/storage/**` | `docs/adr/0001-architecture-baseline.md` |
-| `src/ui/**` | `docs/adr/0001-architecture-baseline.md` |
-| `tests/**` | `docs/dev/workflow.md`（テスト戦略 3 層） |
-| `.claude/skills/**` | `docs/dev/agent-skill-boundaries.md`、`docs/dev/workflow.md` |
-| `.claude/agents/**` | `docs/dev/agent-skill-boundaries.md` |
-| `.github/**` | `docs/dev/github-ops.md`、`docs/dev/workflow.md` |
-| `.github/workflows/**` | `docs/dev/workflow.md`（CI 層） |
-| `scripts/**` | `docs/dev/workflow.md` |
+```yaml
+directory_mappings:
+  - pattern: "src/state/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "src/render/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "src/systems/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "src/data/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "src/storage/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "src/ui/**"
+    ssots:
+      - docs/adr/0001-architecture-baseline.md
+  - pattern: "tests/**"
+    ssots:
+      - docs/dev/workflow.md
+  - pattern: ".claude/skills/**"
+    ssots:
+      - docs/dev/agent-skill-boundaries.md
+      - docs/dev/workflow.md
+  - pattern: ".claude/agents/**"
+    ssots:
+      - docs/dev/agent-skill-boundaries.md
+  - pattern: ".github/**"
+    ssots:
+      - docs/dev/github-ops.md
+      - docs/dev/workflow.md
+  - pattern: ".github/workflows/**"
+    ssots:
+      - docs/dev/workflow.md
+  - pattern: "scripts/**"
+    ssots:
+      - docs/dev/workflow.md
+```
 
 ---
 

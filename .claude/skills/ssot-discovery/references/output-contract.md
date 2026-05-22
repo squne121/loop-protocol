@@ -23,6 +23,7 @@ SSOT_DISCOVERY_RESULT_V1:
       reason: "src/state ↔ src/render 分離原則"
       sections: []
   unmatched_keywords: ["..."]              # マッチしなかったキーワード（SSOT 未整備の示唆）
+  unmatched_paths: ["src/data/foo.ts"]    # マッチしなかった target_paths
   notes: []                                # 補足
   warnings: []
   errors: []                               # status=failed 時のみ必須
@@ -41,7 +42,7 @@ SSOT_DISCOVERY_RESULT_V1:
 | status | 条件 |
 |---|---|
 | `ok` | すべてのキーワード / パスについて 1 件以上のマッチを得た |
-| `partial` | 一部キーワードはマッチしたが、未マッチ（`unmatched_keywords` 非空）あり |
+| `partial` | 一部キーワードはマッチしたが未マッチ（`unmatched_keywords` 非空）あり、またはパス入力でマッチしないパスが存在（`unmatched_paths` 非空） |
 | `failed` | 入力不正・スクリプト実行失敗・SSOT カタログ不在 等 |
 
 ## 共通フィールド

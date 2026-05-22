@@ -39,7 +39,7 @@ LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情
 
 ## Procedure
 
-1. `docs/dev/ssot-registry.md` で SSOT カタログを確認する（正本）。または Skill 層の参照として [references/ssot-catalog.md](references/ssot-catalog.md) を使う。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
+1. `docs/dev/ssot-registry.md` を正本として参照する。registry が読めない場合は `match-ssot.sh` が `status: failed` を返す（ssot-catalog.md へのフォールバックは行わない）。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
 2. 入力からキーワードを抽出する：
    - `task_keywords` はそのまま
    - `target_paths` はディレクトリ名・ファイル名語幹を切り出す
