@@ -6,30 +6,60 @@
 # Options:
 #   milestone-number  Milestone の number（デフォルト: 1）
 #   --post <issue>    rollup 結果を指定 Issue にコメント投稿する
+#   --help, -h        使い方を表示する
 #
 # SSOT: docs/dev/milestone-ops.md
 # AI は Milestone close を実行しない。
 
 set -euo pipefail
 
-MILESTONE_NUMBER=${1:-1}
-REPO="squne121/loop-protocol"
-POST_TO_ISSUE=""
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+usage() {
+  cat >&2 <<USAGE_EOF
+Usage: $(basename "$0") [milestone-number] [--post <issue-number>]
 
-# --post オプション解析
-shift || true
+Options:
+  milestone-number  Milestone の number（デフォルト: 1, 数値のみ）
+  --post <issue>    rollup 結果を指定 Issue にコメント投稿する
+  --help, -h        この使い方を表示する
+
+Examples:
+  $(basename "$0")           # Milestone 1 を rollup（read-only）
+  $(basename "$0") 2         # Milestone 2 を rollup（read-only）
+  $(basename "$0") --post 147  # Milestone 1 を rollup して Issue #147 にコメント投稿
+  $(basename "$0") 2 --post 147  # Milestone 2 を rollup して Issue #147 にコメント投稿
+USAGE_EOF
+}
+
+# --------------------------------------------------------------------------
+# 引数パース（while ループで先に全引数を処理）
+# --------------------------------------------------------------------------
+MILESTONE_NUMBER=1
+POST_TO_ISSUE=""
+
 while [[ $# -gt 0 ]]; do
-  case $1 in
+  case "$1" in
     --post)
+      [[ $# -ge 2 ]] || { echo "ERROR: --post requires issue number" >&2; exit 2; }
       POST_TO_ISSUE="$2"
       shift 2
       ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    ''|*[!0-9]*)
+      echo "ERROR: milestone-number must be numeric: $1" >&2
+      exit 2
+      ;;
     *)
+      MILESTONE_NUMBER="$1"
       shift
       ;;
   esac
 done
+
+REPO="squne121/loop-protocol"
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # --------------------------------------------------------------------------
 # Step 1: Milestone 主要フィールドの取得（AC2）
@@ -50,31 +80,55 @@ M_URL=$(echo "$MILESTONE_JSON" | jq -r '.html_url')
 
 # --------------------------------------------------------------------------
 # Step 2: 全 item 取得と PR 混入チェック（AC3）
+# --paginate --slurp で全ページを外側配列に包んで安定した JSON 配列として扱う
 # --------------------------------------------------------------------------
 echo "[Step 2] 全 item 取得中..." >&2
 
-ALL_ITEMS=$(gh api --paginate \
+ALL_ITEMS_JSON=$(gh api --paginate \
   "repos/${REPO}/issues?milestone=${MILESTONE_NUMBER}&state=all&per_page=100" \
-  --jq '.[]' 2>/dev/null) || {
+  --slurp 2>/dev/null) || {
   echo "ERROR: milestone=${MILESTONE_NUMBER} の issue 一覧取得に失敗しました" >&2
   exit 1
 }
 
-PR_MIXED=$(echo "$ALL_ITEMS" | jq -c 'select(.pull_request != null) | {number, title, state}' 2>/dev/null || true)
-PR_MIXED_COUNT=$(echo "$PR_MIXED" | grep -c '"number"' 2>/dev/null || echo "0")
+# jq '[...] | length' で count（grep -c は 0 件でも exit 1 になり || echo "0" で 0\n0 になるバグを回避）
+PR_MIXED_COUNT=$(jq '[.[][] | select(.pull_request != null)] | length' <<< "$ALL_ITEMS_JSON")
+ISSUES_ONLY_JSON=$(jq '[.[][] | select(.pull_request == null)]' <<< "$ALL_ITEMS_JSON")
 
-ISSUES_ONLY=$(echo "$ALL_ITEMS" | jq -c 'select(.pull_request == null)' 2>/dev/null || true)
-OPEN_ISSUES=$(echo "$ISSUES_ONLY" | jq -c 'select(.state == "open")' 2>/dev/null || true)
-CLOSED_ISSUES=$(echo "$ISSUES_ONLY" | jq -c 'select(.state == "closed")' 2>/dev/null || true)
+OPEN_ISSUES=$(jq -c '.[] | select(.state == "open")' <<< "$ISSUES_ONLY_JSON" 2>/dev/null || true)
+CLOSED_ISSUES=$(jq -c '.[] | select(.state == "closed")' <<< "$ISSUES_ONLY_JSON" 2>/dev/null || true)
 
 # --------------------------------------------------------------------------
 # Step 3: Assignment Drift の検出（AC4）
+# #146 の M-A3 Milestone Assignment Readback コメントから expected_set を動的取得
 # --------------------------------------------------------------------------
-# #146 M-A3 Milestone Assignment Readback コメントより確定した expected set
-# expected: #133, #131, #40
-EXPECTED_SET=(133 131 40)
+echo "[Step 3] #146 M-A3 Readback から expected_set を取得中..." >&2
 
-ACTUAL_SET=$(echo "$ISSUES_ONLY" | jq -r '.number' 2>/dev/null | sort -n | tr '\n' ' ' || echo "")
+EXPECTED_SET_JSON=$(
+  gh issue view 146 --repo "$REPO" --comments --json comments \
+    --jq '
+      .comments
+      | map(select(.body | startswith("## M-A3 Milestone Assignment Readback")))
+      | last.body
+    ' 2>/dev/null |
+  grep -E '^- expected:' |
+  grep -oE '#[0-9]+' |
+  tr -d '#' |
+  sort -nu |
+  jq -R . | jq -s 'map(tonumber)' 2>/dev/null
+) || true
+
+# フォールバック: 取得失敗時はハードコードした値を使用
+if [[ -z "$EXPECTED_SET_JSON" || "$EXPECTED_SET_JSON" == "[]" ]]; then
+  echo "[Step 3] WARN: #146 readback 取得失敗。フォールバック値を使用します: [133, 131, 40]" >&2
+  EXPECTED_SET=(133 131 40)
+else
+  # JSON 配列からbash配列に変換
+  mapfile -t EXPECTED_SET < <(jq -r '.[]' <<< "$EXPECTED_SET_JSON")
+  echo "[Step 3] expected_set 取得完了: ${EXPECTED_SET[*]}" >&2
+fi
+
+ACTUAL_SET=$(jq -r '.[].number' <<< "$ISSUES_ONLY_JSON" 2>/dev/null | sort -n | tr '\n' ' ' || echo "")
 
 IN_EXPECTED_NOT_ACTUAL=()
 IN_ACTUAL_NOT_EXPECTED=()
@@ -127,23 +181,31 @@ while IFS= read -r issue_json; do
     has_needs_human=true
   fi
 
-  # issue 本文から Depends On を確認
+  # issue 本文から Depends On セクションのみを抽出して確認
+  # awk で ## Depends On セクション配下のみを抽出（セクション外の #NNN を誤検知しない）
   issue_body=$(gh api "repos/${REPO}/issues/${issue_num}" --jq '.body' 2>/dev/null || echo "")
   has_open_dep=false
   dep_reason=""
 
-  if echo "$issue_body" | grep -qiE "Depends On|depends_on"; then
-    # Depends On セクションから Issue 番号を抽出して状態を確認
-    dep_issues=$(echo "$issue_body" | grep -oE '#[0-9]+' | tr -d '#' 2>/dev/null || echo "")
-    for dep_num in $dep_issues; do
-      dep_state=$(gh api "repos/${REPO}/issues/${dep_num}" --jq '.state' 2>/dev/null || echo "unknown")
-      if [[ "$dep_state" == "open" ]]; then
-        has_open_dep=true
-        dep_reason="Depends On: #${dep_num} (open)"
-        break
-      fi
-    done
-  fi
+  dep_issues=$(
+    awk '
+      /^## Depends On[[:space:]]*$/ {in_dep=1; next}
+      /^## / && in_dep {in_dep=0}
+      in_dep {print}
+    ' <<< "$issue_body" |
+    grep -oE '#[0-9]+' |
+    tr -d '#' |
+    sort -nu
+  ) || true
+
+  for dep_num in $dep_issues; do
+    dep_state=$(gh api "repos/${REPO}/issues/${dep_num}" --jq '.state' 2>/dev/null || echo "unknown")
+    if [[ "$dep_state" == "open" ]]; then
+      has_open_dep=true
+      dep_reason="Depends On: #${dep_num} (open)"
+      break
+    fi
+  done
 
   if [[ "$has_needs_human" == "true" ]]; then
     NEEDS_HUMAN_ISSUES+=("| #${issue_num} | ${issue_title} | state/needs-human ラベルあり |")
@@ -183,7 +245,6 @@ if [[ "$DRIFT_STATUS" == "drift_detected" ]]; then
 fi
 
 # 優先度 2: parent close を阻害する open child
-# (blocked issues が parent の close を阻害している場合)
 for blocked_item in "${BLOCKED_ISSUES[@]}"; do
   issue_num_raw=$(echo "$blocked_item" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
   if [[ -n "$issue_num_raw" ]]; then
@@ -270,10 +331,16 @@ fi
 # expected / actual set の表示用
 EXPECTED_STR=$(printf '%s,' "${EXPECTED_SET[@]}" | sed 's/,$//')
 ACTUAL_STR=$(echo "$ACTUAL_SET" | tr ' ' ',' | sed 's/,$//')
-NOT_ACTUAL_STR=$(printf '#%s,' "${IN_EXPECTED_NOT_ACTUAL[@]:-}" | sed 's/,$//' || echo "なし")
-NOT_EXPECTED_STR=$(printf '#%s,' "${IN_ACTUAL_NOT_EXPECTED[@]:-}" | sed 's/,$//' || echo "なし")
-[[ -z "${NOT_ACTUAL_STR}" ]] && NOT_ACTUAL_STR="なし"
-[[ -z "${NOT_EXPECTED_STR}" ]] && NOT_EXPECTED_STR="なし"
+if [[ ${#IN_EXPECTED_NOT_ACTUAL[@]} -eq 0 ]]; then
+  NOT_ACTUAL_STR="なし"
+else
+  NOT_ACTUAL_STR=$(printf '#%s,' "${IN_EXPECTED_NOT_ACTUAL[@]}" | sed 's/,$//')
+fi
+if [[ ${#IN_ACTUAL_NOT_EXPECTED[@]} -eq 0 ]]; then
+  NOT_EXPECTED_STR="なし"
+else
+  NOT_EXPECTED_STR=$(printf '#%s,' "${IN_ACTUAL_NOT_EXPECTED[@]}" | sed 's/,$//')
+fi
 
 OUTPUT=$(cat <<OUTPUT_EOF
 ## Milestone Rollup: ${M_TITLE} (#${MILESTONE_NUMBER})
