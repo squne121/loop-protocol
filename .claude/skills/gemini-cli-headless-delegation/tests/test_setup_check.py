@@ -501,3 +501,30 @@ def test_trusted_folders_parent_trust_noop_dict(tmp_path):
     assert after == initial, (
         "Dict must not be modified when TRUST_PARENT ancestor covers the repo root"
     )
+
+
+# ---------------------------------------------------------------------------
+# B4: GEMINI_CLI_TRUSTED_FOLDERS_PATH env override
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_folders_path_honors_env_override(tmp_path, monkeypatch):
+    """GIVEN GEMINI_CLI_TRUSTED_FOLDERS_PATH is set to a custom path
+    WHEN _trusted_folders_path() is called
+    THEN it returns that path (not ~/.gemini/trustedFolders.json)."""
+    sc = load_setup_check()
+
+    override_path = tmp_path / "trusted.json"
+    monkeypatch.setenv("GEMINI_CLI_TRUSTED_FOLDERS_PATH", str(override_path))
+    assert sc._trusted_folders_path() == override_path
+
+
+def test_trusted_folders_path_default_without_env(monkeypatch):
+    """GIVEN GEMINI_CLI_TRUSTED_FOLDERS_PATH is not set
+    WHEN _trusted_folders_path() is called
+    THEN it returns ~/.gemini/trustedFolders.json."""
+    sc = load_setup_check()
+
+    monkeypatch.delenv("GEMINI_CLI_TRUSTED_FOLDERS_PATH", raising=False)
+    result = sc._trusted_folders_path()
+    assert result == Path.home() / ".gemini" / "trustedFolders.json"

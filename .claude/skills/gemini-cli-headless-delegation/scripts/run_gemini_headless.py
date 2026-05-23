@@ -557,10 +557,27 @@ def _validate_github_research_argv(argv: list[str]) -> list[str]:
             errors.append("github_research: gh api graphql is not allowed (always uses POST)")
             return errors
 
-        # Reject implicit-POST flags: -f/-F/--field/--raw-field/--input imply a non-GET request
+        # Reject implicit-POST flags: -f/-F/--field/--raw-field/--input imply a non-GET request.
+        # Handles exact match, =-separated (--field=val, --raw-field=val, --input=val),
+        # and concatenated short forms (-fkey=val, -Fkey=val where len > 2).
         implicit_post_flags = {"-f", "-F", "--field", "--raw-field", "--input"}
+        implicit_post_prefixes = ("--field=", "--raw-field=", "--input=")
         for token in argv:
             if token in implicit_post_flags:
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif any(token.startswith(prefix) for prefix in implicit_post_prefixes):
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif len(token) > 2 and token.startswith("-f") and not token.startswith("--"):
+                # Concatenated form: -fkey=val
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif len(token) > 2 and token.startswith("-F") and not token.startswith("--"):
+                # Concatenated form: -Fkey=val
                 errors.append(
                     f"github_research: gh api with {token} implies a non-GET request and is not allowed"
                 )
@@ -778,7 +795,12 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     tool_profile = request.get("tool_profile")
     if tool_profile not in ALLOWED_TOOL_PROFILES:
         errors.append("tool_profile must be one of: no_tools, grounded_research, local_asset_research, proposal_only, github_research")
-    elif tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
+    else:
+        # B3: gh_commands is only allowed with github_research profile (fail-closed)
+        if request.get("gh_commands") is not None and tool_profile != GITHUB_RESEARCH_PROFILE:
+            errors.append("gh_commands is only allowed with tool_profile='github_research'")
+
+    if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
         if request.get("post_to_issue_url"):
             errors.append("local_asset_research forbids post_to_issue_url")
         errors.extend(_validate_local_asset_research_settings())
@@ -1357,55 +1379,9 @@ def run_delegation(
                 )
                 return base_result
 
-    # local_asset_research / proposal_only: execute gh_commands with warn-on-denied
-    elif tool_profile in (LOCAL_ASSET_RESEARCH_PROFILE, PROPOSAL_ONLY_PROFILE):
-        gh_commands = request.get("gh_commands")
-        if isinstance(gh_commands, list) and gh_commands:
-            gh_output_parts_warn: list[str] = []
-            for idx, entry in enumerate(gh_commands):
-                if not isinstance(entry, dict):
-                    request_warnings.append(
-                        f"{tool_profile}: gh_commands[{idx}] must be an object with 'argv' field; skipping"
-                    )
-                    continue
-                argv = entry.get("argv")
-                if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
-                    request_warnings.append(
-                        f"{tool_profile}: gh_commands[{idx}].argv must be a list of strings; skipping"
-                    )
-                    continue
-                # allowlist validation: invalid argv -> warn + skip (no fail-close)
-                argv_errors = _validate_github_research_argv(argv)
-                if argv_errors:
-                    for err in argv_errors:
-                        request_warnings.append(
-                            f"{tool_profile}: gh_commands[{idx}] argv denied: {err}; skipping"
-                        )
-                    continue
-                # valid argv: execute
-                try:
-                    gh_proc = subprocess.run(
-                        ["gh"] + argv,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        cwd=str(_repo_root()),
-                        check=False,
-                    )
-                    cmd_str = "gh " + " ".join(argv)
-                    if gh_proc.returncode == 0:
-                        gh_output_parts_warn.append(f"## gh command: {cmd_str}\n{gh_proc.stdout.strip()}")
-                    else:
-                        gh_output_parts_warn.append(
-                            f"## gh command: {cmd_str}\n[exit {gh_proc.returncode}] {gh_proc.stderr.strip()}"
-                        )
-                        request_warnings.append(
-                            f"{tool_profile}: gh {' '.join(argv)} exited {gh_proc.returncode}: {gh_proc.stderr.strip()}"
-                        )
-                except Exception as exc:
-                    request_warnings.append(f"{tool_profile}: gh command error: {exc}")
-            if gh_output_parts_warn:
-                gh_commands_output = "\n\n".join(gh_output_parts_warn)
+    # NOTE: The branch for local_asset_research / proposal_only + gh_commands has been removed.
+    # B3: validate_request() now rejects gh_commands for any profile other than github_research
+    # (fail-closed), so this branch is unreachable and has been deleted to prevent confusion.
 
     # Merge gh_commands output into inline_context
     existing_inline = request.get("inline_context") or ""

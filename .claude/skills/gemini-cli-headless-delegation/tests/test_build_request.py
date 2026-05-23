@@ -505,3 +505,82 @@ def test_build_request_output_passes_validate_only(tmp_path):
         f"--validate-only failed:\nstdout: {validate_result.stdout}\nstderr: {validate_result.stderr}"
     )
     assert "OK" in validate_result.stdout or "ok" in validate_result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# B1: SKILL.md example command regression test
+# ---------------------------------------------------------------------------
+
+
+def test_skill_md_example_github_research_command_passes_validate_only(tmp_path):
+    """GIVEN the SKILL.md example command for github_research profile
+    (--context-file + --gh-issue + --gh-pr)
+    WHEN build_request.py generates the request and --validate-only is run
+    THEN both exit 0 (regression test for B1).
+
+    This test mirrors the command shown in SKILL.md Workflow step 1:
+        build_request.py --profile github_research \\
+          --objective '...' \\
+          --context-file <context> \\
+          --gh-issue 313 --gh-pr 321 \\
+          --output /tmp/gemini/request.json
+    """
+    # Use the real usage-contract.md as context file (just like SKILL.md example)
+    # Fall back to a tmp context file if it doesn't exist in this environment
+    skill_dir = _SCRIPTS_DIR.parent
+    usage_contract = skill_dir / "references" / "usage-contract.md"
+    if usage_contract.exists():
+        context_file = usage_contract
+    else:
+        context_file = tmp_path / "usage-contract.md"
+        context_file.write_text("# usage-contract placeholder", encoding="utf-8")
+
+    output = tmp_path / "request.json"
+
+    build_result = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPTS_DIR / "build_request.py"),
+            "--profile", "github_research",
+            "--objective", "Issue #313 と PR #321 を gh issue view / gh pr view で調査する",
+            "--context-file", str(context_file),
+            "--gh-issue", "313",
+            "--gh-pr", "321",
+            "--output", str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert build_result.returncode == 0, (
+        f"SKILL.md example build_request.py failed:\nstdout: {build_result.stdout}\nstderr: {build_result.stderr}"
+    )
+    assert output.exists(), "request.json was not created"
+
+    validate_result = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPTS_DIR / "run_gemini_headless.py"),
+            "--validate-only",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert validate_result.returncode == 0, (
+        f"SKILL.md example --validate-only failed:\nstdout: {validate_result.stdout}\nstderr: {validate_result.stderr}"
+    )
+    assert "OK" in validate_result.stdout or "ok" in validate_result.stdout.lower()
+
+    # Verify the generated request contains gh_commands for issue and PR
+    import json as _json
+    request = _json.loads(output.read_text(encoding="utf-8"))
+    assert request.get("tool_profile") == "github_research"
+    gh_commands = request.get("gh_commands", [])
+    assert len(gh_commands) >= 2, f"expected at least 2 gh_commands, got: {gh_commands}"
+    argv_list = [cmd["argv"] for cmd in gh_commands]
+    assert any(argv[0] == "issue" and argv[1] == "view" for argv in argv_list), (
+        f"expected 'issue view' in gh_commands, got: {argv_list}"
+    )
+    assert any(argv[0] == "pr" and argv[1] == "view" for argv in argv_list), (
+        f"expected 'pr view' in gh_commands, got: {argv_list}"
+    )

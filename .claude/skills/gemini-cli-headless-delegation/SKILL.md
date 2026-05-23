@@ -29,7 +29,11 @@ disable-model-invocation: true
 1. **request JSON を build_request.py で生成する（推奨）**:
    ```bash
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
-     --profile github_research --objective 'Issue #N の調査' --output /tmp/gemini/request.json
+     --profile github_research \
+     --objective 'Issue #313 と PR #321 を gh issue view / gh pr view で調査する' \
+     --context-file .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md \
+     --gh-issue 313 --gh-pr 321 \
+     --output /tmp/gemini/request.json
    ```
    または手動で `delegation_request_v1` JSON を作成する（`references/usage-contract.md` 参照）。
 

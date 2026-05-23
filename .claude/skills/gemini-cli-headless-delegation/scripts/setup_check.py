@@ -65,6 +65,14 @@ def _run(command: list[str], timeout: int | None = None) -> subprocess.Completed
     )
 
 
+def _trusted_folders_path() -> Path:
+    """Return the path to trustedFolders.json, honouring GEMINI_CLI_TRUSTED_FOLDERS_PATH override."""
+    override = os.environ.get("GEMINI_CLI_TRUSTED_FOLDERS_PATH")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".gemini" / "trustedFolders.json"
+
+
 def _git_repo_root() -> Path | None:
     """Return the absolute repo root via git rev-parse, or None on failure."""
     try:
@@ -139,7 +147,7 @@ def check_trusted_folders(repo_root: Path | None = None, fix: bool = False) -> d
             "recovery": ["Run setup_check.py from inside the LOOP_PROTOCOL git repository."],
         }
 
-    trusted_path = Path.home() / ".gemini" / "trustedFolders.json"
+    trusted_path = _trusted_folders_path()
     trust_folder = str(root)
 
     # Load existing dict. The gemini CLI schema is {path: "TRUST_FOLDER" | "TRUST_PARENT"}.
