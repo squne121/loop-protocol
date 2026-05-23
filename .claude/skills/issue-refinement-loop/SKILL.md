@@ -137,6 +137,83 @@ gh issue view <issue_number> --json title,body,labels --jq '.title + " | " + (.l
 
 LOOP_STATE を iteration = 0 で初期化。
 
+#### Step 0d: scope rollup preflight（`plan_issue_scope_rollup.py` 実行）
+
+> **実行タイミング**: Step 0 で対象 Issue が存在し refinement 続行可能と判断した後、かつ Step 0-hygiene（state label 削除）より**前**に実行する。
+> scope rollup preflight は mutation-free（Issue 作成・編集・クローズ禁止）。
+> `ISSUE_SCOPE_ROLLUP_DECISION_V2` を `LOOP_STATE.scope_rollup_decision` に記録してから Step 0-hygiene に進む。
+
+関連 Issue / PR の統合候補を判定し、同一ファイル・同一 skill family の修正が複数の PR に分散することを防ぐ。
+
+```bash
+REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+
+# issues と PRs の一覧を取得（open のみ）
+gh issue list --repo "$REPO_FULL_NAME" --state open --json number,title,body,labels > /tmp/issues_open.json
+gh pr list --repo "$REPO_FULL_NAME" --state open --json number,title,body,labels > /tmp/prs_open.json
+
+# scope rollup preflight を実行（read-only — mutation なし）
+python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
+  --issues-json /tmp/issues_open.json \
+  --prs-json /tmp/prs_open.json \
+  --current-issue <issue_number> \
+  --repo "$REPO_FULL_NAME"
+```
+
+出力（`ISSUE_SCOPE_ROLLUP_PLAN_V2`）を `LOOP_STATE.scope_rollup_plan` に格納する。
+
+**orchestrator の判断ルール**:
+
+```yaml
+scope_rollup_orchestrator_rules:
+  confidence_high:
+    rule: candidates[].confidence == "high" の候補が 1 件以上ある場合、
+          orchestrator は各候補の suggested_action を確認し、統合実施可否を判断する。
+          判断結果を ISSUE_SCOPE_ROLLUP_DECISION_V2 に記録してから Step 0-hygiene に進む。
+    security_override: security/auth/permission/sandbox 関連は必ず human_review_required に設定し停止する。
+    auto_execute: false  # high でも自動実行しない。orchestrator が明示的に判断する。
+
+  confidence_medium:
+    rule: 候補を LOOP_STATE に記録し、推奨アクションを提示するが自動実行はしない。
+    auto_execute: false
+
+  confidence_low:
+    rule: LOOP_STATE に記録するが、アクション不要（keep_separate_with_reason として記録）。
+    auto_execute: false
+
+  security_candidates:
+    rule: suggested_action == "human_review_required" の候補が含まれる場合は即時停止。
+          termination_reason: human_escalation で停止し、人間が判断する。
+    auto_execute: false
+
+  no_candidates:
+    rule: candidates が空または全候補が low の場合はそのまま Step 0-hygiene に進む。
+```
+
+**`ISSUE_SCOPE_ROLLUP_DECISION_V2` の記録**（統合実施・未実施にかかわらず常時記録）:
+
+```yaml
+ISSUE_SCOPE_ROLLUP_DECISION_V2:
+  schema_version: 2
+  recorded_at: "<ISO8601>"
+  rollup_plan_ref:
+    body_sha256: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.body_sha256>"
+    generated_at: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.generated_at>"
+  decision: executed | skipped | deferred | human_review_required
+  executed_actions: []
+  skipped_reason: null
+  candidates_reviewed:
+    - kind: "issue|pr"
+      number: <int>
+      confidence: "high|medium|low"
+      suggested_action: "<action>"
+      final_decision: "accepted|rejected|deferred|human_review_required"
+      rejection_reason: null
+```
+
+`LOOP_STATE.scope_rollup_decision` に記録した後、Step 0-hygiene に進む。
+詳細は `.claude/skills/issue-refinement-loop/references/scope-rollup-policy.md` を参照。
+
 #### Step 0-hygiene: stale state label 掃除（state label hygiene）
 
 > **実行タイミング**: この hygiene は、Step 0 で対象 Issue が存在し refinement 続行可能と判断した後に実行する。
