@@ -123,6 +123,67 @@ SubAgent（役割）── Skill（作業手順）
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
 
+## Spec Kit (speckit-*) スキル責務境界
+
+specify-cli v0.8.13 upstream から取得した 9 本の speckit-* スキルを `.claude/skills/` に配置する（Issue #303）。
+upstream 名をそのまま採用（ADR 0002 確定方針 — `upstream_name_adopted`）。
+
+### スキル一覧・役割・loading tier
+
+| Skill | 行数 | 役割 | Loading Tier | 備考 |
+|-------|------|------|--------------|------|
+| `speckit-analyze` | 260 | 既存 spec / docs を分析してギャップ・矛盾を検出する | **Tier 3** | 250 行超 / auto_load_prohibited |
+| `speckit-checklist` | 372 | 機能の実装前チェックリストを生成する | **Tier 3** | 250 行超 / auto_load_prohibited |
+| `speckit-clarify` | 254 | 要求の曖昧さを解消するための質問リストを生成する | **Tier 3** | 250 行超 / auto_load_prohibited |
+| `speckit-constitution` | 157 | プロジェクト憲法（.specify/memory/constitution.md）を生成・更新する | Tier 2 | 必要時のみ読む |
+| `speckit-implement` | 210 | 実装タスクを実行する | Tier 2 | **direct execution prohibited** — impl-review-loop 経由必須（下記参照） |
+| `speckit-plan` | 152 | 機能の開発計画（plan.md）を生成する | Tier 2 | 必要時のみ読む |
+| `speckit-specify` | 330 | 機能仕様（spec.md）を生成する | **Tier 3** | 250 行超 / auto_load_prohibited |
+| `speckit-tasks` | 202 | spec から実装タスク（tasks.md）を生成する | Tier 2 | tasks.md は staging artifact / materialize 後 archived に降格 |
+| `speckit-taskstoissues` | 106 | tasks.md から GitHub Issues を起票する | Tier 2 | `issue-author` / `create-issue` 経由で実行 |
+
+### Tier 定義（speckit スキルにおける適用）
+
+| Tier | 意味 | 読込タイミング |
+|------|------|----------------|
+| Tier 0 | ssot-registry / ADR summary 等 — 常時読む | 常時 |
+| Tier 1 | 現在の feature spec compact — セッション開始時 | 必要なセッションのみ |
+| Tier 2 | 作業手順・full design — 必要時のみ | 明示的に require したとき |
+| **Tier 3** | archived / large artifact — auto_load_prohibited | 明示指示があるときのみ |
+
+speckit-analyze / speckit-checklist / speckit-clarify / speckit-specify の 4 本は 250 行超のため **Tier 3** に分類する。
+`CLAUDE.md` / `.claude/rules/` に常時読込（always / 常時 / autoload / auto-load）指示を追加することを禁止する。
+
+### speckit-implement: direct execution prohibited
+
+```yaml
+speckit_implement_policy:
+  direct_execution_on_main: prohibited
+  reason: >
+    ADR 0002 の implementation_execution_policy より。
+    /speckit.implement や tasks.md からの直接実装は、
+    既存の issue-contract-review / impl-review-loop / test-runner / pr-review-judge
+    による ledger / review 経路を迂回するため禁止する。
+  allowed_path:
+    - github_issue
+    - issue-contract-review
+    - impl-review-loop
+    - implementation-worker
+    - test-runner
+    - pr-review-judge
+  supervised_spike_use: allowed_in_throwaway_worktree_only
+```
+
+**speckit-implement は impl-review-loop 経由必須 / direct execution prohibited**
+
+### artifact 分類
+
+`.claude/skills/speckit-*` は `reviewed upstream snapshot` / `managed derived artifact` として扱う。
+- specify-cli v0.8.13 upstream から throwaway spike (#298) で生成・検証後に手動マージ済み
+- 直接 `specify init` による再生成は禁止（ADR 0002 Stop Condition 準拠）
+- upstream 更新時は別 Issue を起票して管理する
+- provenance: `.specify/provenance/spec-kit-main-introduction.yml`
+
 ### ssot-discovery 発動タイミング
 
 以下の操作・コンテキストで `ssot-discovery` を積極的にトリガーする:

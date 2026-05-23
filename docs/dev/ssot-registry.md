@@ -99,7 +99,7 @@
   path: docs/adr/0002-sdd-tool-adoption.md
   title: SDD ツール採否 — Spec-Driven Development 運用方針
   keywords: [sdd, spec-driven-development, spec-kit, openspec, ears, canonical_source, docs-ssot, derived-workbench, tasks_md, staging-artifact, token-policy, compact-spec, scoped-loading, serena-mcp, playtest, feedback-loop, namespace, collision-policy]
-  description: SDD ツール採否（Spec Kit upstream-compatible / accepted-with-deferral）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正
+  description: SDD ツール採否（Spec Kit upstream-compatible / accepted・confirmed by #303）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正
   sections:
     - "## 決定"
     - "## Decision Points"
@@ -175,6 +175,18 @@ directory_mappings:
       - docs/dev/ssot-registry.md
       - docs/dev/workflow.md
 ```
+
+---
+
+## Derived Artifacts
+
+`docs/` SSOT の下位に位置する derived workbench artifacts を管理する。
+derived artifact は `docs/` SSOT に矛盾した場合、`docs/` が勝つ（conflict_rule: docs-ssot-wins）。
+
+| Path | Source | Role | 生成方法 | 注意事項 |
+|------|--------|------|----------|----------|
+| `.specify/` | specify-cli v0.8.13 upstream | derived workbench artifact | throwaway spike (#298) で `specify init --here --no-git --integration claude --force` を実行し、手動マージ（Issue #303） | 直接 `specify init` による再生成禁止。ADR 0002 `direct_speckit_implement_on_main: prohibited` 準拠。`.specify/memory/constitution.md` を docs/ SSOT の上位に置くことも禁止。 |
+| `.claude/skills/speckit-*/` | specify-cli v0.8.13 upstream | reviewed upstream snapshot | throwaway spike (#298) の成果物を Issue #303 で手動マージ | upstream 名のまま維持。250 行超 SKILL.md は Tier 3 扱いで on-demand loading のみ許可（詳細は `docs/dev/agent-skill-boundaries.md`）。 |
 
 ---
 
