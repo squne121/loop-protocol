@@ -1,15 +1,18 @@
 # Implementation Issue 標準ラベル自動付与
 
-`create_issue_txn.py` は `--issue-kind implementation` が指定された場合、以下の標準ラベル 4 種を自動付与する。
+`create_issue_txn.py` は `--issue-kind implementation` が指定された場合、以下の標準ラベル 3 種を自動付与する。
 
 ## 標準ラベル一覧
 
 | ラベル | 意味 |
 |---|---|
-| `state/queued` | 実装キューに入り着手待ちの状態 |
 | `phase/implementation` | 実装フェーズ |
 | `agent/implementer` | AI implementer agent が担当 |
 | `enhancement` | 新機能・改善要求 |
+
+> **注意**: `state/queued` は標準ラベルから除外された（#211 対応）。
+> `state/queued` は AI 着手可否の primary signal ではなく、着手可否は blocker/dependency の close 状態で判断する。
+> `state/queued` は deprecated / legacy 扱いであり、AI 着手可否・VC・contract-review では参照禁止。
 
 ## 動作仕様
 
@@ -29,7 +32,7 @@ uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
   --parent-issue 40
 ```
 
-上記実行時、`state/queued` / `phase/implementation` / `agent/implementer` / `enhancement` の 4 ラベルが `gh issue edit --add-label` 経由で付与される。
+上記実行時、`phase/implementation` / `agent/implementer` / `enhancement` の 3 ラベルが `gh issue edit --add-label` 経由で付与される。
 
 ## 背景
 

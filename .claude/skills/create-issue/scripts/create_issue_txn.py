@@ -251,8 +251,10 @@ def _find_open_issues_by_title(repo: str, title: str, gh_bin: str) -> list[int]:
 _PARENT_READBACK_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
 
 # Standard labels auto-assigned when issue_kind is "implementation".
+# NOTE: state/queued is intentionally NOT included here.
+# state/queued is a deprecated label for AI readiness signaling;
+# AI착手 eligibility is determined by blocker/dependency close state, not by this label.
 _IMPLEMENTATION_STANDARD_LABELS: tuple[str, ...] = (
-    "state/queued",
     "phase/implementation",
     "agent/implementer",
     "enhancement",
