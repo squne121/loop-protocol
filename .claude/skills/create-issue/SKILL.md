@@ -202,6 +202,35 @@ helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--depende
 
 `create_issue_txn.py` 実行後、起票した Issue URL（`issue_url`）を Output として提示する。
 
+### 4a. Delivery-rollup parent の child materialization（`CHILD_MATERIALIZATION_PLAN_V1` 経由）
+
+`delivery-rollup` parent が持つ child issue を起票する場合、`plan_child_materialization.py` が生成した `CHILD_MATERIALIZATION_PLAN_V1` を入口として使う。LLM が parent body 全体を都度読む必要をなくし、トークン消費を抑えるための標準フロー。
+
+**フロー**:
+
+1. plan を取得する（read-only — GitHub Issue は変更しない）:
+   ```bash
+   uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+     --repo <owner>/<repo> \
+     --issue <parent_issue_number>
+   ```
+
+2. `CHILD_MATERIALIZATION_PLAN_V1.children` から `action: create_issue` のエントリのみを対象にする（`no_op` / `human_escalation` / `reuse_and_update_parent` は本 step でスキップ）。
+
+3. 各 `action: create_issue` の child について `create_issue_txn.py` を実行する:
+   - `--parent-issue <parent_issue_number>` を必ず渡す
+   - body に `parent_issue: "<parent_issue_number>"` と `child_id: <child_id>` / `dedupe_key: <dedupe_key>` を含める
+   - `create_issue_txn.py` の dedupe 機構により重複起票を防止する
+
+4. `action: reuse_and_update_parent` の child は **起票せず** `edit-issue` skill に `CHILD_MATERIALIZATION_PLAN_V1.parent_body_updates` を渡して parent body の placeholder を修正する。
+
+5. `action: human_escalation` の child は自動処理せず `warnings` として記録し、人間判断を仰ぐ。
+
+**制約**:
+- `plan_child_materialization.py` は read-only（GitHub Issue を変更しない）
+- plan が存在しない / 取得できない場合は通常の create-issue フロー（ステップ 1〜4）にフォールバック
+- `CHILD_MATERIALIZATION_PLAN_V1` は `docs/dev/agent-skill-boundaries.md` が schema 正本
+
 ## Output
 
 1. **Issue タイトル**: `<type>(<scope>): <description>` 形式で 1 案を決定（ユーザーへの選択肢提示は不要）

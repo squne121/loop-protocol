@@ -183,10 +183,52 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 
 1. **本表（SSOT Routing Table）** にエントリ追加
 2. **`docs/dev/ssot-registry.md`**（SSOT カタログ正本）にエントリ追加
-3. **`.claude/skills/ssot-discovery/references/ssot-catalog.md`** にエントリ追加（ssot-registry.md から派生）
-4. **`.claude/skills/ssot-discovery/SKILL.md`** の説明・例を必要に応じて更新
+3. **`.claude/skills/ssot-discovery/SKILL.md`** の説明・例を必要に応じて更新
+
+> 注意: `ssot-catalog.md` は PR #302 で削除済み（`ssot-registry.md` に統合）。以前の手順にあった「ssot-catalog.md にエントリ追加」は不要。
 
 上記を同一 PR で更新しない場合、AI エージェントが新 SSOT を見落として古い情報で誤実行するリスクが生じる。
+
+## Delivery-rollup Parent / Parent-mode Handoff 手順
+
+`parent_mode: delivery-rollup` / `closure_mode: child-complete` の親 Issue を持つ child PR がマージされたとき、残り child を確実に起票・管理するための標準フロー。
+
+### フロー概要
+
+```
+child PR マージ
+  ↓
+post-merge-cleanup Section 6a:
+  plan_child_materialization.py --repo ... --issue <parent>
+  → CHILD_MATERIALIZATION_PLAN_V1
+    → missing children → follow_up_issue_requests (optional_follow_up)
+    → stale_body_only → edit-issue (delivery-rollup-parent-update mode)
+    → human_escalation → human_review_required: true
+  ↓
+main thread: dedupe チェック → issue-author / create-issue で起票
+```
+
+### 使用するスクリプト
+
+```bash
+# read-only plan 生成（GitHub から取得）
+uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+  --repo <owner>/<repo> \
+  --issue <parent_issue_number>
+```
+
+スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V1`
+
+### skill 別の責務
+
+| skill / SubAgent | delivery-rollup 特有の責務 |
+|---|---|
+| `create-issue` | `CHILD_MATERIALIZATION_PLAN_V1` の `action=create_issue` を `create_issue_txn.py` 経由で materialize する |
+| `edit-issue` | `parent_body_updates` を backup / guard / rollback 付きで適用する（`delivery-rollup-parent-update` mode） |
+| `issue-refinement-loop` | delivery-rollup parent approve 前に child materialization gate を実行する（Step 4.5） |
+| `impl-review-loop` Step 5 | APPROVE 前に delivery-rollup parent の残り child を `mandatory_follow_up` として処理する |
+| `open-pr` | PR 本文に `## Parent Child Materialization` セクションを追加する |
+| `post-merge-cleanup` | Section 6a で delivery-rollup parent の残り child を検出し `follow_up_issue_requests` に追加する |
 
 ## 関連ドキュメント
 

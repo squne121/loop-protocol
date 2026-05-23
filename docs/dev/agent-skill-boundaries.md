@@ -363,6 +363,70 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 - `post-merge-cleanup-worker`: `follow_up_issue_requests` を `FOLLOW_UP_ISSUE_REQUEST_V1[]` として列挙して返す。**Issue 起票は行わない**。
 - main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
 
+## CHILD_MATERIALIZATION_PLAN_V1
+
+delivery-rollup parent の child materialization 制御スキームで使う plan スキーマ。
+`.claude/skills/create-issue/scripts/plan_child_materialization.py` が生成し、`create-issue` / `edit-issue` / `issue-refinement-loop` / `impl-review-loop` / `open-pr` / `post-merge-cleanup` の各 skill が消費する。
+
+### スキーマ定義
+
+```yaml
+CHILD_MATERIALIZATION_PLAN_V1:
+  parent_issue: <int>          # delivery-rollup parent の Issue 番号
+  parent_mode: delivery-rollup # 現時点では delivery-rollup のみ対応
+  children:
+    - child_id: <string>       # 例: C254-3
+      title: <string>          # child の期待タイトル（placeholder / issue ref を除去済み）
+      status: missing | existing | stale_body_only | ambiguous
+      existing_issue_number: null | <int>
+      action: create_issue | reuse_and_update_parent | no_op | human_escalation
+      dedupe_key: "delivery-rollup:<parent_issue>:<child_id>"
+  parent_body_updates:          # stale_body_only child が存在する場合に生成
+    - replace: <string>         # parent body 内の置換対象テキスト
+      with: <string>            # 置換後テキスト（placeholder を issue ref に修正）
+  required_issue_creations: [] # action=create_issue の child_id リスト
+  required_issue_edits: []     # parent body 更新が必要な記述リスト
+  warnings: []                 # 警告メッセージ（空でもキー必須）
+```
+
+### child.status の定義
+
+| status | 意味 | action |
+|---|---|---|
+| `missing` | parent body に `(未起票)` と記載され、issue ref がない | `create_issue` |
+| `existing` | parent body に有効な issue ref があり open issue が確認できる | `no_op` |
+| `stale_body_only` | `(未起票)` と issue ref が共存（body drift 状態） | `reuse_and_update_parent` |
+| `ambiguous` | issue ref はあるが open issues に該当なし（closed または存在不明） | `human_escalation` |
+
+### 生成スクリプト
+
+```bash
+# GitHub から直接取得（read-only）
+uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+  --repo squne121/loop-protocol \
+  --issue 254
+
+# ローカル fixture から取得（テスト・dry-run 用）
+uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+  --body-file fixtures/parent_254.md \
+  --issue 254
+```
+
+スクリプトは read-only: GitHub Issue を変更しない。plan の mutation は `create_issue_txn.py`（create_issue action）と `edit-issue` skill（parent body update）が担う。
+
+### skill 横断の消費フロー
+
+```
+plan_child_materialization.py
+  → CHILD_MATERIALIZATION_PLAN_V1
+    → create-issue (action=create_issue → create_issue_txn.py)
+    → edit-issue (parent_body_updates → backup/guard/rollback)
+    → issue-refinement-loop (delivery-rollup gate)
+    → impl-review-loop Step 5 (mandatory_follow_up)
+    → open-pr (Parent Child Materialization section)
+    → post-merge-cleanup Section 6 (残 child 検出)
+```
+
 ## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け

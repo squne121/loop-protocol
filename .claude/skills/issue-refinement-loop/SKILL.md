@@ -721,6 +721,54 @@ SubAgent は `edit-issue` skill の Procedure を実行し、バックアップ 
 `ISSUE_EDIT_RESULT_V1.status: ok` を確認したら LOOP_STATE.iteration += 1 して Step 1 に戻る。
 `failed` の場合は LOOP_STATE.blockers_history に記録し、人間判断（`termination_reason: human_escalation`）。
 
+### Step 4.5: Delivery-rollup Parent の Child Materialization Gate（`approve` 直前）
+
+Step 2 で `verdict: approve` が返った後、終了処理（Step 5）に進む前に以下を実行する。対象 Issue が `parent_mode: delivery-rollup` かつ `closure_mode: child-complete` の parent Issue である場合のみ適用する。
+
+```yaml
+delivery_rollup_gate:
+  trigger:
+    issue_kind: parent
+    parent_mode: delivery-rollup
+    closure_mode: child-complete
+  gate:
+    action: run_child_materialization_plan
+    command: |
+      uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+        --repo <owner>/<repo> \
+        --issue <issue_number>
+    on_missing_children:
+      # action=create_issue の child が 1 件以上 → mandatory_follow_up として記録
+      severity: mandatory_follow_up
+      add_to_follow_up_issue_requests: true
+      approve_without_materialization: prohibited
+    on_stale_body_only:
+      # action=reuse_and_update_parent → edit-issue skill に委譲して parent body を修正
+      severity: mandatory_follow_up
+      delegate_to: edit-issue (delivery-rollup-parent-update mode)
+    on_ambiguous:
+      severity: human_escalation
+      reason: child_state_unknown
+    on_no_children:
+      # plan に children が 0 件 → gate をパス（warnings をログに記録）
+      pass: true
+```
+
+**判定フロー**:
+
+1. `plan_child_materialization.py` を実行して `CHILD_MATERIALIZATION_PLAN_V1` を取得する（read-only）。
+2. `action: create_issue` のエントリが存在する場合:
+   - `mandatory_follow_up` として `FOLLOW_UP_ISSUE_REQUEST_V1` を生成する
+   - `severity: mandatory_follow_up` のため、APPROVE 確定前に materialize が必要
+   - main thread が `issue-author` / `create-issue` 経由で起票する
+3. `action: reuse_and_update_parent` のエントリが存在する場合:
+   - `edit-issue` skill の `delivery-rollup-parent-update` mode に `CHILD_MATERIALIZATION_PLAN_V1` を渡して parent body を修正する
+4. `action: human_escalation` のエントリが存在する場合:
+   - `termination_reason: human_escalation` で停止する
+5. すべての mandatory_follow_up が materialize 済みになったら Step 5（終了処理）に進む。
+
+**注意**: `plan_child_materialization.py` の実行は read-only（GitHub Issue を変更しない）。mutation は `create-issue` / `edit-issue` skill が担う。
+
 ### Step 5: 終了処理
 
 | termination_reason | アクション |
