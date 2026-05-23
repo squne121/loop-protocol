@@ -9,6 +9,10 @@ Usage:
     python3 plan_issue_scope_rollup.py --issues-json <path> --prs-json <path> [--current-issue <number>] [--repo <owner/repo>]
 
 Mutation-free: this script never creates, edits, or closes any Issue or PR.
+
+Exit codes:
+    0 - success (completeness: full or partial with warnings)
+    2 - current_issue not found in issues_json (completeness: partial, candidates: [])
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +41,10 @@ CONFIDENCE_LOW = "low"
 
 # Signals
 SIGNAL_SHARED_DEDUPE_KEY = "shared_dedupe_key"
-SIGNAL_EXACT_ALLOWED_PATH_OVERLAP = "exact_allowed_path_overlap"
+# Allowed-path signals (B3: split into three levels)
+SIGNAL_EXACT_ALLOWED_PATH_OVERLAP = "exact_allowed_paths_equal"   # complete set equality
+SIGNAL_ALLOWED_PATH_INTERSECTION = "allowed_path_intersection"    # non-empty intersection
+SIGNAL_ALLOWED_PATH_PREFIX_OVERLAP = "allowed_path_prefix_overlap"  # prefix-level overlap
 SIGNAL_SAME_PARENT_ISSUE = "same_parent_issue"
 SIGNAL_SAME_SKILL_FAMILY = "same_skill_family"
 SIGNAL_SAME_FAILURE_MODE_MARKER = "same_failure_mode_marker"
@@ -48,21 +56,15 @@ ACTION_CREATE_PARENT_ROLLUP_ISSUE = "create_parent_rollup_issue"
 ACTION_KEEP_SEPARATE_WITH_REASON = "keep_separate_with_reason"
 ACTION_HUMAN_REVIEW_REQUIRED = "human_review_required"
 
-# Keywords that flag security-related content -> always human_review_required
-SECURITY_KEYWORDS = frozenset(
-    [
-        "security",
-        "auth",
-        "authentication",
-        "authorization",
-        "permission",
-        "sandbox",
-        "privilege",
-        "secret",
-        "credential",
-        "token",
-        "oauth",
-    ]
+# Regex for security-related keyword detection (word-boundary based).
+# "auth" and "token" are intentionally excluded to avoid false positives on
+# "author", "authored", "トークン消費", "token efficiency", etc.
+SECURITY_RE = re.compile(
+    r"\b("
+    r"security|authentication|authorization|permission|sandbox|"
+    r"privilege|secret|credential|oauth|api[_ -]?key"
+    r")\b",
+    re.IGNORECASE,
 )
 
 
@@ -112,6 +114,28 @@ def _extract_dedupe_key(item: dict[str, Any]) -> str | None:
     return None
 
 
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+
+
+def _extract_path_from_bullet(line: str) -> str | None:
+    """Extract a normalised path from a bullet line.
+
+    Handles lines like:
+      - `.claude/skills/foo.py`
+      - `.claude/skills/foo.py`（新規作成）
+      - .claude/skills/foo.py
+    """
+    # Prefer the first backtick-quoted span (strips annotations like （新規作成）)
+    m = _CODE_SPAN_RE.search(line)
+    if m:
+        return m.group(1).strip().replace("\\", "/").rstrip("/") or None
+    # Fall back to raw text after the bullet marker
+    raw = line[2:].strip()
+    # Take the first whitespace-separated token and strip stray backticks
+    token = raw.split()[0].strip("`").replace("\\", "/").rstrip("/") if raw.split() else ""
+    return token or None
+
+
 def _extract_allowed_paths(item: dict[str, Any]) -> frozenset[str]:
     """Extract Allowed Paths list from the issue/PR body."""
     body = _body_text(item)
@@ -126,7 +150,7 @@ def _extract_allowed_paths(item: dict[str, Any]) -> frozenset[str]:
             if stripped.startswith("## ") and not stripped.startswith("## Allowed Paths"):
                 break
             if stripped.startswith("- ") or stripped.startswith("* "):
-                path = stripped[2:].strip().strip("`")
+                path = _extract_path_from_bullet(stripped)
                 if path:
                     paths.append(path)
     return frozenset(paths)
@@ -187,12 +211,21 @@ def _extract_failure_mode_marker(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _security_match_evidence(item: dict[str, Any]) -> list[str]:
+    """Return list of matched security keywords (word-boundary based).
+
+    "auth" and "token" are intentionally excluded — they cause false positives
+    on "author", "authored", "トークン消費", "token efficiency" etc.
+    """
+    body = _body_text(item)
+    title = str(_extract_field(item, "title", default=""))
+    combined = title + " " + body
+    return list({m.group(1).lower() for m in SECURITY_RE.finditer(combined)})
+
+
 def _is_security_related(item: dict[str, Any]) -> bool:
     """Return True if the issue/PR touches security-sensitive areas."""
-    body = _body_text(item).lower()
-    title = str(_extract_field(item, "title", default="")).lower()
-    combined = title + " " + body
-    return any(kw in combined for kw in SECURITY_KEYWORDS)
+    return bool(_security_match_evidence(item))
 
 
 def _determine_confidence(signals: list[str]) -> str:
@@ -201,17 +234,22 @@ def _determine_confidence(signals: list[str]) -> str:
 
     high conditions:
       - shared_dedupe_key
-      - exact_allowed_path_overlap + same_parent_issue
-      - exact_allowed_path_overlap + same_failure_mode_marker
+      - exact_allowed_paths_equal + same_parent_issue
+      - exact_allowed_paths_equal + same_failure_mode_marker
+      - allowed_path_intersection + same_parent_issue
+      - allowed_path_intersection + same_failure_mode_marker
       NOTE: same_skill_family ONLY is NOT sufficient for high.
 
     medium:
-      - exact_allowed_path_overlap (alone)
+      - exact_allowed_paths_equal (alone)
+      - allowed_path_intersection (alone)
+      - allowed_path_prefix_overlap + another signal
       - same_parent_issue (alone or with same_skill_family)
       - same_skill_family + another signal (except the combinations already at high)
 
     low:
       - same_skill_family only
+      - allowed_path_prefix_overlap only
       - any single low-value signal
     """
     s = set(signals)
@@ -219,17 +257,22 @@ def _determine_confidence(signals: list[str]) -> str:
     if SIGNAL_SHARED_DEDUPE_KEY in s:
         return CONFIDENCE_HIGH
 
-    if SIGNAL_EXACT_ALLOWED_PATH_OVERLAP in s and SIGNAL_SAME_PARENT_ISSUE in s:
+    # Treat exact equality or non-empty intersection as the path-overlap signal for high
+    _has_path_overlap = (
+        SIGNAL_EXACT_ALLOWED_PATH_OVERLAP in s or SIGNAL_ALLOWED_PATH_INTERSECTION in s
+    )
+
+    if _has_path_overlap and SIGNAL_SAME_PARENT_ISSUE in s:
         return CONFIDENCE_HIGH
 
-    if SIGNAL_EXACT_ALLOWED_PATH_OVERLAP in s and SIGNAL_SAME_FAILURE_MODE_MARKER in s:
+    if _has_path_overlap and SIGNAL_SAME_FAILURE_MODE_MARKER in s:
         return CONFIDENCE_HIGH
 
     # same_skill_family ONLY -> must NOT be high (AC6 requirement)
     if s == {SIGNAL_SAME_SKILL_FAMILY}:
         return CONFIDENCE_LOW
 
-    if SIGNAL_EXACT_ALLOWED_PATH_OVERLAP in s:
+    if _has_path_overlap:
         return CONFIDENCE_MEDIUM
 
     if SIGNAL_SAME_PARENT_ISSUE in s:
@@ -239,6 +282,9 @@ def _determine_confidence(signals: list[str]) -> str:
         return CONFIDENCE_MEDIUM
 
     if SIGNAL_SAME_FAILURE_MODE_MARKER in s:
+        return CONFIDENCE_MEDIUM
+
+    if SIGNAL_ALLOWED_PATH_PREFIX_OVERLAP in s and len(s) >= 2:
         return CONFIDENCE_MEDIUM
 
     return CONFIDENCE_LOW
@@ -256,7 +302,8 @@ def _suggested_action(
     if confidence == CONFIDENCE_HIGH:
         if SIGNAL_SHARED_DEDUPE_KEY in signals:
             return ACTION_MERGE_INTO_CURRENT_PR
-        if SIGNAL_EXACT_ALLOWED_PATH_OVERLAP in signals and SIGNAL_SAME_PARENT_ISSUE in signals:
+        _path_signals = {SIGNAL_EXACT_ALLOWED_PATH_OVERLAP, SIGNAL_ALLOWED_PATH_INTERSECTION}
+        if any(s in signals for s in _path_signals) and SIGNAL_SAME_PARENT_ISSUE in signals:
             return ACTION_AMEND_CURRENT_ISSUE
         return ACTION_MERGE_INTO_CURRENT_PR
 
@@ -271,6 +318,50 @@ def _suggested_action(
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
+
+
+def _extract_pr_file_paths(item: dict[str, Any]) -> frozenset[str]:
+    """Extract file paths from a PR's `files` field (gh pr list --json files)."""
+    files = item.get("files", [])
+    if not isinstance(files, list):
+        return frozenset()
+    paths: list[str] = []
+    for f in files:
+        if isinstance(f, dict):
+            path = f.get("path") or f.get("filename") or ""
+        elif isinstance(f, str):
+            path = f
+        else:
+            path = ""
+        path = path.replace("\\", "/").rstrip("/")
+        if path:
+            paths.append(path)
+    return frozenset(paths)
+
+
+def _paths_share_prefix(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Return True if any path in *a* is a prefix of a path in *b* or vice versa."""
+    for pa in a:
+        for pb in b:
+            short, long = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
+            if long.startswith(short.rstrip("/") + "/") or long == short:
+                return True
+    return False
+
+
+def _non_mergeable_reasons(item: dict[str, Any], kind: str) -> list[str]:
+    """Collect reasons why a candidate may not be directly mergeable."""
+    reasons: list[str] = []
+    state = str(item.get("state", "")).lower()
+    state_reason = str(item.get("stateReason", "") or "").lower()
+    if state == "closed":
+        if state_reason == "not_planned":
+            reasons.append("closed_not_planned")
+        elif state_reason == "completed":
+            reasons.append("closed_completed")
+        else:
+            reasons.append(f"closed({state_reason or 'unknown'})")
+    return reasons
 
 
 def _build_candidates(
@@ -297,18 +388,30 @@ def _build_candidates(
             continue  # skip the current issue itself
 
         signals: list[str] = []
+        matched_paths: list[str] = []
 
         # Signal: shared_dedupe_key
         item_dedupe_key = _extract_dedupe_key(item)
         if current_dedupe_key and item_dedupe_key and current_dedupe_key == item_dedupe_key:
             signals.append(SIGNAL_SHARED_DEDUPE_KEY)
 
-        # Signal: exact_allowed_path_overlap
-        item_allowed_paths = _extract_allowed_paths(item)
+        # Signal: allowed-path overlap (three levels — B3)
+        # For PRs, use the `files` field as primary path signal
+        if kind == "pr":
+            item_allowed_paths = _extract_pr_file_paths(item) or _extract_allowed_paths(item)
+        else:
+            item_allowed_paths = _extract_allowed_paths(item)
+
         if current_allowed_paths and item_allowed_paths:
             overlap = current_allowed_paths & item_allowed_paths
             if overlap:
-                signals.append(SIGNAL_EXACT_ALLOWED_PATH_OVERLAP)
+                matched_paths = sorted(overlap)
+                if current_allowed_paths == item_allowed_paths:
+                    signals.append(SIGNAL_EXACT_ALLOWED_PATH_OVERLAP)
+                else:
+                    signals.append(SIGNAL_ALLOWED_PATH_INTERSECTION)
+            elif _paths_share_prefix(current_allowed_paths, item_allowed_paths):
+                signals.append(SIGNAL_ALLOWED_PATH_PREFIX_OVERLAP)
 
         # Signal: same_parent_issue
         item_parent = _extract_parent_issue(item)
@@ -346,18 +449,35 @@ def _build_candidates(
         # dedupe_key for the candidate itself
         candidate_dedupe_key = item_dedupe_key or f"{kind}-{item_number}"
 
-        candidates.append(
-            {
-                "kind": kind,
-                "number": item_number,
-                "confidence": confidence,
-                "dedupe_key": candidate_dedupe_key,
-                "signals": signals,
-                "suggested_action": action,
-            }
-        )
+        # Security evidence (B4)
+        sec_evidence = _security_match_evidence(item)
+
+        # Non-mergeable reasons (closed issues/PRs from --state all)
+        nmr = _non_mergeable_reasons(item, kind)
+
+        entry: dict[str, Any] = {
+            "kind": kind,
+            "number": item_number,
+            "title": _extract_field(item, "title", default=None),
+            "url": _extract_field(item, "url", default=None),
+            "state": _extract_field(item, "state", default=None),
+            "confidence": confidence,
+            "dedupe_key": candidate_dedupe_key,
+            "signals": signals,
+            "matched_paths": matched_paths,
+            "suggested_action": action,
+        }
+        if sec_evidence:
+            entry["security_match_evidence"] = sec_evidence
+        if nmr:
+            entry["non_mergeable_reasons"] = nmr
+
+        candidates.append(entry)
 
     return candidates
+
+
+_CURRENT_ISSUE_NOT_FOUND = "current_issue_not_found"
 
 
 def run(
@@ -365,9 +485,17 @@ def run(
     prs_json_path: str,
     current_issue_number: int | None = None,
     repo: str = "",
-) -> dict[str, Any]:
-    """Main analysis function. Returns ISSUE_SCOPE_ROLLUP_PLAN_V2 dict."""
+) -> tuple[dict[str, Any], int]:
+    """Main analysis function.
+
+    Returns (ISSUE_SCOPE_ROLLUP_PLAN_V2 dict, exit_code).
+
+    exit_code == 2 when current_issue_number is specified but not found in
+    issues_json (B1: fallback to first issue is prohibited).
+    exit_code == 0 otherwise.
+    """
     warnings: list[str] = []
+    exit_code = 0
 
     try:
         issues, issues_raw = _load_json(issues_json_path)
@@ -384,27 +512,30 @@ def run(
         warnings.append(f"prs_json parse error: {exc}")
 
     body_sha256 = _sha256_of_inputs(issues_raw, prs_raw)
-    completeness = "partial" if warnings else "full"
 
-    # Identify the "current" issue
+    # Identify the "current" issue — B1: NO fallback to first issue
     current_issue: dict[str, Any] | None = None
     if current_issue_number is not None:
         for iss in issues:
             if _extract_field(iss, "number", default=None) == current_issue_number:
                 current_issue = iss
                 break
-        if current_issue is None and issues:
-            warnings.append(
-                f"current_issue #{current_issue_number} not found in issues_json; "
-                "using first issue as reference"
-            )
-            current_issue = issues[0]
+        if current_issue is None:
+            # B1: do NOT fall back to issues[0]; report partial completeness + exit 2
+            warnings.append(_CURRENT_ISSUE_NOT_FOUND)
+            exit_code = 2
     elif issues:
         current_issue = issues[0]
 
-    issue_candidates = _build_candidates(current_issue, issues, "issue")
-    pr_candidates = _build_candidates(current_issue, prs, "pr")
-    all_candidates = issue_candidates + pr_candidates
+    completeness = "partial" if (warnings or exit_code != 0) else "full"
+
+    if exit_code == 2:
+        # B1: no candidates when current issue is not found
+        all_candidates: list[dict[str, Any]] = []
+    else:
+        issue_candidates = _build_candidates(current_issue, issues, "issue")
+        pr_candidates = _build_candidates(current_issue, prs, "pr")
+        all_candidates = issue_candidates + pr_candidates
 
     plan: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -419,7 +550,7 @@ def run(
         "candidates": all_candidates,
     }
 
-    return plan
+    return plan, exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +591,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
 
-    plan = run(
+    plan, exit_code = run(
         issues_json_path=args.issues_json,
         prs_json_path=args.prs_json,
         current_issue_number=args.current_issue,
@@ -473,6 +604,8 @@ def main(argv: list[str] | None = None) -> None:
         Path(args.output).write_text(output_text, encoding="utf-8")
     else:
         print(output_text)
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

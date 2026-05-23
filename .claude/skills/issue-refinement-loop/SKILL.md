@@ -148,14 +148,31 @@ LOOP_STATE を iteration = 0 で初期化。
 ```bash
 REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 
-# issues と PRs の一覧を取得（open のみ）
-gh issue list --repo "$REPO_FULL_NAME" --state open --json number,title,body,labels > /tmp/issues_open.json
-gh pr list --repo "$REPO_FULL_NAME" --state open --json number,title,body,labels > /tmp/prs_open.json
+# 対象 Issue を個別取得（current_issue として使用）
+gh issue view <issue_number> \
+  --repo "$REPO_FULL_NAME" \
+  --json number,title,body,labels,state,stateReason,url \
+  > /tmp/current_issue.json
+
+# issues と PRs の一覧を全状態（open + closed）で取得（デフォルト 30 件制限を回避するため --limit 1000）
+gh issue list \
+  --repo "$REPO_FULL_NAME" \
+  --state all \
+  --limit 1000 \
+  --json number,title,body,labels,state,stateReason,url \
+  > /tmp/issues_all.json
+
+gh pr list \
+  --repo "$REPO_FULL_NAME" \
+  --state all \
+  --limit 1000 \
+  --json number,title,body,labels,state,url,files,closingIssuesReferences \
+  > /tmp/prs_all.json
 
 # scope rollup preflight を実行（read-only — mutation なし）
 python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
-  --issues-json /tmp/issues_open.json \
-  --prs-json /tmp/prs_open.json \
+  --issues-json /tmp/issues_all.json \
+  --prs-json /tmp/prs_all.json \
   --current-issue <issue_number> \
   --repo "$REPO_FULL_NAME"
 ```
