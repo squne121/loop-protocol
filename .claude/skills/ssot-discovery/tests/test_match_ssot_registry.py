@@ -32,7 +32,7 @@ def repo_root():
 def registry_data(repo_root):
     registry_path = repo_root / "docs" / "dev" / "ssot-registry.md"
     assert registry_path.exists(), f"ssot-registry.md not found at {registry_path}"
-    entries, directory_mappings = parse_registry(registry_path)
+    entries, directory_mappings, _warnings = parse_registry(registry_path)
     return entries, directory_mappings
 
 
@@ -135,3 +135,59 @@ def test_output_contract_fields():
         assert field in r, f"Missing required field '{field}' in SSOT_DISCOVERY_RESULT_V1"
     assert isinstance(r["inputs"]["task_keywords"], list)
     assert isinstance(r["inputs"]["target_paths"], list)
+
+
+# ---- Test 7: expected registry ids are parsed ----
+
+def test_expected_registry_ids_are_parsed(repo_root):
+    entries, _ , _ = parse_registry(repo_root / "docs/dev/ssot-registry.md")
+    ids = {e["id"] for e in entries}
+    expected = {
+        "workflow",
+        "agent-skill-boundaries",
+        "github-ops",
+        "milestone-ops",
+        "directory-structure",
+        "current-focus",
+        "runtime-verification-policy",
+        "adr-0001-architecture-baseline",
+        "adr-0002-sdd-tool-adoption",
+        "game-overview",
+        "requirements",
+    }
+    missing = expected - ids
+    assert not missing, f"registry entries missing from parse: {missing}"
+
+
+# ---- Test 8: ssot-catalog.md is deleted (AC1 regression) ----
+
+def test_catalog_file_removed(repo_root):
+    catalog = repo_root / ".claude" / "skills" / "ssot-discovery" / "references" / "ssot-catalog.md"
+    assert not catalog.exists(), (
+        f"ssot-catalog.md should be deleted but found at {catalog}. "
+        "This file has been superseded by docs/dev/ssot-registry.md as the sole registry."
+    )
+
+
+# ---- Test 9: runtime,verification keywords return runtime-verification-policy.md (AC3 regression) ----
+
+def test_runtime_verification_keyword_returns_policy():
+    r = run_match(["--keywords", "runtime,verification"])
+    matched_paths = [d["path"] for d in r.get("matched_documents", [])]
+    assert "docs/dev/runtime-verification-policy.md" in matched_paths, (
+        f"docs/dev/runtime-verification-policy.md not found when searching 'runtime,verification'. "
+        f"Got: {matched_paths}"
+    )
+
+
+# ---- Test 10: directory mapping does not match sibling prefix (regression) ----
+
+def test_directory_mapping_does_not_match_sibling_prefix():
+    """src/state/** pattern should not match src/stateful/foo.ts."""
+    r = run_match(["--paths", "src/stateful/foo.ts"])
+    matched_paths = [d["path"] for d in r.get("matched_documents", [])]
+    # src/stateful/ is not in directory_mappings, so it should be unmatched
+    unmatched = r.get("unmatched_paths", [])
+    assert "src/stateful/foo.ts" in unmatched, (
+        f"src/stateful/foo.ts should be in unmatched_paths (no mapping). Got matched: {matched_paths}"
+    )

@@ -18,9 +18,8 @@ LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情
 
 ことを保証する。各層特有の不変条件は各ディレクトリの `CLAUDE.md` に集約されているため、本スキルでそれらを再説明しない。
 
-> **SSOT カタログの正本**: SSOT エントリのカタログは `docs/dev/ssot-registry.md`（docs 層の正本）を参照すること。
-> [references/ssot-catalog.md](references/ssot-catalog.md) は Skill 層からの参照用に維持されるキャッシュ（`derived_from: docs/dev/ssot-registry.md`）であり、
-> 正本ではない。新規エントリ追加時は `docs/dev/ssot-registry.md` を先に更新すること。
+> **SSOT エントリの正本**: SSOT エントリは `docs/dev/ssot-registry.md`（docs 層）を参照すること。
+> `references/` 配下の手動キャッシュファイルは廃止済みである。新規エントリ追加時は `docs/dev/ssot-registry.md` のみを手編集すること。フォールバックは行わない。
 
 ## Inputs
 
@@ -39,7 +38,7 @@ LOOP_PROTOCOL の `docs/` 配下は **プロジェクトの単一の真実の情
 
 ## Procedure
 
-1. `docs/dev/ssot-registry.md` を正本として参照する。registry が読めない場合は `match-ssot.sh` が `status: failed` を返す（ssot-catalog.md へのフォールバックは行わない）。`docs/` 直下スキャンより先にカタログを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
+1. `docs/dev/ssot-registry.md` を正本として参照する。registry が読めない場合は `match-ssot.sh` が `status: failed` を返す（手動キャッシュへのフォールバックは行わない）。`docs/` 直下スキャンより先にエントリを読むことで、ディレクトリ → SSOT の事前定義マッピングを活かせる
 2. 入力からキーワードを抽出する：
    - `task_keywords` はそのまま
    - `target_paths` はディレクトリ名・ファイル名語幹を切り出す
@@ -102,10 +101,11 @@ KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:p
 - マッチしないキーワードがあっても fail にせず `partial` で返す（SSOT 未整備のヒントを潰さない）
 - 出力は YAML 構造のまま渡す（散文サマリで上書きしない）
 
-## カタログ更新
+## Registry 更新
 
-`docs/` に新規 SSOT を追加・削除したら、必ず以下を同 PR で更新する。これを忘れると本スキルが古い世界観で動き続ける。
+`docs/` に新規 SSOT を追加・削除したら、以下を同 PR で更新する。これを忘れると本スキルが古い世界観で動き続ける。
 
-1. `docs/dev/ssot-registry.md`（SSOT カタログの正本）にエントリ追加
-2. [references/ssot-catalog.md](references/ssot-catalog.md) に同期（`derived_from: docs/dev/ssot-registry.md` のキャッシュ）
-3. `match-ssot.sh` は `docs/dev/ssot-registry.md` を動的に読むため、エントリ追加で自動反映される
+1. `docs/dev/ssot-registry.md` のみを手編集してエントリを追加・削除する
+2. `match-ssot.sh` は `docs/dev/ssot-registry.md` を動的に読むため、エントリ追加で自動反映される
+
+registry が読めない場合は `match-ssot.sh` が `status: failed` を返す。手動キャッシュへのフォールバックは行わない。
