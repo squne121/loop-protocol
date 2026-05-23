@@ -199,6 +199,59 @@ def check_fail_closed_on_unknown_visibility(data: dict) -> Tuple[bool, str]:
     return True, "checkpoint_remote: fail_closed_on_unknown_visibility=true, allowed_visibility includes private_verified"
 
 
+def check_global_safety_flags(data: dict) -> Tuple[bool, str]:
+    """Check 9: top-level fail-closed safety flags."""
+    expected = {
+        "github_public_checkpoint_branch_allowed": False,
+        "auto_push_sessions_allowed": False,
+        "manual_review_required_before_push": True,
+    }
+    violations = []
+    for key, expected_val in expected.items():
+        actual = data.get(key)
+        if actual is not expected_val:
+            violations.append(f"{key}={actual!r} (expected {expected_val!r})")
+    if violations:
+        return False, "global safety flag violations: " + "; ".join(violations)
+    return True, "global safety flags are fail-closed (checkpoint_branch=false, auto_push=false, manual_review=true)"
+
+
+def check_source_of_truth_paths(data: dict) -> Tuple[bool, str]:
+    """Check 10: source_of_truth paths reference expected schema identifiers."""
+    sot = data.get("source_of_truth")
+    if not isinstance(sot, dict):
+        return False, "source_of_truth key missing or not a mapping"
+    violations = []
+    sp = sot.get("secret_policy", "")
+    if not sp or "secret-policy" not in str(sp) and "secret_policy" not in str(sp):
+        violations.append(f"secret_policy={sp!r} does not reference secret-policy")
+    ms = sot.get("manifest_schema", "")
+    if not ms or "agent-session-manifest" not in str(ms) and "agent_session_manifest" not in str(ms):
+        violations.append(f"manifest_schema={ms!r} does not reference agent-session-manifest")
+    if violations:
+        return False, "source_of_truth path issues: " + "; ".join(violations)
+    return True, f"source_of_truth references are valid (secret_policy={sp!r}, manifest_schema={ms!r})"
+
+
+_VERIFICATION_PATTERNS = [
+    ("git ls-remote", r"git ls-remote"),
+    ("git hooks / pre-push / pre-commit", r"\.git/hooks|pre-push|pre-commit"),
+    ("pushRemote / insteadOf", r"pushRemote|insteadOf|pushInsteadOf|pushurl"),
+    ("GitHub comment surface", r"gh issue|gh pr|public.*surface|transcript.*comment|comment.*surface"),
+]
+
+
+def check_verification_commands_presence(content: str) -> Tuple[bool, str]:
+    """Check 11: Markdown body contains the 4 required verification command patterns."""
+    missing = []
+    for label, pattern in _VERIFICATION_PATTERNS:
+        if not re.search(pattern, content):
+            missing.append(label)
+    if missing:
+        return False, f"verification command patterns missing in document: {missing}"
+    return True, f"all {len(_VERIFICATION_PATTERNS)} required verification command patterns found"
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -269,6 +322,24 @@ def main() -> int:
     else:
         ok8, msg8 = False, "Skipped (YAML parse failed)"
     results.append(("checkpoint_remote.fail_closed_on_unknown_visibility=true", ok8, msg8))
+
+    # 9. global safety flags
+    if ok1:
+        ok9, msg9 = check_global_safety_flags(yaml_data)
+    else:
+        ok9, msg9 = False, "Skipped (YAML parse failed)"
+    results.append(("global safety flags (checkpoint_branch/auto_push/manual_review)", ok9, msg9))
+
+    # 10. source_of_truth path references
+    if ok1:
+        ok10, msg10 = check_source_of_truth_paths(yaml_data)
+    else:
+        ok10, msg10 = False, "Skipped (YAML parse failed)"
+    results.append(("source_of_truth path references valid", ok10, msg10))
+
+    # 11. verification command patterns in Markdown body
+    ok11, msg11 = check_verification_commands_presence(content)
+    results.append(("verification command patterns present in document", ok11, msg11))
 
     # Print results
     all_pass = True

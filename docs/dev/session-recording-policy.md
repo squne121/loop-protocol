@@ -274,6 +274,56 @@ secrets_mode 変化（none → 非 none）
 
 ---
 
+## 運用導線
+
+### いつ checker を実行するか
+
+以下のファイルを変更する PR では、必ず checker を実行して結果を PR 本文に記録する。
+
+- `docs/dev/session-recording-policy.md`（本文書）
+- `docs/dev/secret-policy.md`
+- `docs/schemas/agent-session-manifest.schema.json`
+- `.claude/scripts/check_session_recording_policy.py`
+- session 記録 / checkpoint / EntireCLI / Claude hook / Secret 関連設定
+
+```bash
+python3 .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
+```
+
+### どこに記録するか
+
+PR 本文または GitHub Issue コメントに以下の YAML を記録する。
+
+```yaml
+SESSION_RECORDING_POLICY_VERDICT:
+  checker: pass | fail
+  secret_policy_consistent: true | false
+  manifest_policy_consistent: true | false
+  kill_switch_triggered: true | false
+  kill_switch_required_end_state_recorded: true | false  # Kill Switch 発動時のみ
+  human_review_required: true | false
+```
+
+Kill Switch を実行した場合は `required_end_state` の達成状況も GitHub Issue コメントに記録する。
+
+### 現時点の未完成導線
+
+本文書（`session_recording_policy/v1`）は policy 宣言と checker スクリプトまで完成しているが、
+以下の導線は後続 Issue で実装予定であり、完成までは手動実行が必要。
+
+| 導線 | 状態 | 担当 Issue |
+|---|---|---|
+| CI 連動（`pnpm policy:check` / python-test workflow）| 未実装 | #245 以降で検討 |
+| Claude hook（Stop/SubagentStop での自動実行）| 未実装 | 専用 Issue で別途起票 |
+| Skill（操作手順の標準化・自動発火）| 未実装 | 専用 Issue で別途起票 |
+| 人間導入手順書（onboarding）| 未実装 | Issue #245 |
+| pilot smoke test（Kill Switch 動作確認）| 未実装 | Issue #246 |
+
+> **重要**: Issue #245（onboarding 手順）と Issue #246（pilot smoke test）が完了するまで、
+> full transcript を生成する session 記録ツールの本番運用を開始しないこと。
+
+---
+
 ## 関連文書
 
 - `docs/dev/secret-policy.md` — Secret Inventory と no-secret 運用境界（`secret_policy/v1` SSOT）
@@ -282,7 +332,9 @@ secrets_mode 変化（none → 非 none）
 - `docs/dev/runtime-verification-policy.md` — 動作検証 AC 運用ポリシー
 - `CLAUDE.md` — プロジェクト入口
 - `.claude/rules/project-constitution.md` — 運用ルールの正本
-- `.claude/scripts/check_session_recording_policy.py` — policy 構造検証スクリプト
+- `.claude/scripts/check_session_recording_policy.py` — policy 構造検証スクリプト（11 項目）
 - Issue #136 — session 記録ツール導入判断（親 Issue）
 - Issue #241 — `secret_policy/v1` SSOT 化（PR #317 完了）
 - Issue #243 — `agent_session_manifest/v1` schema SSOT 化（PR #314 完了）
+- Issue #245 — session 記録ツール人間導入手順書（予定）
+- Issue #246 — pilot smoke test（予定）
