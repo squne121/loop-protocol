@@ -422,6 +422,7 @@ safety_claims:
 
 ## 関連ドキュメント
 
+- `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill の全体的な責務境界
 - `docs/dev/workflow.md` — 全体ワークフロー
 - `.claude/skills/implement-issue/SKILL.md` — 実装手順
