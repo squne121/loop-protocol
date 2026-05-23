@@ -13,7 +13,7 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 | `pr-reviewer` | read-only | `dontAsk` | Bash, Read, Grep, Glob | Edit, Write, MultiEdit |
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
 | `review-issue`（standalone SubAgent） | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
-| `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit |
+| `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
 | `issue-author` | write | `acceptEdits` | Bash, Read, Write | Agent, Edit, MultiEdit |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
@@ -443,6 +443,22 @@ routing_allowed_fields:
 ```
 
 詳細な domain judgment（blocking_issues のテキスト / diff_proposal の内容 / test failure の詳細 等）は、後続 SubAgent へ参照（GitHub comment URL / issue_url）として渡す。オーケストレーターが詳細を再解釈しない。
+
+### 一時例外（temporary_exceptions）
+
+以下は ORCHESTRATOR_IO_BOUNDARY_V1 の `forbidden_context` に対する一時的な例外として承認された項目:
+
+```yaml
+temporary_exceptions:
+  - raw_anchor_comment_snapshot:
+      owner: issue-refinement-loop Step 0/2
+      reason: issue-227 first-stage scope. anchor comment classification は今回スコープでは main thread に残す
+      allowed_until: follow-up issue (impl-review-loop boundary conformance check)
+      constraints:
+        - must not be forwarded raw to issue-author
+        - must be normalized before Step 4
+        - must not be used as generic reviewer_feedback_text
+```
 
 ## オーケストレーター設計原則（impl-review-loop / issue-refinement-loop）
 
