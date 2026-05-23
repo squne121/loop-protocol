@@ -1,6 +1,7 @@
 ---
 name: gemini-cli-headless-delegation
 description: Gemini CLI を wrapper 経由で非対話 delegation する shared skill。巨大ログ調査、構造化された技術調査、根拠付き比較を構造化 request 契約で委譲したいときに使う。
+disable-model-invocation: true
 ---
 
 # Gemini CLI Headless Delegation
@@ -49,7 +50,7 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
    ```
    - `exit_code: 0` かつ `ok: true` であれば Step 1 に進む。
    - `ok: false` の場合は JSON 出力の各チェック項目 (`tools`, `trusted_folders`, `serena_mcp`, `gemini_settings`, `auth`) を確認し、`recovery` フィールドに従って対処する。
-   - `trusted_folders` チェックはリポジトリルートを `~/.gemini/trustedFolders.json` に programmatic に追記する（idempotent）。
+   - `trusted_folders` チェックはリポジトリルートを `~/.gemini/trustedFolders.json` に**書き込む**（read-only ではない）。既登録時は no-op（idempotent）。`--fix` による check / write 分離は #313 で対応予定。
    - `gemini_settings` チェックは `.gemini/settings.json` が不在の場合にのみ Serena MCP テンプレを生成する（既存ファイルは保護）。
    - アカウント認証（Google OAuth）は人間が事前に `gemini auth login` で完了させておく必要がある。
 
@@ -85,7 +86,7 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
 
 ### Delegation Boundary
 - Gemini 側の `file write` / `shell edit` / GitHub mutation は禁止。
-- `post_to_issue_url` は **wrapper 側**の GitHub コメント投稿操作（Gemini 側ではない）。許可 profile での利用可能、詳細は `references/usage-contract.md` 参照。
+- `post_to_issue_url` は **wrapper 側**の GitHub コメント投稿操作（Gemini 側ではない）。`no_tools` / `grounded_research` のみ許可（`local_asset_research` / `proposal_only` / `github_research` では拒否）。詳細は `references/usage-contract.md` 参照。
 - 最終 file edit / shell 実行 / GitHub mutation は caller / orchestrator が保持する。
 
 ### Request Validation
