@@ -1,5 +1,6 @@
 specify_cli_version: "0.8.13"
 upstream_tag: "v0.8.13"
+upstream_commit_sha: "b2314680fce898e0a9151b37ad2535d810c93eef"
 generation_command: "specify init --here --no-git --integration claude --force"
 generated_at: "2026-05-23T00:00:00Z"
 source_worktree: "/tmp/spec-kit-spike (Issue #298 throwaway)"

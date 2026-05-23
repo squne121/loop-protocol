@@ -99,7 +99,7 @@
   path: docs/adr/0002-sdd-tool-adoption.md
   title: SDD ツール採否 — Spec-Driven Development 運用方針
   keywords: [sdd, spec-driven-development, spec-kit, openspec, ears, canonical_source, docs-ssot, derived-workbench, tasks_md, staging-artifact, token-policy, compact-spec, scoped-loading, serena-mcp, playtest, feedback-loop, namespace, collision-policy]
-  description: SDD ツール採否（Spec Kit upstream-compatible / accepted-with-deferral）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正
+  description: SDD ツール採否（Spec Kit upstream-compatible / accepted・confirmed by #303）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正
   sections:
     - "## 決定"
     - "## Decision Points"

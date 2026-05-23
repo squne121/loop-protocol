@@ -10,6 +10,9 @@ user-invocable: true
 disable-model-invocation: false
 ---
 
+> **LOOP_PROTOCOL NOTE（2026-05-23）**: このスキルを直接 invoke することは LOOP_PROTOCOL では禁止されています。
+> 実装は必ず `GitHub Issue → issue-contract-review → impl-review-loop` 経由で行うこと。
+> ADR 0002 `direct_speckit_implement_on_main: prohibited` 参照。
 
 ## User Input
 

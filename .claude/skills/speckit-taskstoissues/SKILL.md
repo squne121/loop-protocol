@@ -10,6 +10,8 @@ user-invocable: true
 disable-model-invocation: false
 ---
 
+> **LOOP_PROTOCOL NOTE（2026-05-23）**: このスキルを LOOP_PROTOCOL の Issue 起票に直接使うことは禁止されています。
+> Issue 起票は必ず `issue-author` / `create-issue` skill 経由で行うこと（body quality gate・triage policy 適用のため）。
 
 ## User Input
 
