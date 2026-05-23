@@ -42,17 +42,29 @@ permissionMode: acceptEdits
 
 Issue contract に動作検証が必要な AC（`decision: immediate` と contract snapshot に記載されている場合）が含まれるとき、以下を必須とする。
 
-### 実行環境 preflight（着手前の必須確認）
+### 実行環境 preflight（2 段構成）
 
-実装着手前（worktree 作成前）に以下の preflight を実行する:
+preflight は worktree 作成前と作成後の 2 段で実施する。
+
+#### 1. worktree 作成前
 
 ```bash
 # 必要なツールの存在確認（Issue の動作検証 AC に依存するものを列挙）
 which <required-cli>   # 例: gemini, jq, uv 等
 # 認証状態の確認（必要な場合）
-# artifact 書き込み先の存在確認
-ls artifacts/ 2>/dev/null || echo "artifacts/ not yet created (will be created by VC script)"
+# network / external service 前提の確認
 ```
+
+#### 2. worktree 作成後・実装前
+
+```bash
+# artifact 書き込み先の存在確認と書き込み可能性の検証
+mkdir -p artifacts
+test -w artifacts
+realpath artifacts   # worktree 配下であることを確認
+```
+
+`realpath artifacts` の出力が worktree パス配下でない場合は Stop Condition とする。
 
 preflight の結果が以下のいずれかの場合は **Stop Condition 該当** として実装を進めず、人間判断を求める:
 
@@ -60,7 +72,8 @@ preflight の結果が以下のいずれかの場合は **Stop Condition 該当*
 |---|---|
 | 必要な CLI が `not found` | Stop Condition — 人間に環境整備を依頼 |
 | 認証状態が `unknown` または `error` | Stop Condition — 人間に認証確認を依頼 |
-| artifact 書き込み先に権限がない | Stop Condition — 人間に確認を依頼 |
+| artifact 書き込み先に権限がない（`test -w artifacts` が失敗） | Stop Condition — 人間に確認を依頼 |
+| `realpath artifacts` が worktree パス配下でない | Stop Condition — 人間に確認を依頼（worktree 外への書き込み禁止） |
 
 preflight が pass した場合のみ実装フローを継続する。
 

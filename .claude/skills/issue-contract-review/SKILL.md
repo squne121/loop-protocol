@@ -97,7 +97,10 @@ BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement
 
 Issue 本文の `## Runtime Verification Applicability` セクションを確認する。
 
-- `decision: not_applicable` または セクション自体が存在しない → 本チェックをスキップ（次へ）
+- `decision: not_applicable` が明示されている → 本チェックをスキップ（次へ）
+- セクション自体が存在しない:
+  - implementation issue の場合 → **BLOCKED** または `human_judgment`（fail-closed）
+  - non-implementation / legacy issue の場合 → warning（non-blocking）
 - `decision: deferred` → 本チェックをスキップ（後続 Issue/フェーズで確認）
 - `decision: immediate` → 以下の実行環境前提チェックを実施する
 

@@ -65,7 +65,13 @@ test -f / test -d <path>
 gh pr view <番号> --json mergeable,mergeStateStatus
 ```
 
-`bash scripts/<name>.sh` は読み取り専用スクリプトに限り許可。実行前に `cat <script>` で内容を確認し、ファイル書き込み操作（`sed -i`, `tee`, `>`, `>>`）がないことを確認してから実行する。
+`bash scripts/<name>.sh` は原則読み取り専用に限る。実行前に `cat <script>` で内容を確認し、ファイル書き込み操作（`sed -i`, `tee`, `>`, `>>`）がないことを確認してから実行する。
+
+例外: contract snapshot で「動作検証 VC」と明示された script は、以下の条件をすべて満たす場合のみ実行可。
+- 書き込み先が worktree-local `artifacts/` 配下に限定されている
+- `rm`, `mv`, `cp`, `git`, network side effect を含まない
+- `tee`, `>`, `>>`, `mkdir -p` は `artifacts/` 配下への証跡生成に限る
+- 実行後に artifact path を `runtime_ac_results[].notes` または `artifact_present` に記録する
 
 ## 実行してはいけないコマンド
 
@@ -112,6 +118,8 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 | 全動作検証 VC が SKIP | PARTIAL + human_review_required | 全件未検証の状態であり、Stop Condition に相当 |
 
 > 「この VC が動作検証 VC かどうか」の判断は `issue-contract-review` が contract snapshot に明示する。test-runner はその指示に従い結果を分類するのみ。
+
+> exit code 77 は、このプロジェクトの bash-based runtime verification wrapper における SKIP 規約とする。pytest 等、独自の exit code 体系を持つツールの exit code と混同しない。
 
 ### 動作検証 VC スクリプトの artifact 出力について
 
