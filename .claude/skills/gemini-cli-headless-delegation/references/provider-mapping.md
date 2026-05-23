@@ -1,13 +1,13 @@
 # Provider Mapping
 
 ## Canonical Path
-- 正本は `.agents/skills/gemini-cli-headless-delegation/` に置く。
+- 正本は `.claude/skills/gemini-cli-headless-delegation/` に置く。
 - Gemini を直接 ad hoc に叩かず、必ず `scripts/run_gemini_headless.py` を経由する。
 - provider 固有の差分は caller 側の request JSON に閉じ込め、wrapper の contract を変えない。
 
 ## Common Wrapper Invocation
 ```bash
-uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
   --request-file request.json \
   --output-file result.json
 ```
@@ -37,7 +37,7 @@ uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 4. Gemini 実行自体は wrapper 経由でのみ行う。
 
 ```bash
-uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
   --request-file request.json \
   --output-file result.json
 ```
@@ -48,7 +48,7 @@ uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 3. Gemini への直接実行や ad hoc prompt は使わない。
 
 ```bash
-uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
   --request-file request.json \
   --output-file result.json
 ```

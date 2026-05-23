@@ -422,9 +422,45 @@ def _strip_verbose_subfields(result: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+def _build_next_action(result: dict[str, Any]) -> dict[str, Any]:
+    """Build the next_action field for all results.
+
+    For success results: next_action points to running the actual delegation wrapper.
+    For failure results: next_action points to the appropriate recovery command.
+    """
+    failure_class = result.get("failure_class")
+    if failure_class == "trusted_workspace_required":
+        argv = ["setup_check.py", "--json", "--fix"]
+        return {"argv": argv, "command": " ".join(argv)}
+    if result.get("ok"):
+        # Success: suggest running the delegation wrapper.
+        argv = ["run_gemini_headless.py", "--request-file", "<request.json>", "--output-file", "<result.json>"]
+        return {"argv": argv, "command": " ".join(argv)}
+    # Generic failure: suggest re-running preflight after fixing the issue.
+    argv = ["preflight_gemini_headless.py", "--output-file", "tmp/preflight.json"]
+    return {"argv": argv, "command": " ".join(argv)}
+
+
+def _inject_next_action(result: dict[str, Any]) -> dict[str, Any]:
+    """Inject next_action into results if not already present.
+
+    Always injected so callers can rely on next_action being present.
+    """
+    if "next_action" not in result:
+        result = dict(result)
+        result["next_action"] = _build_next_action(result)
+    return result
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-file", required=True, type=Path)
+    parser.add_argument(
+        "--output-file",
+        required=False,
+        type=Path,
+        default=None,
+        help="Path to write the preflight result JSON. Optional when --json is used.",
+    )
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -435,10 +471,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             " smoke.command/stdout/stderr/stats."
         ),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_stdout",
+        default=False,
+        help=(
+            "Print the preflight result JSON to stdout. "
+            "Can be combined with --output-file to both write a file and print to stdout."
+        ),
+    )
     return parser
 
 
-def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
+def _print_stdout_summary(result: dict[str, Any], output_file: Path | None) -> None:
     """Print a human/agent-friendly summary to stdout after JSON is saved."""
     if result["ok"]:
         version = result.get("version", {}).get("value") or "unknown"
@@ -447,32 +493,51 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
         failure_class = result.get("failure_class")
         recovery_action = result.get("recovery_action")
         failure_reason = result.get("failure_reason")
+        next_action = result.get("next_action", {})
         if failure_class == "trusted_workspace_required":
             print(
                 f"[gemini-preflight] error: trusted_workspace_required"
                 f" — {failure_reason}"
             )
-            print(
-                f"[gemini-preflight] recovery: {recovery_action}"
-                f" (GEMINI_CLI_TRUST_WORKSPACE=true)"
-            )
+            if next_action.get("command"):
+                print(f"[gemini-preflight] next_action: {next_action['command']}")
+            elif recovery_action:
+                print(
+                    f"[gemini-preflight] recovery: {recovery_action}"
+                    f" (GEMINI_CLI_TRUST_WORKSPACE=true)"
+                )
         elif failure_reason:
             print(f"[gemini-preflight] error: {failure_reason}")
+            if next_action.get("command"):
+                print(f"[gemini-preflight] next_action: {next_action['command']}")
         else:
             print(
                 "[gemini-preflight] error: preflight failed"
                 " (no failure reason available; see result JSON)"
             )
-    print(f"[gemini-preflight] result saved to: {output_file}")
+    if output_file is not None:
+        print(f"[gemini-preflight] result saved to: {output_file}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.output_file is None and not args.json_stdout:
+        # Default: require at least one output mechanism.
+        print(
+            "[gemini-preflight] error: specify --output-file <path> or --json (or both)",
+            file=__import__("sys").stderr,
+        )
+        return 2
     result = run_preflight()
+    result = _inject_next_action(result)
     if args.compact:
         result = _strip_verbose_subfields(result)
-    _dump_json(args.output_file, result)
-    _print_stdout_summary(result, args.output_file)
+    if args.output_file is not None:
+        _dump_json(args.output_file, result)
+    if args.json_stdout:
+        print(__import__("json").dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_stdout_summary(result, args.output_file)
     return 0 if result["ok"] else 1
 
 

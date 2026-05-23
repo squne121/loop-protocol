@@ -1661,8 +1661,8 @@ def _apply_compact(result: dict[str, Any]) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request-file", required=True, type=Path)
-    parser.add_argument("--output-file", required=True, type=Path)
+    parser.add_argument("--request-file", required=False, type=Path, default=None)
+    parser.add_argument("--output-file", required=False, type=Path, default=None)
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -1674,6 +1674,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["json", "ndjson"],
         default="json",
         help="Output format: 'json' (default, overwrite) or 'ndjson' (append, one JSON object per line).",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Validate the request JSON without executing Gemini CLI. "
+            "Exits 0 if valid, 1 if invalid. Requires --request-file; --output-file is optional."
+        ),
+    )
+    # Positional argument: allow `run_gemini_headless.py --validate-only <file>` shorthand.
+    parser.add_argument(
+        "request_file_positional",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Request JSON file path (positional shorthand for --request-file).",
     )
     return parser
 
@@ -1696,7 +1713,41 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    request = _load_json(args.request_file)
+
+    # Resolve request file: prefer --request-file, fall back to positional argument.
+    request_file: Path | None = args.request_file or args.request_file_positional
+
+    # --validate-only mode: validate request JSON without executing Gemini CLI.
+    if args.validate_only:
+        if request_file is None:
+            print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+            return 1
+        try:
+            request = _load_json(request_file)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[gemini-headless] error: cannot load request file: {exc}")
+            return 1
+        if not isinstance(request, Mapping):
+            print("[gemini-headless] error: request file must contain a JSON object")
+            return 1
+        errors = validate_request(request, request_path=request_file)
+        if errors:
+            print(f"[gemini-headless] validation FAIL: {errors[0]}")
+            for err in errors[1:]:
+                print(f"  {err}")
+            return 1
+        print("[gemini-headless] validation OK")
+        return 0
+
+    # Normal execution mode: --request-file and --output-file are required.
+    if request_file is None:
+        print("[gemini-headless] error: --request-file is required")
+        return 1
+    if args.output_file is None:
+        print("[gemini-headless] error: --output-file is required")
+        return 1
+
+    request = _load_json(request_file)
     if not isinstance(request, Mapping):
         result = {
             "schema": "delegation_result/v1",
@@ -1714,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
             "raw_command": [],
         }
     else:
-        result = run_delegation(request, request_path=args.request_file)
+        result = run_delegation(request, request_path=request_file)
     if args.compact:
         result = _apply_compact(result)
     if args.output_format == "ndjson":

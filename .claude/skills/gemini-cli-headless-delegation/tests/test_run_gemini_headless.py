@@ -62,7 +62,7 @@ def test_validate_request_accepts_local_asset_research_with_safe_serena_settings
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -82,7 +82,7 @@ def test_validate_request_rejects_local_asset_research_post_to_issue_url(tmp_pat
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -107,7 +107,7 @@ def test_validate_request_rejects_local_asset_research_unverified_mcp_settings(t
     )
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -264,7 +264,7 @@ def test_validate_request_rejects_proposal_only_same_clause_negation_mutation(tm
 def make_local_asset_request(context_files: list[str]):
     return {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -335,7 +335,7 @@ def test_build_prompt_includes_local_asset_research_serena_guidance(monkeypatch)
     module = load_module()
     monkeypatch.setattr(module, "_validate_local_asset_research_settings", lambda: [])
     request = {
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],

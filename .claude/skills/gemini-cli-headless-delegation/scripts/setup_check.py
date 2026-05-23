@@ -119,15 +119,16 @@ def check_tools() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
-    """Programmatically register repo root in ~/.gemini/trustedFolders.json.
+def check_trusted_folders(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    """Check (and optionally register) repo root in ~/.gemini/trustedFolders.json.
 
     Logic:
     - trustedFolders.json uses a dict schema: {path: "TRUST_FOLDER" | "TRUST_PARENT"}.
     - If the repo root (TRUST_FOLDER) or a parent directory (TRUST_PARENT) is
       already present, perform no-op (idempotent). Existing entries are preserved.
-    - Otherwise append the repo root as {repo_root: "TRUST_FOLDER"} and persist.
-    - Creates the file if absent.
+    - When fix=False (default): check-only, no HOME or repo side-effects.
+      Returns ok=False with status="needs_fix" when the entry is missing.
+    - When fix=True: append the repo root as {repo_root: "TRUST_FOLDER"} and persist.
     """
     root = repo_root or _git_repo_root()
     if root is None:
@@ -165,7 +166,20 @@ def check_trusted_folders(repo_root: Path | None = None) -> dict[str, Any]:
             except ValueError:
                 pass
 
-    # Append new entry and persist. Existing entries are preserved.
+    # Entry is missing.
+    if not fix:
+        return {
+            "ok": False,
+            "status": "needs_fix",
+            "path": trust_folder,
+            "detail": f"'{trust_folder}' is not in {trusted_path}. Run with --fix to register it.",
+            "recovery": [
+                "Run: setup_check.py --json --fix",
+                f"Or manually add '{trust_folder}' to {trusted_path}",
+            ],
+        }
+
+    # fix=True: Append new entry and persist. Existing entries are preserved.
     existing[trust_folder] = "TRUST_FOLDER"
     try:
         trusted_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,10 +275,11 @@ _SETTINGS_TEMPLATE: dict[str, Any] = {
 }
 
 
-def check_gemini_settings(repo_root: Path | None = None) -> dict[str, Any]:
-    """Generate .gemini/settings.json template when absent.
+def check_gemini_settings(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    """Check (and optionally create) .gemini/settings.json.
 
-    Never overwrites an existing file.
+    When fix=False (default): check-only, no repo side-effects.
+    When fix=True: generate template if absent. Never overwrites an existing file.
     """
     root = repo_root or _git_repo_root()
     if root is None:
@@ -279,7 +294,20 @@ def check_gemini_settings(repo_root: Path | None = None) -> dict[str, Any]:
     if settings_path.exists():
         return {"ok": True, "status": "exists", "path": str(settings_path)}
 
-    # Generate template.
+    # File is absent.
+    if not fix:
+        return {
+            "ok": False,
+            "status": "needs_fix",
+            "path": str(settings_path),
+            "detail": f"{settings_path} is absent. Run with --fix to create the Serena MCP template.",
+            "recovery": [
+                "Run: setup_check.py --json --fix",
+                f"Or manually create {settings_path} with the Serena MCP template.",
+            ],
+        }
+
+    # fix=True: Generate template.
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(
@@ -363,14 +391,18 @@ def check_auth() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def run_all_checks(repo_root: Path | None = None) -> dict[str, Any]:
-    """Execute all checks and return a consolidated result dict."""
+def run_all_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    """Execute all checks and return a consolidated result dict.
+
+    When fix=False (default): check-only mode — no HOME or repo side-effects.
+    When fix=True: allow trustedFolders and .gemini/settings.json mutations.
+    """
     root = repo_root or _git_repo_root()
 
     tools_result = check_tools()
-    trusted_result = check_trusted_folders(root)
+    trusted_result = check_trusted_folders(root, fix=fix)
     serena_result = check_serena_mcp()
-    settings_result = check_gemini_settings(root)
+    settings_result = check_gemini_settings(root, fix=fix)
     auth_result = check_auth()
 
     all_ok = all(
@@ -470,10 +502,21 @@ def main() -> None:
         dest="json_output",
         help="Output results as JSON (machine-readable).",
     )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        dest="fix",
+        default=False,
+        help=(
+            "Allow side-effects: register repo root in ~/.gemini/trustedFolders.json "
+            "and create .gemini/settings.json template when absent. "
+            "Without --fix, this script is check-only (no HOME or repo mutations)."
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        result = run_all_checks()
+        result = run_all_checks(fix=args.fix)
     except Exception as exc:  # pylint: disable=broad-except
         err = {"ok": False, "exit_code": 2, "error": str(exc)}
         if args.json_output:
