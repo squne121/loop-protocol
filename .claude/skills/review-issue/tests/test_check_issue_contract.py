@@ -142,18 +142,18 @@ class TestC9Fail:
         )
 
     def test_c9_fails(self):
-        """GIVEN c9_fail_issue.md WHEN checker runs THEN C9_runtime_applicability_present is fail."""
+        """GIVEN c9_fail_issue.md WHEN checker runs THEN C9_runtime_applicability_present is fail or legacy_missing."""
         output = run_checker("c9_fail_issue.md")
         checks = output["deterministic_checks"]
-        assert checks["C9_runtime_applicability_present"] == "fail", (
-            f"Expected C9 to fail, got {checks['C9_runtime_applicability_present']}"
+        assert checks["C9_runtime_applicability_present"] in ("fail", "legacy_missing_applicability"), (
+            f"Expected C9 to fail or legacy_missing, got {checks['C9_runtime_applicability_present']}"
         )
 
     def test_c9_blocking_message(self):
         """GIVEN c9_fail_issue.md WHEN checker runs THEN blocking_issues contains C9 message."""
         output = run_checker("c9_fail_issue.md")
         blocking = output["blocking_issues"]
-        assert any("Runtime Verification" in msg or "Applicability" in msg for msg in blocking), (
+        assert any("Runtime Verification" in msg or "Applicability" in msg or "レガシー" in msg for msg in blocking), (
             f"Expected C9 blocking message in {blocking}"
         )
 
@@ -189,9 +189,9 @@ class TestJsonOutputStructure:
     """GIVEN any fixture WHEN checker runs with --json THEN output matches expected schema."""
 
     def test_json_has_required_keys(self):
-        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, etc."""
+        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, issue_kind, generated_at, etc."""
         output = run_checker("pass_issue.md")
-        required_keys = {"verdict", "deterministic_checks", "blocking_issues", "non_blocking_improvements"}
+        required_keys = {"verdict", "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
         missing = required_keys - set(output.keys())
         assert not missing, f"JSON output missing keys: {missing}"
 
@@ -214,3 +214,153 @@ class TestJsonOutputStructure:
         }
         missing = expected_keys - set(checks.keys())
         assert not missing, f"deterministic_checks missing keys: {missing}"
+
+
+class TestC2Fail:
+    """GIVEN a fixture with fewer than 6 stop conditions WHEN checker runs THEN C2 fails."""
+
+    def test_c2_fail(self):
+        """GIVEN c2_fail_issue.md WHEN checker runs THEN C2 is fail."""
+        output = run_checker("c2_fail_issue.md")
+        assert output["deterministic_checks"]["C2_stop_conditions_6"] == "fail", (
+            f"Expected C2 to fail, got {output['deterministic_checks']['C2_stop_conditions_6']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c2_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c2_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC3Fail:
+    """GIVEN a fixture with non-checkbox AC WHEN checker runs THEN C3 fails."""
+
+    def test_c3_fail(self):
+        """GIVEN c3_fail_issue.md WHEN checker runs THEN C3 is fail."""
+        output = run_checker("c3_fail_issue.md")
+        assert output["deterministic_checks"]["C3_ac_checkbox_format"] == "fail", (
+            f"Expected C3 to fail, got {output['deterministic_checks']['C3_ac_checkbox_format']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c3_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c3_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC4Fail:
+    """GIVEN a fixture with VC code block but no executable commands WHEN checker runs THEN C4 fails."""
+
+    def test_c4_fail(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN C4 is fail."""
+        output = run_checker("c4_fail_issue.md")
+        assert output["deterministic_checks"]["C4_vc_commands_present"] == "fail", (
+            f"Expected C4 to fail, got {output['deterministic_checks']['C4_vc_commands_present']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c4_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC5Fail:
+    """GIVEN a fixture where AC2 has no corresponding VC reference WHEN checker runs THEN C5 fails."""
+
+    def test_c5_fail(self):
+        """GIVEN c5_fail_issue.md WHEN checker runs THEN C5 is fail."""
+        output = run_checker("c5_fail_issue.md")
+        assert output["deterministic_checks"]["C5_ac_vc_number_alignment"] == "fail", (
+            f"Expected C5 to fail, got {output['deterministic_checks']['C5_ac_vc_number_alignment']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c5_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c5_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC6Fail:
+    """GIVEN a fixture with subjective phrasing in AC WHEN checker runs THEN C6 fails."""
+
+    def test_c6_fail(self):
+        """GIVEN c6_fail_issue.md WHEN checker runs THEN C6 is fail."""
+        output = run_checker("c6_fail_issue.md")
+        assert output["deterministic_checks"]["C6_no_subjective_phrasing"] == "fail", (
+            f"Expected C6 to fail, got {output['deterministic_checks']['C6_no_subjective_phrasing']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c6_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c6_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC8Fail:
+    """GIVEN a fixture with vague Outcome WHEN checker runs THEN C8 fails."""
+
+    def test_c8_fail(self):
+        """GIVEN c8_fail_issue.md WHEN checker runs THEN C8 is fail."""
+        output = run_checker("c8_fail_issue.md")
+        assert output["deterministic_checks"]["C8_outcome_concreteness"] == "fail", (
+            f"Expected C8 to fail, got {output['deterministic_checks']['C8_outcome_concreteness']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c8_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c8_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestC10Fail:
+    """GIVEN a fixture with decision: deferred but no destination WHEN checker runs THEN C10 fails."""
+
+    def test_c10_fail(self):
+        """GIVEN c10_fail_issue.md WHEN checker runs THEN C10 is fail."""
+        output = run_checker("c10_fail_issue.md")
+        assert output["deterministic_checks"]["C10_deferred_destination_present"] == "fail", (
+            f"Expected C10 to fail, got {output['deterministic_checks']['C10_deferred_destination_present']}"
+        )
+
+    def test_verdict_is_needs_fix(self):
+        """GIVEN c10_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
+        output = run_checker("c10_fail_issue.md")
+        assert output["verdict"] == "needs-fix", (
+            f"Expected needs-fix, got {output['verdict']}"
+        )
+
+
+class TestJsonOutputSchema:
+    """GIVEN any fixture WHEN checker runs THEN JSON output has all required fields."""
+
+    def test_json_output_schema(self):
+        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, blocking_issues, non_blocking_improvements, issue_kind, generated_at."""
+        output = run_checker("pass_issue.md")
+        required_fields = {"verdict", "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
+        missing = required_fields - set(output.keys())
+        assert not missing, f"JSON output missing fields: {missing}"
+
+
+class TestMachineReadableContractPriority:
+    """GIVEN an issue with Machine-Readable Contract WHEN checker runs THEN issue_kind from contract takes priority."""
+
+    def test_machine_readable_contract_priority(self):
+        """GIVEN c2_fail_issue.md with issue_kind: implementation in contract WHEN checker runs THEN issue_kind is implementation."""
+        # c2_fail_issue.md has issue_kind: implementation in the Machine-Readable Contract
+        # and no labels/title prefix, so it should be detected from the contract
+        output = run_checker("c2_fail_issue.md")
+        assert output["issue_kind"] == "implementation", (
+            f"Expected issue_kind=implementation from Machine-Readable Contract, got {output['issue_kind']}"
+        )

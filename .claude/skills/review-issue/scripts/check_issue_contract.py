@@ -91,6 +91,33 @@ IMPLEMENTATION_REQUIRED_SECTIONS = [
 ]
 
 
+def get_required_sections(issue_kind: str, template_path: str = ".github/ISSUE_TEMPLATE/implementation.yml") -> list:
+    """Issue template から必須セクションを動的取得。未存在時はハードコードにフォールバック。"""
+    if issue_kind != "implementation":
+        return []
+
+    import os
+    import yaml as _yaml
+    if os.path.exists(template_path):
+        try:
+            with open(template_path) as f:
+                tmpl = _yaml.safe_load(f)
+            required = [
+                item["attributes"]["label"]
+                for item in tmpl.get("body", [])
+                if item.get("type") != "markdown"
+                   and item.get("validations", {}).get("required", False)
+                   and "label" in item.get("attributes", {})
+            ]
+            if required:
+                return required
+        except Exception:
+            pass
+
+    # fallback
+    return IMPLEMENTATION_REQUIRED_SECTIONS
+
+
 @dataclass
 class DeterministicChecks:
     C1_required_sections: str = CheckResult.NA
@@ -124,14 +151,32 @@ def extract_section(body: str, section_name: str) -> str:
     return ""
 
 
-def detect_issue_kind(labels: str, title: str) -> str:
-    """Detect issue kind from labels and title."""
+def detect_issue_kind(body: str, labels: str = "", title: str = "") -> str:
+    """Issue kind を検出する。Machine-Readable Contract を最優先で参照。"""
+    # 最優先: Machine-Readable Contract の issue_kind フィールド
+    # ```yaml ... contract_schema_version ... issue_kind: <value> ... ``` を探す
+    contract_match = re.search(
+        r'```yaml\s*\n.*?contract_schema_version.*?\n.*?issue_kind:\s*(\S+)',
+        body,
+        re.DOTALL
+    )
+    if contract_match:
+        kind = contract_match.group(1).strip().rstrip('"\'')
+        if kind in ("implementation", "research", "tracking", "parent"):
+            return kind
+
+    # fallback: labels
     if "tracking" in labels or "parent" in labels:
         return "tracking"
     if "phase/research" in labels or title.startswith("調査:"):
         return "research"
     if "phase/implementation" in labels or title.startswith("実装:"):
         return "implementation"
+
+    # fallback: title prefix
+    if title.startswith(("実装:", "implement:", "perf:", "fix:", "docs:")):
+        return "implementation"
+
     # Default to implementation for unknown
     return "implementation"
 
@@ -141,8 +186,9 @@ def check_c1_required_sections(body: str, issue_kind: str) -> tuple[str, list[st
     if issue_kind not in ("implementation",):
         return CheckResult.NA, []
 
+    required = get_required_sections(issue_kind)
     failing = []
-    for section in IMPLEMENTATION_REQUIRED_SECTIONS:
+    for section in required:
         pattern = rf"^## {re.escape(section)}"
         if not re.search(pattern, body, re.MULTILINE):
             failing.append(f"必須セクション '## {section}' が存在しない")
@@ -185,12 +231,26 @@ def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
     if not section:
         return CheckResult.FAIL, ["## Verification Commands セクションが存在しないか空"]
 
-    # コマンド行: $ で始まる行、または ``` コードブロック内の非空行
-    has_dollar_prefix = bool(re.search(r"^\$\s+\S", section, re.MULTILINE))
-    has_code_block = bool(re.search(r"```", section))
+    # コードブロック内のコマンド行を確認（$ または - で始まる行）
+    code_blocks = re.findall(r'```[^\n]*\n(.*?)```', section, re.DOTALL)
+    command_lines = []
+    for block in code_blocks:
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('$') or (stripped.startswith('-') and '`' in stripped):
+                command_lines.append(stripped)
 
-    if not has_dollar_prefix and not has_code_block:
-        return CheckResult.FAIL, ["Verification Commands に `$` 始まりのコマンド行またはコードブロックが見つからない"]
+    if command_lines:
+        return CheckResult.PASS, []
+
+    # コードブロックが存在しない場合: コードブロック外のインライン backtick を確認
+    # コードブロックを除去してからインライン backtick を確認する
+    section_without_code_blocks = re.sub(r'```[^\n]*\n.*?```', '', section, flags=re.DOTALL)
+    inline = re.findall(r'`[^`]+`', section_without_code_blocks)
+
+    if not inline:
+        return CheckResult.FAIL, ["VC に実行可能コマンドが見当たらない（$ / - で始まる行、またはインライン backtick が必要）"]
+
     return CheckResult.PASS, []
 
 
@@ -199,25 +259,27 @@ def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
     ac_section = extract_section(body, "Acceptance Criteria")
     vc_section = extract_section(body, "Verification Commands")
 
-    ac_numbers = set(re.findall(r"\bAC(\d+)\b", ac_section))
-    vc_numbers = set(re.findall(r"\bAC(\d+)\b", vc_section))
+    if not ac_section or not vc_section:
+        return CheckResult.NA, []
 
+    # AC 番号を収集
+    ac_numbers = set(re.findall(r'AC(\d+)', ac_section))
+
+    # VC 内の AC 参照を収集（# AC1 形式のコメント）
+    vc_ac_refs = set(re.findall(r'#\s*AC(\d+)', vc_section))
+
+    # AC 番号と VC 参照が全て一致するか
     if not ac_numbers:
         return CheckResult.FAIL, ["AC セクションに AC[N] 番号が見つからない"]
-    if not vc_numbers:
-        return CheckResult.FAIL, ["VC セクションに AC[N] 番号が見つからない"]
 
-    missing_in_vc = ac_numbers - vc_numbers
-    extra_in_vc = vc_numbers - ac_numbers
+    missing_in_vc = ac_numbers - vc_ac_refs
 
-    issues = []
     if missing_in_vc:
-        issues.append(f"AC番号 {sorted(missing_in_vc)} が VC に対応コマンドなし")
-    if extra_in_vc:
-        issues.append(f"VC に AC番号 {sorted(extra_in_vc)} があるが AC セクションに存在しない")
+        missing_list = [f"AC{n}" for n in sorted(missing_in_vc)]
+        return CheckResult.FAIL, [
+            f"以下の AC が VC に '# AC<N>' 形式でコメント参照されていない: {', '.join(missing_list)}"
+        ]
 
-    if issues:
-        return CheckResult.FAIL, issues
     return CheckResult.PASS, []
 
 
@@ -279,19 +341,34 @@ def check_c8_outcome_concreteness(body: str) -> tuple[str, list[str]]:
 
 def check_c9_runtime_applicability(body: str, issue_kind: str) -> tuple[str, list[str]]:
     """C9: Runtime Verification Applicability セクション存在チェック"""
+    section = extract_section(body, "Runtime Verification Applicability")
     has_section = bool(re.search(r"^## Runtime Verification Applicability", body, re.MULTILINE))
 
     if issue_kind == "implementation":
         if not has_section:
-            return CheckResult.FAIL, ["implementation Issue に ## Runtime Verification Applicability セクションが存在しない（blocker）"]
+            # セクション自体がない
+            return CheckResult.LEGACY_MISSING, ["## Runtime Verification Applicability セクションがない（レガシー Issue）"]
+
+        # decision: フィールドの確認
+        decision_match = re.search(r'decision:\s*(\S+)', section)
+        if not decision_match:
+            return CheckResult.LEGACY_MISSING, ["decision: フィールドがない（レガシー Issue）"]
+
+        decision = decision_match.group(1).strip()
+        valid_decisions = {"not_applicable", "deferred", "immediate"}
+        if decision not in valid_decisions:
+            return CheckResult.FAIL, [f"decision: '{decision}' が不正（not_applicable / deferred / immediate のいずれかであること）"]
+
         return CheckResult.PASS, []
+
     elif issue_kind in ("research", "tracking"):
         if not has_section:
             return CheckResult.WARN, ["research/tracking Issue に ## Runtime Verification Applicability セクションが存在しない（warn、approve を妨げない）"]
         return CheckResult.PASS, []
+
     else:
         if not has_section:
-            return CheckResult.FAIL, ["## Runtime Verification Applicability セクションが存在しない"]
+            return CheckResult.WARN, ["## Runtime Verification Applicability セクションが推奨（非実装 Issue）"]
         return CheckResult.PASS, []
 
 
@@ -347,7 +424,7 @@ def check_c11_decision_tag_consistency(body: str) -> tuple[str, list[str]]:
 
 def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     """Run all C1-C11 checks and return structured result."""
-    issue_kind = detect_issue_kind(labels, title)
+    issue_kind = detect_issue_kind(body, labels, title)
     result = CheckerResult(issue_kind=issue_kind)
     checks = result.deterministic_checks
 
@@ -386,7 +463,7 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     # C9
     checks.C9_runtime_applicability_present, issues = check_c9_runtime_applicability(body, issue_kind)
     # warn は blocking_issues に追加しない
-    if checks.C9_runtime_applicability_present == CheckResult.FAIL:
+    if checks.C9_runtime_applicability_present in (CheckResult.FAIL, CheckResult.LEGACY_MISSING):
         result.blocking_issues.extend(issues)
     elif checks.C9_runtime_applicability_present == CheckResult.WARN:
         result.non_blocking_improvements.extend(issues)
@@ -400,9 +477,6 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     result.blocking_issues.extend(issues)
 
     # Verdict
-    blocking_check_results = {
-        CheckResult.FAIL,
-    }
     all_check_values = [
         checks.C1_required_sections,
         checks.C2_stop_conditions_6,
@@ -416,7 +490,7 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
         checks.C10_deferred_destination_present,
         checks.C11_decision_tag_consistency,
     ]
-    has_fail = any(v == CheckResult.FAIL for v in all_check_values)
+    has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
     result.verdict = "needs-fix" if has_fail else "approve"
 
     return result
@@ -473,9 +547,11 @@ def load_fixture_file(path: str) -> tuple[str, str, str]:
 
 def result_to_dict(result: CheckerResult) -> dict:
     """Convert CheckerResult to a dict for JSON output."""
+    import datetime
     return {
         "verdict": result.verdict,
         "issue_kind": result.issue_kind,
+        "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "deterministic_checks": {
             "C1_required_sections": result.deterministic_checks.C1_required_sections,
             "C2_stop_conditions_6": result.deterministic_checks.C2_stop_conditions_6,

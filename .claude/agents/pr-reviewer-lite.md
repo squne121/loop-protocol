@@ -62,8 +62,8 @@ deny_if_any:
 ```
 
 deny-list に該当する場合のアクション:
-1. PR に「deny-list 該当のため Sonnet pr-reviewer へルーティング」と即座にコメントする
-2. `LOOP_VERDICT` に `verdict: SONNET_REQUIRED` を出力して終了する（実装側で Sonnet pr-reviewer を起動する）
+1. PR への mutation（コメント等）を行わない
+2. `LOOP_VERDICT` に `verdict: SONNET_REQUIRED` を出力して終了する（orchestrator が Sonnet pr-reviewer へルーティングする）
 
 ## 適用条件（allow-list）
 
@@ -102,9 +102,32 @@ gh pr checks <PR番号>
 
 フォールバック（GitHub Actions 未設定時）:
 ```bash
-gh pr view <PR番号> --json comments --jq \
-  '[.comments[] | select(.body | contains("<!-- TEST_VERDICT_MACHINE v1 -->"))] | last | .body' \
-  | grep "verification_commands_fail:"
+VERDICT_BODY=$(gh pr view <PR番号> --json comments --jq \
+  '[.comments[] | select(.body | contains("<!-- TEST_VERDICT_MACHINE v1 -->"))] | last | .body // empty')
+
+if [ -z "$VERDICT_BODY" ]; then
+  echo "TEST_VERDICT_MACHINE コメントが存在しない → REQUEST_CHANGES"
+else
+  # verification_commands_fail の値を数値として確認
+  FAIL_COUNT=$(echo "$VERDICT_BODY" | python3 -c "
+import sys, re
+body = sys.stdin.read()
+m = re.search(r'verification_commands_fail:\s*(\d+)', body)
+print(m.group(1) if m else '-1')
+")
+  SKIP_COUNT=$(echo "$VERDICT_BODY" | python3 -c "
+import sys, re
+body = sys.stdin.read()
+m = re.search(r'verification_skipped_count:\s*(\d+)', body)
+print(m.group(1) if m else '-1')
+")
+
+  if [ "$FAIL_COUNT" -gt 0 ] || [ "$SKIP_COUNT" -gt 0 ] || [ "$FAIL_COUNT" = "-1" ]; then
+    echo "verification fail/skip あり → REQUEST_CHANGES"
+  else
+    echo "TEST_VERDICT_MACHINE: verification_commands_fail=0, skipped=0 → pass"
+  fi
+fi
 ```
 
 ### Gate 3: AC Coverage 確認

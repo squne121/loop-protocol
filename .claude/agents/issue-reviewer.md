@@ -51,7 +51,8 @@ python3 .claude/skills/review-issue/scripts/check_issue_contract.py \
   --issue <issue_number> --repo "$REPO" --json
 ```
 
-スクリプトが利用できない場合（ファイル未存在等）は、`review-issue` skill の決定論的チェック手順（C1〜C11）にフォールバックする。
+スクリプトが利用できない場合（ファイル未存在・実行エラー等）は、フォールバックせず **fail-closed** とする。
+`status: failed`, `failure_class: checker_unavailable`, `verdict: needs-fix` を返して終了する。
 
 ### Step 3: 軽量構造評価（non-blocking improvement 候補）を実行する
 
