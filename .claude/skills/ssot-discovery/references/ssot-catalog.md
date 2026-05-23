@@ -27,6 +27,7 @@ SSOT カタログの正本は docs/dev/ssot-registry.md を参照すること。
 | パス | 主題 | 主要キーワード |
 |---|---|---|
 | `docs/adr/0001-architecture-baseline.md` | state/render/systems/ui/storage 分離・60Hz 固定タイムステップ | architecture, state, render, systems, ecs, 60hz, タイムステップ |
+| `docs/adr/0002-sdd-tool-adoption.md` | SDD ツール採否（Spec Kit upstream-compatible / accepted-with-deferral）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正 | sdd, spec-kit, openspec, ears, canonical_source, docs-ssot, derived-workbench, tasks_md, staging-artifact, token-policy, compact-spec, scoped-loading, serena-mcp, playtest, feedback-loop, namespace |
 
 新規 ADR は `docs/adr/NNNN-<topic>.md` で追加し、本表に追記する。
 

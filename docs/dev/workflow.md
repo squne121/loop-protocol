@@ -172,6 +172,7 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 | `gh` CLI 利用規約・ラベル運用 | `docs/dev/github-ops.md` |
 | GitHub Milestone 作成・割当・close・rollup | `docs/dev/milestone-ops.md` |
 | アーキテクチャ分離原則・60Hz タイムステップ | `docs/adr/0001-architecture-baseline.md` |
+| SDD ツール採否・正本境界・token 対策・playtest 補正 | `docs/adr/0002-sdd-tool-adoption.md` |
 | 全体要件・非ゴール | `docs/product/requirements.md` |
 | 現在のフェーズ・優先項目 | `docs/dev/current-focus.md` |
 | SSOT カタログ全体 | `docs/dev/ssot-registry.md` |
