@@ -117,7 +117,7 @@ class Plan:
 _CHILD_LINE_RE = re.compile(
     r"^[-*]?\s*"
     r"(?:\[[ xX]?\]\s*)?"   # optional checkbox like "- [ ]" or "- [x]"
-    r"(?:#\d+\s*[—–—–-]\s*)?"  # optional leading "#N —" issue reference form
+    r"(?:#(?P<leading_ref>\d+)\s*[—–—–-]\s*)?"  # optional leading "#N —" with capture
     r"(?P<child_id>C\d+-\d+)"
     r"[:\s]+"               # separator: space(s) or colon+space(s) after child_id
     r"(?P<rest>.+)$"
@@ -207,6 +207,9 @@ def _parse_child_lines(body: str) -> list[dict]:
         rest = m.group("rest").strip()
         is_placeholder = bool(_PLACEHOLDER_RE.search(rest))
         issue_refs = [int(r) for r in _ISSUE_REF_RE.findall(rest)]
+        leading = m.group("leading_ref")
+        if leading and int(leading) not in issue_refs:
+            issue_refs.insert(0, int(leading))
         results.append(
             {
                 "child_id": child_id,

@@ -76,3 +76,9 @@
 - `M1: Foundation Gate (v0.1.x)` の間は、まず基盤整備 Issue を閉じる。
 - `movement + projectile` は `#2` の最小仕様と `#3` の docs 整備を前提に進める。
 - hooks、permission 詳細、skill 実装はそれぞれ専用 Issue で扱う。
+
+## Secret 管理
+
+- Secret Inventory と no-secret 運用境界の正本は `docs/dev/secret-policy.md` を参照する。
+- `VITE_*` 環境変数に sensitive な値を設定しない（client bundle に露出するため）。
+- Secret 発生時は `docs/dev/secret-policy.md` の Decision Gate を通過してから実装を進める。
