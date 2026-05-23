@@ -1,0 +1,19 @@
+# Invalid fixture: manifest_id が asm-<UUIDv4> パターンに違反
+# manifest_id: asm-20260523-001 は旧形式で不正
+schema: agent_session_manifest/v1
+manifest_id: "asm-20260523-001"
+recorded_at: "2026-05-24T10:00:00Z"
+repository: "squne121/loop-protocol"
+head_sha: null
+actor:
+  type: ai_agent
+  name: implementation-worker
+  session_id: "session-001"
+phase:
+  main_loop: impl
+  ledger_phase: implementation
+  phase_instance_id: "issue-243:impl:001"
+redaction:
+  raw_transcript_included: false
+  local_paths_included: false
+  secret_scan_status: not_applicable

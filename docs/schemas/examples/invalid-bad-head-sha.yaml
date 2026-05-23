@@ -1,0 +1,18 @@
+# Invalid fixture: head_sha が 40 hex パターンに違反（短い SHA）
+schema: agent_session_manifest/v1
+manifest_id: "asm-12345678-1234-4123-89ab-123456789abc"
+recorded_at: "2026-05-24T10:00:00Z"
+repository: "squne121/loop-protocol"
+head_sha: "abc1234"
+actor:
+  type: ai_agent
+  name: implementation-worker
+  session_id: null
+phase:
+  main_loop: impl
+  ledger_phase: implementation
+  phase_instance_id: "issue-243:impl:001"
+redaction:
+  raw_transcript_included: false
+  local_paths_included: false
+  secret_scan_status: not_applicable
