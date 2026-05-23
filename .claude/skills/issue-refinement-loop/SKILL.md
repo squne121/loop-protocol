@@ -965,11 +965,6 @@ echo "PASS: Procedure Step 2 no direct Skill call"
 - `docs/dev/agent-skill-boundaries.md` — オーケストレーター設計原則（ORCHESTRATOR_IO_BOUNDARY_V1 / control-plane / LOOP_STATE / 人間承認原則）
 - `docs/dev/github-ops.md` — GitHub 運用ルール（body-file guard / Parent Mode / コメントテンプレ）
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- LOOP_STATE は構造化 YAML のみ（散文サマリで上書きしない）
-- Issue 本文の全文再掲禁止（Issue URL で参照する）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

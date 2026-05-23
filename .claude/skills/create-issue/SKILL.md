@@ -367,10 +367,6 @@ comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idem
 - `.claude/skills/ssot-discovery/SKILL.md` — 関連 SSOT の探索
 - `.github/ISSUE_TEMPLATE/implementation.yml` / `parent.yml` / `research.yml` — Issue Forms 正本
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- 起票した Issue 本文の全文再掲禁止（Issue URL で参照する）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

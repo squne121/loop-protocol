@@ -79,11 +79,6 @@ echo <テキスト>  # stdout への出力のみ
 - 確認できない情報は推測で報告しない
 - 承認なしに Issue 本文を書き換えない（fail-closed）
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 SubAgent の出力は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- Issue 本文の全文再掲禁止（差分提案は diff 形式で最小限に示す）
-- エビデンスは Issue URL / `path:line-line` 参照形式で示す
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

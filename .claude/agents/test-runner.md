@@ -193,12 +193,7 @@ TEST_VERDICT:
 - git 操作（add / commit / push / checkout）
 - AC リストや Verification Commands の推測補完（欠落時は即停止）
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 SubAgent の出力は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- テスト生出力の全文再掲禁止（exit code + 1 行要約で示す）
-- `TEST_VERDICT_MACHINE/v1` の全フィールドは削らない（routing 必須フィールド）
-- `runtime_ac_results` は 5 件まで（超過分は件数のみ）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`TEST_VERDICT_MACHINE/v1` の全フィールドは必ず含める（routing 必須フィールド）。

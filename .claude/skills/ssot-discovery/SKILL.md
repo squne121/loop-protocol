@@ -110,10 +110,6 @@ KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:p
 
 registry が読めない場合は `match-ssot.sh` が `status: failed` を返す。手動キャッシュへのフォールバックは行わない。
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- SSOT マッチ結果は YAML 構造のまま渡す（散文サマリで上書きしない）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

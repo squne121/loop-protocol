@@ -238,11 +238,7 @@ POST_MERGE_CLEANUP_REPORT_V1:
 - `.claude/skills/create-issue/SKILL.md` — follow-up 起票委譲先
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- `POST_MERGE_CLEANUP_REPORT_V1` の全フィールドは削らない（routing 必須フィールド）
-- follow-up Issue 候補リストは 5 件まで（超過分は件数+参照のみ）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`POST_MERGE_CLEANUP_REPORT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

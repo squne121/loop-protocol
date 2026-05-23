@@ -840,7 +840,7 @@ OUTPUT_BUDGET_V1:
 
 ### `escape_hatch` の条件
 
-budger 制約の適用によりブロッキングな知見が伝達不能になる場合は、以下の形式で `NEEDS_EXPANSION` を emit して人間または orchestrator に判断を委ねる。
+budget 制約の適用によりブロッキングな知見が伝達不能になる場合は、以下の形式で `NEEDS_EXPANSION` を emit して人間または orchestrator に判断を委ねる。
 
 ```
 NEEDS_EXPANSION: <topic>

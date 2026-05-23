@@ -210,11 +210,7 @@ IMPLEMENT_RESULT_V1:
 - ルート `CLAUDE.md` + per-directory `CLAUDE.md` — 不変条件の正本
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- `IMPLEMENT_RESULT_V1` の全フィールドは削らない（routing 必須フィールド）
-- diff・コード変更の全文再掲禁止（PR URL で参照する）
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`IMPLEMENT_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

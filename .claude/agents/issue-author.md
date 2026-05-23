@@ -43,11 +43,6 @@ permissionMode: acceptEdits
 - `/tmp/` 以外のリポジトリ内ファイルを作成・編集しない
 - 人間承認なく Issue 本文を書き換えるかどうかは、呼び出し元 skill の Procedure に従う（`create-issue` は guard を全通過時自動起票、`edit-issue` は invoked_as_loop の値や呼び出し元の指示に従う）
 
-## 出力制約（OUTPUT_BUDGET_V1）
+## 出力制約 (OUTPUT_BUDGET_V1)
 
-本 SubAgent の出力は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
-
-- 人間向けサマリは 30 行・2400 文字以内
-- 起票・編集した Issue の本文全文を返答に再掲しない
-- エビデンスは Issue URL / comment URL / `path:line-line` 参照形式で示す
-- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
