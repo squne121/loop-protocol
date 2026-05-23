@@ -13,6 +13,7 @@ disallowedTools:
   - Edit
   - Write
   - MultiEdit
+  - Skill
 skills:
   - review-issue
 ---
@@ -23,7 +24,7 @@ skills:
 
 - **read-only**: Issue の mutation を行わない
 - **loop worker**: `issue-refinement-loop` orchestrator から呼ばれ、結果を返して終了する
-- **skill executor**: `review-issue` skill を `invoked_as_loop: true` 相当で実行する
+- **skill executor**: preload された `review-issue` 手順に従い、`invoked_as_loop: true` 相当の read-only 結果だけを返す。Skill tool は呼び出さない。
 
 ## 入力
 
@@ -58,6 +59,12 @@ REVIEW_ISSUE_RESULT_V1:
   generated_by: review-issue
   issue_url: https://github.com/<owner>/<repo>/issues/<番号>
   verdict: approve | needs-fix
+  failure_class: null | gh_auth | permission_denied | issue_not_found | schema_invalid | unknown  # status: failed 時のみ設定
+  error_summary: null | <エラーの概要>  # status: failed 時のみ設定
+  review_result_ref:
+    kind: agent_transcript | hook_artifact | github_comment
+    ref: null  # path-or-url（取得可能な場合のみ設定、null 可）
+  detail_payload_policy: opaque_ref_only
   deterministic_checks:
     C1_required_sections: pass | fail | n/a
     C2_stop_conditions_6: pass | fail | n/a

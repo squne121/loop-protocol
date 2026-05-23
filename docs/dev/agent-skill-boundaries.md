@@ -327,6 +327,9 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 オーケストレーター（`impl-review-loop` / `issue-refinement-loop`）が保持してよいコンテキストと、保持・処理を禁止するコンテキストを定義する。
 
+> **適用スコープ**: 本 PR（#238 / Issue #227）では `issue-refinement-loop` への適用を完了条件とする。
+> `impl-review-loop` および他 orchestrator skill への適合確認は follow-up Issue の Remaining Parent Gap として扱う。
+
 ### 保持可能コンテキスト（Allowed Context）
 
 オーケストレーターのメインスレッドが LOOP_STATE として保持・参照してよい情報:
@@ -346,6 +349,8 @@ allowed_context:
   - blockers_history      # blockers の要約リスト（構造化データのみ）
   - improvements_applied  # 改善履歴（各 iteration の概要のみ）
   - subagent_result_refs  # SubAgent 結果の参照（GitHub comment URL / issue_url 等）
+  - opaque_forwarding_payload  # SubAgent から後続 SubAgent へ転送する opaque payload
+                               # （routing 判断には使わない。blocking_issues / diff_proposal 等）
 ```
 
 ### 禁止コンテキスト（Forbidden Context）
@@ -356,12 +361,15 @@ allowed_context:
 forbidden_context:
   - raw_issue_body          # Issue 本文の raw テキスト全体
   - raw_pr_diff             # PR の raw diff テキスト
-  - review_details          # review-issue / pr-review-judge の詳細な domain judgment 内容
-  - blocking_issue_details  # blocking_issues の個別テキスト（verdict / status 参照で足りる）
-  - diff_proposal_text      # diff_proposal の add / remove / rewrite テキスト
+  - review_details          # review-issue / pr-review-judge の詳細な domain judgment 内容（routing 判断への使用禁止）
+  - blocking_issue_details  # blocking_issues の個別テキスト（routing 判断に使用禁止。opaque forwarding は allowed_context 参照）
   - code_content            # 実装ファイルのコード内容
   - test_output_raw         # テスト実行の生出力
 ```
+
+> **Note**: `diff_proposal` / `blocking_issues` の内容テキストは routing 判断に使用してはならないが、
+> 後続 SubAgent（`issue-author` 等）への **opaque forwarding payload** として LOOP_STATE に保持・転送することは許可する。
+> orchestrator はこれらの内容を再解釈せず、受け取ったまま転送する（`detail_payload_policy: opaque_ref_only`）。
 
 **禁止の理由**: raw コンテンツをオーケストレーターが直接保持すると以下の問題が生じる。
 
@@ -421,8 +429,9 @@ action: |
 ```yaml
 routing_allowed_fields:
   REVIEW_ISSUE_RESULT_V1:
-    - verdict    # approve | needs-fix
-    - status     # ok | failed
+    - verdict        # approve | needs-fix
+    - status         # ok | failed
+    - failure_class  # gh_auth | permission_denied | issue_not_found | schema_invalid | unknown（status: failed 時のみ）
   TEST_VERDICT_MACHINE/v1:
     - status     # pass | partial | fail
     - summary    # 統計のみ（raw 出力は参照しない）

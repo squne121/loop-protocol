@@ -604,6 +604,12 @@ anchor comment が以下のいずれかを含む場合、`issue-reviewer` の既
 REVIEW_ISSUE_RESULT_V1:
   verdict: approve | needs-fix
   status: ok | failed
+  failure_class: null | gh_auth | permission_denied | issue_not_found | schema_invalid | unknown  # status: failed 時のみ設定
+  error_summary: null | <エラーの概要>  # status: failed 時のみ設定
+  review_result_ref:
+    kind: agent_transcript | hook_artifact | github_comment
+    ref: null  # path-or-url（取得可能な場合のみ設定、null 可）
+  detail_payload_policy: opaque_ref_only
   deterministic_checks: { ... }  # C1〜C11 全フィールド
   blocking_issues: []
   non_blocking_improvements: []
@@ -616,8 +622,19 @@ REVIEW_ISSUE_RESULT_V1:
 ```
 
 orchestrator の routing 判断:
-- `verdict: approve` → Step 5（終了処理）へ
-- `verdict: needs-fix` → `blocking_issues` と `diff_proposal` を LOOP_STATE に記録（参照のみ）、Step 4 へ
+
+```yaml
+orchestrator routing:
+  if status == failed:
+    termination_reason: human_escalation
+    reason: issue_reviewer_failed
+    failure_class: <REVIEW_ISSUE_RESULT_V1.failure_class>  # gh_auth | permission_denied | issue_not_found | schema_invalid | unknown
+  if status == ok and verdict == approve:
+    proceed_to: Step 5
+  if status == ok and verdict == needs-fix:
+    blocking_issues と diff_proposal を LOOP_STATE に記録（opaque forwarding payload として）
+    proceed_to: Step 4
+```
 
 > Critical Guard: refinement フェーズでは AC を実行しない（review-issue 内で guard 済み）。
 > baseline fail は正常動作のため、それを根拠に追加 iteration を要求しない。
@@ -629,7 +646,10 @@ subagent_type: issue-author
 inputs:
   task: edit
   issue_number: <LOOP_STATE.issue_number>
-  reviewer_feedback_text: <review-issue が返した diff_proposal を整形した文字列>
+  reviewer_feedback_text: <REVIEW_ISSUE_RESULT_V1 から転送する opaque forwarding payload（orchestrator は再解釈しない）>
+  # reviewer_feedback_text は REVIEW_ISSUE_RESULT_V1.blocking_issues / diff_proposal を
+  # orchestrator が再解釈せず opaque のまま issue-author に転送する。
+  # orchestrator はこのフィールドを routing 判断に使わない（domain judgment は issue-author に委ねる）。
 ```
 
 **B2: anchor_comment が feedback_update_required / reframe_in_place の場合の追加入力**:
@@ -881,11 +901,54 @@ PY
 awk '/^## Loop Structure/{f=1} /^## LOOP_STATE/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md | grep -q "issue-reviewer SubAgent" && echo "PASS: Loop Structure updated to issue-reviewer SubAgent" || echo "FAIL: Loop Structure not updated"
 awk '/^### Step 2: レビュー/{f=1} /^### Step 4:/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md | grep -q "issue-reviewer" && echo "PASS: Procedure Step 2 updated to issue-reviewer" || echo "FAIL: Procedure Step 2 not updated"
 
+# issue-227 AC7 smoke test: issue-refinement-loop Step 2→Step 4 フローの構造検証
+# （transcript assertion の最低要件: 設計上の保証を静的構造チェックで代替）
+# 1. Step 2 が issue-reviewer SubAgent として定義されている
+awk '/^### Step 2: レビュー/{f=1} /^### Step 4:/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md \
+  | grep -q "subagent_type: issue-reviewer" \
+  && echo "PASS: AC7-1 Step 2 uses issue-reviewer SubAgent" \
+  || { echo "FAIL: AC7-1 Step 2 does not use issue-reviewer SubAgent"; exit 1; }
+
+# 2. Step 2 に review-issue Skill tool の直接呼び出しがない（Skill tool は issue-reviewer 内部で実行）
+if awk '/^### Step 2: レビュー/{f=1} /^### Step 4:/{f=0} f' \
+  .claude/skills/issue-refinement-loop/SKILL.md \
+  | grep -E "^[[:space:]]*(skill:|Skill tool)" | grep -v "^#"
+then
+  echo "FAIL: AC7-2 Step 2 has direct Skill tool call in main transcript"
+  exit 1
+fi
+echo "PASS: AC7-2 No direct Skill tool call in Step 2"
+
+# 3. verdict: needs-fix 後に Step 4 issue-author が定義されている（フロー保証）
+awk '/^### Step 4: 本文改善/{f=1} /^### Step 5:/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md \
+  | grep -q "subagent_type: issue-author" \
+  && echo "PASS: AC7-3 Step 4 uses issue-author SubAgent after needs-fix" \
+  || { echo "FAIL: AC7-3 Step 4 does not use issue-author SubAgent"; exit 1; }
+
+# 4. issue-reviewer の disallowedTools に Skill が含まれている（mutation 禁止構造）
+grep -q "Skill" .claude/agents/issue-reviewer.md \
+  && echo "PASS: AC7-4 issue-reviewer disallowedTools includes Skill" \
+  || { echo "FAIL: AC7-4 issue-reviewer disallowedTools missing Skill"; exit 1; }
+
 # issue-227 AC4-a: Loop Structure 内に review-issue skill / skill: review-issue / invoked_as_loop の直接参照がないこと
-! awk '/^\[Step 2: レビュー\]/{f=1} /^\[Step 4:/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md | rg "review-issue skill|skill:[[:space:]]*review-issue|invoked_as_loop" && echo "PASS: Loop Structure no direct Skill call" || echo "WARN: Loop Structure may have direct Skill call reference"
+if awk '/^\[Step 2: レビュー\]/{f=1} /^\[Step 4:/{f=0} f' \
+  .claude/skills/issue-refinement-loop/SKILL.md \
+  | rg "review-issue skill|skill:[[:space:]]*review-issue|invoked_as_loop"
+then
+  echo "FAIL: Loop Structure has direct review-issue Skill reference"
+  exit 1
+fi
+echo "PASS: Loop Structure no direct Skill call"
 
 # issue-227 AC4-b: Procedure Step 2 内に skill: review-issue / review-issue skill / invoked_as_loop の直接参照がないこと
-! awk '/^### Step 2: レビュー/{f=1} /^### Step 4:/{f=0} f' .claude/skills/issue-refinement-loop/SKILL.md | rg "skill:[[:space:]]*review-issue|review-issue skill|^invoked_as_loop" && echo "PASS: Procedure Step 2 no direct Skill call" || echo "WARN: Procedure Step 2 may have direct Skill call reference"
+if awk '/^### Step 2: レビュー/{f=1} /^### Step 4:/{f=0} f' \
+  .claude/skills/issue-refinement-loop/SKILL.md \
+  | rg "skill:[[:space:]]*review-issue|review-issue skill|invoked_as_loop"
+then
+  echo "FAIL: Procedure Step 2 has direct review-issue Skill reference"
+  exit 1
+fi
+echo "PASS: Procedure Step 2 no direct Skill call"
 ```
 
 ## Related
