@@ -860,6 +860,9 @@ refs: [<url-or-path>]
 Claude Code の hooks を使って SubAgent の開始・終了・結果を自動記録する設計概要。
 **実装は別 Issue で行う**（本 Issue スコープ外）。
 
+hook が記録する metadata の schema は [`docs/schemas/agent-session-manifest.md`](../schemas/agent-session-manifest.md) を参照。
+`agent_session_manifest/v1` が各 phase（`main_loop` / `ledger_phase`）で残すべきフィールドの SSOT。
+
 ### 対象 hook と役割
 
 | hook | タイミング | 役割 | 実装先 |
