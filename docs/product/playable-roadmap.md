@@ -32,7 +32,7 @@ last_updated_by_issue: 148
 | 1 戦闘ごとの sortie を短時間で遊べること | sortie_playable | M2: Gameplay Core (v0.2.x) |
 | プレイヤーは Canvas 上で自機を操作し、戦場へ局所介入する | canvas_player_control | M2: Gameplay Core (v0.2.x) |
 | 戦闘結果は resource として残り、次の強化導線へ接続できること | result_resource_loop | M3: Result Persistence (v0.3.x) / M4: Upgrade Loop (v0.4.x) |
-| UI は DOM、戦闘表示は Canvas に分離すること | dom_canvas_separation | M5: Playable Slice Hardening (v0.5.x) |
+| UI は DOM、戦闘表示は Canvas に分離すること | dom_canvas_separation | M2〜M5 全体の invariant。特に M2/M5 の close_conditions で検証 |
 
 ---
 
@@ -52,13 +52,15 @@ scope: |
   campaign / territory / audio / network / asset polish は除外する。
 dependencies:
   - M1: Foundation Gate (v0.1.x) — docs / guardrail / workflow / 最小仕様正本の整備完了
-  - docs/product/features/movement.md（昇格後）
-  - docs/product/features/projectile.md（昇格後）
+spec_prerequisites:
+  - docs/product/features/movement.md
+  - docs/product/features/projectile.md
 close_conditions:
   - 1 sortie を開始→操作→戦闘結果まで通せる
   - system tests と pnpm build が通る
   - src/systems から DOM / Canvas API を直接触っていない（MVP-001 遵守）
   - 固定タイムステップ 60Hz を維持（MVP-002 遵守）
+  - DOM / Canvas 分離が維持されている（dom_canvas_separation invariant 遵守）
 non_goals:
   - campaign / territory 管理
   - 本格的な audio 実装
@@ -87,7 +89,8 @@ scope: |
   src/storage を通じた snapshot 境界での永続化（MVP-004）に対応する。
 dependencies:
   - M2: Gameplay Core (v0.2.x) — sortie 結果が生成されていること
-  - docs/product/features/sortie.md（昇格後）
+spec_prerequisites:
+  - docs/product/features/sortie.md
 close_conditions:
   - sortie 結果が保存境界を通じて残る
   - reset / reload 後に結果が観測できる
@@ -117,7 +120,8 @@ scope: |
   data-driven な upgrade 定義（src/data 利用、MVP-004）に対応する。
 dependencies:
   - M3: Result Persistence (v0.3.x) — resource 記録が永続化されていること
-  - docs/product/features/resource.md（昇格後）
+spec_prerequisites:
+  - docs/product/features/resource.md
 close_conditions:
   - sortie → resource 獲得 → upgrade → 次 sortie での挙動変化が確認できる
   - upgrade 定義が src/data に存在する（MVP-004 遵守）
@@ -141,10 +145,10 @@ title: "M5: Playable Slice Hardening (v0.5.x)"
 source_mvp_loop:
   - dom_canvas_separation
 scope: |
-  DOM UI / Canvas 戦闘表示の分離を維持しつつ、playable 化を推進する。
+  M2〜M4 で構築した DOM / Canvas 分離を壊さず playable slice を硬化するフェーズ。
   HUD / telemetry / balance / UX hardening を対象とする。
   高品質アセット・本格 audio は除外する。
-  「UI は DOM、戦闘表示は Canvas に分離」MVP Loop の継続的遵守を確認するフェーズ。
+  dom_canvas_separation invariant を M5 完了時点でも維持していることを close_conditions で確認する。
 dependencies:
   - M4: Upgrade Loop (v0.4.x) — M2〜M4 の実装が完了し、一連の loop が成立していること
 close_conditions:
@@ -170,3 +174,12 @@ spec_destination:
 - **GitHub Milestone object の作成は本文書のスコープ外**。この conceptual roadmap を GitHub API で具現化する場合は、別 Issue（change_kind: github-metadata）を切り、`docs/dev/milestone-ops.md` の操作フローに従うこと。
 - **feature spec への昇格**：各 milestone の `spec_destination` に記載した候補は、安定仕様が固まった時点で `docs/product/features/<feature>.md` に昇格させる。昇格前は本文書の記述が暫定スコープ定義として機能する。
 - **非正本の参照元**：本文書の `source_mvp_loop` は `docs/product/game-overview.md` の MVP Loop を参照しているが、`game-overview.md` 自体は要件の正本ではない。要件の正本は `docs/product/requirements.md` とする。
+
+---
+
+## Maintenance Policy
+
+- この文書は conceptual roadmap の正本であり、個別機能仕様の正本ではない。
+- M2〜M5 の Parent Issue が materialize された時点で、対応する issue number を追記する。
+- GitHub Milestone object を作成した場合は `github_milestone_number` を追記し、作成証跡は Issue コメント readback を正本とする。
+- feature spec が作成された後は、詳細仕様は `docs/product/features/<feature>.md` を正本とし、本 roadmap は概要・依存関係・到達条件のみを保持する。
