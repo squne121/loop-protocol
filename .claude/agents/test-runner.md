@@ -93,9 +93,29 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 1. 入力契約の必須情報を確認（欠落時 `INSUFFICIENT_CONTEXT`）
 2. PR 番号があれば mergeable 検知
 3. AC ごとに対応する Verification Commands を確認
-4. 許可コマンドリスト内で順次実行し、各コマンドの exit code・出力を記録
-5. AC ごとに PASS/FAIL を判定
+4. 許可コマンドリスト内で順次実行し、各コマンドの exit code・出力・フォールバックフラグ・証跡ファイルの有無を記録
+5. 各コマンドの結果を以下の分類ロジックで判定する（SKIP / PASS / FAIL を混在させない）
 6. `TEST_VERDICT` YAML + 出力形式（後述）で報告
+
+## 検証コマンド結果の分類ロジック
+
+各検証コマンドの実行結果は以下の基準で分類する。「SKIP は PASS ではない」「フォールバック経由の成功は PASS ではない」。
+
+| 入力 | 分類 | 理由 |
+|---|---|---|
+| exit code 0 かつ上記フラグなし | PASS | 通常成功 |
+| exit code 1 以上（77 以外） | FAIL | 実行失敗 |
+| exit code 77 | SKIP | 実行環境が整っていないため検証を省略。PASS ではない |
+| stdout 先頭が `SKIP:` | SKIP | スクリプトが明示的に省略を宣言。PASS ではない |
+| 結果 JSON に `_*_fallback: true` を含む | FAIL または human_review_required | フォールバック経由の成功は実 CLI 動作を保証しない。PASS ではない |
+| 証跡ファイルが要求されているのに存在しない | FAIL（動作検証 VC の場合） | 動作検証の証跡なしは証明にならない |
+| 全動作検証 VC が SKIP | PARTIAL + human_review_required | 全件未検証の状態であり、Stop Condition に相当 |
+
+> 「この VC が動作検証 VC かどうか」の判断は `issue-contract-review` が contract snapshot に明示する。test-runner はその指示に従い結果を分類するのみ。
+
+### 動作検証 VC スクリプトの artifact 出力について
+
+contract snapshot で「動作検証 VC」として指定されたスクリプトは、worktree-local の `artifacts/` 配下への出力を許可する。test-runner 自体は書き込みを行わないが、VC スクリプトが artifact を生成する場合は実行後に存在を確認して報告する。
 
 ## TEST_VERDICT 報告フォーマット
 
@@ -111,12 +131,27 @@ TEST_VERDICT:
   baseline_only: true | false
   verification_commands_pass: <数値>
   verification_commands_fail: <数値>
+  verification_skipped_count: <数値>
+  runtime_ac_results:
+    - ac: <AC番号>
+      command: "<実行したコマンド>"
+      exit_code: <int>
+      status: pass | fail | skip
+      fallback_detected: true | false
+      artifact_present: true | false | not_required
+      human_review_required: true | false
+      stop_condition_triggered: true | false
+      notes: "<SKIP 理由・fallback 理由・証跡パス等>"
 ```
 ```
 
 **marker**: `<!-- TEST_VERDICT_MACHINE v1 -->` は test-runner が投稿するコメントにのみ含まれる正本マーカー。
 
 **`baseline_only: true` の判定基準**: 全失敗が main ブランチでも再現する既存問題で、PR diff に起因する新規失敗が 0 件である場合のみ true。1 件でも今回差分起因の失敗があれば false。
+
+**`verification_skipped_count`**: exit code 77 または stdout 先頭 `SKIP:` で省略されたコマンドの件数。0 以外の場合は pr-review-judge による追加確認の対象になる。
+
+**`runtime_ac_results`**: contract snapshot で動作検証 VC として指定されたコマンドの詳細結果。動作検証 VC が存在しない場合は空リスト `[]`。
 
 ## 出力形式
 
@@ -125,17 +160,22 @@ TEST_VERDICT:
 
 ### Issue #<N>: <タイトル>
 
-| AC | 確認コマンド | 実行結果（要約） | 判定 |
-|---|---|---|---|
-| AC1 | `pnpm test tests/movement-system.test.ts` | 4 passed | PASS |
-| AC2 | `grep -n "boundary" src/systems/MovementSystem.ts` | found | PASS |
+| AC | 確認コマンド | 実行結果（要約） | exit code | 判定 |
+|---|---|---|---|---|
+| AC1 | `pnpm test tests/movement-system.test.ts` | 4 passed | 0 | PASS |
+| AC2 | `grep -n "boundary" src/systems/MovementSystem.ts` | found | 0 | PASS |
+| AC3 | `bash scripts/verify_acp_roundtrip.sh` | SKIP: jq not found | 77 | SKIP |
 
 ### 総合判定
 - 全 AC PASS: YES / NO
 - FAIL した AC: <なし / AC番号一覧>
+- SKIP した AC: <なし / AC番号一覧>（SKIP は PASS ではない）
+- human_review_required: YES / NO
 
-### FAIL 詳細
-<FAIL が存在する場合のみ、原因と出力を記載>
+### FAIL / SKIP 詳細
+<FAIL または SKIP が存在する場合のみ、原因と出力を記載>
+<exit 77 または SKIP: は「環境不備による省略」として記録。PASS に変換しない>
+<fallback_detected=true は「フォールバック経由の成功」として記録。PASS に変換しない>
 ```
 
 ## 禁止事項
