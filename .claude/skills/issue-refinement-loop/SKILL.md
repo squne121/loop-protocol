@@ -140,8 +140,8 @@ LOOP_STATE を iteration = 0 で初期化。
 #### Step 0-hygiene: stale state label 掃除（state label hygiene）
 
 > **実行タイミング**: この hygiene は、Step 0 で対象 Issue が存在し refinement 続行可能と判断した後に実行する。
-> `state/needs-human` / `state/done` 確認後（ループ停止条件を確認した後）かつ、anchor validation / 分類確定前に行う。
-> 対象 Issue として検証済みかつ refinement 続行が確定した後に実行すること。
+> `state/needs-human` / `state/done` 確認後（ループ停止条件を確認した後）かつ、anchor validation（Step 0a）および mutation 必要性確定後に行う。
+> anchor_comment_url が指定されている場合は Step 0a の issue 所属検証が完了し、本 Issue への refinement 続行が確定した後に実行すること。
 
 対象 Issue に残存する `state/blocked` / `state/queued` を hygiene として削除する。
 これらは AI 着手可否の primary signal ではないため、refinement ループ開始時に除去して stale ラベルを掃除する。
