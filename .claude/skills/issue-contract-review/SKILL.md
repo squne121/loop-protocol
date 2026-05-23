@@ -93,6 +93,38 @@ BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement
 - `file_not_found_unrunnable` 分類時は **BLOCKED** 判定とする（file_not_found_unrunnable → BLOCKED）。
 - `unknown` 分類時は `human_judgment`（自動 GO しない）として人間の判断を求める（unknown → human_judgment）。
 
+### 4.5. 動作検証 AC の実行環境前提チェック
+
+Issue 本文の `## Runtime Verification Applicability` セクションを確認する。
+
+- `decision: not_applicable` が明示されている → 本チェックをスキップ（次へ）
+- セクション自体が存在しない:
+  - implementation issue の場合 → **BLOCKED** または `human_judgment`（fail-closed）
+  - non-implementation / legacy issue の場合 → warning（non-blocking）
+- `decision: deferred` → 本チェックをスキップ（後続 Issue/フェーズで確認）
+- `decision: immediate` → 以下の実行環境前提チェックを実施する
+
+#### decision: immediate の場合の必須確認項目
+
+contract-snapshot に以下がすべて明示されているかを確認する:
+
+| 確認項目 | 判定 |
+|---|---|
+| 動作検証の対象 AC と VC が `applicable_acs` に明示されている | 不在 → BLOCKED |
+| 動作検証に必要な実行環境（CLI ツール名・認証方法・ネットワーク要件等）が記載されている | 不在 → BLOCKED |
+| 実行環境が整っていない場合の停止条件（exit 77 等の SKIP 規約）が記載されている | 不在 → BLOCKED |
+| フォールバック経由の成功を PASS としない旨が明示されている | 不在 → BLOCKED（`_*_fallback: true` は PASS と見なさない原則の確認） |
+| 証跡要件（artifact 出力先・ファイル名パターン等）が記載されている | 不在 → BLOCKED |
+
+上記のいずれかが不足している場合は **BLOCKED** とし、issue comment に不足項目を列挙して `issue-refinement-loop` の起動を人間に提案する。
+
+```bash
+# Issue 本文の Runtime Verification Applicability セクションを確認
+gh issue view <番号> --json body --jq '.body' | grep -A 20 "Runtime Verification Applicability"
+```
+
+> 動作検証の適用判定（immediate / deferred / not_applicable）の詳細規約は `docs/dev/runtime-verification-policy.md` を参照する。本 skill は「contract snapshot に前提が明示されているか」を決定論的に確認するのみ。実環境での動作確認は `implementation-worker` / `test-runner` の責務。
+
 ### 5. AC 検証可能性チェック（決定論的）
 
 | 確認項目 | 判定 |
