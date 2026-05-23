@@ -251,3 +251,8 @@ CONTRACT_REVIEW_RESULT_V1:
 - `.claude/skills/implement-issue/SKILL.md` — `status: go` 時の handoff 先
 - `.claude/skills/ssot-discovery/SKILL.md` — Issue 関連 SSOT の探索
 - `.github/ISSUE_TEMPLATE/implementation.yml` — 必須セクションの正本
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`CONTRACT_REVIEW_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

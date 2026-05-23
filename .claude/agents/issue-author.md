@@ -42,3 +42,7 @@ permissionMode: acceptEdits
 - ファイル編集禁止（`disallowedTools: [Edit, Write, MultiEdit]`）。本文更新は `gh issue edit --body-file` のみ
 - `/tmp/` 以外のリポジトリ内ファイルを作成・編集しない
 - 人間承認なく Issue 本文を書き換えるかどうかは、呼び出し元 skill の Procedure に従う（`create-issue` は guard を全通過時自動起票、`edit-issue` は invoked_as_loop の値や呼び出し元の指示に従う）
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

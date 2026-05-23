@@ -964,3 +964,7 @@ echo "PASS: Procedure Step 2 no direct Skill call"
 - `.claude/agents/issue-author.md` — Step 4 の本文更新者
 - `docs/dev/agent-skill-boundaries.md` — オーケストレーター設計原則（ORCHESTRATOR_IO_BOUNDARY_V1 / control-plane / LOOP_STATE / 人間承認原則）
 - `docs/dev/github-ops.md` — GitHub 運用ルール（body-file guard / Parent Mode / コメントテンプレ）
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

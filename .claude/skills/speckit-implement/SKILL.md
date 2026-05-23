@@ -211,3 +211,7 @@ Note: This command assumes a complete task breakdown exists in tasks.md. If task
         EXECUTE_COMMAND: {command}
         ```
     - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

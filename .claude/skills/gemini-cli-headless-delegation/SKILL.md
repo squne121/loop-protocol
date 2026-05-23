@@ -188,3 +188,7 @@ PY
 - `references/isolated-cwd-rationale.md`（isolated temp cwd の設計根拠）
 - `references/delegation-task-classes.md`（R0/R1/R2/R3 定義と評価マトリクス）
 - `config/model_routing.yaml`（任意オーバーライド設定ファイル）
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

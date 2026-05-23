@@ -366,3 +366,7 @@ comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idem
 - `.claude/skills/issue-contract-review/SKILL.md` — 着手前 contract 確認
 - `.claude/skills/ssot-discovery/SKILL.md` — 関連 SSOT の探索
 - `.github/ISSUE_TEMPLATE/implementation.yml` / `parent.yml` / `research.yml` — Issue Forms 正本
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

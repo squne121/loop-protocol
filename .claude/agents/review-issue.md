@@ -78,3 +78,7 @@ echo <テキスト>  # stdout への出力のみ
 - `gh issue edit --body-file` の前に `wc -c` と `grep -Pn '\\(?:\"|\$)'` を実行し、空/1 byte ファイルと要確認行を表示する。ヒット時は自動続行せず、HEREDOC 由来なら修正し、正当な文字列リテラルなら確認メモを残してから再実行する
 - 確認できない情報は推測で報告しない
 - 承認なしに Issue 本文を書き換えない（fail-closed）
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

@@ -86,3 +86,8 @@ preflight が pass した場合のみ実装フローを継続する。
 - 証跡ファイルを生成しない動作検証 VC（動作検証は artifact への出力を含むべき）
 
 これらは「動作検証が形骸化する構造的欠陥」であり、別 Issue でのスコープ分割または contract の再確認が必要。
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`IMPLEMENT_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

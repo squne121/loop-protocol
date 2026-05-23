@@ -191,3 +191,7 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - `.github/pull_request_template.md` — テンプレート正本（あれば）
 - `docs/dev/schema-governance.md` — schema 定義・Initial Known Schemas・Consumer Inventory 義務の SSOT
 - `scripts/open_pr.py` — 本手順を実装する Python wrapper
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

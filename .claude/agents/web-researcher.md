@@ -117,3 +117,8 @@ fallback route が成功した場合: `status: ok`、`verification_route: direct
 ## Antigravity CLI 互換性ノート
 
 本 SubAgent は `tool_profile: grounded_research` に依存する。Gemini CLI から Antigravity CLI への移行後、`grounded_research` の対応が確認されるまでは同等動作を仮定しない。`grounded_research` が未対応の場合、critical claim は `human_escalation` に倒す。CLI 実装差分は Issue #104 で管理する。wrapper 契約（`delegation_request_v1` JSON + `--request-file` / `--output-file` 引数）を境界とし、本 SubAgent はこの境界の内側を見ない。
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`WEB_RESEARCH_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

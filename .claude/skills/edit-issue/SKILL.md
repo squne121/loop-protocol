@@ -304,3 +304,7 @@ ISSUE_EDIT_RESULT_V1:
 - [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification / Contract block 等の共通ガイドライン
 - `.claude/agents/issue-author.md` — 本 skill を使う「Issue 起票・修正の役割」SubAgent
 - `.claude/skills/review-issue/SKILL.md` — `needs-fix` 結果を本 skill で本文へ反映
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

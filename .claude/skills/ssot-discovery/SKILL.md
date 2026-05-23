@@ -109,3 +109,7 @@ KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:p
 2. `match-ssot.sh` は `docs/dev/ssot-registry.md` を動的に読むため、エントリ追加で自動反映される
 
 registry が読めない場合は `match-ssot.sh` が `status: failed` を返す。手動キャッシュへのフォールバックは行わない。
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
