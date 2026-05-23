@@ -66,20 +66,7 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
    ```
    `ok: false` の場合は委譲を中止し、`failure_reason` を確認して修正する。
 
-   **trusted workspace 失敗の復旧手順（`failure_class: "trusted_workspace_required"`）:**
-
-   preflight smoke および本番委譲コマンドには `--skip-trust` が**既定で付与**されており（Issue #1824）、通常は trust エラーが発生しない。それでも出力 JSON に `failure_class: "trusted_workspace_required"` が含まれる場合は、使用中の Gemini CLI バージョンが `--skip-trust` をサポートしていない可能性がある。以下のフォールバック手順を試すこと:
-
-   ```bash
-   # フォールバック手順（--skip-trust 非対応バージョン用）
-   GEMINI_CLI_TRUST_WORKSPACE=true uv run python3 \
-     .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
-     --output-file tmp/gemini-headless-preflight.json
-   ```
-
-   - `--skip-trust` は `preflight_gemini_headless.py` と `run_gemini_headless.py` の両方に既定で含まれる（Issue #1824）。
-   - `recovery_action` フィールド（JSON 出力）および stdout の `[gemini-preflight] recovery:` 行に復旧手順が machine-readable に含まれる。
-   - `~/.gemini/trustedFolders.json` は exact path matching のみ対応で wildcard 非対応のため、temp dir の信頼付与には使えない。
+   `failure_class: "trusted_workspace_required"` の場合は `--skip-trust` 対応の Gemini CLI バージョンを確認するか `GEMINI_CLI_TRUST_WORKSPACE=true` でフォールバックする（詳細は `references/runtime-portability.md` 参照）。
 
 2. **`delegation_request_v1` JSON を作る**（`references/usage-contract.md` の「Request Contract」を参照）。
 
@@ -92,26 +79,14 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
    - 常に `[gemini-headless] result saved to: <output-file のパス>` が stdout に出力される。
    - orchestrator は `--output-file` の JSON から `result_surface.summary` / `result_surface.primary_artifact` / `result_surface.next_action` を優先して参照し、詳細な long-form evidence が必要な場合だけ `response_text` を読む。
 
-5. **（オプション）GitHub Issue/PR へコメント投稿する**（`post_to_issue_url` が指定された場合のみ）:
-   - `post_to_issue_url` フィールドを request JSON に含める。値は投稿先の GitHub Issue / PR の URL（例: `https://github.com/owner/repo/issues/123` または `https://github.com/owner/repo/pull/456`）。
-   - wrapper（`run_gemini_headless.py`）が自動的に以下を実行する:
-     - Step 4 で `ok: true` かつ `response_text` が存在する場合、内部で以下のコマンドを実行する:
-       ```bash
-       # jq で JSON から response_text を抽出し、投稿本文を準備する
-       RESPONSE=$(jq -r '.response_text' <output-file>)
-       # 実際の投稿経路は wrapper / usage-contract の current 実装を参照する
-       ```
-     - 投稿成功時は `result.json` に `comment_url` フィールドが追加される（例: `https://github.com/owner/repo/issues/123#issuecomment-XXXXXXXXX`）。
-     - 投稿失敗時は `warnings` に失敗理由が追加される。`ok` は変わらない（調査自体は成功）。
-   - **オーケストレーター受取**: `result.json` の `result_surface.primary_artifact` と `result_surface.summary` を記録する。調査結果全文（`response_text`）は detail が必要な場合にだけ読む。
+5. **（オプション）`post_to_issue_url` で GitHub へコメント投稿する**: wrapper 側の書き込み操作（Gemini 側ではない）。`ok: true` かつ `response_text` 存在時に自動投稿し、`result.json` に `comment_url` が追加される。許可 profile・失敗時の warnings 処理は `references/usage-contract.md` 参照。orchestrator は `result_surface.primary_artifact` / `result_surface.summary` を先に参照する。
 
 ## Core Rules
 
 ### Delegation Boundary
-- この skill の delegated 実行は `read-only / report-only / local_asset_research / proposal_only` を想定する。
-- `file write` / `shell edit` / GitHub 書込操作 / `implementation write` は wrapper 契約外のまま維持する。
-- 最終 file edit / shell 実行 / GitHub mutation は caller / orchestrator 側 worker または main thread が保持する。
-- 詳細なフィールド制約・profile ルール・fail-closed 条件は `references/usage-contract.md` を参照。
+- Gemini 側の `file write` / `shell edit` / GitHub mutation は禁止。
+- `post_to_issue_url` は **wrapper 側**の GitHub コメント投稿操作（Gemini 側ではない）。許可 profile での利用可能、詳細は `references/usage-contract.md` 参照。
+- 最終 file edit / shell 実行 / GitHub mutation は caller / orchestrator が保持する。
 
 ### Request Validation
 - `tool_profile` は必ず明示し、暗黙既定を置かない。有効値は `no_tools` / `grounded_research` / `local_asset_research` / `proposal_only` / `github_research` のみ。
@@ -122,62 +97,8 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
 - stderr は破棄せず `warnings` と `stderr` に保持する。
 
 ### Model Routing
-- モデル選択・降格チェーン・role 別優先列の詳細は `references/model-routing.md` を参照。
-- quota 枯渇（429 / `MODEL_CAPACITY_EXHAUSTED` / `RESOURCE_EXHAUSTED`）時は `role` の `model_chain`（または `default_chain`）に沿って下位 model へ自動降格 retry する。chain を使い切ったら fail-closed し、caller-side fallback（直接生成）はその後に発動する。
+- モデル選択・降格チェーン・quota retry・role 別優先列の詳細は `references/model-routing.md` を参照。
 - 明示 `model` 指定時は降格せずその model のみで試行する。
-- `HTTP 429` / `MODEL_CAPACITY_EXHAUSTED` / `RESOURCE_EXHAUSTED` は一時的失敗として扱い、指数バックオフ付きで再試行する。chain を使い切ったら fail-closed（`reason_code: "model_chain_exhausted"`）。
-- 再試行上限超過時は `retry_exhausted` 相当の構造化報告にまとめ、原因・試行回数・各遅延時間・最終状態を明示する。
-
-## local_asset_research runtime smoke
-
-production enablement の acceptance gate として、repo root から以下の手順で runtime smoke を実行できる。
-
-```bash
-# Step 1: preflight で静的設定と trusted workspace / OAuth を確認する
-uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
-  --compact \
-  --output-file tmp/gemini-preflight.json
-# ok: false → failure_reason を確認して Stop Condition として記録する
-uv run python3 - <<'PY'
-import json
-from pathlib import Path
-preflight = json.loads(Path("tmp/gemini-preflight.json").read_text(encoding="utf-8"))
-assert preflight["local_asset_research"]["prompt_stdin_supported"], "long-context stdin route not available"
-PY
-
-# Step 2: local_asset_research smoke fixture を実行する
-uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
-  --request-file .claude/skills/gemini-cli-headless-delegation/tests/fixtures/local_asset_research_smoke_request.json \
-  --output-file tmp/local-asset-smoke.json \
-  --compact
-# ok: false は Stop Condition（外部認証要因）として記録し、実装失敗と混同しない
-
-# Step 3: 結果を機械判定する
-uv run python3 - <<'PY'
-import json
-from pathlib import Path
-r = json.loads(Path('tmp/local-asset-smoke.json').read_text(encoding='utf-8'))
-assert r.get('tool_profile') == 'local_asset_research', f"tool_profile mismatch: {r.get('tool_profile')}"
-if not r.get('ok'):
-    print('STOP_CONDITION: local_asset_research smoke did not pass:', r.get('failure_reason'), r.get('warnings'))
-    raise SystemExit(2)
-response = str(r.get('response_text') or '')
-assert response.strip(), 'response_text is required for successful local_asset_research smoke'
-print('PASS: local_asset_research runtime smoke returned response_text')
-PY
-```
-
-成功時の機械判定基準:
-- `exit_code == 0` かつ `ok == true`
-- `tool_profile == "local_asset_research"`
-- `response_text` が非空文字列
-
-`ok: false` の場合は実装失敗ではなく外部認証要因（trusted workspace 未成立、OAuth credential 不足）の Stop Condition として扱い、`failure_reason` / `warnings` を記録する。
-
-## Verification
-- `python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py --output-file tmp/gemini-headless-preflight.json`
-- `python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py --request-file <request.json> --output-file <result.json>`
-- `git diff --check`
 
 ## References
 - `references/model-routing.md`（model routing スキーマ・role テーブル・reason_code 一覧・解決順）
