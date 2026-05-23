@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -422,6 +423,21 @@ def _strip_verbose_subfields(result: dict[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+def _make_next_action(argv: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build a next_action dict with env, argv, and command fields.
+
+    command is shlex.join(argv); when env is non-empty, env var assignments are
+    prepended as 'KEY=value' tokens so the resulting command string is copy-pasteable.
+    """
+    cmd = shlex.join(argv)
+    if env:
+        env_prefix = " ".join(
+            f"{k}={shlex.quote(v)}" for k, v in env.items()
+        )
+        cmd = f"{env_prefix} {cmd}"
+    return {"env": env or {}, "argv": argv, "command": cmd}
+
+
 def _build_next_action(result: dict[str, Any]) -> dict[str, Any]:
     """Build the next_action field for all results.
 
@@ -430,15 +446,32 @@ def _build_next_action(result: dict[str, Any]) -> dict[str, Any]:
     """
     failure_class = result.get("failure_class")
     if failure_class == "trusted_workspace_required":
-        argv = ["setup_check.py", "--json", "--fix"]
-        return {"argv": argv, "command": " ".join(argv)}
+        # B1: next_action must re-run preflight with GEMINI_CLI_TRUST_WORKSPACE=true,
+        # not point to setup_check --fix. Use shlex.join (B7) and include env prefix.
+        return _make_next_action(
+            argv=[
+                "uv", "run", "python3",
+                ".claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py",
+                "--json",
+            ],
+            env={"GEMINI_CLI_TRUST_WORKSPACE": "true"},
+        )
     if result.get("ok"):
         # Success: suggest running the delegation wrapper.
-        argv = ["run_gemini_headless.py", "--request-file", "<request.json>", "--output-file", "<result.json>"]
-        return {"argv": argv, "command": " ".join(argv)}
+        argv = [
+            "uv", "run", "python3",
+            "run_gemini_headless.py",
+            "--request-file", "<request.json>",
+            "--output-file", "<result.json>",
+        ]
+        return _make_next_action(argv)
     # Generic failure: suggest re-running preflight after fixing the issue.
-    argv = ["preflight_gemini_headless.py", "--output-file", "tmp/preflight.json"]
-    return {"argv": argv, "command": " ".join(argv)}
+    argv = [
+        "uv", "run", "python3",
+        ".claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py",
+        "--output-file", "tmp/preflight.json",
+    ]
+    return _make_next_action(argv)
 
 
 def _inject_next_action(result: dict[str, Any]) -> dict[str, Any]:

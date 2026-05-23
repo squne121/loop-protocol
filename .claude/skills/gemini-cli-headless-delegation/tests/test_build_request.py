@@ -168,7 +168,7 @@ def test_build_request_invalid_profile_failure_json(tmp_path):
 def test_build_request_missing_context_file_failure_json(tmp_path):
     """GIVEN a missing context file
     WHEN build_request.py is called
-    THEN failure JSON contains failure_class=missing_context_file and next_action."""
+    THEN failure JSON contains failure_class=context_file_missing and next_action."""
     br = load_build_request()
 
     output = tmp_path / "failure.json"
@@ -186,11 +186,247 @@ def test_build_request_missing_context_file_failure_json(tmp_path):
     assert output.exists()
 
     result = json.loads(output.read_text(encoding="utf-8"))
-    assert result.get("failure_class") == "missing_context_file"
+    # B2: failure_class must be 'context_file_missing' (not 'missing_context_file')
+    assert result.get("failure_class") == "context_file_missing", (
+        f"Expected 'context_file_missing', got: {result.get('failure_class')}"
+    )
     assert "failure_reason" in result
     assert "next_action" in result
     assert "argv" in result["next_action"]
     assert "command" in result["next_action"]
+
+
+# ---------------------------------------------------------------------------
+# B2: failure_class must be 'context_file_missing' (canonical name from contract)
+# ---------------------------------------------------------------------------
+
+
+def test_build_request_missing_context_file_uses_canonical_failure_class(tmp_path):
+    """GIVEN a context file path that does not exist
+    WHEN build_request.py is called
+    THEN failure_class is exactly 'context_file_missing' (not 'missing_context_file')."""
+    br = load_build_request()
+
+    output = tmp_path / "failure.json"
+    br.build_request(
+        profile="github_research",
+        objective="Investigate the PR history for regressions via gh pr list",
+        instructions=None,
+        context_files=["/nonexistent/path/to/context.md"],
+        gh_pr=None,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result.get("failure_class") == "context_file_missing", (
+        f"Expected failure_class='context_file_missing', got: {result.get('failure_class')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B3: next_action.argv must be a complete runnable command
+# ---------------------------------------------------------------------------
+
+
+def test_build_request_missing_context_next_action_argv_complete(tmp_path):
+    """GIVEN a missing context file
+    WHEN build_request.py produces a failure JSON
+    THEN next_action.argv is a complete runnable command including --profile, --objective, --output."""
+    br = load_build_request()
+
+    output = tmp_path / "failure.json"
+    br.build_request(
+        profile="no_tools",
+        objective="Summarize the build failure",
+        instructions=None,
+        context_files=[str(tmp_path / "nonexistent.md")],
+        gh_pr=None,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    result = json.loads(output.read_text(encoding="utf-8"))
+    argv = result["next_action"]["argv"]
+    argv_str = " ".join(argv)
+    assert "--profile" in argv_str, f"--profile missing from next_action.argv: {argv}"
+    assert "--objective" in argv_str, f"--objective missing from next_action.argv: {argv}"
+    assert "--output" in argv_str, f"--output missing from next_action.argv: {argv}"
+    assert "--context-file" in argv_str, f"--context-file missing from next_action.argv: {argv}"
+
+
+# ---------------------------------------------------------------------------
+# B4: --instruction fail-closed when count < 2 (explicit specification required)
+# ---------------------------------------------------------------------------
+
+
+def test_build_request_single_instruction_fails_closed(tmp_path):
+    """GIVEN --instruction is specified exactly once
+    WHEN build_request.py is called
+    THEN it fails with failure_class='validation_error' (fail-closed)."""
+    br = load_build_request()
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "failure.json"
+
+    exit_code = br.build_request(
+        profile="github_research",
+        objective="Investigate the PR history via gh pr list",
+        instructions=["one instruction only"],
+        context_files=[str(context_file)],
+        gh_pr=None,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code != 0, "Expected non-zero exit when --instruction provided only once"
+    assert output.exists()
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result.get("failure_class") == "validation_error", (
+        f"Expected 'validation_error', got: {result.get('failure_class')!r}"
+    )
+    assert "--instruction must be specified at least twice" in result.get("failure_reason", ""), (
+        f"Expected instruction count message, got: {result.get('failure_reason')!r}"
+    )
+
+
+def test_build_request_zero_instructions_uses_defaults(tmp_path, monkeypatch):
+    """GIVEN --instruction is not specified (None)
+    WHEN build_request.py is called
+    THEN profile defaults are used (no error)."""
+    br = load_build_request()
+    rgh = load_run_gemini_headless()
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "request.json"
+
+    exit_code = br.build_request(
+        profile="github_research",
+        objective="Investigate the PR history for regressions via gh pr list",
+        instructions=None,  # not provided → use defaults
+        context_files=[str(context_file)],
+        gh_pr=None,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code == 0, f"Expected success when instructions=None; got exit {exit_code}"
+
+
+def test_build_request_two_instructions_succeeds(tmp_path, monkeypatch):
+    """GIVEN --instruction is specified twice
+    WHEN build_request.py is called
+    THEN it succeeds (no fail-closed error)."""
+    br = load_build_request()
+    rgh = load_run_gemini_headless()
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "request.json"
+
+    exit_code = br.build_request(
+        profile="github_research",
+        objective="Investigate the PR history for regressions via gh pr list",
+        instructions=["First instruction here.", "Second instruction here."],
+        context_files=[str(context_file)],
+        gh_pr=None,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code == 0, f"Expected success with 2 instructions; got exit {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# B5: --gh-pr / --gh-issue only allowed with github_research profile
+# ---------------------------------------------------------------------------
+
+
+def test_build_request_gh_issue_rejected_for_non_github_research(tmp_path):
+    """GIVEN --gh-issue is specified with a non-github_research profile
+    WHEN build_request.py is called
+    THEN it fails with failure_class='validation_error'."""
+    br = load_build_request()
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "failure.json"
+
+    exit_code = br.build_request(
+        profile="no_tools",
+        objective="Summarize the context file for testing purposes",
+        instructions=None,
+        context_files=[str(context_file)],
+        gh_pr=None,
+        gh_issue=313,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code != 0, "Expected failure when gh_issue used with non-github_research profile"
+    assert output.exists()
+
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result.get("failure_class") == "validation_error", (
+        f"Expected 'validation_error', got: {result.get('failure_class')!r}"
+    )
+    assert "gh_commands" in result.get("failure_reason", "") or "gh-pr" in result.get("failure_reason", "") or "github_research" in result.get("failure_reason", ""), (
+        f"Expected profile restriction message, got: {result.get('failure_reason')!r}"
+    )
+
+
+def test_build_request_gh_pr_rejected_for_non_github_research(tmp_path):
+    """GIVEN --gh-pr is specified with grounded_research profile
+    WHEN build_request.py is called
+    THEN it fails with failure_class='validation_error'."""
+    br = load_build_request()
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "failure.json"
+
+    exit_code = br.build_request(
+        profile="grounded_research",
+        objective="Investigate the search results for regression patterns",
+        instructions=None,
+        context_files=[str(context_file)],
+        gh_pr=321,
+        gh_issue=None,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code != 0, "Expected failure when gh_pr used with grounded_research profile"
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result.get("failure_class") == "validation_error"
+
+
+def test_build_request_gh_issue_allowed_for_github_research(tmp_path, monkeypatch):
+    """GIVEN --gh-issue is specified with github_research profile
+    WHEN build_request.py is called
+    THEN it succeeds."""
+    br = load_build_request()
+    rgh = load_run_gemini_headless()
+    monkeypatch.setattr(rgh, "_validate_local_asset_research_settings", lambda: [])
+
+    context_file = tmp_path / "context.md"
+    context_file.write_text("test context", encoding="utf-8")
+    output = tmp_path / "request.json"
+
+    exit_code = br.build_request(
+        profile="github_research",
+        objective="Investigate the PR history for regressions via gh issue view",
+        instructions=None,
+        context_files=[str(context_file)],
+        gh_pr=None,
+        gh_issue=313,
+        output=output,
+        base_dir=tmp_path,
+    )
+    assert exit_code == 0, f"Expected success for github_research + gh_issue; got exit {exit_code}"
 
 
 # ---------------------------------------------------------------------------

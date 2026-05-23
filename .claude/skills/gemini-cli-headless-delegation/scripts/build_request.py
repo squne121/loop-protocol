@@ -126,6 +126,40 @@ def _write_failure(
 
 
 # ---------------------------------------------------------------------------
+# Command-line reconstruction helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_full_argv(
+    profile: str,
+    objective: str,
+    instructions: list[str] | None,
+    context_file: str,
+    output: Path | None,
+) -> list[str]:
+    """Build the full argv needed to re-run build_request.py with given args.
+
+    Used for next_action.argv in failure JSON so callers can retry the complete
+    command rather than a stub (B3).
+    """
+    argv = [
+        "uv", "run", "python3",
+        ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py",
+    ]
+    if profile:
+        argv += ["--profile", profile]
+    if objective:
+        argv += ["--objective", objective]
+    if instructions:
+        for inst in instructions:
+            argv += ["--instruction", inst]
+    argv += ["--context-file", context_file]
+    if output is not None:
+        argv += ["--output", str(output)]
+    return argv
+
+
+# ---------------------------------------------------------------------------
 # Context file resolution
 # ---------------------------------------------------------------------------
 
@@ -134,6 +168,9 @@ def _resolve_context_files(
     raw_paths: list[str],
     base_dir: Path,
     output: Path | None,
+    profile: str = "",
+    objective: str = "",
+    instructions: list[str] | None = None,
 ) -> list[str] | None:
     """Resolve context files to absolute paths. Returns None on failure."""
     resolved: list[str] = []
@@ -144,19 +181,34 @@ def _resolve_context_files(
         else:
             p = p.resolve()
         if not p.exists():
+            # B2: use failure_class='context_file_missing' (matches Issue #313 contract)
+            # B3: include complete argv so callers can re-run the full command
             _write_failure(
                 output=output,
-                failure_class="missing_context_file",
+                failure_class="context_file_missing",
                 failure_reason=f"context file not found: {raw} (resolved: {p})",
-                next_action_argv=["build_request.py", "--context-file", str(p)],
+                next_action_argv=_build_full_argv(
+                    profile=profile,
+                    objective=objective,
+                    instructions=instructions,
+                    context_file=str(p),
+                    output=output,
+                ),
             )
             return None
         if not p.is_file():
+            # B2/B3: same fix for is-not-a-file case
             _write_failure(
                 output=output,
-                failure_class="missing_context_file",
+                failure_class="context_file_missing",
                 failure_reason=f"context file is not a regular file: {raw} (resolved: {p})",
-                next_action_argv=["build_request.py", "--context-file", str(p)],
+                next_action_argv=_build_full_argv(
+                    profile=profile,
+                    objective=objective,
+                    instructions=instructions,
+                    context_file=str(p),
+                    output=output,
+                ),
             )
             return None
         resolved.append(str(p))
@@ -194,32 +246,79 @@ def build_request(
     # Resolve base dir for relative context file paths
     cwd = base_dir or Path.cwd()
 
+    # B5: --gh-pr / --gh-issue are only allowed with github_research profile.
+    if (gh_pr is not None or gh_issue is not None) and profile != "github_research":
+        _write_failure(
+            output=output,
+            failure_class="validation_error",
+            failure_reason=(
+                f"--gh-pr/--gh-issue (gh_commands) are only supported with github_research profile, got: {profile}"
+            ),
+            next_action_argv=_build_full_argv(
+                profile="github_research",
+                objective=objective,
+                instructions=instructions,
+                context_file="<context-file>",
+                output=output,
+            ),
+        )
+        return 1
+
+    # B4: --instruction fail-closed when explicitly provided but count < 2.
+    # When instructions is None, use profile defaults (OK).
+    # When instructions is explicitly provided (non-None), require >= 2 entries.
+    if instructions is not None and len(instructions) < 2:
+        _write_failure(
+            output=output,
+            failure_class="validation_error",
+            failure_reason="--instruction must be specified at least twice when provided explicitly",
+            next_action_argv=_build_full_argv(
+                profile=profile,
+                objective=objective,
+                instructions=instructions,
+                context_file="<context-file>",
+                output=output,
+            ),
+        )
+        return 1
+
     # Resolve context_files
     raw_context = context_files or []
     if not raw_context:
         _write_failure(
             output=output,
-            failure_class="missing_context_file",
+            failure_class="context_file_missing",
             failure_reason=(
                 "context_files is required (at least 1 file must be specified). "
                 "Use --context-file <path> to add a context file."
             ),
-            next_action_argv=["build_request.py", "--profile", profile, "--objective", objective, "--context-file", "<path>"],
+            next_action_argv=_build_full_argv(
+                profile=profile,
+                objective=objective,
+                instructions=instructions,
+                context_file="<path>",
+                output=output,
+            ),
         )
         return 1
-    resolved_context = _resolve_context_files(raw_paths=raw_context, base_dir=cwd, output=output)
+    resolved_context = _resolve_context_files(
+        raw_paths=raw_context,
+        base_dir=cwd,
+        output=output,
+        profile=profile,
+        objective=objective,
+        instructions=instructions,
+    )
     if resolved_context is None:
         return 1
 
-    # Resolve instructions
-    effective_instructions = instructions if instructions else DEFAULT_INSTRUCTIONS_BY_PROFILE[profile]
-    if len(effective_instructions) < 2:
-        effective_instructions = effective_instructions + ["Provide detailed evidence for each finding."]
+    # Resolve instructions: use profile defaults when not explicitly provided.
+    effective_instructions = instructions if instructions is not None else DEFAULT_INSTRUCTIONS_BY_PROFILE[profile]
 
     # Resolve output sections
     output_sections = DEFAULT_OUTPUT_SECTIONS_BY_PROFILE[profile]
 
-    # Build gh_commands if gh-pr or gh-issue specified
+    # Build gh_commands if gh-pr or gh-issue specified (only for github_research — already validated above)
     gh_commands: list[dict[str, list[str]]] | None = None
     if gh_pr is not None or gh_issue is not None:
         gh_commands = []

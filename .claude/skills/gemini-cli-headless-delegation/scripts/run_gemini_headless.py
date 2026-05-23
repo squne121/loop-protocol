@@ -738,6 +738,28 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
     return errors
 
 
+_POST_TO_ISSUE_URL_PATTERN = re.compile(
+    r'^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+/issues/\d+$'
+)
+
+
+def _validate_post_to_issue_url(url: str) -> list[str]:
+    """Validate post_to_issue_url format.
+
+    B6: Only https://github.com/<owner>/<repo>/issues/<number> is allowed.
+    - host must be github.com (no host spoof)
+    - path must be /issues/<number>, not /pulls/<number>
+    """
+    if not isinstance(url, str) or not url.strip():
+        return ["post_to_issue_url must be a non-empty string when provided"]
+    if not _POST_TO_ISSUE_URL_PATTERN.match(url):
+        return [
+            "post_to_issue_url must match https://github.com/<owner>/<repo>/issues/<number>; "
+            "pulls/<number> and non-github.com hosts are not allowed"
+        ]
+    return []
+
+
 def validate_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
     errors: list[str] = []
 
@@ -764,6 +786,11 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
         errors.extend(_validate_proposal_only_request(request))
     elif tool_profile == GITHUB_RESEARCH_PROFILE:
         errors.extend(_validate_github_research_request(request))
+
+    # B6: validate post_to_issue_url format when present (any profile).
+    post_to_issue_url = request.get("post_to_issue_url")
+    if post_to_issue_url:
+        errors.extend(_validate_post_to_issue_url(post_to_issue_url))
 
     errors.extend(_validate_string_list("output_sections", request.get("output_sections"), 1))
     if tool_profile == PROPOSAL_ONLY_PROFILE:
