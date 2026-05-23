@@ -85,6 +85,7 @@ LOOP_STATE:
   last_verdict: approve | needs-fix | null
   blockers_history: []
   improvements_applied: []  # iteration ごとの「修正サマリ」
+  removed_state_labels: []  # Step 0-hygiene で削除した state ラベルのリスト（state/blocked / state/queued 等）
   termination_reason: null | approved | max_iterations | human_escalation | superseded_by_decision
   anchor_comment:
     url: null
@@ -138,9 +139,14 @@ LOOP_STATE を iteration = 0 で初期化。
 
 #### Step 0-hygiene: stale state label 掃除（state label hygiene）
 
+> **実行タイミング**: この hygiene は、Step 0 で対象 Issue が存在し refinement 続行可能と判断した後に実行する。
+> `state/needs-human` / `state/done` 確認後（ループ停止条件を確認した後）かつ、anchor validation / 分類確定前に行う。
+> 対象 Issue として検証済みかつ refinement 続行が確定した後に実行すること。
+
 対象 Issue に残存する `state/blocked` / `state/queued` を hygiene として削除する。
 これらは AI 着手可否の primary signal ではないため、refinement ループ開始時に除去して stale ラベルを掃除する。
 代替ラベルは付与しない（`state/queued` を自動付与しない）。
+削除したラベルは `LOOP_STATE.removed_state_labels` に記録する。
 
 ```bash
 REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
@@ -148,23 +154,31 @@ REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 # 現在のラベルを取得
 labels_json=$(gh issue view <issue_number> --repo "$REPO_FULL_NAME" --json labels --jq '.labels | map(.name)')
 
+removed_labels=()
+
 # state/blocked が付いていれば remove-label state/blocked
 if echo "$labels_json" | jq -e '.[] | select(. == "state/blocked")' > /dev/null 2>&1; then
   gh issue edit <issue_number> --repo "$REPO_FULL_NAME" --remove-label "state/blocked"
   echo "[hygiene] removed stale label: state/blocked"
+  removed_labels+=("state/blocked")
 fi
 
 # state/queued が付いていれば remove-label state/queued
 if echo "$labels_json" | jq -e '.[] | select(. == "state/queued")' > /dev/null 2>&1; then
   gh issue edit <issue_number> --repo "$REPO_FULL_NAME" --remove-label "state/queued"
   echo "[hygiene] removed stale label: state/queued"
+  removed_labels+=("state/queued")
 fi
+
+# LOOP_STATE.removed_state_labels に記録する（空配列でも記録）
+# LOOP_STATE.removed_state_labels = removed_labels
 ```
 
 **制約**:
-- 削除のみ行う（代替ラベルを付与しない。`state/queued` を自動付与しない）。
+- 削除のみ行う（代替ラベルは付与しない。`state/queued` を自動付与しない）。
 - `state/needs-human` / `state/done` / `state/in-progress` は対象外（変更しない）。
 - 対象ラベルが存在しない場合はスキップ（エラーにしない）。
+- 削除したラベルは `LOOP_STATE.removed_state_labels` に記録する（空配列でも記録）。
 
 #### Step 0a: anchor_comment_url の取得と issue 所属検証（`anchor_comment_url` 指定時のみ）
 

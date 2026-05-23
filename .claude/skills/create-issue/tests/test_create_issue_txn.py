@@ -326,11 +326,13 @@ class TestResolveLables:
     """AC8/AC9/AC10: standard label auto-assignment for implementation kind only."""
 
     def test_implementation_kind_prepends_standard_labels(self) -> None:
-        """AC8/AC10: implementation kind adds all 4 standard labels."""
+        """AC8/AC10: implementation kind adds all 3 standard labels (state/queued removed)."""
         result = txn._resolve_labels([], "implementation")
         for label in txn._IMPLEMENTATION_STANDARD_LABELS:
             assert label in result, f"Expected '{label}' in result"
         assert len(result) == len(txn._IMPLEMENTATION_STANDARD_LABELS)
+        # state/queued must NOT be in standard labels (deprecated, #211)
+        assert "state/queued" not in result
 
     def test_implementation_kind_merges_caller_labels(self) -> None:
         """AC8: caller labels are preserved alongside standard labels."""
@@ -340,9 +342,13 @@ class TestResolveLables:
         assert "custom-label" in result
 
     def test_implementation_kind_no_duplicate_standard_labels(self) -> None:
-        """AC8: no duplicates when caller already provides a standard label."""
-        result = txn._resolve_labels(["state/queued"], "implementation")
-        assert result.count("state/queued") == 1
+        """AC8: no duplicates when caller provides a non-standard label."""
+        result = txn._resolve_labels(["phase/implementation"], "implementation")
+        assert result.count("phase/implementation") == 1
+
+    def test_state_queued_not_in_standard_labels(self) -> None:
+        """state/queued must NOT be in _IMPLEMENTATION_STANDARD_LABELS (deprecated, #211)."""
+        assert "state/queued" not in txn._IMPLEMENTATION_STANDARD_LABELS
 
     def test_research_kind_does_not_add_standard_labels(self) -> None:
         """AC9/AC10: research kind must NOT trigger label auto-assign."""
@@ -461,7 +467,8 @@ class TestRetryDelaysContract:
 
     def test_implementation_standard_labels_are_defined(self) -> None:
         assert hasattr(txn, "_IMPLEMENTATION_STANDARD_LABELS")
-        expected = {"state/queued", "phase/implementation", "agent/implementer", "enhancement"}
+        # state/queued removed in #211 (deprecated label, not a primary signal for AI readiness)
+        expected = {"phase/implementation", "agent/implementer", "enhancement"}
         assert set(txn._IMPLEMENTATION_STANDARD_LABELS) == expected
 
 

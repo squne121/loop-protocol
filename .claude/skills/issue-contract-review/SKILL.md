@@ -127,7 +127,10 @@ CONTRACT_REVIEW_RESULT_V1:
   issue_url: https://github.com/<owner>/<repo>/issues/<番号>
   checks:
     template_compliance: pass | fail
-    state_check: pass | warning  # warning = state/queued 不在・state/blocked 残存（着手を blocking しない）
+    # state_label: ok | warning（non-blocking）
+    # ok = state ラベルに問題なし
+    # warning = state/queued 不在・state/blocked 残存（着手を blocking しない）
+    state_label: ok | warning（non-blocking）
     allowed_paths_present: pass | fail
     vc_present: pass | fail
     stop_conditions_complete: pass | fail | n/a

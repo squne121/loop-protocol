@@ -59,10 +59,30 @@ fi
 issue_body=$("${GH_BIN}" issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
 
 fallback_blockers=()
+
+# Pattern 1: inline "Depends on #N" (case-insensitive)
 while IFS= read -r num; do
   [[ -z "$num" ]] && continue
   fallback_blockers+=("$num")
 done < <(echo "$issue_body" | grep -oP '(?i)Depends on #\K[0-9]+' || true)
+
+# Pattern 2: "## Depends On" section — lines starting with "- #N" or "* #N"
+in_depends_section=false
+while IFS= read -r line; do
+  if echo "$line" | grep -qiP '^\s*#{1,6}\s+Depends\s+On\s*$'; then
+    in_depends_section=true
+    continue
+  fi
+  # Stop at the next heading
+  if $in_depends_section && echo "$line" | grep -qP '^\s*#'; then
+    in_depends_section=false
+  fi
+  if $in_depends_section; then
+    num=$(echo "$line" | grep -oP '(?<=[-*]\s+#)[0-9]+' || true)
+    [[ -z "$num" ]] && continue
+    fallback_blockers+=("$num")
+  fi
+done < <(echo "$issue_body")
 
 # ---------- 3. native API 失敗時の処理 ----------
 if $native_api_failed; then
