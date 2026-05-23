@@ -286,13 +286,13 @@ ISSUE_EDIT_RESULT_V1:
 
 ## Delivery-rollup Parent Body Update Mode
 
-`CHILD_MATERIALIZATION_PLAN_V1` の `parent_body_updates` を使って、delivery-rollup parent の body drift（`(未起票)` placeholder が残ったまま）を修正するための特化手順。通常の edit-issue フロー（backup / guard / rollback）をそのまま踏む。
+`CHILD_MATERIALIZATION_PLAN_V2` の `parent_body_updates` を使って、delivery-rollup parent の body drift（`(未起票)` placeholder が残ったまま）を修正するための特化手順。通常の edit-issue フロー（backup / guard / rollback）をそのまま踏む。
 
 ### 入力
 
 ```yaml
 edit_mode: delivery-rollup-parent-update
-input: CHILD_MATERIALIZATION_PLAN_V1   # plan_child_materialization.py の出力
+input: CHILD_MATERIALIZATION_PLAN_V2   # plan_child_materialization.py の出力
 ```
 
 ### 手順
@@ -314,7 +314,7 @@ input: CHILD_MATERIALIZATION_PLAN_V1   # plan_child_materialization.py の出力
 
 5. 通常手順のステップ 5（`gh issue edit --body-file`）を実行する。失敗時は `rollback_issue_edit()` で復元。
 
-6. 通常手順のステップ 6（変更経緯コメント投稿）を実行する。コメントには `CHILD_MATERIALIZATION_PLAN_V1` の `required_issue_edits` サマリを含める。
+6. 通常手順のステップ 6（変更経緯コメント投稿）を実行する。コメントには `CHILD_MATERIALIZATION_PLAN_V2` の `required_issue_edits` サマリを含める。
 
 ### 制約
 

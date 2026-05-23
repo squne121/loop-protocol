@@ -190,7 +190,7 @@ if [ "$PARENT_MODE" = "delivery-rollup" ]; then
 fi
 ```
 
-`CHILD_MATERIALIZATION_PLAN_V1.children` の各エントリを処理する:
+`CHILD_MATERIALIZATION_PLAN_V2.children` の各エントリを処理する:
 
 | action | 処理 |
 |---|---|
@@ -199,8 +199,8 @@ fi
 | `no_op` | スキップ |
 | `human_escalation` | `warnings` に記録し `human_review_required: true` で返す |
 
-`FOLLOW_UP_ISSUE_REQUEST_V1` の `dedupe_key` は `CHILD_MATERIALIZATION_PLAN_V1.children[*].dedupe_key` を使用する。
-スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V1`
+`FOLLOW_UP_ISSUE_REQUEST_V1` の `dedupe_key` は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する。
+スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
 
 ### 7. Stash の復帰
 

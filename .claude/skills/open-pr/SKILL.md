@@ -125,7 +125,7 @@ PR 本文に追加する `## Parent Child Materialization` セクションのテ
 - child_materialization_plan: pass | pending | n/a
 - unresolved_children: <C254-3, C254-4, ... | なし>
 
-<CHILD_MATERIALIZATION_PLAN_V1 の summary（missing / stale_body_only エントリのみ列挙）>
+<CHILD_MATERIALIZATION_PLAN_V2 の summary（missing / stale_body_only エントリのみ列挙）>
 ```
 
 - `child_materialization_plan: pass` — 全 child が `existing` または `no_op`

@@ -200,7 +200,7 @@ child PR マージ
   ↓
 post-merge-cleanup Section 6a:
   plan_child_materialization.py --repo ... --issue <parent>
-  → CHILD_MATERIALIZATION_PLAN_V1
+  → CHILD_MATERIALIZATION_PLAN_V2
     → missing children → follow_up_issue_requests (optional_follow_up)
     → stale_body_only → edit-issue (delivery-rollup-parent-update mode)
     → human_escalation → human_review_required: true
@@ -217,13 +217,13 @@ uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py
   --issue <parent_issue_number>
 ```
 
-スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V1`
+スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
 
 ### skill 別の責務
 
 | skill / SubAgent | delivery-rollup 特有の責務 |
 |---|---|
-| `create-issue` | `CHILD_MATERIALIZATION_PLAN_V1` の `action=create_issue` を `create_issue_txn.py` 経由で materialize する |
+| `create-issue` | `CHILD_MATERIALIZATION_PLAN_V2` の `action=create_issue` を `create_issue_txn.py` 経由で materialize する |
 | `edit-issue` | `parent_body_updates` を backup / guard / rollback 付きで適用する（`delivery-rollup-parent-update` mode） |
 | `issue-refinement-loop` | delivery-rollup parent approve 前に child materialization gate を実行する（Step 4.5） |
 | `impl-review-loop` Step 5 | APPROVE 前に delivery-rollup parent の残り child を `mandatory_follow_up` として処理する |

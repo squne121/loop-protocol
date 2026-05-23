@@ -756,13 +756,13 @@ delivery_rollup_gate:
 
 **判定フロー**:
 
-1. `plan_child_materialization.py` を実行して `CHILD_MATERIALIZATION_PLAN_V1` を取得する（read-only）。
+1. `plan_child_materialization.py` を実行して `CHILD_MATERIALIZATION_PLAN_V2` を取得する（read-only）。
 2. `action: create_issue` のエントリが存在する場合:
    - `mandatory_follow_up` として `FOLLOW_UP_ISSUE_REQUEST_V1` を生成する
    - `severity: mandatory_follow_up` のため、APPROVE 確定前に materialize が必要
    - main thread が `issue-author` / `create-issue` 経由で起票する
 3. `action: reuse_and_update_parent` のエントリが存在する場合:
-   - `edit-issue` skill の `delivery-rollup-parent-update` mode に `CHILD_MATERIALIZATION_PLAN_V1` を渡して parent body を修正する
+   - `edit-issue` skill の `delivery-rollup-parent-update` mode に `CHILD_MATERIALIZATION_PLAN_V2` を渡して parent body を修正する
 4. `action: human_escalation` のエントリが存在する場合:
    - `termination_reason: human_escalation` で停止する
 5. すべての mandatory_follow_up が materialize 済みになったら Step 5（終了処理）に進む。
