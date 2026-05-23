@@ -1,0 +1,56 @@
+# Valid fixture: issue_review phase
+# Tests: actor, phase, token_usage, invoked_subagents, verification, evidence, redaction
+schema: agent_session_manifest/v1
+manifest_id: "asm-12345678-1234-4123-89ab-123456789abc"
+recorded_at: "2026-05-24T10:00:00Z"
+repository: "squne121/loop-protocol"
+head_sha: null
+issue_number: 243
+pr_number: null
+commit_sha: null
+
+actor:
+  type: ai_agent
+  name: issue-reviewer
+  session_id: "session-001"
+
+phase:
+  main_loop: issue_review
+  ledger_phase: issue_contract_preflight
+  phase_instance_id: "issue-243:issue_review:001"
+
+token_usage:
+  availability: unavailable
+  source: none
+  prompt: null
+  completion: null
+  total: null
+
+invoked_subagents:
+  - name: issue-reviewer
+    count: 1
+    duration_ms: null
+
+verification:
+  overall: not_applicable
+  skipped_count: 0
+  fallback_detected: false
+  ac_results: []
+
+evidence:
+  - source_kind: github_comment
+    source_ref: "https://github.com/squne121/loop-protocol/issues/243#issuecomment-001"
+    source_sha256: null
+    visibility: public_github_comment
+
+human_intervention:
+  required: false
+  type: none
+  summary: null
+
+next_action_issue: null
+
+redaction:
+  raw_transcript_included: false
+  local_paths_included: false
+  secret_scan_status: not_applicable
