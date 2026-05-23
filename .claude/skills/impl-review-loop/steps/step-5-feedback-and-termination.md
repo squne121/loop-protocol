@@ -61,6 +61,29 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 **mandatory_follow_up の処理タイミング**: `severity: mandatory_follow_up` のリクエストは APPROVE 確定**前**に create/reuse する。未 materialize の状態で APPROVE してはならない。
 
+**delivery-rollup parent の残り child 起票（mandatory_follow_up）**:
+
+linked issue の parent が `parent_mode: delivery-rollup` の場合、APPROVE 確定前に以下を実行する:
+
+1. `plan_child_materialization.py` を実行して parent の残り child を確認する（read-only）:
+   ```bash
+   uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+     --repo <owner>/<repo> \
+     --issue <parent_issue_number>
+   ```
+
+2. `CHILD_MATERIALIZATION_PLAN_V2.children` に `action: create_issue` のエントリがある場合:
+   - 各エントリを `severity: mandatory_follow_up` の `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に追加する
+   - dedupe_key は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する
+
+3. `action: reuse_and_update_parent` のエントリがある場合:
+   - `edit-issue` skill の `delivery-rollup-parent-update` mode に委譲して parent body の placeholder を修正する
+
+4. `action: human_escalation` のエントリがある場合:
+   - `human_review_required: true` で停止し、人間判断を仰ぐ
+
+スキーマ: `CHILD_MATERIALIZATION_PLAN_V2` の正本は `docs/dev/agent-skill-boundaries.md` を参照。
+
 pr-review-judge が `LOOP_VERDICT` の `follow_up_issue_requests` フィールドに格納した non-blocker NOTE（任意改善提案・観察事項）が起票対象となる。詳細スキーマは `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照。
 
 ```

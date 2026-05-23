@@ -284,6 +284,44 @@ ISSUE_EDIT_RESULT_V1:
   errors: []
 ```
 
+## Delivery-rollup Parent Body Update Mode
+
+`CHILD_MATERIALIZATION_PLAN_V2` の `parent_body_updates` を使って、delivery-rollup parent の body drift（`(未起票)` placeholder が残ったまま）を修正するための特化手順。通常の edit-issue フロー（backup / guard / rollback）をそのまま踏む。
+
+### 入力
+
+```yaml
+edit_mode: delivery-rollup-parent-update
+input: CHILD_MATERIALIZATION_PLAN_V2   # plan_child_materialization.py の出力
+```
+
+### 手順
+
+1. plan の `parent_body_updates` を取得する（空なら本 mode はスキップ）。
+
+2. 通常手順のステップ 1（バックアップ取得）を実行する — 変更前 body を `tmp/issue_<N>_backup_<ts>.md` に保存。
+
+3. バックアップから新 body を生成する:
+   - `parent_body_updates[*].replace` を `parent_body_updates[*].with` に一括置換する
+   - 許容される placeholder 置換:
+     - `(未起票)` を `#<issue_number>` に置換
+     - stale child list エントリの状態同期
+   - 禁止: Outcome / In Scope / Acceptance Criteria の意味変更、無関係な prose の書き換え
+
+4. 通常手順のステップ 4（guard-issue-body.py による Guard）を実行する:
+   - 差分閾値チェック（削減率 50% 超で abort）
+   - Template Guard / AC-VC 番号一致チェック
+
+5. 通常手順のステップ 5（`gh issue edit --body-file`）を実行する。失敗時は `rollback_issue_edit()` で復元。
+
+6. 通常手順のステップ 6（変更経緯コメント投稿）を実行する。コメントには `CHILD_MATERIALIZATION_PLAN_V2` の `required_issue_edits` サマリを含める。
+
+### 制約
+
+- `plan_child_materialization.py` は read-only であり、本 mode の内部では実行しない（呼び出し元が plan を渡す）
+- guard で abort した場合は `rollback_issue_edit()` を呼びバックアップから復元する
+- Outcome / In Scope / AC の意味を変える置換は forbidden（guard で検出されなくても実施しない）
+
 ## Constraints
 
 - **body-file 経由必須**: `--body "<inline>"` は使わない（クォート崩壊・HEREDOC 由来エスケープのリスク）

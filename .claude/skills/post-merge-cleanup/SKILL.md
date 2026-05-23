@@ -173,6 +173,35 @@ merged PR の本文 / コメントから以下を抽出:
 
 候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-author` SubAgent / `create-issue` 経由で実行）。
 
+#### 6a. Delivery-rollup Parent の残り child 検出（追加ステップ）
+
+ステップ 4 で取得した parent issue が `parent_mode: delivery-rollup` の場合、`plan_child_materialization.py` を実行して残り child を検出し `follow_up_issue_requests` に追加する。
+
+```bash
+# parent が delivery-rollup かどうか確認
+PARENT_BODY=$(gh issue view "$PARENT_ISSUE_NUM" --json body --jq '.body')
+PARENT_MODE=$(echo "$PARENT_BODY" | grep -oP 'parent_mode:\s*\K[\w-]+' | head -1)
+
+if [ "$PARENT_MODE" = "delivery-rollup" ]; then
+  # read-only plan を取得
+  uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+    --repo <owner>/<repo> \
+    --issue "$PARENT_ISSUE_NUM"
+fi
+```
+
+`CHILD_MATERIALIZATION_PLAN_V2.children` の各エントリを処理する:
+
+| action | 処理 |
+|---|---|
+| `create_issue` | `severity: optional_follow_up` の `FOLLOW_UP_ISSUE_REQUEST_V1` を生成（起票実行は main thread） |
+| `reuse_and_update_parent` | parent body 更新を `follow_up_issue_requests` に追加（main thread が `edit-issue` skill に委譲） |
+| `no_op` | スキップ |
+| `human_escalation` | `warnings` に記録し `human_review_required: true` で返す |
+
+`FOLLOW_UP_ISSUE_REQUEST_V1` の `dedupe_key` は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する。
+スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
+
 ### 7. Stash の復帰
 
 ```bash

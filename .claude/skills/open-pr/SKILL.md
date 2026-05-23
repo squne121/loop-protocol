@@ -92,6 +92,48 @@ ISSUE_STATE=$(gh issue view <linked_issue> --json state --jq '.state')
 
 PR 本文に既に `Closes #N` / `Refs #N` がある場合は、上記判定と一致するかを確認し、不一致なら本文側を優先（caller の意図を尊重）。
 
+### 3.5. Parent Child Materialization（delivery-rollup parent の child PR の場合）
+
+linked issue の parent が `parent_mode: delivery-rollup` の場合、PR 本文に `## Parent Child Materialization` セクションを追加する。LLM と人間レビュアーが parent の残り child 状態を PR 本文から把握できるようにする。
+
+```bash
+# parent issue 番号を linked issue から取得
+PARENT_NUM=$(gh api repos/{owner}/{repo}/issues/<linked_issue>/parent --jq '.number // empty')
+
+# parent が delivery-rollup かどうか確認
+if [ -n "$PARENT_NUM" ]; then
+  PARENT_MODE=$(gh issue view "$PARENT_NUM" --json body --jq '.body' \
+    | grep -oP 'parent_mode:\s*\K[\w-]+' | head -1)
+fi
+```
+
+`parent_mode: delivery-rollup` の場合のみ `plan_child_materialization.py` を実行して PR 本文に含める:
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+  --repo <owner>/<repo> \
+  --issue "$PARENT_NUM"
+```
+
+PR 本文に追加する `## Parent Child Materialization` セクションのテンプレート:
+
+```markdown
+## Parent Child Materialization
+
+- parent_issue: #<parent_num>
+- parent_mode: delivery-rollup
+- child_materialization_plan: pass | pending | n/a
+- unresolved_children: <C254-3, C254-4, ... | なし>
+
+<CHILD_MATERIALIZATION_PLAN_V2 の summary（missing / stale_body_only エントリのみ列挙）>
+```
+
+- `child_materialization_plan: pass` — 全 child が `existing` または `no_op`
+- `child_materialization_plan: pending` — `missing` / `stale_body_only` / `human_escalation` が残っている
+- `child_materialization_plan: n/a` — linked issue が delivery-rollup parent の child でない
+
+parent が存在しない、または `parent_mode` が `delivery-rollup` でない場合は本セクションを省略する（n/a 扱い）。
+
 ### 4. Idempotency チェック（既存 PR 検出）
 
 ```bash
