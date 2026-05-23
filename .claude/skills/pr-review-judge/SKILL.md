@@ -99,6 +99,9 @@ gh pr diff <PR番号> --name-only
 | **検証コマンド結果** | linked issue の `## Verification Commands` 各コマンドが PR 本文で結果記録されている（`✅ 通過` 等の具体記述） | blocker（雰囲気で通さない） |
 | **scope 混入** | PR diff にスコープ外の修正・refactoring が混入していない | blocker |
 | **Runtime Verification Evidence（immediate のみ）** | linked issue の `decision: immediate` で、PR 本文に `## Runtime Verification Evidence` セクションが存在し、SKIP のみ・fallback PASS の証跡を含まない | blocker（APPROVE 禁止）: 証跡なし / SKIP のみ / fallback PASS は APPROVE しない |
+| **動作検証証跡の添付確認（immediate のみ）** | linked issue の `decision: immediate` で、PR 本文に動作検証ログ（`worktree/artifacts/runtime-verification-*.log` 等）への参照リンクまたは証跡内容が存在する | blocker（APPROVE 禁止）: 動作検証 AC に対して証跡リンクが一切ない場合は承認不可 |
+| **TEST_VERDICT_MACHINE の SKIP 検出（全 PR）** | test-runner の `TEST_VERDICT_MACHINE` コメントに `verification_skipped_count: 0`、または linked issue に `decision: deferred` / waiver が明示されている | blocker: required VC の SKIP は PASS ではない |
+| **Runtime VC の fallback / 証跡不足検出（immediate のみ）** | linked issue の `decision: immediate` で、`runtime_ac_results` 内に `fallback_detected: true` / `artifact_present: false` / `human_review_required: true` が存在しない | blocker（APPROVE 禁止）: exit 77 / `SKIP:` / `_*_fallback: true` の検出時は APPROVE しない |
 | **deferred 検証先確認** | linked issue の `decision: deferred` で、PR 本文に後続 Issue / 統合フェーズ / 検証条件の参照が存在する | blocker（参照がない場合） |
 
 placeholder のままの行（例: `[x] AC1: <達成（根拠）>` の `<...>` が残存）は証跡として数えず blocker。
