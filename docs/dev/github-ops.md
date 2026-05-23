@@ -160,10 +160,12 @@ triage セッション（人間または AI エージェント）
 
 ### AI 着手可能性の source of truth
 
-**AI が Issue に着手してよいかどうかの source of truth は、blocker / dependency がすべて close されているかどうかである。**
+**AI が Issue に着手してよいかどうかの source of truth は、GitHub native dependency（`depends on` リンク）がすべて close されているかどうかである。native dependency が利用できない場合は Issue 本文の `Depends on #N` fallback で補完する。**
 
-- `state/blocked` ラベルは補助・派生表示にすぎず、AI 着手可否判定の primary signal として使わない。
-  - ラベルは手動更新の遅れや付け忘れが生じうるため、ラベルのみに依存しない。
+- `state/blocked` ラベルは補助・派生表示にすぎず、AI 着手可否の primary signal ではない。
+  - `state/blocked` が残存しているだけで BLOCKED 判定しない（ラベルの更新遅れ・付け忘れが生じうるため）。
+- `state/queued` ラベルは「着手可能な待機状態」を補助的に示すが、AI 着手可否の primary signal ではない。
+  - `state/queued` が付いていなくても blocker / dependency がすべて close されていれば着手可。
 - `state/ready` ラベルは採用しない（判断根拠は後述）。
 
 ### state/ready 不採用の根拠

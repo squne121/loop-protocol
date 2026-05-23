@@ -26,14 +26,14 @@ gh issue view <番号> --json title,body,labels,comments
 | 確認項目 | 判定 |
 |---|---|
 | **テンプレ準拠** | `.github/ISSUE_TEMPLATE/{種別}.yml` の必須セクションがすべて存在 |
-| **state ラベル** | `state/queued` または `state/in-progress` であって `state/needs-human` / `state/blocked` でない |
+| **state ラベル** | `state/needs-human` が付いていれば BLOCKED。`state/queued` 不在・`state/blocked` 残存は blocking しない（warning のみ） |
 | **Allowed Paths 明示** | `## Allowed Paths` が存在し、空でない |
 | **VC 明示** | `## Verification Commands` が存在し、コマンドが 1 つ以上ある |
 | **Stop Conditions 明示**（implementation のみ） | `## Stop Conditions` が 6 定型項目で埋まっている |
 
 1 つでも fail なら **BLOCKED**。issue comment に「contract 不備」を投稿し、`issue-refinement-loop` を呼ぶことを提案する。
 
-注: state ラベルは補助的な開発フロー適合性チェックであり、AI 着手可否の primary signal ではない。着手可否は Step 3 の blocker / dependency 判定を優先する。
+注: state ラベルは補助的な開発フロー適合性チェックであり、AI 着手可否の primary signal ではない。`state/queued` 不在や `state/blocked` 残存のみを根拠に着手を拒否しない。着手可否の source of truth は Step 3 の open blocker / dependency 確認（GitHub native dependency / `Depends on #N` fallback）である。
 
 ### 3. blocker / dependency 全 close 確認（決定論的）
 
@@ -127,7 +127,7 @@ CONTRACT_REVIEW_RESULT_V1:
   issue_url: https://github.com/<owner>/<repo>/issues/<番号>
   checks:
     template_compliance: pass | fail
-    state_label: pass | fail
+    state_check: pass | warning  # warning = state/queued 不在・state/blocked 残存（着手を blocking しない）
     allowed_paths_present: pass | fail
     vc_present: pass | fail
     stop_conditions_complete: pass | fail | n/a

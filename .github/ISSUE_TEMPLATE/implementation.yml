@@ -4,7 +4,7 @@ title: "実装: "
 labels:
   - enhancement
   - phase/implementation
-  - state/queued
+  - triage-required
   - agent/implementer
 body:
   - type: markdown
