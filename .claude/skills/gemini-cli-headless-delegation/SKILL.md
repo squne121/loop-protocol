@@ -37,9 +37,9 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
 | `model` | 任意 | 省略時は `"gemini-3-flash-preview"`（= `default_chain[0]`）。明示指定時はその model のみを使用し、quota 枯渇でも降格しない。 |
 | `role` | 任意 | `"web_research"` / `"code_research"` / `"github_research"` / `"implementation"` / `"issue_authoring"` のいずれか。`model` 非指定時に適用される降格チェーンを選択する。詳細は `references/model-routing.md` 参照。 |
 | `inline_context` | 任意 | 追加コンテキスト文字列。 |
-| `timeout_sec` | 任意 | 省略時は wrapper の既定値。**`grounded_research` 使用時は 300 秒以上を推奨**（Google Search ツール呼び出しで 36〜115 秒以上かかる場合がある）。300 未満を指定すると `warnings` に警告が追加される。 |
+| `timeout_sec` | 任意 | 省略時は wrapper の既定値。**`grounded_research` 使用時は 300 秒以上を推奨**（Google Search ツール呼び出しで 36〜115 秒以上かかる場合がある）。**`github_research` / `local_asset_research` / `proposal_only` で `gh_commands` を使用する場合も `timeout_sec: 300` 以上を推奨**（`gh_commands` 事前実行・結果の `inline_context` prepend・GitHub API レイテンシ・prompt 増加により総実行時間が増加するため）。300 未満を指定すると `warnings` に警告が追加される。なお `timeout_sec` は Gemini CLI 実行フェーズ中心の timeout であり wrapper 全体の wall-clock 予算ではない。`gh_commands` の実行時間（API レイテンシ等）は別途 wall-clock 余裕として見込むこと。 |
 | `post_to_issue_url` | 任意 | GitHub Issue または PR の URL（例: `https://github.com/owner/repo/issues/123`）。指定時は調査結果を自動的に GitHub issue コメントとして投稿する。詳細は「GitHub へのコメント自動投稿」参照。 |
-| `gh_commands` | 任意 | `[{"argv": ["issue", "view", "123"]}]` 形式の argv ベースコマンドリスト。wrapper が事前実行し結果を `inline_context` に prepend する general field。profile ごとに許可 allowlist が異なる（詳細は `references/usage-contract.md` の「gh_commands general field 仕様」セクション参照）。現状は `github_research` のみ完全実装済み（`local_asset_research` / `proposal_only` は設計済み・実装は別 issue）。 |
+| `gh_commands` | 任意 | `[{"argv": ["issue", "view", "123"]}]` 形式の argv ベースコマンドリスト。wrapper が事前実行し結果を `inline_context` に prepend する general field。profile ごとに許可 allowlist が異なる（詳細は `references/usage-contract.md` の「gh_commands general field 仕様」セクション参照）。実装済み profile: `github_research` / `local_asset_research` / `proposal_only`。非対応 profile: `no_tools` / `grounded_research`（isolated temp cwd かつ gh 認証状態が不確かなため非対応）。 |
 
 返却面の優先順位は `references/result-surface.md` を正本とする。caller / orchestrator は `response_text` 全文よりも `result_surface.summary` / `result_surface.primary_artifact` / `result_surface.next_action` を先に使う。
 
