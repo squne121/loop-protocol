@@ -191,3 +191,11 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - `.github/pull_request_template.md` — テンプレート正本（あれば）
 - `docs/dev/schema-governance.md` — schema 定義・Initial Known Schemas・Consumer Inventory 義務の SSOT
 - `scripts/open_pr.py` — 本手順を実装する Python wrapper
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- PR 本文の全文を返答に再掲しない（PR URL で参照する）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

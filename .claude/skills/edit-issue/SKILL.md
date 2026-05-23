@@ -304,3 +304,11 @@ ISSUE_EDIT_RESULT_V1:
 - [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification / Contract block 等の共通ガイドライン
 - `.claude/agents/issue-author.md` — 本 skill を使う「Issue 起票・修正の役割」SubAgent
 - `.claude/skills/review-issue/SKILL.md` — `needs-fix` 結果を本 skill で本文へ反映
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- 編集後の Issue 本文全文を返答に再掲しない（Issue URL で参照する）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

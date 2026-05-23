@@ -118,3 +118,12 @@ REVIEW_ISSUE_RESULT_V1:
 - `.claude/skills/issue-refinement-loop/SKILL.md` — Issue 改善ループ（本 skill を中で呼ぶ）
 - [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification 等の共通ガイドライン
 - `.github/ISSUE_TEMPLATE/implementation.yml` / `research.yml` / `parent.yml` — 必須セクションの SSOT
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- `REVIEW_ISSUE_RESULT_V1` の全フィールドは削らない（routing 必須フィールド）
+- Issue 本文の全文再掲禁止（差分は diff 形式で最小限に示す）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

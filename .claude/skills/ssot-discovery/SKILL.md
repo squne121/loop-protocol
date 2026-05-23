@@ -109,3 +109,11 @@ KW=$(gh issue view 42 --json title,body --jq '.title + " " + .body' | tr -s '[:p
 2. `match-ssot.sh` は `docs/dev/ssot-registry.md` を動的に読むため、エントリ追加で自動反映される
 
 registry が読めない場合は `match-ssot.sh` が `status: failed` を返す。手動キャッシュへのフォールバックは行わない。
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- SSOT マッチ結果は YAML 構造のまま渡す（散文サマリで上書きしない）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

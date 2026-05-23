@@ -214,3 +214,12 @@ follow_up_issue_requests: []
 - `.claude/agents/pr-reviewer.md` — Sonnet reviewer（deny-list 該当時の fallback 先）
 - `.claude/skills/pr-review-judge/SKILL.md` — 必須 gate の詳細手順の SSOT
 - `.claude/skills/impl-review-loop/SKILL.md` — LOOP_VERDICT を読んで自動判定するオーケストレーター
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 SubAgent の出力は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- PR diff・Issue 本文の全文再掲禁止
+- `LOOP_VERDICT` の全フィールドは削らない（routing 必須フィールド）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

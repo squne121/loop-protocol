@@ -127,6 +127,16 @@ REVIEW_ISSUE_RESULT_V1:
 
 本 SubAgent は `review-issue` skill の決定論的チェックと Verdict 決定のみを担当し、anchor comment 関連の domain judgment は orchestrator に委ねる。
 
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 SubAgent の出力は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- `REVIEW_ISSUE_RESULT_V1` の全フィールドは削らない（routing 必須フィールド）
+- `blocking_issues` / `non_blocking_improvements` は 5 件まで（超過分は件数+参照のみ）
+- Issue 本文の全文再掲禁止
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する
+
 ## script-first 化について（コスト削減）
 
 `model: haiku` への変更と併せ、`check_issue_contract.py` により C1〜C11 の機械判定を Python / rg スクリプトで事前実行する。LLM への入力はスクリプトの JSON 結果のみであり、C1〜C11 手順全文をLLMに読ませない。

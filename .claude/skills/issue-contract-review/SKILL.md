@@ -251,3 +251,12 @@ CONTRACT_REVIEW_RESULT_V1:
 - `.claude/skills/implement-issue/SKILL.md` — `status: go` 時の handoff 先
 - `.claude/skills/ssot-discovery/SKILL.md` — Issue 関連 SSOT の探索
 - `.github/ISSUE_TEMPLATE/implementation.yml` — 必須セクションの正本
+
+## 出力制約（OUTPUT_BUDGET_V1）
+
+本 skill の呼び出し元・実行者は `docs/dev/agent-skill-boundaries.md` の `OUTPUT_BUDGET_V1` 定義に従う。
+
+- 人間向けサマリは 30 行・2400 文字以内
+- `CONTRACT_REVIEW_RESULT_V1` の全フィールドは削らない（routing 必須フィールド）
+- Issue 本文・VC の全文再掲禁止（Issue URL で参照する）
+- ブロッキングな知見で予算制約に抵触する場合は `NEEDS_EXPANSION: <topic>` + `refs:` を emit する

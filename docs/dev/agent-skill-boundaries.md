@@ -738,6 +738,62 @@ entries:
   - { phase: pre_merge_judgment, status: pass, ledger_complete: true }
 ```
 
+## OUTPUT_BUDGET_V1
+
+全 SubAgent / Skill に適用する出力制約の定義。目的は「ルーティングに必要なスキーマフィールドを削除せず、人間向けサマリとエビデンスの再掲を削減すること」。
+
+### 定義
+
+```yaml
+OUTPUT_BUDGET_V1:
+  intent: "reduce completion/output bloat without removing routing-critical schema fields"
+  max_human_summary_lines: 30
+  max_human_summary_chars: 2400
+  prohibit_full_body_reprint: true
+  prohibit_full_diff_reprint: true
+  machine_yaml:
+    required_schema_fields: must_include_all
+    optional_arrays_max_items: 5
+    overflow: count_and_refs_only
+  evidence:
+    refs_only_by_default: true
+    allowed_ref_forms: [url, "path:line-line", command_exit_code, artifact_id]
+    short_quote_max_words: 25
+  patch:
+    minimal_delta_only: true
+  escape_hatch:
+    when_budget_blocks_blocking_finding: "emit NEEDS_EXPANSION with refs"
+```
+
+### 適用判定基準
+
+本制約は `.claude/agents/*.md` と `.claude/skills/*/SKILL.md` の全ファイルに適用する。
+
+| 対象 | 適用方法 |
+|---|---|
+| SubAgent の人間向けサマリ出力 | `max_human_summary_lines: 30` / `max_human_summary_chars: 2400` を遵守する |
+| 機械可読 YAML 出力 | `required_schema_fields: must_include_all`（routing 必須フィールドは削らない）、オプション配列は 5 件まで（超過分は件数+参照のみ） |
+| エビデンス・証跡 | 原則 `url` / `path:line-line` / `command_exit_code` / `artifact_id` の参照形式で示す。短い引用は 25 語以内を許容 |
+| パッチ・diff | minimal delta のみ（前後全文の再掲禁止） |
+| Issue / PR 本文の再掲 | 禁止（`prohibit_full_body_reprint: true` / `prohibit_full_diff_reprint: true`） |
+
+### `escape_hatch` の条件
+
+budger 制約の適用によりブロッキングな知見が伝達不能になる場合は、以下の形式で `NEEDS_EXPANSION` を emit して人間または orchestrator に判断を委ねる。
+
+```
+NEEDS_EXPANSION: <topic>
+refs: [<url-or-path>]
+```
+
+`NEEDS_EXPANSION` は制約の例外ではなく、「参照を示した上で詳細展開を要求する」プロトコル。詳細を展開する責務は受け取り側が負う。
+
+### 適用除外（non-goals）
+
+- `machine_yaml` の `required_schema_fields` — routing に必要なフィールドは削らない
+- `escape_hatch` 経由の `NEEDS_EXPANSION` — ブロッキング知見の隠蔽禁止
+- VC や証跡で必須の出力 — OUTPUT_BUDGET_V1 適用により既存 VC が FAIL する場合は Stop Condition に該当
+
 ## Hook-based Ledger Optional Design
 
 Claude Code の hooks を使って SubAgent の開始・終了・結果を自動記録する設計概要。
