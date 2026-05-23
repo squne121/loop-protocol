@@ -172,6 +172,10 @@ directory_mappings:
   - pattern: "scripts/**"
     ssots:
       - docs/dev/workflow.md
+  - pattern: "docs/adr/**"
+    ssots:
+      - docs/dev/ssot-registry.md
+      - docs/dev/workflow.md
 ```
 
 ---

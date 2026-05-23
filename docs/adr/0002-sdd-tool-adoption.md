@@ -107,6 +107,27 @@ namespace 隔離方針:
 - 新規 skill 追加時は `docs/dev/agent-skill-boundaries.md` に責務境界を記録してから追加する
 - 将来の routing 設計（例: `issue-refinement-loop` → `spec-doc-writer` SubAgent）は後続 Issue で実装
 
+Spec Kit spike の受け入れ条件（throwaway worktree spike Issue で検証すること）:
+
+```yaml
+spec_kit_spike_acceptance:
+  required_round_trip:
+    - docs/product or docs/adr SSOT
+    - derived Spec Kit artifact (.specify/ 等)
+    - tasks.md staging
+    - taskstoissues-equivalent GitHub Issues
+    - implementation PR
+    - docs SSOT update（PR 経由）
+  forbidden_writes:
+    - .claude/skills/**
+    - .claude/commands/**
+  required_checks:
+    - generated artifact が docs/SSOT を上書きしない
+    - existing skill / command namespace と衝突しない
+    - tasks.md は materialize 後に archived derived artifact に降格する
+    - 生成した tasks.md と既存 GitHub Issues が乖離しない
+```
+
 ### 5. Token / コンテキスト消費対策（token_policy）
 
 Spec Kit Issue #1492 で確認された問題: 生成 artifact が大きく冗長で、繰り返し再生成・再読込され、
@@ -139,6 +160,20 @@ token_policy:
 semantic code editing に使用する。Markdown spec の肥大化対策ではなく、実装時の code retrieval 対策である。
 spec memory には `ssot-discovery` と registry を使う。Serena を spec authority として扱わない。
 
+token policy の機械的ガード例（C254-2 の `product-spec-lifecycle.md` で詳細化すること）:
+
+```bash
+# compact spec サイズ guard（250 行上限）
+test "$(wc -l < docs/product/<spec>.md)" -le 250
+
+# generated artifact を正本化していないことの確認
+! rg -n "canonical_source:.*(specify|openspec)|generated_artifacts:.*normative" \
+    docs/adr docs/product 2>/dev/null
+
+# full regeneration 禁止・diff-first 更新の明文化確認
+rg -n "full_regeneration: prohibited|diff-first" docs/adr/0002-sdd-tool-adoption.md
+```
+
 ### 6. Playtest-driven 補正（playtest_policy）
 
 ```yaml
@@ -159,6 +194,13 @@ playtest-log entry
   → impl-review-loop
   → next playtest
 ```
+
+**spec delta gate（C254-7 への必須引き継ぎ条件）**:
+- `design hypothesis invalidated` に分類されたエントリは、**必ず** spec delta issue を起票してから
+  implementation task issue に変換する。直接 implementation task として扱ってはならない。
+- `bug` は implementation task issue で扱ってよい。
+- `balance/tuning` は spec delta issue を推奨するが、軽微な場合は implementation task でも可（PR 本文に理由を記載）。
+- `unclear/needs-more-data` は追加 playtest session まで defer する。
 
 `playtest-log.md` エントリの最小構造:
 
@@ -193,8 +235,8 @@ playtest_entry:
 
 ### 将来の ADR 候補
 
-- Spec Kit CLI 本格導入（throwaway worktree spike 後）
-- OpenSpec 再評価（Issue #666 解決後）
+- Spec Kit CLI 本格導入（throwaway worktree spike 後、`spec_kit_spike_acceptance` の全条件を満たした場合）
+- OpenSpec 再評価（Issue #666 解決後、かつ既存 `docs/` schema を adapter なしで扱えることが確認できた後）
 - GitHub native Sub-issues 正式採用（別 ADR / GitHub ops issue）
 - Spec Kit 生成物の正本化（本 ADR の conflict_rule を変更する場合）
 
