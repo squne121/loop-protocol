@@ -127,6 +127,37 @@ gh issue comment <issue_number> --body "## impl-review-loop: 人間判断要請 
 - 人間の確認後、ループ再開または別アプローチを選択してください"
 ```
 
+## ISSUE_SCOPE_ROLLUP_DECISION_V2 の常時記録
+
+`ISSUE_SCOPE_ROLLUP_DECISION_V2` は、統合を実施した場合・しなかった場合を問わず、
+**ループの全終了経路（approved / max_iterations / human_escalation）で必ず記録する**。
+
+終了報告コメントに以下を含める:
+
+```yaml
+ISSUE_SCOPE_ROLLUP_DECISION_V2:
+  schema_version: 2
+  recorded_at: "<ISO8601>"
+  rollup_plan_ref:
+    body_sha256: "<preparation Step 2.5 で生成した plan の body_sha256>"
+    generated_at: "<plan の generated_at>"
+  decision: executed | skipped | deferred | human_review_required
+  executed_actions: []           # 統合を実施した場合のみ設定
+  skipped_reason: null           # decision: skipped の場合の理由（例: "no high-confidence candidates"）
+  candidates_reviewed:
+    - kind: "issue|pr"
+      number: <int>
+      confidence: "high|medium|low"
+      suggested_action: "<action>"
+      final_decision: "accepted|rejected|deferred|human_review_required"
+      rejection_reason: null
+```
+
+**記録の原則**:
+- preparation Step 2.5 で scope rollup preflight を実行しなかった場合でも `decision: skipped` として記録する。
+- `candidates_reviewed` は空配列（`[]`）でも記録する（候補なしの場合）。
+- この記録を省略してはならない（MUST NOT skip）。
+
 ## Output
 
 各終了条件に応じた LOOP_STATE 最終 YAML を会話履歴に記録する。
@@ -137,6 +168,7 @@ LOOP_STATE:
   iteration: <最終 iteration 数>
   last_step: judgment
   termination_reason: approved | max_iterations | human_escalation
+  scope_rollup_decision: <ISSUE_SCOPE_ROLLUP_DECISION_V2>
 ```
 
 その後、orchestrator は次のユーザー入力を待つ（自動で次イテレーションに進む決定済みなら Step 1 を再呼び出し）。
