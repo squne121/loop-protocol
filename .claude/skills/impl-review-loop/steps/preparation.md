@@ -24,7 +24,7 @@ gh issue view <issue_number> --json title,labels --jq '.title + " | " + (.labels
 - labels: `phase/implementation`
 - blocker / dependency: GitHub native dependency（`depends on` リンク）がすべて close 済み、または `Depends on #N` テキスト表現がすべて close 済み（primary signal）
 
-不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、ラベルの有無は ready 判定に影響しない（`docs/dev/github-ops.md` 参照）。
+不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、state labels の有無は ready 判定に影響しない。ただし `phase/implementation` は issue kind / workflow routing の前提として維持する（`docs/dev/github-ops.md` 参照）。
 
 ## 3. worktree / branch の preflight
 

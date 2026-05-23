@@ -53,6 +53,11 @@ bash .claude/skills/issue-contract-review/scripts/check_blockers.sh <issue_numbe
 - native と `Depends on #N` が不一致の場合は自動判断せず human escalation とする。
 - BLOCKED 時は issue comment に open blocker 番号・不一致内容を記載し、人間による確認を依頼する。go 判定は出さない。
 
+Fallback `Depends on #N` parsing は専用セクション（例: `## Depends On`）の line-anchored 宣言文のみを対象とする:
+`^- Depends on #<number>` または `^Depends on #<number>` の形式。
+Delivery Rule の条件文・歴史的注記・コメント・Conditional examples は blocker と見なさない。
+（実績: #262 で Delivery Rule 内の条件文「コンフリクトリスクがある場合は `Depends on #14 merge`」を fallback blocker と誤検出した事例がある。）
+
 ### 4. VC preflight（決定論的）
 
 **前提**: AC は「実装前 baseline で fail し、実装後に pass する」検証スクリプトとして書かれている。
