@@ -12,10 +12,19 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 | `codebase-investigator` | read-only | `dontAsk` | Bash, Read | Edit, Write, MultiEdit, Grep, Glob |
 | `pr-reviewer` | read-only | `dontAsk` | Bash, Read, Grep, Glob | Edit, Write, MultiEdit |
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
-| `review-issue` | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
+| `review-issue`（standalone SubAgent） | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
+| `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
 | `issue-author` | write | `acceptEdits` | Bash, Read, Write | Agent, Edit, MultiEdit |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
+
+### `review-issue` / `issue-reviewer` の使い分け
+
+| エントリ | 種別 | 呼び出し元 | 役割 |
+|---|---|---|---|
+| `review-issue` Skill | Skill（手順書） | main session・各 SubAgent | Issue 本文の品質を決定論的チェックして `REVIEW_ISSUE_RESULT_V1` を返す手順 |
+| `review-issue` SubAgent（`review-issue.md`） | write SubAgent | main session（standalone） | Issue 本文編集を伴う standalone レビュー。`gh issue edit` を human-in-the-loop で実行する |
+| `issue-reviewer` SubAgent（`issue-reviewer.md`） | read-only SubAgent | `issue-refinement-loop`（loop worker） | `review-issue` skill を内部で実行し `REVIEW_ISSUE_RESULT_V1` を返すのみ。Issue の mutation を行わない |
 
 ### 役割カテゴリの定義
 
@@ -56,12 +65,13 @@ SubAgent（役割）── Skill（作業手順）
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
 | `issue-author` | Issue を **起票・修正** する役割 | `create-issue`（新規起票）、`edit-issue`（既存修正）|
+| `issue-reviewer` | `issue-refinement-loop` の loop worker として Issue 品質を判定する役割（read-only） | `review-issue` |
 
 | Skill | 手順 | 呼び出し元の例 |
 |---|---|---|
 | `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-author` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
 | `edit-issue` | 既存 Issue 本文更新の手順（バックアップ / Guard / 差分閾値 / `gh issue edit --body-file`）| `issue-author` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
-| `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-refinement-loop` |
+| `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-reviewer` SubAgent（`issue-refinement-loop` loop worker 経由） |
 | `issue-contract-review` | 実装着手直前に作業計画・コンテクスト・開発フロー適合性を preflight | main session、`implement-issue` の手前 |
 | `issue-refinement-loop` | Issue 改善 4 段ループのオーケストレーター | main session |
 
@@ -312,6 +322,143 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 3. 独立 Skill にはしない（Skill は「何かを実行する手順」であり、共有参照は手順ではないため）
 
 例: VC 作成ガイダンスは `create-issue/references/body-authoring.md` に置き、`edit-issue` / `issue-author` SubAgent から参照する。
+
+## ORCHESTRATOR_IO_BOUNDARY_V1
+
+オーケストレーター（`impl-review-loop` / `issue-refinement-loop`）が保持してよいコンテキストと、保持・処理を禁止するコンテキストを定義する。
+
+> **適用スコープ**: 本 PR（#238 / Issue #227）では `issue-refinement-loop` への適用を完了条件とする。
+> `impl-review-loop` および他 orchestrator skill への適合確認は follow-up Issue の Remaining Parent Gap として扱う。
+
+### 保持可能コンテキスト（Allowed Context）
+
+オーケストレーターのメインスレッドが LOOP_STATE として保持・参照してよい情報:
+
+```yaml
+allowed_context:
+  - issue_number          # Issue 番号（数値 ID のみ）
+  - loop_id               # ループインスタンスの識別子
+  - iteration             # 現在のイテレーション番号（0-indexed）
+  - max_iterations        # 最大イテレーション数
+  - last_verdict          # approve | needs-fix | null（verdict 値のみ）
+  - termination_reason    # approved | max_iterations | human_escalation | superseded_by_decision | null
+  - pr_url                # PR URL（routing 判断に使うメタデータのみ）
+  - branch                # ブランチ名
+  - worktree              # worktree パス
+  - head_sha              # コミット SHA（routing 用）
+  - blockers_history      # blockers の要約リスト（構造化データのみ）
+  - improvements_applied  # 改善履歴（各 iteration の概要のみ）
+  - subagent_result_refs  # SubAgent 結果の参照（GitHub comment URL / issue_url 等）
+  - opaque_forwarding_payload  # SubAgent から後続 SubAgent へ転送する opaque payload
+                               # （routing 判断には使わない。blocking_issues / diff_proposal 等）
+```
+
+### 禁止コンテキスト（Forbidden Context）
+
+オーケストレーターが直接保持・解釈・routing 判断に使用してはならない情報:
+
+```yaml
+forbidden_context:
+  - raw_issue_body          # Issue 本文の raw テキスト全体
+  - raw_pr_diff             # PR の raw diff テキスト
+  - review_details          # review-issue / pr-review-judge の詳細な domain judgment 内容（routing 判断への使用禁止）
+  - blocking_issue_details  # blocking_issues の個別テキスト（routing 判断に使用禁止。opaque forwarding は allowed_context 参照）
+  - code_content            # 実装ファイルのコード内容
+  - test_output_raw         # テスト実行の生出力
+```
+
+> **Note**: `diff_proposal` / `blocking_issues` の内容テキストは routing 判断に使用してはならないが、
+> 後続 SubAgent（`issue-author` 等）への **opaque forwarding payload** として LOOP_STATE に保持・転送することは許可する。
+> orchestrator はこれらの内容を再解釈せず、受け取ったまま転送する（`detail_payload_policy: opaque_ref_only`）。
+
+**禁止の理由**: raw コンテンツをオーケストレーターが直接保持すると以下の問題が生じる。
+
+- Context Rot: raw テキストがメインスレッドに蓄積し、イテレーションを経るごとに context window を圧迫する
+- 責務汚染: routing 判断（control-plane）に domain judgment（data-plane）が混入する
+- 冪等性破壊: SubAgent が独立して判断できるはずの情報をオーケストレーターが先読みすることで、SubAgent の出力と競合する
+
+### オーケストレーターの worker step Skill 直接呼び出し禁止原則
+
+**オーケストレーターは worker step で `Skill` tool を直接呼ばない。** すべての worker step は対応する SubAgent 境界を通す。
+
+```
+WRONG（禁止パターン）:
+  orchestrator → Skill tool（review-issue skill）直接呼び出し
+  orchestrator → Skill tool（implement-issue skill）直接呼び出し
+
+CORRECT（正しいパターン）:
+  orchestrator → issue-reviewer SubAgent → review-issue skill
+  orchestrator → implementation-worker SubAgent → implement-issue skill
+  orchestrator → issue-author SubAgent → edit-issue skill
+```
+
+#### 違反パターンの例示
+
+以下のような呼び出し形式は ORCHESTRATOR_IO_BOUNDARY_V1 の違反:
+
+```yaml
+# 違反例 1: issue-refinement-loop Step 2 での Skill 直接呼び出し
+step: 2
+action: |
+  skill: review-issue
+  inputs:
+    issue_number: <LOOP_STATE.issue_number>
+    invoked_as_loop: true
+# → SubAgent 境界なしで Skill を直接実行している
+
+# 違反例 2: impl-review-loop Step での Skill 直接呼び出し
+step: verification
+action: |
+  skill: pr-review-judge
+  inputs:
+    pr_url: <PR URL>
+# → SubAgent 境界なしで Skill を直接実行している
+```
+
+#### SubAgent 境界を通す理由
+
+1. **コンテキスト隔離**: SubAgent は隔離されたコンテキストで実行されるため、オーケストレーターの蓄積コンテキストに影響されない
+2. **結果の構造化**: SubAgent は構造化された出力スキーマ（`REVIEW_ISSUE_RESULT_V1` 等）を返すため、オーケストレーターは verdict / status のみを参照して routing できる
+3. **再試行・タイムアウト耐性**: SubAgent 境界があることで、個別 step の再試行が可能
+4. **permissionMode 分離**: read-only worker は `dontAsk` permissionMode で動作し、write worker と明確に分離される
+
+#### routing 判断の制約
+
+オーケストレーターが SubAgent から結果を受け取った後の routing 判断では、以下のフィールドのみを参照する:
+
+```yaml
+routing_allowed_fields:
+  REVIEW_ISSUE_RESULT_V1:
+    - verdict        # approve | needs-fix
+    - status         # ok | failed
+    - failure_class  # gh_auth | permission_denied | issue_not_found | schema_invalid | unknown（status: failed 時のみ）
+  TEST_VERDICT_MACHINE/v1:
+    - status     # pass | partial | fail
+    - summary    # 統計のみ（raw 出力は参照しない）
+  LOOP_VERDICT:
+    - verdict    # APPROVE | REQUEST_CHANGES
+    - status     # ok | failed
+  IMPLEMENT_RESULT_V1:
+    - status     # ok | failed | blocked
+```
+
+詳細な domain judgment（blocking_issues のテキスト / diff_proposal の内容 / test failure の詳細 等）は、後続 SubAgent へ参照（GitHub comment URL / issue_url）として渡す。オーケストレーターが詳細を再解釈しない。
+
+### 一時例外（temporary_exceptions）
+
+以下は ORCHESTRATOR_IO_BOUNDARY_V1 の `forbidden_context` に対する一時的な例外として承認された項目:
+
+```yaml
+temporary_exceptions:
+  - raw_anchor_comment_snapshot:
+      owner: issue-refinement-loop Step 0/2
+      reason: issue-227 first-stage scope. anchor comment classification は今回スコープでは main thread に残す
+      allowed_until: follow-up issue (impl-review-loop boundary conformance check)
+      constraints:
+        - must not be forwarded raw to issue-author
+        - must be normalized before Step 4
+        - must not be used as generic reviewer_feedback_text
+```
 
 ## オーケストレーター設計原則（impl-review-loop / issue-refinement-loop）
 
