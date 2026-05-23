@@ -1,0 +1,50 @@
+{
+  "mcp": {
+    "allowed": [
+      "serena"
+    ]
+  },
+  "mcpServers": {
+    "serena": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/oraios/serena",
+        "serena",
+        "--project-from-cwd"
+      ],
+      "trust": false,
+      "includeTools": [
+        "find_file",
+        "find_referencing_symbols",
+        "find_symbol",
+        "get_symbols_overview",
+        "list_dir",
+        "search_for_pattern"
+      ],
+      "excludeTools": [
+        "activate_project",
+        "create_text_file",
+        "delete_lines",
+        "execute_shell_command",
+        "insert_after_symbol",
+        "insert_at_line",
+        "insert_before_symbol",
+        "prepare_for_new_conversation",
+        "read_file_content",
+        "read_memory",
+        "remove_project",
+        "replace_lines",
+        "replace_regex",
+        "replace_symbol_body",
+        "restart_language_server",
+        "switch_modes",
+        "think_about_collected_information",
+        "think_about_task_adherence",
+        "think_about_whether_you_are_done",
+        "write_file",
+        "write_memory"
+      ]
+    }
+  }
+}
