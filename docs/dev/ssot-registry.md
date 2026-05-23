@@ -97,6 +97,16 @@
     - "## 決定事項"
     - "## 背景・根拠"
 
+- id: adr-0002-sdd-tool-adoption
+  path: docs/adr/0002-sdd-tool-adoption.md
+  title: SDD ツール採否 — Spec-Driven Development 運用方針
+  keywords: [sdd, spec-driven-development, spec-kit, openspec, ears, canonical_source, docs-ssot, derived-workbench, tasks_md, staging-artifact, token-policy, compact-spec, scoped-loading, serena-mcp, playtest, feedback-loop, namespace, collision-policy]
+  description: SDD ツール採否（Spec Kit upstream-compatible / accepted-with-deferral）・正本境界・conflict rule・tasks.md staging・namespace policy・token 対策・playtest 補正
+  sections:
+    - "## 決定"
+    - "## Decision Points"
+    - "## 結果と影響"
+
 新規 ADR は `docs/adr/NNNN-<topic>.md` で追加し、本表にエントリを追加する。
 
 ---
@@ -161,6 +171,10 @@ directory_mappings:
       - docs/dev/workflow.md
   - pattern: "scripts/**"
     ssots:
+      - docs/dev/workflow.md
+  - pattern: "docs/adr/**"
+    ssots:
+      - docs/dev/ssot-registry.md
       - docs/dev/workflow.md
 ```
 
