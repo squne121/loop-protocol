@@ -26,14 +26,14 @@ gh issue view <番号> --json title,body,labels,comments
 | 確認項目 | 判定 |
 |---|---|
 | **テンプレ準拠** | `.github/ISSUE_TEMPLATE/{種別}.yml` の必須セクションがすべて存在 |
-| **state ラベル** | `state/needs-human` が付いていれば BLOCKED。`state/queued` 不在・`state/blocked` 残存は blocking しない（warning のみ） |
+| **state ラベル** | `state/needs-human` が付いていれば BLOCKED。それ以外の state ラベル（`state/blocked` 等）の有無は着手判定に影響しない |
 | **Allowed Paths 明示** | `## Allowed Paths` が存在し、空でない |
 | **VC 明示** | `## Verification Commands` が存在し、コマンドが 1 つ以上ある |
 | **Stop Conditions 明示**（implementation のみ） | `## Stop Conditions` が 6 定型項目で埋まっている |
 
 1 つでも fail なら **BLOCKED**。issue comment に「contract 不備」を投稿し、`issue-refinement-loop` を呼ぶことを提案する。
 
-注: state ラベルは補助的な開発フロー適合性チェックであり、AI 着手可否の primary signal ではない。`state/queued` 不在や `state/blocked` 残存のみを根拠に着手を拒否しない。着手可否の source of truth は Step 3 の open blocker / dependency 確認（GitHub native dependency / `Depends on #N` fallback）である。
+注: state ラベルチェックは `state/needs-human` 付与の有無のみを着手判定に用いる。`state/needs-human` が付いていない場合、その他の state ラベル（`state/blocked` 等）の有無は BLOCKED 判定に影響しない。着手可否の source of truth は Step 3 の open blocker / dependency 確認（GitHub native dependency / `Depends on #N` fallback）である。
 
 ### 3. blocker / dependency 全 close 確認（決定論的）
 
@@ -159,10 +159,10 @@ CONTRACT_REVIEW_RESULT_V1:
   issue_url: https://github.com/<owner>/<repo>/issues/<番号>
   checks:
     template_compliance: pass | fail
-    # state_label: ok | warning（non-blocking）
-    # ok = state ラベルに問題なし
-    # warning = state/queued 不在・state/blocked 残存（着手を blocking しない）
-    state_label: ok | warning（non-blocking）
+    # state_label: ok | blocked
+    # ok = state/needs-human ラベルなし（着手可能）
+    # blocked = state/needs-human ラベルあり（着手不可）
+    state_label: ok | blocked
     allowed_paths_present: pass | fail
     vc_present: pass | fail
     stop_conditions_complete: pass | fail | n/a
