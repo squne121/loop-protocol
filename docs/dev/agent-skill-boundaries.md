@@ -363,30 +363,53 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 - `post-merge-cleanup-worker`: `follow_up_issue_requests` を `FOLLOW_UP_ISSUE_REQUEST_V1[]` として列挙して返す。**Issue 起票は行わない**。
 - main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
 
-## CHILD_MATERIALIZATION_PLAN_V1
+## CHILD_MATERIALIZATION_PLAN_V2
 
 delivery-rollup parent の child materialization 制御スキームで使う plan スキーマ。
 `.claude/skills/create-issue/scripts/plan_child_materialization.py` が生成し、`create-issue` / `edit-issue` / `issue-refinement-loop` / `impl-review-loop` / `open-pr` / `post-merge-cleanup` の各 skill が消費する。
 
+> V1 からの主な変更点: closed child を `existing_closed` に正しく分類、section scoping により `## Child Issues` 外の child ID を無視、`parent_mode` 欠落時に `unknown` を返しデフォルト assumption を廃止、schema に `closure_mode` / `repo` / `source` / `generated_at` / `body_sha256` / `issue_lookup.complete` を追加、`parent_body_updates` を line-oriented patch 形式に変更、dry-run 時の issue ref を `existing_unverified` に分類。
+
 ### スキーマ定義
 
 ```yaml
-CHILD_MATERIALIZATION_PLAN_V1:
-  parent_issue: <int>          # delivery-rollup parent の Issue 番号
-  parent_mode: delivery-rollup # 現時点では delivery-rollup のみ対応
+CHILD_MATERIALIZATION_PLAN_V2:
+  schema_version: 2
+  repo: "squne121/loop-protocol"
+  generated_at: "2026-05-24T00:00:00Z"
+  source:
+    kind: parent_issue_body
+    issue_number: 254
+    body_sha256: "<sha256 of body>"
+  parent:
+    issue_number: 254
+    parent_mode: delivery-rollup    # 欠落時は 'unknown'
+    closure_mode: child-complete    # 欠落時は 'unknown'
+  issue_lookup:
+    strategy: "referenced_issue_view_and_dedupe_search_all_states"
+    complete: true                  # false の場合、consumer skill は mutation 禁止
+    warnings: []
   children:
-    - child_id: <string>       # 例: C254-3
-      title: <string>          # child の期待タイトル（placeholder / issue ref を除去済み）
-      status: missing | existing | stale_body_only | ambiguous
-      existing_issue_number: null | <int>
+    - child_id: "C254-3"            # 例: C254-3
+      title: "..."                  # child の期待タイトル（placeholder / issue ref を除去済み）
+      status: missing | existing_open | existing_closed | existing_unverified | stale_body_only | ambiguous
+      existing_issue:               # null or object
+        number: 281
+        state: OPEN | CLOSED
+        state_reason: null | COMPLETED | NOT_PLANNED
+        url: "https://github.com/..."
       action: create_issue | reuse_and_update_parent | no_op | human_escalation
       dedupe_key: "delivery-rollup:<parent_issue>:<child_id>"
-  parent_body_updates:          # stale_body_only child が存在する場合に生成
-    - replace: <string>         # parent body 内の置換対象テキスト
-      with: <string>            # 置換後テキスト（placeholder を issue ref に修正）
-  required_issue_creations: [] # action=create_issue の child_id リスト
-  required_issue_edits: []     # parent body 更新が必要な記述リスト
-  warnings: []                 # 警告メッセージ（空でもキー必須）
+      existing_issue_candidates: [] # dedupe search 結果
+  parent_body_updates:              # stale_body_only child が存在する場合に生成
+    - section: "Child Issues"
+      line_number: 143              # 1-based; parent body 内の行番号
+      old_line: "- C254-5 ...（未起票） #285"
+      new_line: "- C254-5 ... #285"
+      expected_match_count: 1       # 1 以外の場合は edit-issue が abort
+  required_issue_creations: []     # action=create_issue の child_id リスト
+  required_issue_edits: []         # parent body 更新が必要な記述リスト
+  warnings: []                     # 警告メッセージ（空でもキー必須）
 ```
 
 ### child.status の定義
@@ -394,9 +417,16 @@ CHILD_MATERIALIZATION_PLAN_V1:
 | status | 意味 | action |
 |---|---|---|
 | `missing` | parent body に `(未起票)` と記載され、issue ref がない | `create_issue` |
-| `existing` | parent body に有効な issue ref があり open issue が確認できる | `no_op` |
+| `existing_open` | parent body に有効な issue ref があり open issue が gh issue view で確認できる | `no_op` |
+| `existing_closed` | parent body に issue ref があり closed issue が確認できる（child-complete では正常系） | `no_op` |
+| `existing_unverified` | dry-run (`--body-file`) 時の issue ref（API 未確認） | `no_op` |
 | `stale_body_only` | `(未起票)` と issue ref が共存（body drift 状態） | `reuse_and_update_parent` |
-| `ambiguous` | issue ref はあるが open issues に該当なし（closed または存在不明） | `human_escalation` |
+| `ambiguous` | issue ref は present だが gh issue view が失敗（存在不明） | `human_escalation` |
+
+### issue_lookup.complete の消費ルール
+
+- `complete: true` — 通常通り plan を処理する
+- `complete: false` — consumer skill は GitHub Issue の mutation を行わない。human escalation として報告する
 
 ### 生成スクリプト
 
@@ -407,6 +437,7 @@ uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py
   --issue 254
 
 # ローカル fixture から取得（テスト・dry-run 用）
+# NOTE: issue ref は 'existing_unverified' として分類される（API 未呼び出し）
 uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
   --body-file fixtures/parent_254.md \
   --issue 254
@@ -414,13 +445,15 @@ uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py
 
 スクリプトは read-only: GitHub Issue を変更しない。plan の mutation は `create_issue_txn.py`（create_issue action）と `edit-issue` skill（parent body update）が担う。
 
+`edit-issue` は `parent_body_updates` の `expected_match_count != 1` を検出した場合、更新を abort する。
+
 ### skill 横断の消費フロー
 
 ```
 plan_child_materialization.py
-  → CHILD_MATERIALIZATION_PLAN_V1
+  → CHILD_MATERIALIZATION_PLAN_V2
     → create-issue (action=create_issue → create_issue_txn.py)
-    → edit-issue (parent_body_updates → backup/guard/rollback)
+    → edit-issue (parent_body_updates → line-oriented patch / abort if expected_match_count != 1)
     → issue-refinement-loop (delivery-rollup gate)
     → impl-review-loop Step 5 (mandatory_follow_up)
     → open-pr (Parent Child Materialization section)
