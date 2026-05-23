@@ -26,6 +26,76 @@ gh issue view <issue_number> --json title,labels --jq '.title + " | " + (.labels
 
 不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、state labels の有無は ready 判定に影響しない。ただし `phase/implementation` は issue kind / workflow routing の前提として維持する（`docs/dev/github-ops.md` 参照）。
 
+## 2.5. scope rollup preflight（`plan_issue_scope_rollup.py` 実行）
+
+worktree 作成前に scope rollup preflight を実行し、同一 Allowed Paths / 同一 skill family / 同一 parent_issue / 同一 dedupe_key を持つ OPEN Issue / PR の統合候補を確認する。
+preflight は mutation-free（Issue 作成・編集・クローズ禁止）。
+
+```bash
+REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+
+# 対象 Issue を個別取得（current_issue として使用）
+gh issue view <issue_number> \
+  --repo "$REPO_FULL_NAME" \
+  --json number,title,body,labels,state,stateReason,url \
+  > /tmp/current_issue.json
+
+# issues と PRs の一覧を全状態（open + closed）で取得（デフォルト 30 件制限を回避するため --limit 1000）
+gh issue list \
+  --repo "$REPO_FULL_NAME" \
+  --state all \
+  --limit 1000 \
+  --json number,title,body,labels,state,stateReason,url \
+  > /tmp/issues_all.json
+
+gh pr list \
+  --repo "$REPO_FULL_NAME" \
+  --state all \
+  --limit 1000 \
+  --json number,title,body,labels,state,url,files,closingIssuesReferences \
+  > /tmp/prs_all.json
+
+# scope rollup preflight を実行（read-only — mutation なし）
+python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
+  --issues-json /tmp/issues_all.json \
+  --prs-json /tmp/prs_all.json \
+  --current-issue <issue_number> \
+  --repo "$REPO_FULL_NAME"
+```
+
+出力（`ISSUE_SCOPE_ROLLUP_PLAN_V2`）を `LOOP_STATE.scope_rollup_plan` に格納する。
+
+**orchestrator の判断ルール**:
+
+- `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認し、統合実施可否を判断してから次ステップに進む。自動実行しない。
+- `security` / `auth` / `permission` / `sandbox` 関連の候補（`suggested_action: human_review_required`）: 即時停止して人間が判断する（`termination_reason: human_escalation`）。
+- `confidence: medium` の候補: LOOP_STATE に記録し、推奨アクションを提示するが自動実行しない。
+- `confidence: low` または候補なし: 記録してそのまま次ステップに進む。
+
+**`ISSUE_SCOPE_ROLLUP_DECISION_V2` の記録**（統合実施・未実施にかかわらず常時記録）:
+
+```yaml
+ISSUE_SCOPE_ROLLUP_DECISION_V2:
+  schema_version: 2
+  recorded_at: "<ISO8601>"
+  rollup_plan_ref:
+    body_sha256: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.body_sha256>"
+    generated_at: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.generated_at>"
+  decision: executed | skipped | deferred | human_review_required
+  executed_actions: []
+  skipped_reason: null
+  candidates_reviewed:
+    - kind: "issue|pr"
+      number: <int>
+      confidence: "high|medium|low"
+      suggested_action: "<action>"
+      final_decision: "accepted|rejected|deferred|human_review_required"
+      rejection_reason: null
+```
+
+`LOOP_STATE.scope_rollup_decision` に記録した後、Step 3（worktree/branch preflight）に進む。
+詳細は `.claude/skills/issue-refinement-loop/references/scope-rollup-policy.md` を参照。
+
 ## 3. worktree / branch の preflight
 
 ```bash
