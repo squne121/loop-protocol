@@ -1,0 +1,53 @@
+# Valid fixture: merge phase by human
+# actor.type: human, session_id: null (人間が GitHub UI でマージした場合)
+schema: agent_session_manifest/v1
+manifest_id: "asm-11111111-2222-4333-89ab-444444444444"
+recorded_at: "2026-05-24T15:00:00Z"
+repository: "squne121/loop-protocol"
+head_sha: "1234567890abcdef1234567890abcdef12345678"
+issue_number: 243
+pr_number: 314
+commit_sha: "1234567890abcdef1234567890abcdef12345678"
+
+actor:
+  type: human
+  name: human
+  session_id: null
+
+phase:
+  main_loop: merge
+  ledger_phase: github_merge_event
+  phase_instance_id: "issue-243:merge:001"
+
+token_usage:
+  availability: unavailable
+  source: none
+  prompt: null
+  completion: null
+  total: null
+
+invoked_subagents: []
+
+verification:
+  overall: not_applicable
+  skipped_count: 0
+  fallback_detected: false
+  ac_results: []
+
+evidence:
+  - source_kind: github_comment
+    source_ref: "https://github.com/squne121/loop-protocol/pull/314"
+    source_sha256: null
+    visibility: public_github_comment
+
+human_intervention:
+  required: true
+  type: approval
+  summary: "人間が GitHub UI からマージを実行"
+
+next_action_issue: null
+
+redaction:
+  raw_transcript_included: false
+  local_paths_included: false
+  secret_scan_status: not_applicable

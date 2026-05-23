@@ -1,0 +1,24 @@
+# Invalid fixture: visibility: public_github_comment で source_kind: transcript を使用
+# evidence.visibility が public_github_comment のとき transcript / local_file は禁止
+schema: agent_session_manifest/v1
+manifest_id: "asm-12345678-1234-4123-89ab-123456789abc"
+recorded_at: "2026-05-24T10:00:00Z"
+repository: "squne121/loop-protocol"
+head_sha: null
+actor:
+  type: ai_agent
+  name: implementation-worker
+  session_id: null
+phase:
+  main_loop: impl
+  ledger_phase: implementation
+  phase_instance_id: "issue-243:impl:001"
+evidence:
+  - source_kind: transcript
+    source_ref: "/home/user/.claude/transcripts/session-001.jsonl"
+    source_sha256: null
+    visibility: public_github_comment
+redaction:
+  raw_transcript_included: true
+  local_paths_included: true
+  secret_scan_status: flagged

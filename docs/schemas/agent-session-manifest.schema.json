@@ -1,0 +1,385 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/agent-session-manifest.schema.json",
+  "title": "agent_session_manifest/v1",
+  "description": "LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata を記録するための SSOT schema。",
+  "type": "object",
+  "required": ["schema", "manifest_id", "recorded_at", "repository", "actor", "phase", "redaction"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "agent_session_manifest/v1",
+      "description": "schema バージョン識別子"
+    },
+    "manifest_id": {
+      "type": "string",
+      "pattern": "^asm-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "asm-<UUIDv4> 形式の一意 ID"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 タイムスタンプ"
+    },
+    "repository": {
+      "type": "string",
+      "description": "リポジトリ名（例: squne121/loop-protocol）"
+    },
+    "head_sha": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "40 hex chars の git commit SHA"
+        },
+        { "type": "null" }
+      ],
+      "description": "観測時点の HEAD commit SHA（nullable）"
+    },
+    "issue_number": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "null" }
+      ],
+      "description": "対象 Issue 番号（optional）"
+    },
+    "pr_number": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "null" }
+      ],
+      "description": "対象 PR 番号（optional）"
+    },
+    "commit_sha": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "40 hex chars の git commit SHA"
+        },
+        { "type": "null" }
+      ],
+      "description": "コミット SHA（optional, nullable）"
+    },
+    "actor": {
+      "type": "object",
+      "required": ["type", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ai_agent", "human", "github_action"],
+          "description": "セッション実行者の種別"
+        },
+        "name": {
+          "type": "string",
+          "description": "エージェント名または human"
+        },
+        "session_id": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "セッション ID（nullable。人間操作の場合は null 可）"
+        }
+      }
+    },
+    "phase": {
+      "type": "object",
+      "required": ["main_loop", "phase_instance_id"],
+      "additionalProperties": false,
+      "properties": {
+        "main_loop": {
+          "type": "string",
+          "enum": [
+            "issue_create",
+            "issue_review",
+            "impl",
+            "pr_open",
+            "pr_review",
+            "merge",
+            "followup_create"
+          ],
+          "description": "Main Loop phase（7 値）"
+        },
+        "ledger_phase": {
+          "title": "ledger_phase enum (scalar)",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "followup_issue_materialization",
+                "issue_contract_preflight",
+                "implementation",
+                "post_commit_verification",
+                "pr_body_update",
+                "semantic_review",
+                "pre_merge_judgment",
+                "github_merge_event"
+              ]
+            },
+            { "type": "null" }
+          ],
+          "description": "SubAgent Execution Ledger の対応 phase（scalar enum, optional）。1 manifest = 1 ledger phase 原則。impl phase では implementation と post_commit_verification に対して別々の manifest を残す"
+        },
+        "phase_instance_id": {
+          "type": "string",
+          "pattern": "^issue-[0-9]+:[a-z_]+:[0-9]{3}$",
+          "description": "issue-<N>:<main_loop_phase>:<seq> 形式"
+        }
+      }
+    },
+    "token_usage": {
+      "type": "object",
+      "required": ["availability", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": ["measured", "estimated", "unavailable"],
+          "description": "トークン使用量の取得状況。unavailable の場合は数値フィールドを null にする（0 偽装禁止）"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["provider_api", "tool_log", "entire_cli", "manual_report", "none"],
+          "description": "トークン情報の取得元"
+        },
+        "prompt": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "completion": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "total": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "invoked_subagents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "count"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "SubAgent 名"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "呼び出し回数"
+          },
+          "duration_ms": {
+            "oneOf": [
+              { "type": "integer", "minimum": 0 },
+              { "type": "null" }
+            ],
+            "description": "実行時間 ms（optional）"
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["overall", "skipped_count", "fallback_detected", "ac_results"],
+      "additionalProperties": false,
+      "properties": {
+        "overall": {
+          "type": "string",
+          "enum": ["pass", "fail", "partial", "blocked", "not_applicable"],
+          "description": "全体の検証結果。skipped_count > 0 のとき pass 禁止"
+        },
+        "skipped_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "スキップされた AC 数"
+        },
+        "fallback_detected": {
+          "type": "boolean",
+          "description": "フォールバック PASS の検出有無"
+        },
+        "ac_results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ac", "verdict"],
+            "additionalProperties": false,
+            "properties": {
+              "ac": {
+                "type": "string",
+                "description": "AC 番号（例: AC7）"
+              },
+              "verdict": {
+                "type": "string",
+                "enum": ["pass", "fail", "skip", "blocked", "not_applicable"]
+              },
+              "command": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "null" }
+                ]
+              },
+              "exit_code": {
+                "oneOf": [
+                  { "type": "integer" },
+                  { "type": "null" }
+                ]
+              },
+              "artifact_ref": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "null" }
+                ]
+              },
+              "waiver_ref": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "null" }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_kind", "source_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "source_kind": {
+            "type": "string",
+            "enum": ["github_comment", "ci_check", "hook_jsonl", "artifact", "transcript", "local_file"],
+            "description": "証拠の種別"
+          },
+          "source_ref": {
+            "type": "string",
+            "description": "証拠の URL またはパス"
+          },
+          "source_sha256": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "null" }
+            ],
+            "description": "ファイルの SHA-256（optional）"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["public_github_comment", "private_artifact", "local_only"],
+            "description": "証拠の公開範囲。public_github_comment 時は transcript / local_file を禁止する"
+          }
+        },
+        "if": {
+          "properties": {
+            "visibility": { "const": "public_github_comment" }
+          },
+          "required": ["visibility"]
+        },
+        "then": {
+          "properties": {
+            "source_kind": {
+              "not": {
+                "enum": ["transcript", "local_file"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "hook_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "hook イベント情報（optional）",
+      "properties": {
+        "event_type": {
+          "type": "string",
+          "enum": ["SubagentStart", "SubagentStop", "PostToolUse", "Stop", "PreToolUse"],
+          "description": "Claude Code hook event 種別"
+        },
+        "hook_id": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "hook 実行 ID（optional）"
+        },
+        "triggered_at": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "hook トリガー時刻（ISO 8601）"
+        }
+      }
+    },
+    "sanitization_status": {
+      "type": "string",
+      "enum": ["not_sanitized", "sanitized", "sanitization_failed"],
+      "description": "機微情報のサニタイズ状態（hook 記録時に設定）"
+    },
+    "redaction": {
+      "type": "object",
+      "required": ["raw_transcript_included", "local_paths_included", "secret_scan_status"],
+      "additionalProperties": false,
+      "properties": {
+        "raw_transcript_included": {
+          "type": "boolean",
+          "description": "raw transcript を含むか。GitHub comment に投稿する場合は false 必須"
+        },
+        "local_paths_included": {
+          "type": "boolean",
+          "description": "ローカル絶対パスを含むか"
+        },
+        "secret_scan_status": {
+          "type": "string",
+          "enum": ["not_applicable", "clean", "flagged"],
+          "description": "シークレットスキャン状態"
+        }
+      }
+    },
+    "human_intervention": {
+      "type": "object",
+      "required": ["required", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "人間介入が必要だったか"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["none", "approval", "correction", "escalation"],
+          "description": "介入種別"
+        },
+        "summary": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "介入内容の概要（nullable）"
+        }
+      }
+    },
+    "next_action_issue": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "null" }
+      ],
+      "description": "次に実行すべき Issue 番号（nullable）"
+    }
+  }
+}
