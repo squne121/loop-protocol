@@ -214,3 +214,8 @@ follow_up_issue_requests: []
 - `.claude/agents/pr-reviewer.md` — Sonnet reviewer（deny-list 該当時の fallback 先）
 - `.claude/skills/pr-review-judge/SKILL.md` — 必須 gate の詳細手順の SSOT
 - `.claude/skills/impl-review-loop/SKILL.md` — LOOP_VERDICT を読んで自動判定するオーケストレーター
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`LOOP_VERDICT` の全フィールドは必ず含める（routing 必須フィールド）。

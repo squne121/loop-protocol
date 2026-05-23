@@ -37,3 +37,8 @@ main thread から以下を受け取る:
 - superseded PR の close / comment を実行しない（候補列挙のみ。実行は main thread）
 - CONFLICT 検出時は即 fail-close（`human_review_required: true`、復旧操作は人間が判断）
 - 破壊的 git/gh コマンド（`git stash` / `git branch -D` / `gh pr merge` / `git push`）は ask に残す。`permissionMode: default` のまま維持し、これらの操作は必ず人間承認を経る
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`POST_MERGE_CLEANUP_REPORT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

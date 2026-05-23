@@ -209,3 +209,8 @@ IMPLEMENT_RESULT_V1:
 - `.claude/agents/test-runner.md` — Verification Commands を実行する SubAgent
 - ルート `CLAUDE.md` + per-directory `CLAUDE.md` — 不変条件の正本
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`IMPLEMENT_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。

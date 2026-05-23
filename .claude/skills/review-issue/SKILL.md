@@ -118,3 +118,8 @@ REVIEW_ISSUE_RESULT_V1:
 - `.claude/skills/issue-refinement-loop/SKILL.md` — Issue 改善ループ（本 skill を中で呼ぶ）
 - [`.claude/skills/create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) — VC 作成 / Anchor Verification 等の共通ガイドライン
 - `.github/ISSUE_TEMPLATE/implementation.yml` / `research.yml` / `parent.yml` — 必須セクションの SSOT
+
+## 出力制約 (OUTPUT_BUDGET_V1)
+
+`docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+`REVIEW_ISSUE_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。
