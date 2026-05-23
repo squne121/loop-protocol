@@ -87,3 +87,4 @@ jobs:
       - run: uv sync --group dev
       - run: uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
       - run: uv run pytest .claude/skills/create-issue/tests/
+      - run: uv run pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q

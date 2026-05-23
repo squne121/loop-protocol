@@ -25,18 +25,24 @@ def get_repo_root() -> Path:
 def parse_registry(registry_path: Path) -> tuple:
     """
     Parse ssot-registry.md.
-    Returns (entries, directory_mappings).
+    Returns (entries, directory_mappings, warnings).
 
     entries format:
       [{"id": ..., "path": ..., "keywords": [...], "sections": [...], ...}]
 
     directory_mappings format:
       [{"pattern": "src/state/**", "ssots": ["docs/..."]}]
+
+    For backwards compatibility, the function can be called as:
+      entries, directory_mappings = parse_registry(...)
+    or:
+      entries, directory_mappings, warnings = parse_registry(...)
     """
     text = registry_path.read_text(encoding="utf-8")
 
     entries = []
     directory_mappings = []
+    parse_warnings = []
 
     # Extract YAML entries (- id: ... blocks)
     # Split by "- id:" to get individual entries
@@ -63,8 +69,8 @@ def parse_registry(registry_path: Path) -> tuple:
                     kws = [k.strip() for k in kws.split(",")]
                 entry["keywords"] = kws
                 entries.append(entry)
-        except yaml.YAMLError:
-            continue
+        except yaml.YAMLError as e:
+            parse_warnings.append(f"YAML parse error in registry block (skipped): {e}")
 
     # Extract directory_mappings YAML block
     # Look for ```yaml ... ``` block under "## ディレクトリ" section
@@ -92,7 +98,7 @@ def parse_registry(registry_path: Path) -> tuple:
             except yaml.YAMLError:
                 pass
 
-    return entries, directory_mappings
+    return entries, directory_mappings, parse_warnings
 
 
 def match_keywords(keywords, entries, docs_dir):
@@ -171,7 +177,7 @@ def match_paths(paths, directory_mappings, entries):
             pattern = dm.get("pattern", "")
             # Directory prefix match: strip trailing /** and require path separator
             # to avoid matching sibling directories (e.g. src/state/** must not match src/stateful/)
-            prefix = pattern.rstrip("/**").rstrip("/")
+            prefix = pattern.removesuffix("/**").rstrip("/")
             if p.startswith(prefix + "/") or p.rstrip("/") == prefix:
                 ssots = dm.get("ssots", [])
                 for ssot_path in ssots:
@@ -279,7 +285,7 @@ def main():
         sys.exit(2)
 
     try:
-        entries, directory_mappings = parse_registry(registry_path)
+        entries, directory_mappings, parse_warnings = parse_registry(registry_path)
     except Exception as e:
         print(emit_result(keywords, paths, [], keywords, paths, errors=[f"Failed to parse registry: {e}"]), end="")
         sys.exit(2)
@@ -289,7 +295,7 @@ def main():
 
     matched = merge_results(kw_matched, path_matched)
 
-    print(emit_result(keywords, paths, matched, unmatched_keywords, unmatched_paths), end="")
+    print(emit_result(keywords, paths, matched, unmatched_keywords, unmatched_paths, warnings=parse_warnings), end="")
 
 
 if __name__ == "__main__":
