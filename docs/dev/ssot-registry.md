@@ -178,6 +178,18 @@ directory_mappings:
 
 ---
 
+## Derived Artifacts
+
+`docs/` SSOT の下位に位置する derived workbench artifacts を管理する。
+derived artifact は `docs/` SSOT に矛盾した場合、`docs/` が勝つ（conflict_rule: docs-ssot-wins）。
+
+| Path | Source | Role | 生成方法 | 注意事項 |
+|------|--------|------|----------|----------|
+| `.specify/` | specify-cli v0.8.13 upstream | derived workbench artifact | throwaway spike (#298) で `specify init --here --no-git --integration claude --force` を実行し、手動マージ（Issue #303） | 直接 `specify init` による再生成禁止。ADR 0002 `direct_speckit_implement_on_main: prohibited` 準拠。`.specify/memory/constitution.md` を docs/ SSOT の上位に置くことも禁止。 |
+| `.claude/skills/speckit-*/` | specify-cli v0.8.13 upstream | reviewed upstream snapshot | throwaway spike (#298) の成果物を Issue #303 で手動マージ | upstream 名のまま維持。250 行超 SKILL.md は Tier 3 扱いで on-demand loading のみ許可（詳細は `docs/dev/agent-skill-boundaries.md`）。 |
+
+---
+
 ## 更新ガイド
 
 新規 SSOT 文書追加時の必須更新セット（同一 PR で実施すること）:

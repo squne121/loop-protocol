@@ -1,9 +1,11 @@
 # ADR 0002: SDD ツール採否 — Spec-Driven Development 運用方針
 
 ```yaml
-status: accepted-with-deferral
+status: accepted
 decision_date: 2026-05-23
+confirmed_date: 2026-05-23
 issue: "#257"
+confirmation_issue: "#303"
 parent_issue: "#254"
 ```
 
@@ -53,8 +55,9 @@ task_tracking: github-issues
 tasks_md_role: staging-artifact
 ```
 
-Spec Kit を upstream-compatible な方針で採用する（`accepted-with-deferral`）。
-ただし Spec Kit CLI の main ブランチ直接導入・生成物の正本化は別 Issue での throwaway worktree spike 後とする。
+Spec Kit を upstream-compatible な方針で採用する。
+Issue #298 の throwaway worktree spike（`spec_kit_spike_acceptance` 6 項目が条件付き PASS 以上）完了により、
+`accepted-with-deferral` から `accepted` に確定した（Issue #303 で実施）。
 
 OpenSpec は primary SDD tool として採用しない。比較対象・軽量 spike・将来再評価対象に留める
 （OpenSpec Issue #666: hard-coded spec format が既存 `docs/` 形式との整合を阻害する）。
@@ -294,10 +297,71 @@ playtest_entry:
 - GitHub native Sub-issues 正式採用（別 ADR / GitHub ops issue）
 - Spec Kit 生成物の正本化（本 ADR の conflict_rule を変更する場合）
 
+## Policy Delta（Issue #303 確定時 — accepted 更新）
+
+Issue #303（Spec Kit CLI main ブランチ導入）の実施により、以下のポリシーが確定した。
+
+```yaml
+policy_delta:
+  issue: "#303"
+  confirmed_at: "2026-05-23"
+
+  skill_namespace:
+    decision: upstream_name_adopted
+    rationale: >
+      ADR 0002 Decision Point 4 で「spec- prefix で命名する」方針を示したが、
+      Issue #257 の ADR マージ後の検討（upstream-compatible 優先）により、
+      speckit-* upstream 名をそのまま採用することを明示的な後続決定として確定する。
+      既存の spec- prefix 方針よりも upstream-compatible 維持が優先される。
+    adopted_names:
+      - speckit-analyze
+      - speckit-checklist
+      - speckit-clarify
+      - speckit-constitution
+      - speckit-implement
+      - speckit-plan
+      - speckit-specify
+      - speckit-tasks
+      - speckit-taskstoissues
+
+  skill_artifact_classification:
+    path: ".claude/skills/speckit-*/"
+    classification: reviewed_upstream_snapshot
+    status: managed_derived_artifact
+    description: >
+      .claude/skills/speckit-* は specify-cli v0.8.13 upstream から throwaway spike (#298) で
+      生成・検証後に手動マージした reviewed upstream snapshot である。
+      直接 specify init による再生成は禁止し、upstream 更新時は別 Issue で管理する。
+
+  implementation_execution_policy:
+    direct_speckit_implement_on_main: prohibited
+    description: >
+      ADR 0002 で定めた direct_speckit_implement_on_main: prohibited が維持される。
+      speckit-implement スキルは impl-review-loop 経由の supervised use のみ許可。
+
+  docs_ssot_boundary:
+    docs_wins: true
+    specify_role: derived_workbench
+    description: >
+      .specify/ は derived workbench artifact であり、docs/ SSOT とは独立している。
+      docs/ SSOT と .specify/ 生成物が矛盾した場合は docs/ が勝つ（conflict_rule 維持）。
+      .specify/memory/constitution.md を docs/ の上位に置くことは引き続き禁止。
+
+  tier_policy:
+    tier3_skills:
+      - speckit-analyze      # 260 lines
+      - speckit-checklist    # 372 lines
+      - speckit-clarify      # 254 lines
+      - speckit-specify      # 330 lines
+    loading_policy: auto_load_prohibited
+    description: >
+      250 行超の speckit-* SKILL.md は Tier 3 扱いで常時読込禁止。
+      CLAUDE.md / .claude/rules/ に常時読込指示を追加してはならない。
+```
+
 ## スコープ外
 
-- 実 SDD ツール（Spec Kit / OpenSpec）の main ブランチ直接導入
-- 採用後の throwaway worktree spike の実施
 - 各 product doc（game-thesis / game-design / game-logic / mvp-scope / playtest / lifecycle 等）の本文作成
 - CLAUDE.md や `.claude/rules/project-constitution.md` の「読む順序」更新
 - 既存 13 skill / 9 SubAgent の改修
+- speckit-* スキルの spec-* namespace へのリネーム（upstream-compatible 優先のため非実施）

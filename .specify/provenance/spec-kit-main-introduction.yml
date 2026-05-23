@@ -1,0 +1,11 @@
+specify_cli_version: "0.8.13"
+upstream_tag: "v0.8.13"
+generation_command: "specify init --here --no-git --integration claude --force"
+generated_at: "2026-05-23T00:00:00Z"
+source_worktree: "/tmp/spec-kit-spike (Issue #298 throwaway)"
+introduction_method: "manual merge from throwaway spike worktree"
+introduction_issue: "#303"
+notes: >
+  main worktree での specify init 直接実行は ADR 0002 の Stop Condition により禁止。
+  throwaway spike (#298) の成果物を手動マージした。
+  .specify/ は derived workbench artifact であり、docs/ SSOT とは独立している。
