@@ -1,11 +1,9 @@
 # SSOT レジストリ（SSOT カタログの正本）
 
-本ドキュメントは `docs/` 配下を SSOT として扱う際の **カタログの正本（docs 層）** である。
-`.claude/skills/ssot-discovery/references/ssot-catalog.md` は本ドキュメントから派生するキャッシュであり、
-正本は本ドキュメントである。
+本ドキュメントは `docs/` 配下を SSOT として扱う際の **カタログの唯一の正本（docs 層）** である。
+`match-ssot.sh` は本ドキュメントを動的に読み取り、SSOT discovery を行う。
 
-新規 SSOT を追加した場合は、本ドキュメント・ssot-catalog.md・ssot-discovery/SKILL.md・match-ssot.sh を
-**同一 PR で更新**すること（発見性ギャップ防止）。
+新規 SSOT を追加した場合は、本ドキュメントのみを手編集すること。`match-ssot.sh` は本ドキュメントを動的に読むため、エントリ追加で自動反映される（発見性ギャップ防止）。
 
 ## エントリ形式
 
@@ -184,9 +182,8 @@ directory_mappings:
 
 新規 SSOT 文書追加時の必須更新セット（同一 PR で実施すること）:
 
-1. 本ドキュメント（`docs/dev/ssot-registry.md`）にエントリ追加
-2. `.claude/skills/ssot-discovery/references/ssot-catalog.md` にエントリ追加（本ドキュメントから派生）
-3. `.claude/skills/ssot-discovery/SKILL.md` の説明・例を更新（必要な場合）
-4. `match-ssot.sh` が ssot-registry.md を動的読み取りしているため、エントリ追加で自動反映される
+1. 本ドキュメント（`docs/dev/ssot-registry.md`）のみを手編集してエントリを追加する
+2. `match-ssot.sh` が本ドキュメントを動的に読み取るため、エントリ追加で自動反映される
+3. `.claude/skills/ssot-discovery/SKILL.md` の説明・例を更新（内容が変わった場合）
 
-SSOT 文書削除時は上記の逆順で削除し、参照していた skill / agent も同 PR で更新する。
+SSOT 文書削除時は本ドキュメントからエントリを削除し、参照していた skill / agent も同 PR で更新する。

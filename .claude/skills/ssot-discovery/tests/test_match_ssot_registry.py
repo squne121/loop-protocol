@@ -135,3 +135,37 @@ def test_output_contract_fields():
         assert field in r, f"Missing required field '{field}' in SSOT_DISCOVERY_RESULT_V1"
     assert isinstance(r["inputs"]["task_keywords"], list)
     assert isinstance(r["inputs"]["target_paths"], list)
+
+
+# ---- Test 7: ssot-catalog.md is deleted (AC1 regression) ----
+
+def test_catalog_file_removed(repo_root):
+    catalog = repo_root / ".claude" / "skills" / "ssot-discovery" / "references" / "ssot-catalog.md"
+    assert not catalog.exists(), (
+        f"ssot-catalog.md should be deleted but found at {catalog}. "
+        "This file has been superseded by docs/dev/ssot-registry.md as the sole registry."
+    )
+
+
+# ---- Test 8: runtime,verification keywords return runtime-verification-policy.md (AC3 regression) ----
+
+def test_runtime_verification_keyword_returns_policy():
+    r = run_match(["--keywords", "runtime,verification"])
+    matched_paths = [d["path"] for d in r.get("matched_documents", [])]
+    assert "docs/dev/runtime-verification-policy.md" in matched_paths, (
+        f"docs/dev/runtime-verification-policy.md not found when searching 'runtime,verification'. "
+        f"Got: {matched_paths}"
+    )
+
+
+# ---- Test 9: directory mapping does not match sibling prefix (regression) ----
+
+def test_directory_mapping_does_not_match_sibling_prefix():
+    """src/state/** pattern should not match src/stateful/foo.ts."""
+    r = run_match(["--paths", "src/stateful/foo.ts"])
+    matched_paths = [d["path"] for d in r.get("matched_documents", [])]
+    # src/stateful/ is not in directory_mappings, so it should be unmatched
+    unmatched = r.get("unmatched_paths", [])
+    assert "src/stateful/foo.ts" in unmatched, (
+        f"src/stateful/foo.ts should be in unmatched_paths (no mapping). Got matched: {matched_paths}"
+    )

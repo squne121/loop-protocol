@@ -45,6 +45,9 @@ def parse_registry(registry_path: Path) -> tuple:
         block = block.strip()
         if not block.startswith("- id:"):
             continue
+        # Strip YAML document separator lines (---) and Markdown section headers
+        # which cause multi-document parse errors or YAML key errors
+        block = re.split(r'\n---\s*\n|\n---\s*$|\n(?=\S)', block)[0].strip()
         try:
             parsed = yaml.safe_load(block)
             if isinstance(parsed, list) and parsed:
@@ -166,9 +169,10 @@ def match_paths(paths, directory_mappings, entries):
 
         for dm in directory_mappings:
             pattern = dm.get("pattern", "")
-            # Simple prefix match: strip trailing /**
+            # Directory prefix match: strip trailing /** and require path separator
+            # to avoid matching sibling directories (e.g. src/state/** must not match src/stateful/)
             prefix = pattern.rstrip("/**").rstrip("/")
-            if p.startswith(prefix) or p.rstrip("/") == prefix:
+            if p.startswith(prefix + "/") or p.rstrip("/") == prefix:
                 ssots = dm.get("ssots", [])
                 for ssot_path in ssots:
                     if ssot_path not in matched:
