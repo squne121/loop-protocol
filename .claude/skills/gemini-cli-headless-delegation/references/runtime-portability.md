@@ -23,7 +23,7 @@
 ### 1. Preflight で環境確認
 
 ```bash
-uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
   --output-file tmp/gemini-headless-preflight.json
 cat tmp/gemini-headless-preflight.json
 ```
@@ -46,7 +46,7 @@ cat tmp/gemini-headless-preflight.json
 ### 3. Wrapper 実行
 
 ```bash
-uv run python3 .agents/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
   --request-file <request.json> \
   --output-file <result.json>
 ```

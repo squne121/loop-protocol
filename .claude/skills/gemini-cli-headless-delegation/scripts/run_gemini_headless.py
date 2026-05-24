@@ -557,10 +557,27 @@ def _validate_github_research_argv(argv: list[str]) -> list[str]:
             errors.append("github_research: gh api graphql is not allowed (always uses POST)")
             return errors
 
-        # Reject implicit-POST flags: -f/-F/--field/--raw-field/--input imply a non-GET request
+        # Reject implicit-POST flags: -f/-F/--field/--raw-field/--input imply a non-GET request.
+        # Handles exact match, =-separated (--field=val, --raw-field=val, --input=val),
+        # and concatenated short forms (-fkey=val, -Fkey=val where len > 2).
         implicit_post_flags = {"-f", "-F", "--field", "--raw-field", "--input"}
+        implicit_post_prefixes = ("--field=", "--raw-field=", "--input=")
         for token in argv:
             if token in implicit_post_flags:
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif any(token.startswith(prefix) for prefix in implicit_post_prefixes):
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif len(token) > 2 and token.startswith("-f") and not token.startswith("--"):
+                # Concatenated form: -fkey=val
+                errors.append(
+                    f"github_research: gh api with {token} implies a non-GET request and is not allowed"
+                )
+            elif len(token) > 2 and token.startswith("-F") and not token.startswith("--"):
+                # Concatenated form: -Fkey=val
                 errors.append(
                     f"github_research: gh api with {token} implies a non-GET request and is not allowed"
                 )
@@ -738,6 +755,28 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
     return errors
 
 
+_POST_TO_ISSUE_URL_PATTERN = re.compile(
+    r'^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+/issues/\d+$'
+)
+
+
+def _validate_post_to_issue_url(url: str) -> list[str]:
+    """Validate post_to_issue_url format.
+
+    B6: Only https://github.com/<owner>/<repo>/issues/<number> is allowed.
+    - host must be github.com (no host spoof)
+    - path must be /issues/<number>, not /pulls/<number>
+    """
+    if not isinstance(url, str) or not url.strip():
+        return ["post_to_issue_url must be a non-empty string when provided"]
+    if not _POST_TO_ISSUE_URL_PATTERN.match(url):
+        return [
+            "post_to_issue_url must match https://github.com/<owner>/<repo>/issues/<number>; "
+            "pulls/<number> and non-github.com hosts are not allowed"
+        ]
+    return []
+
+
 def validate_request(request: Mapping[str, Any], request_path: Path | None = None) -> list[str]:
     errors: list[str] = []
 
@@ -756,7 +795,12 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     tool_profile = request.get("tool_profile")
     if tool_profile not in ALLOWED_TOOL_PROFILES:
         errors.append("tool_profile must be one of: no_tools, grounded_research, local_asset_research, proposal_only, github_research")
-    elif tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
+    else:
+        # B3: gh_commands is only allowed with github_research profile (fail-closed)
+        if request.get("gh_commands") is not None and tool_profile != GITHUB_RESEARCH_PROFILE:
+            errors.append("gh_commands is only allowed with tool_profile='github_research'")
+
+    if tool_profile == LOCAL_ASSET_RESEARCH_PROFILE:
         if request.get("post_to_issue_url"):
             errors.append("local_asset_research forbids post_to_issue_url")
         errors.extend(_validate_local_asset_research_settings())
@@ -764,6 +808,11 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
         errors.extend(_validate_proposal_only_request(request))
     elif tool_profile == GITHUB_RESEARCH_PROFILE:
         errors.extend(_validate_github_research_request(request))
+
+    # B6: validate post_to_issue_url format when present (any profile).
+    post_to_issue_url = request.get("post_to_issue_url")
+    if post_to_issue_url:
+        errors.extend(_validate_post_to_issue_url(post_to_issue_url))
 
     errors.extend(_validate_string_list("output_sections", request.get("output_sections"), 1))
     if tool_profile == PROPOSAL_ONLY_PROFILE:
@@ -1330,55 +1379,9 @@ def run_delegation(
                 )
                 return base_result
 
-    # local_asset_research / proposal_only: execute gh_commands with warn-on-denied
-    elif tool_profile in (LOCAL_ASSET_RESEARCH_PROFILE, PROPOSAL_ONLY_PROFILE):
-        gh_commands = request.get("gh_commands")
-        if isinstance(gh_commands, list) and gh_commands:
-            gh_output_parts_warn: list[str] = []
-            for idx, entry in enumerate(gh_commands):
-                if not isinstance(entry, dict):
-                    request_warnings.append(
-                        f"{tool_profile}: gh_commands[{idx}] must be an object with 'argv' field; skipping"
-                    )
-                    continue
-                argv = entry.get("argv")
-                if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
-                    request_warnings.append(
-                        f"{tool_profile}: gh_commands[{idx}].argv must be a list of strings; skipping"
-                    )
-                    continue
-                # allowlist validation: invalid argv -> warn + skip (no fail-close)
-                argv_errors = _validate_github_research_argv(argv)
-                if argv_errors:
-                    for err in argv_errors:
-                        request_warnings.append(
-                            f"{tool_profile}: gh_commands[{idx}] argv denied: {err}; skipping"
-                        )
-                    continue
-                # valid argv: execute
-                try:
-                    gh_proc = subprocess.run(
-                        ["gh"] + argv,
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        cwd=str(_repo_root()),
-                        check=False,
-                    )
-                    cmd_str = "gh " + " ".join(argv)
-                    if gh_proc.returncode == 0:
-                        gh_output_parts_warn.append(f"## gh command: {cmd_str}\n{gh_proc.stdout.strip()}")
-                    else:
-                        gh_output_parts_warn.append(
-                            f"## gh command: {cmd_str}\n[exit {gh_proc.returncode}] {gh_proc.stderr.strip()}"
-                        )
-                        request_warnings.append(
-                            f"{tool_profile}: gh {' '.join(argv)} exited {gh_proc.returncode}: {gh_proc.stderr.strip()}"
-                        )
-                except Exception as exc:
-                    request_warnings.append(f"{tool_profile}: gh command error: {exc}")
-            if gh_output_parts_warn:
-                gh_commands_output = "\n\n".join(gh_output_parts_warn)
+    # NOTE: The branch for local_asset_research / proposal_only + gh_commands has been removed.
+    # B3: validate_request() now rejects gh_commands for any profile other than github_research
+    # (fail-closed), so this branch is unreachable and has been deleted to prevent confusion.
 
     # Merge gh_commands output into inline_context
     existing_inline = request.get("inline_context") or ""
@@ -1661,8 +1664,8 @@ def _apply_compact(result: dict[str, Any]) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request-file", required=True, type=Path)
-    parser.add_argument("--output-file", required=True, type=Path)
+    parser.add_argument("--request-file", required=False, type=Path, default=None)
+    parser.add_argument("--output-file", required=False, type=Path, default=None)
     parser.add_argument(
         "--compact",
         action="store_true",
@@ -1674,6 +1677,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["json", "ndjson"],
         default="json",
         help="Output format: 'json' (default, overwrite) or 'ndjson' (append, one JSON object per line).",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Validate the request JSON without executing Gemini CLI. "
+            "Exits 0 if valid, 1 if invalid. Requires --request-file; --output-file is optional."
+        ),
+    )
+    # Positional argument: allow `run_gemini_headless.py --validate-only <file>` shorthand.
+    parser.add_argument(
+        "request_file_positional",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Request JSON file path (positional shorthand for --request-file).",
     )
     return parser
 
@@ -1696,7 +1716,41 @@ def _print_stdout_summary(result: dict[str, Any], output_file: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    request = _load_json(args.request_file)
+
+    # Resolve request file: prefer --request-file, fall back to positional argument.
+    request_file: Path | None = args.request_file or args.request_file_positional
+
+    # --validate-only mode: validate request JSON without executing Gemini CLI.
+    if args.validate_only:
+        if request_file is None:
+            print("[gemini-headless] error: --validate-only requires a request file (--request-file or positional)")
+            return 1
+        try:
+            request = _load_json(request_file)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"[gemini-headless] error: cannot load request file: {exc}")
+            return 1
+        if not isinstance(request, Mapping):
+            print("[gemini-headless] error: request file must contain a JSON object")
+            return 1
+        errors = validate_request(request, request_path=request_file)
+        if errors:
+            print(f"[gemini-headless] validation FAIL: {errors[0]}")
+            for err in errors[1:]:
+                print(f"  {err}")
+            return 1
+        print("[gemini-headless] validation OK")
+        return 0
+
+    # Normal execution mode: --request-file and --output-file are required.
+    if request_file is None:
+        print("[gemini-headless] error: --request-file is required")
+        return 1
+    if args.output_file is None:
+        print("[gemini-headless] error: --output-file is required")
+        return 1
+
+    request = _load_json(request_file)
     if not isinstance(request, Mapping):
         result = {
             "schema": "delegation_result/v1",
@@ -1714,7 +1768,7 @@ def main(argv: list[str] | None = None) -> int:
             "raw_command": [],
         }
     else:
-        result = run_delegation(request, request_path=args.request_file)
+        result = run_delegation(request, request_path=request_file)
     if args.compact:
         result = _apply_compact(result)
     if args.output_format == "ndjson":

@@ -254,7 +254,7 @@ def test_trusted_folders_parent_match_noop(tmp_path):
 
 def test_trusted_folders_absent_creates_file(tmp_path):
     """GIVEN trustedFolders.json does not exist
-    WHEN check_trusted_folders is called
+    WHEN check_trusted_folders is called with fix=True
     THEN file is created with repo root as dict entry {path: TRUST_FOLDER}."""
     sc = load_setup_check()
 
@@ -265,7 +265,7 @@ def test_trusted_folders_absent_creates_file(tmp_path):
     home_dir.mkdir()
 
     with patch.object(Path, "home", return_value=home_dir):
-        result = sc.check_trusted_folders(repo_root=repo_root)
+        result = sc.check_trusted_folders(repo_root=repo_root, fix=True)
 
     assert result["ok"] is True
     assert result["status"] == "added"
@@ -306,14 +306,14 @@ def test_gemini_settings_not_overwritten(tmp_path):
 
 def test_gemini_settings_created_when_absent(tmp_path):
     """GIVEN .gemini/settings.json does not exist
-    WHEN check_gemini_settings is called
+    WHEN check_gemini_settings is called with fix=True
     THEN template is created with serena MCP allowlist."""
     sc = load_setup_check()
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    result = sc.check_gemini_settings(repo_root=repo_root)
+    result = sc.check_gemini_settings(repo_root=repo_root, fix=True)
 
     assert result["ok"] is True
     assert result["status"] == "created"
@@ -376,7 +376,7 @@ def test_serena_mcp_unavailable_has_recovery(tmp_path):
 
 def test_trusted_folders_dict_existing_preserved(tmp_path):
     """GIVEN trustedFolders.json has 3 existing dict entries (preserve existing data)
-    WHEN check_trusted_folders is called with a new repo root
+    WHEN check_trusted_folders is called with fix=True and a new repo root
     THEN all 3 existing dict entries are preserved in the output dict.
 
     This verifies that setup_check preserves existing dict entries and does not
@@ -402,7 +402,7 @@ def test_trusted_folders_dict_existing_preserved(tmp_path):
     trusted_file.write_text(json.dumps(existing_entries), encoding="utf-8")
 
     with patch.object(Path, "home", return_value=home_dir):
-        result = sc.check_trusted_folders(repo_root=repo_root)
+        result = sc.check_trusted_folders(repo_root=repo_root, fix=True)
 
     assert result["ok"] is True
     assert result["status"] == "added"
@@ -446,7 +446,7 @@ def test_trusted_folders_append_as_dict_entry(tmp_path):
     trusted_file.write_text(json.dumps(initial), encoding="utf-8")
 
     with patch.object(Path, "home", return_value=home_dir):
-        result = sc.check_trusted_folders(repo_root=repo_root)
+        result = sc.check_trusted_folders(repo_root=repo_root, fix=True)
 
     assert result["ok"] is True
     assert result["status"] == "added"
@@ -501,3 +501,30 @@ def test_trusted_folders_parent_trust_noop_dict(tmp_path):
     assert after == initial, (
         "Dict must not be modified when TRUST_PARENT ancestor covers the repo root"
     )
+
+
+# ---------------------------------------------------------------------------
+# B4: GEMINI_CLI_TRUSTED_FOLDERS_PATH env override
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_folders_path_honors_env_override(tmp_path, monkeypatch):
+    """GIVEN GEMINI_CLI_TRUSTED_FOLDERS_PATH is set to a custom path
+    WHEN _trusted_folders_path() is called
+    THEN it returns that path (not ~/.gemini/trustedFolders.json)."""
+    sc = load_setup_check()
+
+    override_path = tmp_path / "trusted.json"
+    monkeypatch.setenv("GEMINI_CLI_TRUSTED_FOLDERS_PATH", str(override_path))
+    assert sc._trusted_folders_path() == override_path
+
+
+def test_trusted_folders_path_default_without_env(monkeypatch):
+    """GIVEN GEMINI_CLI_TRUSTED_FOLDERS_PATH is not set
+    WHEN _trusted_folders_path() is called
+    THEN it returns ~/.gemini/trustedFolders.json."""
+    sc = load_setup_check()
+
+    monkeypatch.delenv("GEMINI_CLI_TRUSTED_FOLDERS_PATH", raising=False)
+    result = sc._trusted_folders_path()
+    assert result == Path.home() / ".gemini" / "trustedFolders.json"
