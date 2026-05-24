@@ -9,6 +9,8 @@
 - `docs/`: 仕様と構成ルールの正本。
 - `.github/`: build と unit test を通す最小 CI。
 - `.devcontainer/`: WSL2 / container 共用の最小開発環境。
+- `AGENTS.md`: Codex project-local の実行方針。
+- `.codex/`: Codex project-local config / rules surface。
 - `assets/`: 人手管理アセット。AI は直接編集しない。
 - `LICENSES/`: ライセンス分離。
 

@@ -1,0 +1,121 @@
+# LOOP_PROTOCOL project-local command policy for Codex.
+# This is intentionally stricter than `.claude/settings.json`: Codex uses `rtk`
+# as the command harness, but only for explicitly allowlisted subcommands.
+
+prefix_rule(
+    pattern = ["rtk", "--help"],
+    decision = "allow",
+    justification = "Inspect the project harness interface before using it.",
+    match = [
+        "rtk --help",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", ["git", "gh", "pnpm"]],
+    decision = "allow",
+    justification = "Allow documented project harness subcommands for git, GitHub, and validation flows.",
+    match = [
+        "rtk git status",
+        "rtk gh issue view 1",
+        "rtk pnpm test",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", ["ls", "read", "find", "grep", "wc", "diff", "log", "summary", "json", "test", "tsc", "lint", "vitest", "pytest", "mypy", "ruff", "prettier", "format"]],
+    decision = "allow",
+    justification = "Allow read-oriented and verification-oriented rtk helpers.",
+    match = [
+        "rtk ls",
+        "rtk read README.md",
+        "rtk lint .",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", ["curl", "env"]],
+    decision = "prompt",
+    justification = "Network and environment inspection can expose secrets or remote content; require explicit review.",
+    match = [
+        "rtk curl https://api.github.com/repos/squne121/loop-protocol",
+        "rtk env",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", "--show-current"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git branch --show-current",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "log"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git log --oneline -5",
+        "git log --stat",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "status"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git status",
+        "git status --short",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "diff"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git diff",
+        "git diff --stat",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["push", "commit", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "add", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
+    decision = "forbidden",
+    justification = "Use `rtk git ...` for mutating repository operations so project policy is applied.",
+    match = [
+        "git commit -m update",
+        "git push",
+        "git checkout -b topic",
+        "git worktree add ../tmp main",
+        "git add AGENTS.md",
+        "git fetch origin",
+    ],
+)
+
+prefix_rule(
+    pattern = ["pnpm"],
+    decision = "forbidden",
+    justification = "Use `rtk pnpm ...` so validation runs through the project harness.",
+    match = [
+        "pnpm test",
+        "pnpm lint",
+        "pnpm typecheck",
+        "pnpm build",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh"],
+    decision = "forbidden",
+    justification = "Use `rtk gh ...` so GitHub operations follow project policy.",
+    match = [
+        "gh issue view 1",
+        "gh issue create",
+        "gh pr create",
+        "gh api repos/squne121/loop-protocol",
+    ],
+)

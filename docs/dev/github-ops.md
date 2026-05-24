@@ -277,3 +277,118 @@ gh api repos/squne121/loop-protocol/branches/main/protection
 ```
 
 組織全体で許可したいパターンは `.claude/settings.json`（repo-tracked / 共有）に置く。個人ローカル特化（端末固有のパス、テスト用環境変数等）は `.claude/settings.local.json` に置く。
+
+## Codex project-local permissions 方針
+
+Codex 側では `.claude/settings.json` と同型の allow / ask / deny を持たないため、project-local の境界は以下 3 面に分解して管理する。
+
+- `.codex/config.toml`: filesystem / network の permission profile を定義する
+- `.codex/rules/default.rules`: sandbox 外実行の allow / prompt / forbidden を定義する
+- `AGENTS.md`: repo 内で守る実行方針と `rtk` 前提を定義する
+
+公式ドキュメント（確認日: 2026-05-24）:
+
+- Config basics: https://developers.openai.com/codex/config-basic
+- Permissions: https://developers.openai.com/codex/permissions
+- Rules: https://developers.openai.com/codex/rules
+- AGENTS.md: https://developers.openai.com/codex/guides/agents-md
+
+### 有効化前提
+
+- Codex がこの repository を trusted project として扱っていること
+- untrusted project では `.codex/config.toml` / `.codex/rules/*.rules` は読み込まれない
+- user-global config や CLI flag で `sandbox_mode` が有効な場合、permission profile より旧 sandbox 設定が優先される
+- 実作業前に active permission profile、active rules、読み込まれた instruction surface を確認する
+
+### sandbox_mode 競合リスク
+
+`~/.codex/config.toml` や Codex CLI flags で旧 `sandbox_mode` / `sandbox_workspace_write` が有効な場合、`.codex/config.toml` の `default_permissions` profile ではなく、旧 sandbox 設定が優先されます。
+
+対策:
+1. `codex status` で active sandbox_mode を確認
+2. この repository 作業時は旧 sandbox 設定を無効化 (`--disable sandbox_mode` など)
+3. または Permission profile ベースの設定に全面移行するまで、global config の `sandbox_mode` を disabled に設定
+
+### bootstrap profile 使用例
+
+`loop-protocol-bootstrap` profile は npm registry access が必要な bootstrap / dependency 更新作業に使用します。使用例:
+
+```bash
+# 依存関係の更新が必要な場合のみ以下を実行
+codex sandbox linux --permissions-profile loop-protocol-bootstrap -C . -- rtk pnpm install
+codex sandbox linux --permissions-profile loop-protocol-bootstrap -C . -- rtk pnpm add package-name
+
+# 通常の開発・検証は loop-protocol-rtk を使用
+codex sandbox linux --permissions-profile loop-protocol-rtk -C . -- rtk pnpm test
+```
+
+### `.codex/config.toml` の責務
+
+- `approval_policy = "on-request"` を project-local の既定とする
+- `default_permissions` で Codex の custom profile を選択する
+- workspace root は write、`assets/` と `LICENSES/` は read-only に固定する
+- `loop-protocol-rtk` では GitHub 操作に必要な最小 network allowlist だけを持たせる
+- npm registry が必要な bootstrap / dependency 導入は `loop-protocol-bootstrap` profile に分離する
+- permission profile は beta であり、`sandbox_mode` と併用しない
+
+### `.codex/rules/default.rules` の責務
+
+- `rtk` は documented subcommand だけを allow し、Codex の shell 実行入口を project harness に寄せる
+- direct `pnpm`、direct `gh`、mutating `git` は forbidden にする
+- read-only git inspection は最小限だけ allow する
+- `match` サンプルを付けて rule load 時に自己検証できる形を保つ
+
+### `AGENTS.md` の責務
+
+- Codex が repo ルートで読む project-local instruction surface として使う
+- `rtk` 経由実行、保護領域、検証コマンド対応を短く固定する
+- 既存の `CLAUDE.md` / SSOT を置き換えず、Codex が project-local guidance を確実に読める薄い入口として保つ
+
+### Instruction surface / rules surface の実効確認
+
+Codex が project-local config / rules / instruction を正しく読み込んでいることを確認する手順:
+
+```bash
+# 1. Instruction surface 確認
+# （Codex に project-local AGENTS.md を読んでいるかを確認させる）
+codex --ask-for-approval never "List the active instruction sources and summarize loaded AGENTS.md guidance."
+
+# 2. Rules surface 確認
+# （project-local rules が active profile に反映されているかを確認）
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh issue view 1
+
+# 3. Permission profile 実効確認
+# （現在のコンテキストで active permission profile と sandbox_mode が何かを確認）
+# Note: コマンド名は Codex バージョンで異なる可能性があるため、`codex --help` で確認
+codex status
+```
+
+失敗原因が user-global config や CLI flags による上書きなら、PR コメントに「repo-local 設定は user-global / CLI flags に上書きされ得るため、merge 後の有効化は各環境で確認が必要」と明記すること。
+
+## rtk gh trust boundary
+
+`.codex/rules/default.rules` は `rtk gh` を allow している。これは direct `gh` を forbidden にする設計とは整合しますが、`rtk gh` が GitHub write 操作の安全性をどう保証するかは、このルール定義単体では証明されていません。
+
+**確認が必要な点:**
+
+- `rtk gh` が arbitrary shell passthrough を提供しない（documented subcommand のみを許可する）
+- GitHub write operations（issue/PR create、edit、merge、API -X POST 等）が human approval または project policy を要求する
+- direct `gh` が execpolicy で確実に forbidden と判定される
+
+**確認方法:**
+
+```bash
+# rtk が provide する subcommand を確認
+rtk --help
+rtk gh --help
+
+# rules surface で git / gh / pnpm の判定を確認
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh issue view 1
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- gh issue view 1
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk git status
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- git status
+```
+
+**制限:**
+
+本ドキュメント作成時点（PR #345）では、rtk 自体の実装・subcommand enforcement の詳細は`.codex/rules/default.rules` の scope 外です。rtk trust boundary が変わった場合や passthrough が導入された場合は、rules 設定を再審査し、必要に応じて `rtk gh` write operations を prompt / forbidden に落とす必要があります。
