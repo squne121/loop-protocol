@@ -242,6 +242,86 @@ def truncate_output(text: str, max_lines: int = 20, bytes_per_line: int = 2048) 
     return result, was_truncated, original_line_count
 
 
+def _strip_uv_run_options(argv: List[str]) -> List[str]:
+    """
+    uv run [options...] <cmd...> を unwrap して <cmd...> の argv を返す。
+
+    uv flag (--locked, --with <pkg> など) を取り除く。
+    例: ["uv", "run", "--locked", "pytest"] → ["pytest"]
+    例: ["uv", "run", "--with", "pytest", "pytest"] → ["pytest"]
+    """
+    if not argv or argv[0] != "uv":
+        return argv
+
+    if len(argv) < 2 or argv[1] != "run":
+        return argv
+
+    # argv[2:] から uv flags を取り除く
+    result = []
+    i = 2
+    while i < len(argv):
+        arg = argv[i]
+        # uv flags that take an argument
+        if arg in ("--with", "--extra", "-p", "--python"):
+            i += 2  # skip flag and its argument
+            continue
+        # uv flags that don't take an argument
+        if arg.startswith("--"):
+            i += 1  # skip flag only
+            continue
+        # Non-flag argument: this is the start of the command
+        result = argv[i:]
+        break
+
+    return result if result else argv
+
+
+def _is_pytest_invocation(command: str) -> bool:
+    """
+    コマンドが pytest invocation かどうかを argv/token ベースで検出。
+
+    対象パターン:
+    - pytest
+    - python -m pytest
+    - python3 -m pytest
+    - uv run pytest
+    - uv run --locked pytest
+    - uv run --with pytest pytest
+    - uv run python -m pytest (等々)
+
+    戻り値: True if pytest invocation, False otherwise
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        # shlex.split 失敗 = compound または複雑なコマンド
+        return False
+
+    if not argv:
+        return False
+
+    # uv run を unwrap
+    unwrapped = _strip_uv_run_options(argv)
+    if not unwrapped:
+        return False
+
+    # unwrapped の最初の要素の basename が pytest か確認
+    first_cmd = unwrapped[0]
+    if Path(first_cmd).name == "pytest":
+        return True
+
+    # python / python3 -m pytest パターン
+    if (
+        Path(first_cmd).name in ("python", "python3")
+        and len(unwrapped) >= 3
+        and unwrapped[1] == "-m"
+        and unwrapped[2] == "pytest"
+    ):
+        return True
+
+    return False
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
@@ -300,6 +380,22 @@ def classify_result(
 
     if "No such file or directory" in stderr and exit_code == -1:
         return "blocked", "env_missing_dep", "blocked", "Command not found"
+
+    # pytest baseline fail patterns (AC2, AC3)
+    if _is_pytest_invocation(command):
+        combined_lower = f"{stdout}\n{stderr}".lower()
+
+        # AC2: pytest exit 4 + file not found → expected_baseline_fail
+        if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
+            return "expected_fail", "expected_baseline_fail", "go", None
+
+        # AC3: pytest exit 5 + no tests collected → expected_baseline_fail
+        if exit_code == 5 and (
+            "no tests ran" in combined_lower
+            or "no tests collected" in combined_lower
+            or "collected 0 items" in combined_lower
+        ):
+            return "expected_fail", "expected_baseline_fail", "go", None
 
     # expected baseline fail patterns
     # rg with no match returns 1
