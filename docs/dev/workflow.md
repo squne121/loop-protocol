@@ -113,6 +113,8 @@ git branch -d worktree-<slug>
 
 `human-confirm.yml` は不採用（PR #16）。人間判断は元 Issue 内でブロッカー扱い + 本文修正の運用とする。
 
+Note: `research.yml` の `state/queued` は Known residual。#275 が `.github/ISSUE_TEMPLATE/research.yml` の writer cleanup を所有するため、本表の research 行も #275 完了時に同期更新する。
+
 ### Implementation issue canonical contract
 
 implementation issue では、以下 3 つを別概念として扱う。

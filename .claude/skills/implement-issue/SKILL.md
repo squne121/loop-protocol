@@ -13,6 +13,8 @@ description: 承認済みの implementation child issue（`issue-contract-review
 - `Issue番号` または `Issue URL`（必須）
 - `issue-contract-review` の contract-snapshot comment URL（必須）
 
+Note: `contract_snapshot_url` の省略時自動検出・自動 materialize は #149 の責務。本 skill 単体では URL 入力を必須とし、URL 未提供時は `impl-review-loop` / #149 実装後の preparation に委譲する。
+
 ## Procedure
 
 ### 1. Issue contract を再取得
