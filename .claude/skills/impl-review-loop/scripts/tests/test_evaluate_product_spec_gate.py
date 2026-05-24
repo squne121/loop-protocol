@@ -165,6 +165,19 @@ def test_contract_snapshot_url_cli_passthrough():
     assert "issue_url" in result, "Expected issue_url field to be present for back-compat"
 
 
+# Issue #333 VC node name aliases (AC2 and AC4)
+def test_decision_fail_stops_human():
+    """AC2 alias: Issue #333 VC requires test_decision_fail_stops_human node name"""
+    test_fail_stops_human()
+
+
+def test_missing_or_stale_routes_refresh():
+    """AC4 alias: Issue #333 VC requires test_missing_or_stale_routes_refresh node name"""
+    test_missing_schema_refreshes()
+    test_stale_snapshot_refreshes()
+    test_missing_contract_root_refreshes()
+
+
 if __name__ == "__main__":
     # Run all tests
     tests = [
