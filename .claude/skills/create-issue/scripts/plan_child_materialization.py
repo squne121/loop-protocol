@@ -50,7 +50,29 @@ ChildStatus = Literal[
     "stale_body_only",
     "ambiguous",
 ]
-ChildAction = Literal["create_issue", "reuse_and_update_parent", "no_op", "human_escalation"]
+ChildAction = Literal[
+    "create_issue",
+    "reuse_and_update_parent",
+    "no_op",
+    "human_escalation",
+    "register_subissue_or_human_escalation",
+]
+
+GapReason = Literal[
+    "unsupported_child_id_format",
+    "checkbox_without_issue_ref_but_title_present",
+    "issue_ref_present_but_not_native_subissue",
+    "stale_placeholder_with_issue_ref",
+    "duplicate_child_id",
+    "multiple_issue_refs",
+    "missing_title",
+    "cross_owner_issue",
+    "github_api_422",
+    "expected_match_count_not_1",
+    "malformed_checkbox",
+]
+
+RepairConfidence = Literal["high", "medium", "low"]
 
 
 @dataclass
@@ -82,6 +104,28 @@ class ParentBodyUpdate:
 
 
 @dataclass
+class ParserGapEntry:
+    """A line in the ## Child Issues section that could not be fully parsed."""
+    line_number: int
+    raw_line: str
+    gap_reason: GapReason
+    suggested_repair: Optional[str]
+    repair_confidence: RepairConfidence
+    minimal_context: dict
+
+
+@dataclass
+class BodyInventory:
+    """Body desired state from ## Child Issues section."""
+    child_issues_section_found: bool
+    start_line: Optional[int]
+    end_line: Optional[int]
+    candidate_count: int  # total checkbox/bullet candidate lines
+    parsed_count: int     # successfully parsed child lines
+    parser_gap_report: list[ParserGapEntry] = field(default_factory=list)
+
+
+@dataclass
 class IssueLookup:
     strategy: str
     complete: bool
@@ -99,9 +143,12 @@ class Plan:
     parent_mode: str
     closure_mode: str
     issue_lookup: IssueLookup
+    body_inventory: Optional[BodyInventory] = None
+    github_subissues_actual: list[dict] = field(default_factory=list)
     children: list[ChildEntry] = field(default_factory=list)
     parent_body_updates: list[ParentBodyUpdate] = field(default_factory=list)
     required_issue_creations: list[str] = field(default_factory=list)
+    required_subissue_registrations: list[str] = field(default_factory=list)
     required_issue_edits: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -114,12 +161,14 @@ class Plan:
 #   - [ ] #N — C254-M: ...
 #   - C254-M ... （未起票）  (bullet form)
 #   - C254-M ... #N
+#   - A: ... (A/B/C/D track ID form under ## Child Issues)
+#   - [ ] A: ... (checkbox form with A/B/C/D track ID)
 _CHILD_LINE_RE = re.compile(
     r"^[-*]?\s*"
     r"(?:\[[ xX]?\]\s*)?"   # optional checkbox like "- [ ]" or "- [x]"
     r"(?:#(?P<leading_ref>\d+)\s*[—–—–-]\s*)?"  # optional leading "#N —" with capture
-    r"(?P<child_id>C\d+-\d+)"
-    r"[:\s]+"               # separator: space(s) or colon+space(s) after child_id
+    r"(?P<child_id>C\d+-\d+|[A-Z])"             # C254-3 OR single uppercase letter (A/B/C/D)
+    r"[:\s]+"                # separator: space(s) or colon+space(s) after child_id
     r"(?P<rest>.+)$"
 )
 
@@ -143,6 +192,11 @@ _PARENT_MODE_RE = re.compile(
 # Matches the closure_mode in the Machine-Readable Contract block
 _CLOSURE_MODE_RE = re.compile(
     r"(?im)^[ \t]*closure_mode\s*:\s*[\"']?(?P<mode>[\w-]+)[\"']?\s*$"
+)
+
+# Matches a candidate checkbox/bullet line (may or may not parse successfully)
+_CANDIDATE_LINE_RE = re.compile(
+    r"^[-*]?\s*(?:\[[ xX]?\]\s*)?(?:#\d+\s*[—–—–-]\s*)?\S"
 )
 
 
@@ -169,35 +223,65 @@ def _extract_closure_mode(body: str) -> str:
     return "unknown"
 
 
-def _extract_child_issues_section(body: str) -> list[tuple[int, str]]:
-    """Extract lines from the '## Child Issues' section only.
+def _extract_child_issues_section(body: str) -> tuple[list[tuple[int, str]], Optional[int], Optional[int]]:
+    """Extract lines from the '## Child Issues' section, including sub-headings.
 
-    Returns a list of (1-based-line-number, line) tuples for lines
-    within the section, stopping at the next heading.
+    Unlike the previous implementation, this version does NOT stop at sub-headings
+    (### or deeper). It only stops at a sibling heading (## or higher level).
+
+    Returns:
+        - list of (1-based-line-number, line) tuples within the section
+        - start_line (1-based) or None if section not found
+        - end_line (1-based, exclusive) or None if section not found
     """
     in_section = False
     results: list[tuple[int, str]] = []
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
     for i, line in enumerate(body.splitlines(), start=1):
         stripped = line.strip()
         if stripped == "## Child Issues":
             in_section = True
+            start_line = i
             continue
         if in_section:
-            # Stop at any other heading (## or deeper)
-            if re.match(r"^#{1,6}\s", stripped):
+            # Stop only at sibling (##) or parent (#) heading, NOT at sub-headings (###)
+            if re.match(r"^#{1,2}\s", stripped):
+                end_line = i
                 break
             results.append((i, line))
-    return results
+    if in_section and end_line is None:
+        end_line = (start_line or 0) + len(results) + 1
+    return results, start_line, end_line
+
+
+def _is_candidate_line(line: str) -> bool:
+    """Return True if the line looks like a child candidate (checkbox or bullet).
+
+    Blank lines, prose paragraphs, and sub-headings are not candidates.
+    Sub-heading lines (###) are NOT candidates but are included in the section scan.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Sub-headings are section markers, not candidates
+    if re.match(r"^#{1,6}\s", stripped):
+        return False
+    # Must start with bullet/checkbox or look like a child reference
+    return bool(re.match(r"^[-*]", stripped) or re.match(r"^[A-Z][:\s]", stripped) or
+                re.match(r"^C\d+-\d+", stripped) or re.match(r"^#\d+\s*[—–]", stripped))
 
 
 def _parse_child_lines(body: str) -> list[dict]:
-    """Parse Cxxx-N child lines from the '## Child Issues' section only.
+    """Parse child lines from the '## Child Issues' section only.
+
+    Supports both C254-N format and A:/B:/C:/D: track ID format.
 
     Returns a list of raw dicts with keys:
         child_id, title_fragment, rest, is_placeholder, raw_issue_refs,
         line_number (1-based), raw_line
     """
-    section_lines = _extract_child_issues_section(body)
+    section_lines, _, _ = _extract_child_issues_section(body)
     results = []
     for line_number, line in section_lines:
         m = _CHILD_LINE_RE.match(line.strip())
@@ -221,6 +305,177 @@ def _parse_child_lines(body: str) -> list[dict]:
             }
         )
     return results
+
+
+def _build_body_inventory(
+    body: str,
+    parent_issue: int,
+    parent_mode: str,
+) -> BodyInventory:
+    """Build a BodyInventory from the ## Child Issues section.
+
+    Inventory-first approach: count all candidate lines before parsing,
+    then record gaps between candidate_count and parsed_count.
+    """
+    section_lines, start_line, end_line = _extract_child_issues_section(body)
+
+    if start_line is None:
+        return BodyInventory(
+            child_issues_section_found=False,
+            start_line=None,
+            end_line=None,
+            candidate_count=0,
+            parsed_count=0,
+            parser_gap_report=[],
+        )
+
+    # Count candidates (lines that look like child items)
+    candidate_lines = [(ln, line) for ln, line in section_lines if _is_candidate_line(line)]
+    candidate_count = len(candidate_lines)
+
+    # Parse successfully
+    parsed = _parse_child_lines(body)
+    parsed_count = len(parsed)
+    parsed_line_numbers = {p["line_number"] for p in parsed}
+
+    # Build parser_gap_report for candidate lines that didn't parse
+    parser_gap_report: list[ParserGapEntry] = []
+    parsed_child_ids: set[str] = set()
+    duplicate_child_ids: set[str] = set()
+    for p in parsed:
+        cid = p["child_id"]
+        if cid in parsed_child_ids:
+            duplicate_child_ids.add(cid)
+        parsed_child_ids.add(cid)
+
+    for line_number, line in candidate_lines:
+        if line_number in parsed_line_numbers:
+            # Check for duplicate child_id (unsafe gap)
+            stripped = line.strip()
+            m = _CHILD_LINE_RE.match(stripped)
+            if m:
+                cid = m.group("child_id")
+                if cid in duplicate_child_ids:
+                    issue_refs = [int(r) for r in _ISSUE_REF_RE.findall(m.group("rest") or "")]
+                    if len(issue_refs) > 1:
+                        gap_reason: GapReason = "multiple_issue_refs"
+                        confidence: RepairConfidence = "low"
+                        suggested = None
+                    else:
+                        gap_reason = "duplicate_child_id"
+                        confidence = "low"
+                        suggested = None
+                    parser_gap_report.append(ParserGapEntry(
+                        line_number=line_number,
+                        raw_line=line,
+                        gap_reason=gap_reason,
+                        suggested_repair=suggested,
+                        repair_confidence=confidence,
+                        minimal_context={
+                            "parent_issue": parent_issue,
+                            "section": "Child Issues",
+                            "raw_line": line.strip(),
+                        },
+                    ))
+            continue
+
+        # This candidate line didn't parse — classify the gap
+        stripped = line.strip()
+        gap = _classify_parser_gap(
+            line_number=line_number,
+            raw_line=line,
+            stripped=stripped,
+            parent_issue=parent_issue,
+        )
+        if gap is not None:
+            parser_gap_report.append(gap)
+
+    return BodyInventory(
+        child_issues_section_found=True,
+        start_line=start_line,
+        end_line=end_line,
+        candidate_count=candidate_count,
+        parsed_count=parsed_count,
+        parser_gap_report=parser_gap_report,
+    )
+
+
+def _classify_parser_gap(
+    *,
+    line_number: int,
+    raw_line: str,
+    stripped: str,
+    parent_issue: int,
+) -> Optional[ParserGapEntry]:
+    """Classify a candidate line that failed to parse into a ParserGapEntry.
+
+    Returns None if the line is not actually a candidate (shouldn't happen).
+
+    Gap classification rules:
+    - repairable (high confidence): unsupported format, missing issue ref but title present
+    - unsafe (low confidence / human_escalation): duplicate_child_id, multiple refs, missing title
+    """
+    minimal_context = {
+        "parent_issue": parent_issue,
+        "section": "Child Issues",
+        "raw_line": stripped,
+    }
+
+    # Check for multiple issue refs — unsafe
+    issue_refs = [int(r) for r in _ISSUE_REF_RE.findall(stripped)]
+    if len(issue_refs) > 1:
+        return ParserGapEntry(
+            line_number=line_number,
+            raw_line=raw_line,
+            gap_reason="multiple_issue_refs",
+            suggested_repair=None,
+            repair_confidence="low",
+            minimal_context=minimal_context,
+        )
+
+    # Check if it looks like a single-letter child ID without proper separator
+    # e.g. "- A Issue body validator" (space separator, no colon) — repairable
+    m_alpha = re.match(
+        r"^[-*]?\s*(?:\[[ xX]?\]\s*)?(?:#\d+\s*[—–—–-]\s*)?([A-Z])\s+(\S.*)$", stripped
+    )
+    if m_alpha:
+        child_id_candidate = m_alpha.group(1)
+        rest_candidate = m_alpha.group(2).strip()
+        if rest_candidate:
+            suggested = f"- [ ] {child_id_candidate}: {rest_candidate}"
+            return ParserGapEntry(
+                line_number=line_number,
+                raw_line=raw_line,
+                gap_reason="unsupported_child_id_format",
+                suggested_repair=suggested,
+                repair_confidence="high",
+                minimal_context=minimal_context,
+            )
+
+    # Check for missing title (only whitespace after child_id or ref)
+    m_no_title = re.match(
+        r"^[-*]?\s*(?:\[[ xX]?\]\s*)?(?:#\d+\s*[—–—–-]\s*)?(?:C\d+-\d+|[A-Z])[:\s]*$",
+        stripped,
+    )
+    if m_no_title:
+        return ParserGapEntry(
+            line_number=line_number,
+            raw_line=raw_line,
+            gap_reason="missing_title",
+            suggested_repair=None,
+            repair_confidence="low",
+            minimal_context=minimal_context,
+        )
+
+    # Fallback: malformed checkbox / unknown format
+    return ParserGapEntry(
+        line_number=line_number,
+        raw_line=raw_line,
+        gap_reason="malformed_checkbox",
+        suggested_repair=None,
+        repair_confidence="low",
+        minimal_context=minimal_context,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +534,33 @@ def _view_issue(repo: str, issue_number: int, gh_bin: str = "gh") -> Optional[Ex
         return None
 
 
+def _fetch_subissues_actual(
+    repo: str, parent_issue: int, gh_bin: str = "gh"
+) -> list[dict]:
+    """Fetch native GitHub Sub-issues for a parent issue via REST API.
+
+    Returns a list of sub-issue dicts (may be empty on failure or no sub-issues).
+    Each dict has: number, title, state, url.
+    """
+    args = [
+        gh_bin,
+        "api",
+        f"repos/{repo}/issues/{parent_issue}/sub_issues",
+        "--jq",
+        "[.[] | {number: .number, title: .title, state: .state, url: .html_url}]",
+    ]
+    cp = subprocess.run(args, capture_output=True, text=True)
+    if cp.returncode != 0:
+        return []
+    try:
+        result = json.loads(cp.stdout.strip() or "[]")
+        if isinstance(result, list):
+            return result
+        return []
+    except json.JSONDecodeError:
+        return []
+
+
 def _search_dedupe_candidates(
     repo: str, dedupe_key: str, gh_bin: str = "gh"
 ) -> list[dict]:
@@ -323,6 +605,7 @@ def _classify_child(
     gh_bin: str = "gh",
     dry_run: bool = False,
     issue_lookup_warnings: list[str],
+    subissues_actual: list[dict],
 ) -> ChildEntry:
     """Classify a single parsed child line into a ChildEntry.
 
@@ -342,6 +625,8 @@ def _classify_child(
         When True, no GitHub API calls are made.
     issue_lookup_warnings:
         Mutable list to append lookup warnings to.
+    subissues_actual:
+        Native GitHub Sub-issues read-back (actual state).
     """
     child_id: str = parsed["child_id"]
     rest: str = parsed["rest"]
@@ -387,6 +672,26 @@ def _classify_child(
             status: ChildStatus = "existing_unverified"
             if is_placeholder:
                 status = "stale_body_only"
+
+            # Check if issue_number appears in subissues_actual (even in dry_run if provided)
+            actual_match = any(s.get("number") == issue_number for s in subissues_actual)
+            if not actual_match and not is_placeholder and subissues_actual:
+                # Body has #N but native sub-issue not registered
+                return ChildEntry(
+                    child_id=child_id,
+                    title=title,
+                    status="existing_unverified",
+                    existing_issue=ExistingIssueInfo(
+                        number=issue_number,
+                        state="UNKNOWN",
+                        state_reason=None,
+                        url="",
+                    ),
+                    action="register_subissue_or_human_escalation",
+                    dedupe_key=dedupe_key,
+                    existing_issue_candidates=[],
+                )
+
             return ChildEntry(
                 child_id=child_id,
                 title=title,
@@ -422,6 +727,9 @@ def _classify_child(
 
         is_open = info.state.upper() == "OPEN"
 
+        # Check if issue_number appears in subissues_actual
+        actual_match = any(s.get("number") == issue_number for s in subissues_actual)
+
         if is_placeholder:
             if is_open:
                 # Body says "(未起票)" + issue ref + issue is open → stale body
@@ -446,8 +754,33 @@ def _classify_child(
                     existing_issue_candidates=[],
                 )
         else:
+            # AC4: body has #N but native Sub-issue parent read-back doesn't match
+            # → register_subissue_or_human_escalation (not no_op)
+            if not actual_match and subissues_actual is not None:
+                candidates = _search_dedupe_candidates(repo, dedupe_key, gh_bin)
+                if is_open:
+                    return ChildEntry(
+                        child_id=child_id,
+                        title=title,
+                        status="existing_open",
+                        existing_issue=info,
+                        action="register_subissue_or_human_escalation",
+                        dedupe_key=dedupe_key,
+                        existing_issue_candidates=candidates,
+                    )
+                else:
+                    return ChildEntry(
+                        child_id=child_id,
+                        title=title,
+                        status="existing_closed",
+                        existing_issue=info,
+                        action="register_subissue_or_human_escalation",
+                        dedupe_key=dedupe_key,
+                        existing_issue_candidates=candidates,
+                    )
+
             if is_open:
-                # Normal case: body references a known open issue
+                # Normal case: body references a known open issue, registered as subissue
                 candidates = _search_dedupe_candidates(repo, dedupe_key, gh_bin)
                 return ChildEntry(
                     child_id=child_id,
@@ -536,6 +869,14 @@ def build_plan(
     if dry_run:
         issue_lookup.strategy = "body_file_dry_run_no_api_calls"
 
+    # Fetch native Sub-issue actual state (AC3: separate actual from desired)
+    subissues_actual: list[dict] = []
+    if not dry_run and repo:
+        subissues_actual = _fetch_subissues_actual(repo, parent_issue, gh_bin)
+
+    # Build body inventory (desired state — AC2a)
+    body_inventory = _build_body_inventory(body, parent_issue, parent_mode)
+
     plan = Plan(
         schema_version=2,
         repo=repo,
@@ -546,13 +887,15 @@ def build_plan(
         parent_mode=parent_mode,
         closure_mode=closure_mode,
         issue_lookup=issue_lookup,
+        body_inventory=body_inventory,
+        github_subissues_actual=subissues_actual,
     )
 
     parsed_children = _parse_child_lines(body)
 
     if not parsed_children:
         plan.warnings.append(
-            "No child lines (Cxxx-N pattern) found in the '## Child Issues' section. "
+            "No child lines (Cxxx-N or A/B/C/D pattern) found in the '## Child Issues' section. "
             "Verify the body contains delivery-rollup child references under that heading."
         )
 
@@ -565,12 +908,20 @@ def build_plan(
             gh_bin=gh_bin,
             dry_run=dry_run,
             issue_lookup_warnings=issue_lookup_warnings,
+            subissues_actual=subissues_actual,
         )
         plan.children.append(entry)
 
         # Collect required_issue_creations
         if entry.action == "create_issue":
             plan.required_issue_creations.append(entry.child_id)
+
+        # Collect required_subissue_registrations (AC4)
+        if entry.action == "register_subissue_or_human_escalation":
+            if entry.existing_issue is not None:
+                plan.required_subissue_registrations.append(
+                    f"#{entry.existing_issue.number} → #{parent_issue} ({entry.child_id})"
+                )
 
         # Collect required_issue_edits (parent body update needed)
         if entry.action == "reuse_and_update_parent":
@@ -644,6 +995,44 @@ def plan_to_yaml(plan: Plan) -> str:
     else:
         for w in plan.issue_lookup.warnings:
             lines.append(f"      - {_quote_yaml_str(w)}")
+
+    # Body inventory (AC2a, AC3)
+    lines.append("  body_inventory:")
+    if plan.body_inventory is None:
+        lines.append("    null")
+    else:
+        bi = plan.body_inventory
+        lines.append(f"    child_issues_section_found: {'true' if bi.child_issues_section_found else 'false'}")
+        lines.append(f"    start_line: {'null' if bi.start_line is None else bi.start_line}")
+        lines.append(f"    end_line: {'null' if bi.end_line is None else bi.end_line}")
+        lines.append(f"    candidate_count: {bi.candidate_count}")
+        lines.append(f"    parsed_count: {bi.parsed_count}")
+        lines.append("    parser_gap_report:")
+        if not bi.parser_gap_report:
+            lines.append("      []")
+        else:
+            for gap in bi.parser_gap_report:
+                lines.append(f"      - line_number: {gap.line_number}")
+                lines.append(f"        raw_line: {_quote_yaml_str(gap.raw_line)}")
+                lines.append(f"        gap_reason: {gap.gap_reason}")
+                sr = gap.suggested_repair
+                lines.append(f"        suggested_repair: {'null' if sr is None else _quote_yaml_str(sr)}")
+                lines.append(f"        repair_confidence: {gap.repair_confidence}")
+                lines.append("        minimal_context:")
+                for k, v in gap.minimal_context.items():
+                    lines.append(f"          {k}: {_quote_yaml_str(str(v))}")
+
+    # GitHub Sub-issues actual state (AC3)
+    lines.append("  github_subissues_actual:")
+    if not plan.github_subissues_actual:
+        lines.append("    []")
+    else:
+        for si in plan.github_subissues_actual:
+            lines.append(f"    - number: {si.get('number', '')}")
+            lines.append(f"      title: {_quote_yaml_str(str(si.get('title', '')))}")
+            lines.append(f"      state: {si.get('state', '')}")
+            lines.append(f"      url: {_quote_yaml_str(str(si.get('url', '')))}")
+
     lines.append("  children:")
 
     if not plan.children:
@@ -691,6 +1080,13 @@ def plan_to_yaml(plan: Plan) -> str:
     else:
         for item in plan.required_issue_creations:
             lines.append(f"    - {item}")
+
+    lines.append("  required_subissue_registrations:")
+    if not plan.required_subissue_registrations:
+        lines.append("    []")
+    else:
+        for item in plan.required_subissue_registrations:
+            lines.append(f"    - {_quote_yaml_str(item)}")
 
     lines.append("  required_issue_edits:")
     if not plan.required_issue_edits:

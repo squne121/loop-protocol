@@ -57,6 +57,36 @@ Some background text that mentions C254-9 and #999 but should NOT be parsed.
 """
 
 
+#: #244-style fixture with ### subheading and A/B/C/D track IDs
+FIXTURE_PARENT_BODY_244_ABCD = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: parent
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Outcome
+
+#244 の child issues が全て close されたとき、本 Issue を close する。
+
+## Child Issues
+
+### 実装トラック
+
+- [ ] A: Issue body validator 実装 — #327
+- [ ] B: baseline_vc_preflight.py 実装 — #329
+- [ ] C: validate_pr_body.py 実装 — #330
+- [ ] D: text/markdown lint 導入 — #331
+
+## Background
+
+Some background.
+"""
+
+
 def _make_issue_info(number: int, state: str = "OPEN", state_reason=None) -> pmc.ExistingIssueInfo:
     return pmc.ExistingIssueInfo(
         number=number,
@@ -77,26 +107,28 @@ def _build_live(
     repo: str = "squne121/loop-protocol",
     view_side_effects: dict | None = None,
     search_return: list | None = None,
+    subissues_actual: list | None = None,
 ) -> pmc.Plan:
     """Build a plan in live mode with mocked gh calls.
 
     view_side_effects: {issue_number: ExistingIssueInfo | None}
         If None, the API call "failed" for that issue.
     search_return: list of candidate dicts returned by _search_dedupe_candidates.
+    subissues_actual: list of sub-issue dicts returned by _fetch_subissues_actual.
     """
     if view_side_effects is None:
         view_side_effects = {}
     if search_return is None:
         search_return = []
+    if subissues_actual is None:
+        subissues_actual = []
 
     def fake_view(r, n, g="gh"):
         return view_side_effects.get(n)
 
-    def fake_search(r, key, g="gh"):
-        return search_return
-
     with patch.object(pmc, "_view_issue", side_effect=fake_view), \
-         patch.object(pmc, "_search_dedupe_candidates", return_value=search_return):
+         patch.object(pmc, "_search_dedupe_candidates", return_value=search_return), \
+         patch.object(pmc, "_fetch_subissues_actual", return_value=subissues_actual):
         return pmc.build_plan(body, parent_issue=parent_issue, repo=repo, dry_run=False)
 
 
@@ -231,6 +263,501 @@ Some text mentions C254-9 for context.
         results = pmc._parse_child_lines(body)
         assert results == []
 
+    def test_section_includes_subheading_children(self) -> None:
+        """GIVEN a ## Child Issues section with a ### subheading
+        WHEN _parse_child_lines is called
+        THEN children under the subheading are also returned (not stopped by ###).
+
+        Regression: previously the parser stopped at ### subheadings, missing
+        A/B/C/D tracks in '### 実装トラック' style bodies (#244 pattern).
+        """
+        body = """\
+## Child Issues
+
+### 実装トラック
+
+- [ ] A: Issue body validator — #327
+- [ ] B: baseline_vc_preflight.py — #329
+
+## Background
+"""
+        results = pmc._parse_child_lines(body)
+        child_ids = [r["child_id"] for r in results]
+        assert "A" in child_ids
+        assert "B" in child_ids
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC1 — A/B/C/D format and C254-N format parsing
+# ---------------------------------------------------------------------------
+
+
+class TestABCDTrackIdParsing:
+    """AC1: plan_child_materialization.py can parse both C254-3 format and A:/B:/C:/D: format."""
+
+    def test_abcd_track_ids_parsed_in_child_issues_section(self) -> None:
+        """GIVEN A:/B:/C:/D: format lines under ## Child Issues
+        WHEN _parse_child_lines is called
+        THEN all four track IDs are detected.
+
+        AC1: abcd format support.
+        """
+        body = """\
+## Child Issues
+
+- [ ] A: Issue body validator 実装 — #327
+- [ ] B: baseline_vc_preflight.py 実装 — #329
+- [ ] C: validate_pr_body.py 実装 — #330
+- [ ] D: text/markdown lint 導入 — #331
+"""
+        results = pmc._parse_child_lines(body)
+        child_ids = [r["child_id"] for r in results]
+        assert "A" in child_ids, "A track should be parsed"
+        assert "B" in child_ids, "B track should be parsed"
+        assert "C" in child_ids, "C track should be parsed"
+        assert "D" in child_ids, "D track should be parsed"
+        assert len(results) == 4
+
+    def test_c254_format_still_parsed(self) -> None:
+        """GIVEN C254-N format lines under ## Child Issues
+        WHEN _parse_child_lines is called
+        THEN C254-N entries are still detected.
+
+        AC1: c254 format not regressed.
+        """
+        body = """\
+## Child Issues
+
+- C254-1 docs: something #281
+- C254-3 docs: something（未起票）
+"""
+        results = pmc._parse_child_lines(body)
+        child_ids = [r["child_id"] for r in results]
+        assert "C254-1" in child_ids
+        assert "C254-3" in child_ids
+
+    def test_abcd_with_subheading_fixture_244(self) -> None:
+        """GIVEN #244-style body with ### 実装トラック subheading
+        WHEN build_plan is called
+        THEN all 4 A/B/C/D tracks are detected.
+
+        AC1: subheading traversal for abcd.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_ABCD, parent_issue=244)
+        child_ids = [c.child_id for c in plan.children]
+        assert "A" in child_ids
+        assert "B" in child_ids
+        assert "C" in child_ids
+        assert "D" in child_ids
+        assert len(plan.children) == 4
+
+    def test_abcd_dedupe_key_format(self) -> None:
+        """GIVEN A/B/C/D track IDs under delivery-rollup parent
+        WHEN build_plan is called
+        THEN dedupe_key is 'delivery-rollup:<parent>:<child_id>'.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_ABCD, parent_issue=244)
+        child_a = _child_by_id(plan, "A")
+        assert child_a.dedupe_key == "delivery-rollup:244:A"
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC2a, AC2b — candidate inventory and parser_gap_report
+# ---------------------------------------------------------------------------
+
+
+class TestCandidateInventory:
+    """AC2a: candidate inventory before parsing."""
+
+    def test_body_inventory_present_in_plan(self) -> None:
+        """GIVEN a body with ## Child Issues
+        WHEN build_plan is called
+        THEN plan.body_inventory is not None.
+
+        AC2a: candidate_inventory field present.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        assert plan.body_inventory is not None
+
+    def test_candidate_count_equals_parsed_count_for_clean_body(self) -> None:
+        """GIVEN a clean body where all candidate lines parse successfully
+        WHEN build_plan is called
+        THEN candidate_count == parsed_count.
+
+        AC2a: candidate_inventory.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.candidate_count == bi.parsed_count, (
+            f"Expected candidate_count == parsed_count, got "
+            f"candidate={bi.candidate_count}, parsed={bi.parsed_count}"
+        )
+
+    def test_candidate_count_for_244_fixture(self) -> None:
+        """GIVEN #244-style body with 4 A/B/C/D tracks
+        WHEN build_plan is called
+        THEN candidate_count == 4 and parsed_count == 4.
+
+        AC2a: candidate_inventory for abcd.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_ABCD, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.candidate_count == 4, f"Expected 4 candidates, got {bi.candidate_count}"
+        assert bi.parsed_count == 4, f"Expected 4 parsed, got {bi.parsed_count}"
+
+    def test_body_inventory_section_not_found(self) -> None:
+        """GIVEN a body without ## Child Issues
+        WHEN build_plan is called
+        THEN body_inventory.child_issues_section_found is False.
+
+        AC2a: candidate_inventory when section absent.
+        """
+        body = "## Outcome\n\nNo children.\n"
+        plan = _build_dry_run(body)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.child_issues_section_found is False
+        assert bi.candidate_count == 0
+        assert bi.parsed_count == 0
+
+
+class TestParserGapReport:
+    """AC2b: parser_gap_report schema."""
+
+    def test_parser_gap_report_is_empty_for_clean_body(self) -> None:
+        """GIVEN a clean body where all candidates parse
+        WHEN build_plan is called
+        THEN parser_gap_report is empty.
+
+        AC2b: parser_gap_report.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.parser_gap_report == []
+
+    def test_parser_gap_report_schema_fields(self) -> None:
+        """GIVEN a body with a gap entry (from duplicate_child_id or malformed line)
+        WHEN build_plan is called and gap report produced
+        THEN gap items have required schema fields.
+
+        AC2b: gap schema (line_number, raw_line, gap_reason, suggested_repair,
+              repair_confidence, minimal_context).
+        """
+        # Create a body with a duplicate child_id to trigger gap report
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+- [ ] A: valid entry — #327
+- [ ] A: duplicate A — #400
+"""
+        plan = _build_dry_run(body, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        # Parser_gap_report should have duplicate_child_id gap
+        assert isinstance(bi.parser_gap_report, list)
+        if bi.parser_gap_report:
+            gap = bi.parser_gap_report[0]
+            assert hasattr(gap, "line_number"), "gap must have line_number"
+            assert hasattr(gap, "raw_line"), "gap must have raw_line"
+            assert hasattr(gap, "gap_reason"), "gap must have gap_reason"
+            assert hasattr(gap, "suggested_repair"), "gap must have suggested_repair"
+            assert hasattr(gap, "repair_confidence"), "gap must have repair_confidence"
+            assert hasattr(gap, "minimal_context"), "gap must have minimal_context"
+
+    def test_parser_gap_report_yaml_output(self) -> None:
+        """GIVEN any plan
+        WHEN plan_to_yaml is called
+        THEN output contains parser_gap_report section.
+
+        AC2b: yaml serialization of parser_gap_report.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        yaml_output = pmc.plan_to_yaml(plan)
+        assert "parser_gap_report:" in yaml_output
+        assert "candidate_count:" in yaml_output
+        assert "parsed_count:" in yaml_output
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC2c — repairable parser gap → issue-author delegation
+# ---------------------------------------------------------------------------
+
+
+class TestRepairableParserGap:
+    """AC2c: repairable_parser_gap / repair_confidence routing."""
+
+    def test_unsupported_child_id_format_is_repairable(self) -> None:
+        """GIVEN a line with 'A issue title' (space not colon) format
+        WHEN _classify_parser_gap is called
+        THEN gap_reason is unsupported_child_id_format and repair_confidence is high.
+
+        AC2c: repairable_parser_gap.
+        """
+        gap = pmc._classify_parser_gap(
+            line_number=5,
+            raw_line="- [ ] A Issue body validator",
+            stripped="- [ ] A Issue body validator",
+            parent_issue=244,
+        )
+        assert gap is not None
+        assert gap.gap_reason == "unsupported_child_id_format"
+        assert gap.repair_confidence == "high"
+        assert gap.suggested_repair is not None
+
+    def test_unsupported_child_id_format_suggested_repair(self) -> None:
+        """GIVEN a repairable line
+        WHEN _classify_parser_gap is called
+        THEN suggested_repair contains corrected form.
+
+        AC2c: repair_confidence high → suggested_repair available.
+        """
+        gap = pmc._classify_parser_gap(
+            line_number=5,
+            raw_line="- [ ] B baseline_vc_preflight.py 実装",
+            stripped="- [ ] B baseline_vc_preflight.py 実装",
+            parent_issue=244,
+        )
+        assert gap is not None
+        assert gap.repair_confidence == "high"
+        # suggested_repair should contain the corrected colon-separated form
+        assert gap.suggested_repair is not None
+        assert "B:" in gap.suggested_repair
+
+    def test_repair_confidence_high_in_classifier(self) -> None:
+        """GIVEN a repairable gap
+        WHEN _classify_parser_gap returns
+        THEN repair_confidence is 'high'.
+
+        AC2c: repair_confidence field.
+        """
+        gap = pmc._classify_parser_gap(
+            line_number=5,
+            raw_line="- [ ] C validate_pr_body.py 実装",
+            stripped="- [ ] C validate_pr_body.py 実装",
+            parent_issue=244,
+        )
+        assert gap is not None
+        assert gap.repair_confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC2e — unsafe parser gaps → human_escalation
+# ---------------------------------------------------------------------------
+
+
+class TestUnsafeParserGap:
+    """AC2e: unsafe_parser_gap scenarios that require human_escalation."""
+
+    def test_duplicate_child_id_produces_low_confidence_gap(self) -> None:
+        """GIVEN a body with duplicate child_id 'A' appearing twice
+        WHEN build_plan is called
+        THEN parser_gap_report contains gap with gap_reason duplicate_child_id.
+
+        AC2e: duplicate_child_id → human_escalation.
+        """
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+- [ ] A: Issue body validator — #327
+- [ ] A: duplicate A track — #400
+"""
+        plan = _build_dry_run(body, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        gap_reasons = [g.gap_reason for g in bi.parser_gap_report]
+        assert "duplicate_child_id" in gap_reasons, (
+            f"Expected duplicate_child_id in gap_reasons, got: {gap_reasons}"
+        )
+
+    def test_multiple_issue_refs_produces_low_confidence_gap(self) -> None:
+        """GIVEN a line with multiple issue refs
+        WHEN _classify_parser_gap is called
+        THEN gap has multiple_issue_refs reason and low confidence.
+
+        AC2e: multiple_issue_refs → human_escalation.
+        """
+        gap = pmc._classify_parser_gap(
+            line_number=5,
+            raw_line="- [ ] A: Issue body validator #327 #400",
+            stripped="- [ ] A: Issue body validator #327 #400",
+            parent_issue=244,
+        )
+        assert gap is not None
+        assert gap.gap_reason == "multiple_issue_refs"
+        assert gap.repair_confidence == "low"
+        assert gap.suggested_repair is None
+
+    def test_missing_title_produces_low_confidence_gap(self) -> None:
+        """GIVEN a line with only a child_id but no title
+        WHEN _classify_parser_gap is called
+        THEN gap has missing_title reason and low confidence.
+
+        AC2e: missing_title → human_escalation.
+        """
+        gap = pmc._classify_parser_gap(
+            line_number=5,
+            raw_line="- [ ] A:",
+            stripped="- [ ] A:",
+            parent_issue=244,
+        )
+        assert gap is not None
+        assert gap.gap_reason == "missing_title"
+        assert gap.repair_confidence == "low"
+        assert gap.suggested_repair is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC3 — body_inventory / github_subissues_actual separation
+# ---------------------------------------------------------------------------
+
+
+class TestInventorySplit:
+    """AC3: body_inventory (desired) / github_subissues_actual (actual) are separate."""
+
+    def test_inventory_split_fields_present(self) -> None:
+        """GIVEN a plan
+        WHEN plan is built
+        THEN plan has both body_inventory and github_subissues_actual fields.
+
+        AC3: inventory_split.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        assert hasattr(plan, "body_inventory"), "plan must have body_inventory"
+        assert hasattr(plan, "github_subissues_actual"), "plan must have github_subissues_actual"
+
+    def test_subissues_actual_empty_in_dry_run(self) -> None:
+        """GIVEN dry-run mode (no GitHub API)
+        WHEN build_plan is called
+        THEN github_subissues_actual is empty list (no API call made).
+
+        AC3: subissues_actual is actual state from native read-back.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        assert plan.github_subissues_actual == []
+
+    def test_subissues_actual_populated_in_live_mode(self) -> None:
+        """GIVEN live mode with mocked sub-issues API returning 2 sub-issues
+        WHEN build_plan is called
+        THEN github_subissues_actual contains the returned sub-issues.
+
+        AC3: subissues_actual in live mode.
+        """
+        mock_subissues = [
+            {"number": 281, "title": "docs", "state": "OPEN", "url": "https://..."},
+            {"number": 285, "title": "feat", "state": "OPEN", "url": "https://..."},
+        ]
+        view_effects = {
+            281: _make_issue_info(281, "OPEN"),
+            285: _make_issue_info(285, "OPEN"),
+        }
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=mock_subissues,
+        )
+        assert len(plan.github_subissues_actual) == 2
+
+    def test_yaml_contains_body_inventory_and_subissues_actual(self) -> None:
+        """GIVEN a plan
+        WHEN plan_to_yaml is called
+        THEN output contains body_inventory: and github_subissues_actual: sections.
+
+        AC3: yaml serialization of both fields.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        yaml_output = pmc.plan_to_yaml(plan)
+        assert "body_inventory:" in yaml_output
+        assert "github_subissues_actual:" in yaml_output
+
+
+# ---------------------------------------------------------------------------
+# Tests: AC4 — register_subissue_or_human_escalation
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterSubissue:
+    """AC4: body has #N but native Sub-issue parent read-back doesn't match → register_subissue."""
+
+    def test_register_subissue_when_not_in_subissues_actual(self) -> None:
+        """GIVEN body has #281 for C254-1, but native sub-issues list is empty
+        WHEN build_plan is called (live mode with subissues=[])
+        THEN C254-1 action is register_subissue_or_human_escalation.
+
+        AC4: register_subissue.
+        """
+        view_effects = {
+            281: _make_issue_info(281, "OPEN"),
+            285: _make_issue_info(285, "OPEN"),
+        }
+        # subissues_actual is empty — #281 is not registered as native sub-issue
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],  # no native sub-issues registered
+        )
+        child = _child_by_id(plan, "C254-1")
+        assert child.action == "register_subissue_or_human_escalation", (
+            f"Expected register_subissue_or_human_escalation, got {child.action}"
+        )
+
+    def test_no_op_when_issue_registered_as_subissue(self) -> None:
+        """GIVEN body has #281 for C254-1, and native sub-issues contains #281
+        WHEN build_plan is called
+        THEN C254-1 action is no_op.
+
+        AC4: when subissue is properly registered, no_op.
+        """
+        view_effects = {
+            281: _make_issue_info(281, "OPEN"),
+            285: _make_issue_info(285, "OPEN"),
+        }
+        # subissues_actual contains #281 — properly registered
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[{"number": 281, "title": "docs", "state": "OPEN", "url": ""}],
+        )
+        child = _child_by_id(plan, "C254-1")
+        assert child.action == "no_op", (
+            f"Expected no_op when sub-issue is registered, got {child.action}"
+        )
+
+    def test_required_subissue_registrations_populated(self) -> None:
+        """GIVEN body references #281 but it's not in subissues_actual
+        WHEN build_plan is called
+        THEN plan.required_subissue_registrations contains an entry for C254-1.
+
+        AC4: required_subissue_registrations.
+        """
+        view_effects = {
+            281: _make_issue_info(281, "OPEN"),
+            285: _make_issue_info(285, "OPEN"),
+        }
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+        )
+        # Should have registrations for C254-1 (and possibly C254-5 after stale update)
+        assert len(plan.required_subissue_registrations) > 0
+
 
 # ---------------------------------------------------------------------------
 # Tests: child line parsing
@@ -321,6 +848,7 @@ class TestClassifyChildMissing:
             repo="squne121/loop-protocol",
             dry_run=False,
             issue_lookup_warnings=warnings,
+            subissues_actual=[],
         )
         assert entry.status == "missing"
         assert entry.action == "create_issue"
@@ -348,6 +876,7 @@ class TestClassifyChildMissing:
             repo="",
             dry_run=True,
             issue_lookup_warnings=warnings,
+            subissues_actual=[],
         )
         assert entry.status == "missing"
         assert entry.action == "create_issue"
@@ -356,9 +885,9 @@ class TestClassifyChildMissing:
 class TestClassifyChildExistingOpen:
     """Classification: existing_open."""
 
-    def test_existing_open_when_ref_matches_open_issue(self) -> None:
-        """GIVEN a child line referencing a known open issue #281
-        WHEN classified (live mode, issue is OPEN)
+    def test_existing_open_when_ref_matches_open_issue_and_registered(self) -> None:
+        """GIVEN a child line referencing a known open issue #281 that is registered
+        WHEN classified (live mode, issue is OPEN, in subissues_actual)
         THEN status is 'existing_open' and action is 'no_op'.
         """
         parsed = {
@@ -380,6 +909,7 @@ class TestClassifyChildExistingOpen:
                 repo="squne121/loop-protocol",
                 dry_run=False,
                 issue_lookup_warnings=warnings,
+                subissues_actual=[{"number": 281, "state": "OPEN", "title": "docs", "url": ""}],
             )
         assert entry.status == "existing_open"
         assert entry.action == "no_op"
@@ -410,6 +940,7 @@ class TestClassifyChildExistingOpen:
                 repo="squne121/loop-protocol",
                 dry_run=False,
                 issue_lookup_warnings=warnings,
+                subissues_actual=[{"number": 281, "state": "OPEN", "title": "docs", "url": ""}],
             )
         assert entry.dedupe_key == "delivery-rollup:254:C254-1"
 
@@ -443,6 +974,7 @@ class TestClassifyChildExistingClosed:
                 repo="squne121/loop-protocol",
                 dry_run=False,
                 issue_lookup_warnings=warnings,
+                subissues_actual=[{"number": 281, "state": "CLOSED", "title": "docs", "url": ""}],
             )
         assert entry.status == "existing_closed", (
             "closed child must be 'existing_closed', not 'ambiguous'"
@@ -479,6 +1011,7 @@ class TestClassifyChildStaleBodyOnly:
                 repo="squne121/loop-protocol",
                 dry_run=False,
                 issue_lookup_warnings=warnings,
+                subissues_actual=[],
             )
         assert entry.status == "stale_body_only"
         assert entry.action == "reuse_and_update_parent"
@@ -515,6 +1048,7 @@ class TestClassifyChildAmbiguous:
                 repo="squne121/loop-protocol",
                 dry_run=False,
                 issue_lookup_warnings=warnings,
+                subissues_actual=[],
             )
         assert entry.status == "ambiguous"
         assert entry.action == "human_escalation"
@@ -547,6 +1081,7 @@ class TestParentModeUnknown:
             repo="",
             dry_run=True,
             issue_lookup_warnings=warnings,
+            subissues_actual=[],
         )
         assert entry.action == "human_escalation"
 
@@ -665,18 +1200,29 @@ class TestBuildPlan254FixtureLive:
             285: _make_issue_info(285, "OPEN"),
         }
 
-    def test_c254_1_is_existing_open(self) -> None:
-        """GIVEN C254-1 references open issue #281
+    def test_c254_1_is_existing_open_with_registered_subissue(self) -> None:
+        """GIVEN C254-1 references open issue #281, registered as sub-issue
         WHEN classified via build_plan (live, mocked)
-        THEN status is 'existing_open'.
+        THEN status is 'existing_open', action is 'no_op'.
         """
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=self._make_view_effects())
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=self._make_view_effects(),
+            subissues_actual=[
+                {"number": 281, "state": "OPEN", "title": "docs", "url": ""},
+                {"number": 285, "state": "OPEN", "title": "feat", "url": ""},
+            ],
+        )
         child = _child_by_id(plan, "C254-1")
         assert child.status == "existing_open"
         assert child.action == "no_op"
 
     def test_c254_5_is_stale_body_only(self) -> None:
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=self._make_view_effects())
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=self._make_view_effects(),
+            subissues_actual=[],
+        )
         child = _child_by_id(plan, "C254-5")
         assert child.status == "stale_body_only"
         assert child.action == "reuse_and_update_parent"
@@ -692,7 +1238,11 @@ class TestBuildPlan254FixtureLive:
             281: _make_issue_info(281, "CLOSED", "COMPLETED"),
             285: _make_issue_info(285, "OPEN"),
         }
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=view_effects)
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[{"number": 281, "state": "CLOSED", "title": "docs", "url": ""}],
+        )
         child = _child_by_id(plan, "C254-1")
         assert child.status == "existing_closed", (
             "closed referenced issue must be 'existing_closed', NOT 'ambiguous'"
@@ -700,7 +1250,11 @@ class TestBuildPlan254FixtureLive:
         assert child.action == "no_op"
 
     def test_required_issue_edits_contains_stale(self) -> None:
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=self._make_view_effects())
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=self._make_view_effects(),
+            subissues_actual=[],
+        )
         assert len(plan.required_issue_edits) > 0
 
     def test_parent_body_updates_for_stale_child(self) -> None:
@@ -708,13 +1262,17 @@ class TestBuildPlan254FixtureLive:
         WHEN build_plan is called (live, mocked)
         THEN parent_body_updates contains a safe patch entry for C254-5.
         """
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=self._make_view_effects())
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=self._make_view_effects(),
+            subissues_actual=[],
+        )
         stale_updates = [u for u in plan.parent_body_updates if "C254-5" in u.old_line]
         assert len(stale_updates) == 1
         upd = stale_updates[0]
         assert "（未起票）" not in upd.new_line
         assert "#285" in upd.new_line
-        # Verify safe patch fields
+        # Verify safe patch fields (AC7: old_line/new_line/expected_match_count)
         assert upd.section == "Child Issues"
         assert upd.line_number > 0
         assert upd.expected_match_count >= 1
@@ -724,7 +1282,11 @@ class TestBuildPlan254FixtureLive:
         WHEN build_plan is called
         THEN expected_match_count is 1 for each update.
         """
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=self._make_view_effects())
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=self._make_view_effects(),
+            subissues_actual=[],
+        )
         for upd in plan.parent_body_updates:
             assert upd.expected_match_count == 1, (
                 f"expected_match_count must be 1 for unique lines, got {upd.expected_match_count} "
@@ -743,7 +1305,11 @@ class TestBuildPlan254FixtureLive:
             "- C254-5 feat: SDD 採否 ADR を追加（未起票） #285\n"
         )
         view_effects = self._make_view_effects()
-        plan = _build_live(duplicate_body, view_side_effects=view_effects)
+        plan = _build_live(
+            duplicate_body,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+        )
         # With a duplicate stale line for C254-5 in the body, we expect TWO children
         c254_5_updates = [u for u in plan.parent_body_updates if "C254-5" in u.old_line]
         # The duplicate body causes expected_match_count > 1 for the first occurrence
@@ -780,7 +1346,8 @@ closure_mode: child-complete
 - C254-9 feat: something #999
 """
         with patch.object(pmc, "_view_issue", return_value=None), \
-             patch.object(pmc, "_search_dedupe_candidates", return_value=[]):
+             patch.object(pmc, "_search_dedupe_candidates", return_value=[]), \
+             patch.object(pmc, "_fetch_subissues_actual", return_value=[]):
             plan = pmc.build_plan(
                 body, parent_issue=254, repo="squne121/loop-protocol", dry_run=False
             )
@@ -935,12 +1502,16 @@ class TestPlanToYaml:
         assert "complete:" in yaml_output
 
     def test_parent_body_updates_have_safe_patch_fields(self) -> None:
-        """Serialized parent_body_updates must include safe patch fields."""
+        """Serialized parent_body_updates must include safe patch fields (AC7 schema)."""
         view_effects = {
             281: _make_issue_info(281, "OPEN"),
             285: _make_issue_info(285, "OPEN"),
         }
-        plan = _build_live(FIXTURE_PARENT_BODY_254, view_side_effects=view_effects)
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+        )
         yaml_output = pmc.plan_to_yaml(plan)
         if plan.parent_body_updates:
             assert "section:" in yaml_output
@@ -959,6 +1530,16 @@ class TestPlanToYaml:
         assert "CHILD_MATERIALIZATION_PLAN_V2:" in yaml_output
         # A warning should be present about no children found
         assert "warnings:" in yaml_output
+
+    def test_output_contains_body_inventory_and_subissues(self) -> None:
+        """GIVEN any plan
+        WHEN plan_to_yaml is called
+        THEN output contains body_inventory and github_subissues_actual sections.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
+        yaml_output = pmc.plan_to_yaml(plan)
+        assert "body_inventory:" in yaml_output
+        assert "github_subissues_actual:" in yaml_output
 
 
 # ---------------------------------------------------------------------------
