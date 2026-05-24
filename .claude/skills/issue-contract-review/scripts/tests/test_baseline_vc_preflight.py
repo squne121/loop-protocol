@@ -591,6 +591,178 @@ def test_confidence_json_fragment_parity():
         assert json_conf == frag_conf, f"AC {ac}: JSON confidence {json_conf} != fragment {frag_conf}"
 
 
+# AC1-AC7: pytest invocation detection and exit code classification
+
+def test_pytest_invocation_detect_pytest_direct():
+    """AC1: _is_pytest_invocation detects bare pytest"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    # Import the function for testing
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_pytest_invocation
+
+    assert _is_pytest_invocation("pytest")
+    assert _is_pytest_invocation("pytest tests/")
+    assert _is_pytest_invocation("pytest --verbose tests/")
+
+
+def test_pytest_invocation_detect_python_m_pytest():
+    """AC1: _is_pytest_invocation detects python -m pytest"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_pytest_invocation
+
+    assert _is_pytest_invocation("python -m pytest")
+    assert _is_pytest_invocation("python3 -m pytest")
+    assert _is_pytest_invocation("python -m pytest tests/")
+
+
+def test_pytest_invocation_detect_uv_run_pytest():
+    """AC1: _is_pytest_invocation detects uv run pytest"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_pytest_invocation
+
+    assert _is_pytest_invocation("uv run pytest")
+    assert _is_pytest_invocation("uv run pytest tests/")
+    assert _is_pytest_invocation("uv run --locked pytest")
+    assert _is_pytest_invocation("uv run --with pytest pytest")
+    assert _is_pytest_invocation("uv run python -m pytest")
+
+
+def test_pytest_invocation_detect_non_pytest():
+    """AC1: _is_pytest_invocation rejects non-pytest commands"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_pytest_invocation
+
+    assert not _is_pytest_invocation("bash")
+    assert not _is_pytest_invocation("grep test file.txt")
+    assert not _is_pytest_invocation("rg pytest")
+    assert not _is_pytest_invocation("node test.js")
+
+
+def test_pytest_exit4_missing_file_expected_fail():
+    """AC2: pytest exit 4 + file not found → expected_baseline_fail / go"""
+    fixture = Path(__file__).parent / "fixtures" / "pytest_exit4_missing_file.md"
+    data = run_preflight(str(fixture))
+
+    results = data["results"]
+    assert len(results) > 0, "Expected at least one result"
+
+    # Should be classified as expected_baseline_fail with decision go
+    found = any(
+        r["classification"] == "expected_fail"
+        and r["category"] == "expected_baseline_fail"
+        and r["decision"] == "go"
+        for r in results
+    )
+    assert found, f"Expected expected_baseline_fail/go. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
+
+
+def test_pytest_exit5_no_tests_collected_expected_fail():
+    """AC3: pytest exit 5 + no tests collected → expected_baseline_fail / go"""
+    fixture = Path(__file__).parent / "fixtures" / "pytest_exit5_no_tests.md"
+    data = run_preflight(str(fixture))
+
+    results = data["results"]
+    assert len(results) > 0, "Expected at least one result"
+
+    # Should be classified as expected_baseline_fail with decision go
+    found = any(
+        r["classification"] == "expected_fail"
+        and r["category"] == "expected_baseline_fail"
+        and r["decision"] == "go"
+        for r in results
+    )
+    assert found, f"Expected expected_baseline_fail/go. Got: {[r['category'] + '/' + r['decision'] for r in results]}"
+
+
+def test_pytest_exit4_usage_error_not_expected():
+    """AC4: pytest exit 4 + CLI usage error → NOT expected_baseline_fail"""
+    fixture = Path(__file__).parent / "fixtures" / "pytest_usage_error.md"
+    data = run_preflight(str(fixture))
+
+    results = data["results"]
+    assert len(results) > 0, "Expected at least one result"
+
+    # Should NOT be classified as expected_baseline_fail
+    found_expected_baseline = any(
+        r["category"] == "expected_baseline_fail"
+        for r in results
+    )
+    assert not found_expected_baseline, "pytest CLI usage error should not be expected_baseline_fail"
+
+
+def test_non_pytest_exit4_not_expected():
+    """AC5: non-pytest command + exit 4 → NOT expected_baseline_fail"""
+    fixture = Path(__file__).parent / "fixtures" / "bash_exit4_file_not_found.md"
+    data = run_preflight(str(fixture))
+
+    results = data["results"]
+    assert len(results) > 0, "Expected at least one result"
+
+    # Should NOT be classified as expected_baseline_fail
+    found_expected_baseline = any(
+        r["category"] == "expected_baseline_fail"
+        for r in results
+    )
+    assert not found_expected_baseline, "bash exit 4 should not be expected_baseline_fail"
+
+
+def test_pytest_unexpected_pass_unchanged():
+    """AC6: pytest exit 0 → unexpected_pass / blocked (regression check)"""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+$ python3 -c "import sys; sys.exit(0)"
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        data = run_preflight(fixture_file)
+        results = data["results"]
+        assert len(results) > 0
+
+        # Should be unexpected_pass / blocked
+        found = any(
+            r["classification"] == "unexpected_pass"
+            and r["decision"] == "blocked"
+            for r in results
+        )
+        assert found, "pytest exit 0 should still be unexpected_pass / blocked"
+    finally:
+        import os
+        os.unlink(fixture_file)
+
+
+def test_full_preflight_pytest_baseline_fail_status_pass():
+    """AC7: full preflight with pytest baseline fail → status=pass, human_judgment=0"""
+    fixture = Path(__file__).parent / "fixtures" / "pytest_baseline_only.md"
+    data = run_preflight(str(fixture))
+
+    # Top-level status should be pass
+    assert data["status"] == "pass", f"Expected status=pass but got {data['status']}"
+
+    # Summary should show expected_fail >= 1
+    assert data["summary"]["expected_fail"] >= 1, f"Expected at least 1 expected_fail in summary"
+
+    # Summary should show human_judgment == 0
+    assert data["summary"]["human_judgment"] == 0, f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
+
+    # At least one result should be expected_fail
+    assert len(data["results"]) > 0
+    found = any(r["classification"] == "expected_fail" for r in data["results"])
+    assert found, "Expected at least one expected_fail result"
+
+
 # C5: Test preparation stops on human_judgment
 def test_preparation_stops_on_human_judgment():
     """C5: preparation.md に human_judgment 停止が記載されている"""
