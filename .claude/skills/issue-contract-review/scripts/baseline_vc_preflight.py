@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""
+Baseline Verification Command Preflight
+
+Issue body の `## Verification Commands` セクションから VC を AC 別に抽出して単体実行し、
+root-cause 分類（expected_fail / unexpected_pass / blocked / human_judgment）と
+category / decision / confidence を含む JSON を返す。
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    GitHub API から Issue body を取得
+
+    戻り値: (body, error_code)
+      error_code: None (成功), "gh_auth_failed", "gh_repo_not_found", "gh_other_error"
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--json",
+                "body",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return data.get("body"), None
+        else:
+            stderr_lower = result.stderr.lower()
+            if "not authenticated" in stderr_lower or "authentication failed" in stderr_lower:
+                return None, "gh_auth_failed"
+            elif "not found" in stderr_lower or "could not resolve" in stderr_lower:
+                return None, "gh_repo_not_found"
+            else:
+                return None, "gh_other_error"
+    except json.JSONDecodeError:
+        return None, "gh_json_parse_error"
+    except subprocess.TimeoutExpired:
+        return None, "gh_timeout"
+    except Exception as e:
+        return None, "gh_other_error"
+
+
+def read_body_file(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    ファイルから Issue body を読み込み
+
+    戻り値: (body, error_code)
+      error_code: None (成功), "body_file_not_found", "body_parse_error"
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read(), None
+    except FileNotFoundError:
+        return None, "body_file_not_found"
+    except Exception as e:
+        return None, "body_parse_error"
+
+
+def extract_verification_commands_section(body: str) -> Optional[str]:
+    """body から `## Verification Commands` セクションを抽出"""
+    match = re.search(
+        r"^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def extract_fenced_bash_blocks(section: str) -> List[str]:
+    """セクションから ```bash ... ``` ブロックを抽出"""
+    blocks = []
+    for match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", section, re.DOTALL):
+        blocks.append(match.group(1))
+    return blocks
+
+
+def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int]]:
+    """
+    bash ブロックからコマンドを抽出。
+    AC マーカーとコマンドの行番号を返す。
+
+    戻り値: [(ac_label, command, line_number), ...]
+      - ac_label: "AC1", "AC2", ... または None
+      - command: raw command ($ prefix 除去済み、suffix marker 除去済み)
+      - line_number: block 内での行番号
+    """
+    commands = []
+    lines = block.split("\n")
+    current_ac = None
+
+    for i, line in enumerate(lines, start=1):
+        # AC マーカーの抽出: `# AC<N>` または `# AC<N>:` (単独コメント行)
+        ac_match = re.match(r"^\s*#\s*AC(\d+)\s*:?\s*$", line)
+        if ac_match:
+            current_ac = f"AC{ac_match.group(1)}"
+            continue
+
+        # コマンド行の抽出（$ prefix 除去）
+        cmd_match = re.match(r"^\s*\$\s+(.+)$", line)
+        if not cmd_match:
+            # $ がない行でも、$ でなく非コメント・非空行の場合は取得
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                cmd_match = re.match(r"^\s*(.+)$", line)
+
+        if cmd_match:
+            cmd = cmd_match.group(1).strip()
+            if cmd and not cmd.startswith("#"):
+                # B4: inline suffix `# AC<N>` を検出して ac_label を上書き、suffix を除去
+                suffix_match = re.search(r"\s+#\s*AC(\d+)\s*:?\s*$", cmd)
+                if suffix_match:
+                    current_ac = f"AC{suffix_match.group(1)}"
+                    cmd = re.sub(r"\s+#\s*AC\d+\s*:?\s*$", "", cmd).strip()
+
+                commands.append((current_ac, cmd, i))
+
+    return commands
+
+
+def compute_command_hash(command: str) -> str:
+    """コマンドの SHA-256 hash を計算"""
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
+def detect_compound_command(command: str) -> bool:
+    """
+    コマンドが compound shell syntax を含むか検出
+
+    shlex.shlex で正確に tokenize し、shell operator を検出する。
+    これにより:
+    - cmd&&cmd（空白なし）も検出
+    - quoted string 内の | は誤検出しない
+    - redirect ( > < >> ) も compound と見なす (fail-closed)
+    """
+    try:
+        # C6: shlex.shlex with punctuation_chars=True for operator detection
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        tokens = list(lexer)
+    except ValueError:
+        # parse 失敗 = 複雑なコマンド = fail-closed で compound と見なす
+        return True
+
+    # shell operators
+    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+    return any(t in operators for t in tokens)
+
+
+def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str, str, int]:
+    """
+    コマンドを単体実行。
+
+    戻り値: (exit_code, stdout, stderr, duration_ms)
+    """
+    try:
+        # shlex.split で argv を構築（shell=False で安全に実行）
+        argv = shlex.split(command)
+    except ValueError:
+        # shlex.split に失敗した場合は compound command の可能性
+        return -1, "", "shlex.split failed", 0
+
+    start = datetime.now()
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=cwd,
+            shell=False,
+        )
+        duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+        return result.returncode, result.stdout, result.stderr, duration_ms
+    except subprocess.TimeoutExpired:
+        duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+        return -1, "", "timeout", duration_ms
+    except Exception as e:
+        duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+        return -1, "", str(e), duration_ms
+
+
+def truncate_line_bytes(line: str, max_bytes: int) -> str:
+    """
+    単一行を byte 単位で切り詰める。
+
+    戻り値: byte で切り詰められた行（UTF-8 safe）
+    """
+    raw = line.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return line
+    return raw[:max_bytes].decode("utf-8", errors="replace")
+
+
+def truncate_output(text: str, max_lines: int = 20, bytes_per_line: int = 2048) -> Tuple[List[str], bool, int]:
+    """
+    stdout / stderr を行数とバイト数で切り詰める。
+
+    中リスク 3: truncation 情報を返す。
+    戻り値: (lines, was_truncated, original_line_count)
+      - lines: truncate されたテキストを行配列で返す（空の場合は []）
+      - was_truncated: 行数が max_lines を超えたかどうか
+      - original_line_count: 元のテキストの行数
+    """
+    all_lines = text.split("\n")
+    original_line_count = len(all_lines)
+    lines = all_lines[:max_lines]
+    was_truncated = original_line_count > max_lines
+
+    result = []
+    for line in lines:
+        # B7: byte-safe truncation
+        truncated_line = truncate_line_bytes(line, bytes_per_line)
+        if truncated_line or line:  # 中リスク 3: 空行の場合も keep
+            result.append(truncated_line)
+
+    # 中リスク 3: 空出力時は [] を返す（[""] ではなく）
+    if not result or (len(result) == 1 and result[0] == ""):
+        return [], was_truncated, original_line_count
+
+    return result, was_truncated, original_line_count
+
+
+def classify_result(
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    command: str,
+) -> Tuple[str, str, str, Optional[str]]:
+    """
+    VC 実行結果を分類。
+
+    戻り値: (classification, category, decision, fix_hint)
+      classification: expected_fail | unexpected_pass | blocked | human_judgment
+      category: file_not_found_expected | expected_baseline_fail | unexpected_pass |
+                env_missing_dep | file_not_found_unrunnable | timeout |
+                compound_command_disallowed | unknown
+      decision: go | blocked | human_judgment
+      fix_hint: nullable hint
+    """
+
+    # compound command は blocked
+    if detect_compound_command(command):
+        return "blocked", "compound_command_disallowed", "blocked", "Compound shell commands are not supported in initial implementation"
+
+    # timeout check
+    if "timeout" in stderr.lower():
+        return "blocked", "timeout", "blocked", "Command exceeded timeout"
+
+    # exit_code = 0 は unexpected_pass / blocked
+    if exit_code == 0:
+        return "unexpected_pass", "unexpected_pass", "blocked", "Command unexpectedly passed"
+
+    # shlex.split failed
+    if "shlex.split failed" in stderr:
+        return "blocked", "compound_command_disallowed", "blocked", "Command syntax is not supported"
+
+    # B5: file_not_found_unrunnable - missing script/file being executed
+    # e.g., python3 missing.py, node missing.js, ./missing-script
+    if (
+        ("No such file or directory" in stderr or "can't open file" in stderr)
+        and exit_code == 2
+        and any(
+            cmd_pattern in command
+            for cmd_pattern in ["python3 ", "python ", "node ", "./", "../"]
+        )
+    ):
+        return "blocked", "file_not_found_unrunnable", "blocked", "Script or file being executed does not exist"
+
+    # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
+    if exit_code in (126, 127):
+        return "blocked", "env_missing_dep", "blocked", "Command not found or permission denied"
+
+    if "command not found" in stderr.lower() or "ModuleNotFoundError" in stderr:
+        return "blocked", "env_missing_dep", "blocked", "Dependency or command missing"
+
+    if "Permission denied" in stderr:
+        return "blocked", "env_missing_dep", "blocked", "Permission denied"
+
+    if "No such file or directory" in stderr and exit_code == -1:
+        return "blocked", "env_missing_dep", "blocked", "Command not found"
+
+    # expected baseline fail patterns
+    # rg with no match returns 1
+    if "rg " in command and exit_code == 1:
+        return "expected_fail", "expected_baseline_fail", "go", None
+
+    # test -f / test -d with non-existent file
+    if ("test -f " in command or "test -d " in command) and exit_code == 1:
+        return "expected_fail", "file_not_found_expected", "go", None
+
+    # Generic exit_code != 0: try to infer expected_fail for common utilities
+    # grep, sed, awk などが no-match で exit 1 を返すことは expected
+    # ただし invalid regex や file not found は exclude (medium risk 1)
+    if exit_code == 1 and any(util in command for util in ["grep", "rg", "ag", "ack", "fgrep", "egrep"]):
+        # grep が invalid regex で fail した場合 expected_fail にしない
+        # "grep:" error pattern を検出
+        grep_error_patterns = [
+            r"grep:.+: No such file or directory",
+            r"grep:.+: Invalid regular expression",
+            r"egrep:.+",
+            r"fgrep:.+"
+        ]
+        is_likely_grep_error = any(re.search(pattern, stderr) for pattern in grep_error_patterns)
+        if is_likely_grep_error:
+            return "human_judgment", "unknown", "human_judgment", "grep error classification uncertain"
+        return "expected_fail", "expected_baseline_fail", "go", None
+
+    # Unknown: cannot classify
+    return "human_judgment", "unknown", "human_judgment", "Unable to automatically classify exit code"
+
+
+def compute_source_hash(body: str) -> str:
+    """body の SHA-256 hash を計算"""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def compute_confidence(category: str) -> str:
+    """
+    B8: category に基づいて confidence を算出.
+
+    高確度: compound_command_disallowed, file_not_found_expected, expected_baseline_fail, env_missing_dep, file_not_found_unrunnable
+    中確度: timeout, unexpected_pass
+    低確度: unknown
+    """
+    high_confidence = {
+        "compound_command_disallowed",
+        "file_not_found_expected",
+        "expected_baseline_fail",
+        "env_missing_dep",
+        "file_not_found_unrunnable",
+    }
+    medium_confidence = {"timeout", "unexpected_pass"}
+
+    if category in high_confidence:
+        return "high"
+    elif category in medium_confidence:
+        return "medium"
+    else:
+        return "low"
+
+
+def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    B8: JSON results を CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight に対応する YAML fragment に変換.
+
+    C3: human_judgment を保持する。vc_preflight.passed は status == "pass" のときのみ true。
+
+    戻り値は YAML 形式の dict.
+    """
+    vc_failed_as_expected = sum(
+        1 for r in results if r["classification"] == "expected_fail"
+    )
+    vc_passed_unexpectedly = sum(
+        1 for r in results if r["classification"] == "unexpected_pass"
+    )
+    vc_unrunnable = sum(
+        1 for r in results if r["classification"] == "blocked"
+    )
+    vc_human_judgment = sum(
+        1 for r in results if r["decision"] == "human_judgment"
+    )
+
+    classifications = []
+    for r in results:
+        stdout_lines = r["stdout_head"]
+        stderr_lines = r["stderr_head"]
+
+        # C3: decision をそのまま渡す（human_judgment を保持）
+        decision = r["decision"]
+
+        classification_item = {
+            "ac": r["ac"],
+            "command": r["raw_command"],
+            "exit_code": r["exit_code"],
+            "category": r["category"],
+            "confidence": compute_confidence(r["category"]),
+            "evidence": {
+                "stdout_excerpt": " ".join(stdout_lines[:5]) if stdout_lines else "",
+                "stderr_excerpt": " ".join(stderr_lines[:5]) if stderr_lines else "",
+            },
+            "decision": decision,
+        }
+        classifications.append(classification_item)
+
+    return {
+        "vc_preflight": {
+            "passed": status == "pass",
+            "vc_failed_as_expected": vc_failed_as_expected,
+            "vc_passed_unexpectedly": vc_passed_unexpectedly,
+            "vc_unrunnable": vc_unrunnable,
+            "vc_human_judgment": vc_human_judgment,
+            "classifications": classifications,
+        }
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Baseline VC Preflight: extract and classify VCs from Issue body"
+    )
+    parser.add_argument("--issue", type=int, help="GitHub Issue number")
+    parser.add_argument("--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)")
+    parser.add_argument("--body-file", help="Path to Issue body file (for testing)")
+    parser.add_argument("--cwd", default=".", help="Working directory for command execution")
+    parser.add_argument("--timeout-seconds", type=int, default=30, help="Timeout per command")
+    parser.add_argument("--max-head-lines", type=int, default=20, help="Max lines for stdout/stderr")
+    # B8: contract-review-fragment format support
+    parser.add_argument(
+        "--format",
+        choices=["json", "contract-review-fragment"],
+        default="json",
+        help="Output format (json or contract-review-fragment YAML)",
+    )
+
+    args = parser.parse_args()
+
+    # Issue body を取得 (C2: error code と一緒に返す)
+    body = None
+    source_kind = None
+    error_code = None
+
+    if args.body_file:
+        body, error_code = read_body_file(args.body_file)
+        source_kind = "body_file"
+    elif args.issue:
+        body, error_code = get_issue_body(args.issue, args.repo)
+        source_kind = "github_issue"
+
+    if not body:
+        result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {"kind": "unknown", "body_sha256": ""},
+            "status": "blocked",
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": 0,
+                "human_judgment": 0,
+                "extraction_errors": 1,
+            },
+            "results": [],
+            "errors": [error_code or "failed_to_retrieve_issue_body"],
+        }
+        print(json.dumps(result, indent=2))
+        # C2: exit code 2 for retrieval/parse errors
+        return 2 if error_code else 2
+
+    # Verification Commands セクションを抽出
+    vc_section = extract_verification_commands_section(body)
+    if not vc_section:
+        result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {
+                "kind": source_kind,
+                "body_sha256": f"sha256:{compute_source_hash(body)}",
+            },
+            "status": "blocked",
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": 0,
+                "human_judgment": 0,
+                "extraction_errors": 1,
+            },
+            "results": [],
+            "errors": ["Verification Commands section not found"],
+        }
+        print(json.dumps(result, indent=2))
+        # C2: exit code 2 for extraction errors
+        return 2
+
+    # bash ブロックからコマンドを抽出
+    blocks = extract_fenced_bash_blocks(vc_section)
+    commands = []
+    for block in blocks:
+        commands.extend(parse_commands_from_block(block))
+
+    # B3: 0 件抽出は blocked として返す
+    if not commands:
+        result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {
+                "kind": source_kind,
+                "body_sha256": f"sha256:{compute_source_hash(body)}",
+            },
+            "status": "blocked",
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": 0,
+                "human_judgment": 0,
+                "extraction_errors": 1,
+            },
+            "results": [],
+            "errors": ["No verification commands extracted from Verification Commands section"],
+        }
+        print(json.dumps(result, indent=2))
+        # C2: exit code 2 for extraction errors
+        return 2
+
+    # 各コマンドを実行して分類
+    results = []
+    summary = {
+        "expected_fail": 0,
+        "unexpected_pass": 0,
+        "blocked": 0,
+        "human_judgment": 0,
+        "extraction_errors": 0,
+    }
+
+    for ac_label, command, line_no in commands:
+        # B1: Detect compound command BEFORE running
+        if detect_compound_command(command):
+            exit_code, stdout, stderr, duration_ms = None, "", "", 0
+            classification, category, decision, fix_hint = (
+                "blocked",
+                "compound_command_disallowed",
+                "blocked",
+                "Compound shell commands are not supported in baseline_vc_preflight/v1",
+            )
+        else:
+            exit_code, stdout, stderr, duration_ms = run_command(
+                command, args.timeout_seconds, args.cwd
+            )
+
+            classification, category, decision, fix_hint = classify_result(
+                exit_code, stdout, stderr, command
+            )
+
+        # C4: confidence を compute_confidence 経由で統一
+        stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, args.max_head_lines)
+        stderr_head, stderr_truncated, stderr_orig_count = truncate_output(stderr, args.max_head_lines)
+
+        result_item = {
+            "ac": ac_label or "AC_UNKNOWN",
+            "line": line_no,
+            "raw_command": command,
+            "command_hash": f"sha256:{compute_command_hash(command)}",
+            "runner": "exec",
+            "exit_code": exit_code,
+            "classification": classification,
+            "category": category,
+            "decision": decision,
+            "confidence": compute_confidence(category),  # C4: category ベースで統一
+            "stdout_head": stdout_head,
+            "stdout_truncated": stdout_truncated,
+            "stdout_original_line_count": stdout_orig_count,
+            "stderr_head": stderr_head,
+            "stderr_truncated": stderr_truncated,
+            "stderr_original_line_count": stderr_orig_count,
+            "duration_ms": duration_ms,
+            "fix_hint": fix_hint,
+        }
+        results.append(result_item)
+        summary[classification] += 1
+
+    # B2: status 優先順位を blocked > human_judgment > pass にする
+    status = "pass"
+    if not results:
+        status = "blocked"
+    elif any(r["decision"] == "blocked" for r in results):
+        status = "blocked"
+    elif any(r["decision"] == "human_judgment" for r in results):
+        status = "human_judgment"
+
+    output = {
+        "schema": "baseline_vc_preflight/v1",
+        "issue": args.issue or 0,
+        "repo": args.repo,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        "source": {
+            "kind": source_kind,
+            "body_sha256": f"sha256:{compute_source_hash(body)}",
+        },
+        "status": status,
+        "summary": summary,
+        "results": results,
+        "errors": [],
+    }
+
+    # B8: Output format selection
+    if args.format == "contract-review-fragment":
+        # C1: lazy import yaml - only when needed for fragment output
+        try:
+            import yaml
+        except ImportError:
+            error_result = {
+                "schema": "baseline_vc_preflight/v1",
+                "issue": args.issue or 0,
+                "repo": args.repo,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                "source": {
+                    "kind": source_kind,
+                    "body_sha256": f"sha256:{compute_source_hash(body)}",
+                },
+                "status": "blocked",
+                "summary": summary,
+                "results": results,
+                "errors": ["PyYAML is required for contract-review-fragment format; install pyyaml"],
+            }
+            print(json.dumps(error_result, indent=2))
+            # C2: exit code 2 for missing dependency
+            return 2
+        fragment = generate_contract_review_fragment(status, results)
+        print(yaml.dump(fragment, default_flow_style=False))
+    else:
+        print(json.dumps(output, indent=2))
+
+    # C2: Exit code contract
+    # status: pass → 0, blocked → 1, human_judgment → 3
+    if status == "pass":
+        return 0
+    elif status == "blocked":
+        return 1
+    elif status == "human_judgment":
+        return 3
+    else:
+        return 0  # default fallback
+
+
+if __name__ == "__main__":
+    sys.exit(main())

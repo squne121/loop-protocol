@@ -82,6 +82,10 @@ LOOP_STATE:
 
 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を default 経路として使い、結果を LOOP_STATE の `external_research_skip_basis` に記録する。LOOP_PROTOCOL は internal-only 変更が多い前提のため、デフォルトはスキップで構わない（スキップ時も判定根拠を記録する）。
 
+## Contract Snapshot 参照ルール
+
+preparation step で取得した contract snapshot 内の `vc_preflight` JSON（`baseline_vc_preflight.py` が生成）を Step 1-4 で参照し、impl-review-loop 側で `baseline_vc_preflight.py` を重複実行しない。VC 分類の正本は contract snapshot の `vc_preflight.classifications[]` に従う。
+
 ## Guardrails
 
 - control-plane だけを担い、data-plane 操作（push / `gh pr edit` / マージ等）は SubAgent に委譲する

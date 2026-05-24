@@ -78,6 +78,25 @@ gh api --paginate \
 
 > **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
+### 1-c. contract snapshot 内 VC preflight の参照（#329）
+
+contract snapshot コメント内には `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight` セクションが含まれており、以下の情報を保持:
+
+- 各 VC の実行結果（exit code / stdout / stderr）
+- root-cause 分類（category / decision / confidence）：`baseline_vc_preflight.py` による自動分類
+- `status: pass | blocked | human_judgment`
+
+**Step 1 (implementation) で実施すべき確認**:
+
+- contract snapshot の `vc_preflight.status` が **`pass` の場合のみ続行**。`blocked` または `human_judgment` の場合は停止し `termination_reason: human_escalation` を記録して人間判断へ送る
+- `vc_preflight.classifications` 配列を参照し、各 VC の `decision` を把握
+  - `decision: go` → baseline で失敗することが予期される
+  - `decision: blocked` → 実行不可能（コマンド不在等） → preflight status: blocked → 停止
+  - `decision: human_judgment` → 分類不能 → preflight status: human_judgment → 停止して人間判断へ
+- implementation-worker は `pass` 時のみ起動され、preflight 結果を context として活用する
+
+preflight では `baseline_vc_preflight.py` により **script 化された自動分類** が行われるため、本ステップでは重複実行を避ける（idempotency）。
+
 ## 2. ready tuple の再確認
 
 ```bash
