@@ -23,9 +23,15 @@ def load_contract_snapshot(snapshot_source: str) -> Dict[str, Any]:
     return json.loads(content)
 
 
-def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_product_spec_check(
+    contract_snapshot: Dict[str, Any], contract_snapshot_url: str = None
+) -> Dict[str, Any]:
     """
     Evaluate product_spec_check from contract snapshot.
+
+    Args:
+        contract_snapshot: CONTRACT_REVIEW_RESULT_V1 snapshot JSON
+        contract_snapshot_url: Snapshot comment URL for provenance (optional)
 
     Returns PRODUCT_SPEC_GATE_DECISION_V1 with routing_action.
     """
@@ -44,16 +50,25 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
 
     contract_result = contract_snapshot["CONTRACT_REVIEW_RESULT_V1"]
 
-    # Blocker 3: Check if checks.product_spec_check exists
+    # Blocker 3: Extract body_sha256 at the top so it survives all return paths
+    body_sha256 = contract_snapshot.get("body_sha256", None)
+
+    # Check if checks.product_spec_check exists
     # Do NOT rely on standalone product_spec_check_triggers
     if "checks" not in contract_result or "product_spec_check" not in contract_result.get("checks", {}):
+        # Blocker 2: Use CLI-provided or snapshot field for contract_snapshot_url
+        resolved_snapshot_url = (
+            contract_snapshot_url
+            or contract_snapshot.get("contract_snapshot_url")
+            or None
+        )
         return {
             "status": "ok",
             "applicability": "missing",
             "decision": "missing",
             "blocked_rule_ids": [],
-            "contract_snapshot_url": None,
-            "body_sha256": None,
+            "contract_snapshot_url": resolved_snapshot_url,
+            "body_sha256": body_sha256,
             "routing_action": "refresh_contract_snapshot",
             "reason": "product_spec_check missing from contract snapshot",
         }
@@ -63,8 +78,6 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
     # Extract key fields
     applicability = product_spec_check.get("applicability", "unknown")
     decision = product_spec_check.get("decision", "unknown")
-    contract_snapshot_url = contract_result.get("issue_url", None)
-    body_sha256 = contract_snapshot.get("body_sha256", None)
 
     # Blocker 1: Normalize blocked_rule_ids from blocked_reasons[].rule_id
     # Fallback to direct blocked_rule_ids for backward compatibility with old fixtures
@@ -82,15 +95,40 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
     valid_decision = {"pass", "fail", "human_judgment"}
 
     if applicability not in valid_applicability or decision not in valid_decision:
+        # Blocker 2: Use resolved contract_snapshot_url
+        resolved_snapshot_url = (
+            contract_snapshot_url
+            or contract_snapshot.get("contract_snapshot_url")
+            or contract_result.get("issue_url")
+        )
         return {
             "status": "ok",
             "applicability": applicability,
             "decision": decision,
             "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
-            "contract_snapshot_url": contract_snapshot_url,
+            "contract_snapshot_url": resolved_snapshot_url,
             "body_sha256": body_sha256,
             "routing_action": "refresh_contract_snapshot",
             "reason": "Invalid product_spec_check enum value",
+        }
+
+    # Blocker 1: Pair invariant check — not_applicable requires decision=pass
+    if applicability == "not_applicable" and decision != "pass":
+        # Blocker 2: Use resolved contract_snapshot_url
+        resolved_snapshot_url = (
+            contract_snapshot_url
+            or contract_snapshot.get("contract_snapshot_url")
+            or contract_result.get("issue_url")
+        )
+        return {
+            "status": "ok",
+            "applicability": applicability,
+            "decision": decision,
+            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
+            "contract_snapshot_url": resolved_snapshot_url,
+            "body_sha256": body_sha256,
+            "routing_action": "refresh_contract_snapshot",
+            "reason": "Inconsistent product_spec_check: not_applicable requires decision=pass",
         }
 
     # Determine routing action
@@ -99,7 +137,6 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
     if applicability == "not_applicable":
         # No product spec relevance, continue normally
         routing_action = "continue"
-        decision = "pass"
     elif decision == "pass":
         routing_action = "continue"
     elif decision == "fail":
@@ -107,12 +144,20 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
     elif decision == "human_judgment":
         routing_action = "stop_human"
 
+    # Blocker 2: Use resolved contract_snapshot_url
+    resolved_snapshot_url = (
+        contract_snapshot_url
+        or contract_snapshot.get("contract_snapshot_url")
+        or contract_result.get("issue_url")
+    )
+
     return {
         "status": "ok",
         "applicability": applicability,
         "decision": decision,
         "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
-        "contract_snapshot_url": contract_snapshot_url,
+        "contract_snapshot_url": resolved_snapshot_url,
+        "issue_url": contract_result.get("issue_url"),
         "body_sha256": body_sha256,
         "routing_action": routing_action,
     }
@@ -128,6 +173,12 @@ def main():
         default=None,
         help="Contract snapshot JSON string (or '-' for stdin)",
     )
+    parser.add_argument(
+        "--contract-snapshot-url",
+        type=str,
+        default=None,
+        help="Contract snapshot comment URL for provenance",
+    )
 
     args = parser.parse_args()
 
@@ -140,7 +191,7 @@ def main():
 
     try:
         snapshot = load_contract_snapshot(snapshot_source)
-        decision = evaluate_product_spec_check(snapshot)
+        decision = evaluate_product_spec_check(snapshot, args.contract_snapshot_url)
         print(json.dumps(decision, indent=2))
         return 0
     except json.JSONDecodeError as e:

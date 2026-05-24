@@ -19,5 +19,6 @@
       }
     }
   },
-  "body_sha256": "def456"
+  "body_sha256": "def456",
+  "contract_snapshot_url": "https://github.com/squne121/loop-protocol/issues/333#issuecomment-1000000001"
 }

@@ -6,9 +6,15 @@
     "issue_url": "https://github.com/squne121/loop-protocol/issues/333",
     "checks": {
       "product_spec_check": {
-        "applicability": "applicable",
-        "decision": "pass",
-        "blocked_rule_ids": [],
+        "applicability": "not_applicable",
+        "decision": "human_judgment",
+        "blocked_reasons": [
+          {
+            "rule_id": "PS005",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "ambiguous rule violation"
+          }
+        ],
         "triggers": {
           "docs_product_allowed_paths": false,
           "tasks_md_mentioned": false,
@@ -19,6 +25,6 @@
       }
     }
   },
-  "body_sha256": "abc123",
-  "contract_snapshot_url": "https://github.com/squne121/loop-protocol/issues/333#issuecomment-1000000000"
+  "body_sha256": "uvw456",
+  "contract_snapshot_url": "https://github.com/squne121/loop-protocol/issues/333#issuecomment-1234567891"
 }

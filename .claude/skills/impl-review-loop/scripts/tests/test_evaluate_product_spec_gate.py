@@ -27,12 +27,16 @@ def load_fixture(fixture_name: str) -> Dict[str, Any]:
     return json.loads(fixture_path.read_text(encoding="utf-8"))
 
 
-def run_gate_evaluator(fixture_data: Dict[str, Any]) -> Dict[str, Any]:
+def run_gate_evaluator(fixture_data: Dict[str, Any], contract_snapshot_url: str = None) -> Dict[str, Any]:
     """Run evaluate_product_spec_gate.py with fixture data via stdin."""
     script_path = Path(__file__).parent.parent / "evaluate_product_spec_gate.py"
 
+    cmd = [sys.executable, str(script_path), "--snapshot-json", "-"]
+    if contract_snapshot_url:
+        cmd.extend(["--contract-snapshot-url", contract_snapshot_url])
+
     result = subprocess.run(
-        [sys.executable, str(script_path), "--snapshot-json", "-"],
+        cmd,
         input=json.dumps(fixture_data),
         capture_output=True,
         text=True,
@@ -100,6 +104,15 @@ def test_missing_schema_refreshes():
     assert result["applicability"] == "missing", f"Expected applicability=missing, got {result['applicability']}"
 
 
+def test_missing_schema_preserves_body_sha256():
+    """Blocker 3: MISSING-SCHEMA fixture must preserve body_sha256 even when product_spec_check absent"""
+    fixture = load_fixture("missing-schema")
+    result = run_gate_evaluator(fixture)
+
+    expected_body_sha256 = fixture.get("body_sha256")
+    assert result["body_sha256"] == expected_body_sha256, f"Expected body_sha256={expected_body_sha256}, got {result['body_sha256']}"
+
+
 def test_stale_snapshot_refreshes():
     """AC7: STALE-SNAPSHOT fixture — invalid enum (decision: blocked) → routing_action: refresh_contract_snapshot"""
     fixture = load_fixture("stale-snapshot")
@@ -119,6 +132,39 @@ def test_missing_contract_root_refreshes():
     assert result["applicability"] == "missing", f"Expected applicability=missing, got {result['applicability']}"
 
 
+def test_not_applicable_fail_refreshes():
+    """Blocker 1: NOT_APPLICABLE_FAIL fixture — applicability=not_applicable, decision=fail → routing_action: refresh_contract_snapshot"""
+    fixture = load_fixture("not_applicable_fail")
+    result = run_gate_evaluator(fixture)
+
+    assert result["routing_action"] == "refresh_contract_snapshot", f"Expected routing_action=refresh_contract_snapshot, got {result['routing_action']}"
+    assert result["applicability"] == "not_applicable", f"Expected applicability=not_applicable, got {result['applicability']}"
+    assert result["decision"] == "fail", f"Expected decision=fail, got {result['decision']}"
+    assert result["reason"] == "Inconsistent product_spec_check: not_applicable requires decision=pass", f"Expected consistency check reason, got {result.get('reason')}"
+
+
+def test_not_applicable_human_judgment_refreshes():
+    """Blocker 1: NOT_APPLICABLE_HUMAN_JUDGMENT fixture — applicability=not_applicable, decision=human_judgment → routing_action: refresh_contract_snapshot"""
+    fixture = load_fixture("not_applicable_human_judgment")
+    result = run_gate_evaluator(fixture)
+
+    assert result["routing_action"] == "refresh_contract_snapshot", f"Expected routing_action=refresh_contract_snapshot, got {result['routing_action']}"
+    assert result["applicability"] == "not_applicable", f"Expected applicability=not_applicable, got {result['applicability']}"
+    assert result["decision"] == "human_judgment", f"Expected decision=human_judgment, got {result['decision']}"
+    assert result["reason"] == "Inconsistent product_spec_check: not_applicable requires decision=pass", f"Expected consistency check reason, got {result.get('reason')}"
+
+
+def test_contract_snapshot_url_cli_passthrough():
+    """Blocker 2: CLI argument --contract-snapshot-url is passed through to output"""
+    fixture = load_fixture("pass")
+    cli_url = "https://github.com/squne121/loop-protocol/issues/333#issuecomment-9999999"
+    result = run_gate_evaluator(fixture, contract_snapshot_url=cli_url)
+
+    assert result["contract_snapshot_url"] == cli_url, f"Expected contract_snapshot_url={cli_url}, got {result['contract_snapshot_url']}"
+    # Verify issue_url is still present for back-compat
+    assert "issue_url" in result, "Expected issue_url field to be present for back-compat"
+
+
 if __name__ == "__main__":
     # Run all tests
     tests = [
@@ -127,8 +173,12 @@ if __name__ == "__main__":
         test_fail_stops_human,
         test_human_judgment_stops_human,
         test_missing_schema_refreshes,
+        test_missing_schema_preserves_body_sha256,
         test_stale_snapshot_refreshes,
         test_missing_contract_root_refreshes,
+        test_not_applicable_fail_refreshes,
+        test_not_applicable_human_judgment_refreshes,
+        test_contract_snapshot_url_cli_passthrough,
     ]
 
     passed = 0
