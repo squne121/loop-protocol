@@ -121,6 +121,10 @@ LOOP_STATE:
     result: null             # WEB_RESEARCH_RESULT_V1 または null
     failure_reason: null     # 失敗時のみ
     critical_claims: []      # Outcome / In Scope / AC を左右すると判断した主張リスト
+  product_spec_context:      # Step 0e: Product/Spec Kit Signal Detection で更新
+    detected: false          # true | false
+    work_kind: null          # spec_creation | spec_update | tasks_materialization | unknown | null
+    signals: []              # 検知したシグナルのリスト（例: "docs/product/**", "tasks.md", "speckit" 等）
 ```
 
 ## Procedure
@@ -228,8 +232,101 @@ ISSUE_SCOPE_ROLLUP_DECISION_V2:
       rejection_reason: null
 ```
 
-`LOOP_STATE.scope_rollup_decision` に記録した後、Step 0-hygiene に進む。
+`LOOP_STATE.scope_rollup_decision` に記録した後、Step 0e に進む。
 詳細は `.claude/skills/issue-refinement-loop/references/scope-rollup-policy.md` を参照。
+
+#### Step 0e: Product/Spec Kit Signal Detection と Routing Gate
+
+> **実行タイミング**: Step 0d（scope rollup preflight）完了後、Step 0-hygiene の前に実行する。
+
+Issue の title / body / labels から以下のシグナルを検知し、`LOOP_STATE.product_spec_context` を更新する。
+
+**検知対象シグナル**:
+
+```yaml
+signal_matching:
+  normalize:
+    - issue.title / body を lower-case に正規化
+    - labels は label.name の配列として扱う
+    - slash command は /speckit.tasks / speckit-tasks / $speckit-tasks を同系統として扱う
+  patterns:
+    docs_product_path: '(^|[\s`"'''])docs/product/[^ \n`"''']+'
+    specify_path: '(^|[\s`"'''])\.specify/[^ \n`"''']+'
+    spec_file: '(^|/)spec\.md\b'
+    plan_file: '(^|/)plan\.md\b'
+    tasks_file: '(^|/)tasks\.md\b'
+    speckit_token: '\b(spec kit|spec-kit|speckit|/speckit\.|speckit-|\$speckit-)\b'
+```
+
+検知ロジック: 上記 patterns を正規化済み issue.title / body / labels に対して regex マッチし、1 件以上ヒットした場合 `LOOP_STATE.product_spec_context.detected = true` を設定し、マッチしたパターン名を `LOOP_STATE.product_spec_context.signals` に追加する。
+
+`work_kind` の分類（precedence-based）:
+
+```yaml
+work_kind_precedence:
+  1. tasks_file シグナルあり and 実装指示あり（「直接実装」「このまま実装」「タスクを実行」等）:
+       work_kind: tasks_materialization
+       fail_closed: true
+  2. tasks_file シグナルあり（実装指示の有無に関わらず、シグナルが存在する時点で要注意）:
+       work_kind: tasks_materialization  # conservative fallback
+       fail_closed: true
+  3. spec_or_plan_or_specify_signal あり and 更新意図あり:
+       work_kind: spec_update
+  4. spec_or_plan_or_specify_signal あり:
+       work_kind: spec_creation
+  5. speckit_token のみ:
+       work_kind: spec_creation
+  6. その他（docs_product のみ等）:
+       work_kind: unknown
+       fail_closed_if_tasks_signal_present: true
+```
+
+tasks_file シグナルが存在する時点で `tasks_materialization` として扱い、implementation route には進まない（fail-closed）。
+
+**Routing Gate（`product_spec_context.detected: true` の場合）**:
+
+```yaml
+product_spec_routing_gate:
+  trigger: LOOP_STATE.product_spec_context.detected == true
+  actions:
+    - LOOP_STATE.product_spec_context を後続 worker（issue-reviewer / issue-author）に opaque context として渡す
+    - work_kind を routing hint として記録する（後続 worker が参照するが、refinement loop は上書きしない）
+
+  tasks_md_guard:
+    # tasks.md シグナルを検知した場合は fail-closed で振り分ける
+    trigger: >
+      LOOP_STATE.product_spec_context.work_kind == tasks_materialization
+    action:
+      - LOOP_STATE.product_spec_context.routing_target を "issue_materialization" に設定
+      - implementation route に進まない（fail-closed）
+    fail_closed: true  # 判定不能な場合も implementation route には進まない
+
+  routing_targets:
+    tasks_materialization_route:
+      orchestrator_action:
+        - LOOP_STATE.product_spec_context.routing_target を "issue_materialization" に設定
+        - implementation route に進まない（fail-closed）
+      worker_chain_hint: >
+        issue-author SubAgent → speckit-taskstoissues skill → create-issue skill の順で処理する。
+        orchestrator（issue-refinement-loop）は worker chain を直接実行しない。
+        main thread が routing 先を確認した後、issue-author SubAgent を委譲する。
+      mutation_boundary: >
+        main thread が mutation の可否を決定する。
+        issue-author SubAgent のみが Issue 起票（materialization）を実行する。
+```
+
+**成果物手順の禁止**: この gate は signal detection / LOOP_STATE 更新 / worker routing のみを行う。spec 作成・更新・変換・archive の具体手順はこの gate に含まない。成果物の詳細手順は後続 skill（speckit-taskstoissues 等）が担う。
+
+## Product/Spec Kit Routing Gate — Follow-up Issues
+
+以下の Issue が #332 の分割先として起票または参照されている:
+
+- **#338** — `review-issue` / `issue-reviewer`: product trace fields の構造チェック追加
+- **#335** — `issue-contract-review`: product/spec-kit implementation preflight
+- **#333** — `impl-review-loop` / `implementation-worker`: tasks.md / speckit-implement direct execution guard
+- **#339** — `speckit-taskstoissues`: LOOP_PROTOCOL adapter alignment
+
+Step 0e 完了後、Step 0-hygiene に進む。
 
 #### Step 0-hygiene: stale state label 掃除（state label hygiene）
 
@@ -1100,6 +1197,15 @@ fi
 echo "PASS: Procedure Step 2 no direct Skill call"
 ```
 
+## Delivery Rule
+
+本 skill（`issue-refinement-loop/SKILL.md`）は複数の Issue が並行して編集する可能性がある単一ファイルである。以下の Issue が同一ファイルを Allowed Paths に含むため、マージコンフリクトのリスクに注意する:
+
+- **#203**: issue-refinement-loop 関連の改善 Issue（同一ファイル編集リスク）
+- **#295**: issue-refinement-loop の軽量化 Issue（max_iterations / SubAgent 条件付き実行）— 同一ファイルを対象とするため、本 #332 との PR が並行 OPEN になる場合は統合 PR または逐次マージを検討する
+
+複数の実装 PR が同一ファイルを変更する場合は、マージ順序を確認し、後発 PR では最新 main から rebase してからマージする。
+
 ## Related
 
 - `.claude/agents/issue-reviewer.md` — Step 2 の loop worker SubAgent（review-issue skill を内部実行）
@@ -1113,6 +1219,7 @@ echo "PASS: Procedure Step 2 no direct Skill call"
 - `.claude/agents/issue-author.md` — Step 4 の本文更新者
 - `docs/dev/agent-skill-boundaries.md` — オーケストレーター設計原則（ORCHESTRATOR_IO_BOUNDARY_V1 / control-plane / LOOP_STATE / 人間承認原則）
 - `docs/dev/github-ops.md` — GitHub 運用ルール（body-file guard / Parent Mode / コメントテンプレ）
+- `speckit-taskstoissues` skill（未整備）— tasks.md → GitHub Issue 変換アルゴリズムの LOOP_PROTOCOL adapter。Step 0e の tasks_md_guard が振り分ける先となる予定（#332 follow-up Issue）
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
