@@ -10,6 +10,13 @@ normative_references:
   - docs/dev/ssot-registry.md
 ```
 
+## 文書の位置づけ（policy / reference）
+
+この文書は **policy / reference 文書**である。AI が直接実行手順として読む操作マニュアルではない。
+
+- 具体的な作業手順（spec 作成・レビュー・修正・Issue 化）は、既存のループ（`issue-refinement-loop` / `impl-review-loop` / `issue-contract-review`）に従う。
+- この文書は `docs/product/**` ライフサイクルの規則・制約・状態遷移を定義する参照 SSOT として機能する。
+
 ## Authority / Responsibility Boundary
 
 This document defines the lifecycle of product SSOT documents (`docs/product/**`).

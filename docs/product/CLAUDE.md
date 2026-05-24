@@ -1,30 +1,11 @@
 # docs/product
 
-## 位置づけ
+`docs/product/**` は product SSOT である。
 
-`docs/product/` は **プロダクト SSOT（単一の真実の情報源）**。
-product spec、ゲーム設計、MVP スコープ、仕様ライフサイクルに関する正本はここに置く。
+## 最小ルール
 
-## docs/product/** を操作するときのルール
-
-`docs/product/**` を作成・更新・archive・tasks.md 変換する場合は、以下の入口を使う:
-
-1. **path-scoped rule**: `.claude/rules/product-spec-lifecycle.md`（`paths: ["docs/product/**"]` スコープ）
-2. **手順 skill**: `.claude/skills/product-spec-lifecycle/SKILL.md`
-3. **ライフサイクル正本**: `docs/dev/product-spec-lifecycle.md`（状態遷移・token_policy・EARS 等の詳細）
-
-## full_regeneration 禁止
-
-```yaml
-full_regeneration: prohibited
-```
-
-spec を全文再生成しない。必ず diff-first（差分更新）で操作する。
-再生成された出力は既存 GitHub Issues と乖離することが多く、SSOT を破壊する。
-
-## Spec Kit / `.specify/` 由来 artifact との関係
-
-`.specify/` 配下の artifact は **derived workbench**（派生作業場）であり、SSOT ではない。
-`docs/product/**` の内容と `.specify/` 由来 artifact が矛盾する場合は **`docs/product/**` が勝つ**。
-
-詳細は `docs/adr/0002-sdd-tool-adoption.md` §"generated_artifact_boundary" を参照する。
+- `docs/product/**` と `.specify/**` / Spec Kit 生成物が矛盾する場合、`docs/product/**` を優先する。
+- `docs/product/**` は全文再生成しない。既存文書は diff-first で変更する。
+- `docs/product/**` の変更は、必ず対応する GitHub Issue / PR を持つ。
+- Spec / Plan / Tasks / 実装タスクの作成・レビュー・修正は、既存の `issue-refinement-loop` と `impl-review-loop` の手順に従う。
+- Spec Kit の `tasks.md` は tracking SSOT ではない。GitHub Issue 化してから作業する。
