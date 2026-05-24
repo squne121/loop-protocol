@@ -6,12 +6,56 @@
 
 ```yaml
 issue_number: <int, 必須>
-contract_snapshot_url: <URL, 必須>
+contract_snapshot_url: <URL, 任意>  # 省略時は以下の自動検出フローで取得
 max_iterations: 5  # 任意
 ```
 
-- `contract_snapshot_url` のコメントを `gh api` で取得し、`status: go` 判定が記録されていることを確認
-- 不一致の場合は `issue-contract-review` を先に通すよう人間に提案して停止
+### 1-a. `contract_snapshot_url` が提供された場合
+
+`gh api` でコメントを取得し、`CONTRACT_REVIEW_RESULT_V1`・`generated_by: issue-contract-review`・`status: go` の組み合わせが記録されていることを確認する。
+確認できない場合は停止し、人間判断を仰ぐ。
+
+`LOOP_STATE.contract_snapshot_source` に `provided` を記録する。
+
+### 1-b. `contract_snapshot_url` が未提供の場合（自動検出フロー）
+
+以下の順で処理する。
+
+```bash
+# Issue の全コメントを取得
+gh issue view <issue_number> --repo "$REPO" --comments --json comments \
+  --jq '.comments[] | select(.body | test("CONTRACT_REVIEW_RESULT_V1")) | {url: .url, body: .body}'
+```
+
+**ステップ 1: 最新 `status: blocked` チェック**
+
+`CONTRACT_REVIEW_RESULT_V1` を含むコメントの中で、作成日時が最新のものが `status: blocked` である場合は、古い `status: go` コメントが存在していても採用せず停止する。
+
+```
+最新 CONTRACT_REVIEW_RESULT_V1 が status: blocked → 停止（人間判断）
+```
+
+**ステップ 2: 既存 `status: go` の検出（idempotency 保証）**
+
+最新 `CONTRACT_REVIEW_RESULT_V1` が `status: blocked` でない場合、コメント一覧から以下の条件を全て満たすコメントを探す:
+
+- 本文に `CONTRACT_REVIEW_RESULT_V1` が含まれる
+- `generated_by: issue-contract-review` が含まれる
+- `status: go` が含まれる
+
+最新の該当コメントが存在する場合: その URL を `contract_snapshot_url` として採用する。
+既存 `status: go` が存在する場合は `issue-contract-review` を再実行しない（idempotency 保証）。
+
+`LOOP_STATE.contract_snapshot_source` に `detected_existing` を記録する。
+
+**ステップ 3: 既存 `status: go` が存在しない場合 — `issue-contract-review` 先行実行**
+
+既存 `status: go` が存在しない場合にのみ、`issue-contract-review` を先行実行する。
+実行後、生成されたコメント URL を `contract_snapshot_url` として採用する。
+
+`LOOP_STATE.contract_snapshot_source` に `materialized_by_issue_contract_review` を記録する。
+
+> **スコープ境界（#245 との関係）**: ready tuple の確認・ラベルのドリフト修正は #245 のスコープで扱う。本ステップは contract snapshot の取得（materialization）のみを担う。また、#245 の ready tuple / ラベルドリフトは本 Issue（#149）のスコープ外であり、本 Issue は contract snapshot materialization のみを扱う。
 
 ## 2. ready tuple の再確認
 
@@ -118,6 +162,7 @@ iteration = 0 で開始:
 LOOP_STATE:
   issue_number: <int>
   contract_snapshot_url: <URL>
+  contract_snapshot_source: provided | detected_existing | materialized_by_issue_contract_review
   iteration: 0
   max_iterations: 5
   worktree: .claude/worktrees/issue-<番号>-<slug>
