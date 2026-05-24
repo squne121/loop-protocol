@@ -96,6 +96,76 @@ generated_artifacts: derived-workbench
 `.specify/memory/constitution.md` 等を正本にすることは、既存 workflow の根本ルールを上書きする
 設計変更になるため、本 ADR のスコープでは禁止する。
 
+### 2.1 Override Mechanism Boundary
+
+Spec Kit v0.8.13 の override / preset / extension 系の境界は、`docs/` が normative、
+`.specify/` が derived workbench である前提を補強するために次のように固定する。
+
+```yaml
+override_mechanism_boundary:
+  target_spec_kit:
+    specify_cli_version: "specify 0.8.13"
+    source_tag_or_commit: "v0.8.13 (b2314680fce898e0a9151b37ad2535d810c93eef)"
+    evidence_doc: "docs/dev/spec-kit-override-investigation.md"
+    docs_reference_rule: >
+      Spec Kit docs and CLI behavior must be reviewed against the same immutable tag or
+      commit. Do not mix latest or main documentation with an installed CLI version.
+    upgrade_rule: >
+      Before applying this boundary to a newer Spec Kit version, rerun the template
+      resolution matrix, command behavior matrix, and spec-kit#2278 regression check.
+
+  boundary_version_guard: >
+    Keep this section pinned to specify 0.8.13 / v0.8.13 / b2314680fce898e0a9151b37ad2535d810c93eef;
+    rerun docs/dev/spec-kit-override-investigation.md §3-A / §3-B and spec-kit#2278 before
+    changing the tag or commit.
+
+  mechanisms:
+    project_local_template_overrides:
+      decision: adopted
+      scope: ".specify/templates/overrides/"
+      rationale: "Runtime template resolution; low upgrade risk; single-repo local adaptation."
+
+    preset:
+      decision: conditional
+      conditions:
+        - "Only for multi-repository reuse"
+        - "Pin source to immutable tag or commit"
+        - "Review preset source before install"
+        - "Record generated command snapshot diff in a dedicated PR"
+        - "No network install during implementation loop unless explicitly allowed"
+      rationale: "Preset is acceptable only when the source is pinned and reviewed as a reusable boundary."
+
+    extension:
+      decision: default_non_adopted
+      rationale: >
+        Extensions are for new commands, hooks, quality gates, and external integrations;
+        overbroad for docs canonical policy. Future adoption must re-check v0.8.13
+        docs and source precedence differences for extension template resolution.
+
+    extension_hooks:
+      decision: default_non_adopted
+      rationale: "Runtime hook execution is not a canonical docs boundary mechanism."
+
+    installed_command_registration_and_snapshot_overrides:
+      decision: default_non_adopted
+      rationale: >
+        Spec Kit commands are registered into agent integration directories at install
+        time. Local mutation is reviewed snapshot drift, not runtime override, and must
+        not be used as the default docs-canonical boundary mechanism.
+    installed_command_snapshot_overrides:
+      alias_of: installed_command_registration_and_snapshot_overrides
+
+  constitution_memory:
+    decision: keep_as_derived_pointer
+    operational_note: >
+      /speckit-constitution may rewrite .specify/memory/constitution.md. If invoked,
+      restore or update the derived pointer through a reviewed PR.
+    canonical_refs:
+      - "docs/adr/0002-sdd-tool-adoption.md"
+      - "docs/dev/product-spec-lifecycle.md"
+      - "docs/product/**"
+```
+
 ### 3. Issue contract と tasks.md の責務分担
 
 ```yaml
