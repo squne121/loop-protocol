@@ -11,7 +11,7 @@ Does NOT reimplement PS001-PS006 semantics. Reads product_spec_check output only
 import argparse
 import json
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def load_contract_snapshot(snapshot_source: str) -> Dict[str, Any]:
@@ -29,7 +29,7 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
 
     Returns PRODUCT_SPEC_GATE_DECISION_V1 with routing_action.
     """
-    # Check if CONTRACT_REVIEW_RESULT_V1 exists
+    # Blocker 2: Check if CONTRACT_REVIEW_RESULT_V1 exists
     if "CONTRACT_REVIEW_RESULT_V1" not in contract_snapshot:
         return {
             "status": "ok",
@@ -38,57 +38,60 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
             "blocked_rule_ids": [],
             "contract_snapshot_url": None,
             "body_sha256": None,
-            "routing_action": "continue",
+            "routing_action": "refresh_contract_snapshot",
             "reason": "CONTRACT_REVIEW_RESULT_V1 not found in snapshot",
         }
 
     contract_result = contract_snapshot["CONTRACT_REVIEW_RESULT_V1"]
 
-    # Check if checks.product_spec_check exists
+    # Blocker 3: Check if checks.product_spec_check exists
+    # Do NOT rely on standalone product_spec_check_triggers
     if "checks" not in contract_result or "product_spec_check" not in contract_result.get("checks", {}):
-        # Check if product spec context is triggered
-        triggers = contract_result.get("checks", {}).get("product_spec_check_triggers", {})
-        has_product_spec_trigger = any([
-            triggers.get("docs_product_allowed_paths", False),
-            triggers.get("tasks_md_mentioned", False),
-            triggers.get("specify_artifact_mentioned", False),
-            triggers.get("generated_task_mentioned", False),
-            triggers.get("product_spec_context_present", False),
-        ])
-
-        if has_product_spec_trigger:
-            # Product/spec trigger present but product_spec_check missing
-            return {
-                "status": "ok",
-                "applicability": "applicable",
-                "decision": "missing",
-                "blocked_rule_ids": [],
-                "contract_snapshot_url": None,
-                "body_sha256": None,
-                "routing_action": "refresh_contract_snapshot",
-                "reason": "Product/spec trigger present but product_spec_check missing from contract snapshot",
-            }
-        else:
-            # No product spec context, so continue normally
-            return {
-                "status": "ok",
-                "applicability": "not_applicable",
-                "decision": "pass",
-                "blocked_rule_ids": [],
-                "contract_snapshot_url": None,
-                "body_sha256": None,
-                "routing_action": "continue",
-                "reason": "No product/spec trigger detected",
-            }
+        return {
+            "status": "ok",
+            "applicability": "missing",
+            "decision": "missing",
+            "blocked_rule_ids": [],
+            "contract_snapshot_url": None,
+            "body_sha256": None,
+            "routing_action": "refresh_contract_snapshot",
+            "reason": "product_spec_check missing from contract snapshot",
+        }
 
     product_spec_check = contract_result["checks"]["product_spec_check"]
 
     # Extract key fields
     applicability = product_spec_check.get("applicability", "unknown")
     decision = product_spec_check.get("decision", "unknown")
-    blocked_rule_ids = product_spec_check.get("blocked_rule_ids", [])
     contract_snapshot_url = contract_result.get("issue_url", None)
     body_sha256 = contract_snapshot.get("body_sha256", None)
+
+    # Blocker 1: Normalize blocked_rule_ids from blocked_reasons[].rule_id
+    # Fallback to direct blocked_rule_ids for backward compatibility with old fixtures
+    blocked_rule_ids = product_spec_check.get("blocked_rule_ids")
+    if blocked_rule_ids is None:
+        blocked_reasons = product_spec_check.get("blocked_reasons", [])
+        blocked_rule_ids = [
+            r.get("rule_id")
+            for r in blocked_reasons
+            if isinstance(r, dict) and r.get("rule_id")
+        ]
+
+    # Blocker 4: Enum validation
+    valid_applicability = {"applicable", "not_applicable"}
+    valid_decision = {"pass", "fail", "human_judgment"}
+
+    if applicability not in valid_applicability or decision not in valid_decision:
+        return {
+            "status": "ok",
+            "applicability": applicability,
+            "decision": decision,
+            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
+            "contract_snapshot_url": contract_snapshot_url,
+            "body_sha256": body_sha256,
+            "routing_action": "refresh_contract_snapshot",
+            "reason": "Invalid product_spec_check enum value",
+        }
 
     # Determine routing action
     routing_action = "continue"
@@ -103,15 +106,12 @@ def evaluate_product_spec_check(contract_snapshot: Dict[str, Any]) -> Dict[str, 
         routing_action = "stop_human"
     elif decision == "human_judgment":
         routing_action = "stop_human"
-    elif applicability == "applicable" and decision == "missing":
-        # Stale snapshot case
-        routing_action = "refresh_contract_snapshot"
 
     return {
         "status": "ok",
         "applicability": applicability,
         "decision": decision,
-        "blocked_rule_ids": blocked_rule_ids,
+        "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
         "contract_snapshot_url": contract_snapshot_url,
         "body_sha256": body_sha256,
         "routing_action": routing_action,

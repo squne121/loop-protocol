@@ -8,7 +8,18 @@
       "product_spec_check": {
         "applicability": "applicable",
         "decision": "fail",
-        "blocked_rule_ids": ["PS001", "PS002"],
+        "blocked_reasons": [
+          {
+            "rule_id": "PS001",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "feature_id not found"
+          },
+          {
+            "rule_id": "PS002",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "acceptance criteria incomplete"
+          }
+        ],
         "triggers": {
           "docs_product_allowed_paths": true,
           "tasks_md_mentioned": true,

@@ -8,7 +8,13 @@
       "product_spec_check": {
         "applicability": "applicable",
         "decision": "human_judgment",
-        "blocked_rule_ids": ["PS006"],
+        "blocked_reasons": [
+          {
+            "rule_id": "PS006",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "ambiguous acceptance criteria requiring human judgment"
+          }
+        ],
         "triggers": {
           "docs_product_allowed_paths": false,
           "tasks_md_mentioned": true,

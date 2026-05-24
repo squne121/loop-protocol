@@ -66,40 +66,57 @@ def test_not_applicable_continues():
 
 
 def test_fail_stops_human():
-    """AC7: FAIL fixture — decision=fail → routing_action: stop_human"""
+    """AC7: FAIL fixture — decision=fail → routing_action: stop_human with blocked_rule_ids normalized from blocked_reasons"""
     fixture = load_fixture("fail")
     result = run_gate_evaluator(fixture)
 
     assert result["routing_action"] == "stop_human", f"Expected routing_action=stop_human, got {result['routing_action']}"
     assert result["decision"] == "fail", f"Expected decision=fail, got {result['decision']}"
     assert len(result["blocked_rule_ids"]) > 0, "Expected blocked_rule_ids to be non-empty"
+    # Verify blocked_rule_ids were normalized from blocked_reasons
+    assert "PS001" in result["blocked_rule_ids"], f"Expected PS001 in blocked_rule_ids, got {result['blocked_rule_ids']}"
+    assert "PS002" in result["blocked_rule_ids"], f"Expected PS002 in blocked_rule_ids, got {result['blocked_rule_ids']}"
 
 
 def test_human_judgment_stops_human():
-    """AC7: HUMAN_JUDGMENT fixture — decision=human_judgment → routing_action: stop_human"""
+    """AC7: HUMAN_JUDGMENT fixture — decision=human_judgment → routing_action: stop_human with blocked_rule_ids normalized from blocked_reasons"""
     fixture = load_fixture("human_judgment")
     result = run_gate_evaluator(fixture)
 
     assert result["routing_action"] == "stop_human", f"Expected routing_action=stop_human, got {result['routing_action']}"
     assert result["decision"] == "human_judgment", f"Expected decision=human_judgment, got {result['decision']}"
+    # Verify blocked_rule_ids were normalized from blocked_reasons
+    assert len(result["blocked_rule_ids"]) > 0, "Expected blocked_rule_ids to be non-empty"
+    assert "PS006" in result["blocked_rule_ids"], f"Expected PS006 in blocked_rule_ids, got {result['blocked_rule_ids']}"
 
 
 def test_missing_schema_refreshes():
-    """AC7: MISSING-SCHEMA fixture — product/spec trigger present but product_spec_check absent → routing_action: refresh_contract_snapshot"""
+    """AC7: MISSING-SCHEMA fixture — product_spec_check absent → routing_action: refresh_contract_snapshot"""
     fixture = load_fixture("missing-schema")
     result = run_gate_evaluator(fixture)
 
     assert result["routing_action"] == "refresh_contract_snapshot", f"Expected routing_action=refresh_contract_snapshot, got {result['routing_action']}"
     assert result["decision"] == "missing", f"Expected decision=missing, got {result['decision']}"
-    assert result["applicability"] == "applicable", f"Expected applicability=applicable, got {result['applicability']}"
+    assert result["applicability"] == "missing", f"Expected applicability=missing, got {result['applicability']}"
 
 
 def test_stale_snapshot_refreshes():
-    """AC7: STALE-SNAPSHOT fixture — schema mismatch → routing_action: refresh_contract_snapshot"""
+    """AC7: STALE-SNAPSHOT fixture — invalid enum (decision: blocked) → routing_action: refresh_contract_snapshot"""
     fixture = load_fixture("stale-snapshot")
     result = run_gate_evaluator(fixture)
 
     assert result["routing_action"] == "refresh_contract_snapshot", f"Expected routing_action=refresh_contract_snapshot, got {result['routing_action']}"
+    assert result["reason"] == "Invalid product_spec_check enum value", f"Expected reason about invalid enum, got {result['reason']}"
+
+
+def test_missing_contract_root_refreshes():
+    """Blocker 2: MISSING-CONTRACT-ROOT fixture — CONTRACT_REVIEW_RESULT_V1 root absent → routing_action: refresh_contract_snapshot"""
+    fixture = load_fixture("missing-contract-root")
+    result = run_gate_evaluator(fixture)
+
+    assert result["routing_action"] == "refresh_contract_snapshot", f"Expected routing_action=refresh_contract_snapshot, got {result['routing_action']}"
+    assert result["decision"] == "missing", f"Expected decision=missing, got {result['decision']}"
+    assert result["applicability"] == "missing", f"Expected applicability=missing, got {result['applicability']}"
 
 
 if __name__ == "__main__":
@@ -111,6 +128,7 @@ if __name__ == "__main__":
         test_human_judgment_stops_human,
         test_missing_schema_refreshes,
         test_stale_snapshot_refreshes,
+        test_missing_contract_root_refreshes,
     ]
 
     passed = 0
