@@ -344,25 +344,12 @@ Avoid:
 
 ## 6. Follow-up decision
 
-### 6.1 ADR 0002 追補案（骨子）
+### 6.1 ADR 0002 追補案（確定済み）
 
-`docs/adr/0002-sdd-tool-adoption.md` への追補セクション骨子:
+Follow-up A は PR #361 で実装済み。
+確定版は [docs/adr/0002-sdd-tool-adoption.md#override-mechanism-boundary](../adr/0002-sdd-tool-adoption.md#override-mechanism-boundary) を参照する。
 
-```markdown
-## Override Mechanism Boundary (added)
-
-Spec Kit v0.8.13 で確認された 5 機構（§docs/dev/spec-kit-override-investigation.md §2）
-について、LOOP が採用する境界を次のとおりに固定する:
-
-- 採用: project-local template overrides (`.specify/templates/overrides/`)
-- 条件付き採用: preset（複数 repo 横展開時のみ。Spec Kit tag 固定 + reviewed
-  snapshot PR + §10 supply-chain guard 遵守が必須）
-- 非採用 default: extension / extension hooks / installed command snapshot
-  overrides（reviewed snapshot 原則と衝突するため）
-- `.specify/memory/constitution.md` は derived pointer として維持し、本文は
-  `docs/adr/0002-sdd-tool-adoption.md` / `docs/dev/product-spec-lifecycle.md` /
-  `docs/product/**` を canonical として参照させる
-```
+この節の旧骨子は superseded とする。今後は ADR 本体を正本とする。
 
 ### 6.2 follow-up Implementation Issue 案（2 本に分割）
 
