@@ -87,13 +87,13 @@ python3 .claude/skills/issue-contract-review/scripts/check_product_spec_contract
 | **PS003** | `.specify/` は derived workbench に限定されているか | workbench として参照し docs/SSOT 優先を明記 | canonical source / docs より優先する扱い | .specify 言及なし |
 | **PS004** | product spec 更新に diff_rationale / changed_requirement_id / affected_sections が存在するか | 上記いずれか 1 件以上が存在 | spec update Issue が存在するが evidence なし | non-spec Issue |
 | **PS005** | generated task 由来 Issue が `requirement_id` / `source_task_id` を保持しているか | 両方存在 | 片方以上欠落 | generated task でない |
-| **PS006** | generated task dependency が materialize されているか（GitHub native または `Depends on #N`） | GitHub native dependency または line-anchored `Depends on #N` を保持 | dependency 未 materialize | generated task でない |
+| **PS006** | generated task dependency が materialize されているか（line-anchored `Depends on #N`） | line-anchored `Depends on #N` を保持（GitHub native dependency 対応は follow-up） | dependency 未 materialize | generated task でない |
 
 **判定規則**
 
 | 結果 | 処置 |
 |---|---|
-| `applicability: not_applicable` かつ `decision: n/a` | Step 4 へ（spec 関連なし） |
+| `applicability: not_applicable` かつ `decision: pass` | Step 4 へ（spec 関連なし） |
 | `applicability: applicable` かつ `decision: pass` | Step 4 へ |
 | `applicability: applicable` かつ `decision: human_judgment` | BLOCKED → issue comment に根拠を列挙して人間判断を求める |
 | `applicability: applicable` かつ `decision: fail` | BLOCKED → issue comment に blocked_reasons（rule_id / source / excerpt）を列挙 |

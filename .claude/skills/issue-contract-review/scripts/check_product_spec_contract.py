@@ -34,7 +34,7 @@ def run_gh_api(issue_number: int, repo: str) -> Optional[Dict[str, Any]]:
                 "--repo",
                 repo,
                 "--json",
-                "title,body,labels,baseRefName",
+                "title,body,labels",
             ],
             capture_output=True,
             text=True,
@@ -132,12 +132,12 @@ def check_ps001(
     - applicability: only if docs_product_allowed_paths is true
     """
     if not triggers["docs_product_allowed_paths"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
     # Issue 自体が spec/update Issue かどうかを判定
-    # Machine-Readable Contract に change_kind: product-spec-delta / update があるか
+    # Machine-Readable Contract に change_kind: product-spec-delta 等があるか
     if re.search(
-        r"change_kind:\s*(spec-?delta|product-?spec|update)",
+        r"change_kind:\s*(spec-?delta|product-?spec|product[_-]?spec[_-]?delta|product[_-]?spec[_-]?update|spec[_-]?update)",
         issue_body,
         re.IGNORECASE,
     ):
@@ -198,38 +198,16 @@ def check_ps002(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     - Fail: direct source / tracking SSOT として言及
     """
     if not triggers["tasks_md_mentioned"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
-    # prohibit patterns
-    prohibit = [
-        r"implement.*tasks\.md|tasks\.md.*implement",
-        r"direct.*tasks\.md|tasks\.md.*direct",
-        r"source.*tasks\.md|tasks\.md.*source\b(?!_task_id)",
-        r"tracking.*tasks\.md|tasks\.md.*tracking",
-        r"proceed.*tasks\.md|tasks\.md.*proceed",
-    ]
-
-    for pattern in prohibit:
-        if re.search(pattern, issue_body, re.IGNORECASE):
-            # ただし "source_task_id" は許可（これは metadata）
-            if "source_task_id" in issue_body:
-                continue
-            return "fail", [
-                {
-                    "rule_id": "PS002",
-                    "source": "issue_body",
-                    "excerpt": re.search(pattern, issue_body, re.IGNORECASE).group(0),
-                }
-            ]
-
-    # allow patterns
+    # allow patterns first — higher priority
+    # These patterns relate to tasks.md as staging/artifact/convert/materialize
     allow = [
         r"tasks\.md.*staging",
         r"staging.*tasks\.md",
         r"tasks\.md.*artifact",
         r"artifact.*tasks\.md",
         r"convert.*tasks\.md.*issue|materialize.*tasks\.md",
-        r"source_task_id|requirement_id",
     ]
 
     if any(re.search(p, issue_body, re.IGNORECASE) for p in allow):
@@ -240,6 +218,25 @@ def check_ps002(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
                 "excerpt": "tasks.md を staging artifact として参照",
             }
         ]
+
+    # prohibit patterns — checked after allow to prevent false positive
+    prohibit = [
+        r"implement\s+.*?tasks\.md(?!.*(?:from|materialize|staging|artifact))|tasks\.md\s+.*?implement",
+        r"direct.*tasks\.md|tasks\.md.*direct",
+        r"source.*tasks\.md(?!_task_id)|tasks\.md.*source\b(?!_task_id)",
+        r"tracking.*tasks\.md|tasks\.md.*tracking",
+        r"proceed.*tasks\.md|tasks\.md.*proceed",
+    ]
+
+    for pattern in prohibit:
+        if re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL):
+            return "fail", [
+                {
+                    "rule_id": "PS002",
+                    "source": "issue_body",
+                    "excerpt": re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL).group(0),
+                }
+            ]
 
     # neutral mention — pass but with note
     return "pass", [
@@ -258,7 +255,7 @@ def check_ps003(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     - Fail: canonical source / SSOT override として言及
     """
     if not triggers["specify_artifact_mentioned"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
     # prohibit patterns (check FIRST, before allow)
     # Specifically match .specify as THE canonical/SSOT (not derived from docs)
@@ -314,26 +311,42 @@ def check_ps004(
     - Applicability: only if docs_product_allowed_paths AND not pure spec issue
     """
     if not triggers["docs_product_allowed_paths"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
-    # If Issue 自体が spec delta/update Issue, then PS004 is less strict
+    # If Issue 自体が spec delta/update Issue, then evidence is required
     if re.search(
-        r"change_kind:\s*(spec-?delta|product-?spec|update|spec[_-]update)",
+        r"change_kind:\s*(spec-?delta|product-?spec|product[_-]?spec[_-]?delta|product[_-]?spec[_-]?update|spec[_-]?update)",
         issue_body,
         re.IGNORECASE,
     ):
-        # Spec delta issues should still have rationale, but we check more loosely
+        # Spec delta issues must have evidence in Machine-Readable Contract or Product Spec Context
+        contract_match = re.search(
+            r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
+            issue_body,
+            re.MULTILINE | re.DOTALL,
+        )
+
+        context_match = re.search(
+            r"^##\s+Product Spec Context\s*$(.+?)(?=^##|\Z)",
+            issue_body,
+            re.MULTILINE | re.DOTALL,
+        )
+
         evidence_patterns = [
-            r"diff[_-]?rationale",
-            r"changed[_-]?requirement",
-            r"affected[_-]?sections",
-            r"change[_-]?summary",
-            r"playtest|feedback|requirement|balance",
+            r"diff[_-]?rationale\s*:",
+            r"changed[_-]?requirement\s*:",
+            r"affected[_-]?sections\s*:",
         ]
 
         found = []
+        search_text = ""
+        if contract_match:
+            search_text += contract_match.group(1)
+        if context_match:
+            search_text += context_match.group(1)
+
         for pattern in evidence_patterns:
-            if re.search(pattern, issue_body, re.IGNORECASE):
+            if re.search(pattern, search_text, re.IGNORECASE):
                 found.append(pattern)
 
         if found:
@@ -345,20 +358,44 @@ def check_ps004(
                 }
             ]
 
-        # Spec issues without explicit evidence still pass as n/a
-        return "n/a", []
+        # Spec delta issues without explicit evidence: fail
+        return "fail", [
+            {
+                "rule_id": "PS004",
+                "source": "issue_body",
+                "excerpt": "spec delta issue without diff_rationale / changed_requirement_id / affected_sections",
+            }
+        ]
 
     # Non-spec issues with docs/product updates need diff evidence
+    contract_match = re.search(
+        r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
+        issue_body,
+        re.MULTILINE | re.DOTALL,
+    )
+
+    context_match = re.search(
+        r"^##\s+Product Spec Context\s*$(.+?)(?=^##|\Z)",
+        issue_body,
+        re.MULTILINE | re.DOTALL,
+    )
+
     evidence_patterns = [
-        r"diff[_-]?rationale",
-        r"changed[_-]?requirement",
-        r"affected[_-]?sections",
-        r"change[_-]?summary",
+        r"diff[_-]?rationale\s*:",
+        r"changed[_-]?requirement\s*:",
+        r"affected[_-]?sections\s*:",
+        r"change[_-]?summary\s*:",
     ]
 
     found = []
+    search_text = ""
+    if contract_match:
+        search_text += contract_match.group(1)
+    if context_match:
+        search_text += context_match.group(1)
+
     for pattern in evidence_patterns:
-        if re.search(pattern, issue_body, re.IGNORECASE):
+        if re.search(pattern, search_text, re.IGNORECASE):
             found.append(pattern)
 
     if found:
@@ -396,7 +433,7 @@ def check_ps005(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     - Applicability: only if generated_task_mentioned
     """
     if not triggers["generated_task_mentioned"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
     # context check (most reliable source)
     context = extract_product_spec_context(issue_body)
@@ -448,9 +485,10 @@ def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     """
     PS006: generated task dependency が materialize されているか
     - Applicability: only if generated_task_mentioned AND mentions dependencies
+    - Line-anchored Depends on #N を使用（GitHub native dependency 対応は follow-up）
     """
     if not triggers["generated_task_mentioned"]:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
     # Check if dependencies are mentioned
     has_dependency_mention = bool(
@@ -462,27 +500,18 @@ def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     )
 
     if not has_dependency_mention:
-        return "n/a", []
+        return "pass", []  # n/a: applicability check does not apply
 
-    # Check for actual GitHub native dependency declaration or Depends on #N (not just text mention)
+    # Check for line-anchored Depends on #N
     depends_on = extract_depends_on(issue_body)
     has_depends_on = len(depends_on) > 0
 
-    # More strict check for GitHub native dependency declaration
-    has_github_dependency_decl = bool(
-        re.search(
-            r"^\s*-\s*Depends on #\d+|^Depends on #\d+",
-            issue_body,
-            re.MULTILINE,
-        )
-    )
-
-    if has_depends_on or has_github_dependency_decl:
+    if has_depends_on:
         return "pass", [
             {
                 "rule_id": "PS006",
                 "source": "dependencies",
-                "excerpt": "Depends on または GitHub native dependency 宣言あり",
+                "excerpt": "Depends on #N 宣言あり（line-anchored）",
             }
         ]
 
@@ -553,9 +582,7 @@ def main():
             all_blocked_reasons.extend(evidence)
 
     # decision を決定
-    if applicability == "not_applicable":
-        decision = "n/a"
-    elif any(s == "fail" for s, _ in checks.values()):
+    if any(s == "fail" for s, _ in checks.values()):
         decision = "fail"
     elif any(s == "human_judgment" for s, _ in checks.values()):
         decision = "human_judgment"
@@ -571,7 +598,7 @@ def main():
     }
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    sys.exit(0 if decision in ("pass", "n/a") else 1)
+    sys.exit(0 if decision in ("pass",) else 1)
 
 
 if __name__ == "__main__":

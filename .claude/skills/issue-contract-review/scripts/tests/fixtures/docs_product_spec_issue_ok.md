@@ -8,6 +8,9 @@ Update `docs/product/game-logic.md` with new balance parameters discovered in pl
 contract_schema_version: v1
 issue_kind: spec
 change_kind: spec-delta
+diff_rationale: |
+  Playtest feedback revealed movement speed imbalance.
+  Updated MOVE_SPEED values to match playtested metrics.
 ```
 
 ## Outcome
