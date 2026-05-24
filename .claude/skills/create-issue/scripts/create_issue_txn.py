@@ -1104,6 +1104,60 @@ def _reconcile_issue_links(
     return completed, parent_verified, dependency_verified
 
 
+def _run_issue_body_validator(body: str) -> dict[str, Any]:
+    """Call validate_issue_body.py validator on issue body text.
+
+    Returns the JSON output from the validator (parsed).
+    Raises on validator exit code != 0/1 (internal error case exit 2).
+    """
+    import subprocess
+    import json
+    import tempfile
+
+    # Write body to temporary file for validator
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+        f.write(body)
+        temp_body_file = f.name
+
+    try:
+        validator_script = Path(__file__).parent / "validate_issue_body.py"
+        if not validator_script.exists():
+            raise TransactionError(
+                stage="issue-body-validate",
+                message=f"validate_issue_body.py not found at {validator_script}"
+            )
+
+        cp = subprocess.run(
+            [sys.executable, str(validator_script), "--body-file", temp_body_file],
+            capture_output=True,
+            text=True
+        )
+
+        # Parse validator JSON output
+        try:
+            result = json.loads(cp.stdout)
+        except json.JSONDecodeError as exc:
+            raise TransactionError(
+                stage="issue-body-validate",
+                message=f"Validator returned non-JSON output: {exc}",
+                output=cp.stdout[:500]
+            )
+
+        # Validator exit codes: 0 = pass, 1 = fail (with errors in JSON), 2 = internal error
+        if cp.returncode == 2:
+            raise TransactionError(
+                stage="issue-body-validate",
+                message="Validator internal error (exit code 2)",
+                output=cp.stderr[:500] if cp.stderr else cp.stdout[:500]
+            )
+
+        return result
+
+    finally:
+        # Clean up temp file
+        Path(temp_body_file).unlink(missing_ok=True)
+
+
 def run_transaction(
     *,
     repo: str,
@@ -1147,6 +1201,35 @@ def run_transaction(
     else:
         _body_text_for_parent = body
     # --- End Blocker 2 ---
+
+    # --- Blocker 2.5: Issue body validation (fail-closed before any GitHub mutation) ---
+    # Call validate_issue_body.py to check for LP rule violations
+    try:
+        _validator_result = _run_issue_body_validator(_body_text_for_parent)
+        if _validator_result.get("status") == "fail":
+            # Extract error details for logging
+            errors = _validator_result.get("errors", [])
+            error_count = len(errors)
+            error_summary = f"{error_count} validation error(s)" if error_count > 0 else "validation error"
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage="issue-body-validate",
+                failure_message=f"Issue body validation failed: {error_summary}",
+            )
+    except Exception as exc:
+        # Validator execution error (exit code 2 or exception)
+        return TransactionResult(
+            status="failure",
+            issue_number=None,
+            issue_url=None,
+            completed_steps=[],
+            failure_stage="issue-body-validate",
+            failure_message=f"Issue body validator error: {str(exc)}",
+        )
+    # --- End Blocker 2.5 ---
 
     # --- Body-derived parent resolution (fail-closed before any GitHub mutation) ---
     try:
