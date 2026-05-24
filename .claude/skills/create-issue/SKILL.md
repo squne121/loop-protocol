@@ -29,7 +29,7 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 - 実装案だけでなく、運用で解決できる案も比較し、採用方針を明示する
 - 要件が曖昧な場合は Issue を確定させず、`## Notes for Reviewer` に記載するか blocking stop として扱う（推測で埋めない）
 - **タイトル prefix と AC の性質のセルフチェック**: `research` / `調査` を名乗る Issue に `src/` や `tests/` の実装変更が AC として入っていないか確認する。入っている場合は `implementation` / `実装` に切り替えるか、Scope を分割して別 Issue にする
-- 不確実性が残る場合は `phase/research` / `state/needs-human` ラベルの付与要否を先に決める。implementation に昇格できる場合は `実装:` prefix + `phase/implementation` の canonical ready tuple を正本として付与する（`state/queued` は deprecated のため付与しない）
+- 不確実性が残る場合は `phase/research` / `state/needs-human` ラベルの付与要否を先に決める。implementation に昇格できる場合は `docs/dev/workflow.md` の implementation issue canonical contract を正本とし、`実装:` prefix + `phase/implementation` の consumer ready contract に沿って起票する（`state/queued` は deprecated のため付与しない）
 
 #### desired destination handoff guard
 

@@ -84,6 +84,8 @@ reviewer feedback に基づき以下を満たす形で本文を更新:
 - AC / VC 番号一致を確認（[`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) §VC 作成ガイダンス参照）
 - Machine-Readable Contract block の YAML key を破壊しない（値のみ更新）
 - 削除確認パターン、決定論的 VC の原則を適用
+- implementation issue を更新する場合は `docs/dev/workflow.md` の canonical contract を正本とし、`template auto-labels` / `consumer ready contract` / `triage profile` の区別を崩さない
+- implementation issue では state/queued を ready gate として再導入しないこと。body/title 更新だけで metadata drift を解消できない場合は human escalation に留める
 
 #### 3a. ISSUE_TEMPLATE を読み込んで required ラベルを列挙する
 
