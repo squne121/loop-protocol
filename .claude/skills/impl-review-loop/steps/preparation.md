@@ -88,12 +88,12 @@ contract snapshot コメント内には `CONTRACT_REVIEW_RESULT_V1.checks.vc_pre
 
 **Step 1 (implementation) で実施すべき確認**:
 
-- contract snapshot の `vc_preflight.status` が `blocked` でないことを確認（blocked なら停止）
+- contract snapshot の `vc_preflight.status` が **`pass` の場合のみ続行**。`blocked` または `human_judgment` の場合は停止し `termination_reason: human_escalation` を記録して人間判断へ送る
 - `vc_preflight.classifications` 配列を参照し、各 VC の `decision` を把握
   - `decision: go` → baseline で失敗することが予期される
-  - `decision: blocked` → 実行不可能（コマンド不在等）
-  - `decision: human_judgment` → 分類不能（実装中に追加注意）
-- implementation-worker が `## Verification Commands` を実行する際、preflight 結果を context として活用し、追加注意や検証スキップの判断に用いる
+  - `decision: blocked` → 実行不可能（コマンド不在等） → preflight status: blocked → 停止
+  - `decision: human_judgment` → 分類不能 → preflight status: human_judgment → 停止して人間判断へ
+- implementation-worker は `pass` 時のみ起動され、preflight 結果を context として活用する
 
 preflight では `baseline_vc_preflight.py` により **script 化された自動分類** が行われるため、本ステップでは重複実行を避ける（idempotency）。
 
