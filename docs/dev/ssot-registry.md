@@ -141,11 +141,12 @@
 - id: game-design
   path: docs/product/game-design.md
   title: Game Design Document (GDD v0.1)
-  keywords: [game-design, gdd, core-loop, sortie-loop, screens, progression, rewards, non-goals, downstream-boundaries, open-questions, compact-spec, ears]
-  description: GDD-level design の正本。Core Loop / Sortie Loop / Screens / Progression / Rewards / Non-Goals / Downstream Boundaries / Open Questions を保持し、game-logic.md / mvp-scope.md / playtest-protocol.md の上位制約として機能する（実装定数は委譲）
+  keywords: [game-design, gdd, core-loop, sortie-loop, screens, progression, rewards, non-goals, downstream-boundaries, open-questions, playtest-hypotheses, design-pillars, localized-intervention, reverse-engineering, analysis-data, combat-readability, compact-spec, ears]
+  description: GDD-level design の正本。Core Loop / Sortie Loop / Screens / Progression / Rewards / Non-Goals / Downstream Boundaries / Open Questions / Playtest Hypotheses を保持し、game-logic.md / mvp-scope.md / playtest-protocol.md の上位制約として機能する（実装定数は委譲、game-thesis.md 未マージ時は fallback draft）
   sections:
     - "## Intent"
     - "## Authority and Fallbacks"
+    - "## Design Pillars"
     - "## Requirements"
     - "## Core Loop"
     - "## Sortie Loop"
@@ -155,6 +156,7 @@
     - "## Non-Goals"
     - "## Downstream Boundaries"
     - "## Open Questions"
+    - "## Playtest Hypotheses"
 
 ---
 
