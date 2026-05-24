@@ -211,6 +211,11 @@ speckit_implement_policy:
 | `test-runner` | `immediate` の VC スクリプトを実行し、exit code と証跡を `TEST_VERDICT_MACHINE` に統合する。SKIP exit 77 を検知して `stop_condition_triggered: true` を返す |
 | `pr-reviewer` | `immediate` で証跡なし / SKIP のみ / fallback PASS の場合は APPROVE しない。`deferred` は後続 Issue 参照の有無を確認する |
 
+## Self-Report 単独 APPROVE 禁止原則
+
+PR review では implementer の self-report 単独では APPROVE を決定してはならない（schema 検証段階で G2 gate により reject される）。
+review verdict は external evidence（CI artifact、evidence_refs 構造、oracle 検証、head SHA consistency 等）に基づく必要がある（#371 G2 gate reference）。
+
 ## Issue / PR を主インターフェースとする原則
 
 AI エージェントと人間のコミュニケーションは **Issue / PR を主インターフェース（primary interface）** として行う。
