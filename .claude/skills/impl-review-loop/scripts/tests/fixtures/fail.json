@@ -1,0 +1,34 @@
+{
+  "CONTRACT_REVIEW_RESULT_V1": {
+    "status": "go",
+    "generated_at": "2026-05-24T10:00:00Z",
+    "generated_by": "issue-contract-review",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/333",
+    "checks": {
+      "product_spec_check": {
+        "applicability": "applicable",
+        "decision": "fail",
+        "blocked_reasons": [
+          {
+            "rule_id": "PS001",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "feature_id not found"
+          },
+          {
+            "rule_id": "PS002",
+            "source": "docs/product/features/task-tracking.md",
+            "excerpt": "acceptance criteria incomplete"
+          }
+        ],
+        "triggers": {
+          "docs_product_allowed_paths": true,
+          "tasks_md_mentioned": true,
+          "specify_artifact_mentioned": false,
+          "generated_task_mentioned": false,
+          "product_spec_context_present": false
+        }
+      }
+    }
+  },
+  "body_sha256": "ghi789"
+}
