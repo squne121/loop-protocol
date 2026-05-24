@@ -67,6 +67,14 @@ LOOP_STATE:
   blockers_history: []
   external_research_skip_basis: "<理由 or null>"
   termination_reason: null | approved | max_iterations | human_escalation
+  product_spec_preflight:
+    source: contract_snapshot.checks.product_spec_check
+    applicability: applicable | not_applicable | missing
+    decision: pass | fail | human_judgment | missing
+    blocked_rule_ids: []
+    contract_snapshot_url: "<url>"
+    body_sha256: "<sha256>"
+    routing_action: continue | stop_human | refresh_contract_snapshot
 ```
 
 ## 終了条件
@@ -84,7 +92,23 @@ LOOP_STATE:
 
 ## Contract Snapshot 参照ルール
 
-preparation step で取得した contract snapshot 内の `vc_preflight` JSON（`baseline_vc_preflight.py` が生成）を Step 1-4 で参照し、impl-review-loop 側で `baseline_vc_preflight.py` を重複実行しない。VC 分類の正本は contract snapshot の `vc_preflight.classifications[]` に従う。
+preparation step で取得した contract snapshot 内の以下の情報を Step 1-4 で参照する:
+
+### VC Preflight Reference
+
+`vc_preflight` JSON（`baseline_vc_preflight.py` が生成）を参照し、impl-review-loop 側で `baseline_vc_preflight.py` を重複実行しない。VC 分類の正本は contract snapshot の `vc_preflight.classifications[]` に従う。
+
+### Product Spec Check Reference (Issue #333)
+
+`checks.product_spec_check` を contract snapshot から読み取り、Step 1 delegation 前に `LOOP_STATE.product_spec_preflight` に正規化して格納する。以下のルールに従う:
+
+- `product_spec_check.decision == fail` → fail-closed で停止。`implementation-worker` を起動しない
+- `product_spec_check.decision == human_judgment` → 人間判断へ escalate
+- `product_spec_check.applicability == not_applicable` → 無関係 Issue を block せず続行
+- `product_spec_check` が snapshot に存在しないが triggers が present → stale / incomplete snapshot として停止し `issue-contract-review` 再実行へ route
+- `decision == pass` → 続行
+
+**実装例**: `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` が mutation-free CLI として `PRODUCT_SPEC_GATE_DECISION_V1` を出力する（routing_action: continue | stop_human | refresh_contract_snapshot）。
 
 ## Guardrails
 

@@ -97,6 +97,38 @@ contract snapshot コメント内には `CONTRACT_REVIEW_RESULT_V1.checks.vc_pre
 
 preflight では `baseline_vc_preflight.py` により **script 化された自動分類** が行われるため、本ステップでは重複実行を避ける（idempotency）。
 
+## 1-d. Product Spec Check の評価（#333）
+
+contract snapshot から `CONTRACT_REVIEW_RESULT_V1.checks.product_spec_check` を読み取り、Step 1 delegation 前に決定論的に評価する。以下のスクリプトを実行:
+
+```bash
+PRODUCT_SPEC_GATE_DECISION=$(python3 .claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py \
+  --snapshot-json "$(cat <contract_snapshot_file>)")
+```
+
+**評価ルール**:
+
+- `routing_action: continue` → Step 1 へ進む
+- `routing_action: stop_human` → 停止。`LOOP_STATE.termination_reason: human_escalation` を記録して人間判断へ送る
+- `routing_action: refresh_contract_snapshot` → stale / incomplete snapshot として停止。`issue-contract-review` 再実行へ route
+
+**LOOP_STATE への記録**:
+
+評価結果を `LOOP_STATE.product_spec_preflight` に正規化して格納する。Step 1 には raw `product_spec_check` ではなく summary のみを渡す:
+
+```yaml
+product_spec_preflight:
+  source: contract_snapshot.checks.product_spec_check
+  applicability: applicable | not_applicable | missing
+  decision: pass | fail | human_judgment | missing
+  blocked_rule_ids: []
+  contract_snapshot_url: "<url>"
+  body_sha256: "<sha256>"
+  routing_action: continue | stop_human | refresh_contract_snapshot
+```
+
+**注**: `impl-review-loop` は PS001〜PS006 の意味論判定を行わない。evaluation は contract snapshot に既に存在する `product_spec_check` 結果を読むだけ（mutation-free gate）。意味論判定は `issue-contract-review` / `check_product_spec_contract.py` に集約。
+
 ## 2. ready tuple の再確認
 
 ```bash
@@ -194,9 +226,9 @@ git branch --list "$BRANCH" && echo "[WARN] branch 既存" || echo "[OK] branch 
 
 既存衝突あり → 過去のイテレーションの残骸の可能性。人間判断を仰ぐ。
 
-## 4. LOOP_STATE 初期化
+## 4. Product Spec Gate 評価完了後の LOOP_STATE 初期化
 
-iteration = 0 で開始:
+Product Spec Check 評価（1-d）を完了後、iteration = 0 で以下の状態で開始:
 
 ```yaml
 LOOP_STATE:
@@ -212,7 +244,17 @@ LOOP_STATE:
   blockers_history: []
   external_research_skip_basis: null
   termination_reason: null
+  product_spec_preflight:
+    source: contract_snapshot.checks.product_spec_check
+    applicability: applicable | not_applicable | missing
+    decision: pass | fail | human_judgment | missing
+    blocked_rule_ids: []
+    contract_snapshot_url: "<url>"
+    body_sha256: "<sha256>"
+    routing_action: continue | stop_human | refresh_contract_snapshot
 ```
+
+routing_action が `stop_human` または `refresh_contract_snapshot` の場合は、ループを開始せず人間判断へ escalate する。
 
 ## 5. 外部仕様調査スキップ判断（任意）
 
