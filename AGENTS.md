@@ -14,4 +14,12 @@
   - `lint`: `pnpm lint`
   - `test`: `pnpm test`
   - `build`: `pnpm build`
-  These should be invoked through `rtk` when `rtk` provides wrappers.
+  These must be invoked through `rtk` when `rtk` provides wrappers (rules forbid direct `pnpm` execution).
+
+## rtk trust boundary
+
+- `rtk git` enforces direct mutating git operations within project policy.
+- `rtk gh` controls GitHub write operations according to human approval / project policy.
+- `rtk pnpm` enforces dependency mutation (install / add / remove / update) within project constraints.
+- `rtk curl` and `rtk env` require explicit review due to secret/exfiltration risk.
+- If `rtk` provides arbitrary shell passthrough without subcommand enforcement, this rules profile is not effective and must be renegotiated.

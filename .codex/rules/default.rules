@@ -23,13 +23,23 @@ prefix_rule(
 )
 
 prefix_rule(
-    pattern = ["rtk", ["ls", "read", "find", "grep", "wc", "diff", "log", "summary", "json", "env", "test", "tsc", "lint", "vitest", "pytest", "mypy", "ruff", "prettier", "format", "curl"]],
+    pattern = ["rtk", ["ls", "read", "find", "grep", "wc", "diff", "log", "summary", "json", "test", "tsc", "lint", "vitest", "pytest", "mypy", "ruff", "prettier", "format"]],
     decision = "allow",
     justification = "Allow read-oriented and verification-oriented rtk helpers.",
     match = [
         "rtk ls",
         "rtk read README.md",
         "rtk lint .",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", ["curl", "env"]],
+    decision = "prompt",
+    justification = "Network and environment inspection can expose secrets or remote content; require explicit review.",
+    match = [
+        "rtk curl https://api.github.com/repos/squne121/loop-protocol",
+        "rtk env",
     ],
 )
 
