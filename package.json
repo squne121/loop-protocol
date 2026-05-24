@@ -9,7 +9,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "policy:check:secret": "uv run python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
+    "policy:check:session": "uv run python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
+    "policy:check": "pnpm policy:check:secret && pnpm policy:check:session"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
