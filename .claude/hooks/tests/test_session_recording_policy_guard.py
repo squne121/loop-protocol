@@ -24,10 +24,18 @@ from typing import Any, Dict, List, Tuple
 import pytest
 
 
-# Worktree and hook paths
-WORKTREE_ROOT = Path(__file__).parent.parent.parent.parent.parent.parent / "worktrees" / "issue-325-session-recording-policy-guard-claude-ho"
-HOOK_PATH = WORKTREE_ROOT / ".claude" / "hooks" / "session_recording_policy_guard.sh"
-SETTINGS_JSON_PATH = WORKTREE_ROOT / ".claude" / "settings.json"
+# Dynamically resolve repo root using git rev-parse
+REPO_ROOT = Path(
+    subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+)
+
+HOOK_PATH = REPO_ROOT / ".claude" / "hooks" / "session_recording_policy_guard.sh"
+SETTINGS_JSON_PATH = REPO_ROOT / ".claude" / "settings.json"
 
 
 def run_hook(
@@ -190,6 +198,14 @@ kill_switch:
         """#!/usr/bin/env python3
 # Minimal passable checker for tests
 import sys
+import os
+from pathlib import Path
+
+# Create marker file to verify checker was called
+marker_dir = Path("tmp")
+marker_dir.mkdir(exist_ok=True)
+(marker_dir / "checker-called.txt").write_text("called")
+
 sys.exit(0)
 """
     )
@@ -281,20 +297,53 @@ sys.exit(1)
         """TC-4: Untracked watched file -> checker is called.
 
         When an untracked file in watched paths is detected,
-        the checker should be invoked (exit 0 if checker passes).
+        the checker should be invoked and a marker file should be created.
         """
         repo = create_test_repo(tmp_path)
 
-        # Create an untracked watched file
+        # IMPORTANT: In initial repo, watched file is tracked.
+        # Remove the tracked version to make it truly untracked
+        subprocess.run(
+            ["git", "rm", "--cached", "docs/dev/session-recording-policy.md"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "Remove tracked policy file"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+        )
+
+        # Now create an untracked watched file with new content
         untracked_file = repo / "docs" / "dev" / "session-recording-policy.md"
-        untracked_file.unlink()  # Remove tracked version
         untracked_file.write_text("New untracked policy\n")
+
+        # Verify file is untracked
+        ls_files_result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "--", "docs/dev/session-recording-policy.md"],
+            cwd=str(repo),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        assert "session-recording-policy.md" in ls_files_result.stdout, \
+            "Expected file to be in untracked list"
+
+        # Clear any existing marker from previous tests
+        marker_file = repo / "tmp" / "checker-called.txt"
+        if marker_file.exists():
+            marker_file.unlink()
 
         stdin = {"hook_event_name": "Stop", "cwd": str(repo), "stop_hook_active": False}
         exit_code, _, _ = run_hook(repo, stdin)
 
-        # Since checker is minimal and always exits 0, we expect exit 0
+        # Verify checker was called by checking marker file
         assert exit_code == 0, "Expected exit 0 when untracked file detected and checker passes"
+        assert marker_file.exists(), "Expected marker file to exist after checker call"
+        assert marker_file.read_text().strip() == "called", \
+            "Expected marker file to contain 'called'"
 
     def test_05_stop_fixture_json_stdin(self, tmp_path: Path) -> None:
         """TC-5: Stop fixture JSON stdin -> deterministic result.
@@ -377,13 +426,115 @@ sys.exit(1)
         assert "SESSION_RECORDING_POLICY_GUARD" in stderr, \
             "Expected SESSION_RECORDING_POLICY_GUARD error message"
 
+    def test_10_stop_payload_with_change_and_fail_returns_exit_2(self, tmp_path: Path) -> None:
+        """TC-10: Stop fixture with watched change + checker fail -> exit 2.
+
+        When Stop event has watched file changes and checker fails,
+        the hook should exit 2 with SESSION_RECORDING_POLICY_GUARD in stderr.
+        """
+        repo = create_test_repo(tmp_path)
+
+        # Modify a watched file
+        policy_file = repo / "docs" / "dev" / "session-recording-policy.md"
+        policy_file.write_text("Intentionally broken policy\n")
+
+        # Make checker fail
+        checker_script = repo / ".claude" / "scripts" / "check_session_recording_policy.py"
+        checker_script.write_text(
+            """#!/usr/bin/env python3
+import sys
+sys.exit(1)
+"""
+        )
+
+        stdin = {
+            "hook_event_name": "Stop",
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        }
+        exit_code, _, stderr = run_hook(repo, stdin)
+
+        assert exit_code == 2, "Expected exit 2 when Stop event has changes and checker fails"
+        assert "SESSION_RECORDING_POLICY_GUARD" in stderr, \
+            "Expected SESSION_RECORDING_POLICY_GUARD in stderr"
+
+    def test_11_subagent_stop_payload_with_change_and_fail_returns_exit_2(self, tmp_path: Path) -> None:
+        """TC-11: SubagentStop fixture with watched change + checker fail -> exit 2.
+
+        When SubagentStop event has watched file changes and checker fails,
+        the hook should exit 2 with SESSION_RECORDING_POLICY_GUARD in stderr.
+        """
+        repo = create_test_repo(tmp_path)
+
+        # Modify a watched file
+        policy_file = repo / "docs" / "dev" / "session-recording-policy.md"
+        policy_file.write_text("Intentionally broken policy\n")
+
+        # Make checker fail
+        checker_script = repo / ".claude" / "scripts" / "check_session_recording_policy.py"
+        checker_script.write_text(
+            """#!/usr/bin/env python3
+import sys
+sys.exit(1)
+"""
+        )
+
+        stdin = {
+            "hook_event_name": "SubagentStop",
+            "cwd": str(repo),
+            "agent_id": "test-agent-123",
+            "agent_type": "implementation-worker",
+            "agent_transcript_path": "/tmp/transcript.log",
+            "stop_hook_active": False,
+        }
+        exit_code, _, stderr = run_hook(repo, stdin)
+
+        assert exit_code == 2, "Expected exit 2 when SubagentStop event has changes and checker fails"
+        assert "SESSION_RECORDING_POLICY_GUARD" in stderr, \
+            "Expected SESSION_RECORDING_POLICY_GUARD in stderr"
+
+    def test_12_subagent_stop_with_stop_hook_active_short_circuits(self, tmp_path: Path) -> None:
+        """TC-12: SubagentStop with stop_hook_active: true -> exit 0.
+
+        When SubagentStop has stop_hook_active flag set to true,
+        the hook should exit 0 immediately even with watched changes and checker failure.
+        """
+        repo = create_test_repo(tmp_path)
+
+        # Modify a watched file
+        policy_file = repo / "docs" / "dev" / "session-recording-policy.md"
+        policy_file.write_text("Intentionally broken policy\n")
+
+        # Make checker fail
+        checker_script = repo / ".claude" / "scripts" / "check_session_recording_policy.py"
+        checker_script.write_text(
+            """#!/usr/bin/env python3
+import sys
+sys.exit(1)
+"""
+        )
+
+        stdin = {
+            "hook_event_name": "SubagentStop",
+            "cwd": str(repo),
+            "agent_id": "test-agent-123",
+            "agent_type": "implementation-worker",
+            "agent_transcript_path": "/tmp/transcript.log",
+            "stop_hook_active": True,
+        }
+        exit_code, _, _ = run_hook(repo, stdin)
+
+        assert exit_code == 0, \
+            "Expected exit 0 short-circuit when SubagentStop has stop_hook_active: true"
+
     def test_09_settings_json_has_hooks_with_proper_structure(self) -> None:
         """TC-9: .claude/settings.json has Stop/SubagentStop hooks with proper structure.
 
-        Verify that the main settings.json file (not in test repo) contains
-        hook handlers for Stop and SubagentStop events with:
-        - type: command
-        - command pointing to session_recording_policy_guard.sh
+        Verify that the main settings.json file contains hook handlers for Stop and SubagentStop
+        with exact matching:
+        - type: "command"
+        - command == "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh"
+        - args: [] (empty list)
         - timeout >= 30
         """
         assert SETTINGS_JSON_PATH.exists(), \
@@ -408,33 +559,37 @@ sys.exit(1)
         assert isinstance(subagent_stop_handlers, list), "SubagentStop handlers should be a list"
         assert len(subagent_stop_handlers) > 0, "SubagentStop handlers should not be empty"
 
-        # Validate Stop handler structure
+        expected_command = "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh"
+
+        # Validate Stop handler structure (exact match)
         stop_found = False
         for handler_group in stop_handlers:
             if "hooks" in handler_group and isinstance(handler_group["hooks"], list):
                 for hook in handler_group["hooks"]:
                     if (hook.get("type") == "command" and
-                        "session_recording_policy_guard.sh" in hook.get("command", "") and
+                        hook.get("command") == expected_command and
+                        hook.get("args") == [] and
                         hook.get("timeout", 0) >= 30):
                         stop_found = True
                         break
 
         assert stop_found, \
-            "Stop handler does not have command hook with timeout >= 30"
+            f"Stop handler does not have proper structure: type=command, command={expected_command}, args=[], timeout>=30"
 
-        # Validate SubagentStop handler structure
+        # Validate SubagentStop handler structure (exact match)
         subagent_found = False
         for handler_group in subagent_stop_handlers:
             if "hooks" in handler_group and isinstance(handler_group["hooks"], list):
                 for hook in handler_group["hooks"]:
                     if (hook.get("type") == "command" and
-                        "session_recording_policy_guard.sh" in hook.get("command", "") and
+                        hook.get("command") == expected_command and
+                        hook.get("args") == [] and
                         hook.get("timeout", 0) >= 30):
                         subagent_found = True
                         break
 
         assert subagent_found, \
-            "SubagentStop handler does not have command hook with timeout >= 30"
+            f"SubagentStop handler does not have proper structure: type=command, command={expected_command}, args=[], timeout>=30"
 
 
 if __name__ == "__main__":

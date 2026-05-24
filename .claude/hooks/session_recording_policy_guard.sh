@@ -33,20 +33,6 @@ die() {
 	exit 2
 }
 
-# Extract JSON field from stdin. stdin must be a valid JSON object.
-# Usage: json_get_field "field_name"
-json_get_field() {
-	local field="$1"
-	python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    print(data.get('$field', ''))
-except (json.JSONDecodeError, ValueError):
-    print('')
-" 2>/dev/null || echo ""
-}
-
 # Resolve repo root from prioritized sources
 # Priority: \$CLAUDE_PROJECT_DIR -> stdin cwd -> pwd
 resolve_repo_root() {
@@ -83,7 +69,7 @@ detect_changes() {
 	# Check tracked changes
 	while IFS= read -r file; do
 		[[ -n "$file" ]] && changed_files+=("$file")
-	done < <(git -C "$repo_root" diff --name-only --diff-filter=ACMRT HEAD -- "${WATCHED_PATHS[@]}" 2>/dev/null || true)
+	done < <(git -C "$repo_root" diff --name-only --diff-filter=ACDMRT HEAD -- "${WATCHED_PATHS[@]}" 2>/dev/null || true)
 
 	# Check untracked changes
 	while IFS= read -r file; do
@@ -108,14 +94,16 @@ run_checker() {
 # Main
 # ---------------------------------------------------------------------------
 
-# Save stdin to a temp file and extract JSON fields
-readonly _STDIN_TEMP_FILE=$(mktemp)
-trap "rm -f '$_STDIN_TEMP_FILE' '${_STDIN_CWD_FILE:-}'" EXIT
+# Create a temporary directory for stdin files (cleaned up on exit)
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+_STDIN_TEMP_FILE="$tmpdir/stdin.json"
+_STDIN_CWD_FILE="$tmpdir/cwd.txt"
 
 cat > "$_STDIN_TEMP_FILE"
 
 # Extract hook context from JSON
-readonly _STDIN_CWD_FILE=$(mktemp)
 python3 -c "
 import json, sys
 try:

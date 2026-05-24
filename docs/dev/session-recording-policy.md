@@ -306,10 +306,10 @@ SESSION_RECORDING_POLICY_VERDICT:
 
 Kill Switch を実行した場合は `required_end_state` の達成状況も GitHub Issue コメントに記録する。
 
-### 現時点の未完成導線
+### 運用導線の実装状況
 
-本文書（`session_recording_policy/v1`）は policy 宣言と checker スクリプトまで完成しているが、
-以下の導線は後続 Issue で実装予定であり、完成までは手動実行が必要。
+本文書（`session_recording_policy/v1`）は policy 宣言と checker スクリプトまで完成しており、
+以下の導線の実装状況を示す。
 
 | 導線 | 状態 | 担当 Issue |
 |---|---|---|
@@ -317,11 +317,11 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 | Claude hook（Stop/SubagentStop での自動実行）| 実装済み | #325 |
 | Skill（操作手順の標準化・自動発火）| 未実装 | #326 |
 | 人間導入手順書（onboarding）| 実装済み | #245 |
-| pilot smoke test（Kill Switch 動作確認）| 未実装 | Issue #246 |
+| pilot smoke test（Kill Switch 動作確認）| 未実装 | #246 |
 
 > **重要**: deterministic manifest producer、manifest schema validation path、
 > no-push / private checkpoint / local-only verifier、Kill Switch runtime smoke test、
-> Claude hook guard (#325)、Skill 手順 (#326) が完了するまで、
+> Skill 手順 (#326)、pilot smoke test (#246) が完了するまで、
 > full transcript を生成する session 記録ツールの pilot / 本番運用を開始しないこと。
 
 ---

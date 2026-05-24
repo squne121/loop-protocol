@@ -45,6 +45,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
+            "args": [],
             "timeout": 120
           }
         ]
@@ -56,6 +57,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
+            "args": [],
             "timeout": 120
           }
         ]
