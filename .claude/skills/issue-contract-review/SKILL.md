@@ -58,6 +58,61 @@ Fallback `Depends on #N` parsing は専用セクション（例: `## Depends On`
 Delivery Rule の条件文・歴史的注記・コメント・Conditional examples は blocker と見なさない。
 （実績: #262 で Delivery Rule 内の条件文「コンフリクトリスクがある場合は `Depends on #14 merge`」を fallback blocker と誤検出した事例がある。）
 
+### 3.5. Product Spec Preflight（決定論的）
+
+**実行タイミング**: Step 3 (blocker 確認) 完了後、Step 4 (VC preflight) 開始前。
+
+**適用条件** 次のいずれかが true の場合、本チェックを実行する:
+
+- Allowed Paths に `docs/product/**` を含む
+- Issue body に `tasks.md` への言及がある
+- Issue body に `.specify/` artifact への言及がある
+- Issue body に `generated_task_mentioned: true` または `source_task_id` が存在する
+- Issue body に `## Product Spec Context` セクションがある
+
+**実行方法**
+
+```bash
+python3 .claude/skills/issue-contract-review/scripts/check_product_spec_contract.py \
+  --issue-number <番号> \
+  --repo <owner>/<repo>
+```
+
+**出力解釈** — JSON 出力を解析し、以下のルール ID で判定:
+
+| Rule ID | Condition | Pass | Blocked | N/A |
+|---|---|---|---|---|
+| **PS001** | `docs/product/**` 更新が spec delta Issue / spec update Issue を参照しているか | 別 spec/update Issue が linked、または Issue 自体が spec/update | implementation Issue で spec delta リンクなし | 無関連 Issue |
+| **PS002** | `tasks.md` は staging artifact に限定されているか | staging artifact として参照し GitHub Issue 化を明記 | direct implementation source / tracking SSOT としての参照 | tasks.md 言及なし |
+| **PS003** | `.specify/` は derived workbench に限定されているか | workbench として参照し docs/SSOT 優先を明記 | canonical source / docs より優先する扱い | .specify 言及なし |
+| **PS004** | product spec 更新に diff_rationale / changed_requirement_id / affected_sections が存在するか | 上記いずれか 1 件以上が存在 | spec update Issue が存在するが evidence なし | non-spec Issue |
+| **PS005** | generated task 由来 Issue が `requirement_id` / `source_task_id` を保持しているか | 両方存在 | 片方以上欠落 | generated task でない |
+| **PS006** | generated task dependency が materialize されているか（line-anchored `Depends on #N`） | line-anchored `Depends on #N` を保持（GitHub native dependency 対応は follow-up） | dependency 未 materialize | generated task でない |
+
+**判定規則**
+
+| 結果 | 処置 |
+|---|---|
+| `applicability: not_applicable` かつ `decision: pass` | Step 4 へ（spec 関連なし） |
+| `applicability: applicable` かつ `decision: pass` | Step 4 へ |
+| `applicability: applicable` かつ `decision: human_judgment` | BLOCKED → issue comment に根拠を列挙して人間判断を求める |
+| `applicability: applicable` かつ `decision: fail` | BLOCKED → issue comment に blocked_reasons（rule_id / source / excerpt）を列挙 |
+
+BLOCKED 時は issue comment に以下を記載:
+
+```markdown
+## Product Spec Preflight: BLOCKED
+
+### 判定理由
+<判定内容を列挙>
+
+### 該当ルール
+<PS001–PS006 の rule_id と excerpt>
+
+### 推奨アクション
+`issue-refinement-loop` の起動を推奨します。
+```
+
 ### 4. VC preflight（決定論的）
 
 **前提**: AC は「実装前 baseline で fail し、実装後に pass する」検証スクリプトとして書かれている。
@@ -187,6 +242,38 @@ CONTRACT_REVIEW_RESULT_V1:
             stderr_excerpt: "<stderr の抜粋>"
           decision: go | blocked | human_judgment
     ac_verifiability: pass | fail
+    product_spec_check:
+      applicability: applicable | not_applicable
+      decision: pass | fail | human_judgment
+      triggers:
+        docs_product_allowed_paths: true | false
+        tasks_md_mentioned: true | false
+        specify_artifact_mentioned: true | false
+        generated_task_mentioned: true | false
+        product_spec_context_present: true | false
+      conditions:
+        docs_product_requires_spec_evidence:
+          status: pass | fail | n/a
+          evidence: []
+        tasks_md_not_direct_source:
+          status: pass | fail | n/a
+          evidence: []
+        specify_not_canonical:
+          status: pass | fail | n/a
+          evidence: []
+        diff_first_rationale_present:
+          status: pass | fail | n/a | human_judgment
+          evidence: []
+        generated_task_trace_present:
+          status: pass | fail | n/a
+          evidence: []
+        task_dependencies_materialized:
+          status: pass | fail | n/a | human_judgment
+          evidence: []
+      blocked_reasons:
+        - rule_id: PS001 | PS002 | PS003 | PS004 | PS005 | PS006
+          source: issue_body | allowed_paths | dependencies
+          excerpt: "<short excerpt>"
     worktree_branch_collision: clear | conflict
   next_action: implement_issue | propose_refinement_loop | human_judgment
   blocked_reasons: []
