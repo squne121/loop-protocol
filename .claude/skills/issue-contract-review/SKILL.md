@@ -244,7 +244,7 @@ CONTRACT_REVIEW_RESULT_V1:
     ac_verifiability: pass | fail
     product_spec_check:
       applicability: applicable | not_applicable
-      decision: pass | fail | human_judgment | n/a
+      decision: pass | fail | human_judgment
       triggers:
         docs_product_allowed_paths: true | false
         tasks_md_mentioned: true | false
