@@ -1,6 +1,6 @@
 # Agent Runtime Ops
 
-Codex local runtime の運用知識をまとめる補助 SSOT。
+Codex local runtime 運用の主文書。
 この文書は Codex CLI の起動・sandbox・permission profile・rules・instruction surface を扱い、GitHub 操作ルールそのものは [github-ops.md](github-ops.md) を参照する。
 
 ## Runtime Positioning
@@ -22,16 +22,16 @@ codex sandbox linux -- pwd
 
 ### 推奨 workaround
 
-1. 実体バイナリを `/usr/local/bin/codex` に配置する
+1. `~/.codex/packages/standalone/current/bin/codex` が指す実体を `/usr/local/bin/codex` に配置する
 2. `PATH` で `/usr/local/bin` を `~/.local/bin` より前に置く
 3. 以後の preflight は `/usr/local/bin/codex` が使われる状態で行う
 
 例:
 
 ```bash
-sudo install -m 0755 \
-  ~/.codex/packages/standalone/releases/0.133.0-x86_64-unknown-linux-musl/bin/codex \
-  /usr/local/bin/codex
+src="$(readlink -f "$HOME/.codex/packages/standalone/current/bin/codex")"
+test -x "$src"
+sudo install -m 0755 "$src" /usr/local/bin/codex
 
 export PATH=/usr/local/bin:$PATH
 which codex
@@ -41,12 +41,30 @@ codex sandbox linux -- pwd
 codex sandbox linux --permissions-profile loop-protocol-rtk -C . -- echo ok
 ```
 
+### 更新時の注意
+
+`/usr/local/bin/codex` は `~/.codex/packages/standalone/current` とは独立した実体コピーである。
+Codex 更新後は version drift を避けるため、以下を必ず確認する。
+
+```bash
+which codex
+readlink -f "$(which codex)"
+/usr/local/bin/codex --version
+~/.codex/packages/standalone/current/bin/codex --version
+codex sandbox linux -- pwd
+```
+
+バージョンがずれている場合は、上記の `sudo install` を再実行して `/usr/local/bin/codex` を更新する。
+
 ### 定常運用で採らないもの
 
 - `danger-full-access` を恒久運用の既定にしない
 - `--sandbox workspace-write` を workaround の正解として固定しない
 - `~/.codex` 全体の広い bind mount を定常解にしない
 - `use_legacy_landlock` と permission profile の併用を前提にしない
+
+`danger-full-access` は filesystem / network boundary を外すため、`self-binary ENOENT` の恒久解として採用しない。
+切り分けで一時的に使った場合も、成功証跡は別途 `codex sandbox linux --permissions-profile ...` で取り直す。
 
 ### この repo で残してよい根拠
 
@@ -83,6 +101,13 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 - secret / environment の広い参照
 - sandbox bypass や runtime policy の再設計
 
+## Official References
+
+- Codex permissions: https://developers.openai.com/codex/permissions
+- Codex rules: https://developers.openai.com/codex/rules
+- Codex AGENTS.md: https://developers.openai.com/codex/guides/agents-md
+- Codex sandboxing / approval policy: https://developers.openai.com/codex/concepts/sandboxing
+
 ## Permission / Rules / Instruction Surface
 
 ### project-local boundary
@@ -99,7 +124,8 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 
 ### trusted project 前提
 
-- Codex がこの repo を **trusted project** として扱っていないと、project-local config / rules / `AGENTS.md` が期待通り効かない
+- `.codex/config.toml` / `.codex/rules/*.rules` は project-local config layer の trust state に依存する
+- `AGENTS.md` は Codex の instruction discovery 対象だが、読み込み確認は rules / config と分けて行う
 - merge 後の利用者には「trusted project と active profile を自分の環境で確認すること」を前提として伝える
 
 ### 実効確認

@@ -287,6 +287,17 @@ Codex local runtime の install / PATH / runtime recovery / permission profile /
 ## GitHub Trust Boundary
 
 - Codex session での GitHub 操作は `rtk gh` を入口にそろえる
-- 長文更新は上の Body File Guidance を使い、`gh issue edit` / `gh pr edit` / `gh issue comment` を body-file 経由で行う
+- 長文更新は上の Body File Guidance を使い、Codex session では `rtk gh issue edit --body-file ...` / `rtk gh pr edit --body-file ...` / `rtk gh issue comment --body-file ...` を使う
+- この文書中の `gh ...` 表記は GitHub CLI の概念説明であり、Codex session から direct `gh` を実行してよいという意味ではない
 - `rtk gh` の documented subcommand 範囲と GitHub write policy が変わった場合は、この節と runtime 側の運用文書を同時に見直す
 - この文書は GitHub trust boundary と body-file guidance の窓口であり、runtime 復旧手順の詳細は持たない
+
+### GitHub Trust Boundary Smoke Check
+
+`rtk gh` の入口が想定どおり維持されているか、最低限以下を確認する。
+
+```bash
+rtk gh --help
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh issue view 1
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- gh issue view 1
+```
