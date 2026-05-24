@@ -63,6 +63,26 @@ prefix_rule(
 )
 
 prefix_rule(
+    pattern = ["git", "status"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git status",
+        "git status --short",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "diff"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git diff",
+        "git diff --stat",
+    ],
+)
+
+prefix_rule(
     pattern = ["git", ["push", "commit", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "add", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
     decision = "forbidden",
     justification = "Use `rtk git ...` for mutating repository operations so project policy is applied.",

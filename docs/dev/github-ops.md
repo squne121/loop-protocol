@@ -364,3 +364,31 @@ codex status
 ```
 
 失敗原因が user-global config や CLI flags による上書きなら、PR コメントに「repo-local 設定は user-global / CLI flags に上書きされ得るため、merge 後の有効化は各環境で確認が必要」と明記すること。
+
+## rtk gh trust boundary
+
+`.codex/rules/default.rules` は `rtk gh` を allow している。これは direct `gh` を forbidden にする設計とは整合しますが、`rtk gh` が GitHub write 操作の安全性をどう保証するかは、このルール定義単体では証明されていません。
+
+**確認が必要な点:**
+
+- `rtk gh` が arbitrary shell passthrough を提供しない（documented subcommand のみを許可する）
+- GitHub write operations（issue/PR create、edit、merge、API -X POST 等）が human approval または project policy を要求する
+- direct `gh` が execpolicy で確実に forbidden と判定される
+
+**確認方法:**
+
+```bash
+# rtk が provide する subcommand を確認
+rtk --help
+rtk gh --help
+
+# rules surface で git / gh / pnpm の判定を確認
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh issue view 1
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- gh issue view 1
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk git status
+codex execpolicy check --pretty --rules .codex/rules/default.rules -- git status
+```
+
+**制限:**
+
+本ドキュメント作成時点（PR #345）では、rtk 自体の実装・subcommand enforcement の詳細は`.codex/rules/default.rules` の scope 外です。rtk trust boundary が変わった場合や passthrough が導入された場合は、rules 設定を再審査し、必要に応じて `rtk gh` write operations を prompt / forbidden に落とす必要があります。
