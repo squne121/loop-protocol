@@ -14,7 +14,22 @@ enabled = true
 
 [permissions.loop-protocol-rtk.network.domains]
 "github.com" = "allow"
-"**.github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+
+[permissions.loop-protocol-bootstrap.filesystem]
+":minimal" = "read"
+
+[permissions.loop-protocol-bootstrap.filesystem.":workspace_roots"]
+"." = "write"
+"assets" = "read"
+"LICENSES" = "read"
+
+[permissions.loop-protocol-bootstrap.network]
+enabled = true
+
+[permissions.loop-protocol-bootstrap.network.domains]
+"github.com" = "allow"
 "api.github.com" = "allow"
 "objects.githubusercontent.com" = "allow"
 "registry.npmjs.org" = "allow"
