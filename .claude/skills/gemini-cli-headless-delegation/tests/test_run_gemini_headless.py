@@ -62,7 +62,7 @@ def test_validate_request_accepts_local_asset_research_with_safe_serena_settings
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -82,7 +82,7 @@ def test_validate_request_rejects_local_asset_research_post_to_issue_url(tmp_pat
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -107,7 +107,7 @@ def test_validate_request_rejects_local_asset_research_unverified_mcp_settings(t
     )
     request = {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -264,7 +264,7 @@ def test_validate_request_rejects_proposal_only_same_clause_negation_mutation(tm
 def make_local_asset_request(context_files: list[str]):
     return {
         "schema": "delegation_request_v1",
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -335,7 +335,7 @@ def test_build_prompt_includes_local_asset_research_serena_guidance(monkeypatch)
     module = load_module()
     monkeypatch.setattr(module, "_validate_local_asset_research_settings", lambda: [])
     request = {
-        "objective": "調査対象 .agents/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
+        "objective": "調査対象 .claude/skills/gemini-cli-headless-delegation/SKILL.md の構造を確認する",
         "instructions": ["Serena MCP で対象 symbol を確認する", "根拠パスを列挙する"],
         "tool_profile": "local_asset_research",
         "output_sections": ["Summary"],
@@ -1514,6 +1514,65 @@ def test_validate_github_research_argv_rejects_api_graphql():
     assert any("gh api graphql is not allowed" in e for e in errors), f"errors={errors}"
 
 
+# B2: =-separated and concatenated implicit-body flag forms
+
+@pytest.mark.parametrize(
+    "token",
+    ["--field=body=hello", "--raw-field=title=test", "--input=payload.json"],
+)
+def test_validate_github_research_argv_rejects_implicit_post_prefix_forms(token):
+    """B2: --field=val / --raw-field=val / --input=val は拒否されること。"""
+    module = load_module()
+    argv = ["api", "repos/owner/repo/issues", token]
+    errors = module._validate_github_research_argv(argv)
+    assert any("implies a non-GET request" in e for e in errors), (
+        f"expected rejection for token={token!r}, got errors={errors}"
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["-fbody=hello", "-fkey=val"],  # -f + key=val concatenated, len > 2
+)
+def test_validate_github_research_argv_rejects_concatenated_f_forms(token):
+    """B2: -fkey=val 形式（-f に続く concatenated）は拒否されること。"""
+    module = load_module()
+    argv = ["api", "repos/owner/repo/issues", token]
+    errors = module._validate_github_research_argv(argv)
+    assert any("implies a non-GET request" in e for e in errors), (
+        f"expected rejection for token={token!r}, got errors={errors}"
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["-Fbody=hello", "-Fkey=val"],  # -F + key=val concatenated, len > 2
+)
+def test_validate_github_research_argv_rejects_concatenated_F_forms(token):
+    """B2: -Fkey=val 形式（-F に続く concatenated）は拒否されること。"""
+    module = load_module()
+    argv = ["api", "repos/owner/repo/issues", token]
+    errors = module._validate_github_research_argv(argv)
+    assert any("implies a non-GET request" in e for e in errors), (
+        f"expected rejection for token={token!r}, got errors={errors}"
+    )
+
+
+def test_validate_request_rejects_github_research_field_equals_form(tmp_path, monkeypatch):
+    """B2: validate_request で --field=value が拒否されること (run_delegation 経由)。"""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
+    request = make_github_research_request()
+    request["gh_commands"] = [{"argv": ["api", "repos/x/y/issues", "--field=body=x"]}]
+
+    errors = module.validate_request(request, request_path=tmp_path / "request.json")
+
+    assert any("implies a non-GET request" in e for e in errors), (
+        f"expected --field= rejection in validate_request, got errors={errors}"
+    )
+
+
 @pytest.mark.parametrize(
     "flag",
     ["-f", "-F", "--field", "--raw-field", "--input"],
@@ -1781,12 +1840,12 @@ def test_run_delegation_github_research_empty_gh_commands_sets_failure_class(tmp
 
 
 # ---------------------------------------------------------------------------
-# Issue #2309: gh_commands for local_asset_research / proposal_only profiles
+# B3: gh_commands restricted to github_research profile only (fail-closed)
 # ---------------------------------------------------------------------------
 
 
-def test_run_delegation_local_asset_research_gh_commands_prepends_inline_context(tmp_path, monkeypatch):
-    """AC1: local_asset_research profile で有効な gh_commands → inline_context に prepend される。"""
+def test_validate_request_rejects_local_asset_research_with_gh_commands(tmp_path, monkeypatch):
+    """B3: local_asset_research + gh_commands → validate_request で fail-closed。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1796,80 +1855,32 @@ def test_run_delegation_local_asset_research_gh_commands_prepends_inline_context
     request = make_local_asset_request(["context.md"])
     request["gh_commands"] = [{"argv": ["issue", "view", "2309"]}]
 
-    fake_output = "title: test issue"
+    errors = module.validate_request(request, request_path=tmp_path / "request.json")
 
-    class FakeProc:
-        returncode = 0
-        stdout = fake_output
-        stderr = ""
-
-    def fake_subprocess_run(cmd, **kwargs):
-        return FakeProc()
-
-    captured_inline: list[str] = []
-    original_build_prompt = module.build_prompt
-
-    def capturing_build_prompt(req, *args, **kwargs):
-        captured_inline.append(req.get("inline_context") or "")
-        return original_build_prompt(req, *args, **kwargs)
-
-    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(module, "build_prompt", capturing_build_prompt)
-    monkeypatch.setattr(module, "_run_gemini", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gemini not found")))
-
-    result = module.run_delegation(request, request_path=tmp_path / "request.json")
-
-    # gh_commands_output should have been captured in inline_context before build_prompt
-    assert len(captured_inline) > 0
-    assert "## gh command: gh issue view 2309" in captured_inline[0]
-    assert fake_output in captured_inline[0]
-    # No warnings about skipping
-    skip_warnings = [w for w in result.get("warnings", []) if "skipping" in w]
-    assert not skip_warnings, f"unexpected skip warnings: {skip_warnings}"
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in e for e in errors), (
+        f"expected gh_commands profile restriction error, got errors={errors}"
+    )
 
 
-def test_run_delegation_proposal_only_gh_commands_prepends_inline_context(tmp_path, monkeypatch):
-    """AC2: proposal_only profile で有効な gh_commands → inline_context に prepend される。"""
+def test_validate_request_rejects_proposal_only_with_gh_commands(tmp_path, monkeypatch):
+    """B3: proposal_only + gh_commands → validate_request で fail-closed。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
-    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
 
     request = make_proposal_only_request()
+    request["context_files"] = ["context.md"]
     request["gh_commands"] = [{"argv": ["pr", "view", "42"]}]
 
-    fake_output = "PR #42 title"
+    errors = module.validate_request(request, request_path=tmp_path / "request.json")
 
-    class FakeProc:
-        returncode = 0
-        stdout = fake_output
-        stderr = ""
-
-    def fake_subprocess_run(cmd, **kwargs):
-        return FakeProc()
-
-    captured_inline: list[str] = []
-    original_build_prompt = module.build_prompt
-
-    def capturing_build_prompt(req, *args, **kwargs):
-        captured_inline.append(req.get("inline_context") or "")
-        return original_build_prompt(req, *args, **kwargs)
-
-    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(module, "build_prompt", capturing_build_prompt)
-    monkeypatch.setattr(module, "_run_gemini", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gemini not found")))
-
-    result = module.run_delegation(request, request_path=tmp_path / "request.json")
-
-    assert len(captured_inline) > 0
-    assert "## gh command: gh pr view 42" in captured_inline[0]
-    assert fake_output in captured_inline[0]
-    skip_warnings = [w for w in result.get("warnings", []) if "skipping" in w]
-    assert not skip_warnings, f"unexpected skip warnings: {skip_warnings}"
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in e for e in errors), (
+        f"expected gh_commands profile restriction error, got errors={errors}"
+    )
 
 
-def test_run_delegation_local_asset_research_gh_commands_invalid_argv_warns_and_skips(tmp_path, monkeypatch):
-    """AC3: local_asset_research profile で allowlist 外 argv → warnings に記録、サイレントスキップではない。"""
+def test_run_delegation_local_asset_research_gh_commands_fails_at_validate(tmp_path, monkeypatch):
+    """B3: run_delegation with local_asset_research + gh_commands → ok=False at validate stage。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1877,82 +1888,33 @@ def test_run_delegation_local_asset_research_gh_commands_invalid_argv_warns_and_
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
 
     request = make_local_asset_request(["context.md"])
-    # gh issue comment is not in allowlist
-    request["gh_commands"] = [{"argv": ["issue", "comment", "2309", "--body", "hi"]}]
-
-    subprocess_called = []
-
-    def fake_subprocess_run(cmd, **kwargs):
-        subprocess_called.append(cmd)
-        raise AssertionError("subprocess.run should not be called for denied argv")
-
-    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(module, "_run_gemini", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gemini not found")))
+    request["gh_commands"] = [{"argv": ["issue", "view", "2309"]}]
 
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
-    # subprocess should not have been called
-    assert not subprocess_called
-    # warnings must contain a deny notice (not silently skipped)
-    deny_warnings = [w for w in result.get("warnings", []) if "argv denied" in w and "local_asset_research" in w]
-    assert deny_warnings, f"expected deny warning, got warnings={result.get('warnings')}"
+    assert result["ok"] is False
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get("warnings", [])), (
+        f"expected gh_commands restriction in warnings, got: {result.get('warnings')}"
+    )
 
 
-def test_run_delegation_proposal_only_gh_commands_invalid_argv_warns_and_skips(tmp_path, monkeypatch):
-    """AC3: proposal_only profile で allowlist 外 argv → warnings に記録、サイレントスキップではない。"""
+def test_run_delegation_proposal_only_gh_commands_fails_at_validate(tmp_path, monkeypatch):
+    """B3: run_delegation with proposal_only + gh_commands → ok=False at validate stage。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
 
     request = make_proposal_only_request()
-    # gh issue comment is not in allowlist
-    request["gh_commands"] = [{"argv": ["issue", "comment", "2309", "--body", "hi"]}]
-
-    subprocess_called = []
-
-    def fake_subprocess_run(cmd, **kwargs):
-        subprocess_called.append(cmd)
-        raise AssertionError("subprocess.run should not be called for denied argv")
-
-    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(module, "_run_gemini", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gemini not found")))
+    request["context_files"] = ["context.md"]
+    request["gh_commands"] = [{"argv": ["pr", "view", "42"]}]
 
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
-    assert not subprocess_called
-    deny_warnings = [w for w in result.get("warnings", []) if "argv denied" in w and "proposal_only" in w]
-    assert deny_warnings, f"expected deny warning, got warnings={result.get('warnings')}"
-
-
-def test_run_delegation_local_asset_research_gh_commands_format_error_warns_and_skips(tmp_path, monkeypatch):
-    """フォーマット不正な entry（dict でない / argv が文字列リストでない）→ warnings に記録して skip。"""
-    module = load_module()
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
-    monkeypatch.setattr(module, "_validate_local_asset_research_settings", lambda: [])
-    monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)
-
-    request = make_local_asset_request(["context.md"])
-    request["gh_commands"] = [
-        "not-a-dict",  # format error: not a dict
-        {"argv": [1, 2, 3]},  # format error: argv not list of strings
-    ]
-
-    subprocess_called = []
-
-    def fake_subprocess_run(cmd, **kwargs):
-        subprocess_called.append(cmd)
-        raise AssertionError("subprocess.run should not be called for invalid format")
-
-    monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
-    monkeypatch.setattr(module, "_run_gemini", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("gemini not found")))
-
-    result = module.run_delegation(request, request_path=tmp_path / "request.json")
-
-    assert not subprocess_called
-    format_warnings = [w for w in result.get("warnings", []) if "local_asset_research" in w and "skipping" in w]
-    assert len(format_warnings) >= 2, f"expected at least 2 format warnings, got: {format_warnings}"
+    assert result["ok"] is False
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get("warnings", [])), (
+        f"expected gh_commands restriction in warnings, got: {result.get('warnings')}"
+    )
 
 
 # --- NDJSON output tests ---
