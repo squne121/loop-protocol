@@ -19,43 +19,64 @@ max_iterations: 5  # 任意
 
 ### 1-b. `contract_snapshot_url` が未提供の場合（自動検出フロー）
 
-以下の順で処理する。
+Issue コメント一覧から `CONTRACT_REVIEW_RESULT_V1` marker を持つ YAML block を検出し、以下の流れで contract_snapshot_url を決定する。
+
+**前提: valid CONTRACT_REVIEW_RESULT_V1 の定義**
+
+YAML block は `CONTRACT_REVIEW_RESULT_V1` marker を含むコメント本文内の fenced code block（``` yaml ... ```）に限定して抽出する。以下の fields がすべて存在し、値が妥当であることを必須とする:
+
+- `status`: `go | blocked` のいずれか
+- `generated_by`: `issue-contract-review`
+- `issue_url`: 現在の Issue URL と完全一致（例: https://github.com/<owner>/<repo>/issues/<current_issue_number>）
+- `generated_at`: ISO8601 形式の timestamp
+
+本文に `CONTRACT_REVIEW_RESULT_V1` / `generated_by: issue-contract-review` / `status: go` が含まれるだけでは採用しない。review comments や example code blocks の引用を誤採用しないこと。
+
+**Issue コメント取得の手順**
 
 ```bash
-# Issue の全コメントを取得
-gh issue view <issue_number> --repo "$REPO" --comments --json comments \
-  --jq '.comments[] | select(.body | test("CONTRACT_REVIEW_RESULT_V1")) | {url: .url, body: .body}'
+REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+ISSUE_NUMBER=<issue_number>
+
+gh api --paginate \
+  "repos/${REPO_FULL_NAME}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+  --jq '.[] | select(.body | contains("CONTRACT_REVIEW_RESULT_V1")) |
+        {id, html_url, created_at, updated_at, body}'
 ```
+
+出力は comment `id` 昇順（ascending）で返される。最新判定は `created_at desc, id desc` の precedence で行う（newer が先）。
 
 **ステップ 1: 最新 `status: blocked` チェック**
 
-`CONTRACT_REVIEW_RESULT_V1` を含むコメントの中で、作成日時が最新のものが `status: blocked` である場合は、古い `status: go` コメントが存在していても採用せず停止する。
+上記コメント一覧から、valid `CONTRACT_REVIEW_RESULT_V1` YAML block を持つ最新コメント（`created_at desc, id desc`）を特定する。その `status` が `blocked` である場合は、古い `status: go` コメントが存在していても採用せず停止する。
 
 ```
-最新 CONTRACT_REVIEW_RESULT_V1 が status: blocked → 停止（人間判断）
+最新の valid CONTRACT_REVIEW_RESULT_V1 が status: blocked → 停止（人間判断）
 ```
 
 **ステップ 2: 既存 `status: go` の検出（idempotency 保証）**
 
-最新 `CONTRACT_REVIEW_RESULT_V1` が `status: blocked` でない場合、コメント一覧から以下の条件を全て満たすコメントを探す:
-
-- 本文に `CONTRACT_REVIEW_RESULT_V1` が含まれる
-- `generated_by: issue-contract-review` が含まれる
-- `status: go` が含まれる
-
-最新の該当コメントが存在する場合: その URL を `contract_snapshot_url` として採用する。
-既存 `status: go` が存在する場合は `issue-contract-review` を再実行しない（idempotency 保証）。
+最新の valid `CONTRACT_REVIEW_RESULT_V1` が `status: go` である場合、そのコメント URL を `contract_snapshot_url` として採用する。
+既存 `status: go` が存在する場合は、以降の `issue-contract-review` 先行実行をスキップする（idempotency 保証）。
 
 `LOOP_STATE.contract_snapshot_source` に `detected_existing` を記録する。
 
 **ステップ 3: 既存 `status: go` が存在しない場合 — `issue-contract-review` 先行実行**
 
-既存 `status: go` が存在しない場合にのみ、`issue-contract-review` を先行実行する。
-実行後、生成されたコメント URL を `contract_snapshot_url` として採用する。
+有効な `status: go` が検出されなかった場合にのみ、`issue-contract-review` を先行実行する。
 
-`LOOP_STATE.contract_snapshot_source` に `materialized_by_issue_contract_review` を記録する。
+実行後、生成された最新の `CONTRACT_REVIEW_RESULT_V1` を再取得し、以下で分岐する:
 
-> **スコープ境界（#245 との関係）**: ready tuple の確認・ラベルのドリフト修正は #245 のスコープで扱う。本ステップは contract snapshot の取得（materialization）のみを担う。また、#245 の ready tuple / ラベルドリフトは本 Issue（#149）のスコープ外であり、本 Issue は contract snapshot materialization のみを扱う。
+- `status: go` かつ `generated_by`, `issue_url`, `generated_at` が妥当:
+  - その comment URL を `contract_snapshot_url` として採用
+  - `LOOP_STATE.contract_snapshot_source` に `materialized_by_issue_contract_review` を記録
+- `status: blocked`:
+  - `contract_snapshot_url` を設定せず停止
+  - `LOOP_STATE.termination_reason` に `human_escalation` を記録
+- 有効な `CONTRACT_REVIEW_RESULT_V1` が見つからない:
+  - 停止し、人間判断を仰ぐ
+
+> **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
 ## 2. ready tuple の再確認
 
