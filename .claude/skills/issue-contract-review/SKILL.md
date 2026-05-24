@@ -113,45 +113,54 @@ BLOCKED 時は issue comment に以下を記載:
 `issue-refinement-loop` の起動を推奨します。
 ```
 
-### 4. VC preflight（決定論的）
+### 4. VC preflight（決定論的・script-backed）
 
 **前提**: AC は「実装前 baseline で fail し、実装後に pass する」検証スクリプトとして書かれている。
 
+**実行方法**
+
 ```bash
-# Issue 本文から VC を抽出し、現状（実装前 baseline）で実行
-# 各 VC を実行して結果を集計
+# baseline_vc_preflight.py を使用して Issue 本文から VC を AC 別に抽出・実行
+python3 .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py \
+  --issue <番号> --repo <owner>/<repo>
 ```
 
-判定:
-- **想定どおり fail**: OK（実装着手可）
-- **想定外に pass**: VC 設定がおかしい（既に該当機能が存在する / VC が緩すぎる / Issue が既に解決済み）→ BLOCKED
-- **実行不可能（コマンド不在 / ファイル不在）**: VC が誤っている → BLOCKED
+出力は `baseline_vc_preflight/v1` JSON schema で、各 VC の実行結果と root-cause 分類（category / decision / confidence）を含む。
 
-BLOCKED 時は issue comment に該当 VC と理由を書き、`issue-refinement-loop` の起動を **人間に提案** する（自動起動しない）。
+**判定ルール**
 
-#### VC failure root cause 分類
+script の出力に基づいて以下で判定:
 
-各 VC が fail した場合、以下の 5 分類で root cause を判定する（正規表現マッチ + exit code の組み合わせ）:
+- `status: pass` → OK（全 VC が `decision: go`）
+- `status: blocked` → BLOCKED（1 つ以上の `decision: blocked`）
+- `status: human_judgment` → `human_judgment`（1 つ以上の `decision: human_judgment`、blocker なし）
 
-| 分類 | 条件 | 判定 |
-|---|---|---|
-| `file_not_found_expected` | `test -f` / `test -d` 等の存在確認コマンド + exit 1 + stderr 空 | 期待通り baseline fail → GO |
-| `file_not_found_unrunnable` | `No such file or directory` を含む + 実行対象ファイル/コマンドが missing | 想定外 → BLOCKED |
-| `env_missing_dep` | stderr に `No module named`/`ModuleNotFoundError`/`ImportError`/`command not found`/`not found`/`ERR_MODULE_NOT_FOUND`/`Permission denied`/`is not executable` を含む、または exit code 126/127 | 想定外（env 不備）→ BLOCKED |
-| `expected_baseline_fail` | grep/rg 系コマンドの exit 1 + no match、count assertion が threshold 未満 | 期待通り baseline fail → GO |
-| `unknown` | 上記いずれにも該当しない | `human_judgment`（自動 GO しない）|
+BLOCKED 時は issue comment に該当 VC の分類（category / decision / confidence）と理由を記載し、`issue-refinement-loop` の起動を **人間に提案** する（自動起動しない）。
 
-分類例:
-- `uv run python -m pytest tests/` が `ModuleNotFoundError: No module named 'yaml'` で exit 1 → `env_missing_dep` → BLOCKED
-- `rg -n "pattern" file` が exit 1 + no output → `expected_baseline_fail` → GO
-- `python missing_script.py` が `No such file or directory` で exit 1 → `file_not_found_unrunnable` → BLOCKED
-- `test -f new_feature.py` が exit 1 → `file_not_found_expected` → GO
+#### VC failure root cause 分類（baseline_vc_preflight.py による）
 
-`unknown` 判定時は自動 GO しない。`human_judgment` として扱い、人間に確認を求める。
+script は各 VC 実行結果を以下の category で分類（classify_result 関数）:
 
-- `env_missing_dep` 分類時は **BLOCKED** 判定とする（env_missing_dep → BLOCKED）。
-- `file_not_found_unrunnable` 分類時は **BLOCKED** 判定とする（file_not_found_unrunnable → BLOCKED）。
-- `unknown` 分類時は `human_judgment`（自動 GO しない）として人間の判断を求める（unknown → human_judgment）。
+| category | 条件 | decision | 説明 |
+|---|---|---|---|
+| `file_not_found_expected` | `test -f` / `test -d` + exit 1 | go | 期待通り baseline fail |
+| `file_not_found_unrunnable` | `No such file or directory` stderr + 実行対象 missing | blocked | 想定外の missing |
+| `env_missing_dep` | stderr に `No module named` / `ModuleNotFoundError` / `command not found` / `Permission denied` 等 or exit 126/127 | blocked | 環境不備 |
+| `expected_baseline_fail` | grep/rg 系の exit 1（no match）/ test コマンド失敗 | go | 期待通り baseline fail |
+| `compound_command_disallowed` | `&&` / `\|\|` / `\|` / `;` / heredoc を含む | blocked | 初期実装で非対応 |
+| `timeout` | コマンド実行が timeout | blocked | 実行不可能 |
+| `unexpected_pass` | exit_code = 0 | blocked | VC が緩すぎるか既に機能存在 |
+| `unknown` | 上記いずれにも該当しない | human_judgment | 分類不能 |
+
+分類ロジック（classify_result 関数）:
+1. compound command 検出 → `compound_command_disallowed` / blocked
+2. timeout 検出 → `timeout` / blocked
+3. exit_code = 0 → `unexpected_pass` / blocked
+4. env_missing_dep パターン → `env_missing_dep` / blocked
+5. expected baseline fail パターン（rg no match、test -f 不在） → `expected_baseline_fail` / go
+6. その他 → `unknown` / human_judgment
+
+既存分類との互換性: AC10 で JSON を CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight.classifications[] へ写像（category / decision / confidence を維持）。
 
 ### 4.5. 動作検証 AC の実行環境前提チェック
 
