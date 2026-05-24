@@ -84,9 +84,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv sync --group dev
-      - run: uv run python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md
-      - run: uv run python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
-      - run: uv run pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
-      - run: uv run pytest .claude/skills/create-issue/tests/
-      - run: uv run pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
+      - run: uv sync --locked --group dev
+      - run: uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md
+      - run: uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
+      - run: uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
+      - run: uv run --locked pytest .claude/skills/create-issue/tests/
+      - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
