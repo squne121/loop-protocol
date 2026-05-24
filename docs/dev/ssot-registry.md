@@ -82,6 +82,21 @@
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
+- id: product-spec-lifecycle
+  path: docs/dev/product-spec-lifecycle.md
+  title: Product Spec Lifecycle
+  keywords: [product-spec, lifecycle, docs/product, compact-spec, scoped-loading, diff-first, token-policy, ears, spec-delta, tasks-md, staging-artifact, archive, supersede, ssot-registry, registry-entry, directory-mapping]
+  description: docs/product/** の作成・更新・archive・supersede・registry 登録・compact spec・diff-first 更新・EARS 採用・playtest feedback から spec delta issue への変換。workflow.md との責務境界定義を含む
+  sections:
+    - "## Authority / Responsibility Boundary"
+    - "## Product SSOT Taxonomy"
+    - "## Lifecycle States"
+    - "## Creation Rules"
+    - "## Token Policy"
+    - "## Product Spec Delta Flow"
+    - "## tasks.md Adapter"
+    - "## Registry / Discovery Rules"
+
 ---
 
 ## アーキテクチャ決定記録 (`docs/adr/`)
@@ -174,6 +189,11 @@ directory_mappings:
     ssots:
       - docs/dev/ssot-registry.md
       - docs/dev/workflow.md
+  - pattern: "docs/product/**"
+    ssots:
+      - docs/dev/product-spec-lifecycle.md
+      - docs/product/requirements.md
+      - docs/adr/0002-sdd-tool-adoption.md
 ```
 
 ---

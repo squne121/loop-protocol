@@ -176,6 +176,7 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 | 全体要件・非ゴール | `docs/product/requirements.md` |
 | 現在のフェーズ・優先項目 | `docs/dev/current-focus.md` |
 | SSOT カタログ全体 | `docs/dev/ssot-registry.md` |
+| product spec / `docs/product/**` ライフサイクル（作成・更新・archive・compact spec・spec delta・tasks.md adapter） | `docs/dev/product-spec-lifecycle.md` |
 
 ### 新規 SSOT 追加時の必須更新セット
 

@@ -58,3 +58,4 @@
 - アーキテクチャ理由: `docs/adr/0001-architecture-baseline.md`
 - 動作検証 AC の運用規約: `docs/dev/runtime-verification-policy.md`
 - Secret Inventory と no-secret 運用境界: `docs/dev/secret-policy.md`
+- `docs/product/**` を変更する場合: `docs/product/CLAUDE.md` の最小ルールを参照する
