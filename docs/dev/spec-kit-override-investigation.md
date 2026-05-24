@@ -348,6 +348,8 @@ Avoid:
 
 `docs/adr/0002-sdd-tool-adoption.md` への追補セクション骨子:
 
+ADR 本体の確定版は [docs/adr/0002-sdd-tool-adoption.md#override-mechanism-boundary](../adr/0002-sdd-tool-adoption.md#override-mechanism-boundary) を参照すること。
+
 ```markdown
 ## Override Mechanism Boundary (added)
 
