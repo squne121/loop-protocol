@@ -1,7 +1,7 @@
 ---
 doc_id: DOC-PRODUCT-GAME-THESIS-001
 title: Game Thesis
-status: draft
+status: accepted
 issue: "#281"
 parent_issue: "#254"
 canonical_source: docs-product
