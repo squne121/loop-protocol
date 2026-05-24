@@ -132,6 +132,12 @@
   keywords: [game, overview, シナリオ, 世界観, ゲーム概要]
   description: ゲーム全体像（概念説明。要件正本として扱わない）
 
+- id: game-thesis
+  path: docs/product/game-thesis.md
+  title: Game Thesis
+  keywords: [game-thesis, concept, pitch, target player, design pillars, non-goals, design hypotheses, mda]
+  description: ゲームのコアコンセプト、ターゲット、設計の柱、および設計仮説を定義するプロダクト仕様の正本
+
 - id: requirements
   path: docs/product/requirements.md
   title: 要件定義
