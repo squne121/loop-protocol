@@ -37,5 +37,29 @@
       "Write(LICENSES/**)",
       "Edit(LICENSES/**)"
     ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
   }
 }
