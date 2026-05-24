@@ -32,6 +32,23 @@ import create_issue_txn as txn  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Minimal valid Issue body that passes LP001-LP030 validation
+_MINIMAL_VALID_BODY = """## Acceptance Criteria
+
+- AC1: Basic test
+
+## Verification Commands
+
+```bash
+echo "AC1"
+```
+
+## Allowed Paths
+
+- src/**
+"""
+
+
 class FakeSleep:
     """Records sleep calls without actually sleeping."""
 
@@ -202,7 +219,7 @@ class TestRunTransactionParentReadbackAllFail:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Test Issue",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -256,7 +273,7 @@ class TestRunTransactionParentReadbackRecovery:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Test Issue",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -287,7 +304,7 @@ class TestBothPathsUseHelper:
         monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-55", 5500))
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
         # Mock _run_gh_json for dedupe-body-read stage (Blocker 3/4 fix requires this)
-        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": "", "number": 55})
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": _MINIMAL_VALID_BODY, "number": 55})
 
         helper_calls: list[tuple[Any, ...]] = []
         original_helper = txn._readback_parent_issue_with_retry
@@ -304,7 +321,7 @@ class TestBothPathsUseHelper:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Title",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -400,7 +417,7 @@ class TestRunTransactionImplementationLabels:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Test Implementation Issue",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="implementation",
@@ -432,7 +449,7 @@ class TestRunTransactionImplementationLabels:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Test Research Issue",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="research",
@@ -686,7 +703,7 @@ class TestRunTransactionParentArgBodyMismatch:
     def test_mismatch_returns_failure_before_any_create(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         # Body declares parent #42, but --parent-issue says 99
         body_file = tmp_path / "body.md"
-        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+        body_file.write_text('parent_issue: "#42"\n' + _MINIMAL_VALID_BODY)
 
         create_called: list[bool] = []
 
@@ -715,7 +732,7 @@ class TestRunTransactionParentArgBodyMismatch:
     def test_body_parent_used_when_arg_absent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         """When --parent-issue is 0 (absent) and body declares parent #42, parent=42 is used."""
         body_file = tmp_path / "body.md"
-        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+        body_file.write_text('parent_issue: "#42"\n' + _MINIMAL_VALID_BODY)
 
         resolved_parents: list[int] = []
 
@@ -853,7 +870,7 @@ class TestDedupePathParentReconcile:
 
     def test_dedupe_path_registers_and_readbacks_parent(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         body_file = tmp_path / "body.md"
-        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+        body_file.write_text('parent_issue: "#42"\n' + _MINIMAL_VALID_BODY)
 
         register_calls: list[tuple[Any, ...]] = []
 
@@ -868,7 +885,7 @@ class TestDedupePathParentReconcile:
         monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
         # Mock _run_gh_json for dedupe-body-read to return existing body with matching parent
-        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": 'parent_issue: "#42"', "number": 55})
+        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": 'parent_issue: "#42"\n' + _MINIMAL_VALID_BODY, "number": 55})
 
         fake_sleep = FakeSleep()
         result = txn.run_transaction(
@@ -893,7 +910,7 @@ class TestDedupePathParentReconcile:
     def test_dedupe_path_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         """Body says parent #42, arg says #99 -> fail-closed before dedupe search."""
         body_file = tmp_path / "body.md"
-        body_file.write_text('parent_issue: "#42"\n## Outcome\nTest')
+        body_file.write_text('parent_issue: "#42"\n' + _MINIMAL_VALID_BODY)
 
         search_called: list[bool] = []
 
@@ -1147,7 +1164,7 @@ class TestDedupeParentMismatch:
     # Case 12: dedupe issue body has different parent -> failure
     def test_dedupe_existing_body_different_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Existing issue (#55) body declares parent #99, but we're creating with parent #42
-        existing_issue_body = "parent_issue: #99\n## Outcome\nTest"
+        existing_issue_body = "parent_issue: #99\n" + _MINIMAL_VALID_BODY
 
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
@@ -1161,7 +1178,7 @@ class TestDedupeParentMismatch:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="parent_issue: #42\n## Outcome\nTest",
+            body="parent_issue: #42\n" + _MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -1327,7 +1344,7 @@ class TestDedupeBodyReadFailClosed:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -1352,13 +1369,13 @@ class TestDedupeExistingBodyMalformedParentFailClosed:
         monkeypatch.setattr(
             txn,
             "_run_gh_json",
-            lambda *_a, stage, **_k: {"body": 'parent_issue: "#abc"\n', "number": 55},
+            lambda *_a, stage, **_k: {"body": 'parent_issue: "#abc"\n' + _MINIMAL_VALID_BODY, "number": 55},
         )
 
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="",
+            body=_MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -1444,7 +1461,7 @@ class TestDedupeExistingBodyExplicitNoneWithParent:
     ) -> None:
         """Existing issue body: parent_issue: none. Current resolved parent: 42.
         -> failure_stage == "dedupe-parent-mismatch"."""
-        existing_issue_body = "parent_issue: none\n## Outcome\nTest"
+        existing_issue_body = "parent_issue: none\n" + _MINIMAL_VALID_BODY
 
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
@@ -1458,7 +1475,7 @@ class TestDedupeExistingBodyExplicitNoneWithParent:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="parent_issue: #42\n## Outcome\nTest",
+            body="parent_issue: #42\n" + _MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -1475,7 +1492,7 @@ class TestDedupeExistingBodyExplicitNoneWithParent:
     ) -> None:
         """Existing issue body: 'none（単独改善）'. Current resolved parent: 42.
         -> failure_stage == "dedupe-parent-mismatch"."""
-        existing_issue_body = "## Parent Issue\n\nnone（単独改善）\n## Outcome\nTest"
+        existing_issue_body = "## Parent Issue\n\nnone（単独改善）\n## Acceptance Criteria\n\n- AC1: Test\n## Verification Commands\n\n```bash\necho test\n```\n## Allowed Paths\n\n- src/**"
 
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
@@ -1489,7 +1506,7 @@ class TestDedupeExistingBodyExplicitNoneWithParent:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="parent_issue: #42\n## Outcome\nTest",
+            body="parent_issue: #42\n" + _MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
@@ -1579,7 +1596,7 @@ class TestDedupeIssueKindMismatch:
     def test_dedupe_issue_kind_mismatch_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Existing issue: issue_kind: research. Current: issue_kind: implementation.
         -> failure_stage == "dedupe-kind-mismatch"."""
-        existing_issue_body = "issue_kind: research\n## Outcome\nTest"
+        existing_issue_body = "issue_kind: research\n" + _MINIMAL_VALID_BODY
 
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
@@ -1593,7 +1610,7 @@ class TestDedupeIssueKindMismatch:
         result = txn.run_transaction(
             repo="owner/repo",
             title="Existing Issue Title",
-            body="issue_kind: implementation\n## Outcome\nTest",
+            body="issue_kind: implementation\n" + _MINIMAL_VALID_BODY,
             body_file="",
             labels=[],
             issue_kind="",
