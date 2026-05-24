@@ -314,13 +314,15 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 | 導線 | 状態 | 担当 Issue |
 |---|---|---|
 | CI 連動（`pnpm policy:check` / python-test workflow）| 実装済み | #324 |
-| Claude hook（Stop/SubagentStop での自動実行）| 未実装 | 専用 Issue で別途起票 |
-| Skill（操作手順の標準化・自動発火）| 未実装 | 専用 Issue で別途起票 |
-| 人間導入手順書（onboarding）| 未実装 | Issue #245 |
+| Claude hook（Stop/SubagentStop での自動実行）| 未実装 | #325 |
+| Skill（操作手順の標準化・自動発火）| 未実装 | #326 |
+| 人間導入手順書（onboarding）| 実装済み | #245 |
 | pilot smoke test（Kill Switch 動作確認）| 未実装 | Issue #246 |
 
-> **重要**: Issue #245（onboarding 手順）と Issue #246（pilot smoke test）が完了するまで、
-> full transcript を生成する session 記録ツールの本番運用を開始しないこと。
+> **重要**: deterministic manifest producer、manifest schema validation path、
+> no-push / private checkpoint / local-only verifier、Kill Switch runtime smoke test、
+> Claude hook guard (#325)、Skill 手順 (#326) が完了するまで、
+> full transcript を生成する session 記録ツールの pilot / 本番運用を開始しないこと。
 
 ---
 
@@ -336,5 +338,5 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 - Issue #136 — session 記録ツール導入判断（親 Issue）
 - Issue #241 — `secret_policy/v1` SSOT 化（PR #317 完了）
 - Issue #243 — `agent_session_manifest/v1` schema SSOT 化（PR #314 完了）
-- Issue #245 — session 記録ツール人間導入手順書（予定）
-- Issue #246 — pilot smoke test（予定）
+- Issue #245 — session 記録ツール人間導入手順書（実装済み / PR #347）
+- Issue #246 — pilot smoke test（実装予定）
