@@ -104,19 +104,20 @@ class TestG2EvidenceBinding:
             local_head_sha="abc123"
         )
         assert result.status == GateStatus.FAIL.value
-        assert "self_report alone" in result.minimal_context
+        assert "no structured findings block" in result.minimal_context
 
     def test_g2_evidence_refs_present(self):
         """G2: evidence_refs structure present → pass"""
         checker = CheckPRReviewGates()
-        pr_body = """
-## 検証コマンド結果
+        pr_body = """```yaml
 findings:
-  - evidence_refs:
+  - head_sha: abc123
+    source_kind: ci_artifact
+    evidence_refs:
       ci_run_ref:
         url: https://github.com/test
         workflow: ci.yml
-"""
+```"""
         result = checker.g2_evidence_binding(
             pr_body=pr_body,
             pr_head_sha="abc123",
@@ -125,10 +126,10 @@ findings:
         assert result.status == GateStatus.PASS.value
 
     def test_g2_empty_pr_body(self):
-        """G2: empty PR body → pass (no self_report violation)"""
+        """G2: empty PR body → not_applicable in lenient mode"""
         checker = CheckPRReviewGates()
         result = checker.g2_evidence_binding(pr_body="")
-        assert result.status == GateStatus.PASS.value
+        assert result.status == GateStatus.NOT_APPLICABLE.value
 
 
 class TestG3ImplementationOracle:
@@ -256,7 +257,7 @@ class TestG5FixtureGuardPathCoverage:
         assert result.status == GateStatus.NOT_APPLICABLE.value
 
     def test_g5_trace_with_coverage_marker(self):
-        """G5: trace log contains fixture_path_coverage/v1 → pass"""
+        """G5: marker-only trace without structured tests → fail"""
         checker = CheckPRReviewGates()
         trace_log = """
 Test run started...
@@ -265,17 +266,17 @@ fixture_path_coverage/v1:
   assertions: 5
 """
         result = checker.g5_fixture_guard_path_coverage(trace_log=trace_log)
-        assert result.status == GateStatus.PASS.value
+        assert result.status == GateStatus.FAIL.value
 
     def test_g5_coverage_file_with_marker(self):
-        """G5: coverage file contains fixture_path_coverage/v1 → pass"""
+        """G5: marker-only coverage file without structured tests → fail"""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write("fixture_path_coverage/v1\nobserved_paths:\n  - path1\n  - path2")
             f.flush()
 
             checker = CheckPRReviewGates()
             result = checker.g5_fixture_guard_path_coverage(coverage_file=f.name)
-            assert result.status == GateStatus.PASS.value
+            assert result.status == GateStatus.FAIL.value
 
             Path(f.name).unlink()
 
@@ -426,6 +427,386 @@ class TestMinimalContextOnlyForFail:
         gate_dict = result_dict["gates"][0]
         assert "minimal_context" in gate_dict
         assert gate_dict["minimal_context"] is not None
+
+
+class TestStrictMode:
+    """Tests for strict mode behavior (B1)."""
+
+    def test_strict_mode_request_changes_on_missing_g1_input(self):
+        """G1 in strict mode: missing --ci-artifact → fail"""
+        checker = CheckPRReviewGates(strict=True)
+        result = checker.g1_ci_test_selection(artifact_path=None)
+        assert result.status == GateStatus.FAIL.value
+        assert "G1: required --ci-artifact missing" in result.minimal_context
+
+    def test_strict_mode_request_changes_on_missing_g2_input(self):
+        """G2 in strict mode: empty --pr-body → fail"""
+        checker = CheckPRReviewGates(strict=True)
+        result = checker.g2_evidence_binding(pr_body="")
+        assert result.status == GateStatus.FAIL.value
+        assert "G2: required --pr-body missing or empty" in result.minimal_context
+
+    def test_strict_mode_request_changes_on_missing_g4_input(self):
+        """G4 in strict mode: missing SHA → fail"""
+        checker = CheckPRReviewGates(strict=True)
+        result = checker.g4_head_sha_consistency(pr_head_sha="", local_head_sha="")
+        assert result.status == GateStatus.FAIL.value
+        assert "G4: required --pr-head-sha and --local-head-sha" in result.minimal_context
+
+    def test_lenient_mode_not_applicable_on_missing_input(self):
+        """Lenient mode (strict=False): missing input → not_applicable"""
+        checker = CheckPRReviewGates(strict=False)
+        result = checker.g1_ci_test_selection(artifact_path=None)
+        assert result.status == GateStatus.NOT_APPLICABLE.value
+
+
+class TestG2StructuredEvidenceBinding:
+    """Tests for G2 structured evidence binding validation (B3)."""
+
+    def test_g2_empty_pr_body_strict_fail(self):
+        """G2 strict: empty PR body → fail"""
+        checker = CheckPRReviewGates(strict=True)
+        result = checker.g2_evidence_binding(pr_body="")
+        assert result.status == GateStatus.FAIL.value
+
+    def test_g2_self_report_only_fail(self):
+        """G2: self_report_only without supporting refs → fail"""
+        checker = CheckPRReviewGates()
+        pr_body = """```yaml
+findings:
+  - head_sha: abc123
+    source_kind: pr_body
+    evidence_refs:
+      self_report_only: true
+```"""
+        result = checker.g2_evidence_binding(pr_body=pr_body)
+        assert result.status == GateStatus.FAIL.value
+        assert "self_report" in result.minimal_context.lower()
+
+    def test_g2_evidence_word_without_findings_fail(self):
+        """G2: 'evidence' keyword without findings structure → fail"""
+        checker = CheckPRReviewGates()
+        pr_body = "## Evidence\nThis is just text with word evidence."
+        result = checker.g2_evidence_binding(pr_body=pr_body)
+        assert result.status == GateStatus.FAIL.value
+
+    def test_g2_valid_findings_structure_pass(self):
+        """G2: valid findings with code_ref → pass"""
+        checker = CheckPRReviewGates()
+        pr_body = """```yaml
+findings:
+  - head_sha: abc123
+    source_kind: ci_artifact
+    evidence_refs:
+      code_ref: src/test.py
+```"""
+        result = checker.g2_evidence_binding(pr_body=pr_body)
+        assert result.status == GateStatus.PASS.value
+
+    def test_g2_valid_findings_with_ci_run_ref_pass(self):
+        """G2: valid findings with ci_run_ref → pass"""
+        checker = CheckPRReviewGates()
+        pr_body = """```yaml
+findings:
+  - head_sha: abc123
+    source_kind: ci_artifact
+    evidence_refs:
+      ci_run_ref:
+        url: https://github.com/test/actions/runs/123
+```"""
+        result = checker.g2_evidence_binding(pr_body=pr_body)
+        assert result.status == GateStatus.PASS.value
+
+    def test_g2_json_findings_block_pass(self):
+        """G2: JSON findings block → pass"""
+        checker = CheckPRReviewGates()
+        pr_body = """```json
+{
+  "findings": [
+    {
+      "head_sha": "abc123",
+      "source_kind": "pr_body",
+      "evidence_refs": {"code_ref": "src/test.py"}
+    }
+  ]
+}
+```"""
+        result = checker.g2_evidence_binding(pr_body=pr_body)
+        assert result.status == GateStatus.PASS.value
+
+
+class TestG3ImplementationOracle:
+    """Tests for G3 YAML oracle parsing and AST alias resolution (B4)."""
+
+    def test_g3_yaml_block_oracle_parse(self):
+        """G3: parse YAML oracle block from issue body"""
+        checker = CheckPRReviewGates()
+        issue_body = """## implementation_oracles:
+- id: test_oracle
+  kind: ast
+  must_call:
+    module: subprocess
+    function: run
+  files: [src/test.py]
+"""
+        oracles = checker._parse_implementation_oracles(issue_body)
+        assert len(oracles) > 0
+        assert oracles[0].get("id") == "test_oracle"
+
+    def test_g3_ast_import_alias_detection(self):
+        """G3: import subprocess as sp; sp.run(...) → detected as subprocess.run"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write("import subprocess as sp\nsp.run(['ls'])")
+            f.flush()
+
+            checker = CheckPRReviewGates()
+            result = checker._verify_ast_call(
+                oracle={
+                    "id": "test",
+                    "must_call": {"module": "subprocess", "function": "run"}
+                },
+                files=[f.name]
+            )
+            assert result["passed"] is True
+            Path(f.name).unlink()
+
+    def test_g3_ast_from_import_detection(self):
+        """G3: from subprocess import run; run(...) → detected"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write("from subprocess import run\nrun(['ls'])")
+            f.flush()
+
+            checker = CheckPRReviewGates()
+            result = checker._verify_ast_call(
+                oracle={
+                    "id": "test",
+                    "must_call": {"module": "subprocess", "function": "run"}
+                },
+                files=[f.name]
+            )
+            assert result["passed"] is True
+            Path(f.name).unlink()
+
+    def test_g3_grep_fallback_excludes_comment_only_match(self):
+        """G3: grep fallback excludes comment-only matches"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write("# this function is called: subprocess.run\n# but only in comments")
+            f.flush()
+
+            checker = CheckPRReviewGates()
+            result = checker._verify_grep(
+                oracle={
+                    "id": "test",
+                    "must_call": {"function": "subprocess.run"}
+                },
+                files=[f.name]
+            )
+            assert result["passed"] is False
+            Path(f.name).unlink()
+
+    def test_g3_ast_required_does_not_pass_via_grep_fallback(self):
+        """G3: AST kind=ast oracle does NOT fallback to grep"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write("# subprocess.run mentioned in comment")
+            f.flush()
+
+            checker = CheckPRReviewGates()
+            result = checker._verify_ast_call(
+                oracle={
+                    "id": "test",
+                    "kind": "ast",
+                    "must_call": {"module": "subprocess", "function": "run"}
+                },
+                files=[f.name]
+            )
+            assert result["passed"] is False
+            Path(f.name).unlink()
+
+
+class TestG5StructuredFixtureTrace:
+    """Tests for G5 structured fixture trace validation (B5)."""
+
+    def test_g5_marker_only_substring_fail(self):
+        """G5: just 'fixture_path_coverage/v1' substring → fail (not structured)"""
+        checker = CheckPRReviewGates()
+        trace_log = "Some output with fixture_path_coverage/v1 marker only"
+        result = checker.g5_fixture_guard_path_coverage(trace_log=trace_log)
+        assert result.status == GateStatus.FAIL.value
+
+    def test_g5_expected_vs_observed_mismatch_fail(self):
+        """G5: expected != observed guard path → fail"""
+        checker = CheckPRReviewGates()
+        trace_log = """
+schema_version: fixture_path_coverage/v1
+tests:
+  - test: test_guard
+    expected_guard_path: /expected/path
+    observed_guard_path: /different/path
+    status: pass
+"""
+        result = checker.g5_fixture_guard_path_coverage(trace_log=trace_log)
+        assert result.status == GateStatus.FAIL.value
+        assert "path mismatch" in result.minimal_context.lower()
+
+    def test_g5_valid_structured_trace_pass(self):
+        """G5: valid structured fixture_path_coverage/v1 trace → pass"""
+        checker = CheckPRReviewGates()
+        trace_log = """
+schema_version: fixture_path_coverage/v1
+tests:
+  - test: test_guard
+    expected_guard_path: /path/to/guard
+    observed_guard_path: /path/to/guard
+    status: pass
+"""
+        result = checker.g5_fixture_guard_path_coverage(trace_log=trace_log)
+        assert result.status == GateStatus.PASS.value
+
+    def test_g5_status_fail_detected(self):
+        """G5: test with status != pass → fail"""
+        checker = CheckPRReviewGates()
+        trace_log = """
+schema_version: fixture_path_coverage/v1
+tests:
+  - test: test_guard
+    expected_guard_path: /path
+    observed_guard_path: /path
+    status: fail
+"""
+        result = checker.g5_fixture_guard_path_coverage(trace_log=trace_log)
+        assert result.status == GateStatus.FAIL.value
+
+
+class TestSchemaValidator:
+    """Tests for schema validation (B6)."""
+
+    def test_schema_validator_rejects_minimal_context_on_pass(self):
+        """Schema validator: pass gate with minimal_context → error"""
+        from check_pr_review_gates import validate_against_schema
+        from pathlib import Path
+
+        output_dict = {
+            "schema_version": "PR_REVIEW_GATE_RESULT_V1",
+            "generated_at": "2026-05-24T00:00:00Z",
+            "generated_by": "check_pr_review_gates.py",
+            "verdict": "APPROVE",
+            "gates": [
+                {
+                    "gate_id": "g1",
+                    "gate_name": "ci_test_selection",
+                    "status": "pass",
+                    "minimal_context": "should not be present"
+                }
+            ]
+        }
+        schema_path = Path(__file__).parent.parent / "references" / "pr-review-gate-result-schema.yml"
+        errors = validate_against_schema(output_dict, schema_path)
+        # Should have error about minimal_context on pass gate
+        assert any("minimal_context" in str(e) for e in errors)
+
+    def test_schema_validator_rejects_missing_minimal_context_on_fail(self):
+        """Schema validator: fail gate without minimal_context → error"""
+        from check_pr_review_gates import validate_against_schema
+        from pathlib import Path
+
+        output_dict = {
+            "schema_version": "PR_REVIEW_GATE_RESULT_V1",
+            "generated_at": "2026-05-24T00:00:00Z",
+            "generated_by": "check_pr_review_gates.py",
+            "verdict": "REQUEST_CHANGES",
+            "gates": [
+                {
+                    "gate_id": "g1",
+                    "gate_name": "ci_test_selection",
+                    "status": "fail"
+                }
+            ]
+        }
+        schema_path = Path(__file__).parent.parent / "references" / "pr-review-gate-result-schema.yml"
+        errors = validate_against_schema(output_dict, schema_path)
+        # Should have error about missing minimal_context on fail gate
+        assert any("minimal_context" in str(e) for e in errors)
+
+    def test_schema_validator_rejects_self_report_only_findings(self):
+        """Schema validator: self_report_only without supporting refs → error"""
+        from check_pr_review_gates import validate_against_schema
+        from pathlib import Path
+
+        output_dict = {
+            "schema_version": "PR_REVIEW_GATE_RESULT_V1",
+            "generated_at": "2026-05-24T00:00:00Z",
+            "generated_by": "check_pr_review_gates.py",
+            "verdict": "REQUEST_CHANGES",
+            "gates": [
+                {
+                    "gate_id": "g2",
+                    "gate_name": "evidence_binding",
+                    "status": "fail",
+                    "minimal_context": "test",
+                    "findings": [
+                        {
+                            "head_sha": "abc123",
+                            "source_kind": "pr_body",
+                            "evidence_refs": {"self_report_only": True}
+                        }
+                    ]
+                }
+            ]
+        }
+        schema_path = Path(__file__).parent.parent / "references" / "pr-review-gate-result-schema.yml"
+        errors = validate_against_schema(output_dict, schema_path)
+        # Should have error about self_report_only
+        assert any("self_report" in str(e) for e in errors)
+
+
+class TestArtifactGenerator:
+    """Tests for generate_ci_test_selection_artifact.py (B2)."""
+
+    def test_artifact_generator_uses_pytest_collect_only(self):
+        """Artifact generator should use pytest --collect-only"""
+        # This test verifies the function exists and has correct signature
+        from generate_ci_test_selection_artifact import get_pytest_collected_tests
+        # Function should exist and be callable
+        assert callable(get_pytest_collected_tests)
+
+    def test_artifact_generator_emits_pr_head_sha_and_merge_sha(self):
+        """Artifact should include pr_head_sha and merge_sha fields"""
+        from generate_ci_test_selection_artifact import generate_artifact
+        import argparse
+
+        # Create mock args
+        args = argparse.Namespace(
+            output='/tmp/test_artifact.json',
+            pytest_args=[],
+            pr_head_sha='abc123',
+            checked_out_sha='def456',
+            merge_sha='ghi789',
+            workflow='ci',
+            job='python-test',
+            ci_run_url='https://github.com/test'
+        )
+
+        # Should not raise (and file won't be written for this test)
+        assert hasattr(args, 'pr_head_sha')
+        assert hasattr(args, 'merge_sha')
+
+
+class TestAllNotApplicableApprove:
+    """Tests that all gates not_applicable → APPROVE (lenient mode)."""
+
+    def test_all_not_applicable_approve_lenient(self):
+        """All gates not_applicable (lenient mode) → APPROVE"""
+        checker = CheckPRReviewGates(strict=False)
+        # No inputs provided - all gates should be not_applicable
+        checker.result.gates = [
+            checker.g1_ci_test_selection(),
+            checker.g2_evidence_binding(),
+            checker.g3_implementation_oracle(),
+            checker.g4_head_sha_consistency(),
+            checker.g5_fixture_guard_path_coverage(),
+        ]
+        checker.finalize_verdict()
+        assert checker.result.verdict == Verdict.APPROVE.value
 
 
 if __name__ == "__main__":

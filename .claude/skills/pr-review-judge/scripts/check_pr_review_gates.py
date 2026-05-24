@@ -21,6 +21,10 @@ import ast
 import re
 from dataclasses import dataclass, asdict
 from enum import Enum
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 class GateStatus(Enum):
@@ -90,8 +94,9 @@ class PRReviewGateResult:
 class CheckPRReviewGates:
     """Main checker class implementing G1-G5."""
 
-    def __init__(self):
+    def __init__(self, strict: bool = False):
         self.result = PRReviewGateResult()
+        self.strict = strict
 
     def g1_ci_test_selection(self, artifact_path: Optional[str] = None) -> GateResult:
         """
@@ -99,6 +104,8 @@ class CheckPRReviewGates:
 
         Checks CI artifact (schema_version: ci_test_selection/v1) for uncovered test files.
         Requires: HEAD SHA + uncovered_changed_test_files field non-empty → fail
+
+        In strict mode: missing or unreadable artifact → fail
         """
         gate = GateResult(
             gate_id="g1",
@@ -107,14 +114,22 @@ class CheckPRReviewGates:
         )
 
         if not artifact_path or not Path(artifact_path).exists():
-            gate.status = GateStatus.NOT_APPLICABLE.value
+            if self.strict:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G1: required --ci-artifact missing or unreadable"
+            else:
+                gate.status = GateStatus.NOT_APPLICABLE.value
             return gate
 
         try:
             with open(artifact_path) as f:
                 artifact = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
-            gate.status = GateStatus.NOT_APPLICABLE.value
+            if self.strict:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G1: required --ci-artifact missing or unreadable"
+            else:
+                gate.status = GateStatus.NOT_APPLICABLE.value
             return gate
 
         # Verify schema version
@@ -122,7 +137,7 @@ class CheckPRReviewGates:
             gate.status = GateStatus.NOT_APPLICABLE.value
             return gate
 
-        head_sha = artifact.get("head_sha")
+        head_sha = artifact.get("pr_head_sha") or artifact.get("head_sha")
         uncovered = artifact.get("uncovered_changed_test_files", [])
 
         if uncovered:
@@ -147,16 +162,16 @@ class CheckPRReviewGates:
 
     def g2_evidence_binding(self, pr_body: str = "", pr_head_sha: str = "", local_head_sha: str = "") -> GateResult:
         """
-        G2: Evidence binding structure
+        G2: Evidence binding structure validation
 
-        Validates per-finding evidence_refs structure containing:
-        - code_ref (optional per-finding)
-        - pr_head_sha (optional per-finding)
-        - local_head_sha (optional per-finding)
-        - ci_run_ref (optional per-finding with {url, workflow, job, step, command})
+        Extracts fenced code blocks (YAML/JSON) and validates findings structure:
+        - Each finding must have: head_sha, source_kind, evidence_refs
+        - evidence_refs must have at least one supporting ref (not self_report_only)
+        - Supporting refs: code_ref, pr_head_sha, local_head_sha, ci_run_ref
 
-        Per-finding scope allows flexible evidence binding without top-level required fields.
-        self_report 単独 APPROVE 禁止: チェックは PR body に evidence が適切に構造化されているかを確認。
+        Fails if:
+        - No findings block found (strict: fail / lenient: fail if "findings" keyword present)
+        - All findings blocks invalid (missing required keys or self_report_only)
         """
         gate = GateResult(
             gate_id="g2",
@@ -164,30 +179,171 @@ class CheckPRReviewGates:
             status=GateStatus.PASS.value
         )
 
-        # Basic check: if PR has evidence markers, validate structure
-        # This is a structural validation that self_report ONLY is not acceptable.
-        # In practice, pr-review-judge will check the actual evidence completeness.
+        if not pr_body:
+            if self.strict:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G2: required --pr-body missing or empty in strict review mode"
+            else:
+                gate.status = GateStatus.NOT_APPLICABLE.value
+            return gate
 
-        # For this checker: detect if there's evidence_refs structure anywhere
-        # and ensure it's not solely self_report
-        if "self_report" in pr_body and "evidence" not in pr_body and "findings" not in pr_body:
+        # Extract fenced code blocks
+        findings_blocks = self._extract_findings_blocks(pr_body)
+
+        if not findings_blocks:
             gate.status = GateStatus.FAIL.value
-            gate.minimal_context = "Evidence binding: self_report found without supporting evidence_refs structure. self_report alone cannot approve PR."
-            gate.findings = [Finding(
-                head_sha=pr_head_sha or local_head_sha or "unknown",
-                source_kind="pr_body",
-                evidence_refs={"self_report_only": True}
-            )]
+            gate.minimal_context = "G2: no structured findings block found in PR body"
+            return gate
 
+        # Validate findings blocks
+        valid_findings = []
+        for block in findings_blocks:
+            if self._validate_findings_structure(block):
+                valid_findings.extend(block)
+
+        if not valid_findings:
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = "G2: all findings lack proper evidence_refs (only self_report or missing required keys)"
+            return gate
+
+        gate.status = GateStatus.PASS.value
         return gate
+
+    @staticmethod
+    def _coerce_scalar(value: str) -> Any:
+        value = value.strip()
+        if value in {"true", "false"}:
+            return value == "true"
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            if not inner:
+                return []
+            return [item.strip().strip("'\"") for item in inner.split(",")]
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            return value[1:-1]
+        return value
+
+    def _parse_findings_yaml_block(self, text: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        in_evidence_refs = False
+        in_ci_run_ref = False
+
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped == "findings:":
+                continue
+            if stripped.startswith("- "):
+                if current:
+                    findings.append(current)
+                current = {}
+                in_evidence_refs = False
+                in_ci_run_ref = False
+                stripped = stripped[2:].strip()
+                if stripped and ":" in stripped:
+                    key, value = stripped.split(":", 1)
+                    current[key.strip()] = self._coerce_scalar(value)
+                continue
+            if current is None or ":" not in stripped:
+                continue
+
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if key == "evidence_refs" and not value:
+                current.setdefault("evidence_refs", {})
+                in_evidence_refs = True
+                in_ci_run_ref = False
+                continue
+            if in_evidence_refs and key == "ci_run_ref" and not value:
+                current.setdefault("evidence_refs", {})["ci_run_ref"] = {}
+                in_ci_run_ref = True
+                continue
+            if in_evidence_refs and in_ci_run_ref and key in {"url", "workflow", "job", "step", "command"}:
+                current["evidence_refs"]["ci_run_ref"][key] = self._coerce_scalar(value)
+                continue
+            if in_evidence_refs:
+                current.setdefault("evidence_refs", {})[key] = self._coerce_scalar(value)
+                in_ci_run_ref = False
+                continue
+
+            current[key] = self._coerce_scalar(value)
+
+        if current:
+            findings.append(current)
+        return findings
+
+    def _extract_findings_blocks(self, pr_body: str) -> List[List[Dict[str, Any]]]:
+        """Extract and parse fenced code blocks containing findings."""
+        blocks = []
+
+        # Match fenced code blocks with optional language specifiers
+        pattern = r'```(?:\w+)?\n([\s\S]*?)\n```'
+        matches = re.findall(pattern, pr_body)
+
+        for match in matches:
+            try:
+                if yaml:
+                    parsed = yaml.safe_load(match)
+                else:
+                    # Fallback to JSON
+                    parsed = json.loads(match)
+
+                if isinstance(parsed, dict) and "findings" in parsed:
+                    if isinstance(parsed["findings"], list):
+                        blocks.append(parsed["findings"])
+                        continue
+            except (yaml.YAMLError if yaml else Exception, json.JSONDecodeError):
+                pass
+
+            parsed_findings = self._parse_findings_yaml_block(match)
+            if parsed_findings:
+                blocks.append(parsed_findings)
+
+        return blocks
+
+    def _validate_findings_structure(self, findings: List[Dict[str, Any]]) -> bool:
+        """Validate each finding has required keys and valid evidence_refs."""
+        if not findings:
+            return False
+
+        valid_count = 0
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+
+            # Check required keys
+            if not all(k in finding for k in ["head_sha", "source_kind", "evidence_refs"]):
+                continue
+
+            # Validate evidence_refs
+            evidence_refs = finding.get("evidence_refs", {})
+            if not isinstance(evidence_refs, dict):
+                continue
+
+            # Check for self_report_only violation
+            if evidence_refs.get("self_report_only") is True:
+                if not any(k in evidence_refs for k in ["code_ref", "pr_head_sha", "local_head_sha", "ci_run_ref"]):
+                    continue
+
+            # Check for at least one supporting ref
+            if any(k in evidence_refs for k in ["code_ref", "pr_head_sha", "local_head_sha", "ci_run_ref"]):
+                valid_count += 1
+
+        return valid_count > 0
 
     def g3_implementation_oracle(self, issue_body: str = "", target_files: Optional[List[str]] = None, method: str = "ast") -> GateResult:
         """
         G3: Implementation oracle verification
 
-        Parses implementation_oracles from issue body (YAML/markdown list).
-        For kind: python_ast_call → uses AST-based verification.
-        Falls back to grep if AST fails or kind: grep specified.
+        Parses implementation_oracles: YAML block from issue body.
+        For kind: ast or python_ast_call → uses AST-based verification with alias resolution.
+        Falls back to grep (strict: kind: grep only) or returns fail.
+
+        Handles import aliases:
+          - import subprocess as sp → sp.run(...) matches subprocess.run
+          - from subprocess import run → run(...) matches subprocess.run
         """
         gate = GateResult(
             gate_id="g3",
@@ -196,10 +352,16 @@ class CheckPRReviewGates:
         )
 
         if not issue_body or "implementation_oracles:" not in issue_body:
+            if self.strict and target_files:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G3: implementation_oracles block required but --target-files provided"
             return gate
 
         oracles = self._parse_implementation_oracles(issue_body)
         if not oracles:
+            if self.strict and target_files:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G3: implementation_oracles parsing failed but --target-files provided"
             return gate
 
         gate.status = GateStatus.PASS.value
@@ -208,89 +370,125 @@ class CheckPRReviewGates:
 
         for oracle in oracles:
             oracle_id = oracle.get("id", "unknown")
-            oracle_kind = oracle.get("kind", "grep")
+            oracle_kind = oracle.get("kind", "ast")
             files = oracle.get("files", target_files or [])
 
-            if oracle_kind == "python_ast_call":
-                result = self._verify_ast_call(oracle, files)
-            else:  # fallback to grep
-                result = self._verify_grep(oracle, files)
+            if not files:
+                continue
 
-            if not result["passed"]:
-                failed_oracles.append((oracle_id, result["error"]))
+            result = None
+            if oracle_kind in ["ast", "python_ast_call"]:
+                result = self._verify_ast_call(oracle, files)
+            elif oracle_kind == "grep":
+                result = self._verify_grep(oracle, files)
+            else:
+                result = {"passed": False, "error": f"unknown oracle kind: {oracle_kind}"}
+
+            if not result.get("passed"):
+                failed_oracles.append((oracle_id, result.get("error", "unknown error")))
                 findings.append(Finding(
                     head_sha=result.get("head_sha", "unknown"),
                     source_kind=oracle_kind,
-                    evidence_refs={"oracle_id": oracle_id, "error": result["error"]}
+                    evidence_refs={"oracle_id": oracle_id, "error": result.get("error", "unknown")}
                 ))
 
         if failed_oracles:
             gate.status = GateStatus.FAIL.value
-            gate.minimal_context = f"Oracle verification failed: {failed_oracles}"
+            gate.minimal_context = f"Oracle verification failed: {', '.join([f'{id}: {err}' for id, err in failed_oracles])}"
             gate.findings = findings
 
         return gate
 
     def _parse_implementation_oracles(self, issue_body: str) -> List[Dict[str, Any]]:
-        """Parse implementation_oracles block from markdown."""
-        oracles = []
+        """Parse implementation_oracles: YAML block from issue body."""
+        oracles: List[Dict[str, Any]] = []
+
+        # Find the implementation_oracles: line and extract the block
         lines = issue_body.split("\n")
-        in_oracles = False
-        current_oracle = {}
-        list_item_indent = None
-
-        for line in lines:
+        start_idx = None
+        for i, line in enumerate(lines):
             if "implementation_oracles:" in line:
-                in_oracles = True
-                continue
-            if in_oracles:
-                # Detect list item (starts with "- ")
-                if re.match(r"^\s*- ", line):
-                    # Save previous oracle if exists
-                    if current_oracle and "id" in current_oracle:
-                        oracles.append(current_oracle)
-                    # Start new oracle from list item
-                    current_oracle = {}
-                    list_item_indent = len(line) - len(line.lstrip())
-                    # Extract id from first line after "- "
-                    remainder = line.strip()[2:].strip()
-                    if remainder:
-                        current_oracle["id"] = remainder
-                elif line.strip() == "":
-                    # Empty line might end the section
-                    continue
-                elif line.strip() and not line[0].isspace() and not line.startswith("#"):
-                    # Non-indented non-empty line ends section
-                    if current_oracle and "id" in current_oracle:
-                        oracles.append(current_oracle)
-                    in_oracles = False
-                    break
-                elif line.strip().startswith("id:") and current_oracle:
-                    current_oracle["id"] = line.split(":", 1)[1].strip()
-                elif line.strip().startswith("kind:") and current_oracle:
-                    current_oracle["kind"] = line.split(":", 1)[1].strip()
-                elif line.strip().startswith("files:") and current_oracle:
-                    # Simple parse: files on same line or next lines
-                    files_part = line.split(":", 1)[1].strip()
-                    if files_part.startswith("["):
-                        # YAML list format, simple extraction
-                        current_oracle["files"] = [f.strip("- [],'\"").strip() for f in files_part.split(",")]
-                    else:
-                        current_oracle["files"] = [files_part] if files_part else []
-                elif line.strip().startswith("must_call:") and current_oracle:
-                    current_oracle["must_call"] = {}
-                elif "module:" in line and current_oracle and "must_call" in current_oracle:
-                    current_oracle["must_call"]["module"] = line.split(":", 1)[1].strip()
-                elif "function:" in line and current_oracle and "must_call" in current_oracle:
-                    current_oracle["must_call"]["function"] = line.split(":", 1)[1].strip()
+                start_idx = i
+                break
 
-        if current_oracle and "id" in current_oracle:
-            oracles.append(current_oracle)
+        if start_idx is None:
+            return oracles
+
+        # Collect lines following implementation_oracles:
+        block_lines = []
+        for i in range(start_idx + 1, len(lines)):
+            line = lines[i]
+            if line.strip() == "":
+                continue
+            if line[0] not in (" ", "\t", "-"):
+                break
+            block_lines.append(line)
+
+        if not block_lines:
+            return oracles
+
+        block_text = "\n".join(block_lines)
+        if yaml:
+            try:
+                parsed = yaml.safe_load(block_text)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict):
+                    if "oracles" in parsed:
+                        return parsed["oracles"] if isinstance(parsed["oracles"], list) else []
+                    return [parsed] if any(k in parsed for k in ["id", "kind", "must_call"]) else []
+            except yaml.YAMLError:
+                pass
+
+        current: Optional[Dict[str, Any]] = None
+        in_must_call = False
+        for raw_line in block_lines:
+            stripped = raw_line.strip()
+            if stripped.startswith("- "):
+                if current:
+                    oracles.append(current)
+                current = {}
+                in_must_call = False
+                stripped = stripped[2:].strip()
+                if stripped and ":" in stripped:
+                    key, value = stripped.split(":", 1)
+                    current[key.strip()] = self._coerce_scalar(value)
+                continue
+            if current is None or ":" not in stripped:
+                continue
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "must_call" and not value:
+                current["must_call"] = {}
+                in_must_call = True
+                continue
+            if in_must_call and key in {"module", "function"}:
+                current.setdefault("must_call", {})[key] = self._coerce_scalar(value)
+                continue
+            current[key] = self._coerce_scalar(value)
+            in_must_call = False
+
+        if current:
+            oracles.append(current)
 
         return oracles
 
+    def _validate_non_comment_literal_match(self, filepath: str, literal: str) -> bool:
+        try:
+            with open(filepath) as handle:
+                for raw_line in handle:
+                    stripped = raw_line.lstrip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if literal in raw_line:
+                        return True
+        except (FileNotFoundError, OSError):
+            return False
+        return False
+
     def _verify_ast_call(self, oracle: Dict[str, Any], files: List[str]) -> Dict[str, Any]:
-        """Verify must_call using Python AST analysis."""
+        """Verify must_call using Python AST analysis with alias resolution."""
         must_call = oracle.get("must_call", {})
         module = must_call.get("module")
         function = must_call.get("function")
@@ -305,33 +503,71 @@ class CheckPRReviewGates:
             try:
                 with open(filepath) as f:
                     tree = ast.parse(f.read())
-                calls = self._find_ast_calls(tree, module, function)
+                calls = self._find_ast_calls_with_aliases(tree, module, function)
                 found_calls.extend(calls)
             except (SyntaxError, UnicodeDecodeError):
                 continue
 
         if found_calls:
             return {"passed": True, "head_sha": "ast-verified"}
+
+        # Try grep fallback only if oracle explicitly specifies kind: grep
+        if oracle.get("kind") == "grep":
+            return self._verify_grep(oracle, files)
+
         return {
             "passed": False,
             "error": f"AST call not found: {module}.{function} in {files}",
             "head_sha": "unknown"
         }
 
-    def _find_ast_calls(self, tree: ast.AST, module: str, function: str) -> List[str]:
-        """Find all calls to module.function in AST."""
+    def _find_ast_calls_with_aliases(self, tree: ast.AST, module: str, function: str) -> List[str]:
+        """Find calls to module.function with import alias resolution."""
+        # Build alias tables
+        alias_table = {}  # maps alias to actual module
+        from_table = {}   # maps imported name to (module, name)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    # import M [as A] → alias_table[A or M] = M
+                    key = alias.asname if alias.asname else alias.name
+                    alias_table[key] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                for alias in node.names:
+                    # from M import F [as G] → from_table[G or F] = (M, F)
+                    key = alias.asname if alias.asname else alias.name
+                    from_table[key] = (mod, alias.name)
+
+        # Find calls
         calls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                # Match module.function pattern
+                # Match Name.Attr(...) pattern
                 if isinstance(node.func, ast.Attribute):
                     if isinstance(node.func.value, ast.Name):
-                        if node.func.value.id == module and node.func.attr == function:
+                        caller_name = node.func.value.id
+                        func_name = node.func.attr
+                        # Check direct match
+                        if caller_name == module and func_name == function:
                             calls.append(f"{module}.{function}")
+                        # Check alias match: import subprocess as sp; sp.run(...)
+                        elif alias_table.get(caller_name) == module and func_name == function:
+                            calls.append(f"{module}.{function}")
+                # Match Name(...) pattern
+                elif isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                    # Check from_table match: from subprocess import run; run(...)
+                    if func_name in from_table:
+                        mod, name = from_table[func_name]
+                        if mod == module and name == function:
+                            calls.append(f"{module}.{function}")
+
         return calls
 
     def _verify_grep(self, oracle: Dict[str, Any], files: List[str]) -> Dict[str, Any]:
-        """Fallback verification using grep."""
+        """Fallback verification using grep with stricter matching (exclude comments)."""
         must_call = oracle.get("must_call", {})
         function = must_call.get("function", oracle.get("pattern", ""))
 
@@ -341,16 +577,8 @@ class CheckPRReviewGates:
         for filepath in files:
             if not Path(filepath).exists():
                 continue
-            try:
-                result = subprocess.run(
-                    ["grep", "-q", function, filepath],
-                    capture_output=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    return {"passed": True, "head_sha": "grep-verified"}
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                continue
+            if self._validate_non_comment_literal_match(filepath, function):
+                return {"passed": True, "head_sha": "grep-verified"}
 
         return {
             "passed": False,
@@ -364,6 +592,8 @@ class CheckPRReviewGates:
 
         Compares gh pr view headRefOid with local git rev-parse.
         Mismatch → fail (indicates push incomplete or stale review).
+
+        In strict mode: both SHAs required
         """
         gate = GateResult(
             gate_id="g4",
@@ -372,7 +602,11 @@ class CheckPRReviewGates:
         )
 
         if not pr_head_sha or not local_head_sha:
-            gate.status = GateStatus.NOT_APPLICABLE.value
+            if self.strict:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G4: required --pr-head-sha and --local-head-sha must both be provided in strict review mode"
+            else:
+                gate.status = GateStatus.NOT_APPLICABLE.value
             return gate
 
         if pr_head_sha != local_head_sha:
@@ -394,11 +628,17 @@ class CheckPRReviewGates:
 
     def g5_fixture_guard_path_coverage(self, trace_log: Optional[str] = None, coverage_file: Optional[str] = None) -> GateResult:
         """
-        G5: Fixture guard path coverage
+        G5: Fixture guard path coverage with structured trace validation
 
-        Verifies fixture_path_coverage/v1 trace output.
-        Can use --trace-guards flag output or coverage marker file.
-        Fails if no guard path coverage evidence is found.
+        Validates fixture_path_coverage/v1 schema with:
+        - schema_version: "fixture_path_coverage/v1"
+        - tests: array with test/expected_guard_path/observed_guard_path/status
+
+        Fails if:
+        - Parse fails
+        - schema_version mismatch
+        - tests array empty
+        - any test with status != pass or path mismatch
         """
         gate = GateResult(
             gate_id="g5",
@@ -406,26 +646,115 @@ class CheckPRReviewGates:
             status=GateStatus.NOT_APPLICABLE.value
         )
 
-        # Check trace log for fixture_path_coverage/v1
-        if trace_log:
-            if "fixture_path_coverage/v1" in trace_log:
-                gate.status = GateStatus.PASS.value
-                return gate
+        trace_content = None
 
-        # Check coverage file
-        if coverage_file and Path(coverage_file).exists():
+        # Try trace_log first
+        if trace_log:
+            trace_content = trace_log
+        # Then try coverage_file
+        elif coverage_file and Path(coverage_file).exists():
             try:
                 with open(coverage_file) as f:
-                    content = f.read()
-                    if "fixture_path_coverage/v1" in content:
-                        gate.status = GateStatus.PASS.value
-                        return gate
+                    trace_content = f.read()
             except (FileNotFoundError, IOError):
                 pass
 
-        # Default: not applicable if no evidence found
-        gate.status = GateStatus.NOT_APPLICABLE.value
+        if not trace_content:
+            if self.strict and (trace_log or coverage_file):
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G5: trace parse failed"
+            else:
+                gate.status = GateStatus.NOT_APPLICABLE.value
+            return gate
+
+        # Parse trace content
+        try:
+            if yaml:
+                parsed = yaml.safe_load(trace_content)
+            else:
+                parsed = json.loads(trace_content)
+        except (yaml.YAMLError if yaml else Exception, json.JSONDecodeError):
+            parsed = self._parse_fixture_trace_text(trace_content)
+            if parsed is None:
+                gate.status = GateStatus.FAIL.value
+                gate.minimal_context = "G5: trace parse failed"
+                return gate
+
+        if not isinstance(parsed, dict):
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = "G5: trace parse failed"
+            return gate
+
+        # Validate schema_version
+        if parsed.get("schema_version") != "fixture_path_coverage/v1":
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = "G5: trace parse failed"
+            return gate
+
+        # Validate tests array
+        tests = parsed.get("tests", [])
+        if not isinstance(tests, list) or not tests:
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = "G5: empty tests array"
+            return gate
+
+        # Validate each test
+        failed_tests = []
+        for test in tests:
+            if not isinstance(test, dict):
+                failed_tests.append("invalid test entry")
+                continue
+
+            expected = test.get("expected_guard_path")
+            observed = test.get("observed_guard_path")
+            status = test.get("status")
+
+            if expected != observed:
+                failed_tests.append(f"{test.get('test', 'unknown')}: path mismatch")
+            if status != "pass":
+                failed_tests.append(f"{test.get('test', 'unknown')}: status={status}")
+
+        if failed_tests:
+            gate.status = GateStatus.FAIL.value
+            gate.minimal_context = f"G5: {', '.join(failed_tests[:3])}"
+            return gate
+
+        gate.status = GateStatus.PASS.value
         return gate
+
+    def _parse_fixture_trace_text(self, text: str) -> Optional[Dict[str, Any]]:
+        parsed: Dict[str, Any] = {}
+        tests: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("schema_version:"):
+                parsed["schema_version"] = self._coerce_scalar(stripped.split(":", 1)[1])
+                continue
+            if stripped == "tests:":
+                continue
+            if stripped.startswith("- "):
+                if current:
+                    tests.append(current)
+                current = {}
+                stripped = stripped[2:].strip()
+                if stripped and ":" in stripped:
+                    key, value = stripped.split(":", 1)
+                    current[key.strip()] = self._coerce_scalar(value)
+                continue
+            if current is not None and ":" in stripped:
+                key, value = stripped.split(":", 1)
+                current[key.strip()] = self._coerce_scalar(value)
+
+        if current:
+            tests.append(current)
+        if "schema_version" not in parsed or not tests:
+            return None
+        parsed["tests"] = tests
+        return parsed
 
     def run_gate(self, gate_id: str, **kwargs) -> GateResult:
         """Run a specific gate by ID."""
@@ -461,6 +790,96 @@ class CheckPRReviewGates:
         self.result.verdict = Verdict.REQUEST_CHANGES.value if has_fail else Verdict.APPROVE.value
 
 
+def validate_against_schema(output_dict: Dict[str, Any], schema_path: Path) -> List[str]:
+    """Validate output dict against JSON Schema (hand-rolled lightweight validator)."""
+    errors = []
+
+    try:
+        with open(schema_path) as f:
+            schema_doc = yaml.safe_load(f) if yaml else json.load(f)
+    except Exception:
+        schema_doc = {
+            "schema": {
+                "required": ["schema_version", "generated_at", "generated_by", "verdict", "gates"]
+            }
+        }
+
+    if "schema" not in schema_doc:
+        schema_doc = {
+            "schema": {
+                "required": ["schema_version", "generated_at", "generated_by", "verdict", "gates"]
+            }
+        }
+
+    schema = schema_doc["schema"]
+
+    # Required top-level keys
+    required_keys = schema.get("required", [])
+    for key in required_keys:
+        if key not in output_dict:
+            errors.append(f"Missing required top-level key: {key}")
+
+    # Validate verdict enum
+    if "verdict" in output_dict:
+        if output_dict["verdict"] not in ["APPROVE", "REQUEST_CHANGES"]:
+            errors.append(f"Invalid verdict value: {output_dict['verdict']}")
+
+    # Validate gates
+    gates = output_dict.get("gates", [])
+    if not isinstance(gates, list):
+        errors.append("gates must be array")
+        return errors
+
+    if len(gates) < 5:
+        errors.append(f"gates must have at least 5 items, got {len(gates)}")
+
+    for gate in gates:
+        if not isinstance(gate, dict):
+            errors.append("Each gate must be object")
+            continue
+
+        gate_id = gate.get("gate_id")
+        gate_status = gate.get("status")
+        minimal_context = gate.get("minimal_context")
+
+        # Validate required gate fields
+        if gate_id not in ["g1", "g2", "g3", "g4", "g5"]:
+            errors.append(f"Invalid gate_id: {gate_id}")
+        if gate_status not in ["pass", "fail", "not_applicable"]:
+            errors.append(f"Invalid gate status: {gate_status}")
+
+        # Validate minimal_context rules
+        if gate_status == "fail":
+            if not minimal_context or not isinstance(minimal_context, str):
+                errors.append(f"Gate {gate_id}: fail status requires non-empty minimal_context")
+        else:
+            if minimal_context is not None:
+                errors.append(f"Gate {gate_id}: {gate_status} status must not have minimal_context")
+
+        # Validate findings
+        findings = gate.get("findings")
+        if findings is not None:
+            if not isinstance(findings, list):
+                errors.append(f"Gate {gate_id}: findings must be array")
+                continue
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    errors.append(f"Gate {gate_id}: each finding must be object")
+                    continue
+                for req_key in ["head_sha", "source_kind", "evidence_refs"]:
+                    if req_key not in finding:
+                        errors.append(f"Gate {gate_id}: finding missing {req_key}")
+                # Validate evidence_refs
+                evidence_refs = finding.get("evidence_refs", {})
+                if isinstance(evidence_refs, dict):
+                    if evidence_refs.get("self_report_only") is True:
+                        has_support = any(k in evidence_refs for k in ["code_ref", "pr_head_sha", "local_head_sha", "ci_run_ref"])
+                        if not has_support:
+                            errors.append(f"Gate {gate_id}: finding has self_report_only without supporting refs")
+
+    return errors
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PR Review Deterministic Gates Checker (G1-G5)"
@@ -469,6 +888,11 @@ def main():
         "--rule", "-r",
         help="Gate to run: g1|g2|g3|g4|g5 or all (default: all)",
         default="all"
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Enable strict mode for --rule all (default ON for all, OFF for single rules)"
     )
     parser.add_argument(
         "--ci-artifact",
@@ -517,7 +941,11 @@ def main():
 
     args = parser.parse_args()
 
-    checker = CheckPRReviewGates()
+    # Determine strict mode: ON for --rule all, OFF for single rules (unless explicitly set)
+    is_all_rule = args.rule.lower() == "all"
+    strict_mode = args.strict if args.strict else is_all_rule
+
+    checker = CheckPRReviewGates(strict=strict_mode)
     gates_to_run = args.rule.split(",") if args.rule != "all" else ["g1", "g2", "g3", "g4", "g5"]
 
     for gate in gates_to_run:
@@ -541,11 +969,9 @@ def main():
     output_dict = checker.result.to_dict()
 
     if args.format == "yaml":
-        try:
-            import yaml
+        if yaml:
             output = yaml.dump(output_dict, default_flow_style=False)
-        except ImportError:
-            # Fallback to JSON if PyYAML not available
+        else:
             output = json.dumps(output_dict, indent=2)
     else:
         output = json.dumps(output_dict, indent=2)
@@ -556,6 +982,15 @@ def main():
         print(f"Result written to {args.output}")
     else:
         print(output)
+
+    # Validate output against schema
+    schema_path = Path(__file__).parent.parent / "references" / "pr-review-gate-result-schema.yml"
+    validation_errors = validate_against_schema(output_dict, schema_path)
+    if validation_errors:
+        print("Schema validation errors:", file=sys.stderr)
+        for err in validation_errors:
+            print(f"  - {err}", file=sys.stderr)
+        sys.exit(2)
 
     # Exit code based on verdict
     sys.exit(0 if checker.result.verdict == Verdict.APPROVE.value else 1)

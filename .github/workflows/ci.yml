@@ -102,9 +102,24 @@ jobs:
       - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
-      - run: |
+      - name: Generate ci_test_selection/v1 artifact
+        run: |
           mkdir -p ci_test_selection_artifacts
-          python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py --output ci_test_selection_artifacts/ci_test_selection_v1.json --head-sha "${{ github.sha }}" --workflow ci --job python-test
+          python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py \
+            --output ci_test_selection_artifacts/ci_test_selection_v1.json \
+            --pytest-args \
+              .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
+              .claude/skills/edit-issue/tests/test_guard_issue_body.py \
+              .claude/skills/create-issue/tests/ \
+              .claude/skills/create-issue/scripts/tests/ \
+              .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
+              .claude/hooks/tests/test_session_recording_policy_guard.py \
+              .claude/skills/issue-contract-review/scripts/tests/ \
+              .claude/skills/pr-review-judge/scripts/tests/ \
+            --pr-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --merge-sha "${{ github.sha }}" \
+            --workflow ci --job python-test \
+            --ci-run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - uses: actions/upload-artifact@v6
         with:
           name: ci_test_selection
