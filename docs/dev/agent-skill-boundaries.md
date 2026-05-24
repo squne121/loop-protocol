@@ -488,7 +488,7 @@ plan_child_materialization.py
 
 ```yaml
 CHILD_MATERIALIZATION_RESULT_V2:
-  status: success | partial_failure | materialization_failed | materialization_human_escalation
+  status: ok | partial_failure | failed | human_escalation
   created_issues:
     - child_id: "A"                     # plan.children[*].child_id に対応
       issue_number: 330
@@ -508,19 +508,19 @@ CHILD_MATERIALIZATION_RESULT_V2:
 
 | status | 条件 |
 |---|---|
-| `success` | `created_issues >= 1` かつ `errors` が空 |
+| `ok` | `created_issues >= 1` かつ `errors` が空 |
 | `partial_failure` | `created_issues >= 1` かつ `errors` が 1 件以上 |
-| `materialization_failed` | `created_issues == 0` かつ `errors` が 1 件以上 |
-| `materialization_human_escalation` | `escalation_items >= 1` かつ `errors` が空 |
+| `failed` | `created_issues == 0` かつ `errors` が 1 件以上 |
+| `human_escalation` | `escalation_items >= 1` かつ `errors` が空 |
 
 ### issue-refinement-loop Step 4.5 での消費ルール
 
 | CHILD_MATERIALIZATION_RESULT_V2.status | termination_reason |
 |---|---|
-| `success` | `approved`（Step 5 へ進む） |
+| `ok` | `approved`（Step 5 へ進む） |
 | `partial_failure` | `human_escalation`（失敗した child ID をコメントに記録） |
-| `materialization_failed` | `human_escalation` |
-| `materialization_human_escalation` | `human_escalation`（escalation_items をコメントに記録） |
+| `failed` | `human_escalation` |
+| `human_escalation` | `human_escalation`（escalation_items をコメントに記録） |
 
 ## 設計原則の補足
 

@@ -58,6 +58,29 @@ ChildAction = Literal[
     "register_subissue_or_human_escalation",
 ]
 
+SubissuesReadbackStatus = Literal[
+    "ok",
+    "api_error",
+    "forbidden",
+    "not_found",
+    "gone",
+    "rate_limited",
+]
+
+
+@dataclass
+class SubissuesReadback:
+    """Result of fetching native GitHub Sub-issues for a parent issue.
+
+    complete == False means the actual state is unknown and the plan
+    must not be used for mutation (fail-closed design).
+    """
+    status: SubissuesReadbackStatus
+    items: list[dict] = field(default_factory=list)
+    http_status: Optional[int] = None
+    stderr: Optional[str] = None
+    complete: bool = True
+
 GapReason = Literal[
     "unsupported_child_id_format",
     "checkbox_without_issue_ref_but_title_present",
@@ -144,7 +167,7 @@ class Plan:
     closure_mode: str
     issue_lookup: IssueLookup
     body_inventory: Optional[BodyInventory] = None
-    github_subissues_actual: list[dict] = field(default_factory=list)
+    github_subissues_actual: Optional[SubissuesReadback] = None
     children: list[ChildEntry] = field(default_factory=list)
     parent_body_updates: list[ParentBodyUpdate] = field(default_factory=list)
     required_issue_creations: list[str] = field(default_factory=list)
@@ -157,20 +180,46 @@ class Plan:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-# Matches a child list line in either of:
-#   - [ ] #N — C254-M: ...
-#   - C254-M ... （未起票）  (bullet form)
-#   - C254-M ... #N
-#   - A: ... (A/B/C/D track ID form under ## Child Issues)
-#   - [ ] A: ... (checkbox form with A/B/C/D track ID)
-_CHILD_LINE_RE = re.compile(
+# Two separate regexes for child_id matching:
+#
+# _CHILD_LINE_RE_CNUM: C254-N format (space or colon separator)
+#   e.g. "- C254-1 docs: something" or "- C254-1: docs: something"
+#
+# _CHILD_LINE_RE_ABCD: A/B/C/D track ID format (colon REQUIRED)
+#   e.g. "- [ ] A: Issue body validator"  -- VALID
+#   e.g. "- [ ] A Issue body validator"   -- NOT matched; parser_gap=unsupported_child_id_format
+#
+# NOTE: [A-D] is intentionally limited to A/B/C/D (Issue #328 scope).
+# Future track expansion (E/F/…) must be handled in a separate Issue.
+_CHILD_LINE_RE_CNUM = re.compile(
     r"^[-*]?\s*"
-    r"(?:\[[ xX]?\]\s*)?"   # optional checkbox like "- [ ]" or "- [x]"
-    r"(?:#(?P<leading_ref>\d+)\s*[—–—–-]\s*)?"  # optional leading "#N —" with capture
-    r"(?P<child_id>C\d+-\d+|[A-Z])"             # C254-3 OR single uppercase letter (A/B/C/D)
-    r"[:\s]+"                # separator: space(s) or colon+space(s) after child_id
+    r"(?:\[[ xX]?\]\s*)?"                        # optional checkbox
+    r"(?:#(?P<leading_ref>\d+)\s*[—–—–-]\s*)?"   # optional leading "#N —"
+    r"(?P<child_id>C\d+-\d+)"                     # C254-3 form
+    r"[:\s]+"                                      # space or colon separator
     r"(?P<rest>.+)$"
 )
+
+_CHILD_LINE_RE_ABCD = re.compile(
+    r"^[-*]?\s*"
+    r"(?:\[[ xX]?\]\s*)?"                        # optional checkbox
+    r"(?:#(?P<leading_ref>\d+)\s*[—–—–-]\s*)?"   # optional leading "#N —"
+    r"(?P<child_id>[A-D])"                        # A/B/C/D track ID (not [A-Z])
+    r":"                                           # colon is REQUIRED (blocker_1 + blocker_3)
+    r"\s*"                                         # optional spaces
+    r"(?P<rest>.+)$"
+)
+
+
+def _match_child_line(line: str):
+    """Try to match a child line against both C254-N and A/B/C/D patterns.
+
+    Returns the first match object or None.
+    """
+    m = _CHILD_LINE_RE_CNUM.match(line)
+    if m:
+        return m
+    return _CHILD_LINE_RE_ABCD.match(line)
 
 # Matches an existing GitHub issue reference at the end of a rest string, e.g. "#281"
 _ISSUE_REF_RE = re.compile(r"#(?P<number>\d+)")
@@ -256,11 +305,34 @@ def _extract_child_issues_section(body: str) -> tuple[list[tuple[int, str]], Opt
 
 
 def _is_candidate_line(line: str) -> bool:
-    """Return True if the line looks like a child candidate (checkbox or bullet).
+    """Return True if the line looks like a TOP-LEVEL child candidate (checkbox or bullet).
 
     Blank lines, prose paragraphs, and sub-headings are not candidates.
     Sub-heading lines (###) are NOT candidates but are included in the section scan.
+
+    IMPORTANT (blocker_2 fix): Only lines with at most 2 leading spaces are considered
+    top-level candidates.  Lines with 3+ leading spaces are nested metadata bullets
+    (e.g. ``absorbs:``, ``output:``, ``validates:``) and must NOT be counted as candidates.
+    This prevents nested bullets from being classified as parser_gap entries.
+
+    Example:
+        "- [ ] A: Issue body validator — #327"   → candidate  (0 leading spaces)
+        "  - absorbs: #46, #57"                  → NOT candidate (2 leading spaces, but
+                                                    the stripped form starts with a bullet
+                                                    — allow 0-2 leading spaces for
+                                                    top-level, but "  -" is 2-space-indent)
+    The rule is: at most 2 leading spaces **before** the bullet/reference character.
+    Lines indented 3 or more spaces are considered nested metadata and are ignored.
     """
+    # Leading-space count check (top-level = 0 spaces before the bullet/reference character).
+    # Lines indented by 2 or more spaces are treated as nested metadata bullets
+    # (e.g. "  - absorbs: #46, #57") and are NOT candidates.
+    # GitHub Markdown nested list items commonly use 2-space indentation.
+    leading_spaces = len(line) - len(line.lstrip(" "))
+    if leading_spaces >= 2:
+        # Nested metadata bullet (absorbs/output/validates style) — not a candidate
+        return False
+
     stripped = line.strip()
     if not stripped:
         return False
@@ -268,7 +340,7 @@ def _is_candidate_line(line: str) -> bool:
     if re.match(r"^#{1,6}\s", stripped):
         return False
     # Must start with bullet/checkbox or look like a child reference
-    return bool(re.match(r"^[-*]", stripped) or re.match(r"^[A-Z][:\s]", stripped) or
+    return bool(re.match(r"^[-*]", stripped) or re.match(r"^[A-D][:\s]", stripped) or
                 re.match(r"^C\d+-\d+", stripped) or re.match(r"^#\d+\s*[—–]", stripped))
 
 
@@ -284,7 +356,7 @@ def _parse_child_lines(body: str) -> list[dict]:
     section_lines, _, _ = _extract_child_issues_section(body)
     results = []
     for line_number, line in section_lines:
-        m = _CHILD_LINE_RE.match(line.strip())
+        m = _match_child_line(line.strip())
         if not m:
             continue
         child_id = m.group("child_id")
@@ -352,7 +424,7 @@ def _build_body_inventory(
         if line_number in parsed_line_numbers:
             # Check for duplicate child_id (unsafe gap)
             stripped = line.strip()
-            m = _CHILD_LINE_RE.match(stripped)
+            m = _match_child_line(stripped)
             if m:
                 cid = m.group("child_id")
                 if cid in duplicate_child_ids:
@@ -536,11 +608,21 @@ def _view_issue(repo: str, issue_number: int, gh_bin: str = "gh") -> Optional[Ex
 
 def _fetch_subissues_actual(
     repo: str, parent_issue: int, gh_bin: str = "gh"
-) -> list[dict]:
+) -> SubissuesReadback:
     """Fetch native GitHub Sub-issues for a parent issue via REST API.
 
-    Returns a list of sub-issue dicts (may be empty on failure or no sub-issues).
-    Each dict has: number, title, state, url.
+    Returns a SubissuesReadback with status and items.
+    Fail-closed design: API errors are never silently treated as empty lists.
+
+    status mapping:
+        "ok"           — successful fetch (items may be empty list = 0 sub-issues)
+        "forbidden"    — HTTP 403
+        "not_found"    — HTTP 404
+        "gone"         — HTTP 410
+        "api_error"    — HTTP 422 or other non-2xx
+        "rate_limited" — HTTP 429 or rate-limit signal in stderr
+
+    complete == False means actual state is unknown; plan MUST NOT be used for mutation.
     """
     args = [
         gh_bin,
@@ -550,15 +632,48 @@ def _fetch_subissues_actual(
         "[.[] | {number: .number, title: .title, state: .state, url: .html_url}]",
     ]
     cp = subprocess.run(args, capture_output=True, text=True)
+
     if cp.returncode != 0:
-        return []
+        stderr = cp.stderr.strip()
+        # Try to detect HTTP status from gh CLI stderr output
+        # gh CLI emits e.g. "HTTP 403: ..." or "GraphQL: ..."
+        http_status: Optional[int] = None
+        m_http = re.search(r"\bHTTP\s+(\d{3})\b", stderr)
+        if m_http:
+            http_status = int(m_http.group(1))
+
+        if http_status == 403:
+            return SubissuesReadback(
+                status="forbidden", items=[], http_status=403, stderr=stderr, complete=False
+            )
+        if http_status == 404:
+            return SubissuesReadback(
+                status="not_found", items=[], http_status=404, stderr=stderr, complete=False
+            )
+        if http_status == 410:
+            return SubissuesReadback(
+                status="gone", items=[], http_status=410, stderr=stderr, complete=False
+            )
+        if http_status == 429 or "rate limit" in stderr.lower() or "rate-limit" in stderr.lower():
+            return SubissuesReadback(
+                status="rate_limited", items=[], http_status=http_status, stderr=stderr, complete=False
+            )
+        # 422 or any other error
+        return SubissuesReadback(
+            status="api_error", items=[], http_status=http_status, stderr=stderr, complete=False
+        )
+
     try:
         result = json.loads(cp.stdout.strip() or "[]")
         if isinstance(result, list):
-            return result
-        return []
-    except json.JSONDecodeError:
-        return []
+            return SubissuesReadback(status="ok", items=result, complete=True)
+        return SubissuesReadback(
+            status="api_error", items=[], stderr="Unexpected non-list JSON response", complete=False
+        )
+    except json.JSONDecodeError as exc:
+        return SubissuesReadback(
+            status="api_error", items=[], stderr=f"JSON decode error: {exc}", complete=False
+        )
 
 
 def _search_dedupe_candidates(
@@ -606,6 +721,7 @@ def _classify_child(
     dry_run: bool = False,
     issue_lookup_warnings: list[str],
     subissues_actual: list[dict],
+    subissues_readback_complete: bool = True,
 ) -> ChildEntry:
     """Classify a single parsed child line into a ChildEntry.
 
@@ -626,7 +742,12 @@ def _classify_child(
     issue_lookup_warnings:
         Mutable list to append lookup warnings to.
     subissues_actual:
-        Native GitHub Sub-issues read-back (actual state).
+        Native GitHub Sub-issues read-back items (actual state). Empty list when
+        readback was incomplete.
+    subissues_readback_complete:
+        False when _fetch_subissues_actual returned an error. When False, any
+        child that would require Sub-issue registration is routed to
+        human_escalation instead of register_subissue_or_human_escalation.
     """
     child_id: str = parsed["child_id"]
     rest: str = parsed["rest"]
@@ -756,7 +877,28 @@ def _classify_child(
         else:
             # AC4: body has #N but native Sub-issue parent read-back doesn't match
             # → register_subissue_or_human_escalation (not no_op)
-            if not actual_match and subissues_actual is not None:
+            #
+            # Fail-closed (blocker_4): if readback was incomplete (API error),
+            # route to human_escalation instead of register_subissue_or_human_escalation.
+            # We must not produce a mutation plan when actual state is unknown.
+            if not actual_match and subissues_readback_complete is not None:
+                if not subissues_readback_complete:
+                    # Actual state unknown — human must verify before registering
+                    issue_lookup_warnings.append(
+                        f"Sub-issue readback was incomplete (API error). "
+                        f"Child {child_id} (#{issue_number}) cannot be safely registered. "
+                        "Routed to human_escalation."
+                    )
+                    return ChildEntry(
+                        child_id=child_id,
+                        title=title,
+                        status="ambiguous",
+                        existing_issue=info,
+                        action="human_escalation",
+                        dedupe_key=dedupe_key,
+                        existing_issue_candidates=[],
+                    )
+
                 candidates = _search_dedupe_candidates(repo, dedupe_key, gh_bin)
                 if is_open:
                     return ChildEntry(
@@ -870,9 +1012,9 @@ def build_plan(
         issue_lookup.strategy = "body_file_dry_run_no_api_calls"
 
     # Fetch native Sub-issue actual state (AC3: separate actual from desired)
-    subissues_actual: list[dict] = []
+    subissues_readback: Optional[SubissuesReadback] = None
     if not dry_run and repo:
-        subissues_actual = _fetch_subissues_actual(repo, parent_issue, gh_bin)
+        subissues_readback = _fetch_subissues_actual(repo, parent_issue, gh_bin)
 
     # Build body inventory (desired state — AC2a)
     body_inventory = _build_body_inventory(body, parent_issue, parent_mode)
@@ -888,7 +1030,25 @@ def build_plan(
         closure_mode=closure_mode,
         issue_lookup=issue_lookup,
         body_inventory=body_inventory,
-        github_subissues_actual=subissues_actual,
+        github_subissues_actual=subissues_readback,
+    )
+
+    # Fail-closed: if Sub-issue readback is incomplete, do NOT produce a mutation plan.
+    # Consumer skills must check github_subissues_actual.complete before acting.
+    if subissues_readback is not None and not subissues_readback.complete:
+        plan.warnings.append(
+            f"github_subissues_actual.complete=false (status={subissues_readback.status}, "
+            f"http_status={subissues_readback.http_status}): actual Sub-issue state is unknown. "
+            "All children requiring Sub-issue registration are routed to human_escalation. "
+            "Do NOT use this plan for mutation."
+        )
+        issue_lookup.complete = False
+
+    # Items to use for child classification (empty list if readback incomplete)
+    subissues_items: list[dict] = (
+        subissues_readback.items
+        if subissues_readback is not None and subissues_readback.complete
+        else []
     )
 
     parsed_children = _parse_child_lines(body)
@@ -908,7 +1068,10 @@ def build_plan(
             gh_bin=gh_bin,
             dry_run=dry_run,
             issue_lookup_warnings=issue_lookup_warnings,
-            subissues_actual=subissues_actual,
+            subissues_actual=subissues_items,
+            subissues_readback_complete=(
+                subissues_readback.complete if subissues_readback is not None else True
+            ),
         )
         plan.children.append(entry)
 
@@ -1024,14 +1187,27 @@ def plan_to_yaml(plan: Plan) -> str:
 
     # GitHub Sub-issues actual state (AC3)
     lines.append("  github_subissues_actual:")
-    if not plan.github_subissues_actual:
-        lines.append("    []")
+    if plan.github_subissues_actual is None:
+        lines.append("    status: not_fetched")
+        lines.append("    complete: true")
+        lines.append("    items: []")
     else:
-        for si in plan.github_subissues_actual:
-            lines.append(f"    - number: {si.get('number', '')}")
-            lines.append(f"      title: {_quote_yaml_str(str(si.get('title', '')))}")
-            lines.append(f"      state: {si.get('state', '')}")
-            lines.append(f"      url: {_quote_yaml_str(str(si.get('url', '')))}")
+        rb = plan.github_subissues_actual
+        lines.append(f"    status: {rb.status}")
+        lines.append(f"    complete: {'true' if rb.complete else 'false'}")
+        if rb.http_status is not None:
+            lines.append(f"    http_status: {rb.http_status}")
+        if rb.stderr:
+            lines.append(f"    stderr: {_quote_yaml_str(rb.stderr)}")
+        lines.append("    items:")
+        if not rb.items:
+            lines.append("      []")
+        else:
+            for si in rb.items:
+                lines.append(f"      - number: {si.get('number', '')}")
+                lines.append(f"        title: {_quote_yaml_str(str(si.get('title', '')))}")
+                lines.append(f"        state: {si.get('state', '')}")
+                lines.append(f"        url: {_quote_yaml_str(str(si.get('url', '')))}")
 
     lines.append("  children:")
 

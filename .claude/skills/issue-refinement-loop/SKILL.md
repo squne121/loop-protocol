@@ -861,10 +861,10 @@ delivery_rollup_gate:
    - `edit-issue` skill の `delivery-rollup-parent-update` mode に `CHILD_MATERIALIZATION_PLAN_V2` を渡して parent body を修正する
 4. `action: human_escalation` のエントリが存在する場合:
    - `termination_reason: human_escalation` で停止する
-5. `issue-author` の `CHILD_MATERIALIZATION_RESULT_V2` が `partial_failure` / `materialization_failed` を返した場合（AC8）:
+5. `issue-author` の `CHILD_MATERIALIZATION_RESULT_V2` が `partial_failure` / `failed` / `human_escalation` を返した場合（AC8）:
    - `partial_failure`: 一部の child 起票に失敗 → `termination_reason: human_escalation` で停止し、失敗した child ID と理由をコメントに記録する
-   - `materialization_failed`: 全件失敗 → `termination_reason: human_escalation` で停止する
-   - `materialization_human_escalation`: 起票不可（parser_gap 低確信度等） → `termination_reason: human_escalation` で停止する
+   - `failed`: 全件失敗 → `termination_reason: human_escalation` で停止する
+   - `human_escalation`: 起票不可（parser_gap 低確信度・API error 等） → `termination_reason: human_escalation` で停止する（escalation_items をコメントに記録）
    - いずれの場合も「approve で即終了」とせず、人間が残作業を確認できる状態で停止する
 6. すべての mandatory_follow_up が materialize 済みになったら Step 5（終了処理）に進む。
 

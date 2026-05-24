@@ -108,13 +108,15 @@ def _build_live(
     view_side_effects: dict | None = None,
     search_return: list | None = None,
     subissues_actual: list | None = None,
+    subissues_readback_status: str = "ok",
 ) -> pmc.Plan:
     """Build a plan in live mode with mocked gh calls.
 
     view_side_effects: {issue_number: ExistingIssueInfo | None}
         If None, the API call "failed" for that issue.
     search_return: list of candidate dicts returned by _search_dedupe_candidates.
-    subissues_actual: list of sub-issue dicts returned by _fetch_subissues_actual.
+    subissues_actual: list of sub-issue dicts (items) for SubissuesReadback.
+    subissues_readback_status: status for SubissuesReadback (default "ok").
     """
     if view_side_effects is None:
         view_side_effects = {}
@@ -123,12 +125,19 @@ def _build_live(
     if subissues_actual is None:
         subissues_actual = []
 
+    # Build SubissuesReadback as _fetch_subissues_actual now returns
+    readback = pmc.SubissuesReadback(
+        status=subissues_readback_status,  # type: ignore[arg-type]
+        items=subissues_actual,
+        complete=(subissues_readback_status == "ok"),
+    )
+
     def fake_view(r, n, g="gh"):
         return view_side_effects.get(n)
 
     with patch.object(pmc, "_view_issue", side_effect=fake_view), \
          patch.object(pmc, "_search_dedupe_candidates", return_value=search_return), \
-         patch.object(pmc, "_fetch_subissues_actual", return_value=subissues_actual):
+         patch.object(pmc, "_fetch_subissues_actual", return_value=readback):
         return pmc.build_plan(body, parent_issue=parent_issue, repo=repo, dry_run=False)
 
 
@@ -642,20 +651,20 @@ class TestInventorySplit:
         assert hasattr(plan, "body_inventory"), "plan must have body_inventory"
         assert hasattr(plan, "github_subissues_actual"), "plan must have github_subissues_actual"
 
-    def test_subissues_actual_empty_in_dry_run(self) -> None:
+    def test_subissues_actual_none_in_dry_run(self) -> None:
         """GIVEN dry-run mode (no GitHub API)
         WHEN build_plan is called
-        THEN github_subissues_actual is empty list (no API call made).
+        THEN github_subissues_actual is None (no API call made in dry-run).
 
-        AC3: subissues_actual is actual state from native read-back.
+        AC3: subissues_actual is None when not fetched (dry-run).
         """
         plan = _build_dry_run(FIXTURE_PARENT_BODY_254)
-        assert plan.github_subissues_actual == []
+        assert plan.github_subissues_actual is None
 
     def test_subissues_actual_populated_in_live_mode(self) -> None:
         """GIVEN live mode with mocked sub-issues API returning 2 sub-issues
         WHEN build_plan is called
-        THEN github_subissues_actual contains the returned sub-issues.
+        THEN github_subissues_actual.items contains the returned sub-issues.
 
         AC3: subissues_actual in live mode.
         """
@@ -672,7 +681,9 @@ class TestInventorySplit:
             view_side_effects=view_effects,
             subissues_actual=mock_subissues,
         )
-        assert len(plan.github_subissues_actual) == 2
+        assert plan.github_subissues_actual is not None
+        assert plan.github_subissues_actual.status == "ok"
+        assert len(plan.github_subissues_actual.items) == 2
 
     def test_yaml_contains_body_inventory_and_subissues_actual(self) -> None:
         """GIVEN a plan
@@ -1347,7 +1358,8 @@ closure_mode: child-complete
 """
         with patch.object(pmc, "_view_issue", return_value=None), \
              patch.object(pmc, "_search_dedupe_candidates", return_value=[]), \
-             patch.object(pmc, "_fetch_subissues_actual", return_value=[]):
+             patch.object(pmc, "_fetch_subissues_actual",
+                          return_value=pmc.SubissuesReadback(status="ok", items=[], complete=True)):
             plan = pmc.build_plan(
                 body, parent_issue=254, repo="squne121/loop-protocol", dry_run=False
             )
@@ -1585,3 +1597,367 @@ class TestEdgeCases:
         body = "## Child Issues\n\n- C254-3 docs: something（未起票）\n"
         results = pmc._parse_child_lines(body)
         assert "C254-3" in results[0]["raw_line"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Blocker 1 — _CHILD_LINE_RE limited to [A-D], not [A-Z]
+# ---------------------------------------------------------------------------
+
+
+class TestChildLineReAbcdLimited:
+    """Blocker 1: _CHILD_LINE_RE_ABCD accepts only A/B/C/D, not arbitrary uppercase letters."""
+
+    def test_e_through_z_not_parsed(self) -> None:
+        """GIVEN lines like '- [ ] E: ...' or '- [ ] Z: ...'
+        WHEN _parse_child_lines is called
+        THEN they are NOT parsed (only A-D allowed).
+        """
+        body = """\
+## Child Issues
+
+- [ ] E: should not be parsed
+- [ ] F: also not parsed
+- [ ] Z: nor this
+"""
+        results = pmc._parse_child_lines(body)
+        child_ids = [r["child_id"] for r in results]
+        assert "E" not in child_ids
+        assert "F" not in child_ids
+        assert "Z" not in child_ids
+
+    def test_a_b_c_d_still_parsed(self) -> None:
+        """GIVEN lines with A/B/C/D track IDs (colon form)
+        WHEN _parse_child_lines is called
+        THEN they ARE parsed.
+        """
+        body = """\
+## Child Issues
+
+- [ ] A: valid entry — #327
+- [ ] B: valid entry — #329
+- [ ] C: valid entry — #330
+- [ ] D: valid entry — #331
+"""
+        results = pmc._parse_child_lines(body)
+        child_ids = [r["child_id"] for r in results]
+        assert "A" in child_ids
+        assert "B" in child_ids
+        assert "C" in child_ids
+        assert "D" in child_ids
+
+
+# ---------------------------------------------------------------------------
+# Tests: Blocker 2 — nested bullets (absorbs/output/validates) are NOT candidates
+# ---------------------------------------------------------------------------
+
+#: Fixture that matches the real #244 structure with nested metadata bullets.
+FIXTURE_PARENT_BODY_244_WITH_NESTED_METADATA = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: parent
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+### 実装トラック
+
+- [ ] A: Issue body validator — #327
+  - absorbs: #46, #57
+  - output: validate_issue_body.py
+- [ ] B: baseline_vc_preflight.py 実装 — #329
+  - absorbs: #100
+  - validates: preflight conditions
+- [ ] C: validate_pr_body.py 実装 — #330
+  - output: validate_pr_body.py
+- [ ] D: text/markdown lint 導入 — #331
+  - optional: true
+
+## Background
+
+Some background.
+"""
+
+
+class TestNestedBulletNotCandidate:
+    """Blocker 2: nested bullet lines (absorbs/output/validates) must NOT be candidates."""
+
+    def test_nested_bullets_not_counted_as_candidates(self) -> None:
+        """GIVEN #244-style body with nested metadata under A/B/C/D entries
+        WHEN build_plan is called
+        THEN candidate_count == 4 (only A/B/C/D, not absorbs/output/validates/optional).
+
+        Blocker 2: nested metadata bullets are ignored as child candidates.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_WITH_NESTED_METADATA, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.candidate_count == 4, (
+            f"Expected 4 candidates (A/B/C/D only), got {bi.candidate_count}. "
+            "Nested bullets (absorbs/output/validates/optional) must not be counted."
+        )
+        assert bi.parsed_count == 4, (
+            f"Expected 4 parsed, got {bi.parsed_count}"
+        )
+
+    def test_nested_bullets_produce_no_parser_gap(self) -> None:
+        """GIVEN #244-style body with nested metadata under A/B/C/D entries
+        WHEN build_plan is called
+        THEN parser_gap_report is empty (no false gaps from nested bullets).
+
+        Blocker 2: nested metadata must not generate parser_gap entries.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_WITH_NESTED_METADATA, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.parser_gap_report == [], (
+            f"Expected empty parser_gap_report, got: {bi.parser_gap_report}"
+        )
+
+    def test_nested_bullets_children_still_parsed(self) -> None:
+        """GIVEN #244-style body with nested metadata
+        WHEN build_plan is called
+        THEN all 4 A/B/C/D children are in plan.children.
+
+        Blocker 2: nested bullets must not interfere with top-level child parsing.
+        """
+        plan = _build_dry_run(FIXTURE_PARENT_BODY_244_WITH_NESTED_METADATA, parent_issue=244)
+        child_ids = [c.child_id for c in plan.children]
+        assert "A" in child_ids
+        assert "B" in child_ids
+        assert "C" in child_ids
+        assert "D" in child_ids
+        assert len(plan.children) == 4
+
+
+# ---------------------------------------------------------------------------
+# Tests: Blocker 3 — A/B/C/D colon-required build_plan() integration path
+# ---------------------------------------------------------------------------
+
+
+class TestAbcdColonRequired:
+    """Blocker 3: A/B/C/D without colon must produce parser_gap via build_plan()."""
+
+    def test_abcd_no_colon_is_parser_gap_not_parsed(self) -> None:
+        """GIVEN '- [ ] A Title' (no colon after A)
+        WHEN build_plan is called
+        THEN candidate_count=1, parsed_count=0 (colon missing = not parsed).
+
+        Blocker 3: colon-less A/B/C/D is a parser gap, not a valid child.
+        """
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+- [ ] A Issue body validator
+"""
+        plan = _build_dry_run(body, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.candidate_count == 1, f"Expected 1 candidate, got {bi.candidate_count}"
+        assert bi.parsed_count == 0, (
+            f"Expected 0 parsed (colon missing), got {bi.parsed_count}"
+        )
+
+    def test_abcd_no_colon_produces_high_confidence_repair(self) -> None:
+        """GIVEN '- [ ] A Title' (no colon after A)
+        WHEN build_plan is called
+        THEN parser_gap has repair_confidence=high and suggested_repair contains 'A:'.
+
+        Blocker 3: AC2c integration — high repair_confidence routed to issue-author.
+        """
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+- [ ] A Issue body validator
+"""
+        plan = _build_dry_run(body, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert len(bi.parser_gap_report) == 1, (
+            f"Expected 1 parser gap entry, got {len(bi.parser_gap_report)}"
+        )
+        gap = bi.parser_gap_report[0]
+        assert gap.repair_confidence == "high", (
+            f"Expected repair_confidence=high, got {gap.repair_confidence}"
+        )
+        assert gap.suggested_repair is not None
+        assert "A:" in gap.suggested_repair, (
+            f"Expected suggested_repair to contain 'A:', got: {gap.suggested_repair!r}"
+        )
+
+    def test_abcd_with_colon_parses_correctly(self) -> None:
+        """GIVEN '- [ ] A: Title' (colon present)
+        WHEN build_plan is called
+        THEN parsed_count=1 and no parser_gap.
+
+        Blocker 3: colon-present form must still parse correctly.
+        """
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+parent_mode: delivery-rollup
+closure_mode: child-complete
+```
+
+## Child Issues
+
+- [ ] A: Issue body validator
+"""
+        plan = _build_dry_run(body, parent_issue=244)
+        bi = plan.body_inventory
+        assert bi is not None
+        assert bi.parsed_count == 1, f"Expected 1 parsed, got {bi.parsed_count}"
+        assert bi.parser_gap_report == [], (
+            f"Expected empty parser_gap_report, got: {bi.parser_gap_report}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Blocker 4 — SubissuesReadback fail-closed design
+# ---------------------------------------------------------------------------
+
+
+class TestSubissuesReadbackFailClosed:
+    """Blocker 4: _fetch_subissues_actual returns SubissuesReadback; API errors are fail-closed."""
+
+    def test_subissues_readback_ok_status(self) -> None:
+        """GIVEN successful API response
+        WHEN _fetch_subissues_actual is called (mocked)
+        THEN SubissuesReadback.status == 'ok' and complete == True.
+
+        Blocker 4: ok status with items.
+        """
+        # Mock via build_plan using _build_live helper
+        mock_items = [{"number": 281, "title": "docs", "state": "OPEN", "url": ""}]
+        view_effects = {281: _make_issue_info(281, "OPEN")}
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=mock_items,
+            subissues_readback_status="ok",
+        )
+        assert plan.github_subissues_actual is not None
+        assert plan.github_subissues_actual.status == "ok"
+        assert plan.github_subissues_actual.complete is True
+
+    def test_api_error_routes_to_human_escalation(self) -> None:
+        """GIVEN SubissuesReadback with status='forbidden' (API error)
+        WHEN build_plan is called
+        THEN issue_lookup.complete=False AND children needing registration get human_escalation.
+
+        Blocker 4: fail-closed — API error must not produce mutation plan.
+        """
+        view_effects = {
+            281: _make_issue_info(281, "OPEN"),
+            285: _make_issue_info(285, "OPEN"),
+        }
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+            subissues_readback_status="forbidden",
+        )
+        # Plan lookup must be incomplete when readback failed
+        assert plan.issue_lookup.complete is False
+        # Children that would need register_subissue must be routed to human_escalation
+        for child in plan.children:
+            assert child.action != "register_subissue_or_human_escalation", (
+                f"Child {child.child_id} must not be register_subissue when readback is incomplete"
+            )
+
+    def test_api_error_adds_warning(self) -> None:
+        """GIVEN SubissuesReadback with status='not_found'
+        WHEN build_plan is called
+        THEN plan.warnings contains a message about incomplete readback.
+
+        Blocker 4: consumer must be notified that actual state is unknown.
+        """
+        view_effects = {281: _make_issue_info(281, "OPEN")}
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+            subissues_readback_status="not_found",
+        )
+        warning_text = " ".join(plan.warnings)
+        assert "complete=false" in warning_text or "complete" in warning_text.lower(), (
+            "Expected a warning about incomplete readback"
+        )
+
+    def test_subissues_readback_complete_false_in_yaml(self) -> None:
+        """GIVEN API error readback
+        WHEN plan_to_yaml is called
+        THEN YAML contains 'complete: false' under github_subissues_actual.
+
+        Blocker 4: YAML output must expose incomplete status for consumers.
+        """
+        view_effects = {281: _make_issue_info(281, "OPEN")}
+        plan = _build_live(
+            FIXTURE_PARENT_BODY_254,
+            view_side_effects=view_effects,
+            subissues_actual=[],
+            subissues_readback_status="api_error",
+        )
+        yaml_output = pmc.plan_to_yaml(plan)
+        assert "complete: false" in yaml_output, (
+            "YAML must contain 'complete: false' when readback failed"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Blocker 7 — hidden/Bidi Unicode scan
+# ---------------------------------------------------------------------------
+
+
+class TestHiddenBidiUnicode:
+    """Blocker 7: no hidden/Bidi Unicode control characters in target files."""
+
+    _TARGETS = [
+        ".claude/skills/create-issue/scripts/plan_child_materialization.py",
+        ".claude/skills/create-issue/tests/test_plan_child_materialization.py",
+        ".claude/agents/issue-author.md",
+        ".claude/skills/issue-refinement-loop/SKILL.md",
+        ".claude/skills/edit-issue/SKILL.md",
+    ]
+
+    def test_no_hidden_bidi_chars_in_target_files(self) -> None:
+        """GIVEN target script / agent / skill files
+        WHEN each file is scanned for hidden/Bidi Unicode control characters
+        THEN no Cf/Cc category characters (except newline/tab/CR) are found.
+
+        Blocker 7: Bidi/hidden Unicode warning from GitHub PR view.
+        """
+        import unicodedata
+
+        repo_root = Path(__file__).parent.parent.parent.parent.parent  # up to repo root
+
+        bad: list[tuple[str, int, str, str]] = []
+        for rel_path in self._TARGETS:
+            p = repo_root / rel_path
+            if not p.is_file():
+                continue
+            text = p.read_text(encoding="utf-8")
+            for i, ch in enumerate(text):
+                cat = unicodedata.category(ch)
+                if cat in {"Cf", "Cc"} and ch not in "\n\r\t":
+                    bad.append((rel_path, i, hex(ord(ch)), unicodedata.name(ch, "")))
+
+        assert not bad, f"Found hidden/Bidi chars: {bad}"
