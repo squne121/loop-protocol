@@ -227,7 +227,7 @@ triage せずに積まれた Issue は定期 triage セッション（または 
 
 | triage 結果 | アクション |
 |---|---|
-| 有効な改善 | `triage-required` を外し、適切な `phase/` ラベルを付与して `state/queued` に移行 |
+| 有効な改善 | `triage-required` を外し、implementation issue canonical contract に沿って適切な `phase/` / `agent/` routing label を維持または付与する。着手可否は `issue-contract-review` の `status: go` と dependency close 状態で判定し、`state/queued` は付与しない |
 | 重複 | 既存 Issue にコメントして close（`duplicate` ラベル） |
 | 不要 | `not planned` で close（理由をコメントに記録） |
 | 判断保留 | `state/needs-human` を付与して人間判断を仰ぐ |

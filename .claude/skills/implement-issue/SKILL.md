@@ -13,6 +13,8 @@ description: 承認済みの implementation child issue（`issue-contract-review
 - `Issue番号` または `Issue URL`（必須）
 - `issue-contract-review` の contract-snapshot comment URL（必須）
 
+Note: `contract_snapshot_url` の省略時自動検出・自動 materialize は #149 の責務。本 skill 単体では URL 入力を必須とし、URL 未提供時は `impl-review-loop` / #149 実装後の preparation に委譲する。
+
 ## Procedure
 
 ### 1. Issue contract を再取得
@@ -31,7 +33,7 @@ gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels,comments
 - `## Stop Conditions`
 - 最新コメントに `## Contract Snapshot` があり、それと本文が整合している
 
-ready tuple（title `実装:` + `phase/implementation` + `state/queued`）が揃っているかも確認。不一致なら停止して人間判断を仰ぐ。
+consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、`state/needs-human` 不在、dependency all closed、最新 `CONTRACT_REVIEW_RESULT_V1 status: go`）が揃っているかも確認する。legacy state label の有無だけを理由に停止してはならない。不一致なら停止して人間判断を仰ぐ。
 
 ### 2. 複数 Issue 同時着手時の Allowed Paths 重複チェック
 
