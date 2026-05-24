@@ -407,10 +407,31 @@ CHILD_MATERIALIZATION_PLAN_V2:
       old_line: "- C254-5 ...（未起票） #285"
       new_line: "- C254-5 ... #285"
       expected_match_count: 1       # 1 以外の場合は edit-issue が abort
+  body_inventory:                   # AC2: candidate count vs parsed count の差分（parser gap 検出）
+    candidate_count: 5             # _is_candidate_line() で検出した行数
+    parsed_count: 4                # 実際にパースできた child 数
+    parser_gap_report:             # parsed_count < candidate_count の場合に生成
+      - line_number: 12
+        raw_line: "- A issue without colon"
+        gap_reason: unsupported_child_id_format   # GapReason literal
+        suggested_repair: "- A: issue without colon"
+        repair_confidence: high   # high | medium | low
+        minimal_context: "..."    # gap 前後数行のコンテキスト
+  github_subissues_actual:         # AC3: native GitHub Sub-issues API から取得した実際の sub-issues
+    - number: 281
+      title: "..."
+      state: OPEN | CLOSED
+      url: "https://github.com/..."
   required_issue_creations: []     # action=create_issue の child_id リスト
   required_issue_edits: []         # parent body 更新が必要な記述リスト
   warnings: []                     # 警告メッセージ（空でもキー必須）
 ```
+
+### child.action の追加値（V2 拡張）
+
+| action | 意味 |
+|---|---|
+| `register_subissue_or_human_escalation` | parent body に `#N` が存在するが native Sub-issues に未登録（AC4） |
 
 ### child.status の定義
 
@@ -459,6 +480,47 @@ plan_child_materialization.py
     → open-pr (Parent Child Materialization section)
     → post-merge-cleanup Section 6 (残 child 検出)
 ```
+
+## CHILD_MATERIALIZATION_RESULT_V2
+
+`issue-author` SubAgent が `task: materialize_children` を実行した後に返す出力スキーマ。
+`issue-refinement-loop` の Step 4.5 がこのスキーマを消費して `termination_reason` を決定する。
+
+```yaml
+CHILD_MATERIALIZATION_RESULT_V2:
+  status: ok | partial_failure | failed | human_escalation
+  created_issues:
+    - child_id: "A"                     # plan.children[*].child_id に対応
+      issue_number: 330
+      issue_url: "https://github.com/..."
+      action_taken: create_issue
+  updated_parent: true | false          # parent body を edit-issue で更新した場合 true
+  escalation_items:                     # human_escalation が必要な child のリスト
+    - child_id: "B"
+      reason: "repair_confidence: low — missing_title"
+      raw_line: "- B: some description without #ref"
+  errors:                               # 処理中にエラーが発生した child のリスト
+    - child_id: "C"
+      error: "create-issue failed: <error detail>"
+```
+
+### status の決定ルール
+
+| status | 条件 |
+|---|---|
+| `ok` | `created_issues >= 1` かつ `errors` が空 |
+| `partial_failure` | `created_issues >= 1` かつ `errors` が 1 件以上 |
+| `failed` | `created_issues == 0` かつ `errors` が 1 件以上 |
+| `human_escalation` | `escalation_items >= 1` かつ `errors` が空 |
+
+### issue-refinement-loop Step 4.5 での消費ルール
+
+| CHILD_MATERIALIZATION_RESULT_V2.status | termination_reason |
+|---|---|
+| `ok` | `approved`（Step 5 へ進む） |
+| `partial_failure` | `human_escalation`（失敗した child ID をコメントに記録） |
+| `failed` | `human_escalation` |
+| `human_escalation` | `human_escalation`（escalation_items をコメントに記録） |
 
 ## 設計原則の補足
 

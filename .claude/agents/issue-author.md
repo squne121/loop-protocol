@@ -27,6 +27,7 @@ permissionMode: acceptEdits
 | 新規起票 | ユーザー要求 / Outcome / scope ヒント | `create-issue` |
 | 既存修正 | `issue_number` + `reviewer_feedback_url` または `reviewer_feedback_text` | `edit-issue` |
 | 起票 + 即時修正 | ユーザー要求 + 追記内容 | `create-issue` → `edit-issue` 連続 |
+| child materialization | `task: materialize_children` + `CHILD_MATERIALIZATION_PLAN_V2` | `create-issue` + `edit-issue` (delivery-rollup-parent-update) |
 
 ## 振る舞い
 
@@ -34,7 +35,80 @@ permissionMode: acceptEdits
 
 - 新規起票なら `create-issue` の Procedure を実行する
 - 既存修正なら `edit-issue` の Procedure を実行する
-- 完了時は skill 側で定義された出力契約（`ISSUE_AUTHOR_COVERAGE_V1` / `ISSUE_EDIT_RESULT_V1` 等）を返す
+- `task: materialize_children` の場合は以下を実行する（AC6）:
+
+### task: materialize_children
+
+入力として `CHILD_MATERIALIZATION_PLAN_V2` を受け取り、以下の順序で処理する。
+
+**入力スキーマ**:
+```yaml
+task: materialize_children
+plan: <CHILD_MATERIALIZATION_PLAN_V2 の内容>
+parent_issue_number: <int>
+repo: <owner/repo>
+```
+
+**処理フロー**:
+1. `plan.children` を走査し、各 child の `action` に応じて処理する:
+   - `action: create_issue` → `create-issue` skill で新規起票する（dedupe チェック必須）
+   - `action: reuse_and_update_parent` → `edit-issue` の `delivery-rollup-parent-update` mode で parent body を更新する
+   - `action: register_subissue_or_human_escalation` → `gh` CLI で native Sub-issue 登録を試みる（**subissue_registration contract** 参照）。失敗または `repair_confidence: low` の場合は `escalation_items` に追加する
+   - `action: no_op` → スキップ
+   - `action: human_escalation` → `escalation_items` に追加してスキップ
+2. `plan.body_inventory.parser_gap_report` が存在する場合:
+   - `repair_confidence: high` のエントリは修復を試みる（issue-author が `edit-issue` 経由で parent body を修正する）
+   - `repair_confidence: low` / `repair_confidence: medium` のエントリは `escalation_items` に追加する
+3. すべての `action: create_issue` の処理完了後、`plan.parent_body_updates` に従って parent body を更新する（`edit-issue` の `delivery-rollup-parent-update` mode）
+4. 結果を `CHILD_MATERIALIZATION_RESULT_V2` として返す
+
+**subissue_registration contract**（`action: register_subissue_or_human_escalation` の処理手順）:
+
+```yaml
+subissue_registration:
+  preconditions:
+    - child issue number を REST id に解決（gh api repos/{repo}/issues/{number} で .id を取得）
+    - github_subissues_actual.complete == true（readback が ok であること）
+    - child が same repository owner に属する
+  mutation:
+    - gh api --method POST repos/{repo}/issues/{parent}/sub_issues -f sub_issue_id=<child_issue_id>
+  postconditions:
+    - GET repos/{repo}/issues/{parent}/sub_issues で child の number が exactly 1件確認
+  failure_routing:
+    403: human_escalation
+    404: human_escalation
+    410: human_escalation
+    422: human_escalation
+    rate_limit: human_escalation
+    readback_incomplete: human_escalation  # github_subissues_actual.complete == false の場合
+```
+
+**出力スキーマ** (`CHILD_MATERIALIZATION_RESULT_V2`):
+```yaml
+CHILD_MATERIALIZATION_RESULT_V2:
+  status: ok | partial_failure | failed | human_escalation
+  created_issues:
+    - child_id: "A"
+      issue_number: 330
+      issue_url: "https://github.com/..."
+      action_taken: create_issue
+  updated_parent: true | false
+  escalation_items:
+    - child_id: "B"
+      reason: "repair_confidence: low — missing_title"
+      raw_line: "..."
+  errors:
+    - child_id: "C"
+      error: "create-issue failed: ..."
+```
+
+`status` の決定ルール（Issue #328 AC6 enum に準拠）:
+- `created_issues` が 1 件以上かつ `errors` が 0 件 → `ok`
+- `created_issues` が 1 件以上かつ `errors` が 1 件以上 → `partial_failure`
+- `created_issues` が 0 件かつ `errors` が 1 件以上 → `failed`
+- `escalation_items` のみ（`errors` なし） → `human_escalation`
+
+- 完了時は skill 側で定義された出力契約（`ISSUE_AUTHOR_COVERAGE_V1` / `ISSUE_EDIT_RESULT_V1` / `CHILD_MATERIALIZATION_RESULT_V2` 等）を返す
 
 ## 制約
 

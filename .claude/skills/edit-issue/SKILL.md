@@ -302,7 +302,8 @@ input: CHILD_MATERIALIZATION_PLAN_V2   # plan_child_materialization.py の出力
 2. 通常手順のステップ 1（バックアップ取得）を実行する — 変更前 body を `tmp/issue_<N>_backup_<ts>.md` に保存。
 
 3. バックアップから新 body を生成する:
-   - `parent_body_updates[*].replace` を `parent_body_updates[*].with` に一括置換する
+   - `parent_body_updates[*].old_line` を `parent_body_updates[*].new_line` に一括置換する
+   - 各エントリの `expected_match_count` が指定されている場合、実際の置換件数と一致しない場合は abort する（fail-closed）
    - 許容される placeholder 置換:
      - `(未起票)` を `#<issue_number>` に置換
      - stale child list エントリの状態同期
