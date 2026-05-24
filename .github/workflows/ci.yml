@@ -96,7 +96,7 @@ jobs:
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
       - run: |
           mkdir -p ci_test_selection_artifacts
-          python3 .claude/scripts/generate_ci_test_selection_artifact.py --output ci_test_selection_artifacts/ci_test_selection_v1.json --head-sha "${{ github.sha }}" --workflow ci --job python-test
+          python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py --output ci_test_selection_artifacts/ci_test_selection_v1.json --head-sha "${{ github.sha }}" --workflow ci --job python-test
       - uses: actions/upload-artifact@v6
         with:
           name: ci_test_selection
