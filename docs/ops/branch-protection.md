@@ -34,32 +34,173 @@ GitHub Ruleset を一次保護とし、Branch protection rule を二次保護と
 ### 二次: Branch protection rule (`/branches/main/protection`)
 
 - `required_status_checks.contexts`: `typecheck`, `lint`, `test`, `build`, `python-test`（`strict: true`）
+- `required_status_checks.checks[].app_id`: 全て `15368`（GitHub Actions app）。check source は GitHub Actions に固定されており、外部 PAT / 第三者 GitHub App による status 詐称は受け付けない（Blocker 3 対応）
 - `enforce_admins.enabled`: `true`（admin bypass を禁止）
 - `required_pull_request_reviews.dismiss_stale_reviews`: `true`
-- `required_pull_request_reviews.required_approving_review_count`: `0`（PR フローは必須だが承認件数は 0。reviewer は SubAgent / 人間の運用判断で運用）
+- `required_pull_request_reviews.required_approving_review_count`: `0`（**意図的に 0**。本設定は「main 更新を PR 経由に限定する」ことが目的であり、「承認 1 件以上を必須にする」ことは #359 のスコープ外。承認要件の引き上げは別 Issue として扱う）
+- `required_pull_request_reviews.bypass_pull_request_allowances`: API レスポンスにフィールド自体が存在しない。個人 (user-owned) リポジトリでは GitHub が当該フィールドを返さず、PR review 要件を bypass できる users / teams / apps は構造上存在しない（Blocker 2 対応）
 - `required_conversation_resolution.enabled`: `true`
 - `required_linear_history.enabled`: `true`
 - `allow_force_pushes.enabled`: `false`
 - `allow_deletions.enabled`: `false`
+
+### required_approving_review_count を 0 とした判断（Blocker 5 対応）
+
+本設定は「main 更新を PR 経由に限定する」ことが目的であり、「承認 1 件以上を必須にする」ことは今回の #359 スコープ外。`required_approving_review_count` は意図的に 0 とする。
+
+将来 agent 運用事故の再発防止として一段強める場合の候補:
+
+- `required_approving_review_count: 1` 以上を必須化
+- `require_last_push_approval: true` で push 後の再承認を必須化
+
+いずれも別 Issue で議論し、本書とは独立して更新する。
+
+### Required status checks の source pinning（Blocker 3 対応）
+
+- Ruleset 側 `required_status_checks[].context` は status check 名のみ指定（context のみ）
+- Branch protection 側 `required_status_checks.checks[]` で 5 contexts すべてを `app_id: 15368`（GitHub Actions app）に固定
+- これにより、required check の status は GitHub Actions が報告したもののみが評価対象となる（外部 PAT / 別 GitHub App / 任意 user が `gh api .../statuses` で詐称した同名 status は無視される）
+- Ruleset 側にも `integration_id` で source pinning できるが、二層構成のうち Branch protection 側で固定済みのため、Ruleset 側は context-only で運用する（多層防御として十分）
 
 ## 検証手順
 
 ### 設定 snapshot の取得
 
 ```bash
-# Ruleset
+# Ruleset 一覧と詳細
 gh api repos/squne121/loop-protocol/rulesets --jq '.[] | {id, name, enforcement, target}'
-gh api repos/squne121/loop-protocol/rulesets/16796903
+gh api repos/squne121/loop-protocol/rulesets/16796903 \
+  --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'
 
 # Branch protection
 gh api repos/squne121/loop-protocol/branches/main/protection \
-  --jq '{required_status_checks, required_pull_request_reviews, required_conversation_resolution, enforce_admins, restrictions, allow_force_pushes, allow_deletions, required_linear_history}'
+  --jq '{
+    required_status_checks,
+    required_pull_request_reviews,
+    required_conversation_resolution,
+    enforce_admins,
+    restrictions,
+    allow_force_pushes,
+    allow_deletions,
+    required_linear_history
+  }'
+
+# bypass_pull_request_allowances の存在確認
+gh api repos/squne121/loop-protocol/branches/main/protection/required_pull_request_reviews \
+  --jq '.bypass_pull_request_allowances // "field_absent"'
 ```
+
+### 2026-05-24 取得 raw snapshot（Blocker 1 対応・監査正本）
+
+**Ruleset `16796903`** — `gh api .../rulesets/16796903 --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'`
+
+```json
+{
+  "id": 16796903,
+  "name": "main-direct-push-protection",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "current_user_can_bypass": "never",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": ["refs/heads/main"]
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "allowed_merge_methods": ["merge", "squash", "rebase"],
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_approving_review_count": 0,
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          { "context": "typecheck" },
+          { "context": "lint" },
+          { "context": "test" },
+          { "context": "build" },
+          { "context": "python-test" }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Branch protection** — `gh api .../branches/main/protection --jq '{...}'`（上記コマンド参照）
+
+```json
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["typecheck", "lint", "test", "build", "python-test"],
+    "checks": [
+      { "context": "typecheck", "app_id": 15368 },
+      { "context": "lint", "app_id": 15368 },
+      { "context": "test", "app_id": 15368 },
+      { "context": "build", "app_id": 15368 },
+      { "context": "python-test", "app_id": 15368 }
+    ]
+  },
+  "required_pull_request_reviews": {
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false,
+    "require_last_push_approval": false,
+    "required_approving_review_count": 0
+  },
+  "required_conversation_resolution": { "enabled": true },
+  "enforce_admins": { "enabled": true },
+  "restrictions": null,
+  "allow_force_pushes": { "enabled": false },
+  "allow_deletions": { "enabled": false },
+  "required_linear_history": { "enabled": true }
+}
+```
+
+**bypass_pull_request_allowances** — `gh api .../required_pull_request_reviews --jq '.bypass_pull_request_allowances // "field_absent"'`
+
+```
+field_absent
+```
+
+> このリポジトリは個人 (user-owned, `owner.type: User`) であり、GitHub REST は当該リポジトリの `required_pull_request_reviews` に `bypass_pull_request_allowances` フィールドを返さない。すなわち PR review 要件を bypass できる users / teams / apps は構造上存在しない（[REST API: Branch protection](https://docs.github.com/en/rest/branches/branch-protection?apiVersion=2022-11-28)）。組織リポジトリへ移管する場合は本フィールドが返るようになるため、その時点で本書を更新し空であることを再確認する。
 
 ### 直接 push 拒否の実測
 
+#### A. AC6 契約文言準拠 (`HEAD:main`)
+
+Issue #359 の AC6 と完全一致する形式での再現コマンド:
+
 ```bash
-# ローカル test ブランチで origin/main に直接 push を試みる
+git fetch origin main
+git checkout -b test-direct-push-main-protection origin/main
+git commit --allow-empty -m "test: verify main direct push protection"
+git push origin HEAD:main
+# 期待: GH013 / remote rejected — 失敗で終わる
+git checkout -  # 元のブランチへ戻る
+git branch -D test-direct-push-main-protection
+```
+
+#### B. ローカル汚染を最小化する form（commit-tree 経由）
+
+実際の 2026-05-24 実測ではローカルブランチを切らずに `update-ref` + `commit-tree` 経由で同等のテストを行った:
+
+```bash
 git fetch origin main
 git update-ref refs/heads/test-direct-push-main-protection origin/main
 TREE=$(git rev-parse refs/heads/test-direct-push-main-protection^{tree})
@@ -72,6 +213,20 @@ git push origin refs/heads/test-direct-push-main-protection:refs/heads/main
 # 期待: remote rejected — 失敗で終わる
 git branch -D test-direct-push-main-protection
 ```
+
+A と B は宛先 ref が同じ `refs/heads/main` であり、push 評価対象として GitHub remote 側は同一の保護 rule に照合する。
+
+#### Stop Condition: 想定外の push 成功
+
+上記 A / B のどちらの form でも、**push が成功した場合は即時 incident として扱う**:
+
+1. 直ちに作業を停止し、追加の push / 変更を一切行わない
+2. `origin/main` の HEAD を確認し、誤って進んだ commit を特定する
+3. PR #358 と同様の手順で人間判断で revert PR を起票する
+4. Ruleset (`16796903`) と Branch protection 設定を `gh api` で再取得し、`enforcement`, `bypass_actors`, `enforce_admins.enabled`, `required_status_checks` の差分を確認する
+5. 本書の AC マッピングを再検証する
+
+成功してしまった test commit は tree が同一であっても main 履歴を 1 commit 進める **main 汚染** であり、`origin/main` の前進が ruleset 違反の徴候となる。
 
 ### 2026-05-24 実測ログ（AC6 evidence）
 
@@ -98,9 +253,9 @@ error: failed to push some refs to 'https://github.com/squne121/loop-protocol.gi
 | AC2: PR 経由必須 / 直接 push 不可 | OK | Ruleset `pull_request` rule + branch protection `required_pull_request_reviews` |
 | AC3: required checks に 5 種が含まれる | OK | 両層に `typecheck/lint/test/build/python-test` 設定済み |
 | AC4: conversation resolution 必須 | OK | Ruleset `required_review_thread_resolution: true` + branch protection `required_conversation_resolution.enabled: true` |
-| AC5: admin / bypass actor 禁止 | OK | Ruleset `bypass_actors: []` (`current_user_can_bypass: never`) + branch protection `enforce_admins.enabled: true` |
-| AC6: 直接 push 拒否の実測 | OK | 上記「直接 push 拒否の実測」ログ参照 |
-| AC7: snapshot と検証手順を docs に記録 | OK | 本文書 |
+| AC5: admin / bypass actor 禁止 | OK | Ruleset `bypass_actors: []` (`current_user_can_bypass: never`) + branch protection `enforce_admins.enabled: true` + `bypass_pull_request_allowances` フィールド構造上不在（個人 repo） |
+| AC6: 直接 push 拒否の実測 | OK | 「直接 push 拒否の実測」セクション A (`HEAD:main` form) / B (commit-tree form) と 2026-05-24 実測ログ参照 |
+| AC7: snapshot と検証手順を docs に記録 | OK | 「2026-05-24 取得 raw snapshot」セクションに ruleset / branch protection の raw JSON、`bypass_pull_request_allowances` 確認結果、`required_status_checks.checks[].app_id` による source pinning を記録 |
 
 ## 補完策との関係
 
