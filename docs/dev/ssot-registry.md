@@ -137,6 +137,17 @@
   title: Game Thesis
   keywords: [game-thesis, concept, pitch, target player, design pillars, non-goals, design hypotheses, mda]
   description: ゲームのコアコンセプト、ターゲット、設計の柱、および設計仮説を定義するプロダクト仕様の正本
+  sections:
+    - "## Pitch"
+    - "## Target Player"
+    - "## Design Pillars"
+    - "## Non-Goals"
+    - "## Design Hypotheses"
+    - "## Intent"
+    - "## Open Questions"
+    - "## Playtest Hypotheses"
+    - "## Acceptance Criteria Boundary"
+    - "## Trace Links"
 
 - id: requirements
   path: docs/product/requirements.md
