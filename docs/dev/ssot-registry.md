@@ -176,6 +176,26 @@
     - "## Open Questions"
     - "## Playtest Hypotheses"
 
+- id: game-logic
+  path: docs/product/game-logic.md
+  title: Game Logic Specification
+  keywords: [game-logic, state-transition, input, fixed-timestep, accumulator, collision, ccd, persistence, snapshot, victory, defeat, deterministic-test]
+  description: 状態遷移・入力正規化・60Hz 固定タイムステップ・衝突・勝敗・保存境界を定義するゲームロジック仕様の正本
+  sections:
+    - "## 目的 / Intent"
+    - "## 正本階層 / Authority and Fallbacks"
+    - "## 要求 / Requirements"
+    - "## 状態遷移 / State Transitions"
+    - "## 入力 / Input"
+    - "## 時間モデル / Time Model"
+    - "## 衝突 / Collision"
+    - "## 勝敗 / Victory, Defeat, Draw"
+    - "## 保存境界 / Persistence Boundary"
+    - "## 非ゴール / Non-Goals"
+    - "## 下流境界 / Downstream Boundaries"
+    - "## 未解決の問い / Open Questions"
+    - "## 検証 / Verification Notes"
+
 ---
 
 ## ディレクトリ → SSOT マッピング
