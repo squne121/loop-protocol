@@ -32,11 +32,6 @@ gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels,comments
 - `## Allowed Paths`
 - `## Stop Conditions`
 - 最新コメントに `## Contract Snapshot` があり、それと本文が整合している
-- **VC preflight 結果の参照**（`issue-contract-review` Step 4 で生成）:
-  - `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight` の JSON が存在することを確認
-  - 各 VC の root-cause 分類（category / decision / confidence）が記載されていることを確認
-  - `status: pass` または `status: human_judgment` であることを確認（`status: blocked` なら停止）
-  - 本 skill での `## Verification Commands` 実行時に、preflight で `decision: human_judgment` だった VC については追加の注意を払う
 
 consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、`state/needs-human` 不在、dependency all closed、最新 `CONTRACT_REVIEW_RESULT_V1 status: go`）が揃っているかも確認する。legacy state label の有無だけを理由に停止してはならない。不一致なら停止して人間判断を仰ぐ。
 
