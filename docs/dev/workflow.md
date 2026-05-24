@@ -105,13 +105,76 @@ git branch -d worktree-<slug>
 
 | テンプレ | 用途 | 自動付与ラベル |
 |---|---|---|
-| `implementation.yml` | 実装作業 | `phase/implementation`, `state/queued`, `agent/implementer` |
+| `implementation.yml` | 実装作業 | `enhancement`, `phase/implementation`, `triage-required`, `agent/implementer` |
 | `research.yml` | 仕様調査・比較検討 | `phase/research`, `state/queued`, `agent/research` |
 | `parent.yml` | parent tracker（複数 child を束ねる） | `tracking`, `state/in-progress` |
 | `bug-report.yml` | エンドユーザーバグ報告 | `bug` |
 | `feature-request.yml` | エンドユーザー機能要望 | `enhancement` |
 
 `human-confirm.yml` は不採用（PR #16）。人間判断は元 Issue 内でブロッカー扱い + 本文修正の運用とする。
+
+### Implementation issue canonical contract
+
+implementation issue では、以下 3 つを別概念として扱う。
+
+#### Template auto-labels
+
+```yaml
+implementation_template_auto_labels:
+  - enhancement
+  - phase/implementation
+  - triage-required
+  - agent/implementer
+```
+
+- 正本は `.github/ISSUE_TEMPLATE/implementation.yml`
+- 自動付与ラベルは classification / routing 用であり、そのまま AI 着手可否の state machine に使わない
+
+#### Consumer ready contract
+
+```yaml
+implementation_consumer_ready_contract:
+  title_prefix:
+    - "実装:"
+    - "implement:"
+  required_routing_labels:
+    - phase/implementation
+  hard_stop_labels:
+    - state/needs-human
+  dependency_source_of_truth:
+    - GitHub native issue dependency
+    - line-anchored "Depends on #N" fallback
+  dependency_required_state: all_closed
+  contract_review:
+    required: "CONTRACT_REVIEW_RESULT_V1 status: go"
+```
+
+- `impl-review-loop` / `implement-issue` / `issue-contract-review` はこの contract を正本として着手可否を判定する
+- `triage-required` は補助ラベルであり、consumer ready contract の必須条件ではない
+
+#### Triage profile
+
+```yaml
+implementation_triage_profile:
+  unresolved_default:
+    - triage-required
+  triaged_valid:
+    remove:
+      - triage-required
+    preserve_or_add:
+      - phase/implementation
+      - agent/implementer
+  human_escalation:
+    - state/needs-human
+```
+
+- triage 完了後も ready 判定の primary signal は dependency close 状態と contract review 結果である
+
+#### Deprecated legacy labels
+
+- `state/queued` は deprecated / legacy であり、template auto-labels にも consumer ready contract にも含めない
+- `state/queued` 不在だけで BLOCKED 判定しない
+- `state/blocked` 残存だけで BLOCKED 判定しない
 
 ### PR テンプレート
 
