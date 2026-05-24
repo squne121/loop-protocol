@@ -44,13 +44,10 @@ INVENTORY_COLUMNS = [
 ]
 PLACEHOLDER_SNIPPETS = [
     "（例:",
-    "変更対象 schema:",
     "（変更前のキー名・フィールド・型）",
     "（変更後のキー名・フィールド・型）",
     "（rg で列挙したファイル）",
     "yes / no / partial",
-    "# before",
-    "# after",
 ]
 
 
