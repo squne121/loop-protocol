@@ -1,0 +1,88 @@
+# LOOP_PROTOCOL project-local command policy for Codex.
+# Keep repository work on the `rtk` execution harness when shell commands mutate state.
+
+prefix_rule(
+    pattern = ["rtk"],
+    decision = "allow",
+    justification = "Project work must run through the rtk execution harness.",
+    match = [
+        "rtk --help",
+        "rtk pnpm test",
+        "rtk gh issue view 1",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "status"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git status",
+        "git status --short",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "diff"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git diff",
+        "git diff --stat",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", "--show-current"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git branch --show-current",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "log"],
+    decision = "allow",
+    justification = "Read-only git inspection is allowed.",
+    match = [
+        "git log --oneline -5",
+        "git log --stat",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", ["push", "commit", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore"]],
+    decision = "forbidden",
+    justification = "Use `rtk git ...` for mutating repository operations so project policy is applied.",
+    match = [
+        "git commit -m update",
+        "git push",
+        "git checkout -b topic",
+        "git worktree add ../tmp main",
+    ],
+)
+
+prefix_rule(
+    pattern = ["pnpm"],
+    decision = "forbidden",
+    justification = "Use `rtk pnpm ...` so validation runs through the project harness.",
+    match = [
+        "pnpm test",
+        "pnpm lint",
+        "pnpm typecheck",
+        "pnpm build",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh"],
+    decision = "forbidden",
+    justification = "Use `rtk gh ...` so GitHub operations follow project policy.",
+    match = [
+        "gh issue view 1",
+        "gh issue create",
+        "gh pr create",
+        "gh api repos/squne121/loop-protocol",
+    ],
+)

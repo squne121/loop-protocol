@@ -277,3 +277,39 @@ gh api repos/squne121/loop-protocol/branches/main/protection
 ```
 
 組織全体で許可したいパターンは `.claude/settings.json`（repo-tracked / 共有）に置く。個人ローカル特化（端末固有のパス、テスト用環境変数等）は `.claude/settings.local.json` に置く。
+
+## Codex project-local permissions 方針
+
+Codex 側では `.claude/settings.json` と同型の allow / ask / deny を持たないため、project-local の境界は以下 3 面に分解して管理する。
+
+- `.codex/config.toml`: filesystem / network の permission profile を定義する
+- `.codex/rules/default.rules`: sandbox 外実行の allow / prompt / forbidden を定義する
+- `AGENTS.md`: repo 内で守る実行方針と `rtk` 前提を定義する
+
+公式ドキュメント（確認日: 2026-05-24）:
+
+- Config basics: https://developers.openai.com/codex/config-basic
+- Permissions: https://developers.openai.com/codex/permissions
+- Rules: https://developers.openai.com/codex/rules
+- AGENTS.md: https://developers.openai.com/codex/guides/agents-md
+
+### `.codex/config.toml` の責務
+
+- `approval_policy = "on-request"` を project-local の既定とする
+- `default_permissions` で Codex の custom profile を選択する
+- workspace root は write、`assets/` と `LICENSES/` は read-only に固定する
+- GitHub / npm registry だけを allow する network policy を持たせる
+- permission profile は beta であり、`sandbox_mode` と併用しない
+
+### `.codex/rules/default.rules` の責務
+
+- `rtk` を allow し、Codex の shell 実行入口を project harness に寄せる
+- direct `pnpm`、direct `gh`、mutating `git` は forbidden にする
+- read-only git inspection は最小限だけ allow する
+- `match` サンプルを付けて rule load 時に自己検証できる形を保つ
+
+### `AGENTS.md` の責務
+
+- Codex が repo ルートで読む project-local instruction surface として使う
+- `rtk` 経由実行、保護領域、検証コマンド対応を短く固定する
+- 既存の `CLAUDE.md` / SSOT を置き換えず、Codex が project-local guidance を確実に読める薄い入口として保つ
