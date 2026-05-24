@@ -18,11 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
 
+def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    GitHub API から Issue body を取得
 
-def get_issue_body(issue_number: int, repo: str) -> Optional[str]:
-    """GitHub API から Issue body を取得"""
+    戻り値: (body, error_code)
+      error_code: None (成功), "gh_auth_failed", "gh_repo_not_found", "gh_other_error"
+    """
     try:
         result = subprocess.run(
             [
@@ -41,19 +44,37 @@ def get_issue_body(issue_number: int, repo: str) -> Optional[str]:
         )
         if result.returncode == 0:
             data = json.loads(result.stdout)
-            return data.get("body")
+            return data.get("body"), None
+        else:
+            stderr_lower = result.stderr.lower()
+            if "not authenticated" in stderr_lower or "authentication failed" in stderr_lower:
+                return None, "gh_auth_failed"
+            elif "not found" in stderr_lower or "could not resolve" in stderr_lower:
+                return None, "gh_repo_not_found"
+            else:
+                return None, "gh_other_error"
+    except json.JSONDecodeError:
+        return None, "gh_json_parse_error"
+    except subprocess.TimeoutExpired:
+        return None, "gh_timeout"
     except Exception as e:
-        pass
-    return None
+        return None, "gh_other_error"
 
 
-def read_body_file(path: str) -> Optional[str]:
-    """ファイルから Issue body を読み込み"""
+def read_body_file(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    ファイルから Issue body を読み込み
+
+    戻り値: (body, error_code)
+      error_code: None (成功), "body_file_not_found", "body_parse_error"
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return None
+            return f.read(), None
+    except FileNotFoundError:
+        return None, "body_file_not_found"
+    except Exception as e:
+        return None, "body_parse_error"
 
 
 def extract_verification_commands_section(body: str) -> Optional[str]:
@@ -125,14 +146,26 @@ def compute_command_hash(command: str) -> str:
 
 
 def detect_compound_command(command: str) -> bool:
-    """コマンドが compound shell syntax を含むか検出"""
-    # && || | ; または heredoc を検出
-    # shlex.split で parse できるかで判定（実際の parse に委譲）
-    compound_indicators = [r'\s&&\s', r'\s\|\|\s', r'\s\|\s', r';\s', r'<<']
-    for indicator in compound_indicators:
-        if re.search(indicator, command):
-            return True
-    return False
+    """
+    コマンドが compound shell syntax を含むか検出
+
+    shlex.shlex で正確に tokenize し、shell operator を検出する。
+    これにより:
+    - cmd&&cmd（空白なし）も検出
+    - quoted string 内の | は誤検出しない
+    - redirect ( > < >> ) も compound と見なす (fail-closed)
+    """
+    try:
+        # C6: shlex.shlex with punctuation_chars=True for operator detection
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        tokens = list(lexer)
+    except ValueError:
+        # parse 失敗 = 複雑なコマンド = fail-closed で compound と見なす
+        return True
+
+    # shell operators
+    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+    return any(t in operators for t in tokens)
 
 
 def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str, str, int]:
@@ -180,18 +213,33 @@ def truncate_line_bytes(line: str, max_bytes: int) -> str:
     return raw[:max_bytes].decode("utf-8", errors="replace")
 
 
-def truncate_output(text: str, max_lines: int = 20, bytes_per_line: int = 2048) -> List[str]:
+def truncate_output(text: str, max_lines: int = 20, bytes_per_line: int = 2048) -> Tuple[List[str], bool, int]:
     """
     stdout / stderr を行数とバイト数で切り詰める。
 
-    戻り値: リスト形式の行（JSON 配列化用）
+    中リスク 3: truncation 情報を返す。
+    戻り値: (lines, was_truncated, original_line_count)
+      - lines: truncate されたテキストを行配列で返す（空の場合は []）
+      - was_truncated: 行数が max_lines を超えたかどうか
+      - original_line_count: 元のテキストの行数
     """
-    lines = text.split("\n")[:max_lines]
+    all_lines = text.split("\n")
+    original_line_count = len(all_lines)
+    lines = all_lines[:max_lines]
+    was_truncated = original_line_count > max_lines
+
     result = []
     for line in lines:
         # B7: byte-safe truncation
-        result.append(truncate_line_bytes(line, bytes_per_line))
-    return result
+        truncated_line = truncate_line_bytes(line, bytes_per_line)
+        if truncated_line or line:  # 中リスク 3: 空行の場合も keep
+            result.append(truncated_line)
+
+    # 中リスク 3: 空出力時は [] を返す（[""] ではなく）
+    if not result or (len(result) == 1 and result[0] == ""):
+        return [], was_truncated, original_line_count
+
+    return result, was_truncated, original_line_count
 
 
 def classify_result(
@@ -264,7 +312,19 @@ def classify_result(
 
     # Generic exit_code != 0: try to infer expected_fail for common utilities
     # grep, sed, awk などが no-match で exit 1 を返すことは expected
-    if exit_code == 1 and any(util in command for util in ["grep", "rg", "ag", "ack"]):
+    # ただし invalid regex や file not found は exclude (medium risk 1)
+    if exit_code == 1 and any(util in command for util in ["grep", "rg", "ag", "ack", "fgrep", "egrep"]):
+        # grep が invalid regex で fail した場合 expected_fail にしない
+        # "grep:" error pattern を検出
+        grep_error_patterns = [
+            r"grep:.+: No such file or directory",
+            r"grep:.+: Invalid regular expression",
+            r"egrep:.+",
+            r"fgrep:.+"
+        ]
+        is_likely_grep_error = any(re.search(pattern, stderr) for pattern in grep_error_patterns)
+        if is_likely_grep_error:
+            return "human_judgment", "unknown", "human_judgment", "grep error classification uncertain"
         return "expected_fail", "expected_baseline_fail", "go", None
 
     # Unknown: cannot classify
@@ -305,6 +365,8 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
     """
     B8: JSON results を CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight に対応する YAML fragment に変換.
 
+    C3: human_judgment を保持する。vc_preflight.passed は status == "pass" のときのみ true。
+
     戻り値は YAML 形式の dict.
     """
     vc_failed_as_expected = sum(
@@ -316,11 +378,17 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
     vc_unrunnable = sum(
         1 for r in results if r["classification"] == "blocked"
     )
+    vc_human_judgment = sum(
+        1 for r in results if r["decision"] == "human_judgment"
+    )
 
     classifications = []
     for r in results:
         stdout_lines = r["stdout_head"]
         stderr_lines = r["stderr_head"]
+
+        # C3: decision をそのまま渡す（human_judgment を保持）
+        decision = r["decision"]
 
         classification_item = {
             "ac": r["ac"],
@@ -332,7 +400,7 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
                 "stdout_excerpt": " ".join(stdout_lines[:5]) if stdout_lines else "",
                 "stderr_excerpt": " ".join(stderr_lines[:5]) if stderr_lines else "",
             },
-            "decision": "go" if r["decision"] == "go" else "blocked",
+            "decision": decision,
         }
         classifications.append(classification_item)
 
@@ -342,6 +410,7 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
             "vc_failed_as_expected": vc_failed_as_expected,
             "vc_passed_unexpectedly": vc_passed_unexpectedly,
             "vc_unrunnable": vc_unrunnable,
+            "vc_human_judgment": vc_human_judgment,
             "classifications": classifications,
         }
     }
@@ -367,15 +436,16 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Issue body を取得
+    # Issue body を取得 (C2: error code と一緒に返す)
     body = None
     source_kind = None
+    error_code = None
 
     if args.body_file:
-        body = read_body_file(args.body_file)
+        body, error_code = read_body_file(args.body_file)
         source_kind = "body_file"
     elif args.issue:
-        body = get_issue_body(args.issue, args.repo)
+        body, error_code = get_issue_body(args.issue, args.repo)
         source_kind = "github_issue"
 
     if not body:
@@ -394,10 +464,11 @@ def main() -> int:
                 "extraction_errors": 1,
             },
             "results": [],
-            "errors": ["Failed to retrieve Issue body"],
+            "errors": [error_code or "failed_to_retrieve_issue_body"],
         }
         print(json.dumps(result, indent=2))
-        return 0
+        # C2: exit code 2 for retrieval/parse errors
+        return 2 if error_code else 2
 
     # Verification Commands セクションを抽出
     vc_section = extract_verification_commands_section(body)
@@ -423,7 +494,8 @@ def main() -> int:
             "errors": ["Verification Commands section not found"],
         }
         print(json.dumps(result, indent=2))
-        return 0
+        # C2: exit code 2 for extraction errors
+        return 2
 
     # bash ブロックからコマンドを抽出
     blocks = extract_fenced_bash_blocks(vc_section)
@@ -454,7 +526,8 @@ def main() -> int:
             "errors": ["No verification commands extracted from Verification Commands section"],
         }
         print(json.dumps(result, indent=2))
-        return 0
+        # C2: exit code 2 for extraction errors
+        return 2
 
     # 各コマンドを実行して分類
     results = []
@@ -485,6 +558,10 @@ def main() -> int:
                 exit_code, stdout, stderr, command
             )
 
+        # C4: confidence を compute_confidence 経由で統一
+        stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, args.max_head_lines)
+        stderr_head, stderr_truncated, stderr_orig_count = truncate_output(stderr, args.max_head_lines)
+
         result_item = {
             "ac": ac_label or "AC_UNKNOWN",
             "line": line_no,
@@ -495,9 +572,13 @@ def main() -> int:
             "classification": classification,
             "category": category,
             "decision": decision,
-            "confidence": "high" if decision != "human_judgment" else "medium",
-            "stdout_head": truncate_output(stdout, args.max_head_lines),
-            "stderr_head": truncate_output(stderr, args.max_head_lines),
+            "confidence": compute_confidence(category),  # C4: category ベースで統一
+            "stdout_head": stdout_head,
+            "stdout_truncated": stdout_truncated,
+            "stdout_original_line_count": stdout_orig_count,
+            "stderr_head": stderr_head,
+            "stderr_truncated": stderr_truncated,
+            "stderr_original_line_count": stderr_orig_count,
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
         }
@@ -530,12 +611,42 @@ def main() -> int:
 
     # B8: Output format selection
     if args.format == "contract-review-fragment":
+        # C1: lazy import yaml - only when needed for fragment output
+        try:
+            import yaml
+        except ImportError:
+            error_result = {
+                "schema": "baseline_vc_preflight/v1",
+                "issue": args.issue or 0,
+                "repo": args.repo,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                "source": {
+                    "kind": source_kind,
+                    "body_sha256": f"sha256:{compute_source_hash(body)}",
+                },
+                "status": "blocked",
+                "summary": summary,
+                "results": results,
+                "errors": ["PyYAML is required for contract-review-fragment format; install pyyaml"],
+            }
+            print(json.dumps(error_result, indent=2))
+            # C2: exit code 2 for missing dependency
+            return 2
         fragment = generate_contract_review_fragment(status, results)
         print(yaml.dump(fragment, default_flow_style=False))
     else:
         print(json.dumps(output, indent=2))
 
-    return 0
+    # C2: Exit code contract
+    # status: pass → 0, blocked → 1, human_judgment → 3
+    if status == "pass":
+        return 0
+    elif status == "blocked":
+        return 1
+    elif status == "human_judgment":
+        return 3
+    else:
+        return 0  # default fallback
 
 
 if __name__ == "__main__":
