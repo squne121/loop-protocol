@@ -315,7 +315,7 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 |---|---|---|
 | CI 連動（`pnpm policy:check` / python-test workflow）| 実装済み | #324 |
 | Claude hook（Stop/SubagentStop での自動実行）| 実装済み | #325 |
-| Skill（操作手順の標準化・自動発火）| 未実装 | #326 |
+| Skill（操作手順の標準化・手動呼び出し）| 実装済み | #326 |
 | 人間導入手順書（onboarding）| 実装済み | #245 |
 | pilot smoke test（Kill Switch 動作確認）| 未実装 | #246 |
 
