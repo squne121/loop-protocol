@@ -244,33 +244,44 @@ Issue の title / body / labels から以下のシグナルを検知し、`LOOP_
 **検知対象シグナル**:
 
 ```yaml
-product_spec_signal_patterns:
-  - "docs/product/**"
-  - ".specify/**"
-  - "spec.md"
-  - "plan.md"
-  - "tasks.md"
-  - "speckit"
-  - "Spec Kit"
+signal_matching:
+  normalize:
+    - issue.title / body を lower-case に正規化
+    - labels は label.name の配列として扱う
+    - slash command は /speckit.tasks / speckit-tasks / $speckit-tasks を同系統として扱う
+  patterns:
+    docs_product_path: '(^|[\s`"'''])docs/product/[^ \n`"''']+'
+    specify_path: '(^|[\s`"'''])\.specify/[^ \n`"''']+'
+    spec_file: '(^|/)spec\.md\b'
+    plan_file: '(^|/)plan\.md\b'
+    tasks_file: '(^|/)tasks\.md\b'
+    speckit_token: '\b(spec kit|spec-kit|speckit|/speckit\.|speckit-|\$speckit-)\b'
 ```
 
-検知ロジック（擬似コード）:
+検知ロジック: 上記 patterns を正規化済み issue.title / body / labels に対して regex マッチし、1 件以上ヒットした場合 `LOOP_STATE.product_spec_context.detected = true` を設定し、マッチしたパターン名を `LOOP_STATE.product_spec_context.signals` に追加する。
+
+`work_kind` の分類（precedence-based）:
 
 ```yaml
-for pattern in product_spec_signal_patterns:
-  if pattern in issue.title or pattern in issue.body or pattern in issue.labels:
-    LOOP_STATE.product_spec_context.detected = true
-    LOOP_STATE.product_spec_context.signals.append(pattern)
+work_kind_precedence:
+  1. tasks_file シグナルあり and 実装指示あり（「直接実装」「このまま実装」「タスクを実行」等）:
+       work_kind: tasks_materialization
+       fail_closed: true
+  2. tasks_file シグナルあり（実装指示の有無に関わらず、シグナルが存在する時点で要注意）:
+       work_kind: tasks_materialization  # conservative fallback
+       fail_closed: true
+  3. spec_or_plan_or_specify_signal あり and 更新意図あり:
+       work_kind: spec_update
+  4. spec_or_plan_or_specify_signal あり:
+       work_kind: spec_creation
+  5. speckit_token のみ:
+       work_kind: spec_creation
+  6. その他（docs_product のみ等）:
+       work_kind: unknown
+       fail_closed_if_tasks_signal_present: true
 ```
 
-`work_kind` の分類:
-
-| シグナル | work_kind |
-|---|---|
-| `spec.md` / `plan.md` / `.specify/**` のみ | `spec_creation` |
-| 既存 `docs/product/**` の更新 | `spec_update` |
-| `tasks.md` + 実装指示 | `tasks_materialization` |
-| 複数シグナルの組み合わせで判別不能 | `unknown` |
+tasks_file シグナルが存在する時点で `tasks_materialization` として扱い、implementation route には進まない（fail-closed）。
 
 **Routing Gate（`product_spec_context.detected: true` の場合）**:
 
@@ -282,17 +293,38 @@ product_spec_routing_gate:
     - work_kind を routing hint として記録する（後続 worker が参照するが、refinement loop は上書きしない）
 
   tasks_md_guard:
-    # tasks.md への直接実装要求を検知した場合は fail-closed で振り分ける
+    # tasks.md シグナルを検知した場合は fail-closed で振り分ける
     trigger: >
       LOOP_STATE.product_spec_context.work_kind == tasks_materialization
-      and Issue body に「直接実装」「このまま実装」「タスクを実行」等の実装指示が含まれる
-    action: >
-      implementation route に進まず、Issue materialization route へ振り分ける。
-      後続 worker（speckit-taskstoissues skill）への委譲を推奨する旨を LOOP_STATE に記録する。
+    action:
+      - LOOP_STATE.product_spec_context.routing_target を "issue_materialization" に設定
+      - implementation route に進まない（fail-closed）
     fail_closed: true  # 判定不能な場合も implementation route には進まない
+
+  routing_targets:
+    tasks_materialization_route:
+      orchestrator_action:
+        - LOOP_STATE.product_spec_context.routing_target を "issue_materialization" に設定
+        - implementation route に進まない（fail-closed）
+      worker_chain_hint: >
+        issue-author SubAgent → speckit-taskstoissues skill → create-issue skill の順で処理する。
+        orchestrator（issue-refinement-loop）は worker chain を直接実行しない。
+        main thread が routing 先を確認した後、issue-author SubAgent を委譲する。
+      mutation_boundary: >
+        main thread が mutation の可否を決定する。
+        issue-author SubAgent のみが Issue 起票（materialization）を実行する。
 ```
 
 **成果物手順の禁止**: この gate は signal detection / LOOP_STATE 更新 / worker routing のみを行う。spec 作成・更新・変換・archive の具体手順はこの gate に含まない。成果物の詳細手順は後続 skill（speckit-taskstoissues 等）が担う。
+
+## Product/Spec Kit Routing Gate — Follow-up Issues
+
+以下の Issue が #332 の分割先として起票または参照されている:
+
+- **#338** — `review-issue` / `issue-reviewer`: product trace fields の構造チェック追加
+- **#335** — `issue-contract-review`: product/spec-kit implementation preflight
+- **#333** — `impl-review-loop` / `implementation-worker`: tasks.md / speckit-implement direct execution guard
+- **#339** — `speckit-taskstoissues`: LOOP_PROTOCOL adapter alignment
 
 Step 0e 完了後、Step 0-hygiene に進む。
 
