@@ -6,12 +6,77 @@
 
 ```yaml
 issue_number: <int, 必須>
-contract_snapshot_url: <URL, 必須>
+contract_snapshot_url: <URL, 任意>  # 省略時は以下の自動検出フローで取得
 max_iterations: 5  # 任意
 ```
 
-- `contract_snapshot_url` のコメントを `gh api` で取得し、`status: go` 判定が記録されていることを確認
-- 不一致の場合は `issue-contract-review` を先に通すよう人間に提案して停止
+### 1-a. `contract_snapshot_url` が提供された場合
+
+`gh api` でコメントを取得し、`CONTRACT_REVIEW_RESULT_V1`・`generated_by: issue-contract-review`・`status: go` の組み合わせが記録されていることを確認する。
+確認できない場合は停止し、人間判断を仰ぐ。
+
+`LOOP_STATE.contract_snapshot_source` に `provided` を記録する。
+
+### 1-b. `contract_snapshot_url` が未提供の場合（自動検出フロー）
+
+Issue コメント一覧から `CONTRACT_REVIEW_RESULT_V1` marker を持つ YAML block を検出し、以下の流れで contract_snapshot_url を決定する。
+
+**前提: valid CONTRACT_REVIEW_RESULT_V1 の定義**
+
+YAML block は `CONTRACT_REVIEW_RESULT_V1` marker を含むコメント本文内の fenced code block（``` yaml ... ```）に限定して抽出する。以下の fields がすべて存在し、値が妥当であることを必須とする:
+
+- `status`: `go | blocked` のいずれか
+- `generated_by`: `issue-contract-review`
+- `issue_url`: 現在の Issue URL と完全一致（例: https://github.com/<owner>/<repo>/issues/<current_issue_number>）
+- `generated_at`: ISO8601 形式の timestamp
+
+本文に `CONTRACT_REVIEW_RESULT_V1` / `generated_by: issue-contract-review` / `status: go` が含まれるだけでは採用しない。review comments や example code blocks の引用を誤採用しないこと。
+
+**Issue コメント取得の手順**
+
+```bash
+REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+ISSUE_NUMBER=<issue_number>
+
+gh api --paginate \
+  "repos/${REPO_FULL_NAME}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+  --jq '.[] | select(.body | contains("CONTRACT_REVIEW_RESULT_V1")) |
+        {id, html_url, created_at, updated_at, body}'
+```
+
+出力は comment `id` 昇順（ascending）で返される。最新判定は `created_at desc, id desc` の precedence で行う（newer が先）。
+
+**ステップ 1: 最新 `status: blocked` チェック**
+
+上記コメント一覧から、valid `CONTRACT_REVIEW_RESULT_V1` YAML block を持つ最新コメント（`created_at desc, id desc`）を特定する。その `status` が `blocked` である場合は、古い `status: go` コメントが存在していても採用せず停止する。
+
+```
+最新の valid CONTRACT_REVIEW_RESULT_V1 が status: blocked → 停止（人間判断）
+```
+
+**ステップ 2: 既存 `status: go` の検出（idempotency 保証）**
+
+最新の valid `CONTRACT_REVIEW_RESULT_V1` が `status: go` である場合、そのコメント URL を `contract_snapshot_url` として採用する。
+既存 `status: go` が存在する場合は、以降の `issue-contract-review` 先行実行をスキップする（idempotency 保証）。
+
+`LOOP_STATE.contract_snapshot_source` に `detected_existing` を記録する。
+
+**ステップ 3: 既存 `status: go` が存在しない場合 — `issue-contract-review` 先行実行**
+
+有効な `status: go` が検出されなかった場合にのみ、`issue-contract-review` を先行実行する。
+
+実行後、生成された最新の `CONTRACT_REVIEW_RESULT_V1` を再取得し、以下で分岐する:
+
+- `status: go` かつ `generated_by`, `issue_url`, `generated_at` が妥当:
+  - その comment URL を `contract_snapshot_url` として採用
+  - `LOOP_STATE.contract_snapshot_source` に `materialized_by_issue_contract_review` を記録
+- `status: blocked`:
+  - `contract_snapshot_url` を設定せず停止
+  - `LOOP_STATE.termination_reason` に `human_escalation` を記録
+- 有効な `CONTRACT_REVIEW_RESULT_V1` が見つからない:
+  - 停止し、人間判断を仰ぐ
+
+> **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
 ## 2. ready tuple の再確認
 
@@ -118,6 +183,7 @@ iteration = 0 で開始:
 LOOP_STATE:
   issue_number: <int>
   contract_snapshot_url: <URL>
+  contract_snapshot_source: provided | detected_existing | materialized_by_issue_contract_review
   iteration: 0
   max_iterations: 5
   worktree: .claude/worktrees/issue-<番号>-<slug>
