@@ -120,6 +120,47 @@ issue_kind: implementation
         lp002_errors = [e for e in result.errors if e.rule_id == "LP002"]
         assert any("contract_schema_version" in e.message for e in lp002_errors)
 
+    def test_lp002_positive_yaml_syntax_error(self):
+        """AC2: LP002 positive fixture - invalid YAML syntax."""
+        body = """
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+  invalid: [unclosed list
+```
+
+## Acceptance Criteria
+
+- [ ] AC1: Test
+"""
+        result = validate_issue_body(body)
+        assert result.status == "fail"
+        lp002_errors = [e for e in result.errors if e.rule_id == "LP002"]
+        assert len(lp002_errors) >= 1, "LP002 should detect YAML syntax errors"
+        assert any("YAML" in e.message or "syntax" in e.message.lower() for e in lp002_errors)
+
+    def test_lp002_positive_yaml_not_dict(self):
+        """AC2: LP002 positive fixture - YAML is not a dict (list instead)."""
+        body = """
+## Machine-Readable Contract
+
+```yaml
+- item1
+- item2
+```
+
+## Acceptance Criteria
+
+- [ ] AC1: Test
+"""
+        result = validate_issue_body(body)
+        assert result.status == "fail"
+        lp002_errors = [e for e in result.errors if e.rule_id == "LP002"]
+        assert len(lp002_errors) >= 1, "LP002 should detect non-dict YAML"
+        assert any("dictionary" in e.message.lower() or "dict" in e.message.lower() for e in lp002_errors)
+
     def test_lp002_false_positive_valid_yaml(self):
         """AC3: LP002 false-positive - valid YAML contract."""
         body = """
@@ -136,7 +177,7 @@ issue_kind: implementation
 """
         result = validate_issue_body(body)
         lp002_errors = [e for e in result.errors if e.rule_id == "LP002"]
-        assert len(lp002_errors) == 0
+        assert len(lp002_errors) == 0, "LP002 should pass valid YAML"
 
 
 class TestLP010ACVCMismatch:
@@ -300,8 +341,8 @@ test -f file  # AC1
 class TestLP012RgEncodingFlag:
     """LP012: rg -E encoding flag misuse."""
 
-    def test_lp012_positive_rg_e_with_encoding(self):
-        """AC9: LP012 positive fixture - rg -E with encoding flag."""
+    def test_lp012_positive_rg_e_token_aware(self):
+        """AC9: LP012 positive fixture - rg -E flag (token-aware detection)."""
         body = """
 ## Acceptance Criteria
 
@@ -310,7 +351,7 @@ class TestLP012RgEncodingFlag:
 ## Verification Commands
 
 ```bash
-rg -E 'pattern' --encoding=UTF-8 file  # AC1
+rg -E 'pattern' file  # AC1
 ```
 
 ## Allowed Paths
@@ -318,11 +359,31 @@ rg -E 'pattern' --encoding=UTF-8 file  # AC1
 - /path
 """
         result = validate_issue_body(body)
-        # Note: LP012 detection may not trigger on all patterns
-        # This is a simplified test case
         lp012_errors = [e for e in result.errors if e.rule_id == "LP012"]
-        # Token-aware detection should find this
-        # (simplified implementation may not detect all cases)
+        # Token-aware detection should find 'rg' + '-E' token combination
+        assert len(lp012_errors) >= 1, "LP012 should detect rg with -E flag"
+        assert any("rg -E" in e.message.lower() or "-E" in e.message for e in lp012_errors)
+
+    def test_lp012_false_positive_rg_encoding_only(self):
+        """AC3: LP012 false-positive - rg with --encoding but no -E."""
+        body = """
+## Acceptance Criteria
+
+- [ ] AC1: Test
+
+## Verification Commands
+
+```bash
+rg --encoding=UTF-8 'pattern' file  # AC1
+```
+
+## Allowed Paths
+
+- /path
+"""
+        result = validate_issue_body(body)
+        lp012_errors = [e for e in result.errors if e.rule_id == "LP012"]
+        assert len(lp012_errors) == 0, "LP012 should allow --encoding without -E flag"
 
     def test_lp012_false_positive_rg_without_e_flag(self):
         """AC3: LP012 false-positive - rg without -E flag."""
@@ -343,7 +404,7 @@ rg 'pattern' file  # AC1
 """
         result = validate_issue_body(body)
         lp012_errors = [e for e in result.errors if e.rule_id == "LP012"]
-        assert len(lp012_errors) == 0
+        assert len(lp012_errors) == 0, "LP012 should allow rg without -E flag"
 
 
 class TestLP013DeletionNegativeGrep:
@@ -565,7 +626,7 @@ class TestMinimalContextLimits:
     """AC6: minimal_context is limited to 5 lines and 2KB."""
 
     def test_minimal_context_size_limits(self):
-        """AC6: minimal_context respects size limits."""
+        """AC6: minimal_context respects size limits (multi-line case)."""
         large_body = """
 ## Acceptance Criteria
 
@@ -592,6 +653,34 @@ class TestMinimalContextLimits:
                 # Check byte limit
                 context_str = '\n'.join(error.minimal_context)
                 assert len(context_str.encode('utf-8')) <= 2048
+
+    def test_minimal_context_single_long_line(self):
+        """AC6: minimal_context respects byte limit with single long line."""
+        # Create a body with a single very long line (3KB)
+        long_line = "x" * 3000
+        body = f"""
+## Acceptance Criteria
+
+- [ ] AC1: Test
+
+## Verification Commands
+
+```bash
+{long_line}  # AC1
+```
+
+## Allowed Paths
+
+- /path
+"""
+        result = validate_issue_body(body)
+
+        for error in result.errors:
+            if error.minimal_context:
+                # Check byte limit is enforced even for single long lines
+                context_str = '\n'.join(error.minimal_context)
+                assert len(context_str.encode('utf-8')) <= 2048, \
+                    f"Context exceeded 2KB limit: {len(context_str.encode('utf-8'))} bytes"
 
 
 class TestSHA256Hash:

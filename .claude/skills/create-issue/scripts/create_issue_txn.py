@@ -1108,14 +1108,14 @@ def _run_issue_body_validator(body: str) -> dict[str, Any]:
     """Call validate_issue_body.py validator on issue body text.
 
     Returns the JSON output from the validator (parsed).
-    Raises on validator exit code != 0/1 (internal error case exit 2).
+    Raises on validator exit code != 0/1 (internal error case exit 2 or unknown code).
     """
     import subprocess
     import json
     import tempfile
 
-    # Write body to temporary file for validator
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+    # Write body to temporary file for validator (with explicit UTF-8 encoding)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.md', delete=False) as f:
         f.write(body)
         temp_body_file = f.name
 
@@ -1143,11 +1143,12 @@ def _run_issue_body_validator(body: str) -> dict[str, Any]:
                 output=cp.stdout[:500]
             )
 
-        # Validator exit codes: 0 = pass, 1 = fail (with errors in JSON), 2 = internal error
-        if cp.returncode == 2:
+        # Validator exit codes: 0 = pass, 1 = fail (with errors in JSON)
+        # Any other exit code (including 2 for internal error) is fail-closed
+        if cp.returncode not in (0, 1):
             raise TransactionError(
                 stage="issue-body-validate",
-                message="Validator internal error (exit code 2)",
+                message=f"Validator error (exit code {cp.returncode})",
                 output=cp.stderr[:500] if cp.stderr else cp.stdout[:500]
             )
 

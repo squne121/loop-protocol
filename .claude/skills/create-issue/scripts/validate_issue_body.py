@@ -18,6 +18,7 @@ import json
 import re
 import shlex
 import sys
+import yaml
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -115,6 +116,7 @@ def _get_context_lines(body: str, start_line: int, end_line: int, max_lines: int
 
     Returns (context_lines, truncated_flag).
     Lines are 1-indexed.
+    Both max_lines and max_bytes limits are enforced.
     """
     lines = body.split('\n')
 
@@ -122,18 +124,32 @@ def _get_context_lines(body: str, start_line: int, end_line: int, max_lines: int
     start = max(0, start_line - 1)
     end = min(len(lines), end_line)
 
-    context = lines[start:end]
+    context = lines[start:end][:max_lines]  # First limit to max_lines
 
-    # Check size limits
-    context_str = '\n'.join(context)
-    if len(context) > max_lines or len(context_str.encode('utf-8')) > max_bytes:
-        # Truncate to first max_lines
-        context = context[:max_lines]
-        truncated = True
-    else:
-        truncated = False
+    # Then enforce byte limit
+    truncated = False
+    result = []
+    total_bytes = 0
 
-    return context, truncated
+    for line in context:
+        encoded = line.encode('utf-8')
+        # Account for newline separator (1 byte)
+        line_with_newline_cost = len(encoded) + 1
+
+        if total_bytes + line_with_newline_cost > max_bytes:
+            # This line would exceed limit
+            if total_bytes == 0:
+                # First line is too long, truncate it
+                remaining = max_bytes
+                truncated_line = encoded[:remaining].decode('utf-8', errors='ignore')
+                result.append(truncated_line)
+            truncated = True
+            break
+
+        result.append(line)
+        total_bytes += line_with_newline_cost
+
+    return result, truncated
 
 
 def _extract_ac_numbers(body: str) -> set[str]:
@@ -219,15 +235,50 @@ def _validate_lp002_invalid_machine_readable_contract(body: str) -> list[Validat
 
     yaml_content = yaml_match.group(1)
 
-    # Basic YAML validation: check for required fields if contract exists
+    # Parse and validate YAML
+    errors = []
+
+    try:
+        data = yaml.safe_load(yaml_content)
+    except yaml.YAMLError as exc:
+        context, trunc = _get_context_lines(body, start_line, end_line)
+        return [ValidationError(
+            rule_id="LP002",
+            severity="error",
+            section="Machine-Readable Contract",
+            line_start=start_line,
+            line_end=end_line,
+            message=f"Machine-Readable Contract YAML syntax error: {str(exc)[:100]}",
+            minimal_context=context,
+            context_truncated=trunc,
+            fix_hint="Fix YAML syntax errors in contract block.",
+            autofixable=False
+        )]
+
+    # Check if parsed data is a dict
+    if not isinstance(data, dict):
+        context, trunc = _get_context_lines(body, start_line, end_line)
+        return [ValidationError(
+            rule_id="LP002",
+            severity="error",
+            section="Machine-Readable Contract",
+            line_start=start_line,
+            line_end=end_line,
+            message="Machine-Readable Contract YAML must be a dictionary",
+            minimal_context=context,
+            context_truncated=trunc,
+            fix_hint="Ensure YAML contract root is a dictionary (key: value pairs).",
+            autofixable=False
+        )]
+
+    # Check for required fields
     required_contract_fields = [
         "contract_schema_version",
         "issue_kind"
     ]
 
-    errors = []
     for field in required_contract_fields:
-        if not re.search(rf'^\s*{re.escape(field)}:', yaml_content, re.MULTILINE):
+        if field not in data:
             context, trunc = _get_context_lines(body, start_line, end_line)
             errors.append(ValidationError(
                 rule_id="LP002",
@@ -319,7 +370,11 @@ def _validate_lp011_verification_command_format(body: str) -> list[ValidationErr
 
 
 def _validate_lp012_rg_encoding_flag(body: str) -> list[ValidationError]:
-    """LP012: Detect misuse of rg -E flag (should not include encoding)."""
+    """LP012: Detect misuse of rg -E flag.
+
+    The -E flag in ripgrep is for --encoding (specifying file encoding),
+    not for ERE like grep -E. Combining rg with -E (encoding flag) is error-prone.
+    """
     section_info = _extract_section(body, "Verification Commands")
     if not section_info:
         return []
@@ -331,7 +386,7 @@ def _validate_lp012_rg_encoding_flag(body: str) -> list[ValidationError]:
     current_line = start_line
 
     for line in lines:
-        # Skip non-command lines
+        # Skip pure comment lines or empty lines
         if line.strip().startswith('#') or not line.strip():
             current_line += 1
             continue
@@ -339,31 +394,27 @@ def _validate_lp012_rg_encoding_flag(body: str) -> list[ValidationError]:
         # Check if this is an executable command line (not a comment)
         if 'rg' in line:
             try:
-                tokens = shlex.split(line)
-                # Check for 'rg -E' pattern without encoding
-                for i, token in enumerate(tokens):
-                    if token == 'rg' and i + 1 < len(tokens) and tokens[i + 1] == '-E':
-                        # Check if there's an encoding flag after -E
-                        rest = ' '.join(tokens[i:])
-                        if '--encoding' in rest or '-E' in rest:
-                            # This is a false positive - check if it's actually problematic
-                            # LP012 targets: rg -E with encoding mismatch
-                            if re.search(r'rg\s+-E.*?--encoding\s*=\s*\w+', rest):
-                                context, trunc = _get_context_lines(body, current_line, current_line)
-                                errors.append(ValidationError(
-                                    rule_id="LP012",
-                                    severity="error",
-                                    section="Verification Commands",
-                                    line_start=current_line,
-                                    line_end=current_line,
-                                    message="rg -E should not combine with --encoding flag (token-aware detection)",
-                                    minimal_context=context,
-                                    context_truncated=trunc,
-                                    fix_hint="Use rg -P for pattern matching instead of -E with encoding.",
-                                    autofixable=False
-                                ))
+                # Remove trailing # AC<N> marker before tokenizing
+                cleaned = re.sub(r'\s+#\s*AC\d+\s*:?\s*$', '', line)
+                tokens = shlex.split(cleaned, posix=True)
+
+                # Check for 'rg' command with '-E' token
+                if tokens and tokens[0] == 'rg' and '-E' in tokens:
+                    context, trunc = _get_context_lines(body, current_line, current_line)
+                    errors.append(ValidationError(
+                        rule_id="LP012",
+                        severity="error",
+                        section="Verification Commands",
+                        line_start=current_line,
+                        line_end=current_line,
+                        message="rg -E flag (encoding) should not be used. Use rg -P for pattern matching instead.",
+                        minimal_context=context,
+                        context_truncated=trunc,
+                        fix_hint="Replace 'rg -E' with 'rg -P' for extended regex patterns.",
+                        autofixable=False
+                    ))
             except ValueError:
-                # shlex.split failed - not a valid command
+                # shlex.split failed - not a valid command, skip
                 pass
 
         current_line += 1

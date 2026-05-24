@@ -33,14 +33,17 @@ import create_issue_txn as txn  # noqa: E402
 # ---------------------------------------------------------------------------
 
 # Minimal valid Issue body that passes LP001-LP030 validation
+# Must have:
+# - [ ] AC<N>: format in Acceptance Criteria (detected by _extract_ac_numbers)
+# - # AC<N> markers in Verification Commands (detected by _extract_vc_ac_numbers)
 _MINIMAL_VALID_BODY = """## Acceptance Criteria
 
-- AC1: Basic test
+- [ ] AC1: Basic test
 
 ## Verification Commands
 
 ```bash
-echo "AC1"
+test -n "ok"  # AC1
 ```
 
 ## Allowed Paths
@@ -1690,3 +1693,28 @@ class TestDedupeIssueKindMismatch:
         )
 
         assert result.failure_stage != "dedupe-kind-mismatch"
+
+
+# ---------------------------------------------------------------------------
+# B4 Regression: _MINIMAL_VALID_BODY extraction correctness
+# ---------------------------------------------------------------------------
+
+class TestMinimalValidBodyExtraction:
+    """Regression test for AC/VC extraction from _MINIMAL_VALID_BODY.
+
+    Ensures that the fixture is not accidentally using validator loopholes
+    (empty AC/VC sets) and that AC/VC numbers are correctly extracted.
+    """
+
+    def test_minimal_valid_body_ac_extraction(self) -> None:
+        """AC/VC set from _MINIMAL_VALID_BODY must both be {AC1}."""
+        # Import validator helpers to test extraction
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from validate_issue_body import _extract_ac_numbers, _extract_vc_ac_numbers
+
+        ac_set = _extract_ac_numbers(_MINIMAL_VALID_BODY)
+        vc_set = _extract_vc_ac_numbers(_MINIMAL_VALID_BODY)
+
+        assert ac_set == {"AC1"}, f"Expected AC set {{AC1}}, got {ac_set}"
+        assert vc_set == {"AC1"}, f"Expected VC set {{AC1}}, got {vc_set}"
+        assert ac_set == vc_set, "AC and VC sets must match (no LP010 mismatch)"
