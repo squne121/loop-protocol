@@ -1,0 +1,46 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 6,
+    "issue_body_sha256": "d83ff64c3ac559703db8e9583538bebe3d127bcd2a21f734ee2cc8952ff22ee7",
+    "comments_sha256": null,
+    "known_context_sha256": "e7d1b9f390521cc8b05e64296d6387089b1c9254939ff78cdbbc000c0fd37265",
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "no_repo_fact_claim",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "no_critical_external_claim",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": true,
+      "reason_code": "anchor_reframe_exclusion",
+      "excluded_by_anchor_reframe": true,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}

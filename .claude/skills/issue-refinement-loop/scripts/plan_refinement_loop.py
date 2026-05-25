@@ -90,17 +90,23 @@ UNMATERIALIZED_MARKER_PATTERN = re.compile(
     r"(?:（未起票）|（未起票）|\(未起票\)|unmaterialized|TBD)"
 )
 
-# Keywords indicating critical external claims
+# Keywords indicating critical external claims (B7: more specific keywords to reduce false positives)
 CRITICAL_EXTERNAL_KEYWORDS = {
-    "external",
-    "spec",
     "official",
     "api",
     "cli",
     "auth",
     "migration",
-    "version",
-    "documentation",
+}
+
+# Keywords for human-requested web verification in comments
+HUMAN_WEB_VERIFICATION_KEYWORDS = {
+    "webで確認",
+    "web確認",
+    "verify externally",
+    "external verification",
+    "公式 docs",
+    "official docs",
 }
 
 
@@ -147,12 +153,17 @@ def _extract_section_lines(text: str, section_name: str) -> list[str]:
     return content.splitlines() if content else []
 
 
+def _remove_fenced_code(text: str) -> str:
+    """Remove fenced code blocks from text."""
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"~~~[\s\S]*?~~~", "", text)
+    return text
+
+
 def _extract_paths_from_text(text: str, exclude_fenced: bool = True) -> frozenset[str]:
     """Extract file paths from text, optionally excluding fenced code blocks."""
     if exclude_fenced:
-        # Remove fenced code blocks
-        text = re.sub(r"```[\s\S]*?```", "", text)
-        text = re.sub(r"~~~[\s\S]*?~~~", "", text)
+        text = _remove_fenced_code(text)
 
     paths = []
     for match in PATH_PATTERN.finditer(text):
@@ -181,8 +192,12 @@ def _extract_repo_claims(issue_body: str) -> list[str]:
     claims = []
     sections = _extract_sections(issue_body)
 
-    for section_name in ["Outcome", "In Scope", "Acceptance Criteria", "Verification Commands"]:
+    # Include Allowed Paths section as per B6
+    for section_name in ["Outcome", "In Scope", "Acceptance Criteria", "Verification Commands", "Allowed Paths"]:
         content = sections.get(section_name, "")
+        # B6: Also exclude fenced code for repo_claims
+        content = _remove_fenced_code(content)
+
         for line in content.splitlines():
             # Only extract lines that mention concrete repo elements (paths, scripts)
             # NOT generic section headers like "## Verification Commands"
@@ -212,7 +227,7 @@ def _extract_critical_external_claims(
     claims = []
     sections = _extract_sections(issue_body)
 
-    # Check each section for external claims
+    # Check each section for external claims in issue body
     for section_name in ["Outcome", "In Scope", "Acceptance Criteria", "Verification Commands", "Out of Scope"]:
         content = sections.get(section_name, "")
         for line in content.splitlines():
@@ -228,7 +243,35 @@ def _extract_critical_external_claims(
                         }
                     )
 
-    return claims
+    # B4: Check comments for human-requested web verification
+    if comments and isinstance(comments, list):
+        for comment in comments:
+            if isinstance(comment, dict):
+                comment_body = comment.get("body", "")
+                comment_id = comment.get("id", comment.get("comment_id"))
+
+                for keyword in HUMAN_WEB_VERIFICATION_KEYWORDS:
+                    if keyword in comment_body.lower():
+                        # Found human request for web verification in comments
+                        claim_text = comment_body[:100].strip() if comment_body else "Human requested web verification"
+                        claims.append(
+                            {
+                                "claim": claim_text,
+                                "affects": "VC",
+                                "source_hint": f"comment_{comment_id}" if comment_id else "comment",
+                            }
+                        )
+                        break  # Only add once per comment
+
+    # B7: Stable sort and dedupe by claim text
+    claims_by_text = {}
+    for claim in claims:
+        key = claim["claim"]
+        if key not in claims_by_text:
+            claims_by_text[key] = claim
+
+    # Return sorted deduped claims
+    return sorted(claims_by_text.values(), key=lambda c: c["claim"])
 
 
 def _infer_affects_section(section_name: str) -> str:
@@ -397,6 +440,8 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
     Returns (REFINEMENT_LOOP_PLAN_V1 dict, exit_code).
     exit_code: 0 = success, 2 = invalid input, 3 = internal error.
+
+    B2: Supports optional 'now' parameter for deterministic generated_at timestamp.
     """
     # Validate input schema
     if not _validate_input_schema(input_data):
@@ -429,15 +474,26 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         # Compute hashes
         issue_body_sha256 = _sha256(issue_body)
-        comments_sha256 = _canonical_json(comments) if comments else None
-        known_context_sha256 = _canonical_json(known_context) if known_context else None
+        # B4: Handle comments_sha256 - empty list is different from None
+        if comments is None:
+            comments_sha256 = None
+        elif isinstance(comments, list):
+            if len(comments) == 0:
+                comments_sha256 = _sha256("[]")
+            else:
+                comments_sha256 = _sha256(_canonical_json(comments))
+        else:
+            comments_sha256 = None
 
-        if comments_sha256:
-            comments_sha256 = _sha256(comments_sha256)
+        known_context_sha256 = _canonical_json(known_context) if known_context else None
         if known_context_sha256:
             known_context_sha256 = _sha256(known_context_sha256)
 
-        generated_at = datetime.now(timezone.utc).isoformat()
+        # B2: Support optional 'now' parameter for deterministic timestamp
+        if "now" in input_data and input_data["now"]:
+            generated_at = input_data["now"]
+        else:
+            generated_at = datetime.now(timezone.utc).isoformat()
 
         # Check for malformations
         fail_closed_reasons = []
@@ -449,6 +505,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
 
         if fail_closed_reasons:
+            # B3: Return schema-valid decisions with unknown confidence even in fail_closed
             return (
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -459,7 +516,37 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                         "known_context_sha256": known_context_sha256,
                         "generated_at": generated_at,
                     },
-                    "decisions": {},
+                    "decisions": {
+                        "investigation_policy": {
+                            "required": False,
+                            "reason_code": INVESTIGATION_REASON_UNKNOWN_SCHEMA,
+                            "target_paths": [],
+                            "repo_claims": [],
+                            "evidence_spans": [],
+                            "confidence": CONFIDENCE_UNKNOWN,
+                        },
+                        "web_research_policy": {
+                            "required": False,
+                            "reason_code": WEB_RESEARCH_REASON_UNKNOWN_SCHEMA,
+                            "critical_external_claims": [],
+                            "evidence_spans": [],
+                            "confidence": CONFIDENCE_UNKNOWN,
+                        },
+                        "scope_signal_guard": {
+                            "triggered": False,
+                            "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
+                            "excluded_by_anchor_reframe": False,
+                            "evidence_spans": [],
+                        },
+                        "delivery_rollup": {
+                            "applicable": False,
+                            "unmaterialized_slots": [],
+                            "evidence_spans": [],
+                        },
+                        "follow_up_materialization": {
+                            "candidates": [],
+                        },
+                    },
                     "fail_closed": {
                         "required": True,
                         "reason_codes": fail_closed_reasons,
@@ -489,7 +576,8 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         )
 
         investigation_evidence = []
-        if target_paths:
+        # B6: Add evidence if investigation is required (either from paths OR repo_claims)
+        if investigation_required:
             investigation_evidence.append(
                 _create_evidence_span(
                     "issue_body",
@@ -585,7 +673,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         return plan, 0
 
     except Exception as e:
-        # Internal error
+        # Internal error - B3: Return schema-valid decisions with unknown confidence
         fail_closed_plan = {
             "schema_version": SCHEMA_VERSION,
             "source": {
@@ -595,7 +683,37 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "known_context_sha256": None,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
-            "decisions": {},
+            "decisions": {
+                "investigation_policy": {
+                    "required": False,
+                    "reason_code": INVESTIGATION_REASON_UNKNOWN_SCHEMA,
+                    "target_paths": [],
+                    "repo_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "web_research_policy": {
+                    "required": False,
+                    "reason_code": WEB_RESEARCH_REASON_UNKNOWN_SCHEMA,
+                    "critical_external_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "scope_signal_guard": {
+                    "triggered": False,
+                    "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
+                    "excluded_by_anchor_reframe": False,
+                    "evidence_spans": [],
+                },
+                "delivery_rollup": {
+                    "applicable": False,
+                    "unmaterialized_slots": [],
+                    "evidence_spans": [],
+                },
+                "follow_up_materialization": {
+                    "candidates": [],
+                },
+            },
             "fail_closed": {
                 "required": True,
                 "reason_codes": [FAIL_CLOSED_REASON_INTERNAL_ERROR],
@@ -616,6 +734,7 @@ def main(argv: list[str] | None = None) -> None:
         input_text = sys.stdin.read()
         input_data = json.loads(input_text)
     except json.JSONDecodeError as e:
+        # B3: Return schema-valid decisions even for JSON decode errors
         fail_closed_plan = {
             "schema_version": SCHEMA_VERSION,
             "source": {
@@ -625,7 +744,37 @@ def main(argv: list[str] | None = None) -> None:
                 "known_context_sha256": None,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             },
-            "decisions": {},
+            "decisions": {
+                "investigation_policy": {
+                    "required": False,
+                    "reason_code": INVESTIGATION_REASON_UNKNOWN_SCHEMA,
+                    "target_paths": [],
+                    "repo_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "web_research_policy": {
+                    "required": False,
+                    "reason_code": WEB_RESEARCH_REASON_UNKNOWN_SCHEMA,
+                    "critical_external_claims": [],
+                    "evidence_spans": [],
+                    "confidence": CONFIDENCE_UNKNOWN,
+                },
+                "scope_signal_guard": {
+                    "triggered": False,
+                    "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
+                    "excluded_by_anchor_reframe": False,
+                    "evidence_spans": [],
+                },
+                "delivery_rollup": {
+                    "applicable": False,
+                    "unmaterialized_slots": [],
+                    "evidence_spans": [],
+                },
+                "follow_up_materialization": {
+                    "candidates": [],
+                },
+            },
             "fail_closed": {
                 "required": True,
                 "reason_codes": [FAIL_CLOSED_REASON_UNKNOWN_SCHEMA],

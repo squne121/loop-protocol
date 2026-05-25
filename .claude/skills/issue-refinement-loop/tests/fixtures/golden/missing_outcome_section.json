@@ -1,0 +1,48 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 13,
+    "issue_body_sha256": "a496e0a06edf2cf447a8fd090c28cfcd62dc49ea49189ac24239e6408049e5e5",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "unknown_input_schema",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "unknown_input_schema",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": false,
+      "reason_code": "no_scope_signal",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": true,
+    "reason_codes": [
+      "missing_required_section"
+    ],
+    "human_message": "Issue contract malformation detected: missing_required_section"
+  }
+}

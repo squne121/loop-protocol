@@ -1,0 +1,65 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 4,
+    "issue_body_sha256": "d8dc5bf1a562ea6fd5927c48b368a1bcdc15ba1f052246517e2cdbd55b04b046",
+    "comments_sha256": null,
+    "known_context_sha256": "e7d1b9f390521cc8b05e64296d6387089b1c9254939ff78cdbbc000c0fd37265",
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "no_repo_fact_claim",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": true,
+      "reason_code": "critical_external_spec_claim",
+      "critical_external_claims": [
+        {
+          "claim": "- AC2: Both manual and API changes are in scope",
+          "affects": "AC",
+          "source_hint": null
+        },
+        {
+          "claim": "- API surface remains stable",
+          "affects": "InScope",
+          "source_hint": null
+        }
+      ],
+      "evidence_spans": [
+        {
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "end_line": 21,
+          "text_sha256": "d8dc5bf1a562ea6fd5927c48b368a1bcdc15ba1f052246517e2cdbd55b04b046"
+        }
+      ],
+      "confidence": "deterministic"
+    },
+    "scope_signal_guard": {
+      "triggered": true,
+      "reason_code": "anchor_reframe_exclusion",
+      "excluded_by_anchor_reframe": true,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}
