@@ -1,0 +1,68 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 18,
+    "issue_body_sha256": "0172535a5a05b26ff4148ea8249520bebf8eca6d4fbf6a5ef6b910727b77ece1",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": true,
+      "reason_code": "target_paths_present",
+      "target_paths": [
+        ".claude/skills",
+        "docs/product"
+      ],
+      "repo_claims": [
+        "- Changes to `.claude/skills` framework layer",
+        "- Updates to `docs/product` specification layer"
+      ],
+      "evidence_spans": [
+        {
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "end_line": 22,
+          "text_sha256": "0172535a5a05b26ff4148ea8249520bebf8eca6d4fbf6a5ef6b910727b77ece1"
+        }
+      ],
+      "confidence": "deterministic"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "no_critical_external_claim",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": true,
+      "reason_code": "new_in_scope_area",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": [
+        {
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "end_line": 1,
+          "text_sha256": "d7dddbd6b8b86e4d9156aaa1efd215d2f50d49ec6db7ac51cb5524fc8fc3b3d5"
+        }
+      ]
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}

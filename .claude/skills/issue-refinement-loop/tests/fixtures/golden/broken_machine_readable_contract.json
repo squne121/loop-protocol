@@ -1,0 +1,48 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 12,
+    "issue_body_sha256": "fb321911702e1073d0646c67eb0ac712e82cbf97d61754dc8aec2c13cda522c9",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "unknown_input_schema",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "unknown_input_schema",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": false,
+      "reason_code": "no_scope_signal",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": true,
+    "reason_codes": [
+      "malformed_machine_readable_contract"
+    ],
+    "human_message": "Issue contract malformation detected: malformed_machine_readable_contract"
+  }
+}
