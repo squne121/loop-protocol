@@ -115,12 +115,12 @@ SubAgent（役割）── Skill（作業手順）
 
 | SubAgent | 役割 |
 |---|---|
-| `codebase-investigator` | 大規模コードベース調査の役割（常に `gemini-cli-headless-delegation` skill に委譲して大規模文脈読み取りを行う） |
+| `codebase-investigator` | 大規模コードベース調査の役割（常に `gemini-cli-headless-delegation` skill に委譲して大規模文脈読み取りを行う）。file evidence の精度保証は `.claude/skills/gemini-cli-headless-delegation/references/usage-contract.md#REPO_EVIDENCE_REF_V1` に SSOT 化される。 |
 
 | Skill | 手順 |
 |---|---|
 | `ssot-discovery` | `docs/` 配下を SSOT として横断探索する手順 |
-| `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順 |
+| `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順。file evidence の structure (REPO_EVIDENCE_REF_V1) と verification contract が定義されている。 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
 
 ## Spec Kit (speckit-*) スキル責務境界
