@@ -60,6 +60,12 @@ export const PRODUCER_ACTOR_TYPES = ['ai_agent', 'github_action']
 // Producer is restricted to these evidence source kinds (validator allows all in schema)
 export const PRODUCER_EVIDENCE_SOURCE_KINDS = ['hook_jsonl', 'ci_check', 'artifact']
 
+export const PRODUCER_KIND_BY_EVIDENCE_SOURCE = {
+  artifact: 'script_generated',
+  hook_jsonl: 'hook_generated',
+  ci_check: 'github_action_generated',
+}
+
 // ============================================================================
 // Semantic Validation
 // ============================================================================
@@ -222,6 +228,22 @@ export function validateProducerContractForIssue377(manifest, opts = {}) {
     }
   }
 
+  const primaryEvidence = manifest.evidence?.[0]
+  if (manifest.producer) {
+    const expectedKind = primaryEvidence ? PRODUCER_KIND_BY_EVIDENCE_SOURCE[primaryEvidence.source_kind] : undefined
+    if (!manifest.producer.kind) {
+      errors.push({
+        path: 'producer.kind',
+        message: 'producer.kind is required when producer is present',
+      })
+    } else if (expectedKind && manifest.producer.kind !== expectedKind) {
+      errors.push({
+        path: 'producer.kind',
+        message: `producer.kind must match evidence.source_kind mapping. Expected: ${expectedKind}. Got: ${manifest.producer.kind}`,
+      })
+    }
+  }
+
   // M2 iter2: verification semantic rules
   if (manifest.verification?.skipped_count && manifest.verification.skipped_count > 0 && manifest.verification.overall === 'pass') {
     errors.push({
@@ -338,4 +360,5 @@ export default {
   detectSecretsInMarkdown,
   PRODUCER_ACTOR_TYPES,
   PRODUCER_EVIDENCE_SOURCE_KINDS,
+  PRODUCER_KIND_BY_EVIDENCE_SOURCE,
 }

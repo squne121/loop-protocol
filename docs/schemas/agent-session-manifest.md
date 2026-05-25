@@ -50,6 +50,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `issue_number` | integer\|null | no | 対象 Issue 番号（optional） |
 | `pr_number` | integer\|null | no | 対象 PR 番号（optional） |
 | `commit_sha` | string\|null（40-hex pattern または null） | no | コミット SHA（optional, nullable） |
+| `producer` | object | no | producer provenance object（後述）。`producer.kind` は self-claim |
 | `token_usage` | object | no | トークン使用量（availability 付き。後述） |
 | `invoked_subagents` | array | no | 呼び出した SubAgent のリスト（後述） |
 | `verification` | object | no | AC 検証結果（`verification.overall` / per-AC 構造体。後述） |
@@ -66,6 +67,22 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `type` | enum | yes | `ai_agent \| human \| github_action` |
 | `name` | string | yes | エージェント名または `"human"` |
 | `session_id` | string\|null | no | セッション ID（nullable。人間操作の場合は `null` 可） |
+
+## Producer Provenance
+
+`producer` は optional object であり、既存 manifest との backward compatibility のため `required` には含めない。  
+`producer.kind` is a self-claim であり、schema 追加だけで真正性を証明するものではない。真正性は `evidence` linkage、および #378 / #402 で扱う hook / CI wiring で担保する。
+
+### `producer` オブジェクト
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `kind` | enum | yes | `script_generated \| hook_generated \| github_action_generated` |
+| `version` | string\|null | no | producer 実装 version（既知なら設定） |
+| `command` | string\|null | no | sanitized invocation command。secret / expanded env values / unsafe local path を含めない |
+| `source_ref` | string\|null | no | git ref / PR / workflow run / artifact reference / hook id など |
+
+`human_attested_from_deterministic_evidence` remains outside the schema enum。これは schema の producer kind ではなく、人間が deterministic evidence を確認したという運用上の attestation として扱う。
 
 ### `phase` オブジェクト
 
@@ -286,6 +303,12 @@ token_usage:
   completion: null
   total: null
 
+producer:
+  kind: script_generated
+  version: null
+  command: "node scripts/generate-session-manifest.mjs"
+  source_ref: null
+
 invoked_subagents:
   - name: issue-reviewer
     count: 1
@@ -357,6 +380,12 @@ token_usage:
   completion: null
   total: null
 
+producer:
+  kind: script_generated
+  version: null
+  command: "node scripts/generate-session-manifest.mjs"
+  source_ref: null
+
 invoked_subagents: []
 
 verification:
@@ -398,6 +427,7 @@ redaction:
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界（Hook-based Ledger Optional Design セクション）
 - `docs/dev/schema-governance.md` — Schema governance ルール（本 schema の登録先）
 - `docs/dev/runtime-verification-policy.md` — Runtime Verification Applicability 判定スキーマ
+- quality-gate rerun is executed in test-runner phase
 - `#136` — metadata-first 方針の anchor decision
 - `#44` — SubAgent Execution Ledger 設計（ledger_phase の元定義）
 - `#241` — Secret Inventory SSOT 化（session recording 前提条件）

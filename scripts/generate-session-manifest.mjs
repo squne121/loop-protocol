@@ -36,6 +36,7 @@ import {
   validateProducerContractForIssue377,
   PRODUCER_ACTOR_TYPES,
   PRODUCER_EVIDENCE_SOURCE_KINDS,
+  PRODUCER_KIND_BY_EVIDENCE_SOURCE,
 } from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -319,6 +320,12 @@ function generateManifest(opts) {
         visibility: opts['evidence-visibility'],
       },
     ],
+    producer: {
+      kind: PRODUCER_KIND_BY_EVIDENCE_SOURCE[opts['evidence-source-kind']],
+      version: null,
+      command: 'node scripts/generate-session-manifest.mjs',
+      source_ref: null,
+    },
     redaction: {
       raw_transcript_included: false,
       local_paths_included: opts['evidence-visibility'] === 'private_artifact' && /^\//.test(opts['evidence-source-ref']),

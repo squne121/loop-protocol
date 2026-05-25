@@ -171,6 +171,62 @@ describe('B3: producer JSON → validator pass', () => {
     const validationResult = runValidator(manifestPath)
     expect(validationResult.exitCode).toBe(0)
   })
+
+  it('GIVEN artifact evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('script_generated')
+    expect(manifest.producer.command).toBe('node scripts/generate-session-manifest.mjs')
+    expect(manifest.producer.source_ref).toBeNull()
+  })
+
+  it('GIVEN hook_jsonl evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'issue_review',
+      '--phase-instance-id', 'issue-377:issue_review:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'hook_jsonl',
+      '--evidence-source-ref', 'artifacts/hook.jsonl',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('hook_generated')
+  })
+
+  it('GIVEN ci_check evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'pr_review',
+      '--phase-instance-id', 'issue-377:pr_review:001',
+      '--actor-type', 'github_action',
+      '--actor-name', 'ci-worker',
+      '--evidence-source-kind', 'ci_check',
+      '--evidence-source-ref', 'https://github.com/squne121/loop-protocol/actions/runs/1',
+      '--evidence-visibility', 'public_github_comment',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('github_action_generated')
+  })
 })
 
 describe('B4: token_usage unavailable semantics', () => {
