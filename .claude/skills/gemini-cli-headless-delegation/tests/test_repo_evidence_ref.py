@@ -43,7 +43,7 @@ class TestRepoEvidenceRefValidator:
     # ===== 1. Basic Valid Cases (schema + type check)
 
     def test_valid_evidence_verified_sha1(self):
-        """Test a valid verified evidence with SHA-1 commit_sha."""
+        """Test a valid verified evidence with SHA-1 commit_sha (no backend → inconclusive)."""
         evidence = {
             "type": "REPO_EVIDENCE_REF_V1",
             "commit_sha": "abc123def456abc123def456abc123def456abc1",
@@ -58,9 +58,11 @@ class TestRepoEvidenceRefValidator:
             "verification_method": "sha256_hash_match",
             "verified_at": "2026-05-23T15:30:45Z",
         }
+        # Without backend, verified evidence becomes inconclusive (fail-closed)
         result = validate_repo_evidence_ref(evidence)
         assert result["ok"], f"Expected valid evidence, got errors: {result['errors']}"
-        assert result["status"] == "verified"
+        assert result["status"] == "inconclusive"
+        assert "verification_backend_missing" in result["reasons"]
 
     def test_valid_evidence_inconclusive_sha1(self):
         """Test a valid inconclusive evidence with SHA-1."""
@@ -467,6 +469,150 @@ class TestRepoEvidenceRefValidator:
         }
         result = validate_repo_evidence_ref(evidence)
         assert result["ok"]
+
+    # ===== 12. Blocking 1 & 2: Fail-closed backend validation + line range EOF detection
+
+    def test_no_backend_returns_inconclusive_not_verified(self):
+        """Blocking 1: No backend + verified input → inconclusive (fail-closed)."""
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "docs/adr/0001.md",
+            "start_line": 42,
+            "end_line": 67,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L42-L67",
+            "excerpt_sha256": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+            "verification_status": "verified",  # Input claims verified
+            "verification_method": "sha256_hash_match",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        # No blob_bytes_getter, no repo_root → backend unavailable
+        result = validate_repo_evidence_ref(evidence)
+        assert result["ok"] is True
+        assert result["status"] == "inconclusive"
+        assert "verification_backend_missing" in result["reasons"]
+
+    def test_inconclusive_input_stays_inconclusive(self):
+        """Blocking 1: Inconclusive input with no backend → stays inconclusive (no upgrade)."""
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "docs/adr/0001.md",
+            "start_line": 42,
+            "end_line": 67,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L42-L67",
+            "excerpt_sha256": "f" * 64,
+            "verification_status": "inconclusive",  # Already inconclusive
+            "verification_method": "sha256_hash_mismatch",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        # No backend → must not upgrade to verified
+        result = validate_repo_evidence_ref(evidence)
+        assert result["ok"] is True
+        assert result["status"] == "inconclusive"
+
+    def test_line_range_exceeds_eof_inconclusive(self):
+        """Blocking 2: Line range exceeds file EOF → inconclusive, not hash mismatch."""
+        actual_content = b"line 1\nline 2\nline 3\nline 4\nline 5\n"
+
+        def fake_getter(commit_sha, path):
+            return actual_content
+
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "docs/adr/0001.md",
+            "start_line": 10,  # Beyond EOF (only 5 lines)
+            "end_line": 15,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L10-L15",
+            "excerpt_sha256": "a" * 64,  # Valid hash format (won't be compared due to EOF)
+            "verification_status": "inconclusive",  # Mark as inconclusive to pass permalink
+            "verification_method": "sha256_hash_mismatch",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        result = validate_repo_evidence_ref(evidence, blob_bytes_getter=fake_getter)
+        assert result["ok"] is True
+        assert result["status"] == "inconclusive"
+        assert "line_range_unverified" in result["reasons"]
+        # Ensure hash comparison did NOT happen (by checking errors don't mention hash)
+        assert not any("mismatch" in r.lower() for r in result["reasons"])
+
+    def test_empty_excerpt_not_verified_via_eof_overflow(self):
+        """Blocking 2: Empty line range (start > end due to EOF) → inconclusive via line_range_unverified."""
+        actual_content = b"line 1\nline 2\nline 3\n"
+
+        def fake_getter(commit_sha, path):
+            return actual_content
+
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "test.txt",
+            "start_line": 10,
+            "end_line": 10,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/test.txt#L10-L10",
+            "excerpt_sha256": hashlib.sha256(b"").hexdigest(),  # hash of empty bytes
+            "verification_status": "verified",
+            "verification_method": "sha256_hash_match",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        result = validate_repo_evidence_ref(evidence, blob_bytes_getter=fake_getter)
+        assert result["ok"] is True
+        assert result["status"] == "inconclusive"
+        assert "line_range_unverified" in result["reasons"]
+
+    def test_backend_present_hash_match_returns_verified(self):
+        """Sanity check: backend present + hash match → verified."""
+        actual_content = b"line 1\nline 2\nline 3\n"
+        actual_hash = hashlib.sha256(actual_content).hexdigest()
+
+        def fake_getter(commit_sha, path):
+            return actual_content
+
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "docs/adr/0001.md",
+            "start_line": 1,
+            "end_line": 3,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L1-L3",
+            "excerpt_sha256": actual_hash,
+            "verification_status": "verified",
+            "verification_method": "sha256_hash_match",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        result = validate_repo_evidence_ref(evidence, blob_bytes_getter=fake_getter)
+        assert result["ok"] is True
+        assert result["status"] == "verified"
+
+    def test_caller_revalidation_does_not_mutate_input(self):
+        """Blocking 1: Validator does not mutate input dict in-place."""
+        evidence = {
+            "type": "REPO_EVIDENCE_REF_V1",
+            "commit_sha": "abc123def456abc123def456abc123def456abc1",
+            "object_format": "sha1",
+            "path": "docs/adr/0001.md",
+            "start_line": 42,
+            "end_line": 67,
+            "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L42-L67",
+            "excerpt_sha256": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+            "verification_status": "inconclusive",  # Input is inconclusive
+            "verification_method": "sha256_hash_mismatch",
+            "verified_at": "2026-05-23T15:30:45Z",
+        }
+        original_status = evidence["verification_status"]
+        result = validate_repo_evidence_ref(evidence)
+        # Check input dict was not mutated
+        assert evidence["verification_status"] == original_status
+        assert evidence["verification_status"] == "inconclusive"
+        # Validator output is inconclusive (separate from input, no in-place upgrade)
+        assert result["ok"] is True
+        assert result["status"] == "inconclusive"
 
 
 if __name__ == "__main__":

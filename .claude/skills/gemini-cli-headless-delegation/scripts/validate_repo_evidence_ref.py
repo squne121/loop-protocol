@@ -229,8 +229,32 @@ def validate_repo_evidence_ref(
             "reasons": reasons,
         }
 
-    # Check 14: excerpt_sha256 verification (optional, only if blob_bytes_getter or repo_root provided)
-    if blob_bytes_getter is not None or repo_root is not None:
+    # Check 14: Verify backend availability for fail-closed decision
+    # If neither backend is available and evidence claims "verified", reject it
+    backend_available = blob_bytes_getter is not None or repo_root is not None
+
+    if not backend_available:
+        # No verification backend provided
+        if verification_status == "verified":
+            # Input claims verified but we can't verify — reject
+            reasons.append("verification_backend_missing")
+            return {
+                "ok": True,
+                "status": "inconclusive",
+                "errors": errors,
+                "reasons": reasons,
+            }
+        elif verification_status == "inconclusive":
+            # Input is already inconclusive — keep it that way (no upgrade)
+            return {
+                "ok": True,
+                "status": "inconclusive",
+                "errors": errors,
+                "reasons": reasons,
+            }
+
+    # Check 15: excerpt_sha256 verification (only if blob_bytes_getter or repo_root provided)
+    if backend_available:
         try:
             if blob_bytes_getter is not None:
                 # Unit test mode: use provided getter
@@ -253,8 +277,25 @@ def validate_repo_evidence_ref(
                     }
                 excerpt_bytes = result.stdout
 
-            # Slice lines: convert to list, slice [start_line-1 : end_line] (0-indexed, inclusive)
+            # Blocking 2: Check line range EOF before attempting hash computation
+            # Split on LF to get line array
             lines = excerpt_bytes.split(b"\n")
+
+            # Calculate line count (excluding empty element from trailing LF)
+            if excerpt_bytes.endswith(b"\n"):
+                line_count = len(lines) - 1
+            else:
+                line_count = len(lines)
+
+            # Validate line range bounds
+            if not (1 <= start_line <= end_line <= line_count):
+                reasons.append("line_range_unverified")
+                return {
+                    "ok": True,
+                    "status": "inconclusive",
+                    "errors": [f"start_line={start_line} end_line={end_line} line_count={line_count}"],
+                    "reasons": reasons,
+                }
 
             # Handle inclusive range: start_line=1, end_line=10 -> lines[0:10]
             # (note: split produces N+1 elements if there's a trailing LF, so this is careful)

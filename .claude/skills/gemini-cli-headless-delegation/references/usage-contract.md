@@ -786,7 +786,7 @@ REPO_EVIDENCE_REF_V1:
     permalink:
       type: string
       format: uri
-      pattern: "^https://github.com/[^/]+/[^/]+/blob/[a-f0-9]{40}/"
+      pattern: "^https://github.com/[^/]+/[^/]+/blob/([a-f0-9]{40}|[a-f0-9]{64})/"
       description: "GitHub permanent link using commit SHA (not branch name). Format: https://github.com/{owner}/{repo}/blob/{commit_sha}/{path}#L{start_line}-L{end_line}. Mutable URLs (blob/main, blob/develop, etc.) are forbidden and MUST be rejected by validator."
     
     excerpt_sha256:
@@ -795,7 +795,7 @@ REPO_EVIDENCE_REF_V1:
       description: "SHA-256 hash of the excerpt bytes (lines start_line..end_line inclusive). Used to detect stale references when line numbers drift due to file edits."
     
     anchor_text:
-      type: string
+      type: [string, "null"]
       description: "Optional human fallback: section heading name, symbol name, or other landmark text for manual navigation. NOT authoritative — line numbers are the ground truth. anchor_text is provided for human readability only and MUST NOT be used as primary evidence. Vulnerable to heading renames, section moves, and symbol refactoring."
     
     verification_status:
@@ -816,23 +816,27 @@ REPO_EVIDENCE_REF_V1:
       description: "ISO 8601 timestamp (UTC) when verification completed. Used to detect verification staleness if reference ages beyond acceptable bounds."
 
   examples:
-    - commit_sha: "abc123def456abc123def456abc123def456abc1"
+    - type: "REPO_EVIDENCE_REF_V1"
+      object_format: "sha1"
+      commit_sha: "abc123def456abc123def456abc123def456abc1"
       path: "docs/adr/0001-architecture.md"
       start_line: 42
       end_line: 67
       permalink: "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001-architecture.md#L42-L67"
-      excerpt_sha256: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1"
+      excerpt_sha256: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
       anchor_text: "## Architecture Overview"
       verification_status: "verified"
       verification_method: "sha256_hash_match"
       verified_at: "2026-05-23T15:30:45Z"
 
-    - commit_sha: "def456abc123def456abc123def456abc123def4"
+    - type: "REPO_EVIDENCE_REF_V1"
+      object_format: "sha1"
+      commit_sha: "def456abc123def456abc123def456abc123def4"
       path: "src/systems/combat.ts"
       start_line: 100
       end_line: 120
       permalink: "https://github.com/squne121/loop-protocol/blob/def456abc123def456abc123def456abc123def4/src/systems/combat.ts#L100-L120"
-      excerpt_sha256: "f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5"
+      excerpt_sha256: "f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5cab"
       anchor_text: null
       verification_status: "inconclusive"
       verification_method: "sha256_hash_mismatch"

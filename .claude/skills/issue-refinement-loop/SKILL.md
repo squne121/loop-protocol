@@ -683,35 +683,33 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
   unresolved_risks: []
 ```
 
-### REPO_EVIDENCE_REF_V1 構造を要求（`kind: file` 時の additive rule）
+### evidence[].ref discriminated union
 
-`ANCHOR_COMMENT_FACT_CHECK_RESULT_V1.evidence[]` の各要素について、`kind: file` のとき、`ref` フィールドは自由文字列ではなく以下の構造化 schema を要求する:
+`evidence[]` は `kind` discriminator で ref schema が決まる:
+
+- `kind: issue | pr | comment | web` → `ref` は自由文字列（既存・後方互換）
+- `kind: file` → `ref` は `REPO_EVIDENCE_REF_V1` object でなければならない。schema 本体は `.claude/skills/gemini-cli-headless-delegation/references/usage-contract.md#REPO_EVIDENCE_REF_V1` を参照する。SKILL.md ではこれを再定義・部分コピーしない。
+
+Example of `kind: file`:
 
 ```yaml
 evidence:
   - kind: file
     ref:
-      type: REPO_EVIDENCE_REF_V1  # schema identifier constant
-      # 以下、REPO_EVIDENCE_REF_V1 スキーマの全必須フィールド:
+      type: REPO_EVIDENCE_REF_V1
       commit_sha: "abc123def456abc123def456abc123def456abc1"
-      object_format: "sha1"  # or "sha256"
+      object_format: "sha1"
       path: "docs/adr/0001.md"
       start_line: 42
       end_line: 67
-      permalink: "https://github.com/..."
+      permalink: "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/adr/0001.md#L42-L67"
       excerpt_sha256: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
-      anchor_text: "## Architecture Overview"  # optional, can be null
-      verification_status: "verified" | "inconclusive"
-      verification_method: "sha256_hash_match" | "sha256_hash_mismatch" | "line_range_unverified" | "fetch_error"
+      anchor_text: "## Architecture Overview"
+      verification_status: "verified"
+      verification_method: "sha256_hash_match"
       verified_at: "2026-05-23T15:30:45Z"
     summary: "..."
 ```
-
-既存の `kind: issue | pr | comment | web` の `ref` 自由文字列は**維持**（後方互換）。拡張は `kind: file` のみ。
-
-**Rationale（理由）**:
-
-`kind: file` の evidence が行番号を指す場合、caller は file:line pair の信頼性を機械的に判定する必要がある（excerpt hash mismatch 検知、commit SHA 固定確認等）。自由文字列 `"path#lineN-lineM"` では caller が hash 検証や stale 判定を実施できない。`REPO_EVIDENCE_REF_V1` 構造化により、caller 側で fail-closed な検証ロジックを実装できる。
 
 **main thread の責務**: `codebase-investigator` から `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を受け取った後、`recommended_final_classification` を参考に main thread / orchestrator が `LOOP_STATE.anchor_comment.final_classification` を確定する。`final_classification` の確定責務は main thread にあり、SubAgent に委譲してはならない。
 
