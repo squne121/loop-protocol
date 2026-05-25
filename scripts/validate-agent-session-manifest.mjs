@@ -18,40 +18,9 @@
 import { readFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
+import { validateManifest } from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-
-// Dynamic import of Ajv (require it as devDependency)
-let Ajv, ajvFormats
-
-try {
-  const ajvModule = await import('ajv')
-  Ajv = ajvModule.default
-  const formatsModule = await import('ajv-formats')
-  ajvFormats = formatsModule.default
-} catch (err) {
-  console.error('Error: ajv and ajv-formats must be installed as devDependencies')
-  console.error('Run: pnpm install')
-  process.exit(1)
-}
-
-// ============================================================================
-// Schema Loading
-// ============================================================================
-
-function loadSchema() {
-  const schemaPath = resolve(__dirname, '../docs/schemas/agent-session-manifest.schema.json')
-  try {
-    const schemaContent = readFileSync(schemaPath, 'utf-8')
-    const schema = JSON.parse(schemaContent)
-    // Remove $schema reference to avoid meta-schema fetch
-    delete schema['$schema']
-    return schema
-  } catch (err) {
-    console.error(`Error loading schema from ${schemaPath}:`, err.message)
-    process.exit(1)
-  }
-}
 
 // ============================================================================
 // JSON Loading
@@ -89,37 +58,19 @@ function loadJsonFromArgsOrStdin() {
 }
 
 // ============================================================================
-// Validation
+// Main
 // ============================================================================
 
-async function validateManifest() {
-  const schema = loadSchema()
+async function main() {
   const jsonData = loadJsonFromArgsOrStdin()
 
-  // Create Ajv instance with 2020-12 spec
-  // spec: draft2020-12 is the default for Ajv 8.x
-  const ajv = new Ajv()
-  ajvFormats(ajv)
+  // Validate using common module
+  const result = validateManifest(jsonData)
 
-  // Compile schema
-  let validate
-  try {
-    validate = ajv.compile(schema)
-  } catch (err) {
-    console.error('Error compiling schema:', err.message)
-    process.exit(1)
-  }
-
-  // Validate
-  const valid = validate(jsonData)
-
-  if (!valid) {
+  if (!result.valid) {
     console.error('Validation failed with errors:')
-    for (const error of validate.errors || []) {
-      console.error(`  - ${error.instancePath || 'root'}: ${error.message}`)
-      if (error.params) {
-        console.error(`    params: ${JSON.stringify(error.params)}`)
-      }
+    for (const error of result.errors) {
+      console.error(`  - ${error.path}: ${error.message}`)
     }
     process.exit(1)
   } else {
@@ -128,11 +79,7 @@ async function validateManifest() {
   }
 }
 
-// ============================================================================
-// Main
-// ============================================================================
-
-validateManifest().catch((err) => {
+main().catch((err) => {
   console.error('Unexpected error:', err.message)
   process.exit(1)
 })

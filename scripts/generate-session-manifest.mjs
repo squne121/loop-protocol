@@ -29,8 +29,12 @@ import { randomUUID } from 'crypto'
 import { readFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
+import { validateManifest, detectSecretPatterns, detectSecretsInMarkdown } from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Re-export from validation module for local use
+const detectSecretPatternsLocal = detectSecretPatterns
 
 // ============================================================================
 // Argument Parsing
@@ -51,7 +55,16 @@ function parseArgs() {
       const key = arg.slice(2)
       const value = args[i + 1]
       if (value && !value.startsWith('--')) {
-        result[key] = value
+        // Support repeated flags (store as array)
+        if (key in result) {
+          if (Array.isArray(result[key])) {
+            result[key].push(value)
+          } else {
+            result[key] = [result[key], value]
+          }
+        } else {
+          result[key] = value
+        }
         i++
       } else {
         result[key] = true
@@ -69,24 +82,37 @@ agent_session_manifest/v1 deterministic producer
 USAGE:
   node scripts/generate-session-manifest.mjs [OPTIONS]
 
-OPTIONS:
-  --repository REPO              Repository name (e.g., squne121/loop-protocol) [required]
-  --issue NUMBER                 Issue number [optional, default: null]
-  --pr NUMBER                    PR number [optional, default: null]
-  --phase-main-loop PHASE        Main loop phase: issue_create, issue_review, impl, pr_open, pr_review, merge, followup_create [required]
-  --phase-ledger-phase PHASE     Ledger phase: followup_issue_materialization, issue_contract_preflight, implementation, post_commit_verification, pr_body_update, semantic_review, pre_merge_judgment, github_merge_event [optional]
-  --phase-instance-id ID         Phase instance ID format: issue-<N>:<phase>:<seq> [required]
-  --actor-type TYPE              Actor type: ai_agent, human, github_action [required]
-  --actor-name NAME              Actor name [required]
+REQUIRED OPTIONS:
+  --repository REPO              Repository name (e.g., squne121/loop-protocol)
+  --phase-main-loop PHASE        Main loop phase: issue_create, issue_review, impl, pr_open, pr_review, merge, followup_create
+  --phase-instance-id ID         Phase instance ID format: issue-<N>:<phase>:<seq>
+  --actor-type TYPE              Actor type: ai_agent, github_action (human not supported in this scope)
+  --actor-name NAME              Actor name
+  --evidence-source-kind KIND    Evidence source kind: github_comment, ci_check, hook_jsonl, artifact, transcript, local_file
+  --evidence-source-ref REF      Evidence source reference (URL or path)
+  --evidence-visibility VIS      Evidence visibility: public_github_comment, private_artifact, local_only
+
+OPTIONAL OPTIONS:
+  --issue NUMBER                 Issue number (must match ^[1-9][0-9]*$) [default: null]
+  --pr NUMBER                    PR number (must match ^[1-9][0-9]*$) [default: null]
+  --phase-ledger-phase PHASE     Ledger phase (optional, defaults to null)
   --actor-session-id ID          Actor session ID [optional]
-  --evidence-source-kind KIND    Evidence source kind: github_comment, ci_check, hook_jsonl, artifact, transcript, local_file [required]
-  --evidence-source-ref REF      Evidence source reference (URL or path) [required]
-  --evidence-visibility VIS      Evidence visibility: public_github_comment, private_artifact, local_only [required]
   --format FORMAT                Output format: json, github-comment [default: json]
-  --dry-run                      Print to stdout without validation [default: false]
-  --validate                     Run internal Ajv validation [optional]
-  --strict-redaction             Exit non-zero on secret patterns [optional]
+  --manifest-id UUID             Override manifest_id (asm-<UUIDv4> format) [optional, auto-generated if omitted]
+  --recorded-at ISO8601          Override recorded_at timestamp [optional, auto-generated if omitted]
+  --validate                     Run schema + semantic validation before output [optional]
+  --strict-redaction             Force redaction scan on all formats [optional]
+  --verification-overall STATUS  Overall verification result: pass|fail|partial|n_a [optional]
+  --verification-ac-result AC=STATUS  AC verdict (repeatable, format: AC7=pass) [optional]
+  --verification-evidence-ref REF  Evidence reference (repeatable) [optional]
+  --human-intervention-required BOOL  Human intervention flag: true|false [optional, default: false]
+  --human-intervention-reason TEXT  Reason for human intervention [optional]
   --help                         Show this help message
+
+DETERMINISM NOTES:
+  Non-deterministic fields (when not overridden):
+  - manifest_id: auto-generated UUIDv4 (use --manifest-id to fix)
+  - recorded_at: current ISO 8601 timestamp (use --recorded-at to fix)
 
 EXAMPLES:
   node scripts/generate-session-manifest.mjs \\
@@ -100,7 +126,8 @@ EXAMPLES:
     --evidence-source-kind artifact \\
     --evidence-source-ref artifacts/manifest.json \\
     --evidence-visibility private_artifact \\
-    --format json
+    --format json \\
+    --validate
 
   node scripts/generate-session-manifest.mjs \\
     --repository squne121/loop-protocol \\
@@ -112,7 +139,8 @@ EXAMPLES:
     --evidence-source-kind ci_check \\
     --evidence-source-ref https://github.com/squne121/loop-protocol/runs/123456 \\
     --evidence-visibility public_github_comment \\
-    --format github-comment
+    --format github-comment \\
+    --validate
 `)
 }
 
@@ -120,7 +148,15 @@ EXAMPLES:
 // UUIDv4 Generation
 // ============================================================================
 
-function generateManifestId() {
+function generateManifestId(override) {
+  if (override) {
+    // Validate format
+    const pattern = /^asm-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    if (!pattern.test(override)) {
+      throw new Error(`Invalid manifest_id format: ${override}. Expected: asm-<UUIDv4>`)
+    }
+    return override
+  }
   const uuid = randomUUID()
   return `asm-${uuid}`
 }
@@ -183,50 +219,20 @@ function validatePhaseInstanceId(value) {
   }
 }
 
-// ============================================================================
-// Secret Detection
-// ============================================================================
-
-function detectSecretPatterns(obj) {
-  const jsonStr = JSON.stringify(obj)
-
-  // raw_transcript field (not raw_transcript_included, which is allowed)
-  if (jsonStr.includes('"raw_transcript":') || jsonStr.includes('"raw_transcript":')) {
-    return 'raw_transcript field detected'
+function validateIssueNumber(value) {
+  const pattern = /^[1-9][0-9]*$/
+  if (!pattern.test(value)) {
+    throw new Error(`Invalid issue number: ${value}. Must match ^[1-9][0-9]*$`)
   }
-
-  // local_file: true
-  if (jsonStr.includes('"local_file":true') || /local_file\s*:\s*true/.test(jsonStr)) {
-    return 'local_file: true detected'
-  }
-
-  // Absolute paths: /home/, /Users/, /tmp/
-  if (/\/home\/|\/Users\/|\/tmp\//.test(jsonStr)) {
-    return 'absolute path detected'
-  }
-
-  // .env pattern (but allow .env as filename in schema context)
-  if (/\.env\b[^.]/.test(jsonStr) && !jsonStr.includes('agent-session-manifest')) {
-    return '.env content pattern detected'
-  }
-
-  // OpenAI token format: sk-[A-Za-z0-9_-]{20,}
-  if (/sk-[A-Za-z0-9_-]{20,}/.test(jsonStr)) {
-    return 'OpenAI token pattern detected'
-  }
-
-  // GitHub token format: gh[pousr]_[A-Za-z0-9_]{20,}
-  if (/gh[pousr]_[A-Za-z0-9_]{20,}/.test(jsonStr)) {
-    return 'GitHub token pattern detected'
-  }
-
-  // PRIVATE KEY
-  if (/BEGIN\s+\w+\s+PRIVATE\s+KEY/.test(jsonStr)) {
-    return 'PRIVATE KEY pattern detected'
-  }
-
-  return ''
 }
+
+function validatePrNumber(value) {
+  const pattern = /^[1-9][0-9]*$/
+  if (!pattern.test(value)) {
+    throw new Error(`Invalid PR number: ${value}. Must match ^[1-9][0-9]*$`)
+  }
+}
+
 
 // ============================================================================
 // Manifest Generation
@@ -269,10 +275,18 @@ function generateManifest(opts) {
   validateEvidenceVisibility(opts['evidence-visibility'])
   validatePhaseInstanceId(opts['phase-instance-id'])
 
+  // M1: Validate issue/pr numbers if provided
+  if (opts.issue) {
+    validateIssueNumber(opts.issue)
+  }
+  if (opts.pr) {
+    validatePrNumber(opts.pr)
+  }
+
   const manifest = {
     schema: 'agent_session_manifest/v1',
-    manifest_id: generateManifestId(),
-    recorded_at: new Date().toISOString(),
+    manifest_id: generateManifestId(opts['manifest-id']),
+    recorded_at: opts['recorded-at'] || new Date().toISOString(),
     repository: opts.repository,
     actor: {
       type: opts['actor-type'],
@@ -317,12 +331,57 @@ function generateManifest(opts) {
     manifest.phase.ledger_phase = opts['phase-ledger-phase']
   }
 
-  // Default to not_applicable if not provided
+  // Default to null if not provided
   if (!manifest.phase.ledger_phase) {
     manifest.phase.ledger_phase = null
   }
 
+  // B7: Add verification if overall provided
+  if (opts['verification-overall']) {
+    const acResults = []
+    // Parse repeated --verification-ac-result AC=STATUS
+    const acResultEntries = Array.isArray(opts['verification-ac-result'])
+      ? opts['verification-ac-result']
+      : opts['verification-ac-result']
+        ? [opts['verification-ac-result']]
+        : []
+    for (const entry of acResultEntries) {
+      const [ac, verdict] = entry.split('=')
+      if (ac && verdict) {
+        acResults.push({ ac, verdict })
+      }
+    }
+
+    manifest.verification = {
+      overall: opts['verification-overall'],
+      skipped_count: 0,
+      fallback_detected: false,
+      ac_results: acResults,
+    }
+  }
+
+  // B7: Add human_intervention
+  const humanInterventionRequired = opts['human-intervention-required'] === 'true'
+  manifest.human_intervention = {
+    required: humanInterventionRequired,
+    type: humanInterventionRequired ? 'escalation' : 'none',
+    summary: opts['human-intervention-reason'] || null,
+  }
+
   return manifest
+}
+
+// ============================================================================
+// Backtick Fence Calculation (B6)
+// ============================================================================
+
+function calculateFenceLength(manifest) {
+  // Find max consecutive backtick run in JSON representation
+  const jsonStr = JSON.stringify(manifest, null, 2)
+  const backtickMatches = jsonStr.match(/`+/g) || []
+  const maxRun = backtickMatches.reduce((max, match) => Math.max(max, match.length), 0)
+  // Use max(maxRun + 1, 4) for fence length
+  return Math.max(maxRun + 1, 4)
 }
 
 // ============================================================================
@@ -335,11 +394,13 @@ function formatAsJson(manifest) {
 
 function formatAsGithubComment(manifest) {
   const jsonStr = JSON.stringify(manifest, null, 2)
+  const fenceLength = calculateFenceLength(manifest)
+  const fence = '`'.repeat(fenceLength)
   return (
     `<!-- agent_session_manifest:v1 start -->\n` +
-    `\`\`\`\`json\n` +
+    `${fence}json\n` +
     `${jsonStr}\n` +
-    `\`\`\`\`\n` +
+    `${fence}\n` +
     `<!-- agent_session_manifest:v1 end -->`
   )
 }
@@ -355,18 +416,41 @@ async function main() {
     // Generate manifest
     const manifest = generateManifest(opts)
 
-    // Secret detection
-    const secretPattern = detectSecretPatterns(manifest)
-    if (secretPattern && opts['strict-redaction']) {
-      console.error(`Error: Secret pattern detected: ${secretPattern}`)
-      process.exit(1)
+    // B1: Run validation if --validate is specified or format is github-comment
+    const format = opts.format || 'json'
+    const shouldValidate = opts.validate || format === 'github-comment'
+
+    if (shouldValidate) {
+      const validationResult = validateManifest(manifest)
+      if (!validationResult.valid) {
+        console.error('Validation failed:')
+        for (const error of validationResult.errors) {
+          console.error(`  ${error.path}: ${error.message}`)
+        }
+        process.exit(1)
+      }
+    }
+
+    // B5: Secret detection (fail-closed for github-comment, optional for others)
+    const secretPattern = detectSecretPatternsLocal(manifest)
+    if (secretPattern) {
+      if (format === 'github-comment' || opts['strict-redaction']) {
+        console.error(`Error: Secret pattern detected: ${secretPattern}`)
+        process.exit(1)
+      }
     }
 
     // Format output
-    const format = opts.format || 'json'
     let output
     if (format === 'github-comment') {
       output = formatAsGithubComment(manifest)
+
+      // B5: Scan markdown output for secrets as well
+      const markdownSecrets = detectSecretsInMarkdown(output)
+      if (markdownSecrets) {
+        console.error(`Error: Secret pattern detected in output: ${markdownSecrets}`)
+        process.exit(1)
+      }
     } else if (format === 'json') {
       output = formatAsJson(manifest)
     } else {

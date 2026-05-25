@@ -51,35 +51,83 @@ function loadMarkdownFromArgsOrStdin() {
 }
 
 // ============================================================================
-// Extraction
+// Extraction (B6: Line-based parser with fence length matching)
 // ============================================================================
 
 function extractManifestFromMarkdown(markdown) {
   const startMarker = '<!-- agent_session_manifest:v1 start -->'
   const endMarker = '<!-- agent_session_manifest:v1 end -->'
 
-  const startIdx = markdown.indexOf(startMarker)
-  const endIdx = markdown.indexOf(endMarker)
+  const lines = markdown.split('\n')
 
-  if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) {
-    console.error('Error: Manifest markers not found')
-    console.error(
-      `Expected: <!-- agent_session_manifest:v1 start --> ... <!-- agent_session_manifest:v1 end -->`,
-    )
+  // Find marker lines
+  let startMarkerLine = -1
+  let endMarkerLine = -1
+  let startMarkerCount = 0
+  let endMarkerCount = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(startMarker)) {
+      startMarkerLine = i
+      startMarkerCount++
+    }
+    if (lines[i].includes(endMarker)) {
+      endMarkerLine = i
+      endMarkerCount++
+    }
+  }
+
+  // B6: Validate marker uniqueness
+  if (startMarkerCount !== 1) {
+    console.error(`Error: Start marker appears ${startMarkerCount} times (expected 1)`)
+    process.exit(1)
+  }
+  if (endMarkerCount !== 1) {
+    console.error(`Error: End marker appears ${endMarkerCount} times (expected 1)`)
     process.exit(1)
   }
 
-  const contentBetweenMarkers = markdown.substring(startIdx + startMarker.length, endIdx)
-
-  // Extract content between backticks (support both 3 and 4 backticks)
-  const codeBlockMatch = contentBetweenMarkers.match(/`{3,4}(?:json)?\s*\n([\s\S]*?)\n`{3,4}/)
-  if (!codeBlockMatch) {
-    console.error('Error: Code block with JSON not found between markers')
-    console.error('Expected: ```json\n{...}\n```')
+  if (startMarkerLine === -1 || endMarkerLine === -1 || startMarkerLine >= endMarkerLine) {
+    console.error('Error: Manifest markers not found or in wrong order')
+    console.error(`Expected: <!-- agent_session_manifest:v1 start --> ... <!-- agent_session_manifest:v1 end -->`)
     process.exit(1)
   }
 
-  const jsonStr = codeBlockMatch[1]
+  // Find opening fence (first line after start marker with backticks)
+  let openingFenceLine = -1
+  let openingFenceLength = 0
+  for (let i = startMarkerLine + 1; i < endMarkerLine; i++) {
+    const match = lines[i].match(/^(`+)/)
+    if (match) {
+      openingFenceLine = i
+      openingFenceLength = match[1].length
+      break
+    }
+  }
+
+  if (openingFenceLine === -1) {
+    console.error('Error: Opening fence not found')
+    process.exit(1)
+  }
+
+  // Find closing fence (matching length)
+  let closingFenceLine = -1
+  for (let i = openingFenceLine + 1; i < endMarkerLine; i++) {
+    const match = lines[i].match(/^(`+)$/)
+    if (match && match[1].length === openingFenceLength) {
+      closingFenceLine = i
+      break
+    }
+  }
+
+  if (closingFenceLine === -1) {
+    console.error(`Error: Closing fence not found (expected ${openingFenceLength} backticks)`)
+    process.exit(1)
+  }
+
+  // Extract JSON between fences
+  const jsonLines = lines.slice(openingFenceLine + 1, closingFenceLine)
+  const jsonStr = jsonLines.join('\n')
 
   try {
     const jsonData = JSON.parse(jsonStr)
