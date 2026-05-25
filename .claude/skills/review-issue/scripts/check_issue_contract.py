@@ -131,6 +131,7 @@ class DeterministicChecks:
     C9_runtime_applicability_present: str = CheckResult.NA
     C10_deferred_destination_present: str = CheckResult.NA
     C11_decision_tag_consistency: str = CheckResult.NA
+    C12_product_trace_fields_structure: str = CheckResult.NA
 
 
 @dataclass
@@ -138,8 +139,25 @@ class CheckerResult:
     verdict: str = "approve"
     deterministic_checks: DeterministicChecks = field(default_factory=DeterministicChecks)
     blocking_issues: list[str] = field(default_factory=list)
-    non_blocking_improvements: list[str] = field(default_factory=list)
+    non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
+    diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
     issue_kind: str = "implementation"
+
+
+PLACEHOLDER_VALUES = {"", "tbd", "todo", "none", "n/a", "na", "<tbd>", "<todo>"}
+PLACEHOLDER_PATTERN = re.compile(r"^\s*<[^>]+>\s*$")  # <...> 形式
+REQUIREMENT_ID_PATTERN = re.compile(r"^REQ-\d{3,}$")
+SOURCE_TASK_ID_PATTERN = re.compile(r"^(T|TASK-)\d{3,}$")
+
+
+def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: list, suggested_action: str) -> None:
+    """Append a structured non_blocking_improvement entry."""
+    result.non_blocking_improvements.append({
+        "code": code,
+        "severity": severity,
+        "evidence": evidence,
+        "suggested_action": suggested_action,
+    })
 
 
 def extract_section(body: str, section_name: str) -> str:
@@ -422,6 +440,178 @@ def check_c11_decision_tag_consistency(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
+def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]:
+    """C12: Product Spec / task-lineage Issue で trace fields の構造を検査する。
+
+    Applicable 条件: body に `## Product Spec Context`、`## Machine-Readable Contract` 内の
+    product trace fields、または `product_spec_id` / `requirement_id` / `source_task_id`
+    の言及があるとき。
+
+    Applicable な場合、以下を要求:
+      - product_spec_id / requirement_id / source_task_id の 3 fields が全て存在し non-placeholder
+      - requirement_id は REQ-\\d{3,} 形式
+      - source_task_id は (T|TASK-)\\d{3,} 形式
+      - product_spec_id は non-empty / non-placeholder のみ確認（canonical format は固定しない）
+    """
+    # Applicability detection
+    has_product_spec_context = bool(re.search(r"^## Product Spec Context\b", body, re.MULTILINE))
+    has_trace_field_mention = bool(re.search(
+        r"\b(product_spec_id|requirement_id|source_task_id)\b", body
+    ))
+    has_task_lineage_marker = bool(re.search(
+        r"^\s*-?\s*(generated_from_task|task_lineage|source_task)\s*:", body, re.MULTILINE
+    ))
+
+    applicable = has_product_spec_context or has_trace_field_mention or has_task_lineage_marker
+    if not applicable:
+        return CheckResult.NA, []
+
+    # Extract trace fields from Machine-Readable Contract YAML or Product Spec Context
+    def _extract_field(field_name: str) -> Optional[str]:
+        # Match `field_name: "value"` or `field_name: value` (with optional quotes)
+        m = re.search(
+            rf'^\s*-?\s*{re.escape(field_name)}\s*:\s*["\']?([^"\'\n]*?)["\']?\s*$',
+            body,
+            re.MULTILINE,
+        )
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _is_placeholder(v: Optional[str]) -> bool:
+        if v is None:
+            return True
+        norm = v.strip().lower()
+        if norm in PLACEHOLDER_VALUES:
+            return True
+        if PLACEHOLDER_PATTERN.match(v):
+            return True
+        return False
+
+    product_spec_id = _extract_field("product_spec_id")
+    requirement_id = _extract_field("requirement_id")
+    source_task_id = _extract_field("source_task_id")
+
+    failures = []
+    if _is_placeholder(product_spec_id):
+        failures.append("product_spec_id が欠落または placeholder")
+    if _is_placeholder(requirement_id):
+        failures.append("requirement_id が欠落または placeholder")
+    elif not REQUIREMENT_ID_PATTERN.match(requirement_id):
+        failures.append(f"requirement_id '{requirement_id}' が REQ-\\d{{3,}} 形式に一致しない")
+    if _is_placeholder(source_task_id):
+        failures.append("source_task_id が欠落または placeholder")
+    elif not SOURCE_TASK_ID_PATTERN.match(source_task_id):
+        failures.append(f"source_task_id '{source_task_id}' が (T|TASK-)\\d{{3,}} 形式に一致しない")
+
+    if failures:
+        return CheckResult.FAIL, failures
+    return CheckResult.PASS, []
+
+
+def detect_warning_scope_cvs_in_scope_mismatch(body: str, result: CheckerResult) -> None:
+    """non_blocking: Current Validated Scope と In Scope の bullet 集合の乖離検出。"""
+    cvs = extract_section(body, "Current Validated Scope")
+    in_scope = extract_section(body, "In Scope")
+    if not cvs or not in_scope:
+        return
+
+    def _bullet_tokens(section: str) -> set:
+        tokens = set()
+        for line in section.splitlines():
+            s = line.strip()
+            if s.startswith("- "):
+                # crude tokenization: backtick-quoted paths and significant words
+                for tok in re.findall(r"`([^`]+)`", s):
+                    tokens.add(tok.strip())
+        return tokens
+
+    cvs_tokens = _bullet_tokens(cvs)
+    in_scope_tokens = _bullet_tokens(in_scope)
+    if not cvs_tokens or not in_scope_tokens:
+        return
+
+    overlap = cvs_tokens & in_scope_tokens
+    union = cvs_tokens | in_scope_tokens
+    # Substantial divergence: less than 30% jaccard overlap
+    if union and (len(overlap) / len(union)) < 0.3:
+        _add_warning(
+            result,
+            code="scope_cvs_in_scope_mismatch",
+            severity="warning",
+            evidence=[
+                f"Current Validated Scope tokens: {sorted(cvs_tokens)[:5]}",
+                f"In Scope tokens: {sorted(in_scope_tokens)[:5]}",
+            ],
+            suggested_action="Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、乖離理由を Background / Scope Delta に記載する",
+        )
+
+
+def detect_warning_vc_untracked_false_negative(body: str, result: CheckerResult) -> None:
+    """non_blocking: `git status --porcelain | grep -v "^?"` 型の偽陰性パターン検出。"""
+    vc = extract_section(body, "Verification Commands")
+    if not vc:
+        return
+
+    matches = re.findall(
+        r"git\s+status\s+--porcelain[^\n]*\|\s*grep\s+-v\s+[\"']?\^[?][\"']?",
+        vc,
+    )
+    if matches:
+        _add_warning(
+            result,
+            code="vc_untracked_false_negative_pattern",
+            severity="warning",
+            evidence=[m[:120] for m in matches[:3]],
+            suggested_action="`grep -v \"^?\"` は untracked 行を除外するため、unstaged 変更を見逃す。検証対象を literal で列挙する形式に変更する",
+        )
+
+
+def detect_warning_vc_negative_grep_without_literal_inventory(body: str, result: CheckerResult) -> None:
+    """non_blocking: 削除確認 VC が削除対象 literal を列挙せず否定 grep のみで完了確認している形を検出。"""
+    vc = extract_section(body, "Verification Commands")
+    ac = extract_section(body, "Acceptance Criteria")
+    if not vc:
+        return
+
+    # Triggers: deletion intent in AC/VC + negation grep pattern in VC
+    deletion_intent = bool(re.search(r"(削除|deletion|removed?\b|delete\b)", ac + "\n" + vc, re.IGNORECASE))
+    negation_patterns = re.findall(
+        r"(?:^|\n)\s*\$?\s*!\s*(?:rg|grep)\b[^\n]+",
+        vc,
+    )
+    if not deletion_intent or not negation_patterns:
+        return
+
+    # Heuristic: literal inventory absent if there's no `test -f <path>` or rg listing deletion targets.
+    # Look for explicit removal-target enumeration: `removed:` section, or `- [ ] AC.*削除.*<literal>`
+    has_literal_inventory = bool(re.search(r"(removed_paths|削除対象|deleted_files|literal_list)\s*:", vc + "\n" + body))
+    if not has_literal_inventory:
+        _add_warning(
+            result,
+            code="vc_negative_grep_without_literal_inventory",
+            severity="warning",
+            evidence=[m.strip()[:120] for m in negation_patterns[:3]],
+            suggested_action="削除確認 VC では削除対象 literal を明示的に列挙し、`test ! -f <path>` 形式または `removed_paths:` リストで個別確認する",
+        )
+
+
+def generate_c1_missing_section_skeleton(missing_sections: list[str]) -> list[dict]:
+    """C1 fail 時に missing section ごとの diff_proposal.add エントリを生成する。
+
+    各エントリは sentinel marker `missing_section_skeleton` を含み、impl-review-loop / issue-author
+    が機械的に skeleton を挿入できる形式にする。
+    """
+    entries = []
+    for section in missing_sections:
+        entries.append({
+            "kind": "missing_section_skeleton",
+            "section": section,
+            "skeleton": f"## {section}\n\n<!-- TODO: {section} を記述する。詳細は .github/ISSUE_TEMPLATE/implementation.yml 参照 -->\n",
+        })
+    return entries
+
+
 def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     """Run all C1-C11 checks and return structured result."""
     issue_kind = detect_issue_kind(body, labels, title)
@@ -431,6 +621,17 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     # C1
     checks.C1_required_sections, issues = check_c1_required_sections(body, issue_kind)
     result.blocking_issues.extend(issues)
+    # C1 fail 時: missing section ごとの skeleton を diff_proposal.add に同梱する
+    if checks.C1_required_sections == CheckResult.FAIL and issues:
+        missing_sections = []
+        for msg in issues:
+            m = re.search(r"必須セクション '## ([^']+)' が存在しない", msg)
+            if m:
+                missing_sections.append(m.group(1))
+        if missing_sections:
+            result.diff_proposal["add"].extend(
+                generate_c1_missing_section_skeleton(missing_sections)
+            )
 
     # C2
     checks.C2_stop_conditions_6, issues = check_c2_stop_conditions(body, issue_kind)
@@ -466,7 +667,14 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     if checks.C9_runtime_applicability_present in (CheckResult.FAIL, CheckResult.LEGACY_MISSING):
         result.blocking_issues.extend(issues)
     elif checks.C9_runtime_applicability_present == CheckResult.WARN:
-        result.non_blocking_improvements.extend(issues)
+        for msg in issues:
+            _add_warning(
+                result,
+                code="c9_runtime_applicability_missing",
+                severity="warning",
+                evidence=[msg],
+                suggested_action="implementation 以外の Issue でも `## Runtime Verification Applicability` セクションの追加を推奨する",
+            )
 
     # C10
     checks.C10_deferred_destination_present, issues = check_c10_deferred_destination(body)
@@ -475,6 +683,15 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     # C11
     checks.C11_decision_tag_consistency, issues = check_c11_decision_tag_consistency(body)
     result.blocking_issues.extend(issues)
+
+    # C12: Product trace fields structure
+    checks.C12_product_trace_fields_structure, issues = check_c12_product_trace_fields_structure(body)
+    result.blocking_issues.extend(issues)
+
+    # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
+    detect_warning_scope_cvs_in_scope_mismatch(body, result)
+    detect_warning_vc_untracked_false_negative(body, result)
+    detect_warning_vc_negative_grep_without_literal_inventory(body, result)
 
     # Verdict
     all_check_values = [
@@ -489,6 +706,7 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
         checks.C9_runtime_applicability_present,
         checks.C10_deferred_destination_present,
         checks.C11_decision_tag_consistency,
+        checks.C12_product_trace_fields_structure,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
     result.verdict = "needs-fix" if has_fail else "approve"
@@ -564,9 +782,11 @@ def result_to_dict(result: CheckerResult) -> dict:
             "C9_runtime_applicability_present": result.deterministic_checks.C9_runtime_applicability_present,
             "C10_deferred_destination_present": result.deterministic_checks.C10_deferred_destination_present,
             "C11_decision_tag_consistency": result.deterministic_checks.C11_decision_tag_consistency,
+            "C12_product_trace_fields_structure": result.deterministic_checks.C12_product_trace_fields_structure,
         },
         "blocking_issues": result.blocking_issues,
         "non_blocking_improvements": result.non_blocking_improvements,
+        "diff_proposal": result.diff_proposal,
     }
 
 
