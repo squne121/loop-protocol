@@ -60,6 +60,60 @@
 | `model_downgrades` | `list[{from, to, reason}]` | 降格イベントのリスト。降格なし時は `[]`。常に存在。 |
 | `reason_code` | `str` | fail-closed 理由コード（エラー時のみ設定）。値: `model_chain_exhausted` / `unknown_role` / `empty_chain` / `routing_config_invalid` |
 
+## REPO_EVIDENCE_REF_V1 Output Examples
+
+`local_asset_research` / `github_research` profile で file evidence を返す場合、以下の形式を使う。`response_text` / コメント / artifact の一部として embed される。
+
+### Example 1: Verified File Evidence
+
+```json
+{
+  "kind": "file",
+  "ref": {
+    "type": "REPO_EVIDENCE_REF_V1",
+    "commit_sha": "abc123def456abc123def456abc123def456abc1",
+    "object_format": "sha1",
+    "path": "docs/dev/agent-skill-boundaries.md",
+    "start_line": 42,
+    "end_line": 67,
+    "permalink": "https://github.com/squne121/loop-protocol/blob/abc123def456abc123def456abc123def456abc1/docs/dev/agent-skill-boundaries.md#L42-L67",
+    "excerpt_sha256": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+    "anchor_text": "## Agent / Skill 責務境界",
+    "verification_status": "verified",
+    "verification_method": "sha256_hash_match",
+    "verified_at": "2026-05-23T15:30:45Z"
+  },
+  "summary": "The file defines responsibility boundaries between SubAgent roles and Skill procedures."
+}
+```
+
+### Example 2: Inconclusive File Evidence
+
+```json
+{
+  "kind": "file",
+  "ref": {
+    "type": "REPO_EVIDENCE_REF_V1",
+    "commit_sha": "def456abc123def456abc123def456abc123def4",
+    "object_format": "sha1",
+    "path": "src/systems/combat.ts",
+    "start_line": 100,
+    "end_line": 120,
+    "permalink": "https://github.com/squne121/loop-protocol/blob/def456abc123def456abc123def456abc123def4/src/systems/combat.ts#L100-L120",
+    "excerpt_sha256": "f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+    "anchor_text": null,
+    "verification_status": "inconclusive",
+    "verification_method": "sha256_hash_mismatch",
+    "verified_at": "2026-05-23T15:31:10Z"
+  },
+  "summary": "File excerpt could not be verified: SHA-256 mismatch suggests the line range may have drifted due to file updates. Human re-verification required."
+}
+```
+
+**Caller behavior difference**:
+- Example 1 (`verified`): Caller can confidently use this excerpt as authoritative code reference.
+- Example 2 (`inconclusive`): Caller MUST escalate to human review or re-request file evidence with updated parameters. DO NOT use the provided line numbers as ground truth.
+
 ## Non-Goals
 
 - `response_text` 自体を削除すること
