@@ -333,3 +333,107 @@ def test_n1_empty_changed_paths_treated_as_unavailable():
     errors = [error for error in result.errors if error.rule_id == "LP058"]
     assert result.status == "fail"
     assert len(errors) == 1
+
+
+def test_safety_sensitive_na_reason_fails_lp051():
+    """Safety-sensitive PR with N/A + reason in Safety Claim Matrix should fail LP051."""
+    body = """## Summary
+
+- test
+
+## Checks
+
+- [ ] `pnpm typecheck`
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+
+## Schema Consumer Inventory
+
+N/A
+
+## Safety Claim Matrix
+
+N/A
+reason: not needed
+
+## Notes
+
+- Related issue: #330
+"""
+    # .github/workflows is safety-sensitive
+    result = validate_pr_body(body, [".github/workflows/ci.yml"], linked_issue=330)
+    errors = [error for error in result.errors if error.rule_id == "LP051"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+    assert "N/A with reason" in errors[0].message
+
+
+def test_safety_sensitive_na_reason_fails_lp055():
+    """Safety-sensitive PR with N/A + reason should fail LP055 (missing header)."""
+    body = """## Summary
+
+- test
+
+## Checks
+
+- [ ] `pnpm typecheck`
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+
+## Schema Consumer Inventory
+
+N/A
+
+## Safety Claim Matrix
+
+N/A
+reason: not needed
+
+## Notes
+
+- Related issue: #330
+"""
+    # .claude/skills is safety-sensitive
+    result = validate_pr_body(body, [".claude/skills/open-pr/validate_pr_body.py"], linked_issue=330)
+    errors = [error for error in result.errors if error.rule_id == "LP055"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+    assert "header row is missing" in errors[0].message
+
+
+def test_non_safety_sensitive_na_reason_passes():
+    """Non-safety-sensitive PR with N/A + reason should pass (backward compat)."""
+    body = """## Summary
+
+- docs-only change
+
+## Checks
+
+- [ ] `pnpm typecheck`
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+
+## Schema Consumer Inventory
+
+N/A
+
+## Safety Claim Matrix
+
+N/A
+reason: docs-only change, no safety controls affected
+
+## Notes
+
+- Related issue: #330
+"""
+    # docs-only, non-safety-sensitive
+    result = validate_pr_body(body, ["docs/dev/foo.md"], linked_issue=330)
+    safety_rule_ids = {error.rule_id for error in result.errors} & {"LP051", "LP055", "LP056"}
+    # Should pass without safety-related errors
+    assert not safety_rule_ids, f"Non-safety-sensitive PR should not fail safety rules, but got: {safety_rule_ids}"

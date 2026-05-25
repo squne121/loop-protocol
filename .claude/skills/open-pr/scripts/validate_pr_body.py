@@ -309,7 +309,12 @@ def _validate_lp051(
         ]
 
     content, start_line, end_line = info
-    if _is_placeholder_text(content):
+    # For safety-sensitive PRs, N/A + reason is not a valid short-circuit.
+    # Must have concrete table with claims and evidence.
+    has_na_reason = (
+        re.search(r"(?i)\bN/A\b", content) and re.search(r"(?i)\breason\b", content)
+    )
+    if _is_placeholder_text(content) or has_na_reason:
         context, truncated = _get_context_lines(body, start_line, end_line)
         return [
             ValidationError(
@@ -318,7 +323,7 @@ def _validate_lp051(
                 section="Safety Claim Matrix",
                 line_start=start_line,
                 line_end=end_line,
-                message="Safety-sensitive PR cannot leave Safety Claim Matrix empty or placeholder-only.",
+                message="Safety-sensitive PR cannot leave Safety Claim Matrix empty, placeholder-only, or N/A with reason.",
                 minimal_context=context,
                 context_truncated=truncated,
                 fix_hint="Fill concrete safety claims, evidence, and follow-up.",
@@ -327,12 +332,21 @@ def _validate_lp051(
     return []
 
 
-def _validate_lp055(body: str, sections: dict[str, tuple[str, int, int]]) -> list[ValidationError]:
+def _validate_lp055(
+    body: str,
+    sections: dict[str, tuple[str, int, int]],
+    is_safety_sensitive: bool = False,
+) -> list[ValidationError]:
     info = sections.get("Safety Claim Matrix")
     if not info:
         return []
     content, start_line, end_line = info
-    if re.search(r"(?i)\bN/A\b", content) and re.search(r"(?i)\breason\b", content):
+    # N/A + reason short-circuit is only valid for non-safety-sensitive PRs.
+    if (
+        not is_safety_sensitive
+        and re.search(r"(?i)\bN/A\b", content)
+        and re.search(r"(?i)\breason\b", content)
+    ):
         return []
     header = _find_safety_header_line(content)
     if header is None:
@@ -372,12 +386,21 @@ def _validate_lp055(body: str, sections: dict[str, tuple[str, int, int]]) -> lis
     ]
 
 
-def _validate_lp056(body: str, sections: dict[str, tuple[str, int, int]]) -> list[ValidationError]:
+def _validate_lp056(
+    body: str,
+    sections: dict[str, tuple[str, int, int]],
+    is_safety_sensitive: bool = False,
+) -> list[ValidationError]:
     info = sections.get("Safety Claim Matrix")
     if not info:
         return []
     content, start_line, _ = info
-    if re.search(r"(?i)\bN/A\b", content) and re.search(r"(?i)\breason\b", content):
+    # N/A + reason short-circuit is only valid for non-safety-sensitive PRs.
+    if (
+        not is_safety_sensitive
+        and re.search(r"(?i)\bN/A\b", content)
+        and re.search(r"(?i)\breason\b", content)
+    ):
         return []
     lines = content.splitlines()
     for index, line in enumerate(lines, 1):
@@ -500,13 +523,14 @@ def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[Validati
 def validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: int | None = None) -> ValidationResult:
     body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
     sections = _extract_sections(body)
+    is_safety_sensitive = changed_paths is not None and _is_safety_sensitive(changed_paths)
     errors: list[ValidationError] = []
     errors.extend(_validate_lp052(body, sections))
     errors.extend(_validate_lp053(body, sections))
     errors.extend(_validate_lp050(body, sections))
     errors.extend(_validate_lp051(body, sections, changed_paths))
-    errors.extend(_validate_lp055(body, sections))
-    errors.extend(_validate_lp056(body, sections))
+    errors.extend(_validate_lp055(body, sections, is_safety_sensitive))
+    errors.extend(_validate_lp056(body, sections, is_safety_sensitive))
     errors.extend(_validate_lp057(body, sections, linked_issue))
     errors.extend(_validate_lp058(body, changed_paths))
     status: Literal["pass", "fail"] = "fail" if errors else "pass"
