@@ -61,12 +61,12 @@ class TestPassCase:
                 f"Check {check_id} has unexpected result '{result}' for pass fixture"
             )
 
-    def test_has_11_deterministic_checks(self):
-        """GIVEN any fixture WHEN checker runs THEN deterministic_checks has exactly 11 keys."""
+    def test_has_12_deterministic_checks(self):
+        """GIVEN any fixture WHEN checker runs THEN deterministic_checks has exactly 12 keys (C1-C12)."""
         output = run_checker("pass_issue.md")
         checks = output["deterministic_checks"]
-        assert len(checks) == 11, (
-            f"Expected 11 deterministic checks, got {len(checks)}: {list(checks.keys())}"
+        assert len(checks) == 12, (
+            f"Expected 12 deterministic checks (C1-C12), got {len(checks)}: {list(checks.keys())}"
         )
 
     def test_no_blocking_issues(self):
