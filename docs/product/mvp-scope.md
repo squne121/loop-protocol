@@ -28,11 +28,17 @@ trace_links:
 
 ## 正本階層 / Authority and Fallbacks
 
+### Normativity Guard
+
+`status: draft` の間、本書は discovery / review / playtest planning のための作業仮説であり、implementation issue の acceptance source としては使用しない。
+
+以下の Authority and Fallbacks は `status: accepted` に昇格した後にのみ適用する。draft 段階で実装判断が必要な場合は、`docs/product/requirements.md`、accepted `docs/product/game-thesis.md`、対象 Issue contract を優先し、本書は非拘束の参考情報として扱う。
+
 優先順位（上が強い）:
 
 1. `docs/product/requirements.md` — 全体要件と global non-goals の正本
 2. `docs/product/game-thesis.md` — accepted な上位コンセプト正本
-3. 本書（`docs/product/mvp-scope.md`） — MVP に含める / 含めない境界
+3. 本書（`docs/product/mvp-scope.md`） — `status: accepted` 後にのみ、MVP に含める / 含めない境界の正本
 4. `docs/product/game-logic.md` — implementation-facing reference（main 上に存在するが `status: draft`）
 5. `docs/product/game-design.md` — GDD-level design。`status: draft` のため **auxiliary_only_until_reconciled**
 6. `docs/product/game-overview.md` — 概念説明 fallback（正本ではない）
@@ -43,7 +49,7 @@ trace_links:
 
 - **HYP-MVP-001:** プレイヤーは短時間 sortie の中で、自分の直接介入が局所戦況を変えたと説明できる。Trace: `HYP-001-ace-intervention`
 - **HYP-MVP-002:** 撃破・解析・強化の流れが、単なる数値加算ではなく「敵技術を取り込んだ成長」として読まれる。Trace: `HYP-002-tech-extraction-loop`
-- **HYP-MVP-003:** 色だけに依存せず、形状・シルエット・明度差・警告形状で戦況と危険を把握できる。Trace: `Combat Readability`
+- **HYP-MVP-003:** 色だけに依存せず、形状・シルエット・明度差・警告形状で戦況と危険を把握できる。Trace: `docs/product/game-thesis.md` の Design Pillars / Combat Readability
 
 ## Included
 
@@ -85,6 +91,16 @@ trace_links:
 - 可読性が成立しない場合、asset 品質向上より先に shape / silhouette / warning grammar を見直す
 - sortie timer や敵数が不適切な場合、コード変更へ直行せず spec delta issue を経由して調整する
 
+## Measurement Contract
+
+| Hypothesis | Observable Signal | Collection Method | Success | Failure |
+|---|---|---|---|---|
+| `HYP-MVP-001` | プレイヤーが局所戦況変化の主因を自機介入として説明する | 3〜5 sortie の internal playtest 後に self-explanation prompt を記録する | 主要因として player intervention が語られる | 主要因が allied AI / passive stat / randomness に帰属される |
+| `HYP-MVP-002` | 報酬が enemy technology / analysis / capability growth として読まれる | debrief 後の自由記述または probe を記録する | reward が敵技術の解析・取り込みとして説明される | reward が cosmetic / generic currency / just numbers と説明される |
+| `HYP-MVP-003` | 色以外の cue で敵味方・危険・報酬導線を判別できる | observation log と misread notes を残す | shape / silhouette / brightness / warning grammar で判別できる | color-only cue 依存または誤認が支配的 |
+
+本書は測定契約の最小境界のみを定め、playtest 手順・記録フォーマット・判定ログの詳細は `docs/product/playtest-protocol.md` に委譲する。
+
 ## Non-Goals
 
 - Combat 全機能の固定仕様化
@@ -101,11 +117,18 @@ trace_links:
 | `docs/product/playtest-protocol.md` | 仮説の観測手順、playtest-log、spec delta 連携 |
 | implementation issue | 具体コード変更、テスト、PR |
 
+## MVP Tunable Parameters
+
+- `sortie_timer_initial`: `120s` は `docs/product/game-logic.md` 由来の draft test parameter として扱う。`status: accepted` までは fixed normative constant ではない
+- timer を扱う implementation は hard-code ではなく configurable value とし、後続 playtest の spec delta 対象にできること
+- enemy count / outpost HP / reward amount / upgrade count は本書では固定しない
+- 軽量マクロ指示は MVP test parameter として最大 1 種類まで含め得る。具体キー・UI・command taxonomy は `game-logic.md` と `playtest-protocol.md` に委譲する
+
 ## Open Questions
 
-- sortie timer は MVP test parameter として 120s を初期値に置くか、別の初期値を採るか
-- enemy count / outpost HP / reward amount / upgrade count をどこまで本書で固定せず残すか
-- 軽量マクロ指示を MVP に含める範囲をどこまでにするか
+- sortie timer の初期値を 120s 以外へ spec delta すべき signal を何にするか
+- enemy count / outpost HP / reward amount / upgrade count の初期仮置きをどの issue で固定するか
+- 軽量マクロ指示 1 種を採る場合、どの command intent を最優先にするか
 - Human Product Review で `status: accepted` に上げるための最低観測証拠を何にするか
 
 ## Playtest Handoff
