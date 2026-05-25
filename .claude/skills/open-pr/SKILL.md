@@ -207,7 +207,42 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - linked issue が CLOSED の場合は `Closes` を `Refs` に必ず downgrade（リンク済み close 連鎖防止）
 - 同一ブランチに OPEN PR がある場合は重複作成せず既存 URL を返す
 - `dry_run: true` でも publish ゲートと validator は実行する
-- 既存 PR が見つかった場合、本文 update は本 skill では行わない（呼び出し元が `gh pr edit` で対応）
+- 既存 PR が見つかった場合、本文 update は必ず update_pr.py wrapper 経由で行う（validator bypass 防止）
+
+## PR Body Update（既存 PR への本文反映）
+
+PR の本文を更新する場合（既存 PR 発見時など）は、必ず以下の wrapper 経由で行う（validator pre-write hook を強制）:
+
+```bash
+uv run python3 .claude/skills/open-pr/scripts/update_pr.py \
+  --pr-number <N> \
+  --body-file <path-to-new-body.md> \
+  --linked-issue <linked-issue-num> \
+  --changed-paths-file <changed-paths-file>
+```
+
+direct `gh pr edit --body-file` は使用禁止（validator が bypass されるため）。
+
+update_pr.py は以下を実行:
+1. 新しい body を読み込む
+2. validator pre-write hook 実行（fail-closed）
+3. validator pass 後、本検証済み body を temp file に書き出す
+4. gh pr edit に temp file の path を渡す（TOCTOU 安全）
+5. temp file を削除
+
+KEY=VALUE stdout contract:
+```
+PR_NUMBER=<N>
+REPO=<owner>/<repo>
+UPDATED=true
+```
+
+エラー時:
+```
+ERROR=E_VALIDATION_FAILED | E_UPDATE_FAILURE | E_FILE_NOT_FOUND
+ERROR_DETAIL=<詳細>
+VALIDATOR_RULE_IDS=<rule_ids>  # validator fail 時
+```
 
 ## Related
 
@@ -215,7 +250,8 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - `.claude/skills/impl-review-loop/SKILL.md` — オーケストレーター（差し戻し時の再呼び出し含む）
 - `.github/pull_request_template.md` — テンプレート正本（あれば）
 - `docs/dev/schema-governance.md` — schema 定義・Initial Known Schemas・Consumer Inventory 義務の SSOT
-- `scripts/open_pr.py` — 本手順を実装する Python wrapper
+- `scripts/open_pr.py` — PR 작성手順を実装する Python wrapper
+- `scripts/update_pr.py` — PR body 更新 wrapper with validator pre-write hook
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
