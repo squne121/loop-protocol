@@ -91,7 +91,7 @@ LOOP_STATE:
   blockers_history: []
   improvements_applied: []  # iteration ごとの「修正サマリ」
   removed_state_labels: []  # Step 0-hygiene で削除した state ラベルのリスト（state/blocked / state/queued 等）
-  termination_reason: null | approved | max_iterations | needs_second_pass | human_escalation | superseded_by_decision
+  termination_reason: null | approved | needs_second_pass | human_escalation | superseded_by_decision
   anchor_comment:
     url: null
     id: null
@@ -592,9 +592,20 @@ policy_derivation:
   sync_rule:
     # critical 判定の SoT は web_research_policy.critical_external_claims。
     # 既存 Step 1b 処理との整合のため web_research.critical_claims := web_research_policy.critical_external_claims で複製する。
+
+extraction:
+  target_paths: rg-like tokens in Outcome/InScope/AC/VC/AllowedPaths matching:
+    - '\.claude/[^`\s)]+' | 'docs/[^`\s)]+' | 'scripts/[^`\s)]+'
+    - '\.github/workflows/[^`\s)]+' | 'src/[^`\s)]+' | 'tests?/[^`\s)]+'
+    normalize: strip backticks / trailing punctuation; dedup
+  critical_external_claims:
+    include_if:
+      - claim affects Outcome/InScope/AC/VC/StopCondition
+      - claim depends on current external docs/API/CLI/auth/migration behavior
+    item_schema: {claim: string, affects: Outcome|InScope|AC|VC|StopCondition, source_hint: string|null}
 ```
 
-derivation 完了後は両 policy 値と `skip_reason` を LOOP_STATE に記録してから Step 1 / 1b に進む。
+derivation 完了後は両 policy 値・`skip_reason`・抽出した `target_paths` / `critical_external_claims` を LOOP_STATE に記録してから Step 1 / 1b に進む。
 
 ### Step 1: 調査（`codebase-investigator` SubAgent）
 **トリガー**: `LOOP_STATE.investigation_policy.codebase_required == true` のとき実行。codebase_required=true: (1) `requires_fact_check==true` (2) `target_paths` 非空 (3) Outcome/AC/VC が repo path/コマンド/skill/schema 明示 (4) scope rollup で same-file 衝突 (5) reviewer 要求。条件外は `skip_reason="no_repo_fact_claim"` でスキップ。
@@ -680,6 +691,7 @@ LOOP_PROTOCOL では `ssot-discovery` skill を併用して `docs/` 配下の関
 Step 1 完了後、`requires_fact_check == true` だった場合は main thread が `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を統合して `LOOP_STATE.anchor_comment.final_classification` を確定し、`verified_claims` と `unresolved_claims` を更新する。
 ### Step 1b: 外部仕様の事実確認（条件付き、`web-researcher` SubAgent）
 Step 1 と並列実行可。**トリガー**: `LOOP_STATE.web_research_policy.required == true` のとき実行。条件: Issue が外部仕様・公式 API・ツール現仕様・CLI 引数・認証・移行スケジュール・技術情報の裏付けが必要な場合。条件外は `skip_reason="no_critical_external_claim"` でスキップ。
+<!-- #203 integration point: auth_error retry state belongs to LOOP_STATE.web_research.retry_count; web_research_policy.required gates Step 1b BEFORE retry handling (policy=false ならそもそも retry 経路に入らない)。 -->
 `critical_external_claims`（Outcome / In Scope / Out of Scope / AC / VC を左右する主張）は `critical: true` として `web-researcher` に渡す。
 
 ```yaml
@@ -995,7 +1007,7 @@ delivery_rollup_gate:
 | termination_reason | アクション |
 |---|---|
 | `approved` | Issue コメントで「refinement loop 完了」を報告 |
-| `max_iterations` | Issue コメントで残存 blockers を提示、人間判断 |
+| `needs_second_pass` | Issue コメントで残存 blockers を提示、`max_iterations > 1` 明示指定または human decision で次パス許可（自動再ループ禁止）|
 | `human_escalation` | Issue コメントで詳細を提示、人間判断 |
 | `superseded_by_decision` | Issue クローズ（`--reason "not planned"`）+ 代替 Issue 起票 + close コメントに代替 Issue 番号と termination_reason を記録（Step 0c で実行済み） |
 
@@ -1004,7 +1016,7 @@ gh issue comment <issue_number> --body "## issue-refinement-loop: 完了 ($(date
 
 - iteration: <最終 iteration 数>
 - verdict: <approve | needs-fix>
-- termination_reason: <approved | max_iterations | human_escalation>
+- termination_reason: <approved | needs_second_pass | human_escalation | superseded_by_decision>
 - 改善履歴: <improvements_applied の要約>
 - 次アクション: <issue-contract-review 起動 / 人間レビュー / 追加 iteration 等>
 
