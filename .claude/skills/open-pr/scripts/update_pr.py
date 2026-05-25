@@ -240,6 +240,22 @@ def _run_pr_body_validator(
                 "stderr": f"expected {expected_sha256}, got {payload.get('body_sha256')}",
             }
 
+        # AC6: Verify exit code and status consistency (Blocker 2)
+        if cp.returncode == 0 and payload.get("status") != "pass":
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator exit/status mismatch: returncode=0 but status!=pass",
+                "stderr": "",
+            }
+        if cp.returncode == 1 and payload.get("status") != "fail":
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator exit/status mismatch: returncode=1 but status!=fail",
+                "stderr": "",
+            }
+
         return payload
     finally:
         Path(body_file.name).unlink(missing_ok=True)
@@ -247,19 +263,36 @@ def _run_pr_body_validator(
             Path(changed_paths_file.name).unlink(missing_ok=True)
 
 
-def update_pr(repo: str, pr_number: int, body_file: Path) -> bool:
-    """Update PR body using gh pr edit --body-file."""
-    args = [
-        "pr",
-        "edit",
-        str(pr_number),
-        "--repo",
-        repo,
-        "--body-file",
-        str(body_file),
-    ]
-    result = run_gh(*args, check=False)
-    return result.returncode == 0
+def update_pr(repo: str, pr_number: int, body_text: str) -> bool:
+    """Update PR body using gh pr edit --body-file with validated body text.
+
+    Creates a temporary file with the validated body text and passes it to gh pr edit.
+    Ensures TOCTOU safety by using the validated body_text, not the original file.
+    """
+    temp_body = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        encoding="utf-8",
+        delete=False,
+    )
+    try:
+        temp_body.write(body_text)
+        temp_body.flush()
+        temp_body.close()
+
+        args = [
+            "pr",
+            "edit",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--body-file",
+            str(temp_body.name),
+        ]
+        result = run_gh(*args, check=False)
+        return result.returncode == 0
+    finally:
+        Path(temp_body.name).unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -278,15 +311,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # AC2: Run validator pre-write hook
-    # Resolve changed paths if not provided as file
-    changed_paths = None
-    if args.changed_paths_file and args.changed_paths_file.exists():
+    # Resolve changed paths if not provided as file (Blocker 3)
+    if args.changed_paths_file:
+        if not args.changed_paths_file.exists():
+            emit_error(E_FILE_NOT_FOUND, f"changed-paths-file が存在しません: {args.changed_paths_file}")
+            return 2
         changed_paths = [
             line.strip()
             for line in args.changed_paths_file.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-    elif args.changed_paths is not None:
+    else:
         changed_paths = resolve_changed_paths(args.changed_paths)
 
     validator_result = _run_pr_body_validator(body_text, changed_paths, args.linked_issue)
@@ -302,8 +337,9 @@ def main(argv: list[str] | None = None) -> int:
         emit_error(E_VALIDATION_FAILED, str(detail))
         return 1
 
-    # AC8: If validator passes (exit 0), proceed with update
-    if not update_pr(repo, args.pr_number, args.body_file):
+    # AC8: If validator passes (exit 0), proceed with update (Blocker 1)
+    # Use validated body_text, not the original args.body_file, to prevent TOCTOU
+    if not update_pr(repo, args.pr_number, body_text):
         emit_error(E_UPDATE_FAILURE, f"gh pr edit 失敗: PR #{args.pr_number}")
         return 2
 
