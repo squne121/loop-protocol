@@ -683,6 +683,35 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
   unresolved_risks: []
 ```
 
+### REPO_EVIDENCE_REF_V1 構造を要求（`kind: file` 時の additive rule）
+
+`ANCHOR_COMMENT_FACT_CHECK_RESULT_V1.evidence[]` の各要素について、`kind: file` のとき、`ref` フィールドは自由文字列ではなく以下の構造化 schema を要求する:
+
+```yaml
+evidence:
+  - kind: file
+    ref:
+      type: REPO_EVIDENCE_REF_V1  # schema identifier
+      # 以下、REPO_EVIDENCE_REF_V1 スキーマの全必須フィールド:
+      commit_sha: "abc123def456abc123def456abc123def456abc1"
+      path: "docs/adr/0001.md"
+      start_line: 42
+      end_line: 67
+      permalink: "https://github.com/..."
+      excerpt_sha256: "1a2b3c4d5e6f7a8b..."
+      anchor_text: "## Architecture Overview"  # optional
+      verification_status: "verified" | "inconclusive"
+      verification_method: "sha256_hash_match" | "sha256_hash_mismatch" | "line_range_unverified" | "fetch_error"
+      verified_at: "2026-05-23T15:30:45Z"
+    summary: "..."
+```
+
+既存の `kind: issue | pr | comment | web` の `ref` 自由文字列は**維持**（後方互換）。拡張は `kind: file` のみ。
+
+**Rationale（理由）**:
+
+`kind: file` の evidence が行番号を指す場合、caller は file:line pair の信頼性を機械的に判定する必要がある（excerpt hash mismatch 検知、commit SHA 固定確認等）。自由文字列 `"path#lineN-lineM"` では caller が hash 検証や stale 判定を実施できない。`REPO_EVIDENCE_REF_V1` 構造化により、caller 側で fail-closed な検証ロジックを実装できる。
+
 **main thread の責務**: `codebase-investigator` から `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を受け取った後、`recommended_final_classification` を参考に main thread / orchestrator が `LOOP_STATE.anchor_comment.final_classification` を確定する。`final_classification` の確定責務は main thread にあり、SubAgent に委譲してはならない。
 
 SubAgent は Issue 本文に関連するコードベース・既存 ADR・関連 Issue / PR を調査し、構造化レポートを返す。
