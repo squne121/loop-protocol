@@ -453,13 +453,36 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
       - source_task_id は (T|TASK-)\\d{3,} 形式
       - product_spec_id は non-empty / non-placeholder のみ確認（canonical format は固定しない）
     """
-    # Applicability detection
-    has_product_spec_context = bool(re.search(r"^## Product Spec Context\b", body, re.MULTILINE))
+    # Applicability detection (PR #390 REQUEST_CHANGES blocker 1 対応):
+    # 本文全体に trace field 語を含むだけで applicable にすると、Out of Scope や
+    # spec 説明文に出現する言及まで誤って C12 対象にしてしまう。Machine-Readable
+    # Contract の YAML / Product Spec Context セクションに `<field>:` 形式で
+    # **構造化された** trace field が存在する場合に限って applicable とする。
+    mrc_yaml = ""
+    mrc_match = re.search(
+        r"```yaml\s*\n(.*?contract_schema_version.*?)\n```",
+        body,
+        re.DOTALL,
+    )
+    if mrc_match:
+        mrc_yaml = mrc_match.group(1)
+    psc_section = extract_section(body, "Product Spec Context")
+    structured_trace_text = mrc_yaml + "\n" + psc_section
+
+    has_product_spec_context = bool(psc_section)
     has_trace_field_mention = bool(re.search(
-        r"\b(product_spec_id|requirement_id|source_task_id)\b", body
+        r"\b(product_spec_id|requirement_id|source_task_id)\s*:",
+        structured_trace_text,
     ))
+    # task-lineage marker: structured field か、tasks.md / generated task 由来の宣言文
     has_task_lineage_marker = bool(re.search(
-        r"^\s*-?\s*(generated_from_task|task_lineage|source_task)\s*:", body, re.MULTILINE
+        r"^\s*-?\s*(generated_from_task|task_lineage|source_task)\s*:",
+        body,
+        re.MULTILINE,
+    )) or bool(re.search(
+        r"\b(generated\s+from\s+tasks?\.md|from\s+tasks?\.md|task_materialization|generated\s+task)\b",
+        body,
+        re.IGNORECASE,
     ))
 
     applicable = has_product_spec_context or has_trace_field_mention or has_task_lineage_marker
@@ -467,11 +490,11 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
         return CheckResult.NA, []
 
     # Extract trace fields from Machine-Readable Contract YAML or Product Spec Context
+    # (PR #390 REQUEST_CHANGES blocker 1 対応: 本文全体 → structured sections に限定)
     def _extract_field(field_name: str) -> Optional[str]:
-        # Match `field_name: "value"` or `field_name: value` (with optional quotes)
         m = re.search(
             rf'^\s*-?\s*{re.escape(field_name)}\s*:\s*["\']?([^"\'\n]*?)["\']?\s*$',
-            body,
+            structured_trace_text,
             re.MULTILINE,
         )
         if m:
@@ -596,18 +619,68 @@ def detect_warning_vc_negative_grep_without_literal_inventory(body: str, result:
         )
 
 
-def generate_c1_missing_section_skeleton(missing_sections: list[str]) -> list[dict]:
+def get_required_section_placeholders(
+    issue_kind: str,
+    template_path: str = ".github/ISSUE_TEMPLATE/implementation.yml",
+) -> dict[str, str]:
+    """ISSUE_TEMPLATE の attributes.label → attributes.placeholder map を返す。
+
+    PR #390 REQUEST_CHANGES blocker 3 対応:
+    C1 skeleton を `## <label>` + 固定 TODO ではなく、template の placeholder 由来にする。
+    """
+    if issue_kind != "implementation":
+        return {}
+
+    import os
+    import yaml as _yaml
+    if not os.path.exists(template_path):
+        return {}
+    try:
+        with open(template_path) as f:
+            tmpl = _yaml.safe_load(f)
+    except Exception:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for item in tmpl.get("body", []):
+        if item.get("type") == "markdown":
+            continue
+        attrs = item.get("attributes", {})
+        label = attrs.get("label")
+        if not label:
+            continue
+        placeholder = attrs.get("placeholder") or attrs.get("description") or ""
+        mapping[label] = placeholder
+    return mapping
+
+
+def generate_c1_missing_section_skeleton(
+    missing_sections: list[str],
+    placeholders: Optional[dict[str, str]] = None,
+) -> list[dict]:
     """C1 fail 時に missing section ごとの diff_proposal.add エントリを生成する。
 
     各エントリは sentinel marker `missing_section_skeleton` を含み、impl-review-loop / issue-author
-    が機械的に skeleton を挿入できる形式にする。
+    が機械的に skeleton を挿入できる形式にする。skeleton 本文は ISSUE_TEMPLATE の
+    `attributes.placeholder` を優先し、無い場合のみ fallback TODO 文字列を使う
+    (PR #390 REQUEST_CHANGES blocker 3 対応)。
     """
+    placeholders = placeholders or {}
     entries = []
     for section in missing_sections:
+        placeholder_text = placeholders.get(section, "").strip()
+        if placeholder_text:
+            body_block = placeholder_text
+        else:
+            body_block = (
+                f"<!-- TODO: {section} を記述する。"
+                "詳細は .github/ISSUE_TEMPLATE/implementation.yml 参照 -->"
+            )
         entries.append({
             "kind": "missing_section_skeleton",
             "section": section,
-            "skeleton": f"## {section}\n\n<!-- TODO: {section} を記述する。詳細は .github/ISSUE_TEMPLATE/implementation.yml 参照 -->\n",
+            "placeholder_source": "template" if placeholder_text else "fallback_todo",
+            "skeleton": f"## {section}\n\n{body_block}\n",
         })
     return entries
 
@@ -629,8 +702,9 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
             if m:
                 missing_sections.append(m.group(1))
         if missing_sections:
+            placeholders = get_required_section_placeholders(issue_kind)
             result.diff_proposal["add"].extend(
-                generate_c1_missing_section_skeleton(missing_sections)
+                generate_c1_missing_section_skeleton(missing_sections, placeholders)
             )
 
     # C2
