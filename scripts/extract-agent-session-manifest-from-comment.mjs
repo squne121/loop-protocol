@@ -5,12 +5,14 @@
  *
  * Extracts agent_session_manifest/v1 JSON from GitHub comment markdown.
  *
- * Searches for HTML comment markers:
+ * Searches for HTML comment markers with dynamic fence length (minimum 4 backticks per PR #314):
  *   <!-- agent_session_manifest:v1 start -->
- *   ```json
+ *   ````json  (outer fence length: max(max_backtick_run_in_json + 1, 4))
  *   {...}
- *   ```
+ *   ````
  *   <!-- agent_session_manifest:v1 end -->
+ *
+ * Opening and closing fence lengths must match to prevent collision with inline code.
  *
  * Outputs extracted JSON to stdout.
  *

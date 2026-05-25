@@ -29,12 +29,16 @@ import { randomUUID } from 'crypto'
 import { readFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { validateManifest, detectSecretPatterns, detectSecretsInMarkdown } from './lib/agent-session-manifest-validation.mjs'
+import {
+  validateManifest,
+  detectSecretPatterns,
+  detectSecretsInMarkdown,
+  validateProducerContractForIssue377,
+  PRODUCER_ACTOR_TYPES,
+  PRODUCER_EVIDENCE_SOURCE_KINDS,
+} from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-
-// Re-export from validation module for local use
-const detectSecretPatternsLocal = detectSecretPatterns
 
 // ============================================================================
 // Argument Parsing
@@ -86,9 +90,9 @@ REQUIRED OPTIONS:
   --repository REPO              Repository name (e.g., squne121/loop-protocol)
   --phase-main-loop PHASE        Main loop phase: issue_create, issue_review, impl, pr_open, pr_review, merge, followup_create
   --phase-instance-id ID         Phase instance ID format: issue-<N>:<phase>:<seq>
-  --actor-type TYPE              Actor type: ai_agent, github_action (human not supported in this scope)
+  --actor-type TYPE              Actor type (producer limited to): ai_agent, github_action
   --actor-name NAME              Actor name
-  --evidence-source-kind KIND    Evidence source kind: github_comment, ci_check, hook_jsonl, artifact, transcript, local_file
+  --evidence-source-kind KIND    Evidence source kind (producer limited to): hook_jsonl, ci_check, artifact
   --evidence-source-ref REF      Evidence source reference (URL or path)
   --evidence-visibility VIS      Evidence visibility: public_github_comment, private_artifact, local_only
 
@@ -100,10 +104,15 @@ OPTIONAL OPTIONS:
   --format FORMAT                Output format: json, github-comment [default: json]
   --manifest-id UUID             Override manifest_id (asm-<UUIDv4> format) [optional, auto-generated if omitted]
   --recorded-at ISO8601          Override recorded_at timestamp [optional, auto-generated if omitted]
-  --validate                     Run schema + semantic validation before output [optional]
+  --validate                     Run schema + semantic validation before output (default: false for json, true for github-comment)
+  --no-validate                  Skip all validation (escape hatch)
+  --allow-local-path             Allow local absolute paths in output (downgrades to warning, default: fail-closed)
   --strict-redaction             Force redaction scan on all formats [optional]
+  --dry-run                      Output to stdout only, no side effects [no-op for script producer]
   --verification-overall STATUS  Overall verification result: pass|fail|partial|n_a [optional]
   --verification-ac-result AC=STATUS  AC verdict (repeatable, format: AC7=pass) [optional]
+  --verification-skipped-count N  Verification skipped count [optional]
+  --verification-fallback-detected BOOL  Fallback detected flag: true|false [optional]
   --verification-evidence-ref REF  Evidence reference (repeatable) [optional]
   --human-intervention-required BOOL  Human intervention flag: true|false [optional, default: false]
   --human-intervention-reason TEXT  Reason for human intervention [optional]
@@ -190,16 +199,16 @@ function validatePhaseLedgerPhase(value) {
 }
 
 function validateActorType(value) {
-  const valid = ['ai_agent', 'human', 'github_action']
-  if (!valid.includes(value)) {
-    throw new Error(`Invalid actor.type: ${value}. Must be one of: ${valid.join(', ')}`)
+  // B1 iter2: Producer is limited to PRODUCER_ACTOR_TYPES subset
+  if (!PRODUCER_ACTOR_TYPES.includes(value)) {
+    throw new Error(`Invalid actor.type for producer: ${value}. Producer is limited to: ${PRODUCER_ACTOR_TYPES.join(', ')}`)
   }
 }
 
 function validateEvidenceSourceKind(value) {
-  const valid = ['github_comment', 'ci_check', 'hook_jsonl', 'artifact', 'transcript', 'local_file']
-  if (!valid.includes(value)) {
-    throw new Error(`Invalid evidence.source_kind: ${value}. Must be one of: ${valid.join(', ')}`)
+  // B1 iter2: Producer is limited to PRODUCER_EVIDENCE_SOURCE_KINDS subset
+  if (!PRODUCER_EVIDENCE_SOURCE_KINDS.includes(value)) {
+    throw new Error(`Invalid evidence.source_kind for producer: ${value}. Producer is limited to: ${PRODUCER_EVIDENCE_SOURCE_KINDS.join(', ')}`)
   }
 }
 
@@ -336,7 +345,7 @@ function generateManifest(opts) {
     manifest.phase.ledger_phase = null
   }
 
-  // B7: Add verification if overall provided
+  // M2: Add verification with semantic rules
   if (opts['verification-overall']) {
     const acResults = []
     // Parse repeated --verification-ac-result AC=STATUS
@@ -354,8 +363,8 @@ function generateManifest(opts) {
 
     manifest.verification = {
       overall: opts['verification-overall'],
-      skipped_count: 0,
-      fallback_detected: false,
+      skipped_count: parseInt(opts['verification-skipped-count'] || '0', 10),
+      fallback_detected: opts['verification-fallback-detected'] === 'true',
       ac_results: acResults,
     }
   }
@@ -416,11 +425,15 @@ async function main() {
     // Generate manifest
     const manifest = generateManifest(opts)
 
-    // B1: Run validation if --validate is specified or format is github-comment
     const format = opts.format || 'json'
-    const shouldValidate = opts.validate || format === 'github-comment'
+
+    // M1 iter2: Run validation by default (unless --no-validate is set)
+    // Validation is mandatory for github-comment format
+    const skipValidation = opts['no-validate'] === true
+    const shouldValidate = !skipValidation
 
     if (shouldValidate) {
+      // B3 iter2: Run both schema and semantic validation
       const validationResult = validateManifest(manifest)
       if (!validationResult.valid) {
         console.error('Validation failed:')
@@ -429,13 +442,28 @@ async function main() {
         }
         process.exit(1)
       }
+
+      // B1 iter2: Validate producer contract (subset enforcement)
+      const producerContractResult = validateProducerContractForIssue377(manifest)
+      if (!producerContractResult.valid) {
+        console.error('Producer contract validation failed:')
+        for (const error of producerContractResult.errors) {
+          console.error(`  ${error.path}: ${error.message}`)
+        }
+        process.exit(1)
+      }
     }
 
-    // B5: Secret detection (fail-closed for github-comment, optional for others)
-    const secretPattern = detectSecretPatternsLocal(manifest)
+    // B2 iter2: Secret detection - fail-closed by default (default behavior unless --allow-local-path)
+    const allowLocalPath = opts['allow-local-path'] === true
+    const secretPattern = detectSecretPatterns(manifest)
     if (secretPattern) {
-      if (format === 'github-comment' || opts['strict-redaction']) {
-        console.error(`Error: Secret pattern detected: ${secretPattern}`)
+      if (allowLocalPath) {
+        // Downgrade to warning
+        console.warn(`Warning: Secret pattern detected (allowed by --allow-local-path): ${secretPattern}`)
+      } else {
+        // Fail-closed (default)
+        console.error(`Error: Secret pattern detected: ${secretPattern}. Use --allow-local-path to allow local paths.`)
         process.exit(1)
       }
     }
@@ -445,11 +473,15 @@ async function main() {
     if (format === 'github-comment') {
       output = formatAsGithubComment(manifest)
 
-      // B5: Scan markdown output for secrets as well
+      // B2 iter2: Scan markdown output for secrets as well (fail-closed by default)
       const markdownSecrets = detectSecretsInMarkdown(output)
       if (markdownSecrets) {
-        console.error(`Error: Secret pattern detected in output: ${markdownSecrets}`)
-        process.exit(1)
+        if (allowLocalPath) {
+          console.warn(`Warning: Secret pattern detected in output (allowed by --allow-local-path): ${markdownSecrets}`)
+        } else {
+          console.error(`Error: Secret pattern detected in output: ${markdownSecrets}. Use --allow-local-path to allow local paths.`)
+          process.exit(1)
+        }
       }
     } else if (format === 'json') {
       output = formatAsJson(manifest)

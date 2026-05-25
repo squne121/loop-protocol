@@ -6,12 +6,19 @@
  * Validates agent_session_manifest/v1 JSON against
  * docs/schemas/agent-session-manifest.schema.json using Ajv 2020-12.
  *
+ * Performs:
+ * - JSON Schema validation (Draft 2020-12)
+ * - Semantic validation (token_usage null semantics, visibility constraints, etc.)
+ *
+ * Does NOT enforce producer-specific contract (actor.type/evidence.source_kind subset).
+ * Producer contract is enforced by scripts/generate-session-manifest.mjs only.
+ *
  * Usage:
  *   node scripts/validate-agent-session-manifest.mjs manifest.json
  *   cat manifest.json | node scripts/validate-agent-session-manifest.mjs
  *
  * Exit codes:
- *   0: JSON is valid
+ *   0: JSON is valid per schema + semantic rules
  *   1: JSON is invalid
  */
 

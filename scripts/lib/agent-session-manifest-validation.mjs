@@ -51,6 +51,16 @@ function loadSchema() {
 }
 
 // ============================================================================
+// Producer Contract Constants (B1 iter2)
+// ============================================================================
+
+// Producer is restricted to these actor types (validator allows all in schema)
+export const PRODUCER_ACTOR_TYPES = ['ai_agent', 'github_action']
+
+// Producer is restricted to these evidence source kinds (validator allows all in schema)
+export const PRODUCER_EVIDENCE_SOURCE_KINDS = ['hook_jsonl', 'ci_check', 'artifact']
+
+// ============================================================================
 // Semantic Validation
 // ============================================================================
 
@@ -108,6 +118,129 @@ function validateSemantics(manifest) {
   }
 
   return errors
+}
+
+// ============================================================================
+// Schema-Only Validation (for validator script)
+// ============================================================================
+
+export function validateManifestAgainstSchema(json) {
+  try {
+    const schema = loadSchema()
+
+    const ajv = new Ajv2020({
+      strict: true,
+      allErrors: true,
+    })
+    ajvFormats(ajv)
+
+    let validate
+    try {
+      validate = ajv.compile(schema)
+    } catch (err) {
+      return {
+        valid: false,
+        errors: [
+          {
+            path: 'schema',
+            message: `Schema compilation error: ${err.message}`,
+          },
+        ],
+      }
+    }
+
+    const schemaValid = validate(json)
+    const schemaErrors = !schemaValid ? (validate.errors || []) : []
+
+    return {
+      valid: schemaErrors.length === 0,
+      errors: schemaErrors.map((err) => ({
+        path: err.instancePath || 'root',
+        message: err.message,
+      })),
+    }
+  } catch (err) {
+    return {
+      valid: false,
+      errors: [
+        {
+          path: 'validation',
+          message: `Unexpected validation error: ${err.message}`,
+        },
+      ],
+    }
+  }
+}
+
+// ============================================================================
+// Semantic-Only Validation
+// ============================================================================
+
+export function validateManifestSemantics(json) {
+  try {
+    const semanticErrors = validateSemantics(json)
+    return {
+      valid: semanticErrors.length === 0,
+      errors: semanticErrors,
+    }
+  } catch (err) {
+    return {
+      valid: false,
+      errors: [
+        {
+          path: 'semantics',
+          message: `Unexpected semantic validation error: ${err.message}`,
+        },
+      ],
+    }
+  }
+}
+
+// ============================================================================
+// Producer Contract Validation (for producer script only)
+// ============================================================================
+
+export function validateProducerContractForIssue377(manifest, opts = {}) {
+  const errors = []
+
+  // B1 iter2: actor.type must be in PRODUCER_ACTOR_TYPES
+  if (manifest.actor?.type && !PRODUCER_ACTOR_TYPES.includes(manifest.actor.type)) {
+    errors.push({
+      path: 'actor.type',
+      message: `actor.type must be one of: ${PRODUCER_ACTOR_TYPES.join(', ')}. Got: ${manifest.actor.type}`,
+    })
+  }
+
+  // B1 iter2: all evidence.source_kind must be in PRODUCER_EVIDENCE_SOURCE_KINDS
+  for (let i = 0; i < (manifest.evidence || []).length; i++) {
+    const evidence = manifest.evidence[i]
+    if (evidence.source_kind && !PRODUCER_EVIDENCE_SOURCE_KINDS.includes(evidence.source_kind)) {
+      errors.push({
+        path: `evidence[${i}].source_kind`,
+        message: `evidence.source_kind must be one of: ${PRODUCER_EVIDENCE_SOURCE_KINDS.join(', ')}. Got: ${evidence.source_kind}`,
+      })
+    }
+  }
+
+  // M2 iter2: verification semantic rules
+  if (manifest.verification?.skipped_count && manifest.verification.skipped_count > 0 && manifest.verification.overall === 'pass') {
+    errors.push({
+      path: 'verification',
+      message: 'verification.skipped_count > 0 is incoherent with verification.overall === "pass"',
+    })
+  }
+
+  if (manifest.verification?.fallback_detected === true && manifest.verification.overall === 'pass') {
+    errors.push({
+      path: 'verification',
+      message: 'verification.fallback_detected === true is incoherent with verification.overall === "pass" (PR #314 schema description)',
+    })
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  }
 }
 
 // ============================================================================
@@ -181,70 +314,28 @@ export function detectSecretsInMarkdown(markdown) {
 }
 
 // ============================================================================
-// Main Validation Function
+// Main Validation Function (combines schema + semantic for backward compat)
 // ============================================================================
 
 export function validateManifest(json) {
-  try {
-    const schema = loadSchema()
+  const schemaResult = validateManifestAgainstSchema(json)
+  const semanticResult = validateManifestSemantics(json)
 
-    // Create Ajv instance with 2020-12 spec
-    const ajv = new Ajv2020({
-      strict: true,
-      allErrors: true,
-    })
-    ajvFormats(ajv)
+  const allErrors = [...schemaResult.errors, ...semanticResult.errors]
 
-    // Compile and validate schema
-    let validate
-    try {
-      validate = ajv.compile(schema)
-    } catch (err) {
-      return {
-        valid: false,
-        errors: [
-          {
-            path: 'schema',
-            message: `Schema compilation error: ${err.message}`,
-          },
-        ],
-      }
-    }
-
-    const schemaValid = validate(json)
-    const schemaErrors = !schemaValid ? (validate.errors || []) : []
-
-    // Semantic validation
-    const semanticErrors = validateSemantics(json)
-
-    // Combine errors
-    const allErrors = [
-      ...schemaErrors.map((err) => ({
-        path: err.instancePath || 'root',
-        message: err.message,
-      })),
-      ...semanticErrors,
-    ]
-
-    return {
-      valid: allErrors.length === 0,
-      errors: allErrors,
-    }
-  } catch (err) {
-    return {
-      valid: false,
-      errors: [
-        {
-          path: 'validation',
-          message: `Unexpected validation error: ${err.message}`,
-        },
-      ],
-    }
+  return {
+    valid: allErrors.length === 0,
+    errors: allErrors,
   }
 }
 
 export default {
   validateManifest,
+  validateManifestAgainstSchema,
+  validateManifestSemantics,
+  validateProducerContractForIssue377,
   detectSecretPatterns,
   detectSecretsInMarkdown,
+  PRODUCER_ACTOR_TYPES,
+  PRODUCER_EVIDENCE_SOURCE_KINDS,
 }

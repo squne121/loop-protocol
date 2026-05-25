@@ -125,7 +125,8 @@ describe('B1: --validate implementation', () => {
       '--validate',
     ])
     expect(result.exitCode).toBe(1)
-    expect(result.stderr).toContain('Validation failed')
+    // Should fail due to producer subset constraint (transcript not allowed for producer)
+    expect(result.stderr).toContain('Invalid evidence.source_kind for producer')
   })
 })
 
@@ -466,5 +467,198 @@ describe('AC6: Fenced markdown roundtrip', () => {
 
     const validationResult = runValidator(manifestFile)
     expect(validationResult.exitCode).toBe(0)
+  })
+})
+
+// ============================================================================
+// Iter2 Fix Delta Tests
+// ============================================================================
+
+describe('B1 iter2: producer provenance subset enforcement', () => {
+  it('GIVEN producer with --actor-type human WHEN invalid for producer THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'human',
+      '--actor-name', 'test-user',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Invalid actor.type for producer')
+  })
+
+  it('GIVEN producer with --evidence-source-kind transcript WHEN invalid for producer THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'transcript',
+      '--evidence-source-ref', 'artifacts/transcript.jsonl',
+      '--evidence-visibility', 'private_artifact',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Invalid evidence.source_kind for producer')
+  })
+
+  it('GIVEN producer with --evidence-source-kind local_file WHEN invalid for producer THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'local_file',
+      '--evidence-source-ref', 'artifacts/file.txt',
+      '--evidence-visibility', 'local_only',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Invalid evidence.source_kind for producer')
+  })
+})
+
+describe('B2 iter2: --format json default fail-closed for secrets', () => {
+  it('GIVEN producer --format json with absolute path WHEN default behavior THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', '/home/user/secret.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Secret pattern detected')
+  })
+
+  it('GIVEN producer --format json with absolute path and --allow-local-path WHEN allow override THEN exits 0', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', '/home/user/secret.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--allow-local-path',
+    ])
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('"/home/user/secret.json"')
+  })
+})
+
+describe('M1 iter2: default validation for all formats', () => {
+  it('GIVEN producer with --format json WHEN invalid manifest THEN validation fails by default', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'transcript',
+      '--evidence-source-ref', 'artifacts/transcript.jsonl',
+      '--evidence-visibility', 'public_github_comment',
+      '--format', 'json',
+    ])
+    // Should fail due to producer subset constraint (transcript not allowed)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Invalid evidence.source_kind for producer')
+  })
+
+  it('GIVEN producer with --format json and --no-validate WHEN skip validation THEN exits 0 even with invalid combo', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--no-validate',
+    ])
+    expect(result.exitCode).toBe(0)
+  })
+})
+
+describe('M2 iter2: verification semantic rules', () => {
+  it('GIVEN verification.skipped_count > 0 with overall=pass WHEN semantic rule THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--verification-overall', 'pass',
+      '--verification-skipped-count', '1',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Producer contract validation failed')
+  })
+
+  it('GIVEN verification.fallback_detected=true with overall=pass WHEN semantic rule THEN exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--verification-overall', 'pass',
+      '--verification-fallback-detected', 'true',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('Producer contract validation failed')
+  })
+
+  it('GIVEN verification.skipped_count > 0 with overall=partial WHEN semantic rule THEN exits 0', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--verification-overall', 'partial',
+      '--verification-skipped-count', '1',
+    ])
+    expect(result.exitCode).toBe(0)
+  })
+})
+
+describe('Minor: --dry-run flag in help', () => {
+  it('GIVEN producer --help WHEN listing options THEN includes --dry-run', () => {
+    const result = runProducer(['--help'])
+    expect(result.stdout).toContain('--dry-run')
   })
 })
