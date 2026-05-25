@@ -458,16 +458,29 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     # spec 説明文に出現する言及まで誤って C12 対象にしてしまう。Machine-Readable
     # Contract の YAML / Product Spec Context セクションに `<field>:` 形式で
     # **構造化された** trace field が存在する場合に限って applicable とする。
-    mrc_yaml = ""
+    #
+    # PR #390 review-2 blocker 3 対応: MRC YAML は yaml.safe_load で parse し、
+    # inline comment / quote / null / folded scalar を YAML semantics で正しく扱う。
+    # parse 失敗時は regex fallback に降りる（既存挙動を破壊しない）。
+    mrc_yaml_text = ""
+    mrc_parsed: dict = {}
+    mrc_yaml_parse_failed = False
     mrc_match = re.search(
         r"```yaml\s*\n(.*?contract_schema_version.*?)\n```",
         body,
         re.DOTALL,
     )
     if mrc_match:
-        mrc_yaml = mrc_match.group(1)
+        mrc_yaml_text = mrc_match.group(1)
+        try:
+            import yaml as _yaml  # noqa: PLC0415
+            loaded = _yaml.safe_load(mrc_yaml_text)
+            if isinstance(loaded, dict):
+                mrc_parsed = loaded
+        except Exception:
+            mrc_yaml_parse_failed = True
     psc_section = extract_section(body, "Product Spec Context")
-    structured_trace_text = mrc_yaml + "\n" + psc_section
+    structured_trace_text = mrc_yaml_text + "\n" + psc_section
 
     has_product_spec_context = bool(psc_section)
     has_trace_field_mention = bool(re.search(
@@ -489,11 +502,18 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     if not applicable:
         return CheckResult.NA, []
 
-    # Extract trace fields from Machine-Readable Contract YAML or Product Spec Context
-    # (PR #390 REQUEST_CHANGES blocker 1 対応: 本文全体 → structured sections に限定)
+    # Extract trace fields:
+    # 1) MRC YAML が parse 成功した場合: mrc_parsed[field] を優先（inline comment 等を YAML semantics で除去）
+    # 2) それ以外（PSC セクション / parse 失敗時）: regex fallback で structured_trace_text を走査
+    # (PR #390 REQUEST_CHANGES blocker 1 + review-2 blocker 3 対応)
     def _extract_field(field_name: str) -> Optional[str]:
+        if field_name in mrc_parsed:
+            v = mrc_parsed.get(field_name)
+            if v is None:
+                return None
+            return str(v).strip()
         m = re.search(
-            rf'^\s*-?\s*{re.escape(field_name)}\s*:\s*["\']?([^"\'\n]*?)["\']?\s*$',
+            rf'^\s*-?\s*{re.escape(field_name)}\s*:\s*["\']?([^"\'\n#]*?)["\']?\s*(?:#.*)?$',
             structured_trace_text,
             re.MULTILINE,
         )

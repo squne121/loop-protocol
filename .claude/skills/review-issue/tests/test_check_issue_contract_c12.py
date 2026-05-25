@@ -196,6 +196,49 @@ class TestNonBlockingWarningsStructure:
             assert "suggested_action" in w, "Warning missing 'suggested_action' field"
 
 
+class TestC12YamlSafeLoad:
+    """PR #390 review-2 blocker 3: MRC YAML を yaml.safe_load で parse する。"""
+
+    def test_c12_yaml_inline_comment_not_false_positive(self, tmp_path):
+        """GIVEN MRC YAML with inline comment on requirement_id / source_task_id
+        WHEN checker runs THEN C12 == pass (comment は YAML semantics で除去される)."""
+        fixture = tmp_path / "c12_inline_comment.md"
+        fixture.write_text(
+            "---\n"
+            "LABELS: phase/implementation,kind/implementation\n"
+            "TITLE: 実装: yaml inline comment\n"
+            "---\n"
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            "contract_schema_version: v1\n"
+            "issue_kind: implementation\n"
+            'parent_issue: "#300"\n'
+            'goal_ref: "yaml inline comment test"\n'
+            "change_kind: code\n"
+            'product_spec_id: "features/game-core"  # spec id\n'
+            "requirement_id: REQ-001  # generated from spec\n"
+            "source_task_id: T001  # task id\n"
+            "```\n\n"
+            "## Outcome\n\nXを実装する。\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC1: X\n\n"
+            "## Verification Commands\n\n```bash\n# AC1\n$ test -f X\n```\n\n"
+            "## Stop Conditions\n\n- 1\n- 2\n- 3\n- 4\n- 5\n- 6\n\n"
+            "## Runtime Verification Applicability\n\ndecision: not_applicable\n\n"
+            "## Allowed Paths\n\n- `X`\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--file", str(fixture), "--json"],
+            capture_output=True, text=True,
+        )
+        output = json.loads(result.stdout)
+        assert output["deterministic_checks"]["C12_product_trace_fields_structure"] == "pass", (
+            f"yaml inline comment should not trigger format fail. "
+            f"Got {output['deterministic_checks']['C12_product_trace_fields_structure']}, "
+            f"blocking={output.get('blocking_issues')}"
+        )
+
+
 class TestC12ApplicabilityRestrictedToStructuredSections:
     """PR #390 REQUEST_CHANGES blocker 1: applicability は構造化セクション限定。"""
 
