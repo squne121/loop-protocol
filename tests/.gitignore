@@ -1,0 +1,5 @@
+# M3 iter2: Temporary test artifacts
+# Tests use os.tmpdir() or path.join(os.tmpdir(), `asm-test-${randomUUID()}`)
+# for runtime artifacts. Fixed fixtures go in tests/fixtures/.
+temp/
+*.log
