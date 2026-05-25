@@ -574,38 +574,21 @@ Step 0c 完了後は `LOOP_STATE.superseded_decision.close_comment_posted = true
 
 #### Step 0f: investigation / web_research policy derivation（決定論・MUST）
 
-Step 0c までで継続が確定した時点で、Issue 本文 / AC / VC / `scope_rollup_decision` / `anchor_comment` から両 policy を機械的に算出する。本ステップを通らない場合、両 policy は既定 `false` のままで Step 1 / 1b が silent skip されるため derivation は必須。
+Step 0c までで継続が確定した時点で、Issue 本文 / AC / VC / `scope_rollup_decision` / `anchor_comment` から両 policy を機械的に算出する。
 
-```yaml
-policy_derivation:
-  investigation_policy.codebase_required = any:
-    [anchor_comment.requires_fact_check == true, target_paths non-empty,
-     Outcome/AC/VC contains repo path/command/script/skill/schema/workflow name,
-     scope_rollup_decision detects same-file or same-skill-family conflict,
-     reviewer explicitly requests repo fact verification]
-    else: skip_reason = no_repo_fact_claim
-  web_research_policy.required = any:
-    [critical_external_claims non-empty,
-     human explicitly requests web/source verification,
-     Issue depends on current external CLI/API/auth/migration behavior]
-    else: skip_reason = no_critical_external_claim
-  sync_rule:
-    # critical 判定の SoT は web_research_policy.critical_external_claims。
-    # 既存 Step 1b 処理との整合のため web_research.critical_claims := web_research_policy.critical_external_claims で複製する。
+**As of #392, this step is automated by the `plan_refinement_loop.py` script**, which produces a `REFINEMENT_LOOP_PLAN_V1` JSON output. The orchestrator should:
 
-extraction:
-  target_paths: rg-like tokens in Outcome/InScope/AC/VC/AllowedPaths matching:
-    - '\.claude/[^`\s)]+' | 'docs/[^`\s)]+' | 'scripts/[^`\s)]+'
-    - '\.github/workflows/[^`\s)]+' | 'src/[^`\s)]+' | 'tests?/[^`\s)]+'
-    normalize: strip backticks / trailing punctuation; dedup
-  critical_external_claims:
-    include_if:
-      - claim affects Outcome/InScope/AC/VC/StopCondition
-      - claim depends on current external docs/API/CLI/auth/migration behavior
-    item_schema: {claim: string, affects: Outcome|InScope|AC|VC|StopCondition, source_hint: string|null}
-```
+1. Invoke `plan_refinement_loop.py` with `REFINEMENT_LOOP_PLANNER_INPUT_V1` (issue body, comments, known_context)
+2. Validate output against `schemas/refinement_loop_plan_v1.json` JSON Schema (Draft 2020-12)
+3. If `fail_closed.required == true`, escalate to human with reason codes and message
+4. Otherwise, consume the planner output to populate:
+   - `LOOP_STATE.investigation_policy` from `decisions.investigation_policy`
+   - `LOOP_STATE.web_research_policy` from `decisions.web_research_policy`
+   - `LOOP_STATE.scope_signal_guard` from `decisions.scope_signal_guard`
+   - Delivery rollup unmaterialized slots from `decisions.delivery_rollup.unmaterialized_slots`
+   - Follow-up candidates from `decisions.follow_up_materialization.candidates`
 
-derivation 完了後は両 policy 値・`skip_reason`・抽出した `target_paths` / `critical_external_claims` を LOOP_STATE に記録してから Step 1 / 1b に進む。
+The planner output schema and field mapping is documented at `.claude/skills/issue-refinement-loop/references/refinement-loop-plan-output.md`.
 
 ### Step 1: 調査（`codebase-investigator` SubAgent）
 **トリガー**: `LOOP_STATE.investigation_policy.codebase_required == true` のとき実行。codebase_required=true: (1) `requires_fact_check==true` (2) `target_paths` 非空 (3) Outcome/AC/VC が repo path/コマンド/skill/schema 明示 (4) scope rollup で same-file 衝突 (5) reviewer 要求。条件外は `skip_reason="no_repo_fact_claim"` でスキップ。

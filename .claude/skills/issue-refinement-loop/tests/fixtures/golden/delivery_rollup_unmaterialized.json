@@ -1,0 +1,72 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 3,
+    "issue_body_sha256": "df9a750daed1a630a7d65e5de67734bcea5e7ec2370f5254dd372cd857a97fd7",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "no_repo_fact_claim",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "no_critical_external_claim",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": false,
+      "reason_code": "no_scope_signal",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": true,
+      "unmaterialized_slots": [
+        {
+          "child_title_hint": "# Test Issue: Extract  child slots",
+          "marker": "unmaterialized",
+          "body_line": 1
+        },
+        {
+          "child_title_hint": "- #100  - Initial planning document",
+          "marker": "未起票",
+          "body_line": 9
+        },
+        {
+          "child_title_hint": "- #101 () - Implementation phase",
+          "marker": "unmaterialized",
+          "body_line": 10
+        },
+        {
+          "child_title_hint": "- #102 () - Verification and testing",
+          "marker": "TBD",
+          "body_line": 11
+        },
+        {
+          "child_title_hint": "- Code change tracking with (#103)  first sub-issue",
+          "marker": "未起票",
+          "body_line": 12
+        }
+      ],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}

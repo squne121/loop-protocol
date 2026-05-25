@@ -1,0 +1,68 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 16,
+    "issue_body_sha256": "356330f0e8b9801cb75490de729a57d07a9999ff232ab493bffd031ddfa04c2c",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": true,
+      "reason_code": "target_paths_present",
+      "target_paths": [
+        ".claude/skills/refinement",
+        "src/components/Button.tsx",
+        "tests/unit/button.test.ts"
+      ],
+      "repo_claims": [
+        "| Skills | `.claude/skills/refinement` | Done |",
+        "| Source | `src/components/Button.tsx` | WIP |",
+        "| Tests | `tests/unit/button.test.ts` | TBD |"
+      ],
+      "evidence_spans": [
+        {
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "end_line": 27,
+          "text_sha256": "356330f0e8b9801cb75490de729a57d07a9999ff232ab493bffd031ddfa04c2c"
+        }
+      ],
+      "confidence": "deterministic"
+    },
+    "web_research_policy": {
+      "required": false,
+      "reason_code": "no_critical_external_claim",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "scope_signal_guard": {
+      "triggered": false,
+      "reason_code": "no_scope_signal",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": true,
+      "unmaterialized_slots": [
+        {
+          "child_title_hint": "| Tests | `tests/unit/button.test.ts` |  |",
+          "marker": "TBD",
+          "body_line": 11
+        }
+      ],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}

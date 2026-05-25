@@ -1,0 +1,80 @@
+{
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "issue_number": 2,
+    "issue_body_sha256": "8adcdfd785eade52c99ad96a5a9dba8f6467ded1ea8e256359d860614e7ee7c8",
+    "comments_sha256": null,
+    "known_context_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00"
+  },
+  "decisions": {
+    "investigation_policy": {
+      "required": false,
+      "reason_code": "no_repo_fact_claim",
+      "target_paths": [],
+      "repo_claims": [],
+      "evidence_spans": [],
+      "confidence": "unknown"
+    },
+    "web_research_policy": {
+      "required": true,
+      "reason_code": "critical_external_spec_claim",
+      "critical_external_claims": [
+        {
+          "claim": "# Verify against official API documentation: https://api.example.com/docs",
+          "affects": "VC",
+          "source_hint": null
+        },
+        {
+          "claim": "- Analysis of current official API specification",
+          "affects": "InScope",
+          "source_hint": null
+        },
+        {
+          "claim": "- Validation of auth migration behavior",
+          "affects": "InScope",
+          "source_hint": null
+        },
+        {
+          "claim": "Additional requirement: Verify current CLI authentication flow matches the official spec documentation.",
+          "affects": "VC",
+          "source_hint": null
+        },
+        {
+          "claim": "Need to verify official CLI API behavior and authentication flow against published documentation.",
+          "affects": "Outcome",
+          "source_hint": null
+        }
+      ],
+      "evidence_spans": [
+        {
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "end_line": 25,
+          "text_sha256": "8adcdfd785eade52c99ad96a5a9dba8f6467ded1ea8e256359d860614e7ee7c8"
+        }
+      ],
+      "confidence": "deterministic"
+    },
+    "scope_signal_guard": {
+      "triggered": false,
+      "reason_code": "no_scope_signal",
+      "excluded_by_anchor_reframe": false,
+      "evidence_spans": []
+    },
+    "delivery_rollup": {
+      "applicable": false,
+      "unmaterialized_slots": [],
+      "evidence_spans": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    }
+  },
+  "fail_closed": {
+    "required": false,
+    "reason_codes": [],
+    "human_message": ""
+  }
+}
