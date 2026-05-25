@@ -718,24 +718,23 @@ external_spec routing:
       - any critical external_spec claim is inconclusive or failed in WEB_RESEARCH_RESULT_V1
 ```
 
-`WEB_RESEARCH_RESULT_V1` の schema:
+`WEB_RESEARCH_RESULT_V1` consumer boundary:
 
 ```yaml
-WEB_RESEARCH_RESULT_V1:
-  schema_version: 1
-  status: ok | inconclusive | failed
-  failure_class: null | auth_error | capability_unavailable | query_error
-  verification_route: grounded_research | direct_web | direct_cli | none
-  claims:
-    - claim_id: <C3>
-      type: external_spec
-      critical: true | false
-      verdict: supported | contradicted | inconclusive
-      evidence:
-        - kind: web
-          ref: <citation>
-          summary: <string>
-  unresolved_risks: []
+Step 1b は `WEB_RESEARCH_RESULT_V1` を opaque に扱う
+schema_ssot:
+  - .claude/agents/web-researcher.md
+  - .claude/skills/gemini-cli-headless-delegation/SKILL.md
+consumer_fields:
+  - status
+  - failure_class
+  - verification_route
+  - claims
+  - unresolved_risks
+must_not_store:
+  - retry_count
+  - fallback_query
+  - raw_grounding_state
 ```
 
 `WEB_RESEARCH_RESULT_V1` 受信後（`WEB_RESEARCH_RESULT_V1 handling`）:
@@ -751,6 +750,13 @@ WEB_RESEARCH_RESULT_V1 handling:
 
   if status == ok:
     proceed_to: Step 2
+
+  if status == insufficient_context:
+    if web_research_policy.critical_external_claims is non-empty:
+      termination_reason: human_escalation
+      reason: web_research_insufficient_context_critical
+    else:
+      proceed_to: Step 2
 
   if status == inconclusive:
     if any claims[].critical == true and claims[].verdict == inconclusive:

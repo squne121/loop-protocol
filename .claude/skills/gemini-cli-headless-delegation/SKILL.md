@@ -51,6 +51,25 @@ disable-model-invocation: true
    ```
    validate-only（Gemini CLI 未実行）は `--validate-only` を指定する。結果は `result_surface.summary` / `.primary_artifact` / `.next_action` を優先参照する。
 
+## Grounded Research Retry Policy
+
+`tool_profile: grounded_research` の wrapper-level retry は、認証や一時的 CLI failure の回復だけに限定する。
+
+- 対象:
+  - `auth_error`
+  - transient CLI failure
+- 実行方法:
+  - 同一 request を **1 回だけ** retry する
+  - `tool_profile` は変更しない
+  - request body は変更しない
+  - credential mutation なし
+  - 再ログインなし
+- 再試行後も失敗した場合:
+  - wrapper は失敗を隠さず返す
+  - caller は `failure_class` と attempt metadata を読んで fallback / escalation を判断する
+
+この policy は wrapper-level retry のみを扱う。grounding quality の判定、critical claim ごとの direct fallback、`WEB_RESEARCH_RESULT_V1` の最終分類は `web-researcher` の責務とする。
+
 ## Core Rules
 
 ### Delegation Boundary
