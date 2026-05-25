@@ -574,7 +574,21 @@ Step 0c 完了後は `LOOP_STATE.superseded_decision.close_comment_posted = true
 
 #### Step 0f: investigation / web_research policy derivation（決定論・MUST）
 
-Step 0c までで継続が確定した時点で、Issue 本文 / AC / VC / `scope_rollup_decision` / `anchor_comment` から両 policy を機械的に算出する。本ステップを通らない場合、両 policy は既定 `false` のままで Step 1 / 1b が silent skip されるため derivation は必須。
+Step 0c までで継続が確定した時点で、Issue 本文 / AC / VC / `scope_rollup_decision` / `anchor_comment` から両 policy を機械的に算出する。
+
+**As of #392, this step is automated by the `plan_refinement_loop.py` script**, which produces a `REFINEMENT_LOOP_PLAN_V1` JSON output. The orchestrator should:
+
+1. Invoke `plan_refinement_loop.py` with `REFINEMENT_LOOP_PLANNER_INPUT_V1` (issue body, comments, known_context)
+2. Validate output against `schemas/refinement_loop_plan_v1.json` JSON Schema (Draft 2020-12)
+3. If `fail_closed.required == true`, escalate to human with reason codes and message
+4. Otherwise, consume the planner output to populate:
+   - `LOOP_STATE.investigation_policy` from `decisions.investigation_policy`
+   - `LOOP_STATE.web_research_policy` from `decisions.web_research_policy`
+   - `LOOP_STATE.scope_signal_guard` from `decisions.scope_signal_guard`
+   - Delivery rollup unmaterialized slots from `decisions.delivery_rollup.unmaterialized_slots`
+   - Follow-up candidates from `decisions.follow_up_materialization.candidates`
+
+The planner deterministically extracts:
 
 ```yaml
 policy_derivation:
@@ -605,7 +619,7 @@ extraction:
     item_schema: {claim: string, affects: Outcome|InScope|AC|VC|StopCondition, source_hint: string|null}
 ```
 
-derivation 完了後は両 policy 値・`skip_reason`・抽出した `target_paths` / `critical_external_claims` を LOOP_STATE に記録してから Step 1 / 1b に進む。
+See `.claude/skills/issue-refinement-loop/references/refinement-loop-plan-output.md` for planner output examples and consumer guide.
 
 ### Step 1: 調査（`codebase-investigator` SubAgent）
 **トリガー**: `LOOP_STATE.investigation_policy.codebase_required == true` のとき実行。codebase_required=true: (1) `requires_fact_check==true` (2) `target_paths` 非空 (3) Outcome/AC/VC が repo path/コマンド/skill/schema 明示 (4) scope rollup で same-file 衝突 (5) reviewer 要求。条件外は `skip_reason="no_repo_fact_claim"` でスキップ。
