@@ -1,10 +1,10 @@
 {
   "schema_version": "refinement_loop_plan/v1",
   "source": {
-    "issue_number": 6,
-    "issue_body_sha256": "d83ff64c3ac559703db8e9583538bebe3d127bcd2a21f734ee2cc8952ff22ee7",
+    "issue_number": 20,
+    "issue_body_sha256": "0112ab59502bd72d71906f4b9f005a19cca920e7f8e5d6b79a2a76ae19b9a902",
     "comments_sha256": null,
-    "known_context_sha256": "ba061b243a3fce61be405c401f45e60b3fd8f38e240b66e1dd4bde4922501f08",
+    "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
   },
   "decisions": {

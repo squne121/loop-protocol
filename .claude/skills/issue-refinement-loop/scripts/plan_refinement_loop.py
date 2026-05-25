@@ -360,6 +360,107 @@ def _extract_follow_up_candidates(issue_body: str) -> list[dict[str, Any]]:
     return deduped
 
 
+def _is_anchor_reframe_context(known_context: dict | None) -> bool:
+    """Check if known_context indicates anchor reframe exclusion."""
+    if not known_context:
+        return False
+    classification = known_context.get("classification")
+    if classification in ("feedback_update_required", "reframe_in_place"):
+        return True
+    if known_context.get("anchor_comment_url") and known_context.get("anchor_reframe", False):
+        return True
+    return False
+
+
+def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[bool, str, list]:
+    """
+    Detect scope signals (new_in_scope_area, new_allowed_path_layer, new_unverifiable_ac).
+
+    Returns (triggered, reason_code, evidence_spans)
+
+    Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
+    """
+    evidence_spans = []
+    sections = _extract_sections(issue_body)
+
+    in_scope = sections.get("In Scope", "")
+    allowed_paths = sections.get("Allowed Paths", "")
+    acceptance_criteria = sections.get("Acceptance Criteria", "")
+
+    # Subjective keywords indicating unverifiable AC
+    subjective_keywords = [
+        "適切に", "品質を改善", "安定する", "改善する", "最適化", "高品質に",
+        "improve", "enhance", "optimize", "stabilize", "appropriately"
+    ]
+
+    # 1. Check new_unverifiable_ac (highest precedence)
+    for line_num, line in enumerate(acceptance_criteria.splitlines(), start=1):
+        if line.lstrip().startswith("- [ ]") or line.lstrip().startswith("- [x]"):
+            if any(kw in line for kw in subjective_keywords):
+                evidence_spans.append({
+                    "source": "issue_body",
+                    "source_ref": None,
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "text_sha256": _sha256(line),
+                })
+                # Check exclusion
+                excluded = _is_anchor_reframe_context(known_context)
+                if excluded:
+                    return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+                return (True, SCOPE_SIGNAL_REASON_NEW_UNVERIFIABLE_AC, evidence_spans)
+
+    # 2. Check new_allowed_path_layer
+    top_level_prefixes = set()
+    for line in allowed_paths.splitlines():
+        match = re.search(r'`([^/`]+)/', line)
+        if match:
+            top_level_prefixes.add(match.group(1))
+
+    if len(top_level_prefixes) >= 2:
+        # Find evidence line
+        for line_num, line in enumerate(allowed_paths.splitlines(), start=1):
+            if any(p in line for p in top_level_prefixes):
+                evidence_spans.append({
+                    "source": "issue_body",
+                    "source_ref": None,
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "text_sha256": _sha256(line),
+                })
+                break
+        excluded = _is_anchor_reframe_context(known_context)
+        if excluded:
+            return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+        return (True, SCOPE_SIGNAL_REASON_NEW_PATH_LAYER, evidence_spans)
+
+    # 3. Check new_in_scope_area
+    layer_prefixes_in_scope = set()
+    for line in in_scope.splitlines():
+        for prefix in [".claude/", "docs/", "src/", "scripts/", "tests/", ".github/"]:
+            if prefix in line:
+                layer_prefixes_in_scope.add(prefix)
+
+    if len(layer_prefixes_in_scope) >= 2:
+        # Find evidence line
+        for line_num, line in enumerate(in_scope.splitlines(), start=1):
+            if any(p in line for p in layer_prefixes_in_scope):
+                evidence_spans.append({
+                    "source": "issue_body",
+                    "source_ref": None,
+                    "start_line": line_num,
+                    "end_line": line_num,
+                    "text_sha256": _sha256(line),
+                })
+                break
+        excluded = _is_anchor_reframe_context(known_context)
+        if excluded:
+            return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+        return (True, SCOPE_SIGNAL_REASON_NEW_IN_SCOPE, evidence_spans)
+
+    return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
+
+
 def _check_malformed_contract(issue_body: str) -> bool:
     """Check if machine-readable contract is malformed (has YAML but missing required fields)."""
     # If there's no YAML block, it's not malformed - just missing
@@ -608,19 +709,10 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 )
             )
 
-        # Determine scope signal guard
-        scope_signal_triggered = False
-        scope_signal_reason = SCOPE_SIGNAL_REASON_NO_SIGNAL
-        scope_signal_evidence = []
-
-        # Check for anchor reframe exclusion
-        anchor_comment_url = None
-        if known_context and isinstance(known_context, dict):
-            anchor_comment_url = known_context.get("anchor_comment_url")
-
-        if anchor_comment_url:
-            scope_signal_triggered = True
-            scope_signal_reason = SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
+        # Determine scope signal guard using _detect_scope_signals
+        scope_signal_triggered, scope_signal_reason, scope_signal_evidence = _detect_scope_signals(
+            issue_body, known_context
+        )
 
         # Build output
         plan = {

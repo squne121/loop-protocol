@@ -7,6 +7,7 @@ web_research_policy, scope_signal_guard, or follow_up_materialization.
 Instead, it should consume the planner output.
 """
 
+import re
 from pathlib import Path
 
 
@@ -51,21 +52,58 @@ class TestSkillMdWiring:
         ), "SKILL.md should mention fail_closed handling"
 
     def test_skill_md_does_not_repedge_investigation_logic(self):
-        """AC7: SKILL.md should not re-implement investigation_policy logic."""
+        """AC7: SKILL.md Step 0f has no prose re-judgment logic"""
         skill_md = load_skill_md()
 
-        # Check that Step 0f doesn't contain prose logic we've extracted
-        # (This is a heuristic check, but if planner is properly integrated,
-        # Step 0f should either reference the planner or only consume its output)
-        step_0f_section = skill_md.split("#### Step 0f:")[1].split("###")[0] if "#### Step 0f:" in skill_md else ""
+        # Step 0f section extraction (heading-based slicing)
+        if "#### Step 0f:" not in skill_md:
+            # Step 0f is gone - OK
+            return
 
-        # The section might mention "policy derivation" but should not
-        # re-implement the extraction logic (e.g., should not mention
-        # "target_paths" extraction logic outside of referencing the planner)
-        if "Step 0f" in skill_md and "planner" not in step_0f_section.lower():
-            # If Step 0f exists and doesn't mention planner, check that it at least
-            # references the planner output
-            pass  # Allow Step 0f to coexist as long as planner is mentioned elsewhere
+        step_0f = skill_md.split("#### Step 0f:")[1]
+        # Find next heading (####, ###, or ##)
+        next_heading = re.search(r'\n(####? )', step_0f)
+        if next_heading:
+            step_0f = step_0f[:next_heading.start()]
+
+        # Forbidden fragments indicating prose re-judgment
+        forbidden_fragments = [
+            "true_if_any",
+            "false_only_if",
+            "investigation_policy.codebase_required = true",
+            "investigation_policy.codebase_required = false",
+            "web_research_policy.required = true",
+            "web_research_policy.required = false",
+            "policy_derivation:",  # Old YAML schema literal
+        ]
+
+        found = [f for f in forbidden_fragments if f in step_0f]
+        assert not found, (
+            f"SKILL.md Step 0f contains prose re-judgment logic: {found}\n\n"
+            f"Step 0f should call plan_refinement_loop.py instead.\n\n"
+            f"Step 0f excerpt:\n{step_0f[:500]}"
+        )
+
+    def test_skill_md_step_0f_references_planner(self):
+        """AC7: Step 0f references plan_refinement_loop.py or REFINEMENT_LOOP_PLAN_V1"""
+        skill_md = load_skill_md()
+        if "#### Step 0f:" not in skill_md:
+            # Step 0f deleted - OK (handled by automated planner)
+            return
+
+        step_0f = skill_md.split("#### Step 0f:")[1]
+        next_heading = re.search(r'\n(####? )', step_0f)
+        if next_heading:
+            step_0f = step_0f[:next_heading.start()]
+
+        has_planner_ref = (
+            "plan_refinement_loop.py" in step_0f or
+            "REFINEMENT_LOOP_PLAN_V1" in step_0f
+        )
+        assert has_planner_ref, (
+            "Step 0f should reference plan_refinement_loop.py or REFINEMENT_LOOP_PLAN_V1 "
+            f"to show it uses the planner output.\n\nStep 0f excerpt:\n{step_0f[:500]}"
+        )
 
     def test_skill_md_has_wiring_for_planner_invocation(self):
         """AC7: SKILL.md should have wiring for planner invocation."""

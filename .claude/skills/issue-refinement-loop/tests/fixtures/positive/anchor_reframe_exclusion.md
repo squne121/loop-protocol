@@ -6,7 +6,8 @@ Reviewed in #123456 with scope reframe: scope is not expanding beyond the explic
 
 ## In Scope
 
-- Internal refactoring of module structure
+- Changes to `.claude/skills` layer (refactoring)
+- Updates to `docs/product` layer (coordination)
 - API surface remains stable
 
 ## Acceptance Criteria

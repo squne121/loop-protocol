@@ -75,9 +75,14 @@ def fixture_to_input(
     }
 
     # B4: Add known_context for anchor_reframe fixtures
-    if fixture_name == "anchor_reframe_exclusion" or fixture_name == "known_context_anchor_reframe":
+    if fixture_name == "anchor_reframe_exclusion":
         input_data["known_context"] = {
-            "anchor_comment_url": "https://github.com/owner/repo/issues/4#issuecomment-123456"
+            "anchor_comment_url": "https://github.com/owner/repo/issues/4#issuecomment-123456",
+            "classification": "feedback_update_required"
+        }
+    elif fixture_name == "known_context_anchor_reframe":
+        input_data["known_context"] = {
+            "anchor_comment_url": "https://github.com/owner/repo/issues/6#issuecomment-123456"
         }
 
     # B4: Add comments for comment-based fixtures
@@ -134,6 +139,9 @@ class TestPlanRefinementLoop:
             ("anchor_reframe_exclusion", "positive", 4),
             ("comment_requests_web_verification", "positive", 5),
             ("known_context_anchor_reframe", "positive", 6),
+            ("new_in_scope_area", "positive", 18),
+            ("new_allowed_path_layer", "positive", 19),
+            ("new_unverifiable_ac", "positive", 20),
             ("no_repo_fact_claim", "negative", 7),
             ("no_critical_external_claim", "negative", 8),
             ("path_only_in_fenced_code", "false_positive", 9),
