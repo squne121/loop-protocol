@@ -196,6 +196,30 @@
     - "## 未解決の問い / Open Questions"
     - "## 検証 / Verification Notes"
 
+- id: mvp-scope
+  path: docs/product/mvp-scope.md
+  title: MVP Scope Definition
+  keywords: [mvp-scope, mvp, scope, hypotheses, success-criteria, failure-criteria, pivot-criteria, playtest, downstream-boundaries]
+  description: MVP に含める / 含めない境界、検証仮説、success / failure / pivot criteria を定義する draft product spec。status: accepted になるまでは実装判断の normative source ではない
+  sections:
+    - "## 状態注記 / Status Note"
+    - "## 目的 / Intent"
+    - "## 正本階層 / Authority and Fallbacks"
+    - "### Normativity Guard"
+    - "## MVP Hypotheses"
+    - "## Included"
+    - "## Excluded"
+    - "## Success Criteria"
+    - "## Failure Criteria"
+    - "## Pivot Criteria"
+    - "## Measurement Contract"
+    - "## Non-Goals"
+    - "## Downstream Boundaries"
+    - "## MVP Tunable Parameters"
+    - "## Open Questions"
+    - "## Playtest Handoff"
+    - "## Trace Links"
+
 ---
 
 ## ディレクトリ → SSOT マッピング
