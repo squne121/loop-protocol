@@ -102,6 +102,7 @@ jobs:
       - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
+      - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
       - name: Generate ci_test_selection/v1 artifact
         run: |
           mkdir -p ci_test_selection_artifacts
@@ -116,6 +117,7 @@ jobs:
               .claude/hooks/tests/test_session_recording_policy_guard.py \
               .claude/skills/issue-contract-review/scripts/tests/ \
               .claude/skills/pr-review-judge/scripts/tests/ \
+              .claude/skills/open-pr/scripts/tests/ \
             --pr-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
             --merge-sha "${{ github.sha }}" \
             --workflow ci --job python-test \
