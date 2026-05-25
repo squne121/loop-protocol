@@ -51,24 +51,22 @@ disable-model-invocation: true
    ```
    validate-only（Gemini CLI 未実行）は `--validate-only` を指定する。結果は `result_surface.summary` / `.primary_artifact` / `.next_action` を優先参照する。
 
-## Grounded Research Retry Policy
+## Grounded Research Retry Policy（governance）
 
-`tool_profile: grounded_research` の wrapper-level retry は、認証や一時的 CLI failure の回復だけに限定する。
+このセクションは `tool_profile: grounded_research` における **wrapper-level retry の運用境界**を定義する governance 文書である。wrapper script (`scripts/run_gemini_headless.py`) の実 retry 挙動・retry 回数・`delegation_result_v1` の attempt フィールド仕様は `references/usage-contract.md` および `references/model-routing.md` を SSOT とし、本セクションはそれらと衝突しない範囲の運用方針のみを定める。
 
-- 対象:
+- 対象（運用境界として retry が妥当な失敗）:
   - `auth_error`
   - transient CLI failure
-- 実行方法:
-  - 同一 request を **1 回だけ** retry する
-  - `tool_profile` は変更しない
-  - request body は変更しない
-  - credential mutation なし
-  - 再ログインなし
+- 運用境界:
+  - 同一 request の retry は wrapper 内に閉じ、caller / orchestrator 側で重ねて retry しない
+  - retry 中に `tool_profile` / request body を変更しない
+  - credential mutation なし、再ログインなし
 - 再試行後も失敗した場合:
   - wrapper は失敗を隠さず返す
-  - caller は `failure_class` と attempt metadata を読んで fallback / escalation を判断する
+  - caller は `failure_class`（および wrapper が提供する attempt 情報があれば）を読んで fallback / escalation を判断する
 
-この policy は wrapper-level retry のみを扱う。grounding quality の判定、critical claim ごとの direct fallback、`WEB_RESEARCH_RESULT_V1` の最終分類は `web-researcher` の責務とする。
+この policy は wrapper-level retry の governance のみを扱う。grounding quality の判定、critical claim ごとの direct fallback、`WEB_RESEARCH_RESULT_V1` の最終分類は `web-researcher` の責務とする。wrapper script の挙動変更が必要になった場合は、本ファイルではなく `references/usage-contract.md` / `scripts/run_gemini_headless.py` / tests を更新する別 Issue を起票する。
 
 ## Core Rules
 

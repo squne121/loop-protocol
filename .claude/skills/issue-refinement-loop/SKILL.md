@@ -691,7 +691,6 @@ LOOP_PROTOCOL では `ssot-discovery` skill を併用して `docs/` 配下の関
 Step 1 完了後、`requires_fact_check == true` だった場合は main thread が `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1` を統合して `LOOP_STATE.anchor_comment.final_classification` を確定し、`verified_claims` と `unresolved_claims` を更新する。
 ### Step 1b: 外部仕様の事実確認（条件付き、`web-researcher` SubAgent）
 Step 1 と並列実行可。**トリガー**: `LOOP_STATE.web_research_policy.required == true` のとき実行。条件: Issue が外部仕様・公式 API・ツール現仕様・CLI 引数・認証・移行スケジュール・技術情報の裏付けが必要な場合。条件外は `skip_reason="no_critical_external_claim"` でスキップ。
-<!-- #203 integration point: auth_error retry state belongs to LOOP_STATE.web_research.retry_count; web_research_policy.required gates Step 1b BEFORE retry handling (policy=false ならそもそも retry 経路に入らない)。 -->
 `critical_external_claims`（Outcome / In Scope / Out of Scope / AC / VC を左右する主張）は `critical: true` として `web-researcher` に渡す。
 
 ```yaml
@@ -724,7 +723,9 @@ external_spec routing:
 Step 1b は `WEB_RESEARCH_RESULT_V1` を opaque に扱う
 schema_ssot:
   - .claude/agents/web-researcher.md
+delegation_contract_refs:
   - .claude/skills/gemini-cli-headless-delegation/SKILL.md
+  - .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md
 consumer_fields:
   - status
   - failure_class

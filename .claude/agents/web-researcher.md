@@ -73,7 +73,7 @@ WEB_RESEARCH_RESULT_V1:
   raw_summary: <Gemini の result_surface.summary>
 ```
 
-- `failure_class`: `status: failed` 時のみ設定する。`status: ok` または `status: insufficient_context` 時は `failure_class: null`。
+- `failure_class`: `status: failed` または `status: inconclusive` 時に設定可。`status: ok` または `status: insufficient_context` 時は `failure_class: null`。`status: inconclusive` で grounding quality gate が原因なら `grounding_failure` を設定する。
   - `auth_error`: 認証・権限エラー（OAuth 期限切れ / トークン無効など）
   - `capability_unavailable`: `grounded_research` tool_profile 未対応・CLI 機能不足
   - `query_error`: クエリ実行エラー（タイムアウト・API エラー・結果なしなど）
