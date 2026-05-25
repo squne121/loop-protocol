@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -120,10 +121,11 @@ def _get_context_lines(
     lines = body.split("\n")
     start = max(0, start_line - 1)
     end = min(len(lines), end_line)
-    context = lines[start:end][:max_lines]
+    raw_context = lines[start:end]
+    truncated = len(raw_context) > max_lines
+    context = raw_context[:max_lines]
     result: list[str] = []
     total_bytes = 0
-    truncated = False
     for line in context:
         encoded = line.encode("utf-8")
         line_cost = len(encoded) + 1
@@ -409,12 +411,56 @@ def _validate_lp056(body: str, sections: dict[str, tuple[str, int, int]]) -> lis
     return []
 
 
-def _validate_lp057(body: str, sections: dict[str, tuple[str, int, int]]) -> list[ValidationError]:
-    if re.search(r"(?i)\b(?:Closes|Refs)\s+#\d+\b", body):
+def _validate_lp057(body: str, sections: dict[str, tuple[str, int, int]], linked_issue: int | None = None) -> list[ValidationError]:
+    closes_match = re.search(r"(?i)\bCloses\s+#(\d+)\b", body)
+    refs_match = re.search(r"(?i)\bRefs\s+#(\d+)\b", body)
+
+    if closes_match or refs_match:
+        match = closes_match or refs_match
+        matched_issue = int(match.group(1))
+        if linked_issue is not None and matched_issue != linked_issue:
+            line_no = 1
+            context, truncated = _get_context_lines(body, line_no, line_no)
+            return [
+                ValidationError(
+                    rule_id="LP057",
+                    severity="error",
+                    section="Notes",
+                    line_start=line_no,
+                    line_end=line_no,
+                    message=f"PR body references #{matched_issue} but linked issue is #{linked_issue}.",
+                    minimal_context=context,
+                    context_truncated=truncated,
+                    fix_hint=f"Update Closes/Refs to reference #{linked_issue}.",
+                )
+            ]
         return []
+
     notes_info = sections.get("Notes")
-    if notes_info and _extract_notes_related_issue(notes_info[0]):
-        return []
+    if notes_info:
+        notes_related = _extract_notes_related_issue(notes_info[0])
+        if notes_related:
+            try:
+                notes_issue = int(notes_related.lstrip("#"))
+                if linked_issue is not None and notes_issue != linked_issue:
+                    line_no = notes_info[1]
+                    context, truncated = _get_context_lines(body, line_no, line_no)
+                    return [
+                        ValidationError(
+                            rule_id="LP057",
+                            severity="error",
+                            section="Notes",
+                            line_start=line_no,
+                            line_end=line_no,
+                            message=f"Related issue references #{notes_issue} but linked issue is #{linked_issue}.",
+                            minimal_context=context,
+                            context_truncated=truncated,
+                            fix_hint=f"Update Related issue to reference #{linked_issue}.",
+                        )
+                    ]
+                return []
+            except (ValueError, AttributeError):
+                pass
 
     line_no = notes_info[1] if notes_info else 1
     context, truncated = _get_context_lines(body, line_no, line_no if notes_info else 1)
@@ -434,7 +480,7 @@ def _validate_lp057(body: str, sections: dict[str, tuple[str, int, int]]) -> lis
 
 
 def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[ValidationError]:
-    if changed_paths is not None:
+    if changed_paths is not None and len(changed_paths) > 0:
         return []
     return [
         ValidationError(
@@ -451,7 +497,7 @@ def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[Validati
     ]
 
 
-def validate_pr_body(body: str, changed_paths: list[str] | None) -> ValidationResult:
+def validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: int | None = None) -> ValidationResult:
     body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
     sections = _extract_sections(body)
     errors: list[ValidationError] = []
@@ -461,7 +507,7 @@ def validate_pr_body(body: str, changed_paths: list[str] | None) -> ValidationRe
     errors.extend(_validate_lp051(body, sections, changed_paths))
     errors.extend(_validate_lp055(body, sections))
     errors.extend(_validate_lp056(body, sections))
-    errors.extend(_validate_lp057(body, sections))
+    errors.extend(_validate_lp057(body, sections, linked_issue))
     errors.extend(_validate_lp058(body, changed_paths))
     status: Literal["pass", "fail"] = "fail" if errors else "pass"
     return ValidationResult(
@@ -496,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: Cannot read changed-paths file: {exc}", file=sys.stderr)
         return 2
 
-    result = validate_pr_body(body, changed_paths)
+    result = validate_pr_body(body, changed_paths, args.linked_issue)
     print(
         json.dumps(
             {

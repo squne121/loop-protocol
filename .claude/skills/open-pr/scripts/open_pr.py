@@ -13,6 +13,7 @@ LOOP_PROTOCOL の PR 起票を決定論的に行う。skill (SKILL.md) の手順
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -196,13 +197,28 @@ def _run_pr_body_validator(
             changed_paths_file.close()
             cmd.extend(["--changed-paths-file", changed_paths_file.name])
 
-        cp = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        try:
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator timeout",
+                "stderr": (exc.stderr or "").strip() if exc.stderr else "Timeout expired",
+            }
+        except OSError as exc:
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator spawn error",
+                "stderr": str(exc),
+            }
 
         if cp.returncode not in {0, 1}:
             return {
@@ -220,6 +236,46 @@ def _run_pr_body_validator(
                 "errors": [],
                 "message": "Validator returned non-JSON output",
                 "stderr": (cp.stdout or "").strip(),
+            }
+
+        # B3: Verify JSON schema integrity
+        if payload.get("schema") != "loop_body_lint/v1":
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": f"Validator schema mismatch: {payload.get('schema')}",
+                "stderr": "",
+            }
+        if payload.get("target") != "pr":
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": f"Validator target mismatch: {payload.get('target')}",
+                "stderr": "",
+            }
+        if payload.get("status") not in {"pass", "fail"}:
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": f"Validator status invalid: {payload.get('status')}",
+                "stderr": "",
+            }
+        if not isinstance(payload.get("errors"), list):
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator errors field is not a list",
+                "stderr": "",
+            }
+
+        # B3: Verify body_sha256
+        expected_sha256 = f"sha256:{hashlib.sha256(body_text.encode('utf-8')).hexdigest()}"
+        if payload.get("body_sha256") != expected_sha256:
+            return {
+                "status": "internal",
+                "errors": [],
+                "message": "Validator body_sha256 mismatch",
+                "stderr": f"expected {expected_sha256}, got {payload.get('body_sha256')}",
             }
 
         return payload

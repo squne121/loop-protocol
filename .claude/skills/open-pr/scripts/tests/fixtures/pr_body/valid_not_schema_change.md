@@ -23,4 +23,4 @@ reason: safety-sensitive path に該当しない
 
 ## Notes
 
-- Related issue: #244
+- Related issue: #330

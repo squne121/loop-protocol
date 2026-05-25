@@ -209,3 +209,175 @@ def test_changed_paths_unavailable(monkeypatch: pytest.MonkeyPatch):
         assert rc == 2
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+
+def test_b3_validator_schema_mismatch(monkeypatch: pytest.MonkeyPatch):
+    """B3: Verify schema field is loop_body_lint/v1."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-validate-pr-body")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        class FakeCP:
+            returncode = 0
+            stdout = json.dumps({"schema": "wrong_schema", "target": "pr", "status": "pass", "errors": []})
+            stderr = ""
+
+        monkeypatch.setattr(open_pr.subprocess, "run", lambda *args, **kwargs: FakeCP())
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        rc = open_pr.main(
+            [
+                "--pr-title",
+                "feat: test",
+                "--linked-issue",
+                "330",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                body_path,
+            ]
+        )
+        assert rc == 2
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_b3_validator_target_mismatch(monkeypatch: pytest.MonkeyPatch):
+    """B3: Verify target field is 'pr'."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-validate-pr-body")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        class FakeCP:
+            returncode = 0
+            stdout = json.dumps({"schema": "loop_body_lint/v1", "target": "issue", "status": "pass", "errors": []})
+            stderr = ""
+
+        monkeypatch.setattr(open_pr.subprocess, "run", lambda *args, **kwargs: FakeCP())
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        rc = open_pr.main(
+            [
+                "--pr-title",
+                "feat: test",
+                "--linked-issue",
+                "330",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                body_path,
+            ]
+        )
+        assert rc == 2
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_b3_validator_body_sha256_mismatch(monkeypatch: pytest.MonkeyPatch):
+    """B3: Verify body_sha256 matches the final body."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-validate-pr-body")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        class FakeCP:
+            returncode = 0
+            stdout = json.dumps({
+                "schema": "loop_body_lint/v1",
+                "target": "pr",
+                "status": "pass",
+                "errors": [],
+                "body_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            })
+            stderr = ""
+
+        monkeypatch.setattr(open_pr.subprocess, "run", lambda *args, **kwargs: FakeCP())
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        rc = open_pr.main(
+            [
+                "--pr-title",
+                "feat: test",
+                "--linked-issue",
+                "330",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                body_path,
+            ]
+        )
+        assert rc == 2
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_b5_validator_timeout(monkeypatch: pytest.MonkeyPatch):
+    """B5: Handle subprocess.TimeoutExpired gracefully."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-validate-pr-body")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        def fake_run_timeout(*args, **kwargs):
+            raise open_pr.subprocess.TimeoutExpired(cmd=["validator"], timeout=60)
+
+        monkeypatch.setattr(open_pr.subprocess, "run", fake_run_timeout)
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        rc = open_pr.main(
+            [
+                "--pr-title",
+                "feat: test",
+                "--linked-issue",
+                "330",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                body_path,
+            ]
+        )
+        assert rc == 2
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_b5_validator_oserror(monkeypatch: pytest.MonkeyPatch):
+    """B5: Handle OSError gracefully."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-validate-pr-body")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        def fake_run_oserror(*args, **kwargs):
+            raise OSError("Spawn error")
+
+        monkeypatch.setattr(open_pr.subprocess, "run", fake_run_oserror)
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        rc = open_pr.main(
+            [
+                "--pr-title",
+                "feat: test",
+                "--linked-issue",
+                "330",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                body_path,
+            ]
+        )
+        assert rc == 2
+    finally:
+        Path(body_path).unlink(missing_ok=True)
