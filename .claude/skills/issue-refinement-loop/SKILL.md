@@ -691,15 +691,16 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
 evidence:
   - kind: file
     ref:
-      type: REPO_EVIDENCE_REF_V1  # schema identifier
+      type: REPO_EVIDENCE_REF_V1  # schema identifier constant
       # 以下、REPO_EVIDENCE_REF_V1 スキーマの全必須フィールド:
       commit_sha: "abc123def456abc123def456abc123def456abc1"
+      object_format: "sha1"  # or "sha256"
       path: "docs/adr/0001.md"
       start_line: 42
       end_line: 67
       permalink: "https://github.com/..."
-      excerpt_sha256: "1a2b3c4d5e6f7a8b..."
-      anchor_text: "## Architecture Overview"  # optional
+      excerpt_sha256: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"
+      anchor_text: "## Architecture Overview"  # optional, can be null
       verification_status: "verified" | "inconclusive"
       verification_method: "sha256_hash_match" | "sha256_hash_mismatch" | "line_range_unverified" | "fetch_error"
       verified_at: "2026-05-23T15:30:45Z"
