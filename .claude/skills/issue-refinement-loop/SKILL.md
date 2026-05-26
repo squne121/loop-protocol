@@ -55,6 +55,7 @@ LOOP_STATE:
   improvements_applied: []
   removed_state_labels: []
   termination_reason: null | approved | needs_second_pass | human_escalation | superseded_by_decision
+  scope_rollup_decision: null
   anchor_comment:
     url: null
     preliminary_classification: null
@@ -70,6 +71,10 @@ LOOP_STATE:
     target_paths: []
     repo_claims: []
     skip_reason: null
+  scope_signal_guard:
+    triggered: false
+    excluded_by_anchor_reframe: false
+    reason_code: null
   web_research_policy:
     required: false
     reason: null
@@ -85,6 +90,15 @@ LOOP_STATE:
     detected: false
     work_kind: null
     signals: []
+  delivery_rollup:
+    applicable: false
+    unmaterialized_slots: []
+  follow_up_materialization:
+    candidates: []
+  superseded_decision:
+    decision_summary: null
+    alternative_issue_number: null
+    close_reason: null
 ```
 
 詳細なフィールド定義と routing semantics は `references/` 側の owner file を参照する。
@@ -95,8 +109,9 @@ LOOP_STATE:
 
 1. Issue 本文と必要コメントを取得し、`state/needs-human` / `state/done` の hard stop を確認する。
 2. `anchor_comment_url` がある場合は snapshot を固定し、対象 Issue 所属を検証する。
-3. stale な `state/blocked` / `state/queued` は hygiene として除去する。
-4. scope rollup と Product/Spec routing はそれぞれの references を参照して実行する。
+3. scope rollup preflight を mutation-free で実行し、`LOOP_STATE.scope_rollup_decision` を記録する。
+4. Product/Spec routing signal を検知し、`LOOP_STATE.product_spec_context` を更新する。
+5. 本 Issue への refinement 継続が確定した後に、stale な `state/blocked` / `state/queued` を hygiene として除去する。
 
 ### Step 0f: Planner Consumption
 

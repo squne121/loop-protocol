@@ -71,3 +71,34 @@ def test_required_reference_files_exist():
     ]
     missing = [name for name in required_files if not (REFERENCES_DIR / name).exists()]
     assert not missing, f"Missing required reference files: {missing}"
+
+
+def test_step0_orders_scope_rollup_before_hygiene():
+    skill_md = load_skill_md()
+    assert "scope rollup preflight" in skill_md
+    assert "stale な `state/blocked` / `state/queued`" in skill_md
+    assert skill_md.index("scope rollup preflight") < skill_md.index(
+        "stale な `state/blocked` / `state/queued`"
+    )
+
+
+def test_loop_state_summary_keeps_routing_critical_fields():
+    skill_md = load_skill_md()
+    for field in [
+        "scope_rollup_decision",
+        "scope_signal_guard",
+        "delivery_rollup",
+        "follow_up_materialization",
+        "superseded_decision",
+    ]:
+        assert field in skill_md, f"Missing routing-critical field: {field}"
+
+
+def test_scope_signal_guard_reference_keeps_tasks_md_fail_closed_routing():
+    text = (REFERENCES_DIR / "scope-signal-guard.md").read_text(encoding="utf-8")
+    for field in [
+        "routing_target: issue_materialization",
+        "fail_closed: true",
+        "implementation_route_allowed: false",
+    ]:
+        assert field in text, f"Missing Product/Spec routing field: {field}"

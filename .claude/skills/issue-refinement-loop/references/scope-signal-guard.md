@@ -16,6 +16,19 @@ Issue title / body / labels に `docs/product/**`、`tasks.md`、`.specify/`、`
 - spec / plan / specify signal あり: `spec_creation` または `spec_update` として routing hint を記録する
 - `docs/product/**` 単独: `unknown` として扱い、後続 worker に context を渡す
 
+最低限維持すべき fail-closed routing state は以下。
+
+```yaml
+product_spec_routing_gate:
+  tasks_md_signal:
+    work_kind: tasks_materialization
+    routing_target: issue_materialization
+    fail_closed: true
+    implementation_route_allowed: false
+```
+
+`tasks.md` signal がある場合は `LOOP_STATE.product_spec_context.work_kind = tasks_materialization` を設定し、implementation route へ進めない。routing 先は `issue_materialization` として記録する。
+
 ## Loop stop signals
 
 iteration 中に以下が新規追加されたら `termination_reason: human_escalation` で停止する。
