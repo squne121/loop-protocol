@@ -447,7 +447,7 @@ def check_c13_vc_preflight_decision_consistency(
     """C13: VC preflight JSON (if provided) has consistent decision values.
 
     Applicability: only if --vc-preflight-json path is provided.
-    If not provided, return PASS with reason "no preflight json supplied".
+    If not provided, return NA (not PASS).
 
     Checks:
       - All entries in vc_preflight JSON results have valid decision field
@@ -455,9 +455,14 @@ def check_c13_vc_preflight_decision_consistency(
       - skipped results have verification_owner and runtime_verification_required fields
 
     戻り値: (CheckResult, list[failure_message])
+
+    Note: category is regression_gate for both pass and fail outcomes.
+    The pass/fail distinction is carried by classification (expected_pass vs blocked)
+    and decision (go vs blocked). Downstream consumers MUST read classification
+    for the routing-canonical pass/fail signal.
     """
     if not vc_preflight_json_path:
-        return CheckResult.PASS, []
+        return CheckResult.NA, []
 
     try:
         with open(vc_preflight_json_path) as f:

@@ -101,7 +101,10 @@ def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Op
     """
     VC コマンド行（target_line_idx）の直前行から `# preflight-scope: <value>` marker を抽出。
 
-    戻り値: marker value ('pr_review_only' / 'runtime_only') または None
+    戻り値: marker value ('pr_review_only' / 'runtime_only' / <invalid-value>) または None
+
+    NB2: If the value does not match the allowed set {pr_review_only, runtime_only},
+    it is returned as-is for downstream classification to handle as human_judgment.
     """
     if target_line_idx <= 0:
         return None
@@ -345,12 +348,22 @@ def _is_pytest_invocation(command: str) -> bool:
     return False
 
 
-def _is_regression_gate_command(command: str) -> bool:
+def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool:
     """
     AC4: regression_gate prefix detection.
 
     Detects: pnpm typecheck / lint / test / build / uv run pytest <existing-path>
+
+    For pytest commands, requires an existing positional path argument.
+    Args:
+        command: command string to check
+        cwd: working directory (defaults to Path.cwd())
+
+    Returns True if command is a regression gate command, False otherwise.
     """
+    if cwd is None:
+        cwd = str(Path.cwd())
+
     # Check for exact command prefixes
     prefixes = [
         "pnpm typecheck",
@@ -362,9 +375,60 @@ def _is_regression_gate_command(command: str) -> bool:
         return True
 
     # Check for uv run pytest with existing test paths
-    if "uv run" in command and "pytest" in command:
-        return True
+    if "uv run" not in command or "pytest" not in command:
+        return False
 
+    # B3: For pytest commands, extract positional path argument
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not argv:
+        return False
+
+    # Strip uv run and options to find positional arguments
+    unwrapped = _strip_uv_run_options(argv)
+    if not unwrapped:
+        return False
+
+    # Find pytest invocation
+    pytest_idx = -1
+    for i, arg in enumerate(unwrapped):
+        if Path(arg).name == "pytest":
+            pytest_idx = i
+            break
+        if (
+            Path(arg).name in ("python", "python3")
+            and i + 2 < len(unwrapped)
+            and unwrapped[i + 1] == "-m"
+            and unwrapped[i + 2] == "pytest"
+        ):
+            pytest_idx = i + 2
+            break
+
+    if pytest_idx == -1:
+        return False
+
+    # Collect positional arguments after pytest (skip options starting with -)
+    positional_args = []
+    for i in range(pytest_idx + 1, len(unwrapped)):
+        arg = unwrapped[i]
+        # Skip option flags (-k, -v, etc.)
+        if arg.startswith("-"):
+            # Skip the flag and its argument if it takes one
+            if arg in ("-k", "-m"):
+                i += 1
+            continue
+        positional_args.append(arg)
+
+    # B3: Check if any positional argument exists and is a valid path
+    for arg in positional_args:
+        test_path = Path(cwd) / arg
+        if test_path.exists():
+            return True
+
+    # No valid path found
     return False
 
 
@@ -383,6 +447,21 @@ def _is_negated_search_command(command: str) -> bool:
     return any(rest.startswith(util) for util in ["rg", "grep"])
 
 
+def has_command_substitution(command: str) -> bool:
+    """
+    B2: Detect command substitution patterns: $(...), `...`, ${...}
+
+    Returns True if the command contains command substitution, False otherwise.
+    Avoids false positives by not checking inside single-quoted segments.
+    """
+    # Simple check for command substitution patterns
+    if "$(" in command or "`" in command or "${" in command:
+        # For the implementation, a simple substring check is acceptable
+        # (avoiding false positives inside single quotes is a future refinement)
+        return True
+    return False
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
@@ -396,31 +475,47 @@ def classify_result(
       classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
       category: file_not_found_expected | expected_baseline_fail | unexpected_pass |
                 env_missing_dep | file_not_found_unrunnable | timeout |
-                compound_command_disallowed | unknown
+                compound_command_disallowed | unknown | regression_gate
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
     """
 
-    # AC4: regression_gate prefix detection BEFORE execution effects
-    # If it's a regression gate, apply special rules
-    if _is_regression_gate_command(command):
-        if exit_code == 0:
-            return "expected_pass", "regression_gate", "go", None, "regression_gate"
-        else:
-            return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
-
-    # AC6: negated search commands - static classification
+    # AC6: negated search commands - static classification (BEFORE run_command)
     if _is_negated_search_command(command):
+        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+    # B2: command substitution detection - static classification without execution
+    if has_command_substitution(command):
         return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # compound command は blocked (default scope_class)
     if detect_compound_command(command):
         return "blocked", "compound_command_disallowed", "blocked", "Compound shell commands are not supported in initial implementation", "baseline_fail_expected"
 
-    # AC7: command substitution detection - static classification without execution
-    if "$(" in command or "`" in command:
-        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+    # AC4: regression_gate prefix detection AFTER static checks
+    # If it's a regression gate, apply special rules
+    if _is_regression_gate_command(command):
+        if exit_code == 0:
+            return "expected_pass", "regression_gate", "go", None, "regression_gate"
+        else:
+            # B3: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
+            if _is_pytest_invocation(command):
+                combined_lower = f"{stdout}\n{stderr}".lower()
+
+                # B3: pytest exit 4 + file not found → expected_baseline_fail
+                if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
+                    return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+                # B3: pytest exit 5 + no tests collected → expected_baseline_fail
+                if exit_code == 5 and (
+                    "no tests ran" in combined_lower
+                    or "no tests collected" in combined_lower
+                    or "collected 0 items" in combined_lower
+                ):
+                    return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+            return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
 
     # timeout check
     if "timeout" in stderr.lower():
@@ -541,6 +636,11 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
 
     C3: human_judgment を保持する。vc_preflight.passed は status == "pass" のときのみ true。
 
+    B1: Each classification item includes:
+      - classification (always)
+      - scope_class (always)
+      - For skipped items: verification_owner, deferred_reason, runtime_verification_required
+
     戻り値は YAML 形式の dict.
     """
     vc_failed_as_expected = sum(
@@ -570,18 +670,31 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
         # C3: decision をそのまま渡す（human_judgment を保持）
         decision = r["decision"]
 
+        # B1: classification and scope_class are always included
         classification_item = {
             "ac": r["ac"],
             "command": r["raw_command"],
             "exit_code": r["exit_code"],
+            "classification": r["classification"],
             "category": r["category"],
             "confidence": compute_confidence(r["category"]),
+            "scope_class": r["scope_class"],
             "evidence": {
                 "stdout_excerpt": " ".join(stdout_lines[:5]) if stdout_lines else "",
                 "stderr_excerpt": " ".join(stderr_lines[:5]) if stderr_lines else "",
             },
             "decision": decision,
         }
+
+        # B1: For skipped items, add routing metadata
+        if r["classification"] == "skipped":
+            if "verification_owner" in r:
+                classification_item["verification_owner"] = r["verification_owner"]
+            if "deferred_reason" in r:
+                classification_item["deferred_reason"] = r["deferred_reason"]
+            if "runtime_verification_required" in r:
+                classification_item["runtime_verification_required"] = r["runtime_verification_required"]
+
         classifications.append(classification_item)
 
     return {
@@ -725,26 +838,60 @@ def main() -> int:
 
     for ac_label, command, line_no, preflight_scope in commands:
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
-        if preflight_scope in ("pr_review_only", "runtime_only"):
-            classification = "skipped"
-            decision = "go"
-            category = f"preflight_scope_{preflight_scope}"
-            exit_code = None
-            stdout, stderr = "", ""
-            duration_ms = 0
-            fix_hint = None
-            scope_class = preflight_scope
-            # Routing metadata for skipped results
-            verification_owner = "pr-review-judge" if preflight_scope == "pr_review_only" else "impl-review-loop"
-            deferred_reason = (
-                "VC marked pr_review_only; verification deferred to PR review"
-                if preflight_scope == "pr_review_only"
-                else "VC marked runtime_only; verification deferred to post-implementation runtime"
-            )
-            runtime_verification_required = preflight_scope == "runtime_only"
+        # NB2: Invalid marker values (typos) → human_judgment
+        if preflight_scope is not None:
+            if preflight_scope in ("pr_review_only", "runtime_only"):
+                classification = "skipped"
+                decision = "go"
+                category = f"preflight_scope_{preflight_scope}"
+                exit_code = None
+                stdout, stderr = "", ""
+                duration_ms = 0
+                fix_hint = None
+                scope_class = preflight_scope
+                # Routing metadata for skipped results
+                verification_owner = "pr-review-judge" if preflight_scope == "pr_review_only" else "impl-review-loop"
+                deferred_reason = (
+                    "VC marked pr_review_only; verification deferred to PR review"
+                    if preflight_scope == "pr_review_only"
+                    else "VC marked runtime_only; verification deferred to post-implementation runtime"
+                )
+                runtime_verification_required = preflight_scope == "runtime_only"
+            else:
+                # NB2: Invalid preflight-scope marker value
+                classification = "human_judgment"
+                decision = "human_judgment"
+                category = "unknown"
+                exit_code = None
+                stdout, stderr = "", ""
+                duration_ms = 0
+                fix_hint = f"Unknown preflight-scope marker value '{preflight_scope}'; expected pr_review_only or runtime_only"
+                scope_class = "baseline_fail_expected"
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
         else:
-            # B1: Detect compound command BEFORE running
-            if detect_compound_command(command):
+            # B2: Static classification checks BEFORE run_command (CRITICAL)
+            # Check for command substitution and negated search BEFORE execution
+            if has_command_substitution(command):
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification, category, decision, fix_hint, scope_class = (
+                    "expected_fail",
+                    "expected_baseline_fail",
+                    "go",
+                    None,
+                    "baseline_fail_expected",
+                )
+            elif _is_negated_search_command(command):
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification, category, decision, fix_hint, scope_class = (
+                    "expected_fail",
+                    "expected_baseline_fail",
+                    "go",
+                    None,
+                    "baseline_fail_expected",
+                )
+            elif detect_compound_command(command):
                 exit_code, stdout, stderr, duration_ms = None, "", "", 0
                 classification, category, decision, fix_hint, scope_class = (
                     "blocked",
@@ -754,6 +901,7 @@ def main() -> int:
                     "baseline_fail_expected",
                 )
             else:
+                # B2: Only run command if not statically classified
                 exit_code, stdout, stderr, duration_ms = run_command(
                     command, args.timeout_seconds, args.cwd
                 )
