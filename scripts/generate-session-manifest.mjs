@@ -33,6 +33,7 @@ import {
   validateManifest,
   detectSecretPatterns,
   detectSecretsInMarkdown,
+  validateProducerMetadataSafety,
   validateProducerContractForIssue377,
   PRODUCER_ACTOR_TYPES,
   PRODUCER_EVIDENCE_SOURCE_KINDS,
@@ -465,8 +466,10 @@ async function main() {
     const allowLocalPath = opts['allow-local-path'] === true
     const secretPattern = detectSecretPatterns(manifest)
     if (secretPattern) {
-      if (allowLocalPath) {
-        // Downgrade to warning
+      const producerMetadataSafety = validateProducerMetadataSafety(manifest)
+      const absolutePathOnly = secretPattern === 'absolute path detected' && producerMetadataSafety.valid
+      if (allowLocalPath && absolutePathOnly) {
+        // Downgrade only for local path usage; token/private-key patterns remain fail-closed.
         console.warn(`Warning: Secret pattern detected (allowed by --allow-local-path): ${secretPattern}`)
       } else {
         // Fail-closed (default)
@@ -483,7 +486,8 @@ async function main() {
       // B2 iter2: Scan markdown output for secrets as well (fail-closed by default)
       const markdownSecrets = detectSecretsInMarkdown(output)
       if (markdownSecrets) {
-        if (allowLocalPath) {
+        const absolutePathOnly = markdownSecrets === 'absolute path detected in markdown'
+        if (allowLocalPath && absolutePathOnly) {
           console.warn(`Warning: Secret pattern detected in output (allowed by --allow-local-path): ${markdownSecrets}`)
         } else {
           console.error(`Error: Secret pattern detected in output: ${markdownSecrets}. Use --allow-local-path to allow local paths.`)

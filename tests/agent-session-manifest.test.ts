@@ -181,6 +181,51 @@ describe('agent-session-manifest semantic validation', () => {
     expect(result.errors.some((error) => error.path === 'token_usage.total')).toBe(true)
   })
 
+  it('GIVEN producer.kind mismatches evidence.source_kind WHEN validating semantics THEN result is invalid', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      producer: {
+        kind: 'github_action_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+    }
+    const result = validateManifestSemantics(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'producer.kind')).toBe(true)
+  })
+
+  it('GIVEN producer.command contains absolute local path WHEN validating semantics THEN result is invalid', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: '/home/squne/projects/LOOP_PROTOCOL/scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+    }
+    const result = validateManifestSemantics(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'producer.command')).toBe(true)
+  })
+
+  it('GIVEN producer.command contains token-like value WHEN validating semantics THEN result is invalid', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'OPENAI_API_KEY=sk-12345678901234567890 node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+    }
+    const result = validateManifestSemantics(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'producer.command')).toBe(true)
+  })
+
   it('GIVEN manifest with valid producer object WHEN running combined validation THEN combined result is valid', () => {
     const manifest = {
       ...createBaseManifest(),
