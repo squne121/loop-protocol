@@ -191,13 +191,7 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   status: ok | failed | inconclusive
   investigation_route: local_asset_research | github_research | none
   evidence_refs:
-    - # .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md#REPO_EVIDENCE_REF_V1 を使用
-      path: <string>
-      commit_sha: <string>
-      start_line: <int>
-      end_line: <int>
-      excerpt_sha256: <string>
-      verification_status: verified | inconclusive
+    - <REPO_EVIDENCE_REF_V1> # .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md を SSOT とする
   discovery_summary: <string>
   impact_scope: [<file_path>]
   failure_reason: <string | null>
@@ -237,15 +231,12 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
 
 ### Verification Status 処理ルール（Execution layer）
 
-#### Rule 1: inconclusive を verified に昇格しない
+#### Rule 1: inconclusive の昇格判断禁止
 
-`REPO_EVIDENCE_REF_V1` で `verification_status: inconclusive` が返った場合、本 SubAgent は以下を禁止する:
+`REPO_EVIDENCE_REF_V1` で `verification_status: inconclusive` が返った場合、本 SubAgent および呼び出し元（orchestrator）は、authoritative evidence として扱ってはならない。
 
-- caller-side での excerpt hash 再計算による `verified` 昇格
-- fallback excerpt による line range 推測
-- 「inconclusive でも内容は正しい可能性が高い」という根拠での pass-through
-
-本 SubAgent は `verification_status: inconclusive` を呼び出し元に素通しする。昇格判断は呼び出し元（main thread / orchestrator）に委譲する。
+- `verified` への昇格は、REPO_EVIDENCE_REF_V1 の生成元または validator が `commit_sha` / `excerpt_sha256` / `verification_method` / `verified_at` 等を再検証した場合に限る。
+- orchestrator は昇格判断を行わず、routing 上は `inconclusive` として扱う。
 
 #### Rule 2: Verification Metadata 欠如による authoritative 扱い禁止（Result layer）
 

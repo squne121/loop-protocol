@@ -50,7 +50,7 @@ REVIEW_ISSUE_RESULT_V1:
   verdict: approve | needs-fix
   needs_second_pass: <bool> # iteration limit 時に orchestrator が参照
   failure_class: null | checker_unavailable | ...
-  blocking_issues: [] # 旧 blocking_findings
+  blocking_issues: []
   non_blocking_improvements: []
   diff_proposal: { add: [], remove: [], rewrite: [] }
   deterministic_checks: { C1: pass, C2: pass, ... }

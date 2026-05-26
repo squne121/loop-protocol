@@ -97,6 +97,7 @@ WEB_RESEARCH_RESULT_V1:
     - attempt_no: <int>
       route: <string>
       status: ok | inconclusive | failed
+      failure_class: null | auth_error | capability_unavailable | query_error | grounding_failure
       claim_ids: []
       citation_count: <int>
       evidence_count: <int>
