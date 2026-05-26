@@ -44,7 +44,7 @@ permissionMode: acceptEdits
 - **Baseline Fail Expectation**: 実装前の段階では、VC の実行失敗（0 hit / file-not-found）は「予定された失敗（expected baseline fail）」として扱い、本文が壊れている証拠とはみなさない。
 - **Outcome Concreteness**: Outcome は実装後に検証可能な具体性を持つように維持・修正する。
 - **No AC weakening**: baseline fail を消すために AC/VC を弱める（曖昧にする）ことを禁止する。
-- **Opaque Feedback Handling**: `reviewer_feedback_text` を opaque forwarding payload として扱い、自身の判断で書き換える。
+- **Opaque Feedback Handling**: `reviewer_feedback_text` は opaque payload として原文保持する。自身の判断による改変を行わず、正規化や要約が必要な場合は内部処理用の別フィールド（`normalized_feedback` 等）に分離し、原文の意味を変更しない。
 
 ### Result: ISSUE_AUTHOR_RESULT_V1 (SubAgent-owned)
 

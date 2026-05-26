@@ -91,10 +91,8 @@ WEB_RESEARCH_RESULT_V1:
   status: ok | inconclusive | failed | insufficient_context
   failure_class: null | auth_error | capability_unavailable | query_error | grounding_failure
   verification_route: grounded_research | direct_web | direct_cli | none
-  retry_count: <int>
-  fallback_used: <bool>
   attempts:
-    - attempt_no: <int>
+    - attempt: <int>
       route: <string>
       status: ok | inconclusive | failed
       failure_class: null | auth_error | capability_unavailable | query_error | grounding_failure
@@ -102,22 +100,23 @@ WEB_RESEARCH_RESULT_V1:
       citation_count: <int>
       evidence_count: <int>
       notes: <string>
-  critical_external_claims:
+
+  claims:
     - claim_id: <string>
       text: <string>
       type: external_spec
+      critical: true | false
       verdict: supported | contradicted | inconclusive
-      citations: [<url>]
-      evidence_summary: <string>
+      evidence:
+        - kind: web
+          ref: <url>
+          summary: <string>
   unresolved_risks: []
   failure_reason: <string>
   raw_summary: <string>
 ```
 
-- `failure_class`: `auth_error` | `capability_unavailable` | `query_error` | `grounding_failure`
-- `retry_count`: `grounded_research` の再試行回数
-- `fallback_used`: `direct_web` / `direct_cli` を使用したか
-- `critical_external_claims`: Outcome/AC/VC を左右する重要主張の検証結果
+`claims` と `topic` が両方欠落していたら即 `status: insufficient_context` を返す。裏付けが取れない主張は推測で埋めず `verdict: inconclusive` と明記する。
 
 ## 認証
 

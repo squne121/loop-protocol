@@ -963,7 +963,7 @@ def main() -> None:
     else:
         body, labels, title = fetch_issue_body(args.issue, args.repo)
 
-    result = run_checks(body, labels, title, args.vc_preflight_json)
+    result = run_checks(body, labels, title, args.vc_preflight_json_path)
     output = result_to_dict(result)
 
     if args.json:
