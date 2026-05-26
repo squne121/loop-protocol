@@ -258,7 +258,76 @@ describe('B3: producer JSON → validator pass', () => {
 
     const result = runValidator(fixtureFile)
     expect(result.exitCode).toBe(1)
-    expect(result.stderr).toContain('producer.kind must match evidence.source_kind mapping')
+    expect(result.stderr).toContain('evidence[0].source_kind maps to script_generated, but producer.kind is github_action_generated')
+  })
+
+  it('GIVEN producer without evidence WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-no-evidence.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('evidence must contain at least one entry when producer is present')
+  })
+
+  it('GIVEN mixed evidence kinds WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [
+        { source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' },
+        { source_kind: 'ci_check', source_ref: 'https://github.com/squne121/loop-protocol/actions/runs/1', visibility: 'public_github_comment' },
+      ],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-mixed-evidence.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('evidence[1].source_kind maps to github_action_generated, but producer.kind is script_generated')
   })
 
   it('GIVEN producer.command contains absolute local path WHEN validator runs THEN exits 1', () => {
@@ -408,6 +477,39 @@ describe('B5: redaction scan fail-closed for github-comment', () => {
     ])
     expect(result.exitCode).toBe(1)
     expect(result.stderr).toContain('OpenAI token pattern detected')
+  })
+
+  it('GIVEN producer.command contains export style env assignment WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [{ source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' }],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'export OPENAI_API_KEY = sk-12345678901234567890 && node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-command-export-token.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('expanded env assignment detected in producer.command')
   })
 })
 

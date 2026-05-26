@@ -85,14 +85,14 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Sanitized invocation command or null. MUST NOT contain secrets, expanded env values, or unsafe local paths intended for public surfaces."
+          "description": "Sanitized invocation command or null. Validator performs best-effort pattern scanning and MUST reject representative secrets, expanded env values, and unsafe local paths intended for public surfaces."
         },
         "source_ref": {
           "oneOf": [
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Git ref, PR, workflow run, artifact reference, hook id, or null."
+          "description": "Git ref, PR, workflow run, artifact reference, hook id, or null. Validator performs best-effort pattern scanning for unsafe metadata."
         }
       }
     },

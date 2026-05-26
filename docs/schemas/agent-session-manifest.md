@@ -79,8 +79,8 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 |---|---|---|---|
 | `kind` | enum | yes | `script_generated \| hook_generated \| github_action_generated` |
 | `version` | string\|null | no | producer 実装 version（既知なら設定） |
-| `command` | string\|null | no | sanitized invocation command。secret / expanded env values / unsafe local path を含めない |
-| `source_ref` | string\|null | no | git ref / PR / workflow run / artifact reference / hook id など |
+| `command` | string\|null | no | sanitized invocation command。validator は best-effort pattern scan で secret / expanded env values / unsafe local path を reject する |
+| `source_ref` | string\|null | no | git ref / PR / workflow run / artifact reference / hook id など。validator は best-effort pattern scan を適用する |
 
 `human_attested_from_deterministic_evidence` remains outside the schema enum。これは schema の producer kind ではなく、人間が deterministic evidence を確認したという運用上の attestation として扱う。
 
@@ -427,7 +427,6 @@ redaction:
 - `docs/dev/agent-skill-boundaries.md` — SubAgent / Skill 責務境界（Hook-based Ledger Optional Design セクション）
 - `docs/dev/schema-governance.md` — Schema governance ルール（本 schema の登録先）
 - `docs/dev/runtime-verification-policy.md` — Runtime Verification Applicability 判定スキーマ
-- quality-gate rerun is executed in test-runner phase
 - `#136` — metadata-first 方針の anchor decision
 - `#44` — SubAgent Execution Ledger 設計（ledger_phase の元定義）
 - `#241` — Secret Inventory SSOT 化（session recording 前提条件）

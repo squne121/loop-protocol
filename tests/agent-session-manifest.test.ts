@@ -193,7 +193,52 @@ describe('agent-session-manifest semantic validation', () => {
     }
     const result = validateManifestSemantics(manifest)
     expect(result.valid).toBe(false)
-    expect(result.errors.some((error) => error.path === 'producer.kind')).toBe(true)
+    expect(result.errors.some((error) => error.path === 'evidence[0].source_kind')).toBe(true)
+  })
+
+  it('GIVEN producer without evidence WHEN validating semantics THEN result is invalid', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      evidence: [],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+    }
+    const result = validateManifestSemantics(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'evidence')).toBe(true)
+  })
+
+  it('GIVEN mixed evidence kinds WHEN validating semantics THEN result is invalid', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      evidence: [
+        {
+          source_kind: 'artifact',
+          source_ref: 'artifacts/manifest.json',
+          source_sha256: null,
+          visibility: 'private_artifact',
+        },
+        {
+          source_kind: 'ci_check',
+          source_ref: 'https://github.com/squne121/loop-protocol/actions/runs/1',
+          source_sha256: null,
+          visibility: 'public_github_comment',
+        },
+      ],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+    }
+    const result = validateManifestSemantics(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'evidence[1].source_kind')).toBe(true)
   })
 
   it('GIVEN producer.command contains absolute local path WHEN validating semantics THEN result is invalid', () => {

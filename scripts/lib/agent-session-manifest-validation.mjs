@@ -230,8 +230,20 @@ export function validateProducerProvenanceSemantics(manifest) {
     })
   }
 
-  for (let i = 0; i < (manifest.evidence || []).length; i++) {
-    const evidence = manifest.evidence[i]
+  const evidenceList = Array.isArray(manifest.evidence) ? manifest.evidence : []
+  if (evidenceList.length === 0) {
+    errors.push({
+      path: 'evidence',
+      message: 'evidence must contain at least one entry when producer is present',
+    })
+    return {
+      valid: false,
+      errors,
+    }
+  }
+
+  for (let i = 0; i < evidenceList.length; i++) {
+    const evidence = evidenceList[i]
     if (evidence.source_kind && !PRODUCER_EVIDENCE_SOURCE_KINDS.includes(evidence.source_kind)) {
       errors.push({
         path: `evidence[${i}].source_kind`,
@@ -240,23 +252,29 @@ export function validateProducerProvenanceSemantics(manifest) {
     }
   }
 
-  const primaryEvidence = manifest.evidence?.[0]
-  const expectedKind = primaryEvidence ? PRODUCER_KIND_BY_EVIDENCE_SOURCE[primaryEvidence.source_kind] : undefined
   if (!manifest.producer.kind) {
     errors.push({
       path: 'producer.kind',
       message: 'producer.kind is required when producer is present',
     })
-  } else if (expectedKind && manifest.producer.kind !== expectedKind) {
-    errors.push({
-      path: 'producer.kind',
-      message: `producer.kind must match evidence.source_kind mapping. Expected: ${expectedKind}. Got: ${manifest.producer.kind}`,
-    })
-  } else if (!expectedKind && primaryEvidence?.source_kind) {
-    errors.push({
-      path: 'producer.kind',
-      message: `producer.kind cannot be derived from unsupported evidence.source_kind: ${primaryEvidence.source_kind}`,
-    })
+  } else {
+    for (let i = 0; i < evidenceList.length; i++) {
+      const evidence = evidenceList[i]
+      const expectedKind = PRODUCER_KIND_BY_EVIDENCE_SOURCE[evidence.source_kind]
+      if (!expectedKind && evidence?.source_kind) {
+        errors.push({
+          path: `evidence[${i}].source_kind`,
+          message: `producer.kind cannot be derived from unsupported evidence.source_kind: ${evidence.source_kind}`,
+        })
+        continue
+      }
+      if (expectedKind && manifest.producer.kind !== expectedKind) {
+        errors.push({
+          path: `evidence[${i}].source_kind`,
+          message: `evidence[${i}].source_kind maps to ${expectedKind}, but producer.kind is ${manifest.producer.kind}`,
+        })
+      }
+    }
   }
 
   // M2 iter2: verification semantic rules
@@ -296,7 +314,7 @@ function collectSecretPatternDetails(text, { includeLocalPath = true } = {}) {
     matches.push({ code: 'absolute_path', message: 'absolute path detected' })
   }
 
-  if (/\.env\b[^.]/.test(value) && !value.includes('agent-session-manifest')) {
+  if (/(^|[\s"'`])(source\s+)?\.env(?:$|[\s"'`])/.test(value) && !value.includes('agent-session-manifest')) {
     matches.push({ code: 'env_content', message: '.env content pattern detected' })
   }
 
@@ -312,7 +330,7 @@ function collectSecretPatternDetails(text, { includeLocalPath = true } = {}) {
     matches.push({ code: 'private_key', message: 'PRIVATE KEY pattern detected' })
   }
 
-  if (/(^|[\s"'`])(?:OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|ANTHROPIC_API_KEY)\s*=/.test(value)) {
+  if (/(^|[\s"'`])(?:export\s+|env\s+)?(?:OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|ANTHROPIC_API_KEY)\s*=\s*/.test(value)) {
     matches.push({ code: 'expanded_env', message: 'expanded env assignment detected' })
   }
 
