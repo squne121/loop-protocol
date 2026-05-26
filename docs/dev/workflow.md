@@ -295,6 +295,8 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 | SSOT カタログ全体 | `docs/dev/ssot-registry.md` |
 | product spec / `docs/product/**` ライフサイクル（作成・更新・archive・compact spec・spec delta・tasks.md adapter） | `docs/dev/product-spec-lifecycle.md` |
 | MVP scope（MVP に含める / 含めない境界・success/failure/pivot criteria。`status: draft` の間は discovery 用であり implementation normative source ではない） | `docs/product/mvp-scope.md` |
+| プレイテストの実施手順・フィードバック分類・PII 保護方針・Spec Delta Gate | `docs/product/playtest-protocol.md` |
+| プレイテスト結果の記録・YAML テンプレート・スキーマ定義 | `docs/product/playtest-log.md` |
 | ゲームロジック仕様（状態遷移・入力・時間モデル・衝突・勝敗・保存境界） | `docs/product/game-logic.md` |
 
 ### 新規 SSOT 追加時の必須更新セット
