@@ -51,7 +51,8 @@ Normative documents defining the product as a whole:
 | `docs/product/game-design.md` | GDD-level design (C254-4) |
 | `docs/product/game-logic.md` | Implementation-facing game rules (C254-5) |
 | `docs/product/mvp-scope.md` | Current MVP boundary (C254-6) |
-| `docs/product/playtest-protocol.md` | Playtest protocol + log template (C254-7) |
+| `docs/product/playtest-protocol.md` | Playtest execution procedure & Spec Delta Gate (C254-7) |
+| `docs/product/playtest-log.md` | Playtest log template & entry schema SSOT (C254-7) |
 
 ### Feature-level spec
 

@@ -220,6 +220,29 @@
     - "## Playtest Handoff"
     - "## Trace Links"
 
+- id: playtest-protocol
+  path: docs/product/playtest-protocol.md
+  title: Playtest Protocol
+  keywords: [playtest, protocol, session-planning, feedback, spec-delta-gate, privacy, pii]
+  description: プレイテストの実施手順、フィードバック分類、Spec Delta Gate、およびプライバシー保護方針を定義する SSOT
+  sections:
+    - "## Session Planning"
+    - "## Participant / Tester Handling"
+    - "## Task Script"
+    - "## Observation Rules"
+    - "## Feedback Classification"
+    - "## Spec Delta Gate"
+    - "## Privacy / PII Handling"
+
+- id: playtest-log
+  path: docs/product/playtest-log.md
+  title: Playtest Log Template
+  keywords: [playtest, log, template, schema, entry]
+  description: プレイテスト結果を記録するための YAML テンプレートとスキーマ定義の SSOT
+  sections:
+    - "## Entry Schema"
+    - "## Example Entry"
+
 ---
 
 ## ディレクトリ → SSOT マッピング
