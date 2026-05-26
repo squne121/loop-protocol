@@ -1440,6 +1440,262 @@ $ grep "test" /tmp/dummy.txt
         os.unlink(fixture_file)
 
 
+# B1: New tests for blocker fixes
+
+def test_has_command_substitution_single_quoted_literal_is_false():
+    """B3: rg -n '\\$\\([^)]+\\)' file → False (single-quoted literal)"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import has_command_substitution
+
+    # Single-quoted pattern is a literal, not substitution
+    result = has_command_substitution(r"rg -n '\$\([^)]+\)' file")
+    assert result is False, "Single-quoted literal should not detect as substitution"
+
+
+def test_has_command_substitution_double_quoted_substitution_is_true():
+    """B3: echo "$(date)" → True (double-quoted substitution)"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import has_command_substitution
+
+    # Double-quoted substitution should be detected
+    result = has_command_substitution('echo "$(date)"')
+    assert result is True, "Double-quoted substitution should be detected"
+
+
+def test_has_command_substitution_mixed_quotes():
+    """B3: Mixed quote detection"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import has_command_substitution
+
+    # Test literal in single quotes
+    assert has_command_substitution("echo '$(date)'") is False
+    # Test substitution in double quotes
+    assert has_command_substitution('echo "$(date)"') is True
+    # Test backtick outside quotes
+    assert has_command_substitution("echo `date`") is True
+    # Test backtick in single quotes
+    assert has_command_substitution("echo '`date`'") is False
+
+
+def test_classify_result_uses_cwd_argument(tmp_path):
+    """B1: classify_result threads cwd to _is_regression_gate_command"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    # Create a test file in tmp_path
+    test_file = tmp_path / "test_example.py"
+    test_file.write_text("def test_example(): pass")
+
+    # Call classify_result with cwd set to tmp_path.parent
+    # Command references relative path
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        command=f"uv run pytest {test_file}",
+        cwd=str(tmp_path.parent)
+    )
+
+    # When exit_code=0 and cwd is threaded properly, should be regression_gate
+    assert scope_class == "regression_gate", f"Expected regression_gate but got {scope_class}"
+    assert classification == "expected_pass", f"Expected expected_pass but got {classification}"
+
+
+def test_uv_pytest_k_option_does_not_treat_value_as_path(tmp_path):
+    """B2: pytest -k option value should not be treated as positional path"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_regression_gate_command
+
+    # Create a directory named "smoke" under tmp_path
+    smoke_dir = tmp_path / "smoke"
+    smoke_dir.mkdir()
+
+    # Create an actual test directory
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_file = tests_dir / "test_example.py"
+    test_file.write_text("def test_example(): pass")
+
+    # Command with -k option and "smoke" as value
+    # Should only return True if "tests/" is detected as positional (not "smoke")
+    result = _is_regression_gate_command(
+        "uv run pytest -k smoke tests/",
+        cwd=str(tmp_path)
+    )
+    assert result is True, "pytest with -k and valid test path should be regression_gate"
+
+    # Command with only -k and no valid positional path
+    result = _is_regression_gate_command(
+        "uv run pytest -k smoke",
+        cwd=str(tmp_path)
+    )
+    assert result is False, "pytest with only -k and no test path should not be regression_gate"
+
+
+def test_regression_gate_pnpm_typecheck_exit1_blocked(tmp_path):
+    """B5: uv run pytest with valid path + failure → regression_gate/blocked"""
+    # Create a test file that will fail
+    test_file = tmp_path / "test_fail.py"
+    test_file.write_text("def test_fail(): assert False")
+
+    fixture_content = f"""## Verification Commands
+
+```bash
+# AC1
+$ uv run pytest {test_file}
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        data = run_preflight(fixture_file)
+        results = data["results"]
+        assert len(results) > 0
+
+        # pytest with valid path that fails should be regression_gate
+        found = any(
+            r["scope_class"] == "regression_gate"
+            for r in results
+        )
+        assert found, f"Expected regression_gate scope_class. Got: {results[0]['scope_class']}"
+    finally:
+        import os
+        os.unlink(fixture_file)
+
+
+def test_check_c13_vc_preflight_decision_consistency_valid():
+    """B4: C13 validates schema consistency for valid classifications"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import check_c13_vc_preflight_decision_consistency
+
+    classifications = [
+        {
+            "ac": "AC1",
+            "command": "rg test file",
+            "exit_code": 1,
+            "classification": "expected_fail",
+            "category": "expected_baseline_fail",
+            "confidence": "high",
+            "scope_class": "baseline_fail_expected",
+            "evidence": {},
+            "decision": "go",
+        },
+        {
+            "ac": "AC2",
+            "command": "pnpm typecheck",
+            "exit_code": 0,
+            "classification": "expected_pass",
+            "category": "regression_gate",
+            "confidence": "high",
+            "scope_class": "regression_gate",
+            "evidence": {},
+            "decision": "go",
+        },
+    ]
+
+    is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
+    assert is_valid, f"Valid classifications should pass. Failures: {failures}"
+    assert len(failures) == 0
+
+
+def test_check_c13_vc_preflight_decision_consistency_missing_field():
+    """B4: C13 detects missing required fields"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import check_c13_vc_preflight_decision_consistency
+
+    classifications = [
+        {
+            "ac": "AC1",
+            "command": "rg test file",
+            "exit_code": 1,
+            # missing "classification"
+            "scope_class": "baseline_fail_expected",
+            "decision": "go",
+        },
+    ]
+
+    is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
+    assert not is_valid, "Missing field should fail"
+    assert any("missing classification" in f for f in failures)
+
+
+def test_check_c13_vc_preflight_decision_consistency_invalid_enum():
+    """B4: C13 detects invalid enum values"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import check_c13_vc_preflight_decision_consistency
+
+    classifications = [
+        {
+            "ac": "AC1",
+            "command": "rg test file",
+            "exit_code": 1,
+            "classification": "invalid_classification",
+            "scope_class": "baseline_fail_expected",
+            "decision": "go",
+        },
+    ]
+
+    is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
+    assert not is_valid, "Invalid enum should fail"
+    assert any("invalid classification" in f for f in failures)
+
+
+def test_check_c13_vc_preflight_decision_regression_gate_consistency():
+    """B4: C13 checks regression_gate + go requires expected_pass"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import check_c13_vc_preflight_decision_consistency
+
+    # Invalid: regression_gate + go but classification=blocked
+    classifications = [
+        {
+            "ac": "AC1",
+            "command": "pnpm typecheck",
+            "exit_code": 1,
+            "classification": "blocked",
+            "scope_class": "regression_gate",
+            "decision": "go",
+        },
+    ]
+
+    is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
+    assert not is_valid, "regression_gate + go requires expected_pass"
+    assert any("regression_gate + go" in f and "expected_pass" in f for f in failures), f"Expected regression_gate + go error, got: {failures}"
+
+
+def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
+    """B4: C13 checks regression_gate + blocked requires blocked classification"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import check_c13_vc_preflight_decision_consistency
+
+    # Invalid: regression_gate + blocked but classification=expected_pass
+    classifications = [
+        {
+            "ac": "AC1",
+            "command": "pnpm typecheck",
+            "exit_code": 0,
+            "classification": "expected_pass",
+            "scope_class": "regression_gate",
+            "decision": "blocked",
+        },
+    ]
+
+    is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
+    assert not is_valid, "regression_gate + blocked requires blocked classification"
+    assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), f"Expected regression_gate + blocked error, got: {failures}"
+
+
 if __name__ == "__main__":
     # Run tests
     test_ac1_file_exists()

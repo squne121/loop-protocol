@@ -357,7 +357,7 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
     For pytest commands, requires an existing positional path argument.
     Args:
         command: command string to check
-        cwd: working directory (defaults to Path.cwd())
+        cwd: working directory (defaults to Path.cwd() if None)
 
     Returns True if command is a regression gate command, False otherwise.
     """
@@ -410,21 +410,32 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
     if pytest_idx == -1:
         return False
 
-    # Collect positional arguments after pytest (skip options starting with -)
+    # B2: Collect positional arguments after pytest (skip options and their values)
     positional_args = []
-    for i in range(pytest_idx + 1, len(unwrapped)):
+    i = pytest_idx + 1
+    n = len(unwrapped)
+    while i < n:
         arg = unwrapped[i]
-        # Skip option flags (-k, -v, etc.)
-        if arg.startswith("-"):
-            # Skip the flag and its argument if it takes one
-            if arg in ("-k", "-m"):
-                i += 1
+        # Options that take a separate value
+        if arg in ("-k", "-m", "-p", "-W", "--rootdir", "--basetemp", "--maxfail", "--tb",
+                   "--lf-name", "--cache-dir", "-c", "-o"):
+            i += 2  # skip flag and its argument
             continue
+        # Other flags without arguments
+        if arg.startswith("-"):
+            i += 1
+            continue
+        # arg is a positional candidate
         positional_args.append(arg)
+        i += 1
 
-    # B3: Check if any positional argument exists and is a valid path
+    # B2: Check if any positional argument exists and is a valid path
     for arg in positional_args:
-        test_path = Path(cwd) / arg
+        # Handle both relative and absolute paths
+        if Path(arg).is_absolute():
+            test_path = Path(arg)
+        else:
+            test_path = Path(cwd) / arg
         if test_path.exists():
             return True
 
@@ -449,16 +460,34 @@ def _is_negated_search_command(command: str) -> bool:
 
 def has_command_substitution(command: str) -> bool:
     """
-    B2: Detect command substitution patterns: $(...), `...`, ${...}
+    B3: Detect command substitution patterns: $(...), `...`, ${...}
+    ONLY in unquoted segments.
 
-    Returns True if the command contains command substitution, False otherwise.
-    Avoids false positives by not checking inside single-quoted segments.
+    Single-quoted segments are excluded — they are literals to subprocess.
     """
-    # Simple check for command substitution patterns
-    if "$(" in command or "`" in command or "${" in command:
-        # For the implementation, a simple substring check is acceptable
-        # (avoiding false positives inside single quotes is a future refinement)
-        return True
+    # Scan the original command character by character, tracking quote state.
+    # Single-quoted content is literal, double-quoted content may have substitution.
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        # Only check for substitution outside of single quotes
+        if not in_single:
+            # $(...) or ${...} or backtick
+            if ch == '$' and i + 1 < len(command) and command[i + 1] in ('(', '{'):
+                return True
+            if ch == '`':
+                return True
+        i += 1
     return False
 
 
@@ -467,9 +496,17 @@ def classify_result(
     stdout: str,
     stderr: str,
     command: str,
+    cwd: Optional[str] = None,
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
+
+    Args:
+        exit_code: command exit code
+        stdout: command standard output
+        stderr: command standard error
+        command: original command string
+        cwd: working directory (threaded to _is_regression_gate_command)
 
     戻り値: (classification, category, decision, fix_hint, scope_class)
       classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
@@ -495,7 +532,7 @@ def classify_result(
 
     # AC4: regression_gate prefix detection AFTER static checks
     # If it's a regression gate, apply special rules
-    if _is_regression_gate_command(command):
+    if _is_regression_gate_command(command, cwd=cwd):
         if exit_code == 0:
             return "expected_pass", "regression_gate", "go", None, "regression_gate"
         else:
@@ -628,6 +665,65 @@ def compute_confidence(category: str) -> str:
         return "medium"
     else:
         return "low"
+
+
+def check_c13_vc_preflight_decision_consistency(classifications: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    """
+    B4: Validate classifications for schema consistency.
+
+    Checks:
+    - All required fields present (classification, scope_class, decision)
+    - Enum values valid
+    - Cross-field consistency (e.g., skipped requires scope_class pr_review_only or runtime_only)
+
+    Returns: (is_valid, list_of_failures)
+    """
+    VALID_SCOPE_CLASSES = {"baseline_fail_expected", "regression_gate", "pr_review_only", "runtime_only"}
+    VALID_CLASSIFICATIONS = {"expected_fail", "expected_pass", "unexpected_pass", "blocked", "human_judgment", "skipped"}
+    VALID_DECISIONS = {"go", "blocked", "human_judgment"}
+
+    failures = []
+
+    for i, item in enumerate(classifications):
+        prefix = f"classifications[{i}]"
+
+        # Required fields
+        if "classification" not in item:
+            failures.append(f"{prefix}: missing classification")
+        if "scope_class" not in item:
+            failures.append(f"{prefix}: missing scope_class")
+        if "decision" not in item:
+            failures.append(f"{prefix}: missing decision")
+
+        # Enum validation
+        if "scope_class" in item and item["scope_class"] not in VALID_SCOPE_CLASSES:
+            failures.append(f"{prefix}: invalid scope_class '{item['scope_class']}' (valid: {VALID_SCOPE_CLASSES})")
+        if "classification" in item and item["classification"] not in VALID_CLASSIFICATIONS:
+            failures.append(f"{prefix}: invalid classification '{item['classification']}' (valid: {VALID_CLASSIFICATIONS})")
+        if "decision" in item and item["decision"] not in VALID_DECISIONS:
+            failures.append(f"{prefix}: invalid decision '{item['decision']}' (valid: {VALID_DECISIONS})")
+
+        # Cross-field consistency rules
+        if "classification" in item and "scope_class" in item:
+            # skipped requires scope_class pr_review_only or runtime_only
+            if item["classification"] == "skipped" and item["scope_class"] not in {"pr_review_only", "runtime_only"}:
+                failures.append(f"{prefix}: skipped requires scope_class pr_review_only or runtime_only")
+
+        # regression_gate consistency
+        if "scope_class" in item and item["scope_class"] == "regression_gate":
+            if "decision" in item and "classification" in item:
+                if item["decision"] == "go" and item["classification"] != "expected_pass":
+                    failures.append(f"{prefix}: regression_gate + go requires classification expected_pass")
+                if item["decision"] == "blocked" and item["classification"] != "blocked":
+                    failures.append(f"{prefix}: regression_gate + blocked requires classification blocked")
+
+        # Skipped routing metadata
+        if "classification" in item and item["classification"] == "skipped":
+            for k in ("verification_owner", "deferred_reason", "runtime_verification_required"):
+                if k not in item:
+                    failures.append(f"{prefix}: skipped requires {k}")
+
+    return len(failures) == 0, failures
 
 
 def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -907,7 +1003,7 @@ def main() -> int:
                 )
 
                 classification, category, decision, fix_hint, scope_class = classify_result(
-                    exit_code, stdout, stderr, command
+                    exit_code, stdout, stderr, command, cwd=args.cwd
                 )
 
             verification_owner = None
