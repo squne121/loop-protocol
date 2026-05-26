@@ -60,6 +60,12 @@ export const PRODUCER_ACTOR_TYPES = ['ai_agent', 'github_action']
 // Producer is restricted to these evidence source kinds (validator allows all in schema)
 export const PRODUCER_EVIDENCE_SOURCE_KINDS = ['hook_jsonl', 'ci_check', 'artifact']
 
+export const PRODUCER_KIND_BY_EVIDENCE_SOURCE = {
+  artifact: 'script_generated',
+  hook_jsonl: 'hook_generated',
+  ci_check: 'github_action_generated',
+}
+
 // ============================================================================
 // Semantic Validation
 // ============================================================================
@@ -116,6 +122,12 @@ function validateSemantics(manifest) {
       message: 'In current implementation scope, actor.type must be "ai_agent" or "github_action" (human not allowed)',
     })
   }
+
+  const producerContractErrors = validateProducerProvenanceSemantics(manifest).errors
+  errors.push(...producerContractErrors)
+
+  const producerMetadataSafetyErrors = validateProducerMetadataSafety(manifest).errors
+  errors.push(...producerMetadataSafetyErrors)
 
   return errors
 }
@@ -197,28 +209,71 @@ export function validateManifestSemantics(json) {
 }
 
 // ============================================================================
-// Producer Contract Validation (for producer script only)
+// Producer Contract Validation
 // ============================================================================
 
-export function validateProducerContractForIssue377(manifest, opts = {}) {
+export function validateProducerProvenanceSemantics(manifest) {
   const errors = []
 
-  // B1 iter2: actor.type must be in PRODUCER_ACTOR_TYPES
+  if (!manifest.producer) {
+    return {
+      valid: true,
+      errors,
+    }
+  }
+
+  // When producer provenance is present, actor / evidence must stay within the deterministic producer subset.
   if (manifest.actor?.type && !PRODUCER_ACTOR_TYPES.includes(manifest.actor.type)) {
     errors.push({
       path: 'actor.type',
-      message: `actor.type must be one of: ${PRODUCER_ACTOR_TYPES.join(', ')}. Got: ${manifest.actor.type}`,
+      message: `actor.type must be one of: ${PRODUCER_ACTOR_TYPES.join(', ')} when producer is present. Got: ${manifest.actor.type}`,
     })
   }
 
-  // B1 iter2: all evidence.source_kind must be in PRODUCER_EVIDENCE_SOURCE_KINDS
-  for (let i = 0; i < (manifest.evidence || []).length; i++) {
-    const evidence = manifest.evidence[i]
+  const evidenceList = Array.isArray(manifest.evidence) ? manifest.evidence : []
+  if (evidenceList.length === 0) {
+    errors.push({
+      path: 'evidence',
+      message: 'evidence must contain at least one entry when producer is present',
+    })
+    return {
+      valid: false,
+      errors,
+    }
+  }
+
+  for (let i = 0; i < evidenceList.length; i++) {
+    const evidence = evidenceList[i]
     if (evidence.source_kind && !PRODUCER_EVIDENCE_SOURCE_KINDS.includes(evidence.source_kind)) {
       errors.push({
         path: `evidence[${i}].source_kind`,
-        message: `evidence.source_kind must be one of: ${PRODUCER_EVIDENCE_SOURCE_KINDS.join(', ')}. Got: ${evidence.source_kind}`,
+        message: `evidence.source_kind must be one of: ${PRODUCER_EVIDENCE_SOURCE_KINDS.join(', ')} when producer is present. Got: ${evidence.source_kind}`,
       })
+    }
+  }
+
+  if (!manifest.producer.kind) {
+    errors.push({
+      path: 'producer.kind',
+      message: 'producer.kind is required when producer is present',
+    })
+  } else {
+    for (let i = 0; i < evidenceList.length; i++) {
+      const evidence = evidenceList[i]
+      const expectedKind = PRODUCER_KIND_BY_EVIDENCE_SOURCE[evidence.source_kind]
+      if (!expectedKind && evidence?.source_kind) {
+        errors.push({
+          path: `evidence[${i}].source_kind`,
+          message: `producer.kind cannot be derived from unsupported evidence.source_kind: ${evidence.source_kind}`,
+        })
+        continue
+      }
+      if (expectedKind && manifest.producer.kind !== expectedKind) {
+        errors.push({
+          path: `evidence[${i}].source_kind`,
+          message: `evidence[${i}].source_kind maps to ${expectedKind}, but producer.kind is ${manifest.producer.kind}`,
+        })
+      }
     }
   }
 
@@ -235,6 +290,73 @@ export function validateProducerContractForIssue377(manifest, opts = {}) {
       path: 'verification',
       message: 'verification.fallback_detected === true is incoherent with verification.overall === "pass" (PR #314 schema description)',
     })
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  }
+}
+
+export function validateProducerContractForIssue377(manifest, opts = {}) {
+  return validateProducerProvenanceSemantics(manifest, opts)
+}
+
+// ============================================================================
+// Producer Metadata Safety Validation
+// ============================================================================
+
+function collectSecretPatternDetails(text, { includeLocalPath = true } = {}) {
+  const value = String(text || '')
+  const matches = []
+
+  if (includeLocalPath && /\/home\/|\/Users\/|\/tmp\//.test(value)) {
+    matches.push({ code: 'absolute_path', message: 'absolute path detected' })
+  }
+
+  if (/(^|[\s"'`])(source\s+)?\.env(?:$|[\s"'`])/.test(value) && !value.includes('agent-session-manifest')) {
+    matches.push({ code: 'env_content', message: '.env content pattern detected' })
+  }
+
+  if (/sk-[A-Za-z0-9_-]{20,}/.test(value)) {
+    matches.push({ code: 'openai_token', message: 'OpenAI token pattern detected' })
+  }
+
+  if (/gh[pousr]_[A-Za-z0-9_]{20,}/.test(value)) {
+    matches.push({ code: 'github_token', message: 'GitHub token pattern detected' })
+  }
+
+  if (/BEGIN\s+\w+\s+PRIVATE\s+KEY/.test(value)) {
+    matches.push({ code: 'private_key', message: 'PRIVATE KEY pattern detected' })
+  }
+
+  if (/(^|[\s"'`])(?:export\s+|env\s+)?(?:OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|ANTHROPIC_API_KEY)\s*=\s*/.test(value)) {
+    matches.push({ code: 'expanded_env', message: 'expanded env assignment detected' })
+  }
+
+  return matches
+}
+
+export function validateProducerMetadataSafety(manifest) {
+  const errors = []
+  const producer = manifest.producer
+
+  if (!producer) {
+    return {
+      valid: true,
+      errors,
+    }
+  }
+
+  for (const field of ['command', 'source_ref']) {
+    const value = producer[field]
+    if (typeof value !== 'string') continue
+    for (const match of collectSecretPatternDetails(value)) {
+      errors.push({
+        path: `producer.${field}`,
+        message: `${match.message} in producer.${field}`,
+      })
+    }
   }
 
   return {
@@ -260,29 +382,9 @@ export function detectSecretPatterns(obj) {
     return 'local_file: true detected'
   }
 
-  // Absolute paths: /home/, /Users/, /tmp/
-  if (/\/home\/|\/Users\/|\/tmp\//.test(jsonStr)) {
-    return 'absolute path detected'
-  }
-
-  // .env pattern (but allow as filename in schema context)
-  if (/\.env\b[^.]/.test(jsonStr) && !jsonStr.includes('agent-session-manifest')) {
-    return '.env content pattern detected'
-  }
-
-  // OpenAI token format: sk-[A-Za-z0-9_-]{20,}
-  if (/sk-[A-Za-z0-9_-]{20,}/.test(jsonStr)) {
-    return 'OpenAI token pattern detected'
-  }
-
-  // GitHub token format: gh[pousr]_[A-Za-z0-9_]{20,}
-  if (/gh[pousr]_[A-Za-z0-9_]{20,}/.test(jsonStr)) {
-    return 'GitHub token pattern detected'
-  }
-
-  // PRIVATE KEY
-  if (/BEGIN\s+\w+\s+PRIVATE\s+KEY/.test(jsonStr)) {
-    return 'PRIVATE KEY pattern detected'
+  const secretMatch = collectSecretPatternDetails(jsonStr).at(0)
+  if (secretMatch) {
+    return secretMatch.message
   }
 
   return ''
@@ -293,21 +395,9 @@ export function detectSecretPatterns(obj) {
 // ============================================================================
 
 export function detectSecretsInMarkdown(markdown) {
-  // Same patterns as detectSecretPatterns, but applied to the markdown string directly
-  if (/\/home\/|\/Users\/|\/tmp\//.test(markdown)) {
-    return 'absolute path detected in markdown'
-  }
-
-  if (/sk-[A-Za-z0-9_-]{20,}/.test(markdown)) {
-    return 'OpenAI token pattern detected in markdown'
-  }
-
-  if (/gh[pousr]_[A-Za-z0-9_]{20,}/.test(markdown)) {
-    return 'GitHub token pattern detected in markdown'
-  }
-
-  if (/BEGIN\s+\w+\s+PRIVATE\s+KEY/.test(markdown)) {
-    return 'PRIVATE KEY pattern detected in markdown'
+  const secretMatch = collectSecretPatternDetails(markdown).at(0)
+  if (secretMatch) {
+    return `${secretMatch.message} in markdown`
   }
 
   return ''
@@ -333,9 +423,12 @@ export default {
   validateManifest,
   validateManifestAgainstSchema,
   validateManifestSemantics,
+  validateProducerProvenanceSemantics,
+  validateProducerMetadataSafety,
   validateProducerContractForIssue377,
   detectSecretPatterns,
   detectSecretsInMarkdown,
   PRODUCER_ACTOR_TYPES,
   PRODUCER_EVIDENCE_SOURCE_KINDS,
+  PRODUCER_KIND_BY_EVIDENCE_SOURCE,
 }

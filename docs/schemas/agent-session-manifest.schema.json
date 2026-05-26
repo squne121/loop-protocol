@@ -62,6 +62,40 @@
       ],
       "description": "コミット SHA（optional, nullable）"
     },
+    "producer": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "description": "Manifest producer provenance. This field is optional for backward compatibility. If present, kind is required. producer.kind is a self-claim; authenticity is established by evidence linkage and downstream hook/CI workflows.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["script_generated", "hook_generated", "github_action_generated"],
+          "description": "Deterministic producer class. AI self-report is not authoritative."
+        },
+        "version": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Producer implementation version, if known."
+        },
+        "command": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Sanitized invocation command or null. Validator performs best-effort pattern scanning and MUST reject representative secrets, expanded env values, and unsafe local paths intended for public surfaces."
+        },
+        "source_ref": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Git ref, PR, workflow run, artifact reference, hook id, or null. Validator performs best-effort pattern scanning for unsafe metadata."
+        }
+      }
+    },
     "actor": {
       "type": "object",
       "required": ["type", "name"],

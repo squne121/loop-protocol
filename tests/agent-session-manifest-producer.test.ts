@@ -171,6 +171,230 @@ describe('B3: producer JSON → validator pass', () => {
     const validationResult = runValidator(manifestPath)
     expect(validationResult.exitCode).toBe(0)
   })
+
+  it('GIVEN artifact evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('script_generated')
+    expect(manifest.producer.command).toBe('node scripts/generate-session-manifest.mjs')
+    expect(manifest.producer.source_ref).toBeNull()
+  })
+
+  it('GIVEN hook_jsonl evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'issue_review',
+      '--phase-instance-id', 'issue-377:issue_review:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'hook_jsonl',
+      '--evidence-source-ref', 'artifacts/hook.jsonl',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('hook_generated')
+  })
+
+  it('GIVEN ci_check evidence WHEN producing THEN valid producer kind manifest is accepted', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'pr_review',
+      '--phase-instance-id', 'issue-377:pr_review:001',
+      '--actor-type', 'github_action',
+      '--actor-name', 'ci-worker',
+      '--evidence-source-kind', 'ci_check',
+      '--evidence-source-ref', 'https://github.com/squne121/loop-protocol/actions/runs/1',
+      '--evidence-visibility', 'public_github_comment',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.producer.kind).toBe('github_action_generated')
+  })
+
+  it('GIVEN producer.kind mismatches evidence.source_kind WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [{ source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' }],
+      producer: {
+        kind: 'github_action_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-mapping.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('evidence[0].source_kind maps to script_generated, but producer.kind is github_action_generated')
+  })
+
+  it('GIVEN producer without evidence WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-no-evidence.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('evidence must contain at least one entry when producer is present')
+  })
+
+  it('GIVEN mixed evidence kinds WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [
+        { source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' },
+        { source_kind: 'ci_check', source_ref: 'https://github.com/squne121/loop-protocol/actions/runs/1', visibility: 'public_github_comment' },
+      ],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-mixed-evidence.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('evidence[1].source_kind maps to github_action_generated, but producer.kind is script_generated')
+  })
+
+  it('GIVEN producer.command contains absolute local path WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [{ source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' }],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: '/home/squne/projects/LOOP_PROTOCOL/scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-command-path.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('absolute path detected in producer.command')
+  })
+
+  it('GIVEN producer.command contains token-like value WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [{ source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' }],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'OPENAI_API_KEY=sk-12345678901234567890 node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-command-token.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('OpenAI token pattern detected in producer.command')
+  })
 })
 
 describe('B4: token_usage unavailable semantics', () => {
@@ -235,6 +459,57 @@ describe('B5: redaction scan fail-closed for github-comment', () => {
     ])
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toContain('<!-- agent_session_manifest:v1 start -->')
+  })
+
+  it('GIVEN --allow-local-path and token-like value WHEN producer runs THEN still exits 1', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '377',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-377:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'test-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'sk-12345678901234567890',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+      '--allow-local-path',
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('OpenAI token pattern detected')
+  })
+
+  it('GIVEN producer.command contains export style env assignment WHEN validator runs THEN exits 1', () => {
+    const invalidManifest = {
+      schema: 'agent_session_manifest/v1',
+      manifest_id: 'asm-12345678-1234-4123-89ab-123456789abc',
+      recorded_at: '2026-05-24T10:00:00Z',
+      repository: 'squne121/loop-protocol',
+      actor: { type: 'ai_agent', name: 'worker' },
+      phase: { main_loop: 'impl', phase_instance_id: 'issue-377:impl:001' },
+      token_usage: {
+        availability: 'unavailable',
+        source: 'none',
+        prompt: null,
+        completion: null,
+        total: null,
+      },
+      evidence: [{ source_kind: 'artifact', source_ref: 'artifacts/test.json', visibility: 'private_artifact' }],
+      producer: {
+        kind: 'script_generated',
+        version: null,
+        command: 'export OPENAI_API_KEY = sk-12345678901234567890 && node scripts/generate-session-manifest.mjs',
+        source_ref: null,
+      },
+      redaction: { raw_transcript_included: false, local_paths_included: false, secret_scan_status: 'clean' },
+    }
+
+    const fixtureFile = resolve(TEMP_DIR, 'invalid-producer-command-export-token.json')
+    writeFileSync(fixtureFile, JSON.stringify(invalidManifest, null, 2))
+
+    const result = runValidator(fixtureFile)
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('expanded env assignment detected in producer.command')
   })
 })
 
@@ -615,7 +890,8 @@ describe('M2 iter2: verification semantic rules', () => {
       '--verification-skipped-count', '1',
     ])
     expect(result.exitCode).toBe(1)
-    expect(result.stderr).toContain('Producer contract validation failed')
+    expect(result.stderr).toContain('Validation failed')
+    expect(result.stderr).toContain('verification.skipped_count > 0 is incoherent')
   })
 
   it('GIVEN verification.fallback_detected=true with overall=pass WHEN semantic rule THEN exits 1', () => {
@@ -634,7 +910,8 @@ describe('M2 iter2: verification semantic rules', () => {
       '--verification-fallback-detected', 'true',
     ])
     expect(result.exitCode).toBe(1)
-    expect(result.stderr).toContain('Producer contract validation failed')
+    expect(result.stderr).toContain('Validation failed')
+    expect(result.stderr).toContain('verification.fallback_detected === true is incoherent')
   })
 
   it('GIVEN verification.skipped_count > 0 with overall=partial WHEN semantic rule THEN exits 0', () => {

@@ -8,10 +8,12 @@
  *
  * Performs:
  * - JSON Schema validation (Draft 2020-12)
- * - Semantic validation (token_usage null semantics, visibility constraints, etc.)
+ * - Semantic validation (token_usage null semantics, visibility constraints, producer provenance semantics, producer metadata safety)
  *
- * Does NOT enforce producer-specific contract (actor.type/evidence.source_kind subset).
- * Producer contract is enforced by scripts/generate-session-manifest.mjs only.
+ * Enforces producer provenance semantics when producer is present:
+ * - actor.type / evidence.source_kind subset for deterministic producers
+ * - producer.kind ↔ evidence.source_kind mapping
+ * - producer.command / producer.source_ref secret and unsafe local path boundary
  *
  * Usage:
  *   node scripts/validate-agent-session-manifest.mjs manifest.json
