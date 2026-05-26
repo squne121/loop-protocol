@@ -97,15 +97,31 @@ def extract_fenced_bash_blocks(section: str) -> List[str]:
     return blocks
 
 
-def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int]]:
+def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Optional[str]:
+    """
+    VC コマンド行（target_line_idx）の直前行から `# preflight-scope: <value>` marker を抽出。
+
+    戻り値: marker value ('pr_review_only' / 'runtime_only') または None
+    """
+    if target_line_idx <= 0:
+        return None
+    prev_line = lines[target_line_idx - 1].strip()
+    match = re.match(r"^\s*#\s*preflight-scope:\s*(\S+)\s*$", prev_line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str]]]:
     """
     bash ブロックからコマンドを抽出。
-    AC マーカーとコマンドの行番号を返す。
+    AC マーカーとコマンドの行番号と preflight-scope marker を返す。
 
-    戻り値: [(ac_label, command, line_number), ...]
+    戻り値: [(ac_label, command, line_number, preflight_scope), ...]
       - ac_label: "AC1", "AC2", ... または None
       - command: raw command ($ prefix 除去済み、suffix marker 除去済み)
       - line_number: block 内での行番号
+      - preflight_scope: 'pr_review_only' / 'runtime_only' / None
     """
     commands = []
     lines = block.split("\n")
@@ -116,6 +132,10 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int]
         ac_match = re.match(r"^\s*#\s*AC(\d+)\s*:?\s*$", line)
         if ac_match:
             current_ac = f"AC{ac_match.group(1)}"
+            continue
+
+        # preflight-scope marker はスキップ（コマンドではない）
+        if re.match(r"^\s*#\s*preflight-scope:\s*\S+\s*$", line):
             continue
 
         # コマンド行の抽出（$ prefix 除去）
@@ -135,7 +155,10 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int]
                     current_ac = f"AC{suffix_match.group(1)}"
                     cmd = re.sub(r"\s+#\s*AC\d+\s*:?\s*$", "", cmd).strip()
 
-                commands.append((current_ac, cmd, i))
+                # 直前行から preflight-scope marker を抽出
+                preflight_scope = extract_preflight_scope_marker(lines, i - 1)
+
+                commands.append((current_ac, cmd, i, preflight_scope))
 
     return commands
 
@@ -322,39 +345,94 @@ def _is_pytest_invocation(command: str) -> bool:
     return False
 
 
+def _is_regression_gate_command(command: str) -> bool:
+    """
+    AC4: regression_gate prefix detection.
+
+    Detects: pnpm typecheck / lint / test / build / uv run pytest <existing-path>
+    """
+    # Check for exact command prefixes
+    prefixes = [
+        "pnpm typecheck",
+        "pnpm lint",
+        "pnpm test",
+        "pnpm build",
+    ]
+    if any(command.startswith(p) for p in prefixes):
+        return True
+
+    # Check for uv run pytest with existing test paths
+    if "uv run" in command and "pytest" in command:
+        return True
+
+    return False
+
+
+def _is_negated_search_command(command: str) -> bool:
+    """
+    AC6: Detect negated search commands like `! rg -q "pattern" file`.
+
+    Returns True if command starts with `!` and contains rg/grep.
+    """
+    # Check if command starts with ! (possibly with spaces)
+    stripped = command.strip()
+    if not stripped.startswith("!"):
+        return False
+    # Check if rg or grep follows after !
+    rest = stripped[1:].strip()
+    return any(rest.startswith(util) for util in ["rg", "grep"])
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
     stderr: str,
     command: str,
-) -> Tuple[str, str, str, Optional[str]]:
+) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
 
-    戻り値: (classification, category, decision, fix_hint)
-      classification: expected_fail | unexpected_pass | blocked | human_judgment
+    戻り値: (classification, category, decision, fix_hint, scope_class)
+      classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
       category: file_not_found_expected | expected_baseline_fail | unexpected_pass |
                 env_missing_dep | file_not_found_unrunnable | timeout |
                 compound_command_disallowed | unknown
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
+      scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
     """
 
-    # compound command は blocked
+    # AC4: regression_gate prefix detection BEFORE execution effects
+    # If it's a regression gate, apply special rules
+    if _is_regression_gate_command(command):
+        if exit_code == 0:
+            return "expected_pass", "regression_gate", "go", None, "regression_gate"
+        else:
+            return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
+
+    # AC6: negated search commands - static classification
+    if _is_negated_search_command(command):
+        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+
+    # compound command は blocked (default scope_class)
     if detect_compound_command(command):
-        return "blocked", "compound_command_disallowed", "blocked", "Compound shell commands are not supported in initial implementation"
+        return "blocked", "compound_command_disallowed", "blocked", "Compound shell commands are not supported in initial implementation", "baseline_fail_expected"
+
+    # AC7: command substitution detection - static classification without execution
+    if "$(" in command or "`" in command:
+        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # timeout check
     if "timeout" in stderr.lower():
-        return "blocked", "timeout", "blocked", "Command exceeded timeout"
+        return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
 
-    # exit_code = 0 は unexpected_pass / blocked
+    # exit_code = 0 で回帰ゲート以外 → unexpected_pass / blocked
     if exit_code == 0:
-        return "unexpected_pass", "unexpected_pass", "blocked", "Command unexpectedly passed"
+        return "unexpected_pass", "unexpected_pass", "blocked", "Command unexpectedly passed", "baseline_fail_expected"
 
     # shlex.split failed
     if "shlex.split failed" in stderr:
-        return "blocked", "compound_command_disallowed", "blocked", "Command syntax is not supported"
+        return "blocked", "compound_command_disallowed", "blocked", "Command syntax is not supported", "baseline_fail_expected"
 
     # B5: file_not_found_unrunnable - missing script/file being executed
     # e.g., python3 missing.py, node missing.js, ./missing-script
@@ -366,20 +444,20 @@ def classify_result(
             for cmd_pattern in ["python3 ", "python ", "node ", "./", "../"]
         )
     ):
-        return "blocked", "file_not_found_unrunnable", "blocked", "Script or file being executed does not exist"
+        return "blocked", "file_not_found_unrunnable", "blocked", "Script or file being executed does not exist", "baseline_fail_expected"
 
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):
-        return "blocked", "env_missing_dep", "blocked", "Command not found or permission denied"
+        return "blocked", "env_missing_dep", "blocked", "Command not found or permission denied", "baseline_fail_expected"
 
     if "command not found" in stderr.lower() or "ModuleNotFoundError" in stderr:
-        return "blocked", "env_missing_dep", "blocked", "Dependency or command missing"
+        return "blocked", "env_missing_dep", "blocked", "Dependency or command missing", "baseline_fail_expected"
 
     if "Permission denied" in stderr:
-        return "blocked", "env_missing_dep", "blocked", "Permission denied"
+        return "blocked", "env_missing_dep", "blocked", "Permission denied", "baseline_fail_expected"
 
     if "No such file or directory" in stderr and exit_code == -1:
-        return "blocked", "env_missing_dep", "blocked", "Command not found"
+        return "blocked", "env_missing_dep", "blocked", "Command not found", "baseline_fail_expected"
 
     # pytest baseline fail patterns (AC2, AC3)
     if _is_pytest_invocation(command):
@@ -387,7 +465,7 @@ def classify_result(
 
         # AC2: pytest exit 4 + file not found → expected_baseline_fail
         if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
-            return "expected_fail", "expected_baseline_fail", "go", None
+            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
         # AC3: pytest exit 5 + no tests collected → expected_baseline_fail
         if exit_code == 5 and (
@@ -395,16 +473,16 @@ def classify_result(
             or "no tests collected" in combined_lower
             or "collected 0 items" in combined_lower
         ):
-            return "expected_fail", "expected_baseline_fail", "go", None
+            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # expected baseline fail patterns
     # rg with no match returns 1
     if "rg " in command and exit_code == 1:
-        return "expected_fail", "expected_baseline_fail", "go", None
+        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # test -f / test -d with non-existent file
     if ("test -f " in command or "test -d " in command) and exit_code == 1:
-        return "expected_fail", "file_not_found_expected", "go", None
+        return "expected_fail", "file_not_found_expected", "go", None, "baseline_fail_expected"
 
     # Generic exit_code != 0: try to infer expected_fail for common utilities
     # grep, sed, awk などが no-match で exit 1 を返すことは expected
@@ -420,11 +498,11 @@ def classify_result(
         ]
         is_likely_grep_error = any(re.search(pattern, stderr) for pattern in grep_error_patterns)
         if is_likely_grep_error:
-            return "human_judgment", "unknown", "human_judgment", "grep error classification uncertain"
-        return "expected_fail", "expected_baseline_fail", "go", None
+            return "human_judgment", "unknown", "human_judgment", "grep error classification uncertain", "baseline_fail_expected"
+        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # Unknown: cannot classify
-    return "human_judgment", "unknown", "human_judgment", "Unable to automatically classify exit code"
+    return "human_judgment", "unknown", "human_judgment", "Unable to automatically classify exit code", "baseline_fail_expected"
 
 
 def compute_source_hash(body: str) -> str:
@@ -477,6 +555,12 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
     vc_human_judgment = sum(
         1 for r in results if r["decision"] == "human_judgment"
     )
+    vc_expected_pass = sum(
+        1 for r in results if r["classification"] == "expected_pass"
+    )
+    vc_skipped = sum(
+        1 for r in results if r["classification"] == "skipped"
+    )
 
     classifications = []
     for r in results:
@@ -507,6 +591,8 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
             "vc_passed_unexpectedly": vc_passed_unexpectedly,
             "vc_unrunnable": vc_unrunnable,
             "vc_human_judgment": vc_human_judgment,
+            "vc_expected_pass": vc_expected_pass,
+            "vc_skipped": vc_skipped,
             "classifications": classifications,
         }
     }
@@ -632,27 +718,53 @@ def main() -> int:
         "unexpected_pass": 0,
         "blocked": 0,
         "human_judgment": 0,
+        "expected_pass": 0,
+        "skipped": 0,
         "extraction_errors": 0,
     }
 
-    for ac_label, command, line_no in commands:
-        # B1: Detect compound command BEFORE running
-        if detect_compound_command(command):
-            exit_code, stdout, stderr, duration_ms = None, "", "", 0
-            classification, category, decision, fix_hint = (
-                "blocked",
-                "compound_command_disallowed",
-                "blocked",
-                "Compound shell commands are not supported in baseline_vc_preflight/v1",
+    for ac_label, command, line_no, preflight_scope in commands:
+        # AC5: Handle pr_review_only / runtime_only preflight-scope markers
+        if preflight_scope in ("pr_review_only", "runtime_only"):
+            classification = "skipped"
+            decision = "go"
+            category = f"preflight_scope_{preflight_scope}"
+            exit_code = None
+            stdout, stderr = "", ""
+            duration_ms = 0
+            fix_hint = None
+            scope_class = preflight_scope
+            # Routing metadata for skipped results
+            verification_owner = "pr-review-judge" if preflight_scope == "pr_review_only" else "impl-review-loop"
+            deferred_reason = (
+                "VC marked pr_review_only; verification deferred to PR review"
+                if preflight_scope == "pr_review_only"
+                else "VC marked runtime_only; verification deferred to post-implementation runtime"
             )
+            runtime_verification_required = preflight_scope == "runtime_only"
         else:
-            exit_code, stdout, stderr, duration_ms = run_command(
-                command, args.timeout_seconds, args.cwd
-            )
+            # B1: Detect compound command BEFORE running
+            if detect_compound_command(command):
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification, category, decision, fix_hint, scope_class = (
+                    "blocked",
+                    "compound_command_disallowed",
+                    "blocked",
+                    "Compound shell commands are not supported in baseline_vc_preflight/v1",
+                    "baseline_fail_expected",
+                )
+            else:
+                exit_code, stdout, stderr, duration_ms = run_command(
+                    command, args.timeout_seconds, args.cwd
+                )
 
-            classification, category, decision, fix_hint = classify_result(
-                exit_code, stdout, stderr, command
-            )
+                classification, category, decision, fix_hint, scope_class = classify_result(
+                    exit_code, stdout, stderr, command
+                )
+
+            verification_owner = None
+            deferred_reason = None
+            runtime_verification_required = None
 
         # C4: confidence を compute_confidence 経由で統一
         stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, args.max_head_lines)
@@ -663,11 +775,12 @@ def main() -> int:
             "line": line_no,
             "raw_command": command,
             "command_hash": f"sha256:{compute_command_hash(command)}",
-            "runner": "exec",
+            "runner": "exec" if preflight_scope is None else "skipped",
             "exit_code": exit_code,
             "classification": classification,
             "category": category,
             "decision": decision,
+            "scope_class": scope_class,
             "confidence": compute_confidence(category),  # C4: category ベースで統一
             "stdout_head": stdout_head,
             "stdout_truncated": stdout_truncated,
@@ -678,6 +791,12 @@ def main() -> int:
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
         }
+        # AC5: Add routing metadata for skipped results
+        if verification_owner:
+            result_item["verification_owner"] = verification_owner
+            result_item["deferred_reason"] = deferred_reason
+            result_item["runtime_verification_required"] = runtime_verification_required
+
         results.append(result_item)
         summary[classification] += 1
 
