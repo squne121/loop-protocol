@@ -24,95 +24,36 @@ skills:
 
 - **read-only**: Issue の mutation を行わない
 - **loop worker**: `issue-refinement-loop` orchestrator から呼ばれ、結果を返して終了する
-- **script-first executor**: C1〜C12 の決定論的チェック・scope mismatch / VC anti-pattern / C1 skeleton 系 non-blocking warning・diff_proposal の生成は `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。**LLM はスクリプト出力 JSON の整形と pass-through のみ行い、C1〜C12 / non-blocking warning / diff_proposal の判定は LLM が独自に行わない**。Skill tool は呼び出さない。
+- **script-first executor**: C1〜C12 の決定論的チェック・scope mismatch / VC anti-pattern / C1 skeleton 系 non-blocking warning・diff_proposal の生成は `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。
 
-## 入力
+## Result & Consume Contract (SubAgent-owned)
 
-- `issue_number`（必須）: レビュー対象の Issue 番号
+本 SubAgent が返す `REVIEW_ISSUE_RESULT_V1` は、以下の消費契約を SSOT とする。orchestrator は判定を再評価せず、機械的に routing する。
 
-## 実行手順
+### Verdict Consumption
 
-### Step 1: Issue 本文と種別を取得する
+- `verdict: approve`: Issue 本文が contract を満たしている。
+- `verdict: needs-fix`: Issue 本文に修正が必要な箇所（C1〜C12 fail）がある。
 
-```bash
-REPO=$(git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//')
-gh issue view <issue_number> --repo "$REPO" --json title,body,labels \
-  --jq '.title + "\n---LABELS---\n" + (.labels | map(.name) | join(",")) + "\n---BODY---\n" + .body'
-```
+### Escape Hatch: needs_second_pass
 
-### Step 2: script-first で C1〜C12 を機械判定する
-
-C1〜C12 の決定論的チェック、`scope_cvs_in_scope_mismatch` / `vc_untracked_false_negative_pattern` / `vc_negative_grep_without_literal_inventory` の non-blocking warning、C1 fail 時の missing section skeleton 生成は、すべて `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。
-**LLM はスクリプト出力 JSON を整形・pass-through するのみで、判定・追加 warning・skeleton 案を独自に生成しない。**
-
-```bash
-REPO=$(git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//')
-python3 .claude/skills/review-issue/scripts/check_issue_contract.py \
-  --issue <issue_number> --repo "$REPO" --json
-```
-
-スクリプトが利用できない場合（ファイル未存在・実行エラー等）は、フォールバックせず **fail-closed** とする。
-`status: failed`, `failure_class: checker_unavailable`, `verdict: needs-fix` を返して終了する。
-
-### Step 3: 出力 JSON を pass-through する
-
-スクリプト出力の `blocking_issues` / `non_blocking_improvements` / `diff_proposal` をそのまま `REVIEW_ISSUE_RESULT_V1` に転記する。**LLM による目視 non-blocking 評価・追加 warning・PR スコープ判断・類似 Issue 重複判定は行わない**（これらは `check_issue_contract.py` 側の責務、または orchestrator / 別 skill の責務）。
-
-### Step 4: Verdict を決定する（approve / needs-fix）
-
-スクリプトの `verdict` フィールドをそのまま採用する。C9 が `warn` の場合は approve を妨げない。LLM 独自の verdict 上書きは禁止。
-
-### Step 5: `REVIEW_ISSUE_RESULT_V1` を返す
-
-スクリプト出力の JSON 全体を欠落なく転記して返す。`deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` のいずれも省略しない。
+- orchestrator 側で `iteration >= max_iterations` に達したが `verdict: needs-fix` の場合、本結果の `blocking_issues` を保持したまま `termination_reason: needs_second_pass` で停止する。
 
 ## 出力（REVIEW_ISSUE_RESULT_V1）
 
 ```yaml
 REVIEW_ISSUE_RESULT_V1:
+  schema_version: 1
   status: ok | failed
   generated_at: <ISO 8601>
-  generated_by: review-issue
-  issue_url: https://github.com/<owner>/<repo>/issues/<番号>
+  issue_url: <url>
   verdict: approve | needs-fix
-  failure_class: null | gh_auth | permission_denied | issue_not_found | schema_invalid | checker_unavailable | unknown  # status: failed 時のみ設定
-  error_summary: null | <エラーの概要>  # status: failed 時のみ設定
-  review_result_ref:
-    kind: agent_transcript | hook_artifact | github_comment
-    ref: null  # path-or-url（取得可能な場合のみ設定、null 可）
-  detail_payload_policy: opaque_ref_only
-  deterministic_checks:
-    C1_required_sections: pass | fail | n/a
-    C2_stop_conditions_6: pass | fail | n/a
-    C3_ac_checkbox_format: pass | fail | n/a
-    C4_vc_commands_present: pass | fail | n/a
-    C5_ac_vc_number_alignment: pass | fail | n/a
-    C6_no_subjective_phrasing: pass | fail | n/a
-    C7_required_skills_semantics: pass | fail | n/a
-    C8_outcome_concreteness: pass | fail | n/a
-    C9_runtime_applicability_present: pass | fail | warn | legacy_missing_applicability | n/a
-    C10_deferred_destination_present: pass | fail | n/a
-    C11_decision_tag_consistency: pass | fail | n/a
-    C12_product_trace_fields_structure: pass | fail | n/a
-  blocking_issues: []  # checker の blocking_issues を欠落なく転記（list[str]）
-  non_blocking_improvements:  # checker の non_blocking_improvements を欠落なく転記（list[dict]）
-    # 各要素は以下の構造を持つ:
-    # - code: <warning code 例: scope_cvs_in_scope_mismatch | vc_untracked_false_negative_pattern | vc_negative_grep_without_literal_inventory | c9_runtime_applicability_missing>
-    #   severity: warning
-    #   evidence: [<string excerpts>]
-    #   suggested_action: <string>
-  diff_proposal:  # checker の diff_proposal を欠落なく転記
-    add:
-      # C1 fail 時に missing section ごとに以下が入る:
-      # - kind: missing_section_skeleton
-      #   section: <section name>
-      #   placeholder_source: template | fallback_todo
-      #   skeleton: <markdown text>
-      []
-    remove: []
-    rewrite: []
-  update_applied: false
-  comment_url: null
+  needs_second_pass: <bool> # iteration limit 時に orchestrator が参照
+  failure_class: null | checker_unavailable | ...
+  blocking_issues: []
+  non_blocking_improvements: []
+  diff_proposal: { add: [], remove: [], rewrite: [] }
+  deterministic_checks: { C1: pass, C2: pass, ... }
 ```
 
 `update_applied` は常に `false`。本 SubAgent は Issue 本文を変更しない。

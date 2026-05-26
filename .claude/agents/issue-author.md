@@ -29,15 +29,50 @@ permissionMode: acceptEdits
 | 起票 + 即時修正 | ユーザー要求 + 追記内容 | `create-issue` → `edit-issue` 連続 |
 | child materialization | `task: materialize_children` + `CHILD_MATERIALIZATION_PLAN_V2` | `create-issue` + `edit-issue` (delivery-rollup-parent-update) |
 
-## 振る舞い
+## AC/VC Reflection & Rewrite Logic (SubAgent-owned)
 
-呼び出し元から受け取った入力に応じて、対応する skill の手順を実行する。skill の手順内容を本 SubAgent 定義に複製しない（DRY）。
+本 SubAgent は、Issue 本文を更新（rewrite）する際、AC（Acceptance Criteria）および VC（Verification Commands）の妥当性を評価し、baseline 状態を適切に扱う責務を持つ。
 
-- 新規起票なら `create-issue` の Procedure を実行する
-- 既存修正なら `edit-issue` の Procedure を実行する
-- `task: materialize_children` の場合は以下を実行する（AC6）:
+### Input: Rewrite Request
 
-### task: materialize_children
+- `reviewer_feedback_text`: 修正が必要な箇所や改善提案
+- `anchor_comment_feedback`: anchor comment 由来の要件変更（正規化済み）
+- `current_body`: 現在の Issue 本文
+
+### Execution: Reflection Rules
+
+- **Baseline Fail Expectation**: 実装前の段階では、VC の実行失敗（0 hit / file-not-found）は「予定された失敗（expected baseline fail）」として扱い、本文が壊れている証拠とはみなさない。
+- **Outcome Concreteness**: Outcome は実装後に検証可能な具体性を持つように維持・修正する。
+- **No AC weakening**: baseline fail を消すために AC/VC を弱める（曖昧にする）ことを禁止する。
+- **Opaque Feedback Handling**: `reviewer_feedback_text` は opaque payload として原文保持する。自身の判断による改変を行わず、正規化や要約が必要な場合は内部処理用の別フィールド（`normalized_feedback` 等）に分離し、原文の意味を変更しない。
+
+### Result: ISSUE_AUTHOR_RESULT_V1 (SubAgent-owned)
+
+Issue 本文の更新結果は以下の機械可読契約として報告する。
+
+```yaml
+ISSUE_AUTHOR_RESULT_V1:
+  schema_version: 1
+  status: ok | partial_failure | failed | no_change
+  updated_fields: [title, body, labels]
+  mutation_result:
+    diff_summary: <string>
+    applied_feedback: [<string>]
+  unchanged_reason: null | already_matches_requirements | insufficient_feedback | conflict_detected
+  validation_blockers:
+    - code: <string>
+      message: <string>
+  reflection_notes:
+    - field: AC/VC
+      status: kept_baseline_fail | updated_to_match_new_scope
+      reason: <string>
+  parser_gap_repaired: <bool>
+```
+
+- `status: no_change` 時は `unchanged_reason` を必須とする。
+- `status: failed` または `partial_failure` 時は `validation_blockers` を含む。
+
+## task: materialize_children
 
 入力として `CHILD_MATERIALIZATION_PLAN_V2` を受け取り、以下の順序で処理する。
 

@@ -57,45 +57,16 @@ anchor_comment:
 
 曖昧な場合は fail-closed で `requires_fact_check: true` とする。
 
-## Fact-check contracts
+## Fact-check contracts (SubAgent-owned)
 
-### ANCHOR_COMMENT_CONTEXT_V1
+`anchor_comment` の事実確認（fact-check）に必要な `Input` および `Result` 契約は、`.claude/agents/codebase-investigator.md` の **Fact-check Contract (SubAgent-owned)** セクションを参照すること。
 
-```yaml
-ANCHOR_COMMENT_CONTEXT_V1:
-  schema_version: 1
-  source_issue_number: <int>
-  anchor_comment_url: <url>
-  snapshot: <string>
-  preliminary_classification: superseded_by_decision | reframe_in_place | feedback_update_required | human_escalation
-  classification_reason: <string>
-  required_checks:
-    - claim_id: C1
-      description: <what to verify>
-      type: repo_fact | issue_pr_fact | external_spec | human_decision
-      critical: true | false
-```
+orchestrator は以下の契約を SSOT とし、判定ロジックを再実装しない。
 
-### ANCHOR_COMMENT_FACT_CHECK_RESULT_V1
+- **Input**: `ANCHOR_COMMENT_CONTEXT_V1`
+- **Result**: `ANCHOR_COMMENT_FACT_CHECK_RESULT_V1`
 
-```yaml
-ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
-  schema_version: 1
-  status: ok | inconclusive | failed
-  claims:
-    - claim_id: C1
-      verdict: supported | contradicted | inconclusive | not_checkable
-      scope_impact: none | amend | replace | ambiguous
-      evidence:
-        - kind: file | issue | pr | comment | web
-          ref: <REPO_EVIDENCE_REF_V1 or opaque reference>
-          summary: <why it matters>
-      critical: true | false
-  recommended_final_classification: superseded_by_decision | reframe_in_place | feedback_update_required | human_escalation
-  unresolved_risks: []
-```
-
-`kind: file` の `ref` は `REPO_EVIDENCE_REF_V1` を使う。schema の再定義はせず、owner file を参照する。
+`kind: file` の証跡には `REPO_EVIDENCE_REF_V1` を使用する。
 
 ## Trusted author policy
 
