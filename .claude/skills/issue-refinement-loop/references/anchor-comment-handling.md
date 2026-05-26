@@ -13,6 +13,35 @@
 5. Step 1 の結果を受けて main thread が `final_classification` を確定する。
 6. Step 4 へ渡すのは raw snapshot ではなく、正規化済み `anchor_comment_feedback` のみとする。
 
+## Required LOOP_STATE fields
+
+`LOOP_STATE.anchor_comment` は少なくとも以下を保持すること。
+
+```yaml
+anchor_comment:
+  url: <string>
+  id: <string>
+  issue_number: <int>
+  html_url: <url>
+  api_url: <url>
+  user_login: <string>
+  author_association: OWNER | MEMBER | COLLABORATOR | CONTRIBUTOR | NONE
+  snapshot: <string>
+  captured_at: <iso8601>
+  fetched_at: <iso8601>
+  comment_created_at: <iso8601>
+  comment_updated_at: <iso8601>
+  preliminary_classification: superseded_by_decision | reframe_in_place | feedback_update_required | human_escalation
+  final_classification: superseded_by_decision | reframe_in_place | feedback_update_required | human_escalation | null
+  classification_reason: <string | null>
+  verified_claims: []
+  unresolved_claims: []
+  scope_impact: none | amend | replace | ambiguous | null
+  requires_fact_check: <bool>
+```
+
+`Trusted author policy` は `author_association` に依存するため、省略してはならない。stale comment / untrusted comment 判定に使う `api_url`、`captured_at`、`comment_updated_at`、`snapshot` も同様に必須。
+
 ## Classification set
 
 - `superseded_by_decision`

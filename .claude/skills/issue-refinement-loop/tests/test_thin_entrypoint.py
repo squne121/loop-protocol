@@ -102,3 +102,15 @@ def test_scope_signal_guard_reference_keeps_tasks_md_fail_closed_routing():
         "implementation_route_allowed: false",
     ]:
         assert field in text, f"Missing Product/Spec routing field: {field}"
+
+
+def test_anchor_comment_reference_keeps_required_metadata_fields():
+    text = (REFERENCES_DIR / "anchor-comment-handling.md").read_text(encoding="utf-8")
+    for field in [
+        "author_association:",
+        "comment_updated_at:",
+        "captured_at:",
+        "api_url:",
+        "snapshot:",
+    ]:
+        assert field in text, f"Missing anchor comment metadata field: {field}"
