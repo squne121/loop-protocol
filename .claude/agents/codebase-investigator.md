@@ -192,10 +192,10 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   investigation_route: local_asset_research | github_research | none
   evidence_refs:
     - # .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md#REPO_EVIDENCE_REF_V1 を使用
-      file_path: <string>
+      path: <string>
       commit_sha: <string>
-      line_start: <int>
-      line_end: <int>
+      start_line: <int>
+      end_line: <int>
       excerpt_sha256: <string>
       verification_status: verified | inconclusive
   discovery_summary: <string>

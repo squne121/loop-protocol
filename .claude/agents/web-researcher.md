@@ -1,6 +1,11 @@
 ---
 name: web-researcher
-description: 外部仕様・公式ドキュメント・公開 API 挙動・ライブラリ / ツールの既定値などの web 調査を担う SubAgent。実調査は優先的に `gemini-cli-headless-delegation` skill 経由（`tool_profile: grounded_research`）で Gemini に委譲する。利用不可の場合は本 SubAgent 自身が WebSearch / WebFetch（direct_web）または gh api --method GET（direct_cli）で fallback 調査を実行する。Issue 本文や対象コメントが外部仕様の主張を含むときの事実確認に使う。
+description: >-
+  外部仕様・公式ドキュメント・公開 API 挙動・ライブラリ / ツールの既定値などの web 調査を担う SubAgent。
+  実調査は優先的に `gemini-cli-headless-delegation` skill 経由（`tool_profile: grounded_research`）で Gemini に委譲する。
+  利用不可の場合は本 SubAgent 自身が WebSearch / WebFetch（direct_web）または gh api --method GET（direct_cli）で fallback 調査を実行する。
+  Issue 本文や対象コメントが外部仕様の主張を含むときの事実確認に使う。
+
 tools:
   - Bash
   - Read

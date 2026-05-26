@@ -32,12 +32,12 @@ skills:
 
 ### Verdict Consumption
 
-- `final_verdict: approve`: Issue 本文が contract を満たしている。
-- `final_verdict: needs-fix`: Issue 本文に修正が必要な箇所（C1〜C12 fail）がある。
+- `verdict: approve`: Issue 本文が contract を満たしている。
+- `verdict: needs-fix`: Issue 本文に修正が必要な箇所（C1〜C12 fail）がある。
 
 ### Escape Hatch: needs_second_pass
 
-- orchestrator 側で `iteration >= max_iterations` に達したが `final_verdict: needs-fix` の場合、本結果の `blocking_findings` を保持したまま `termination_reason: needs_second_pass` で停止する。
+- orchestrator 側で `iteration >= max_iterations` に達したが `verdict: needs-fix` の場合、本結果の `blocking_issues` を保持したまま `termination_reason: needs_second_pass` で停止する。
 
 ## 出力（REVIEW_ISSUE_RESULT_V1）
 
@@ -47,10 +47,10 @@ REVIEW_ISSUE_RESULT_V1:
   status: ok | failed
   generated_at: <ISO 8601>
   issue_url: <url>
-  final_verdict: approve | needs-fix
+  verdict: approve | needs-fix
   needs_second_pass: <bool> # iteration limit 時に orchestrator が参照
   failure_class: null | checker_unavailable | ...
-  blocking_findings: [] # 旧 blocking_issues
+  blocking_issues: [] # 旧 blocking_findings
   non_blocking_improvements: []
   diff_proposal: { add: [], remove: [], rewrite: [] }
   deterministic_checks: { C1: pass, C2: pass, ... }
