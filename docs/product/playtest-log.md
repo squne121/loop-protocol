@@ -30,6 +30,31 @@ privacy:
   pii_reviewed: true
   raw_recording_committed: false
 
+# AI/Automation Metadata (Optional)
+# AI/自動化結果は UX・感情証拠ではない。UX影響がある場合は human_review_required: true とする。
+automation:
+  agent_profile: ""
+  random_seed: null
+  reproduction_command: ""
+  metrics:
+    runs: 0
+    success_count: 0
+    failure_count: 0
+    success_rate: null          # 0.0 - 1.0
+    death_count: 0
+    death_rate: null
+    duration_ms_p50: 0
+    duration_ms_p95: 0
+    input_count_total: 0
+    collision_count_total: 0
+  artifacts:
+    metrics_json: ""
+    trace_ref: ""
+    replay_ref: ""
+    input_script_ref: ""
+  human_review_required: false  # UX影響・違和感がある場合は true
+  ai_result_is_ux_evidence: false # 固定: AI結果を直接のUX証拠としない
+
 playtest_entries:
   - entry_id: "PTE-001"
     task_id: "TASK-001"
@@ -71,6 +96,29 @@ environment: "browser-chrome"
 privacy:
   pii_reviewed: true
   raw_recording_committed: false
+
+automation:
+  agent_profile: "combat-agent-v1"
+  random_seed: 42
+  reproduction_command: "pnpm test:e2e --grep @combat"
+  metrics:
+    runs: 100
+    success_count: 85
+    failure_count: 15
+    success_rate: 0.85
+    death_count: 10
+    death_rate: 0.1
+    duration_ms_p50: 12000
+    duration_ms_p95: 15500
+    input_count_total: 4500
+    collision_count_total: 120
+  artifacts:
+    metrics_json: "docs/playtest/artifacts/PT-20260527-001/metrics.json"
+    trace_ref: "docs/playtest/artifacts/PT-20260527-001/trace.zip"
+    replay_ref: "docs/playtest/artifacts/PT-20260527-001/replay.mp4"
+    input_script_ref: "tests/e2e/scenarios/combat-stress-test.js"
+  human_review_required: true
+  ai_result_is_ux_evidence: false
 
 playtest_entries:
   - entry_id: "PTE-001"
