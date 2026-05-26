@@ -132,6 +132,7 @@ class DeterministicChecks:
     C10_deferred_destination_present: str = CheckResult.NA
     C11_decision_tag_consistency: str = CheckResult.NA
     C12_product_trace_fields_structure: str = CheckResult.NA
+    C13_vc_preflight_decision_consistency: str = CheckResult.NA
 
 
 @dataclass
@@ -440,6 +441,57 @@ def check_c11_decision_tag_consistency(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
+def check_c13_vc_preflight_decision_consistency(
+    vc_preflight_json_path: Optional[str] = None,
+) -> tuple[str, list[str]]:
+    """C13: VC preflight JSON (if provided) has consistent decision values.
+
+    Applicability: only if --vc-preflight-json path is provided.
+    If not provided, return NA (not PASS).
+
+    Checks:
+      - All entries in vc_preflight JSON results have valid decision field
+      - decision values are in (go, blocked, human_judgment)
+      - skipped results have verification_owner and runtime_verification_required fields
+
+    戻り値: (CheckResult, list[failure_message])
+
+    Note: category is regression_gate for both pass and fail outcomes.
+    The pass/fail distinction is carried by classification (expected_pass vs blocked)
+    and decision (go vs blocked). Downstream consumers MUST read classification
+    for the routing-canonical pass/fail signal.
+    """
+    if not vc_preflight_json_path:
+        return CheckResult.NA, []
+
+    try:
+        with open(vc_preflight_json_path) as f:
+            preflight_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return CheckResult.FAIL, [f"Failed to load or parse VC preflight JSON: {vc_preflight_json_path}"]
+
+    issues = []
+    results = preflight_data.get("results", [])
+
+    valid_decisions = {"go", "blocked", "human_judgment"}
+
+    for result in results:
+        decision = result.get("decision")
+        if decision not in valid_decisions:
+            issues.append(f"AC {result.get('ac', 'UNKNOWN')}: invalid decision '{decision}'")
+
+        # Check skipped result metadata
+        if result.get("classification") == "skipped":
+            if "verification_owner" not in result:
+                issues.append(f"AC {result.get('ac', 'UNKNOWN')}: skipped result missing verification_owner")
+            if "runtime_verification_required" not in result:
+                issues.append(f"AC {result.get('ac', 'UNKNOWN')}: skipped result missing runtime_verification_required")
+
+    if issues:
+        return CheckResult.FAIL, issues
+    return CheckResult.PASS, []
+
+
 def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]:
     """C12: Product Spec / task-lineage Issue で trace fields の構造を検査する。
 
@@ -705,8 +757,8 @@ def generate_c1_missing_section_skeleton(
     return entries
 
 
-def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
-    """Run all C1-C11 checks and return structured result."""
+def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_path: Optional[str] = None) -> CheckerResult:
+    """Run all C1-C13 checks and return structured result."""
     issue_kind = detect_issue_kind(body, labels, title)
     result = CheckerResult(issue_kind=issue_kind)
     checks = result.deterministic_checks
@@ -782,6 +834,10 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
     checks.C12_product_trace_fields_structure, issues = check_c12_product_trace_fields_structure(body)
     result.blocking_issues.extend(issues)
 
+    # C13: VC preflight decision consistency (if JSON provided)
+    checks.C13_vc_preflight_decision_consistency, issues = check_c13_vc_preflight_decision_consistency(vc_preflight_json_path)
+    result.blocking_issues.extend(issues)
+
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
     detect_warning_scope_cvs_in_scope_mismatch(body, result)
     detect_warning_vc_untracked_false_negative(body, result)
@@ -801,6 +857,7 @@ def run_checks(body: str, labels: str = "", title: str = "") -> CheckerResult:
         checks.C10_deferred_destination_present,
         checks.C11_decision_tag_consistency,
         checks.C12_product_trace_fields_structure,
+        checks.C13_vc_preflight_decision_consistency,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
     result.verdict = "needs-fix" if has_fail else "approve"
@@ -877,6 +934,7 @@ def result_to_dict(result: CheckerResult) -> dict:
             "C10_deferred_destination_present": result.deterministic_checks.C10_deferred_destination_present,
             "C11_decision_tag_consistency": result.deterministic_checks.C11_decision_tag_consistency,
             "C12_product_trace_fields_structure": result.deterministic_checks.C12_product_trace_fields_structure,
+            "C13_vc_preflight_decision_consistency": result.deterministic_checks.C13_vc_preflight_decision_consistency,
         },
         "blocking_issues": result.blocking_issues,
         "non_blocking_improvements": result.non_blocking_improvements,
@@ -886,13 +944,14 @@ def result_to_dict(result: CheckerResult) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="C1〜C11 決定論的チェッカー — Issue 本文を機械的に検査する"
+        description="C1〜C13 決定論的チェッカー — Issue 本文を機械的に検査する"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", "-f", help="フィクスチャファイルパス（テスト用）")
     group.add_argument("--issue", "-i", type=int, help="GitHub Issue 番号")
     parser.add_argument("--repo", "-r", help="GitHub repo (owner/repo)。--issue と共に使用")
     parser.add_argument("--json", action="store_true", help="JSON 出力モード")
+    parser.add_argument("--vc-preflight-json", help="VC preflight JSON path for C13 check")
     args = parser.parse_args()
 
     if args.issue and not args.repo:
@@ -904,7 +963,7 @@ def main() -> None:
     else:
         body, labels, title = fetch_issue_body(args.issue, args.repo)
 
-    result = run_checks(body, labels, title)
+    result = run_checks(body, labels, title, args.vc_preflight_json_path)
     output = result_to_dict(result)
 
     if args.json:
