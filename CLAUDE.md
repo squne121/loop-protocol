@@ -11,6 +11,7 @@
 4. `docs/product/requirements.md`
 5. `docs/dev/current-focus.md`
 6. 関連する `docs/adr/*.md`、`docs/product/features/<feature>.md`、`docs/dev/directory-structure.md`
+7. プレイテスト関連作業を行う場合: `docs/product/playtest-protocol.md`, `docs/product/playtest-log.md`
 
 ## 不変のアーキテクチャ原則
 

@@ -224,7 +224,7 @@
   path: docs/product/playtest-protocol.md
   title: Playtest Protocol
   keywords: [playtest, protocol, session-planning, feedback, spec-delta-gate, privacy, pii]
-  description: プレイテストの実施手順、フィードバック分類、Spec Delta Gate、およびプライバシー保護方針を定義する SSOT
+  description: プレイテストの実施手順、フィードバック分類、Spec Delta Gate、およびプライバシー保護方針を定義する SSOT。status: draft の間は implementation normative ではない
   sections:
     - "## Session Planning"
     - "## Participant / Tester Handling"
@@ -232,13 +232,14 @@
     - "## Observation Rules"
     - "## Feedback Classification"
     - "## Spec Delta Gate"
+    - "## Decision Meeting"
     - "## Privacy / PII Handling"
 
 - id: playtest-log
   path: docs/product/playtest-log.md
   title: Playtest Log Template
   keywords: [playtest, log, template, schema, entry]
-  description: プレイテスト結果を記録するための YAML テンプレートとスキーマ定義の SSOT
+  description: プレイテスト結果を記録するための YAML テンプレートとスキーマ定義の SSOT。status: draft の間は implementation normative ではない
   sections:
     - "## Entry Schema"
     - "## Example Entry"
