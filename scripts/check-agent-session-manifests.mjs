@@ -55,6 +55,7 @@ function extractManifestFromMarkdown(markdown, filePath) {
         input: markdown,
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024, // NB3: 10MB explicit limit — prevents silent terminate on large output
       }
     )
     try {
@@ -281,8 +282,32 @@ function validateFile(filePath) {
 // Main
 // ============================================================================
 
+const SUPPORTED_EXTENSIONS = new Set(['.json', '.md'])
+
 async function main() {
-  const args = process.argv.slice(2).filter(a => !a.startsWith('--'))
+  const rawArgs = process.argv.slice(2)
+
+  // NB1: Unknown options (anything starting with -- except --help) are rejected
+  for (const arg of rawArgs) {
+    if (arg.startsWith('--') && arg !== '--help') {
+      process.stderr.write(
+        `manifest:check: error: unknown option: ${arg}\n` +
+        `  Only positional file/glob arguments are accepted.\n`
+      )
+      process.exit(2)
+    }
+  }
+
+  if (rawArgs.includes('--help')) {
+    process.stdout.write(
+      'Usage: manifest:check [glob-or-path...]\n' +
+      'Validates agent_session_manifest/v1 manifests.\n' +
+      'If no arguments given, uses default target patterns.\n'
+    )
+    process.exit(0)
+  }
+
+  const args = rawArgs.filter(a => !a.startsWith('--'))
   const isExplicit = args.length > 0
 
   const defaultPatterns = [
@@ -301,6 +326,31 @@ async function main() {
       `  field: target, expected: >= 1 file, actual: 0 files\n`
     )
     process.exit(1)
+  }
+
+  // B1: For explicit targets, check that at least one supported file (.json/.md) is present.
+  // Unsupported files (e.g., .txt) in explicit targets cause a hard failure —
+  // "ignore and succeed" is forbidden for CI safety gates.
+  if (isExplicit) {
+    const supportedFiles = files.filter(f => SUPPORTED_EXTENSIONS.has(extname(f).toLowerCase()))
+    const unsupportedFiles = files.filter(f => !SUPPORTED_EXTENSIONS.has(extname(f).toLowerCase()))
+
+    if (unsupportedFiles.length > 0) {
+      process.stderr.write(
+        `FAIL manifest:check: unsupported file type(s) in explicit target:\n` +
+        unsupportedFiles.map(f => `  ${f.replace(REPO_ROOT + '/', '')}`).join('\n') + '\n' +
+        `  Only .json and .md files are supported.\n`
+      )
+      process.exit(1)
+    }
+
+    if (supportedFiles.length === 0) {
+      process.stderr.write(
+        `FAIL manifest:check: no supported manifest files were validated\n` +
+        `  field: target, expected: >= 1 .json or .md file, actual: 0 supported files\n`
+      )
+      process.exit(1)
+    }
   }
 
   if (files.length === 0) {

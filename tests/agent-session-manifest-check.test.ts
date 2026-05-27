@@ -148,4 +148,30 @@ describe('manifest:check entrypoint', () => {
     expect(result.stderr).toContain('marker')
   })
 
+  // B1 regression: explicit target matching files but no supported manifest files
+  it('GIVEN an explicit target that matches only .txt files WHEN manifest:check is run THEN exits 1 with no-supported-files message', () => {
+    const tempTxtPath = resolve(FIXTURES_DIR, 'temp-unsupported.txt')
+    writeFileSync(tempTxtPath, 'this is not a manifest file\n')
+    const result = runManifestCheck([tempTxtPath])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toMatch(/unsupported file type|no supported manifest files/)
+  })
+
+  // B1 regression: explicit target with mixed .json and unsupported (.txt) files
+  it('GIVEN an explicit target containing both a valid .json and a .txt file WHEN manifest:check is run THEN exits 1 rejecting the unsupported file', () => {
+    const tempTxtPath = resolve(FIXTURES_DIR, 'temp-unsupported.txt')
+    writeFileSync(tempTxtPath, 'this is not a manifest file\n')
+    const fixturePath = resolve(FIXTURES_DIR, 'valid-basic.json')
+    const result = runManifestCheck([fixturePath, tempTxtPath])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('unsupported file type')
+  })
+
+  // NB1: unknown option causes exit 2
+  it('GIVEN an unknown CLI option --unknown-flag WHEN manifest:check is run THEN exits 2 with unknown option message', () => {
+    const result = runManifestCheck(['--unknown-flag'])
+    expect(result.exitCode).toBe(2)
+    expect(result.stderr).toContain('unknown option')
+  })
+
 })
