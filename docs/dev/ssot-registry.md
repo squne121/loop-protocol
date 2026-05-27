@@ -82,6 +82,30 @@
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
+- id: workflows-design-docs-refinement
+  path: docs/dev/workflows/issue-refinement-loop-design.md
+  title: issue-refinement-loop 詳細設計ノート（derived_design_note）
+  keywords: [issue-refinement-loop, planner, state-machine, loop-state, escalation]
+  description: |
+    issue-refinement-loop の詳細設計ノート（ssot_classification: derived_design_note）。
+    canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
+  sections:
+    - "## State Model"
+    - "## Failure Modes and Recovery"
+    - "## SubAgent Contract Matrix"
+
+- id: workflows-design-docs-impl-review
+  path: docs/dev/workflows/impl-review-loop-design.md
+  title: impl-review-loop 詳細設計ノート（derived_design_note）
+  keywords: [impl-review-loop, subagent-contract, loop-state, escalation, state-machine]
+  description: |
+    impl-review-loop の詳細設計ノート（ssot_classification: derived_design_note）。
+    canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
+  sections:
+    - "## State Model"
+    - "## Failure Modes and Recovery"
+    - "## SubAgent Contract Matrix"
+
 - id: product-spec-lifecycle
   path: docs/dev/product-spec-lifecycle.md
   title: Product Spec Lifecycle
@@ -300,6 +324,11 @@ directory_mappings:
       - docs/dev/product-spec-lifecycle.md
       - docs/product/requirements.md
       - docs/adr/0002-sdd-tool-adoption.md
+  - pattern: "docs/dev/workflows/**"
+    ssots:
+      - docs/dev/workflow.md
+      - docs/dev/agent-skill-boundaries.md
+      - docs/dev/ssot-registry.md
 ```
 
 ---
