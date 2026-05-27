@@ -23,10 +23,8 @@ trace_links:
 session_id: "PT-YYYYMMDD-001"
 date: "YYYY-MM-DD"
 build_ref: "<commit-sha-or-release-tag>"
-execution:
-  mode: "human_developer | ai_agent | scripted_automation | ci_browser_automation"
-  actor_id: "developer-self | combat-agent-v1 | playwright-ci"
-  trigger: "manual | ci | agent_loop"
+session_mode: "human_internal | human_external | ai_agent | browser_automation"
+tester_profile: "developer-self | combat-agent-v1 | playwright-ci"
 environment: "browser-chrome | local-dev | automated-ci"
 privacy:
   pii_reviewed: true
@@ -35,6 +33,9 @@ privacy:
 # AI/Automation Metadata (Optional)
 # Default: automation: null
 automation:
+  execution:
+    actor_id: "developer-self | combat-agent-v1 | playwright-ci"
+    trigger: "manual | ci | agent_loop"
   agent_profile: ""
   random_seed: null
   reproduction_command: ""
@@ -45,6 +46,7 @@ automation:
     failure_count: 0
     success_rate: null          # 0.0 - 1.0
     death_count: 0
+    # Invariant: death_rate = death_count / runs
     death_rate: null
     duration:
       p50: 0
@@ -59,6 +61,9 @@ automation:
     trace_ref: ""
     replay_ref: ""
     input_script_ref: ""
+    raw_artifact_committed: false
+    artifact_sensitivity: "none | telemetry | screenshot | video | trace_with_dom"
+    redaction_status: "not_applicable | pending | reviewed"
     trace_redacted: true        # Required for secure handling
   human_review_required: false  # UX影響・違和感がある場合は true
 
@@ -97,43 +102,19 @@ playtest_entries:
 
 ## Example Entry (Draft)
 
+### Example 1: Human Internal Session
 ```yaml
 session_id: "PT-20260527-001"
 date: "2026-05-27"
 build_ref: "3f0e79d"
-execution:
-  mode: "human_developer"
-  actor_id: "developer-self"
-  trigger: "manual"
+session_mode: "human_internal"
+tester_profile: "developer-self"
 environment: "browser-chrome"
 privacy:
   pii_reviewed: true
   raw_recording_committed: false
 
-automation:
-  agent_profile: "combat-agent-v1"
-  random_seed: 42
-  reproduction_command: "pnpm test:e2e --grep @combat"
-  metrics:
-    runs: 100
-    success_count: 85
-    failure_count: 15
-    success_rate: 0.85
-    death_count: 10
-    death_rate: 0.1
-    duration:
-      p50: 12000
-      p95: 15500
-      unit: "ms"
-    input_count_total: 4500
-    collision_count_total: 120
-  artifacts:
-    metrics_json: "external-secure-storage:PT-20260527-001/metrics.json"
-    trace_ref: "external-secure-storage:PT-20260527-001/trace.zip"
-    replay_ref: "external-secure-storage:PT-20260527-001/replay.mp4"
-    input_script_ref: "tests/e2e/scenarios/combat-stress-test.js"
-    trace_redacted: true
-  human_review_required: true
+automation: null
 
 playtest_entries:
   - entry_id: "PTE-001"
@@ -159,5 +140,70 @@ playtest_entries:
     decision: "implementation_issue"
     proposed_spec_delta: ""
     linked_issue: "#000"
+    validation_method: "human_internal"
+```
+
+### Example 2: Browser Automation Session
+```yaml
+session_id: "PT-20260527-002"
+date: "2026-05-27"
+build_ref: "3f0e79d"
+session_mode: "browser_automation"
+tester_profile: "playwright-ci"
+environment: "automated-ci"
+privacy:
+  pii_reviewed: true
+  raw_recording_committed: false
+
+automation:
+  execution:
+    actor_id: "playwright-ci"
+    trigger: "ci"
+  agent_profile: "combat-agent-v1"
+  random_seed: 42
+  reproduction_command: "pnpm test:e2e --grep @combat"
+  metrics:
+    runs: 100
+    success_count: 85
+    failure_count: 15
+    success_rate: 0.85
+    death_count: 10
+    death_rate: 0.1
+    duration:
+      p50: 12000
+      p95: 15500
+      unit: "ms"
+    input_count_total: 4500
+    collision_count_total: 120
+  artifacts:
+    metrics_json: "external-secure-storage:PT-20260527-002/metrics.json"
+    trace_ref: "external-secure-storage:PT-20260527-002/trace.zip"
+    replay_ref: "external-secure-storage:PT-20260527-002/replay.mp4"
+    input_script_ref: "tests/e2e/scenarios/combat-stress-test.js"
+    raw_artifact_committed: false
+    artifact_sensitivity: "trace_with_dom"
+    redaction_status: "reviewed"
+    trace_redacted: true
+  human_review_required: true
+
+playtest_entries:
+  - entry_id: "PTE-001"
+    task_id: "TASK-001"
+    hypothesis_id: "HYP-MVP-001"
+    observed_behavior: "AIエージェントが特定のコーナーで壁に衝突し続けている"
+    emotional_signal: "n/a"
+    developer_interpretation: "コーナー判定の閾値が不適切である可能性"
+    
+    observable_signal: "collision_count_total"
+    collection_method: "automated_telemetry"
+    success_failure_assessment: "failure"
+    retest_target: true
+    
+    affected_requirements:
+      - "REQ-LOGIC-001"
+    classification: "bug"
+    severity: "high"
+    confidence: "high"
+    decision: "spec_delta_issue"
     validation_method: "browser_automation"
 ```
