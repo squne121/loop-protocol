@@ -41,6 +41,39 @@ class CheckResult(str, Enum):
     LEGACY_MISSING = "legacy_missing_applicability"
 
 
+# --- scope_cvs_in_scope_mismatch tokenization constants (Issue #396) ---
+
+PATH_TOKEN_EXTENSIONS = (".md", ".py", ".ts", ".tsx", ".js", ".json", ".yml", ".yaml", ".toml", ".sh")
+PATH_TOKEN_PREFIXES = ("docs/", ".claude/", ".github/")
+PATH_TOKEN_STRIP_CHARS = ".,:;)]}>"
+
+PATH_TOKEN_RE = re.compile(
+    r"(?<![/\w.-])"
+    r"(?:"
+    r"(?:[\w.-]+/)*[\w.-]+\.(?:md|py|ts|tsx|js|json|yml|yaml|toml|sh)"
+    r"|"
+    r"(?:docs|\.claude|\.github)/(?:[\w./-]+)"
+    r")"
+    r"(?![/\w.-])"
+)
+
+SIGNIFICANT_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{4,}")
+
+STOP_TOKENS: frozenset[str] = frozenset({
+    "issue", "scope", "current", "validated", "warning",
+    "token", "tokens", "checker", "review", "script",
+    "scripts", "test", "tests", "fixture", "fixtures",
+    "implementation", "function", "detect", "result",
+    "output", "outcome", "verification", "commands",
+    "acceptance", "criteria", "allowed", "paths",
+    "this", "that", "with", "from", "will", "also",
+    "have", "been", "more", "than", "when", "then",
+})
+
+JACCARD_THRESHOLD = 0.3
+
+# --- end of scope_cvs tokenization constants ---
+
 WORKFLOW_SKILLS = {
     "implement-issue",
     "pr-review-judge",
@@ -604,22 +637,56 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     return CheckResult.PASS, []
 
 
+def _bullet_tokens(section: str) -> set[str]:
+    """Extract tokens from bullet lines in a section using 3-pass tokenization.
+
+    Pass 1: backtick-quoted tokens (e.g. `foo.py`)
+    Pass 2: bare path tokens matching PATH_TOKEN_RE (with extension or prefix)
+    Pass 3: ASCII significant tokens matching SIGNIFICANT_TOKEN_RE (lowercased, STOP_TOKENS excluded)
+
+    Only bullet lines (starting with "- ") are processed.
+    Tokens are lowercased for normalization.
+    """
+    tokens: set[str] = set()
+    for line in section.splitlines():
+        s = line.strip()
+        if not s.startswith("- "):
+            continue
+
+        content = s[2:]  # strip "- " prefix
+
+        # Pass 1: backtick-quoted tokens
+        for tok in re.findall(r"`([^`]+)`", content):
+            cleaned = tok.strip().rstrip(PATH_TOKEN_STRIP_CHARS)
+            if cleaned:
+                # normalize ./prefix
+                if cleaned.startswith("./"):
+                    cleaned = cleaned[2:]
+                tokens.add(cleaned.lower())
+
+        # Pass 2: bare path tokens
+        for match in PATH_TOKEN_RE.finditer(content):
+            tok = match.group(0).rstrip(PATH_TOKEN_STRIP_CHARS)
+            if tok:
+                if tok.startswith("./"):
+                    tok = tok[2:]
+                tokens.add(tok.lower())
+
+        # Pass 3: ASCII significant tokens
+        for match in SIGNIFICANT_TOKEN_RE.finditer(content):
+            tok = match.group(0).lower()
+            if tok not in STOP_TOKENS:
+                tokens.add(tok)
+
+    return tokens
+
+
 def detect_warning_scope_cvs_in_scope_mismatch(body: str, result: CheckerResult) -> None:
     """non_blocking: Current Validated Scope と In Scope の bullet 集合の乖離検出。"""
     cvs = extract_section(body, "Current Validated Scope")
     in_scope = extract_section(body, "In Scope")
     if not cvs or not in_scope:
         return
-
-    def _bullet_tokens(section: str) -> set:
-        tokens = set()
-        for line in section.splitlines():
-            s = line.strip()
-            if s.startswith("- "):
-                # crude tokenization: backtick-quoted paths and significant words
-                for tok in re.findall(r"`([^`]+)`", s):
-                    tokens.add(tok.strip())
-        return tokens
 
     cvs_tokens = _bullet_tokens(cvs)
     in_scope_tokens = _bullet_tokens(in_scope)
@@ -628,15 +695,20 @@ def detect_warning_scope_cvs_in_scope_mismatch(body: str, result: CheckerResult)
 
     overlap = cvs_tokens & in_scope_tokens
     union = cvs_tokens | in_scope_tokens
-    # Substantial divergence: less than 30% jaccard overlap
-    if union and (len(overlap) / len(union)) < 0.3:
+    jaccard = len(overlap) / len(union) if union else 1.0
+    # Substantial divergence: less than JACCARD_THRESHOLD overlap
+    if union and jaccard < JACCARD_THRESHOLD:
+        missing_from_cvs = sorted(in_scope_tokens - cvs_tokens)[:10]
+        missing_from_in_scope = sorted(cvs_tokens - in_scope_tokens)[:10]
         _add_warning(
             result,
             code="scope_cvs_in_scope_mismatch",
             severity="warning",
             evidence=[
-                f"Current Validated Scope tokens: {sorted(cvs_tokens)[:5]}",
-                f"In Scope tokens: {sorted(in_scope_tokens)[:5]}",
+                {"jaccard": round(jaccard, 3)},
+                {"overlap": sorted(overlap)[:10]},
+                {"missing_from_cvs": missing_from_cvs},
+                {"missing_from_in_scope": missing_from_in_scope},
             ],
             suggested_action="Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、乖離理由を Background / Scope Delta に記載する",
         )
@@ -963,7 +1035,7 @@ def main() -> None:
     else:
         body, labels, title = fetch_issue_body(args.issue, args.repo)
 
-    result = run_checks(body, labels, title, args.vc_preflight_json_path)
+    result = run_checks(body, labels, title, args.vc_preflight_json)
     output = result_to_dict(result)
 
     if args.json:

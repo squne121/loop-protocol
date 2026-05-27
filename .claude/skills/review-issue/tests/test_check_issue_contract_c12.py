@@ -180,6 +180,116 @@ class TestScopeCVSInScopeMismatchWarning:
         )
 
 
+class TestScopeCVSInScopeMismatchExtended:
+    """Issue #396: scope_cvs_in_scope_mismatch tokenization extension tests (AC1-AC7)."""
+
+    def test_scope_cvs_bare_path_mismatch_warns(self):
+        """GIVEN scope_cvs_in_scope_mismatch_bare_path_mismatch.md (bare path tokens on each side differ)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_bare_path_mismatch.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" in codes, (
+            f"Expected scope_cvs_in_scope_mismatch warning for bare path mismatch, got: {codes}"
+        )
+
+    def test_scope_cvs_bare_path_overlap_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_bare_path_overlap.md (same bare paths on both sides)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_bare_path_overlap.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning for bare path overlap, got: {codes}"
+        )
+
+    def test_scope_cvs_natural_en_mismatch_warns(self):
+        """GIVEN scope_cvs_in_scope_mismatch_natural_en_mismatch.md (English natural text mismatch)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_natural_en_mismatch.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" in codes, (
+            f"Expected scope_cvs_in_scope_mismatch warning for natural English mismatch, got: {codes}"
+        )
+
+    def test_scope_cvs_natural_en_overlap_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_natural_en_overlap.md (English natural text with meaningful overlap)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_natural_en_overlap.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning for natural English overlap, got: {codes}"
+        )
+
+    def test_scope_cvs_boilerplate_only_overlap_warns(self):
+        """GIVEN scope_cvs_in_scope_mismatch_boilerplate_only_overlap.md (stop-tokens only in common)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is still present (stop-tokens don't count)."""
+        output = run_checker("scope_cvs_in_scope_mismatch_boilerplate_only_overlap.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" in codes, (
+            f"Expected scope_cvs_in_scope_mismatch warning when only stop-tokens match, got: {codes}"
+        )
+
+    def test_scope_cvs_punct_normalization_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_punct_normalization.md (foo.py, and foo.py should match)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_punct_normalization.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning after punctuation normalization, got: {codes}"
+        )
+
+    def test_scope_cvs_extension_coverage_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_extension_coverage.md (.yaml/.tsx/.json/.sh/.yml paths)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present (all paths match)."""
+        output = run_checker("scope_cvs_in_scope_mismatch_extension_coverage.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning for extension coverage overlap, got: {codes}"
+        )
+
+    def test_scope_cvs_one_side_empty_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_one_side_empty.md (one side yields 0 tokens)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present."""
+        output = run_checker("scope_cvs_in_scope_mismatch_one_side_empty.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning when one side is empty, got: {codes}"
+        )
+
+    def test_scope_cvs_japanese_only_no_warn(self):
+        """GIVEN scope_cvs_in_scope_mismatch_japanese_only.md (Japanese text only, no ASCII tokens)
+        WHEN checker runs THEN scope_cvs_in_scope_mismatch warning is NOT present (no extractable tokens)."""
+        output = run_checker("scope_cvs_in_scope_mismatch_japanese_only.md")
+        codes = [w.get("code") for w in output.get("non_blocking_improvements", [])]
+        assert "scope_cvs_in_scope_mismatch" not in codes, (
+            f"Expected no scope_cvs_in_scope_mismatch warning for Japanese-only text, got: {codes}"
+        )
+
+    def test_scope_cvs_evidence_has_four_fields(self):
+        """GIVEN scope_cvs_in_scope_mismatch_issue.md (warning should be present)
+        WHEN checker runs THEN the warning evidence contains jaccard, overlap, missing_from_cvs, missing_from_in_scope."""
+        output = run_checker("scope_cvs_in_scope_mismatch_issue.md")
+        warnings = [w for w in output.get("non_blocking_improvements", [])
+                    if w.get("code") == "scope_cvs_in_scope_mismatch"]
+        assert len(warnings) == 1, f"Expected exactly 1 scope_cvs_in_scope_mismatch warning, got {len(warnings)}"
+
+        evidence = warnings[0]["evidence"]
+        # evidence is a list of dicts, each with one key
+        evidence_keys: set[str] = set()
+        for item in evidence:
+            if isinstance(item, dict):
+                evidence_keys.update(item.keys())
+
+        assert "jaccard" in evidence_keys, f"Expected 'jaccard' in evidence keys, got: {evidence_keys}"
+        assert "overlap" in evidence_keys, f"Expected 'overlap' in evidence keys, got: {evidence_keys}"
+        assert "missing_from_cvs" in evidence_keys, f"Expected 'missing_from_cvs' in evidence keys, got: {evidence_keys}"
+        assert "missing_from_in_scope" in evidence_keys, f"Expected 'missing_from_in_scope' in evidence keys, got: {evidence_keys}"
+
+        # jaccard must be float-compatible
+        jaccard_val = next(item["jaccard"] for item in evidence if isinstance(item, dict) and "jaccard" in item)
+        assert isinstance(jaccard_val, (int, float)), f"jaccard must be numeric, got {type(jaccard_val)}"
+        assert 0.0 <= jaccard_val <= 1.0, f"jaccard must be in [0, 1], got {jaccard_val}"
+
+
 class TestNonBlockingWarningsStructure:
     """non_blocking_improvements structure validation."""
 
