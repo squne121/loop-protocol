@@ -28,6 +28,7 @@ import { readFileSync, existsSync } from 'fs'
 import { glob as fsGlob, stat } from 'fs/promises'
 import { resolve, dirname, extname } from 'path'
 import { fileURLToPath } from 'url'
+import { execFileSync } from 'child_process'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..')
@@ -39,121 +40,97 @@ const REPO_ROOT = resolve(__dirname, '..')
 import { validateManifest } from './lib/agent-session-manifest-validation.mjs'
 
 // ============================================================================
-// Markdown extraction (re-implemented inline to avoid subprocess overhead,
-// mirrors logic from extract-agent-session-manifest-from-comment.mjs)
+// Markdown extraction via scripts/extract-agent-session-manifest-from-comment.mjs
+// (subprocess integration — no inline reimplementation)
 // ============================================================================
 
+const EXTRACTOR_PATH = resolve(__dirname, 'extract-agent-session-manifest-from-comment.mjs')
+
 function extractManifestFromMarkdown(markdown, filePath) {
-  const startMarker = '<!-- agent_session_manifest:v1 start -->'
-  const endMarker = '<!-- agent_session_manifest:v1 end -->'
-
-  const lines = markdown.split('\n')
-
-  let startMarkerLine = -1
-  let endMarkerLine = -1
-  let startMarkerCount = 0
-  let endMarkerCount = 0
-
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(startMarker)) {
-      startMarkerLine = i
-      startMarkerCount++
-    }
-    if (lines[i].includes(endMarker)) {
-      endMarkerLine = i
-      endMarkerCount++
-    }
-  }
-
-  if (startMarkerCount !== 1) {
-    return {
-      ok: false,
-      error: {
-        field: 'markers.start',
-        expected: '1 start marker',
-        actual: `${startMarkerCount} start markers`,
-      },
-    }
-  }
-  if (endMarkerCount !== 1) {
-    return {
-      ok: false,
-      error: {
-        field: 'markers.end',
-        expected: '1 end marker',
-        actual: `${endMarkerCount} end markers`,
-      },
-    }
-  }
-
-  if (startMarkerLine === -1 || endMarkerLine === -1 || startMarkerLine >= endMarkerLine) {
-    return {
-      ok: false,
-      error: {
-        field: 'markers.order',
-        expected: 'start marker before end marker',
-        actual: `startLine=${startMarkerLine} endLine=${endMarkerLine}`,
-      },
-    }
-  }
-
-  // Find opening fence
-  let openingFenceLine = -1
-  let openingFenceLength = 0
-  for (let i = startMarkerLine + 1; i < endMarkerLine; i++) {
-    const match = lines[i].match(/^(`+)/)
-    if (match) {
-      openingFenceLine = i
-      openingFenceLength = match[1].length
-      break
-    }
-  }
-
-  if (openingFenceLine === -1) {
-    return {
-      ok: false,
-      error: {
-        field: 'fence.opening',
-        expected: 'backtick fence after start marker',
-        actual: 'not found',
-      },
-    }
-  }
-
-  // Find closing fence (matching length)
-  let closingFenceLine = -1
-  for (let i = openingFenceLine + 1; i < endMarkerLine; i++) {
-    const match = lines[i].match(/^(`+)$/)
-    if (match && match[1].length === openingFenceLength) {
-      closingFenceLine = i
-      break
-    }
-  }
-
-  if (closingFenceLine === -1) {
-    return {
-      ok: false,
-      error: {
-        field: 'fence.closing',
-        expected: `closing fence with ${openingFenceLength} backticks`,
-        actual: 'not found',
-      },
-    }
-  }
-
-  const jsonLines = lines.slice(openingFenceLine + 1, closingFenceLine)
-  const jsonStr = jsonLines.join('\n')
-
   try {
-    const jsonData = JSON.parse(jsonStr)
-    return { ok: true, manifest: jsonData }
+    const stdout = execFileSync(
+      process.execPath,
+      [EXTRACTOR_PATH],
+      {
+        input: markdown,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    )
+    try {
+      const jsonData = JSON.parse(stdout)
+      return { ok: true, manifest: jsonData }
+    } catch (err) {
+      return {
+        ok: false,
+        error: {
+          field: 'json.parse',
+          expected: 'valid JSON from extractor stdout',
+          actual: err.message,
+        },
+      }
+    }
   } catch (err) {
+    const exitCode = (err && typeof err === 'object' && 'status' in err) ? err.status : 1
+    const stderr = (err && typeof err === 'object' && 'stderr' in err) ? String(err.stderr || '') : ''
+    // Map extractor exit code / stderr to structured error
+    const stderrStr = stderr.trim()
+    if (stderrStr.includes('Start marker appears') || stderrStr.includes('start')) {
+      return {
+        ok: false,
+        error: {
+          field: 'markers.start',
+          expected: '1 start marker',
+          actual: stderrStr || `extractor exit ${exitCode}`,
+        },
+      }
+    }
+    if (stderrStr.includes('End marker appears') || stderrStr.includes('end marker')) {
+      return {
+        ok: false,
+        error: {
+          field: 'markers.end',
+          expected: '1 end marker',
+          actual: stderrStr || `extractor exit ${exitCode}`,
+        },
+      }
+    }
+    if (stderrStr.includes('wrong order') || stderrStr.includes('not found')) {
+      return {
+        ok: false,
+        error: {
+          field: 'markers.order',
+          expected: 'start marker before end marker',
+          actual: stderrStr || `extractor exit ${exitCode}`,
+        },
+      }
+    }
+    if (stderrStr.includes('Opening fence') || stderrStr.includes('fence')) {
+      return {
+        ok: false,
+        error: {
+          field: 'fence',
+          expected: 'valid backtick fence enclosing JSON',
+          actual: stderrStr || `extractor exit ${exitCode}`,
+        },
+      }
+    }
+    if (stderrStr.includes('parsing JSON') || stderrStr.includes('JSON')) {
+      return {
+        ok: false,
+        error: {
+          field: 'json.parse',
+          expected: 'valid JSON in code block',
+          actual: stderrStr || `extractor exit ${exitCode}`,
+        },
+      }
+    }
     return {
       ok: false,
       error: {
-        field: 'json.parse',
-        expected: 'valid JSON in code block',
-        actual: err.message,
+        field: 'extraction',
+        expected: 'extractor exit 0',
+        actual: stderrStr || `extractor exit ${exitCode}`,
       },
     }
   }
