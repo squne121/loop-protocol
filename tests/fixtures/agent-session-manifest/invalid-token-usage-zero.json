@@ -1,0 +1,54 @@
+{
+  "schema": "agent_session_manifest/v1",
+  "manifest_id": "asm-abcdef12-abcd-4abc-89ab-abcdef12345a",
+  "recorded_at": "2026-05-24T12:00:00Z",
+  "repository": "squne121/loop-protocol",
+  "head_sha": null,
+  "issue_number": null,
+  "pr_number": null,
+  "commit_sha": null,
+  "actor": {
+    "type": "ai_agent",
+    "name": "implementation-worker",
+    "session_id": "session-378"
+  },
+  "phase": {
+    "main_loop": "impl",
+    "ledger_phase": "implementation",
+    "phase_instance_id": "issue-378:impl:005"
+  },
+  "token_usage": {
+    "availability": "unavailable",
+    "source": "none",
+    "prompt": 0,
+    "completion": 0,
+    "total": 0
+  },
+  "invoked_subagents": [],
+  "verification": {
+    "overall": "pass",
+    "skipped_count": 0,
+    "fallback_detected": false,
+    "ac_results": []
+  },
+  "evidence": [
+    {
+      "source_kind": "github_comment",
+      "source_ref": "https://github.com/squne121/loop-protocol/issues/378#issuecomment-5",
+      "source_sha256": null,
+      "visibility": "private_artifact"
+    }
+  ],
+  "sanitization_status": "sanitized",
+  "human_intervention": {
+    "required": false,
+    "type": "none",
+    "summary": null
+  },
+  "next_action_issue": null,
+  "redaction": {
+    "raw_transcript_included": false,
+    "local_paths_included": false,
+    "secret_scan_status": "clean"
+  }
+}

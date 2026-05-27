@@ -1,0 +1,69 @@
+{
+  "schema": "agent_session_manifest/v1",
+  "manifest_id": "asm-abcdef12-abcd-4abc-89ab-abcdef12345b",
+  "recorded_at": "2026-05-24T12:00:00Z",
+  "repository": "squne121/loop-protocol",
+  "head_sha": null,
+  "issue_number": null,
+  "pr_number": null,
+  "commit_sha": null,
+  "actor": {
+    "type": "ai_agent",
+    "name": "implementation-worker",
+    "session_id": "session-378"
+  },
+  "phase": {
+    "main_loop": "impl",
+    "ledger_phase": "implementation",
+    "phase_instance_id": "issue-378:impl:006"
+  },
+  "token_usage": {
+    "availability": "measured",
+    "source": "provider_api",
+    "prompt": 1000,
+    "completion": 500,
+    "total": 1500
+  },
+  "invoked_subagents": [],
+  "verification": {
+    "overall": "pass",
+    "skipped_count": 3,
+    "fallback_detected": false,
+    "ac_results": [
+      {
+        "ac": "AC1",
+        "verdict": "pass",
+        "command": "test -f file.txt",
+        "exit_code": 0,
+        "artifact_ref": null,
+        "waiver_ref": null
+      }
+    ]
+  },
+  "evidence": [
+    {
+      "source_kind": "artifact",
+      "source_ref": "artifacts/test.json",
+      "source_sha256": null,
+      "visibility": "private_artifact"
+    }
+  ],
+  "producer": {
+    "kind": "script_generated",
+    "version": null,
+    "command": "node scripts/generate.mjs",
+    "source_ref": "scripts/generate.mjs"
+  },
+  "sanitization_status": "sanitized",
+  "human_intervention": {
+    "required": false,
+    "type": "none",
+    "summary": null
+  },
+  "next_action_issue": null,
+  "redaction": {
+    "raw_transcript_included": false,
+    "local_paths_included": false,
+    "secret_scan_status": "clean"
+  }
+}
