@@ -84,7 +84,7 @@ REVIEW_ISSUE_RESULT_V1:
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
-`REVIEW_ISSUE_RESULT_V1` の全フィールド（`deterministic_checks` の C1〜C12、`blocking_issues`、`non_blocking_improvements`、`diff_proposal` を含む）は必ず欠落なく含める（routing 必須フィールド）。
+`REVIEW_ISSUE_RESULT_V1` の全フィールド（`deterministic_checks` の C1〜C13、`blocking_issues`、`non_blocking_improvements`、`diff_proposal` を含む）は必ず欠落なく含める（routing 必須フィールド）。
 
 ## script-first 化について（コスト削減）
 
@@ -96,9 +96,9 @@ REVIEW_ISSUE_RESULT_V1:
 
 - `REVIEW_ISSUE_RESULT_V1` の全フィールドを欠落なく返す
 - `verdict` と `status` を必ず含める（orchestrator の routing 判断に使われるため）
-- `deterministic_checks` の全 C1〜C12 フィールドを含める
+- `deterministic_checks` の全 C1〜C13 フィールドを含める
 - `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を欠落なく checker JSON から pass-through する
-- `non_blocking_improvements` の各要素は `{code, severity, evidence, suggested_action}` 構造を保持する
+- `non_blocking_improvements` の各要素は `{code, severity, evidence, suggested_action}` 構造を保持する（`evidence` は `list[str]`、`details` は warning 固有の optional dict）
 - `diff_proposal.add` の `missing_section_skeleton` エントリは `{kind, section, placeholder_source, skeleton}` 構造を保持する
 - `update_applied: false` を明示する（本 SubAgent は更新を行わないため）
 - `comment_url: null` を明示する（コメント投稿なし）
