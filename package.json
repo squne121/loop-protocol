@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
     "policy:check:session": "uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
-    "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session"
+    "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session",
+    "manifest:check": "node scripts/check-agent-session-manifests.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
