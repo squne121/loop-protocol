@@ -221,3 +221,124 @@ playtest_entries:
     decision: "spec_delta_issue"
     validation_method: "browser_automation"
 ```
+
+---
+
+### Automation Artifact Contract
+
+**schema_version**: `playtest.telemetry.v1`
+**issued_by**: `#419`
+
+このセクションは、自動プレイテスト runner が出力する artifact の構造化契約を定義する。
+
+#### 責務分離
+
+| Artifact | 責務 | public_repo_safe |
+|---|---|---|
+| `playtest-log.md` | playtest session 証跡台帳（artifact への参照を保持） | true |
+| `events.jsonl` | runtime event 時系列（runner 出力、行ごとに 1 event JSON） | false |
+| `metrics.json` | events.jsonl から再計算可能な derived 集計 | false（redacted 版は別途） |
+| `trace / replay` | Playwright trace 等の raw artifact | false（public repo に置かない） |
+
+#### Event Taxonomy
+
+必須 13 種の event_type enum:
+
+```json
+[
+  "session_start",
+  "session_end",
+  "scenario_start",
+  "scenario_end",
+  "input_summary",
+  "collision",
+  "hit",
+  "damage",
+  "death",
+  "sortie_clear",
+  "sortie_fail",
+  "reward_granted",
+  "debrief_summary"
+]
+```
+
+#### Event Envelope Spec
+
+events.jsonl の各行は以下のフィールドを持つ JSON オブジェクトである:
+
+```json
+{
+  "schema_version": "playtest.telemetry.v1",
+  "event_id": "evt-00000001",
+  "event_type": "session_start",
+  "session_id": "PT-20260528-001",
+  "run_id": "run-0001",
+  "seq": 1,
+  "tick": 0,
+  "occurred_at": "2026-05-28T00:00:00.000Z",
+  "build_ref": "1965306",
+  "scenario_id": "scenario-combat-001",
+  "random_seed": 42,
+  "agent_profile": "combat-agent-v1",
+  "actor_id": "player-0",
+  "entity_type": "player",
+  "data": {}
+}
+```
+
+#### Metrics Schema (`metrics.json`)
+
+metrics.json の fenced JSON example（parse 可能な内容）:
+
+```json
+{
+  "schema_version": "playtest.metrics.v1",
+  "computed_from": "events.jsonl",
+  "session_id": "PT-20260528-001",
+  "build_ref": "1965306",
+  "raw": {
+    "run_count": 100,
+    "success_count": 85,
+    "failure_count": 12,
+    "aborted_count": 3,
+    "death_count": 10,
+    "collision_count_total": 120,
+    "damage_taken_total": 450
+  },
+  "derived": {
+    "success_rate": 0.85
+  },
+  "duration_ms_p50": 12000,
+  "duration_ms_p95": 15500
+}
+```
+
+#### Invariants
+
+以下の不変条件はすべての metrics.json に適用される:
+
+- `run_count == success_count + failure_count + aborted_count`
+- `0.0 <= success_rate <= 1.0`
+- `success_rate == success_count / run_count`
+- `duration_ms_p95 >= duration_ms_p50`
+- `metrics.computed_from MUST reference events.jsonl`
+- `raw trace artifacts MUST NOT be committed to public repo`
+
+#### 単位規約
+
+- 率（rate）: `0.0-1.0 fraction`（`unit: percent` を使う場合は明示する）
+- duration: ms 単位、field name suffix は `_ms` を必須とする（例: `duration_ms_p50`, `duration_ms_p95`）
+- tick: 整数、シミュレーション固定ステップカウント
+
+#### Artifact Safety
+
+| Artifact | 命名規約 | public_repo_safe | 参照方式 |
+|---|---|---|---|
+| metrics（公開可能版） | `metrics.redacted.json` | true | git 管理可 |
+| metrics（生データ） | `metrics.json` | false | `external-secure-artifact://` URI で参照 |
+| trace / replay | セッション ID プレフィックス | false | `external-secure-artifact://` URI で参照 |
+
+- `public_repo_safe` flag は artifact ごとに付与する（上表参照）。
+- `metrics.redacted.json` 命名規約: PII・機密データを除去した metrics の公開版は `metrics.redacted.json` という名前で管理する。
+- trace artifact は `external-secure-artifact://<session_id>/trace.zip` の形式で参照する（外部セキュアストレージへの URI scheme）。
+- raw artifact（trace / replay / events.jsonl）は public repo に commit してはならない（`raw_artifact_committed: false` を維持する）。
