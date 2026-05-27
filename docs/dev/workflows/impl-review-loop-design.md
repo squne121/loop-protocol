@@ -158,12 +158,12 @@ orchestrator は data-plane 操作を直接行わない。
 |---|---|---|---|---|---|---|---|---|---|---|
 | `implementation-worker` | Issue 実装・worktree 管理・PR 起票 | orchestrator（contract_snapshot_url, fix_delta） | orchestrator | `IMPLEMENT_RESULT_V1` | `status`, `pr_url`, `worktree`, `branch`, `verification.*`, `allowed_paths_compliance` | なし | data-plane の実装詳細（orchestrator は読まない） | write（ファイル・git・PR） | `implementation_failed` | `.claude/skills/implement-issue/` |
 | `test-runner` | Verification Commands 実行 | orchestrator（worktree, branch） | orchestrator | `TEST_RESULT_V1` | `status`, `passed`, `failed`, `details[]` | なし | test 実行の内部 stderr 詳細（summary のみ） | read-only（mutation 禁止） | `verification_failed` | `.claude/agents/test-runner.md` |
-| `pr-reviewer` | PR コードレビュー・LOOP_VERDICT 記録 | orchestrator（pr_url） | orchestrator | `LOOP_VERDICT: APPROVE | REQUEST_CHANGES` | `verdict`, `blockers[]`, `fix_delta` | なし | review 判断の内部 rationale（verdict のみ読む） | write（`gh pr review` のみ） | `pr_review_failed` | `.claude/skills/pr-review-judge/` |
+| `pr-reviewer` | PR コードレビュー・LOOP_VERDICT 記録 | orchestrator（pr_url） | orchestrator | `LOOP_VERDICT: APPROVE | REQUEST_CHANGES` | `verdict`, `blockers[]`, `reviewed_head_sha`, `follow_up_issue_requests` | なし | review 判断の内部 rationale（verdict のみ読む） | write（`gh pr review` のみ） | `pr_review_failed` | `.claude/skills/pr-review-judge/` |
 
 ### SubAgent 設計上の注意
 
 - orchestrator は `IMPLEMENT_RESULT_V1` の verification 詳細をパースするが、実装の内部判断を re-evaluate しない
-- `pr-reviewer` の `verdict: REQUEST_CHANGES` には `fix_delta` が含まれ、これを次 iteration の Step 1 に渡す
+- `pr-reviewer` の `verdict: REQUEST_CHANGES` には `blockers[]` が含まれ、orchestrator はこれを `fix_delta` として次 iteration の Step 1 に渡す
 - `test-runner` は Verification Commands の実行専用。impl-review-loop が `baseline_vc_preflight.py` を重複実行しない
 
 ## Artifact and Evidence Contract

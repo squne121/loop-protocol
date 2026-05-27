@@ -82,19 +82,6 @@
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
-- id: workflows-design-docs-readme
-  path: docs/dev/workflows/README.md
-  title: 運用単位別詳細設計ノート インデックス（derived_design_note）
-  keywords: [workflow-design, derived-design-note, subagent-contract, control-plane, data-plane]
-  description: |
-    issue-refinement-loop / impl-review-loop の詳細設計ノート群のインデックス（ssot_classification: derived_design_note）。
-    canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
-    architecture review / contract migration / failure-mode update 時のみロードする。normal loop execution 時はロード不要。
-  sections:
-    - "## Status"
-    - "## Purpose"
-    - "## Authority Map"
-
 - id: workflows-design-docs-refinement
   path: docs/dev/workflows/issue-refinement-loop-design.md
   title: issue-refinement-loop 詳細設計ノート（derived_design_note）
