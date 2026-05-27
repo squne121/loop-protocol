@@ -12,11 +12,13 @@ Tests verify:
 8. duplicate skip: same stable key skipped on second invocation (Blocker 4)
 9. PostToolUse payload does not emit absolute paths in stderr (Blocker 5)
 10. PostToolUse matcher excludes Read (HIGH fix)
+11. artifact JSON file is actually created in artifacts/ dir (Blocker 5 - artifact creation)
+12. duplicate skip after artifact exists: second run skips and artifact count unchanged (Blocker 5 - robustness)
+13. stderr never contains absolute paths matching /home/, /Users/, C:\\ patterns (Blocker 5 - strict redaction)
+14. settings.json exec-form: command == "node" and args[0] ends with wrapper .mjs (Blocker 1 - enhanced)
 """
 
 import json
-import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -434,4 +436,241 @@ def test_post_tool_use_payload_no_absolute_path_in_stderr():
     # stdout must be empty regardless
     assert result.stdout == "", (
         f"Expected empty stdout for PostToolUse payload, got: {result.stdout[:200]!r}"
+    )
+
+
+# ============================================================================
+# Blocker 5 (new): artifact JSON file creation in artifacts/ dir
+# ============================================================================
+
+
+def test_artifact_json_created_in_artifacts_dir():
+    """GIVEN hook wrapper is invoked with a Stop event,
+    WHEN it runs successfully,
+    THEN an artifact JSON file must be created in artifacts/ (Blocker 5 - artifact creation)."""
+    if not HOOK_WRAPPER_PATH.exists():
+        pytest.skip("Hook wrapper not found")
+
+    artifacts_dir = REPO_ROOT / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+
+    # Use a unique tool name so we don't collide with existing artifacts
+    unique_marker = "ArtifactCreationTest_unique_67890"
+    hook_stdin = json.dumps({
+        "hook_event_name": "PostToolUse",
+        "tool_name": unique_marker,
+        "tool_use_id": "test-artifact-creation-001",
+    })
+
+    before_files = set(artifacts_dir.glob("private-agent-session-manifest-posttooluse-*.json"))
+
+    result = subprocess.run(
+        ["node", str(HOOK_WRAPPER_PATH)],
+        input=hook_stdin,
+        text=True,
+        capture_output=True,
+        cwd=str(REPO_ROOT),
+        timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Hook wrapper exited with {result.returncode}: {result.stderr[:300]!r}"
+    )
+
+    after_files = set(artifacts_dir.glob("private-agent-session-manifest-posttooluse-*.json"))
+    new_files = after_files - before_files
+
+    # Cleanup before asserting (so failures don't leave artifacts)
+    for f in list(new_files):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+    # Exactly one new artifact file must have been created (or skip was emitted)
+    if "duplicate skip" in result.stderr:
+        # Already existed from a prior test run — acceptable (robustness)
+        pytest.skip("Stable key already exists; duplicate skip triggered (prior test run)")
+
+    assert len(new_files) >= 1, (
+        f"Expected at least 1 new artifact JSON in artifacts/, got 0. "
+        f"stderr: {result.stderr[:300]!r}"
+    )
+
+
+# ============================================================================
+# Blocker 5 (new): duplicate skip with artifact verified to exist first
+# ============================================================================
+
+
+def test_duplicate_skip_robustness_artifact_exists_first():
+    """GIVEN an artifact with a known stable key already exists,
+    WHEN hook wrapper is invoked with the same payload,
+    THEN it must emit 'duplicate skip' and NOT create a second artifact (Blocker 5 - robustness)."""
+    if not HOOK_WRAPPER_PATH.exists():
+        pytest.skip("Hook wrapper not found")
+
+    artifacts_dir = REPO_ROOT / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+
+    unique_marker = "DuplicateSkipRobustnessTest_unique_11111"
+    hook_stdin = json.dumps({
+        "hook_event_name": "PostToolUse",
+        "tool_name": unique_marker,
+        "tool_use_id": "test-duplicate-robustness-001",
+    })
+
+    run_kwargs = dict(
+        input=hook_stdin,
+        text=True,
+        capture_output=True,
+        cwd=str(REPO_ROOT),
+        timeout=30,
+    )
+
+    before_first = set(artifacts_dir.glob("private-agent-session-manifest-posttooluse-*.json"))
+
+    # First invocation — should create artifact
+    result1 = subprocess.run(["node", str(HOOK_WRAPPER_PATH)], **run_kwargs)
+    assert result1.returncode == 0, f"First invocation failed: {result1.stderr}"
+
+    after_first = set(artifacts_dir.glob("private-agent-session-manifest-posttooluse-*.json"))
+    created_by_first = after_first - before_first
+
+    if "duplicate skip" in result1.stderr:
+        # Already existed — test cannot verify fresh creation; skip gracefully
+        pytest.skip("Stable key already exists before first run; cannot test robustness from scratch")
+
+    assert len(created_by_first) >= 1, (
+        f"First invocation did not create artifact. stderr: {result1.stderr[:300]!r}"
+    )
+
+    # Small delay for filesystem consistency
+    time.sleep(0.05)
+
+    # Second invocation — must skip
+    result2 = subprocess.run(["node", str(HOOK_WRAPPER_PATH)], **run_kwargs)
+    assert result2.returncode == 0, f"Second invocation failed: {result2.stderr}"
+
+    after_second = set(artifacts_dir.glob("private-agent-session-manifest-posttooluse-*.json"))
+    created_by_second = after_second - after_first
+
+    # Cleanup all artifacts created by this test
+    for f in created_by_first | created_by_second:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+    assert "duplicate skip" in result2.stderr, (
+        f"Expected 'duplicate skip' in second invocation stderr. "
+        f"stderr: {result2.stderr[:300]!r}"
+    )
+    assert len(created_by_second) == 0, (
+        f"Second invocation created {len(created_by_second)} new artifact(s) — must be 0 on duplicate skip"
+    )
+
+
+# ============================================================================
+# Blocker 5 (new): strict stderr absolute path redaction test
+# ============================================================================
+
+
+def test_stderr_never_contains_absolute_paths():
+    """GIVEN hook wrapper is invoked with payloads containing absolute paths,
+    WHEN it runs (for Stop, PostToolUse, and SubagentStop event types),
+    THEN stderr must never emit strings matching /home/, /Users/, or C:\\ patterns."""
+    if not HOOK_WRAPPER_PATH.exists():
+        pytest.skip("Hook wrapper not found")
+
+    sensitive_path_patterns = [
+        "/home/sensitive-user/workspace",
+        "/Users/Developer/secret-project",
+        "C:\\Users\\Developer\\workspace",
+    ]
+
+    payloads = [
+        {
+            "hook_event_name": "Stop",
+            "transcript_path": f"{sensitive_path_patterns[0]}/transcript.jsonl",
+            "cwd": sensitive_path_patterns[0],
+        },
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "test-strict-redaction-001",
+            "transcript_path": f"{sensitive_path_patterns[1]}/session.jsonl",
+            "cwd": sensitive_path_patterns[1],
+        },
+        {
+            "hook_event_name": "SubagentStop",
+            "agent_id": "test-agent-12345678",
+            "transcript_path": f"{sensitive_path_patterns[2]}\\transcript.jsonl",
+            "cwd": sensitive_path_patterns[2],
+        },
+    ]
+
+    for payload in payloads:
+        result = subprocess.run(
+            ["node", str(HOOK_WRAPPER_PATH)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(REPO_ROOT),
+            timeout=30,
+        )
+        # Check stderr does not contain sensitive absolute paths from stdin
+        for sensitive in sensitive_path_patterns:
+            # Normalize to check both forward-slash and backslash variants
+            sensitive_fwd = sensitive.replace("\\", "/")
+            assert sensitive_fwd not in result.stderr and sensitive not in result.stderr, (
+                f"Event={payload['hook_event_name']}: sensitive path leaked to stderr: "
+                f"{sensitive!r} found in {result.stderr[:300]!r}"
+            )
+
+
+# ============================================================================
+# Blocker 1 (enhanced): exec-form — verify command == "node" and args[0] is wrapper
+# ============================================================================
+
+
+def test_settings_json_exec_form_command_is_node_and_args0_is_wrapper():
+    """GIVEN Blocker 1 fix (exec-form compliance, enhanced),
+    WHEN checking all hook entries that reference generate_session_manifest_from_hook,
+    THEN command must equal 'node' exactly and args[0] must end with
+    'generate_session_manifest_from_hook.mjs'."""
+    data = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
+    hooks_section = data.get("hooks", {})
+
+    producer_hooks_found = 0
+    for event_name, event_entries in hooks_section.items():
+        for entry in event_entries:
+            for hook in entry.get("hooks", []):
+                args = hook.get("args", [])
+                if not args:
+                    continue
+                if "generate_session_manifest_from_hook" not in args[0]:
+                    continue
+
+                producer_hooks_found += 1
+                cmd = hook.get("command", "")
+
+                assert cmd == "node", (
+                    f"[{event_name}] manifest producer hook must have command='node' "
+                    f"(exec-form), got: {cmd!r}"
+                )
+                assert args[0].endswith("generate_session_manifest_from_hook.mjs"), (
+                    f"[{event_name}] manifest producer hook args[0] must end with "
+                    f"'generate_session_manifest_from_hook.mjs', got: {args[0]!r}"
+                )
+                # args[0] must NOT be just the bare filename without a path prefix
+                # (must include ${CLAUDE_PROJECT_DIR} or equivalent absolute-like reference)
+                assert "/" in args[0] or "\\" in args[0], (
+                    f"[{event_name}] manifest producer hook args[0] must include a path "
+                    f"(not bare filename), got: {args[0]!r}"
+                )
+
+    assert producer_hooks_found >= 1, (
+        "No manifest producer hooks (exec-form) found in settings.json — "
+        "expected at least 1 entry with args[0] containing generate_session_manifest_from_hook"
     )

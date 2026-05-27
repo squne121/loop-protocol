@@ -353,7 +353,8 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 > **注意（#412 境界）**: artifact に Secret が混入しない保証は `#412` 完了まで **保留**。
 > 現状は `secrets_mode: none` 前提で運用する。
-> "private artifact" とは「retention-limited GitHub Actions artifact」を指し、Secret 境界の完全な保証ではない。
+> "private artifact channel" とは「Issue / PR comment ではない非コメント面（retention-limited GitHub Actions artifact）」を指す。
+> **public repo では artifact は REST API 経由で公開アクセス可能**。manifest content は public-safe contract（絶対パスなし、token なし、transcript 本文なし）を満たすこと。
 
 `session_recording_policy_guard.sh` は Stop / SubagentStop で producer hook より前に評価される（順序固定）。
 
@@ -371,10 +372,31 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 ---
 
-## private artifact channel（禁止チャネル）
+## artifact channel と public-safe content contract
 
-manifest の出力先は **retention-limited GitHub Actions artifact**（private artifact channel）とする。
-「private artifact」は「GitHub Actions artifact として保存され、保持期間付きで管理される」ことを指す。
+manifest の出力先は **retention-limited GitHub Actions artifact** とする。
+「private artifact channel」は「Issue / PR comment ではない非コメント面（artifact として保持期間付きで管理）」を指す。
+
+**重要**: public repo（`squne121/loop-protocol`）では、GitHub Actions artifact は
+`actions/artifacts` REST API 経由で誰でもダウンロード可能である。
+「private artifact」という語は "Secret が含まれない" ことを保証するものではなく、
+「公開コメント・git history ではない管理された配布面」であることを示す用語である。
+
+### manifest content の public-safe contract
+
+manifest JSON が GitHub Actions artifact として公開リポジトリに格納される以上、
+**manifest content は public-safe でなければならない**。以下を contract として定める。
+
+| 項目 | 要件 | 理由 |
+|---|---|---|
+| 絶対パス（`/home/`, `/Users/`, `C:\` 等） | 含めない | 開発環境のパスが漏洩する |
+| token-like string（40 文字以上の hex/base64） | 含めない | API key / git token が漏洩する |
+| transcript 本文（会話内容） | 含めない | session 内容が公開される |
+| Secret 値（API key, password, token） | 含めない（#412 担当） | Secret 漏洩 |
+
+manifest JSON に含まれる情報（例: repository, phase, actor-type, evidence-source-ref, timestamp）は
+public-safe な構造化メタデータであり、上記の禁止項目は producer CLI が生成しない設計になっている。
+
 Secret 境界の完全な保護は `#412` が担当し、本スコープ（#402）では保証しない。
 
 以下のチャネルへの manifest 本文の出力は **禁止**。
