@@ -14,8 +14,8 @@ trace_links:
 # Playtest Log Template
 
 ## Intent
-この文書は、プレイテスト中に得られた観察事実、プレイヤーの反応、および開発チームによる決定事項を記録するための YAML テンプレートとスキーマを定義する。
-`docs/product/mvp-scope.md` の Measurement Contract に基づき、仮説検証の証跡として機能する。
+この文書は、プレイテスト中に得られた観察事実、プレイヤーの反応、および開発チームによる決定事項を記録する ための YAML テンプレートとスキーマを定義する。
+`docs/product/mvp-scope.md` は現在ドラフト段階であるため、本テンプレートは「厳密な測定の契約 (Normative Measurement Contract)」ではなく、プレイテストログを記録するための「実運用向けのワーキングフォーマット (Working Format)」として位置付ける。
 
 ## Entry Schema
 
@@ -23,7 +23,7 @@ trace_links:
 session_id: "PT-YYYYMMDD-001"
 date: "YYYY-MM-DD"
 build_ref: "<commit-sha-or-release-tag>"
-session_mode: "human_internal | human_external | ai_agent | browser_automation"
+session_mode: "human_internal | human_external | ai_simulation | browser_automation"
 tester_profile: "developer-self | combat-agent-v1 | playwright-ci"
 environment: "browser-chrome | local-dev | automated-ci"
 privacy:
@@ -31,6 +31,7 @@ privacy:
   raw_recording_committed: false
 
 # AI/Automation Metadata (Optional)
+# REQUIRED for ai_simulation or browser_automation. MUST be null for human-only sessions.
 # Default: automation: null
 automation:
   execution:
@@ -41,6 +42,9 @@ automation:
   reproduction_command: ""
   metrics:
     # Invariant: success_rate = success_count / runs
+    computed_by: "agent_exporter | ci_scripts | manual_aggregation"
+    source: "runtime_telemetry | playwright_trace | vitest_json"
+    sample_unit: "runs | tasks | sortie"
     runs: 0
     success_count: 0
     failure_count: 0
@@ -57,6 +61,9 @@ automation:
   artifacts:
     # WARNING: DO NOT commit raw recordings or PII to the repository.
     # Ensure privacy.pii_reviewed is true before referencing artifacts.
+    storage_class: "local_git | external_bucket | secure_vault"
+    artifact_contains: ["dom_snapshot", "screenshot", "video", "telemetry"]
+    public_repo_safe: false
     metrics_json: ""
     trace_ref: ""
     replay_ref: ""
@@ -99,6 +106,7 @@ playtest_entries:
 
 ## Policies
 - `ai_result_is_ux_evidence: false` # AI結果を直接のUX証拠としない
+- **UX Evidence Policy Invariant**: `session_mode` が AI/Automation かつ（`classification` が 'design hypothesis invalidated' または `decision` が 'spec_delta_issue'）の場合、`automation.human_review_required` は必ず `true` でなければならない。
 
 ## Example Entry (Draft)
 
@@ -163,6 +171,9 @@ automation:
   random_seed: 42
   reproduction_command: "pnpm test:e2e --grep @combat"
   metrics:
+    computed_by: "ci_scripts"
+    source: "playwright_trace"
+    sample_unit: "tasks"
     runs: 100
     success_count: 85
     failure_count: 15
@@ -176,6 +187,9 @@ automation:
     input_count_total: 4500
     collision_count_total: 120
   artifacts:
+    storage_class: "external_bucket"
+    artifact_contains: ["dom_snapshot", "trace_with_dom", "telemetry"]
+    public_repo_safe: false
     metrics_json: "external-secure-storage:PT-20260527-002/metrics.json"
     trace_ref: "external-secure-storage:PT-20260527-002/trace.zip"
     replay_ref: "external-secure-storage:PT-20260527-002/replay.mp4"
