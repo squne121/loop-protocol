@@ -82,30 +82,42 @@
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
-- id: workflows-design-docs
-  path: docs/dev/workflows/
-  title: 運用単位別詳細設計ノート（derived_design_note）
-  keywords: [workflow-design, issue-refinement-loop, impl-review-loop, subagent-contract, loop-state, escalation, control-plane, data-plane, planner, state-machine, derived-design-note]
+- id: workflows-design-docs-readme
+  path: docs/dev/workflows/README.md
+  title: 運用単位別詳細設計ノート インデックス（derived_design_note）
+  keywords: [workflow-design, derived-design-note, subagent-contract, control-plane, data-plane]
   description: |
-    issue-refinement-loop / impl-review-loop の詳細設計ノート（ssot_classification: derived_design_note）。
+    issue-refinement-loop / impl-review-loop の詳細設計ノート群のインデックス（ssot_classification: derived_design_note）。
     canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
     architecture review / contract migration / failure-mode update 時のみロードする。normal loop execution 時はロード不要。
   sections:
     - "## Status"
     - "## Purpose"
-    - "## SubAgent Contract Matrix"
+    - "## Authority Map"
+
+- id: workflows-design-docs-refinement
+  path: docs/dev/workflows/issue-refinement-loop-design.md
+  title: issue-refinement-loop 詳細設計ノート（derived_design_note）
+  keywords: [issue-refinement-loop, planner, state-machine, loop-state, escalation]
+  description: |
+    issue-refinement-loop の詳細設計ノート（ssot_classification: derived_design_note）。
+    canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
+  sections:
     - "## State Model"
     - "## Failure Modes and Recovery"
-    - "## Authority Map"
-  ssot_classification: derived_design_note
-  conflict_rule: canonical_sources_win
-  loaded_when:
-    - architecture review
-    - contract migration
-    - failure-mode update
-  not_loaded_when:
-    - normal loop execution
-    - routine issue refinement
+    - "## SubAgent Contract Matrix"
+
+- id: workflows-design-docs-impl-review
+  path: docs/dev/workflows/impl-review-loop-design.md
+  title: impl-review-loop 詳細設計ノート（derived_design_note）
+  keywords: [impl-review-loop, subagent-contract, loop-state, escalation, state-machine]
+  description: |
+    impl-review-loop の詳細設計ノート（ssot_classification: derived_design_note）。
+    canonical_sources の正本と矛盾した場合は正本が勝つ（conflict_rule: canonical_sources_win）。
+  sections:
+    - "## State Model"
+    - "## Failure Modes and Recovery"
+    - "## SubAgent Contract Matrix"
 
 - id: product-spec-lifecycle
   path: docs/dev/product-spec-lifecycle.md
