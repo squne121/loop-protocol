@@ -32,9 +32,9 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 
 決定論的判定の詳細仕様は `scripts/check_issue_contract.py` に集約する。本 SKILL.md には判定表・regex・Step 4 自然言語評価を重複記載しない。checker は以下を返す:
 
-- `C1_required_sections` 〜 `C12_product_trace_fields_structure` の 12 件の `pass | fail | warn | n/a | legacy_missing_applicability` 値
+- `C1_required_sections` 〜 `C13_vc_preflight_decision_consistency` の 13 件の `pass | fail | warn | n/a | legacy_missing_applicability` 値
 - `blocking_issues`: 各 fail の説明 string 配列
-- `non_blocking_improvements`: 各 warning が `{code, severity, evidence, suggested_action}` の dict として配列
+- `non_blocking_improvements`: 各 warning が `{code, severity, evidence, details?, suggested_action}` の dict として配列（`evidence` は `list[str]`、`details` は warning 固有の構造化情報 dict で省略可）
 - `diff_proposal.add`: C1 fail 時の `missing_section_skeleton` 等、機械的に挿入可能な skeleton 配列
 - `verdict`: いずれか fail があれば `needs-fix`、それ以外は `approve`
 

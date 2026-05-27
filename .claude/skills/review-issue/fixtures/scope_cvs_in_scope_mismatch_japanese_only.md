@@ -2,6 +2,12 @@
 LABELS: phase/implementation,kind/implementation
 TITLE: 実装: Japanese only fixture (no warning)
 ---
+<!-- KNOWN LIMITATION: This fixture contains Japanese natural-language text only (no bare path tokens,
+no backtick-quoted tokens). The scope_cvs tokenizer is limited to ASCII / English natural-language
+tokens. Japanese text without path/backtick tokens yields 0 tokens on both sides, so the mismatch
+detector does not fire (guarded by the "if not cvs_tokens or not in_scope_tokens: return" check).
+Japanese path-only divergence can be detected if a bare ASCII path is present — see
+scope_cvs_in_scope_mismatch_japanese_path_divergence.md for that case. -->
 ## Machine-Readable Contract
 
 ```yaml

@@ -47,15 +47,31 @@ PATH_TOKEN_EXTENSIONS = (".md", ".py", ".ts", ".tsx", ".js", ".json", ".yml", ".
 PATH_TOKEN_PREFIXES = ("docs/", ".claude/", ".github/")
 PATH_TOKEN_STRIP_CHARS = ".,:;)]}>"
 
+# SSOT: PATH_TOKEN_RE auto-generated from PATH_TOKEN_EXTENSIONS and PATH_TOKEN_PREFIXES (Blocker 4 fix)
+_EXT_RE = "|".join(re.escape(ext.lstrip(".")) for ext in PATH_TOKEN_EXTENSIONS)
+_PREFIX_RE = "|".join(re.escape(prefix.rstrip("/")) for prefix in PATH_TOKEN_PREFIXES)
+
+# ASCII-only path components, Unicode path matching is out of scope (Non-blocking C fix).
+# Blocker 3: trailing sentence-final punctuation (.,;) is included in the match then stripped via
+# rstrip(PATH_TOKEN_STRIP_CHARS). Both extension branch and prefix branch allow optional trailing
+# punctuation chars so that "src/foo.py." and "config/settings.yaml." are captured and normalized.
+# The suffix group [.,;]? must be kept outside PATH_TOKEN_STRIP_CHARS rstrip so we only need
+# the lookahead to handle the character AFTER the optional trailing punct.
+_SENT_PUNCT = r"[.,;]?"  # optional sentence-final punctuation included in match; rstripped later
+_PATH_BOUNDARY_END = r"(?=$|[\s:)\]}>\"。．、])"  # must NOT include . , ; (already in _SENT_PUNCT)
+
 PATH_TOKEN_RE = re.compile(
-    r"(?<![/\w.-])"
-    r"(?:"
-    r"(?:[\w.-]+/)*[\w.-]+\.(?:md|py|ts|tsx|js|json|yml|yaml|toml|sh)"
-    r"|"
-    r"(?:docs|\.claude|\.github)/(?:[\w./-]+)"
-    r")"
-    r"(?![/\w.-])"
+    r"(?<![/A-Za-z0-9_.~-])"
+    + r"(?:"
+    + r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:" + _EXT_RE + r")" + _SENT_PUNCT
+    + r"|"
+    + r"(?:" + _PREFIX_RE + r")/(?:[A-Za-z0-9_./-]+)" + _SENT_PUNCT
+    + r")"
+    + _PATH_BOUNDARY_END
 )
+
+# Bullet pattern: matches "- ", "* ", "+ " and indented variants (up to 3 spaces) (Blocker 2 fix)
+BULLET_RE = re.compile(r"^\s{0,3}[-*+]\s+(.+)$")
 
 SIGNIFICANT_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{4,}")
 
@@ -644,16 +660,18 @@ def _bullet_tokens(section: str) -> set[str]:
     Pass 2: bare path tokens matching PATH_TOKEN_RE (with extension or prefix)
     Pass 3: ASCII significant tokens matching SIGNIFICANT_TOKEN_RE (lowercased, STOP_TOKENS excluded)
 
-    Only bullet lines (starting with "- ") are processed.
+    Bullet markers supported: "- ", "* ", "+ " and indented variants (up to 3 spaces).
+    Scope: ASCII / English natural-language tokens only.
+    Japanese text without path/backtick tokens yields 0 tokens (known limitation).
     Tokens are lowercased for normalization.
     """
     tokens: set[str] = set()
     for line in section.splitlines():
-        s = line.strip()
-        if not s.startswith("- "):
+        m = BULLET_RE.match(line)
+        if not m:
             continue
 
-        content = s[2:]  # strip "- " prefix
+        content = m.group(1)  # content after bullet marker
 
         # Pass 1: backtick-quoted tokens
         for tok in re.findall(r"`([^`]+)`", content):
@@ -700,18 +718,26 @@ def detect_warning_scope_cvs_in_scope_mismatch(body: str, result: CheckerResult)
     if union and jaccard < JACCARD_THRESHOLD:
         missing_from_cvs = sorted(in_scope_tokens - cvs_tokens)[:10]
         missing_from_in_scope = sorted(cvs_tokens - in_scope_tokens)[:10]
-        _add_warning(
-            result,
-            code="scope_cvs_in_scope_mismatch",
-            severity="warning",
-            evidence=[
-                {"jaccard": round(jaccard, 3)},
-                {"overlap": sorted(overlap)[:10]},
-                {"missing_from_cvs": missing_from_cvs},
-                {"missing_from_in_scope": missing_from_in_scope},
-            ],
-            suggested_action="Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、乖離理由を Background / Scope Delta に記載する",
-        )
+        # evidence: list[str] — machine-readable shape (Blocker 1: keep as list[str])
+        evidence = [
+            f"scope token jaccard {jaccard:.3f} < {JACCARD_THRESHOLD}",
+            f"Current Validated Scope tokens: {sorted(cvs_tokens)[:10]}",
+            f"In Scope tokens: {sorted(in_scope_tokens)[:10]}",
+        ]
+        # details: dict — structured info separated from evidence (Blocker 1: new field)
+        details = {
+            "jaccard": round(jaccard, 4),
+            "overlap": sorted(overlap)[:10],
+            "missing_from_cvs": missing_from_cvs,
+            "missing_from_in_scope": missing_from_in_scope,
+        }
+        result.non_blocking_improvements.append({
+            "code": "scope_cvs_in_scope_mismatch",
+            "severity": "warning",
+            "evidence": evidence,
+            "details": details,
+            "suggested_action": "Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、乖離理由を Background / Scope Delta に記載する",
+        })
 
 
 def detect_warning_vc_untracked_false_negative(body: str, result: CheckerResult) -> None:
