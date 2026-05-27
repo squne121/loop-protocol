@@ -115,6 +115,8 @@ orchestrator は data-plane 操作を直接行わない。
 - 5 を上限とすることで「無限ループ防止」と「genuine な fix cycle 許容」を両立
 - 5 超過は「根本的な contract の問題」として人間判断へ委ねる
 
+> `max_iterations=5` は運用上の安全上限値であり、実測に基づく最適値ではない。無限の review/implementation ループを防ぐための暫定キャップである。運用ログから適切なしきい値が判明した場合は、ワークフロー変更プロセスを通じて値を更新すること。
+
 ## State Model
 
 `LOOP_STATE` の完全フィールド定義は `.claude/skills/impl-review-loop/SKILL.md` の `## LOOP_STATE YAML` セクションを参照する。
@@ -291,17 +293,19 @@ orchestrator は data-plane 操作を直接行わない。
 | product_spec_preflight 実装 | `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` | routing table の設計意図を説明 | スクリプトロジックを複製 |
 | Issue contract 着手条件 | `docs/dev/workflow.md` の `## Issue contract を作業計画の正本として扱う条件` | 設計根拠へのリンク | 条件を複製 |
 
-## References
+## Traceability
 
 実装 Issue および関連 Issue:
-- #392 CLOSED: issue-refinement-loop の deterministic planner/checker script 抽出
-- #393 CLOSED: issue-refinement-loop SKILL.md を thin entrypoint + references 構成へ分割
-- #394 CLOSED: SubAgent 固有契約の SubAgent 側への移管
-- #384 CLOSED: 関連ループ改善
-- #385 OPEN: 関連ループ改善
-- #387 OPEN: 関連ループ改善
-- #410 CLOSED: baseline_vc_preflight classifier 拡張
-- #422 CLOSED: 本設計書の作成 Issue
+- #392: issue-refinement-loop の deterministic planner/checker script 抽出
+- #393: issue-refinement-loop SKILL.md を thin entrypoint + references 構成へ分割
+- #394: SubAgent 固有契約の SubAgent 側への移管
+- #384: 関連ループ改善
+- #385: 関連ループ改善
+- #387: 関連ループ改善
+- #410: baseline_vc_preflight classifier 拡張
+- #422: 本設計書の作成 Issue
+
+> Issue / PR の現在状態は GitHub 側を正本とし、本設計書では複製しない。
 
 ## 実体参照
 

@@ -324,6 +324,11 @@ directory_mappings:
       - docs/dev/product-spec-lifecycle.md
       - docs/product/requirements.md
       - docs/adr/0002-sdd-tool-adoption.md
+  - pattern: "docs/dev/workflows/**"
+    ssots:
+      - docs/dev/workflow.md
+      - docs/dev/agent-skill-boundaries.md
+      - docs/dev/ssot-registry.md
 ```
 
 ---
