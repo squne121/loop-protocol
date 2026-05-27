@@ -1,3 +1,11 @@
+---
+adr_id: "0001"
+title: "Architecture Baseline"
+status: accepted
+date: "2025-01-01"
+related_issue: "#2"
+---
+
 # ADR 0001: Architecture Baseline
 
 ECS 風の責務分離、固定タイムステップ、データ駆動設計をこのプロジェクトの初期方針とする。
