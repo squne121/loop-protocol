@@ -1,0 +1,67 @@
+name: session-manifest
+
+# Trigger on push and pull_request only.
+# Elevated-privilege trigger is intentionally excluded (no write permissions needed).
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Minimal read-only permissions — no write access, no secrets exposure.
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate agent session manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate session manifest artifact
+        run: |
+          mkdir -p artifacts
+          # Generate manifest via producer script.
+          # Manifest JSON is written to artifacts/ only — NOT to stdout, log, or any public surface.
+          node scripts/generate-session-manifest.mjs \
+            --repository "${{ github.repository }}" \
+            --phase-main-loop impl \
+            --phase-ledger-phase post_commit_verification \
+            --phase-instance-id "issue-402:impl:001" \
+            --actor-type github_action \
+            --actor-name session-manifest-workflow \
+            --evidence-source-kind ci_check \
+            --evidence-source-ref "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --evidence-visibility private_artifact \
+            --format json \
+            --validate \
+            > artifacts/private-agent-session-manifest-ci.json
+          # Verify file was written (no content in logs)
+          test -s artifacts/private-agent-session-manifest-ci.json
+          echo "Manifest artifact generated successfully."
+
+      - name: Upload session manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-agent-session-manifest-${{ github.run_id }}
+          path: artifacts/private-agent-session-manifest-ci.json
+          if-no-files-found: error
+          retention-days: 7

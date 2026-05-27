@@ -317,12 +317,84 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 | Claude hook（Stop/SubagentStop での自動実行）| 実装済み | #325 |
 | Skill（操作手順の標準化・手動呼び出し）| 実装済み | #326 |
 | 人間導入手順書（onboarding）| 実装済み | #245 |
+| manifest producer hook wiring（Stop/SubagentStop/PostToolUse）| 実装済み | #402 |
+| GitHub Actions artifact workflow（private artifact のみ）| 実装済み | #402 |
 | pilot smoke test（Kill Switch 動作確認）| 未実装 | #246 |
 
 > **重要**: deterministic manifest producer、manifest schema validation path、
 > no-push / private checkpoint / local-only verifier、Kill Switch runtime smoke test、
 > Skill 手順 (#326)、pilot smoke test (#246) が完了するまで、
 > full transcript を生成する session 記録ツールの pilot / 本番運用を開始しないこと。
+
+---
+
+## manifest producer lifecycle（Hook + CI）
+
+manifest producer（`scripts/generate-session-manifest.mjs`）は以下の自動 lifecycle で呼び出される。
+
+### Claude Code hook lifecycle
+
+`.claude/settings.json` の hooks セクションで以下のイベントが wiring されている。
+
+| イベント | hooks（順序固定） |
+|---|---|
+| Stop | 1. `session_recording_policy_guard.sh`（policy guard、先行評価）→ 2. `generate_session_manifest_from_hook.mjs`（producer） |
+| SubagentStop | 1. `session_recording_policy_guard.sh`（policy guard、先行評価）→ 2. `generate_session_manifest_from_hook.mjs`（producer） |
+| PostToolUse | `generate_session_manifest_from_hook.mjs`（matcher で対象 tool を限定） |
+| SessionStart | 対象外（context 混入リスクが高いため除外） |
+
+hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
+- stdin の hook JSON を読み取り、producer CLI 引数へ変換する
+- stdout は完全に沈黙させる（manifest JSON を stdout に出さない）
+- `transcript_path` / `cwd` の絶対パスを public output に含めない
+- artifact file へ atomic write（temp + rename）を行う
+- 同一 content hash の artifact が既にあれば duplicate skip する
+
+`session_recording_policy_guard.sh` は Stop / SubagentStop で producer hook より前に評価される（順序固定）。
+
+### GitHub Actions CI lifecycle
+
+`.github/workflows/session-manifest.yml` が `push` / `pull_request` trigger で実行される。
+
+| 設定項目 | 値 |
+|---|---|
+| trigger | `push` + `pull_request`（`pull_request_target` は不使用） |
+| permissions | `contents: read`（read-only、write 権限なし） |
+| persist-credentials | `false` |
+| artifact upload | `actions/upload-artifact@v4`、`retention-days: 7`、`if-no-files-found: error` |
+| artifact name prefix | `private-agent-session-manifest` |
+
+---
+
+## private artifact channel（禁止チャネル）
+
+manifest の出力先は **GitHub Actions artifact only**（private channel）とする。
+以下のチャネルへの manifest 本文の出力は **禁止**。
+
+| チャネル | 禁止理由 |
+|---|---|
+| workflow log（`echo` / `cat` 等） | public log に manifest content が混入する |
+| Issue / PR comment（`gh issue comment` / `gh pr comment`） | public surface に manifest が露出する |
+| git commit（commit message / blob） | git history に manifest が残る |
+| stdout（hook wrapper 経由） | hook stdout は Claude Code に取り込まれる可能性がある |
+
+manifest を参照する必要がある場合は、GitHub Actions の artifact download を経由する。
+
+---
+
+## #412 との境界
+
+本文書のスコープ（#402）は **hook / CI wiring と private artifact channel の設計**に限定する。
+
+upstream security boundary として `#412` が担当する範囲は以下のとおり。
+
+| 境界 | 担当 |
+|---|---|
+| Secret 値を manifest producer pipeline に到達させない upstream 統制 | `#412` |
+| Secret scan / token rotation / rotate-on-leak 手順 | `#412` + `docs/dev/secret-policy.md` |
+| manifest validation gate を CI required check に昇格する enforcement | 別 follow-up |
+
+`#412` が完了するまでは、manifest には Secret を含まない前提で運用する（`secrets_mode: none`）。
 
 ---
 
@@ -335,8 +407,12 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 - `CLAUDE.md` — プロジェクト入口
 - `.claude/rules/project-constitution.md` — 運用ルールの正本
 - `.claude/scripts/check_session_recording_policy.py` — policy 構造検証スクリプト（11 項目）
+- `.claude/hooks/generate_session_manifest_from_hook.mjs` — hook wrapper（producer 呼び出し）
+- `.github/workflows/session-manifest.yml` — CI artifact workflow
 - Issue #136 — session 記録ツール導入判断（親 Issue）
 - Issue #241 — `secret_policy/v1` SSOT 化（PR #317 完了）
 - Issue #243 — `agent_session_manifest/v1` schema SSOT 化（PR #314 完了）
 - Issue #245 — session 記録ツール人間導入手順書（実装済み / PR #347）
 - Issue #246 — pilot smoke test（実装予定）
+- Issue #402 — hook + CI wiring 実装（本 Issue）
+- Issue #412 — upstream security boundary（Secret 管理）

@@ -47,6 +47,12 @@
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
             "args": [],
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
+            "args": [],
+            "timeout": 60
           }
         ]
       }
@@ -59,6 +65,25 @@
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh",
             "args": [],
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
+            "args": [],
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
+            "args": [],
+            "timeout": 60
           }
         ]
       }
