@@ -1,0 +1,146 @@
+[
+  {
+    "issue_number": 151,
+    "title": "実装: issue-refinement-loop に delivery-rollup parent の未起票 child slot 検出 guard を追加する",
+    "current_state": "OPEN",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed by the fail-closed delivery-rollup child materialization and follow-up materialization rules.",
+    "evidence": {
+      "pr_numbers": [341, 413],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/follow-up-materialization.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 203,
+    "title": "改善: issue-refinement-loop の web-researcher Step 1b に transient auth failure への 1-retry 機構を追加する",
+    "current_state": "CLOSED",
+    "decision": "superseded",
+    "github_close_state": "not_planned",
+    "reasoning": "Superseded as retry responsibility shifted to the SubAgent itself autonomously.",
+    "evidence": {
+      "pr_numbers": [],
+      "file_paths": [],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 220,
+    "title": "実装: issue-refinement-loop の Scope 変更シグナル検出に anchor-comment 由来 reframe の除外規定を追加する",
+    "current_state": "OPEN",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed into scope signal guard reference via thin entrypoint implementation.",
+    "evidence": {
+      "pr_numbers": [407, 413],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/scope-signal-guard.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 228,
+    "title": "実装: issue-refinement-loop が anchor_comment_url 未指定時に trusted author コメントを自動検出して Step 0a/0b を起動する",
+    "current_state": "OPEN",
+    "decision": "superseded",
+    "github_close_state": "not_planned",
+    "reasoning": "Superseded by the thin entrypoint architectural shift, where orchestrator or CLI explicitly pass the anchor comment URL."
+  },
+  {
+    "issue_number": 252,
+    "title": "実装: issue-refinement-loop がコメントフィードバックの AC/VC 修正案を Issue 本文に反映していることを確認するチェックを追加",
+    "current_state": "OPEN",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed into ac-vc reflection reference.",
+    "evidence": {
+      "pr_numbers": [413],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/ac-vc-reflection.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 300,
+    "title": "docs(issue-refinement-loop): superseded_by_decision / max_iterations 終了時の派生改善候補追跡手順を明確化する",
+    "current_state": "OPEN",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed into the termination policy documentation.",
+    "evidence": {
+      "pr_numbers": [413],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/termination-policy.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 185,
+    "title": "運用: issue-refinement-loop SKILL.md の自動起票セクションで候補収集 SubAgent 名を明示する",
+    "current_state": "OPEN",
+    "decision": "superseded",
+    "github_close_state": "not_planned",
+    "reasoning": "Superseded by the SubAgent-owned contract migration which redefines data flow."
+  },
+  {
+    "issue_number": 186,
+    "title": "運用: impl-review-loop 以外の skill 終了コメントにも note_only_observations / follow_up_issues フィールドを統一する",
+    "current_state": "OPEN",
+    "decision": "still_needed",
+    "github_close_state": null,
+    "reasoning": "Cross-cutting concern. Should not be closed in a single phase according to review feedback."
+  },
+  {
+    "issue_number": 30,
+    "title": "実装: Out of Scope / Remaining Parent Gaps を実 Issue として必ず起票する手順を create-issue / review-issue / refinement-loop に組み込む",
+    "current_state": "OPEN",
+    "decision": "still_needed",
+    "github_close_state": null,
+    "reasoning": "Cross-cutting concern. Should not be closed in a single phase according to review feedback."
+  },
+  {
+    "issue_number": 247,
+    "title": "実装: web-researcher / gemini-cli-headless-delegation に grounding failure retry と direct fallback 判定を集約する",
+    "current_state": "CLOSED",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed via WEB_RESEARCH_RESULT_V1 schema migration.",
+    "evidence": {
+      "pr_numbers": [403],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/web-research-routing.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 248,
+    "title": "実装: gemini-cli-headless-delegation に REPO_EVIDENCE_REF_V1 を追加し file evidence の commit_sha 固定・excerpt_sha256 検証を SSOT 化する",
+    "current_state": "CLOSED",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Absorbed via REPO_EVIDENCE_REF_V1 acting as SSOT.",
+    "evidence": {
+      "pr_numbers": [406],
+      "file_paths": [".claude/skills/issue-refinement-loop/references/anchor-comment-handling.md"],
+      "ac_vc_refs": []
+    }
+  },
+  {
+    "issue_number": 339,
+    "title": "改善: speckit-taskstoissues に LOOP_PROTOCOL adapter alignment を追加する（Follow-up D）",
+    "current_state": "OPEN",
+    "decision": "still_needed",
+    "github_close_state": null,
+    "reasoning": "Still needed as this is an active speckit-taskstoissues improvement."
+  },
+  {
+    "issue_number": 389,
+    "title": "perf(claude): #295 軽量化後の runtime /usage 計測（3 代表 Issue）",
+    "current_state": "CLOSED",
+    "decision": "absorbed",
+    "github_close_state": "completed",
+    "reasoning": "Performance measurement task was completed during the #295 lightweighting.",
+    "evidence": {
+      "pr_numbers": [388],
+      "file_paths": [],
+      "ac_vc_refs": []
+    }
+  }
+]

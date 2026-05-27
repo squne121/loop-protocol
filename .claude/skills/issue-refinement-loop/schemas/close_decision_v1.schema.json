@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.local/schemas/CLOSE_DECISION_V1.schema.json",
+  "title": "CLOSE_DECISION_V1",
+  "type": "object",
+  "description": "Structured data representing a decision to close or retain an improvement issue.",
+  "properties": {
+    "issue_number": {
+      "type": "integer",
+      "description": "The GitHub issue number."
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["absorbed", "superseded", "still_needed", "blocked"],
+      "description": "The classification of the decision. 'absorbed' (implemented elsewhere), 'superseded' (no longer needed due to new structure), 'still_needed' (keep open as standalone), 'blocked' (requires other dependencies)."
+    },
+    "github_close_state": {
+      "type": ["string", "null"],
+      "enum": ["completed", "not_planned", null],
+      "description": "How the issue should be closed on GitHub. Use 'completed' for absorbed, 'not_planned' for superseded, and null for others."
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Evidence required for 'absorbed' decisions.",
+      "properties": {
+        "pr_numbers": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "file_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ac_vc_refs": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["pr_numbers", "file_paths", "ac_vc_refs"],
+      "additionalProperties": false
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "Detailed reasoning for the decision."
+    }
+  },
+  "required": ["issue_number", "decision", "reasoning"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "decision": { "const": "absorbed" }
+        }
+      },
+      "then": {
+        "required": ["evidence"],
+        "properties": {
+          "github_close_state": { "const": "completed" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision": { "const": "superseded" }
+        }
+      },
+      "then": {
+        "properties": {
+          "github_close_state": { "const": "not_planned" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "enum": ["still_needed", "blocked"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "github_close_state": { "type": "null" }
+        }
+      }
+    }
+  ]
+}
