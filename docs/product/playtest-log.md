@@ -23,28 +23,33 @@ trace_links:
 session_id: "PT-YYYYMMDD-001"
 date: "YYYY-MM-DD"
 build_ref: "<commit-sha-or-release-tag>"
-session_mode: "human_internal | ai_simulation | browser_automation" # Maps to Issue #417 execution_mode
-tester_profile: "developer | target_player_layer | ai_agent"
+execution:
+  mode: "human_developer | ai_agent | scripted_automation | ci_browser_automation"
+  actor_id: "developer-self | combat-agent-v1 | playwright-ci"
+  trigger: "manual | ci | agent_loop"
 environment: "browser-chrome | local-dev | automated-ci"
 privacy:
   pii_reviewed: true
   raw_recording_committed: false
 
 # AI/Automation Metadata (Optional)
-# AI/自動化結果は UX・感情証拠ではない。UX影響がある場合は human_review_required: true とする。
+# Default: automation: null
 automation:
   agent_profile: ""
   random_seed: null
   reproduction_command: ""
   metrics:
+    # Invariant: success_rate = success_count / runs
     runs: 0
     success_count: 0
     failure_count: 0
     success_rate: null          # 0.0 - 1.0
     death_count: 0
     death_rate: null
-    duration_ms_p50: 0
-    duration_ms_p95: 0
+    duration:
+      p50: 0
+      p95: 0
+      unit: "ms"
     input_count_total: 0
     collision_count_total: 0
   artifacts:
@@ -54,8 +59,8 @@ automation:
     trace_ref: ""
     replay_ref: ""
     input_script_ref: ""
+    trace_redacted: true        # Required for secure handling
   human_review_required: false  # UX影響・違和感がある場合は true
-  ai_result_is_ux_evidence: false # 固定: AI結果を直接のUX証拠としない
 
 playtest_entries:
   - entry_id: "PTE-001"
@@ -86,14 +91,20 @@ playtest_entries:
     validation_method: "human_internal | ai_simulation | browser_automation | manual_reproduction"
 ```
 
+
+## Policies
+- `ai_result_is_ux_evidence: false` # AI結果を直接のUX証拠としない
+
 ## Example Entry (Draft)
 
 ```yaml
 session_id: "PT-20260527-001"
 date: "2026-05-27"
 build_ref: "3f0e79d"
-session_mode: "human_internal"
-tester_profile: "developer"
+execution:
+  mode: "human_developer"
+  actor_id: "developer-self"
+  trigger: "manual"
 environment: "browser-chrome"
 privacy:
   pii_reviewed: true
@@ -110,17 +121,19 @@ automation:
     success_rate: 0.85
     death_count: 10
     death_rate: 0.1
-    duration_ms_p50: 12000
-    duration_ms_p95: 15500
+    duration:
+      p50: 12000
+      p95: 15500
+      unit: "ms"
     input_count_total: 4500
     collision_count_total: 120
   artifacts:
-    metrics_json: "docs/playtest/artifacts/PT-20260527-001/metrics.json"
-    trace_ref: "docs/playtest/artifacts/PT-20260527-001/trace.zip"
-    replay_ref: "docs/playtest/artifacts/PT-20260527-001/replay.mp4"
+    metrics_json: "external-secure-storage:PT-20260527-001/metrics.json"
+    trace_ref: "external-secure-storage:PT-20260527-001/trace.zip"
+    replay_ref: "external-secure-storage:PT-20260527-001/replay.mp4"
     input_script_ref: "tests/e2e/scenarios/combat-stress-test.js"
+    trace_redacted: true
   human_review_required: true
-  ai_result_is_ux_evidence: false
 
 playtest_entries:
   - entry_id: "PTE-001"
