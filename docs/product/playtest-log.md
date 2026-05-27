@@ -262,6 +262,35 @@ playtest_entries:
 ]
 ```
 
+#### Event-specific `data` Contract
+
+| event_type | required data fields | derived metric use |
+|---|---|---|
+| session_start | `build_ref`, `scenario_id`, `random_seed` | session identifier seeding |
+| session_end | `duration_ms`, `aborted` | session aggregate |
+| scenario_start | `scenario_id` | scenario boundary |
+| scenario_end | `scenario_id`, `outcome` | scenario aggregate |
+| input_summary | `input_count`, `duration_ms` | `input_count_total`, duration metrics |
+| collision | `source_entity_id`, `target_entity_id`, `collision_kind` | `collision_count_total` |
+| hit | `source_entity_id`, `target_entity_id`, `weapon_id` | hit-derived metrics |
+| damage | `target_entity_id`, `amount`, `damage_type`, `source_entity_id?` | `damage_taken_total`, `death_count` precondition |
+| death | `entity_id`, `cause`, `tick` | `death_count` |
+| sortie_clear | `scenario_id`, `clear_reason` | `success_count` |
+| sortie_fail | `scenario_id`, `failure_reason` | `failure_count` |
+| reward_granted | `recipient_id`, `reward_kind`, `amount` | reward analytics |
+| debrief_summary | `scenario_id`, `summary_text` | post-scenario log |
+
+#### events.jsonl Format Rules
+- encoding: UTF-8
+- bom: MUST NOT be present
+- line_format: one compact JSON object per line
+- blank_lines: MUST NOT be present
+- line_terminator: LF (`\n`); final newline SHOULD be present
+- file_extension: `.jsonl`
+- validation:
+  - every line MUST parse independently as JSON
+  - every parsed value MUST be an object
+
 #### Event Envelope Spec
 
 events.jsonl の各行は以下のフィールドを持つ JSON オブジェクトである:
@@ -293,9 +322,10 @@ metrics.json の fenced JSON example（parse 可能な内容）:
 ```json
 {
   "schema_version": "playtest.metrics.v1",
-  "computed_from": "events.jsonl",
   "session_id": "PT-20260528-001",
   "build_ref": "1965306",
+  "scenario_id": "scenario-combat-001",
+  "random_seed": 42,
   "raw": {
     "run_count": 100,
     "success_count": 85,
@@ -306,12 +336,49 @@ metrics.json の fenced JSON example（parse 可能な内容）:
     "damage_taken_total": 450
   },
   "derived": {
-    "success_rate": 0.85
+    "success_rate": 0.85,
+    "duration_ms_p50": 12000,
+    "duration_ms_p95": 15500
   },
-  "duration_ms_p50": 12000,
-  "duration_ms_p95": 15500
+  "computed_from": "events.jsonl",
+  "computed_by": "ci_scripts"
 }
 ```
+
+#### `metrics.json` Field Definitions
+
+| field | path | type | required | unit | aggregation source | rounding | missing policy |
+|---|---|---|---|---|---|---|---|
+| schema_version | `$.schema_version` | string | yes | — | constant `"playtest.metrics.v1"` | — | MUST be present |
+| session_id | `$.session_id` | string | yes | — | session_start.session_id | — | MUST be present |
+| build_ref | `$.build_ref` | string | yes | — | session_start.build_ref | — | MUST be present |
+| scenario_id | `$.scenario_id` | string | yes | — | session_start.scenario_id | — | MUST be present |
+| random_seed | `$.random_seed` | integer | yes | — | session_start.random_seed | — | `null` if not seeded |
+| raw.run_count | `$.raw.run_count` | integer | yes | count | count of scenario_start | — | 0 if no scenario |
+| raw.success_count | `$.raw.success_count` | integer | yes | count | count of sortie_clear | — | 0 |
+| raw.failure_count | `$.raw.failure_count` | integer | yes | count | count of sortie_fail | — | 0 |
+| raw.aborted_count | `$.raw.aborted_count` | integer | yes | count | scenario_end without sortie_clear/fail | — | 0 |
+| raw.death_count | `$.raw.death_count` | integer | yes | count | count of death | — | 0 |
+| raw.collision_count_total | `$.raw.collision_count_total` | integer | yes | count | count of collision | — | 0 |
+| raw.damage_taken_total | `$.raw.damage_taken_total` | integer | yes | hp | sum of damage.amount | floor | 0 |
+| derived.success_rate | `$.derived.success_rate` | number | yes | fraction (0.0-1.0) | `success_count / run_count` | 4 decimal places | `null` if run_count == 0 |
+| derived.duration_ms_p50 | `$.derived.duration_ms_p50` | number | yes | ms | scenario duration percentile | round half to even | `null` if run_count == 0 |
+| derived.duration_ms_p95 | `$.derived.duration_ms_p95` | number | yes | ms | scenario duration percentile | round half to even | `null` if run_count == 0 |
+| computed_from | `$.computed_from` | string | yes | — | constant `"events.jsonl"` | — | MUST be `"events.jsonl"` |
+| computed_by | `$.computed_by` | string | yes | — | runner identifier | — | MUST be present |
+
+#### Mapping: `automation.metrics` -> `metrics.json`
+
+| automation.metrics (PR #418) | metrics.json | note |
+|---|---|---|
+| `runs` | `raw.run_count` | same denominator |
+| `success_count` | `raw.success_count` | count |
+| `failure_count` | `raw.failure_count` | count |
+| `aborted_count` | `raw.aborted_count` | count |
+| `success_rate` | `derived.success_rate` | same 0.0-1.0 fraction |
+| `duration.p50` + `duration.unit: ms` | `derived.duration_ms_p50` | derived from scenario durations |
+| `duration.p95` + `duration.unit: ms` | `derived.duration_ms_p95` | derived from scenario durations |
+| `collision_count_total` | `raw.collision_count_total` | same count |
 
 #### Invariants
 
@@ -321,7 +388,7 @@ metrics.json の fenced JSON example（parse 可能な内容）:
 - `0.0 <= success_rate <= 1.0`
 - `success_rate == success_count / run_count`
 - `duration_ms_p95 >= duration_ms_p50`
-- `metrics.computed_from MUST reference events.jsonl`
+- `$.computed_from == "events.jsonl"`
 - `raw trace artifacts MUST NOT be committed to public repo`
 
 #### 単位規約
@@ -342,3 +409,17 @@ metrics.json の fenced JSON example（parse 可能な内容）:
 - `metrics.redacted.json` 命名規約: PII・機密データを除去した metrics の公開版は `metrics.redacted.json` という名前で管理する。
 - trace artifact は `external-secure-artifact://<session_id>/trace.zip` の形式で参照する（外部セキュアストレージへの URI scheme）。
 - raw artifact（trace / replay / events.jsonl）は public repo に commit してはならない（`raw_artifact_committed: false` を維持する）。
+
+#### Artifact Reference Metadata
+
+各 artifact 参照には以下のフィールドを必須とする:
+
+| field | type | required | description |
+|---|---|---|---|
+| artifact_uri | string | yes | `external-secure-artifact://` または `artifacts/playtest/{session_id}/...` |
+| artifact_type | string (enum) | yes | `events_jsonl` / `metrics_json` / `metrics_redacted_json` / `playwright_trace` / `replay` |
+| public_repo_safe | boolean | yes | `metrics.redacted.json` のみ true、他は false |
+| contains | array<string> | yes | `event_stream` / `derived_metric` / `dom_snapshot` / `screenshot` / `network_request` / `console_log` / `source_location` 等 |
+| redaction_status | string (enum) | yes | `pending` / `reviewed` / `not_applicable` |
+| retention_policy | string (enum) | yes | `local_ephemeral` / `secure_vault` / `ci_artifact_private` |
+| raw_artifact_committed | boolean | yes | public repo に raw artifact をコミットしているか（playtest-log.md 上は MUST be `false`） |
