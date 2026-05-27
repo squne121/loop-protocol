@@ -50,8 +50,8 @@
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
-            "args": [],
+            "command": "node",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs"],
             "timeout": 60
           }
         ]
@@ -68,8 +68,8 @@
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
-            "args": [],
+            "command": "node",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs"],
             "timeout": 60
           }
         ]
@@ -77,12 +77,12 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Edit|Write|Read",
+        "matcher": "Bash|Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs",
-            "args": [],
+            "command": "node",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs"],
             "timeout": 60
           }
         ]

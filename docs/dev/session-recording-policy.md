@@ -344,11 +344,16 @@ manifest producer（`scripts/generate-session-manifest.mjs`）は以下の自動
 | SessionStart | 対象外（context 混入リスクが高いため除外） |
 
 hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
-- stdin の hook JSON を読み取り、producer CLI 引数へ変換する
+- stdin の hook JSON を読み取り、producer CLI 引数へ変換する（hook_event_name / session_id / tool_name / tool_use_id / agent_id を抽出）
 - stdout は完全に沈黙させる（manifest JSON を stdout に出さない）
 - `transcript_path` / `cwd` の絶対パスを public output に含めない
 - artifact file へ atomic write（temp + rename）を行う
-- 同一 content hash の artifact が既にあれば duplicate skip する
+- 同一 stable key（`hookEventName:toolName:ledgerPhase`）の artifact が既にあれば duplicate skip する
+- **best-effort artifact generation**: producer 失敗 / artifact 書き込み失敗時は `exit 0` でセッションをブロックしない（stderr にログを出力）
+
+> **注意（#412 境界）**: artifact に Secret が混入しない保証は `#412` 完了まで **保留**。
+> 現状は `secrets_mode: none` 前提で運用する。
+> "private artifact" とは「retention-limited GitHub Actions artifact」を指し、Secret 境界の完全な保証ではない。
 
 `session_recording_policy_guard.sh` は Stop / SubagentStop で producer hook より前に評価される（順序固定）。
 
@@ -368,7 +373,10 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 ## private artifact channel（禁止チャネル）
 
-manifest の出力先は **GitHub Actions artifact only**（private channel）とする。
+manifest の出力先は **retention-limited GitHub Actions artifact**（private artifact channel）とする。
+「private artifact」は「GitHub Actions artifact として保存され、保持期間付きで管理される」ことを指す。
+Secret 境界の完全な保護は `#412` が担当し、本スコープ（#402）では保証しない。
+
 以下のチャネルへの manifest 本文の出力は **禁止**。
 
 | チャネル | 禁止理由 |
@@ -395,6 +403,7 @@ upstream security boundary として `#412` が担当する範囲は以下のと
 | manifest validation gate を CI required check に昇格する enforcement | 別 follow-up |
 
 `#412` が完了するまでは、manifest には Secret を含まない前提で運用する（`secrets_mode: none`）。
+`#412` 完了まで **Secret 混入は保証外** であり、Safety Claim Matrix の "Not controlled" 列に該当する。
 
 ---
 
