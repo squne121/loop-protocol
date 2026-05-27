@@ -23,7 +23,7 @@ trace_links:
 session_id: "PT-YYYYMMDD-001"
 date: "YYYY-MM-DD"
 build_ref: "<commit-sha-or-release-tag>"
-session_mode: "human_internal | ai_simulation | browser_automation"
+session_mode: "human_internal | ai_simulation | browser_automation" # Maps to Issue #417 execution_mode
 tester_profile: "developer | target_player_layer | ai_agent"
 environment: "browser-chrome | local-dev | automated-ci"
 privacy:
@@ -48,6 +48,8 @@ automation:
     input_count_total: 0
     collision_count_total: 0
   artifacts:
+    # WARNING: DO NOT commit raw recordings or PII to the repository.
+    # Ensure privacy.pii_reviewed is true before referencing artifacts.
     metrics_json: ""
     trace_ref: ""
     replay_ref: ""
@@ -144,5 +146,5 @@ playtest_entries:
     decision: "implementation_issue"
     proposed_spec_delta: ""
     linked_issue: "#000"
-    validation_method: "automated test"
+    validation_method: "browser_automation"
 ```
