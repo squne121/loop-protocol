@@ -92,6 +92,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build for E2E
+        run: VITE_E2E_MODE=true pnpm build
       - name: Install Playwright Chromium browser
         run: pnpm playwright:install:ci
       - name: Run E2E tests
