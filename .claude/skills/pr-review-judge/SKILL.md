@@ -288,6 +288,7 @@ blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
+recommendations: []  # APPROVE + MERGEABLE + BEHIND のとき [update_branch]。有効値: update_branch
 follow_up_issue_requests:
   - title: "<follow-up タイトル>"
     issue_kind: implementation | research | parent

@@ -51,11 +51,55 @@ fi
 | verdict | mergeable | merge_state_status | 次アクション |
 |---|---|---|---|
 | `APPROVE` | `MERGEABLE` | `CLEAN` or `UNSTABLE` | 終了（approved） |
-| `APPROVE` | `MERGEABLE` | `BEHIND` | approved（update-branch 自動化は #67 の責務） |
+| `APPROVE` | `MERGEABLE` | `BEHIND` | BEHIND 分岐: `gh pr update-branch` を実行し、完了後 merge_state_status を再確認する |
 | `APPROVE` | `MERGEABLE` | `BLOCKED` | branch protection 設定待ち。人間判断 |
 | `REQUEST_CHANGES` | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
 | 任意 | `CONFLICTING` | `DIRTY` | CONFLICTING PR Escalation Runbook 発動 |
 | 任意 | `UNKNOWN` | 任意 | 5 秒待機 × 最大 3 回 retry、それでも UNKNOWN なら human_escalation |
+
+## BEHIND 分岐: `gh pr update-branch` 実行手順
+
+`verdict=APPROVE` かつ `mergeable=MERGEABLE` かつ `mergeStateStatus=BEHIND` の場合、以下の手順で base branch に追従させる。
+
+```bash
+# 1. update-branch を実行（base の最新コミットを head に merge）
+gh pr update-branch "$PR_NUMBER"
+
+# 2. GitHub API が merge_state_status を再計算するまで待機（最大 30 秒）
+for i in 1 2 3 4 5 6; do
+  sleep 5
+  NEW_STATUS=$(gh pr view "$PR_NUMBER" --json mergeStateStatus --jq .mergeStateStatus)
+  echo "[update-branch] attempt $i: mergeStateStatus=$NEW_STATUS"
+  [ "$NEW_STATUS" != "BEHIND" ] && break
+done
+
+# 3. 再確認結果に応じて次アクションを分岐
+case "$NEW_STATUS" in
+  CLEAN|UNSTABLE)
+    echo "[update-branch] OK: mergeStateStatus=$NEW_STATUS → merge 可能"
+    ;;
+  DIRTY|CONFLICTING)
+    echo "[update-branch] CONFLICTING 検出 → CONFLICTING PR Escalation Runbook を発動"
+    # BEHIND から update-branch 実行後に CONFLICTING / DIRTY になった場合も
+    # 通常の CONFLICTING と同じ Escalation Runbook に従う
+    ;;
+  BEHIND)
+    echo "[update-branch] 依然 BEHIND → human_escalation"
+    ;;
+  *)
+    echo "[update-branch] UNKNOWN または BLOCKED → human_escalation"
+    ;;
+esac
+```
+
+### BEHIND 後 CONFLICTING 発生時の Escalation 経路
+
+`gh pr update-branch` 実行後に `mergeStateStatus` が `DIRTY` または `CONFLICTING` になった場合は、判定表の `任意 | CONFLICTING | DIRTY` 行と同様に **CONFLICTING PR Escalation Runbook** を発動する。
+
+Escalation Runbook 発動時の処理:
+1. LOOP_STATE に `conflicting_after_update_branch: true` を記録する
+2. orchestrator は `human_review_required: true` を返して人間判断を仰ぐ
+3. マージコンフリクトの解消は実装担当者（`implementation-worker`）の責務であり、orchestrator は自動解消を試みない
 
 ## 出力
 
