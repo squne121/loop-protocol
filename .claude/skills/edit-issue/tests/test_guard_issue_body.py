@@ -30,6 +30,7 @@ _spec.loader.exec_module(_mod)
 
 guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
+guard_vc_compound_shell_disallowed = _mod.guard_vc_compound_shell_disallowed
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
 validate_issue_kind = _mod.validate_issue_kind
@@ -993,3 +994,214 @@ not in VC section
         # AC が 0 件なので pass
         assert result["passed"] is True
         assert result["ac_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# guard_vc_compound_shell_disallowed のテスト (#445 AC2/AC3 対応)
+# ---------------------------------------------------------------------------
+
+def test_guard_issue_body_rejects_compound_shell_vc():
+    """
+    operator matrix テスト。各ケースを個別に検証する。
+    """
+    # --- case 1: cmd && echo PASS → FAIL（&& operator 検出）---
+    compound_body = """\
+## Verification Commands
+
+```bash
+# AC1
+cmd && echo PASS || echo FAIL
+```
+"""
+    result = guard_vc_compound_shell_disallowed(compound_body)
+    assert result["name"] == "vc_compound_shell_disallowed"
+    assert result["passed"] is False
+    assert len(result["violations"]) >= 1
+    # violations は structured diagnostics 形式
+    v0 = result["violations"][0]
+    assert v0["command"] == "cmd && echo PASS || echo FAIL"
+    assert v0["category"] == "compound_command_disallowed"
+    assert v0["operator"] in ("&&", "||")  # 最初に検出したもの
+    assert v0["ac_label"] == "AC1"
+    assert "line_number" in v0
+    assert isinstance(v0["line_number"], int)
+
+    # --- case 2: grep -E "foo|bar" file → PASS（quoted operator は誤検出しない）---
+    quoted_pipe_body = """\
+## Verification Commands
+
+```bash
+# AC2
+grep -E "foo|bar" file
+```
+"""
+    result_quoted = guard_vc_compound_shell_disallowed(quoted_pipe_body)
+    assert result_quoted["name"] == "vc_compound_shell_disallowed"
+    assert result_quoted["passed"] is True
+    assert result_quoted["violations"] == []
+
+    # --- case 3: unmatched quote (parse error) → FAIL（fail-closed）---
+    parse_error_body = """\
+## Verification Commands
+
+```bash
+# AC3
+cmd "foo
+```
+"""
+    result_parse = guard_vc_compound_shell_disallowed(parse_error_body)
+    assert result_parse["name"] == "vc_compound_shell_disallowed"
+    assert result_parse["passed"] is False
+    assert len(result_parse["violations"]) >= 1
+    v_parse = result_parse["violations"][0]
+    assert v_parse["operator"] == "_parse_error"
+    assert v_parse["category"] == "compound_command_disallowed"
+
+    # --- case 4: cmd ; cmd2 → FAIL（; operator）---
+    semicolon_body = """\
+## Verification Commands
+
+```bash
+# AC4
+cmd ; cmd2
+```
+"""
+    result_semi = guard_vc_compound_shell_disallowed(semicolon_body)
+    assert result_semi["name"] == "vc_compound_shell_disallowed"
+    assert result_semi["passed"] is False
+    assert len(result_semi["violations"]) >= 1
+    v_semi = result_semi["violations"][0]
+    assert v_semi["operator"] == ";"
+    assert v_semi["category"] == "compound_command_disallowed"
+
+    # --- case 5: violations に ac_label / line_number / operator が含まれることを検証 ---
+    structured_body = """\
+## Verification Commands
+
+```bash
+# AC5
+bad_cmd && other_cmd
+```
+"""
+    result_structured = guard_vc_compound_shell_disallowed(structured_body)
+    assert result_structured["passed"] is False
+    v_s = result_structured["violations"][0]
+    assert "ac_label" in v_s
+    assert "line_number" in v_s
+    assert "operator" in v_s
+    assert v_s["ac_label"] == "AC5"
+    assert v_s["operator"] == "&&"
+
+    # --- single command fixture: compound operator なし（既存テスト継続）---
+    single_body = """\
+## Verification Commands
+
+```bash
+# AC1
+grep -F "VC_SINGLE_COMMAND_GUARDRAIL" .claude/agents/issue-author.md
+```
+"""
+    result_single = guard_vc_compound_shell_disallowed(single_body)
+    assert result_single["name"] == "vc_compound_shell_disallowed"
+    assert result_single["passed"] is True
+    assert result_single["violations"] == []
+
+
+def _make_vc_body(command: str) -> str:
+    """単一コマンドを含む VC セクション body を生成するヘルパー。"""
+    return f"""\
+## Verification Commands
+
+```bash
+# AC1
+{command}
+```
+"""
+
+
+def test_guard_vc_compound_shell_b4_reject_punctuation_run_tokens():
+    """
+    B4: shlex punctuation run token（>&, &>, |& 等）を REJECT することを確認する。
+    """
+    # 2>&1 → shlex が >&  を punctuation run として返す
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cmd 2>&1"))
+    assert result["passed"] is False, "cmd 2>&1 should be rejected (>& is punctuation run)"
+    assert len(result["violations"]) >= 1
+    assert result["violations"][0]["category"] == "compound_command_disallowed"
+
+    # &> /dev/null → &> が punctuation run
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cmd &> /dev/null"))
+    assert result["passed"] is False, "cmd &> /dev/null should be rejected (&> is punctuation run)"
+
+    # |& tee log → |& が punctuation run
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cmd |& tee log"))
+    assert result["passed"] is False, "cmd |& tee log should be rejected (|& is punctuation run)"
+
+    # > outfile → > は exact match
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cmd > outfile"))
+    assert result["passed"] is False, "cmd > outfile should be rejected (> is exact match)"
+
+    # < infile → < は exact match
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cmd < infile"))
+    assert result["passed"] is False, "cmd < infile should be rejected (< is exact match)"
+
+    # cat << EOF → << は exact match（heredoc）
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("cat << EOF"))
+    assert result["passed"] is False, "cat << EOF should be rejected (<< is exact match)"
+
+
+def test_guard_vc_compound_shell_b4_pass_quoted_operators():
+    """
+    B4 false positive 防止: quoted operator は誤検出しないことを確認する。
+    """
+    # grep -E "foo|bar" file → quoted | は誤検出しない
+    result = guard_vc_compound_shell_disallowed(_make_vc_body('grep -E "foo|bar" file'))
+    assert result["passed"] is True, 'grep -E "foo|bar" should pass (quoted |)'
+
+    # rg 'pattern' file → single quote 内
+    result = guard_vc_compound_shell_disallowed(_make_vc_body("rg 'pattern' file"))
+    assert result["passed"] is True, "rg 'pattern' file should pass"
+
+    # test -f .claude/agents/issue-author.md → ファイルパスの - は問題なし
+    result = guard_vc_compound_shell_disallowed(
+        _make_vc_body("test -f .claude/agents/issue-author.md")
+    )
+    assert result["passed"] is True, "test -f <path> should pass (- is not shell operator)"
+
+    # grep -F "2>&1" file → quoted 2>&1 は誤検出しない
+    result = guard_vc_compound_shell_disallowed(_make_vc_body('grep -F "2>&1" file'))
+    assert result["passed"] is True, 'grep -F "2>&1" should pass (quoted 2>&1)'
+
+
+def test_guard_vc_compound_shell_b3_inline_ac_suffix():
+    """
+    B3: inline # ACN suffix からも ac_label を抽出することを確認する。
+    """
+    # inline suffix のみ（直前行に # AC<N> なし）
+    inline_body = """\
+## Verification Commands
+
+```bash
+grep -F "VC_SINGLE_COMMAND_GUARDRAIL" .claude/agents/issue-author.md  # AC1
+```
+"""
+    result = guard_vc_compound_shell_disallowed(inline_body)
+    # このコマンド自体は compound でないので passed=True
+    assert result["passed"] is True
+    assert result["violations"] == []
+
+    # inline suffix を持つ compound コマンド → violation の ac_label が抽出されること
+    inline_compound_body = """\
+## Verification Commands
+
+```bash
+cmd && echo done  # AC2
+```
+"""
+    result = guard_vc_compound_shell_disallowed(inline_compound_body)
+    assert result["passed"] is False
+    assert len(result["violations"]) >= 1
+    # inline suffix から ac_label が抽出される
+    assert result["violations"][0]["ac_label"] == "AC2"
+    # command から inline suffix が除去されていること
+    assert "# AC2" not in result["violations"][0]["command"]
