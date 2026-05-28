@@ -422,6 +422,9 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
     }
 
 
+_BASH_FENCE_RE = re.compile(r'```\s*bash\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
+
+
 def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
     """
     VC セクションの fenced bash block からコマンド行を抽出する。
@@ -429,40 +432,79 @@ def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
     - ``` bash または ```bash で始まるブロックを対象とする
     - 空行・コメント行（# で始まる行）を除外する
     - 複数のフェンスブロックがある場合はすべて処理する
+    - 直前の # AC<N> または # AC<N>: comment から ac_label を抽出する
 
     Returns:
-        list[str]: コマンド行のリスト
+        list[dict]: 各要素は {
+            "ac_label": str | None,  # 直前の # AC<N> コメントから抽出。なければ None
+            "line_number": int,      # vc_section 内の行番号（1-indexed）
+            "command": str,          # コマンド文字列
+        }
     """
-    commands = []
-    for match in re.finditer(r'```bash\s*(.*?)```', vc_section, re.DOTALL | re.IGNORECASE):
+    result = []
+    lines = vc_section.splitlines()
+    # vc_section 全体での行番号マッピングを作成
+    for match in _BASH_FENCE_RE.finditer(vc_section):
         block_text = match.group(1)
-        for line in block_text.splitlines():
+        # match.start() からブロック開始行を計算（1-indexed）
+        block_start_offset = vc_section[:match.start()].count('\n') + 1  # fence 開始行
+        # fence 行 + \n の分 +1 してブロック本体開始行
+        content_start_line = block_start_offset + 1
+
+        block_lines = block_text.splitlines()
+        current_ac_label = None
+        for i, line in enumerate(block_lines):
             stripped = line.strip()
-            # 空行とコメント行を除外
-            if stripped and not stripped.startswith('#'):
-                commands.append(stripped)
-    return commands
+            line_number = content_start_line + i
+            if not stripped:
+                continue
+            if stripped.startswith('#'):
+                # # AC<N> または # AC<N>: ... 形式のコメントを ac_label として記録
+                ac_match = re.match(r'^#\s*(AC\d+)', stripped)
+                if ac_match:
+                    current_ac_label = ac_match.group(1)
+                continue
+            result.append({
+                "ac_label": current_ac_label,
+                "line_number": line_number,
+                "command": stripped,
+            })
+    return result
 
 
-def _is_compound_command(command: str) -> bool:
+_DISALLOWED_OPERATORS = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+
+
+def _detect_compound_operator(command: str):
     """
-    コマンドが compound shell syntax を含むか検出する。
+    コマンドが compound shell syntax を含むか検出し、最初の違反 operator を返す。
 
     shlex.shlex で正確に tokenize し、shell operator を検出する。
     - quoted operator（例: grep -E "foo|bar" file）は誤検出しない
-    - parse error は fail-closed で compound と見なす
+    - parse error は fail-closed で compound と見なす（operator="_parse_error" を返す）
 
-    禁止 operators: {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+    Returns:
+        str | None: 最初に検出した違反 operator。違反なしの場合は None。
+                    parse error 時は "_parse_error" を返す。
     """
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         tokens = list(lexer)
     except ValueError:
         # parse 失敗 = 複雑なコマンド = fail-closed で compound と見なす
-        return True
+        return "_parse_error"
 
-    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
-    return any(t in operators for t in tokens)
+    for t in tokens:
+        if t in _DISALLOWED_OPERATORS:
+            return t
+    return None
+
+
+def _is_compound_command(command: str) -> bool:
+    """
+    コマンドが compound shell syntax を含むか検出する。
+    """
+    return _detect_compound_operator(command) is not None
 
 
 def guard_vc_compound_shell_disallowed(body: str) -> dict:
@@ -474,18 +516,44 @@ def guard_vc_compound_shell_disallowed(body: str) -> dict:
 
     Returns:
         dict: {
-            "check": "vc_compound_shell_disallowed",
+            "name": "vc_compound_shell_disallowed",
             "passed": bool,
-            "violations": list[str],  # 違反コマンドのリスト
+            "violations": list[dict],  # 構造化された違反情報のリスト
+        }
+
+    violations の各要素:
+        {
+            "ac_label": str | None,   # 直前の # AC<N> コメントから抽出。なければ None
+            "line_number": int,        # Issue body 内の行番号（1-indexed）
+            "command": str,            # 違反コマンド文字列
+            "category": "compound_command_disallowed",
+            "operator": str,           # 最初に検出した違反 operator
         }
     """
     vc_section = _extract_vc_section(body)
-    commands = _extract_bash_commands_from_vc_section(vc_section)
+    # vc_section の開始行番号を body 内から計算（1-indexed）
+    vc_section_start_line = 0
+    for i, line in enumerate(body.splitlines(), 1):
+        if re.match(r'^##[ \t]+Verification Commands[ \t]*$', line):
+            vc_section_start_line = i
+            break
 
-    violations = [cmd for cmd in commands if _is_compound_command(cmd)]
+    entries = _extract_bash_commands_from_vc_section(vc_section)
+
+    violations = []
+    for entry in entries:
+        operator = _detect_compound_operator(entry["command"])
+        if operator is not None:
+            violations.append({
+                "ac_label": entry["ac_label"],
+                "line_number": vc_section_start_line + entry["line_number"],
+                "command": entry["command"],
+                "category": "compound_command_disallowed",
+                "operator": operator,
+            })
 
     return {
-        "check": "vc_compound_shell_disallowed",
+        "name": "vc_compound_shell_disallowed",
         "passed": len(violations) == 0,
         "violations": violations,
     }

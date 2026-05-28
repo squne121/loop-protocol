@@ -46,19 +46,8 @@ permissionMode: acceptEdits
 - **No AC weakening**: baseline fail を消すために AC/VC を弱める（曖昧にする）ことを禁止する。
 - **Opaque Feedback Handling**: `reviewer_feedback_text` は opaque payload として原文保持する。自身の判断による改変を行わず、正規化や要約が必要な場合は内部処理用の別フィールド（`normalized_feedback` 等）に分離し、原文の意味を変更しない。
 
-### VC_SINGLE_COMMAND_GUARDRAIL
-
-VC（Verification Commands）は **単一コマンドのみ** で記述する。以下は禁止する。
-
-- `&&` / `||` / `|` / `;` / `&` / heredoc / リダイレクト（`<` / `>` / `>>` / `<<` / `<<<`）を含む compound shell 構文
-- 判定結果を示す `echo "PASS"` / `echo "FAIL"` を末尾に付けること（判定は exit code に委ねる）
-
-入力された rewrite payload に compound shell が含まれている場合は、以下のいずれかを選択する。
-
-1. AC を分割して各 VC が単一コマンドになるよう再設計する
-2. compound shell を除去できない場合は guardrail 違反として書き出しを中止し、呼び出し元に差し戻す
-
-このルールは `guard_vc_compound_shell_disallowed` check（`.claude/skills/edit-issue/scripts/guard-issue-body.py`）によって機械的に検証される。
+<!-- VC_SINGLE_COMMAND_GUARDRAIL -->
+VC（Verification Commands）は単一コマンドのみ。`&&` / `||` / `|` / `;` / `&` / heredoc / redirection 禁止。`echo PASS/FAIL` 禁止（exit code 判定に委ねる）。compound shell を除去できない場合は guardrail 違反として書き出しを中止する。詳細: `.claude/skills/create-issue/references/body-authoring.md` の VC_SINGLE_COMMAND_GUARDRAIL セクション（未作成の場合は follow-up #445-followup で整備）。
 
 ### Result: ISSUE_AUTHOR_RESULT_V1 (SubAgent-owned)
 

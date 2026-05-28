@@ -1002,15 +1002,9 @@ not in VC section
 
 def test_guard_issue_body_rejects_compound_shell_vc():
     """
-    GIVEN compound shell を含む VC
-    WHEN guard_vc_compound_shell_disallowed を呼ぶ
-    THEN passed=False を返す（違反コマンドが violations に含まれる）
-
-    GIVEN 単一コマンドのみの VC
-    WHEN guard_vc_compound_shell_disallowed を呼ぶ
-    THEN passed=True を返す
+    operator matrix テスト。各ケースを個別に検証する。
     """
-    # --- compound shell fixture: && と || を含む ---
+    # --- case 1: cmd && echo PASS → FAIL（&& operator 検出）---
     compound_body = """\
 ## Verification Commands
 
@@ -1020,12 +1014,85 @@ cmd && echo PASS || echo FAIL
 ```
 """
     result = guard_vc_compound_shell_disallowed(compound_body)
-    assert result["check"] == "vc_compound_shell_disallowed"
+    assert result["name"] == "vc_compound_shell_disallowed"
     assert result["passed"] is False
     assert len(result["violations"]) >= 1
-    assert "cmd && echo PASS || echo FAIL" in result["violations"]
+    # violations は structured diagnostics 形式
+    v0 = result["violations"][0]
+    assert v0["command"] == "cmd && echo PASS || echo FAIL"
+    assert v0["category"] == "compound_command_disallowed"
+    assert v0["operator"] in ("&&", "||")  # 最初に検出したもの
+    assert v0["ac_label"] == "AC1"
+    assert "line_number" in v0
+    assert isinstance(v0["line_number"], int)
 
-    # --- single command fixture: compound operator なし ---
+    # --- case 2: grep -E "foo|bar" file → PASS（quoted operator は誤検出しない）---
+    quoted_pipe_body = """\
+## Verification Commands
+
+```bash
+# AC2
+grep -E "foo|bar" file
+```
+"""
+    result_quoted = guard_vc_compound_shell_disallowed(quoted_pipe_body)
+    assert result_quoted["name"] == "vc_compound_shell_disallowed"
+    assert result_quoted["passed"] is True
+    assert result_quoted["violations"] == []
+
+    # --- case 3: unmatched quote (parse error) → FAIL（fail-closed）---
+    parse_error_body = """\
+## Verification Commands
+
+```bash
+# AC3
+cmd "foo
+```
+"""
+    result_parse = guard_vc_compound_shell_disallowed(parse_error_body)
+    assert result_parse["name"] == "vc_compound_shell_disallowed"
+    assert result_parse["passed"] is False
+    assert len(result_parse["violations"]) >= 1
+    v_parse = result_parse["violations"][0]
+    assert v_parse["operator"] == "_parse_error"
+    assert v_parse["category"] == "compound_command_disallowed"
+
+    # --- case 4: cmd ; cmd2 → FAIL（; operator）---
+    semicolon_body = """\
+## Verification Commands
+
+```bash
+# AC4
+cmd ; cmd2
+```
+"""
+    result_semi = guard_vc_compound_shell_disallowed(semicolon_body)
+    assert result_semi["name"] == "vc_compound_shell_disallowed"
+    assert result_semi["passed"] is False
+    assert len(result_semi["violations"]) >= 1
+    v_semi = result_semi["violations"][0]
+    assert v_semi["operator"] == ";"
+    assert v_semi["category"] == "compound_command_disallowed"
+
+    # --- case 5: violations に ac_label / line_number / operator が含まれることを検証 ---
+    structured_body = """\
+## Verification Commands
+
+```bash
+# AC5
+bad_cmd && other_cmd
+```
+"""
+    result_structured = guard_vc_compound_shell_disallowed(structured_body)
+    assert result_structured["passed"] is False
+    v_s = result_structured["violations"][0]
+    assert "ac_label" in v_s
+    assert "line_number" in v_s
+    assert "operator" in v_s
+    assert v_s["ac_label"] == "AC5"
+    assert v_s["operator"] == "&&"
+
+    # --- single command fixture: compound operator なし（既存テスト継続）---
     single_body = """\
 ## Verification Commands
 
@@ -1035,6 +1102,6 @@ grep -F "VC_SINGLE_COMMAND_GUARDRAIL" .claude/agents/issue-author.md
 ```
 """
     result_single = guard_vc_compound_shell_disallowed(single_body)
-    assert result_single["check"] == "vc_compound_shell_disallowed"
+    assert result_single["name"] == "vc_compound_shell_disallowed"
     assert result_single["passed"] is True
     assert result_single["violations"] == []
