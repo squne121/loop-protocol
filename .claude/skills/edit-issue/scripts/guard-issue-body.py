@@ -424,6 +424,24 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
 
 _BASH_FENCE_RE = re.compile(r'```\s*bash\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
 
+# inline # ACN suffix パターン（コマンド末尾の "  # AC1" や "  # AC1: comment" を抽出）
+_INLINE_AC_RE = re.compile(r'\s+#\s*(AC\d+)\b.*$')
+
+
+def _strip_inline_ac_and_extract(command_line: str) -> tuple:
+    """
+    コマンド行から inline # ACN suffix を除去し、(cleaned_command, ac_label) を返す。
+
+    例: "grep -F 'foo' file  # AC1" → ("grep -F 'foo' file", "AC1")
+    inline suffix がない場合: ("grep -F 'foo' file", None)
+    """
+    m = _INLINE_AC_RE.search(command_line)
+    if m:
+        ac_label = m.group(1)
+        clean = command_line[:m.start()]
+        return clean.strip(), ac_label
+    return command_line.strip(), None
+
 
 def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
     """
@@ -464,15 +482,42 @@ def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
                 if ac_match:
                     current_ac_label = ac_match.group(1)
                 continue
+            # inline # ACN suffix の処理（直前行 ac_label がない場合のフォールバック）
+            cleaned_command, inline_ac_label = _strip_inline_ac_and_extract(stripped)
+            effective_ac_label = current_ac_label if current_ac_label is not None else inline_ac_label
             result.append({
-                "ac_label": current_ac_label,
+                "ac_label": effective_ac_label,
                 "line_number": line_number,
-                "command": stripped,
+                "command": cleaned_command,
             })
     return result
 
 
-_DISALLOWED_OPERATORS = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+# 既知の shell operator の exact set
+_EXACT_OPERATORS = frozenset({"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"})
+
+# punctuation run に含まれる shell operator 文字
+_SHELL_OP_CHARS = frozenset("><|&;")
+
+
+def _is_shell_operator_token(token: str) -> bool:
+    """
+    shlex punctuation run token が shell operator を含むか判定する。
+
+    shlex.shlex(punctuation_chars=True) は ();<>|& の連続を単一 punctuation run token
+    として返す。例: `2>&1` → tokens: ['2', '>&', '1'] の `>&` が該当する。
+
+    - exact match: 既知の operator セットに含まれる場合
+    - punctuation run: 全文字が ();<>|& かつ、shell operator 文字を含む場合
+    """
+    # exact match: 既知の operator
+    if token in _EXACT_OPERATORS:
+        return True
+    # punctuation run: 全文字が ();<>|& かつ、shell operator 文字を含む
+    # 例: >&, &>, |&, 2>&1 分割後の >&
+    if token and all(c in "();<>|&" for c in token) and any(c in _SHELL_OP_CHARS for c in token):
+        return True
+    return False
 
 
 def _detect_compound_operator(command: str):
@@ -482,6 +527,7 @@ def _detect_compound_operator(command: str):
     shlex.shlex で正確に tokenize し、shell operator を検出する。
     - quoted operator（例: grep -E "foo|bar" file）は誤検出しない
     - parse error は fail-closed で compound と見なす（operator="_parse_error" を返す）
+    - punctuation run token（例: >&, &>, |&）も検出する
 
     Returns:
         str | None: 最初に検出した違反 operator。違反なしの場合は None。
@@ -495,7 +541,7 @@ def _detect_compound_operator(command: str):
         return "_parse_error"
 
     for t in tokens:
-        if t in _DISALLOWED_OPERATORS:
+        if _is_shell_operator_token(t):
             return t
     return None
 
