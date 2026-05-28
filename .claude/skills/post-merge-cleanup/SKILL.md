@@ -57,11 +57,15 @@ for each request in follow_up_issue_requests:
 
 ```yaml
 FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: post-merge-cleanup
   follow_up_issues:
     - request_dedupe_key: "..."
-      issue_number: 123
-      issue_url: "https://github.com/..."
       status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+      issue:
+        number: 123
+        url: "https://github.com/..."
+      reason: null
 
   note_only_observations:
     - dedupe_key: "..."
