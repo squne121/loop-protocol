@@ -36,6 +36,10 @@ canvas {
   font: inherit;
 }
 
+canvas {
+  touch-action: none;
+}
+
 button {
   border: 1px solid var(--line);
   background: rgba(10, 18, 31, 0.8);

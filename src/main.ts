@@ -1,6 +1,6 @@
 import './style.css'
 
-import { createInputState, mapInputToCommands } from './input'
+import { bindInput, createInputState, mapInputToCommands } from './input'
 import { createCanvasRenderer } from './render'
 import {
   createGameSnapshot,
@@ -8,7 +8,12 @@ import {
   defaultSimulationConfig,
 } from './state'
 import { createLocalGameStorage } from './storage'
-import { runCollisionSystem, runCombatSystem, runMovementSystem } from './systems'
+import {
+  runCollisionSystem,
+  runCombatSystem,
+  runMovementSystem,
+  runProjectileSystem,
+} from './systems'
 import { createHudController } from './ui'
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -54,12 +59,14 @@ const hud = createHudController(commandRail, {
 })
 const inputState = createInputState()
 
-bindInput(canvas, inputState, () => state)
+bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
 
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
+
+const { fixedDeltaMs, maxFrameSkip } = defaultSimulationConfig
 
 function frame(now: number): void {
   const deltaMs = now - previousFrameTime
@@ -67,13 +74,15 @@ function frame(now: number): void {
   accumulatorMs += deltaMs
 
   let frameSkips = 0
-  while (
-    accumulatorMs >= defaultSimulationConfig.fixedDeltaMs &&
-    frameSkips < defaultSimulationConfig.maxFrameSkip
-  ) {
-    stepSimulation(defaultSimulationConfig.fixedDeltaMs)
-    accumulatorMs -= defaultSimulationConfig.fixedDeltaMs
+  while (accumulatorMs >= fixedDeltaMs && frameSkips < maxFrameSkip) {
+    stepSimulation(fixedDeltaMs)
+    accumulatorMs -= fixedDeltaMs
     frameSkips += 1
+  }
+
+  // Panic clamp: discard residual accumulator after maxFrameSkip to avoid spiral of death
+  if (accumulatorMs >= fixedDeltaMs) {
+    accumulatorMs = accumulatorMs % fixedDeltaMs
   }
 
   hud.render(state)
@@ -87,60 +96,10 @@ function stepSimulation(deltaMs: number): void {
   const commands = mapInputToCommands(inputState)
   runMovementSystem(state, commands, deltaMs)
   runCombatSystem(state, commands, deltaMs)
+  runProjectileSystem(state, commands, deltaMs)
   runCollisionSystem(state)
   state.tick += 1
   state.elapsedMs += deltaMs
-}
-
-function bindInput(
-  canvasElement: HTMLCanvasElement,
-  input: ReturnType<typeof createInputState>,
-  getState: () => typeof state,
-): void {
-  type MovementKey = 'moveUp' | 'moveDown' | 'moveLeft' | 'moveRight'
-
-  const keyMap = new Map<string, MovementKey>([
-    ['w', 'moveUp'],
-    ['ArrowUp', 'moveUp'],
-    ['s', 'moveDown'],
-    ['ArrowDown', 'moveDown'],
-    ['a', 'moveLeft'],
-    ['ArrowLeft', 'moveLeft'],
-    ['d', 'moveRight'],
-    ['ArrowRight', 'moveRight'],
-  ])
-
-  window.addEventListener('keydown', (event) => {
-    const key = keyMap.get(event.key)
-    if (key) {
-      input[key] = true
-    }
-  })
-
-  window.addEventListener('keyup', (event) => {
-    const key = keyMap.get(event.key)
-    if (key) {
-      input[key] = false
-    }
-  })
-
-  const updatePointer = (event: PointerEvent) => {
-    const bounds = canvasElement.getBoundingClientRect()
-    const currentState = getState()
-    input.pointerX =
-      ((event.clientX - bounds.left) / bounds.width) * currentState.arena.width
-    input.pointerY =
-      ((event.clientY - bounds.top) / bounds.height) * currentState.arena.height
-  }
-
-  canvasElement.addEventListener('pointermove', updatePointer)
-  canvasElement.addEventListener('pointerdown', (event) => {
-    updatePointer(event)
-    input.primaryPressed = true
-  })
-  window.addEventListener('pointerup', () => {
-    input.primaryPressed = false
-  })
 }
 
 function resizeArena(currentState: typeof state): void {

@@ -1,3 +1,5 @@
 export * from './MovementSystem'
 export * from './CombatSystem'
 export * from './CollisionSystem'
+export * from './ProjectileSystem'
+export * from './SimulationLoop'

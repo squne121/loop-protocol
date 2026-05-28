@@ -20,6 +20,18 @@ export interface PlayerState {
   shotsFired: number
 }
 
+export interface ProjectileState {
+  id: number
+  x: number
+  y: number
+  radius: number
+  directionX: number
+  directionY: number
+  speedPxPerSec: number
+  ageMs: number
+  lifetimeMs: number
+}
+
 export interface ProgressState {
   stageLabel: string
   resources: number
@@ -36,6 +48,8 @@ export interface GameState {
   elapsedMs: number
   arena: ArenaState
   player: PlayerState
+  projectiles: ProjectileState[]
+  nextProjectileId: number
   progress: ProgressState
   telemetry: TelemetryState
 }
@@ -77,6 +91,8 @@ export function createInitialGameState(
       resources: snapshot.resources ?? 0,
       weaponPower: snapshot.weaponPower ?? 1,
     },
+    projectiles: [],
+    nextProjectileId: 1,
     telemetry: {
       status: 'Combat systems green',
       lastCommandSummary: 'Awaiting pilot input',
