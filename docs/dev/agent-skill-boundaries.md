@@ -364,7 +364,9 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 
 **責務境界**:
 
-- `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。
+- `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。`follow_up_issues`（materialize 結果）を出力してはならない（`follow_up_issue_requests`（起票前候補）のみを出力する）。
+- `post-merge-cleanup`: PR / impl-review-loop 由来の follow-up 候補を受け取り、dedupe 後に `issue-author` / `create-issue` 経由で Issue 化する **terminal materializer** である。follow-up の raw context を保持・判断する context owner ではなく、蓄積された `FOLLOW_UP_ISSUE_REQUEST_V1[]` を終端で materialize・report する役割を担う。
+- `issue-refinement-loop`: scope split / out-of-scope discovery / child materialization の出口を持つ **thin orchestrator** である。review-issue 由来の観察を routing するだけで、follow-up の raw context を保持・再解釈しない。終了コメントには materialization 結果（`FOLLOW_UP_MATERIALIZATION_RESULT_V1`）のみを出す。
 - `post-merge-cleanup-worker`: `follow_up_issue_requests` を `FOLLOW_UP_ISSUE_REQUEST_V1[]` として列挙して返す。**Issue 起票は行わない**。
 - main thread（impl-review-loop Step 5 / post-merge-cleanup Delegation）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
 
