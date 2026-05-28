@@ -6,6 +6,8 @@ export interface InputState {
   pointerX: number
   pointerY: number
   primaryPressed: boolean
+  /** Tracks the currently captured pointer id. null when no pointer is captured. */
+  activePointerId: number | null
 }
 
 export function createInputState(): InputState {
@@ -17,5 +19,6 @@ export function createInputState(): InputState {
     pointerX: 0,
     pointerY: 0,
     primaryPressed: false,
+    activePointerId: null,
   }
 }

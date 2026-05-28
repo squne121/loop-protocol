@@ -105,3 +105,55 @@ function resizeArena(currentState: typeof state): void {
   // Re-clamp player after arena resize to prevent out-of-bounds position.
   clampPlayerToArena(currentState)
 }
+
+// ---------------------------------------------------------------------------
+// E2E observability hook (AC12)
+// - ONLY active when VITE_E2E_MODE === 'true' (tree-shaken in production builds)
+// - Read-only: returns a shallow snapshot (spread copy), never exposes live state
+// - Production build MUST NOT contain '__LOOP_E2E__'
+// ---------------------------------------------------------------------------
+
+/** Minimal snapshot type exposed to E2E tests. */
+interface LoopE2ESnapshot {
+  tick: number
+  elapsedMs: number
+  player: {
+    x: number
+    y: number
+    aimX: number
+    aimY: number
+  }
+  projectiles: Array<{
+    id: number
+    x: number
+    y: number
+    ageMs: number
+  }>
+  input: {
+    primaryPressed: boolean
+    activePointerId: number | null
+  }
+}
+
+if (import.meta.env.VITE_E2E_MODE === 'true') {
+  ;(
+    window as Window &
+      typeof globalThis & {
+        __LOOP_E2E__: { getState: () => LoopE2ESnapshot }
+      }
+  ).__LOOP_E2E__ = {
+    /** Returns a shallow snapshot copy of the current game + input state. Read-only. */
+    getState(): LoopE2ESnapshot {
+      return {
+        tick: state.tick,
+        elapsedMs: state.elapsedMs,
+        player: { ...state.player },
+        projectiles: state.projectiles.map((p) => ({ ...p })),
+        input: {
+          primaryPressed: inputState.primaryPressed,
+          activePointerId: inputState.activePointerId,
+        },
+      }
+    },
+  }
+}
