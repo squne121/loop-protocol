@@ -51,6 +51,7 @@ fi
 | verdict | mergeable | merge_state_status | 次アクション |
 |---|---|---|---|
 | `APPROVE` | `MERGEABLE` | `CLEAN` or `UNSTABLE` | 終了（approved） |
+| `APPROVE` | `MERGEABLE` | `BEHIND` | approved（update-branch 自動化は #67 の責務） |
 | `APPROVE` | `MERGEABLE` | `BLOCKED` | branch protection 設定待ち。人間判断 |
 | `REQUEST_CHANGES` | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
 | 任意 | `CONFLICTING` | `DIRTY` | CONFLICTING PR Escalation Runbook 発動 |

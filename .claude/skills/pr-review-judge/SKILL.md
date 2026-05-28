@@ -62,7 +62,8 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 - `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
 - `mergeStateStatus=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
 - `mergeable=UNKNOWN`（retry 後も） → **Unknown blocker**（REQUEST_CHANGES）
-- `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE` → 次へ進む
+- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務
+- `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE|BEHIND` → 次へ進む
 
 ### 3. CI 証跡を確認
 
@@ -265,7 +266,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 ## Verdict: APPROVE | REQUEST_CHANGES
 
 ### Mergeability
-- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, mergeStateStatus=<CLEAN|UNSTABLE|DIRTY|BLOCKED|UNKNOWN>
+- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, mergeStateStatus=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
 
 ### Evidence Check
 - AC coverage: <○/△/×、根拠>
@@ -285,7 +286,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 verdict: APPROVE | REQUEST_CHANGES
 blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
+mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
 follow_up_issue_requests:
   - title: "<follow-up タイトル>"
