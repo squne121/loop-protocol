@@ -16,6 +16,38 @@ scope 外だが記録価値のある改善候補を見つけた場合は、別 I
 - closed issue の reopen は自動実行しない
 - 起票またはスキップ結果は終了報告に列挙する
 
+## Step 5 Result Block
+
+Step 5（終了コメント）では、起票結果を `FOLLOW_UP_MATERIALIZATION_RESULT_V1` として報告する。`issue-refinement-loop` は thin orchestrator として raw context を保持せず、routing・reporting のみを担う。
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
+  follow_up_issues:
+    - request_dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+      issue:
+        number: 123
+        url: "https://github.com/..."
+      reason: null
+  note_only_observations:
+    - dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+      source_url: "<観察元の URL>"
+      source_note_id: "<note_id>"
+      summary: "<観察内容の要約>"
+```
+
+空の場合（`follow_up_issues: []` / `note_only_observations: []` は省略禁止）:
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
+  follow_up_issues: []
+  note_only_observations: []
+```
+
 ## Must not
 
 - title の類似検索だけで dedupe を済ませない

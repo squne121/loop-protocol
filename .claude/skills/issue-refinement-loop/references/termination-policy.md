@@ -23,3 +23,17 @@
 
 - `approve` 以外を success 扱いして silently finish しない
 - `max_iterations` を超えて自動ループしない
+
+## Termination Comment（全 termination reason 共通）
+
+すべての termination reason（`approved` / `needs_second_pass` / `human_escalation` / `superseded_by_decision`）で、終了コメントに `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を含める。follow-up が存在しない場合も空配列で出力する（`follow_up_issues: []` / `note_only_observations: []`）。
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
+  follow_up_issues: []   # 起票済み / reuse / skip 結果。空の場合も省略しない
+  note_only_observations: []  # 起票せず記録のみ。空の場合も省略しない
+```
+
+詳細 schema は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を参照。`issue-refinement-loop` は thin orchestrator として raw context を保持せず、materialization 結果のみを報告する（`docs/dev/agent-skill-boundaries.md` の `ORCHESTRATOR_IO_BOUNDARY_V1` 参照）。

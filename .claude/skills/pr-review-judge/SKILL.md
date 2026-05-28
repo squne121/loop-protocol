@@ -331,6 +331,18 @@ follow_up_issue_requests:
 2. コメント本文全体で `reviewed_head_sha:` 行は 1 つだけ（複数だと parse が最初の行のみ採用）
 3. コードフェンス（` ``` `）は `\` でエスケープしない（heredoc 内でもそのまま書く）
 4. `follow_up_issue_requests` は non-blocker observations を構造化したフィールド。pr-review-judge は **起票を実行しない**。起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
+5. **negative rule**: pr-review-judge は `follow_up_issues`（materialize 結果フィールド）を出力してはならない。`LOOP_VERDICT` に出力するのは `follow_up_issue_requests`（起票前候補）のみ。`follow_up_issues` は Issue 起票後の materialize 結果であり、起票を行わない pr-review-judge が正しく埋めることはできない。
+
+   ```yaml
+   # INVALID — LOOP_VERDICT に follow_up_issues を出してはならない
+   follow_up_issues:
+     - issue_number: 123
+
+   # VALID — LOOP_VERDICT には follow_up_issue_requests のみを出す
+   follow_up_issue_requests:
+     - title: "..."
+       severity: optional_follow_up
+   ```
 
 ## Stop Conditions
 
