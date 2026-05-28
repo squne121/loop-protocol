@@ -22,7 +22,7 @@ LOOP_VERDICT:
   verdict: APPROVE | REQUEST_CHANGES
   blockers: []
   mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-  mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
+  mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
   reviewed_head_sha: <SHA>
 ```
 

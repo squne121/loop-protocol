@@ -192,7 +192,7 @@ self-authored PR の場合は **verdict 値に関わらず `--comment` で投稿
 verdict: APPROVE | REQUEST_CHANGES | SONNET_REQUIRED
 blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-mergeStateStatus: CLEAN | UNSTABLE | DIRTY | BLOCKED | UNKNOWN
+mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
 reviewer_model: haiku
 lite_applicable: true | false
