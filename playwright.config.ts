@@ -43,7 +43,7 @@ export default defineConfig({
    * VITE_E2E_MODE=true enables the read-only __LOOP_E2E__ hook. */
   webServer: {
     command:
-      'VITE_E2E_MODE=true pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort',
+      'VITE_E2E_MODE=true pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort',
     url: 'http://127.0.0.1:4173',
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
