@@ -62,7 +62,7 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 - `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
 - `mergeStateStatus=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
 - `mergeable=UNKNOWN`（retry 後も） → **Unknown blocker**（REQUEST_CHANGES）
-- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務
+- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
 - `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE|BEHIND` → 次へ進む
 
 ### 3. CI 証跡を確認
@@ -249,6 +249,25 @@ gh pr view <PR番号> --json title --jq '.title' | grep -iE "\bsafe\b|\bread-onl
 
 self-authored PR の場合は **verdict 値に関わらず `--comment` で投稿**（GitHub 制約）。
 
+#### recommendations の決定（APPROVE 時のみ）
+
+verdict が `APPROVE` に確定した後、以下のロジックで `recommendations` フィールドを決定する:
+
+```
+BRANCH_BEHIND_MAIN=$(echo "$TEST_VERDICT_BODY" | grep "branch_behind_main:" | head -n1 | sed -E 's/.*branch_behind_main:[[:space:]]*//; s/[[:space:]]*//')
+
+if [ "$VERDICT" = "APPROVE" ] && [ "$MERGEABLE" = "MERGEABLE" ] && [ "$BRANCH_BEHIND_MAIN" = "true" ]; then
+  RECOMMENDATIONS="[update_branch]"
+else
+  RECOMMENDATIONS="[]"
+fi
+```
+
+- `APPROVE` かつ `mergeable=MERGEABLE` かつ `branch_behind_main: true` のとき → `recommendations: [update_branch]`
+- それ以外 → `recommendations: []`
+
+この `recommendations` を LOOP_VERDICT YAML に含めることで、Step 5（impl-review-loop）が `update_branch` routing signal を受け取り `gh pr update-branch` を実行する。
+
 ### 6. verdict コメントを投稿
 
 ```bash
@@ -288,6 +307,7 @@ blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
+recommendations: []  # APPROVE + MERGEABLE + BEHIND のとき [update_branch]。有効値: update_branch
 follow_up_issue_requests:
   - title: "<follow-up タイトル>"
     issue_kind: implementation | research | parent

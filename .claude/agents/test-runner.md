@@ -137,6 +137,7 @@ TEST_VERDICT:
   result: PASS | PARTIAL | FAIL
   mergeable: MERGEABLE | CONFLICTING | UNKNOWN
   merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+  branch_behind_main: true | false  # merge_state_status == BEHIND のとき true
   baseline_only: true | false
   verification_commands_pass: <数値>
   verification_commands_fail: <数値>
