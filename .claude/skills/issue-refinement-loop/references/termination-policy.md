@@ -30,6 +30,8 @@
 
 ```yaml
 FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
   follow_up_issues: []   # 起票済み / reuse / skip 結果。空の場合も省略しない
   note_only_observations: []  # 起票せず記録のみ。空の場合も省略しない
 ```

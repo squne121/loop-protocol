@@ -22,11 +22,15 @@ Step 5（終了コメント）では、起票結果を `FOLLOW_UP_MATERIALIZATIO
 
 ```yaml
 FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
   follow_up_issues:
     - request_dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
-      issue_number: 123 | null
-      issue_url: "https://github.com/..." | null
       status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+      issue:
+        number: 123
+        url: "https://github.com/..."
+      reason: null
   note_only_observations:
     - dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
       source_url: "<観察元の URL>"
@@ -34,7 +38,15 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
       summary: "<観察内容の要約>"
 ```
 
-follow-up が存在しない場合も `follow_up_issues: []` / `note_only_observations: []` を出力する（省略禁止）。
+空の場合（`follow_up_issues: []` / `note_only_observations: []` は省略禁止）:
+
+```yaml
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: issue-refinement-loop
+  follow_up_issues: []
+  note_only_observations: []
+```
 
 ## Must not
 
