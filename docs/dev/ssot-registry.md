@@ -150,6 +150,20 @@
 
 ## プロダクト仕様 (`docs/product/`)
 
+- id: movement-projectile
+  path: docs/product/features/movement-projectile.md
+  title: Movement + Projectile 最小仕様
+  keywords: [movement, projectile, combat, player, aim, fire, cooldown, arena, coordinate, diagonal_normalization, boundary_clamp, PointerEvent, GameState.projectiles, speed_px_per_sec, lifetime_ms, monotonic_counter, fixed_timestep, 60hz, raf]
+  description: player 移動・aim・fire・projectile の最小ライフサイクルを固定する feature spec（status: draft）。#1 実装の前提仕様
+  sections:
+    - "## intent"
+    - "## requirements"
+    - "## acceptance_criteria"
+    - "## non_goals"
+    - "## open_questions"
+    - "## playtest_hypotheses"
+    - "## related_tests"
+
 - id: game-overview
   path: docs/product/game-overview.md
   title: ゲーム全体像
