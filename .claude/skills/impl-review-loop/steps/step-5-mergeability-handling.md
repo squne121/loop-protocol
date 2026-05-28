@@ -30,32 +30,49 @@ VERDICT=$(echo "$LATEST_VERDICT_BODY" | grep -E "^[[:space:]]*verdict:" | head -
 MERGEABLE=$(echo "$LATEST_VERDICT_BODY" | grep -E "^[[:space:]]*mergeable:" | head -n1 | sed -E 's/.*mergeable:[[:space:]]*//; s/[[:space:]]*$//')
 MERGE_STATE_STATUS=$(echo "$LATEST_VERDICT_BODY" | grep -E "^[[:space:]]*mergeStateStatus:" | head -n1 | sed -E 's/.*mergeStateStatus:[[:space:]]*//; s/[[:space:]]*$//')
 REVIEWED_HEAD_SHA=$(echo "$LATEST_VERDICT_BODY" | grep -E "^[[:space:]]*reviewed_head_sha:" | head -n1 | sed -E 's/.*reviewed_head_sha:[[:space:]]*//; s/[[:space:]]*$//')
+RECOMMENDATIONS=$(echo "$LATEST_VERDICT_BODY" | grep -E "^[[:space:]]*recommendations:" | head -n1 | sed -E 's/.*recommendations:[[:space:]]*//; s/[[:space:]]*$//')
 ```
 
 - 各 `head -n1` でコメント本文全体での最初の出現を採用（重複行記載は禁止だが防御として最初を採る）
 - 値が空 → LOOP_VERDICT 不正として `human_review_required` で停止
+- `RECOMMENDATIONS` の有効値は `[]` または `[update_branch]` のみ。それ以外の値（空文字を除く）は unknown recommendation として `human_escalation` で停止する
 
 ## reviewed_head_sha 整合確認
 
+`CURRENT_HEAD` として PR の現在の `headRefOid` を取得し、`REVIEWED_HEAD_SHA` と照合する:
+
 ```bash
 CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
-
-if [ "$REVIEWED_HEAD_SHA" != "$CURRENT_HEAD" ]; then
-  echo "[STALE] LOOP_VERDICT は古い head ($REVIEWED_HEAD_SHA) に対するレビュー。current: $CURRENT_HEAD"
-  # Step 4 を再委譲して最新 head を再レビューさせる
-fi
 ```
+
+`REVIEWED_HEAD_SHA` と `CURRENT_HEAD` が一致しない場合（stale LOOP_VERDICT 検出）:
+
+- 取得した LOOP_VERDICT は古い head に対するレビューであるため無効とみなし、以降の判定に使用しない
+- `termination_reason` は設定しない（失敗ではなく再評価が必要なケースのため）
+- Step 4（pr-review-judge）を再委譲し、現在の head に対する最新の LOOP_VERDICT を取得する
+- 新しい LOOP_VERDICT が得られた後、改めて Step 5 の判定を最初から実行する。stale な LOOP_VERDICT で BEHIND 分岐その他の判定を継続してはならない
 
 ## 判定結果の orchestrator 反映
 
-| verdict | mergeable | merge_state_status | 次アクション |
-|---|---|---|---|
-| `APPROVE` | `MERGEABLE` | `CLEAN` or `UNSTABLE` | 終了（approved） |
-| `APPROVE` | `MERGEABLE` | `BEHIND` | approved（update-branch 自動化は #67 の責務） |
-| `APPROVE` | `MERGEABLE` | `BLOCKED` | branch protection 設定待ち。人間判断 |
-| `REQUEST_CHANGES` | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
-| 任意 | `CONFLICTING` | `DIRTY` | CONFLICTING PR Escalation Runbook 発動 |
-| 任意 | `UNKNOWN` | 任意 | 5 秒待機 × 最大 3 回 retry、それでも UNKNOWN なら human_escalation |
+| verdict | mergeable | merge_state_status | recommendations | 次アクション |
+|---|---|---|---|---|
+| `APPROVE` | `MERGEABLE` | `CLEAN` or `UNSTABLE` | 任意 | 終了（approved） |
+| `APPROVE` | `MERGEABLE` | `BEHIND` | `[update_branch]` | BEHIND 分岐: `recommendations: [update_branch]` 含む場合 — 下記「BEHIND 分岐 routing」参照（失敗時は Escalation Runbook） |
+| `APPROVE` | `MERGEABLE` | `BLOCKED` | 任意 | branch protection 設定待ち。人間判断 |
+| `REQUEST_CHANGES` | 任意 | 任意 | 任意 | 次イテレーションへ（blockers を fix_delta に） |
+| 任意 | `CONFLICTING` | 任意 | 任意 | CONFLICTING PR Escalation Runbook 発動 |
+| 任意 | 任意 | `DIRTY` | 任意 | CONFLICTING PR Escalation Runbook 発動 |
+| 任意 | `UNKNOWN` | 任意 | 任意 | 5 秒待機 × 最大 3 回 retry、それでも UNKNOWN なら human_escalation |
+
+## BEHIND 分岐 routing
+
+`APPROVE + MERGEABLE + BEHIND`（`recommendations: [update_branch]` 含む）の場合:
+
+1. `implementation-worker` に `gh pr update-branch` の実行を委譲する（具体的な実行手順は implementation-worker 側）
+2. 委譲成功後: 既存の TEST_VERDICT / LOOP_VERDICT は headRefOid が変わるため stale とみなす
+3. Step 2（test-runner）→ Step 4（pr-review-judge）を再実行し、新しい reviewed_head_sha の LOOP_VERDICT で Step 5 を再判定する
+4. 委譲失敗時: `termination_reason: human_escalation` を記録して停止する
+5. 更新後に `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` を検出した場合: `CONFLICTING PR Escalation Runbook` を発動する
 
 ## 出力
 
