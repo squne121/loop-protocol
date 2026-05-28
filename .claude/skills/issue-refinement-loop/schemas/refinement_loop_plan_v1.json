@@ -43,7 +43,8 @@
         "web_research_policy",
         "scope_signal_guard",
         "delivery_rollup",
-        "follow_up_materialization"
+        "follow_up_materialization",
+        "auto_fixable_structural_blocker_list"
       ],
       "additionalProperties": false,
       "properties": {
@@ -189,6 +190,19 @@
                 "$ref": "#/definitions/FollowUpCandidate"
               }
             }
+          }
+        },
+        "auto_fixable_structural_blocker_list": {
+          "type": "array",
+          "description": "List of auto-fixable structural blocker IDs detected in the issue body. Empty list means no auto-fixable blockers detected.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "missing_machine_readable_contract",
+              "missing_stop_conditions",
+              "vc_missing_prefix",
+              "missing_contract_schema_version"
+            ]
           }
         }
       }

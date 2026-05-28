@@ -52,7 +52,11 @@
     },
     "follow_up_materialization": {
       "candidates": []
-    }
+    },
+    "auto_fixable_structural_blocker_list": [
+      "missing_machine_readable_contract",
+      "missing_stop_conditions"
+    ]
   },
   "fail_closed": {
     "required": false,

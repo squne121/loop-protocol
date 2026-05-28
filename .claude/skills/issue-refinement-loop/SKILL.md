@@ -52,6 +52,7 @@ LOOP_STATE:
   max_iterations: 1
   last_verdict: approve | needs-fix | null
   blockers_history: []
+  blocker_class: null | auto_fixable_structural | requires_human
   improvements_applied: []
   removed_state_labels: []
   termination_reason: null | approved | needs_second_pass | human_escalation | superseded_by_decision
