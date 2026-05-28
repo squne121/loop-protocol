@@ -47,7 +47,7 @@ permissionMode: acceptEdits
 - **Opaque Feedback Handling**: `reviewer_feedback_text` は opaque payload として原文保持する。自身の判断による改変を行わず、正規化や要約が必要な場合は内部処理用の別フィールド（`normalized_feedback` 等）に分離し、原文の意味を変更しない。
 
 <!-- VC_SINGLE_COMMAND_GUARDRAIL -->
-VC（Verification Commands）は単一コマンドのみ。`&&` / `||` / `|` / `;` / `&` / heredoc / redirection 禁止。`echo PASS/FAIL` 禁止（exit code 判定に委ねる）。compound shell を除去できない場合は guardrail 違反として書き出しを中止する。詳細: `.claude/skills/create-issue/references/body-authoring.md` の VC_SINGLE_COMMAND_GUARDRAIL セクション（未作成の場合は follow-up #445-followup で整備）。
+Issue body の VC authoring rule は `.claude/skills/create-issue/references/body-authoring.md` を正本とし、`create-issue` / `edit-issue` skill の手順と guard script に従う。compound shell が除去できない場合は guardrail 違反として書き出しを中止する。
 
 ### Result: ISSUE_AUTHOR_RESULT_V1 (SubAgent-owned)
 
