@@ -98,9 +98,9 @@ describe('runCombatSystem', () => {
     expect(state.player.shotsFired).toBe(0)
   })
 
-  it('GIVEN aim at same position as player WHEN fire command THEN projectile direction defaults to +X', () => {
+  it('GIVEN aim at same position as player WHEN fire command THEN projectile direction defaults to +X (initial fallback)', () => {
     const state = createInitialGameState()
-    // aim at same position as player
+    // aim at same position as player — no previous non-zero direction, initial default is +X
     runCombatSystem(
       state,
       [
@@ -113,6 +113,41 @@ describe('runCombatSystem', () => {
     const p = state.projectiles[0]
     expect(p.directionX).toBeCloseTo(1)
     expect(p.directionY).toBeCloseTo(0)
+  })
+
+  it('GIVEN previous aim upward WHEN next tick aim overlaps player position THEN projectile uses last non-zero direction', () => {
+    const state = createInitialGameState()
+
+    // Tick 1: aim above player (upward direction) and fire — saves lastAimDirection = (0, -1)
+    runCombatSystem(
+      state,
+      [
+        { type: 'aim', x: state.player.x, y: state.player.y - 100 },
+        { type: 'fire' },
+      ],
+      16,
+    )
+    expect(state.player.lastAimDirectionX).toBeCloseTo(0)
+    expect(state.player.lastAimDirectionY).toBeCloseTo(-1)
+
+    // Reset cooldown for second shot
+    state.player.weaponCooldownMs = 0
+
+    // Tick 2: aim at same position as player (distance < epsilon) — should use last direction
+    runCombatSystem(
+      state,
+      [
+        { type: 'aim', x: state.player.x, y: state.player.y },
+        { type: 'fire' },
+      ],
+      16,
+    )
+
+    const p = state.projectiles[1]
+    expect(p.directionX).toBeCloseTo(0)
+    expect(p.directionY).toBeCloseTo(-1)
+    // Must be a unit vector
+    expect(Math.hypot(p.directionX, p.directionY)).toBeCloseTo(1)
   })
 
   it('GIVEN weapon ready WHEN aim command THEN aimX/aimY updated', () => {

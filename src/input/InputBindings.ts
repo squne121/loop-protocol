@@ -54,6 +54,15 @@ export function bindInput(
 ): void {
   let capturedPointerId: number | null = null
 
+  function resetInput(): void {
+    input.moveUp = false
+    input.moveDown = false
+    input.moveLeft = false
+    input.moveRight = false
+    input.primaryPressed = false
+    capturedPointerId = null
+  }
+
   keyTarget.addEventListener('keydown', (event: KeyboardEvent) => {
     const key = KEY_CODE_MAP.get(event.code)
     if (key) {
@@ -67,6 +76,17 @@ export function bindInput(
       input[key] = false
     }
   })
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('blur', resetInput)
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        resetInput()
+      }
+    })
+  }
 
   canvasElement.addEventListener('pointerdown', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent

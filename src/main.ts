@@ -9,6 +9,8 @@ import {
 } from './state'
 import { createLocalGameStorage } from './storage'
 import {
+  advanceSimulationLoop,
+  clampPlayerToArena,
   runCollisionSystem,
   runCombatSystem,
   runMovementSystem,
@@ -66,24 +68,17 @@ window.addEventListener('resize', () => resizeArena(state))
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
 
-const { fixedDeltaMs, maxFrameSkip } = defaultSimulationConfig
-
 function frame(now: number): void {
   const deltaMs = now - previousFrameTime
   previousFrameTime = now
-  accumulatorMs += deltaMs
 
-  let frameSkips = 0
-  while (accumulatorMs >= fixedDeltaMs && frameSkips < maxFrameSkip) {
-    stepSimulation(fixedDeltaMs)
-    accumulatorMs -= fixedDeltaMs
-    frameSkips += 1
-  }
-
-  // Panic clamp: discard residual accumulator after maxFrameSkip to avoid spiral of death
-  if (accumulatorMs >= fixedDeltaMs) {
-    accumulatorMs = accumulatorMs % fixedDeltaMs
-  }
+  const result = advanceSimulationLoop(
+    accumulatorMs,
+    deltaMs,
+    defaultSimulationConfig,
+    stepSimulation,
+  )
+  accumulatorMs = result.accumulatorMs
 
   hud.render(state)
   renderer.render(state)
@@ -107,4 +102,6 @@ function resizeArena(currentState: typeof state): void {
   const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
   currentState.arena.width = width
   currentState.arena.height = Math.round(width * 0.5625)
+  // Re-clamp player after arena resize to prevent out-of-bounds position.
+  clampPlayerToArena(currentState)
 }

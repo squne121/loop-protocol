@@ -18,6 +18,9 @@ export interface PlayerState {
   weaponCooldownMs: number
   weaponIntervalMs: number
   shotsFired: number
+  /** Runtime-only: last non-zero aim direction. Not persisted in GameSnapshot. */
+  lastAimDirectionX: number
+  lastAimDirectionY: number
 }
 
 export interface ProjectileState {
@@ -85,6 +88,8 @@ export function createInitialGameState(
       weaponCooldownMs: 0,
       weaponIntervalMs: 280,
       shotsFired: 0,
+      lastAimDirectionX: 1,
+      lastAimDirectionY: 0,
     },
     progress: {
       stageLabel: 'MVP Sortie',

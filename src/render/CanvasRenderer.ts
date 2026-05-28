@@ -30,7 +30,7 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         lastArenaWidth = arenaW
         lastArenaHeight = arenaH
         lastDpr = dpr
-        context.scale(dpr, dpr)
+        context.setTransform(dpr, 0, 0, dpr, 0, 0)
       }
 
       context.fillStyle = '#07111f'

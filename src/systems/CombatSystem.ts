@@ -40,15 +40,15 @@ export function runCombatSystem(
   let directionY: number
 
   if (dist < AIM_EPSILON_PX) {
-    // Same-position fallback: use last non-zero direction stored as aimX/aimY relative offsets
-    // Since aimX/aimY are world coordinates, we try to recover from previous non-zero direction.
-    // We store fallback direction as unit vector embedded in aimX/aimY being 1px away from player.
-    // If still zero, default to +X.
-    directionX = 1
-    directionY = 0
+    // Same-position fallback: use last saved aim direction (initial default is +X).
+    directionX = state.player.lastAimDirectionX
+    directionY = state.player.lastAimDirectionY
   } else {
     directionX = dx / dist
     directionY = dy / dist
+    // Persist non-zero direction for future same-position fallback.
+    state.player.lastAimDirectionX = directionX
+    state.player.lastAimDirectionY = directionY
   }
 
   state.projectiles.push({
