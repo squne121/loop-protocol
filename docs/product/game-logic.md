@@ -68,7 +68,7 @@ DOM event (KeyboardEvent, PointerEvent) は input layer で capture し、以下
 ```typescript
 type InputCommand = 
   | { type: 'MoveIntent'; direction: Vec2; }   // normalized (-1..1)
-  | { type: 'AimIntent'; angle: number; }      // radians
+  | { type: 'AimIntent'; x: number; y: number; } // arena logical coordinates
   | { type: 'FireIntent'; }
   | { type: 'IssueAllyCommandIntent'; command: string; }
   | { type: 'PauseIntent'; }
