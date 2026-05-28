@@ -11,35 +11,56 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
     throw new Error('2D canvas context is not available.')
   }
 
+  let lastArenaWidth = 0
+  let lastArenaHeight = 0
+  let lastDpr = 0
+
   return {
     render(state) {
-      if (
-        canvas.width !== state.arena.width ||
-        canvas.height !== state.arena.height
-      ) {
-        canvas.width = state.arena.width
-        canvas.height = state.arena.height
+      const dpr = window.devicePixelRatio ?? 1
+      const arenaW = state.arena.width
+      const arenaH = state.arena.height
+
+      // Resize backing store when arena or dpr changes
+      if (arenaW !== lastArenaWidth || arenaH !== lastArenaHeight || dpr !== lastDpr) {
+        canvas.width = Math.round(arenaW * dpr)
+        canvas.height = Math.round(arenaH * dpr)
+        canvas.style.width = `${arenaW}px`
+        canvas.style.height = `${arenaH}px`
+        lastArenaWidth = arenaW
+        lastArenaHeight = arenaH
+        lastDpr = dpr
+        context.setTransform(dpr, 0, 0, dpr, 0, 0)
       }
 
       context.fillStyle = '#07111f'
-      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.fillRect(0, 0, arenaW, arenaH)
 
       context.strokeStyle = 'rgba(92, 219, 190, 0.08)'
       context.lineWidth = 1
-      for (let x = 0; x <= canvas.width; x += 40) {
+      for (let x = 0; x <= arenaW; x += 40) {
         context.beginPath()
         context.moveTo(x, 0)
-        context.lineTo(x, canvas.height)
+        context.lineTo(x, arenaH)
         context.stroke()
       }
 
-      for (let y = 0; y <= canvas.height; y += 40) {
+      for (let y = 0; y <= arenaH; y += 40) {
         context.beginPath()
         context.moveTo(0, y)
-        context.lineTo(canvas.width, y)
+        context.lineTo(arenaW, y)
         context.stroke()
       }
 
+      // Draw projectiles
+      context.fillStyle = '#f4c25b'
+      for (const projectile of state.projectiles) {
+        context.beginPath()
+        context.arc(projectile.x, projectile.y, projectile.radius, 0, Math.PI * 2)
+        context.fill()
+      }
+
+      // Draw player
       context.fillStyle = '#70f0d0'
       context.beginPath()
       context.arc(
@@ -51,6 +72,7 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       )
       context.fill()
 
+      // Draw aim line
       context.strokeStyle = '#f4c25b'
       context.lineWidth = 3
       context.beginPath()

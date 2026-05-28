@@ -1,6 +1,6 @@
 import './style.css'
 
-import { createInputState, mapInputToCommands } from './input'
+import { bindInput, createInputState, mapInputToCommands } from './input'
 import { createCanvasRenderer } from './render'
 import {
   createGameSnapshot,
@@ -8,7 +8,14 @@ import {
   defaultSimulationConfig,
 } from './state'
 import { createLocalGameStorage } from './storage'
-import { runCollisionSystem, runCombatSystem, runMovementSystem } from './systems'
+import {
+  advanceSimulationLoop,
+  clampPlayerToArena,
+  runCollisionSystem,
+  runCombatSystem,
+  runMovementSystem,
+  runProjectileSystem,
+} from './systems'
 import { createHudController } from './ui'
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -54,7 +61,7 @@ const hud = createHudController(commandRail, {
 })
 const inputState = createInputState()
 
-bindInput(canvas, inputState, () => state)
+bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
 
@@ -64,17 +71,14 @@ let previousFrameTime = performance.now()
 function frame(now: number): void {
   const deltaMs = now - previousFrameTime
   previousFrameTime = now
-  accumulatorMs += deltaMs
 
-  let frameSkips = 0
-  while (
-    accumulatorMs >= defaultSimulationConfig.fixedDeltaMs &&
-    frameSkips < defaultSimulationConfig.maxFrameSkip
-  ) {
-    stepSimulation(defaultSimulationConfig.fixedDeltaMs)
-    accumulatorMs -= defaultSimulationConfig.fixedDeltaMs
-    frameSkips += 1
-  }
+  const result = advanceSimulationLoop(
+    accumulatorMs,
+    deltaMs,
+    defaultSimulationConfig,
+    stepSimulation,
+  )
+  accumulatorMs = result.accumulatorMs
 
   hud.render(state)
   renderer.render(state)
@@ -87,60 +91,10 @@ function stepSimulation(deltaMs: number): void {
   const commands = mapInputToCommands(inputState)
   runMovementSystem(state, commands, deltaMs)
   runCombatSystem(state, commands, deltaMs)
+  runProjectileSystem(state, commands, deltaMs)
   runCollisionSystem(state)
   state.tick += 1
   state.elapsedMs += deltaMs
-}
-
-function bindInput(
-  canvasElement: HTMLCanvasElement,
-  input: ReturnType<typeof createInputState>,
-  getState: () => typeof state,
-): void {
-  type MovementKey = 'moveUp' | 'moveDown' | 'moveLeft' | 'moveRight'
-
-  const keyMap = new Map<string, MovementKey>([
-    ['w', 'moveUp'],
-    ['ArrowUp', 'moveUp'],
-    ['s', 'moveDown'],
-    ['ArrowDown', 'moveDown'],
-    ['a', 'moveLeft'],
-    ['ArrowLeft', 'moveLeft'],
-    ['d', 'moveRight'],
-    ['ArrowRight', 'moveRight'],
-  ])
-
-  window.addEventListener('keydown', (event) => {
-    const key = keyMap.get(event.key)
-    if (key) {
-      input[key] = true
-    }
-  })
-
-  window.addEventListener('keyup', (event) => {
-    const key = keyMap.get(event.key)
-    if (key) {
-      input[key] = false
-    }
-  })
-
-  const updatePointer = (event: PointerEvent) => {
-    const bounds = canvasElement.getBoundingClientRect()
-    const currentState = getState()
-    input.pointerX =
-      ((event.clientX - bounds.left) / bounds.width) * currentState.arena.width
-    input.pointerY =
-      ((event.clientY - bounds.top) / bounds.height) * currentState.arena.height
-  }
-
-  canvasElement.addEventListener('pointermove', updatePointer)
-  canvasElement.addEventListener('pointerdown', (event) => {
-    updatePointer(event)
-    input.primaryPressed = true
-  })
-  window.addEventListener('pointerup', () => {
-    input.primaryPressed = false
-  })
 }
 
 function resizeArena(currentState: typeof state): void {
@@ -148,4 +102,6 @@ function resizeArena(currentState: typeof state): void {
   const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
   currentState.arena.width = width
   currentState.arena.height = Math.round(width * 0.5625)
+  // Re-clamp player after arena resize to prevent out-of-bounds position.
+  clampPlayerToArena(currentState)
 }
