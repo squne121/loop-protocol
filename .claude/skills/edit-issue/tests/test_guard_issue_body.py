@@ -30,6 +30,7 @@ _spec.loader.exec_module(_mod)
 
 guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
+guard_vc_compound_shell_disallowed = _mod.guard_vc_compound_shell_disallowed
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
 validate_issue_kind = _mod.validate_issue_kind
@@ -993,3 +994,47 @@ not in VC section
         # AC が 0 件なので pass
         assert result["passed"] is True
         assert result["ac_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# guard_vc_compound_shell_disallowed のテスト (#445 AC2/AC3 対応)
+# ---------------------------------------------------------------------------
+
+def test_guard_issue_body_rejects_compound_shell_vc():
+    """
+    GIVEN compound shell を含む VC
+    WHEN guard_vc_compound_shell_disallowed を呼ぶ
+    THEN passed=False を返す（違反コマンドが violations に含まれる）
+
+    GIVEN 単一コマンドのみの VC
+    WHEN guard_vc_compound_shell_disallowed を呼ぶ
+    THEN passed=True を返す
+    """
+    # --- compound shell fixture: && と || を含む ---
+    compound_body = """\
+## Verification Commands
+
+```bash
+# AC1
+cmd && echo PASS || echo FAIL
+```
+"""
+    result = guard_vc_compound_shell_disallowed(compound_body)
+    assert result["check"] == "vc_compound_shell_disallowed"
+    assert result["passed"] is False
+    assert len(result["violations"]) >= 1
+    assert "cmd && echo PASS || echo FAIL" in result["violations"]
+
+    # --- single command fixture: compound operator なし ---
+    single_body = """\
+## Verification Commands
+
+```bash
+# AC1
+grep -F "VC_SINGLE_COMMAND_GUARDRAIL" .claude/agents/issue-author.md
+```
+"""
+    result_single = guard_vc_compound_shell_disallowed(single_body)
+    assert result_single["check"] == "vc_compound_shell_disallowed"
+    assert result_single["passed"] is True
+    assert result_single["violations"] == []

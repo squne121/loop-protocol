@@ -24,6 +24,7 @@ Exit codes:
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -421,6 +422,75 @@ def guard_ac_vc_alignment(body: str, issue_kind: str, template_dir=None) -> dict
     }
 
 
+def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
+    """
+    VC セクションの fenced bash block からコマンド行を抽出する。
+
+    - ``` bash または ```bash で始まるブロックを対象とする
+    - 空行・コメント行（# で始まる行）を除外する
+    - 複数のフェンスブロックがある場合はすべて処理する
+
+    Returns:
+        list[str]: コマンド行のリスト
+    """
+    commands = []
+    for match in re.finditer(r'```bash\s*(.*?)```', vc_section, re.DOTALL | re.IGNORECASE):
+        block_text = match.group(1)
+        for line in block_text.splitlines():
+            stripped = line.strip()
+            # 空行とコメント行を除外
+            if stripped and not stripped.startswith('#'):
+                commands.append(stripped)
+    return commands
+
+
+def _is_compound_command(command: str) -> bool:
+    """
+    コマンドが compound shell syntax を含むか検出する。
+
+    shlex.shlex で正確に tokenize し、shell operator を検出する。
+    - quoted operator（例: grep -E "foo|bar" file）は誤検出しない
+    - parse error は fail-closed で compound と見なす
+
+    禁止 operators: {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        tokens = list(lexer)
+    except ValueError:
+        # parse 失敗 = 複雑なコマンド = fail-closed で compound と見なす
+        return True
+
+    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
+    return any(t in operators for t in tokens)
+
+
+def guard_vc_compound_shell_disallowed(body: str) -> dict:
+    """
+    ## Verification Commands セクションの fenced bash block から
+    compound shell syntax を含むコマンドを検出する。
+
+    違反 1 件以上で passed=False を返す。
+
+    Returns:
+        dict: {
+            "check": "vc_compound_shell_disallowed",
+            "passed": bool,
+            "violations": list[str],  # 違反コマンドのリスト
+        }
+    """
+    vc_section = _extract_vc_section(body)
+    commands = _extract_bash_commands_from_vc_section(vc_section)
+
+    violations = [cmd for cmd in commands if _is_compound_command(cmd)]
+
+    return {
+        "check": "vc_compound_shell_disallowed",
+        "passed": len(violations) == 0,
+        "violations": violations,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Guard checks for GitHub Issue body files"
@@ -495,6 +565,7 @@ def main() -> None:
             "ac_count": ac_count,
             "vc_ac_count": vc_ac_count,
         })
+        results.append(guard_vc_compound_shell_disallowed(body))
     else:
         results = []
         results.append(guard_template(body, issue_kind))
@@ -505,6 +576,7 @@ def main() -> None:
             results.append(guard_diff_threshold(orig_body, body))
 
         results.append(guard_ac_vc_alignment(body, issue_kind))
+        results.append(guard_vc_compound_shell_disallowed(body))
 
     all_passed = all(r["passed"] for r in results)
     output = {
@@ -519,10 +591,12 @@ def main() -> None:
         print(f"all_passed: {str(all_passed).lower()}")
         print("guards:")
         for r in results:
-            print(f"  - name: {r['name']}")
+            # support both 'name' key (legacy guards) and 'check' key (vc_compound_shell_disallowed)
+            guard_id = r.get('name') or r.get('check', 'unknown')
+            print(f"  - name: {guard_id}")
             print(f"    passed: {str(r['passed']).lower()}")
             for k, v in r.items():
-                if k in ("name", "passed"):
+                if k in ("name", "check", "passed"):
                     continue
                 if v is None:
                     print(f"    {k}: null")
