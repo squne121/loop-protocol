@@ -52,15 +52,13 @@ export function bindInput(
   getArena: () => { width: number; height: number },
   keyTarget: KeyEventTarget = window as unknown as KeyEventTarget,
 ): void {
-  let capturedPointerId: number | null = null
-
   function resetInput(): void {
     input.moveUp = false
     input.moveDown = false
     input.moveLeft = false
     input.moveRight = false
     input.primaryPressed = false
-    capturedPointerId = null
+    input.activePointerId = null
   }
 
   keyTarget.addEventListener('keydown', (event: KeyboardEvent) => {
@@ -93,7 +91,7 @@ export function bindInput(
     if (!event.isPrimary || event.button !== 0) {
       return
     }
-    capturedPointerId = event.pointerId
+    input.activePointerId = event.pointerId
     canvasElement.setPointerCapture(event.pointerId)
     updatePointerCoords(event, canvasElement, input, getArena)
     input.primaryPressed = true
@@ -101,7 +99,7 @@ export function bindInput(
 
   canvasElement.addEventListener('pointermove', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent
-    if (capturedPointerId === null || event.pointerId !== capturedPointerId) {
+    if (input.activePointerId === null || event.pointerId !== input.activePointerId) {
       return
     }
     updatePointerCoords(event, canvasElement, input, getArena)
@@ -109,28 +107,28 @@ export function bindInput(
 
   canvasElement.addEventListener('pointerup', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent
-    if (capturedPointerId === null || event.pointerId !== capturedPointerId) {
+    if (input.activePointerId === null || event.pointerId !== input.activePointerId) {
       return
     }
-    capturedPointerId = null
+    input.activePointerId = null
     input.primaryPressed = false
   })
 
   canvasElement.addEventListener('pointercancel', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent
-    if (capturedPointerId === null || event.pointerId !== capturedPointerId) {
+    if (input.activePointerId === null || event.pointerId !== input.activePointerId) {
       return
     }
-    capturedPointerId = null
+    input.activePointerId = null
     input.primaryPressed = false
   })
 
   canvasElement.addEventListener('lostpointercapture', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent
-    if (capturedPointerId === null || event.pointerId !== capturedPointerId) {
+    if (input.activePointerId === null || event.pointerId !== input.activePointerId) {
       return
     }
-    capturedPointerId = null
+    input.activePointerId = null
     input.primaryPressed = false
   })
 }

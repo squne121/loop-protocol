@@ -30,7 +30,6 @@ interface LoopE2EState {
     y: number
     aimX: number
     aimY: number
-    primaryPressed?: boolean
   }
   projectiles: Array<{
     id: number
@@ -38,6 +37,10 @@ interface LoopE2EState {
     y: number
     ageMs: number
   }>
+  input: {
+    primaryPressed: boolean
+    activePointerId: number | null
+  }
 }
 
 async function getGameState(page: Page): Promise<LoopE2EState> {
@@ -314,14 +317,15 @@ test('pointerup clears primary fire state', async ({ page }) => {
 
   await page.mouse.up()
 
-  // Record projectile count after pointerup + several ticks
-  const stateAfterUp = await getGameState(page)
-  const tickAfterUp = stateAfterUp.tick
+  // Assert pointer state cleared immediately after pointerup
+  const afterUp = await getGameState(page)
+  expect(afterUp.input.primaryPressed).toBe(false)
+  expect(afterUp.input.activePointerId).toBeNull()
 
+  // Also verify simulation keeps running
+  const tickAfterUp = afterUp.tick
   await waitForTick(page, tickAfterUp + 10)
 
-  // Count after waiting — may go down (projectiles expire) or stay same — but NOT
-  // continuously grow, since fire is released. We verify tick advanced (simulation running).
   const stateFinal = await getGameState(page)
   expect(stateFinal.tick).toBeGreaterThan(tickAfterUp)
 })
@@ -354,13 +358,87 @@ test('pointercancel clears active pointer state', async ({ page }) => {
     button: 0,
   })
 
-  // After cancel the pointer state should clear.
-  // We verify by checking no more projectiles accumulate unexpectedly.
-  const stateAfterCancel = await getGameState(page)
-  const tickAfterCancel = stateAfterCancel.tick
+  // Assert pointer state cleared after pointercancel
+  const afterCancel = await getGameState(page)
+  expect(afterCancel.input.primaryPressed).toBe(false)
+  expect(afterCancel.input.activePointerId).toBeNull()
 
+  // Also verify simulation keeps running
+  const tickAfterCancel = afterCancel.tick
   await waitForTick(page, tickAfterCancel + 10)
 
   const stateFinal = await getGameState(page)
   expect(stateFinal.tick).toBeGreaterThan(tickAfterCancel)
+})
+
+test('lostpointercapture clears active pointer state', async ({ page }) => {
+  // GIVEN a pointerdown has been dispatched to the canvas
+  // WHEN lostpointercapture is dispatched on the canvas
+  // THEN primaryPressed should become false and activePointerId should be null
+  const canvas = page.locator('canvas.battle-stage__canvas')
+
+  await canvas.dispatchEvent('pointerdown', {
+    bubbles: true,
+    cancelable: true,
+    pointerId: 1,
+    isPrimary: true,
+    button: 0,
+  })
+  await page.waitForTimeout(100)
+
+  const before = await getGameState(page)
+  // pointerdown should have activated primary fire
+  expect(before.input.primaryPressed).toBe(true)
+  expect(before.input.activePointerId).toBe(1)
+
+  // Dispatch lostpointercapture to simulate pointer capture being lost
+  await canvas.dispatchEvent('lostpointercapture', {
+    bubbles: false,
+    cancelable: false,
+    pointerId: 1,
+  })
+  await page.waitForTimeout(100)
+
+  const after = await getGameState(page)
+  expect(after.input.primaryPressed).toBe(false)
+  expect(after.input.activePointerId).toBeNull()
+})
+
+test('projectile renders on canvas', async ({ page }) => {
+  // GIVEN the app is loaded and the canvas is idle
+  // WHEN a pointer down is held long enough to fire a projectile
+  // THEN the canvas pixel data should differ from the pre-fire state
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  const box = await canvas.boundingBox()
+  expect(box).not.toBeNull()
+
+  const centerX = box!.x + box!.width / 2
+  const centerY = box!.y + box!.height / 2
+
+  // Wait for initial render to settle
+  await page.waitForTimeout(100)
+
+  // Record canvas before firing
+  const beforeDataUrl = await page.evaluate(() => {
+    const c = document.querySelector('canvas') as HTMLCanvasElement
+    return c.toDataURL()
+  })
+
+  // Fire projectile
+  await page.mouse.move(centerX, centerY)
+  await page.mouse.down({ button: 'left' })
+
+  // Wait for weapon interval (280ms) plus render frame buffer
+  await page.waitForTimeout(400)
+
+  await page.mouse.up()
+
+  // Record canvas after firing
+  const afterDataUrl = await page.evaluate(() => {
+    const c = document.querySelector('canvas') as HTMLCanvasElement
+    return c.toDataURL()
+  })
+
+  // Canvas pixel data must have changed (projectile rendered)
+  expect(afterDataUrl).not.toBe(beforeDataUrl)
 })
