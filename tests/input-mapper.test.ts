@@ -13,6 +13,7 @@ describe('mapInputToCommands', () => {
       pointerX: 120,
       pointerY: 340,
       primaryPressed: true,
+      activePointerId: null,
     })
 
     expect(commands).toEqual([
@@ -31,6 +32,7 @@ describe('mapInputToCommands', () => {
       pointerX: 0,
       pointerY: 0,
       primaryPressed: false,
+      activePointerId: null,
     })
 
     expect(commands.some((c) => c.type === 'move')).toBe(false)
