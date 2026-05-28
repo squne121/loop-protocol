@@ -3,7 +3,8 @@ import { defineConfig, devices } from '@playwright/test'
 /**
  * Playwright E2E configuration for LOOP_PROTOCOL.
  *
- * - Uses Vite preview server (pnpm build && pnpm preview) — not the dev server.
+ * - Uses Vite preview server (started by webServer) — not the dev server.
+ *   Run `pnpm test:e2e` for local (includes build), `pnpm test:e2e:ci` for CI (build done separately).
  * - VITE_E2E_MODE=true enables the read-only window.__LOOP_E2E__ observability hook.
  * - trace: 'retain-on-failure' ensures trace files are saved on any first failure
  *   (AC6: first-run failures are captured without requiring retries).

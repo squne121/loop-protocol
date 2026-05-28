@@ -264,30 +264,29 @@ test('projectile position changes after simulation ticks (projectile moves)', as
   // Record projectile position
   const stateWithProjectile = await getGameState(page)
   const firstProjectile = stateWithProjectile.projectiles[0]
-  const xBefore = firstProjectile.x
-  const yBefore = firstProjectile.y
-  const tickBefore = stateWithProjectile.tick
 
   await page.mouse.up()
 
-  // Wait for more ticks
-  await waitForTick(page, tickBefore + 10)
-
-  const stateAfter = await getGameState(page)
-  // Find same projectile by id (or check if position changed in the array)
-  const sameProjectile = stateAfter.projectiles.find(
-    (p) => p.id === firstProjectile.id,
-  )
-
-  if (sameProjectile) {
-    // Projectile still alive — position should have changed
-    const moved =
-      sameProjectile.x !== xBefore || sameProjectile.y !== yBefore
-    expect(moved).toBe(true)
-  }
-  // If projectile has expired (left arena), that's also valid simulation progress
-  // — we just confirm the test ran (tick advanced).
-  expect(stateAfter.tick).toBeGreaterThan(tickBefore)
+  // Assert the specific projectile moves within 1 second.
+  // The arena is large enough that a freshly-fired projectile cannot leave bounds
+  // within 1 second (weapon fires from center, arena is 800×600 minimum).
+  await expect
+    .poll(
+      async () => {
+        const s = await page.evaluate(() =>
+          (
+            window as Window & {
+              __LOOP_E2E__?: { getState: () => LoopE2EState }
+            }
+          ).__LOOP_E2E__!.getState(),
+        )
+        const p = s.projectiles.find((c) => c.id === firstProjectile.id)
+        if (!p) return false
+        return p.x !== firstProjectile.x || p.y !== firstProjectile.y
+      },
+      { timeout: 1000, intervals: [16, 33, 50] },
+    )
+    .toBe(true)
 })
 
 test('pointerup clears primary fire state', async ({ page }) => {

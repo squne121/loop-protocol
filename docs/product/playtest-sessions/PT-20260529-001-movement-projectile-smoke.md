@@ -1,3 +1,5 @@
+# Example / Template — このファイルは実際の playtest 実行結果ではなく、記録フォーマットのサンプルです。実際の証跡は CI artifact として別途保存されます。
+
 # Playtest Session: Movement + Projectile Smoke (E2E)
 
 > **IMPORTANT**: Automatic E2E results are NOT UX validity evidence.
@@ -5,9 +7,9 @@
 > Human playtesting is required to evaluate feel and UX.
 
 ```yaml
-session_id: "PT-20260529-001"
-date: "2026-05-29"
-build_ref: "906533e"
+session_id: "PT-YYYYMMDD-XXX"
+date: "<FILL_IN_FROM_CI>"
+build_ref: "<FILL_IN_FROM_CI>"
 session_mode: "browser_automation"
 tester_profile: "playwright-ci"
 environment: "automated-ci"
@@ -26,10 +28,10 @@ automation:
     computed_by: "ci_scripts"
     source: "playwright_trace"
     sample_unit: "runs"
-    runs: 1
-    success_count: 1
-    failure_count: 0
-    success_rate: 1.0
+    runs: "<FILL_IN_FROM_CI>"
+    success_count: "<FILL_IN_FROM_CI>"
+    failure_count: "<FILL_IN_FROM_CI>"
+    success_rate: "<FILL_IN_FROM_CI>"
     death_count: 0
     death_rate: null
     duration:
@@ -43,7 +45,7 @@ automation:
     artifact_contains: ["dom_snapshot"]
     public_repo_safe: false
     metrics_json: ""
-    trace_ref: ""
+    trace_ref: "<FILL_IN_FROM_CI>"
     replay_ref: ""
     input_script_ref: "tests/e2e/movement-projectile.spec.ts"
     raw_artifact_committed: false
