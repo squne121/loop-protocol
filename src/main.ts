@@ -7,6 +7,7 @@ import {
   createInitialGameState,
   defaultSimulationConfig,
 } from './state'
+import type { GameState } from './state'
 import { createLocalGameStorage } from './storage'
 import {
   advanceSimulationLoop,
@@ -104,4 +105,24 @@ function resizeArena(currentState: typeof state): void {
   currentState.arena.height = Math.round(width * 0.5625)
   // Re-clamp player after arena resize to prevent out-of-bounds position.
   clampPlayerToArena(currentState)
+}
+
+// ---------------------------------------------------------------------------
+// E2E observability hook (AC12)
+// - ONLY active when VITE_E2E_MODE === 'true' (tree-shaken in production builds)
+// - Read-only: exposes a getter snapshot function, never mutates game state
+// - Production build MUST NOT contain '__LOOP_E2E__'
+// ---------------------------------------------------------------------------
+if (import.meta.env.VITE_E2E_MODE === 'true') {
+  ;(
+    window as Window &
+      typeof globalThis & {
+        __LOOP_E2E__: { getState: () => Readonly<GameState> }
+      }
+  ).__LOOP_E2E__ = {
+    /** Returns a shallow snapshot of the current game state. Read-only. */
+    getState(): Readonly<GameState> {
+      return state
+    },
+  }
 }
