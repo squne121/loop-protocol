@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "vitest run --exclude 'tests/e2e/**'",
+    "test": "vitest run --exclude 'tests/e2e/**' --exclude '.claude/worktrees/**'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc && vite build",
