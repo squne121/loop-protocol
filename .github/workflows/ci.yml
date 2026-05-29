@@ -143,6 +143,8 @@ jobs:
       - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
       - name: Kill Switch smoke test
         run: python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
+      - name: Secret exposure scan (production scripts)
+        run: python3 .claude/scripts/secret_exposure_scanner.py --local .claude/scripts --exclude secret_exposure_scanner.py --exclude check_session_recording_runtime_safety.py --fail-on-finding
       - name: Secret exposure scan (clean fixtures)
         run: python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/valid --fail-on-finding
       - name: Generate ci_test_selection/v1 artifact

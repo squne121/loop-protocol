@@ -128,10 +128,16 @@ RULES: list[dict[str, Any]] = [
         "description": "Anthropic project API key (sk-proj-...)",
     },
     {
-        "rule_id": "github_pat",
+        "rule_id": "github_token_classic",
         "source_kind": "github_token",
-        "pattern": re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
-        "description": "GitHub PAT or OAuth token",
+        "pattern": re.compile(r"gh[pousr]_[A-Za-z0-9]{36,255}"),
+        "description": "GitHub classic PAT or OAuth token (length range updated for 2026 formats)",
+    },
+    {
+        "rule_id": "github_fine_grained_pat",
+        "source_kind": "github_token",
+        "pattern": re.compile(r"github_pat_[A-Za-z0-9_]{82}"),
+        "description": "GitHub fine-grained PAT (github_pat_ prefix, 82 char body)",
     },
 ]
 
@@ -265,6 +271,101 @@ def scan_local(root: Path, exclude_patterns: list[str] | None = None) -> list[di
     return findings
 
 
+def _run_gh_api(url: str, fail_on_api_error: bool) -> Any | None:
+    """
+    Run `gh api <url>` and return parsed JSON, or None on error.
+    B5: GitHub surface scan helper.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["gh", "api", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print(
+                f"ERROR: gh api {url!r} failed (exit {result.returncode}): {result.stderr.strip()}",
+                file=sys.stderr,
+            )
+            if fail_on_api_error:
+                sys.exit(2)
+            return None
+        return json.loads(result.stdout)
+    except FileNotFoundError:
+        print("ERROR: `gh` CLI not found. Install gh and authenticate to use GitHub surface scan.", file=sys.stderr)
+        if fail_on_api_error:
+            sys.exit(2)
+        return None
+    except Exception as exc:
+        print(f"ERROR: gh api request failed: {exc}", file=sys.stderr)
+        if fail_on_api_error:
+            sys.exit(2)
+        return None
+
+
+def _parse_owner_repo_number(spec: str) -> tuple[str, str, str]:
+    """
+    Parse 'OWNER/REPO#N' into (owner, repo, number).
+    B5: GitHub surface scan helper.
+    """
+    import re as _re
+    m = _re.match(r"^([^/]+)/([^#]+)#(\d+)$", spec)
+    if not m:
+        raise ValueError(f"Invalid GitHub spec {spec!r}. Expected OWNER/REPO#N")
+    return m.group(1), m.group(2), m.group(3)
+
+
+def scan_github_issue(spec: str, fail_on_api_error: bool) -> list[dict[str, Any]]:
+    """
+    B5: Scan GitHub issue comments for secrets.
+    spec: 'OWNER/REPO#N'
+    """
+    owner, repo, number = _parse_owner_repo_number(spec)
+    url = f"repos/{owner}/{repo}/issues/{number}/comments"
+    comments = _run_gh_api(url, fail_on_api_error)
+    if comments is None:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for comment in comments:
+        comment_id = comment.get("id", "unknown")
+        body = comment.get("body", "") or ""
+        location = f"issue:{number}#comment:{comment_id}"
+        findings.extend(scan_text(body, location=location))
+    return findings
+
+
+def scan_github_pr(spec: str, fail_on_api_error: bool) -> list[dict[str, Any]]:
+    """
+    B5: Scan GitHub PR comments and review comments for secrets.
+    spec: 'OWNER/REPO#N'
+    """
+    owner, repo, number = _parse_owner_repo_number(spec)
+    findings: list[dict[str, Any]] = []
+
+    # PR issue comments (general comments on the PR)
+    issue_url = f"repos/{owner}/{repo}/issues/{number}/comments"
+    issue_comments = _run_gh_api(issue_url, fail_on_api_error) or []
+    for comment in issue_comments:
+        comment_id = comment.get("id", "unknown")
+        body = comment.get("body", "") or ""
+        location = f"pr:{number}#comment:{comment_id}"
+        findings.extend(scan_text(body, location=location))
+
+    # PR review comments (inline review comments)
+    review_url = f"repos/{owner}/{repo}/pulls/{number}/comments"
+    review_comments = _run_gh_api(review_url, fail_on_api_error) or []
+    for comment in review_comments:
+        comment_id = comment.get("id", "unknown")
+        body = comment.get("body", "") or ""
+        location = f"pr:{number}#review_comment:{comment_id}"
+        findings.extend(scan_text(body, location=location))
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Output schema (SECRET_EXPOSURE_SCAN_RESULT_V1)
 # ---------------------------------------------------------------------------
@@ -294,10 +395,26 @@ def main() -> int:
         help="Local path (file or directory) to scan",
     )
     parser.add_argument(
+        "--github-issue",
+        metavar="OWNER/REPO#N",
+        help="Scan GitHub issue comments for secrets (B5: GitHub surface scan)",
+    )
+    parser.add_argument(
+        "--github-pr",
+        metavar="OWNER/REPO#N",
+        help="Scan GitHub PR comments and review comments for secrets (B5: GitHub surface scan)",
+    )
+    parser.add_argument(
         "--fail-on-finding",
         action="store_true",
         default=False,
         help="Exit non-zero if any findings are detected",
+    )
+    parser.add_argument(
+        "--fail-on-api-error",
+        action="store_true",
+        default=False,
+        help="Exit non-zero if GitHub API call fails (used with --github-issue / --github-pr)",
     )
     parser.add_argument(
         "--exclude",
@@ -315,27 +432,55 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.local:
-        print("ERROR: --local <path> is required", file=sys.stderr)
+    # Determine scan mode
+    scan_modes = [m for m in [args.local, args.github_issue, args.github_pr] if m]
+    if not scan_modes:
+        print("ERROR: one of --local, --github-issue, or --github-pr is required", file=sys.stderr)
+        return 2
+    if len(scan_modes) > 1:
+        print("ERROR: only one scan mode may be specified at a time", file=sys.stderr)
         return 2
 
-    scan_root = Path(args.local).resolve()
-    if not scan_root.exists():
-        print(f"ERROR: path not found: {scan_root}", file=sys.stderr)
+    findings: list[dict[str, Any]]
+
+    if args.local:
+        scan_root = Path(args.local).resolve()
+        if not scan_root.exists():
+            print(f"ERROR: path not found: {scan_root}", file=sys.stderr)
+            return 2
+
+        # B7: apply --max-file-size globally
+        global _MAX_FILE_SIZE
+        _MAX_FILE_SIZE = args.max_file_size
+
+        # Use relative path from cwd if possible, else use the argument as-is
+        try:
+            display_path = str(scan_root.relative_to(Path.cwd()))
+        except ValueError:
+            display_path = args.local
+
+        findings = scan_local(scan_root, exclude_patterns=args.exclude if args.exclude else None)
+
+    elif args.github_issue:
+        display_path = f"github:issue:{args.github_issue}"
+        try:
+            findings = scan_github_issue(args.github_issue, fail_on_api_error=args.fail_on_api_error)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    elif args.github_pr:
+        display_path = f"github:pr:{args.github_pr}"
+        try:
+            findings = scan_github_pr(args.github_pr, fail_on_api_error=args.fail_on_api_error)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    else:
+        # Unreachable, but satisfies type checker
         return 2
 
-    # B7: apply --max-file-size globally
-    global _MAX_FILE_SIZE
-    _MAX_FILE_SIZE = args.max_file_size
-
-    # B5 fix: scanned_path is the argument as given (not resolved absolute path)
-    # Use relative path from cwd if possible, else use the argument as-is
-    try:
-        display_path = str(scan_root.relative_to(Path.cwd()))
-    except ValueError:
-        display_path = args.local
-
-    findings = scan_local(scan_root, exclude_patterns=args.exclude if args.exclude else None)
     result = build_result(findings, scanned_path=display_path)
 
     # Enforce: raw_value MUST be false in output

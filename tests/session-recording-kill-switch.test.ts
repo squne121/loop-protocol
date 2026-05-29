@@ -167,7 +167,7 @@ describe('scanner_transcript (AC8)', () => {
 // ============================================================================
 
 describe('scanner_token (AC9)', () => {
-  it('GIVEN a file containing ghp_ fake token WHEN scanner runs THEN github_pat rule fires', () => {
+  it('GIVEN a file containing ghp_ fake token WHEN scanner runs THEN github_token_classic rule fires', () => {
     const tokenFile = join(FIXTURES_DIR, 'invalid', 'with_token.txt')
     expect(existsSync(tokenFile)).toBe(true)
 
@@ -177,7 +177,8 @@ describe('scanner_token (AC9)', () => {
     expect(parsed.finding_count).toBeGreaterThan(0)
 
     const ruleIds = parsed.findings.map((f: { rule_id: string }) => f.rule_id)
-    expect(ruleIds).toContain('github_pat')
+    // B6: rule was renamed to github_token_classic (length range updated for 2026 formats)
+    expect(ruleIds).toContain('github_token_classic')
   })
 })
 
