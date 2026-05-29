@@ -28,15 +28,28 @@ subagent_contract_mode: link_only
 ```text
 [Step 0: Preconditions / planner input assembly]
         ↓
-[Step 0f: plan_refinement_loop.py]
+[Step 0f: plan_refinement_loop.py]  → REFINEMENT_LOOP_PLAN_V1
         ↓
 [Step 1: Investigation]      → codebase-investigator
 [Step 1b: Web research]      → web-researcher (conditional)
         ↓
-[Step 2: Review]             → issue-reviewer
+[Step 2: Review]             → issue-reviewer → REVIEW_ISSUE_RESULT_V1
         ↓
  approve → Step 4.5 → Step 5
  needs-fix
+   ├─ [blocker_class 確定]
+   │    review_blockers = REVIEW_ISSUE_RESULT_V1.blocking_issues
+   │    auto_fixable_ids = REFINEMENT_LOOP_PLAN_V1.decisions.auto_fixable_structural_blocker_list
+   │    if (review_blockers - auto_fixable_ids) is empty:
+   │      blocker_class = auto_fixable_structural
+   │    else:
+   │      blocker_class = requires_human
+   │
+   ├─ no_approval == true
+   │  AND blocker_class == auto_fixable_structural
+   │  AND requires_human blockers == 0:
+   │    iteration += 1 → Step 4 (自動継続)
+   │
    ├─ iteration + 1 >= max_iterations → Step 5 (needs_second_pass)
    └─ else Step 4 → issue-author → next iteration
 ```
@@ -52,6 +65,7 @@ LOOP_STATE:
   max_iterations: 1
   last_verdict: approve | needs-fix | null
   blockers_history: []
+  blocker_class: null | auto_fixable_structural | requires_human
   improvements_applied: []
   removed_state_labels: []
   termination_reason: null | approved | needs_second_pass | human_escalation | superseded_by_decision
