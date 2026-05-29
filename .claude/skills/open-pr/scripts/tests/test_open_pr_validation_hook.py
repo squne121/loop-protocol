@@ -637,3 +637,62 @@ def test_ac6_dry_run_also_validates_and_classifies(
     assert any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines), (
         f"dry-run must still classify LP050 as E_SCHEMA_CONSUMER_INVENTORY_MISSING; got: {lines}"
     )
+
+
+# --- B3: Integration test using real validator subprocess ---
+
+
+def test_integration_missing_schema_consumer_inventory_uses_real_validator(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Real validator subprocess integration: LP052 missing Schema Consumer Inventory
+    section yields E_SCHEMA_CONSUMER_INVENTORY_MISSING via open_pr.main.
+
+    _run_pr_body_validator is NOT monkeypatched; only create_pr and gh-related helpers
+    are replaced to avoid network calls.
+    """
+    fixture_path = FIXTURE_DIR / "missing_schema_consumer_inventory_section.md"
+    body_path = write_temp_body(fixture_path.read_text(encoding="utf-8"))
+    output_lines: list[str] = []
+
+    def capture_print(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        line = sep.join(str(a) for a in args)
+        output_lines.append(line)
+
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-170-test")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+        monkeypatch.setattr(
+            open_pr,
+            "create_pr",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("create_pr must not be called")),
+        )
+        monkeypatch.setattr("builtins.print", capture_print)
+
+        # _run_pr_body_validator is NOT monkeypatched — real subprocess is used
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test integration",
+                "--linked-issue", "170",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+            ]
+        )
+
+        assert rc == 2, f"Expected exit 2 from validator failure; got {rc}; output: {output_lines}"
+        assert any(
+            line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in output_lines
+        ), (
+            f"Expected ERROR=E_SCHEMA_CONSUMER_INVENTORY_MISSING in stdout; got: {output_lines}"
+        )
+        assert not any(
+            line == f"ERROR={open_pr.E_PR_BODY_VALIDATION_FAILED}" for line in output_lines
+        ), (
+            f"Should not emit E_PR_BODY_VALIDATION_FAILED for LP052/Schema Consumer Inventory; got: {output_lines}"
+        )
+    finally:
+        Path(body_path).unlink(missing_ok=True)

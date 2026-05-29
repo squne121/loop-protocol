@@ -43,7 +43,7 @@ def _classify_validator_errors(errors: list[object]) -> str:
             return E_SCHEMA_CONSUMER_INVENTORY_MISSING
         if rule_id == "LP052":
             message = error.get("message", "")
-            if "Schema Consumer Inventory" in message:
+            if message.strip() == "Missing required section: Schema Consumer Inventory":
                 return E_SCHEMA_CONSUMER_INVENTORY_MISSING
     return E_PR_BODY_VALIDATION_FAILED
 
