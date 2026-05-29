@@ -59,6 +59,13 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
       source_url: \"...\"
       source_note_id: \"...\"
       summary: \"...\"
+
+# 空の場合の形式（省略禁止）
+FOLLOW_UP_MATERIALIZATION_RESULT_V1:
+  schema_version: 1
+  materialized_by: impl-review-loop
+  follow_up_issues: []
+  note_only_observations: []
 \`\`\`"
 ```
 
