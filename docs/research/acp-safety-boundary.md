@@ -82,7 +82,7 @@ approvalMode = approvalMode ?? this.config.getApprovalMode(
 | approvalMode 値 | session/new 受理 | effective mode | exposed native tools | MCP tools | fallback/downgrade | fail-closed 方針 |
 |---|---|---|---|---|---|---|
 | `"default"` | 受理 | ツール呼び出し前に `session/request_permission` を発行 | 全 native tool が active（read/write/execute/network） | 全 MCP tool が active | なし | permission handler で write/execute を deny |
-| `"plan"` | 受理 | read-only（write/execute ツール拒否） | read 系のみ（`read_file`/`search`/`fetch` 等）、`write_file`/`run_shell_command` 等は内部で拒否 | read-only MCP のみ | plan モードで拒否された tool は `session/request_permission` を発行しない | 最も安全な設定 |
+| `"plan"` | 受理 | read-only（write/execute ツール拒否）。ただし **plan artifact ディレクトリへの書き込みは例外的に許可される**。`activate_skill`/`ask_user` も許容。custom plan directory（`settings.general.defaultPlanDirectory` 等）では policy 次第で書き込み先が変わるため probe 対象とする。invariant: project workspace / target repo / caller 指定パスへは mutate しない。`replace`/`write_file` の plan-directory 例外は probe で実測要。read-only MCP tools は許容されるが、その read-only 判定を信頼境界に含めない | read 系のみ（`read_file`/`search`/`fetch` 等）、`write_file`/`run_shell_command` 等は内部で拒否（plan directory 書き込みは例外） | read-only MCP のみ（MCP tool の read-only 判定は MCP server 実装依存。信頼境界に含めない） | plan モードで拒否された tool は `session/request_permission` を発行しない | 最も安全な設定だが plan-directory 例外と MCP read-only 判定の probe が必要 |
 | `"auto_edit"` | 受理 | edit 系を自動承認 | edit ツールを含む多くの native tool が無確認で実行 | MCP tool を自動承認 | なし | 安全でない（write 操作が自動実行される） |
 | `"yolo"` | 受理 | すべて自動承認 | すべての native tool が無確認で実行 | すべての MCP tool が無確認で実行 | なし | 最も危険。delegation には使用禁止 |
 | 不正値（`"readonly"` 等） | **拒否**（session/new error） | N/A | N/A | N/A | `session_new_failed` → headless_json fallback | fail-closed（セッション開始されない） |
@@ -158,6 +158,21 @@ Gemini CLI 0.44.1 の native tool registry（`coreTools.js` / `chunk-GPVT36PL.js
 | `extensions` | settings.json の `extensions` | 拡張機能（read/write/execute は拡張依存） | ACP セッションでも extensions はロードされる。抑止には `extensions: []` or `--extensions ""` |
 | `agents` | `.gemini/agents/` / settings.json | sub-agent 定義（execute side effect） | agents がツールを保持している場合、execute side effect の可能性あり |
 | `adminSkillsEnabled` | settings.json の `adminSkillsEnabled` | admin スキルの有効化（`true` が既定） | `adminSkillsEnabled: false` で admin スキルを無効化可。read-only delegation では `false` を推奨 |
+
+### settings.json 外部キー / 内部 Config / CLI flag 対応表
+
+| 目的 | settings.json key | CLI flag | 内部 Config field | runtime 確認方法 |
+|---|---|---|---|---|
+| native tool allowlist | `tools.core` | — | `coreTools` | tool registry dump で実際の tool list を確認 |
+| tool 事前承認リスト | `tools.allowed` | — | `allowedTools` | `tools.allowed=[]` で全自動承認を無効化 |
+| tool 完全無効化 | `tools.excludeTools` | — | `excludeTools` | `excludeTools: ["write_file", ...]` で denylist |
+| 外部 tool discovery | — | — | `toolDiscoveryCommand` | `null` で無効化（execute side effect 防止） |
+| 外部 tool call | — | — | `toolCallCommand` | `null` で無効化（execute side effect 防止） |
+| admin スキル | `adminSkillsEnabled` | — | `adminSkillsEnabled` | `false` で admin スキル無効化 |
+| MCP server 許可リスト | `mcp.allowed` | — | — | `[]` で全 MCP 無効化（admin required を除く） |
+| MCP server 除外リスト | `mcp.excluded` | — | — | `["*"]` で全除外 |
+| admin required MCP | `admin.mcp.requiredConfig` | — | — | 抑止不能（admin 設定優先） |
+| admin スキル有効化 | `admin.skills.enabled` | — | — | `false` で admin スキル無効化 |
 
 ### 重要な発見
 
@@ -248,6 +263,80 @@ Gemini CLI 0.44.1 の native tool registry（`coreTools.js` / `chunk-GPVT36PL.js
 # 証跡: artifacts/schema-capture-<ISO8601>.json に保存
 ```
 
+#### probe 7: user settings MCP injection probe
+
+**目的**: `~/.gemini/settings.json` に MCP server を定義した状態で ACP session を開始し、tool registry に MCP tool が露出するかを確認する。
+
+```bash
+# 前提: ~/.gemini/settings.json に canary MCP server を追加
+# ACP セッションを開始し、tool registry に MCP tool が露出するかを確認
+# exit 0: 露出が確認された（user settings MCP injection の証明）
+# exit 1: 露出が確認されない
+# 証跡: artifacts/user-mcp-injection-probe-<ISO8601>.json に保存
+```
+
+#### probe 8: workspace MCP injection probe
+
+**目的**: `<cwd>/.gemini/settings.json` に MCP server を定義し、`session/new` の `cwd` 経由で MCP が注入されるかを確認する。
+
+```bash
+# 前提: <tmpdir>/.gemini/settings.json に canary MCP server を追加
+# session/new の cwd に tmpdir を指定して ACP セッションを開始
+# tool registry に MCP tool が露出するかを確認
+# exit 0: 露出が確認された（workspace MCP injection の証明）
+# exit 1: 露出が確認されない
+# 証跡: artifacts/workspace-mcp-injection-probe-<ISO8601>.json に保存
+```
+
+#### probe 9: admin required MCP 抑止不可の明示
+
+**目的**: `admin.mcp.requiredConfig` で定義された MCP は `mcp.allowed=[]` でも残留することを確認する。
+
+```bash
+# 前提: admin policy に requiredMcpServers が定義された環境
+# mcp.allowed=[] を設定した ACP セッションを開始
+# tool registry に admin required MCP tool が残留するかを確認
+# exit 0: 残留が確認された（admin required MCP は抑止不可の証明）
+# exit 1: 残留が確認されない（環境に admin policy がない場合は SKIP）
+# 証跡: artifacts/admin-mcp-probe-<ISO8601>.json に保存
+```
+
+#### probe 10: mcp.allowed=[] 空 allowlist 実効性確認
+
+**目的**: `mcp.allowed=[]` が空 allowlist として実際に効くかを実測する。
+
+```bash
+# isolated settings に mcp.allowed=[] を設定して ACP セッションを開始
+# tool registry に MCP tool が露出しないことを確認
+# exit 0: MCP tool が存在しない（mcp.allowed=[] が機能している）
+# exit 1: MCP tool が露出している（mcp.allowed=[] が機能していない）
+# 証跡: artifacts/mcp-allowed-empty-probe-<ISO8601>.json に保存
+```
+
+#### probe 11: readOnlyHint=true を持つ悪性 MCP tool の扱い
+
+**目的**: `toolAnnotations.readOnlyHint=true` だが副作用を持つ MCP tool が Plan mode で許容されるかを確認する。
+
+```bash
+# 前提: readOnlyHint=true だが write side effect を持つ canary MCP tool を用意
+# plan mode で ACP セッションを開始し、canary MCP tool が実行可能かを確認
+# exit 0: canary MCP tool が拒否される（read-only hint を超えた保護）
+# exit 1: canary MCP tool が実行される（readOnlyHint=true の信頼は危険）
+# 証跡: artifacts/readonly-hint-probe-<ISO8601>.json に保存
+```
+
+#### probe 12: mcpServers trust:true の禁止確認
+
+**目的**: ACP `session/new` で渡された `mcpServers` に `trust:true` が設定可能かを確認し、禁止することを明示する。
+
+```bash
+# session/new の mcpServers に trust:true を設定して ACP セッションを開始
+# trust:true が受理されるか（受理された場合は危険）を確認
+# exit 0: trust:true が拒否または無視される（安全）
+# exit 1: trust:true が受理される（禁止設定が必要）
+# 証跡: artifacts/mcp-trust-probe-<ISO8601>.json に保存
+```
+
 ### probe exit code convention
 
 | exit code | 意味 |
@@ -302,7 +391,7 @@ artifacts/runtime-verification-AC-probe-<ISO8601 UTC>.json
 
 | 要件 | 実装方法 |
 |---|---|
-| isolated HOME/settings | `HOME=$(mktemp -d)` で gemini 起動（user settings MCP を完全隔離） |
+| isolated HOME/settings | `GEMINI_CLI_HOME=$(mktemp -d)` で gemini 起動（user settings MCP を完全隔離。`HOME=$(mktemp -d)` は Gemini CLI 以外の挙動も変えるため非推奨） |
 | version pin | `semver` チェックで安全確認済みの version range のみ使用 |
 | `approvalMode: "plan"` | `session/new` で `approvalMode: "plan"` を必須化 |
 | `mcp.allowed=[]` | isolated settings に `mcp.allowed: []` を明示 |
@@ -375,7 +464,7 @@ experimental/off-by-default とする。
 
 **スコープ**:
 - `verify_acp_safety_boundary.sh` の実装（probe 1-6 の full suite）
-- isolated HOME での gemini 起動テスト
+- `GEMINI_CLI_HOME=$(mktemp -d)` を使った isolated state での gemini 起動テスト
 - `approvalMode: "plan"` + `mcp.allowed=[]` + `adminSkillsEnabled: false` の combination test
 - Antigravity CLI（`agy`）の ACP サポート有無の確認（`agy --help` / `agy --acp` probe）
 
