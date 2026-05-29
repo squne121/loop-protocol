@@ -655,9 +655,9 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
     lines = body.split('\n')[start_line - 1:end_line]
 
     errors = []
-    # Match lines that are pure comment-only lines (no leading spaces before #)
-    # with the pattern: # AC<N>: <description>
-    pattern = re.compile(r'^\s*#\s+AC\d+\s*:')
+    # Match lines that are AC markers with a colon + non-whitespace description.
+    # Requires non-whitespace after ':' to avoid false positives on trailing colons.
+    pattern = re.compile(r'^\s*#\s+AC\d+\s*:\s*\S')
 
     current_line = start_line
     for line in lines:
