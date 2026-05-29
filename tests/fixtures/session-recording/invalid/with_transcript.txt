@@ -1,0 +1,3 @@
+This file contains transcript markers that the scanner should detect.
+source_kind: transcript
+assistant_response: some content here

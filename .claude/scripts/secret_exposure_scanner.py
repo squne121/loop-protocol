@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+secret_exposure_scanner.py
+
+Secret exposure scanner for session recording artifacts.
+Scans files for secret-like patterns (provider-aware rules).
+Outputs findings in SECRET_EXPOSURE_SCAN_RESULT_V1 format.
+raw_value / matched_text / context_line are NEVER included in output.
+
+Usage:
+    python3 .claude/scripts/secret_exposure_scanner.py --local <path> [--fail-on-finding]
+
+Exit codes:
+    0  - no findings
+    1  - findings detected (with --fail-on-finding)
+    2  - scan error
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Secret patterns (provider-aware)
+# ---------------------------------------------------------------------------
+
+RULES: list[dict[str, Any]] = [
+    {
+        "rule_id": "entircli_checkpoint_v1",
+        "source_kind": "entircli_checkpoint",
+        "pattern": re.compile(r"entire/checkpoints/v1"),
+        "description": "EntireCLI checkpoint v1 marker",
+    },
+    {
+        "rule_id": "entircli_checkpoint_header",
+        "source_kind": "entircli_checkpoint",
+        "pattern": re.compile(r"Entire-Checkpoint"),
+        "description": "EntireCLI checkpoint header",
+    },
+    {
+        "rule_id": "entircli_attribution_header",
+        "source_kind": "entircli_checkpoint",
+        "pattern": re.compile(r"Entire-Attribution"),
+        "description": "EntireCLI attribution header",
+    },
+    {
+        "rule_id": "transcript_source_kind",
+        "source_kind": "transcript",
+        "pattern": re.compile(r"source_kind:\s*transcript"),
+        "description": "Raw transcript source_kind marker",
+    },
+    {
+        "rule_id": "local_file_source_kind",
+        "source_kind": "transcript",
+        "pattern": re.compile(r"source_kind:\s*local_file"),
+        "description": "Local file source_kind marker",
+    },
+    {
+        "rule_id": "raw_transcript_marker",
+        "source_kind": "transcript",
+        "pattern": re.compile(r"\braw_transcript\b"),
+        "description": "Raw transcript field marker",
+    },
+    {
+        "rule_id": "assistant_response_marker",
+        "source_kind": "transcript",
+        "pattern": re.compile(r"\bassistant_response\b"),
+        "description": "Assistant response field marker",
+    },
+    {
+        "rule_id": "tool_result_marker",
+        "source_kind": "transcript",
+        "pattern": re.compile(r"\btool_result\b"),
+        "description": "Tool result field marker",
+    },
+    {
+        "rule_id": "absolute_path_posix_home",
+        "source_kind": "path",
+        "pattern": re.compile(r"/home/[^\s/]+"),
+        "description": "Absolute POSIX home path",
+    },
+    {
+        "rule_id": "absolute_path_posix_users",
+        "source_kind": "path",
+        "pattern": re.compile(r"/Users/[^\s/]+"),
+        "description": "Absolute POSIX users path",
+    },
+    {
+        "rule_id": "absolute_path_tmp",
+        "source_kind": "path",
+        "pattern": re.compile(r"/tmp/[^\s]*"),
+        "description": "Absolute /tmp path",
+    },
+    {
+        "rule_id": "absolute_path_windows",
+        "source_kind": "path",
+        "pattern": re.compile(r"[A-Z]:\\[^\s]+"),
+        "description": "Absolute Windows path",
+    },
+    {
+        "rule_id": "dotenv_content",
+        "source_kind": "env_file",
+        "pattern": re.compile(r"^[A-Z_][A-Z0-9_]*=\S+", re.MULTILINE),
+        "description": ".env file content pattern",
+    },
+    {
+        "rule_id": "private_key_begin",
+        "source_kind": "crypto_key",
+        "pattern": re.compile(r"BEGIN\s+\w*\s*PRIVATE\s+KEY"),
+        "description": "PEM private key header",
+    },
+    {
+        "rule_id": "anthropic_api_key",
+        "source_kind": "api_key",
+        "pattern": re.compile(r"sk-[A-Za-z0-9_\-]{30,}"),
+        "description": "Anthropic API key (sk-...)",
+    },
+    {
+        "rule_id": "anthropic_project_key",
+        "source_kind": "api_key",
+        "pattern": re.compile(r"sk-proj-[A-Za-z0-9_\-]{30,}"),
+        "description": "Anthropic project API key (sk-proj-...)",
+    },
+    {
+        "rule_id": "github_pat",
+        "source_kind": "github_token",
+        "pattern": re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
+        "description": "GitHub PAT or OAuth token",
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Safe redaction (no raw value in output)
+# ---------------------------------------------------------------------------
+
+def _sha256_prefix(raw_match: str, length: int = 8) -> str:
+    """Return hex SHA-256 prefix of the raw match value (no raw value exposed)."""
+    digest = hashlib.sha256(raw_match.encode("utf-8")).hexdigest()
+    return digest[:length]
+
+
+def _redacted_preview(raw_match: str, max_chars: int = 8) -> str:
+    """
+    Return a redacted preview: first min(4, len) chars + '****'.
+    Never exposes the full value.
+    """
+    show = min(4, len(raw_match))
+    return raw_match[:show] + "****"
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
+def scan_text(content: str, location: str) -> list[dict[str, Any]]:
+    """
+    Scan text content for secret patterns.
+    Returns findings with NO raw_value / matched_text / context_line.
+    """
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()  # (rule_id, sha256_prefix) dedup
+
+    for rule in RULES:
+        for match in rule["pattern"].finditer(content):
+            raw = match.group(0)
+            sha_prefix = _sha256_prefix(raw)
+            dedup_key = (rule["rule_id"], sha_prefix)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            finding: dict[str, Any] = {
+                "rule_id": rule["rule_id"],
+                "source_kind": rule["source_kind"],
+                "redacted_preview": _redacted_preview(raw),
+                "sha256_prefix": sha_prefix,
+                "location": location,
+            }
+            # Explicit enforcement: raw_value / matched_text / context_line MUST NOT appear
+            assert "raw_value" not in finding
+            assert "matched_text" not in finding
+            assert "context_line" not in finding
+            findings.append(finding)
+
+    return findings
+
+
+def scan_file(path: Path) -> list[dict[str, Any]]:
+    """Scan a single file. Returns findings list."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [{
+            "rule_id": "scan_error",
+            "source_kind": "error",
+            "redacted_preview": "****",
+            "sha256_prefix": "00000000",
+            "location": str(path),
+        }]
+    return scan_text(content, location=str(path))
+
+
+def scan_local(root: Path) -> list[dict[str, Any]]:
+    """Recursively scan a local directory or file."""
+    findings: list[dict[str, Any]] = []
+    if root.is_file():
+        findings.extend(scan_file(root))
+    elif root.is_dir():
+        for child in sorted(root.rglob("*")):
+            if child.is_file():
+                findings.extend(scan_file(child))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Output schema (SECRET_EXPOSURE_SCAN_RESULT_V1)
+# ---------------------------------------------------------------------------
+
+def build_result(findings: list[dict[str, Any]], scanned_path: str) -> dict[str, Any]:
+    """Build the SECRET_EXPOSURE_SCAN_RESULT_V1 output schema."""
+    return {
+        "schema": "SECRET_EXPOSURE_SCAN_RESULT_V1",
+        "raw_value_included": False,  # REQUIRED false
+        "scanned_path": scanned_path,
+        "finding_count": len(findings),
+        "findings": findings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Secret exposure scanner for session recording artifacts."
+    )
+    parser.add_argument(
+        "--local",
+        metavar="PATH",
+        help="Local path (file or directory) to scan",
+    )
+    parser.add_argument(
+        "--fail-on-finding",
+        action="store_true",
+        default=False,
+        help="Exit non-zero if any findings are detected",
+    )
+    args = parser.parse_args()
+
+    if not args.local:
+        print("ERROR: --local <path> is required", file=sys.stderr)
+        return 2
+
+    scan_root = Path(args.local).resolve()
+    if not scan_root.exists():
+        print(f"ERROR: path not found: {scan_root}", file=sys.stderr)
+        return 2
+
+    findings = scan_local(scan_root)
+    result = build_result(findings, scanned_path=str(scan_root))
+
+    # Enforce: raw_value MUST be false in output
+    assert result["raw_value_included"] is False, "raw_value_included must be false"
+
+    # Print JSON result (no raw secrets in output)
+    output = json.dumps(result, indent=2, ensure_ascii=False)
+    print(output, flush=True)
+
+    if findings:
+        print(f"\nScan complete: {len(findings)} finding(s) detected.", file=sys.stderr, flush=True)
+        if args.fail_on_finding:
+            return 1
+    else:
+        print("Scan complete: no findings.", file=sys.stderr, flush=True)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

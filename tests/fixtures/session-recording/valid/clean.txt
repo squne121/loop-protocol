@@ -1,0 +1,2 @@
+This file is clean — no secret patterns detected by the scanner.
+All checks should PASS for this file.

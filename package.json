@@ -20,7 +20,10 @@
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
     "policy:check:session": "uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md",
     "policy:check": "pnpm run policy:check:secret && pnpm run policy:check:session",
-    "manifest:check": "node scripts/check-agent-session-manifests.mjs"
+    "manifest:check": "node scripts/check-agent-session-manifests.mjs",
+    "session-recording:smoke": "python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording",
+    "secret-exposure:scan": "python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording --fail-on-finding",
+    "security:session-recording": "pnpm run policy:check && pnpm run manifest:check && pnpm run session-recording:smoke && pnpm run secret-exposure:scan"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
