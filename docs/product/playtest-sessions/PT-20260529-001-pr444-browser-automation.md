@@ -32,7 +32,7 @@ automation:
     runs: 13
     success_count: 13
     failure_count: 0
-    success_rate: "100%"
+    success_rate: 1.0
     death_count: 0
     death_rate: null
     duration:
@@ -42,8 +42,8 @@ automation:
     input_count_total: 13
     collision_count_total: 0
   artifacts:
-    storage_class: "retain-on-failure"
-    artifact_contains: ["dom_snapshot"]
+    storage_class: "local_git"
+    artifact_contains: []
     public_repo_safe: false
     metrics_json: ""
     trace_ref: ""
@@ -54,8 +54,8 @@ automation:
     redaction_status: "not_applicable"
     trace_redacted: true
     artifact_absent_reason: >
-      All 13 tests passed (green run). Playwright is configured retain-on-failure,
-      so no trace artifacts are retained for passing runs.
+      All 13 tests passed (green run). Playwright trace is configured as
+      retain-on-failure, so no trace artifact is retained for passing runs.
   human_review_required: false
 
 playtest_entries:

@@ -21,6 +21,8 @@ privacy:
   raw_video_committed: false
   personal_data_in_session: false
 
+automation: null
+
 task_script:
   - task_id: "TASK-HI-001"
     description: "Open http://localhost:5173 (or dist via pnpm preview)"
@@ -94,10 +96,9 @@ playtest_entries:
     player_quote_redacted: ""
     emotional_signal: "positive"
     developer_interpretation: >
-      Movement implementation from PR #444 is confirmed responsive and correct from
-      a human perception standpoint. The fixed 60Hz simulation tick produces smooth
-      motion at the display refresh rate. No balance or tuning concerns noted for
-      current speed values — feels appropriate for prototype stage.
+      Developer-self did not observe blocking movement issues in this focused
+      regression check. The 60Hz tick produced smooth motion during this session.
+      This does not establish general-player UX validity or final tuning quality.
     player_suggested_fix: ""
     observable_signal: "player position visual delta per frame, response latency"
     collection_method: "direct_observation"
@@ -109,8 +110,8 @@ playtest_entries:
       - "REQ-MOVEMENT-001"
     classification: "unclear_needs_more_data"
     severity: "low"
-    confidence: "high"
-    decision: "no_action"
+    confidence: "medium"
+    decision: "defer"
     proposed_spec_delta: ""
     linked_issue: "#448"
     validation_method: "human_internal"
@@ -127,10 +128,9 @@ playtest_entries:
     player_quote_redacted: ""
     emotional_signal: "positive"
     developer_interpretation: >
-      Projectile firing mechanic from PR #444 is confirmed functional from a human
-      experience standpoint. The pointer-to-direction mapping feels intuitive.
-      Speed and visual appearance are acceptable for prototype stage.
-      No bugs or misfires observed during testing.
+      Developer-self did not observe blocking projectile issues in this focused
+      regression check. Pointer-to-direction mapping appeared directionally correct.
+      This does not establish general-player UX validity or final tuning quality.
     player_suggested_fix: ""
     observable_signal: "projectile spawn, trajectory arc, disappearance off-canvas"
     collection_method: "direct_observation"
@@ -142,8 +142,8 @@ playtest_entries:
       - "REQ-PROJECTILE-001"
     classification: "unclear_needs_more_data"
     severity: "low"
-    confidence: "high"
-    decision: "no_action"
+    confidence: "medium"
+    decision: "defer"
     proposed_spec_delta: ""
     linked_issue: "#448"
     validation_method: "human_internal"
