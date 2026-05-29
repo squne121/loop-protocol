@@ -6,17 +6,17 @@ parent_issue: "#483"
 trace_links:
   - "#483"
   - "#484"
+  - "#485"
   - "#486"
   - "#488"
   - "#489"
   - "docs/product/features/movement-projectile.md"
-  - "docs/product/features/sortie.md"
   - "docs/product/game-logic.md"
   - "docs/adr/0001-architecture-baseline.md"
   - "docs/product/playable-roadmap.md"
 related_tests:
-  - src/systems/CollisionSystem.test.ts
-  - src/systems/CombatSystem.test.ts
+  - tests/collision-system.test.ts
+  - tests/combat-system.test.ts
 ---
 
 # Combat Core Feature Spec
@@ -69,8 +69,9 @@ M2（v0.2.x）の Combat 最小仕様は以下を含む:
 ### EnemyDefinition（テンプレート）
 
 ```typescript
+// EnemyDefinition（src/data/enemies.ts で定義）
 type EnemyDefinition = {
-  id: number;               // unique identifier（spawn 順の monotonic counter）
+  definitionId: string;     // archetype id（例: "enemy-basic"）
   maxHp: number;            // 最大 HP
   radius: number;           // circle hitbox 半径（px）
   speedPxPerSec: number;    // 移動速度（px/sec）
@@ -81,8 +82,10 @@ type EnemyDefinition = {
 ### EnemyState（ランタイム状態）
 
 ```typescript
+// EnemyState（runtime instance）
 type EnemyState = {
-  id: number;               // unique identifier
+  id: number;               // monotonic spawn counter
+  definitionId: string;     // 対応する EnemyDefinition.definitionId
   hp: number;               // 現在 HP（0 以上、maxHp 以下）
   maxHp: number;            // 最大 HP
   x: number;                // arena 座標 X（px）
@@ -143,12 +146,14 @@ type CollisionPair = {
 
 ## CollisionSystem Contract
 
+> **M2 Migration Note**: 現行の `CollisionSystem.ts` は player boundary clamp / telemetry を担う void system である。M2 実装（Issue #488）では、boundary clamp 責務を `MovementSystem` または `BoundaryClampSystem` へ移管し、本仕様の pure CollisionPair[] producer として再実装する。現行 `CombatSystem.ts` は aim/fire/cooldown を担う system であり、M2 では collision damage 処理を担う `CombatResolutionSystem` を別途追加するか、既存 `CombatSystem` をリネーム・分割して対応する（#488 で実装判断を行う）。
+
 ### 責務
 
 `CollisionSystem` は **circle hitbox 判定のみ** を行い、`CollisionPair[]` を返す。
 
 入力: `GameState`
-出力: sorted `CollisionPair[]`（`priorityKey` 昇順）
+出力: sorted `CollisionPair[]`（後述 `compareCollisionPair` comparator 順）
 
 ### 禁止事項
 
@@ -198,7 +203,7 @@ function runCollisionSystem(state: GameState): CollisionPair[] {
     }
   }
 
-  return pairs.sort((a, b) => a.priorityKey.localeCompare(b.priorityKey));
+  return pairs.sort(compareCollisionPair);
 }
 ```
 
@@ -236,10 +241,33 @@ function runCollisionSystem(state: GameState): CollisionPair[] {
 1. **`projectile-enemy` を先に処理**
 2. 次に **`player-enemy` を処理**
 3. 同種内は **id 昇順**:
-   - `projectile-enemy`: `projectileId ASC`、同一 projectileId では `enemyId ASC`
-   - `player-enemy`: `playerId ASC`、同一 playerId では `enemyId ASC`
+   - `projectile-enemy`: `projectileId ASC`（数値比較）、同一 projectileId では `enemyId ASC`（数値比較）
+   - `player-enemy`: `playerId ASC`（文字列比較）、同一 playerId では `enemyId ASC`（数値比較）
 
 この順序により、同一 tick 内での処理結果が deterministic になる。
+
+正規ソート順の **SSOT は以下の `compareCollisionPair` comparator** とする。`priorityKey` フィールドは重複排除用途に残すが、ソート順の決定には使用しない。
+
+```typescript
+function compareCollisionPair(a: CollisionPair, b: CollisionPair): number {
+  // projectile-enemy を player-enemy より先に処理
+  const kindRank = (p: CollisionPair) => (p.kind === "projectile-enemy" ? 0 : 1);
+  const ak = kindRank(a);
+  const bk = kindRank(b);
+  if (ak !== bk) return ak - bk;
+
+  if (a.kind === "projectile-enemy" && b.kind === "projectile-enemy") {
+    if (a.projectileId !== b.projectileId) return (a.projectileId ?? 0) - (b.projectileId ?? 0);
+    return a.enemyId - b.enemyId;
+  }
+  if (a.kind === "player-enemy" && b.kind === "player-enemy") {
+    const playerCmp = (a.playerId ?? "").localeCompare(b.playerId ?? "");
+    if (playerCmp !== 0) return playerCmp;
+    return a.enemyId - b.enemyId;
+  }
+  return 0;
+}
+```
 
 ---
 
@@ -280,11 +308,22 @@ result.kills = kills;
 
 ---
 
-## game-logic.md との関係
+## M2 Scope Exception（game-logic.md からの一時的逸脱）
 
-`docs/product/game-logic.md` の「衝突 / Collision」セクションが定義する上位制約（60Hz 固定タイムステップ、衝突の deterministic 性）に本 spec は準拠する。
+上位仕様 `docs/product/game-logic.md` は broad-phase / CCD / swept circle を collision 要件に含む。
+M2 ではこれらを **non-goals（後続 Issue に defer）** として一時的に除外する。
 
-game-logic.md で言及される broad-phase / CCD については、M2 では **non-goals** とし、後続 Issue に defer する。M2 は narrow-phase（`O(projectiles × enemies)` circle 判定）のみで実装する。
+**No-tunneling envelope（M2 制約）:**
+- projectile speed: 最大 ~520 px/s（60Hz では 1 tick あたり ~8.7 px 移動）
+- projectile radius: 最小 4 px
+- enemy radius: 最小 16 px
+
+1 tick の移動量（~8.7px）は enemy radius（16px）を超えないため、
+M2 で実装する enemy サイズの範囲では tunneling は発生しない。
+この制約を超える high-speed projectile または small enemy を追加する場合は、
+CCD（swept circle / segment-circle 判定）を先行 Issue として起票すること。
+
+broad-phase / CCD は後続 Issue（#483 またはその sub-issue）で対応する。
 
 ---
 
@@ -295,7 +334,7 @@ game-logic.md で言及される broad-phase / CCD については、M2 では *
 | AC1 | 本ファイルが存在する |
 | AC2 | YAML frontmatter に `doc_id`、`status: accepted`、`issue: "#484"`、`parent_issue`、`trace_links` がある |
 | AC3 | `trace_links` に `#483`、`#486`、`#488`、`#489`、`movement-projectile.md`、`game-logic.md`、`0001-architecture-baseline.md` が含まれる |
-| AC4 | EnemyState の最小フィールドが定義されている |
+| AC4 | EnemyState の最小フィールドが定義されている（`id: number`、`definitionId: string`、`hp`、`maxHp`、`x`、`y`、`radius`、`speedPxPerSec`、`contactDamage`、`defeated`、`defeatedAtTick` を含む） |
 | AC5 | CollisionSystem が circle hitbox 判定のみを行い、CollisionPair[] を返し、HP/削除/defeat/result/resource/persistence を変更しないことが明記されている |
 | AC6 | CombatSystem が CollisionPair[] を消費し、enemy damage / player damage / defeat marker / projectile deletion を担当し、sortie result / resource / persistence を直接変更しないことが明記されている |
 | AC7 | projectile-enemy 衝突が single-hit / non-piercing / `projectileId ASC, enemyId ASC` 優先順序で定義されている |
@@ -305,4 +344,4 @@ game-logic.md で言及される broad-phase / CCD については、M2 では *
 | AC11 | M2 では narrow-phase のみ（O(projectiles × enemies) circle 判定）とし、broad-phase / CCD を non-goals または後続 Issue に defer することが明記されている |
 | AC12 | 同一 tick 処理順序（projectile-enemy 先処理、次に player-enemy；同種内は id 昇順）が明記されている |
 | AC13 | non-goals に campaign / upgrade / persistence / audio / network / VFX / broad-phase / CCD が含まれる |
-| AC14 | `related_tests` に CollisionSystem.test.ts / CombatSystem.test.ts が列挙されている |
+| AC14 | `related_tests` に `tests/collision-system.test.ts` / `tests/combat-system.test.ts` が列挙されている |
