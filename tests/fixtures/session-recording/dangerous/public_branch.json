@@ -8,5 +8,8 @@
     "SRRS_CHECKPOINT_TOKEN": "absent"
   },
   "expected_exit": "nonzero",
-  "trigger": "public_checkpoint_branch_present"
+  "trigger": "public_checkpoint_branch_present",
+  "expected_triggers": [
+    "FAIL:public_checkpoint_branch_present"
+  ]
 }

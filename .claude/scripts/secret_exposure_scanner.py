@@ -156,6 +156,14 @@ def _redacted_preview(raw_match: str, max_chars: int = 8) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# B7: default max file size (1MB)
+_MAX_FILE_SIZE: int = 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
 # Scanner
 # ---------------------------------------------------------------------------
 
@@ -192,30 +200,68 @@ def scan_text(content: str, location: str) -> list[dict[str, Any]]:
     return findings
 
 
-def scan_file(path: Path) -> list[dict[str, Any]]:
-    """Scan a single file. Returns findings list."""
+def scan_file(path: Path, base: Path) -> list[dict[str, Any]]:
+    """
+    Scan a single file. Returns findings list.
+    B5 fix: location uses relative path from base to avoid absolute paths in output.
+    """
+    # B7: skip symlinks and binary-like files
+    if path.is_symlink():
+        return []
+    # B7: skip files above max size (default 1MB)
+    try:
+        if path.stat().st_size > _MAX_FILE_SIZE:
+            return []
+    except OSError:
+        return []
+
+    # B7: skip binary files (check for null bytes in first 8KB)
+    try:
+        sample = path.read_bytes()[:8192]
+        if b"\x00" in sample:
+            return []
+    except OSError:
+        pass
+
+    try:
+        location = str(path.relative_to(base))
+    except ValueError:
+        location = str(path)
+
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+    except OSError:
         return [{
             "rule_id": "scan_error",
             "source_kind": "error",
             "redacted_preview": "****",
             "sha256_prefix": "00000000",
-            "location": str(path),
+            "location": location,
         }]
-    return scan_text(content, location=str(path))
+    return scan_text(content, location=location)
 
 
-def scan_local(root: Path) -> list[dict[str, Any]]:
-    """Recursively scan a local directory or file."""
+def scan_local(root: Path, exclude_patterns: list[str] | None = None) -> list[dict[str, Any]]:
+    """
+    Recursively scan a local directory or file.
+    B7: Supports exclude patterns and skips symlinks/binaries.
+    """
+    import fnmatch
     findings: list[dict[str, Any]] = []
     if root.is_file():
-        findings.extend(scan_file(root))
+        findings.extend(scan_file(root, root.parent))
     elif root.is_dir():
         for child in sorted(root.rglob("*")):
-            if child.is_file():
-                findings.extend(scan_file(child))
+            if not child.is_file():
+                continue
+            if child.is_symlink():
+                continue
+            # B7: apply exclude patterns
+            if exclude_patterns:
+                rel = str(child.relative_to(root))
+                if any(fnmatch.fnmatch(rel, pat) for pat in exclude_patterns):
+                    continue
+            findings.extend(scan_file(child, root))
     return findings
 
 
@@ -253,6 +299,20 @@ def main() -> int:
         default=False,
         help="Exit non-zero if any findings are detected",
     )
+    parser.add_argument(
+        "--exclude",
+        metavar="PATTERN",
+        action="append",
+        default=[],
+        help="Glob pattern to exclude (relative to scan root). May be specified multiple times.",
+    )
+    parser.add_argument(
+        "--max-file-size",
+        metavar="BYTES",
+        type=int,
+        default=1024 * 1024,
+        help="Skip files larger than this size in bytes (default: 1048576 = 1MB)",
+    )
     args = parser.parse_args()
 
     if not args.local:
@@ -264,8 +324,19 @@ def main() -> int:
         print(f"ERROR: path not found: {scan_root}", file=sys.stderr)
         return 2
 
-    findings = scan_local(scan_root)
-    result = build_result(findings, scanned_path=str(scan_root))
+    # B7: apply --max-file-size globally
+    global _MAX_FILE_SIZE
+    _MAX_FILE_SIZE = args.max_file_size
+
+    # B5 fix: scanned_path is the argument as given (not resolved absolute path)
+    # Use relative path from cwd if possible, else use the argument as-is
+    try:
+        display_path = str(scan_root.relative_to(Path.cwd()))
+    except ValueError:
+        display_path = args.local
+
+    findings = scan_local(scan_root, exclude_patterns=args.exclude if args.exclude else None)
+    result = build_result(findings, scanned_path=display_path)
 
     # Enforce: raw_value MUST be false in output
     assert result["raw_value_included"] is False, "raw_value_included must be false"

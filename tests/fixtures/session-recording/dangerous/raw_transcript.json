@@ -8,5 +8,8 @@
     "SRRS_CHECKPOINT_TOKEN": "absent"
   },
   "expected_exit": "nonzero",
-  "trigger": "raw_transcript_public_surface_detected"
+  "trigger": "checkpoint_remote_visibility_unknown",
+  "expected_triggers": [
+    "FAIL_CLOSED:checkpoint_remote_visibility_unknown"
+  ]
 }

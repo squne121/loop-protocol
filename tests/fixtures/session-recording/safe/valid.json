@@ -8,5 +8,8 @@
     "SRRS_CHECKPOINT_TOKEN": "absent"
   },
   "expected_exit": "zero",
-  "trigger": null
+  "trigger": null,
+  "expected_triggers": [
+    "PASS"
+  ]
 }
