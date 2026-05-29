@@ -55,15 +55,56 @@ MERGE_STATE_STATUS=$(echo "$TEST_VERDICT_BODY" | grep "merge_state_status:" | he
 
 TEST_VERDICT_MACHINE コメントが見つからない場合のみ、フォールバックで:
 ```bash
-gh pr view <PR番号> --json mergeable,mergeStateStatus
+gh pr view <PR番号> --json mergeable,merge_state_status
 ```
 
 判定:
-- `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
-- `mergeStateStatus=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
+- `mergeable=CONFLICTING` または `merge_state_status=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
+- `merge_state_status=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
 - `mergeable=UNKNOWN`（retry 後も） → **Unknown blocker**（REQUEST_CHANGES）
-- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
-- `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE|BEHIND` → 次へ進む
+- `merge_state_status=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
+- `mergeable=MERGEABLE` かつ `merge_state_status=CLEAN|UNSTABLE|BEHIND` → 次へ進む
+
+## VC 証跡判定ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
+
+`PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY: TEST_VERDICT_MACHINE > CI_CHECK_RUN_SCOPED > PR_BODY_SELF_REPORT`
+
+VC 証跡の信頼階層は以下の順とする（上位が存在する場合は下位を単独の根拠として使わない）:
+
+1. **TEST_VERDICT_MACHINE**（最優先）: test-runner SubAgent が投稿する `<!-- TEST_VERDICT_MACHINE v1 -->` マーカー付きコメント。機械的に生成された検証結果であり、最も信頼できる。
+2. **CI_CHECK_RUN_SCOPED**（補助証跡）: `CI_CHECK_RUN_SCOPED は head_sha・workflow・job・step・command・conclusion=success が対象 VC と対応する場合のみ補助証跡`。以下の条件をすべて満たす場合のみ有効:
+   - `conclusion=success`（`skipped` / `neutral` は不可）
+   - 対象 PR の `head_sha` で実行されたもの（stale な SHA は不可）
+   - `workflow` / `job` / `step` / `command` が linked issue の対象 VC に対応している
+   - runtime verification AC の場合は artifact/log が参照可能
+   - TEST_VERDICT_MACHINE が存在しない理由が明示されている
+3. **PR_BODY_SELF_REPORT**（補助情報のみ）: PR 本文の自己申告。単独では APPROVE の根拠にならない（`PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED` 参照）。
+
+### APPROVE 禁止条件（PR_REVIEW_JUDGE_APPROVE_PROHIBITION_SKIP_FALLBACK）
+
+`PR_REVIEW_JUDGE_APPROVE_PROHIBITION_SKIP_FALLBACK`: 以下のいずれかが検出された場合は **APPROVE 禁止（REQUEST_CHANGES）**:
+
+- `verification_skipped_count > 0`（TEST_VERDICT_MACHINE に記録されている場合）
+- `SKIP:` または `exit 77` を返す VC が存在する
+- `_*_fallback: true` フィールドが runtime_ac_results 内に存在する
+- fallback 経由の成功を PASS として扱っている（fallback PASS は APPROVE 禁止）
+- PR の `head_sha` が TEST_VERDICT_MACHINE の SHA と一致しない（stale head_sha）
+
+required VC の SKIP は PASS ではない。SKIP guard / fallback 経由の成功は形骸化した検証であり APPROVE 不可。
+
+### PR 自己申告単独禁止（PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED）
+
+`PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED`: PR 本文（`## 検証コマンド結果` 等）の自己申告のみを根拠として APPROVE してはならない。TEST_VERDICT_MACHINE または CI_CHECK_RUN_SCOPED（限定条件を満たすもの）の証跡が存在しない場合、PR body self-report のみでは APPROVE 不可。
+
+### 複数 linked issue AC coverage 義務（MULTI_LINKED_ISSUE_AC_COVERAGE_REQUIRED）
+
+`MULTI_LINKED_ISSUE_AC_COVERAGE_REQUIRED`: 1 つの PR が複数の Issue を close する場合（`Closes #N, Closes #M` 等）、すべての linked issue それぞれについて AC coverage が確認できない限り APPROVE 禁止。Issue ごとの AC coverage matrix（どの Issue のどの AC が満たされているか）を PR 本文で確認し、いずれか 1 つでも AC coverage が未確認の Issue がある場合は blocker とする。
+
+### レビュー優先順位（PR_REVIEW_PRIORITY_ORDER）
+
+`PR_REVIEW_PRIORITY_ORDER: Outcome/AC達成 -> VC妥当性 -> SKIP/fallback検出 -> CI scope/head_sha -> runtime evidence -> PR本文形式`
+
+レビュー時はこの順序で判定を行い、上位の問題が存在する場合は下位の確認より優先して blocker として報告する。
 
 ### 3. CI 証跡を確認
 
@@ -72,15 +113,12 @@ gh pr checks <PR番号>
 ```
 
 判定:
-- 全チェックが `pass` / `success` → CI pass
+- 全チェックが `pass` / `success` → CI pass（ただし CI_CHECK_RUN_SCOPED の限定条件を満たす場合のみ補助証跡として有効）
 - `fail` / `failure` が存在 → CI fail（blocker として記録、Step 4 へ進む）
 - CI チェックが紐づいていない、または `pending` のみ → **CI 証跡なし blocker**（REQUEST_CHANGES、CI 完了後に再レビュー）
+- `skipped` / `neutral` → CI 証跡として扱わない（PR_REVIEW_JUDGE_APPROVE_PROHIBITION_SKIP_FALLBACK 適用）
 
-GitHub Actions が動いていない場合のフォールバック（test-runner 出力の `verification_commands_pass/fail` 数値で代替）:
-```bash
-echo "$TEST_VERDICT_BODY" | grep -E "verification_commands_(pass|fail):"
-```
-test-runner が `verification_commands_fail: 0` を返していれば CI 証跡相当として扱う。
+GitHub Actions が動いていない場合: TEST_VERDICT_MACHINE コメントの `verification_commands_pass/fail` 数値は CI 代替として扱わない。CI チェックが紐づいていない場合は **CI 証跡なし blocker** とし、fail-closed で判定する。TEST_VERDICT_MACHINE が存在し、かつ CI_CHECK_RUN_SCOPED の全条件（head_sha・workflow・job・step・command・conclusion=success）を満たす場合のみ補助証跡として使用可能。
 
 ### 4. PR Evidence をレビュー
 
@@ -104,6 +142,7 @@ gh pr diff <PR番号> --name-only
 | **TEST_VERDICT_MACHINE の SKIP 検出（全 PR）** | test-runner の `TEST_VERDICT_MACHINE` コメントに `verification_skipped_count: 0`、または linked issue に `decision: deferred` / waiver が明示されている | blocker: required VC の SKIP は PASS ではない |
 | **Runtime VC の fallback / 証跡不足検出（immediate のみ）** | linked issue の `decision: immediate` で、`runtime_ac_results` 内に `fallback_detected: true` / `artifact_present: false` / `human_review_required: true` が存在しない | blocker（APPROVE 禁止）: exit 77 / `SKIP:` / `_*_fallback: true` の検出時は APPROVE しない |
 | **deferred 検証先確認** | linked issue の `decision: deferred` で、PR 本文に後続 Issue / 統合フェーズ / 検証条件の参照が存在する | blocker（参照がない場合） |
+| **複数 linked issue coverage** | PR が複数 Issue を close する場合、各 Issue の AC coverage が PR 本文に issue ごとの matrix として記載されている（MULTI_LINKED_ISSUE_AC_COVERAGE_REQUIRED） | blocker |
 
 placeholder のままの行（例: `[x] AC1: <達成（根拠）>` の `<...>` が残存）は証跡として数えず blocker。
 
@@ -220,9 +259,11 @@ Safety Claim Matrix の必須列: `Claim` / `Implemented?` / `Not controlled` / 
 | 条件 | 判定 |
 |---|---|
 | safety-sensitive PR なのに Safety Claim Matrix セクションが存在しない | **APPROVE 禁止** |
-| `Not controlled` 列が非空なのに、PR title / summary / docs が無限定の `safe` / `read-only` / `sandboxed` / `isolated` / `complete` を使用している | **APPROVE 禁止** |
+| `Not controlled` 列が非空なのに、PR title / summary / docs が無限定の `safe` / `read-only` / `sandboxed` / `isolated` / `complete` を使用している | **APPROVE 禁止** (`SAFETY_CLAIM_OVERCLAIM_REQUEST_CHANGES`) |
 | `Not controlled` 列が非空なのに、`Follow-up` 列に open な follow-up Issue の参照がない | **APPROVE 禁止** |
 | `Evidence` 列が、linked issue の Verification Commands または PR の Verification Results と対応していない | **APPROVE 禁止** |
+
+`SAFETY_CLAIM_OVERCLAIM_REQUEST_CHANGES`: 安全主張・read-only 主張・sandbox 主張・isolated 主張が実装の制御範囲を超える場合（`Not controlled` 列が非空なのに無限定の安全主張をしている場合）は REQUEST_CHANGES とする。bounded claim（射程が閉じた経路に限定された主張）のみ許可する。
 
 以下の場合は APPROVE 禁止しない（bounded claim として許可）:
 
@@ -285,7 +326,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 ## Verdict: APPROVE | REQUEST_CHANGES
 
 ### Mergeability
-- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, mergeStateStatus=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
+- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, merge_state_status=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
 
 ### Evidence Check
 - AC coverage: <○/△/×、根拠>
@@ -305,7 +346,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 verdict: APPROVE | REQUEST_CHANGES
 blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
 recommendations: []  # APPROVE + MERGEABLE + BEHIND のとき [update_branch]。有効値: update_branch
 follow_up_issue_requests:
