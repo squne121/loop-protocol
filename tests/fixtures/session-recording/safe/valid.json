@@ -1,0 +1,15 @@
+{
+  "fixture_id": "valid_safe",
+  "description": "Safe configuration — no Kill Switch triggers, all checks PASS",
+  "srrs_overrides": {
+    "SRRS_GIT_LS_REMOTE_EXIT": "2",
+    "SRRS_GH_VISIBILITY": "private",
+    "SRRS_GIT_CONFIG_OUTPUT": "",
+    "SRRS_CHECKPOINT_TOKEN": "absent"
+  },
+  "expected_exit": "zero",
+  "trigger": null,
+  "expected_triggers": [
+    "PASS"
+  ]
+}

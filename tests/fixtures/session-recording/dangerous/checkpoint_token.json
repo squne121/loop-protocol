@@ -1,0 +1,15 @@
+{
+  "fixture_id": "checkpoint_token",
+  "description": "ENTIRE_CHECKPOINT_TOKEN present with no verified private remote — triggers Kill Switch (FAIL-CLOSED)",
+  "srrs_overrides": {
+    "SRRS_GIT_LS_REMOTE_EXIT": "2",
+    "SRRS_GH_VISIBILITY": "unknown",
+    "SRRS_GIT_CONFIG_OUTPUT": "",
+    "SRRS_CHECKPOINT_TOKEN": "present"
+  },
+  "expected_exit": "nonzero",
+  "trigger": "checkpoint_token_present_no_verified_remote",
+  "expected_triggers": [
+    "FAIL_CLOSED:checkpoint_token_present_no_verified_remote"
+  ]
+}

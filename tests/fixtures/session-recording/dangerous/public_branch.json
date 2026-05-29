@@ -1,0 +1,15 @@
+{
+  "fixture_id": "public_branch",
+  "description": "Public checkpoint branch detected via git ls-remote — triggers Kill Switch",
+  "srrs_overrides": {
+    "SRRS_GIT_LS_REMOTE_EXIT": "0",
+    "SRRS_GH_VISIBILITY": "private",
+    "SRRS_GIT_CONFIG_OUTPUT": "",
+    "SRRS_CHECKPOINT_TOKEN": "absent"
+  },
+  "expected_exit": "nonzero",
+  "trigger": "public_checkpoint_branch_present",
+  "expected_triggers": [
+    "FAIL:public_checkpoint_branch_present"
+  ]
+}

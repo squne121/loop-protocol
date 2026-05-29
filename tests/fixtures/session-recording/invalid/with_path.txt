@@ -1,0 +1,2 @@
+This file contains an absolute path that the scanner should detect.
+path: /home/user/secret/path

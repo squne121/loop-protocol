@@ -1,0 +1,2 @@
+This file contains a fake GitHub token for testing scanner detection.
+token: ghp_FAKETOKEN000000000000000000000000000
