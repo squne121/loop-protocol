@@ -87,6 +87,45 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 > 動作検証 AC（`runtime-verification: true`）を含む VC の設計は `docs/dev/runtime-verification-policy.md` を参照すること。
 > SKIP 規約（exit 77）・証跡保存フォーマット・テストシナリオ最小セット・Stop Condition 連動が定義されている。
 
+## VC_SINGLE_COMMAND_GUARDRAIL
+
+Issue body の VC（Verification Commands）は **shell control operator に依存しない単一コマンド** で記述する。
+
+### 禁止 operators
+
+以下の shell control operators を VC コマンド行で使用してはならない:
+
+| Operator | 禁止理由 |
+|---|---|
+| `&&` | 前段の exit code に依存した条件実行。失敗判定が不完全になる |
+| `||` | `A && B || C` は if-then-else と等価ではない（SC2015）。A が成功して B が失敗した場合に C が実行される |
+| `|` | パイプの exit code は最終コマンドに依存し、前段の失敗を隠蔽する |
+| `;` | 逐次実行。前段の失敗を無視する |
+| `&` | バックグラウンド実行。exit code が非同期になる |
+| `<<`, `<`, `>`, `>>`, `<<<` | リダイレクト。VC の決定論性を下げる |
+
+### SC2015 問題（A && B || C パターン）
+
+`A && B || C` は "if A then B else C" と等価ではない:
+
+- A が成功し B が失敗した場合: C が実行される（意図しない PASS）
+- 例: `grep -q pattern file && echo PASS || echo FAIL`
+  - `grep` が成功（pattern 存在）しても `echo PASS` が非 0 を返すと `echo FAIL` が実行される
+
+### compound shell が避けられない場合の AC 分割方針
+
+1 つの VC コマンドが複数の条件チェックを行う必要がある場合は、AC を複数エントリに分割する。
+
+### checker script entrypoint
+
+compound shell 違反の自動検出は以下のスクリプトで行う:
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/verify_vc_single_command_guardrail_docs.py --strict
+```
+
+違反があれば file:line で報告して exit 1。成功時は exit 0。
+
 ### 決定論的 VC と意味的評価 AC の分離
 
 VC はすべて **決定論的（deterministic）** な形式で作成する。意味的評価は PR レビュアーの責務であり、test-runner が実行可能な VC 内で行わせない。
@@ -113,9 +152,14 @@ AC に「特定の関数内」で何かを確認する VC を書く場合、`gre
 
 ### 削除確認パターン
 
+削除されたことを確認するには、パターンの count が 0 件であることを単一コマンドで確認する。
+
 ```bash
-grep -q "削除対象の記述" <file> && echo "FAIL: 旧記述が残存" || echo "PASS: 旧記述削除済み"
+# count が 0 であることを確認する（rg は 0 件の場合 exit 1 を返す）
+rg -c "削除対象の記述" <file>
 ```
+
+> `A && echo PASS || echo FAIL` 形式の compound shell は使用しない。`VC_SINGLE_COMMAND_GUARDRAIL` セクションを参照。
 
 ### AC/VC 番号一致制約
 
@@ -128,10 +172,10 @@ Verification Commands 内の `# AC<N>` コメント番号は、Acceptance Criter
 
 ## Verification Commands
 # AC1: ファイル存在確認
-test -f <file> && echo "PASS: AC1" || echo "FAIL: AC1"
+test -f <file>
 
 # AC2: フィールド確認
-grep -q "<field>" <file> && echo "PASS: AC2" || echo "FAIL: AC2"
+rg -q "<field>" <file>
 ```
 
 ### rg 構文チェック
@@ -150,9 +194,18 @@ rg -n "^## VC 作成ガイダンス" .claude/skills/create-issue/references/body
 
 # 特定のコマンド例が記述されていることを確認する例
 rg -n "uv run --with" .claude/skills/create-issue/references/body-authoring.md
+```
 
-# 見出し配下のコンテキストを含めて確認する例（見出し + 20 行以内に内容が存在）
-rg -nA 20 "^## VC 作成ガイダンス" .claude/skills/create-issue/references/body-authoring.md | rg "rg -n"
+見出し配下のコンテキストを含めて確認する例（見出し + 20 行以内に内容が存在）は 2 段階の確認が必要なため、2 つの独立した VC に分割する:
+
+```bash
+# VC1: 見出しが存在することを確認
+rg -nA 20 "^## VC 作成ガイダンス" .claude/skills/create-issue/references/body-authoring.md
+```
+
+```bash
+# VC2: 見出し配下に rg -n が存在することを確認（VC1 通過後に実行）
+rg -n "rg -n" .claude/skills/create-issue/references/body-authoring.md
 ```
 
 Perl 互換正規表現（後読み / 先読み / Unicode property 等）が必要な場合は `-P` フラグを優先する。
@@ -190,7 +243,7 @@ uv run python -m pytest tests/
 
 **アンチパターン 2**: `cd` + `python3` 直接実行
 
-```bash
+```
 # BAD: PATH 依存・venv 未整備・cwd 前提が絡み合い環境依存が高い
 cd .claude/skills/some-skill && python3 -m pytest tests/
 ```
@@ -218,7 +271,7 @@ uv run python -m pytest .claude/skills/some-skill/tests/
 
 **アンチパターン**: `cd <dir> && python3 -m pytest`
 
-```bash
+```
 # BAD: 以下の理由で決定論性が低い
 # - cwd 変更が後続コマンドに副作用を与える
 # - python3 コマンドの PATH は環境依存
@@ -319,8 +372,8 @@ AC の番号（`- [ ] AC<n>`）と VC の行末コメント（`# AC<n>`）が一
 
 ### awk による AC 件数カウント
 
-```bash
-# Acceptance Criteria セクションの AC 件数を数える
+```
+# Acceptance Criteria セクションの AC 件数を数える（awk + wc -l の参照例）
 awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l
 ```
 
@@ -336,11 +389,17 @@ rg -c "# AC[0-9]" issue_body.md
 AC 件数と VC の `# AC<n>` 件数が一致しなければ起票・更新しない。
 `edit-issue` の guard-issue-body.py も同様の整合チェックを実施するが、起票前に手動照合しておくと手戻りを減らせる。
 
-```bash
-AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l)
-VC_AC_COUNT=$(rg -c "# AC[0-9]" issue_body.md || echo 0)
-[ "$AC_COUNT" -eq "$VC_AC_COUNT" ] && echo "PASS: AC/VC 番号一致 ($AC_COUNT 件)" || echo "FAIL: AC=$AC_COUNT / VC AC コメント=$VC_AC_COUNT"
 ```
+# 照合の参照例（各コマンドを個別に実行する）
+# AC 件数カウント
+AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l)
+# VC の # AC<n> コメント件数カウント
+VC_AC_COUNT=$(rg -c "# AC[0-9]" issue_body.md)
+# 件数比較（個別に実行）
+[ "$AC_COUNT" -eq "$VC_AC_COUNT" ]
+```
+
+> 上記を連結した `[ ... ] && echo PASS || echo FAIL` 形式は使用しない。`VC_SINGLE_COMMAND_GUARDRAIL` セクションを参照。
 
 ## 単独 implementation Issue 向け Parent 系セクション scaffold
 
