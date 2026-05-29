@@ -25,6 +25,27 @@ E_APPROVAL_MISSING = "E_APPROVAL_MISSING"
 E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
 E_LINKED_ISSUE_STATE_UNKNOWN = "E_LINKED_ISSUE_STATE_UNKNOWN"
 E_GH_FAILURE = "E_GH_FAILURE"
+E_SCHEMA_CONSUMER_INVENTORY_MISSING = "E_SCHEMA_CONSUMER_INVENTORY_MISSING"
+
+
+def _classify_validator_errors(errors: list[object]) -> str:
+    """Classify validator errors list into an error code.
+
+    Returns E_SCHEMA_CONSUMER_INVENTORY_MISSING if any error is LP050, or
+    if any LP052 error references the Schema Consumer Inventory section.
+    Returns E_PR_BODY_VALIDATION_FAILED for all other failures.
+    """
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        rule_id = error.get("rule_id", "")
+        if rule_id == "LP050":
+            return E_SCHEMA_CONSUMER_INVENTORY_MISSING
+        if rule_id == "LP052":
+            message = error.get("message", "")
+            if message.strip() == "Missing required section: Schema Consumer Inventory":
+                return E_SCHEMA_CONSUMER_INVENTORY_MISSING
+    return E_PR_BODY_VALIDATION_FAILED
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -348,7 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         if rule_ids:
             detail = f"{detail}; rule_ids={rule_ids}"
             emit_kv("VALIDATOR_RULE_IDS", rule_ids)
-        emit_error(E_PR_BODY_VALIDATION_FAILED, str(detail))
+        error_code = _classify_validator_errors(errors)
+        emit_error(error_code, str(detail))
         return 2
 
     existing = find_existing_pr(repo, branch)

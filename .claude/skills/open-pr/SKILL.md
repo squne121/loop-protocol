@@ -195,7 +195,8 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 | code | 意味 | 復旧手順 |
 |---|---|---|
 | `E_APPROVAL_MISSING` | `publish: yes` 未指定 | 人間承認を得て `publish: yes` で再実行 |
-| `E_PR_BODY_VALIDATION_FAILED` | `validate_pr_body.py` が fail / internal を返した | `VALIDATOR_RULE_IDS` と `ERROR_DETAIL` を確認し、該当 section / changed paths / validator 出力を修正して再実行 |
+| `E_PR_BODY_VALIDATION_FAILED` | `validate_pr_body.py` が fail / internal を返した（Schema Consumer Inventory 欠落以外の一般的な validation 失敗） | `VALIDATOR_RULE_IDS` と `ERROR_DETAIL` を確認し、該当 section / changed paths / validator 出力を修正して再実行 |
+| `E_SCHEMA_CONSUMER_INVENTORY_MISSING` | `schema_change` / `uncertain` PR で Schema Consumer Inventory が欠落または placeholder（LP050 / LP052 による検出） | `## Schema Consumer Inventory` セクションを追加し、before/after、consumer 列挙、更新状況を記載する |
 | `E_LINKED_ISSUE_STATE_UNKNOWN` | linked issue の state 取得失敗 | gh 認証 / linked_issue 番号を確認 |
 | `E_GH_FAILURE` | `gh pr create` 失敗 | stderr の詳細を確認、リポジトリ権限 / ブランチ存在 / リモート push 済みを確認 |
 
