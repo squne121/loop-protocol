@@ -62,11 +62,22 @@ CODE_FAIL_CLOSED_NON_GITHUB = "FAIL_CLOSED:non_github_remote_not_in_allowlist"
 # Redact helpers (AC8: no secrets in diagnostics)
 # ---------------------------------------------------------------------------
 _SECRET_PATTERNS = [
+    # Existing patterns
     re.compile(r"ghp_[0-9A-Za-z]+"),
     re.compile(r"sk-[0-9A-Za-z]+"),
     re.compile(r"ENTIRE_[A-Z_]+=\S+"),
     re.compile(r"https?://[^@\s]*:[^@\s]*@\S+"),
     re.compile(r"://[^@\s]*:[^@\s]*@"),
+    # B6: Additional token patterns
+    re.compile(r"sk-proj-[0-9A-Za-z_\-]+"),
+    re.compile(r"github_pat_[0-9A-Za-z_]+"),
+    re.compile(r"gho_[0-9A-Za-z]+"),
+    re.compile(r"ghu_[0-9A-Za-z]+"),
+    re.compile(r"ghs_[0-9A-Za-z]+"),
+    re.compile(r"ghr_[0-9A-Za-z]+"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"ASIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)(?:authorization|x-api-key|token|access_token|api_key)[=:\s]+['\"]?[0-9A-Za-z\-_\.]{20,}"),
 ]
 _ABS_PATH_POSIX = re.compile(r"/(?:home|Users|root|tmp|var|opt|usr)/\S+")
 _ABS_PATH_WINDOWS = re.compile(r"[A-Z]:\\[^\s]+")
@@ -808,6 +819,16 @@ def _self_check_redaction() -> bool:
         "ghp_abc123XYZ",
         "sk-abcDEF123",
         "https://user:pass@github.com/org/repo",
+        # B6: Additional patterns
+        "sk-proj-abcDEF123xyz",
+        "github_pat_abc123XYZ456",
+        "gho_abc123XYZ",
+        "ghu_abc123XYZ",
+        "ghs_abc123XYZ",
+        "ghr_abc123XYZ",
+        "AKIAIOSFODNN7EXAMPLE",
+        "ASIAQNCDONTUSEME1234",
+        "Authorization: abcdefghijklmnopqrstuvwxyz123456",
     ]
     for raw in samples:
         if raw in redact(raw):
