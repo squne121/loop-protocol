@@ -7,7 +7,7 @@
 ```yaml
 issue_number: <int, 必須>
 contract_snapshot_url: <URL, 任意>  # 省略時は以下の自動検出フローで取得
-max_iterations: 5  # 任意
+max_iterations: 3  # 任意
 ```
 
 ### 1-a. `contract_snapshot_url` が提供された場合
@@ -244,7 +244,7 @@ LOOP_STATE:
   contract_snapshot_url: <URL>
   contract_snapshot_source: provided | detected_existing | materialized_by_issue_contract_review
   iteration: 0
-  max_iterations: 5
+  max_iterations: 3
   worktree: .claude/worktrees/issue-<番号>-<slug>
   branch: worktree-issue-<番号>-<slug>
   last_step: null

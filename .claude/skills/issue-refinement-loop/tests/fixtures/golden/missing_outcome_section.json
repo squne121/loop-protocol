@@ -36,8 +36,7 @@
     },
     "follow_up_materialization": {
       "candidates": []
-    },
-    "auto_fixable_structural_blocker_list": []
+    }
   },
   "fail_closed": {
     "required": true,
