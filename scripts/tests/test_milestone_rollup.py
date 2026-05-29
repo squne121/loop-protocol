@@ -167,6 +167,14 @@ class TestMdCell(unittest.TestCase):
     def test_multiple_pipes(self):
         self.assertEqual(mr.md_cell("a|b|c"), "a\\|b\\|c")
 
+    def test_backtick_escaped(self):
+        """Fix 6: backtick must be escaped as \\`."""
+        self.assertEqual(mr.md_cell("a`b"), "a\\`b")
+
+    def test_combined_escapes(self):
+        """Fix 6: pipe, newline, backtick all escaped."""
+        self.assertEqual(mr.md_cell("a|b\nc`d"), "a\\|b<br>c\\`d")
+
 
 # ---------------------------------------------------------------------------
 # Mock helpers for urlopen
@@ -222,7 +230,7 @@ def _make_urlopen_mock(
     call_count = {"milestone": 0}
     sub_call_count: dict[int, int] = {}
 
-    def urlopen_side_effect(req):
+    def urlopen_side_effect(req, timeout=None):
         url = req.full_url if hasattr(req, "full_url") else str(req)
 
         # native dependency API endpoint
@@ -287,7 +295,8 @@ class TestCollectDescendants(unittest.TestCase):
             native_deps_map=native_deps_map,
         )
         with patch("urllib.request.urlopen", side_effect=side_effect):
-            return mr.collect_descendants("owner", "repo", 1, "fake_token")
+            issues, warnings, partial = mr.collect_descendants("owner", "repo", 1, "fake_token")
+            return issues, warnings
 
     def test_single_direct_issue(self):
         pages = [[_make_issue(10, "Issue A")]]
@@ -300,7 +309,7 @@ class TestCollectDescendants(unittest.TestCase):
         """Blocker 2: milestone issues endpoint must use ?milestone=N&state=all&per_page=100."""
         captured_urls = []
 
-        def capturing_urlopen(req):
+        def capturing_urlopen(req, timeout=None):
             url = req.full_url if hasattr(req, "full_url") else str(req)
             captured_urls.append(url)
             # sub_issues -> empty
@@ -431,7 +440,7 @@ class TestCollectDescendants(unittest.TestCase):
         """Blocker 3: token=None should not prevent API calls (no auth header required)."""
         pages = [[_make_issue(10)]]
 
-        def urlopen_check_auth(req):
+        def urlopen_check_auth(req, timeout=None):
             # Verify no Authorization header sent when token is None
             auth = req.get_header("Authorization")
             if "sub_issues" in req.full_url:
@@ -441,7 +450,7 @@ class TestCollectDescendants(unittest.TestCase):
             return FakeResponse([_make_issue(10)])
 
         with patch("urllib.request.urlopen", side_effect=urlopen_check_auth):
-            issues, warnings = mr.collect_descendants("owner", "repo", 1, None)
+            issues, warnings, partial = mr.collect_descendants("owner", "repo", 1, None)
 
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]["number"], 10)
@@ -456,7 +465,7 @@ class TestNativeDependencies(unittest.TestCase):
         """Blocker 1: native API 200 -> returns dep numbers, source='native'."""
         dep_obj = [{"number": 42, "state": "open", "title": "Blocker"}]
 
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             if "dependencies/blocked_by" in req.full_url:
                 return FakeResponse(dep_obj)
             raise FakeHTTPError(404)
@@ -469,7 +478,7 @@ class TestNativeDependencies(unittest.TestCase):
 
     def test_native_api_200_empty_no_fallback(self):
         """Blocker 1: native API 200 empty -> deps=[], source='native', no fallback."""
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             if "dependencies/blocked_by" in req.full_url:
                 return FakeResponse([])
             raise FakeHTTPError(404)
@@ -483,7 +492,7 @@ class TestNativeDependencies(unittest.TestCase):
 
     def test_native_api_404_triggers_fallback(self):
         """Blocker 1: native API 404 -> returns (None, 'fallback_trigger')."""
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             raise FakeHTTPError(404)
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
@@ -496,7 +505,7 @@ class TestNativeDependencies(unittest.TestCase):
         """Blocker 1: _get_dependencies_with_source prefers native over body parsing."""
         body = "## Depends On\n- #99\n"  # body has #99 but native returns #42
 
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             if "dependencies/blocked_by" in req.full_url:
                 return FakeResponse([{"number": 42}])
             raise FakeHTTPError(404)
@@ -512,7 +521,7 @@ class TestNativeDependencies(unittest.TestCase):
         """Blocker 1: when native returns 404, fall back to ## Depends On body parsing."""
         body = "## Depends On\n- #99\n"
 
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             raise FakeHTTPError(404)
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
@@ -525,7 +534,7 @@ class TestNativeDependencies(unittest.TestCase):
         """Blocker 1: native 200 empty means 'no deps', must not consult body."""
         body = "## Depends On\n- #99\n"  # body has a dep but native says empty
 
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             if "dependencies/blocked_by" in req.full_url:
                 return FakeResponse([])
             raise FakeHTTPError(404)
@@ -535,6 +544,191 @@ class TestNativeDependencies(unittest.TestCase):
 
         self.assertEqual(nums, [], "native 200 empty must return [] without consulting body")
         self.assertEqual(source, "native")
+
+    def test_native_api_uses_paginated_helper(self):
+        """Fix 2: _get_native_dependencies must use _api_get_paginated (paginated URL)."""
+        called_urls = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            called_urls.append(url)
+            if "dependencies/blocked_by" in url:
+                return FakeResponse([{"number": 7}])
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        dep_urls = [u for u in called_urls if "dependencies/blocked_by" in u]
+        self.assertTrue(len(dep_urls) >= 1, "native deps URL must be called")
+        self.assertIn("per_page=100", dep_urls[0], "URL must use per_page=100 (paginated)")
+        self.assertEqual(nums, [7])
+        self.assertEqual(source, "native")
+
+    def test_native_api_403_raises_runtime_error(self):
+        """Fix 2: 403 must raise RuntimeError, not trigger fallback."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(403)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError, msg="403 must raise RuntimeError, not return fallback_trigger"):
+                mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+    def test_native_api_429_raises_runtime_error(self):
+        """Fix 2: 429 (rate limit) must raise RuntimeError, not trigger fallback."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(429)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError, msg="429 must raise RuntimeError, not return fallback_trigger"):
+                mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+    def test_native_api_network_error_raises_runtime_error(self):
+        """Fix 2: URLError (network error) must raise RuntimeError, not trigger fallback."""
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeError, msg="Network error must raise RuntimeError, not return fallback_trigger"):
+                mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+    def test_native_api_501_triggers_fallback(self):
+        """Fix 2: 501 (not implemented) must trigger fallback, not raise."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(501)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        self.assertIsNone(nums)
+        self.assertEqual(source, "fallback_trigger")
+
+    def test_native_api_410_triggers_fallback(self):
+        """Fix 2: 410 (gone) must trigger fallback, not raise."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(410)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        self.assertIsNone(nums)
+        self.assertEqual(source, "fallback_trigger")
+
+
+# ---------------------------------------------------------------------------
+# Tests for Fix 3 (timeout) and Fix 4 (422 partial)
+# ---------------------------------------------------------------------------
+
+class TestTimeoutAndPartial(unittest.TestCase):
+    def test_api_get_uses_timeout(self):
+        """Fix 3: _api_get must pass timeout=30 to urlopen."""
+        captured_args = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured_args["timeout"] = timeout
+            return FakeResponse({"key": "value"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mr._api_get("https://api.github.com/repos/o/r/issues/1", "tok")
+
+        self.assertEqual(captured_args.get("timeout"), 30, "_api_get must use timeout=30")
+
+    def test_api_get_paginated_uses_timeout(self):
+        """Fix 3: _api_get_paginated must pass timeout=30 to urlopen."""
+        captured_args = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured_args["timeout"] = timeout
+            return FakeResponse([])
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mr._api_get_paginated("https://api.github.com/repos/o/r/issues?milestone=1", "tok")
+
+        self.assertEqual(captured_args.get("timeout"), 30, "_api_get_paginated must use timeout=30")
+
+    def test_sub_issues_paginated_uses_timeout(self):
+        """Fix 3: _get_sub_issues_paginated must pass timeout=30 to urlopen."""
+        captured_args = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured_args["timeout"] = timeout
+            return FakeResponse([])
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            mr._get_sub_issues_paginated("owner", "repo", 10, "tok")
+
+        self.assertEqual(captured_args.get("timeout"), 30, "_get_sub_issues_paginated must use timeout=30")
+
+    def test_sub_issues_422_returns_partial_true(self):
+        """Fix 4: 422 from sub_issues endpoint -> partial=True."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(422)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            children, warnings, partial = mr._get_sub_issues_paginated("owner", "repo", 10, "tok")
+
+        self.assertEqual(children, [])
+        self.assertTrue(partial, "422 must return partial=True")
+        err_warnings = [w for w in warnings if w["type"] == "sub_issues_error"]
+        self.assertEqual(len(err_warnings), 1)
+        self.assertEqual(err_warnings[0]["http_code"], 422)
+
+    def test_sub_issues_404_returns_partial_false(self):
+        """Fix 4: 404 from sub_issues endpoint -> partial=False (endpoint not available)."""
+        def fake_urlopen(req, timeout=None):
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            children, warnings, partial = mr._get_sub_issues_paginated("owner", "repo", 10, "tok")
+
+        self.assertFalse(partial, "404 must return partial=False")
+
+    def test_sub_issues_200_returns_partial_false(self):
+        """Fix 4: 200 success -> partial=False."""
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse([])
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            children, warnings, partial = mr._get_sub_issues_paginated("owner", "repo", 10, "tok")
+
+        self.assertFalse(partial)
+
+    def test_collect_descendants_422_sets_partial(self):
+        """Fix 4: 422 during traversal -> collect_descendants returns partial=True."""
+        pages = [[_make_issue(10)]]
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "sub_issues" in url:
+                raise FakeHTTPError(422)
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            return FakeResponse(pages[0])
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            issues, warnings, partial = mr.collect_descendants("owner", "repo", 1, "tok")
+
+        self.assertTrue(partial, "422 sub_issues must propagate partial=True from collect_descendants")
+
+    def test_build_report_partial_field(self):
+        """Fix 4: build_report includes partial in top-level and summary."""
+        report = mr.build_report(
+            1, [], {"pr_mixed": [], "milestone_mismatches": [],
+                    "stale_state_labels": [], "open_blockers": []},
+            [], "2026-01-01T00:00:00Z", "owner/repo", partial=True
+        )
+        self.assertTrue(report["partial"])
+        self.assertTrue(report["summary"]["partial"])
+
+    def test_build_report_partial_false_by_default(self):
+        """Fix 4: partial defaults to False."""
+        report = mr.build_report(
+            1, [], {"pr_mixed": [], "milestone_mismatches": [],
+                    "stale_state_labels": [], "open_blockers": []},
+            [], "2026-01-01T00:00:00Z", "owner/repo"
+        )
+        self.assertFalse(report["partial"])
+        self.assertFalse(report["summary"]["partial"])
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +743,7 @@ class TestAnalyze(unittest.TestCase):
         dep_states = dep_states or {}
         native_deps_map = native_deps_map or {}
 
-        def fake_urlopen(req):
+        def fake_urlopen(req, timeout=None):
             url = req.full_url if hasattr(req, "full_url") else str(req)
 
             # native dependency API
@@ -865,7 +1059,7 @@ class TestMainExitCodes(unittest.TestCase):
 
     def test_api_error_propagates_as_runtime_error(self):
         """HTTP errors from the API are raised as RuntimeError (non-zero exit path)"""
-        def raising_urlopen(req):
+        def raising_urlopen(req, timeout=None):
             raise urllib.error.URLError('connection refused')
 
         with patch('urllib.request.urlopen', side_effect=raising_urlopen):

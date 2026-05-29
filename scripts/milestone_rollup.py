@@ -28,7 +28,8 @@ NEXT_LINK_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 def md_cell(value: Any) -> str:
     """Escape a value for safe embedding in a Markdown table cell."""
-    return str(value).replace("|", "\\|").replace("\n", "<br>")
+    s = str(value).replace("|", "\\|").replace("\n", "<br>").replace("`", "\\`")
+    return s
 
 
 def _build_headers(token: str | None) -> dict[str, str]:
@@ -47,7 +48,7 @@ def _api_get(url: str, token: str | None) -> Any:
     headers = _build_headers(token)
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code} for {url}: {exc.read().decode()}") from exc
@@ -75,7 +76,7 @@ def _api_get_paginated(base_url: str, token: str | None) -> list[Any]:
         headers = _build_headers(token)
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 page = json.loads(resp.read().decode("utf-8"))
                 if isinstance(page, list):
                     results.extend(page)
@@ -94,13 +95,13 @@ def _api_get_paginated(base_url: str, token: str | None) -> list[Any]:
 
 def _get_sub_issues_paginated(
     owner: str, repo: str, issue_number: int, token: str | None
-) -> tuple[list[Any], list[dict[str, Any]]]:
+) -> tuple[list[Any], list[dict[str, Any]], bool]:
     """Get sub-issues for an issue with pagination.
 
-    Returns (children_list, warnings_list).
-    - 200 empty -> children = [] (normal, no children)
-    - 404/410 -> warning sub_issues_unavailable, children = []
-    - 422 -> warning sub_issues_error (treated as error in data quality)
+    Returns (children_list, warnings_list, partial).
+    - 200 empty -> children = [], partial=False (normal, no children)
+    - 404/410 -> warning sub_issues_unavailable, children = [], partial=False
+    - 422 -> warning sub_issues_error, children = [], partial=True (degraded mode)
     - other HTTP errors -> raise RuntimeError
     """
     results: list[Any] = []
@@ -112,7 +113,7 @@ def _get_sub_issues_paginated(
         headers = _build_headers(token)
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 page = json.loads(resp.read().decode("utf-8"))
                 if isinstance(page, list):
                     results.extend(page)
@@ -129,7 +130,7 @@ def _get_sub_issues_paginated(
                         "message": "sub_issues endpoint not available for this issue",
                     }
                 )
-                return [], warnings
+                return [], warnings, False
             if code == 422:
                 warnings.append(
                     {
@@ -139,7 +140,7 @@ def _get_sub_issues_paginated(
                         "message": "sub_issues endpoint returned 422 (unprocessable entity)",
                     }
                 )
-                return [], warnings
+                return [], warnings, True
             raise RuntimeError(
                 f"HTTP {code} fetching sub_issues for issue #{issue_number}: {exc.read().decode()}"
             ) from exc
@@ -147,7 +148,7 @@ def _get_sub_issues_paginated(
             raise RuntimeError(
                 f"Network error for sub_issues #{issue_number}: {exc.reason}"
             ) from exc
-    return results, warnings
+    return results, warnings, False
 
 
 def _get_native_dependencies(
@@ -157,32 +158,26 @@ def _get_native_dependencies(
 
     Returns (dep_numbers_or_None, source_string).
     - If native API returns 200: returns (list_of_numbers, "native")
-    - If native API returns 404/410/permission/feature unavailable: returns (None, "fallback_trigger")
+    - If native API returns 404/410/501 (endpoint unavailable): returns (None, "fallback_trigger")
     - 200 empty array is "no deps", returns ([], "native") — no fallback
+    - 403/429/network/parse errors -> raise RuntimeError (do not silently fallback)
     """
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100"
-    headers = _build_headers(token)
-    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            numbers: list[int] = []
-            if isinstance(data, list):
-                for dep in data:
-                    n = dep.get("number")
-                    if isinstance(n, int):
-                        numbers.append(n)
-            return numbers, "native"
-    except urllib.error.HTTPError as exc:
-        code = exc.code
-        # 404 = endpoint not found, 410 = gone, 403 = permission denied
-        # Any of these trigger fallback to ## Depends On section
-        if code in (403, 404, 410, 422, 501):
+        pages = _api_get_paginated(url, token)
+        numbers: list[int] = []
+        for dep in pages:
+            n = dep.get("number")
+            if isinstance(n, int):
+                numbers.append(n)
+        return numbers, "native"
+    except RuntimeError as exc:
+        msg = str(exc)
+        # Only fallback for 404/410/501 (endpoint not available)
+        if any(f"HTTP {code}" in msg for code in ("404", "410", "501")):
             return None, "fallback_trigger"
-        # Other unexpected errors also trigger fallback (feature may be unavailable)
-        return None, "fallback_trigger"
-    except urllib.error.URLError:
-        return None, "fallback_trigger"
+        # 403/429/network/parse errors: propagate as error (do not silently fallback)
+        raise
 
 
 def _parse_depends_on(body: str | None) -> list[int]:
@@ -223,13 +218,14 @@ def collect_descendants(
     repo: str,
     milestone_number: int,
     token: str | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """BFS traversal of milestone direct issues + sub-issues.
 
-    Returns (all_issues, warnings_list).
+    Returns (all_issues, warnings_list, partial).
     Each issue dict has keys: number, title, state, milestone, labels, body,
                               is_pr, depth, parent_number.
     visited set: (owner, repo, number) to prevent cycles and cross-repo duplicates.
+    partial=True if any 422 was encountered during sub_issues traversal.
 
     Uses official milestone issues endpoint:
       GET /repos/{owner}/{repo}/issues?milestone={n}&state=all&per_page=100
@@ -246,6 +242,7 @@ def collect_descendants(
     queue: deque[tuple[Any, int, int | None]] = deque()
     all_issues: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    any_partial: bool = False
 
     for item in direct_items:
         key = (owner, repo, item["number"])
@@ -277,8 +274,10 @@ def collect_descendants(
         )
 
         if not is_pr:
-            children, sub_warnings = _get_sub_issues_paginated(owner, repo, number, token)
+            children, sub_warnings, sub_partial = _get_sub_issues_paginated(owner, repo, number, token)
             warnings.extend(sub_warnings)
+            if sub_partial:
+                any_partial = True
             for child in children:
                 # Cross-repo guard: exact match (not startswith) to prevent owner/repo-evil bypass
                 child_repo_url = child.get("repository_url", "")
@@ -308,7 +307,7 @@ def collect_descendants(
                 visited.add(child_key)
                 queue.append((child, depth + 1, number))
 
-    return all_issues, warnings
+    return all_issues, warnings, any_partial
 
 
 def analyze(
@@ -415,6 +414,7 @@ def build_report(
     warnings: list[dict[str, Any]],
     generated_at: str,
     repo: str,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Build the MILESTONE_DESCENDANT_ROLLUP_V1 report structure."""
     issues_only = [i for i in all_issues if not i["is_pr"]]
@@ -428,6 +428,7 @@ def build_report(
         "generated_at": generated_at,
         "repo": repo,
         "milestone_number": milestone_number,
+        "partial": partial,
         "summary": {
             "total_descendants": len(all_issues),
             "open_issues": open_count,
@@ -437,6 +438,7 @@ def build_report(
             "stale_state_label_count": len(findings["stale_state_labels"]),
             "open_blocker_count": len(findings["open_blockers"]),
             "has_invariant_violation": has_invariant_violation,
+            "partial": partial,
         },
         "pr_mixed": findings["pr_mixed"],
         "milestone_mismatches": findings["milestone_mismatches"],
@@ -576,17 +578,17 @@ def main() -> int:
             f"[info] Collecting milestone #{milestone_number} descendants from {owner}/{repo_name}...",
             file=sys.stderr,
         )
-        all_issues, warnings = collect_descendants(
+        all_issues, warnings, partial = collect_descendants(
             owner, repo_name, milestone_number, token
         )
         print(
-            f"[info] Collected {len(all_issues)} items ({len(warnings)} warnings)",
+            f"[info] Collected {len(all_issues)} items ({len(warnings)} warnings, partial={partial})",
             file=sys.stderr,
         )
 
         findings = analyze(all_issues, milestone_number, owner, repo_name, token)
         report = build_report(
-            milestone_number, all_issues, findings, warnings, generated_at, repo
+            milestone_number, all_issues, findings, warnings, generated_at, repo, partial=partial
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
