@@ -190,6 +190,18 @@
               }
             }
           }
+        },
+        "auto_fixable_structural_blocker_list": {
+          "type": "array",
+          "description": "List of auto-fixable structural blocker IDs detected in the issue body. Empty list means no auto-fixable blockers detected.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "missing_machine_readable_contract",
+              "missing_stop_conditions",
+              "vc_missing_prefix"
+            ]
+          }
         }
       }
     },
