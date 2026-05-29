@@ -182,13 +182,15 @@ change_kind: feature
 
 
 class TestMissingContractSchemaVersion:
-    """Test detection of missing_contract_schema_version blocker.
+    """Test that missing_contract_schema_version is NOT in auto-fixable blocker list.
 
-    Note: When a YAML block exists but lacks contract_schema_version,
-    _check_malformed_contract triggers fail_closed, which takes precedence.
-    The missing_contract_schema_version auto-fixable blocker is detected only
-    when the YAML block is present and parseable (contract_schema_version check
-    in _detect_auto_fixable_structural_blockers applies to non-fail_closed path).
+    B3 resolution: missing_contract_schema_version is removed from auto_fixable_structural
+    because when a YAML block exists but lacks contract_schema_version,
+    _check_malformed_contract triggers fail_closed (which empties the auto_fixable list).
+    There is no non-fail_closed path where this blocker is actionable, so it is
+    excluded from scope entirely.
+
+    The fail_closed behavior for malformed YAML contracts is retained.
     """
 
     ISSUE_WITHOUT_YAML = """## Outcome
@@ -217,8 +219,7 @@ No YAML block here.
     def test_no_yaml_block_does_not_trigger_version_blocker(self):
         """GIVEN issue with no YAML block at all
         WHEN planner runs
-        THEN missing_contract_schema_version is NOT in blocker list
-        (only missing_machine_readable_contract may apply, since no yaml block)."""
+        THEN missing_contract_schema_version is NOT in blocker list."""
         output = run_planner(self.ISSUE_WITHOUT_YAML)
         blockers = output["decisions"]["auto_fixable_structural_blocker_list"]
         assert "missing_contract_schema_version" not in blockers
@@ -234,9 +235,9 @@ No YAML block here.
     def test_yaml_block_without_version_triggers_fail_closed(self):
         """GIVEN issue with YAML block but missing contract_schema_version
         WHEN planner runs
-        THEN fail_closed is required (malformed_machine_readable_contract takes precedence).
+        THEN fail_closed is required (malformed_machine_readable_contract).
 
-        A malformed YAML block is more severe than an auto-fixable structural blocker.
+        A malformed YAML block triggers fail_closed, not an auto-fixable blocker.
         The auto_fixable_structural_blocker_list is empty in fail_closed paths.
         """
         issue_with_malformed_yaml = """## Outcome
@@ -337,7 +338,6 @@ class TestBlockerClassRoutingLogic:
             "missing_machine_readable_contract",
             "missing_stop_conditions",
             "vc_missing_prefix",
-            "missing_contract_schema_version",
         }
         for blocker in blockers:
             assert blocker in valid_auto_fixable, f"Unknown blocker: {blocker}"

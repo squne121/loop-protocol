@@ -71,7 +71,6 @@ FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
 BLOCKER_MISSING_MACHINE_READABLE_CONTRACT = "missing_machine_readable_contract"
 BLOCKER_MISSING_STOP_CONDITIONS = "missing_stop_conditions"
 BLOCKER_VC_MISSING_PREFIX = "vc_missing_prefix"
-BLOCKER_MISSING_CONTRACT_SCHEMA_VERSION = "missing_contract_schema_version"
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +511,6 @@ def _detect_auto_fixable_structural_blockers(issue_body: str) -> list[str]:
     - missing_machine_readable_contract: ## Machine-Readable Contract section missing
     - missing_stop_conditions: ## Stop Conditions section missing
     - vc_missing_prefix: Verification Commands lines missing $ or - prefix
-    - missing_contract_schema_version: contract_schema_version: missing from YAML block
     """
     blockers = []
 
@@ -524,12 +522,6 @@ def _detect_auto_fixable_structural_blockers(issue_body: str) -> list[str]:
     if "## Stop Conditions" not in issue_body:
         blockers.append(BLOCKER_MISSING_STOP_CONDITIONS)
 
-    # Check for missing contract_schema_version in YAML block (only if YAML block exists)
-    if "```yaml" in issue_body:
-        yaml_match = re.search(r"```yaml\n(.*?)\n```", issue_body, re.DOTALL)
-        if yaml_match and "contract_schema_version:" not in yaml_match.group(1):
-            blockers.append(BLOCKER_MISSING_CONTRACT_SCHEMA_VERSION)
-
     # Check for Verification Commands lines missing $ or - prefix
     sections = _extract_sections(issue_body)
     vc_content = sections.get("Verification Commands", "")
@@ -538,27 +530,17 @@ def _detect_auto_fixable_structural_blockers(issue_body: str) -> list[str]:
         has_unprefixed = False
         for line in vc_lines:
             stripped = line.strip()
-            # Skip empty lines, fenced code block markers, comments (#), section headers
+            # Skip empty lines, fenced code block markers, comments (#)
             if not stripped:
                 continue
             if stripped.startswith("```") or stripped.startswith("~~~"):
                 continue
             if stripped.startswith("#"):
                 continue
-            # If a non-empty command line lacks $ or - prefix, flag it
-            if (
-                not stripped.startswith("$")
-                and not stripped.startswith("-")
-                and not stripped.startswith("pnpm ")
-                and not stripped.startswith("npm ")
-                and not stripped.startswith("uv ")
-                and not stripped.startswith("python")
-                and not stripped.startswith("rg ")
-                and not stripped.startswith("test ")
-                and not stripped.startswith("git ")
-                and not stripped.startswith("gh ")
-                and len(stripped) > 0
-            ):
+            # Any non-empty command line that lacks $ or - prefix is a blocker.
+            # Commands like pnpm, uv, rg, git, gh etc. without a $ or - prefix
+            # are exactly what should be flagged.
+            if not stripped.startswith("$") and not stripped.startswith("- "):
                 has_unprefixed = True
                 break
         if has_unprefixed:

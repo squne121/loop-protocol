@@ -43,8 +43,7 @@
         "web_research_policy",
         "scope_signal_guard",
         "delivery_rollup",
-        "follow_up_materialization",
-        "auto_fixable_structural_blocker_list"
+        "follow_up_materialization"
       ],
       "additionalProperties": false,
       "properties": {
@@ -200,8 +199,7 @@
             "enum": [
               "missing_machine_readable_contract",
               "missing_stop_conditions",
-              "vc_missing_prefix",
-              "missing_contract_schema_version"
+              "vc_missing_prefix"
             ]
           }
         }

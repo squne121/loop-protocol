@@ -25,8 +25,7 @@
 |---|---|
 | `missing_machine_readable_contract` | `## Machine-Readable Contract` セクション欠落（YAML フロントマター生成可能） |
 | `missing_stop_conditions` | `## Stop Conditions` セクション欠落（issue_kind / change_kind から定型生成可能） |
-| `vc_missing_prefix` | `## Verification Commands` の `$` / `-` プレフィックス欠落（形式変換のみ） |
-| `missing_contract_schema_version` | `contract_schema_version:` 欠落（固定値補完） |
+| `vc_missing_prefix` | `## Verification Commands` の `$` / `- ` プレフィックス欠落（形式変換のみ） |
 
 ### requires_human とみなす blocker の種類
 

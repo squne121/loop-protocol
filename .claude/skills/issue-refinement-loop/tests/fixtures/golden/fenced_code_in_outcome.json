@@ -53,7 +53,8 @@
     },
     "auto_fixable_structural_blocker_list": [
       "missing_machine_readable_contract",
-      "missing_stop_conditions"
+      "missing_stop_conditions",
+      "vc_missing_prefix"
     ]
   },
   "fail_closed": {
