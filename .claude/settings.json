@@ -35,10 +35,42 @@
       "Write(assets/**)",
       "Edit(assets/**)",
       "Write(LICENSES/**)",
-      "Edit(LICENSES/**)"
+      "Edit(LICENSES/**)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(secrets/**)",
+      "Write(.env)",
+      "Write(.env.*)",
+      "Write(secrets/**)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Edit(secrets/**)",
+      "Read(**/.netrc)",
+      "Read(**/.npmrc)",
+      "Read(**/.pypirc)",
+      "Read(**/credentials)",
+      "Read(**/settings.local.json)",
+      "Bash(gh secret *)",
+      "Bash(printenv *)",
+      "Bash(printenv)",
+      "Bash(export -p)",
+      "Bash(* .env*)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Write|Edit|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/secret_boundary_guard.sh",
+            "args": [],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

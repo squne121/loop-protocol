@@ -4,7 +4,15 @@
   "title": "agent_session_manifest/v1",
   "description": "LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata を記録するための SSOT schema。",
   "type": "object",
-  "required": ["schema", "manifest_id", "recorded_at", "repository", "actor", "phase", "redaction"],
+  "required": [
+    "schema",
+    "manifest_id",
+    "recorded_at",
+    "repository",
+    "actor",
+    "phase",
+    "redaction"
+  ],
   "additionalProperties": false,
   "properties": {
     "schema": {
@@ -33,21 +41,33 @@
           "pattern": "^[0-9a-f]{40}$",
           "description": "40 hex chars の git commit SHA"
         },
-        { "type": "null" }
+        {
+          "type": "null"
+        }
       ],
       "description": "観測時点の HEAD commit SHA（nullable）"
     },
     "issue_number": {
       "oneOf": [
-        { "type": "integer", "minimum": 1 },
-        { "type": "null" }
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
       ],
       "description": "対象 Issue 番号（optional）"
     },
     "pr_number": {
       "oneOf": [
-        { "type": "integer", "minimum": 1 },
-        { "type": "null" }
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
       ],
       "description": "対象 PR 番号（optional）"
     },
@@ -58,39 +78,59 @@
           "pattern": "^[0-9a-f]{40}$",
           "description": "40 hex chars の git commit SHA"
         },
-        { "type": "null" }
+        {
+          "type": "null"
+        }
       ],
       "description": "コミット SHA（optional, nullable）"
     },
     "producer": {
       "type": "object",
-      "required": ["kind"],
+      "required": [
+        "kind"
+      ],
       "additionalProperties": false,
       "description": "Manifest producer provenance. This field is optional for backward compatibility. If present, kind is required. producer.kind is a self-claim; authenticity is established by evidence linkage and downstream hook/CI workflows.",
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["script_generated", "hook_generated", "github_action_generated"],
+          "enum": [
+            "script_generated",
+            "hook_generated",
+            "github_action_generated"
+          ],
           "description": "Deterministic producer class. AI self-report is not authoritative."
         },
         "version": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "Producer implementation version, if known."
         },
         "command": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "Sanitized invocation command or null. Validator performs best-effort pattern scanning and MUST reject representative secrets, expanded env values, and unsafe local paths intended for public surfaces."
         },
         "source_ref": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "Git ref, PR, workflow run, artifact reference, hook id, or null. Validator performs best-effort pattern scanning for unsafe metadata."
         }
@@ -98,12 +138,19 @@
     },
     "actor": {
       "type": "object",
-      "required": ["type", "name"],
+      "required": [
+        "type",
+        "name"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["ai_agent", "human", "github_action"],
+          "enum": [
+            "ai_agent",
+            "human",
+            "github_action"
+          ],
           "description": "セッション実行者の種別"
         },
         "name": {
@@ -112,8 +159,12 @@
         },
         "session_id": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "セッション ID（nullable。人間操作の場合は null 可）"
         }
@@ -121,7 +172,10 @@
     },
     "phase": {
       "type": "object",
-      "required": ["main_loop", "phase_instance_id"],
+      "required": [
+        "main_loop",
+        "phase_instance_id"
+      ],
       "additionalProperties": false,
       "properties": {
         "main_loop": {
@@ -153,7 +207,9 @@
                 "github_merge_event"
               ]
             },
-            { "type": "null" }
+            {
+              "type": "null"
+            }
           ],
           "description": "SubAgent Execution Ledger の対応 phase（scalar enum, optional）。1 manifest = 1 ledger phase 原則。impl phase では implementation と post_commit_verification に対して別々の manifest を残す"
         },
@@ -166,35 +222,63 @@
     },
     "token_usage": {
       "type": "object",
-      "required": ["availability", "source"],
+      "required": [
+        "availability",
+        "source"
+      ],
       "additionalProperties": false,
       "properties": {
         "availability": {
           "type": "string",
-          "enum": ["measured", "estimated", "unavailable"],
+          "enum": [
+            "measured",
+            "estimated",
+            "unavailable"
+          ],
           "description": "トークン使用量の取得状況。unavailable の場合は数値フィールドを null にする（0 偽装禁止）"
         },
         "source": {
           "type": "string",
-          "enum": ["provider_api", "tool_log", "entire_cli", "manual_report", "none"],
+          "enum": [
+            "provider_api",
+            "tool_log",
+            "entire_cli",
+            "manual_report",
+            "none"
+          ],
           "description": "トークン情報の取得元"
         },
         "prompt": {
           "oneOf": [
-            { "type": "integer", "minimum": 0 },
-            { "type": "null" }
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "completion": {
           "oneOf": [
-            { "type": "integer", "minimum": 0 },
-            { "type": "null" }
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "total": {
           "oneOf": [
-            { "type": "integer", "minimum": 0 },
-            { "type": "null" }
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }
@@ -203,7 +287,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "count"],
+        "required": [
+          "name",
+          "count"
+        ],
         "additionalProperties": false,
         "properties": {
           "name": {
@@ -217,8 +304,13 @@
           },
           "duration_ms": {
             "oneOf": [
-              { "type": "integer", "minimum": 0 },
-              { "type": "null" }
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
             ],
             "description": "実行時間 ms（optional）"
           }
@@ -227,12 +319,23 @@
     },
     "verification": {
       "type": "object",
-      "required": ["overall", "skipped_count", "fallback_detected", "ac_results"],
+      "required": [
+        "overall",
+        "skipped_count",
+        "fallback_detected",
+        "ac_results"
+      ],
       "additionalProperties": false,
       "properties": {
         "overall": {
           "type": "string",
-          "enum": ["pass", "fail", "partial", "blocked", "not_applicable"],
+          "enum": [
+            "pass",
+            "fail",
+            "partial",
+            "blocked",
+            "not_applicable"
+          ],
           "description": "全体の検証結果。skipped_count > 0 のとき pass 禁止"
         },
         "skipped_count": {
@@ -248,7 +351,10 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["ac", "verdict"],
+            "required": [
+              "ac",
+              "verdict"
+            ],
             "additionalProperties": false,
             "properties": {
               "ac": {
@@ -257,30 +363,52 @@
               },
               "verdict": {
                 "type": "string",
-                "enum": ["pass", "fail", "skip", "blocked", "not_applicable"]
+                "enum": [
+                  "pass",
+                  "fail",
+                  "skip",
+                  "blocked",
+                  "not_applicable"
+                ]
               },
               "command": {
                 "oneOf": [
-                  { "type": "string" },
-                  { "type": "null" }
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "exit_code": {
                 "oneOf": [
-                  { "type": "integer" },
-                  { "type": "null" }
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "artifact_ref": {
                 "oneOf": [
-                  { "type": "string" },
-                  { "type": "null" }
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "waiver_ref": {
                 "oneOf": [
-                  { "type": "string" },
-                  { "type": "null" }
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               }
             }
@@ -292,12 +420,22 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["source_kind", "source_ref"],
+        "required": [
+          "source_kind",
+          "source_ref"
+        ],
         "additionalProperties": false,
         "properties": {
           "source_kind": {
             "type": "string",
-            "enum": ["github_comment", "ci_check", "hook_jsonl", "artifact", "transcript", "local_file"],
+            "enum": [
+              "github_comment",
+              "ci_check",
+              "hook_jsonl",
+              "artifact",
+              "transcript",
+              "local_file"
+            ],
             "description": "証拠の種別"
           },
           "source_ref": {
@@ -306,28 +444,43 @@
           },
           "source_sha256": {
             "oneOf": [
-              { "type": "string" },
-              { "type": "null" }
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
             "description": "ファイルの SHA-256（optional）"
           },
           "visibility": {
             "type": "string",
-            "enum": ["public_github_comment", "private_artifact", "local_only"],
+            "enum": [
+              "public_github_comment",
+              "private_artifact",
+              "local_only"
+            ],
             "description": "証拠の公開範囲。public_github_comment 時は transcript / local_file を禁止する"
           }
         },
         "if": {
           "properties": {
-            "visibility": { "const": "public_github_comment" }
+            "visibility": {
+              "const": "public_github_comment"
+            }
           },
-          "required": ["visibility"]
+          "required": [
+            "visibility"
+          ]
         },
         "then": {
           "properties": {
             "source_kind": {
               "not": {
-                "enum": ["transcript", "local_file"]
+                "enum": [
+                  "transcript",
+                  "local_file"
+                ]
               }
             }
           }
@@ -341,20 +494,34 @@
       "properties": {
         "event_type": {
           "type": "string",
-          "enum": ["SubagentStart", "SubagentStop", "PostToolUse", "Stop", "PreToolUse"],
+          "enum": [
+            "SubagentStart",
+            "SubagentStop",
+            "PostToolUse",
+            "Stop",
+            "PreToolUse"
+          ],
           "description": "Claude Code hook event 種別"
         },
         "hook_id": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "hook 実行 ID（optional）"
         },
         "triggered_at": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "hook トリガー時刻（ISO 8601）"
         }
@@ -362,12 +529,20 @@
     },
     "sanitization_status": {
       "type": "string",
-      "enum": ["not_sanitized", "sanitized", "sanitization_failed"],
+      "enum": [
+        "not_sanitized",
+        "sanitized",
+        "sanitization_failed"
+      ],
       "description": "機微情報のサニタイズ状態（hook 記録時に設定）"
     },
     "redaction": {
       "type": "object",
-      "required": ["raw_transcript_included", "local_paths_included", "secret_scan_status"],
+      "required": [
+        "raw_transcript_included",
+        "local_paths_included",
+        "secret_scan_status"
+      ],
       "additionalProperties": false,
       "properties": {
         "raw_transcript_included": {
@@ -380,14 +555,21 @@
         },
         "secret_scan_status": {
           "type": "string",
-          "enum": ["not_applicable", "clean", "flagged"],
+          "enum": [
+            "not_applicable",
+            "clean",
+            "flagged"
+          ],
           "description": "シークレットスキャン状態"
         }
       }
     },
     "human_intervention": {
       "type": "object",
-      "required": ["required", "type"],
+      "required": [
+        "required",
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "required": {
@@ -396,13 +578,22 @@
         },
         "type": {
           "type": "string",
-          "enum": ["none", "approval", "correction", "escalation"],
+          "enum": [
+            "none",
+            "approval",
+            "correction",
+            "escalation"
+          ],
           "description": "介入種別"
         },
         "summary": {
           "oneOf": [
-            { "type": "string" },
-            { "type": "null" }
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "介入内容の概要（nullable）"
         }
@@ -410,10 +601,39 @@
     },
     "next_action_issue": {
       "oneOf": [
-        { "type": "integer", "minimum": 1 },
-        { "type": "null" }
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
       ],
       "description": "次に実行すべき Issue 番号（nullable）"
+    },
+    "secret_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Secret boundary policy status for this manifest (#412)",
+      "properties": {
+        "value_exposed": {
+          "type": "boolean",
+          "description": "Whether any Secret value was exposed in this manifest. MUST be false for public-safe manifests."
+        },
+        "boundary_enforced": {
+          "type": "boolean",
+          "description": "Whether secret_boundary_guard PreToolUse hook was active during this session."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "presence_only",
+            "value_included",
+            "not_applicable"
+          ],
+          "description": "How secrets are represented: presence_only (boolean/metadata) or value_included (unsafe). presence_only is the required mode."
+        }
+      }
     }
   }
 }
