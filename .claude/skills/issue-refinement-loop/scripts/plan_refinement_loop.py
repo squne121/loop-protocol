@@ -67,6 +67,11 @@ FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL = "ambiguous_scope_signal"
 FAIL_CLOSED_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
 FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
 
+# Auto-fixable structural blocker IDs
+BLOCKER_MISSING_MACHINE_READABLE_CONTRACT = "missing_machine_readable_contract"
+BLOCKER_MISSING_STOP_CONDITIONS = "missing_stop_conditions"
+BLOCKER_VC_MISSING_PREFIX = "vc_missing_prefix"
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -495,6 +500,55 @@ def _check_missing_vc(issue_body: str) -> bool:
     return "## Verification Commands" not in issue_body
 
 
+def _detect_auto_fixable_structural_blockers(issue_body: str) -> list[str]:
+    """
+    Detect auto-fixable structural blockers in the issue body.
+
+    Returns a list of blocker IDs that are present and auto-fixable
+    (i.e., can be fixed without human judgment).
+
+    Blocker IDs:
+    - missing_machine_readable_contract: ## Machine-Readable Contract section missing
+    - missing_stop_conditions: ## Stop Conditions section missing
+    - vc_missing_prefix: Verification Commands lines missing $ or - prefix
+    """
+    blockers = []
+
+    # Check for missing ## Machine-Readable Contract section
+    if "## Machine-Readable Contract" not in issue_body:
+        blockers.append(BLOCKER_MISSING_MACHINE_READABLE_CONTRACT)
+
+    # Check for missing ## Stop Conditions section
+    if "## Stop Conditions" not in issue_body:
+        blockers.append(BLOCKER_MISSING_STOP_CONDITIONS)
+
+    # Check for Verification Commands lines missing $ or - prefix
+    sections = _extract_sections(issue_body)
+    vc_content = sections.get("Verification Commands", "")
+    if vc_content:
+        vc_lines = vc_content.splitlines()
+        has_unprefixed = False
+        for line in vc_lines:
+            stripped = line.strip()
+            # Skip empty lines, fenced code block markers, comments (#)
+            if not stripped:
+                continue
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                continue
+            if stripped.startswith("#"):
+                continue
+            # Any non-empty command line that lacks $ or - prefix is a blocker.
+            # Commands like pnpm, uv, rg, git, gh etc. without a $ or - prefix
+            # are exactly what should be flagged.
+            if not stripped.startswith("$") and not stripped.startswith("- "):
+                has_unprefixed = True
+                break
+        if has_unprefixed:
+            blockers.append(BLOCKER_VC_MISSING_PREFIX)
+
+    return blockers
+
+
 def _validate_input_schema(data: Any) -> bool:
     """Validate input matches REFINEMENT_LOOP_PLANNER_INPUT_V1 schema."""
     if not isinstance(data, dict):
@@ -647,6 +701,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                         "follow_up_materialization": {
                             "candidates": [],
                         },
+                        "auto_fixable_structural_blocker_list": [],
                     },
                     "fail_closed": {
                         "required": True,
@@ -714,6 +769,9 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
             issue_body, known_context
         )
 
+        # Detect auto-fixable structural blockers
+        auto_fixable_structural_blocker_list = _detect_auto_fixable_structural_blockers(issue_body)
+
         # Build output
         plan = {
             "schema_version": SCHEMA_VERSION,
@@ -754,6 +812,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "follow_up_materialization": {
                     "candidates": follow_up_candidates,
                 },
+                "auto_fixable_structural_blocker_list": auto_fixable_structural_blocker_list,
             },
             "fail_closed": {
                 "required": False,
@@ -805,6 +864,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "follow_up_materialization": {
                     "candidates": [],
                 },
+                "auto_fixable_structural_blocker_list": [],
             },
             "fail_closed": {
                 "required": True,
@@ -866,6 +926,7 @@ def main(argv: list[str] | None = None) -> None:
                 "follow_up_materialization": {
                     "candidates": [],
                 },
+                "auto_fixable_structural_blocker_list": [],
             },
             "fail_closed": {
                 "required": True,
