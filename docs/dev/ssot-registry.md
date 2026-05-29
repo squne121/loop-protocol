@@ -106,6 +106,19 @@
     - "## Failure Modes and Recovery"
     - "## SubAgent Contract Matrix"
 
+- id: release-distribution-policy
+  path: docs/dev/release-distribution-policy.md
+  title: リリース・配布方針
+  keywords: [release, distribution, rc, vite, github-pages, itch.io, dist, 配布, リリース, RC, build-artifact]
+  description: Vite build 成果物の取扱方針、配布候補プラットフォームの評価、M1 RC checklist の正本。status は draft（mvp-scope.md が accepted になるまで public release は blocked）
+  lifecycle_status: draft
+  scope: "M1 Foundation Gate (v0.1.x)"
+  sections:
+    - "## Vite Build Artifact Policy"
+    - "## Distribution Candidate Matrix"
+    - "## Target-Specific Constraints"
+    - "## Release Candidate Checklist"
+
 - id: product-spec-lifecycle
   path: docs/dev/product-spec-lifecycle.md
   title: Product Spec Lifecycle
