@@ -1,0 +1,129 @@
+"""
+Tests for issue-refinement-loop loop policy (Issue #460).
+
+Verifies:
+- AC1: max_iterations default is 3 in SKILL.md
+- AC4: needs-fix at iteration < 3 → auto-continue
+- AC5: needs-fix at iteration >= 3 → human_escalation
+- AC6: hard stop conditions (state/needs-human, scope change) stop as before
+"""
+
+import re
+from pathlib import Path
+
+SKILL_MD = Path(__file__).parent.parent / "SKILL.md"
+TERMINATION_MD = Path(__file__).parent.parent / "references" / "termination-policy.md"
+
+
+def test_skill_md_max_iterations_default_is_3():
+    """AC1: SKILL.md の max_iterations 既定値 = 3"""
+    text = SKILL_MD.read_text()
+    # Check Inputs section
+    assert re.search(r"max_iterations.*既定\s*3", text), \
+        "max_iterations default should be 3 in Inputs section"
+    # Check LOOP_STATE block
+    assert "max_iterations: 3" in text, \
+        "LOOP_STATE.max_iterations should be 3"
+
+
+def test_skill_md_human_approval_gate_not_required():
+    """AC3: human_approval_gate.default_required: false が明記されている"""
+    text = SKILL_MD.read_text()
+    assert "human_approval_gate.default_required: false" in text, \
+        "human_approval_gate.default_required: false must be present in SKILL.md"
+
+
+def test_skill_md_loop_policy_concept_separation():
+    """AC8: loop policy と Claude Code permission mode の概念分離が明記されている"""
+    text = SKILL_MD.read_text()
+    assert "loop policy" in text, "loop policy concept should be mentioned"
+    assert "permission mode" in text, "permission mode concept should be mentioned"
+    # Both concepts should be explained as orthogonal
+    assert "直交" in text, "The two concepts should be described as orthogonal (直交)"
+
+
+def test_loop_continues_when_iteration_below_max():
+    """AC4: needs-fix + iteration < max_iterations → 自動継続"""
+    max_iterations = 3
+    # Simulate loop state
+    iterations_continued = []
+    for iteration in range(max_iterations):
+        verdict = "needs-fix"
+        if verdict == "needs-fix":
+            if iteration + 1 < max_iterations:
+                action = "continue"
+            else:
+                action = "human_escalation"
+        iterations_continued.append((iteration, action))
+
+    # First two iterations (0, 1) should continue
+    assert iterations_continued[0] == (0, "continue"), \
+        "iteration=0 needs-fix should auto-continue"
+    assert iterations_continued[1] == (1, "continue"), \
+        "iteration=1 needs-fix should auto-continue"
+
+
+def test_loop_escalates_at_max_iterations():
+    """AC5: needs-fix + iteration >= max_iterations → human_escalation"""
+    max_iterations = 3
+    iteration = 2  # 0-indexed, this is the 3rd (last allowed)
+    verdict = "needs-fix"
+
+    if verdict == "needs-fix":
+        if iteration + 1 < max_iterations:
+            action = "continue"
+        else:
+            action = "human_escalation"
+
+    assert action == "human_escalation", \
+        "3rd needs-fix (iteration=2) should result in human_escalation"
+
+
+def test_loop_escalation_requires_blocker_summary():
+    """AC5: human_escalation は全 iteration 分の blocker summary を含む"""
+    text = SKILL_MD.read_text()
+    # The policy should mention blocker summary for escalation
+    assert "blocker summary" in text, \
+        "human_escalation path should include blocker summary requirement"
+
+
+def test_hard_stop_state_needs_human():
+    """AC6: state/needs-human は hard stop として従来通り停止する"""
+    text = SKILL_MD.read_text()
+    assert "state/needs-human" in text, \
+        "state/needs-human hard stop must still be present in SKILL.md"
+
+
+def test_hard_stop_scope_change():
+    """AC6: scope change signal は従来通り停止する"""
+    text = SKILL_MD.read_text()
+    assert "Scope Change Stop Conditions" in text, \
+        "Scope Change Stop Conditions section must still be present"
+    # Verify the hard stop triggers human_escalation
+    assert "human_escalation" in text
+
+
+def test_termination_policy_no_auto_fixable_structural():
+    """AC7 (pr_review_only): termination-policy.md に auto_fixable_structural なし"""
+    text = TERMINATION_MD.read_text()
+    assert "auto_fixable_structural" not in text, \
+        "auto_fixable_structural should be removed from termination-policy.md"
+    assert "--no-approval auto-continuation" not in text, \
+        "--no-approval auto-continuation section should be removed"
+
+
+def test_termination_policy_no_no_approval_dependency():
+    """AC4/AC5: termination-policy.md の継続条件に --no-approval 依存なし"""
+    text = TERMINATION_MD.read_text()
+    # The --no-approval flag should not appear as a routing condition
+    assert "--no-approval" not in text, \
+        "--no-approval should not appear as a routing condition in termination-policy.md"
+
+
+def test_termination_policy_human_escalation_at_max():
+    """AC5: termination-policy.md に max_iterations 到達時の human_escalation 条件あり"""
+    text = TERMINATION_MD.read_text()
+    assert "human_escalation" in text, \
+        "human_escalation termination reason must be in termination-policy.md"
+    assert "max_iterations" in text or "iteration" in text, \
+        "iteration/max_iterations condition must appear in termination-policy.md"

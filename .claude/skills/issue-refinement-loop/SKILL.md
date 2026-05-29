@@ -20,8 +20,20 @@ subagent_contract_mode: link_only
 ## Inputs
 
 - `issue_number`（必須）: 改善対象の Issue 番号
-- `max_iterations`（任意、既定 1）: review cycle の上限
+- `max_iterations`（任意、既定 3）: review cycle の上限
 - `anchor_comment_url`（任意）: 人間 Decision や差し戻しコメントを snapshot 固定して扱う対象コメント URL
+
+## Loop Policy
+
+### human_approval_gate
+
+`human_approval_gate.default_required: false`
+
+ループの自動継続は Claude Code の `--no-approval` / `--dangerously-skip-permissions` フラグとは独立して動作する。loop policy は「何回まで自動で回すか」を制御し、Claude Code の permission mode は「ツール呼び出しの承認方式」を制御する。両者は直交する概念であり、loop policy の継続判断に permission mode を参照しない。
+
+needs-fix を受け取ったとき:
+- `iteration + 1 < max_iterations` → 自動継続（条件なし）
+- `iteration + 1 >= max_iterations` → `human_escalation` で停止し、全 iteration 分の blocker summary を添付
 
 ## Loop Structure
 
@@ -37,21 +49,11 @@ subagent_contract_mode: link_only
         ↓
  approve → Step 4.5 → Step 5
  needs-fix
-   ├─ [blocker_class 確定]
-   │    review_blockers = REVIEW_ISSUE_RESULT_V1.blocking_issues
-   │    auto_fixable_ids = REFINEMENT_LOOP_PLAN_V1.decisions.auto_fixable_structural_blocker_list
-   │    if (review_blockers - auto_fixable_ids) is empty:
-   │      blocker_class = auto_fixable_structural
-   │    else:
-   │      blocker_class = requires_human
-   │
-   ├─ no_approval == true
-   │  AND blocker_class == auto_fixable_structural
-   │  AND requires_human blockers == 0:
+   ├─ iteration + 1 < max_iterations:
    │    iteration += 1 → Step 4 (自動継続)
    │
-   ├─ iteration + 1 >= max_iterations → Step 5 (needs_second_pass)
-   └─ else Step 4 → issue-author → next iteration
+   └─ iteration + 1 >= max_iterations:
+        → Step 5 (human_escalation) + 全 iteration 分 blocker summary
 ```
 
 Step 3（adversarial review）と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
@@ -62,13 +64,12 @@ Step 3（adversarial review）と Step 1.5（spec document review）は採用し
 LOOP_STATE:
   issue_number: <int>
   iteration: <int, 0-indexed>
-  max_iterations: 1
+  max_iterations: 3
   last_verdict: approve | needs-fix | null
   blockers_history: []
-  blocker_class: null | auto_fixable_structural | requires_human
   improvements_applied: []
   removed_state_labels: []
-  termination_reason: null | approved | needs_second_pass | human_escalation | superseded_by_decision
+  termination_reason: null | approved | human_escalation | superseded_by_decision
   scope_rollup_decision: null
   anchor_comment:
     url: null
@@ -164,7 +165,7 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 
 ### Step 5: Termination
 
-終了条件、`needs_second_pass` escape hatch、scope change signal 停止、loop termination table は `references/termination-policy.md` を参照する。
+終了条件、`human_escalation` 経路、scope change signal 停止、loop termination table は `references/termination-policy.md` を参照する。
 
 ## Reference Map
 
