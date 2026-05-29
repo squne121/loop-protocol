@@ -22,14 +22,29 @@ import urllib.request
 from collections import deque
 from typing import Any
 
+# Compiled regex for Link header "next" relation
+NEXT_LINK_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
-def _api_get(url: str, token: str) -> Any:
-    """Perform a single GET request to the GitHub API. Returns parsed JSON."""
+
+def md_cell(value: Any) -> str:
+    """Escape a value for safe embedding in a Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+
+def _build_headers(token: str | None) -> dict[str, str]:
+    """Build GitHub API request headers. token is optional (rate-limit purposes)."""
     headers: dict[str, str] = {
-        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _api_get(url: str, token: str | None) -> Any:
+    """Perform a single GET request to the GitHub API. Returns parsed JSON."""
+    headers = _build_headers(token)
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req) as resp:
@@ -41,26 +56,23 @@ def _api_get(url: str, token: str) -> Any:
 
 
 def _parse_next_link(link_header: str) -> str | None:
-    """Extract the 'next' URL from a GitHub Link header."""
+    """Extract the 'next' URL from a GitHub Link header using regex."""
     if not link_header:
         return None
-    for part in link_header.split(","):
-        parts = [p.strip() for p in part.split(";")]
-        if len(parts) == 2 and parts[1] == 'rel="next"':
-            return parts[0].strip("<>")
-    return None
+    m = NEXT_LINK_RE.search(link_header)
+    return m.group(1) if m else None
 
 
-def _api_get_paginated(base_url: str, token: str) -> list[Any]:
-    """Collect all pages of a paginated GitHub API endpoint (appends ?per_page=100&state=all)."""
+def _api_get_paginated(base_url: str, token: str | None) -> list[Any]:
+    """Collect all pages of a paginated GitHub API endpoint.
+
+    Uses /repos/{owner}/{repo}/issues?milestone=...&state=all&per_page=100
+    (official docs endpoint).
+    """
     results: list[Any] = []
-    url: str | None = f"{base_url}?per_page=100&state=all"
+    url: str | None = base_url
     while url:
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        headers = _build_headers(token)
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as resp:
@@ -81,19 +93,23 @@ def _api_get_paginated(base_url: str, token: str) -> list[Any]:
 
 
 def _get_sub_issues_paginated(
-    owner: str, repo: str, issue_number: int, token: str
-) -> list[Any]:
-    """Get sub-issues for an issue with pagination."""
+    owner: str, repo: str, issue_number: int, token: str | None
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Get sub-issues for an issue with pagination.
+
+    Returns (children_list, warnings_list).
+    - 200 empty -> children = [] (normal, no children)
+    - 404/410 -> warning sub_issues_unavailable, children = []
+    - 422 -> warning sub_issues_error (treated as error in data quality)
+    - other HTTP errors -> raise RuntimeError
+    """
     results: list[Any] = []
+    warnings: list[dict[str, Any]] = []
     url: str | None = (
         f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/sub_issues?per_page=100"
     )
     while url:
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        headers = _build_headers(token)
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as resp:
@@ -104,9 +120,26 @@ def _get_sub_issues_paginated(
                 url = _parse_next_link(link_header)
         except urllib.error.HTTPError as exc:
             code = exc.code
-            if code in (404, 422):
-                # sub_issues endpoint not supported or no sub-issues
-                return []
+            if code in (404, 410):
+                warnings.append(
+                    {
+                        "type": "sub_issues_unavailable",
+                        "issue_number": issue_number,
+                        "http_code": code,
+                        "message": "sub_issues endpoint not available for this issue",
+                    }
+                )
+                return [], warnings
+            if code == 422:
+                warnings.append(
+                    {
+                        "type": "sub_issues_error",
+                        "issue_number": issue_number,
+                        "http_code": code,
+                        "message": "sub_issues endpoint returned 422 (unprocessable entity)",
+                    }
+                )
+                return [], warnings
             raise RuntimeError(
                 f"HTTP {code} fetching sub_issues for issue #{issue_number}: {exc.read().decode()}"
             ) from exc
@@ -114,7 +147,42 @@ def _get_sub_issues_paginated(
             raise RuntimeError(
                 f"Network error for sub_issues #{issue_number}: {exc.reason}"
             ) from exc
-    return results
+    return results, warnings
+
+
+def _get_native_dependencies(
+    owner: str, repo: str, issue_number: int, token: str | None
+) -> tuple[list[int] | None, str]:
+    """Fetch dependencies via the native GitHub dependency API.
+
+    Returns (dep_numbers_or_None, source_string).
+    - If native API returns 200: returns (list_of_numbers, "native")
+    - If native API returns 404/410/permission/feature unavailable: returns (None, "fallback_trigger")
+    - 200 empty array is "no deps", returns ([], "native") — no fallback
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100"
+    headers = _build_headers(token)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            numbers: list[int] = []
+            if isinstance(data, list):
+                for dep in data:
+                    n = dep.get("number")
+                    if isinstance(n, int):
+                        numbers.append(n)
+            return numbers, "native"
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        # 404 = endpoint not found, 410 = gone, 403 = permission denied
+        # Any of these trigger fallback to ## Depends On section
+        if code in (403, 404, 410, 422, 501):
+            return None, "fallback_trigger"
+        # Other unexpected errors also trigger fallback (feature may be unavailable)
+        return None, "fallback_trigger"
+    except urllib.error.URLError:
+        return None, "fallback_trigger"
 
 
 def _parse_depends_on(body: str | None) -> list[int]:
@@ -135,22 +203,42 @@ def _parse_depends_on(body: str | None) -> list[int]:
     return numbers
 
 
+def _get_dependencies_with_source(
+    owner: str, repo: str, issue_number: int, token: str | None, body: str
+) -> tuple[list[int], str]:
+    """Get dependency issue numbers, preferring native API with fallback to body parsing.
+
+    Returns (dep_numbers, source) where source is "native" or "depends_on_section".
+    """
+    dep_numbers, source = _get_native_dependencies(owner, repo, issue_number, token)
+    if dep_numbers is not None:
+        # Native API returned successfully (including empty list = no deps)
+        return dep_numbers, "native"
+    # Fallback: parse ## Depends On section
+    return _parse_depends_on(body), "depends_on_section"
+
+
 def collect_descendants(
     owner: str,
     repo: str,
     milestone_number: int,
-    token: str,
+    token: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    BFS traversal of milestone direct issues + sub-issues.
+    """BFS traversal of milestone direct issues + sub-issues.
 
     Returns (all_issues, warnings_list).
     Each issue dict has keys: number, title, state, milestone, labels, body,
                               is_pr, depth, parent_number.
     visited set: (owner, repo, number) to prevent cycles and cross-repo duplicates.
+
+    Uses official milestone issues endpoint:
+      GET /repos/{owner}/{repo}/issues?milestone={n}&state=all&per_page=100
+    PRs are identified by presence of the `pull_request` field and placed in pr_mixed.
     """
+    # Blocker 2: use official milestone issues endpoint (not /milestones/{n}/issues)
     milestone_url = (
-        f"https://api.github.com/repos/{owner}/{repo}/milestones/{milestone_number}/issues"
+        f"https://api.github.com/repos/{owner}/{repo}/issues"
+        f"?milestone={milestone_number}&state=all&per_page=100"
     )
     direct_items = _api_get_paginated(milestone_url, token)
 
@@ -189,12 +277,13 @@ def collect_descendants(
         )
 
         if not is_pr:
-            children = _get_sub_issues_paginated(owner, repo, number, token)
+            children, sub_warnings = _get_sub_issues_paginated(owner, repo, number, token)
+            warnings.extend(sub_warnings)
             for child in children:
-                # Cross-repo guard: skip sub-issues from different repos
+                # Cross-repo guard: exact match (not startswith) to prevent owner/repo-evil bypass
                 child_repo_url = child.get("repository_url", "")
-                expected_prefix = f"https://api.github.com/repos/{owner}/{repo}"
-                if child_repo_url and not child_repo_url.startswith(expected_prefix):
+                expected = f"https://api.github.com/repos/{owner}/{repo}"
+                if child_repo_url and child_repo_url.rstrip("/") != expected:
                     warnings.append(
                         {
                             "type": "cross_repo_sub_issue",
@@ -227,7 +316,7 @@ def analyze(
     milestone_number: int,
     owner: str,
     repo: str,
-    token: str,
+    token: str | None,
 ) -> dict[str, Any]:
     """Produce MILESTONE_DESCENDANT_ROLLUP_V1 findings from collected issues."""
     pr_mixed: list[dict[str, Any]] = []
@@ -280,10 +369,12 @@ def analyze(
                     }
                 )
 
-        # AC5: open issue with open blockers
+        # AC5: open issue with open blockers (native API preferred, fallback to body)
         if state == "open":
             body = issue.get("body", "") or ""
-            dep_numbers = _parse_depends_on(body)
+            dep_numbers, dep_source = _get_dependencies_with_source(
+                owner, repo, number, token, body
+            )
 
             open_dep_numbers: list[int] = []
             for dep_n in dep_numbers:
@@ -305,7 +396,7 @@ def analyze(
                         "title": issue["title"],
                         "open_blocker_numbers": open_dep_numbers,
                         "depth": issue["depth"],
-                        "source": "depends_on_section",
+                        "source": dep_source,
                     }
                 )
 
@@ -366,17 +457,17 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("| field | value |")
     lines.append("|---|---|")
     for k, v in s.items():
-        lines.append(f"| {k} | {v} |")
+        lines.append(f"| {md_cell(k)} | {md_cell(v)} |")
 
     def _table_section(title: str, items: list[dict[str, Any]], cols: list[str]) -> None:
         lines.append(f"\n### {title}\n")
         if not items:
             lines.append("(none)")
             return
-        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("| " + " | ".join(md_cell(c) for c in cols) + " |")
         lines.append("|" + "|".join(["---"] * len(cols)) + "|")
         for item in items:
-            row = [str(item.get(c, "")) for c in cols]
+            row = [md_cell(item.get(c, "")) for c in cols]
             lines.append("| " + " | ".join(row) + " |")
 
     _table_section(
@@ -451,23 +542,25 @@ def main() -> int:
         print("ERROR: milestone_number must be a positive integer", file=sys.stderr)
         return 2
 
-    token = os.environ.get("GITHUB_TOKEN", "")
+    # Blocker 3: token is optional — unauthenticated GET works for public repos
+    token: str | None = os.environ.get("GITHUB_TOKEN") or None
     if not token:
         import subprocess
         try:
             result = subprocess.run(
                 ["gh", "auth", "token"], capture_output=True, text=True, timeout=10
             )
-            token = result.stdout.strip()
+            t = result.stdout.strip()
+            token = t if t else None
         except Exception:
             pass
 
     if not token:
         print(
-            "ERROR: GITHUB_TOKEN environment variable is not set and gh CLI token unavailable",
+            "[warn] No GITHUB_TOKEN or gh CLI token found; proceeding unauthenticated "
+            "(rate-limited to 60 req/h for public repos)",
             file=sys.stderr,
         )
-        return 1
 
     repo = args.repo
     parts = repo.split("/")

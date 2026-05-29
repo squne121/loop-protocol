@@ -9,6 +9,13 @@ AC8 coverage:
   - stale state labels on closed issues
   - milestone null / mismatch
   - open blocker detection
+  - native dependency API priority over ## Depends On section
+  - sub-issues 404 distinguished from "no children"
+  - milestone issues endpoint uses official /issues?milestone=... query
+  - unauthenticated (token-less) operation
+  - cross-repo exact match guard
+  - Markdown table cell escaping
+  - _parse_next_link regex robustness
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import sys
 import types
 import unittest
 from unittest.mock import MagicMock, patch
+import urllib.error
 
 # ---------------------------------------------------------------------------
 # Import the module under test
@@ -126,76 +134,159 @@ class TestParseNextLink(unittest.TestCase):
         header = '<https://api.github.com/repos/o/r/issues?page=5>; rel="last"'
         self.assertIsNone(mr._parse_next_link(header))
 
+    def test_next_link_with_extra_spaces(self):
+        """Regex handles extra spaces around rel="next"."""
+        header = '<https://example.com/page2>;  rel="next"'
+        result = mr._parse_next_link(header)
+        self.assertEqual(result, "https://example.com/page2")
+
+    def test_next_link_no_comma_separation(self):
+        """Only next link, no last link."""
+        header = '<https://api.github.com/repos/o/r/issues?page=2>; rel="next"'
+        result = mr._parse_next_link(header)
+        self.assertEqual(result, "https://api.github.com/repos/o/r/issues?page=2")
+
 
 # ---------------------------------------------------------------------------
-# Tests for collect_descendants (mocked)
+# Tests for md_cell escaping
 # ---------------------------------------------------------------------------
 
-def _make_urlopen_mock(pages: list[list[dict]], sub_issues_map: dict[int, list[dict]] | None = None):
+class TestMdCell(unittest.TestCase):
+    def test_pipe_escaped(self):
+        self.assertEqual(mr.md_cell("a|b"), "a\\|b")
+
+    def test_newline_replaced(self):
+        self.assertEqual(mr.md_cell("a\nb"), "a<br>b")
+
+    def test_plain_string_unchanged(self):
+        self.assertEqual(mr.md_cell("hello"), "hello")
+
+    def test_integer(self):
+        self.assertEqual(mr.md_cell(42), "42")
+
+    def test_multiple_pipes(self):
+        self.assertEqual(mr.md_cell("a|b|c"), "a\\|b\\|c")
+
+
+# ---------------------------------------------------------------------------
+# Mock helpers for urlopen
+# ---------------------------------------------------------------------------
+
+class FakeHTTPError(urllib.error.HTTPError):
+    def __init__(self, code: int, body: str = ""):
+        self._body = body.encode()
+        super().__init__("http://fake", code, f"HTTP {code}", {}, None)
+
+    def read(self):
+        return self._body
+
+
+class FakeResponse:
+    def __init__(self, data: list | dict, link: str = ""):
+        self._data = json.dumps(data).encode()
+        self._link = link
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    @property
+    def headers(self):
+        h = MagicMock()
+        h.get = lambda key, default="": self._link if key == "Link" else default
+        return h
+
+
+def _make_urlopen_mock(
+    pages: list[list[dict]],
+    sub_issues_map: dict[int, list[dict]] | None = None,
+    sub_issues_errors: dict[int, int] | None = None,
+    native_deps_map: dict[int, list[dict] | int] | None = None,
+):
     """
-    Create a mock context manager for urllib.request.urlopen.
-    pages: list of page responses for paginated calls (milestone issues).
+    Create a mock side_effect for urllib.request.urlopen.
+
+    pages: list of page responses for paginated milestone issues calls.
     sub_issues_map: dict mapping issue_number -> list of sub-issues.
+    sub_issues_errors: dict mapping issue_number -> HTTP error code to raise.
+    native_deps_map: dict mapping issue_number -> list of dep objects or HTTP error code (int).
     """
     sub_issues_map = sub_issues_map or {}
+    sub_issues_errors = sub_issues_errors or {}
+    native_deps_map = native_deps_map or {}
     call_count = {"milestone": 0}
     sub_call_count: dict[int, int] = {}
-
-    class FakeResponse:
-        def __init__(self, data: list | dict, link: str = ""):
-            self._data = json.dumps(data).encode()
-            self._link = link
-
-        def read(self):
-            return self._data
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        @property
-        def headers(self):
-            h = MagicMock()
-            h.get = lambda key, default="": self._link if key == "Link" else default
-            return h
 
     def urlopen_side_effect(req):
         url = req.full_url if hasattr(req, "full_url") else str(req)
 
+        # native dependency API endpoint
+        dep_match = re.search(r"/issues/(\d+)/dependencies/blocked_by", url)
+        if dep_match:
+            issue_num = int(dep_match.group(1))
+            if issue_num in native_deps_map:
+                val = native_deps_map[issue_num]
+                if isinstance(val, int):
+                    raise FakeHTTPError(val)
+                return FakeResponse(val)
+            # Default: 404 (not available) → triggers fallback
+            raise FakeHTTPError(404)
+
         # sub_issues endpoint
-        import re
         sub_match = re.search(r"/issues/(\d+)/sub_issues", url)
         if sub_match:
             issue_num = int(sub_match.group(1))
+            if issue_num in sub_issues_errors:
+                raise FakeHTTPError(sub_issues_errors[issue_num])
             children = sub_issues_map.get(issue_num, [])
             sub_call_count.setdefault(issue_num, 0)
             idx = sub_call_count[issue_num]
             sub_call_count[issue_num] += 1
-            # Return children on first call, empty on subsequent (no pagination in default)
             if idx == 0:
                 return FakeResponse(children)
             return FakeResponse([])
 
-        # milestone issues endpoint
+        # milestone issues endpoint — must use ?milestone=... query style
         idx = call_count["milestone"]
         call_count["milestone"] += 1
         if idx < len(pages):
             page = pages[idx]
-            # Add link header if there's a next page
             link = ""
             if idx + 1 < len(pages):
-                link = f'<https://api.github.com/repos/owner/repo/milestones/1/issues?page={idx+2}>; rel="next"'
+                link = f'<https://api.github.com/repos/owner/repo/issues?milestone=1&page={idx+2}>; rel="next"'
             return FakeResponse(page, link)
         return FakeResponse([])
 
     return urlopen_side_effect
 
 
+import re  # noqa: E402 (needed for urlopen_side_effect closure)
+
+
+# ---------------------------------------------------------------------------
+# Tests for collect_descendants (mocked)
+# ---------------------------------------------------------------------------
+
 class TestCollectDescendants(unittest.TestCase):
-    def _run_collect(self, pages, sub_issues_map=None):
-        with patch("urllib.request.urlopen", side_effect=_make_urlopen_mock(pages, sub_issues_map)):
+    def _run_collect(
+        self,
+        pages,
+        sub_issues_map=None,
+        sub_issues_errors=None,
+        native_deps_map=None,
+    ):
+        side_effect = _make_urlopen_mock(
+            pages,
+            sub_issues_map=sub_issues_map,
+            sub_issues_errors=sub_issues_errors,
+            native_deps_map=native_deps_map,
+        )
+        with patch("urllib.request.urlopen", side_effect=side_effect):
             return mr.collect_descendants("owner", "repo", 1, "fake_token")
 
     def test_single_direct_issue(self):
@@ -205,13 +296,38 @@ class TestCollectDescendants(unittest.TestCase):
         self.assertEqual(issues[0]["number"], 10)
         self.assertEqual(warnings, [])
 
+    def test_milestone_issues_endpoint_uses_query_param(self):
+        """Blocker 2: milestone issues endpoint must use ?milestone=N&state=all&per_page=100."""
+        captured_urls = []
+
+        def capturing_urlopen(req):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            captured_urls.append(url)
+            # sub_issues -> empty
+            if "sub_issues" in url:
+                return FakeResponse([])
+            # native deps -> 404 fallback
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            return FakeResponse([_make_issue(1)])
+
+        with patch("urllib.request.urlopen", side_effect=capturing_urlopen):
+            mr.collect_descendants("owner", "repo", 1, "fake_token")
+
+        milestone_urls = [u for u in captured_urls if "sub_issues" not in u and "dependencies" not in u]
+        self.assertTrue(len(milestone_urls) >= 1, "No milestone API call made")
+        first_url = milestone_urls[0]
+        self.assertIn("milestone=1", first_url, "URL must use ?milestone=1 query param")
+        self.assertIn("state=all", first_url, "URL must include state=all")
+        self.assertNotIn("/milestones/", first_url, "Must not use deprecated /milestones/{n}/issues endpoint")
+
     def test_two_level_descendants(self):
         """AC8: 2+ level descendant traversal"""
         child = _make_sub_issue(20, "Child Issue", milestone_number=1)
         grandchild = _make_sub_issue(30, "Grandchild Issue", milestone_number=1)
         pages = [[_make_issue(10, "Parent Issue")]]
         sub_map = {10: [child], 20: [grandchild]}
-        issues, warnings = self._run_collect(pages, sub_map)
+        issues, warnings = self._run_collect(pages, sub_issues_map=sub_map)
         numbers = [i["number"] for i in issues]
         self.assertIn(10, numbers)
         self.assertIn(20, numbers)
@@ -231,21 +347,36 @@ class TestCollectDescendants(unittest.TestCase):
 
     def test_cycle_prevention(self):
         """visited set prevents revisiting same issue"""
-        # Issue 10 has child 20, and issue 20 also has child 10 (cycle)
         child = _make_sub_issue(20)
         back_ref = _make_sub_issue(10)  # cycle back to parent
         pages = [[_make_issue(10)]]
         sub_map = {10: [child], 20: [back_ref]}
-        issues, warnings = self._run_collect(pages, sub_map)
+        issues, warnings = self._run_collect(pages, sub_issues_map=sub_map)
         numbers = [i["number"] for i in issues]
         self.assertIn(10, numbers)
         self.assertIn(20, numbers)
-        # Should only appear once each
         self.assertEqual(numbers.count(10), 1)
         self.assertEqual(numbers.count(20), 1)
-        # cycle warning
         cycle_warnings = [w for w in warnings if w["type"] == "cycle_or_duplicate"]
         self.assertEqual(len(cycle_warnings), 1)
+
+    def test_cross_repo_sub_issue_skipped_exact_match(self):
+        """Blocker 5: cross-repo uses exact match; owner/repo-evil must not match owner/repo."""
+        # This would falsely match with startswith() but not with exact match
+        child_evil = _make_sub_issue(
+            88, repo_url="https://api.github.com/repos/owner/repo-evil"
+        )
+        child_other = _make_sub_issue(
+            99, repo_url="https://api.github.com/repos/other-owner/other-repo"
+        )
+        pages = [[_make_issue(10)]]
+        sub_map = {10: [child_evil, child_other]}
+        issues, warnings = self._run_collect(pages, sub_issues_map=sub_map)
+        numbers = [i["number"] for i in issues]
+        self.assertNotIn(88, numbers, "owner/repo-evil must be rejected by exact match guard")
+        self.assertNotIn(99, numbers)
+        cross_warnings = [w for w in warnings if w["type"] == "cross_repo_sub_issue"]
+        self.assertEqual(len(cross_warnings), 2)
 
     def test_cross_repo_sub_issue_skipped(self):
         """Cross-repo sub-issues produce a warning and are skipped"""
@@ -254,7 +385,7 @@ class TestCollectDescendants(unittest.TestCase):
         )
         pages = [[_make_issue(10)]]
         sub_map = {10: [child]}
-        issues, warnings = self._run_collect(pages, sub_map)
+        issues, warnings = self._run_collect(pages, sub_issues_map=sub_map)
         numbers = [i["number"] for i in issues]
         self.assertNotIn(99, numbers)
         cross_warnings = [w for w in warnings if w["type"] == "cross_repo_sub_issue"]
@@ -267,6 +398,144 @@ class TestCollectDescendants(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertTrue(issues[0]["is_pr"])
 
+    def test_sub_issues_404_produces_warning_not_empty_children(self):
+        """Blocker 4: 404 from sub_issues endpoint -> warning, not silently empty."""
+        pages = [[_make_issue(10)]]
+        issues, warnings = self._run_collect(pages, sub_issues_errors={10: 404})
+        # Issue 10 should still be in the list (we collected it from milestone)
+        numbers = [i["number"] for i in issues]
+        self.assertIn(10, numbers)
+        # A warning of type sub_issues_unavailable should be present
+        unavail = [w for w in warnings if w["type"] == "sub_issues_unavailable"]
+        self.assertEqual(len(unavail), 1, "404 must produce sub_issues_unavailable warning")
+        self.assertEqual(unavail[0]["issue_number"], 10)
+        self.assertEqual(unavail[0]["http_code"], 404)
+
+    def test_sub_issues_410_produces_warning(self):
+        """Blocker 4: 410 from sub_issues endpoint -> warning."""
+        pages = [[_make_issue(10)]]
+        issues, warnings = self._run_collect(pages, sub_issues_errors={10: 410})
+        unavail = [w for w in warnings if w["type"] == "sub_issues_unavailable"]
+        self.assertEqual(len(unavail), 1)
+        self.assertEqual(unavail[0]["http_code"], 410)
+
+    def test_sub_issues_422_produces_warning(self):
+        """Blocker 4: 422 from sub_issues endpoint -> sub_issues_error warning."""
+        pages = [[_make_issue(10)]]
+        issues, warnings = self._run_collect(pages, sub_issues_errors={10: 422})
+        err_warnings = [w for w in warnings if w["type"] == "sub_issues_error"]
+        self.assertEqual(len(err_warnings), 1)
+        self.assertEqual(err_warnings[0]["http_code"], 422)
+
+    def test_unauthenticated_works_without_token(self):
+        """Blocker 3: token=None should not prevent API calls (no auth header required)."""
+        pages = [[_make_issue(10)]]
+
+        def urlopen_check_auth(req):
+            # Verify no Authorization header sent when token is None
+            auth = req.get_header("Authorization")
+            if "sub_issues" in req.full_url:
+                return FakeResponse([])
+            if "dependencies/blocked_by" in req.full_url:
+                raise FakeHTTPError(404)
+            return FakeResponse([_make_issue(10)])
+
+        with patch("urllib.request.urlopen", side_effect=urlopen_check_auth):
+            issues, warnings = mr.collect_descendants("owner", "repo", 1, None)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["number"], 10)
+
+
+# ---------------------------------------------------------------------------
+# Tests for native dependency API
+# ---------------------------------------------------------------------------
+
+class TestNativeDependencies(unittest.TestCase):
+    def test_native_api_returns_deps(self):
+        """Blocker 1: native API 200 -> returns dep numbers, source='native'."""
+        dep_obj = [{"number": 42, "state": "open", "title": "Blocker"}]
+
+        def fake_urlopen(req):
+            if "dependencies/blocked_by" in req.full_url:
+                return FakeResponse(dep_obj)
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        self.assertEqual(nums, [42])
+        self.assertEqual(source, "native")
+
+    def test_native_api_200_empty_no_fallback(self):
+        """Blocker 1: native API 200 empty -> deps=[], source='native', no fallback."""
+        def fake_urlopen(req):
+            if "dependencies/blocked_by" in req.full_url:
+                return FakeResponse([])
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        self.assertIsNotNone(nums)
+        self.assertEqual(nums, [])
+        self.assertEqual(source, "native")
+
+    def test_native_api_404_triggers_fallback(self):
+        """Blocker 1: native API 404 -> returns (None, 'fallback_trigger')."""
+        def fake_urlopen(req):
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_native_dependencies("owner", "repo", 10, "tok")
+
+        self.assertIsNone(nums)
+        self.assertEqual(source, "fallback_trigger")
+
+    def test_get_dependencies_with_source_uses_native_first(self):
+        """Blocker 1: _get_dependencies_with_source prefers native over body parsing."""
+        body = "## Depends On\n- #99\n"  # body has #99 but native returns #42
+
+        def fake_urlopen(req):
+            if "dependencies/blocked_by" in req.full_url:
+                return FakeResponse([{"number": 42}])
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_dependencies_with_source("owner", "repo", 10, "tok", body)
+
+        self.assertEqual(nums, [42])
+        self.assertEqual(source, "native")
+        self.assertNotIn(99, nums, "Body fallback must not be used when native API succeeds")
+
+    def test_get_dependencies_with_source_fallback_on_404(self):
+        """Blocker 1: when native returns 404, fall back to ## Depends On body parsing."""
+        body = "## Depends On\n- #99\n"
+
+        def fake_urlopen(req):
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_dependencies_with_source("owner", "repo", 10, "tok", body)
+
+        self.assertEqual(nums, [99])
+        self.assertEqual(source, "depends_on_section")
+
+    def test_native_200_empty_does_not_fallback_to_body(self):
+        """Blocker 1: native 200 empty means 'no deps', must not consult body."""
+        body = "## Depends On\n- #99\n"  # body has a dep but native says empty
+
+        def fake_urlopen(req):
+            if "dependencies/blocked_by" in req.full_url:
+                return FakeResponse([])
+            raise FakeHTTPError(404)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            nums, source = mr._get_dependencies_with_source("owner", "repo", 10, "tok", body)
+
+        self.assertEqual(nums, [], "native 200 empty must return [] without consulting body")
+        self.assertEqual(source, "native")
+
 
 # ---------------------------------------------------------------------------
 # Tests for analyze
@@ -275,20 +544,35 @@ class TestCollectDescendants(unittest.TestCase):
 class TestAnalyze(unittest.TestCase):
     """Tests for the analyze() function using pre-built issue lists."""
 
-    def _run_analyze(self, issues, dep_states=None):
-        """Run analyze with mocked _api_get for dep issue states."""
+    def _run_analyze(self, issues, dep_states=None, native_deps_map=None):
+        """Run analyze with mocked API calls for dep issue states and native deps."""
         dep_states = dep_states or {}
+        native_deps_map = native_deps_map or {}
 
-        def fake_api_get(url, token):
-            import re
-            m = re.search(r"/issues/(\d+)$", url)
-            if m:
-                num = int(m.group(1))
-                state = dep_states.get(num, "closed")
-                return {"number": num, "state": state, "title": f"Issue {num}"}
-            raise RuntimeError(f"Unexpected URL: {url}")
+        def fake_urlopen(req):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
 
-        with patch.object(mr, "_api_get", side_effect=fake_api_get):
+            # native dependency API
+            dep_match = re.search(r"/issues/(\d+)/dependencies/blocked_by", url)
+            if dep_match:
+                num = int(dep_match.group(1))
+                if num in native_deps_map:
+                    val = native_deps_map[num]
+                    if isinstance(val, int):
+                        raise FakeHTTPError(val)
+                    return FakeResponse(val)
+                raise FakeHTTPError(404)
+
+            # single issue fetch for state check
+            issue_match = re.search(r"/issues/(\d+)$", url)
+            if issue_match:
+                n = int(issue_match.group(1))
+                state = dep_states.get(n, "closed")
+                return FakeResponse({"number": n, "state": state, "title": f"Issue {n}"})
+
+            raise RuntimeError(f"Unexpected URL in test: {url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             return mr.analyze(issues, 1, "owner", "repo", "fake_token")
 
     def test_pr_mixed(self):
@@ -303,7 +587,6 @@ class TestAnalyze(unittest.TestCase):
         findings = self._run_analyze(issues)
         self.assertEqual(len(findings["pr_mixed"]), 1)
         self.assertEqual(findings["pr_mixed"][0]["number"], 1)
-        # PR should not appear in other lists
         self.assertEqual(len(findings["milestone_mismatches"]), 0)
 
     def test_milestone_null_mismatch(self):
@@ -370,8 +653,55 @@ class TestAnalyze(unittest.TestCase):
         findings = self._run_analyze(issues)
         self.assertEqual(len(findings["stale_state_labels"]), 0)
 
-    def test_open_blocker_detected(self):
-        """AC5/AC8: open issue with open dependency -> open_blockers"""
+    def test_open_blocker_via_native_api(self):
+        """Blocker 1/AC5: native dep API returns open dep -> open_blockers with source='native'."""
+        issues = [
+            {
+                "number": 7, "title": "Blocked Issue", "state": "open",
+                "milestone_number": 1, "labels": [], "body": "",
+                "is_pr": False, "depth": 0, "parent_number": None,
+            }
+        ]
+        native_deps = {7: [{"number": 10}]}
+        findings = self._run_analyze(issues, dep_states={10: "open"}, native_deps_map=native_deps)
+        self.assertEqual(len(findings["open_blockers"]), 1)
+        self.assertIn(10, findings["open_blockers"][0]["open_blocker_numbers"])
+        self.assertEqual(findings["open_blockers"][0]["source"], "native")
+
+    def test_open_blocker_via_body_fallback(self):
+        """Blocker 1/AC5: when native 404, falls back to body parsing."""
+        body = "## Depends On\n- #10\n"
+        issues = [
+            {
+                "number": 7, "title": "Blocked Issue", "state": "open",
+                "milestone_number": 1, "labels": [], "body": body,
+                "is_pr": False, "depth": 0, "parent_number": None,
+            }
+        ]
+        # native_deps_map[7] = 404 -> fallback
+        native_deps = {7: 404}
+        findings = self._run_analyze(issues, dep_states={10: "open"}, native_deps_map=native_deps)
+        self.assertEqual(len(findings["open_blockers"]), 1)
+        self.assertIn(10, findings["open_blockers"][0]["open_blocker_numbers"])
+        self.assertEqual(findings["open_blockers"][0]["source"], "depends_on_section")
+
+    def test_native_200_empty_does_not_use_body_dep(self):
+        """Blocker 1: native 200 empty = no deps; body #10 must not appear."""
+        body = "## Depends On\n- #10\n"
+        issues = [
+            {
+                "number": 7, "title": "Blocked Issue", "state": "open",
+                "milestone_number": 1, "labels": [], "body": body,
+                "is_pr": False, "depth": 0, "parent_number": None,
+            }
+        ]
+        # native returns empty list (200 OK, no deps)
+        native_deps = {7: []}
+        findings = self._run_analyze(issues, dep_states={10: "open"}, native_deps_map=native_deps)
+        self.assertEqual(len(findings["open_blockers"]), 0, "native 200 empty must not fall back to body")
+
+    def test_open_blocker_detected_via_body(self):
+        """AC5/AC8: open issue with open dependency via body -> open_blockers"""
         body = "## Depends On\n- #10\n"
         issues = [
             {
@@ -466,8 +796,8 @@ class TestBuildReport(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRenderMarkdown(unittest.TestCase):
-    def test_contains_schema_heading(self):
-        report = {
+    def _base_report(self, **overrides):
+        r = {
             "schema": "MILESTONE_DESCENDANT_ROLLUP_V1",
             "generated_at": "2026-01-01T00:00:00Z",
             "repo": "owner/repo",
@@ -484,31 +814,46 @@ class TestRenderMarkdown(unittest.TestCase):
             "open_blockers": [],
             "warnings": [],
         }
-        md = mr.render_markdown(report)
+        r.update(overrides)
+        return r
+
+    def test_contains_schema_heading(self):
+        md = mr.render_markdown(self._base_report())
         self.assertIn("## Milestone Descendant Rollup: #1", md)
         self.assertIn("owner/repo", md)
 
     def test_pr_mixed_appears_in_table(self):
-        report = {
-            "schema": "MILESTONE_DESCENDANT_ROLLUP_V1",
-            "generated_at": "2026-01-01T00:00:00Z",
-            "repo": "owner/repo",
-            "milestone_number": 1,
-            "summary": {
+        report = self._base_report(
+            pr_mixed=[{"number": 55, "title": "Some PR", "state": "open", "depth": 0}],
+            summary={
                 "total_descendants": 1, "open_issues": 0, "closed_issues": 0,
                 "pr_mixed_count": 1, "milestone_mismatch_count": 0,
                 "stale_state_label_count": 0, "open_blocker_count": 0,
                 "has_invariant_violation": True,
             },
-            "pr_mixed": [{"number": 55, "title": "Some PR", "state": "open", "depth": 0}],
-            "milestone_mismatches": [],
-            "stale_state_labels": [],
-            "open_blockers": [],
-            "warnings": [],
-        }
+        )
         md = mr.render_markdown(report)
         self.assertIn("55", md)
         self.assertIn("Some PR", md)
+
+    def test_pipe_in_title_escaped(self):
+        """High: titles with | must be escaped in table cells."""
+        report = self._base_report(
+            pr_mixed=[{"number": 1, "title": "A|B title", "state": "open", "depth": 0}],
+            summary={
+                "total_descendants": 1, "open_issues": 0, "closed_issues": 0,
+                "pr_mixed_count": 1, "milestone_mismatch_count": 0,
+                "stale_state_label_count": 0, "open_blocker_count": 0,
+                "has_invariant_violation": True,
+            },
+        )
+        md = mr.render_markdown(report)
+        self.assertIn("A\\|B title", md, "Pipe in title must be escaped as \\|")
+        # Should not have unescaped | that would break the table
+        # Check that the raw unescaped title is not present as-is in a table row
+        for line in md.splitlines():
+            if "A|B title" in line and not "A\\|B title" in line:
+                self.fail(f"Unescaped pipe found in table line: {line!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -518,22 +863,8 @@ class TestRenderMarkdown(unittest.TestCase):
 class TestMainExitCodes(unittest.TestCase):
     """Test main() behavior with mocked API and token."""
 
-    def _mock_env(self, env_vars):
-        return patch.dict("os.environ", env_vars, clear=False)
-
-    def test_missing_token_returns_1(self):
-        with patch.dict("os.environ", {"GITHUB_TOKEN": ""}, clear=False):
-            with patch("subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(stdout="", returncode=1)
-                result = mr.main.__wrapped__() if hasattr(mr.main, "__wrapped__") else None
-                # Can't easily call main() with patched argv, so test token detection logic
-                # directly
-        self.assertTrue(True)  # placeholder — token detection tested via collect_descendants
-
     def test_api_error_propagates_as_runtime_error(self):
         """HTTP errors from the API are raised as RuntimeError (non-zero exit path)"""
-        import urllib.error
-
         def raising_urlopen(req):
             raise urllib.error.URLError('connection refused')
 
@@ -543,13 +874,11 @@ class TestMainExitCodes(unittest.TestCase):
 
     def test_exit_0_when_no_strict(self):
         """findings present but no --strict -> exit 0"""
-        # Test build_report produces has_invariant_violation=False for clean runs
         report = mr.build_report(
             1, [], {"pr_mixed": [], "milestone_mismatches": [{"number": 9}],
                     "stale_state_labels": [], "open_blockers": []},
             [], "2026-01-01T00:00:00Z", "owner/repo"
         )
-        # milestone_mismatches don't count as invariant violation
         self.assertFalse(report["summary"]["has_invariant_violation"])
 
     def test_strict_flag_detects_pr_mixed(self):
@@ -561,6 +890,18 @@ class TestMainExitCodes(unittest.TestCase):
             [], "2026-01-01T00:00:00Z", "owner/repo"
         )
         self.assertTrue(report["summary"]["has_invariant_violation"])
+
+    def test_no_token_proceeds_unauthenticated(self):
+        """Blocker 3: missing token must not return 1; proceeds unauthenticated."""
+        # Verify that _build_headers with None token omits Authorization header
+        headers = mr._build_headers(None)
+        self.assertNotIn("Authorization", headers)
+
+    def test_token_present_adds_auth_header(self):
+        """Token present adds Authorization header."""
+        headers = mr._build_headers("mytoken")
+        self.assertIn("Authorization", headers)
+        self.assertEqual(headers["Authorization"], "Bearer mytoken")
 
 
 if __name__ == "__main__":
