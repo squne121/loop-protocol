@@ -295,6 +295,18 @@
     - "## Entry Schema"
     - "## Example Entry"
 
+- id: combat-core
+  path: docs/product/features/combat-core.md
+  title: Combat Core Feature Spec
+  keywords: [combat, collision, hitbox, enemy, projectile, damage, defeat, CombatSystem, CollisionSystem, CollisionPair, EnemyState, contactDamage, defeatedAtTick, M2]
+  description: M2 Combat MVP Gate の前提仕様。CollisionSystem/CombatSystem 責務境界・CollisionPair 型・EnemyState フィールド・defeat policy・deterministic order の正本
+  sections:
+    - "## Non-Goals"
+    - "## EnemyState"
+    - "## CollisionSystem Contract"
+    - "## CombatSystem Contract"
+    - "## Defeat Policy"
+
 ---
 
 ## ディレクトリ → SSOT マッピング
