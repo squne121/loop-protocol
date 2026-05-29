@@ -80,8 +80,9 @@ TELEMETRY_FILE="${GEMINI_TELEMETRY_OUTFILE:-$ARTIFACTS_DIR/runtime-verification-
 # the caller; set defaults here so callers that want to disable telemetry can
 # unset GEMINI_TELEMETRY_ENABLED before running this script.
 export GEMINI_TELEMETRY_OUTFILE="$TELEMETRY_FILE"
-export GEMINI_TELEMETRY_ENABLED="${GEMINI_TELEMETRY_ENABLED:-true}"
-export GEMINI_TELEMETRY_TARGET="${GEMINI_TELEMETRY_TARGET:-local}"
+export GEMINI_TELEMETRY_ENABLED=true
+export GEMINI_TELEMETRY_TARGET=local
+export GEMINI_TELEMETRY_LOG_PROMPTS=false
 # GEMINI_ACP_DEBUG=1 causes run_gemini_acp.py to append --debug to the gemini
 # --acp subprocess args, which enables verbose ACP protocol logging to stderr.
 export GEMINI_ACP_DEBUG="${GEMINI_ACP_DEBUG:-1}"

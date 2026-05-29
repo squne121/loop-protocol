@@ -1837,3 +1837,73 @@ class TestAuthRequiredClassification:
             "failure_class"
         )
         assert fclass == "auth_required"
+
+
+# ---------------------------------------------------------------------------
+# GEMINI_ACP_DEBUG argv shape tests (Issue #113 Major fix)
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiAcpDebugArgvShape:
+    """GIVEN GEMINI_ACP_DEBUG env var, WHEN run_acp is called, THEN argv shape is correct.
+
+    Verifies that:
+    - unset  → gemini --acp  (no --debug)
+    - value=0 → gemini --acp  (no --debug)
+    - value=1 → gemini --acp --debug
+    """
+
+    @pytest.mark.parametrize(
+        "env_value, expected_has_debug",
+        [
+            (None, False),   # unset
+            ("0", False),    # explicitly disabled
+            ("1", True),     # explicitly enabled
+        ],
+    )
+    def test_argv_shape(
+        self, env_value: str | None, expected_has_debug: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify --debug is appended iff GEMINI_ACP_DEBUG=1."""
+        captured_args: list[str] = []
+
+        async def fake_subprocess(*args: str, **kwargs: object) -> None:  # type: ignore[return]
+            captured_args.extend(args)
+            raise FileNotFoundError("fake gemini not found")
+
+        if env_value is None:
+            monkeypatch.delenv("GEMINI_ACP_DEBUG", raising=False)
+        else:
+            monkeypatch.setenv("GEMINI_ACP_DEBUG", env_value)
+
+        fake_request = {
+            "schema": "delegation_request_v1",
+            "transport": "acp",
+            "objective": "test",
+            "instructions": [],
+            "tool_profile": "no_tools",
+            "output_sections": ["Response"],
+            "model": "gemini-2.5-flash",
+            "timeout_sec": 10,
+        }
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
+            result = asyncio.run(
+                acp._run_acp_session(
+                    prompt="test",
+                    model="gemini-2.5-flash",
+                    approve_edits=False,
+                    timeout_sec=10,
+                    gemini_bin="gemini",
+                    cwd_override=None,
+                )
+            )
+
+        assert result.get("failure_class") == "gemini_not_found"
+
+        has_debug = "--debug" in captured_args
+        assert has_debug == expected_has_debug, (
+            f"GEMINI_ACP_DEBUG={env_value!r}: "
+            f"expected --debug={'present' if expected_has_debug else 'absent'}, "
+            f"got args={captured_args!r}"
+        )
