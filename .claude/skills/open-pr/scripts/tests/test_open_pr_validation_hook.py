@@ -381,3 +381,259 @@ def test_b5_validator_oserror(monkeypatch: pytest.MonkeyPatch):
         assert rc == 2
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+
+# --- AC1/AC2: E_SCHEMA_CONSUMER_INVENTORY_MISSING classification tests ---
+
+
+def _run_main_with_validator_result(
+    monkeypatch: pytest.MonkeyPatch,
+    body_fixture: str,
+    validator_result: dict,
+    extra_args: list[str] | None = None,
+) -> tuple[int, list[str]]:
+    """Helper: run open_pr.main with a fixed validator result, capture stdout."""
+    import io
+
+    body_path = write_temp_body(load_fixture(body_fixture))
+    output_lines: list[str] = []
+    original_print = print  # noqa: F841
+
+    def capture_print(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        line = sep.join(str(a) for a in args)
+        output_lines.append(line)
+
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-170-test")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        monkeypatch.setattr(
+            open_pr,
+            "_run_pr_body_validator",
+            lambda body, changed_paths, linked_issue: validator_result,
+        )
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+        monkeypatch.setattr(open_pr, "create_pr", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no create")))
+        monkeypatch.setattr("builtins.print", capture_print)
+
+        base_args = [
+            "--pr-title", "feat: test",
+            "--linked-issue", "170",
+            "--publish", "yes",
+            "--pr-body-file", body_path,
+        ]
+        if extra_args:
+            base_args.extend(extra_args)
+
+        rc = open_pr.main(base_args)
+        return rc, output_lines
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_ac1_lp050_classified_as_schema_consumer_inventory_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC1: LP050 failure results in E_SCHEMA_CONSUMER_INVENTORY_MISSING."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "schema_change_missing_inventory.md",
+        {
+            "status": "fail",
+            "errors": [{"rule_id": "LP050", "message": "Schema change PR requires non-placeholder inventory."}],
+            "message": "LP050 failure",
+        },
+    )
+    assert rc == 2
+    assert any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines), (
+        f"Expected ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING} in output; got: {lines}"
+    )
+    assert not any(line == f"ERROR={open_pr.E_PR_BODY_VALIDATION_FAILED}" for line in lines), (
+        f"Should not emit E_PR_BODY_VALIDATION_FAILED for LP050; got: {lines}"
+    )
+
+
+def test_ac2_lp052_schema_consumer_inventory_classified_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC2: LP052 missing Schema Consumer Inventory => E_SCHEMA_CONSUMER_INVENTORY_MISSING."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "missing_schema_consumer_inventory_section.md",
+        {
+            "status": "fail",
+            "errors": [
+                {
+                    "rule_id": "LP052",
+                    "section": "(global)",
+                    "message": "Missing required section: Schema Consumer Inventory",
+                }
+            ],
+            "message": "LP052 missing section",
+        },
+    )
+    assert rc == 2
+    assert any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines), (
+        f"Expected ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}; got: {lines}"
+    )
+
+
+def test_ac2_lp052_other_section_not_misclassified(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC2 boundary: LP052 missing a different section => E_PR_BODY_VALIDATION_FAILED."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "missing_summary.md",
+        {
+            "status": "fail",
+            "errors": [
+                {
+                    "rule_id": "LP052",
+                    "section": "(global)",
+                    "message": "Missing required section: Summary",
+                }
+            ],
+            "message": "LP052 missing Summary",
+        },
+    )
+    assert rc == 2
+    assert any(line == f"ERROR={open_pr.E_PR_BODY_VALIDATION_FAILED}" for line in lines), (
+        f"Expected E_PR_BODY_VALIDATION_FAILED for LP052/Summary; got: {lines}"
+    )
+    assert not any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines)
+
+
+def test_ac3_stdout_includes_validator_rule_ids_on_lp050(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC3: VALIDATOR_RULE_IDS and ERROR=E_SCHEMA_CONSUMER_INVENTORY_MISSING emitted, no gh pr create."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "schema_change_missing_inventory.md",
+        {
+            "status": "fail",
+            "errors": [{"rule_id": "LP050", "message": "inventory missing"}],
+            "message": "LP050",
+        },
+    )
+    assert rc == 2
+    assert any(line.startswith("VALIDATOR_RULE_IDS=") for line in lines), (
+        f"Expected VALIDATOR_RULE_IDS in stdout; got: {lines}"
+    )
+    assert any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines)
+
+
+def test_ac4_not_schema_change_na_pass_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC4: not_schema_change + N/A inventory passes without E_SCHEMA_CONSUMER_INVENTORY_MISSING.
+
+    Uses find_existing_pr to return an existing PR to avoid calling create_pr in test.
+    """
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    output_lines: list[str] = []
+
+    def capture_print(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        line = sep.join(str(a) for a in args)
+        output_lines.append(line)
+
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-170-test")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        monkeypatch.setattr(
+            open_pr,
+            "_run_pr_body_validator",
+            lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
+        )
+        # Return existing PR so create_pr is not called
+        monkeypatch.setattr(
+            open_pr,
+            "find_existing_pr",
+            lambda repo, branch: {"number": 999, "url": "https://example.com/pr/999"},
+        )
+        monkeypatch.setattr("builtins.print", capture_print)
+
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "170",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+            ]
+        )
+        assert rc == 0
+        assert not any(line.startswith("ERROR=") for line in output_lines), (
+            f"No ERROR expected on pass; got: {output_lines}"
+        )
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_ac5_validator_internal_error_not_misclassified(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC5: validator internal error is NOT classified as E_SCHEMA_CONSUMER_INVENTORY_MISSING."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "valid_not_schema_change.md",
+        {
+            "status": "internal",
+            "errors": [],
+            "message": "Validator timeout",
+        },
+    )
+    assert rc == 2
+    assert not any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines), (
+        f"internal error must NOT map to E_SCHEMA_CONSUMER_INVENTORY_MISSING; got: {lines}"
+    )
+
+
+def test_ac5_schema_mismatch_not_misclassified(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC5: schema mismatch (status=internal) is NOT E_SCHEMA_CONSUMER_INVENTORY_MISSING."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "valid_not_schema_change.md",
+        {
+            "status": "internal",
+            "errors": [],
+            "message": "Validator schema mismatch: wrong_schema",
+        },
+    )
+    assert rc == 2
+    assert not any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines)
+
+
+def test_ac6_dry_run_also_validates_and_classifies(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+):
+    """AC6: --dry-run still applies E_SCHEMA_CONSUMER_INVENTORY_MISSING classification."""
+    rc, lines = _run_main_with_validator_result(
+        monkeypatch,
+        "schema_change_missing_inventory.md",
+        {
+            "status": "fail",
+            "errors": [{"rule_id": "LP050", "message": "inventory missing"}],
+            "message": "LP050",
+        },
+        extra_args=["--dry-run"],
+    )
+    assert rc == 2
+    assert any(line == f"ERROR={open_pr.E_SCHEMA_CONSUMER_INVENTORY_MISSING}" for line in lines), (
+        f"dry-run must still classify LP050 as E_SCHEMA_CONSUMER_INVENTORY_MISSING; got: {lines}"
+    )
