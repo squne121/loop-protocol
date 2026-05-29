@@ -301,6 +301,7 @@ SSOT 追加時の参照先を集約した索引。AI エージェントは実装
 | ゲームロジック仕様（状態遷移・入力・時間モデル・衝突・勝敗・保存境界） | `docs/product/game-logic.md` |
 | movement + projectile 最小仕様（player 移動・aim・fire・projectile 定数・座標系・lifecycle・テスト AC） | `docs/product/features/movement-projectile.md` |
 | issue-refinement-loop / impl-review-loop の詳細設計（SubAgent 契約・state machine・escalation 分類）。architecture review / contract migration 時のみロード | `docs/dev/workflows/*.md` |
+| Vite ビルド成果物の取扱 / 配布候補評価（Local / GitHub Pages / itch.io）/ RC checklist / M1 公開リリース判断基準 | `docs/dev/release-distribution-policy.md` |
 
 ### 新規 SSOT 追加時の必須更新セット
 
