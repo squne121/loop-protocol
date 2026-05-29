@@ -252,6 +252,42 @@ fi
 | timeout（サーバー無応答）| 異常系 | timeout エラーが返り fallback が発火しない |
 | fallback 発火 | 異常系 | `_*_fallback: true` → FAIL 判定 |
 
+### ACP transport 動作検証スクリプト (`verify_acp_roundtrip.sh`)
+
+ACP transport の end-to-end 動作検証は `.claude/skills/gemini-cli-headless-delegation/scripts/verify_acp_roundtrip.sh` で実施する。
+
+このスクリプトは以下の 2 種類のシナリオを含む:
+
+1. **scenario 1（実 Gemini CLI 向け正常系）**: PONG roundtrip — 実 Gemini CLI が pre-authenticated の場合のみ実行。`GEMINI_TELEMETRY_OUTFILE` に telemetry.json を出力し、`--debug` flag（`GEMINI_ACP_DEBUG=1`）で ACP JSON-RPC protocol ログを stderr に記録する。実 CLI 不在または auth 失敗の場合は SKIP exit 77 を返す。
+2. **scenario 2（deterministic fake-agent 向け controlled experiment）**: permission proxy の branch が side effect を制御することを検証する決定論的テスト。実 Gemini CLI を使わないため常に実行される。
+
+#### 実 Gemini CLI 向けの証跡取得フロー（AC1: Issue #113）
+
+実 Gemini CLI が存在し pre-authenticated の場合、以下の環境変数が自動設定される:
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `GEMINI_ACP_DEBUG` | `1` | `gemini --acp --debug` を有効化し ACP JSON-RPC ログを stderr に記録 |
+| `GEMINI_TELEMETRY_ENABLED` | `true` | gemini CLI の telemetry 出力を有効化 |
+| `GEMINI_TELEMETRY_TARGET` | `local` | ローカルファイルへの telemetry 書き出し |
+| `GEMINI_TELEMETRY_OUTFILE` | `artifacts/runtime-verification-AC7-<TIMESTAMP>.telemetry.json` | telemetry 出力先 |
+
+呼び出し元が `GEMINI_TELEMETRY_ENABLED=false` をエクスポートすることで telemetry を無効化できる（CI 環境等）。
+
+#### telemetry.json 証跡の PR 引用規約（AC4: Issue #113）
+
+`artifacts/runtime-verification-AC7-<TIMESTAMP>.telemetry.json` を PR 本文 `## Runtime Verification Evidence` セクションに引用する際は、以下の **redact ルール** を適用する:
+
+| 引用すべき内容 | 引用禁止（redact）する内容 |
+|---|---|
+| `gemini --version` / OS 情報 | HOME / token / OAuth identifier |
+| コマンド形状: `gemini --acp --debug` | absolute local path（フルパス） |
+| initialize / session/new / session/prompt が観測された事実 | prompt 全文 |
+| scenario verdict（PASS / FAIL / SKIP） | telemetry.json 全文の貼り付け |
+
+**禁止**: `telemetry.json` の full content を PR 本文に貼り付けること（token / OAuth 情報漏洩リスク）。
+**必須**: 観測した ACP イベント種別の列挙（`initialize`, `session/new`, `session/prompt` 等）と verdict のみを引用する。
+
 ---
 
 ## 6. Stop Condition 連動
