@@ -56,3 +56,36 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 ```
 
 詳細 schema は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を参照。`issue-refinement-loop` は thin orchestrator として raw context を保持せず、materialization 結果のみを報告する（`docs/dev/agent-skill-boundaries.md` の `ORCHESTRATOR_IO_BOUNDARY_V1` 参照）。
+
+## Loop Policy（LOOP_POLICY_V1）
+
+```yaml
+LOOP_POLICY_V1:
+  max_iterations_default: 3
+  loop_iteration_approval_gate:
+    default_required: false
+    scope: repo_loop_iteration_only
+    does_not_control:
+      - Claude Code permissions.defaultMode
+      - bypassPermissions
+      - --dangerously-skip-permissions
+      - --allow-dangerously-skip-permissions
+      - --permission-mode
+      - hooks PermissionRequest auto-approval
+  routes:
+    - when: hard_stop_triggered
+      action: human_escalation
+    - when: verdict == "approve"
+      action: done
+    - when: "verdict == 'needs-fix' and iteration_plus_one < max_iterations"
+      action: continue
+    - when: "verdict == 'needs-fix' and iteration_plus_one >= max_iterations"
+      action: human_escalation
+  hard_stops:
+    - state/needs-human
+    - state/done
+    - scope_change_signal
+    - contract_malformation
+    - required_external_research_unresolved
+    - unsafe_mutation
+```

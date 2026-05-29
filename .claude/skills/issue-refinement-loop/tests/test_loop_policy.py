@@ -9,6 +9,8 @@ Verifies:
 """
 
 import re
+import yaml
+import pytest
 from pathlib import Path
 
 SKILL_MD = Path(__file__).parent.parent / "SKILL.md"
@@ -26,11 +28,13 @@ def test_skill_md_max_iterations_default_is_3():
         "LOOP_STATE.max_iterations should be 3"
 
 
-def test_skill_md_human_approval_gate_not_required():
-    """AC3: human_approval_gate.default_required: false が明記されている"""
+def test_skill_md_loop_iteration_approval_gate_not_required():
+    """AC3: loop_iteration_approval_gate.default_required: false が明記されている"""
     text = SKILL_MD.read_text()
-    assert "human_approval_gate.default_required: false" in text, \
-        "human_approval_gate.default_required: false must be present in SKILL.md"
+    assert "loop_iteration_approval_gate" in text, \
+        "loop_iteration_approval_gate must be present in SKILL.md"
+    assert "default_required: false" in text, \
+        "default_required: false must be present in SKILL.md"
 
 
 def test_skill_md_loop_policy_concept_separation():
@@ -175,3 +179,68 @@ def test_hard_stop_required_external_research_unresolved():
     """AC6: required external research unresolved は停止条件として termination-policy.md に明記"""
     text = TERMINATION_MD.read_text()
     assert "required external research" in text
+
+
+# ---------------------------------------------------------------------------
+# B2: hard stop priority table-driven tests
+# ---------------------------------------------------------------------------
+
+HARD_STOP_SIGNALS = [
+    "state/needs-human",
+    "state/done",
+    "scope_change_signal",
+    "contract_malformation",
+    "required_external_research_unresolved",
+    "unsafe_mutation",
+]
+
+
+@pytest.mark.parametrize("signal", HARD_STOP_SIGNALS)
+def test_hard_stop_overrides_continue(signal):
+    """AC6: hard stop シグナルは needs-fix + iteration < max_iterations でも継続しない"""
+    policy_text = TERMINATION_MD.read_text()
+    assert signal in policy_text, f"hard_stop '{signal}' が LOOP_POLICY_V1 に含まれていない"
+
+
+# ---------------------------------------------------------------------------
+# B3: LOOP_POLICY_V1 機械可読ブロック parse テスト
+# ---------------------------------------------------------------------------
+
+
+def _load_loop_policy_v1() -> dict:
+    """termination-policy.md から LOOP_POLICY_V1 ブロックを抽出してパース"""
+    text = TERMINATION_MD.read_text()
+    match = re.search(r"```yaml\s*\n(LOOP_POLICY_V1:.*?)```", text, re.DOTALL)
+    assert match, "LOOP_POLICY_V1 が termination-policy.md に見つからない"
+    return yaml.safe_load(match.group(1))
+
+
+def test_loop_policy_v1_max_iterations_default():
+    policy = _load_loop_policy_v1()
+    assert policy["LOOP_POLICY_V1"]["max_iterations_default"] == 3
+
+
+def test_loop_policy_v1_approval_gate_not_required():
+    policy = _load_loop_policy_v1()
+    gate = policy["LOOP_POLICY_V1"]["loop_iteration_approval_gate"]
+    assert gate["default_required"] == False
+    assert gate["scope"] == "repo_loop_iteration_only"
+
+
+def test_loop_policy_v1_hard_stop_overrides_continue():
+    policy = _load_loop_policy_v1()
+    routes = policy["LOOP_POLICY_V1"]["routes"]
+    hard_stop_route = next((r for r in routes if "hard_stop" in r["when"]), None)
+    assert hard_stop_route is not None
+    assert hard_stop_route["action"] == "human_escalation"
+    # hard_stop は needs-fix + iteration < max_iterations より優先（リストの先頭）
+    assert routes.index(hard_stop_route) < routes.index(
+        next(r for r in routes if "needs-fix" in r.get("when", ""))
+    )
+
+
+def test_loop_policy_v1_does_not_control_claude_permissions():
+    policy = _load_loop_policy_v1()
+    dnc = policy["LOOP_POLICY_V1"]["loop_iteration_approval_gate"]["does_not_control"]
+    assert "bypassPermissions" in dnc
+    assert "Claude Code permissions.defaultMode" in dnc

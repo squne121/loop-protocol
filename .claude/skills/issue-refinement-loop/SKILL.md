@@ -28,19 +28,21 @@ subagent_contract_mode: link_only
 ```yaml
 loop_policy:
   default_max_iterations: 3
-  human_approval_gate:
+  loop_iteration_approval_gate:
     default_required: false
-    does_not_modify:
-      - permissions.defaultMode
+    scope: repo_loop_iteration_only
+    does_not_control:
+      - Claude Code permissions.defaultMode
       - bypassPermissions
       - --dangerously-skip-permissions
       - --allow-dangerously-skip-permissions
       - --permission-mode
+      - hooks PermissionRequest auto-approval
 ```
 
-### human_approval_gate
+### loop_iteration_approval_gate
 
-`human_approval_gate.default_required: false`
+`loop_iteration_approval_gate.default_required: false`
 
 ループの自動継続は「このリポジトリの loop policy 上の承認確認（過去に `--no-approval` と呼んでいた運用フラグ/指示）」であり、Claude Code の `--permission-mode`、`--dangerously-skip-permissions`、`permissions.defaultMode` は変更しない。loop policy は「何回まで自動で回すか」を制御し、Claude Code の permission mode は「ツール呼び出しの承認方式」を制御する。両者は直交する概念であり、loop policy の継続判断に permission mode を参照しない。
 
