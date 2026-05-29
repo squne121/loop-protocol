@@ -9,6 +9,8 @@
 #   - scenario 2 (controlled experiment): permission outcome controls a side
 #     effect — 2a deny → no file, 2b approve → file created
 #   - Artifact output to artifacts/runtime-verification-AC7-<ISO8601>.log
+#   - Telemetry artifact to artifacts/runtime-verification-AC7-<ISO8601>.telemetry.json
+#     when real Gemini CLI is available and pre-authenticated
 #
 # Result schema note: run_delegation() normalizes ACP results to
 # delegation_result/v1. ACP-specific fields (structured_events, failure_class)
@@ -22,7 +24,11 @@
 #   77  Execution environment unavailable (gemini, jq, or uv not found)
 #
 # Environment:
-#   GEMINI_BIN   Override the gemini CLI binary path (default: gemini)
+#   GEMINI_BIN              Override the gemini CLI binary path (default: gemini)
+#   GEMINI_ACP_DEBUG        Set to "1" to pass --debug to gemini --acp (real CLI only)
+#   GEMINI_TELEMETRY_ENABLED  Set to "true" to enable telemetry output (real CLI only)
+#   GEMINI_TELEMETRY_TARGET   Set to "local" for local telemetry file output
+#   GEMINI_TELEMETRY_OUTFILE  Path for telemetry JSON output file
 
 set -euo pipefail
 
@@ -63,8 +69,26 @@ ARTIFACTS_DIR="$REPO_DIR/artifacts"
 mkdir -p "$ARTIFACTS_DIR"
 LOG_FILE="$ARTIFACTS_DIR/runtime-verification-AC7-${TIMESTAMP}.log"
 
+# --- Telemetry artifact path (real Gemini CLI + pre-authenticated env only) ---
+# GEMINI_TELEMETRY_OUTFILE defaults to artifacts/runtime-verification-AC7-<TIMESTAMP>.telemetry.json
+# This file is created by gemini CLI when GEMINI_TELEMETRY_ENABLED=true and
+# GEMINI_TELEMETRY_TARGET=local. Fake-ACP-agent scenarios (scenario 2) do NOT
+# produce telemetry artifacts.
+TELEMETRY_FILE="${GEMINI_TELEMETRY_OUTFILE:-$ARTIFACTS_DIR/runtime-verification-AC7-${TIMESTAMP}.telemetry.json}"
+# Export telemetry env vars so run_gemini_acp.py subprocess inherits them for
+# real Gemini CLI scenario 1. Values are only set when not already exported by
+# the caller; set defaults here so callers that want to disable telemetry can
+# unset GEMINI_TELEMETRY_ENABLED before running this script.
+export GEMINI_TELEMETRY_OUTFILE="$TELEMETRY_FILE"
+export GEMINI_TELEMETRY_ENABLED="${GEMINI_TELEMETRY_ENABLED:-true}"
+export GEMINI_TELEMETRY_TARGET="${GEMINI_TELEMETRY_TARGET:-local}"
+# GEMINI_ACP_DEBUG=1 causes run_gemini_acp.py to append --debug to the gemini
+# --acp subprocess args, which enables verbose ACP protocol logging to stderr.
+export GEMINI_ACP_DEBUG="${GEMINI_ACP_DEBUG:-1}"
+
 # Collect environment info once
-ENV_INFO="OS=$(uname -sr), gemini=$(command -v "$GEMINI_BIN"), jq=$(command -v jq), uv=$(command -v uv 2>/dev/null || echo 'not found')"
+GEMINI_VERSION="$("$GEMINI_BIN" --version 2>/dev/null || echo 'unknown')"
+ENV_INFO="OS=$(uname -sr), gemini=$GEMINI_VERSION ($(command -v "$GEMINI_BIN")), jq=$(command -v jq), uv=$(command -v uv 2>/dev/null || echo 'not found')"
 
 # Track overall pass/fail
 OVERALL_RESULT=0
