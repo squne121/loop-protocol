@@ -569,6 +569,52 @@ def _validate_lp020_runtime_verification_incomplete(body: str) -> list[Validatio
     return []
 
 
+def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationError]:
+    """LP016: Detect VC AC markers with inline description suffix.
+
+    Valid form:   # AC1
+    Invalid form: # AC1: some description text
+
+    The '# AC<N>: ...' form (with colon + text) is not a bare AC marker and
+    causes ambiguity in AC-to-VC traceability tooling. Only bare '# AC<N>'
+    standalone comment lines are permitted as AC markers in VC sections.
+    """
+    section_info = _extract_section(body, "Verification Commands")
+    if not section_info:
+        return []
+
+    content, start_line, end_line = section_info
+    lines = body.split('\n')[start_line - 1:end_line]
+
+    errors = []
+    # Match lines that are pure comment-only lines (no leading spaces before #)
+    # with the pattern: # AC<N>: <description>
+    pattern = re.compile(r'^\s*#\s+AC\d+\s*:')
+
+    current_line = start_line
+    for line in lines:
+        if pattern.match(line):
+            context, trunc = _get_context_lines(body, current_line, current_line)
+            errors.append(ValidationError(
+                rule_id="LP016",
+                severity="error",
+                section="Verification Commands",
+                line_start=current_line,
+                line_end=current_line,
+                message=(
+                    f"VC AC marker must be bare '# AC<N>' without description suffix. "
+                    f"Found: {line.strip()!r}"
+                ),
+                minimal_context=context,
+                context_truncated=trunc,
+                fix_hint="Change '# AC<N>: description' to bare '# AC<N>' on its own line.",
+                autofixable=False
+            ))
+        current_line += 1
+
+    return errors
+
+
 def _validate_lp030_forbidden_authoring_doc_path(body: str) -> list[ValidationError]:
     """LP030: Detect reference to forbidden authoring doc path."""
     forbidden_paths = ["docs/dev/body-authoring.md"]
@@ -618,6 +664,7 @@ def validate_issue_body(body: str) -> ValidationResult:
     all_errors.extend(_validate_lp013_deletion_negative_grep(body))
     all_errors.extend(_validate_lp014_markdown_backtick_grep(body))
     all_errors.extend(_validate_lp015_baseline_vc_heading_only(body))
+    all_errors.extend(_validate_lp016_vc_ac_marker_with_description(body))
     all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))
 
