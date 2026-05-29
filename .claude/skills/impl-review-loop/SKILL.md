@@ -114,6 +114,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 
 ## Guardrails
 
+- loop policy（何回まで自動で回すか）と Claude Code permission mode（ツール呼び出しの承認方式）は直交する概念であり、loop policy の継続判断に `--permission-mode` / `permissions.defaultMode` / `--dangerously-skip-permissions` を参照しない
 - control-plane だけを担い、data-plane 操作（push / `gh pr edit` / マージ等）は SubAgent に委譲する
 - LOOP_STATE をイテレーションごとに更新し、人間がループの全履歴を読めるようにする
 - `max_iterations` 超過時は必ず fail-close（無限ループ防止）

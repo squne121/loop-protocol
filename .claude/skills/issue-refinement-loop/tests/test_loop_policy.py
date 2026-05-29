@@ -127,3 +127,51 @@ def test_termination_policy_human_escalation_at_max():
         "human_escalation termination reason must be in termination-policy.md"
     assert "max_iterations" in text or "iteration" in text, \
         "iteration/max_iterations condition must appear in termination-policy.md"
+
+
+# B3: Bidi/Unicode 制御文字検出テスト
+def test_no_unicode_bidi_control_chars_in_loop_policy_files():
+    from pathlib import Path
+    skill_root = Path(__file__).parent.parent
+    paths = [
+        skill_root / "SKILL.md",
+        skill_root / "references" / "termination-policy.md",
+        skill_root.parent / "impl-review-loop" / "SKILL.md",
+        skill_root.parent / "impl-review-loop" / "steps" / "preparation.md",
+    ]
+    forbidden = {
+        "‪", "‫", "‬", "‭", "‮",
+        "⁦", "⁧", "⁨", "⁩",
+    }
+    for path in paths:
+        text = path.read_text()
+        bad = sorted({hex(ord(ch)) for ch in text if ch in forbidden})
+        assert not bad, f"{path} contains bidi control chars: {bad}"
+
+
+# B4: AC5 termination result schema 検証
+def test_human_escalation_termination_result_schema_documented():
+    """AC5: human_escalation 時の termination result が machine-readable に定義されていること"""
+    text = TERMINATION_MD.read_text()
+    assert "LOOP_TERMINATION_RESULT_V1" in text
+    assert "blockers_history" in text
+    assert "human_escalation" in text
+
+
+# B5: AC6 hard stop テスト
+def test_hard_stop_state_done():
+    """AC6: state/done は hard stop として SKILL.md に明記されていること"""
+    text = SKILL_MD.read_text()
+    assert "state/done" in text
+
+
+def test_hard_stop_fail_closed_contract_malformation():
+    """AC6: contract malformation / fail_closed は hard stop として扱われること"""
+    text = SKILL_MD.read_text()
+    assert "fail_closed" in text
+
+
+def test_hard_stop_required_external_research_unresolved():
+    """AC6: required external research unresolved は停止条件として termination-policy.md に明記"""
+    text = TERMINATION_MD.read_text()
+    assert "required external research" in text

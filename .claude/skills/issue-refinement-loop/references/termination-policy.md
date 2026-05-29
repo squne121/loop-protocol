@@ -26,6 +26,23 @@
 - `max_iterations` を超えて自動ループしない
 - hard stop 条件（`state/needs-human`、scope change 等）をスキップしない
 
+## Termination Result Schema（LOOP_TERMINATION_RESULT_V1）
+
+`human_escalation` 終了時は以下の構造で終了コメントを出力する:
+
+```yaml
+LOOP_TERMINATION_RESULT_V1:
+  termination_reason: human_escalation
+  max_iterations: 3
+  blockers_history:
+    - iteration: 0
+      blockers: []
+    - iteration: 1
+      blockers: []
+    - iteration: 2
+      blockers: []
+```
+
 ## Termination Comment（全 termination reason 共通）
 
 すべての termination reason（`approved` / `human_escalation` / `superseded_by_decision`）で、終了コメントに `FOLLOW_UP_MATERIALIZATION_RESULT_V1` を含める。follow-up が存在しない場合も空配列で出力する（`follow_up_issues: []` / `note_only_observations: []`）。
