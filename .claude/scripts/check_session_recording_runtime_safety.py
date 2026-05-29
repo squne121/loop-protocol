@@ -19,7 +19,7 @@ Environment variables (for testability):
     SRRS_GIT_LS_REMOTE_EXIT   override exit code of git ls-remote (0/2/other)
     SRRS_GIT_LS_REMOTE_OUTPUT override stdout of git ls-remote
     SRRS_GH_VISIBILITY        override gh repo view visibility result
-    SRRS_GIT_CONFIG_OUTPUT    override output of git config --show-origin
+    SRRS_GIT_CONFIG_OUTPUT    override output of git config (NUL-delimited)
     SRRS_HOOKS_DIR            override path returned by git rev-parse --git-path hooks
     SRRS_CHECKPOINT_TOKEN     override ENTIRE_CHECKPOINT_TOKEN presence ('present'/'absent')
     SRRS_REPO_ROOT            override repo root (same as --repo-root)
@@ -161,9 +161,9 @@ def _read_json_file(path: Path) -> tuple[Any, str | None]:
     except FileNotFoundError:
         return None, "file_not_found"
     except (json.JSONDecodeError, ValueError) as exc:
-        return None, f"json_parse_error"
+        return None, "json_parse_error"
     except OSError as exc:
-        return None, f"os_error"
+        return None, "os_error"
 
 
 def _merge_entire_settings(base: dict, override: dict) -> dict:
@@ -179,10 +179,41 @@ def _merge_entire_settings(base: dict, override: dict) -> dict:
     return merged
 
 
-def check_push_sessions(repo_root: Path) -> tuple[str, int]:
+def _has_entire_indicators(repo_root: Path) -> bool:
     """
-    Evaluate strategy_options.push_sessions from merged entire settings.
-    true => FAIL, unknown/parse error => FAIL-CLOSED, false => PASS
+    Return True if EntireCLI indicators are present (e.g., .entire directory or
+    agent hook files mentioning entire).
+    """
+    entire_dir = repo_root / ".entire"
+    if entire_dir.is_dir():
+        return True
+    # Check agent hook files for EntireCLI references
+    agent_hook_files = [
+        ".claude/settings.json",
+        ".codex/hooks.json",
+        ".github/hooks/entire.json",
+        ".cursor/hooks.json",
+        ".factory/settings.json",
+        ".gemini/settings.json",
+    ]
+    for rel_path in agent_hook_files:
+        candidate = repo_root / rel_path
+        if candidate.is_file():
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                if re.search(r"entire", text, re.IGNORECASE):
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def _load_merged_entire_settings(repo_root: Path) -> tuple[dict | None, str | None]:
+    """
+    Load and merge .entire/settings.json and .entire/settings.local.json.
+    Returns (merged_dict, error_message).
+    Returns (None, None) if neither file exists.
+    Returns (None, error) on parse error.
     """
     settings_path = repo_root / ".entire" / "settings.json"
     local_path = repo_root / ".entire" / "settings.local.json"
@@ -191,31 +222,58 @@ def check_push_sessions(repo_root: Path) -> tuple[str, int]:
     local_data, local_err = _read_json_file(local_path)
 
     if base_err and base_err != "file_not_found":
-        return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
+        return None, base_err
     if local_err and local_err != "file_not_found":
-        return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
+        return None, local_err
+
+    # Neither file exists
+    if base_data is None and local_data is None:
+        return None, None
 
     base = base_data if isinstance(base_data, dict) else {}
     local = local_data if isinstance(local_data, dict) else {}
 
-    # Neither file exists => not configured => PASS
-    if base_data is None and local_data is None:
-        return CODE_PASS, EXIT_PASS
-
     try:
         merged = _merge_entire_settings(base, local)
+        return merged, None
     except Exception:
+        return None, "merge_error"
+
+
+def check_push_sessions(repo_root: Path) -> tuple[str, int]:
+    """
+    Evaluate strategy_options.push_sessions from merged entire settings.
+
+    B1 fix: FAIL-CLOSED when:
+    - settings files exist but strategy_options is missing
+    - settings files absent but EntireCLI indicators present
+    - push_sessions key is missing from strategy_options
+    - push_sessions is not a bool
+    true => FAIL, false => PASS
+    """
+    merged, err = _load_merged_entire_settings(repo_root)
+
+    if err is not None:
         return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
 
-    strategy_options = merged.get("strategy_options")
+    # Neither settings file exists
+    if merged is None:
+        # If EntireCLI indicators present, we cannot confirm safe
+        if _has_entire_indicators(repo_root):
+            return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
+        # No EntireCLI indicators -> EntireCLI not in use, out of scope
+        return CODE_PASS, EXIT_PASS
 
     # AC19: top-level push_sessions key without nested strategy_options => FAIL-CLOSED
     top_level_push = merged.get("push_sessions")
+    strategy_options = merged.get("strategy_options")
+
     if top_level_push is not None and strategy_options is None:
         return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
 
+    # B1 fix: strategy_options missing entirely => FAIL-CLOSED
     if strategy_options is None:
-        return CODE_PASS, EXIT_PASS
+        return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
 
     if not isinstance(strategy_options, dict):
         return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
@@ -227,18 +285,52 @@ def check_push_sessions(repo_root: Path) -> tuple[str, int]:
     elif push_sessions is False:
         return CODE_PASS, EXIT_PASS
     else:
+        # push_sessions key missing or non-bool => FAIL-CLOSED
         return CODE_FAIL_CLOSED_PUSH_SESSIONS, EXIT_FAIL_CLOSED
 
 
 # ---------------------------------------------------------------------------
 # Check 3: Effective git config (public push remote) (AC4, AC20, AC21)
+# B3: Use git config -z for NUL-delimited parsing
+# B4: Add branch.*.pushRemote, remote.pushDefault, url.*.insteadOf
 # ---------------------------------------------------------------------------
+
+def _get_github_repo_visibility(repo: str) -> str:
+    """
+    B5: Get GitHub repo visibility via gh repo view.
+    repo: "owner/repo" string (must not contain URL prefix).
+    Returns: "public" | "private" | "internal" | "unknown"
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", repo, "--json", "visibility", "--jq", ".visibility"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            vis = result.stdout.strip().lower()
+            if vis in ("public", "private", "internal"):
+                return vis
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _extract_github_owner_repo(url: str) -> str | None:
+    """Extract 'owner/repo' from a GitHub URL or return None."""
+    m = re.search(r"github\.com[:/]([^/\s]+/[^/\s\.]+?)(?:\.git)?(?:[/#\s]|$)", url)
+    if m:
+        return m.group(1)
+    return None
+
 
 def _is_public_github_url(url: str) -> bool | None:
     """
-    True if github.com URL (assume public).
-    None if non-GitHub (unknown, FAIL-CLOSED).
-    False if clearly local/private.
+    B5 fix: Check GitHub URL visibility via gh repo view rather than assuming public.
+
+    Returns:
+      True  if the repo is public
+      False if clearly local, or if the repo is private/internal
+      None  if non-GitHub host (unknown -> FAIL-CLOSED)
     """
     if not url:
         return None
@@ -247,13 +339,90 @@ def _is_public_github_url(url: str) -> bool | None:
         return False
     if "localhost" in url_lower or "127.0.0.1" in url_lower:
         return False
-    if "github.com" in url_lower:
+    if "github.com" not in url_lower and not url_lower.startswith("git@github.com"):
+        return None  # non-GitHub -> FAIL-CLOSED
+
+    # GitHub URL: check actual visibility
+    owner_repo = _extract_github_owner_repo(url)
+    if not owner_repo:
+        # Cannot determine owner/repo -> FAIL-CLOSED
+        return None
+
+    # Check env override first (for tests using SRRS_GH_VISIBILITY at call site)
+    override = os.environ.get("SRRS_GH_VISIBILITY")
+    if override is not None:
+        vis = override.strip().lower()
+        if vis in ("private", "internal"):
+            return False
+        elif vis == "public":
+            return True
+        else:
+            return None
+
+    vis = _get_github_repo_visibility(owner_repo)
+    if vis == "public":
         return True
-    return None
+    elif vis in ("private", "internal"):
+        return False
+    else:
+        return None
 
 
-def _parse_git_config_output(output: str) -> dict[str, str]:
-    """Parse output of git config --show-origin --show-scope --get-regexp."""
+def _parse_git_config_nul(raw_bytes: bytes) -> dict[str, str]:
+    """
+    B3 fix: Parse NUL-delimited output of git config -z --show-origin --show-scope.
+
+    Format per entry (NUL-terminated):
+      <file-origin>\n<scope>\n<key>\n<value>
+
+    When --show-origin and --show-scope are both present, each NUL-terminated
+    record has the format:
+      file:<path>\0<scope>\0<key>\n<value>
+    Actually git config -z output separates key from value with newline and
+    terminates each record with NUL. With --show-origin --show-scope the format is:
+      file:<origin>\tscope\tkey\nvalue\0
+
+    We parse both formats robustly by splitting on NUL and then extracting
+    the last "key\nvalue" portion of each record.
+    """
+    result: dict[str, str] = {}
+    raw_str = raw_bytes.decode("utf-8", errors="replace")
+
+    for record in raw_str.split("\0"):
+        record = record.strip()
+        if not record:
+            continue
+
+        # The key\nvalue part is always at the end.
+        # With --show-origin --show-scope, record looks like:
+        #   "file:.git/config\tlocal\tremote.origin.url\nhttps://github.com/..."
+        # Without those flags:
+        #   "remote.origin.url\nhttps://github.com/..."
+        # Split on the last \n to separate value from everything before it.
+        last_newline = record.rfind("\n")
+        if last_newline == -1:
+            continue
+        key_part = record[:last_newline]
+        value = record[last_newline + 1:]
+
+        # key_part may be tab-separated origin/scope prefix + key
+        # The actual key is always the last token after any tabs
+        if "\t" in key_part:
+            key = key_part.rsplit("\t", 1)[-1].strip().lower()
+        else:
+            key = key_part.strip().lower()
+
+        if key:
+            result[key] = value
+
+    return result
+
+
+def _parse_git_config_text(output: str) -> dict[str, str]:
+    """
+    Fallback: parse text output of git config --show-origin --show-scope --get-regexp.
+    Used when SRRS_GIT_CONFIG_OUTPUT override is provided as text.
+    """
     result: dict[str, str] = {}
     for line in output.splitlines():
         parts = line.split("\t")
@@ -268,70 +437,141 @@ def _parse_git_config_output(output: str) -> dict[str, str]:
     return result
 
 
+def _resolve_push_urls(config: dict[str, str]) -> list[str]:
+    """
+    B4 fix: Resolve all effective push destination URLs from git config, considering:
+    - remote.*.pushurl (highest priority per remote)
+    - remote.*.url (fallback when no pushurl)
+    - remote.pushDefault (overrides which remote is used for unqualified pushes)
+    - branch.*.pushRemote (per-branch override)
+    - url.*.insteadOf (URL rewriting applied before push)
+    - url.*.pushInsteadOf (push-specific URL rewriting)
+
+    Returns a list of resolved push URLs (may contain duplicates; caller deduplicates).
+    """
+    # Collect all remote names
+    remote_names: set[str] = set()
+    for key in config:
+        m = re.match(r"remote\.([^.]+)\.(url|pushurl)$", key)
+        if m:
+            remote_names.add(m.group(1))
+
+    # Build insteadOf maps (applied to fetch URLs)
+    instead_of: list[tuple[str, str]] = []  # (from, to)
+    push_instead_of: list[tuple[str, str]] = []  # (from, to)
+    for key, val in config.items():
+        if key.startswith("url.") and key.endswith(".insteadof"):
+            dest_base = key[4:-10]  # strip "url." and ".insteadof"
+            instead_of.append((val, dest_base))
+        elif key.startswith("url.") and key.endswith(".pushinsteadof"):
+            dest_base = key[4:-14]  # strip "url." and ".pushinsteadof"
+            push_instead_of.append((val, dest_base))
+
+    def apply_url_rewrites(url: str, is_push: bool) -> str:
+        """Apply url.*.insteadOf and url.*.pushInsteadOf rewrites."""
+        # pushInsteadOf takes priority for push operations
+        if is_push:
+            for from_prefix, to_base in push_instead_of:
+                if url.startswith(from_prefix):
+                    return to_base + url[len(from_prefix):]
+        # insteadOf applies to all operations (including push when no pushInsteadOf matches)
+        for from_prefix, to_base in instead_of:
+            if url.startswith(from_prefix):
+                return to_base + url[len(from_prefix):]
+        return url
+
+    push_urls: list[str] = []
+
+    for remote in remote_names:
+        # Determine push URL for this remote
+        push_url_key = f"remote.{remote}.pushurl"
+        url_key = f"remote.{remote}.url"
+
+        if push_url_key in config:
+            raw_url = config[push_url_key]
+            # pushurl is used directly for push (no insteadOf, but pushInsteadOf applies)
+            resolved = apply_url_rewrites(raw_url, is_push=True)
+        elif url_key in config:
+            raw_url = config[url_key]
+            resolved = apply_url_rewrites(raw_url, is_push=True)
+        else:
+            continue
+
+        push_urls.append(resolved)
+
+    # Also collect push destination URLs derived from pushInsteadOf keys
+    # (These rewrite a source prefix to a dest base: the dest base IS the push destination)
+    for key, val in config.items():
+        if key.startswith("url.") and key.endswith(".pushinsteadof"):
+            dest_base = key[4:-14]
+            push_urls.append(dest_base)
+
+    # Collect branch.*.pushRemote - these point to remotes; we already collected all remotes above
+    # But we add them to ensure branch-specific push remotes are considered
+    push_remote_default = config.get("remote.pushdefault", "")
+    for key, val in config.items():
+        if re.match(r"branch\.[^.]+\.pushremote$", key):
+            # val is a remote name; get its push URL
+            push_url_key = f"remote.{val}.pushurl"
+            url_key = f"remote.{val}.url"
+            if push_url_key in config:
+                resolved = apply_url_rewrites(config[push_url_key], is_push=True)
+                push_urls.append(resolved)
+            elif url_key in config:
+                resolved = apply_url_rewrites(config[url_key], is_push=True)
+                push_urls.append(resolved)
+
+    return push_urls
+
+
 def check_git_config_public_remote(repo_root: Path) -> tuple[str, int]:
     """
     Evaluate effective git config for public push remotes.
+    B3 fix: Use NUL-delimited parsing via git config -z.
+    B4 fix: Consider branch.*.pushRemote, remote.pushDefault, url.*.insteadOf.
+    B5 fix: Use gh repo view to verify GitHub URL visibility.
     FAIL if public push destination detected.
     FAIL-CLOSED if config cannot be parsed.
     """
     override = os.environ.get("SRRS_GIT_CONFIG_OUTPUT")
     if override is not None:
-        config_output = override
+        # Override is provided as text (from tests); use text parser
+        try:
+            config = _parse_git_config_text(override)
+        except Exception:
+            return CODE_FAIL_CLOSED_GIT_CONFIG, EXIT_FAIL_CLOSED
     else:
         try:
             result = subprocess.run(
-                ["git", "config", "--show-origin", "--show-scope",
-                 "--get-regexp", r"^(remote|branch|url)\."],
-                capture_output=True, text=True, timeout=15,
+                ["git", "config", "-z", "--show-origin", "--show-scope",
+                 "--get-regexp", r"^(remote|branch|url|include)\."],
+                capture_output=True, text=False,  # binary mode for NUL handling
+                timeout=15,
                 cwd=str(repo_root)
             )
             if result.returncode not in (0, 1):
                 return CODE_FAIL_CLOSED_GIT_CONFIG, EXIT_FAIL_CLOSED
-            config_output = result.stdout
+            config = _parse_git_config_nul(result.stdout)
         except subprocess.TimeoutExpired:
             return CODE_FAIL_CLOSED_GIT_CONFIG, EXIT_FAIL_CLOSED
         except Exception:
             return CODE_FAIL_CLOSED_GIT_CONFIG, EXIT_FAIL_CLOSED
 
     try:
-        config = _parse_git_config_output(config_output)
+        push_urls = _resolve_push_urls(config)
     except Exception:
         return CODE_FAIL_CLOSED_GIT_CONFIG, EXIT_FAIL_CLOSED
 
-    dangerous_keys = set()
+    dangerous_found = False
+    for url in push_urls:
+        is_public = _is_public_github_url(url)
+        if is_public is True:
+            dangerous_found = True
+        elif is_public is None:
+            # Non-GitHub or unknown -> FAIL-CLOSED
+            return CODE_FAIL_CLOSED_NON_GITHUB, EXIT_FAIL_CLOSED
 
-    for key, val in config.items():
-        # remote.*.pushurl
-        if re.match(r"remote\.[^.]+\.pushurl$", key):
-            is_public = _is_public_github_url(val)
-            if is_public is True:
-                dangerous_keys.add(key)
-            elif is_public is None:
-                return CODE_FAIL_CLOSED_NON_GITHUB, EXIT_FAIL_CLOSED
-
-        # remote.*.url (used for push when no pushurl set)
-        elif re.match(r"remote\.[^.]+\.url$", key):
-            remote_name = key.split(".")[1]
-            pushurl_key = f"remote.{remote_name}.pushurl"
-            if pushurl_key not in config:
-                is_public = _is_public_github_url(val)
-                if is_public is True:
-                    dangerous_keys.add(key)
-                elif is_public is None:
-                    return CODE_FAIL_CLOSED_NON_GITHUB, EXIT_FAIL_CLOSED
-
-        # url.*.pushInsteadOf — key is "url.<dest-url>.pushinsteadof"
-        # The dest URL can contain dots, so we strip prefix/suffix rather than use [^.]+
-        elif key.startswith("url.") and key.endswith(".pushinsteadof"):
-            # Extract dest URL: strip "url." prefix and ".pushinsteadof" suffix
-            dest_url = key[len("url."):-len(".pushinsteadof")]
-            is_public = _is_public_github_url(dest_url)
-            if is_public is True:
-                dangerous_keys.add(key)
-            elif is_public is None:
-                return CODE_FAIL_CLOSED_NON_GITHUB, EXIT_FAIL_CLOSED
-
-    if dangerous_keys:
+    if dangerous_found:
         return CODE_FAIL_PUBLIC_REMOTE, EXIT_FAIL
 
     return CODE_PASS, EXIT_PASS
@@ -339,10 +579,24 @@ def check_git_config_public_remote(repo_root: Path) -> tuple[str, int]:
 
 # ---------------------------------------------------------------------------
 # Check 4: Checkpoint remote visibility (AC5, AC6, AC12, AC13, AC15, AC16)
+# B2 fix: Read checkpoint_remote from .entire/settings*.json
 # ---------------------------------------------------------------------------
 
+def _get_gh_visibility_for_url(repo_root: Path, url: str) -> str:
+    """Get visibility for a specific URL."""
+    override = os.environ.get("SRRS_GH_VISIBILITY")
+    if override is not None:
+        return override.strip().lower()
+
+    m = re.search(r"github\.com[:/]([^/\s]+/[^/\s\.]+?)(?:\.git)?(?:[/#\s]|$)", url)
+    if not m:
+        return "unknown"
+    owner_repo = m.group(1)
+    return _get_github_repo_visibility(owner_repo)
+
+
 def _get_gh_visibility(repo_root: Path) -> str:
-    """Returns 'public', 'private', 'internal', or 'unknown'."""
+    """Returns 'public', 'private', 'internal', or 'unknown' for origin remote."""
     override = os.environ.get("SRRS_GH_VISIBILITY")
     if override is not None:
         return override.strip().lower()
@@ -378,11 +632,46 @@ def _get_gh_visibility(repo_root: Path) -> str:
 
 def check_checkpoint_remote_visibility(repo_root: Path) -> tuple[str, int]:
     """
+    B2 fix: Read strategy_options.checkpoint_remote from .entire/settings*.json
+    and verify visibility of that specific repo (not just origin).
+
     private/internal => PASS (private_verified)
     public => FAIL
     unknown/error/non-GitHub => FAIL-CLOSED
     """
-    visibility = _get_gh_visibility(repo_root)
+    # Try to get checkpoint_remote from settings
+    merged, err = _load_merged_entire_settings(repo_root)
+
+    if err is not None:
+        # Parse error -> cannot determine checkpoint remote -> FAIL-CLOSED
+        return CODE_FAIL_CLOSED_VISIBILITY, EXIT_FAIL_CLOSED
+
+    checkpoint_repo: str | None = None
+
+    if merged is not None:
+        strategy_options = merged.get("strategy_options")
+        if isinstance(strategy_options, dict):
+            checkpoint_remote = strategy_options.get("checkpoint_remote")
+            if isinstance(checkpoint_remote, dict):
+                provider = checkpoint_remote.get("provider", "")
+                repo = checkpoint_remote.get("repo", "")
+                if provider == "github" and repo:
+                    checkpoint_repo = repo
+                elif provider and provider != "github":
+                    # Non-GitHub checkpoint provider -> FAIL-CLOSED
+                    return CODE_FAIL_CLOSED_VISIBILITY, EXIT_FAIL_CLOSED
+                # If provider is empty or repo is empty, fall through to origin check
+
+    if checkpoint_repo is not None:
+        # Check visibility of the specified checkpoint repo
+        override = os.environ.get("SRRS_GH_VISIBILITY")
+        if override is not None:
+            visibility = override.strip().lower()
+        else:
+            visibility = _get_github_repo_visibility(checkpoint_repo)
+    else:
+        # No checkpoint_remote configured -> fall back to origin visibility
+        visibility = _get_gh_visibility(repo_root)
 
     if visibility in ("private", "internal"):
         return CODE_PASS, EXIT_PASS
