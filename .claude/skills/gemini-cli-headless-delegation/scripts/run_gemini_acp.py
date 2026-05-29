@@ -435,10 +435,15 @@ async def _run_acp_session(
     session_cwd = cwd_override if cwd_override is not None else os.getcwd()
 
     # Launch gemini --acp — honour GEMINI_BIN so callers can inject a custom binary
+    # GEMINI_ACP_DEBUG=1 appends --debug to enable verbose ACP protocol logging.
+    # This is used by verify_acp_roundtrip.sh to capture ACP JSON-RPC messages
+    # in stderr for runtime verification evidence (AC1 of Issue #113).
+    acp_args: list[str] = [gemini_bin, "--acp"]
+    if os.environ.get("GEMINI_ACP_DEBUG") == "1":
+        acp_args.append("--debug")
     try:
         proc = await asyncio.create_subprocess_exec(
-            gemini_bin,
-            "--acp",
+            *acp_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
