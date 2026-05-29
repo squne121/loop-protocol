@@ -41,13 +41,20 @@ gh issue comment <issue_number> --body "## impl-review-loop: 完了 ($(date -u +
 
 \`\`\`yaml
 FOLLOW_UP_MATERIALIZATION_RESULT_V1:
-  follow_up_issues:
+  schema_version: 1
+  materialized_by: impl-review-loop
+  follow_up_issues: # 空の場合も省略しない
     - request_dedupe_key: \"...\"
-      issue_number: 123
-      issue_url: \"https://github.com/...\"
-      status: created | reused_open | skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
-
-  note_only_observations:
+      status: created | reused_open
+      issue:
+        number: 123
+        url: \"https://github.com/...\"
+      reason: null
+    - request_dedupe_key: \"...\"
+      status: skipped_closed_duplicate | skipped_closed_not_planned | skipped_closed_completed
+      issue: null
+      reason: \"<skipped の理由>\"
+  note_only_observations: # 空の場合も省略しない
     - dedupe_key: \"...\"
       source_url: \"...\"
       source_note_id: \"...\"
