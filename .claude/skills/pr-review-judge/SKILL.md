@@ -55,15 +55,15 @@ MERGE_STATE_STATUS=$(echo "$TEST_VERDICT_BODY" | grep "merge_state_status:" | he
 
 TEST_VERDICT_MACHINE コメントが見つからない場合のみ、フォールバックで:
 ```bash
-gh pr view <PR番号> --json mergeable,merge_state_status
+gh pr view <PR番号> --json mergeable,mergeStateStatus
 ```
 
 判定:
-- `mergeable=CONFLICTING` または `merge_state_status=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
-- `merge_state_status=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
+- `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
+- `mergeStateStatus=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
 - `mergeable=UNKNOWN`（retry 後も） → **Unknown blocker**（REQUEST_CHANGES）
-- `merge_state_status=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
-- `mergeable=MERGEABLE` かつ `merge_state_status=CLEAN|UNSTABLE|BEHIND` → 次へ進む
+- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
+- `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE|BEHIND` → 次へ進む
 
 ## VC 証跡判定ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
 
@@ -72,12 +72,24 @@ gh pr view <PR番号> --json mergeable,merge_state_status
 VC 証跡の信頼階層は以下の順とする（上位が存在する場合は下位を単独の根拠として使わない）:
 
 1. **TEST_VERDICT_MACHINE**（最優先）: test-runner SubAgent が投稿する `<!-- TEST_VERDICT_MACHINE v1 -->` マーカー付きコメント。機械的に生成された検証結果であり、最も信頼できる。
+
+   【#88 pending 注記】#88（impl-review-loop の test-runner 実行明示）が未 merge の場合、
+   TEST_VERDICT_MACHINE コメントが存在しないことがある。
+   その場合は PR_BODY self-report で代替してはならない。
+   CI_CHECK_RUN_SCOPED 条件を満たす外部証跡がなければ REQUEST_CHANGES とする。
+
 2. **CI_CHECK_RUN_SCOPED**（補助証跡）: `CI_CHECK_RUN_SCOPED は head_sha・workflow・job・step・command・conclusion=success が対象 VC と対応する場合のみ補助証跡`。以下の条件をすべて満たす場合のみ有効:
    - `conclusion=success`（`skipped` / `neutral` は不可）
    - 対象 PR の `head_sha` で実行されたもの（stale な SHA は不可）
    - `workflow` / `job` / `step` / `command` が linked issue の対象 VC に対応している
    - runtime verification AC の場合は artifact/log が参照可能
    - TEST_VERDICT_MACHINE が存在しない理由が明示されている
+
+   CI_CHECK_RUN_SCOPED を証跡として採用するには、以下を満たすこと:
+   - `gh pr view <PR> --json headRefOid --jq .headRefOid` で取得した head SHA と check run の head_sha が一致する
+   - `gh run view <RUN_ID> --json headSha,conclusion,workflowName,jobs` で workflow/job/step が対象 VC に対応していることを確認
+   - `conclusion == success` かつ `skipped / neutral / cancelled / timed_out` ではない
+   - `gh pr checks` の pass 表示だけでは CI_CHECK_RUN_SCOPED の条件を満たさない
 3. **PR_BODY_SELF_REPORT**（補助情報のみ）: PR 本文の自己申告。単独では APPROVE の根拠にならない（`PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED` 参照）。
 
 ### APPROVE 禁止条件（PR_REVIEW_JUDGE_APPROVE_PROHIBITION_SKIP_FALLBACK）
@@ -326,7 +338,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 ## Verdict: APPROVE | REQUEST_CHANGES
 
 ### Mergeability
-- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, merge_state_status=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
+- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, mergeStateStatus=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
 
 ### Evidence Check
 - AC coverage: <○/△/×、根拠>
@@ -346,7 +358,7 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 verdict: APPROVE | REQUEST_CHANGES
 blockers: []
 mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
 recommendations: []  # APPROVE + MERGEABLE + BEHIND のとき [update_branch]。有効値: update_branch
 follow_up_issue_requests:
