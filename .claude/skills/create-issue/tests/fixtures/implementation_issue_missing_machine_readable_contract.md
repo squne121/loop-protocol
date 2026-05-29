@@ -1,20 +1,10 @@
-## Machine-Readable Contract
-
-```yaml
-contract_schema_version: "v1"
-issue_kind: implementation
-parent_issue: none
-goal_ref: "テスト用 VC マーカー形式の fixture"
-change_kind: chore
-```
-
 ## Parent Issue
 
 なし
 
 ## Parent Goal Ref
 
-- Goal: テスト用 bad VC marker fixture（AC1: 説明付きマーカー形式の検証）
+- Goal: テスト用 fixture（MRC セクション欠落）
 - Desired Destination: N/A
 
 ## Current Validated Scope
@@ -39,12 +29,12 @@ change_kind: chore
 
 ## Acceptance Criteria
 
-- [ ] AC1: `example_script.py` が存在すること
+- [ ] AC1: `example_script.py` が存在し、`--dry-run` フラグを受け付けること
 
 ## Verification Commands
 
 ```bash
-# AC1: verify the file exists
+# AC1
 test -f example_script.py
 ```
 

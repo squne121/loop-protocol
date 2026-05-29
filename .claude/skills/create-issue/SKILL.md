@@ -194,7 +194,8 @@ Issue Template Guard / Outcome Quality Guard / Scope 重複チェックを全て
 
 ```bash
 # 書き込み前 validator — exit 1 なら起票しない
-uv run python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md
+# --kind を指定すると ISSUE_TEMPLATE/<kind>.yml から必須セクション・Stop Conditions を動的取得する（LP001/LP017）
+uv run python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation
 ```
 
 `validate_issue_body.py` が exit 1 を返した場合は **起票を中止**し、JSON 出力の `errors` を人間に提示して修正を求める。

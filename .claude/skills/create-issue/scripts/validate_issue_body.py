@@ -23,6 +23,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
+# Path to ISSUE_TEMPLATE directory (relative to repo root, resolved at runtime)
+# __file__ is at: <repo>/.claude/skills/create-issue/scripts/validate_issue_body.py
+# parents: [0]=scripts, [1]=create-issue, [2]=skills, [3]=.claude, [4]=<repo root>
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_ISSUE_TEMPLATE_DIR = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE"
+
 
 # =============================================================================
 # Type definitions
@@ -178,13 +184,75 @@ def _extract_vc_ac_numbers(body: str) -> set[str]:
     return {f"AC{m}" for m in matches}
 
 
-def _validate_lp001_missing_required_section(body: str) -> list[ValidationError]:
-    """LP001: Detect missing required sections."""
-    required_sections = [
-        "Acceptance Criteria",
-        "Verification Commands",
-        "Allowed Paths"
-    ]
+def _load_required_section_labels(kind: str) -> list[str]:
+    """Load required section labels from ISSUE_TEMPLATE/<kind>.yml.
+
+    Returns labels of fields with validations.required: true (excluding markdown type).
+    Falls back to a minimal default set if the template file is not found.
+    """
+    template_path = _ISSUE_TEMPLATE_DIR / f"{kind}.yml"
+    if not template_path.exists():
+        # Fallback to static minimal set when template is not available
+        return ["Acceptance Criteria", "Verification Commands", "Allowed Paths"]
+
+    try:
+        form = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return ["Acceptance Criteria", "Verification Commands", "Allowed Paths"]
+
+    labels: list[str] = []
+    for item in form.get("body", []):
+        if item.get("type") == "markdown":
+            continue
+        if item.get("validations", {}).get("required") is True:
+            label = item.get("attributes", {}).get("label", "").removesuffix("*").strip()
+            if label:
+                labels.append(label)
+    return labels
+
+
+def _load_stop_condition_keywords(kind: str) -> list[str]:
+    """Load stop condition keywords from ISSUE_TEMPLATE/<kind>.yml stop-conditions value field.
+
+    Returns list of condition strings (without leading "- ") from the template default value.
+    Returns empty list if template not found or stop-conditions field not present.
+    """
+    template_path = _ISSUE_TEMPLATE_DIR / f"{kind}.yml"
+    if not template_path.exists():
+        return []
+
+    try:
+        form = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return []
+
+    for item in form.get("body", []):
+        if item.get("id") == "stop-conditions":
+            value = item.get("attributes", {}).get("value", "")
+            conditions = []
+            for line in value.splitlines():
+                line = line.strip()
+                if line.startswith("- "):
+                    conditions.append(line[2:].strip())
+            return conditions
+
+    return []
+
+
+def _validate_lp001_missing_required_section(body: str, kind: str | None = None) -> list[ValidationError]:
+    """LP001: Detect missing required sections.
+
+    When kind is provided, loads required sections dynamically from ISSUE_TEMPLATE/<kind>.yml.
+    Falls back to a minimal static set when kind is None or template is not found.
+    """
+    if kind:
+        required_sections = _load_required_section_labels(kind)
+    else:
+        required_sections = [
+            "Acceptance Criteria",
+            "Verification Commands",
+            "Allowed Paths"
+        ]
 
     sections = _extract_sections(body)
     errors = []
@@ -615,6 +683,62 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
     return errors
 
 
+def _validate_lp017_stop_conditions_incomplete(body: str, kind: str | None = None) -> list[ValidationError]:
+    """LP017: Detect incomplete Stop Conditions section (kind-specific check).
+
+    When kind is provided and template has a stop-conditions field, checks that
+    each template-defined condition keyword appears somewhere in the body's
+    Stop Conditions section (keyword match, not full-text equality).
+    Only runs when kind is provided and template conditions are available.
+    """
+    if not kind:
+        return []
+
+    template_conditions = _load_stop_condition_keywords(kind)
+    if not template_conditions:
+        return []
+
+    section_info = _extract_section(body, "Stop Conditions")
+    if not section_info:
+        # Missing section is already caught by LP001; skip here to avoid double-reporting
+        return []
+
+    content, start_line, end_line = section_info
+
+    missing_conditions: list[str] = []
+    for condition in template_conditions:
+        # Keyword match: check if a significant portion of the condition appears in content
+        # Use first ~30 chars as a keyword fingerprint (avoids minor wording drift)
+        keyword = condition[:40].strip()
+        if keyword and keyword not in content:
+            missing_conditions.append(condition)
+
+    if not missing_conditions:
+        return []
+
+    context, trunc = _get_context_lines(body, start_line, end_line)
+    return [ValidationError(
+        rule_id="LP017",
+        severity="error",
+        section="Stop Conditions",
+        line_start=start_line,
+        line_end=end_line,
+        message=(
+            f"Stop Conditions section is missing {len(missing_conditions)} of "
+            f"{len(template_conditions)} required condition(s) from template. "
+            f"Missing: {'; '.join(missing_conditions[:3])}"
+            + (" ..." if len(missing_conditions) > 3 else "")
+        ),
+        minimal_context=context,
+        context_truncated=trunc,
+        fix_hint=(
+            "Ensure all template-defined Stop Conditions are present in the section. "
+            "Do not omit or shorten the standard 6 items."
+        ),
+        autofixable=False
+    )]
+
+
 def _validate_lp030_forbidden_authoring_doc_path(body: str) -> list[ValidationError]:
     """LP030: Detect reference to forbidden authoring doc path."""
     forbidden_paths = ["docs/dev/body-authoring.md"]
@@ -646,8 +770,15 @@ def _validate_lp030_forbidden_authoring_doc_path(body: str) -> list[ValidationEr
 # Main validation dispatcher
 # =============================================================================
 
-def validate_issue_body(body: str) -> ValidationResult:
-    """Run all validation rules and return aggregated results."""
+def validate_issue_body(body: str, kind: str | None = None) -> ValidationResult:
+    """Run all validation rules and return aggregated results.
+
+    Args:
+        body: The issue body text to validate.
+        kind: Optional issue kind (e.g. 'implementation'). When provided,
+              kind-specific rules (LP001 dynamic sections, LP017 Stop Conditions)
+              load their requirements from the corresponding ISSUE_TEMPLATE file.
+    """
 
     # Compute SHA256 of body
     body_bytes = body.encode('utf-8')
@@ -656,7 +787,7 @@ def validate_issue_body(body: str) -> ValidationResult:
     # Run all validators
     all_errors: list[ValidationError] = []
 
-    all_errors.extend(_validate_lp001_missing_required_section(body))
+    all_errors.extend(_validate_lp001_missing_required_section(body, kind=kind))
     all_errors.extend(_validate_lp002_invalid_machine_readable_contract(body))
     all_errors.extend(_validate_lp010_ac_vc_mismatch(body))
     all_errors.extend(_validate_lp011_verification_command_format(body))
@@ -665,6 +796,7 @@ def validate_issue_body(body: str) -> ValidationResult:
     all_errors.extend(_validate_lp014_markdown_backtick_grep(body))
     all_errors.extend(_validate_lp015_baseline_vc_heading_only(body))
     all_errors.extend(_validate_lp016_vc_ac_marker_with_description(body))
+    all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=kind))
     all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))
 
@@ -711,6 +843,16 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Issue body text (used if --body-file not provided)"
     )
+    parser.add_argument(
+        "--kind",
+        type=str,
+        default=None,
+        help=(
+            "Issue kind (e.g. 'implementation'). Enables kind-specific rules: "
+            "LP001 loads required sections from ISSUE_TEMPLATE/<kind>.yml, "
+            "LP017 checks Stop Conditions against template-defined conditions."
+        )
+    )
 
     args = parser.parse_args(argv)
 
@@ -730,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Validate
-    result = validate_issue_body(body)
+    result = validate_issue_body(body, kind=args.kind)
 
     # Output JSON
     output = {
