@@ -82,6 +82,7 @@ reviewer feedback に基づき以下を満たす形で本文を更新:
 
 - テンプレ構造を維持（`.github/ISSUE_TEMPLATE/{種別}.yml` の必須セクションが残っている）
 - AC / VC 番号一致を確認（[`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) §VC 作成ガイダンス参照）
+- **VC_SINGLE_COMMAND_GUARDRAIL**: VC に shell control operator（&&, ||, |, ;, &）を含む compound shell を書かない。詳細は [`../create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL`](../create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL) を参照。
 - Machine-Readable Contract block の YAML key を破壊しない（値のみ更新）
 - 削除確認パターン、決定論的 VC の原則を適用
 - implementation issue を更新する場合は `docs/dev/workflow.md` の canonical contract を正本とし、`template auto-labels` / `consumer ready contract` / `triage profile` の区別を崩さない
