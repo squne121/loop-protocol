@@ -1,8 +1,8 @@
 ---
 adr_id: "0003"
 title: "Schema Catalog 機械可読化の採用方針（C+: catalog 導入 + SSOT 移行）"
-status: accepted
-decision_date: "2026-05-30"
+status: proposed
+decision_date: null
 confirmed_date: null
 related_issues:
   - "#470"
@@ -129,43 +129,55 @@ PR body fixture
 
 各エントリの必須フィールド:
 
+catalog のトップレベルには以下を必須とする:
+
 ```yaml
-schema_id: "<string>"           # 一意識別子（例: delegation_result/v1）
-format: markdown_yaml_contract | json_schema | yaml | ndjson | markdown_table
-definition_paths:               # schema が定義されているファイルパス（複数可）
-  - "<path>"
-producer:
-  owner: "<string>"             # 所有チーム or skill 名
-  paths:                        # producer のソースパス
-    - "<path>"
-consumers:
-  - id: "<string>"              # consumer の識別子
-    paths:                      # consumer のソースパス
+catalog_schema_version: "v1"
+catalog_id: "loop-protocol.schema-catalog/v1"
+generated_from: null   # 将来: 自動生成の場合はソーススクリプトパス
+entries:
+  - schema_id: "<string>"           # 一意識別子（例: delegation_result/v1）
+    format: markdown_yaml_contract | json_schema | yaml | ndjson | markdown_table
+    definition_paths:               # schema が定義されているファイルパス（複数可）
       - "<path>"
-    detection_patterns:         # consumer が参照する文字列パターン（rg 検索用）
-      - "<pattern>"
-    required_test_commands:     # consumer 側の検証コマンド
-      - "<command>"
-compatibility:
-  mode: manual_policy           # 初期版は manual_policy のみ
-  direction: backward | forward | full | custom
-  breaking_changes:             # breaking change とみなす変更種別
-    - remove_required_field
-    - rename_field
-    - narrow_type
-validation:
-  catalog_lint:                 # catalog 自体の整合性チェックコマンド
-    - "<command>"
-  fixture_tests:
-    positive: []                # 正常系 fixture ファイルパス
-    negative: []                # 異常系 fixture ファイルパス
-migration:
-  required_for_breaking_change: true
-  followup_issue_required: true
-last_verified:
-  commit: "<sha>"
-  command: "<command>"
+    producer:
+      owner: "<string>"             # 所有チーム or skill 名
+      paths:                        # producer のソースパス
+        - "<path>"
+    consumers:
+      - id: "<string>"              # consumer の識別子
+        paths:                      # consumer のソースパス
+          - "<path>"
+        detection_patterns:         # consumer が参照する文字列パターン（rg 検索用）
+          - "<pattern>"
+        required_test_commands:     # consumer 側の検証（allowlisted command ID のみ）
+          - id: "<command-id>"      # 任意 shell 文字列を直接記述しない（セキュリティ要件）
+            runner: python_module | pytest | bash_allowlisted
+            target: "<module-or-fixture-path>"
+    compatibility:
+      mode: manual_policy           # 初期版は manual_policy のみ
+      direction: backward | forward | full | custom
+      breaking_changes:             # breaking change とみなす変更種別
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:        # catalog 自体の整合性チェック（allowlisted command ID のみ）
+        - id: "<command-id>"
+          runner: python_module | pytest | bash_allowlisted
+          target: "<module-or-fixture-path>"
+      fixture_tests:
+        positive: []                # 正常系 fixture ファイルパス
+        negative: []                # 異常系 fixture ファイルパス
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "<sha>"
+      command_id: "<command-id>"    # 実行したコマンドの allowlisted ID
 ```
+
+> **セキュリティ要件（Blocker 3 対応）**: `required_test_commands` および `catalog_lint_commands` は任意の shell 文字列を直接記述・実行しない。実行側（`validate_schema_catalog.py`）は `id` を allowlist に解決し、PR branch 上の変更済み catalog から直接コマンドを実行しない。CI では `shell=True` を禁止し、権限は read-only に絞る。
 
 JSON Schema を扱う場合は `$schema`（draft 宣言）と `$id`（絶対 URI による一意識別子）を必須とする。
 
@@ -173,7 +185,7 @@ JSON Schema を扱う場合は `$schema`（draft 宣言）と `$id`（絶対 URI
 
 `validate_schema_catalog.py` を `.claude/skills/open-pr/scripts/` に追加し、以下を検証する:
 
-1. **catalog completeness**: schema_id / format / definition_paths / producer / consumers / detection_patterns / validation_commands が埋まっているか（`推定` 等の曖昧値を禁止）
+1. **catalog completeness**: schema_id / format / definition_paths / producer / consumers / detection_patterns / required_test_commands が埋まっているか（`推定` 等の曖昧値を禁止）
 2. **PR body consistency**: PR 本文の Schema Consumer Inventory が catalog の `consumers[].id` と矛盾していないか
 3. **fixture execution**: 変更対象 schema の positive / negative fixture を実行
 
@@ -213,15 +225,15 @@ LP050 から `validate_schema_catalog.py` を呼び出し、エラーは `E_SCHE
 
 ### 後続 Issue への引き継ぎ
 
-下記の follow-up Issue を分割して起票する（AC7 対応）:
+下記の follow-up Issue を分割して起票済み（AC3 対応）:
 
-| # | タイトル | 内容 |
-|---|---|---|
-| FU-1 | catalog schema + initial migration | `schemas/catalog.yaml` 作成と 16 エントリの移行 |
-| FU-2 | catalog consistency validator | `validate_schema_catalog.py` 実装 |
-| FU-3 | PR body inventory vs catalog 照合 | LP050 拡張：catalog との consumer 整合性チェック |
-| FU-4 | fixture-based consumer contract tests | positive / negative fixture と pytest 追加 |
-| FU-5 | schema-governance.md 生成スクリプト | catalog から Markdown テーブルを生成 |
+| Issue | 内容 |
+|---|---|
+| #517 | FU-1: `schemas/catalog.yaml` 作成と 16 エントリの初期移行 |
+| #518 | FU-2: `validate_schema_catalog.py` 実装（catalog completeness / consumer consistency check） |
+| #519 | FU-3: LP050 拡張 — PR body Schema Consumer Inventory vs catalog 照合 |
+| #520 | FU-4: positive / negative fixture と pytest 追加 |
+| #521 | FU-5: catalog から `schema-governance.md` Markdown テーブルを生成するスクリプト |
 
 ## References
 
