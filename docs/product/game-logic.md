@@ -66,12 +66,10 @@ campaign 層の持続状態：unlocked_resources, upgraded_units, sortie_count�
 DOM event (KeyboardEvent, PointerEvent) は input layer で capture し、以下に正規化：
 
 ```typescript
-type InputCommand = 
-  | { type: 'MoveIntent'; direction: Vec2; }   // normalized (-1..1)
-  | { type: 'AimIntent'; x: number; y: number; } // arena logical coordinates
-  | { type: 'FireIntent'; }
-  | { type: 'IssueAllyCommandIntent'; command: string; }
-  | { type: 'PauseIntent'; }
+type InputCommand =
+  | { type: 'move'; axisX: number; axisY: number; } // semantic axes; MovementSystem normalizes diagonal movement
+  | { type: 'aim'; x: number; y: number; }          // arena logical coordinates
+  | { type: 'fire'; }
 ```
 
 input layer は DOM 依存。`src/systems` は InputCommand を受け取り、simulation state update に反映。
