@@ -902,6 +902,7 @@ def _readback_labels_with_result(
     attempts = 0
     last_actual: list[str] = []
     last_error: str | None = None
+    error_kind: str = "missing_expected_labels"
 
     # Initial attempt
     attempts += 1
@@ -918,8 +919,13 @@ def _readback_labels_with_result(
             )
         last_actual = _fetch_actual_labels()
     except TransactionError as exc:
+        # Blocker A: catch TransactionError from _readback_labels_once; do NOT propagate.
+        # Attempt to fetch actual_labels for diagnostics (Blocker E).
         last_error = exc.message
-        last_actual = []
+        error_kind = "command_error"
+        fetched = _fetch_actual_labels()
+        if fetched:
+            last_actual = fetched
 
     used_delays: list[float] = []
     for delay in delays:
@@ -937,10 +943,16 @@ def _readback_labels_with_result(
                     attempts=attempts,
                     retry_delays=used_delays,
                 )
-            last_actual = _fetch_actual_labels()
+            fetched = _fetch_actual_labels()
+            if fetched:
+                last_actual = fetched
         except TransactionError as exc:
+            # Blocker A: catch TransactionError from _readback_labels_once; do NOT propagate.
             last_error = exc.message
-            last_actual = []
+            error_kind = "command_error"
+            fetched = _fetch_actual_labels()
+            if fetched:
+                last_actual = fetched
 
     return LabelReadbackResult(
         ok=False,
@@ -949,7 +961,7 @@ def _readback_labels_with_result(
         attempts=attempts,
         retry_delays=used_delays,
         last_error=last_error,
-        error_kind="missing_expected_labels",
+        error_kind=error_kind,
     )
 
 
@@ -1198,6 +1210,10 @@ def _report_partial_failure(
     parent_verified: bool | None,
     dependency_verified: bool | None,
     failure_context: str | None = None,
+    applied_steps: list[str] | None = None,
+    verified_steps: list[str] | None = None,
+    pending_steps: list[str] | None = None,
+    failed_readbacks: list[dict] | None = None,
 ) -> TransactionResult:
     failure_stage = failed_exc.stage
     failure_message = failed_exc.message
@@ -1235,6 +1251,11 @@ def _report_partial_failure(
         parent_verified=parent_verified,
         dependency_verified=dependency_verified,
         audit_comment_posted=audit_comment_posted,
+        # Blocker C: pass through step tracking fields so all return paths are consistent.
+        applied_steps=applied_steps if applied_steps is not None else [],
+        verified_steps=verified_steps if verified_steps is not None else [],
+        pending_steps=pending_steps if pending_steps is not None else [],
+        failed_readbacks=failed_readbacks if failed_readbacks is not None else [],
     )
 
 
@@ -1665,6 +1686,14 @@ def run_transaction(
     completed.append("create")
     matching_issue_numbers: list[int] = []
 
+    # Blocker C: initialize step tracking fields before the try block so that all
+    # exception exit paths (including early exits before label-apply) can pass
+    # consistently populated values to _report_partial_failure.
+    applied_steps: list[str] = []
+    verified_steps: list[str] = []
+    pending_steps: list[str] = []
+    failed_readbacks: list[dict] = []
+
     try:
         try:
             poll_verdict, matching_issue_numbers = _poll_for_created_issue(
@@ -1715,11 +1744,9 @@ def run_transaction(
 
         _issue_apply_labels(repo, issue_number, labels, gh_bin)
         completed.append("label")
-        applied_steps: list[str] = ["label"] if labels else []
-        verified_steps: list[str] = []
-        pending_steps: list[str] = []
-
-        failed_readbacks: list[dict] = []
+        # Blocker C: update (not re-declare) applied_steps, which was initialized before the try block.
+        if labels:
+            applied_steps.append("label")
         if labels:
             labels_verified = _readback_labels(repo, issue_number, labels, gh_bin, sleep_fn=sleep_fn)
             if labels_verified:
@@ -1869,6 +1896,11 @@ def run_transaction(
                     f"issue_number={issue_number}",
                 ]
             ),
+            # Blocker C: pass through step tracking fields so all exception paths are consistent.
+            applied_steps=applied_steps,
+            verified_steps=verified_steps,
+            pending_steps=pending_steps,
+            failed_readbacks=failed_readbacks,
         )
 
 
@@ -1956,6 +1988,18 @@ def reconcile_transaction(
             if parent_verified:
                 completed.append("sub-issue-readback")
                 verified_steps.append("sub-issue-readback")
+            else:
+                # Blocker B: parent readback False must be recorded in failed_readbacks.
+                failed_readbacks.append({
+                    "stage": "sub-issue-readback",
+                    "expected_labels": [],
+                    "actual_labels": [],
+                    "attempts": 1,
+                    "retry_delays": list(_PARENT_READBACK_RETRY_DELAYS),
+                    "error_kind": "missing_expected_labels",
+                    "message": "parent read-back mismatch in reconcile",
+                })
+                pending_steps.append("sub-issue-readback")
         except TransactionError as exc:
             return TransactionResult(
                 status="partial_failure",
@@ -1979,9 +2023,18 @@ def reconcile_transaction(
                 dep_node_id, _ = _issue_graphql_ids(repo, dep_number, gh_bin)
                 try:
                     _issue_register_dependency(repo, child_node_id, dep_node_id, gh_bin)
-                except TransactionError:
-                    # dependency registration may fail with 422 if already registered; attempt readback
-                    pass
+                except TransactionError as dep_exc:
+                    # Blocker D: only swallow 422 (already registered = idempotent pass).
+                    # For the GraphQL addBlockedBy mutation, a "duplicate" error from GitHub
+                    # surfaces as a non-zero returncode; we cannot distinguish 422 vs other HTTP
+                    # errors at the GraphQL layer, so we rely on the subsequent readback to
+                    # confirm correctness. If readback fails, that will be recorded below.
+                    # Non-transient failures (e.g., 403/404 surfaced as TransactionError with
+                    # stage != "dependency-register" from graphql_ids) are re-raised; only
+                    # stage="dependency-register" errors are treated as possible 422 idempotency.
+                    if dep_exc.stage != "dependency-register":
+                        raise
+                    # stage="dependency-register": may be 422 already-registered; readback will verify
             applied_steps.append("dependency")
 
             # Readback to verify

@@ -2247,3 +2247,160 @@ class TestPartialFailureCommentFailureIsReported:
         assert result.audit_comment_posted is False, (
             f"audit_comment_posted should be False when comment fails, got {result.audit_comment_posted}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Blocker A: _readback_labels_with_result must not propagate TransactionError
+# from _readback_labels_once
+# ---------------------------------------------------------------------------
+
+class TestReadbackLabelsOnceInvalidPayloadDoesNotPropagateTransactionError:
+    """Blocker A: _readback_labels_once TransactionError is caught inside _readback_labels_with_result."""
+
+    def test_readback_labels_once_invalid_payload_does_not_propagate_transaction_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When _readback_labels_once raises TransactionError (e.g., invalid payload),
+        _readback_labels_with_result must return LabelReadbackResult(ok=False) and NOT
+        allow the exception to propagate to the caller."""
+
+        def _raise_transaction_error(*_a: Any, **_k: Any) -> bool:
+            raise txn.TransactionError(
+                stage="label-readback",
+                message="invalid label read-back payload",
+                output="{'data': None}",
+            )
+
+        monkeypatch.setattr(txn, "_readback_labels_once", _raise_transaction_error)
+
+        # _fetch_actual_labels (internal) calls _run_gh_json; patch it to return empty nodes
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "labels": {"nodes": []}
+                        }
+                    }
+                }
+            }
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        # Must NOT raise; must return LabelReadbackResult(ok=False)
+        result = txn._readback_labels_with_result(
+            repo="owner/repo",
+            issue_number=99,
+            labels=["some-label"],
+            gh_bin="gh",
+            sleep_fn=FakeSleep(),
+        )
+
+        assert result.ok is False, "Expected ok=False when _readback_labels_once raises TransactionError"
+        assert result.error_kind == "command_error", (
+            f"Expected error_kind='command_error', got {result.error_kind!r}"
+        )
+        assert result.last_error is not None, "Expected last_error to be set"
+        assert "invalid label read-back payload" in result.last_error
+
+
+# ---------------------------------------------------------------------------
+# Blocker B: reconcile_transaction parent readback False -> partial_failure with
+# sub-issue-readback in failed_readbacks
+# ---------------------------------------------------------------------------
+
+class TestReconcileParentReadbackFailureReturnsPartialFailure:
+    """Blocker B: when _readback_parent_issue_with_retry returns False in reconcile_transaction,
+    the result must be partial_failure with sub-issue-readback in failed_readbacks."""
+
+    def test_reconcile_parent_readback_failure_returns_partial_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_readback_parent_issue_with_retry False -> reconcile status=partial_failure,
+        failed_readbacks contains sub-issue-readback entry."""
+        # No labels for this test to focus on parent readback
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-99", 9900))
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        # Parent readback always returns False
+        monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: False)
+        monkeypatch.setattr(txn, "_readback_parent_issue", lambda *_a, **_k: False)
+
+        fake_sleep = FakeSleep()
+        result = txn.reconcile_transaction(
+            repo="owner/repo",
+            issue_number=99,
+            labels=[],
+            parent_issue_number=40,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "partial_failure", (
+            f"Expected partial_failure when parent readback is False, got {result.status!r}"
+        )
+        failed_stages = [entry["stage"] for entry in result.failed_readbacks]
+        assert "sub-issue-readback" in failed_stages, (
+            f"Expected sub-issue-readback in failed_readbacks, got {failed_stages}"
+        )
+        assert "sub-issue-readback" in result.pending_steps, (
+            f"Expected sub-issue-readback in pending_steps, got {result.pending_steps}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blocker D: reconcile_transaction non-422 dependency error is recorded in
+# failed_readbacks (not silently swallowed)
+# ---------------------------------------------------------------------------
+
+class TestReconcileDependencyRegistrationNon422ErrorIsRecorded:
+    """Blocker D: dependency registration errors other than 422-idempotent should
+    surface in failed_readbacks, not be silently swallowed."""
+
+    def test_reconcile_dependency_non_dependency_register_stage_error_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A TransactionError from _issue_graphql_ids (non dependency-register stage) propagates
+        and causes partial_failure, not silent pass.
+
+        This verifies the Blocker D guard: only stage="dependency-register" errors are
+        swallowed as possible-422; other stages (e.g., "issue-ids") are re-raised.
+        """
+        call_count = 0
+
+        def _spy_graphql_ids(repo: str, issue_number: int, gh_bin: str) -> tuple[str, int]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call for child_node_id: success
+                return (f"node-{issue_number}", issue_number * 100)
+            # Subsequent calls (for dep_number): raise non-dependency-register error
+            raise txn.TransactionError(
+                stage="issue-ids",
+                message="graphql ids lookup failed (403)",
+                output="HTTP 403",
+            )
+
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", _spy_graphql_ids)
+
+        fake_sleep = FakeSleep()
+        result = txn.reconcile_transaction(
+            repo="owner/repo",
+            issue_number=99,
+            labels=["some-label"],
+            parent_issue_number=0,
+            dependency_issue_numbers=[10],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        # The error from graphql_ids (stage="issue-ids") should NOT be swallowed;
+        # it should result in partial_failure (caught by outer except in reconcile_transaction).
+        assert result.status == "partial_failure", (
+            f"Expected partial_failure when dep graphql_ids raises, got {result.status!r}"
+        )
+        assert result.failure_stage == "issue-ids", (
+            f"Expected failure_stage='issue-ids', got {result.failure_stage!r}"
+        )
