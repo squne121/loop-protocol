@@ -177,19 +177,6 @@
     - "## playtest_hypotheses"
     - "## related_tests"
 
-- id: feature-sortie
-  path: docs/product/features/sortie.md
-  title: Sortie Lifecycle & Combat End Conditions
-  keywords: [sortie, lifecycle, fsm, state-machine, timer, elapsedTicks, targetTicks, fixed_timestep, result-object, victory, defeat, combat, end-conditions, transient-output]
-  description: 戦闘（Sortie）の開始から終了（120秒生存または自機HP0）までの状態遷移、固定タイムステップタイマーの管理、および Transient Result Object の生成ルールの正本。永続化やUI表示に関する定義は持たない。
-  sections:
-    - "## Sortie State Machine (FSM)"
-    - "## End Conditions"
-    - "## Timer Authority"
-    - "## SortieResult"
-    - "## Non-Goals"
-    - "## planned_consumer_tests"
-
 - id: game-overview
   path: docs/product/game-overview.md
   title: ゲーム全体像
