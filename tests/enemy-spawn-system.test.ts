@@ -86,9 +86,17 @@ describe('EnemySpawnSystem', () => {
       expect(state.enemies[0].y).toBe(expectedY)
     })
 
-    it('GIVEN unknown definitionId WHEN spawnEnemy called THEN no enemy is added', () => {
-      spawnEnemy(state, { definitionId: 'nonexistent' })
+    it('GIVEN unknown definitionId WHEN spawnEnemy called THEN returns null and no enemy is added', () => {
+      const result = spawnEnemy(state, { definitionId: 'nonexistent' })
+      expect(result).toBeNull()
       expect(state.enemies).toHaveLength(0)
+      expect(state.nextEnemyId).toBe(1)
+    })
+
+    it('GIVEN valid request WHEN spawnEnemy called THEN returns the spawned EnemyState', () => {
+      const result = spawnEnemy(state)
+      expect(result).not.toBeNull()
+      expect(result).toBe(state.enemies[0])
     })
   })
 
@@ -114,6 +122,17 @@ describe('EnemySpawnSystem', () => {
     it('GIVEN no enemies WHEN runEnemySpawnSystem called THEN spawned enemy has id 1', () => {
       runEnemySpawnSystem(state)
       expect(state.enemies[0].id).toBe(1)
+    })
+  })
+
+  describe('enemy-basic definition constraints', () => {
+    it('GIVEN enemy-basic definition THEN all numeric fields are positive', () => {
+      const definition = enemyDefinitions.find((d) => d.definitionId === 'enemy-basic')
+      expect(definition).toBeDefined()
+      expect(definition!.maxHp).toBeGreaterThan(0)
+      expect(definition!.radius).toBeGreaterThan(0)
+      expect(definition!.speedPxPerSec).toBeGreaterThan(0)
+      expect(definition!.contactDamage).toBeGreaterThan(0)
     })
   })
 

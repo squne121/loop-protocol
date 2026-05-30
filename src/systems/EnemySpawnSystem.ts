@@ -10,11 +10,11 @@ export interface SpawnEnemyRequest {
 export function spawnEnemy(
   state: GameState,
   request: SpawnEnemyRequest = {},
-): void {
+): EnemyState | null {
   const definitionId = request.definitionId ?? 'enemy-basic'
   const definition = enemyDefinitions.find((d) => d.definitionId === definitionId)
   if (definition === undefined) {
-    return
+    return null
   }
 
   const x = request.x ?? state.arena.width - definition.radius - 48
@@ -36,6 +36,8 @@ export function spawnEnemy(
 
   state.enemies.push(enemy)
   state.nextEnemyId += 1
+
+  return enemy
 }
 
 export function runEnemySpawnSystem(state: GameState): void {

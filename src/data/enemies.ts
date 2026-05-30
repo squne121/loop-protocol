@@ -1,12 +1,12 @@
 export interface EnemyDefinition {
-  definitionId: string
-  maxHp: number
-  radius: number
-  speedPxPerSec: number
-  contactDamage: number
+  readonly definitionId: string
+  readonly maxHp: number
+  readonly radius: number
+  readonly speedPxPerSec: number
+  readonly contactDamage: number
 }
 
-export const enemyDefinitions: EnemyDefinition[] = [
+export const enemyDefinitions = [
   {
     definitionId: 'enemy-basic',
     maxHp: 3,
@@ -14,4 +14,4 @@ export const enemyDefinitions: EnemyDefinition[] = [
     speedPxPerSec: 80,
     contactDamage: 0.05,
   },
-]
+] as const satisfies readonly EnemyDefinition[]
