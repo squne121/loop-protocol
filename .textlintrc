@@ -1,0 +1,21 @@
+{
+  "rules": {
+    "prh": {
+      "rulePaths": [".textlint/prh.yml"]
+    },
+    "preset-japanese": {
+      "sentence-length": false,
+      "max-ten": false,
+      "no-mix-dearu-desumasu": false,
+      "no-doubled-joshi": false,
+      "no-doubled-conjunctive-particle-ga": false,
+      "no-doubled-conjunction": false,
+      "no-double-negative-ja": false,
+      "no-dropping-the-ra": false,
+      "no-nfd": true,
+      "no-invalid-control-character": true,
+      "no-zero-width-spaces": true,
+      "no-kangxi-radicals": true
+    }
+  }
+}
