@@ -17,7 +17,11 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 ## Procedure
 
 1. `gh issue view <番号> --json title,body,labels` で本文を取得する。
-2. 本文を一時ファイルに保存し、`python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json` を実行する。
+2. 本文を一時ファイルに保存し、以下の 2 スクリプトを順に実行する:
+   - `python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
+   - `python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode static`
+   
+   `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、各 error の `fix_hint` を `blocking_issues` に転写し、`verdict: needs-fix` とする（判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない）。
 3. checker の JSON をそのまま `REVIEW_ISSUE_RESULT_V1` に整形する（`verdict` / `deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を保持）。
 4. `verdict: needs-fix` の場合のみ `diff_proposal` を呼び出し元に提示する。本文書き戻しは Step 5 の条件分岐に従う。
 5. 本文書き戻し条件:

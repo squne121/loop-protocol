@@ -25,6 +25,7 @@ skills:
 - **read-only**: Issue の mutation を行わない
 - **loop worker**: `issue-refinement-loop` orchestrator から呼ばれ、結果を返して終了する
 - **script-first executor**: C1〜C12 の決定論的チェック・scope mismatch / VC anti-pattern / C1 skeleton 系 non-blocking warning・diff_proposal の生成は `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。
+- **contract readiness consumer**: `ISSUE_CONTRACT_READINESS_RESULT_V1` を `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py --mode static` で取得し、`errors[]` が空でない場合は各 `fix_hint` を `blocking_issues` に転写して `verdict: needs-fix` とする（判定ロジックは helper に委譲し、本 SubAgent では再実装しない）。
 
 ## Result & Consume Contract (SubAgent-owned)
 
