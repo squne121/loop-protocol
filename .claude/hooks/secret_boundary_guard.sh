@@ -89,6 +89,14 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     if echo "$COMMAND" | grep -qE '\b(sed|awk|perl)\b[^|]*\.env(\.[^ ]*)?(\s|$)'; then
         BLOCKED=1
     fi
+    # sed/awk/perl/ruby/rg/grep/find reading credential files (.netrc, .npmrc, .pypirc, .aws/*, .kube/*, gcloud creds)
+    if echo "$COMMAND" | grep -qE '\b(cat|sed|awk|perl|ruby|grep|rg|find|head|tail|less|more)\b[^|]*(\.netrc|\.npmrc|\.pypirc|\.aws/(credentials|config)|\.config/gcloud|\.kube/(config|credentials))'; then
+        BLOCKED=1
+    fi
+    # Tilde-expanded credential paths (e.g. cat ~/.netrc, cat ~/path/.aws/credentials)
+    if echo "$COMMAND" | grep -qE '\b(cat|sed|awk|perl|ruby|grep|rg|find|head|tail|less|more)\b[^|]*~/(\.netrc|\.npmrc|\.pypirc|\.aws/(credentials|config)|\.config/gcloud/application_default_credentials\.json|\.kube/(config|credentials))'; then
+        BLOCKED=1
+    fi
     # python3/python reading .env files or dumping os.environ
     if echo "$COMMAND" | grep -qE '\bpython3?\b[^|]*\.env(\.[^ ]*)?(\s|$)'; then
         BLOCKED=1
@@ -130,7 +138,7 @@ if echo "$SENSITIVE_TOOLS" | grep -qw "$TOOL_NAME" && [ -n "$PATH_INPUT" ]; then
         BLOCKED=1
     fi
     # credential file patterns
-    if echo "$PATH_INPUT" | grep -qE '(^|/)(credentials|\.aws/credentials|\.config/gcloud|\.kube/config)(\.json|\.toml|\.yaml|\.yml)?$'; then
+    if echo "$PATH_INPUT" | grep -qE '(^|/)(credentials|\.aws/credentials|\.aws/config|\.config/gcloud|\.config/gcloud/application_default_credentials\.json|\.kube/config|\.kube/credentials)(\.json|\.toml|\.yaml|\.yml)?$'; then
         BLOCKED=1
     fi
     # local token stores: settings.local.json
