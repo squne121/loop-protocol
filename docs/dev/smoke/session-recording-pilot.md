@@ -7,38 +7,97 @@ status: in-progress
 
 # Session Recording Pilot Smoke Test
 
+## Scope Boundary
+
+このファイルは #522 の smoke test 記録用ワークシートであり、#246 の Acceptance Criteria 達成証跡そのものではない。
+#246 の達成判定は、Issue / PR コメントに保存された `agent_session_manifest/v1`、Kill Switch 検証結果、Secret scan、metrics、採否判断をもって行う。
+
 ## 概要
 
 #246 (research/pilot: AI 駆動 session 記録 pilot smoke test) のパイロット実走記録。
-Hook-based metadata ledger 方式による session 記録の動作確認を行う。
+採用方式: **Hook-based Metadata Ledger**（#245 手順書の Adopt 判定）。EntireCLI は使用しない。
 
-## 採用方式
+## Evidence Storage Boundary
 
-- **方式**: Hook-based Metadata Ledger
-- **概要**: Claude Code の hooks（PreToolUse / PostToolUse / Stop 等）を利用して session メタデータを記録する
-- **証跡保存先**: `artifacts/` ディレクトリ
+- `artifacts/session-recording-pilot/` は local-only / private artifact 用であり、raw transcript、local absolute path、API key、`.env`、agent-local settings を GitHub に投稿・commit・push してはならない。
+- public GitHub comment に置けるのは `agent_session_manifest/v1` の metadata のみ（`source_kind: public_github_comment`）。
+- `entire/checkpoints/v1` または同等の checkpoint branch が public remote に存在しないことを Kill Switch 検証で確認する。
+- raw transcript は `public_github_comment` surface への出力禁止（#242 policy）。
+
+## Claude Code Hooks の既知の制限
+
+- `Stop` は「turn 完了」単位で発火するため、session 完了証跡として単独利用しない。
+- API error 時は `StopFailure` を確認する（`Stop` は発火しない）。
+- ユーザー interrupt 時は `Stop` / `StopFailure` ともに発火しないため、interrupt 時の manifest 未記録リスクを Known Limitation として扱う。
+- `PostToolUse` は既実行操作を取り消せないため、ブロック用途は `PreToolUse` に限定する。
+
+## Required Evidence Links
+
+#246 の各 AC に対応する証跡（実行後に記入）:
+
+| 証跡 | comment_url | manifest_id | verification.overall |
+|---|---|---|---|
+| Preflight manifest | https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583023247 | asm-778b814c-dd9e-40de-9f6e-7a2dffa976f1 | pass |
+| Implementation manifest | https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583035545 | asm-abc08254-6aee-4aa8-8e31-3a876e1655a2 | pass |
+| PR review manifest | https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583040005 | (pr_review phase) | pass |
+| Kill Switch verification log | | | |
+| Secret exposure scan | | | |
+| Metrics report | | | |
+| Recommendation | | | |
 
 ## 実行フェーズ記録
 
-### Phase 1: 環境確認
+### Phase 1: Preflight
 
-- [ ] hooks 設定の確認
-- [ ] artifacts ディレクトリの書き込み権限確認
-- [ ] recording スクリプトの動作確認
+- [x] agent_session_manifest posted
+  - comment_url: https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583023247
+  - manifest_id: asm-778b814c-dd9e-40de-9f6e-7a2dffa976f1
+  - verification.overall: pass
+  - redaction.raw_transcript_included: false
+  - redaction.local_paths_included: false
 
-### Phase 2: パイロット実走
+### Phase 2: Implementation
 
-- [ ] session 開始時のメタデータ記録
-- [ ] ToolUse イベントの記録
-- [ ] session 終了時の証跡出力
+- [x] implementation manifest posted
+  - comment_url: https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583035545
+  - manifest_id: asm-abc08254-6aee-4aa8-8e31-3a876e1655a2
+  - verification.overall: pass
+  - redaction.raw_transcript_included: false
+  - redaction.local_paths_included: false
 
-### Phase 3: 結果検証
+### Phase 3: PR Review
 
-- [ ] 証跡ファイルの生成確認
-- [ ] メタデータの正確性確認
-- [ ] #246 の AC 達成確認
+- [x] pr_review manifest posted
+  - comment_url: https://github.com/squne121/loop-protocol/issues/246#issuecomment-4583040005
+  - manifest_id: (pr_review phase)
+  - verification.overall: pass
+  - redaction.raw_transcript_included: false
+  - redaction.local_paths_included: false
 
-## 備考
+### Phase 4: Kill Switch Verification
 
-- 実走後にこのファイルに結果を記録する
-- 証跡ファイルは `artifacts/session-recording-pilot/` に保存する
+- [ ] kill_switch_runtime_smoke PASS
+  - log_ref:
+  - positive_case: pass
+  - negative_case_public_checkpoint: blocked_exit_2
+  - negative_case_unknown_mapping: blocked_exit_2
+
+### Phase 5: Secret Exposure Scan
+
+- [ ] local_worktree_scan: pass
+- [ ] git_history_scan: pass
+- [ ] entire_metadata_scan: pass
+- [ ] github_secret_scanning: pass / unavailable (reason: )
+- [ ] synthetic_canary: pass (real_secret_used: false)
+
+### Phase 6: Metrics
+
+- token_usage: unavailable (ai_self_reported: forbidden)
+- latency_ms:
+- human_intervention_count:
+
+### Phase 7: Recommendation
+
+- [ ] verdict posted
+  - recommendation: continue_with_metadata_only / continue_after_followups / stop_and_do_not_adopt
+  - reason:
