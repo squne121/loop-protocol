@@ -88,7 +88,7 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 - `rtk git`
 - `rtk pnpm`
 - read-only inspection
-- repo 既定の検証コマンド
+- repo 既定のVerification Commands
 
 ### 明示的に境界外として扱う操作
 

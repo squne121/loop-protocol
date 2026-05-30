@@ -161,7 +161,7 @@ decision_gate:
 
 参考: 手順フロー
 
-```
+```text
 Secret 発生 (新規・変更)
   |
   v

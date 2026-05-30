@@ -54,7 +54,7 @@ docs_reference:
 
 `specify --help` 出力より（環境隔離下で確認、§8 参照）:
 
-```
+```text
 init / check / version / self / extension / preset / integration / workflow
 ```
 
@@ -440,7 +440,7 @@ specify init proj --ai claude --no-git --script sh
 
 ### 8.2 `env | rg 'HOME|XDG|SPECKIT'` summary（実行時の出力）
 
-```
+```bash
 XDG_CONFIG_HOME=/tmp/loop-speckit-xdg-1779605760
 HOME=/tmp/loop-speckit-home-1779605760
 XDG_RUNTIME_DIR=/run/user/1000/
@@ -530,7 +530,7 @@ echo "[CORE]:      $(resolve_template plan-template       "$PWD")"
 
 実行結果（実 transcript）:
 
-```
+```text
 [OVERRIDE]:  /tmp/loop-speckit-e2e-<TS>/proj/.specify/templates/overrides/constitution-template.md
 [PRESET]:    /tmp/loop-speckit-e2e-<TS>/proj/.specify/presets/test-preset/templates/tasks-template.md
 [EXTENSION]: /tmp/loop-speckit-e2e-<TS>/proj/.specify/extensions/test-ext//templates/spec-template.md

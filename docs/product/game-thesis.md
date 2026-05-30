@@ -121,9 +121,9 @@ design_hypotheses:
 - HYP-001-ace-intervention — エース機としての介入感の知覚
 - HYP-002-tech-extraction-loop — 技術抽出 → 強化ループの意味付け
 
-## 受け入れ条件境界 / Acceptance Criteria Boundary
+## 受け入れ条件境界 / AC Boundary
 
-本書は implementation-level の EARS acceptance criteria を定義しない。具体的なタイミング（出撃秒数等）、入力キー割り当て、強化項目数、勝敗条件等は downstream の game-design / game-logic / mvp-scope spec が定める。設計仮説は playtest フィードバックの validation target として機能し、本書から直接 implementation task を生やしてはならない（ADR 0002 の「design hypothesis invalidated は直接 implementation issue にしない」原則）。
+本書は implementation-level の EARS AC を定義しない。具体的なタイミング（出撃秒数等）、入力キー割り当て、強化項目数、勝敗条件等は downstream の game-design / game-logic / mvp-scope spec が定める。設計仮説は playtest フィードバックの validation target として機能し、本書から直接 implementation task を生やしてはならない（ADR 0002 の「design hypothesis invalidated は直接 implementation issue にしない」原則）。
 
 ## トレースリンク / Trace Links
 

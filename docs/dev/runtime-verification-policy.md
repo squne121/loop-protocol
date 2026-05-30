@@ -137,7 +137,7 @@ fi
 
 SKIP 宣言時は stdout の先頭に `SKIP:` プレフィックスを付けた説明メッセージを出力する。
 
-```
+```text
 SKIP: 外部サービス未起動のため AC7 の動作検証を実行できません。
 ```
 
@@ -169,7 +169,7 @@ fi
 
 ### 保存先パス
 
-```
+```text
 <worktree>/artifacts/runtime-verification-<AC>-<timestamp>.log
 ```
 
@@ -184,7 +184,7 @@ fi
 
 ### ログの必須フィールド
 
-```
+```text
 === Runtime Verification Log ===
 AC: <AC番号と内容>
 Timestamp: <ISO 8601 UTC>
@@ -302,7 +302,7 @@ ACP transport の end-to-end 動作検証は `.claude/skills/gemini-cli-headless
 
 ### エスカレーション手順
 
-```
+```text
 実行環境不可（SKIP exit 77）検知
   ↓
 VC スクリプトが SKIP ログを artifacts/ に書き出す

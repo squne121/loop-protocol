@@ -9,7 +9,7 @@
 
 各エントリは以下のフィールドを持つ:
 
-```
+```yaml
 - id: <識別子>
   path: <docs/ 相対パス>
   title: <文書タイトル>
@@ -211,7 +211,7 @@
     - "## 目的 / Intent"
     - "## 未解決の問い / Open Questions"
     - "## プレイテスト仮説 / Playtest Hypotheses"
-    - "## 受け入れ条件境界 / Acceptance Criteria Boundary"
+    - "## 受け入れ条件境界 / AC Boundary"
     - "## トレースリンク / Trace Links"
 
 - id: requirements

@@ -7,7 +7,7 @@ globs:
 
 ignores:
   - "node_modules/**"
-  - ".claude/worktrees/**"
+  - ".claude/**"
   - "dist/**"
   - "coverage/**"
   - "playwright-report/**"
@@ -30,8 +30,9 @@ config:
   # MD034: Bare URL used — disable
   MD034: false
 
-  # MD040: Fenced code blocks language — disable (many existing code blocks lack language)
-  MD040: false
+  # MD040: Fenced code blocks language — enabled to detect unlabeled code fences
+  # allow-empty: false (default) — language specifier is required
+  MD040: true
 
   # MD004: Unordered list style — disable (mixed styles exist)
   MD004: false

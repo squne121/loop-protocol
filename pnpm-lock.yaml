@@ -29,9 +29,6 @@ importers:
       textlint:
         specifier: ^14.4.2
         version: 14.8.4
-      textlint-rule-ja-no-weak-phrase:
-        specifier: ^2.0.0
-        version: 2.0.0
       textlint-rule-preset-japanese:
         specifier: ^10.0.4
         version: 10.0.4
@@ -1557,12 +1554,6 @@ packages:
     resolution: {integrity: sha512-FP+p8RB8OWpF3YZBCrP5gtADmtXApB5AMLn+vdyA+PyxCjrCs00mjyUozssO33cwDeT3wNGdLxJ5M//YqtHAJw==}
     hasBin: true
 
-  morpheme-match-all@2.0.5:
-    resolution: {integrity: sha512-a6B6Nh4AhjMoEzVz8NOT5M9f3XwFVPM395gqnFNUXG/KTqQFTb9qM5JJFHJe+SvWfRVXTZSejyXNt+h+jmHUuQ==}
-
-  morpheme-match@2.0.4:
-    resolution: {integrity: sha512-C3U5g2h47dpztGVePLA8w2O1aQEvuJORwIcahWaCG91YPrq+0u7qcPsF9Nqqe8noFvHwgO7b2EEk3iPnYuGTew==}
-
   ms@2.1.3:
     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
 
@@ -2004,9 +1995,6 @@ packages:
 
   textlint-rule-helper@2.5.0:
     resolution: {integrity: sha512-QIbFPtyqLy0g5BJn8mryk9iHzGYicNaFIpLFPiEnb4RXxrEGeQ2W2aARQ9yEXLIAqo+OwK4ndWBAWkbgJEPzTQ==}
-
-  textlint-rule-ja-no-weak-phrase@2.0.0:
-    resolution: {integrity: sha512-jZ1/3VnE8Bz/p0CCe/+BVOmWE1cZwpDkjKb6hnq39nGk3OD4XPW7biYavK/4/mZhk4bh2+Vtu1xV26lg8d+vBw==}
 
   textlint-rule-max-ten@5.0.0:
     resolution: {integrity: sha512-EWOvbEa3Ukxz0+GAUEJ91DYFSC3IkyJ10dBcsU6VlL33k1BvTRoFr3m26w6upnXJffXQUI70Etn39I++2duyhA==}
@@ -4027,12 +4015,6 @@ snapshots:
     dependencies:
       minimist: 1.2.8
 
-  morpheme-match-all@2.0.5:
-    dependencies:
-      morpheme-match: 2.0.4
-
-  morpheme-match@2.0.4: {}
-
   ms@2.1.3: {}
 
   nanoid@3.3.12: {}
@@ -4529,12 +4511,6 @@ snapshots:
       '@textlint/ast-node-types': 15.7.1
       structured-source: 4.0.0
       unist-util-visit: 2.0.3
-
-  textlint-rule-ja-no-weak-phrase@2.0.0:
-    dependencies:
-      kuromojin: 3.0.1
-      morpheme-match: 2.0.4
-      morpheme-match-all: 2.0.5
 
   textlint-rule-max-ten@5.0.0:
     dependencies:

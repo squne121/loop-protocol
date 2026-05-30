@@ -44,7 +44,7 @@ AI 実装者が state system / system update / collision detection / persistence
 
 ### BattleState
 
-```
+```text
 pre-combat -> combat
 combat -> defeat   [player_hp <= 0]
 combat -> debrief  [sortie_timer_expired | enemy_outpost_destroyed | all_enemy_units_destroyed]
@@ -84,7 +84,7 @@ input layer は DOM 依存。`src/systems` は InputCommand を受け取り、si
 
 ### Accumulator Pattern
 
-```
+```javascript
 accumulated_time += (current_frame_time - last_frame_time)
 while (accumulated_time >= dt) {
   simulate(dt)

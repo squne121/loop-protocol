@@ -315,7 +315,7 @@ playtest_policy:
 
 **feedback_path（フィードバックループ）**:
 
-```
+```text
 playtest-log entry
   → classify: bug | balance/tuning | design hypothesis invalidated | unclear/needs-more-data
   → spec delta issue（docs/product/** 更新）
