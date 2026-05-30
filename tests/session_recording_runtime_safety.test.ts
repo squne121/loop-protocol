@@ -52,6 +52,7 @@ function runVerifier(
 
   const fullEnv: Record<string, string> = { ...(process.env as Record<string, string>) }
   delete fullEnv['ENTIRE_CHECKPOINT_TOKEN']
+  delete fullEnv['SRRS_SECRETS_MODE']
   Object.assign(fullEnv, baseEnv)
 
   const result = spawnSync(
@@ -550,3 +551,73 @@ describe('runtime safety: B5 GitHub URL visibility via gh repo view (iteration-5
   })
 })
 
+
+// ============================================================================
+// Issue #491: SRRS_SECRETS_MODE secrets mode Kill Switch
+// ============================================================================
+
+import { readFileSync } from 'fs'
+import { join as joinPath } from 'path'
+
+describe('runtime safety: SRRS_SECRETS_MODE=current exits FAIL (AC2, AC5, AC9)', () => {
+  it('GIVEN SRRS_SECRETS_MODE=current WHEN verifier runs THEN exit 1 and stdout contains check=secrets_mode and FAIL:secrets_mode_non_none', () => {
+    const result = runVerifier(null, { SRRS_SECRETS_MODE: 'current' })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    expect(result.stdout).toContain('check=secrets_mode')
+    expect(result.stdout).toContain('FAIL:secrets_mode_non_none')
+  })
+})
+
+describe('runtime safety: SRRS_SECRETS_MODE=none passes secrets_mode check (AC1, AC10)', () => {
+  it('GIVEN SRRS_SECRETS_MODE=none WHEN verifier runs THEN secrets_mode check emits PASS', () => {
+    const result = runVerifier(null, { SRRS_SECRETS_MODE: 'none' })
+    const secretsLine = result.stdout.split('\n').find(l => l.includes('check=secrets_mode'))
+    // secrets_mode check should PASS when mode is "none"
+    expect(secretsLine).toContain('PASS')
+  })
+})
+
+describe('runtime safety: SRRS_SECRETS_MODE unset does not change existing behavior (AC4, AC11)', () => {
+  it('GIVEN secrets_mode unset (SRRS_SECRETS_MODE not set) WHEN verifier runs with base safe overrides THEN exits PASS (0)', () => {
+    // No SRRS_SECRETS_MODE in envOverrides means it stays unset (deleted in runVerifier)
+    const result = runVerifier(null)
+    // With base safe overrides (no EntireCLI, private visibility, no public branch),
+    // exit code should be PASS (0). SRRS_SECRETS_MODE unset => no secrets_mode failure.
+    expect(result.exitCode).toBe(EXIT_PASS)
+    expect(result.stdout).not.toContain('FAIL:secrets_mode_non_none')
+    expect(result.stdout).not.toContain('FAIL_CLOSED:secrets_mode_unknown')
+  })
+})
+
+describe('runtime safety: SRRS_SECRETS_MODE=foobar (unknown) exits FAIL-CLOSED (AC7)', () => {
+  it('GIVEN SRRS_SECRETS_MODE=foobar (unknown value) WHEN verifier runs THEN exit 2 and raw value not in stdout', () => {
+    const result = runVerifier(null, { SRRS_SECRETS_MODE: 'foobar' })
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.stdout).toContain('FAIL_CLOSED:secrets_mode_unknown')
+    // Raw env value must not be leaked to stdout/stderr
+    expect(result.stdout).not.toContain('foobar')
+    expect(result.stderr).not.toContain('foobar')
+  })
+})
+
+describe('runtime safety: SRRS_SECRETS_MODE dangerous values exit FAIL (AC3)', () => {
+  const dangerousValues = ['publish_secret', 'app_runtime_secret', 'agent_local_secret', 'checkpoint_token']
+
+  for (const mode of dangerousValues) {
+    it(`GIVEN SRRS_SECRETS_MODE=${mode} WHEN verifier runs THEN exit 1`, () => {
+      const result = runVerifier(null, { SRRS_SECRETS_MODE: mode })
+      expect(result.exitCode).toBe(EXIT_FAIL)
+      expect(result.stdout).toContain('FAIL:secrets_mode_non_none')
+    })
+  }
+})
+
+describe('runtime safety: fail-secrets-mode-nonzero fixture (AC5, fixture-driven)', () => {
+  it('GIVEN fail-secrets-mode-nonzero scenario.json fixture WHEN verifier runs with its env THEN matches expectedExitCode and expectedDiagnostic', () => {
+    const fixtureDir = joinPath(FIXTURES_DIR, 'fail-secrets-mode-nonzero')
+    const scenario = JSON.parse(readFileSync(joinPath(fixtureDir, 'scenario.json'), 'utf-8'))
+    const result = runVerifier(null, scenario.env)
+    expect(result.exitCode).toBe(scenario.expectedExitCode)
+    expect(result.stdout).toContain(scenario.expectedDiagnostic)
+  })
+})

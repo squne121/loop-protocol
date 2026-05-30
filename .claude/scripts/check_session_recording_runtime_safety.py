@@ -57,6 +57,20 @@ CODE_FAIL_CLOSED_VISIBILITY = "FAIL_CLOSED:checkpoint_remote_visibility_unknown"
 CODE_FAIL_CLOSED_GIT_CONFIG = "FAIL_CLOSED:git_config_parse_error"
 CODE_FAIL_CLOSED_TOKEN_NO_REMOTE = "FAIL_CLOSED:checkpoint_token_present_no_verified_remote"
 CODE_FAIL_CLOSED_NON_GITHUB = "FAIL_CLOSED:non_github_remote_not_in_allowlist"
+CODE_FAIL_SECRETS_MODE = "FAIL:secrets_mode_non_none"
+CODE_FAIL_CLOSED_SECRETS_MODE = "FAIL_CLOSED:secrets_mode_unknown"
+
+# ---------------------------------------------------------------------------
+# Secrets mode constants (SRRS_SECRETS_MODE)
+# ---------------------------------------------------------------------------
+SECRET_MODE_NONE = "none"
+SECRET_MODE_DANGEROUS = {
+    "current",
+    "publish_secret",
+    "app_runtime_secret",
+    "agent_local_secret",
+    "checkpoint_token",
+}
 
 # ---------------------------------------------------------------------------
 # Redact helpers (AC8: no secrets in diagnostics)
@@ -837,6 +851,38 @@ def _self_check_redaction() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Check: SRRS_SECRETS_MODE secrets mode Kill Switch (Issue #491)
+# ---------------------------------------------------------------------------
+
+def check_secrets_mode(repo_root: Path) -> tuple[str, int]:
+    """
+    Fail-closed check for SRRS_SECRETS_MODE environment variable.
+
+    SRRS_SECRETS_MODE unset (None) -> PASS (no explicit override, skip check)
+    SRRS_SECRETS_MODE == "none"    -> PASS
+    SRRS_SECRETS_MODE in SECRET_MODE_DANGEROUS -> EXIT_FAIL (1), CODE_FAIL_SECRETS_MODE
+    SRRS_SECRETS_MODE unknown / empty / whitespace / case-mismatched ->
+        EXIT_FAIL_CLOSED (2), CODE_FAIL_CLOSED_SECRETS_MODE
+        (raw value is NOT emitted to stdout/stderr to prevent secret leakage)
+    """
+    raw = os.environ.get("SRRS_SECRETS_MODE")
+
+    if raw is None:
+        return CODE_PASS, EXIT_PASS
+
+    mode = raw.strip()
+
+    if mode == SECRET_MODE_NONE:
+        return CODE_PASS, EXIT_PASS
+
+    if mode in SECRET_MODE_DANGEROUS:
+        return CODE_FAIL_SECRETS_MODE, EXIT_FAIL
+
+    # Unknown / empty / whitespace / case-mismatched: fail-closed without echoing raw value
+    return CODE_FAIL_CLOSED_SECRETS_MODE, EXIT_FAIL_CLOSED
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -856,6 +902,7 @@ def run_all_checks(repo_root: Path) -> int:
         results.append((name, code, exit_code))
         emit(code, f"check={name}")
 
+    run_check("secrets_mode", check_secrets_mode)
     run_check("public_checkpoint_branch", check_public_checkpoint_branch)
     run_check("push_sessions", check_push_sessions)
     run_check("git_config_public_remote", check_git_config_public_remote)
