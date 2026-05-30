@@ -47,7 +47,28 @@ export interface ProjectileState {
   speedPxPerSec: number
   ageMs: number
   lifetimeMs: number
+  /** Damage snapshot taken from state.progress.weaponPower at fire time (AC4). */
+  damage: number
 }
+
+/** Discriminated union for collision pairs resolved in a single tick (AC1, AC7). */
+export type CollisionPair =
+  | {
+      kind: 'projectile-enemy'
+      tick: number
+      projectileId: number
+      enemyId: number
+      priorityKey: string
+      /** Squared distance between centers at collision time. Optional; used for tie-breaking. */
+      distSq?: number
+    }
+  | {
+      kind: 'player-enemy'
+      tick: number
+      playerId: EntityId
+      enemyId: number
+      priorityKey: string
+    }
 
 export interface ProgressState {
   stageLabel: string
