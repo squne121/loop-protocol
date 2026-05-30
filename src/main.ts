@@ -14,8 +14,12 @@ import {
   resolveCombatCollisions,
   runCollisionSystem,
   runCombatSystem,
+  runEnemyAISystem,
+  runEnemySpawnSystem,
   runMovementSystem,
   runProjectileSystem,
+  runSortieSystem,
+  startSortie,
 } from './systems'
 import { createHudController } from './ui'
 
@@ -57,6 +61,7 @@ const hud = createHudController(commandRail, {
   },
   onReset() {
     state = createInitialGameState()
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     resizeArena(state)
   },
 })
@@ -65,6 +70,9 @@ const inputState = createInputState()
 bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
+
+// M2 bootstrap: start sortie once after initialisation (AC12)
+startSortie(state, defaultSimulationConfig.fixedDeltaMs)
 
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
@@ -88,15 +96,22 @@ function frame(now: number): void {
 
 window.requestAnimationFrame(frame)
 
-function stepSimulation(deltaMs: number): void {
+function stepSimulation(fixedDeltaMs: number): void {
+  // AC13: skip all combat processing if sortie is not running
+  if (state.sortie.status !== 'running') {
+    return
+  }
   const commands = mapInputToCommands(inputState)
-  runMovementSystem(state, commands, deltaMs)
-  runCombatSystem(state, commands, deltaMs)
-  runProjectileSystem(state, commands, deltaMs)
-  const collisionPairs = runCollisionSystem(state)
-  resolveCombatCollisions(state, collisionPairs)
+  runMovementSystem(state, commands, fixedDeltaMs)
+  runEnemySpawnSystem(state)
+  runEnemyAISystem(state, fixedDeltaMs)
+  runCombatSystem(state, commands, fixedDeltaMs)
+  runProjectileSystem(state, commands, fixedDeltaMs)
+  const pairs = runCollisionSystem(state)
+  resolveCombatCollisions(state, pairs)
+  runSortieSystem(state, fixedDeltaMs)
   state.tick += 1
-  state.elapsedMs += deltaMs
+  state.elapsedMs += fixedDeltaMs
 }
 
 function resizeArena(currentState: typeof state): void {
