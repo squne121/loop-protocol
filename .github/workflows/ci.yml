@@ -141,6 +141,7 @@ jobs:
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
       - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
+      - run: uv run --locked pytest .claude/skills/review-issue/tests/ -q
       - name: Kill Switch smoke test
         run: python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
       - name: Secret exposure scan (production scripts)
@@ -162,6 +163,7 @@ jobs:
               .claude/skills/issue-contract-review/scripts/tests/ \
               .claude/skills/pr-review-judge/scripts/tests/ \
               .claude/skills/open-pr/scripts/tests/ \
+              .claude/skills/review-issue/tests/ \
             --pr-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
             --merge-sha "${{ github.sha }}" \
             --workflow ci --job python-test \
