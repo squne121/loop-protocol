@@ -113,20 +113,30 @@ def test_ac5_expected_fail():
 
 
 def test_ac6_env_missing_dep():
-    """AC6: env_missing_dep は expected_fail にしない"""
+    """AC6: env_missing_dep は expected_fail にしない。
+    #514 以降: env_missing_dep.md の python3 -c は unsafe_command として blocked になる。
+    テストは「blocked / decision=blocked」として判定する。
+    """
     fixture = Path(__file__).parent / "fixtures" / "env_missing_dep.md"
     data = run_preflight(str(fixture))
 
     results = data["results"]
     assert len(results) > 0
 
-    # env_missing_dep または file_not_found_unrunnable が blocked / human_judgment である
+    # #514: python3 -c は unsafe_command として blocked になる。
+    # env_missing_dep / file_not_found_unrunnable / unsafe_command / command_not_allowed
+    # のどれかが blocked / human_judgment であれば pass。
     found = any(
-        r["category"] in ("env_missing_dep", "file_not_found_unrunnable")
+        r["category"] in (
+            "env_missing_dep",
+            "file_not_found_unrunnable",
+            "unsafe_command",
+            "command_not_allowed",
+        )
         and r["decision"] in ("blocked", "human_judgment")
         for r in results
     )
-    assert found, "No env_missing_dep / file_not_found_unrunnable result found"
+    assert found, "No blocked/human_judgment result found for env_missing_dep fixture"
 
 
 def test_ac7_output_truncation():
@@ -247,19 +257,23 @@ def test_inline_ac_suffix_is_parsed():
 
 
 def test_missing_script_is_file_not_found_unrunnable():
-    """B5: python3 missing.py → file_not_found_unrunnable / blocked"""
+    """B5: python3 missing.py → blocked.
+    #514 以降: `python3 <script>` は -m py_compile / -m pytest 以外は command_not_allowed として blocked。
+    """
     fixture = Path(__file__).parent / "fixtures" / "missing_script.md"
     data = run_preflight(str(fixture))
 
     results = data["results"]
     assert len(results) > 0, "Expected at least one result"
 
-    # Should be classified as file_not_found_unrunnable
+    # #514: python3 <script> (not -m py_compile / -m pytest) is command_not_allowed/blocked.
+    # Accept both file_not_found_unrunnable (old) and command_not_allowed (new #514 behavior).
     found = any(
-        r["category"] == "file_not_found_unrunnable" and r["decision"] == "blocked"
+        r["category"] in ("file_not_found_unrunnable", "command_not_allowed")
+        and r["decision"] == "blocked"
         for r in results
     )
-    assert found, f"Expected file_not_found_unrunnable/blocked. Got: {results[0]['category']}/{results[0]['decision']}"
+    assert found, f"Expected blocked for missing script. Got: {results[0]['category']}/{results[0]['decision']}"
 
 
 def test_truncate_output_is_byte_limited():
@@ -714,12 +728,15 @@ def test_non_pytest_exit4_not_expected():
 
 
 def test_pytest_unexpected_pass_unchanged():
-    """AC6: pytest exit 0 → unexpected_pass / blocked (regression check)"""
+    """AC6: exit 0 → blocked (regression check).
+    #514 以降: python3 -c は unsafe_command として blocked になる (run_command 呼ばれない)。
+    exit 0 で unexpected_pass になるテストは true を返す allowlist コマンド（true コマンド）で確認する。
+    """
     fixture_content = """## Verification Commands
 
 ```bash
 # AC1
-$ python3 -c "import sys; sys.exit(0)"
+$ true
 ```
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -731,13 +748,13 @@ $ python3 -c "import sys; sys.exit(0)"
         results = data["results"]
         assert len(results) > 0
 
-        # Should be unexpected_pass / blocked
+        # `true` exits 0 → unexpected_pass / blocked
         found = any(
             r["classification"] == "unexpected_pass"
             and r["decision"] == "blocked"
             for r in results
         )
-        assert found, "pytest exit 0 should still be unexpected_pass / blocked"
+        assert found, f"'true' exit 0 should be unexpected_pass/blocked. Got: {results[0]}"
     finally:
         import os
         os.unlink(fixture_file)
@@ -1150,7 +1167,9 @@ $ ! rg -q "should_not_exist" src/
 
 
 def test_command_substitution_static_classification():
-    """AC7: test "$(wc -l < file)" → static classification, not executed"""
+    """AC7 (updated for #514): test "$(wc -l < file)" → static blocked, not executed.
+    #514 以降: $(...) は unsupported_shell_syntax として blocked になる（以前は expected_fail/go だった）。
+    """
     fixture_content = """## Verification Commands
 
 ```bash
@@ -1167,13 +1186,15 @@ $ test "$(wc -l < /nonexistent/file)" -le 10
         results = data["results"]
         assert len(results) > 0
 
-        # Should be static classified as expected_fail, not blocked
+        # #514: $(...) → blocked / unsupported_shell_syntax / decision=blocked, not executed
         found = any(
-            r["classification"] == "expected_fail"
-            and r["decision"] == "go"
+            r["classification"] == "blocked"
+            and r["category"] == "unsupported_shell_syntax"
+            and r["decision"] == "blocked"
+            and r["exit_code"] is None  # not executed
             for r in results
         )
-        assert found, f"Command substitution not static classified. Got: {results[0]}"
+        assert found, f"Command substitution should be blocked/unsupported_shell_syntax. Got: {results[0]}"
     finally:
         import os
         os.unlink(fixture_file)
@@ -1265,7 +1286,9 @@ def test_uv_pytest_existing_path_is_regression_gate(tmp_path):
 
 
 def test_command_substitution_is_not_run(monkeypatch):
-    """B2: test "$(wc -l < /nonexistent)" not executed"""
+    """B2 (updated for #514): $(...) not executed (still holds).
+    #514 以降: $(...) は unsupported_shell_syntax/blocked になり、依然として run_command() は呼ばれない。
+    """
     fixture_content = """## Verification Commands
 
 ```bash
@@ -1282,14 +1305,15 @@ $ test "$(wc -l < /nonexistent/file)" -le 10
         results = data["results"]
         assert len(results) > 0
 
-        # Should be statically classified as expected_fail, not blocked from execution
+        # #514: $(...) → blocked / unsupported_shell_syntax, not executed (exit_code=None)
         found = any(
-            r["classification"] == "expected_fail"
-            and r["decision"] == "go"
-            and r["category"] == "expected_baseline_fail"
+            r["classification"] == "blocked"
+            and r["category"] == "unsupported_shell_syntax"
+            and r["decision"] == "blocked"
+            and r["exit_code"] is None  # not executed
             for r in results
         )
-        assert found, f"Command substitution should be static classified. Got: {results[0]}"
+        assert found, f"Command substitution should be blocked/unsupported_shell_syntax and not executed. Got: {results[0]}"
     finally:
         import os
         os.unlink(fixture_file)
