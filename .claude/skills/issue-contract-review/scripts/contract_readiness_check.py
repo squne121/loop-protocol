@@ -321,21 +321,37 @@ def map_preflight_result_to_errors(
 
     # blocked with no results = body-structure issue (needs_fix)
     if overall_status == "blocked" and not preflight_result.get("results"):
-        for err_msg in preflight_result.get("errors", []):
+        for err_item in preflight_result.get("errors", []):
+            # B6: handle both structured dict errors and legacy plain strings
+            if isinstance(err_item, dict):
+                msg = err_item.get("message", "unknown error")
+                mc = err_item.get("minimal_context", "")
+                fh = err_item.get("fix_hint", (
+                    "Ensure Verification Commands section has fenced ```bash blocks "
+                    "with $ prefixed commands."
+                ))
+                rule = err_item.get("rule", "VCP001")
+                # Derive rule_id from structured rule field or fallback
+                rule_id = f"VCP_{rule}" if rule and rule != "VCP001" else "VCP001"
+            else:
+                msg = str(err_item)
+                mc = ""
+                fh = (
+                    "Ensure Verification Commands section has fenced ```bash blocks "
+                    "with $ prefixed commands."
+                )
+                rule_id = "VCP001"
             errors.append(
                 {
-                    "rule_id": "VCP001",
+                    "rule_id": rule_id,
                     "severity": "error",
                     "source_check": "baseline_vc_preflight",
                     "category": "no_commands_extracted",
                     "section": "Verification Commands",
                     "line_start": 0,
                     "line_end": 0,
-                    "minimal_context": [str(err_msg)],
-                    "fix_hint": (
-                        "Ensure Verification Commands section has fenced ```bash blocks "
-                        "with $ prefixed commands."
-                    ),
+                    "minimal_context": [msg] + ([mc] if mc else []),
+                    "fix_hint": fh,
                     "autofixable": False,
                 }
             )
@@ -556,7 +572,8 @@ def check_vc_static_syntax(body: str) -> list[dict]:
     # Only control operators that affect exit-code reliability are hard errors.
     compound_operators = frozenset(["&&", "||", "|", ";", "&"])
 
-    for block_match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", vc_section, re.DOTALL):
+    # B4: only ```bash fenced blocks are canonical VC format; unlabeled fences are ignored
+    for block_match in re.finditer(r"```bash[ \t]*\n(.*?)```", vc_section, re.DOTALL):
         block_content = block_match.group(1)
         block_start_in_section = vc_section[: block_match.start()].count("\n")
         block_abs_start = section_start_line + block_start_in_section

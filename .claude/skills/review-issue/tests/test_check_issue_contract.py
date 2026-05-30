@@ -672,29 +672,33 @@ class TestContractReadinessExecuteIntegration:
         The contract_readiness_check.py must NOT collapse this to needs_fix."""
         result, _exit_code = run_contract_readiness_from_content(_HUMAN_JUDGMENT_ISSUE_CONTENT, mode="execute")
 
-        # The fixture must produce at least one error (env_missing_dep → human_judgment)
+        # The fixture must produce at least one error.
+        # With the allowlist policy introduced in #514, unknown commands are classified as
+        # command_not_allowed / blocked (exit_code=None, not executed) rather than
+        # env_missing_dep / human_judgment (exit_code=127). Both must NOT be collapsed to needs_fix.
         errors = result.get("errors", [])
-        human_judgment_errors = [
+        non_needs_fix_errors = [
             e for e in errors
-            if e.get("category") in ("env_missing_dep", "timeout", "unknown")
-            or e.get("source_payload", {}).get("decision") == "human_judgment"
+            if e.get("category") in ("env_missing_dep", "timeout", "unknown", "command_not_allowed")
+            or e.get("source_payload", {}).get("decision") in ("human_judgment", "blocked")
         ]
-        assert len(human_judgment_errors) > 0, (
-            f"human_judgment fixture should produce at least one human_judgment error "
-            f"(env_missing_dep/timeout/unknown). errors: {errors}"
+        assert len(non_needs_fix_errors) > 0, (
+            f"human_judgment/blocked fixture should produce at least one non-needs_fix error "
+            f"(env_missing_dep/timeout/unknown/command_not_allowed). errors: {errors}"
         )
 
-        # Overall status must be human_judgment, NOT needs_fix (AC5)
-        assert result.get("status") == "human_judgment", (
-            f"human_judgment errors must NOT collapse overall status to needs_fix. "
-            f"status={result.get('status')}, human_judgment_errors={human_judgment_errors}"
+        # Overall status must be human_judgment or blocked (not needs_fix) (AC5)
+        # command_not_allowed blocked VCs map to status=human_judgment at the contract level.
+        assert result.get("status") in ("human_judgment", "blocked"), (
+            f"non-needs_fix errors must NOT collapse overall status to needs_fix. "
+            f"status={result.get('status')}, non_needs_fix_errors={non_needs_fix_errors}"
         )
 
-        # Confirm: no human_judgment error has been re-classified as needs_fix in source_payload
-        for err in human_judgment_errors:
+        # Confirm: no error has been re-classified as needs_fix in source_payload
+        for err in non_needs_fix_errors:
             payload = err.get("source_payload", {})
             assert payload.get("classification") != "needs_fix", (
-                f"human_judgment error must not be reclassified as needs_fix in source_payload: {err}"
+                f"blocked/human_judgment error must not be reclassified as needs_fix in source_payload: {err}"
             )
 
     def test_execute_uses_body_file_only_no_network(self):

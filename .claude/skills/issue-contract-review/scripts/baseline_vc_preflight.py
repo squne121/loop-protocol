@@ -90,11 +90,27 @@ def extract_verification_commands_section(body: str) -> Optional[str]:
 
 
 def extract_fenced_bash_blocks(section: str) -> List[str]:
-    """セクションから ```bash ... ``` ブロックを抽出"""
+    """
+    セクションから ```bash ... ``` ブロックを抽出。
+
+    B4: canonical format は ```bash のみ。unlabeled fence (```) は無視する。
+    """
     blocks = []
-    for match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", section, re.DOTALL):
-        blocks.append(match.group(1))
+    for match in re.finditer(r"```bash[ \t]*\n(.*?)```", section, re.DOTALL):
+        blocks.append(match.group(1).rstrip("\n"))
     return blocks
+
+
+def find_unlabeled_fenced_blocks(section: str) -> List[str]:
+    """
+    B4: unlabeled fence (``` without language specifier) を検出。
+
+    戻り値: unlabeled fence の内容リスト（警告用）
+    """
+    unlabeled = []
+    for match in re.finditer(r"```[ \t]*\n(.*?)```", section, re.DOTALL):
+        unlabeled.append(match.group(1).rstrip("\n"))
+    return unlabeled
 
 
 def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Optional[str]:
@@ -364,14 +380,17 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
     if cwd is None:
         cwd = str(Path.cwd())
 
-    # Check for exact command prefixes
-    prefixes = [
-        "pnpm typecheck",
-        "pnpm lint",
-        "pnpm test",
-        "pnpm build",
-    ]
-    if any(command.startswith(p) for p in prefixes):
+    # B1: Check for exact pnpm subcommand allowlist (argv-based, not prefix string)
+    try:
+        argv_check = shlex.split(command)
+    except ValueError:
+        argv_check = []
+    if (
+        argv_check
+        and Path(argv_check[0]).name == "pnpm"
+        and len(argv_check) >= 2
+        and ("pnpm", argv_check[1].lower()) in _ALLOWED_PNPM_SUBCOMMANDS
+    ):
         return True
 
     # Check for uv run pytest with existing test paths
@@ -491,6 +510,342 @@ def has_command_substitution(command: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Static command classification: allowlist / denylist policy (AC1-AC3)
+# ---------------------------------------------------------------------------
+
+# Commands that are explicitly denied (unsafe for baseline preflight)
+# Checked by the basename of argv[0]
+_DENIED_COMMANDS: frozenset = frozenset([
+    # Shell invocations
+    "bash", "sh", "zsh", "fish", "dash", "ksh",
+    # Inline code execution (python -c / python3 -c / node -e / perl -e / ruby -e)
+    # NOTE: python3 is special-cased below: only -m py_compile / -m pytest is allowed
+    "python",
+    "node", "perl", "ruby",
+    # Network access
+    "curl", "wget", "nc", "ncat", "ssh", "scp", "rsync",
+    # Filesystem mutation
+    "rm", "mv", "cp", "chmod", "chown", "touch",
+    "rmdir", "ln",
+    # Text stream mutation (sed -i is a mutation; all sed uses blocked for safety)
+    "sed", "tee",
+])
+
+# B3: git read-only subcommand allowlist (exact argv[1] check)
+# git -c / --config-env / --exec-path / alias.* flags → blocked via option-flag check
+# git worktree, git submodule, git bisect, etc. (not listed here) → blocked by default
+_ALLOWED_GIT_SUBCOMMANDS: frozenset = frozenset([
+    "status", "diff", "log", "show", "ls-files", "rev-parse", "branch", "tag", "-l",
+])
+
+# B3: gh read-only subcommand allowlist (exact argv tuple prefix check)
+# gh alias, gh extension, gh auth (mutation), etc. → blocked by default
+_ALLOWED_GH_PREFIXES: tuple = (
+    # Read-only tuples: (argv[1],) or (argv[1], argv[2])
+    ("issue", "view"),
+    ("pr", "view"),
+    ("pr", "list"),
+    ("issue", "list"),
+    ("repo", "view"),
+    # NOTE: gh api is blocked — mutation potential via POST/PATCH; not needed in VC context
+)
+
+# B1: pnpm exact subcommand allowlist (tuple-based)
+# Only these exact (argv[0], argv[1]) tuples are allowed for pnpm.
+# pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are blocked.
+_ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
+    ("pnpm", "typecheck"),
+    ("pnpm", "lint"),
+    ("pnpm", "test"),
+    ("pnpm", "build"),
+])
+
+# Explicitly allowed command basenames for baseline preflight
+# Anything NOT in this set is blocked by default (allowlist-closed policy, AC3)
+_ALLOWED_COMMANDS: frozenset = frozenset([
+    "test",      # test -f / -d / -s (read-only assertions)
+    "rg",        # ripgrep (read-only)
+    "grep",      # grep (read-only)
+    "fgrep",
+    "egrep",
+    "python3",   # allowed only when _is_allowed_python3_invocation passes
+    "uv",        # allowed only for uv run pytest / uv run python3 -m pytest
+    "pnpm",      # allowed only for typecheck/lint/test/build subcommands
+    "pytest",    # direct pytest invocation
+    "git",       # allowed only for read-only subcommands (show, log, diff, etc.)
+    "gh",        # allowed only for read-only subcommands (gh issue view, gh pr view)
+    "jq",        # read-only JSON filter
+    "cat",       # read-only
+    "ls",        # read-only
+    "find",      # read-only
+    "wc",        # read-only
+    "sort",      # read-only
+    "uniq",      # read-only
+    "head",      # read-only
+    "tail",      # read-only
+    "diff",      # read-only
+    "echo",      # safe
+    "printf",    # safe
+    "true",      # safe
+    "false",     # safe
+    "realpath",  # safe
+    "dirname",   # safe
+    "basename",  # safe
+    "which",     # safe
+    "type",      # safe
+    "env",       # safe (read env)
+    "printenv",  # safe (read env)
+    "pwd",       # safe
+    "date",      # safe
+    "stat",      # read-only
+    # NOTE: mkdir removed from allowlist (B2) — mkdir -p .git/hooks and similar mutations possible
+])
+
+
+def _is_allowed_python3_invocation(argv: List[str]) -> bool:
+    """
+    python3 is only allowed for:
+      - python3 -m py_compile <file>
+      - python3 -m pytest ...
+    Inline code (-c flag) is NOT allowed (AC2: python3 -c is blocked as unsafe_command).
+    """
+    if not argv or Path(argv[0]).name not in ("python3",):
+        return False
+    if len(argv) >= 2 and argv[1] == "-c":
+        return False  # inline code not allowed
+    if len(argv) >= 3 and argv[1] == "-m" and argv[2] in ("py_compile", "pytest"):
+        return True
+    return False
+
+
+def _is_allowed_git_invocation(argv: List[str]) -> bool:
+    """
+    B3: git read-only allowlist check.
+    Returns True only if the git subcommand is in the read-only allowlist.
+    Blocks git -c, --config-env, --exec-path option flags, and any unlisted subcommand.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return False
+    if len(argv) < 2:
+        return False
+    # Block global git option flags (e.g., git -c alias.x='!...')
+    second_arg = argv[1]
+    if second_arg.startswith("-") and second_arg not in ("-l",):
+        return False
+    subcommand = second_arg.lower()
+    return subcommand in _ALLOWED_GIT_SUBCOMMANDS
+
+
+def _is_allowed_gh_invocation(argv: List[str]) -> bool:
+    """
+    B3: gh read-only allowlist check.
+    Returns True only if the gh subcommand tuple is in the read-only allowlist.
+    Blocks gh alias, gh extension, gh auth (mutations), gh api, and any unlisted subcommand.
+    """
+    if not argv or Path(argv[0]).name != "gh":
+        return False
+    if len(argv) < 3:
+        return False
+    # Check (argv[1], argv[2]) tuple
+    sub_tuple = (argv[1].lower(), argv[2].lower())
+    return sub_tuple in _ALLOWED_GH_PREFIXES
+
+
+def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
+    """
+    B1: pnpm exact subcommand allowlist check.
+    Only (pnpm, typecheck), (pnpm, lint), (pnpm, test), (pnpm, build) are allowed.
+    pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are all blocked.
+    """
+    if not argv or Path(argv[0]).name != "pnpm":
+        return False
+    if len(argv) < 2:
+        return False
+    key = ("pnpm", argv[1].lower())
+    return key in _ALLOWED_PNPM_SUBCOMMANDS
+
+
+def classify_static_command(
+    raw_command: str, cwd: Path
+) -> Optional[Tuple[str, str, str, Optional[str], str]]:
+    """
+    Perform static pre-execution classification of a VC command.
+
+    Returns (classification, category, decision, fix_hint, scope_class) if
+    the command is blocked or can be determined statically without execution,
+    or None if the command should proceed to run_command().
+
+    This is called BEFORE run_command() to prevent dangerous commands from
+    being executed. AC1-AC3 enforcement happens here.
+    """
+    # 1. Check for unsupported shell syntax: $(...), `...`, ${...}  (AC1)
+    if has_command_substitution(raw_command):
+        return (
+            "blocked",
+            "unsupported_shell_syntax",
+            "blocked",
+            "Shell substitution ($(...), `...`, ${...}) is not supported in VC preflight; "
+            "use a direct command without command substitution",
+            "baseline_fail_expected",
+        )
+
+    # 2. Try to parse with shlex (AC1 edge: malformed shell syntax)
+    try:
+        argv = shlex.split(raw_command, posix=True)
+    except ValueError as e:
+        return (
+            "blocked",
+            "unsupported_shell_syntax",
+            "blocked",
+            f"Cannot parse command with shlex: {e}; check for unmatched quotes or unsupported syntax",
+            "baseline_fail_expected",
+        )
+
+    if not argv:
+        return (
+            "blocked",
+            "unsupported_shell_syntax",
+            "blocked",
+            "Empty command after parsing",
+            "baseline_fail_expected",
+        )
+
+    cmd_basename = Path(argv[0]).name
+
+    # 3. Check for compound commands (shell operators)
+    if detect_compound_command(raw_command):
+        return (
+            "blocked",
+            "compound_command_disallowed",
+            "blocked",
+            "Compound shell commands are not supported in baseline_vc_preflight/v1",
+            "baseline_fail_expected",
+        )
+
+    # 4. Check denied commands (unsafe, AC2)
+    if cmd_basename in _DENIED_COMMANDS:
+        return (
+            "blocked",
+            "unsafe_command",
+            "blocked",
+            f"'{cmd_basename}' is not safe for baseline preflight; "
+            "shell interpreters, network tools, and filesystem mutators are blocked",
+            "baseline_fail_expected",
+        )
+
+    # 5. Special case: python3 with -c flag (AC2: python3 -c is blocked)
+    if cmd_basename == "python3" and not _is_allowed_python3_invocation(argv):
+        # python3 without a recognized safe invocation pattern
+        if len(argv) >= 2 and argv[1] == "-c":
+            return (
+                "blocked",
+                "unsafe_command",
+                "blocked",
+                "python3 -c (inline code) is not allowed in VC preflight; "
+                "use python3 -m pytest or python3 -m py_compile instead",
+                "baseline_fail_expected",
+            )
+        # Other python3 invocations not matching safe patterns are command_not_allowed
+        return (
+            "blocked",
+            "command_not_allowed",
+            "blocked",
+            f"python3 invocation '{raw_command}' is not in the VC preflight allowlist; "
+            "use python3 -m pytest or python3 -m py_compile",
+            "baseline_fail_expected",
+        )
+
+    # 6. Check git: exact read-only allowlist (B3)
+    if cmd_basename == "git":
+        if not _is_allowed_git_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'git {argv[1] if len(argv) > 1 else ''}' is not in the git read-only allowlist; "
+                "allowed: status, diff, log, show, ls-files, rev-parse. "
+                "git worktree, git -c, and mutation commands are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed git read-only command
+
+    # 7. Check gh: exact read-only allowlist (B3)
+    if cmd_basename == "gh":
+        if not _is_allowed_gh_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'gh {' '.join(argv[1:])}' is not in the gh read-only allowlist; "
+                "allowed: gh issue view, gh pr view, gh pr list, gh issue list, gh repo view. "
+                "gh api, gh alias, gh extension, and mutation commands are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed gh read-only command
+
+    # 8. Check pnpm: exact subcommand allowlist (B1)
+    if cmd_basename == "pnpm":
+        if not _is_allowed_pnpm_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'pnpm {argv[1] if len(argv) > 1 else ''}' is not in the pnpm allowlist; "
+                "only pnpm typecheck, pnpm lint, pnpm test, pnpm build are allowed. "
+                "pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed pnpm subcommand
+
+    # 9. Check uv: only allow uv run pytest / uv run python -m pytest / uv run python3 -m pytest
+    if cmd_basename == "uv":
+        if len(argv) >= 2 and argv[1] == "run":
+            unwrapped = _strip_uv_run_options(argv)
+            if unwrapped and Path(unwrapped[0]).name in ("pytest",):
+                return None  # allowed
+            if (
+                unwrapped
+                and Path(unwrapped[0]).name in ("python", "python3")
+                and len(unwrapped) >= 3
+                and unwrapped[1] == "-m"
+                and unwrapped[2] == "pytest"
+            ):
+                return None  # allowed
+            # uv run <other> is not in allowlist
+            inner_cmd = unwrapped[0] if unwrapped else "<unknown>"
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'uv run {inner_cmd}' is not in the VC preflight allowlist; "
+                "only 'uv run pytest' and 'uv run python3 -m pytest' are allowed",
+                "baseline_fail_expected",
+            )
+        else:
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"uv subcommand '{argv[1] if len(argv) > 1 else ''}' is not in the VC preflight allowlist",
+                "baseline_fail_expected",
+            )
+
+    # 10. Default allowlist check: command not in allowed set → blocked (AC3)
+    if cmd_basename not in _ALLOWED_COMMANDS:
+        return (
+            "blocked",
+            "command_not_allowed",
+            "blocked",
+            f"'{cmd_basename}' is not in the VC preflight allowlist; "
+            "only explicitly allowed commands are permitted "
+            "(rg, test, grep, uv run pytest, pnpm typecheck/lint/test/build, etc.)",
+            "baseline_fail_expected",
+        )
+
+    return None  # proceed to execution
+
+
 def classify_result(
     exit_code: int,
     stdout: str,
@@ -512,7 +867,8 @@ def classify_result(
       classification: expected_fail | unexpected_pass | blocked | human_judgment | expected_pass | skipped
       category: file_not_found_expected | expected_baseline_fail | unexpected_pass |
                 env_missing_dep | file_not_found_unrunnable | timeout |
-                compound_command_disallowed | unknown | regression_gate
+                compound_command_disallowed | unsupported_shell_syntax |
+                unsafe_command | command_not_allowed | unknown | regression_gate
       decision: go | blocked | human_judgment
       fix_hint: nullable hint
       scope_class: baseline_fail_expected | regression_gate | pr_review_only | runtime_only
@@ -522,9 +878,16 @@ def classify_result(
     if _is_negated_search_command(command):
         return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-    # B2: command substitution detection - static classification without execution
+    # AC1: command substitution detection - blocked (unsupported_shell_syntax), not executed
     if has_command_substitution(command):
-        return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+        return (
+            "blocked",
+            "unsupported_shell_syntax",
+            "blocked",
+            "Shell substitution ($(...), `...`, ${...}) is not supported in VC preflight; "
+            "use a direct command without command substitution",
+            "baseline_fail_expected",
+        )
 
     # compound command は blocked (default scope_class)
     if detect_compound_command(command):
@@ -536,21 +899,24 @@ def classify_result(
         if exit_code == 0:
             return "expected_pass", "regression_gate", "go", None, "regression_gate"
         else:
-            # B3: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
+            # B5: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
             if _is_pytest_invocation(command):
                 combined_lower = f"{stdout}\n{stderr}".lower()
 
-                # B3: pytest exit 4 + file not found → expected_baseline_fail
+                # pytest exit 4 + file not found → expected_baseline_fail (env/path missing)
                 if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
                     return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-                # B3: pytest exit 5 + no tests collected → expected_baseline_fail
-                if exit_code == 5 and (
-                    "no tests ran" in combined_lower
-                    or "no tests collected" in combined_lower
-                    or "collected 0 items" in combined_lower
-                ):
-                    return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+                # B5: pytest exit 5 → vc_no_tests_collected / blocked
+                # exit 5 is "no tests collected" — -k condition mismatch or wrong path
+                if exit_code == 5:
+                    return (
+                        "blocked",
+                        "vc_no_tests_collected",
+                        "blocked",
+                        "pytest collected 0 tests (exit 5); check -k filter or test path",
+                        "baseline_fail_expected",
+                    )
 
             return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
 
@@ -595,17 +961,20 @@ def classify_result(
     if _is_pytest_invocation(command):
         combined_lower = f"{stdout}\n{stderr}".lower()
 
-        # AC2: pytest exit 4 + file not found → expected_baseline_fail
+        # pytest exit 4 + file not found → expected_baseline_fail (path/env missing)
         if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
             return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-        # AC3: pytest exit 5 + no tests collected → expected_baseline_fail
-        if exit_code == 5 and (
-            "no tests ran" in combined_lower
-            or "no tests collected" in combined_lower
-            or "collected 0 items" in combined_lower
-        ):
-            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+        # B5: pytest exit 5 → vc_no_tests_collected / blocked
+        # exit 5 = no tests collected (-k mismatch, wrong path, etc.) → not a valid baseline VC
+        if exit_code == 5:
+            return (
+                "blocked",
+                "vc_no_tests_collected",
+                "blocked",
+                "pytest collected 0 tests (exit 5); check -k filter or test path",
+                "baseline_fail_expected",
+            )
 
     # expected baseline fail patterns
     # rg with no match returns 1
@@ -646,16 +1015,21 @@ def compute_confidence(category: str) -> str:
     """
     B8: category に基づいて confidence を算出.
 
-    高確度: compound_command_disallowed, file_not_found_expected, expected_baseline_fail, env_missing_dep, file_not_found_unrunnable
+    高確度: compound_command_disallowed, unsupported_shell_syntax, unsafe_command, command_not_allowed,
+            file_not_found_expected, expected_baseline_fail, env_missing_dep, file_not_found_unrunnable
     中確度: timeout, unexpected_pass
     低確度: unknown
     """
     high_confidence = {
         "compound_command_disallowed",
+        "unsupported_shell_syntax",
+        "unsafe_command",
+        "command_not_allowed",
         "file_not_found_expected",
         "expected_baseline_fail",
         "env_missing_dep",
         "file_not_found_unrunnable",
+        "vc_no_tests_collected",
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -855,7 +1229,15 @@ def main() -> int:
                 "extraction_errors": 1,
             },
             "results": [],
-            "errors": [error_code or "failed_to_retrieve_issue_body"],
+            "errors": [
+                {
+                    "kind": "retrieval_error",
+                    "rule": "VC000_BODY_RETRIEVAL_FAILED",
+                    "message": error_code or "failed_to_retrieve_issue_body",
+                    "minimal_context": f"issue={args.issue}, repo={args.repo}",
+                    "fix_hint": "Check GitHub credentials (gh auth status) and issue number",
+                }
+            ],
         }
         print(json.dumps(result, indent=2))
         # C2: exit code 2 for retrieval/parse errors
@@ -882,13 +1264,21 @@ def main() -> int:
                 "extraction_errors": 1,
             },
             "results": [],
-            "errors": ["Verification Commands section not found"],
+            "errors": [
+                {
+                    "kind": "extraction_error",
+                    "rule": "VC001_NO_VERIFICATION_COMMANDS_SECTION",
+                    "message": "Verification Commands section not found",
+                    "minimal_context": "body does not contain '## Verification Commands' heading",
+                    "fix_hint": "Add a '## Verification Commands' section with fenced bash blocks to the Issue body",
+                }
+            ],
         }
         print(json.dumps(result, indent=2))
         # C2: exit code 2 for extraction errors
         return 2
 
-    # bash ブロックからコマンドを抽出
+    # B4: bash ブロックからコマンドを抽出 (```bash のみ canonical format)
     blocks = extract_fenced_bash_blocks(vc_section)
     commands = []
     for block in blocks:
@@ -896,6 +1286,27 @@ def main() -> int:
 
     # B3: 0 件抽出は blocked として返す
     if not commands:
+        # B4: check for unlabeled fences to provide better error message
+        unlabeled = find_unlabeled_fenced_blocks(vc_section)
+        if unlabeled:
+            no_cmd_error = {
+                "kind": "unsupported_vc_format",
+                "rule": "VC003_UNLABELED_FENCE_BLOCK",
+                "message": "Unlabeled fenced code blocks (```) found in Verification Commands section; "
+                           "only ```bash fenced blocks are the canonical VC format",
+                "minimal_context": "unlabeled fence blocks are not extracted as VC commands",
+                "fix_hint": "Change ``` to ```bash in Verification Commands fenced blocks; "
+                            "```bash ... ``` is the canonical VC format",
+            }
+        else:
+            no_cmd_error = {
+                "kind": "extraction_error",
+                "rule": "VC002_NO_COMMANDS_EXTRACTED",
+                "message": "No verification commands extracted from Verification Commands section",
+                "minimal_context": "fenced bash blocks found but no commands extracted",
+                "fix_hint": "Add '$ <command>' lines inside fenced bash blocks in the Verification Commands section; "
+                            "fenced bash blocks (```bash ... ```) are the canonical VC format",
+            }
         result = {
             "schema": "baseline_vc_preflight/v1",
             "issue": args.issue or 0,
@@ -914,7 +1325,7 @@ def main() -> int:
                 "extraction_errors": 1,
             },
             "results": [],
-            "errors": ["No verification commands extracted from Verification Commands section"],
+            "errors": [no_cmd_error],
         }
         print(json.dumps(result, indent=2))
         # C2: exit code 2 for extraction errors
@@ -967,44 +1378,33 @@ def main() -> int:
                 deferred_reason = None
                 runtime_verification_required = None
         else:
-            # B2: Static classification checks BEFORE run_command (CRITICAL)
-            # Check for command substitution and negated search BEFORE execution
-            if has_command_substitution(command):
+            # Static classification checks BEFORE run_command (CRITICAL)
+            # Negated search commands are statically classified as expected_fail/go
+            if _is_negated_search_command(command):
                 exit_code, stdout, stderr, duration_ms = None, "", "", 0
                 classification, category, decision, fix_hint, scope_class = (
                     "expected_fail",
                     "expected_baseline_fail",
                     "go",
                     None,
-                    "baseline_fail_expected",
-                )
-            elif _is_negated_search_command(command):
-                exit_code, stdout, stderr, duration_ms = None, "", "", 0
-                classification, category, decision, fix_hint, scope_class = (
-                    "expected_fail",
-                    "expected_baseline_fail",
-                    "go",
-                    None,
-                    "baseline_fail_expected",
-                )
-            elif detect_compound_command(command):
-                exit_code, stdout, stderr, duration_ms = None, "", "", 0
-                classification, category, decision, fix_hint, scope_class = (
-                    "blocked",
-                    "compound_command_disallowed",
-                    "blocked",
-                    "Compound shell commands are not supported in baseline_vc_preflight/v1",
                     "baseline_fail_expected",
                 )
             else:
-                # B2: Only run command if not statically classified
-                exit_code, stdout, stderr, duration_ms = run_command(
-                    command, args.timeout_seconds, args.cwd
-                )
+                # AC1-AC3: classify_static_command checks unsafe/unsupported commands
+                # BEFORE any execution attempt
+                static_result = classify_static_command(command, Path(args.cwd))
+                if static_result is not None:
+                    exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                    classification, category, decision, fix_hint, scope_class = static_result
+                else:
+                    # Safe to run: execute the command
+                    exit_code, stdout, stderr, duration_ms = run_command(
+                        command, args.timeout_seconds, args.cwd
+                    )
 
-                classification, category, decision, fix_hint, scope_class = classify_result(
-                    exit_code, stdout, stderr, command, cwd=args.cwd
-                )
+                    classification, category, decision, fix_hint, scope_class = classify_result(
+                        exit_code, stdout, stderr, command, cwd=args.cwd
+                    )
 
             verification_owner = None
             deferred_reason = None
