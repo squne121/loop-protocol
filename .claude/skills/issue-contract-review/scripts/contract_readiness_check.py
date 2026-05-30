@@ -13,6 +13,9 @@ Exit codes:
 
 Modes:
   --mode static  (default): VC syntax, section, schema only. No VC execution. No network.
+  --mode preflight-static: Same as static. Alias for review-issue / issue-reviewer callers.
+    Detects compound_command_disallowed statically (no execution).
+    unexpected_pass detection requires --mode execute (execution-only signal).
   --mode execute: Invokes baseline_vc_preflight.py to run VCs. May have side effects.
 
 Inputs:
@@ -536,7 +539,9 @@ def check_vc_static_syntax(body: str) -> list[dict]:
     vc_section = vc_match.group(1)
     section_start_line = body[: vc_match.start()].count("\n") + 2  # +2 for header
 
-    compound_operators = frozenset(["&&", "||", "|", ";", "&", "<<", ">>"])
+    # Sync operator set with baseline_vc_preflight.py detect_compound_command()
+    # Includes: <, >, <<< in addition to && || | ; & << >>
+    compound_operators = frozenset(["&&", "||", "|", ";", "&", "<<", ">>", "<", ">", "<<<"])
 
     for block_match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", vc_section, re.DOTALL):
         block_content = block_match.group(1)
@@ -683,9 +688,9 @@ def build_result(
             preflight_result
         )
 
-    # Static VC syntax check: only in static mode (execute mode uses preflight)
+    # Static VC syntax check: in static/preflight-static mode (execute mode uses preflight)
     static_vc_errors: list[dict] = []
-    if mode == "static":
+    if mode in ("static", "preflight-static"):
         static_vc_errors = check_vc_static_syntax(body)
 
     all_errors = validate_errors + rva_errors + static_vc_errors + preflight_errors
@@ -732,10 +737,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["static", "execute"],
+        choices=["static", "preflight-static", "execute"],
         default="static",
         help=(
             "static (default): VC syntax/section/schema only; no execution, no network. "
+            "preflight-static: alias for static; use in review-issue / issue-reviewer callers. "
+            "  Detects compound_command_disallowed statically. "
+            "  unexpected_pass detection requires --mode execute (execution-only signal). "
             "execute: also runs baseline_vc_preflight.py to execute VCs."
         ),
     )
@@ -786,7 +794,7 @@ def main() -> int:
     # Run baseline_vc_preflight only in execute mode
     preflight_result: Optional[dict] = None
     preflight_exit_code: Optional[int] = None
-    if args.mode == "execute":
+    if args.mode == "execute":  # preflight-static is static-only; no execution
         preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
 
     result = build_result(body, args.mode, validate_result, preflight_result, preflight_exit_code)

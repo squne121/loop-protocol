@@ -623,3 +623,151 @@ def test_issue412_go_fixture():
         f"Errors: {data['errors']}"
     )
     assert exit_code == 0
+
+# ---------------------------------------------------------------------------
+# AC3 Unit: map_preflight_result_to_errors() with synthetic preflight JSON
+# (No environment-dependent rg execution — purely unit testing the mapper)
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(_SCRIPTS_DIR))
+from contract_readiness_check import map_preflight_result_to_errors
+
+
+def test_unexpected_pass_maps_to_needs_fix():
+    """AC3 unit: synthetic unexpected_pass result → needs_fix status and category in errors."""
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "rg foo file.md",
+                "raw_command": "rg foo file.md",
+                "exit_code": 0,
+                "classification": "unexpected_pass",
+                "category": "unexpected_pass",
+                "decision": "blocked",
+                "confidence": "high",
+                "scope_class": "baseline_fail_expected",
+                "line": 42,
+                "fix_hint": "VC passed before implementation. Tighten VC so it fails at baseline.",
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "needs_fix", f"Expected needs_fix, got {aggregate}"
+    assert any(e["category"] == "unexpected_pass" for e in errors), (
+        f"unexpected_pass not found in errors: {errors}"
+    )
+
+
+def test_compound_command_maps_to_needs_fix():
+    """AC3 unit: synthetic compound_command_disallowed result → needs_fix."""
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "pnpm build && echo DONE",
+                "raw_command": "pnpm build && echo DONE",
+                "exit_code": -1,
+                "classification": "blocked",
+                "category": "compound_command_disallowed",
+                "decision": "blocked",
+                "confidence": "high",
+                "scope_class": "baseline_fail_expected",
+                "line": 10,
+                "fix_hint": "Replace compound shell command with a single command.",
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "needs_fix", f"Expected needs_fix, got {aggregate}"
+    assert any(e["category"] == "compound_command_disallowed" for e in errors)
+
+
+def test_human_judgment_decision_not_collapsed():
+    """AC3 unit: human_judgment decision MUST NOT be collapsed to needs_fix."""
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "some_tool --check",
+                "raw_command": "some_tool --check",
+                "exit_code": 127,
+                "classification": "blocked",
+                "category": "env_missing_dep",
+                "decision": "human_judgment",
+                "confidence": "high",
+                "scope_class": "baseline_fail_expected",
+                "line": 5,
+                "fix_hint": "Required tool missing. Human intervention needed.",
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "human_judgment", (
+        f"human_judgment must not be collapsed to needs_fix, got: {aggregate}"
+    )
+
+
+def test_expected_baseline_fail_maps_to_go():
+    """AC3 unit: expected_baseline_fail → go (no error emitted)."""
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "pass",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "rg 'new_function' src/new_file.py",
+                "raw_command": "rg 'new_function' src/new_file.py",
+                "exit_code": 1,
+                "classification": "expected_fail",
+                "category": "expected_baseline_fail",
+                "decision": "go",
+                "confidence": "high",
+                "scope_class": "baseline_fail_expected",
+                "line": 8,
+                "fix_hint": "",
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "go", f"Expected go, got {aggregate}"
+    assert not errors, f"Expected no errors for expected_baseline_fail, got: {errors}"
+
+
+def test_preflight_static_mode_schema_valid():
+    """AC3 unit: --mode preflight-static returns valid schema (static alias)."""
+    # preflight-static is an alias for static; should not run baseline_vc_preflight
+    body_file = _FIXTURES_DIR / "issue412_contract_go.md"
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--body-file", str(body_file), "--mode", "preflight-static"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.stdout, f"No stdout from preflight-static mode (stderr: {result.stderr})"
+    data = json.loads(result.stdout)
+    assert data.get("schema") == "ISSUE_CONTRACT_READINESS_RESULT_V1"
+    assert data["status"] in VALID_STATUSES
+    # preflight-static must NOT run baseline_vc_preflight
+    source_names = [sc["name"] for sc in data["source_checks"]]
+    assert "baseline_vc_preflight" not in source_names, (
+        "preflight-static mode must not run baseline_vc_preflight"
+    )

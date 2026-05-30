@@ -25,7 +25,9 @@ skills:
 - **read-only**: Issue の mutation を行わない
 - **loop worker**: `issue-refinement-loop` orchestrator から呼ばれ、結果を返して終了する
 - **script-first executor**: C1〜C12 の決定論的チェック・scope mismatch / VC anti-pattern / C1 skeleton 系 non-blocking warning・diff_proposal の生成は `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。
-- **contract readiness consumer**: `ISSUE_CONTRACT_READINESS_RESULT_V1` を `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py --mode static` で取得し、`errors[]` が空でない場合は各 `fix_hint` を `blocking_issues` に転写して `verdict: needs-fix` とする（判定ロジックは helper に委譲し、本 SubAgent では再実装しない）。
+- **contract readiness consumer**: `ISSUE_CONTRACT_READINESS_RESULT_V1` を `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py --mode preflight-static` で取得し、`errors[]` が空でない場合は以下の 2 系統に分離する：(1) 各 `fix_hint` 文字列を `blocking_issues` に転写する（人間向け要約）、(2) `errors[]` 構造体をそのまま `structured_blockers` に転写する（機械処理用・issue-author への修復 payload）。`verdict: needs-fix` とする（判定ロジックは helper に委譲し、本 SubAgent では再実装しない）。
+
+  Note: `--mode preflight-static` は静的に `compound_command_disallowed` を検出する。`unexpected_pass` は VC を実際に実行しないと検出不可であり、`issue-contract-review` の `--mode execute` で検出される設計。
 
 ## Result & Consume Contract (SubAgent-owned)
 
@@ -52,6 +54,7 @@ REVIEW_ISSUE_RESULT_V1:
   needs_second_pass: <bool> # iteration limit 時に orchestrator が参照
   failure_class: null | checker_unavailable | ...
   blocking_issues: []
+  structured_blockers: []  # contract_readiness_check.py errors[] そのまま（機械処理用）
   non_blocking_improvements: []
   diff_proposal: { add: [], remove: [], rewrite: [] }
   deterministic_checks: { C1: pass, C2: pass, ... }
@@ -98,7 +101,7 @@ REVIEW_ISSUE_RESULT_V1:
 - `REVIEW_ISSUE_RESULT_V1` の全フィールドを欠落なく返す
 - `verdict` と `status` を必ず含める（orchestrator の routing 判断に使われるため）
 - `deterministic_checks` の全 C1〜C13 フィールドを含める
-- `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を欠落なく checker JSON から pass-through する
+- `blocking_issues` / `structured_blockers` / `non_blocking_improvements` / `diff_proposal` を欠落なく checker JSON から pass-through する
 - `non_blocking_improvements` の各要素は `{code, severity, evidence, suggested_action}` 構造を保持する（`evidence` は `list[str]`、`details` は warning 固有の optional dict）
 - `diff_proposal.add` の `missing_section_skeleton` エントリは `{kind, section, placeholder_source, skeleton}` 構造を保持する
 - `update_applied: false` を明示する（本 SubAgent は更新を行わないため）
