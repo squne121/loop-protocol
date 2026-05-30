@@ -1,0 +1,92 @@
+# markdownlint-cli2 configuration for LOOP_PROTOCOL
+# Baseline pass mode: disable rules that cause false positives on existing docs.
+# Rules can be progressively re-enabled as the codebase is cleaned up.
+
+globs:
+  - "**/*.md"
+
+ignores:
+  - "node_modules/**"
+  - ".claude/**"
+  - "dist/**"
+  - "coverage/**"
+  - "playwright-report/**"
+  - "test-results/**"
+  - "docs/**"
+  - ".github/**"
+
+config:
+  default: true
+
+  # --- Disabled for baseline compatibility ---
+
+  # MD013: Line length — disable (long technical/code lines are common)
+  MD013: false
+
+  # MD033: Inline HTML — disable (used in README badges etc.)
+  MD033: false
+
+  # MD041: First line should be top level heading — disable (YAML frontmatter)
+  MD041: false
+
+  # MD034: Bare URL used — disable
+  MD034: false
+
+  # MD040: Fenced code blocks language — enabled to detect unlabeled code fences
+  # allow-empty: false (default) — language specifier is required
+  MD040: true
+
+  # MD004: Unordered list style — disable (mixed styles exist)
+  MD004: false
+
+  # MD007: Unordered list indentation — disable (4-space indent used in some docs)
+  MD007: false
+
+  # MD056: Table column count — disable
+  MD056: false
+
+  # MD018: No space after # (conflicts with issue number patterns like #242)
+  MD018: false
+
+  # MD036: Emphasis as heading — disable for Japanese text
+  MD036: false
+
+  # MD028: Blank line inside blockquote — disable
+  MD028: false
+
+  # MD022: Headings blank lines — disable
+  MD022: false
+
+  # MD032: Lists blank lines — disable
+  MD032: false
+
+  # MD031: Fenced code blocks blank lines — disable
+  MD031: false
+
+  # MD025: Multiple top-level headings — disable
+  MD025: false
+
+  # MD026: Trailing punctuation in headings — disable for Japanese
+  MD026: false
+
+  # MD014: Dollar signs before commands — disable (used as prompt indicator in VC docs)
+  MD014: false
+
+  # MD009: Trailing spaces — disable (some intentional line breaks with 1 space)
+  MD009: false
+
+  # MD029: Ordered list prefix style — disable (some fixtures use reset numbering)
+  MD029: false
+
+  # MD037: Spaces inside emphasis markers — disable
+  MD037: false
+
+  # --- Kept enabled ---
+
+  # MD012: Multiple consecutive blank lines
+  MD012:
+    maximum: 2
+
+  # MD024: Multiple headings with same content — siblings only
+  MD024:
+    siblings_only: true

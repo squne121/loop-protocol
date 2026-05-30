@@ -1,0 +1,10 @@
+# textlint ignore patterns
+# .claude/ contains agent/skill definitions and fixture files that use
+# controlled vocabulary (AC, VC, etc.) in structured formats — excluded
+# from prose lint to avoid false positives on fixture/template content.
+.claude/**
+# docs/ and .github/ contain existing content with prh vocabulary that
+# predates the textlint introduction — excluded to avoid false positives
+# on existing terminology. New docs should comply with textlint rules.
+docs/**
+.github/**
