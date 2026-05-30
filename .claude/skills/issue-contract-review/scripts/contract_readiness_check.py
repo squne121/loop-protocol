@@ -131,12 +131,13 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
         )
         if result.stdout:
             return json.loads(result.stdout)
+        # Empty output or non-zero exit 2+ — validator internal error (not body-author-fixable)
         return {
             "schema": "loop_body_lint/v1",
-            "status": "fail",
+            "status": "validator_internal_error",
             "errors": [
                 {
-                    "rule_id": "INTERNAL",
+                    "rule_id": "VALIDATOR_INTERNAL",
                     "severity": "error",
                     "section": "(global)",
                     "line_start": 0,
@@ -144,18 +145,19 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
                     "message": result.stderr or "no output from validate_issue_body",
                     "minimal_context": [],
                     "context_truncated": False,
-                    "fix_hint": "",
+                    "fix_hint": "validator 実行環境を確認してください",
                     "autofixable": False,
                 }
             ],
         }
     except subprocess.TimeoutExpired:
+        # Tool-level failure — not fixable by body author
         return {
             "schema": "loop_body_lint/v1",
-            "status": "fail",
+            "status": "validator_tool_error",
             "errors": [
                 {
-                    "rule_id": "INTERNAL",
+                    "rule_id": "VALIDATOR_TIMEOUT",
                     "severity": "error",
                     "section": "(global)",
                     "line_start": 0,
@@ -163,18 +165,19 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
                     "message": "validate_issue_body timed out",
                     "minimal_context": [],
                     "context_truncated": False,
-                    "fix_hint": "",
+                    "fix_hint": "validator 実行環境を確認してください",
                     "autofixable": False,
                 }
             ],
         }
     except json.JSONDecodeError as exc:
+        # JSON decode error — validator internal error (not body-author-fixable)
         return {
             "schema": "loop_body_lint/v1",
-            "status": "fail",
+            "status": "validator_internal_error",
             "errors": [
                 {
-                    "rule_id": "INTERNAL",
+                    "rule_id": "VALIDATOR_JSON_ERROR",
                     "severity": "error",
                     "section": "(global)",
                     "line_start": 0,
@@ -182,7 +185,7 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
                     "message": f"json decode error: {exc}",
                     "minimal_context": [],
                     "context_truncated": False,
-                    "fix_hint": "",
+                    "fix_hint": "validator 実行環境を確認してください",
                     "autofixable": False,
                 }
             ],
@@ -389,6 +392,14 @@ def map_preflight_result_to_errors(
                     "minimal_context": _build_vc_context(r),
                     "fix_hint": r.get("fix_hint") or _default_fix_hint(category),
                     "autofixable": category in ("compound_command_disallowed",),
+                    "source_payload": {
+                        "classification": classification,
+                        "decision": decision,
+                        "confidence": r.get("confidence", ""),
+                        "exit_code": r.get("exit_code"),
+                        "command_hash": r.get("command_hash", ""),
+                        "duration_ms": r.get("duration_ms"),
+                    },
                 }
             )
 
@@ -539,9 +550,11 @@ def check_vc_static_syntax(body: str) -> list[dict]:
     vc_section = vc_match.group(1)
     section_start_line = body[: vc_match.start()].count("\n") + 2  # +2 for header
 
-    # Sync operator set with baseline_vc_preflight.py detect_compound_command()
-    # Includes: <, >, <<< in addition to && || | ; & << >>
-    compound_operators = frozenset(["&&", "||", "|", ";", "&", "<<", ">>", "<", ">", "<<<"])
+    # Sync operator set with body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL
+    # Redirect operators (<, >, <<, >>, <<<) are NOT enforced here:
+    # they risk false positives with placeholder syntax (e.g., <file>, <pattern>).
+    # Only control operators that affect exit-code reliability are hard errors.
+    compound_operators = frozenset(["&&", "||", "|", ";", "&"])
 
     for block_match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", vc_section, re.DOTALL):
         block_content = block_match.group(1)
@@ -622,9 +635,15 @@ def compute_aggregate_status(
     """
     status = "go"
 
-    # validate_issue_body errors: all body-author-fixable → needs_fix
+    # validate_issue_body errors: body-author-fixable → needs_fix
+    # validator_tool_error / validator_internal_error → human_judgment (not author-fixable)
     if any(e.get("severity") == "error" for e in validate_errors):
-        status = _raise_status(status, "needs_fix")
+        # Check if errors come from a tool/internal failure (not body-author-fixable)
+        tool_error_rule_ids = {"VALIDATOR_TIMEOUT", "VALIDATOR_INTERNAL", "VALIDATOR_JSON_ERROR"}
+        if any(e.get("rule_id") in tool_error_rule_ids for e in validate_errors):
+            status = _raise_status(status, "human_judgment")
+        else:
+            status = _raise_status(status, "needs_fix")
 
     # RVA immediate field errors: author can add fields → needs_fix
     if rva_errors:

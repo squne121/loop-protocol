@@ -52,6 +52,10 @@ REQUIRED_ERROR_KEYS = {
     "autofixable",
 }
 
+# source_payload is an optional field present only for baseline_vc_preflight errors (AC3 lossless)
+OPTIONAL_ERROR_KEYS = {"source_payload"}
+ALLOWED_ERROR_KEYS = REQUIRED_ERROR_KEYS | OPTIONAL_ERROR_KEYS
+
 REQUIRED_SOURCE_CHECK_KEYS = {"name", "schema", "status", "exit_code"}
 
 VALID_STATUSES = {"go", "needs_fix", "human_judgment"}
@@ -150,11 +154,10 @@ def test_schema_strict_no_unknown_top_level_keys():
 
 
 def test_schema_strict_error_item_no_unknown_keys():
-    """AC13: each error item must not have unknown keys."""
-    allowed_error_keys = REQUIRED_ERROR_KEYS
+    """AC13: each error item must not have unknown keys (source_payload is allowed for preflight errors)."""
     data, _ = run_readiness(_FIXTURES_DIR / "issue412_contract_blocked.md")
     for err in data["errors"]:
-        unknown = set(err.keys()) - allowed_error_keys
+        unknown = set(err.keys()) - ALLOWED_ERROR_KEYS
         assert not unknown, f"Unknown error item keys: {unknown}"
 
 
@@ -770,4 +773,209 @@ def test_preflight_static_mode_schema_valid():
     source_names = [sc["name"] for sc in data["source_checks"]]
     assert "baseline_vc_preflight" not in source_names, (
         "preflight-static mode must not run baseline_vc_preflight"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC3 Lossless: source_payload field presence (Blocker 2)
+# ---------------------------------------------------------------------------
+
+
+def test_source_payload_present_in_preflight_errors():
+    """AC3 lossless: errors from baseline_vc_preflight must include source_payload with all fields."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "pnpm build && echo DONE",
+                "raw_command": "pnpm build && echo DONE",
+                "exit_code": -1,
+                "classification": "blocked",
+                "category": "compound_command_disallowed",
+                "decision": "blocked",
+                "confidence": "high",
+                "command_hash": "sha256:abc123",
+                "duration_ms": 42,
+                "scope_class": "baseline_fail_expected",
+                "line": 10,
+                "fix_hint": "Replace compound shell command with a single command.",
+                "stdout_head": [],
+                "stderr_head": [],
+            }
+        ],
+        "errors": [],
+    }
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert errors, "Expected at least one error"
+    err = errors[0]
+    assert "source_payload" in err, f"source_payload missing from error: {list(err.keys())}"
+    sp = err["source_payload"]
+    required_payload_fields = {"classification", "decision", "confidence", "exit_code", "command_hash", "duration_ms"}
+    missing = required_payload_fields - set(sp.keys())
+    assert not missing, f"source_payload missing fields: {missing}"
+    assert sp["classification"] == "blocked"
+    assert sp["decision"] == "blocked"
+    assert sp["confidence"] == "high"
+    assert sp["exit_code"] == -1
+    assert sp["command_hash"] == "sha256:abc123"
+    assert sp["duration_ms"] == 42
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: Redirect operators not flagged as compound (< > << >> <<<)
+# ---------------------------------------------------------------------------
+
+
+REDIRECT_OPERATOR_BODY = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "1"
+goal_ref: "test"
+change_kind: workflow
+```
+
+## Parent Issue
+
+#1
+
+## Outcome
+
+Test outcome.
+
+## In Scope
+
+- test
+
+## Out of Scope
+
+- n/a
+
+## Acceptance Criteria
+
+- [ ] AC1: Foo
+
+## Verification Commands
+
+```bash
+# AC1
+$ rg "pattern" < input.txt
+$ command > output.txt
+$ command << EOF
+$ heredoc_cmd <<< string
+$ cmd >> append.txt
+```
+
+## Allowed Paths
+
+```
+src/
+```
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要と判明した場合
+- In Scope の固定契約の変更が必要になった場合
+- 新規 Issue の起票が必要と判断した場合
+- 後続 Phase / 別スコープへの波及が判明した場合
+- nested SubAgent delegation が必要になった場合
+- 外部サービス利用・権限昇格・既存テスト大規模改変が必要になった場合
+
+## Runtime Verification Applicability
+
+```yaml
+decision: not_applicable
+```
+"""
+
+
+def test_redirect_operators_not_flagged_as_compound():
+    """Blocker 4: <, >, <<, >>, <<< must NOT be flagged as compound_command_disallowed."""
+    from contract_readiness_check import check_vc_static_syntax
+
+    errors = check_vc_static_syntax(REDIRECT_OPERATOR_BODY)
+    compound_errors = [e for e in errors if e["category"] == "compound_command_disallowed"]
+    assert not compound_errors, (
+        f"Redirect operators should not be flagged as compound_command_disallowed: "
+        f"{[e['minimal_context'] for e in compound_errors]}"
+    )
+
+
+def test_control_operators_still_flagged():
+    """Blocker 4 (contrast): &&, ||, |, ;, & must still be flagged."""
+    from contract_readiness_check import check_vc_static_syntax
+
+    errors = check_vc_static_syntax(COMPOUND_BODY)  # COMPOUND_BODY uses &&
+    compound_errors = [e for e in errors if e["category"] == "compound_command_disallowed"]
+    assert compound_errors, "Control operators (&&) should still be flagged as compound_command_disallowed"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: validator tool/internal errors → human_judgment
+# ---------------------------------------------------------------------------
+
+
+def test_validator_tool_error_maps_to_human_judgment():
+    """Blocker 1: validator_tool_error status → human_judgment aggregate (not needs_fix)."""
+    from contract_readiness_check import compute_aggregate_status
+
+    # Simulate validator timeout error
+    validator_timeout_errors = [
+        {
+            "rule_id": "VALIDATOR_TIMEOUT",
+            "severity": "error",
+            "source_check": "validate_issue_body",
+            "category": "validator_tool_error",
+            "section": "(global)",
+            "line_start": 0,
+            "line_end": 0,
+            "minimal_context": [],
+            "fix_hint": "validator 実行環境を確認してください",
+            "autofixable": False,
+        }
+    ]
+    status = compute_aggregate_status(
+        validate_errors=validator_timeout_errors,
+        preflight_errors=[],
+        rva_errors=[],
+        static_vc_errors=[],
+        preflight_aggregate="go",
+    )
+    assert status == "human_judgment", (
+        f"validator_tool_error must map to human_judgment, got: {status}"
+    )
+
+
+def test_validator_internal_error_maps_to_human_judgment():
+    """Blocker 1: validator_internal_error status → human_judgment aggregate (not needs_fix)."""
+    from contract_readiness_check import compute_aggregate_status
+
+    validator_internal_errors = [
+        {
+            "rule_id": "VALIDATOR_JSON_ERROR",
+            "severity": "error",
+            "source_check": "validate_issue_body",
+            "category": "validator_internal_error",
+            "section": "(global)",
+            "line_start": 0,
+            "line_end": 0,
+            "minimal_context": [],
+            "fix_hint": "validator 実行環境を確認してください",
+            "autofixable": False,
+        }
+    ]
+    status = compute_aggregate_status(
+        validate_errors=validator_internal_errors,
+        preflight_errors=[],
+        rva_errors=[],
+        static_vc_errors=[],
+        preflight_aggregate="go",
+    )
+    assert status == "human_judgment", (
+        f"validator_internal_error must map to human_judgment, got: {status}"
     )

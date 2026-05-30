@@ -147,6 +147,20 @@ CHILD_MATERIALIZATION_RESULT_V2:
 
 - 完了時は skill 側で定義された出力契約（`ISSUE_AUTHOR_COVERAGE_V1` / `ISSUE_EDIT_RESULT_V1` / `CHILD_MATERIALIZATION_RESULT_V2` 等）を返す
 
+## Contract Readiness Repair Input Contract
+
+`REVIEW_ISSUE_RESULT_V1.structured_blockers` を受け取った場合、以下の routing で本文を修正する:
+
+| category | 修復アクション |
+|---|---|
+| `compound_command_disallowed` | VC を単一コマンドに分割、または `# preflight-scope: pr_review_only` / `runtime_only` を直前行に追加 |
+| `unexpected_pass` | VC を baseline で fail する形式（`test -f`, `rg` no-match 等）に変更 |
+| `regression_gate` (blocked) | `# preflight-scope: runtime_only` を追加するか正しい regression gate に修正 |
+| `rva_immediate_field_missing` | `## Runtime Verification Applicability` の不足フィールドを補完 |
+| `body_lint` (LP系) | `fix_hint` に従って対象セクションを修正 |
+
+詳細 authoring rule は `body-authoring.md#Contract-Readiness-Repair-by-Category` を参照する。
+
 ## 制約
 
 - ネスト委譲禁止（`disallowedTools: [Agent]`）。別 SubAgent への委譲は行わない
