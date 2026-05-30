@@ -416,6 +416,12 @@ class TestRunTransactionImplementationLabels:
 
         monkeypatch.setattr(txn, "_issue_apply_labels", _capture_apply)
 
+        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+            return txn.LabelReadbackResult(
+                ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
+            )
+        monkeypatch.setattr(txn, "_readback_labels_with_result", _success_label_rb)
+
         fake_sleep = FakeSleep()
         result = txn.run_transaction(
             repo="owner/repo",
@@ -447,6 +453,12 @@ class TestRunTransactionImplementationLabels:
             applied_labels.append(list(labels))
 
         monkeypatch.setattr(txn, "_issue_apply_labels", _capture_apply)
+
+        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+            return txn.LabelReadbackResult(
+                ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
+            )
+        monkeypatch.setattr(txn, "_readback_labels_with_result", _success_label_rb)
 
         fake_sleep = FakeSleep()
         result = txn.run_transaction(
@@ -545,8 +557,9 @@ class TestRecoveryHintDedupeLabelReadback:
         hint = txn._recovery_hint_for_stage("dedupe-label-readback", "owner/repo", 99, 0, [])
 
         assert "dedupe-label-readback" in hint
-        assert "gh issue edit 99" in hint
-        assert "--add-label" in hint
+        # hint must direct to reconcile subcommand, not raw gh issue edit
+        assert "reconcile" in hint
+        assert "gh issue edit" not in hint
 
     def test_unknown_stage_falls_back_to_generic_hint(self) -> None:
         hint = txn._recovery_hint_for_stage("totally-unknown-stage", "owner/repo", 99, 0, [])
@@ -1788,6 +1801,12 @@ class TestReconcileRecoversLabelReadbackWithoutManualSubIssueMutation:
         """AC4: reconcile succeeds by applying labels via script and returning success."""
         monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+            return txn.LabelReadbackResult(
+                ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
+            )
+        monkeypatch.setattr(txn, "_readback_labels_with_result", _success_label_rb)
         monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-child", 9901))
         monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
         monkeypatch.setattr(txn, "_readback_parent_issue", lambda *_a, **_k: True)
@@ -1954,3 +1973,277 @@ class TestParseArgsWithoutSubcommandRemainsBackwardCompatible:
         """Create path does not have --issue argument."""
         ns = txn.parse_args(["--repo", "owner/repo", "--title", "Test"])
         assert not hasattr(ns, "issue") or getattr(ns, "issue", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: SKILL.md の label-readback 行に gh issue edit が含まれないことを確認
+# ---------------------------------------------------------------------------
+
+class TestSkillLabelReadbackHasNoRawGhIssueEditRecovery:
+    """test_skill_label_readback_has_no_raw_gh_issue_edit_recovery: SKILL.md の label-readback 行に gh issue edit が含まれないことを検査。"""
+
+    def test_skill_label_readback_has_no_raw_gh_issue_edit_recovery(self) -> None:
+        """SKILL.md の Partial-failure Recovery テーブルの label-readback 行に raw gh issue edit が含まれてはならない。"""
+        skill_md = Path(__file__).parent.parent / "SKILL.md"
+        assert skill_md.exists(), f"SKILL.md not found at {skill_md}"
+        content = skill_md.read_text(encoding="utf-8")
+
+        # Find lines that contain both "label-readback" in a table row and "gh issue edit"
+        for line in content.splitlines():
+            if "label-readback" in line and "| " in line:
+                # This is the label-readback table row
+                assert "gh issue edit" not in line, (
+                    f"SKILL.md label-readback table row must NOT contain 'gh issue edit': {line!r}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: _recovery_hint_for_stage("label-readback") が reconcile を含み gh issue edit を含まない
+# ---------------------------------------------------------------------------
+
+class TestRecoveryHintForLabelReadbackUsesReconcile:
+    """test_recovery_hint_for_label_readback_uses_reconcile: recovery hint が reconcile を含み gh issue edit を含まないことを確認。"""
+
+    def test_recovery_hint_for_label_readback_uses_reconcile(self) -> None:
+        """_recovery_hint_for_stage("label-readback") must contain 'reconcile' and NOT contain 'gh issue edit'."""
+        hint = txn._recovery_hint_for_stage("label-readback", "owner/repo", 99, 0, [])
+        assert "reconcile" in hint, f"Hint must contain 'reconcile': {hint!r}"
+        assert "gh issue edit" not in hint, f"Hint must NOT contain 'gh issue edit': {hint!r}"
+
+    def test_recovery_hint_for_dedupe_label_readback_uses_reconcile(self) -> None:
+        """_recovery_hint_for_stage("dedupe-label-readback") must also use reconcile."""
+        hint = txn._recovery_hint_for_stage("dedupe-label-readback", "owner/repo", 42, 0, [])
+        assert "reconcile" in hint, f"Hint must contain 'reconcile': {hint!r}"
+        assert "gh issue edit" not in hint, f"Hint must NOT contain 'gh issue edit': {hint!r}"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: reconcile_transaction が --dependency 指定時に dependency 処理を呼ぶことを検査
+# ---------------------------------------------------------------------------
+
+class TestReconcileDependencyIsNotNoop:
+    """test_reconcile_dependency_is_not_noop: reconcile_transaction が --dependency 指定時に依存登録と readback を実行することを monkeypatch で検査。"""
+
+    def test_reconcile_dependency_is_not_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """reconcile_transaction with dependency_issue_numbers calls _issue_register_dependency and readback."""
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_readback_labels_with_result", lambda *_a, **_k: txn.LabelReadbackResult(
+            ok=True, expected_labels=["label1"], actual_labels=["label1"], attempts=1, retry_delays=[],
+        ))
+
+        register_calls: list[tuple[Any, ...]] = []
+
+        def _spy_register(repo: str, child_node_id: str, dep_node_id: str, gh_bin: str) -> None:
+            register_calls.append((repo, child_node_id, dep_node_id))
+
+        graphql_ids_calls: list[tuple[Any, ...]] = []
+
+        def _spy_graphql_ids(repo: str, issue_number: int, gh_bin: str) -> tuple[str, int]:
+            graphql_ids_calls.append((repo, issue_number))
+            return (f"node-{issue_number}", issue_number * 100)
+
+        readback_calls: list[Any] = []
+
+        def _spy_readback(repo: str, issue_number: int, dep_nums: list[int], gh_bin: str) -> bool:
+            readback_calls.append((repo, issue_number, dep_nums))
+            return True
+
+        monkeypatch.setattr(txn, "_issue_graphql_ids", _spy_graphql_ids)
+        monkeypatch.setattr(txn, "_issue_register_dependency", _spy_register)
+        monkeypatch.setattr(txn, "_readback_dependencies", _spy_readback)
+
+        fake_sleep = FakeSleep()
+        result = txn.reconcile_transaction(
+            repo="owner/repo",
+            issue_number=99,
+            labels=["label1"],
+            parent_issue_number=0,
+            dependency_issue_numbers=[10, 20],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        # _issue_register_dependency must be called for each dependency
+        assert len(register_calls) == 2, f"Expected 2 register calls, got {register_calls}"
+        # _readback_dependencies must be called
+        assert len(readback_calls) >= 1, "_readback_dependencies must be called at least once"
+        assert result.status == "success"
+        assert result.dependency_verified is True
+
+
+# ---------------------------------------------------------------------------
+# Blocker 5: LabelReadbackResult の actual_labels が実際のラベルを含み空リストでない
+# ---------------------------------------------------------------------------
+
+class TestFailedReadbacksContainsActualLabelsAndAttempts:
+    """test_failed_readbacks_contains_actual_labels_and_attempts: LabelReadbackResult の actual_labels が実際のラベルを含むことを検査。"""
+
+    def test_failed_readbacks_contains_actual_labels_and_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_readback_labels_with_result returns actual_labels from GraphQL, not empty list."""
+        # Simulate: labels not confirmed (subset check fails) but actual labels exist on the issue
+        monkeypatch.setattr(txn, "_readback_labels_once", lambda *_a, **_k: False)
+
+        actual_on_issue = ["existing-label", "another-label"]
+
+        # Patch _readback_labels_with_result's internal _fetch_actual_labels via run_command
+        # We do this by patching _run_gh_json to return a GraphQL response with actual labels
+        def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "labels": {
+                                "nodes": [{"name": lbl} for lbl in actual_on_issue]
+                            }
+                        }
+                    }
+                }
+            }
+
+        monkeypatch.setattr(txn, "_run_gh_json", _fake_run_gh_json)
+
+        result = txn._readback_labels_with_result(
+            repo="owner/repo",
+            issue_number=99,
+            labels=["missing-label"],
+            gh_bin="gh",
+            sleep_fn=FakeSleep(),
+        )
+
+        assert result.ok is False
+        assert result.expected_labels == ["missing-label"]
+        # actual_labels must NOT be empty — must contain what's on the issue
+        assert len(result.actual_labels) > 0, "actual_labels must not be empty; should contain labels fetched from GraphQL"
+        assert set(result.actual_labels) == set(actual_on_issue)
+        assert result.attempts >= 1
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: applied_steps / verified_steps / pending_steps の意味論
+# ---------------------------------------------------------------------------
+
+class TestTransactionResultAppliedVerifiedPendingSemantics:
+    """test_transaction_result_applied_verified_pending_semantics: label-readback 失敗後のステップフィールドが正しく埋まることを検査。"""
+
+    def _patch_standard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/99")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [99]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-child", 9901))
+        monkeypatch.setattr(txn, "_readback_parent_issue", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+    def test_transaction_result_applied_verified_pending_semantics(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After label-readback failure:
+        - applied_steps contains 'label' and 'sub_issue'
+        - verified_steps contains 'sub-issue-readback' (parent registered and read back)
+        - pending_steps contains 'label-readback'
+        """
+        self._patch_standard(monkeypatch)
+
+        # Label readback bool check always fails
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: False)
+
+        # _readback_labels_with_result returns structured failure with actual labels
+        def _fake_label_rb(*_a: Any, **_k: Any) -> txn.LabelReadbackResult:
+            return txn.LabelReadbackResult(
+                ok=False,
+                expected_labels=["some-label"],
+                actual_labels=[],
+                attempts=4,
+                retry_delays=[0.25, 0.5, 1.0],
+                error_kind="missing_expected_labels",
+            )
+
+        monkeypatch.setattr(txn, "_readback_labels_with_result", _fake_label_rb)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=["some-label"],
+            issue_kind="",
+            parent_issue_number=40,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "partial_failure"
+        # applied_steps: label and sub_issue were applied
+        assert "label" in result.applied_steps, f"applied_steps={result.applied_steps}"
+        assert "sub_issue" in result.applied_steps, f"applied_steps={result.applied_steps}"
+        # verified_steps: sub-issue-readback was verified (parent confirmed)
+        assert "sub-issue-readback" in result.verified_steps, f"verified_steps={result.verified_steps}"
+        # pending_steps: label-readback failed
+        assert "label-readback" in result.pending_steps, f"pending_steps={result.pending_steps}"
+        # completed_steps backward compat
+        assert "label" in result.completed_steps
+
+
+# ---------------------------------------------------------------------------
+# Blocker 6: partial failure comment 失敗が audit_comment_posted=False で報告される
+# ---------------------------------------------------------------------------
+
+class TestPartialFailureCommentFailureIsReported:
+    """test_partial_failure_comment_failure_is_reported: comment 投稿失敗時に audit_comment_posted=False が結果に含まれることを検査。"""
+
+    def test_partial_failure_comment_failure_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When _post_partial_failure_comment raises TransactionError, result.audit_comment_posted == False."""
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/99")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [99]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-child", 9901))
+        monkeypatch.setattr(txn, "_readback_parent_issue", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", lambda *_a, **_k: "registered")
+
+        # Label readback bool always fails
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: False)
+
+        # _readback_labels_with_result returns structured failure
+        def _fake_label_rb(*_a: Any, **_k: Any) -> txn.LabelReadbackResult:
+            return txn.LabelReadbackResult(
+                ok=False,
+                expected_labels=["some-label"],
+                actual_labels=[],
+                attempts=4,
+                retry_delays=[0.25, 0.5, 1.0],
+                error_kind="missing_expected_labels",
+            )
+
+        monkeypatch.setattr(txn, "_readback_labels_with_result", _fake_label_rb)
+
+        # Comment posting always fails
+        def _fail_comment(*_a: Any, **_k: Any) -> None:
+            raise txn.TransactionError(
+                stage="partial-failure-comment",
+                message="comment post failed",
+                output="network error",
+            )
+
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", _fail_comment)
+
+        fake_sleep = FakeSleep()
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=["some-label"],
+            issue_kind="",
+            parent_issue_number=40,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            sleep_fn=fake_sleep,
+        )
+
+        assert result.status == "partial_failure"
+        assert result.audit_comment_posted is False, (
+            f"audit_comment_posted should be False when comment fails, got {result.audit_comment_posted}"
+        )

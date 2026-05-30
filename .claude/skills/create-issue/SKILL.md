@@ -382,7 +382,7 @@ query {
 |---|---|---|
 | `sub-issue-readback` | readback で関係確認 → 未登録なら `sub_issues` 登録 | 既存関係 readback 後に再実行 |
 | `dependency-readback` / `dependency-register` | blockedBy readback → 未登録なら GraphQL mutation | 既存関係 readback 後に再実行 |
-| `label-readback` | `create_issue_txn.py reconcile --repo <owner/repo> --issue <N> --label <labels>` を実行して script 経由で復旧する。raw `gh issue edit` / `gh api` 手動 mutation は禁止（script 正本経由のみ）。 | yes |
+| `label-readback` | `uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py reconcile --repo <owner/repo> --issue <N> --label <labels>` を実行して script 経由で復旧する。raw direct mutation は禁止（script 正本経由のみ）。 | yes |
 | `dedupe-search` / `dedupe-race-detection` | 自動補正不可。手動で同タイトル open issue を確認・クローズ後に再実行 | no |
 
 comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idempotency 情報が記載されている。
