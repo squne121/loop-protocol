@@ -65,7 +65,7 @@ trace_links:
 これらの状態は戦闘シミュレーションを停止させ、immutable な SortieResult を 1 度だけ生成する。
 `ended` が final state であり、`ACK_RESULT` イベントにより到達する。
 
-```text
+```
 `victory` and `defeat` are result-latched states, not final FSM states.
 They stop combat simulation and expose exactly one immutable SortieResult.
 `ended` is the acknowledged post-result state and is the true terminal state.
@@ -105,7 +105,7 @@ They stop combat simulation and expose exactly one immutable SortieResult.
 
 sortie.status == "running" の各 `FIXED_TICK` において、以下の順序で処理する:
 
-```text
+```
 For each FIXED_TICK while sortie.status == "running":
 
 1. Run movement / projectile / enemy AI / collision / combat systems for this tick.
@@ -132,7 +132,7 @@ For each FIXED_TICK while sortie.status == "running":
 
 ### targetTicks の算出
 
-```text
+```
 targetTicks = ceil(120_000 / fixedDeltaMs)
 ```
 
@@ -141,7 +141,7 @@ targetTicks = ceil(120_000 / fixedDeltaMs)
 
 ### durationMs の算出
 
-```text
+```
 durationMs = elapsedTicks * fixedDeltaMs
 ```
 
@@ -151,7 +151,7 @@ durationMs = elapsedTicks * fixedDeltaMs
 
 **Outer render/infrastructure loop での利用（MAY）:**
 
-```text
+```
 requestAnimationFrame, Date.now(), and performance.now() MAY be used by the
 outer render/infrastructure loop to produce frame deltas for the SimulationLoop accumulator.
 ```
@@ -160,7 +160,7 @@ outer render/infrastructure loop to produce frame deltas for the SimulationLoop 
 
 **SortieResult / sortie duration 計測での利用（MUST NOT）:**
 
-```text
+```
 They MUST NOT be used to:
 - increment sortie elapsed time (elapsedTicks),
 - decide victory or defeat,
