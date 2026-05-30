@@ -12,6 +12,8 @@ ignores:
   - "coverage/**"
   - "playwright-report/**"
   - "test-results/**"
+  - "docs/**"
+  - ".github/**"
 
 config:
   default: true
