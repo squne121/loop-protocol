@@ -42,7 +42,7 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 
 ## 基本モデル
 
-```text
+```
 SubAgent（役割）── Skill（作業手順）
         │              │
         │              └─ references/（補助ドキュメント）
@@ -289,7 +289,7 @@ FOLLOW_UP_ISSUE_REQUEST_V1:
 
 **initial_label_profile に応じた起票フロー**:
 
-```text
+```
 initial_label_profile: triage_only（デフォルト）の場合:
   - create_issue_txn.py は使わず gh issue create を直接実行
   - 付与ラベル: triage-required + labels フィールドの内容のみ
@@ -330,7 +330,7 @@ severity_actions:
 
 **dedupe フロー**:
 
-```text
+```
 for each request:
   1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
      gh issue list --repo <owner>/<repo> --state all \
@@ -484,7 +484,7 @@ uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py
 
 ### skill 横断の消費フロー
 
-```text
+```
 plan_child_materialization.py
   → CHILD_MATERIALIZATION_PLAN_V2
     → create-issue (action=create_issue → create_issue_txn.py)
@@ -615,7 +615,7 @@ forbidden_context:
 
 **オーケストレーターは worker step で `Skill` tool を直接呼ばない。** すべての worker step は対応する SubAgent 境界を通す。
 
-```text
+```
 WRONG（禁止パターン）:
   orchestrator → Skill tool（review-issue skill）直接呼び出し
   orchestrator → Skill tool（implement-issue skill）直接呼び出し
@@ -767,7 +767,7 @@ impl-review-loop が期待する実行フェーズの順序・必須入出力・
 
 ### フェーズ間の前提依存まとめ
 
-```text
+```
 issue_contract_preflight
         ↓ status: go
 runtime_preflight（immediate のとき）
@@ -1015,7 +1015,7 @@ OUTPUT_BUDGET_V1:
 
 budget 制約の適用によりブロッキングな知見が伝達不能になる場合は、以下の形式で `NEEDS_EXPANSION` を emit して人間または orchestrator に判断を委ねる。
 
-```text
+```
 NEEDS_EXPANSION: <topic>
 refs: [<url-or-path>]
 ```

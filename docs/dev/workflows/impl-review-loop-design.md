@@ -75,7 +75,7 @@ summary_budget: "<= 1200 chars"
 
 ## Workflow Topology
 
-```text
+```
 [Preparation: state 初期化・worktree 確認・contract_snapshot 取得]
        ↓
 [Step 1: Implementation]  → implementation-worker SubAgent (implement-issue skill)

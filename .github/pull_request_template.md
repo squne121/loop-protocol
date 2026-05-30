@@ -70,7 +70,7 @@ rg -l "<schema-id-or-key>" .
 
 **記載ルール:**
 - `Not controlled` が非空の場合、PR title / summary / docs で無限定の `safe` / `read-only` / `sandboxed` / `isolated` / `complete` を使わないこと（APPROVE 禁止条件）
-- `Evidence` は本 PR のVerification Commands結果または linked issue の Verification Commands と対応させること
+- `Evidence` は本 PR の検証コマンド結果または linked issue の Verification Commands と対応させること
 - `Not controlled` が非空の場合、`Follow-up` に open な後続 Issue を記載すること（必須）
 - 「閉じる経路を正確に書く」原則: 主張の射程を実装済みの境界に限定すること（例: 「ACP client-side の fs/terminal proxy を提供しない」は許可、「read-only ACP transport」は禁止）
 

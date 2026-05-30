@@ -17,7 +17,7 @@ See that file for the full YAML schema, field definitions, and policies.
 
 ## Naming Convention
 
-```text
+```
 PT-YYYYMMDD-NNN-<short-slug>.md
 ```
 

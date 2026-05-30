@@ -66,7 +66,7 @@ Feature specs follow `project-constitution.md` §"feature spec の標準配置" 
 
 ## Lifecycle States
 
-```text
+```
 draft  →  accepted  →  superseded  →  archived
   ↑             ↓
   └─ (revision) ┘
@@ -112,7 +112,7 @@ When creating a new `docs/product/**` document:
 
 1. Add YAML frontmatter with `status: draft` and `issue` reference.
 2. Apply **compact spec** format (see §Token Policy below).
-3. Use **EARS notation** for AC fields (see §EARS Usage).
+3. Use **EARS notation** for acceptance criteria fields (see §EARS Usage).
 4. Include `non_goals` and `trace_links` sections.
 5. Register in `docs/dev/ssot-registry.md` in the same PR (see §Registry / Discovery Rules).
 6. Add to `docs/dev/workflow.md` SSOT Routing Table in the same PR.
@@ -126,7 +126,7 @@ When updating an existing `docs/product/**` document:
 - Apply **diff-first** updates: change only the affected `REQ-xxx` / `TASK-xxx` / section, not the full document.
 - `full_regeneration: prohibited` — do not regenerate the entire spec. Regenerated output often diverges from existing GitHub Issues.
 - Update `issue` frontmatter field to reference the PR's linked Issue.
-- If the update invalidates prior AC, classify as a **spec delta** (see §Product Spec Delta Flow).
+- If the update invalidates prior acceptance criteria, classify as a **spec delta** (see §Product Spec Delta Flow).
 
 ## Token Policy
 
@@ -186,7 +186,7 @@ Machine guard:
 
 ## EARS Usage
 
-EARS (Easy Approach to Requirements Syntax) is used as a lightweight notation for AC in `docs/product/**` documents. EARS is a notation, not a new SDD tool SSOT.
+EARS (Easy Approach to Requirements Syntax) is used as a lightweight notation for acceptance criteria in `docs/product/**` documents. EARS is a notation, not a new SDD tool SSOT.
 
 Common EARS patterns:
 
@@ -198,17 +198,17 @@ Common EARS patterns:
 | Option | `Where <feature>, the <system> shall <action>.` |
 
 Example:
-```text
+```
 REQ-001: When a playtest session ends, the system shall record a playtest-log entry with hypothesis_id, observed_behavior, fun_failure, affected_requirements, and decision fields.
 ```
 
-EARS is applied only at the AC level. Do not introduce EARS tooling or make EARS the spec format authority.
+EARS is applied only at the acceptance criteria level. Do not introduce EARS tooling or make EARS the spec format authority.
 
 ## Product Spec Delta Flow
 
 Derived from `docs/adr/0002-sdd-tool-adoption.md` §"Playtest-driven 補正（playtest_policy）":
 
-```text
+```
 playtest-log entry
   → classify: bug | balance/tuning | design hypothesis invalidated | unclear/needs-more-data
   → spec delta issue (docs/product/** update, 1 Issue = 1 PR)
@@ -248,7 +248,7 @@ product_task_materialization:
 ```
 
 **Materialization flow:**
-```text
+```
 tasks.md (staging artifact)
   → taskstoissues-equivalent conversion
   → GitHub Issue (tracking SSOT)

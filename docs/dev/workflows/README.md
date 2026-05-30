@@ -6,7 +6,7 @@
 
 ## 位置づけ（SSOT 階層内の役割）
 
-```text
+```
 [SSOT 正本]
   docs/dev/workflow.md              ← 開発フロー全体の SSOT
   docs/dev/agent-skill-boundaries.md ← SubAgent / Skill 責務境界
