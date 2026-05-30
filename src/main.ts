@@ -11,6 +11,7 @@ import { createLocalGameStorage } from './storage'
 import {
   advanceSimulationLoop,
   clampPlayerToArena,
+  resolveCombatCollisions,
   runCollisionSystem,
   runCombatSystem,
   runMovementSystem,
@@ -92,7 +93,8 @@ function stepSimulation(deltaMs: number): void {
   runMovementSystem(state, commands, deltaMs)
   runCombatSystem(state, commands, deltaMs)
   runProjectileSystem(state, commands, deltaMs)
-  runCollisionSystem(state)
+  const collisionPairs = runCollisionSystem(state)
+  resolveCombatCollisions(state, collisionPairs)
   state.tick += 1
   state.elapsedMs += deltaMs
 }

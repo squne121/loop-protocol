@@ -1,25 +1,72 @@
-import type { GameState } from '../state'
+import type { CollisionPair, GameState } from '../state'
 
-export function runCollisionSystem(state: GameState): void {
-  state.player.x = clamp(
-    state.player.x,
-    state.player.radius,
-    state.arena.width - state.player.radius,
-  )
-  state.player.y = clamp(
-    state.player.y,
-    state.player.radius,
-    state.arena.height - state.player.radius,
-  )
+/**
+ * Pure collision detection: returns all collision pairs for this tick.
+ *
+ * AC1: Does NOT mutate hp / projectile / result / resource / persistence.
+ * AC2: boundary clamp is MovementSystem's responsibility (clampPlayerToArena).
+ * AC5: Circle hitbox — dx*dx + dy*dy <= (r1+r2)**2 (no sqrt).
+ * AC6: 1 projectile hits at most 1 enemy per tick (closest; tie-break: id ASC).
+ * AC7: projectile-enemy pairs are listed before player-enemy pairs.
+ */
+export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
+  const pairs: CollisionPair[] = []
 
-  if (state.player.x >= state.arena.width - state.player.radius - 4) {
-    state.telemetry.status = 'Sensor edge reached'
-    return
+  // --- projectile-enemy collisions (AC5, AC6) ---
+  // Track which projectile ids have already been assigned a hit this tick.
+  const hitProjectileIds = new Set<number>()
+
+  for (const projectile of state.projectiles) {
+    let closestEnemyId: number | null = null
+    let closestDistSq = Infinity
+
+    for (const enemy of state.enemies) {
+      if (enemy.defeated) continue
+
+      const dx = projectile.x - enemy.x
+      const dy = projectile.y - enemy.y
+      const distSq = dx * dx + dy * dy
+      const sumR = projectile.radius + enemy.radius
+      const threshold = sumR * sumR
+
+      if (distSq <= threshold) {
+        // Same-distance tie-break: lower enemy.id wins (AC6).
+        if (
+          distSq < closestDistSq ||
+          (distSq === closestDistSq &&
+            closestEnemyId !== null &&
+            enemy.id < closestEnemyId)
+        ) {
+          closestDistSq = distSq
+          closestEnemyId = enemy.id
+        }
+      }
+    }
+
+    if (closestEnemyId !== null && !hitProjectileIds.has(projectile.id)) {
+      hitProjectileIds.add(projectile.id)
+      pairs.push({
+        kind: 'projectile-enemy',
+        projectileId: projectile.id,
+        enemyId: closestEnemyId,
+        distSq: closestDistSq,
+      })
+    }
   }
 
-  state.telemetry.status = 'Combat systems green'
-}
+  // --- player-enemy collisions (AC7: after projectile-enemy) ---
+  const playerR = state.player.radius
+  for (const enemy of state.enemies) {
+    if (enemy.defeated) continue
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value))
+    const dx = state.player.x - enemy.x
+    const dy = state.player.y - enemy.y
+    const distSq = dx * dx + dy * dy
+    const sumR = playerR + enemy.radius
+    if (distSq <= sumR * sumR) {
+      pairs.push({ kind: 'player-enemy', enemyId: enemy.id })
+    }
+  }
+
+  return pairs
 }
