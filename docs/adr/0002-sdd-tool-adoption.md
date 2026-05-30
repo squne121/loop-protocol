@@ -1,13 +1,21 @@
-# ADR 0002: SDD ツール採否 — Spec-Driven Development 運用方針
-
-```yaml
+---
+adr_id: "0002"
+title: "SDD ツール採否 — Spec-Driven Development 運用方針"
 status: accepted
-decision_date: 2026-05-23
-confirmed_date: 2026-05-23
-issue: "#257"
-confirmation_issue: "#303"
-parent_issue: "#254"
-```
+decision_date: "2026-05-23"
+confirmed_date: "2026-05-23"
+metadata_migrated_at: "2026-05-30"
+related_issues:
+  - "#254"
+  - "#257"
+  - "#298"
+  - "#303"
+  - "#442"
+supersedes: []
+superseded_by: null
+---
+
+# ADR 0002: SDD ツール採否 — Spec-Driven Development 運用方針
 
 ## コンテキスト
 
