@@ -15,13 +15,30 @@ export const ENEMY_AI_EPSILON_PX = 0.5
  * @param fixedDeltaMs Fixed timestep in milliseconds (e.g. 1000/60 approx 16.67)
  */
 export function runEnemyAISystem(state: GameState, fixedDeltaMs: number): void {
+  if (!Number.isFinite(fixedDeltaMs) || fixedDeltaMs <= 0) {
+    return
+  }
+
   const deltaSec = fixedDeltaMs / 1000
   const playerX = state.player.x
   const playerY = state.player.y
 
+  if (!Number.isFinite(playerX) || !Number.isFinite(playerY)) {
+    return
+  }
+
   for (const enemy of state.enemies) {
     // AC3: skip defeated enemies
     if (enemy.defeated) {
+      continue
+    }
+
+    if (
+      !Number.isFinite(enemy.x) ||
+      !Number.isFinite(enemy.y) ||
+      !Number.isFinite(enemy.speedPxPerSec) ||
+      enemy.speedPxPerSec <= 0
+    ) {
       continue
     }
 
@@ -30,7 +47,7 @@ export function runEnemyAISystem(state: GameState, fixedDeltaMs: number): void {
     const distance = Math.hypot(dx, dy)
 
     // AC5: avoid NaN when enemy is already at (or extremely close to) player center
-    if (distance <= ENEMY_AI_EPSILON_PX) {
+    if (!Number.isFinite(distance) || distance <= ENEMY_AI_EPSILON_PX) {
       continue
     }
 

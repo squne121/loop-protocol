@@ -146,19 +146,56 @@ describe('runEnemyAISystem', () => {
     expect(state.enemies[2].y).toBeCloseTo(20)
   })
 
-  it('GIVEN enemy moving toward player WHEN AI runs THEN player state is not modified (AC8 — no side effects)', () => {
+  it('GIVEN enemy moving toward player WHEN AI runs THEN non-position state is not modified (AC8 — no side effects)', () => {
     const state = createInitialGameState()
-    const originalPlayerX = state.player.x
-    const originalPlayerY = state.player.y
-    const originalProjectiles = state.projectiles.length
-
+    state.player.x = 240
+    state.player.y = 270
     const enemy = makeEnemy({ x: 400, y: 200, speedPxPerSec: 100 })
     state.enemies = [enemy]
 
+    const staticFields = (e: EnemyState) => ({
+      id: e.id,
+      definitionId: e.definitionId,
+      hp: e.hp,
+      maxHp: e.maxHp,
+      radius: e.radius,
+      speedPxPerSec: e.speedPxPerSec,
+      contactDamage: e.contactDamage,
+      defeated: e.defeated,
+      defeatedAtTick: e.defeatedAtTick,
+    })
+
+    const before = structuredClone({
+      player: state.player,
+      projectiles: state.projectiles,
+      progress: state.progress,
+      telemetry: state.telemetry,
+      enemyStatic: state.enemies.map(staticFields),
+    })
+
     runEnemyAISystem(state, 1000 / 60)
 
-    expect(state.player.x).toBe(originalPlayerX)
-    expect(state.player.y).toBe(originalPlayerY)
-    expect(state.projectiles.length).toBe(originalProjectiles)
+    expect({
+      player: state.player,
+      projectiles: state.projectiles,
+      progress: state.progress,
+      telemetry: state.telemetry,
+      enemyStatic: state.enemies.map(staticFields),
+    }).toEqual(before)
+  })
+
+  it('GIVEN non-finite fixedDeltaMs WHEN AI runs THEN enemy position is not poisoned', () => {
+    const state = createInitialGameState()
+    state.player.x = 0
+    state.player.y = 0
+    const enemy = makeEnemy({ x: 100, y: 0, speedPxPerSec: 100 })
+    state.enemies = [enemy]
+
+    runEnemyAISystem(state, Number.NaN)
+
+    expect(Number.isFinite(state.enemies[0].x)).toBe(true)
+    expect(Number.isFinite(state.enemies[0].y)).toBe(true)
+    expect(state.enemies[0].x).toBe(100)
+    expect(state.enemies[0].y).toBe(0)
   })
 })
