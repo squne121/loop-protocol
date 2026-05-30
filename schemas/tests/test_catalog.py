@@ -20,6 +20,29 @@ from pathlib import Path
 import pytest
 import yaml
 
+
+# --------------------------------------------------------------------------- #
+# UniqueKeySafeLoader (B2)
+# --------------------------------------------------------------------------- #
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.YAMLError(f"duplicate key found: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
 # --------------------------------------------------------------------------- #
 # Paths
 # --------------------------------------------------------------------------- #
@@ -58,7 +81,7 @@ REQUIRED_ENTRY_FIELDS = {
 def catalog() -> dict:
     assert CATALOG_YAML.exists(), f"catalog.yaml not found: {CATALOG_YAML}"
     with CATALOG_YAML.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.load(f, Loader=UniqueKeySafeLoader)
 
 
 @pytest.fixture(scope="module")
@@ -382,3 +405,67 @@ class TestJsonSchemaValidation:
             pytest.skip(
                 "jsonschema not installed; install with: uv add jsonschema"
             )
+
+    def test_catalog_schema_json_is_valid_draft_2020_12(self, schema_json: dict):
+        """catalog.schema.json 自体が Draft 2020-12 として valid"""
+        from jsonschema import Draft202012Validator
+        Draft202012Validator.check_schema(schema_json)
+
+
+# --------------------------------------------------------------------------- #
+# B2: UniqueKeySafeLoader duplicate key rejection
+# --------------------------------------------------------------------------- #
+def test_duplicate_key_loader_rejects_duplicates():
+    """UniqueKeySafeLoader は duplicate key を拒否する"""
+    bad_yaml = "key1: a\nkey1: b\n"
+    with pytest.raises(yaml.YAMLError):
+        yaml.load(bad_yaml, Loader=UniqueKeySafeLoader)
+
+
+# --------------------------------------------------------------------------- #
+# B4: golden set — Initial Known Schemas table
+# --------------------------------------------------------------------------- #
+EXPECTED_SCHEMA_IDS = {
+    "issue_contract/v1",
+    "delegation_request_v1",
+    "delegation_result/v1",
+    "acp_result_v1",
+    "LOOP_VERDICT",
+    "TEST_VERDICT_MACHINE v1",
+    "IMPLEMENT_RESULT_V1",
+    "contract_schema_version: v1",
+    "Runtime Verification Applicability",
+    "Safety Claim Matrix",
+    "model_routing.yaml",
+    "runtime-verification artifact log",
+    "pr_body_schema/schema_change_applicability/v1",
+    "pr_body_schema/schema_consumer_inventory/v1",
+    "agent_session_manifest/v1",
+    "PR_REVIEW_GATE_RESULT_V1",
+}
+
+
+def test_schema_ids_match_golden_set(entries):
+    """catalog の schema_id が Initial Known Schemas table と完全一致する"""
+    actual_ids = {e["schema_id"] for e in entries}
+    assert actual_ids == EXPECTED_SCHEMA_IDS, (
+        f"Missing: {EXPECTED_SCHEMA_IDS - actual_ids}, "
+        f"Extra: {actual_ids - EXPECTED_SCHEMA_IDS}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# B6: last_verified.commit は 40-char full SHA
+# --------------------------------------------------------------------------- #
+SHA40_RE = re.compile(r'^[0-9a-f]{40}$')
+
+
+def test_last_verified_commit_is_full_sha(entries):
+    """last_verified.commit は 40-char full SHA"""
+    for entry in entries:
+        lv = entry.get("last_verified", {})
+        commit = lv.get("commit", "")
+        assert SHA40_RE.match(commit), (
+            f"schema_id={entry['schema_id']!r}: last_verified.commit={commit!r} "
+            "は 40-char full SHA でなければならない"
+        )

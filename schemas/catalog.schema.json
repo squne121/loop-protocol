@@ -282,7 +282,8 @@
       "properties": {
         "commit": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "40-char full git SHA of the commit where this entry was last verified"
         },
         "command_id": {
           "type": "string",

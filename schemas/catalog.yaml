@@ -52,7 +52,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "delegation_request_v1"
@@ -99,7 +99,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "delegation_result/v1"
@@ -151,7 +151,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "acp_result_v1"
@@ -197,7 +197,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "LOOP_VERDICT"
@@ -243,7 +243,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "TEST_VERDICT_MACHINE v1"
@@ -292,7 +292,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "IMPLEMENT_RESULT_V1"
@@ -338,7 +338,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "contract_schema_version: v1"
@@ -384,7 +384,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "Runtime Verification Applicability"
@@ -437,7 +437,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "Safety Claim Matrix"
@@ -490,7 +490,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "model_routing.yaml"
@@ -539,7 +539,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "validate_model_routing"
 
   - schema_id: "runtime-verification artifact log"
@@ -585,7 +585,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "pr_body_schema/schema_change_applicability/v1"
@@ -639,7 +639,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "pr_body_schema/schema_consumer_inventory/v1"
@@ -693,7 +693,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "lint_catalog_yaml"
 
   - schema_id: "agent_session_manifest/v1"
@@ -750,7 +750,7 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "validate_agent_session_manifest"
 
   - schema_id: "PR_REVIEW_GATE_RESULT_V1"
@@ -799,5 +799,5 @@ entries:
       required_for_breaking_change: true
       followup_issue_required: true
     last_verified:
-      commit: "1664872"
+      commit: "dc4f88fea6094269cc715cdd7959d31f2a670ee6"
       command_id: "validate_pr_review_gates"
