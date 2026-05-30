@@ -1,0 +1,70 @@
+version: 1
+rules:
+  # === Prohibited expressions (ambiguous/casual Japanese) ===
+  - expected: "（具体的な依頼内容を記載してください）"
+    patterns:
+      - よしなに
+
+  - expected: "（確実性の高い表現に変えてください）"
+    patterns:
+      - たぶん
+
+  - expected: "（確実性の高い表現に変えてください）"
+    patterns:
+      - おそらく
+
+  # === Game domain terms ===
+  - expected: sortie
+    patterns:
+      - ソーティ
+      - そーてぃ
+
+  # === Project technical terms ===
+  - expected: GitHub
+    patterns:
+      - Github
+      - GITHUB
+
+  - expected: pnpm
+    patterns:
+      - PNPM
+      - Pnpm
+
+  - expected: TypeScript
+    patterns:
+      - Typescript
+
+  - expected: JavaScript
+    patterns:
+      - Javascript
+
+  # === LOOP_PROTOCOL domain terms ===
+  - expected: VC
+    patterns:
+      - verification command
+      - Verification command
+
+  - expected: AC
+    patterns:
+      - acceptance criteria
+      - Acceptance Criteria
+
+  - expected: Verification Commands
+    patterns:
+      - verification commands
+      - 検証コマンド
+
+  - expected: Safety Claim Matrix
+    patterns:
+      - safety claim matrix
+      - セーフティクレームマトリクス
+
+  - expected: fail-closed
+    patterns:
+      - fail closed
+      - failclose
+
+  - expected: fail-open
+    patterns:
+      - fail open
+      - failopen
