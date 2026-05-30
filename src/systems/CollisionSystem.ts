@@ -67,8 +67,10 @@ export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
       hitProjectileIds.add(projectile.id)
       pairs.push({
         kind: 'projectile-enemy',
+        tick: state.tick,
         projectileId: projectile.id,
         enemyId: closestEnemyId,
+        priorityKey: `projectile-enemy:${projectile.id}:${closestEnemyId}`,
         distSq: closestDistSq,
       })
     }
@@ -84,7 +86,13 @@ export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
     const distSq = dx * dx + dy * dy
     const sumR = playerR + enemy.radius
     if (distSq <= sumR * sumR) {
-      pairs.push({ kind: 'player-enemy', enemyId: enemy.id })
+      pairs.push({
+        kind: 'player-enemy',
+        tick: state.tick,
+        playerId: state.player.id,
+        enemyId: enemy.id,
+        priorityKey: `player-enemy:${state.player.id}:${enemy.id}`,
+      })
     }
   }
 

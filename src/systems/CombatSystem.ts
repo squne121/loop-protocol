@@ -93,7 +93,7 @@ export function resolveCombatCollisions(
   const projectileDefeatedEnemyIds = new Set<number>()
 
   // --- Pass 1: projectile-enemy (AC7 ordering guaranteed by CollisionSystem) ---
-  // Sort projectile-enemy pairs by (enemyId ASC) then (projectileId ASC) for determinism.
+  // Sort projectile-enemy pairs by (projectileId ASC) then (enemyId ASC) for determinism.
   // Within the same tick, process projectile-enemy before player-enemy.
   const projEnemyPairs = pairs
     .filter((p): p is Extract<CollisionPair, { kind: 'projectile-enemy' }> => p.kind === 'projectile-enemy')

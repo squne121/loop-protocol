@@ -55,14 +55,19 @@ export interface ProjectileState {
 export type CollisionPair =
   | {
       kind: 'projectile-enemy'
+      tick: number
       projectileId: number
       enemyId: number
-      /** Squared distance between centers at collision time. */
-      distSq: number
+      priorityKey: string
+      /** Squared distance between centers at collision time. Optional; used for tie-breaking. */
+      distSq?: number
     }
   | {
       kind: 'player-enemy'
+      tick: number
+      playerId: EntityId
       enemyId: number
+      priorityKey: string
     }
 
 export interface ProgressState {

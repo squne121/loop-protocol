@@ -57,16 +57,19 @@ describe('runCollisionSystem', () => {
     const enemy = makeEnemy({ id: 1, x: 300, y: 270, radius: 16 })
     state.enemies = [enemy]
     // Place projectile on top of enemy (distSq = 0 <= (4+16)^2 = 400)
-    state.projectiles = [makeProjectile({ id: 1, x: 300, y: 270, radius: 4, damage: 5 })]
+    state.projectiles = [makeProjectile({ id: 2, x: 300, y: 270, radius: 4, damage: 5 })]
+    state.tick = 0
 
     const pairs = runCollisionSystem(state)
 
     expect(pairs).toHaveLength(1)
-    expect(pairs[0].kind).toBe('projectile-enemy')
-    if (pairs[0].kind === 'projectile-enemy') {
-      expect(pairs[0].projectileId).toBe(1)
-      expect(pairs[0].enemyId).toBe(1)
-    }
+    expect(pairs[0]).toMatchObject({
+      kind: 'projectile-enemy',
+      tick: 0,
+      projectileId: 2,
+      enemyId: 1,
+      priorityKey: 'projectile-enemy:2:1',
+    })
   })
 
   it('GIVEN projectile far from enemy WHEN collision system runs THEN no pair returned (AC5)', () => {
@@ -171,6 +174,7 @@ describe('runCollisionSystem', () => {
     state.player.x = 300
     state.player.y = 270
     state.player.radius = 14
+    state.tick = 0
     state.enemies = [makeEnemy({ id: 1, x: 300, y: 270, radius: 16 })]
     state.projectiles = [makeProjectile({ id: 1, x: 300, y: 270, radius: 4, damage: 5 })]
 
@@ -182,6 +186,16 @@ describe('runCollisionSystem', () => {
     expect(firstPlayerIdx).toBeGreaterThanOrEqual(0)
     // projectile-enemy must appear before player-enemy (AC7)
     expect(firstProjectileIdx).toBeLessThan(firstPlayerIdx)
+
+    // player-enemy pair must include tick, playerId, priorityKey (SSOT compliance)
+    const playerPair = pairs[firstPlayerIdx]
+    expect(playerPair).toMatchObject({
+      kind: 'player-enemy',
+      tick: 0,
+      playerId: state.player.id,
+      enemyId: 1,
+      priorityKey: `player-enemy:${state.player.id}:1`,
+    })
   })
 
   it('GIVEN defeated enemy WHEN collision system runs THEN no pair is generated for that enemy (AC1 — no mutation required)', () => {
@@ -406,7 +420,7 @@ describe('resolveCombatCollisions', () => {
     // Provide a collision pair manually (CollisionSystem would not emit this because enemy.defeated,
     // but this tests that if a pair arrives from the same tick that defeated the enemy, the projectile
     // is consumed)
-    resolveCombatCollisions(state, [{ kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 }])
+    resolveCombatCollisions(state, [{ kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy:1:1', distSq: 0 }])
 
     // Projectile must be removed even though the enemy was already defeated
     expect(state.projectiles).toHaveLength(0)
@@ -422,8 +436,8 @@ describe('resolveCombatCollisions', () => {
 
     // Both projectiles target same enemy in same tick
     resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
-      { kind: 'projectile-enemy', projectileId: 2, enemyId: 1, distSq: 0 },
+      { kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy:1:1', distSq: 0 },
+      { kind: 'projectile-enemy', tick: 0, projectileId: 2, enemyId: 1, priorityKey: 'projectile-enemy:2:1', distSq: 0 },
     ])
 
     // Both projectiles must be consumed (id=1 deals damage and defeats, id=2 hits defeated enemy)
