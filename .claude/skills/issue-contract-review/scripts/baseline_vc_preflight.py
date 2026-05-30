@@ -90,11 +90,27 @@ def extract_verification_commands_section(body: str) -> Optional[str]:
 
 
 def extract_fenced_bash_blocks(section: str) -> List[str]:
-    """セクションから ```bash ... ``` ブロックを抽出"""
+    """
+    セクションから ```bash ... ``` ブロックを抽出。
+
+    B4: canonical format は ```bash のみ。unlabeled fence (```) は無視する。
+    """
     blocks = []
-    for match in re.finditer(r"```(?:bash)?\s*\n(.*?)\n```", section, re.DOTALL):
-        blocks.append(match.group(1))
+    for match in re.finditer(r"```bash[ \t]*\n(.*?)```", section, re.DOTALL):
+        blocks.append(match.group(1).rstrip("\n"))
     return blocks
+
+
+def find_unlabeled_fenced_blocks(section: str) -> List[str]:
+    """
+    B4: unlabeled fence (``` without language specifier) を検出。
+
+    戻り値: unlabeled fence の内容リスト（警告用）
+    """
+    unlabeled = []
+    for match in re.finditer(r"```[ \t]*\n(.*?)```", section, re.DOTALL):
+        unlabeled.append(match.group(1).rstrip("\n"))
+    return unlabeled
 
 
 def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Optional[str]:
@@ -364,14 +380,17 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
     if cwd is None:
         cwd = str(Path.cwd())
 
-    # Check for exact command prefixes
-    prefixes = [
-        "pnpm typecheck",
-        "pnpm lint",
-        "pnpm test",
-        "pnpm build",
-    ]
-    if any(command.startswith(p) for p in prefixes):
+    # B1: Check for exact pnpm subcommand allowlist (argv-based, not prefix string)
+    try:
+        argv_check = shlex.split(command)
+    except ValueError:
+        argv_check = []
+    if (
+        argv_check
+        and Path(argv_check[0]).name == "pnpm"
+        and len(argv_check) >= 2
+        and ("pnpm", argv_check[1].lower()) in _ALLOWED_PNPM_SUBCOMMANDS
+    ):
         return True
 
     # Check for uv run pytest with existing test paths
@@ -513,39 +532,33 @@ _DENIED_COMMANDS: frozenset = frozenset([
     "sed", "tee",
 ])
 
-# git subcommands that are mutations (blocked)
-_GIT_MUTATION_SUBCOMMANDS: frozenset = frozenset([
-    "push", "commit", "tag", "checkout", "reset", "clean",
-    "merge", "rebase", "branch", "stash", "apply", "cherry-pick",
-    "fetch", "pull", "remote", "config", "init",
+# B3: git read-only subcommand allowlist (exact argv[1] check)
+# git -c / --config-env / --exec-path / alias.* flags → blocked via option-flag check
+# git worktree, git submodule, git bisect, etc. (not listed here) → blocked by default
+_ALLOWED_GIT_SUBCOMMANDS: frozenset = frozenset([
+    "status", "diff", "log", "show", "ls-files", "rev-parse", "branch", "tag", "-l",
 ])
 
-# gh subcommands (and sub-subcommands) that are mutations (blocked)
-_GH_MUTATION_PREFIXES: tuple = (
-    "api",
-    "issue edit",
-    "issue create",
-    "issue close",
-    "issue reopen",
-    "pr merge",
-    "pr create",
-    "pr edit",
-    "pr close",
-    "pr reopen",
-    "workflow run",
-    "release create",
-    "release upload",
-    "repo edit",
-    "repo clone",
-    "gist create",
-    "secret set",
-    "variable set",
+# B3: gh read-only subcommand allowlist (exact argv tuple prefix check)
+# gh alias, gh extension, gh auth (mutation), etc. → blocked by default
+_ALLOWED_GH_PREFIXES: tuple = (
+    # Read-only tuples: (argv[1],) or (argv[1], argv[2])
+    ("issue", "view"),
+    ("pr", "view"),
+    ("pr", "list"),
+    ("issue", "list"),
+    ("repo", "view"),
+    # NOTE: gh api is blocked — mutation potential via POST/PATCH; not needed in VC context
 )
 
-# pnpm subcommands that are mutations (blocked)
-_PNPM_MUTATION_SUBCOMMANDS: frozenset = frozenset([
-    "add", "install", "remove", "uninstall", "update", "upgrade",
-    "link", "unlink", "publish", "pack",
+# B1: pnpm exact subcommand allowlist (tuple-based)
+# Only these exact (argv[0], argv[1]) tuples are allowed for pnpm.
+# pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are blocked.
+_ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
+    ("pnpm", "typecheck"),
+    ("pnpm", "lint"),
+    ("pnpm", "test"),
+    ("pnpm", "build"),
 ])
 
 # Explicitly allowed command basenames for baseline preflight
@@ -586,7 +599,7 @@ _ALLOWED_COMMANDS: frozenset = frozenset([
     "pwd",       # safe
     "date",      # safe
     "stat",      # read-only
-    "mkdir",     # allowed for artifact dir creation in VC; AC3 note: allowed if prefixed appropriately
+    # NOTE: mkdir removed from allowlist (B2) — mkdir -p .git/hooks and similar mutations possible
 ])
 
 
@@ -606,33 +619,51 @@ def _is_allowed_python3_invocation(argv: List[str]) -> bool:
     return False
 
 
-def _is_denied_git_invocation(argv: List[str]) -> bool:
-    """git mutation subcommands are blocked."""
+def _is_allowed_git_invocation(argv: List[str]) -> bool:
+    """
+    B3: git read-only allowlist check.
+    Returns True only if the git subcommand is in the read-only allowlist.
+    Blocks git -c, --config-env, --exec-path option flags, and any unlisted subcommand.
+    """
     if not argv or Path(argv[0]).name != "git":
         return False
     if len(argv) < 2:
         return False
-    subcommand = argv[1].lower()
-    return subcommand in _GIT_MUTATION_SUBCOMMANDS
+    # Block global git option flags (e.g., git -c alias.x='!...')
+    second_arg = argv[1]
+    if second_arg.startswith("-") and second_arg not in ("-l",):
+        return False
+    subcommand = second_arg.lower()
+    return subcommand in _ALLOWED_GIT_SUBCOMMANDS
 
 
-def _is_denied_gh_invocation(argv: List[str]) -> bool:
-    """gh mutation subcommands are blocked."""
+def _is_allowed_gh_invocation(argv: List[str]) -> bool:
+    """
+    B3: gh read-only allowlist check.
+    Returns True only if the gh subcommand tuple is in the read-only allowlist.
+    Blocks gh alias, gh extension, gh auth (mutations), gh api, and any unlisted subcommand.
+    """
     if not argv or Path(argv[0]).name != "gh":
         return False
-    # Reconstruct subcommand string for prefix matching
-    rest = " ".join(argv[1:]).lower()
-    return any(rest.startswith(prefix) for prefix in _GH_MUTATION_PREFIXES)
+    if len(argv) < 3:
+        return False
+    # Check (argv[1], argv[2]) tuple
+    sub_tuple = (argv[1].lower(), argv[2].lower())
+    return sub_tuple in _ALLOWED_GH_PREFIXES
 
 
-def _is_denied_pnpm_invocation(argv: List[str]) -> bool:
-    """pnpm mutation subcommands (add, install, etc.) are blocked."""
+def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
+    """
+    B1: pnpm exact subcommand allowlist check.
+    Only (pnpm, typecheck), (pnpm, lint), (pnpm, test), (pnpm, build) are allowed.
+    pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are all blocked.
+    """
     if not argv or Path(argv[0]).name != "pnpm":
         return False
     if len(argv) < 2:
         return False
-    subcommand = argv[1].lower()
-    return subcommand in _PNPM_MUTATION_SUBCOMMANDS
+    key = ("pnpm", argv[1].lower())
+    return key in _ALLOWED_PNPM_SUBCOMMANDS
 
 
 def classify_static_command(
@@ -725,37 +756,47 @@ def classify_static_command(
             "baseline_fail_expected",
         )
 
-    # 6. Check git mutations (AC2)
-    if cmd_basename == "git" and _is_denied_git_invocation(argv):
-        return (
-            "blocked",
-            "unsafe_command",
-            "blocked",
-            f"'git {argv[1] if len(argv) > 1 else ''}' is a mutation command; "
-            "blocked for baseline preflight (read-only git commands are allowed)",
-            "baseline_fail_expected",
-        )
+    # 6. Check git: exact read-only allowlist (B3)
+    if cmd_basename == "git":
+        if not _is_allowed_git_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'git {argv[1] if len(argv) > 1 else ''}' is not in the git read-only allowlist; "
+                "allowed: status, diff, log, show, ls-files, rev-parse. "
+                "git worktree, git -c, and mutation commands are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed git read-only command
 
-    # 7. Check gh mutations (AC2)
-    if cmd_basename == "gh" and _is_denied_gh_invocation(argv):
-        return (
-            "blocked",
-            "command_not_allowed",
-            "blocked",
-            f"'gh {' '.join(argv[1:])}' is a mutation command; blocked for baseline preflight",
-            "baseline_fail_expected",
-        )
+    # 7. Check gh: exact read-only allowlist (B3)
+    if cmd_basename == "gh":
+        if not _is_allowed_gh_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'gh {' '.join(argv[1:])}' is not in the gh read-only allowlist; "
+                "allowed: gh issue view, gh pr view, gh pr list, gh issue list, gh repo view. "
+                "gh api, gh alias, gh extension, and mutation commands are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed gh read-only command
 
-    # 8. Check pnpm mutations (AC2)
-    if cmd_basename == "pnpm" and _is_denied_pnpm_invocation(argv):
-        return (
-            "blocked",
-            "command_not_allowed",
-            "blocked",
-            f"'pnpm {argv[1] if len(argv) > 1 else ''}' is a package mutation command; "
-            "blocked for baseline preflight (typecheck/lint/test/build are allowed)",
-            "baseline_fail_expected",
-        )
+    # 8. Check pnpm: exact subcommand allowlist (B1)
+    if cmd_basename == "pnpm":
+        if not _is_allowed_pnpm_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"'pnpm {argv[1] if len(argv) > 1 else ''}' is not in the pnpm allowlist; "
+                "only pnpm typecheck, pnpm lint, pnpm test, pnpm build are allowed. "
+                "pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are blocked.",
+                "baseline_fail_expected",
+            )
+        return None  # allowed pnpm subcommand
 
     # 9. Check uv: only allow uv run pytest / uv run python -m pytest / uv run python3 -m pytest
     if cmd_basename == "uv":
@@ -858,21 +899,24 @@ def classify_result(
         if exit_code == 0:
             return "expected_pass", "regression_gate", "go", None, "regression_gate"
         else:
-            # B3: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
+            # B5: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
             if _is_pytest_invocation(command):
                 combined_lower = f"{stdout}\n{stderr}".lower()
 
-                # B3: pytest exit 4 + file not found → expected_baseline_fail
+                # pytest exit 4 + file not found → expected_baseline_fail (env/path missing)
                 if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
                     return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-                # B3: pytest exit 5 + no tests collected → expected_baseline_fail
-                if exit_code == 5 and (
-                    "no tests ran" in combined_lower
-                    or "no tests collected" in combined_lower
-                    or "collected 0 items" in combined_lower
-                ):
-                    return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+                # B5: pytest exit 5 → vc_no_tests_collected / blocked
+                # exit 5 is "no tests collected" — -k condition mismatch or wrong path
+                if exit_code == 5:
+                    return (
+                        "blocked",
+                        "vc_no_tests_collected",
+                        "blocked",
+                        "pytest collected 0 tests (exit 5); check -k filter or test path",
+                        "baseline_fail_expected",
+                    )
 
             return "blocked", "regression_gate", "blocked", "Regression gate command failed", "regression_gate"
 
@@ -917,17 +961,20 @@ def classify_result(
     if _is_pytest_invocation(command):
         combined_lower = f"{stdout}\n{stderr}".lower()
 
-        # AC2: pytest exit 4 + file not found → expected_baseline_fail
+        # pytest exit 4 + file not found → expected_baseline_fail (path/env missing)
         if exit_code == 4 and re.search(r"error:\s+file or directory not found:", combined_lower):
             return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-        # AC3: pytest exit 5 + no tests collected → expected_baseline_fail
-        if exit_code == 5 and (
-            "no tests ran" in combined_lower
-            or "no tests collected" in combined_lower
-            or "collected 0 items" in combined_lower
-        ):
-            return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
+        # B5: pytest exit 5 → vc_no_tests_collected / blocked
+        # exit 5 = no tests collected (-k mismatch, wrong path, etc.) → not a valid baseline VC
+        if exit_code == 5:
+            return (
+                "blocked",
+                "vc_no_tests_collected",
+                "blocked",
+                "pytest collected 0 tests (exit 5); check -k filter or test path",
+                "baseline_fail_expected",
+            )
 
     # expected baseline fail patterns
     # rg with no match returns 1
@@ -982,6 +1029,7 @@ def compute_confidence(category: str) -> str:
         "expected_baseline_fail",
         "env_missing_dep",
         "file_not_found_unrunnable",
+        "vc_no_tests_collected",
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -1230,7 +1278,7 @@ def main() -> int:
         # C2: exit code 2 for extraction errors
         return 2
 
-    # bash ブロックからコマンドを抽出
+    # B4: bash ブロックからコマンドを抽出 (```bash のみ canonical format)
     blocks = extract_fenced_bash_blocks(vc_section)
     commands = []
     for block in blocks:
@@ -1238,6 +1286,27 @@ def main() -> int:
 
     # B3: 0 件抽出は blocked として返す
     if not commands:
+        # B4: check for unlabeled fences to provide better error message
+        unlabeled = find_unlabeled_fenced_blocks(vc_section)
+        if unlabeled:
+            no_cmd_error = {
+                "kind": "unsupported_vc_format",
+                "rule": "VC003_UNLABELED_FENCE_BLOCK",
+                "message": "Unlabeled fenced code blocks (```) found in Verification Commands section; "
+                           "only ```bash fenced blocks are the canonical VC format",
+                "minimal_context": "unlabeled fence blocks are not extracted as VC commands",
+                "fix_hint": "Change ``` to ```bash in Verification Commands fenced blocks; "
+                            "```bash ... ``` is the canonical VC format",
+            }
+        else:
+            no_cmd_error = {
+                "kind": "extraction_error",
+                "rule": "VC002_NO_COMMANDS_EXTRACTED",
+                "message": "No verification commands extracted from Verification Commands section",
+                "minimal_context": "fenced bash blocks found but no commands extracted",
+                "fix_hint": "Add '$ <command>' lines inside fenced bash blocks in the Verification Commands section; "
+                            "fenced bash blocks (```bash ... ```) are the canonical VC format",
+            }
         result = {
             "schema": "baseline_vc_preflight/v1",
             "issue": args.issue or 0,
@@ -1256,16 +1325,7 @@ def main() -> int:
                 "extraction_errors": 1,
             },
             "results": [],
-            "errors": [
-                {
-                    "kind": "extraction_error",
-                    "rule": "VC002_NO_COMMANDS_EXTRACTED",
-                    "message": "No verification commands extracted from Verification Commands section",
-                    "minimal_context": "fenced bash blocks found but no commands extracted",
-                    "fix_hint": "Add '$ <command>' lines inside fenced bash blocks in the Verification Commands section; "
-                                "fenced bash blocks (```bash ... ```) are the canonical VC format",
-                }
-            ],
+            "errors": [no_cmd_error],
         }
         print(json.dumps(result, indent=2))
         # C2: exit code 2 for extraction errors

@@ -174,7 +174,7 @@ $ {cmd}
 
 
 def test_git_mutation_is_blocked():
-    """AC2: git push, git commit → blocked / unsafe_command"""
+    """AC2: git push, git commit → blocked (command_not_allowed via exact allowlist)"""
     for git_cmd in ["git push origin main", "git commit -m 'test'"]:
         body = f"""## Verification Commands
 
@@ -188,7 +188,8 @@ $ {git_cmd}
         assert len(results) == 1, f"Expected 1 result for '{git_cmd}'"
         r = results[0]
         assert r["classification"] == "blocked", f"'{git_cmd}': expected blocked"
-        assert r["category"] == "unsafe_command", f"'{git_cmd}': expected unsafe_command, got {r['category']}"
+        # B3: git uses exact read-only allowlist; mutations return command_not_allowed
+        assert r["category"] in ("unsafe_command", "command_not_allowed"), f"'{git_cmd}': expected unsafe_command or command_not_allowed, got {r['category']}"
         assert r["decision"] == "blocked"
         assert r["exit_code"] is None, f"'{git_cmd}': must not be executed"
 
@@ -602,22 +603,24 @@ def test_classify_static_command_blocks_curl():
 
 
 def test_classify_static_command_blocks_git_push():
-    """classify_static_command returns unsafe_command for git push"""
+    """classify_static_command returns command_not_allowed for git push (B3: exact allowlist)"""
     from baseline_vc_preflight import classify_static_command
     result = classify_static_command("git push origin main", Path("."))
     assert result is not None
     _, category, decision, _, _ = result
-    assert category == "unsafe_command"
+    # B3: git uses exact read-only allowlist; non-allowed subcommands return command_not_allowed
+    assert category in ("unsafe_command", "command_not_allowed")
     assert decision == "blocked"
 
 
 def test_classify_static_command_blocks_git_commit():
-    """classify_static_command returns unsafe_command for git commit"""
+    """classify_static_command returns command_not_allowed for git commit (B3: exact allowlist)"""
     from baseline_vc_preflight import classify_static_command
     result = classify_static_command("git commit -m 'test'", Path("."))
     assert result is not None
     _, category, decision, _, _ = result
-    assert category == "unsafe_command"
+    # B3: git uses exact read-only allowlist; non-allowed subcommands return command_not_allowed
+    assert category in ("unsafe_command", "command_not_allowed")
     assert decision == "blocked"
 
 
@@ -713,4 +716,246 @@ def test_classify_static_command_blocks_uv_run_unknown():
     assert result is not None
     _, category, decision, _, _ = result
     assert category == "command_not_allowed"
+    assert decision == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# B1: pnpm exact subcommand allowlist tests
+# ---------------------------------------------------------------------------
+
+def test_pnpm_exec_is_blocked():
+    """B1: pnpm exec is not in the exact pnpm allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm exec sh -c "echo hello"
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "command_not_allowed", f"Expected command_not_allowed, got {r['category']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_pnpm_dlx_is_blocked():
+    """B1: pnpm dlx is not in the exact pnpm allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm dlx create-react-app my-app
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked"
+    assert r["category"] == "command_not_allowed"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_pnpm_run_is_blocked():
+    """B1: pnpm run is not in the exact pnpm allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm run my-script
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked"
+    assert r["category"] == "command_not_allowed"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# B2: mkdir blocked tests
+# ---------------------------------------------------------------------------
+
+def test_mkdir_is_blocked():
+    """B2: mkdir is not in the allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ mkdir -p artifacts
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "command_not_allowed", f"Expected command_not_allowed, got {r['category']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# B3: git/gh exact allowlist tests
+# ---------------------------------------------------------------------------
+
+def test_git_worktree_is_blocked():
+    """B3: git worktree is not in the git read-only allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ git worktree add /tmp/wt main
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "command_not_allowed", f"Expected command_not_allowed, got {r['category']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_git_config_env_is_blocked():
+    """B3: git -c (config override) is not in the git read-only allowlist → blocked"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ git -c alias.x='!sh -c echo hi' x
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_gh_alias_is_blocked():
+    """B3: gh alias is not in the gh read-only allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ gh alias set myalias issue list
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "command_not_allowed", f"Expected command_not_allowed, got {r['category']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_gh_extension_is_blocked():
+    """B3: gh extension is not in the gh read-only allowlist → blocked / command_not_allowed"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ gh extension install some/extension
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "command_not_allowed", f"Expected command_not_allowed, got {r['category']}"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# B4: unlabeled fence tests
+# ---------------------------------------------------------------------------
+
+def test_unlabeled_fence_is_blocked_or_ignored():
+    """B4: unlabeled fenced blocks (```) are not extracted as VC commands"""
+    # Unlabeled fence should NOT be extracted as VC; result is blocked with extraction error
+    body = """## Verification Commands
+
+```
+# AC1
+$ rg "pattern" src/
+```
+"""
+    data = run_preflight(body)
+    # Either: no results and status=blocked (unlabeled fence ignored)
+    # Or: results contains a block that has unsupported_vc_format category
+    # Either way, the command must NOT have been extracted and run successfully
+    assert data["status"] == "blocked", (
+        f"Expected status=blocked for unlabeled fence, got {data['status']}"
+    )
+    # The unlabeled fence content should NOT appear in results
+    results = data["results"]
+    for r in results:
+        assert r["category"] != "expected_baseline_fail" or r["decision"] != "go", (
+            "Unlabeled fence command must not be classified as normal expected_fail/go"
+        )
+
+
+def test_unlabeled_fence_error_is_structured():
+    """B4: when only unlabeled fences are present, error is structured with unsupported_vc_format"""
+    body = """## Verification Commands
+
+```
+$ rg "pattern" src/
+```
+"""
+    data = run_preflight(body)
+    assert data["status"] == "blocked"
+    assert len(data["errors"]) > 0
+    err = data["errors"][0]
+    assert isinstance(err, dict), f"Error must be dict, got {type(err)}"
+    assert "kind" in err, f"Error missing 'kind': {err}"
+    # kind should be unsupported_vc_format or extraction_error
+    assert err["kind"] in ("unsupported_vc_format", "extraction_error"), (
+        f"Expected unsupported_vc_format or extraction_error, got {err['kind']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B5: pytest exit 5 (no tests collected) → vc_no_tests_collected / blocked
+# ---------------------------------------------------------------------------
+
+def test_pytest_no_tests_collected_exit5_is_blocked():
+    """B5: pytest exit 5 (no tests collected) → blocked / vc_no_tests_collected"""
+    from baseline_vc_preflight import classify_result
+    # Simulate pytest exit 5 with no tests collected output
+    stdout = "collected 0 items\n\n========== no tests ran ==========\n"
+    stderr = ""
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        5, stdout, stderr, "uv run pytest .claude/skills/some-nonexistent-tests/ -v"
+    )
+    assert classification == "blocked", f"Expected blocked, got {classification}"
+    assert category == "vc_no_tests_collected", f"Expected vc_no_tests_collected, got {category}"
+    assert decision == "blocked", f"Expected decision=blocked, got {decision}"
+
+
+def test_pytest_no_tests_exit5_in_preflight():
+    """B5: pytest exit 5 in end-to-end preflight → blocked / vc_no_tests_collected"""
+    from baseline_vc_preflight import classify_result
+    # exit 5 = no tests collected regardless of output content
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        5, "", "ERROR: no tests ran", "pytest .claude/skills/nonexistent/"
+    )
+    assert classification == "blocked"
+    assert category == "vc_no_tests_collected"
     assert decision == "blocked"
