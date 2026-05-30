@@ -429,6 +429,37 @@ upstream security boundary として `#412` が担当する範囲は以下のと
 
 ---
 
+---
+
+## GitHub Secret 境界ポリシー（#412 追加）
+
+`#412` の実装により、measurement pipeline（Claude Code hooks / GitHub Actions workflow）は
+**GitHub Secret は値を取得しない**。presence boolean と metadata のみを扱う。
+
+### 基本原則
+
+- **Secret 値は取得しない**: `printenv`、`env`、`gh secret`、`export -p`、`.env` ファイル読み取りは
+  `secret_boundary_guard.sh`（PreToolUse hook）によって block される。
+- **presence / metadata のみ扱う**: Secret が存在するかどうか（boolean）と、
+  kind / category などの非機密 metadata のみを pipeline に通す。
+- **value を pipeline に渡さない**: manifest / log / artifact に Secret 値・そのハッシュ・
+  base64 / hex エンコード形式のいずれも含めない。
+- **fail-closed**: guard が malformed stdin を受け取った場合は exit 2（block）で fail closed する。
+
+### 実装（#412 完了後）
+
+| 境界 | 実装手段 |
+|---|---|
+| Claude Code PreToolUse hook | `.claude/hooks/secret_boundary_guard.sh` — 高リスク command / sensitive path を exit 2 で block |
+| `.claude/settings.json` deny | `.env`、`secrets/**`、credential path、`gh secret`、`printenv` 等への deny エントリ |
+| CI workflow | `session-manifest.yml` に `secrets.` 参照なし、`pull_request_target` なし、`contents: read` のみ |
+| manifest schema | `secret_policy.value_exposed: false` フィールドで状態を機械的に記録 |
+
+### 関連テスト
+
+- `.claude/hooks/tests/test_secret_boundary_contract.py` — sentinel fixture・structural・guard 動作検証
+
+
 ## 関連文書
 
 - `docs/dev/secret-policy.md` — Secret Inventory と no-secret 運用境界（`secret_policy/v1` SSOT）
