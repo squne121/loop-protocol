@@ -19,12 +19,16 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 1. `gh issue view <番号> --json title,body,labels` で本文を取得する。
 2. 本文を一時ファイルに保存し、以下の 2 スクリプトを順に実行する:
    - `python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
-   - `python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode preflight-static`
+   - `uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode execute`
    
    `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、以下の 2 系統に分離する：
    - `blocking_issues` には各 error の `fix_hint` 文字列を転写する（人間向け要約）
    - `structured_blockers` には `errors[]` の構造体をそのまま転写する（機械処理用・issue-author への修復 payload）
+     - `source_check` / `source_payload.decision` / `source_payload.classification` / `exit_code` / `command_hash` を損失なく保持すること（lossless pass-through）
+   - `status: human_judgment` を返すエラー（`human_judgment` decision / timeout / env_missing_dep）は `needs-fix` に畳み込まない；`failure_class: contract_readiness_human_judgment` を出力に含む
    `verdict: needs-fix` とする。判定ロジックは `contract_readiness_check.py` に集約し、本 skill では再実装しない。
+   
+   Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。
 3. checker の JSON をそのまま `REVIEW_ISSUE_RESULT_V1` に整形する（`verdict` / `deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を保持）。
 4. `verdict: needs-fix` の場合のみ `diff_proposal` を呼び出し元に提示する。本文書き戻しは Step 5 の条件分岐に従う。
 5. 本文書き戻し条件:
