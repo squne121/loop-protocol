@@ -11,6 +11,7 @@ tools:
   - MultiEdit
 # Bash 制約: pnpm typecheck / lint / test / build と
 # .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
+# 例外: gh api -X PUT repos/{owner}/{repo}/pulls/{pull_number}/update-branch（update_branch contract 実行 — #453）
 # git push / gh pr create は open-pr skill 経由のみ。
 model: sonnet
 permissionMode: acceptEdits
