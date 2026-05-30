@@ -133,6 +133,8 @@ jobs:
           PY
       - run: uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md
       - run: uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
+      - name: Check InputCommand docs schema
+        run: uv run --locked python scripts/check_input_command_schema.py
       - run: uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
       - run: uv run --locked pytest .claude/skills/create-issue/tests/
       - run: uv run --locked pytest .claude/skills/create-issue/scripts/tests/

@@ -1,6 +1,8 @@
 """
-Verify that docs/product/game-logic.md's InputCommand TypeScript code block
-matches the actual schema in src/input/InputMapper.ts.
+Validate the InputCommand TypeScript code block in docs/product/game-logic.md.
+
+This script checks the documented token set for the current move/aim/fire schema.
+It does not parse src/input/InputMapper.ts.
 
 Exit 0 on success, non-zero on failure.
 """
