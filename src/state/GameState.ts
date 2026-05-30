@@ -81,6 +81,53 @@ export interface TelemetryState {
   lastCommandSummary: string
 }
 
+// ---------------------------------------------------------------------------
+// Sortie state machine types (AC1, AC5)
+// ---------------------------------------------------------------------------
+
+export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+
+export interface SortieResult {
+  readonly outcome: 'victory' | 'defeat'
+  readonly durationMs: number
+  readonly kills: number
+  readonly shotsFired: number
+  readonly playerHpRemaining: number
+}
+
+/**
+ * Discriminated union for sortie state.
+ * - `idle`: not yet started; elapsedTicks fixed at 0, result is null
+ * - `running`: in progress; elapsedTicks advances each tick, result is null
+ * - `victory` | `defeat`: terminal; result is populated, no further mutation
+ * - `ended`: reserved for post-result acknowledgement flows (not used in M2)
+ */
+export type SortieState =
+  | {
+      status: 'idle'
+      elapsedTicks: 0
+      targetTicks: number
+      result: null
+    }
+  | {
+      status: 'running'
+      elapsedTicks: number
+      targetTicks: number
+      result: null
+    }
+  | {
+      status: 'victory' | 'defeat'
+      elapsedTicks: number
+      targetTicks: number
+      result: Readonly<SortieResult>
+    }
+  | {
+      status: 'ended'
+      elapsedTicks: number
+      targetTicks: number
+      result: Readonly<SortieResult>
+    }
+
 export interface GameState {
   tick: number
   elapsedMs: number
@@ -92,6 +139,8 @@ export interface GameState {
   nextEnemyId: number
   progress: ProgressState
   telemetry: TelemetryState
+  /** Sortie state machine (AC1). Managed by SortieSystem. */
+  sortie: SortieState
 }
 
 export interface GameSnapshot {
@@ -140,6 +189,13 @@ export function createInitialGameState(
     telemetry: {
       status: 'Combat systems green',
       lastCommandSummary: 'Awaiting pilot input',
+    },
+    sortie: {
+      status: 'idle',
+      elapsedTicks: 0,
+      // targetTicks will be set by startSortie(); placeholder 0 is overwritten before use
+      targetTicks: 0,
+      result: null,
     },
   }
 }
