@@ -5,6 +5,20 @@ export interface ArenaState {
   height: number
 }
 
+export interface EnemyState {
+  id: number
+  definitionId: string
+  hp: number
+  maxHp: number
+  x: number
+  y: number
+  radius: number
+  speedPxPerSec: number
+  contactDamage: number
+  defeated: boolean
+  defeatedAtTick: number | null
+}
+
 export interface PlayerState {
   id: EntityId
   x: number
@@ -53,6 +67,8 @@ export interface GameState {
   player: PlayerState
   projectiles: ProjectileState[]
   nextProjectileId: number
+  enemies: EnemyState[]
+  nextEnemyId: number
   progress: ProgressState
   telemetry: TelemetryState
 }
@@ -98,6 +114,8 @@ export function createInitialGameState(
     },
     projectiles: [],
     nextProjectileId: 1,
+    enemies: [],
+    nextEnemyId: 1,
     telemetry: {
       status: 'Combat systems green',
       lastCommandSummary: 'Awaiting pilot input',
