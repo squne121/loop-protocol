@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'vitest'
 
 import { createInitialGameState } from '../src/state'
-import { runCombatSystem } from '../src/systems'
+import type { EnemyState } from '../src/state'
+import { resolveCombatCollisions, runCombatSystem } from '../src/systems'
+
+function makeEnemy(overrides: Partial<EnemyState>): EnemyState {
+  return {
+    id: 1,
+    definitionId: 'test',
+    hp: 10,
+    maxHp: 10,
+    x: 500,
+    y: 270,
+    radius: 16,
+    speedPxPerSec: 60,
+    contactDamage: 1,
+    defeated: false,
+    defeatedAtTick: null,
+    ...overrides,
+  }
+}
 
 describe('runCombatSystem', () => {
   it('GIVEN weapon ready WHEN fire command with aim THEN shotsFired increments and cooldown resets', () => {
@@ -192,5 +210,101 @@ describe('runCombatSystem', () => {
     runCombatSystem(state, [{ type: 'aim', x: 800, y: 200 }, { type: 'fire' }], 16)
 
     expect(state.projectiles[0].id).toBeLessThan(state.projectiles[1].id)
+  })
+
+  it('GIVEN weapon ready with weaponPower 3 WHEN fire command THEN spawned projectile.damage equals 3 (AC4)', () => {
+    const state = createInitialGameState({ weaponPower: 3 })
+
+    runCombatSystem(state, [{ type: 'aim', x: 800, y: 200 }, { type: 'fire' }], 16)
+
+    expect(state.projectiles[0].damage).toBe(3)
+  })
+
+  it('GIVEN projectile fired with weaponPower 2 WHEN weaponPower later changes to 5 THEN existing projectile.damage remains 2 (AC4 snapshot)', () => {
+    const state = createInitialGameState({ weaponPower: 2 })
+
+    runCombatSystem(state, [{ type: 'aim', x: 800, y: 200 }, { type: 'fire' }], 16)
+    const damageBefore = state.projectiles[0].damage
+
+    // Change weaponPower after firing
+    state.progress.weaponPower = 5
+
+    expect(state.projectiles[0].damage).toBe(damageBefore)
+    expect(damageBefore).toBe(2)
+  })
+})
+
+describe('resolveCombatCollisions (CombatSystem)', () => {
+  it('GIVEN pairs with projectile-enemy hit WHEN resolveCombatCollisions THEN enemy hp decreases (AC8)', () => {
+    const state = createInitialGameState()
+    state.enemies = [makeEnemy({ id: 1, hp: 10, x: 300, y: 270, radius: 16 })]
+    state.projectiles = [
+      {
+        id: 1,
+        x: 300,
+        y: 270,
+        radius: 4,
+        directionX: 1,
+        directionY: 0,
+        speedPxPerSec: 520,
+        ageMs: 0,
+        lifetimeMs: 1200,
+        damage: 4,
+      },
+    ]
+
+    resolveCombatCollisions(state, [
+      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
+    ])
+
+    expect(state.enemies[0].hp).toBe(6)
+  })
+
+  it('GIVEN enemy hp === 0 after hit WHEN resolveCombatCollisions THEN enemy.defeated = true (AC9)', () => {
+    const state = createInitialGameState()
+    state.tick = 7
+    state.enemies = [makeEnemy({ id: 1, hp: 5, x: 300, y: 270, radius: 16 })]
+    state.projectiles = [
+      {
+        id: 1,
+        x: 300,
+        y: 270,
+        radius: 4,
+        directionX: 1,
+        directionY: 0,
+        speedPxPerSec: 520,
+        ageMs: 0,
+        lifetimeMs: 1200,
+        damage: 5,
+      },
+    ]
+
+    resolveCombatCollisions(state, [
+      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
+    ])
+
+    expect(state.enemies[0].defeated).toBe(true)
+    expect(state.enemies[0].defeatedAtTick).toBe(7)
+    expect(state.projectiles).toHaveLength(0)
+  })
+
+  it('GIVEN player-enemy pair WHEN resolveCombatCollisions THEN player.hp decreases by contactDamage (AC12)', () => {
+    const state = createInitialGameState()
+    const initialHp = state.player.hp
+    state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 3 })]
+
+    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+
+    expect(state.player.hp).toBe(initialHp - 3)
+  })
+
+  it('GIVEN contact damage exceeds player hp WHEN resolveCombatCollisions THEN player.hp clamped to 0 (AC13)', () => {
+    const state = createInitialGameState()
+    state.player.hp = 1
+    state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 100 })]
+
+    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+
+    expect(state.player.hp).toBe(0)
   })
 })
