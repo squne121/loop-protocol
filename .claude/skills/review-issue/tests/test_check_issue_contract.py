@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -374,6 +375,93 @@ class TestMachineReadableContractPriority:
 # contract_readiness_execute integration tests (AC3, AC4, AC5, AC7, AC8, AC9)
 # ---------------------------------------------------------------------------
 
+# Inline fixture for unexpected_pass detection tests.
+# This issue has a VC of `$ true` which always returns exit 0 at baseline,
+# triggering unexpected_pass classification.
+# Previously stored as fixtures/unexpected_pass_issue.md; inlined here so the
+# fixtures/ directory does not need to be tracked for this AC.
+_UNEXPECTED_PASS_ISSUE_CONTENT = """\
+---
+LABELS: phase/implementation,kind/implementation
+TITLE: 実装: unexpected_pass テスト用フィクスチャ（VC が baseline で pass する Issue）
+---
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "none"
+goal_ref: "unexpected_pass テスト用フィクスチャ"
+change_kind: code
+```
+
+## Parent Issue
+
+none
+
+## Outcome
+
+`unexpected_pass_issue.md` が baseline_vc_preflight で unexpected_pass 判定されることを確認する。
+
+## Background
+
+このフィクスチャは `--mode execute` の unexpected_pass 検出テスト用。VC の `$ true` は実装前でも常に exit 0 を返すため unexpected_pass となる。
+
+## Parent Goal Ref
+
+- Goal: unexpected_pass テスト用
+- Desired Destination: unexpected_pass が検出されること
+
+## Current Validated Scope
+
+- テストフィクスチャのみ
+
+## Remaining Parent Gaps
+
+なし
+
+## In Scope
+
+- テストフィクスチャのみ
+
+## Out of Scope
+
+- その他のファイルの変更
+
+## Required Skills
+
+なし
+
+## Acceptance Criteria
+
+- [ ] AC1: `true` コマンドが常に exit 0 を返すこと（unexpected_pass テスト用）
+
+## Verification Commands
+
+```bash
+# AC1
+$ true
+```
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合は停止
+- テストが修正できない場合は停止
+- 既存の型定義と競合する場合は停止
+- スコープ外の refactoring が必要な場合は停止
+- ビルドが壊れる場合は停止
+- 依存関係の追加が必要な場合は停止
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: テストフィクスチャ用。
+
+## Allowed Paths
+
+- `.claude/skills/review-issue/tests/test_check_issue_contract.py`
+"""
+
 
 def run_contract_readiness(fixture_name: str, mode: str = "execute") -> tuple[dict, int]:
     """Run contract_readiness_check.py on a fixture file and return (parsed JSON, exit_code).
@@ -390,6 +478,31 @@ def run_contract_readiness(fixture_name: str, mode: str = "execute") -> tuple[di
         text=True,
         shell=False,  # AC8: shell=True is NOT used
     )
+    try:
+        return json.loads(result.stdout), result.returncode
+    except json.JSONDecodeError as e:
+        raise AssertionError(
+            f"contract_readiness_check.py output is not valid JSON: {e}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        ) from e
+
+
+def run_contract_readiness_from_content(content: str, mode: str = "execute") -> tuple[dict, int]:
+    """Run contract_readiness_check.py with inline content via a temp file.
+
+    Uses --body-file only (no --issue / gh / network) per AC7.
+    shell=False is enforced by subprocess.run default per AC8.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    result = subprocess.run(
+        [sys.executable, str(CONTRACT_READINESS_SCRIPT_PATH), "--body-file", tmp_path, "--mode", mode],
+        capture_output=True,
+        text=True,
+        shell=False,  # AC8: shell=True is NOT used
+    )
+    Path(tmp_path).unlink(missing_ok=True)
     try:
         return json.loads(result.stdout), result.returncode
     except json.JSONDecodeError as e:
@@ -425,18 +538,18 @@ class TestContractReadinessExecuteIntegration:
         )
 
     def test_unexpected_pass_fixture_returns_needs_fix(self):
-        """GIVEN unexpected_pass_issue.md (VC: $ true, always exit 0) WHEN --mode execute runs
+        """GIVEN inline unexpected_pass content (VC: $ true, always exit 0) WHEN --mode execute runs
         THEN status == needs_fix (AC3: verdict pathway produces needs-fix)."""
-        result, exit_code = run_contract_readiness("unexpected_pass_issue.md", mode="execute")
+        result, exit_code = run_contract_readiness_from_content(_UNEXPECTED_PASS_ISSUE_CONTENT, mode="execute")
         assert result.get("status") == "needs_fix", (
             f"Expected needs_fix for unexpected_pass fixture, got: {result.get('status')}. "
             f"errors: {result.get('errors')}"
         )
 
     def test_unexpected_pass_category_in_errors(self):
-        """GIVEN unexpected_pass_issue.md WHEN --mode execute runs
+        """GIVEN inline unexpected_pass content WHEN --mode execute runs
         THEN errors[] contains an entry with category == 'unexpected_pass' (AC3 full check)."""
-        result, exit_code = run_contract_readiness("unexpected_pass_issue.md", mode="execute")
+        result, exit_code = run_contract_readiness_from_content(_UNEXPECTED_PASS_ISSUE_CONTENT, mode="execute")
         errors = result.get("errors", [])
         categories = [e.get("category") for e in errors]
         assert "unexpected_pass" in categories, (
@@ -445,9 +558,9 @@ class TestContractReadinessExecuteIntegration:
         )
 
     def test_structured_blockers_lossless_passthrough(self):
-        """GIVEN unexpected_pass_issue.md WHEN --mode execute runs
+        """GIVEN inline unexpected_pass content WHEN --mode execute runs
         THEN errors[] preserves source_check, source_payload fields (AC4: lossless pass-through)."""
-        result, exit_code = run_contract_readiness("unexpected_pass_issue.md", mode="execute")
+        result, exit_code = run_contract_readiness_from_content(_UNEXPECTED_PASS_ISSUE_CONTENT, mode="execute")
         errors = result.get("errors", [])
         unexpected_pass_errors = [e for e in errors if e.get("category") == "unexpected_pass"]
         assert len(unexpected_pass_errors) > 0, (
