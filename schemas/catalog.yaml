@@ -1,0 +1,803 @@
+catalog_schema_version: "v1"
+catalog_id: "loop-protocol.schema-catalog/v1"
+generated_from: null
+entries:
+  - schema_id: "issue_contract/v1"
+    format: github_issue_body
+    source_kind: github_issue_body
+    definition_paths:
+      - ".claude/skills/issue-contract-review/SKILL.md"
+      - ".claude/skills/implement-issue/SKILL.md"
+    producer:
+      owner: "issue-author"
+      paths:
+        - ".claude/skills/issue-author/"
+    consumers:
+      - id: "issue-contract-review"
+        paths:
+          - ".claude/skills/issue-contract-review/SKILL.md"
+      - id: "implement-issue"
+        paths:
+          - ".claude/skills/implement-issue/SKILL.md"
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+    detection_patterns:
+      - id: "issue-contract-frontmatter"
+        engine: ripgrep
+        mode: regex
+        pattern: "issue_contract|Machine-Readable Contract|contract_schema_version"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_issue_contract_schema"
+        runner: pytest
+        target: ".claude/skills/issue-contract-review/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "delegation_request_v1"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/gemini-cli-headless-delegation/SKILL.md"
+    producer:
+      owner: "implement-issue"
+      paths:
+        - ".claude/skills/implement-issue/SKILL.md"
+        - ".claude/skills/codebase-investigator/"
+    consumers:
+      - id: "gemini-cli-wrapper"
+        paths:
+          - ".claude/skills/gemini-cli-headless-delegation/"
+    detection_patterns:
+      - id: "delegation-request-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "delegation_request_v1|delegation_request"
+        paths:
+          - ".claude"
+    required_test_commands:
+      - id: "validate_gemini_delegation"
+        runner: pytest
+        target: ".claude/skills/gemini-cli-headless-delegation/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "delegation_result/v1"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/gemini-cli-headless-delegation/SKILL.md"
+    producer:
+      owner: "gemini-cli-wrapper"
+      paths:
+        - ".claude/skills/gemini-cli-headless-delegation/"
+    consumers:
+      - id: "web-researcher"
+        paths:
+          - ".claude/skills/web-researcher/"
+      - id: "codebase-investigator"
+        paths:
+          - ".claude/skills/codebase-investigator/"
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "delegation-result-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "delegation_result/v1|result_surface|transport_details|failure_class|structured_events"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_gemini_delegation"
+        runner: pytest
+        target: ".claude/skills/gemini-cli-headless-delegation/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "acp_result_v1"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/gemini-cli-headless-delegation/SKILL.md"
+    producer:
+      owner: "gemini-cli-wrapper"
+      paths:
+        - ".claude/skills/gemini-cli-headless-delegation/"
+    consumers:
+      - id: "delegation-result-normalizer"
+        paths:
+          - ".claude/skills/gemini-cli-headless-delegation/"
+    detection_patterns:
+      - id: "acp-result-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "acp_result_v1|acp_result|--acp"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_gemini_delegation"
+        runner: pytest
+        target: ".claude/skills/gemini-cli-headless-delegation/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "LOOP_VERDICT"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/pr-review-judge/SKILL.md"
+    producer:
+      owner: "pr-review-judge"
+      paths:
+        - ".claude/skills/pr-review-judge/SKILL.md"
+    consumers:
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "loop-verdict-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "LOOP_VERDICT|verdict:|reviewed_head_sha"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_pr_review_judge"
+        runner: pytest
+        target: ".claude/skills/pr-review-judge/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "TEST_VERDICT_MACHINE v1"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/test-runner/SKILL.md"
+    producer:
+      owner: "test-runner"
+      paths:
+        - ".claude/skills/test-runner/"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "test-verdict-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "TEST_VERDICT_MACHINE|verification_commands_pass|verification_commands_fail"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_test_runner"
+        runner: pytest
+        target: ".claude/skills/test-runner/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "IMPLEMENT_RESULT_V1"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/implement-issue/SKILL.md"
+    producer:
+      owner: "implement-issue"
+      paths:
+        - ".claude/skills/implement-issue/SKILL.md"
+    consumers:
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "implement-result-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "IMPLEMENT_RESULT_V1|IMPLEMENT_RESULT"
+        paths:
+          - ".claude"
+    required_test_commands:
+      - id: "validate_implement_issue"
+        runner: pytest
+        target: ".claude/skills/implement-issue/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "contract_schema_version: v1"
+    format: github_issue_body
+    source_kind: github_issue_body
+    definition_paths:
+      - ".claude/skills/issue-author/SKILL.md"
+    producer:
+      owner: "issue-author"
+      paths:
+        - ".claude/skills/issue-author/"
+    consumers:
+      - id: "issue-contract-review"
+        paths:
+          - ".claude/skills/issue-contract-review/SKILL.md"
+    detection_patterns:
+      - id: "contract-schema-version-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "contract_schema_version"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_issue_contract_schema"
+        runner: pytest
+        target: ".claude/skills/issue-contract-review/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "Runtime Verification Applicability"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - "docs/dev/runtime-verification-policy.md"
+    producer:
+      owner: "issue-author"
+      paths:
+        - ".claude/skills/issue-author/"
+        - "docs/dev/runtime-verification-policy.md"
+    consumers:
+      - id: "implement-issue"
+        paths:
+          - ".claude/skills/implement-issue/SKILL.md"
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "runtime-verification-applicability-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "Runtime Verification Applicability|runtime_verification_applicability|decision: immediate|decision: deferred|decision: not_applicable"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_runtime_verification_policy"
+        runner: pytest
+        target: "docs/dev/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "Safety Claim Matrix"
+    format: markdown_table
+    source_kind: repo_path
+    definition_paths:
+      - ".github/pull_request_template.md"
+      - ".claude/skills/open-pr/SKILL.md"
+    producer:
+      owner: "pr-author"
+      paths:
+        - ".github/pull_request_template.md"
+        - ".claude/skills/open-pr/SKILL.md"
+    consumers:
+      - id: "open-pr"
+        paths:
+          - ".claude/skills/open-pr/SKILL.md"
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+    detection_patterns:
+      - id: "safety-claim-matrix-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "Safety Claim Matrix|Not controlled|E_SAFETY_CLAIM_MATRIX_MISSING"
+        paths:
+          - ".claude"
+          - ".github"
+          - "docs"
+    required_test_commands:
+      - id: "validate_pr_body_contract_tests"
+        runner: pytest
+        target: ".claude/skills/open-pr/scripts/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "model_routing.yaml"
+    format: yaml
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/gemini-cli-headless-delegation/config/model_routing.yaml"
+    producer:
+      owner: "model-routing-config-manager"
+      paths:
+        - ".claude/skills/gemini-cli-headless-delegation/config/model_routing.yaml"
+    consumers:
+      - id: "gemini-cli-wrapper"
+        paths:
+          - ".claude/skills/gemini-cli-headless-delegation/"
+      - id: "test-model-routing"
+        paths:
+          - ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py"
+    detection_patterns:
+      - id: "model-routing-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "model_routing|model_routing\\.yaml|routing_config"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_model_routing"
+        runner: pytest
+        target: ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "validate_model_routing"
+
+  - schema_id: "runtime-verification artifact log"
+    format: markdown_yaml_contract
+    source_kind: repo_path
+    definition_paths:
+      - "docs/dev/runtime-verification-policy.md"
+    producer:
+      owner: "implement-issue"
+      paths:
+        - ".claude/skills/implement-issue/SKILL.md"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+    detection_patterns:
+      - id: "runtime-verification-artifact-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "runtime.verification.artifact|Runtime Verification Evidence|verification_route"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_runtime_verification_artifacts"
+        runner: pytest
+        target: "docs/dev/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "pr_body_schema/schema_change_applicability/v1"
+    format: markdown_table
+    source_kind: repo_path
+    definition_paths:
+      - ".github/pull_request_template.md"
+      - ".claude/skills/open-pr/SKILL.md"
+    producer:
+      owner: "pr-author"
+      paths:
+        - ".github/pull_request_template.md"
+        - ".claude/skills/open-pr/SKILL.md"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "open-pr"
+        paths:
+          - ".claude/skills/open-pr/SKILL.md"
+      - id: "future-open-pr-py"
+        paths:
+          - ".claude/skills/open-pr/scripts/"
+    detection_patterns:
+      - id: "schema-change-applicability-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "Schema Change Applicability|schema_change_applicability"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_pr_body_contract_tests"
+        runner: pytest
+        target: ".claude/skills/open-pr/scripts/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "pr_body_schema/schema_consumer_inventory/v1"
+    format: markdown_table
+    source_kind: repo_path
+    definition_paths:
+      - ".github/pull_request_template.md"
+      - ".claude/skills/open-pr/SKILL.md"
+    producer:
+      owner: "pr-author"
+      paths:
+        - ".github/pull_request_template.md"
+        - ".claude/skills/open-pr/SKILL.md"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "open-pr"
+        paths:
+          - ".claude/skills/open-pr/SKILL.md"
+      - id: "future-open-pr-py"
+        paths:
+          - ".claude/skills/open-pr/scripts/"
+    detection_patterns:
+      - id: "schema-consumer-inventory-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "Schema Consumer Inventory|Consumer 更新状況|Compatibility Decision"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_pr_body_contract_tests"
+        runner: pytest
+        target: ".claude/skills/open-pr/scripts/tests/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "lint_catalog_yaml"
+
+  - schema_id: "agent_session_manifest/v1"
+    format: yaml
+    source_kind: repo_path
+    definition_paths:
+      - "docs/schemas/agent-session-manifest.md"
+      - "docs/schemas/agent-session-manifest.schema.json"
+    producer:
+      owner: "claude-code-hook-ledger"
+      paths:
+        - "docs/schemas/agent-session-manifest.md"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+      - id: "pilot-smoke-test"
+        paths:
+          - "tests/"
+      - id: "future-aggregation-script"
+        paths:
+          - "scripts/"
+    detection_patterns:
+      - id: "agent-session-manifest-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "agent_session_manifest/v1|agent_session_manifest:v1|agent-session-manifest"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_agent_session_manifest"
+        runner: pnpm
+        target: "tests/agent-session-manifest.test.ts"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive:
+          - "docs/schemas/examples/"
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "validate_agent_session_manifest"
+
+  - schema_id: "PR_REVIEW_GATE_RESULT_V1"
+    format: yaml
+    source_kind: repo_path
+    definition_paths:
+      - ".claude/skills/pr-review-judge/references/pr-review-gate-result-schema.yml"
+    producer:
+      owner: "check-pr-review-gates"
+      paths:
+        - ".claude/skills/pr-review-judge/scripts/check_pr_review_gates.py"
+    consumers:
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+      - id: "impl-review-loop"
+        paths:
+          - ".claude/skills/impl-review-loop/SKILL.md"
+    detection_patterns:
+      - id: "pr-review-gate-result-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "PR_REVIEW_GATE_RESULT_V1|schema_version.*RESULT"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_pr_review_gates"
+        runner: pytest
+        target: ".claude/skills/pr-review-judge/"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive: []
+        negative: []
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "1664872"
+      command_id: "validate_pr_review_gates"
