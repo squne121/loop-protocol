@@ -375,6 +375,92 @@ class TestMachineReadableContractPriority:
 # contract_readiness_execute integration tests (AC3, AC4, AC5, AC7, AC8, AC9)
 # ---------------------------------------------------------------------------
 
+# Inline fixture for human_judgment detection tests.
+# This issue has a VC that calls a nonexistent tool, which produces exit 127
+# (env_missing_dep → human_judgment status in contract_readiness_check.py).
+# The key property: overall status == "human_judgment", NOT "needs_fix".
+_HUMAN_JUDGMENT_ISSUE_CONTENT = """\
+---
+LABELS: phase/implementation,kind/implementation
+TITLE: 実装: human_judgment テスト用フィクスチャ（VC が env_missing_dep で human_judgment になる Issue）
+---
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "none"
+goal_ref: "human_judgment テスト用フィクスチャ"
+change_kind: code
+```
+
+## Parent Issue
+
+none
+
+## Outcome
+
+`human_judgment_issue.md` が baseline_vc_preflight で human_judgment 判定されることを確認する。
+
+## Background
+
+このフィクスチャは `--mode execute` の human_judgment 検出テスト用。VC の `$ loop-protocol-nonexistent-tool-xyz-abc` は常に exit 127 (command not found) を返すため、env_missing_dep → human_judgment となる。
+
+## Parent Goal Ref
+
+- Goal: human_judgment テスト用
+- Desired Destination: human_judgment が検出されること
+
+## Current Validated Scope
+
+- テストフィクスチャのみ
+
+## Remaining Parent Gaps
+
+なし
+
+## In Scope
+
+- テストフィクスチャのみ
+
+## Out of Scope
+
+- その他のファイルの変更
+
+## Required Skills
+
+なし
+
+## Acceptance Criteria
+
+- [ ] AC1: `loop-protocol-nonexistent-tool-xyz-abc` が exit 127 を返すこと（human_judgment テスト用）
+
+## Verification Commands
+
+```bash
+# AC1
+$ loop-protocol-nonexistent-tool-xyz-abc
+```
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合は停止
+- テストが修正できない場合は停止
+- 既存の型定義と競合する場合は停止
+- スコープ外の refactoring が必要な場合は停止
+- ビルドが壊れる場合は停止
+- 依存関係の追加が必要な場合は停止
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: テストフィクスチャ用。
+
+## Allowed Paths
+
+- `.claude/skills/review-issue/tests/test_check_issue_contract.py`
+"""
+
 # Inline fixture for unexpected_pass detection tests.
 # This issue has a VC of `$ true` which always returns exit 0 at baseline,
 # triggering unexpected_pass classification.
@@ -578,28 +664,38 @@ class TestContractReadinessExecuteIntegration:
             assert "command_hash" in payload, f"source_payload missing 'command_hash': {payload}"
 
     def test_human_judgment_not_collapsed_to_needs_fix(self):
-        """GIVEN a fixture that produces human_judgment status WHEN --mode execute runs
-        THEN status remains human_judgment (AC5: must NOT be collapsed to needs_fix).
+        """GIVEN a fixture with a nonexistent-tool VC WHEN --mode execute runs
+        THEN status == human_judgment (AC5: must NOT be collapsed to needs_fix).
 
-        Uses pass_issue.md with a command that is classified as human_judgment to verify
-        the separation. This test verifies the contract_readiness_check.py mapping logic."""
-        # This test verifies the existing contract: human_judgment is NOT collapsed to needs_fix.
-        # We verify by checking that the mapping function preserves human_judgment status
-        # when the preflight result has decision: human_judgment entries.
-        # The contract is already in contract_readiness_check.py; we verify it holds end-to-end.
-        result, _exit_code = run_contract_readiness("pass_issue.md", mode="execute")
-        # pass_issue.md should be go or needs_fix (grep command likely fails = expected_fail = go)
-        # The key assertion: if there are errors, none of the human_judgment errors have been
-        # incorrectly mapped to needs_fix category with the same classification.
+        Uses _HUMAN_JUDGMENT_ISSUE_CONTENT which has VC: $ loop-protocol-nonexistent-tool-xyz-abc.
+        That command exits with 127 (command not found) → env_missing_dep → human_judgment.
+        The contract_readiness_check.py must NOT collapse this to needs_fix."""
+        result, _exit_code = run_contract_readiness_from_content(_HUMAN_JUDGMENT_ISSUE_CONTENT, mode="execute")
+
+        # The fixture must produce at least one error (env_missing_dep → human_judgment)
         errors = result.get("errors", [])
-        for err in errors:
+        human_judgment_errors = [
+            e for e in errors
+            if e.get("category") in ("env_missing_dep", "timeout", "unknown")
+            or e.get("source_payload", {}).get("decision") == "human_judgment"
+        ]
+        assert len(human_judgment_errors) > 0, (
+            f"human_judgment fixture should produce at least one human_judgment error "
+            f"(env_missing_dep/timeout/unknown). errors: {errors}"
+        )
+
+        # Overall status must be human_judgment, NOT needs_fix (AC5)
+        assert result.get("status") == "human_judgment", (
+            f"human_judgment errors must NOT collapse overall status to needs_fix. "
+            f"status={result.get('status')}, human_judgment_errors={human_judgment_errors}"
+        )
+
+        # Confirm: no human_judgment error has been re-classified as needs_fix in source_payload
+        for err in human_judgment_errors:
             payload = err.get("source_payload", {})
-            if payload.get("decision") == "human_judgment":
-                # human_judgment decision → overall status must be human_judgment, NOT needs_fix
-                assert result.get("status") == "human_judgment", (
-                    f"human_judgment decision was collapsed to needs_fix. "
-                    f"status={result.get('status')}, error={err}"
-                )
+            assert payload.get("classification") != "needs_fix", (
+                f"human_judgment error must not be reclassified as needs_fix in source_payload: {err}"
+            )
 
     def test_execute_uses_body_file_only_no_network(self):
         """GIVEN a fixture file WHEN --mode execute runs with --body-file
