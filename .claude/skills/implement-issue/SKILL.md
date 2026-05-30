@@ -216,3 +216,87 @@ IMPLEMENT_RESULT_V1:
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
 `IMPLEMENT_RESULT_V1` の全フィールドは必ず含める（routing 必須フィールド）。
+
+## update_branch Contract
+
+`impl-review-loop` Step 5 の BEHIND 分岐から呼び出される `update_branch` 実行手順の contract。
+
+### UPDATE_BRANCH_REQUEST_V1
+
+```yaml
+UPDATE_BRANCH_REQUEST_V1:
+  pr_number: <int>          # 対象 PR 番号
+  repo: <owner/repo>        # 例: squne121/loop-protocol
+  expected_head_sha: <sha>  # Step 4 の reviewed_head_sha（race guard 用）
+```
+
+### UPDATE_BRANCH_RESULT_V1
+
+```yaml
+UPDATE_BRANCH_RESULT_V1:
+  status: ok | failed | stale_verdict | human_escalation | bounded_backoff_or_human_escalation
+  http_status: 202 | 403 | 422 | <other>
+  new_head_sha: <sha>    # 202 + poll 成功時のみ（head 更新後の headRefOid）
+  permission_diagnostics:  # 403 時のみ
+    auth_actor: <string>
+    head_repo: <owner/repo>
+    base_repo: <owner/repo>
+    fork_pr: true | false
+    maintainer_can_modify: true | false
+    required_permissions: <string>
+  error_body: <string>   # 422 その他エラー時の body（分類根拠の記録用）
+```
+
+### 呼び出し形式
+
+```bash
+REPO=$(git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//')
+PR_NUMBER=<番号>
+EXPECTED_HEAD_SHA=<reviewed_head_sha>
+
+gh api -i -X PUT "repos/$REPO/pulls/$PR_NUMBER/update-branch" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  -f expected_head_sha="$EXPECTED_HEAD_SHA"
+```
+
+`gh pr update-branch` は使用しない（`expected_head_sha` オプションがないため）。
+
+本 contract は **REST merge update 固定**。linear history またはリベース必須リポジトリは out-of-scope — 403 または validation failure 時は `human_escalation` とする。GraphQL `updatePullRequestBranch` mutation は本 contract 対象外。
+
+### HTTP ステータス別分岐
+
+**202 Accepted:**
+
+- update が受け付けられた。headRefOid が `EXPECTED_HEAD_SHA` から変化するまで poll する（bounded retry: 5 秒 × 最大 12 回）
+- poll 成功（head 更新確認）→ `UPDATE_BRANCH_RESULT_V1.status: ok`、`new_head_sha` を記録
+- poll タイムアウト → `status: human_escalation`
+
+**403 Forbidden:**
+
+権限不足またはフォーク PR の書き込み制限。以下の `permission_diagnostics` を出力して `status: human_escalation` とする:
+
+```bash
+# auth_actor の確認
+gh api user --jq .login
+
+# PR の fork / maintainer_can_modify 確認
+gh pr view "$PR_NUMBER" --json headRepository,maintainerCanModify \
+  --jq '{head_repo: .headRepository.nameWithOwner, maintainer_can_modify: .maintainerCanModify}'
+```
+
+403 時は `UPDATE_BRANCH_RESULT_V1.permission_diagnostics` に auth_actor、head_repo、base_repo、fork_pr、maintainer_can_modify、required_permissions を含めて記録する。
+
+**422 Unprocessable Entity:**
+
+body 内容で分類する（422 全体を `expected_head_sha` mismatch とは断定しない）:
+
+| body の内容 | status |
+|---|---|
+| `expected_head_sha` mismatch | `stale_verdict` — Step 4 re-review 後 Step 5 再実行 |
+| secondary rate limit | `bounded_backoff_or_human_escalation` — 指数バックオフ最大 3 回、上限で `human_escalation` |
+| その他 validation failure | `human_escalation` |
+
+### Bash 許可例外
+
+`gh api -X PUT repos/{owner}/{repo}/pulls/{pull_number}/update-branch` の実行は `implementation-worker`（`.claude/agents/implementation-worker.md`）に許可された Bash 操作例外に含まれる。
