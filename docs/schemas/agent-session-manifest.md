@@ -431,3 +431,16 @@ redaction:
 - `#44` — SubAgent Execution Ledger 設計（ledger_phase の元定義）
 - `#241` — Secret Inventory SSOT 化（session recording 前提条件）
 - `#242` — Session Recording Kill Switch policy（session recording 前提条件）
+
+## `secret_policy` オブジェクト（optional, #412 追加）
+
+Secret boundary policy の状態を記録する。`#412` の fail-closed boundary 実装により追加。
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `value_exposed` | boolean | no | Secret 値がこの manifest に露出しているか。public-safe manifest では必ず `false` |
+| `boundary_enforced` | boolean | no | このセッションで `secret_boundary_guard` PreToolUse hook が有効だったか |
+| `mode` | enum | no | `presence_only \| value_included \| not_applicable`。Secret を presence boolean / metadata のみで扱う場合は `presence_only`。`value_included` は unsafe |
+
+`value_exposed: false` かつ `mode: presence_only` が manifest の public-safe 要件。
+`#412` 完了後、manifest producer は `secret_policy.value_exposed: false` を生成するよう更新される。
