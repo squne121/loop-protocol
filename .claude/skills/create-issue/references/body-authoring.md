@@ -55,6 +55,59 @@ prompt 注記による SubAgent 委譲・運用ルール追加は次点オプシ
 
 ワークフロー不具合を起票する follow-up Issue（post-merge-cleanup / issue-refinement-loop から自動抽出されるもの）に適用する。単純なバグ fix や軽微な改善 Issue では本ステップ 3 の明示比較を省略してよい。
 
+## Issue-Author Repair Contract by Blocker Category
+
+`issue-author` が `REVIEW_ISSUE_RESULT_V1.structured_blockers` を受け取ったとき、`category` フィールドに応じて以下の修復手順を適用する。
+
+### compound_command_disallowed
+
+**検出条件**: VC コマンドに shell control operator（`&&`, `||`, `|`, `;`, `&`, `<<`, `>>`, `<`, `>`, `<<<`）が含まれる。
+
+**修復方針（優先順）**:
+1. VC を単一コマンドに分割する（AC を複数エントリに分割することを検討する）
+2. compound が避けられない場合は `# preflight-scope: pr_review_only` または `# preflight-scope: runtime_only` マーカーをコマンド直前行に付与する
+
+```bash
+# 例: pnpm build && echo DONE → 分割
+# AC1
+$ pnpm build
+# （DONE 確認は PR レビュー時に実施）
+```
+
+### unexpected_pass
+
+**検出条件**: VC が実装前 baseline で exit 0 を返す（VC が緩すぎるか、すでに機能が存在する）。
+
+**修復方針**:
+- VC を「baseline で fail するコマンド」に変更する
+- 存在確認 VC では `rg` / `test -f` で「対象が**存在しない**こと」を確認する形式にする
+- 例: `rg -q "new_feature" file.py` → 実装前に機能が存在しないファイルを対象にする
+- または `test -f /path/to/new/file` で未作成ファイルの不在を確認する（不在で exit 1）
+
+### regression_gate fails
+
+**検出条件**: `pnpm typecheck` / `pnpm lint` / `pnpm test` / `pnpm build` / `uv run pytest <existing>` が baseline で fail する。
+
+**修復方針**:
+1. 環境・実装の問題なら `# preflight-scope: runtime_only` を付与する（post-implementation 専用）
+2. 正しい回帰ゲートコマンドに修正する（パス誤り・設定誤りの場合）
+3. 環境起因で baseline が壊れている場合は `human_judgment` として人間対応を依頼する
+
+### rva_immediate_field_missing
+
+**検出条件**: `decision: immediate` の `## Runtime Verification Applicability` セクションに必須フィールドが不足している。
+
+**必須フィールド（すべて必要）**:
+- `applicable_acs`: 動作検証の対象 AC リスト
+- `execution_environment`: 必要な CLI ツール名・認証方法・ネットワーク要件
+- `skip_conditions`: 実行環境が整っていない場合の停止条件（exit 77 SKIP 規約）
+- `fallback_policy`: フォールバック経由の成功を PASS としない旨の明示
+- `artifact_requirements`: 証跡出力先・ファイル名パターン
+
+**修復方針**:
+- `fix_hint` に示された不足フィールドを補完する
+- 各フィールドの詳細要件は `docs/dev/runtime-verification-policy.md` を参照する
+
 ## Runtime Verification Applicability
 
 Issue 起票時に動作検証の適用判定セクションを記載する。`runtime-verification: true` タグ付き AC の起票は `decision: immediate` のときのみ必要。

@@ -196,6 +196,22 @@ uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY"
 
 スクリプトが exit 2 を返した場合は abort し、ステップ 7 の復旧処理へ進む。
 
+### 4.5. contract_readiness_check を fail-closed で実行
+
+`guard-issue-body.py` が pass した後、mutation 前に contract readiness を確認する。
+`status: go` 以外（`needs_fix` / `human_judgment`）の場合は `gh issue edit` を実行しない（fail-closed）。
+
+```bash
+uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
+  --body-file "$NEW_BODY" --mode static
+READINESS_EXIT=$?
+# exit 0 = go, exit 1 = needs_fix, exit 2 = human_judgment
+if [ "$READINESS_EXIT" -ne 0 ]; then
+  echo "[ABORT] contract_readiness_check failed (exit $READINESS_EXIT). Not proceeding with gh issue edit." >&2
+  exit "$READINESS_EXIT"
+fi
+```
+
 ### 5. body-file 経由で `gh issue edit` を実行
 
 top-level `title_update.required == true` の場合、`--title` オプションを同時に指定して body とタイトルを 1 コマンド（single command / co-update）で更新する。`title_update.required` の値に応じて排他的に分岐し、body-only 更新と title+body 更新が両方実行されることがないようにする。
