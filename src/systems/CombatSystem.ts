@@ -1,5 +1,6 @@
 import type { CollisionPair, GameState } from '../state'
 import type { InputCommand } from '../input'
+import { compareCollisionPair } from './CollisionSystem'
 
 const AIM_EPSILON_PX = 0.001
 const PROJECTILE_SPEED_PX_PER_SEC = 520
@@ -96,11 +97,7 @@ export function resolveCombatCollisions(
   // Within the same tick, process projectile-enemy before player-enemy.
   const projEnemyPairs = pairs
     .filter((p): p is Extract<CollisionPair, { kind: 'projectile-enemy' }> => p.kind === 'projectile-enemy')
-    .sort((a, b) => {
-      // Sort by enemyId ASC, then projectileId ASC (numeric tuple comparator, AC7).
-      if (a.enemyId !== b.enemyId) return a.enemyId - b.enemyId
-      return a.projectileId - b.projectileId
-    })
+    .sort(compareCollisionPair)
 
   for (const pair of projEnemyPairs) {
     // Skip if this projectile already used up on another enemy this tick.
@@ -109,6 +106,10 @@ export function resolveCombatCollisions(
     const enemy = state.enemies.find((e) => e.id === pair.enemyId)
     const projectile = state.projectiles.find((p) => p.id === pair.projectileId)
 
+    // This tick's collision pair projectiles are always consumed (BLOCKER2).
+    hitProjectileIds.add(pair.projectileId)
+
+    // Defeated enemy: consume projectile but do not apply damage.
     if (!enemy || enemy.defeated || !projectile) continue
 
     // AC8: reduce hp
@@ -120,8 +121,6 @@ export function resolveCombatCollisions(
       enemy.defeatedAtTick = state.tick
       projectileDefeatedEnemyIds.add(enemy.id)
     }
-
-    hitProjectileIds.add(pair.projectileId)
   }
 
   // AC10: remove hit projectiles from state

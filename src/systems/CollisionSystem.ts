@@ -1,6 +1,26 @@
 import type { CollisionPair, GameState } from '../state'
 
 /**
+ * Deterministic comparator for CollisionPair.
+ * Order: projectile-enemy first, then player-enemy.
+ * Within projectile-enemy: projectileId ASC, then enemyId ASC.
+ * Within player-enemy: enemyId ASC.
+ */
+export function compareCollisionPair(a: CollisionPair, b: CollisionPair): number {
+  const ar = a.kind === 'projectile-enemy' ? 0 : 1
+  const br = b.kind === 'projectile-enemy' ? 0 : 1
+  if (ar !== br) return ar - br
+  if (a.kind === 'projectile-enemy' && b.kind === 'projectile-enemy') {
+    if (a.projectileId !== b.projectileId) return a.projectileId - b.projectileId
+    return a.enemyId - b.enemyId
+  }
+  if (a.kind === 'player-enemy' && b.kind === 'player-enemy') {
+    return a.enemyId - b.enemyId
+  }
+  return 0
+}
+
+/**
  * Pure collision detection: returns all collision pairs for this tick.
  *
  * AC1: Does NOT mutate hp / projectile / result / resource / persistence.
@@ -68,5 +88,5 @@ export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
     }
   }
 
-  return pairs
+  return [...pairs].sort(compareCollisionPair)
 }

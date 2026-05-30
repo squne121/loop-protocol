@@ -106,7 +106,7 @@ describe('runCollisionSystem', () => {
     }
   })
 
-  it('GIVEN projectile id 2 and id 10 both hit different enemies WHEN collision system runs THEN id 2 projectile is listed first', () => {
+  it('GIVEN projectile id 2 and id 10 both hit different enemies WHEN collision system runs THEN id 2 projectile is listed first (projectileId ASC)', () => {
     const state = createInitialGameState()
     state.enemies = [
       makeEnemy({ id: 1, x: 200, y: 270, radius: 16 }),
@@ -120,21 +120,37 @@ describe('runCollisionSystem', () => {
     const pairs = runCollisionSystem(state)
     const projPairs = pairs.filter((p) => p.kind === 'projectile-enemy')
     expect(projPairs).toHaveLength(2)
-    // Both projectiles should appear; order is deterministic by iteration order
-    const projectileIds = projPairs
-      .filter((p) => p.kind === 'projectile-enemy')
-      .map((p) => (p.kind === 'projectile-enemy' ? p.projectileId : -1))
-    expect(projectileIds).toContain(2)
-    expect(projectileIds).toContain(10)
+    // projectileId ASC order must be guaranteed even when projectiles are in reverse order
+    const projectileIds = projPairs.map((p) => (p.kind === 'projectile-enemy' ? p.projectileId : -1))
+    expect(projectileIds).toEqual([2, 10])
   })
 
-  it('GIVEN enemies with id 2 and id 10 WHEN player touches both THEN id 2 enemy appears first in player-enemy pairs', () => {
+  it('GIVEN projectiles [id=10, id=2] in reverse insertion order WHEN collision system runs THEN pairs are sorted projectileId ASC (BLOCKER3)', () => {
+    const state = createInitialGameState()
+    state.enemies = [
+      makeEnemy({ id: 1, x: 200, y: 270, radius: 16 }),
+      makeEnemy({ id: 2, x: 400, y: 270, radius: 16 }),
+    ]
+    // Reverse order: id=10 first, id=2 second
+    state.projectiles = [
+      makeProjectile({ id: 10, x: 400, y: 270, radius: 4, damage: 5 }),
+      makeProjectile({ id: 2, x: 200, y: 270, radius: 4, damage: 5 }),
+    ]
+
+    const pairs = runCollisionSystem(state)
+    const projPairs = pairs.filter((p) => p.kind === 'projectile-enemy')
+    const projectileIds = projPairs.map((p) => (p.kind === 'projectile-enemy' ? p.projectileId : -1))
+    // Must be [2, 10] regardless of insertion order
+    expect(projectileIds).toEqual([2, 10])
+  })
+
+  it('GIVEN enemies with id 2 and id 10 (id 10 inserted first) WHEN player touches both THEN player-enemy pairs are sorted enemyId ASC (BLOCKER3)', () => {
     const state = createInitialGameState()
     // Place player at (300, 270)
     state.player.x = 300
     state.player.y = 270
     state.player.radius = 14
-    // Both enemies overlap player
+    // Reverse insertion order: id=10 first, id=2 second
     state.enemies = [
       makeEnemy({ id: 10, x: 300, y: 270, radius: 16 }),
       makeEnemy({ id: 2, x: 300, y: 270, radius: 16 }),
@@ -143,13 +159,11 @@ describe('runCollisionSystem', () => {
     const pairs = runCollisionSystem(state)
     const playerPairs = pairs.filter((p) => p.kind === 'player-enemy')
     expect(playerPairs.length).toBeGreaterThanOrEqual(2)
-    // Order of player-enemy is by iteration order (state.enemies array order)
-    // resolveCombatCollisions will sort by id ASC; CollisionSystem just needs to return them
+    // Must be sorted by enemyId ASC regardless of insertion order
     const enemyIds = playerPairs.map((p) =>
       p.kind === 'player-enemy' ? p.enemyId : -1,
     )
-    expect(enemyIds).toContain(2)
-    expect(enemyIds).toContain(10)
+    expect(enemyIds).toEqual([2, 10])
   })
 
   it('GIVEN projectile-enemy and player-enemy collisions WHEN collision system runs THEN projectile-enemy pairs appear before player-enemy pairs (AC7)', () => {
@@ -381,6 +395,40 @@ describe('resolveCombatCollisions', () => {
     // id 10 stays alive; contactDamage=1 applies
     expect(state.player.hp).toBe(initialHp - 1)
     expect(state.enemies.find((e) => e.id === 2)?.defeated).toBe(true)
+  })
+
+  it('GIVEN defeated enemy collides with projectile in same tick WHEN resolveCombatCollisions THEN projectile is still consumed (BLOCKER2)', () => {
+    const state = createInitialGameState()
+    // Enemy is already defeated before this tick's resolve
+    state.enemies = [makeEnemy({ id: 1, hp: 0, x: 300, y: 270, radius: 16, defeated: true, defeatedAtTick: 1 })]
+    state.projectiles = [makeProjectile({ id: 1, x: 300, y: 270, radius: 4, damage: 5 })]
+
+    // Provide a collision pair manually (CollisionSystem would not emit this because enemy.defeated,
+    // but this tests that if a pair arrives from the same tick that defeated the enemy, the projectile
+    // is consumed)
+    resolveCombatCollisions(state, [{ kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 }])
+
+    // Projectile must be removed even though the enemy was already defeated
+    expect(state.projectiles).toHaveLength(0)
+  })
+
+  it('GIVEN two projectiles where first kills enemy and second also targets same defeated enemy WHEN resolveCombatCollisions THEN second projectile is also consumed (BLOCKER2)', () => {
+    const state = createInitialGameState()
+    state.enemies = [makeEnemy({ id: 1, hp: 5, x: 300, y: 270, radius: 16 })]
+    state.projectiles = [
+      makeProjectile({ id: 1, x: 300, y: 270, radius: 4, damage: 5 }),
+      makeProjectile({ id: 2, x: 300, y: 270, radius: 4, damage: 5 }),
+    ]
+
+    // Both projectiles target same enemy in same tick
+    resolveCombatCollisions(state, [
+      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
+      { kind: 'projectile-enemy', projectileId: 2, enemyId: 1, distSq: 0 },
+    ])
+
+    // Both projectiles must be consumed (id=1 deals damage and defeats, id=2 hits defeated enemy)
+    expect(state.projectiles).toHaveLength(0)
+    expect(state.enemies[0].defeated).toBe(true)
   })
 
   it('GIVEN no collision pairs WHEN resolveCombatCollisions THEN state is unchanged', () => {
