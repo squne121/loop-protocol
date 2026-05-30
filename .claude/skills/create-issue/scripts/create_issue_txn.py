@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -90,6 +90,10 @@ class TransactionResult:
     dedupe_number: int | None = None
     parent_verified: bool | None = None
     dependency_verified: bool | None = None
+    applied_steps: list[str] = field(default_factory=list)
+    verified_steps: list[str] = field(default_factory=list)
+    failed_readbacks: list[dict] = field(default_factory=list)
+    pending_steps: list[str] = field(default_factory=list)
 
 
 def run_command(command: list[str], *, check: bool = False, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
@@ -102,6 +106,22 @@ def run_command(command: list[str], *, check: bool = False, capture_output: bool
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    if argv is None:
+        argv = sys.argv[1:]
+    # Reconcile subcommand: argv[0] == "reconcile" routes to a separate parser.
+    # This preserves full backward compatibility with the existing --repo/--title form.
+    if argv and argv[0] == "reconcile":
+        recon_parser = argparse.ArgumentParser(description="Reconcile label readback partial failure")
+        recon_parser.add_argument("--repo", required=True, help="owner/repo")
+        recon_parser.add_argument("--issue", type=int, required=True, help="issue number to reconcile")
+        recon_parser.add_argument("--label", action="append", default=[], dest="label")
+        recon_parser.add_argument("--parent-issue", type=int, default=0, dest="parent_issue")
+        recon_parser.add_argument("--dependency", action="append", type=int, default=[], dest="dependency")
+        recon_parser.add_argument("--gh", default="gh")
+        ns = recon_parser.parse_args(argv[1:])
+        ns.subcommand = "reconcile"
+        return ns
+    # Existing create parser (unchanged)
     parser = argparse.ArgumentParser(description="Create issue transaction helper")
     parser.add_argument("--repo", required=True, help="owner/repo or full repo path")
     parser.add_argument("--title", required=True)
@@ -113,7 +133,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dependency", action="append", dest="dependency", type=int, default=[])
     parser.add_argument("--blocked-by", action="append", dest="dependency", type=int)
     parser.add_argument("--gh", default="gh")
-    return parser.parse_args(argv)
+    ns = parser.parse_args(argv)
+    ns.subcommand = "create"
+    return ns
 
 
 def _resolve_labels(labels: list[str], issue_kind: str) -> list[str]:
@@ -249,6 +271,11 @@ def _find_open_issues_by_title(repo: str, title: str, gh_bin: str) -> list[int]:
 # Absorbs GitHub Sub-issues API eventual-consistency lag after POST success.
 # Total worst-case wall time = sum(_PARENT_READBACK_RETRY_DELAYS) ≤ 2 seconds.
 _PARENT_READBACK_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+# Retry delays for label readback (label-readback stage).
+# Absorbs GitHub label application eventual-consistency lag after POST success.
+# Total worst-case wall time = sum(_LABEL_READBACK_RETRY_DELAYS) ≤ 2 seconds.
+_LABEL_READBACK_RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0)
 
 # Standard labels auto-assigned when issue_kind is "implementation".
 # NOTE: state/queued is intentionally NOT included here.
@@ -763,7 +790,12 @@ def _issue_register_dependency(repo: str, child_node_id: str, dependency_node_id
     _run_gh_text(args, stage="dependency-register")
 
 
-def _readback_labels(repo: str, issue_number: int, labels: list[str], gh_bin: str) -> bool:
+def _readback_labels_once(repo: str, issue_number: int, labels: list[str], gh_bin: str) -> bool:
+    """Single attempt to read back labels from GitHub GraphQL API.
+
+    Returns True if all expected labels are confirmed, False otherwise.
+    Raises TransactionError for payload errors.
+    """
     if not labels:
         return True
     owner, name = _github_owner_repo(repo)
@@ -797,6 +829,30 @@ def _readback_labels(repo: str, issue_number: int, labels: list[str], gh_bin: st
     except (KeyError, TypeError) as exc:
         raise TransactionError(stage="label-readback", message="invalid label read-back payload", output=str(payload)) from exc
     return set(labels).issubset(current_labels)
+
+
+def _readback_labels(
+    repo: str,
+    issue_number: int,
+    labels: list[str],
+    gh_bin: str,
+    *,
+    delays: tuple[float, ...] = _LABEL_READBACK_RETRY_DELAYS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Read back labels with retry to absorb GitHub eventual-consistency lag.
+
+    Returns True if all expected labels are confirmed within the retry budget.
+    """
+    if not labels:
+        return True
+    if _readback_labels_once(repo, issue_number, labels, gh_bin):
+        return True
+    for delay in delays:
+        sleep_fn(delay)
+        if _readback_labels_once(repo, issue_number, labels, gh_bin):
+            return True
+    return False
 
 
 def _readback_parent_issue(repo: str, issue_number: int, parent_issue_number: int, gh_bin: str) -> bool:
@@ -1064,16 +1120,27 @@ def _reconcile_issue_links(
     gh_bin: str,
     *,
     sleep_fn: Callable[[float], None] = time.sleep,
-) -> tuple[list[str], bool | None, bool | None]:
+) -> tuple[list[str], bool | None, bool | None, list[dict]]:
     completed: list[str] = []
     parent_verified = True if parent_issue_number else None
     dependency_verified = True if dependency_issue_numbers else None
 
+    failed_readbacks_reconcile: list[dict] = []
     if labels:
-        labels_verified = _readback_labels(repo, issue_number, labels, gh_bin)
-        if not labels_verified:
-            raise TransactionError(stage="dedupe-label-readback", message="label read-back mismatch")
-        completed.append("label-readback")
+        labels_verified = _readback_labels(repo, issue_number, labels, gh_bin, sleep_fn=sleep_fn)
+        if labels_verified:
+            completed.append("label-readback")
+        else:
+            # collect-and-reconcile: record the failure but proceed with sub-issue registration
+            failed_readbacks_reconcile.append({
+                "stage": "dedupe-label-readback",
+                "expected_labels": list(labels),
+                "actual_labels": [],
+                "attempts": 1 + len(_LABEL_READBACK_RETRY_DELAYS),
+                "retry_delays": list(_LABEL_READBACK_RETRY_DELAYS),
+                "error_kind": "missing_expected_labels",
+                "message": "label read-back mismatch after retries (dedupe path)",
+            })
 
     if parent_issue_number:
         # Attempt idempotent sub-issue registration for dedupe path.
@@ -1101,7 +1168,7 @@ def _reconcile_issue_links(
             raise TransactionError(stage="dependency-readback", message="dependency read-back mismatch")
         completed.append("dependency-readback")
 
-    return completed, parent_verified, dependency_verified
+    return completed, parent_verified, dependency_verified, failed_readbacks_reconcile
 
 
 def _run_issue_body_validator(body: str) -> dict[str, Any]:
@@ -1400,7 +1467,7 @@ def run_transaction(
         # --- End Blocker 3 + 4 + iteration 3 ---
 
         try:
-            reconcile_steps, parent_verified, dependency_verified = _reconcile_issue_links(
+            reconcile_steps, parent_verified, dependency_verified, reconcile_failed_readbacks = _reconcile_issue_links(
                 repo=repo,
                 issue_number=dedupe_number,
                 labels=labels,
@@ -1410,6 +1477,34 @@ def run_transaction(
                 sleep_fn=sleep_fn,
             )
             dedupe_completed.extend(reconcile_steps)
+            if reconcile_failed_readbacks:
+                # partial_failure: label readback failed but sub-issue registration succeeded
+                try:
+                    _post_partial_failure_comment(
+                        repo=repo,
+                        issue_number=dedupe_number,
+                        failed_stage=reconcile_failed_readbacks[0]["stage"],
+                        failure_message=reconcile_failed_readbacks[0]["message"],
+                        gh_bin=gh_bin,
+                        completed_steps=dedupe_completed,
+                        requested_labels=labels,
+                        requested_parent_issue_number=parent_issue_number,
+                        requested_dependency_issue_numbers=normalized_dependency_issue_numbers,
+                    )
+                except TransactionError:
+                    pass  # best-effort
+                return TransactionResult(
+                    status="partial_failure",
+                    issue_number=dedupe_number,
+                    issue_url=dedupe_issue_url,
+                    completed_steps=dedupe_completed,
+                    dedupe_number=dedupe_number,
+                    failure_stage=reconcile_failed_readbacks[0]["stage"],
+                    failure_message=reconcile_failed_readbacks[0]["message"],
+                    parent_verified=parent_verified,
+                    dependency_verified=dependency_verified,
+                    failed_readbacks=reconcile_failed_readbacks,
+                )
             return TransactionResult(
                 status="dedupe",
                 issue_number=dedupe_number,
@@ -1490,11 +1585,27 @@ def run_transaction(
         _issue_apply_labels(repo, issue_number, labels, gh_bin)
         completed.append("label")
 
+        failed_readbacks: list[dict] = []
         if labels:
-            labels_verified = _readback_labels(repo, issue_number, labels, gh_bin)
-            if not labels_verified:
-                raise TransactionError(stage="label-readback", message="label read-back mismatch")
-            completed.append("label-readback")
+            labels_verified = _readback_labels(repo, issue_number, labels, gh_bin, sleep_fn=sleep_fn)
+            if labels_verified:
+                completed.append("label-readback")
+            else:
+                # collect-and-reconcile: record the failure but do NOT raise
+                # sub-issue registration must proceed regardless of label readback result
+                try:
+                    actual_labels_result = _readback_labels_once(repo, issue_number, labels, gh_bin)
+                except TransactionError:
+                    actual_labels_result = False
+                failed_readbacks.append({
+                    "stage": "label-readback",
+                    "expected_labels": list(labels),
+                    "actual_labels": [],  # best-effort; exact set unavailable without re-query
+                    "attempts": 1 + len(_LABEL_READBACK_RETRY_DELAYS),
+                    "retry_delays": list(_LABEL_READBACK_RETRY_DELAYS),
+                    "error_kind": "missing_expected_labels",
+                    "message": "label read-back mismatch after retries",
+                })
 
         child_node_id = ""
         child_db_id: int | None = None
@@ -1556,6 +1667,35 @@ def run_transaction(
                 )
             completed.append("sub-issue-readback")
 
+        if failed_readbacks:
+            result = TransactionResult(
+                status="partial_failure",
+                issue_number=issue_number,
+                issue_url=issue_url,
+                completed_steps=completed,
+                failure_stage=failed_readbacks[0]["stage"],
+                failure_message=failed_readbacks[0]["message"],
+                parent_verified=parent_verified if parent_issue_number else None,
+                dependency_verified=dependency_registered if normalized_dependency_issue_numbers else None,
+                failed_readbacks=failed_readbacks,
+            )
+            # Post audit comment for the partial failure
+            try:
+                _post_partial_failure_comment(
+                    repo=repo,
+                    issue_number=issue_number,
+                    failed_stage=failed_readbacks[0]["stage"],
+                    failure_message=failed_readbacks[0]["message"],
+                    gh_bin=gh_bin,
+                    completed_steps=completed,
+                    requested_labels=labels,
+                    requested_parent_issue_number=parent_issue_number,
+                    requested_dependency_issue_numbers=normalized_dependency_issue_numbers,
+                )
+            except TransactionError:
+                pass  # best-effort audit comment
+            return result
+
         return TransactionResult(
             status="success",
             issue_number=issue_number,
@@ -1587,19 +1727,115 @@ def run_transaction(
         )
 
 
+def reconcile_transaction(
+    *,
+    repo: str,
+    issue_number: int,
+    labels: list[str],
+    parent_issue_number: int,
+    dependency_issue_numbers: list[int],
+    gh_bin: str,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> TransactionResult:
+    """Recover a partial_failure caused by label-readback mismatch.
+
+    Applies labels via script and re-runs readback. Does NOT perform raw
+    gh issue edit / gh api mutations directly. Only script-mediated recovery.
+    """
+    issue_url = f"https://github.com/{repo}/issues/{issue_number}"
+    completed: list[str] = []
+
+    # Re-apply labels (idempotent)
+    try:
+        _issue_apply_labels(repo, issue_number, labels, gh_bin)
+        completed.append("label")
+    except TransactionError as exc:
+        return TransactionResult(
+            status="partial_failure",
+            issue_number=issue_number,
+            issue_url=issue_url,
+            completed_steps=completed,
+            failure_stage=exc.stage,
+            failure_message=exc.message,
+        )
+
+    # Read back labels
+    labels_verified = _readback_labels(repo, issue_number, labels, gh_bin, sleep_fn=sleep_fn)
+    if not labels_verified:
+        return TransactionResult(
+            status="partial_failure",
+            issue_number=issue_number,
+            issue_url=issue_url,
+            completed_steps=completed,
+            failure_stage="label-readback",
+            failure_message="label read-back mismatch after reconcile",
+            failed_readbacks=[{
+                "stage": "label-readback",
+                "expected_labels": list(labels),
+                "actual_labels": [],
+                "attempts": 1 + len(_LABEL_READBACK_RETRY_DELAYS),
+                "retry_delays": list(_LABEL_READBACK_RETRY_DELAYS),
+                "error_kind": "missing_expected_labels",
+                "message": "label read-back mismatch after reconcile",
+            }],
+        )
+    completed.append("label-readback")
+
+    # Re-register sub-issue if requested
+    parent_verified: bool | None = None
+    if parent_issue_number:
+        try:
+            _, child_db_id = _issue_graphql_ids(repo, issue_number, gh_bin)
+            _issue_register_sub_issue_idempotent(
+                repo, parent_issue_number, child_db_id, issue_number, gh_bin
+            )
+            completed.append("sub_issue")
+            parent_verified = _readback_parent_issue_with_retry(
+                repo, issue_number, parent_issue_number, gh_bin, sleep_fn=sleep_fn
+            )
+        except TransactionError as exc:
+            return TransactionResult(
+                status="partial_failure",
+                issue_number=issue_number,
+                issue_url=issue_url,
+                completed_steps=completed,
+                failure_stage=exc.stage,
+                failure_message=exc.message,
+                parent_verified=parent_verified,
+            )
+
+    return TransactionResult(
+        status="success",
+        issue_number=issue_number,
+        issue_url=issue_url,
+        completed_steps=completed,
+        parent_verified=parent_verified,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    result = run_transaction(
-        repo=args.repo,
-        title=args.title,
-        body=args.body,
-        body_file=args.body_file,
-        labels=args.label,
-        issue_kind=args.issue_kind,
-        parent_issue_number=args.parent_issue,
-        dependency_issue_numbers=args.dependency,
-        gh_bin=args.gh,
-    )
+    if getattr(args, "subcommand", "create") == "reconcile":
+        result = reconcile_transaction(
+            repo=args.repo,
+            issue_number=args.issue,
+            labels=args.label,
+            parent_issue_number=args.parent_issue,
+            dependency_issue_numbers=args.dependency,
+            gh_bin=args.gh,
+        )
+    else:
+        result = run_transaction(
+            repo=args.repo,
+            title=args.title,
+            body=args.body,
+            body_file=args.body_file,
+            labels=args.label,
+            issue_kind=args.issue_kind,
+            parent_issue_number=args.parent_issue,
+            dependency_issue_numbers=args.dependency,
+            gh_bin=args.gh,
+        )
 
     sys.stdout.write(f"{json.dumps(result.__dict__, ensure_ascii=False, sort_keys=True)}\n")
     if result.status in {"dedupe", "success"}:

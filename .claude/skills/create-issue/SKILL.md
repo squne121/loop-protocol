@@ -382,10 +382,25 @@ query {
 |---|---|---|
 | `sub-issue-readback` | readback で関係確認 → 未登録なら `sub_issues` 登録 | 既存関係 readback 後に再実行 |
 | `dependency-readback` / `dependency-register` | blockedBy readback → 未登録なら GraphQL mutation | 既存関係 readback 後に再実行 |
-| `label-readback` | `gh issue edit <N> --add-label <labels>` | yes |
+| `label-readback` | `create_issue_txn.py reconcile --repo <owner/repo> --issue <N> --label <labels>` を実行して script 経由で復旧する。raw `gh issue edit` / `gh api` 手動 mutation は禁止（script 正本経由のみ）。 | yes |
 | `dedupe-search` / `dedupe-race-detection` | 自動補正不可。手動で同タイトル open issue を確認・クローズ後に再実行 | no |
 
 comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idempotency 情報が記載されている。
+
+### label-readback 失敗後の reconcile 手順
+
+`label-readback` ステージで `partial_failure` が返された場合、**以下の手順で復旧する**:
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py reconcile \
+  --repo <owner/repo> \
+  --issue <issue_number> \
+  --label <label1> --label <label2>
+```
+
+**禁止事項**: `reconcile` サブコマンドを使わずに `gh issue edit <N> --add-label <labels>` を直接実行すること。
+script 正本経由のみで復旧すること（audit trail・idempotency の保証のため）。
+`gh api` 直接 mutation も同様に禁止する。
 
 ## Guardrails
 
