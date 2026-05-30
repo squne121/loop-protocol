@@ -10,8 +10,11 @@ from pathlib import Path
 import re
 import sys
 
-s = Path("docs/product/game-logic.md").read_text()
-m = re.search(r"## 入力 / Input.*?```typescript\n(.*?)```", s, re.S)
+s = Path("docs/product/game-logic.md").read_text(encoding="utf-8")
+section = re.search(r"^## 入力 / Input\b(?P<body>.*?)(?=^## |\Z)", s, re.S | re.M)
+if not section:
+    raise SystemExit("## 入力 / Input section not found")
+m = re.search(r"```typescript\n(.*?)```", section.group("body"), re.S)
 if not m:
     raise SystemExit("InputCommand TypeScript block not found in ## 入力 / Input section")
 
