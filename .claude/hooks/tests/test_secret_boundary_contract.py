@@ -44,12 +44,17 @@ SENTINEL_PLAINTEXT = "SENTINEL_SECRET_412_TEST_abc123XYZ"
 def _encode_variants(value: str) -> list[str]:
     """Return multiple encoded representations of the sentinel value."""
     import base64
+    import hashlib
     import urllib.parse
     variants = [
         value,  # raw
         base64.b64encode(value.encode()).decode(),  # base64
         value.encode().hex(),  # hex
         urllib.parse.quote(value),  # urlencoded
+        hashlib.sha256(value.encode()).hexdigest(),  # sha256 hash
+        hashlib.sha1(value.encode()).hexdigest(),  # sha1 hash
+        value[:8],  # prefix partial (first 8 chars)
+        value[-8:],  # suffix partial (last 8 chars)
     ]
     return variants
 
@@ -73,16 +78,34 @@ def _scan_file_for_sentinel(file_path: Path, sentinel: str) -> list[str]:
 # =============================================================================
 
 
-def test_sentinel_not_in_artifacts():
-    """GIVEN a sentinel secret value, WHEN scanning artifacts/ dir,
-    THEN the sentinel must not appear in any form (raw/base64/hex/urlencoded)."""
-    if not ARTIFACTS_DIR.exists():
-        pytest.skip("artifacts/ dir does not exist — no artifacts to scan")
-    hits = []
-    for f in ARTIFACTS_DIR.rglob("*"):
-        if f.is_file():
-            hits.extend(_scan_file_for_sentinel(f, SENTINEL_PLAINTEXT))
-    assert hits == [], f"Sentinel found in artifacts: {hits}"
+def test_sentinel_not_in_artifacts(tmp_path):
+    """GIVEN a sentinel secret value and an artifacts/ directory with fixture files,
+    WHEN scanning artifacts/ dir,
+    THEN the sentinel must not appear in any form (raw/base64/hex/urlencoded/sha256/sha1/partial).
+
+    This test creates a clean fixture artifact (containing only non-sensitive data)
+    and verifies it does not contain any encoded form of the sentinel.
+    """
+    # Create artifacts dir if it doesn't exist (for this test run)
+    artifacts_dir = ARTIFACTS_DIR
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a clean fixture artifact that must NOT contain the sentinel
+    fixture_file = artifacts_dir / "test_sentinel_clean_fixture.json"
+    fixture_file.write_text(
+        '{"status": "clean", "note": "fixture artifact for sentinel scan test"}\n'
+    )
+
+    try:
+        hits = []
+        for f in artifacts_dir.rglob("*"):
+            if f.is_file():
+                hits.extend(_scan_file_for_sentinel(f, SENTINEL_PLAINTEXT))
+        assert hits == [], f"Sentinel found in artifacts: {hits}"
+    finally:
+        # Clean up the fixture file after test
+        if fixture_file.exists():
+            fixture_file.unlink()
 
 
 def test_sentinel_not_in_settings_json():
@@ -233,6 +256,74 @@ def test_guard_blocks_gh_secret():
 # =============================================================================
 # AC4 / AC13: guard stderr does not echo command/path/env values
 # =============================================================================
+
+
+def test_guard_blocks_sed_env_read():
+    """GIVEN a Bash tool input using sed to read .env, WHEN guard processes it,
+    THEN exit code must be 2 (B5: sed bypass detection)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "sed -n p .env"}})
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit code 2 for 'sed -n p .env', got {result.returncode}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
+
+
+def test_guard_blocks_awk_env_read():
+    """GIVEN a Bash tool input using awk to read .env, WHEN guard processes it,
+    THEN exit code must be 2 (B5: awk bypass detection)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "awk 1 .env"}})
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit code 2 for 'awk 1 .env', got {result.returncode}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
+
+
+def test_guard_blocks_env_standalone():
+    """GIVEN a Bash tool input with bare 'env' command, WHEN guard processes it,
+    THEN exit code must be 2 (B1/B2: env dumps all environment variables)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "env"}})
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit code 2 for bare 'env', got {result.returncode}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
+
+
+def test_guard_blocks_set_standalone():
+    """GIVEN a Bash tool input with bare 'set' command, WHEN guard processes it,
+    THEN exit code must be 2 (B1/B2: set dumps all shell variables)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "set"}})
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit code 2 for bare 'set', got {result.returncode}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
 
 
 def test_guard_stderr_no_command_echo_on_block():

@@ -54,7 +54,11 @@
       "Bash(printenv *)",
       "Bash(printenv)",
       "Bash(export -p)",
-      "Bash(* .env*)"
+      "Bash(* .env*)",
+      "Bash(env)",
+      "Bash(env *)",
+      "Bash(set)",
+      "Bash(set *)"
     ]
   },
   "hooks": {

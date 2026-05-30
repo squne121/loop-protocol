@@ -49,7 +49,17 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
         BLOCKED=1
     fi
     # env — without arguments dumps all env
-    if printf '%s' "$COMMAND" | grep -qP '(^|\||\;|&&|\|\|)\s*env\s*($|\||\;|&&|\|\|)'; then
+    # Use case-based POSIX matching to avoid grep -P (non-portable on macOS)
+    case "$COMMAND" in
+        env|"env "|"env	"*)
+            BLOCKED=1 ;;
+        *"|env"|*"|env "|*"&&env"|*"&&env "|*";env"|*";env ")
+            BLOCKED=1 ;;
+        *"||env"|*"||env ")
+            BLOCKED=1 ;;
+    esac
+    # Also match env as first token or after shell separator via ERE
+    if echo "$COMMAND" | grep -qE '(^|[|;&]|&&|\|\|)\s*env(\s|$)'; then
         BLOCKED=1
     fi
     # export -p — dumps all exported variables
@@ -61,7 +71,7 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
         BLOCKED=1
     fi
     # set (shell builtin to dump all vars/functions)
-    if printf '%s' "$COMMAND" | grep -qP '(^|\||\;|&&|\|\|)\s*set\s*($|\||\;|&&|\|\|)'; then
+    if echo "$COMMAND" | grep -qE '(^|[|;&]|&&|\|\|)\s*set(\s|$)'; then
         BLOCKED=1
     fi
     # python/node commands that dump process.env or os.environ
@@ -73,6 +83,28 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     fi
     # Reading .env files via head/tail/less
     if echo "$COMMAND" | grep -qE '\b(head|tail|less|more)\b[^|]*\.env(\.[^ ]*)?(\s|$)'; then
+        BLOCKED=1
+    fi
+    # sed/awk/perl reading .env files
+    if echo "$COMMAND" | grep -qE '\b(sed|awk|perl)\b[^|]*\.env(\.[^ ]*)?(\s|$)'; then
+        BLOCKED=1
+    fi
+    # python3/python reading .env files or dumping os.environ
+    if echo "$COMMAND" | grep -qE '\bpython3?\b[^|]*\.env(\.[^ ]*)?(\s|$)'; then
+        BLOCKED=1
+    fi
+    if echo "$COMMAND" | grep -qE '\bpython3?\b[^|]*os\.environ'; then
+        BLOCKED=1
+    fi
+    # xargs -a .env — indirect reading
+    if echo "$COMMAND" | grep -qE '\bxargs\b[^|]*-a\s+\.env(\.[^ ]*)?(\s|$)'; then
+        BLOCKED=1
+    fi
+    # source / . to load .env files
+    if echo "$COMMAND" | grep -qE '(^|\s)\.\s+\.env(\.[^ ]*)?(\s|$)'; then
+        BLOCKED=1
+    fi
+    if echo "$COMMAND" | grep -qE '\bsource\s+\.env(\.[^ ]*)?(\s|$)'; then
         BLOCKED=1
     fi
 

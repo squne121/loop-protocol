@@ -614,11 +614,12 @@
     "secret_policy": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Secret boundary policy status for this manifest (#412)",
+      "description": "Secret boundary policy status for this manifest (#412). value_exposed must be false and mode must be presence_only.",
       "properties": {
         "value_exposed": {
           "type": "boolean",
-          "description": "Whether any Secret value was exposed in this manifest. MUST be false for public-safe manifests."
+          "const": false,
+          "description": "Whether any Secret value was exposed in this manifest. MUST be false — value_exposed: true is prohibited."
         },
         "boundary_enforced": {
           "type": "boolean",
@@ -627,11 +628,9 @@
         "mode": {
           "type": "string",
           "enum": [
-            "presence_only",
-            "value_included",
-            "not_applicable"
+            "presence_only"
           ],
-          "description": "How secrets are represented: presence_only (boolean/metadata) or value_included (unsafe). presence_only is the required mode."
+          "description": "How secrets are represented. Only presence_only is permitted; value_included and not_applicable are prohibited."
         }
       }
     }
