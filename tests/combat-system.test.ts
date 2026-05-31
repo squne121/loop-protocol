@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { createInitialGameState } from '../src/state'
-import type { EnemyState } from '../src/state'
+import type { CollisionPair, EnemyState } from '../src/state'
 import { resolveCombatCollisions, runCombatSystem } from '../src/systems'
 
 function makeEnemy(overrides: Partial<EnemyState>): EnemyState {
@@ -18,6 +18,35 @@ function makeEnemy(overrides: Partial<EnemyState>): EnemyState {
     defeated: false,
     defeatedAtTick: null,
     ...overrides,
+  }
+}
+
+function makeProjectileEnemyPair(
+  state: ReturnType<typeof createInitialGameState>,
+  projectileId: number,
+  enemyId: number,
+  distSq = 0,
+): CollisionPair {
+  return {
+    kind: 'projectile-enemy',
+    tick: state.tick,
+    projectileId,
+    enemyId,
+    priorityKey: `projectile-enemy-${projectileId}-${enemyId}`,
+    distSq,
+  }
+}
+
+function makePlayerEnemyPair(
+  state: ReturnType<typeof createInitialGameState>,
+  enemyId: number,
+): CollisionPair {
+  return {
+    kind: 'player-enemy',
+    tick: state.tick,
+    playerId: state.player.id,
+    enemyId,
+    priorityKey: `player-enemy-${state.player.id}-${enemyId}`,
   }
 }
 
@@ -253,9 +282,7 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
       },
     ]
 
-    resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
-    ])
+    resolveCombatCollisions(state, [makeProjectileEnemyPair(state, 1, 1)])
 
     expect(state.enemies[0].hp).toBe(6)
   })
@@ -279,9 +306,7 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
       },
     ]
 
-    resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
-    ])
+    resolveCombatCollisions(state, [makeProjectileEnemyPair(state, 1, 1)])
 
     expect(state.enemies[0].defeated).toBe(true)
     expect(state.enemies[0].defeatedAtTick).toBe(7)
@@ -293,7 +318,7 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
     const initialHp = state.player.hp
     state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 3 })]
 
-    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+    resolveCombatCollisions(state, [makePlayerEnemyPair(state, 1)])
 
     expect(state.player.hp).toBe(initialHp - 3)
   })
@@ -303,7 +328,7 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
     state.player.hp = 1
     state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 100 })]
 
-    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+    resolveCombatCollisions(state, [makePlayerEnemyPair(state, 1)])
 
     expect(state.player.hp).toBe(0)
   })
