@@ -119,6 +119,8 @@ interface LoopE2ESnapshot {
     y: number
     aimX: number
     aimY: number
+    hp: number
+    maxHp: number
   }
   projectiles: Array<{
     id: number
@@ -129,6 +131,19 @@ interface LoopE2ESnapshot {
   input: {
     primaryPressed: boolean
     activePointerId: number | null
+  }
+  enemies: Array<{
+    id: number
+    x: number
+    y: number
+    hp: number
+    maxHp: number
+    defeatedAtTick: number | null
+  }>
+  sortie: {
+    status: 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+    elapsedTicks: number
+    result: 'victory' | 'defeat' | null
   }
 }
 
@@ -144,11 +159,37 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
       return {
         tick: state.tick,
         elapsedMs: state.elapsedMs,
-        player: { ...state.player },
-        projectiles: state.projectiles.map((p) => ({ ...p })),
+        player: {
+          x: state.player.x,
+          y: state.player.y,
+          aimX: state.player.aimX,
+          aimY: state.player.aimY,
+          hp: state.player.hp,
+          maxHp: state.player.maxHp,
+        },
+        projectiles: state.projectiles.map((p) => ({
+          id: p.id,
+          x: p.x,
+          y: p.y,
+          ageMs: p.ageMs,
+        })),
         input: {
           primaryPressed: inputState.primaryPressed,
           activePointerId: inputState.activePointerId,
+        },
+        enemies: state.enemies.map((e) => ({
+          id: e.id,
+          x: e.x,
+          y: e.y,
+          hp: e.hp,
+          maxHp: e.maxHp,
+          defeatedAtTick: e.defeatedAtTick,
+        })),
+        sortie: {
+          status: state.sortie.status,
+          elapsedTicks: state.sortie.elapsedTicks,
+          result:
+            state.sortie.result != null ? state.sortie.result.outcome : null,
         },
       }
     },
