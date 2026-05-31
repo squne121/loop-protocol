@@ -29,6 +29,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import yaml as _yaml_module
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -63,9 +69,28 @@ SCOPE_SIGNAL_REASON_NO_SIGNAL = "no_scope_signal"
 
 FAIL_CLOSED_REASON_MALFORMED_CONTRACT = "malformed_machine_readable_contract"
 FAIL_CLOSED_REASON_MISSING_SECTION = "missing_required_section"
+FAIL_CLOSED_REASON_MISSING_PARENT_SECTION = "missing_required_parent_section"
 FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL = "ambiguous_scope_signal"
 FAIL_CLOSED_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
 FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
+
+
+# ---------------------------------------------------------------------------
+# Repository root resolution
+# ---------------------------------------------------------------------------
+
+def _find_repo_root() -> Path:
+    """Find repository root by walking up to find .git directory."""
+    current = Path(__file__).resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    # Fallback: assume we are in .claude/skills/issue-refinement-loop/scripts/
+    return Path(__file__).resolve().parent.parent.parent.parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +520,129 @@ def _check_missing_vc(issue_body: str) -> bool:
     return "## Verification Commands" not in issue_body
 
 
+# Heading pattern for extracting headings (AC4: fenced-code-aware)
+HEADING_RE = re.compile(r"^[ \t]{0,3}##[ \t]+(?P<title>.+?)[ \t#]*$", re.MULTILINE)
+
+
+def _extract_machine_contract(issue_body: str) -> dict | None:
+    """
+    Extract Machine-Readable Contract from issue body.
+
+    Finds the fenced YAML block that is the value of the
+    'Machine-Readable Contract' section and parses it with yaml.safe_load.
+
+    Returns None if:
+    - No Machine-Readable Contract section found
+    - No YAML fenced block found in that section
+    - yaml.safe_load fails
+    - Result is not a dict (AC3: must be dict)
+    - yaml module is unavailable
+
+    AC4: Only parses the YAML in the Machine-Readable Contract section,
+    not any arbitrary fenced code block.
+    """
+    if not _YAML_AVAILABLE:
+        return None
+
+    sections = _extract_sections(issue_body)
+    contract_section = sections.get("Machine-Readable Contract", "")
+    if not contract_section:
+        return None
+
+    # Extract the first fenced yaml block from the contract section
+    yaml_match = re.search(r"```yaml\n([\s\S]*?)\n```", contract_section)
+    if not yaml_match:
+        return None
+
+    yaml_content = yaml_match.group(1)
+    try:
+        parsed = _yaml_module.safe_load(yaml_content)
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    return parsed
+
+
+def resolve_issue_template(issue_kind: str, repo_root: Path) -> Path | None:
+    """
+    Resolve the issue template file for the given issue_kind.
+
+    Returns the Path to .github/ISSUE_TEMPLATE/<issue_kind>.yml,
+    or None if the file does not exist.
+    """
+    template_path = repo_root / ".github" / "ISSUE_TEMPLATE" / f"{issue_kind}.yml"
+    if template_path.exists():
+        return template_path
+    return None
+
+
+def load_required_section_labels(template_path: Path) -> list[str]:
+    """
+    Load required section labels from an issue template YAML file.
+
+    Returns labels from items where validations.required == True.
+    Returns empty list if file cannot be parsed or yaml is unavailable.
+
+    AC5: Must not hardcode section names — derive from template.
+    AC6: When template changes, detection changes without script modification.
+    """
+    if not _YAML_AVAILABLE:
+        return []
+
+    try:
+        with open(template_path, encoding="utf-8") as f:
+            data = _yaml_module.safe_load(f)
+    except Exception:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    body = data.get("body", [])
+    if not isinstance(body, list):
+        return []
+
+    required_labels = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes", {})
+        if not isinstance(attrs, dict):
+            continue
+        label = attrs.get("label")
+        validations = item.get("validations", {})
+        if not isinstance(validations, dict):
+            continue
+        if label and validations.get("required") is True:
+            required_labels.append(label)
+
+    return required_labels
+
+
+def _check_missing_sections_from_template(
+    issue_body: str,
+    required_labels: list[str],
+) -> list[str]:
+    """
+    Check which required sections (from template labels) are missing in issue body.
+
+    Returns list of missing section labels.
+    Skips 'Machine-Readable Contract' label (it's checked separately).
+    """
+    missing = []
+    for label in required_labels:
+        # Machine-Readable Contract is validated separately
+        if label == "Machine-Readable Contract":
+            continue
+        # Check if the section heading is present in the body
+        heading = f"## {label}"
+        if heading not in issue_body:
+            missing.append(label)
+    return missing
+
 
 def _validate_input_schema(data: Any) -> bool:
     """Validate input matches REFINEMENT_LOOP_PLANNER_INPUT_V1 schema."""
@@ -603,8 +751,43 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         if _check_malformed_contract(issue_body):
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MALFORMED_CONTRACT)
 
-        if _check_missing_outcome(issue_body):
-            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+        # Extract machine contract to determine issue_kind and parent_mode
+        machine_contract = _extract_machine_contract(issue_body)
+        issue_kind = machine_contract.get("issue_kind") if machine_contract else None
+        parent_mode = machine_contract.get("parent_mode") if machine_contract else None
+
+        # Determine if this is a parent delivery-rollup (AC1: exempt from Outcome check)
+        is_parent_delivery_rollup = (
+            issue_kind == "parent" and parent_mode == "delivery-rollup"
+        )
+
+        repo_root = _find_repo_root()
+
+        if issue_kind and not is_parent_delivery_rollup:
+            # For known non-parent-delivery-rollup issue kinds: use template-derived required sections
+            template_path = resolve_issue_template(issue_kind, repo_root)
+            if template_path:
+                required_labels = load_required_section_labels(template_path)
+                missing = _check_missing_sections_from_template(issue_body, required_labels)
+                if missing:
+                    fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+            else:
+                # Template not found: fall back to Outcome check
+                if _check_missing_outcome(issue_body):
+                    fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+        elif is_parent_delivery_rollup:
+            # AC1: parent delivery-rollup — check parent template sections (not Outcome)
+            # AC7: Use separate reason_code for missing parent sections
+            template_path = resolve_issue_template("parent", repo_root)
+            if template_path:
+                required_labels = load_required_section_labels(template_path)
+                missing = _check_missing_sections_from_template(issue_body, required_labels)
+                if missing:
+                    fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_PARENT_SECTION)
+        else:
+            # No machine contract or unknown issue_kind: fall back to Outcome check
+            if _check_missing_outcome(issue_body):
+                fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
 
         if fail_closed_reasons:
             # B3: Return schema-valid decisions with unknown confidence even in fail_closed
