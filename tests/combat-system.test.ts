@@ -253,9 +253,15 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
       },
     ]
 
-    resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
-    ])
+    const pair1: import('../src/state').CollisionPair = {
+      kind: 'projectile-enemy',
+      tick: state.tick,
+      projectileId: 1,
+      enemyId: 1,
+      priorityKey: 'projectile-enemy-1-1',
+      distSq: 0,
+    }
+    resolveCombatCollisions(state, [pair1])
 
     expect(state.enemies[0].hp).toBe(6)
   })
@@ -279,9 +285,15 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
       },
     ]
 
-    resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', projectileId: 1, enemyId: 1, distSq: 0 },
-    ])
+    const pair2: import('../src/state').CollisionPair = {
+      kind: 'projectile-enemy',
+      tick: state.tick,
+      projectileId: 1,
+      enemyId: 1,
+      priorityKey: 'projectile-enemy-1-1',
+      distSq: 0,
+    }
+    resolveCombatCollisions(state, [pair2])
 
     expect(state.enemies[0].defeated).toBe(true)
     expect(state.enemies[0].defeatedAtTick).toBe(7)
@@ -293,7 +305,14 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
     const initialHp = state.player.hp
     state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 3 })]
 
-    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+    const pair3: import('../src/state').CollisionPair = {
+      kind: 'player-enemy',
+      tick: state.tick,
+      playerId: state.player.id,
+      enemyId: 1,
+      priorityKey: 'player-enemy-player-alpha-1',
+    }
+    resolveCombatCollisions(state, [pair3])
 
     expect(state.player.hp).toBe(initialHp - 3)
   })
@@ -303,7 +322,14 @@ describe('resolveCombatCollisions (CombatSystem)', () => {
     state.player.hp = 1
     state.enemies = [makeEnemy({ id: 1, hp: 10, contactDamage: 100 })]
 
-    resolveCombatCollisions(state, [{ kind: 'player-enemy', enemyId: 1 }])
+    const pair4: import('../src/state').CollisionPair = {
+      kind: 'player-enemy',
+      tick: state.tick,
+      playerId: state.player.id,
+      enemyId: 1,
+      priorityKey: 'player-enemy-player-alpha-1',
+    }
+    resolveCombatCollisions(state, [pair4])
 
     expect(state.player.hp).toBe(0)
   })
