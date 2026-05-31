@@ -434,3 +434,90 @@ test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status
   const finalState = await getGameState(page)
   expect(finalState.sortie.result).toBe('defeat')
 })
+
+// ---------------------------------------------------------------------------
+// AC13 — Victory / Defeat HUD display (Issue #541)
+// ---------------------------------------------------------------------------
+
+test('GIVEN short sortie fixture WHEN victory THEN HUD sortie-status shows Victory', async ({
+  page,
+}) => {
+  test.setTimeout(15_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  // Wait for victory state machine transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('victory')
+
+  // HUD sortie-status DOM element must read "Victory" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+
+  // HUD sortie-result DOM element must read "Victory" (AC9: same authority as Canvas overlay)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat', async ({
+  page,
+}) => {
+  test.setTimeout(30_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+  })
+  await page.goto('/')
+
+  // Wait for defeat state machine transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 25_000, intervals: [200] },
+    )
+    .toBe('defeat')
+
+  // HUD sortie-status DOM element must read "Defeat" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+
+  // HUD sortie-result DOM element must read "Defeat" (AC9: same authority as Canvas overlay)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progress', async ({
+  page,
+}) => {
+  // GIVEN the sortie is in running state
+  // WHEN the HUD is rendered
+  // THEN data-field="sortie-status" must be "In Progress" (AC4, AC10)
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('In Progress', {
+    timeout: 3000,
+  })
+})
