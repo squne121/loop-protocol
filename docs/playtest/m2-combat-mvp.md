@@ -2,7 +2,7 @@
 doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
-tested_commit: "PLACEHOLDER_COMMIT_SHA"
+tested_commit: "0a0858b19bc1e41645665dce4802881cc5bf31cf"
 evidence_mode: playwright+manual
 status: accepted
 date: "2026-05-31"
