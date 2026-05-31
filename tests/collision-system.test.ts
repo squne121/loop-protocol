@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { createInitialGameState } from '../src/state'
 import type { EnemyState, ProjectileState } from '../src/state'
 import { resolveCombatCollisions, runCollisionSystem } from '../src/systems'
+import { compareCollisionPair } from '../src/systems/CollisionSystem'
+import type { CollisionPair } from '../src/state'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -68,7 +70,7 @@ describe('runCollisionSystem', () => {
       tick: 0,
       projectileId: 2,
       enemyId: 1,
-      priorityKey: 'projectile-enemy:2:1',
+      priorityKey: 'projectile-enemy-2-1',
     })
   })
 
@@ -194,7 +196,7 @@ describe('runCollisionSystem', () => {
       tick: 0,
       playerId: state.player.id,
       enemyId: 1,
-      priorityKey: `player-enemy:${state.player.id}:1`,
+      priorityKey: `player-enemy-${state.player.id}-1`,
     })
   })
 
@@ -420,7 +422,7 @@ describe('resolveCombatCollisions', () => {
     // Provide a collision pair manually (CollisionSystem would not emit this because enemy.defeated,
     // but this tests that if a pair arrives from the same tick that defeated the enemy, the projectile
     // is consumed)
-    resolveCombatCollisions(state, [{ kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy:1:1', distSq: 0 }])
+    resolveCombatCollisions(state, [{ kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy-1-1', distSq: 0 }])
 
     // Projectile must be removed even though the enemy was already defeated
     expect(state.projectiles).toHaveLength(0)
@@ -436,8 +438,8 @@ describe('resolveCombatCollisions', () => {
 
     // Both projectiles target same enemy in same tick
     resolveCombatCollisions(state, [
-      { kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy:1:1', distSq: 0 },
-      { kind: 'projectile-enemy', tick: 0, projectileId: 2, enemyId: 1, priorityKey: 'projectile-enemy:2:1', distSq: 0 },
+      { kind: 'projectile-enemy', tick: 0, projectileId: 1, enemyId: 1, priorityKey: 'projectile-enemy-1-1', distSq: 0 },
+      { kind: 'projectile-enemy', tick: 0, projectileId: 2, enemyId: 1, priorityKey: 'projectile-enemy-2-1', distSq: 0 },
     ])
 
     // Both projectiles must be consumed (id=1 deals damage and defeats, id=2 hits defeated enemy)
@@ -518,6 +520,16 @@ describe('collision + combat pipeline (AC15 regression)', () => {
 
     expect(state.player.hp).toBe(initialHp)
     expect(state.enemies[0].defeated).toBe(true)
+  })
+
+  it('does not use priorityKey lexical order for collision ordering (#525 AC5 regression)', () => {
+    // "projectile-enemy-10-1" < "projectile-enemy-2-1" lexically (because "1" < "2"),
+    // but compareCollisionPair must use numeric projectileId ASC, so id=2 comes first.
+    const pairs: CollisionPair[] = [
+      { kind: 'projectile-enemy', tick: 0, projectileId: 10, enemyId: 1, priorityKey: 'projectile-enemy-10-1', distSq: 0 },
+      { kind: 'projectile-enemy', tick: 0, projectileId: 2, enemyId: 1, priorityKey: 'projectile-enemy-2-1', distSq: 0 },
+    ]
+    expect([...pairs].sort(compareCollisionPair).map((p) => p.kind === 'projectile-enemy' ? p.projectileId : -1)).toEqual([2, 10])
   })
 
   it('GIVEN no mutations to result/resource/persistence in CollisionSystem WHEN pipeline runs THEN only CombatSystem mutates game state (AC1 regression)', () => {
