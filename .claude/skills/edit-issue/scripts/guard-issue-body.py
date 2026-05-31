@@ -553,6 +553,61 @@ def _is_compound_command(command: str) -> bool:
     return _detect_compound_operator(command) is not None
 
 
+# Implementation issue ready tuple constants
+_IMPLEMENTATION_TITLE_PREFIXES = ("実装:", "implement:")
+_IMPLEMENTATION_REQUIRED_LABEL = "phase/implementation"
+
+
+def check_ready_tuple(
+    issue_kind,
+    title: str,
+    label_names: list,
+) -> list:
+    """Check implementation issue ready tuple (title prefix + phase/implementation label).
+
+    Args:
+        issue_kind: The issue kind (e.g. 'implementation'). Only validates when 'implementation'.
+        title: The issue title string.
+        label_names: List of label name strings on the issue.
+
+    Returns:
+        list[str]: List of error message strings. Empty list means PASS.
+    """
+    if issue_kind != "implementation":
+        return []
+
+    errors: list = []
+
+    if not title.startswith(_IMPLEMENTATION_TITLE_PREFIXES):
+        errors.append(
+            f"implementation issue title must start with '実装:' or 'implement:'. Got: {title!r}"
+        )
+
+    if _IMPLEMENTATION_REQUIRED_LABEL not in set(label_names):
+        errors.append(
+            f"implementation issue must have label '{_IMPLEMENTATION_REQUIRED_LABEL}'"
+        )
+
+    return errors
+
+
+def guard_ready_tuple(issue_kind, title: str, label_names: list) -> dict:
+    """Guard check for implementation issue ready tuple.
+
+    Returns a guard result dict integrated with the existing checks array schema:
+        {name: "ready_tuple", passed: bool, errors: [...]}
+
+    This guard only applies to implementation kind issues.
+    For other kinds, passed=True with empty errors list.
+    """
+    errors = check_ready_tuple(issue_kind, title, label_names)
+    return {
+        "name": "ready_tuple",
+        "passed": len(errors) == 0,
+        "errors": errors,
+    }
+
+
 def guard_vc_compound_shell_disallowed(body: str) -> dict:
     """
     ## Verification Commands セクションの fenced bash block から
@@ -634,6 +689,32 @@ def main() -> None:
         default=None,
         help="Issue kind for template-based guard (implementation/research/parent)"
     )
+    parser.add_argument(
+        "--check-ready-tuple",
+        dest="check_ready_tuple",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, adds a ready_tuple guard check: verifies that implementation issues "
+            "have correct title prefix ('実装:' or 'implement:') and 'phase/implementation' label. "
+            "Requires --title and --label options when checking implementation kind."
+        )
+    )
+    parser.add_argument(
+        "--title",
+        dest="title",
+        type=str,
+        default=None,
+        help="Issue title (used with --check-ready-tuple for ready_tuple guard)"
+    )
+    parser.add_argument(
+        "--label",
+        dest="labels",
+        action="append",
+        default=[],
+        metavar="LABEL",
+        help="Issue label name (may be specified multiple times; used with --check-ready-tuple)"
+    )
     args = parser.parse_args()
 
     body = args.body_file.read_text(encoding="utf-8")
@@ -680,6 +761,9 @@ def main() -> None:
             "vc_ac_count": vc_ac_count,
         })
         results.append(guard_vc_compound_shell_disallowed(body))
+        # ready_tuple guard (when --check-ready-tuple is set)
+        if args.check_ready_tuple:
+            results.append(guard_ready_tuple(issue_kind, args.title or "", args.labels))
     else:
         results = []
         results.append(guard_template(body, issue_kind))
@@ -691,6 +775,9 @@ def main() -> None:
 
         results.append(guard_ac_vc_alignment(body, issue_kind))
         results.append(guard_vc_compound_shell_disallowed(body))
+        # ready_tuple guard (when --check-ready-tuple is set)
+        if args.check_ready_tuple:
+            results.append(guard_ready_tuple(issue_kind, args.title or "", args.labels))
 
     all_passed = all(r["passed"] for r in results)
     output = {

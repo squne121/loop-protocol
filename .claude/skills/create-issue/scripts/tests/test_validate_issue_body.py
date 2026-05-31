@@ -13,6 +13,9 @@ from validate_issue_body import (
     _extract_ac_numbers,
     _extract_vc_ac_numbers,
     _extract_section,
+    _extract_mrc_issue_kind,
+    _validate_lp031_kind_mismatch,
+    _validate_lp031_implementation_title_prefix,
 )
 
 
@@ -743,6 +746,231 @@ other content
         assert "content here" in content
         assert "multiple lines" in content
         assert "Section Two" not in content
+
+
+class TestLP031TitlePrefix:
+    """LP031: implementation kind title prefix validation and kind mismatch detection.
+    AC13: MRC/CLI kind mismatch unit tests.
+    """
+
+    _IMPL_BODY_WITH_MRC = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "#1"
+goal_ref: "test"
+change_kind: workflow
+```
+
+## Outcome
+
+test outcome
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+# AC1
+test -f foo.py
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+
+    _RESEARCH_BODY_WITH_MRC = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: research
+parent_issue: "#1"
+goal_ref: "test"
+change_kind: research
+```
+
+## Outcome
+
+test outcome
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+# AC1
+test -f foo.md
+```
+
+## Allowed Paths
+
+- foo.md
+"""
+
+    @pytest.mark.parametrize("title,cli_kind,body_attr,expected_has_lp031", [
+        # MRC implementation + 実装: prefix => pass (no LP031)
+        ("実装: foo", None, "impl", False),
+        # MRC implementation + implement: prefix => pass (no LP031)
+        ("implement: bar", None, "impl", False),
+        # MRC implementation + non-compliant title => fail (LP031)
+        ("feat: foo", None, "impl", True),
+        # CLI implementation + 実装: prefix => pass
+        ("実装: foo", "implementation", "no_mrc", False),
+        # CLI implementation + non-compliant title => fail
+        ("chore: fix", "implementation", "no_mrc", True),
+        # research kind (MRC) => pass (LP031 not applicable)
+        ("調査: foo", None, "research", False),
+        # research CLI kind => pass
+        ("調査: bar", "research", "no_mrc", False),
+    ])
+    def test_lp031_parametrized(self, title, cli_kind, body_attr, expected_has_lp031):
+        """Parametrized LP031 tests for various kind/title combinations."""
+        if body_attr == "impl":
+            body = self._IMPL_BODY_WITH_MRC
+        elif body_attr == "research":
+            body = self._RESEARCH_BODY_WITH_MRC
+        else:
+            # no_mrc: minimal body without MRC
+            body = """\
+## Outcome
+
+test
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+# AC1
+test -f foo.py
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+
+        result = validate_issue_body(body, kind=cli_kind, title=title)
+        lp031_errors = [e for e in result.errors if e.rule_id == "LP031"]
+        lp031_mismatch_errors = [e for e in lp031_errors if "mismatch" in e.message]
+
+        # Filter to only title-prefix LP031 errors (not mismatch)
+        title_lp031_errors = [e for e in lp031_errors if "mismatch" not in e.message]
+
+        if expected_has_lp031:
+            assert len(title_lp031_errors) > 0, (
+                f"Expected LP031 title error for title={title!r} kind={cli_kind} body={body_attr} "
+                f"but got no LP031 errors"
+            )
+        else:
+            assert len(title_lp031_errors) == 0, (
+                f"Unexpected LP031 title error for title={title!r} kind={cli_kind} body={body_attr}: "
+                f"{[e.message for e in title_lp031_errors]}"
+            )
+
+    @pytest.mark.parametrize("mrc_kind,cli_kind,should_mismatch", [
+        # AC13: MRC implementation + CLI research => kind mismatch
+        ("implementation", "research", True),
+        # AC13: MRC research + CLI implementation => kind mismatch
+        ("research", "implementation", True),
+        # same kind => no mismatch
+        ("implementation", "implementation", False),
+        # no CLI kind => no mismatch check
+        ("implementation", None, False),
+        # no MRC => no mismatch check
+        (None, "implementation", False),
+    ])
+    def test_lp031_kind_mismatch(self, mrc_kind, cli_kind, should_mismatch):
+        """AC13: MRC/CLI kind mismatch triggers LP031 mismatch error before title check."""
+        if mrc_kind is not None:
+            body = f"""\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: {mrc_kind}
+parent_issue: "#1"
+goal_ref: "test"
+change_kind: workflow
+```
+
+## Outcome
+
+test
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+# AC1
+test -f foo.py
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+        else:
+            # no MRC
+            body = """\
+## Outcome
+
+test
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+# AC1
+test -f foo.py
+```
+
+## Allowed Paths
+
+- foo.py
+"""
+
+        errors = _validate_lp031_kind_mismatch(body, cli_kind)
+        if should_mismatch:
+            assert len(errors) > 0, (
+                f"Expected mismatch error for MRC={mrc_kind} CLI={cli_kind}"
+            )
+            assert any("mismatch" in e.message for e in errors)
+        else:
+            assert len(errors) == 0, (
+                f"Unexpected mismatch error for MRC={mrc_kind} CLI={cli_kind}: "
+                f"{[e.message for e in errors]}"
+            )
+
+    def test_lp031_mrc_kind_takes_priority_over_cli(self):
+        """When MRC issue_kind=implementation, effective_kind is implementation even with no CLI kind."""
+        body = self._IMPL_BODY_WITH_MRC
+        result = validate_issue_body(body, kind=None, title="feat: bad")
+        lp031_errors = [e for e in result.errors if e.rule_id == "LP031" and "mismatch" not in e.message]
+        assert len(lp031_errors) > 0, "MRC implementation should trigger LP031 for bad title"
+
+    def test_lp031_no_title_provided_no_check(self):
+        """When title is None, LP031 title check is skipped entirely."""
+        body = self._IMPL_BODY_WITH_MRC
+        result = validate_issue_body(body, kind="implementation", title=None)
+        lp031_errors = [e for e in result.errors if e.rule_id == "LP031" and "mismatch" not in e.message]
+        assert len(lp031_errors) == 0, "No title => no LP031 title check"
 
 
 if __name__ == "__main__":

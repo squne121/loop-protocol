@@ -31,6 +31,8 @@ _spec.loader.exec_module(_mod)
 guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
 guard_vc_compound_shell_disallowed = _mod.guard_vc_compound_shell_disallowed
+guard_ready_tuple = _mod.guard_ready_tuple
+check_ready_tuple = _mod.check_ready_tuple
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
 validate_issue_kind = _mod.validate_issue_kind
@@ -1205,3 +1207,125 @@ cmd && echo done  # AC2
     assert result["violations"][0]["ac_label"] == "AC2"
     # command から inline suffix が除去されていること
     assert "# AC2" not in result["violations"][0]["command"]
+
+
+# ---------------------------------------------------------------------------
+# check_ready_tuple / guard_ready_tuple tests (AC5, AC10, AC12)
+# ---------------------------------------------------------------------------
+
+class TestCheckReadyTuple:
+    """Tests for check_ready_tuple() function — AC5, AC10, AC12."""
+
+    @pytest.mark.parametrize("issue_kind,title,label_names,expected_pass", [
+        # AC5 case 1: implementation + 実装: prefix + phase/implementation => pass
+        (
+            "implementation",
+            "実装: foo bar",
+            ["phase/implementation", "enhancement"],
+            True,
+        ),
+        # AC5 case 2: implementation + implement: prefix + phase/implementation => pass
+        (
+            "implementation",
+            "implement: foo bar",
+            ["phase/implementation"],
+            True,
+        ),
+        # AC5 case 3: implementation + non-compliant title + phase/implementation => fail
+        (
+            "implementation",
+            "feat: foo",
+            ["phase/implementation"],
+            False,
+        ),
+        # AC10 case: implementation + 実装: prefix + NO phase/implementation => fail
+        (
+            "implementation",
+            "実装: foo",
+            ["enhancement"],
+            False,
+        ),
+        # AC5 case 4: research kind => pass (LP031/ready_tuple not applicable)
+        (
+            "research",
+            "調査: foo",
+            [],
+            True,
+        ),
+        # AC5 case 5: research kind with no phase/implementation => pass
+        (
+            "research",
+            "調査: foo",
+            ["phase/implementation"],
+            True,
+        ),
+        # non-implementation kind (parent) => pass
+        (
+            "parent",
+            "なんでもよい",
+            [],
+            True,
+        ),
+        # None kind => pass (no check)
+        (
+            None,
+            "feat: foo",
+            [],
+            True,
+        ),
+    ])
+    def test_check_ready_tuple_parametrized(self, issue_kind, title, label_names, expected_pass):
+        """Parametrized test for check_ready_tuple() covering all AC5/AC10 cases."""
+        errors = check_ready_tuple(issue_kind, title, label_names)
+        if expected_pass:
+            assert errors == [], f"Expected PASS but got errors: {errors}"
+        else:
+            assert len(errors) > 0, f"Expected FAIL but got no errors"
+
+    def test_check_ready_tuple_title_error_message_contains_got(self):
+        """Error message for title mismatch should contain the actual title."""
+        errors = check_ready_tuple("implementation", "chore: cleanup", ["phase/implementation"])
+        assert len(errors) == 1
+        assert "chore: cleanup" in errors[0]
+
+    def test_check_ready_tuple_label_error_message_contains_label_name(self):
+        """Error message for missing label should mention 'phase/implementation'."""
+        errors = check_ready_tuple("implementation", "実装: foo", [])
+        assert len(errors) == 1
+        assert "phase/implementation" in errors[0]
+
+    def test_check_ready_tuple_both_errors_when_both_missing(self):
+        """When both title prefix and label are wrong, two errors are returned."""
+        errors = check_ready_tuple("implementation", "feat: foo", ["enhancement"])
+        assert len(errors) == 2
+
+    def test_check_ready_tuple_empty_labels_list(self):
+        """Empty label list for implementation kind should fail."""
+        errors = check_ready_tuple("implementation", "実装: bar", [])
+        assert len(errors) == 1
+        assert "phase/implementation" in errors[0]
+
+
+class TestGuardReadyTuple:
+    """Tests for guard_ready_tuple() — AC12 output schema integration."""
+
+    def test_guard_ready_tuple_schema_pass(self):
+        """guard_ready_tuple returns {name, passed, errors} schema when passing."""
+        result = guard_ready_tuple("implementation", "実装: foo", ["phase/implementation"])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is True
+        assert result["errors"] == []
+
+    def test_guard_ready_tuple_schema_fail(self):
+        """guard_ready_tuple returns {name, passed, errors} schema when failing."""
+        result = guard_ready_tuple("implementation", "feat: foo", ["phase/implementation"])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is False
+        assert len(result["errors"]) > 0
+
+    def test_guard_ready_tuple_non_implementation_always_pass(self):
+        """Non-implementation kind always returns passed=True."""
+        result = guard_ready_tuple("research", "調査: foo", [])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is True
+        assert result["errors"] == []
