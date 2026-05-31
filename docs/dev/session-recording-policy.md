@@ -360,15 +360,58 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 ### GitHub Actions CI lifecycle
 
-`.github/workflows/session-manifest.yml` が `push` / `pull_request` trigger で実行される。
+`.github/workflows/session-manifest.yml` が `push` / `pull_request` / `merge_group` trigger で実行される。
 
 | 設定項目 | 値 |
 |---|---|
-| trigger | `push` + `pull_request`（`pull_request_target` は不使用） |
+| trigger | `push` + `pull_request` + `merge_group`（`pull_request_target` は不使用） |
 | permissions | `contents: read`（read-only、write 権限なし） |
 | persist-credentials | `false` |
 | artifact upload | `actions/upload-artifact@v4`、`retention-days: 7`、`if-no-files-found: error` |
 | artifact name prefix | `private-agent-session-manifest` |
+
+### required check operational contract (#432)
+
+manifest validation gate を main の merge blocker にする場合、required check の exact context は
+`agent-session-manifest / validate-generated-artifact` とする。
+
+| 項目 | 値 |
+|---|---|
+| workflow name | `agent-session-manifest` |
+| job_id | `validate_generated_artifact` |
+| job name | `validate-generated-artifact` |
+| required check context | `agent-session-manifest / validate-generated-artifact` |
+
+required check の SSOT は **GitHub ruleset** とする。
+legacy branch protection を使う場合も同じ exact check context を登録するが、運用判断・監査の正本は ruleset 側に置く。
+
+<!-- verification-anchor: branch protection|ruleset -->
+
+### required check 設定と確認
+
+1. `agent-session-manifest / validate-generated-artifact` が CI で一度成功してから required check に登録する。
+   GitHub は過去 7 日以内に成功していない check context を required check 候補として扱えないことがある。
+2. ruleset を正本として required check を登録する。
+3. ruleset を使えない環境だけ branch protection を fallback として使う。
+
+確認コマンド:
+
+```bash
+# ruleset 側の確認
+gh api repos/squne121/loop-protocol/rulesets
+
+# branch protection fallback の確認
+gh api repos/squne121/loop-protocol/branches/main/protection/required_status_checks \
+  --jq '.checks[]?.context // .contexts[]?'
+```
+
+### admin stop condition
+
+ruleset / branch protection の参照または更新に必要な admin 権限がない場合は、required check enforcement の実設定を進めず stop condition とする。
+その場合は docs と workflow だけを更新し、`gh api .../rulesets` または
+`gh api .../required_status_checks` を実行できなかった事実を Issue / PR に記録して人間へ引き継ぐ。
+
+<!-- verification-anchor: required_status_checks|admin stop condition|stop condition admin -->
 
 ---
 
