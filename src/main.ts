@@ -11,11 +11,8 @@ import { createLocalGameStorage } from './storage'
 import {
   advanceSimulationLoop,
   clampPlayerToArena,
-  resolveCombatCollisions,
-  runCollisionSystem,
-  runCombatSystem,
-  runMovementSystem,
-  runProjectileSystem,
+  runSortieSimulationStep,
+  startSortie,
 } from './systems'
 import { createHudController } from './ui'
 
@@ -57,6 +54,7 @@ const hud = createHudController(commandRail, {
   },
   onReset() {
     state = createInitialGameState()
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     resizeArena(state)
   },
 })
@@ -65,6 +63,9 @@ const inputState = createInputState()
 bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
+
+// M2 bootstrap: start sortie once after initialisation (AC12)
+startSortie(state, defaultSimulationConfig.fixedDeltaMs)
 
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
@@ -88,15 +89,9 @@ function frame(now: number): void {
 
 window.requestAnimationFrame(frame)
 
-function stepSimulation(deltaMs: number): void {
+function stepSimulation(fixedDeltaMs: number): void {
   const commands = mapInputToCommands(inputState)
-  runMovementSystem(state, commands, deltaMs)
-  runCombatSystem(state, commands, deltaMs)
-  runProjectileSystem(state, commands, deltaMs)
-  const collisionPairs = runCollisionSystem(state)
-  resolveCombatCollisions(state, collisionPairs)
-  state.tick += 1
-  state.elapsedMs += deltaMs
+  runSortieSimulationStep(state, commands, fixedDeltaMs)
 }
 
 function resizeArena(currentState: typeof state): void {
