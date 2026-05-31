@@ -67,6 +67,25 @@ window.addEventListener('resize', () => resizeArena(state))
 // M2 bootstrap: start sortie once after initialisation (AC12)
 startSortie(state, defaultSimulationConfig.fixedDeltaMs)
 
+// E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
+// These are injected via page.addInitScript() in Playwright tests before the
+// page script runs. Window flags are read once at initialisation time.
+if (import.meta.env.VITE_E2E_MODE === 'true') {
+  const e2eFlags = window as Window & {
+    __E2E_SHORT_SORTIE__?: boolean
+    __E2E_PLAYER_HP_OVERRIDE__?: number
+  }
+  // Short sortie: override targetTicks to ~0.5s for deterministic victory E2E
+  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.sortie.status === 'running') {
+    state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
+  }
+  // Player HP override: set hp/maxHp for deterministic defeat E2E
+  if (typeof e2eFlags.__E2E_PLAYER_HP_OVERRIDE__ === 'number') {
+    state.player.hp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+    state.player.maxHp = e2eFlags.__E2E_PLAYER_HP_OVERRIDE__
+  }
+}
+
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
 
@@ -119,6 +138,8 @@ interface LoopE2ESnapshot {
     y: number
     aimX: number
     aimY: number
+    hp: number
+    maxHp: number
   }
   projectiles: Array<{
     id: number
@@ -129,6 +150,23 @@ interface LoopE2ESnapshot {
   input: {
     primaryPressed: boolean
     activePointerId: number | null
+  }
+  enemies: Array<{
+    id: number
+    x: number
+    y: number
+    hp: number
+    maxHp: number
+    defeatedAtTick: number | null
+  }>
+  sortie: {
+    status: 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+    elapsedTicks: number
+    result: 'victory' | 'defeat' | null
+  }
+  arena: {
+    width: number
+    height: number
   }
 }
 
@@ -144,11 +182,41 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
       return {
         tick: state.tick,
         elapsedMs: state.elapsedMs,
-        player: { ...state.player },
-        projectiles: state.projectiles.map((p) => ({ ...p })),
+        player: {
+          x: state.player.x,
+          y: state.player.y,
+          aimX: state.player.aimX,
+          aimY: state.player.aimY,
+          hp: state.player.hp,
+          maxHp: state.player.maxHp,
+        },
+        projectiles: state.projectiles.map((p) => ({
+          id: p.id,
+          x: p.x,
+          y: p.y,
+          ageMs: p.ageMs,
+        })),
         input: {
           primaryPressed: inputState.primaryPressed,
           activePointerId: inputState.activePointerId,
+        },
+        enemies: state.enemies.map((e) => ({
+          id: e.id,
+          x: e.x,
+          y: e.y,
+          hp: e.hp,
+          maxHp: e.maxHp,
+          defeatedAtTick: e.defeatedAtTick,
+        })),
+        sortie: {
+          status: state.sortie.status,
+          elapsedTicks: state.sortie.elapsedTicks,
+          result:
+            state.sortie.result != null ? state.sortie.result.outcome : null,
+        },
+        arena: {
+          width: state.arena.width,
+          height: state.arena.height,
         },
       }
     },
