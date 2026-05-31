@@ -385,14 +385,24 @@ function generateManifest(opts) {
     summary: opts['human-intervention-reason'] || null,
   }
 
-  // Static producer contract: this script generates manifests that conform to the
-  // secret boundary contract defined in docs/dev/secret-policy.md.
-  // boundary_enforced: true is a static declaration ("this producer follows the contract"),
-  // NOT a runtime attestation that a hook ran during this process execution.
+  // Static producer contract. This MUST NOT be interpreted as runtime attestation.
+  // See docs/schemas/agent-session-manifest.schema.json for field semantics.
   manifest.secret_policy = {
     value_exposed: false,
-    boundary_enforced: true,
     mode: 'presence_only',
+    producer_contract: {
+      declared: true,
+      id: 'presence_only_no_secret_values',
+      version: 'v1',
+      claims: {
+        secret_values_not_serialized: true,
+        presence_only: true,
+      },
+    },
+    runtime_boundary: {
+      attested: false,
+      evidence_ref: null,
+    },
   }
 
   return manifest

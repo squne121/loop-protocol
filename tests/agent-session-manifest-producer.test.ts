@@ -958,8 +958,20 @@ describe('AC5: secret_policy field deep-equal assertion', () => {
     const manifest = JSON.parse(result.stdout)
     expect(manifest.secret_policy).toEqual({
       value_exposed: false,
-      boundary_enforced: true,
       mode: 'presence_only',
+      producer_contract: {
+        declared: true,
+        id: 'presence_only_no_secret_values',
+        version: 'v1',
+        claims: {
+          secret_values_not_serialized: true,
+          presence_only: true,
+        },
+      },
+      runtime_boundary: {
+        attested: false,
+        evidence_ref: null,
+      },
     })
   })
 
@@ -980,8 +992,20 @@ describe('AC5: secret_policy field deep-equal assertion', () => {
     const manifest = JSON.parse(result.stdout)
     expect(manifest.secret_policy).toEqual({
       value_exposed: false,
-      boundary_enforced: true,
       mode: 'presence_only',
+      producer_contract: {
+        declared: true,
+        id: 'presence_only_no_secret_values',
+        version: 'v1',
+        claims: {
+          secret_values_not_serialized: true,
+          presence_only: true,
+        },
+      },
+      runtime_boundary: {
+        attested: false,
+        evidence_ref: null,
+      },
     })
   })
 })
