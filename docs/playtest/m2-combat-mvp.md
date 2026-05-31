@@ -2,7 +2,7 @@
 doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
-tested_commit: "fc08eed33c420347d46e2d47dc3b7f5218a66b14"
+tested_commit: "9f87ac91151513110b5d7fd79e6f63f73e2a792a"
 evidence_mode: playwright+manual
 status: accepted_with_unknowns
 date: "2026-05-31"
@@ -41,6 +41,9 @@ pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
+
+# Manual check: verify production build does NOT contain E2E hook (CI automation is a follow-up)
+pnpm build && ! grep -R "__LOOP_E2E__" dist
 ```
 
 ## Observed
@@ -48,61 +51,73 @@ pnpm build
 ```yaml
 observed:
   e2e_playwright:
-    tests_run: 8
-    tests_passed: 8
+    tests_run: 10
+    tests_passed: 10
     tests_failed: 0
-    duration_ms: 12900
+    duration_ms: 21000
     results:
       - name: "GIVEN app loaded WHEN sortie bootstrap runs THEN sortie.status is running"
         status: pass
-        duration_ms: 251
+        duration_ms: 183
       - name: "GIVEN sortie running WHEN enemies spawn THEN enemies array is non-empty"
         status: pass
-        duration_ms: 322
+        duration_ms: 269
       - name: "GIVEN enemy spawned WHEN ticks elapse THEN enemy approaches player (distance decreases)"
         status: pass
         duration_ms: 1300
+        note: "early-return path now asserts defeat proof (at least one defeatedAtTick set) instead of bare tick advance"
       - name: "GIVEN canvas pointer held WHEN ticks elapse THEN projectile appears"
         status: pass
-        duration_ms: 380
+        duration_ms: 261
         note: "renamed from 'shotsFired increases'; LoopE2ESnapshot.player has no shotsFired field, projectile presence is equivalent evidence"
       - name: "GIVEN enemy exists WHEN projectile hits THEN enemy hp decreases or enemy defeated"
         status: pass
         duration_ms: 1300
+        note: "coordinate scale (scaleX/scaleY) applied for world-to-CSS pixel mapping"
       - name: "GIVEN enemy near player WHEN contact damage applies THEN player.hp decreases"
         status: pass
         duration_ms: 7400
         note: "timeout extended to 60s; enemy needs ~30s to traverse arena"
       - name: "GIVEN enemies field in snapshot WHEN E2E hook called THEN enemies and sortie fields present"
         status: pass
-        duration_ms: 164
+        duration_ms: 151
       - name: "GIVEN sortie running WHEN sortie state machine checked THEN victory and defeat statuses are valid enum values"
         status: pass
-        duration_ms: 166
-        note: "victory/defeat state machine schema verified; full cycle not exercised in automated E2E (see unknowns)"
+        duration_ms: 144
+        note: "victory/defeat state machine schema verified; full cycle exercised via fixture tests 9 and 10"
+      - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is victory"
+        status: pass
+        duration_ms: 695
+        note: "__E2E_SHORT_SORTIE__ fixture overrides targetTicks to ~30 ticks (0.5s); victory state machine verified end-to-end"
+      - name: "GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat"
+        status: pass
+        duration_ms: 7800
+        note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
   victory_defeat_state_evidence:
-    method: "E2E schema verification"
-    note: "sortie.status confirmed to accept 'victory'/'defeat' as valid enum values via state machine type check"
-    full_cycle_tested: false
-    reason: "120s real-time victory and player-hp-to-0 defeat cycles exceed practical E2E time budget"
+    method: "E2E deterministic fixture tests (tests 9 and 10)"
+    note: "120s real-time victory replaced by short_sortie fixture (targetTicks≈30); defeat replaced by 1HP player fixture. Both state machine transitions verified end-to-end."
+    full_cycle_tested: true
+    victory_method: "__E2E_SHORT_SORTIE__ fixture (0.5s sortie duration)"
+    defeat_method: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture (first contact triggers defeat)"
   quality_gates:
     typecheck: pass
     lint: pass
     test_vitest: "266 tests passed (15 files)"
     build: pass
     production_build_e2e_hook_absent: confirmed (__LOOP_E2E__ not present in dist/)
+    production_build_e2e_hook_absent_command: "pnpm build && ! grep -R \"__LOOP_E2E__\" dist"
 ```
 
 ## Unknowns
 
 ```yaml
 unknowns:
-  - item: "victory condition full cycle"
-    detail: "120 秒リアルタイム勝利は E2E の時間制約上スキップし、手動証跡は未実施。SortieSystem の state machine schema（victory/defeat enum）は E2E で確認済みだが、実際に全 wave 撃破→victory 遷移のエンド to エンドは未テスト。"
-  - item: "defeat condition full cycle"
-    detail: "player.hp が 0 になるまでの自然経過による defeat 遷移は E2E の時間制約上スキップ。contact damage によって hp が減少することは確認済み。"
+  - item: "victory condition full cycle — RESOLVED via short_sortie fixture"
+    detail: "120 秒リアルタイム勝利は E2E の時間制約上スキップ。短縮 sortie fixture（__E2E_SHORT_SORTIE__）で targetTicks≈30 に上書きし、0.5s で victory 遷移を自動検証済み（test 9）。"
+  - item: "defeat condition full cycle — RESOLVED via 1HP fixture"
+    detail: "player.hp が 0 になるまでの自然経過は E2E の時間制約上スキップ。1HP fixture（__E2E_PLAYER_HP_OVERRIDE__=1）で最初の enemy 接触で defeat 遷移を自動検証済み（test 10）。"
   - item: "UX feel of combat feedback"
-    detail: "Automated tests confirm mechanical correctness; subjective feel (hitfeedback, pacing, audio) requires human playtesting."
+    detail: "Automated tests confirm mechanical correctness; subjective feel (hit feedback, pacing, audio) requires human playtesting."
   - item: "Performance on low-end hardware"
     detail: "Tests run on WSL2/Chromium; performance on actual mobile or low-spec desktops not measured."
 ```
