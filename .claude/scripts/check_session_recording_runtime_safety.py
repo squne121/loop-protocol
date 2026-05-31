@@ -23,6 +23,8 @@ Environment variables (for testability):
     SRRS_HOOKS_DIR            override path returned by git rev-parse --git-path hooks
     SRRS_CHECKPOINT_TOKEN     override ENTIRE_CHECKPOINT_TOKEN presence ('present'/'absent')
     SRRS_REPO_ROOT            override repo root (same as --repo-root)
+    SRRS_SECRETS_MODE         override secrets_mode Kill Switch check ('none'=PASS,
+                              known dangerous values=FAIL, unknown/unset=see check_secrets_mode)
 """
 from __future__ import annotations
 
@@ -67,6 +69,7 @@ SECRET_MODE_NONE = "none"
 SECRET_MODE_DANGEROUS = {
     "current",
     "publish_secret",
+    "app_secret",          # canonical SSOT value (docs/dev/secret-policy.md)
     "app_runtime_secret",
     "agent_local_secret",
     "checkpoint_token",

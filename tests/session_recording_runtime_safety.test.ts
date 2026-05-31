@@ -601,7 +601,7 @@ describe('runtime safety: SRRS_SECRETS_MODE=foobar (unknown) exits FAIL-CLOSED (
 })
 
 describe('runtime safety: SRRS_SECRETS_MODE dangerous values exit FAIL (AC3)', () => {
-  const dangerousValues = ['publish_secret', 'app_runtime_secret', 'agent_local_secret', 'checkpoint_token']
+  const dangerousValues = ['publish_secret', 'app_secret', 'app_runtime_secret', 'agent_local_secret', 'checkpoint_token']
 
   for (const mode of dangerousValues) {
     it(`GIVEN SRRS_SECRETS_MODE=${mode} WHEN verifier runs THEN exit 1`, () => {
