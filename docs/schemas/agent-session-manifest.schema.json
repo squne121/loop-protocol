@@ -614,16 +614,18 @@
     "secret_policy": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Secret boundary policy status for this manifest (#412). value_exposed must be false and mode must be presence_only.",
+      "required": [
+        "value_exposed",
+        "mode",
+        "producer_contract",
+        "runtime_boundary"
+      ],
+      "description": "Secret boundary policy status for this manifest (#412). Static producer contract and runtime attestation are represented separately.",
       "properties": {
         "value_exposed": {
           "type": "boolean",
           "const": false,
           "description": "Whether any Secret value was exposed in this manifest. MUST be false — value_exposed: true is prohibited."
-        },
-        "boundary_enforced": {
-          "type": "boolean",
-          "description": "Whether secret_boundary_guard PreToolUse hook was active during this session."
         },
         "mode": {
           "type": "string",
@@ -631,6 +633,119 @@
             "presence_only"
           ],
           "description": "How secrets are represented. Only presence_only is permitted; value_included and not_applicable are prohibited."
+        },
+        "producer_contract": {
+          "type": "object",
+          "required": [
+            "declared",
+            "id",
+            "version",
+            "claims"
+          ],
+          "additionalProperties": false,
+          "description": "Static producer-side declaration. This MUST NOT be interpreted as runtime attestation.",
+          "properties": {
+            "declared": {
+              "type": "boolean",
+              "const": true,
+              "description": "Whether the producer explicitly declares this static contract."
+            },
+            "id": {
+              "type": "string",
+              "const": "presence_only_no_secret_values",
+              "description": "Machine-readable static contract identifier."
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^v[0-9]+$",
+              "description": "Static contract version."
+            },
+            "claims": {
+              "type": "object",
+              "required": [
+                "secret_values_not_serialized",
+                "presence_only"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "secret_values_not_serialized": {
+                  "type": "boolean",
+                  "const": true,
+                  "description": "Producer guarantees secret values are not serialized into the manifest."
+                },
+                "presence_only": {
+                  "type": "boolean",
+                  "const": true,
+                  "description": "Producer only emits presence-only metadata."
+                }
+              }
+            }
+          }
+        },
+        "runtime_boundary": {
+          "type": "object",
+          "required": [
+            "attested"
+          ],
+          "additionalProperties": false,
+          "description": "Runtime attestation status for secret boundary enforcement.",
+          "properties": {
+            "attested": {
+              "type": "boolean",
+              "description": "Whether runtime secret boundary enforcement was actually attested for this session."
+            },
+            "evidence_ref": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Reference to runtime evidence when attested is true."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "attested": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "attested"
+                ]
+              },
+              "then": {
+                "required": [
+                  "evidence_ref"
+                ],
+                "properties": {
+                  "evidence_ref": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "attested": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "attested"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "evidence_ref": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     }

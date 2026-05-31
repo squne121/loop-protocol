@@ -57,6 +57,26 @@ function createBaseManifest() {
   }
 }
 
+function createSecretPolicy() {
+  return {
+    value_exposed: false,
+    mode: 'presence_only',
+    producer_contract: {
+      declared: true,
+      id: 'presence_only_no_secret_values',
+      version: 'v1',
+      claims: {
+        secret_values_not_serialized: true,
+        presence_only: true,
+      },
+    },
+    runtime_boundary: {
+      attested: false,
+      evidence_ref: null,
+    },
+  }
+}
+
 describe('agent-session-manifest schema file', () => {
   it('GIVEN schema JSON file WHEN checking existence THEN file exists', () => {
     expect(existsSync(SCHEMA_PATH)).toBe(true)
@@ -155,6 +175,63 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     const result = validateManifestAgainstSchema(manifest)
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.path.includes('/sanitization_status'))).toBe(true)
+  })
+
+  it('GIVEN manifest with separated secret policy contract WHEN validating THEN static producer contract is accepted without runtime attestation', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: createSecretPolicy(),
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN manifest with legacy boundary_enforced shape WHEN validating THEN legacy shape is rejected', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        value_exposed: false,
+        boundary_enforced: true,
+        mode: 'presence_only',
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.message?.includes('must have required property'))).toBe(true)
+    expect(result.errors.some((error) => error.message?.includes('must NOT have additional properties'))).toBe(true)
+  })
+
+  it('GIVEN manifest with attested runtime boundary and null evidence WHEN validating THEN missing runtime evidence is rejected', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: true,
+          evidence_ref: null,
+        },
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path.includes('/secret_policy/runtime_boundary/evidence_ref'))).toBe(true)
+  })
+
+  it('GIVEN manifest with attested runtime boundary and evidence WHEN validating THEN runtime evidence requirement is accepted', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: true,
+          evidence_ref: 'artifacts/runtime-boundary.log',
+        },
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
   })
 })
 
