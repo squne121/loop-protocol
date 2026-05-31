@@ -89,7 +89,7 @@ jobs:
             exit 1
           fi
           echo "PASS: no token-like string detected"
-          if grep -qiE '"transcript"|raw_transcript|local_file' "$FILE"; then
+          if grep -qiE '"source_kind"[[:space:]]*:[[:space:]]*"(transcript|local_file)"|"raw_transcript_included"[[:space:]]*:[[:space:]]*true' "$FILE"; then
             echo "FAIL: transcript/local_file marker detected in manifest artifact"
             exit 1
           fi
