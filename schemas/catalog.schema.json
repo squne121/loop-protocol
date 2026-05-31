@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/catalog.schema.json",
+  "title": "Loop Protocol Schema Catalog",
+  "description": "Machine-readable catalog of all Loop Protocol schemas (v1)",
+  "type": "object",
+  "required": ["catalog_schema_version", "catalog_id", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "catalog_schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "catalog_id": {
+      "type": "string",
+      "const": "loop-protocol.schema-catalog/v1"
+    },
+    "generated_from": {
+      "type": ["string", "null"]
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/CatalogEntry"
+      }
+    }
+  },
+  "$defs": {
+    "CatalogEntry": {
+      "type": "object",
+      "required": [
+        "schema_id",
+        "format",
+        "source_kind",
+        "definition_paths",
+        "producer",
+        "consumers",
+        "detection_patterns",
+        "required_test_commands",
+        "compatibility",
+        "validation",
+        "migration",
+        "last_verified"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "yaml",
+            "json_schema",
+            "markdown_yaml_contract",
+            "markdown_table",
+            "github_issue_body",
+            "github_comment",
+            "ndjson"
+          ]
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": [
+            "repo_path",
+            "virtual",
+            "external",
+            "github_issue_body",
+            "github_comment"
+          ]
+        },
+        "definition_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "producer": {
+          "type": "object",
+          "required": ["owner", "paths"],
+          "additionalProperties": false,
+          "properties": {
+            "owner": {
+              "type": "string",
+              "minLength": 1
+            },
+            "paths": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "consumers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Consumer"
+          }
+        },
+        "detection_patterns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/DetectionPattern"
+          }
+        },
+        "required_test_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/CommandRef"
+          }
+        },
+        "compatibility": {
+          "$ref": "#/$defs/Compatibility"
+        },
+        "validation": {
+          "$ref": "#/$defs/Validation"
+        },
+        "migration": {
+          "$ref": "#/$defs/Migration"
+        },
+        "last_verified": {
+          "$ref": "#/$defs/LastVerified"
+        }
+      }
+    },
+    "Consumer": {
+      "type": "object",
+      "required": ["id", "paths"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "DetectionPattern": {
+      "type": "object",
+      "required": ["id", "engine", "mode", "pattern", "paths"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "engine": {
+          "type": "string",
+          "enum": ["ripgrep", "grep", "jq", "python"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["regex", "literal", "glob"]
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1
+        },
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "CommandRef": {
+      "type": "object",
+      "required": ["id", "runner", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runner": {
+          "type": "string",
+          "enum": [
+            "pytest",
+            "pnpm",
+            "rg",
+            "test",
+            "python_module",
+            "bash_allowlisted"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "Compatibility": {
+      "type": "object",
+      "required": ["mode", "direction", "breaking_changes"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["manual_policy"]
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["backward", "forward", "full", "custom"]
+        },
+        "breaking_changes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Validation": {
+      "type": "object",
+      "required": ["catalog_lint_commands", "fixture_tests"],
+      "additionalProperties": false,
+      "properties": {
+        "catalog_lint_commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandRef"
+          }
+        },
+        "fixture_tests": {
+          "type": "object",
+          "required": ["positive", "negative"],
+          "additionalProperties": false,
+          "properties": {
+            "positive": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "negative": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "Migration": {
+      "type": "object",
+      "required": ["required_for_breaking_change", "followup_issue_required"],
+      "additionalProperties": false,
+      "properties": {
+        "required_for_breaking_change": {
+          "type": "boolean"
+        },
+        "followup_issue_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "LastVerified": {
+      "type": "object",
+      "required": ["commit", "command_id"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "40-char full git SHA of the commit where this entry was last verified"
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
