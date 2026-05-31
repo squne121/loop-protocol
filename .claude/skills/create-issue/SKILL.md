@@ -197,7 +197,8 @@ Issue Template Guard / Outcome Quality Guard / Scope 重複チェックを全て
 ```bash
 # 書き込み前 validator — exit 1 なら起票しない
 # --kind を指定すると ISSUE_TEMPLATE/<kind>.yml から必須セクション・Stop Conditions を動的取得する（LP001/LP017）
-uv run python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation
+# --title を指定すると LP031 で implementation kind の title prefix を検証する
+uv run python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation --title "$TITLE"
 ```
 
 `validate_issue_body.py` が exit 1 を返した場合は **起票を中止**し、JSON 出力の `errors` を人間に提示して修正を求める。
@@ -206,13 +207,56 @@ validator が exit 0 を返した後、人間承認なしで即座に `.claude/s
 
 helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--dependency` を受け取り、labels / sub-issue / dependency の read-back を同一 transaction で実施する。
 
+**post-create ready tuple validation（implementation issue のみ）**:
+
+`create_issue_txn.py` 実行後、implementation issue の場合は GitHub 上の最終状態を read-back して ready tuple を検証する。pre-create の body 検証と異なり、GitHub に実際に付与された title / labels を確認する。
+
+**手順（ステップ分割）**:
+
+1. GitHub から title/labels を read-back する:
+
+```bash
+gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels > /tmp/readback.json
+```
+
+2. `guard-issue-body.py` に `--readback-json` を渡して ready tuple を検証する:
+
+```bash
+uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+  --issue-kind implementation \
+  --check-ready-tuple \
+  --readback-json /tmp/readback.json
+```
+
+3. guard の exit code を変数に保存する:
+
+```bash
+uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+  --issue-kind implementation \
+  --check-ready-tuple \
+  --readback-json /tmp/readback.json \
+  --format json > /tmp/guard_result.json
+GUARD_EXIT=$?
+```
+
+4. `GUARD_EXIT` が 0 以外の場合は failure comment を投稿して処理を停止する（成功扱いにしない）:
+
+```bash
+gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
+  --body "[create-issue] post-create ready tuple validation FAILED: title prefix or phase/implementation label missing. Manual fix required."
+```
+
+上記の 2 ステップ構成（guard 実行 + exit code 保存 → 失敗時のみ comment 投稿）により、compound shell operator（`||` / `;`）を使わず exit code を確実に検出する。
+
+検証失敗時は上記 comment 投稿後に処理を停止し、成功扱いにしない（起票自体は完了しているが、ready tuple が canonical でないことを明示的に記録する）。
+
 **blocking stop**:
 1. Scope が複数に分かれる場合（分割採否は人間判断）
 2. Scope Overlap Detected で 3 択のアクション選択が必要な場合
 
 上記以外の確認事項（調査で解決できる技術的事実・フラグ名・コマンド引数・ファイルパス等）は人間確認にせず、Issue 本文の `## Notes for Reviewer` セクションとして記録する。
 
-`create_issue_txn.py` 実行後、起票した Issue URL（`issue_url`）を Output として提示する。
+`create_issue_txn.py` 実行後（および post-create ready tuple validation 通過後）、起票した Issue URL（`issue_url`）を Output として提示する。
 
 ### 4a. Delivery-rollup parent の child materialization（`CHILD_MATERIALIZATION_PLAN_V2` 経由）
 

@@ -250,6 +250,60 @@ if [ "$EDIT_EXIT" -ne 0 ]; then
 fi
 ```
 
+### 5.5. postcondition: ready tuple 検証（implementation issue のみ）
+
+Step 5 の mutation が成功した後、成功 comment（Step 6）を投稿する前に、GitHub 上の最終状態を read-back して implementation issue の ready tuple を `guard-issue-body.py --check-ready-tuple` で検証する。
+
+**適用条件**: `issue_kind == "implementation"` の場合のみ実行する。research / parent 種別ではスキップする。
+
+```bash
+# Step 5.5: gh issue view で読み戻し → guard-issue-body.py --check-ready-tuple で検証
+if [ "${ISSUE_KIND:-}" = "implementation" ]; then
+  READBACK_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,labels)
+  READBACK_TITLE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['title'])" "$READBACK_JSON")
+  LABEL_ARGS=""
+  while IFS= read -r lname; do
+    LABEL_ARGS="$LABEL_ARGS --label $lname"
+  done < <(python3 -c "import json,sys; [print(l['name']) for l in json.loads(sys.argv[1])['labels']]" "$READBACK_JSON")
+
+  uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY" \
+    --issue-kind implementation \
+    --check-ready-tuple \
+    --title "$READBACK_TITLE" \
+    $LABEL_ARGS
+  READY_TUPLE_EXIT=$?
+
+  if [ "$READY_TUPLE_EXIT" -ne 0 ]; then
+    # 失敗時の分岐:
+    # - edit によって title/label を壊した場合 → rollback を試みる
+    # - 元から ready tuple が壊れていた場合 → rollback せず fail comment + stop
+    #   (判定: BACKUP_FILE の title/labels を比較して壊した側を確認する)
+    #
+    # 簡易判定: BACKUP_FILE を参照して元から壊れていたか確認できない場合は
+    # rollback せず fail comment を投稿して停止する（safe-side: rollback しない）
+    mkdir -p tmp
+    echo "## edit-issue: Step 5.5 postcondition FAILED
+- status: failed
+- reason: implementation issue ready tuple validation failed after edit
+- issue_number: ${ISSUE_NUMBER}
+- title: ${READBACK_TITLE}
+- labels: ${READBACK_LABELS:-unknown}
+- guard_exit: ${READY_TUPLE_EXIT}
+- action: manual fix required (check title prefix and phase/implementation label)" > tmp/edit_issue_error.md
+    gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body-file tmp/edit_issue_error.md
+    echo "[ERROR] Step 5.5: ready tuple validation failed. Not proceeding to Step 6." >&2
+    exit "$READY_TUPLE_EXIT"
+  fi
+fi
+```
+
+**失敗時の扱い**:
+- edit によって title/label を壊した場合: rollback を試みる（`rollback_issue_edit()` を呼ぶ）
+- 元から ready tuple が壊れていた（edit 前から非 canonical だった）場合: rollback せず fail comment + stop
+- いずれも Step 6 の「成功コメント」は投稿しない
+
+成功時のみ Step 6 に進む。
+
 ### 6. 変更経緯コメントを投稿
 
 ```bash
