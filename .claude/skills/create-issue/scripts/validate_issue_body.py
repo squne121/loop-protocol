@@ -888,19 +888,22 @@ def validate_issue_body(
                for implementation kind issues.
 
     effective_kind resolution:
-        1. MRC issue_kind (from body) takes priority.
-        2. CLI kind (--kind) is the fallback.
-        3. If both present and mismatched, LP031 reports mismatch error before
-           other LP031 checks.
+        1. CLI kind (--kind) is the authoritative source for LP001/LP017 kind-specific checks.
+        2. MRC issue_kind (from body) is extracted separately for LP031 mismatch detection.
+        3. If both CLI --kind and MRC issue_kind are present and differ, LP031 reports mismatch.
+        4. effective_kind (used for LP001/LP017) is only set when --kind is explicitly provided.
+           MRC issue_kind alone does NOT activate kind-specific LP001/LP017 checks — this
+           prevents regressions when validate_issue_body is called without --kind (e.g. from
+           contract_readiness_check.py which does not forward --kind).
     """
 
     # Compute SHA256 of body
     body_bytes = body.encode('utf-8')
     body_sha256 = f"sha256:{hashlib.sha256(body_bytes).hexdigest()}"
 
-    # Resolve effective_kind: MRC takes priority, CLI is fallback
-    mrc_kind = _extract_mrc_issue_kind(body)
-    effective_kind = mrc_kind if mrc_kind is not None else kind
+    # effective_kind for LP001/LP017: only use CLI --kind (explicit caller intent).
+    # MRC issue_kind is used only for LP031 mismatch and title prefix checks.
+    effective_kind = kind
 
     # Run all validators
     all_errors: list[ValidationError] = []
@@ -922,9 +925,13 @@ def validate_issue_body(
     all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))
 
-    # LP031 title prefix check (only when no kind mismatch)
+    # LP031 title prefix check: use MRC issue_kind when CLI --kind is absent,
+    # so title prefix enforcement works even without explicit --kind.
+    # (LP031 mismatch guard above already ran using CLI kind.)
+    mrc_kind = _extract_mrc_issue_kind(body)
+    lp031_kind = mrc_kind if mrc_kind is not None else kind
     if not kind_mismatch_errors:
-        all_errors.extend(_validate_lp031_implementation_title_prefix(body, title, effective_kind))
+        all_errors.extend(_validate_lp031_implementation_title_prefix(body, title, lp031_kind))
 
     # Determine overall status
     has_errors = any(e.severity == "error" for e in all_errors)
