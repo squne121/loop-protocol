@@ -228,7 +228,7 @@ uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_
   --readback-json /tmp/readback.json
 ```
 
-3. guard の exit code を変数に保存し、失敗（exit code != 0）の場合のみ failure comment を投稿する:
+3. guard の exit code を変数に保存する:
 
 ```bash
 uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
@@ -237,14 +237,16 @@ uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_
   --readback-json /tmp/readback.json \
   --format json > /tmp/guard_result.json
 GUARD_EXIT=$?
-
-if [ "$GUARD_EXIT" -ne 0 ]; then
-  gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
-    --body "[create-issue] post-create ready tuple validation FAILED: title prefix or phase/implementation label missing. Manual fix required."
-fi
 ```
 
-上記の 2 ステップ構成（exit code 変数保存 → 条件分岐）により、compound shell operator（`||`）を使わず exit code を確実に検出する。
+4. `GUARD_EXIT` が 0 以外の場合は failure comment を投稿して処理を停止する（成功扱いにしない）:
+
+```bash
+gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
+  --body "[create-issue] post-create ready tuple validation FAILED: title prefix or phase/implementation label missing. Manual fix required."
+```
+
+上記の 2 ステップ構成（guard 実行 + exit code 保存 → 失敗時のみ comment 投稿）により、compound shell operator（`||` / `;`）を使わず exit code を確実に検出する。
 
 検証失敗時は上記 comment 投稿後に処理を停止し、成功扱いにしない（起票自体は完了しているが、ready tuple が canonical でないことを明示的に記録する）。
 
