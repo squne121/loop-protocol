@@ -136,9 +136,11 @@ type CollisionPair = {
   projectileId?: number;   // kind === "projectile-enemy" の場合に存在
   playerId?: string;       // kind === "player-enemy" の場合に存在
   enemyId: number;
-  priorityKey: string;     // ソート・重複排除用キー
-                           // "projectile-enemy" の場合: `${kind}-${projectileId}-${enemyId}`
-                           // "player-enemy" の場合: `${kind}-${playerId}-${enemyId}`
+  priorityKey: string;
+  // Opaque dedupe/debug key. MUST NOT be parsed. MUST NOT be used for sorting.
+  // Canonical format:
+  // - projectile-enemy: `projectile-enemy-${projectileId}-${enemyId}`
+  // - player-enemy: `player-enemy-${playerId}-${enemyId}`
 };
 ```
 

@@ -70,7 +70,7 @@ export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
         tick: state.tick,
         projectileId: projectile.id,
         enemyId: closestEnemyId,
-        priorityKey: `projectile-enemy:${projectile.id}:${closestEnemyId}`,
+        priorityKey: `projectile-enemy-${projectile.id}-${closestEnemyId}`,
         distSq: closestDistSq,
       })
     }
@@ -91,7 +91,7 @@ export function runCollisionSystem(state: GameState): readonly CollisionPair[] {
         tick: state.tick,
         playerId: state.player.id,
         enemyId: enemy.id,
-        priorityKey: `player-enemy:${state.player.id}:${enemy.id}`,
+        priorityKey: `player-enemy-${state.player.id}-${enemy.id}`,
       })
     }
   }
