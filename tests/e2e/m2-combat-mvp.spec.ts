@@ -521,3 +521,142 @@ test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progres
     timeout: 3000,
   })
 })
+
+// ---------------------------------------------------------------------------
+// Canvas bitmap visual verification (AC7, AC8) — Issue #541
+// ---------------------------------------------------------------------------
+
+test('GIVEN sortie running WHEN enemy spawns and ticks elapse THEN Canvas has non-zero pixels (enemies drawn)', async ({
+  page,
+}) => {
+  // GIVEN enemies have spawned and at least one render frame has fired
+  // WHEN we sample the Canvas bitmap
+  // THEN at least one non-zero pixel must exist (background + entity drawing)
+
+  // Wait for sortie to be running
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  // Wait for at least one enemy to spawn so the canvas has enemy circles
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.enemies.length
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBeGreaterThan(0)
+
+  // Allow a few extra render frames to propagate
+  const stateAfterEnemy = await getGameState(page)
+  await waitForTicks(page, stateAfterEnemy.tick, 5)
+
+  // Verify canvas element is present and has non-zero bitmap content (AC7)
+  const isCanvasNonEmpty = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    return imageData.data.some((v) => v !== 0)
+  })
+  expect(isCanvasNonEmpty).toBe(true)
+})
+
+test('GIVEN short sortie fixture WHEN victory THEN Canvas overlay has non-zero pixels (overlay drawn)', async ({
+  page,
+}) => {
+  // GIVEN the sortie reaches victory via __E2E_SHORT_SORTIE__ fixture
+  // WHEN the CanvasRenderer paints the victory overlay (AC8)
+  // THEN sampling the canvas bitmap must yield non-zero pixels
+  test.setTimeout(15_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  // Wait for victory transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('victory')
+
+  // Allow a couple of render frames to ensure the overlay is painted.
+  // waitForTicks is not used here because the simulation loop may pause after
+  // the sortie reaches a terminal state; a short fixed wait is sufficient.
+  await page.waitForTimeout(200)
+
+  // Canvas must have non-zero pixels — the victory overlay covers the full arena
+  const isCanvasNonEmpty = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    return imageData.data.some((v) => v !== 0)
+  })
+  expect(isCanvasNonEmpty).toBe(true)
+
+  // Additionally confirm the HUD victory label is visible (belt-and-suspenders)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has non-zero pixels (defeat overlay drawn)', async ({
+  page,
+}) => {
+  // GIVEN the player starts with 1HP so first enemy contact triggers defeat
+  // WHEN the CanvasRenderer paints the defeat overlay (AC8)
+  // THEN sampling the canvas bitmap must yield non-zero pixels
+  test.setTimeout(30_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+  })
+  await page.goto('/')
+
+  // Wait for defeat transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 25_000, intervals: [200] },
+    )
+    .toBe('defeat')
+
+  // Allow a couple of render frames to ensure the overlay is painted.
+  // waitForTicks is not used here because the simulation loop may pause after
+  // the sortie reaches a terminal state; a short fixed wait is sufficient.
+  await page.waitForTimeout(200)
+
+  // Canvas must have non-zero pixels — the defeat overlay covers the full arena
+  const isCanvasNonEmpty = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    return imageData.data.some((v) => v !== 0)
+  })
+  expect(isCanvasNonEmpty).toBe(true)
+
+  // Additionally confirm the HUD defeat label is visible (belt-and-suspenders)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+})
