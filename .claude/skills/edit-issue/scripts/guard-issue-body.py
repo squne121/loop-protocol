@@ -553,6 +553,61 @@ def _is_compound_command(command: str) -> bool:
     return _detect_compound_operator(command) is not None
 
 
+# Implementation issue ready tuple constants
+_IMPLEMENTATION_TITLE_PREFIXES = ("実装:", "implement:")
+_IMPLEMENTATION_REQUIRED_LABEL = "phase/implementation"
+
+
+def check_ready_tuple(
+    issue_kind,
+    title: str,
+    label_names: list,
+) -> list:
+    """Check implementation issue ready tuple (title prefix + phase/implementation label).
+
+    Args:
+        issue_kind: The issue kind (e.g. 'implementation'). Only validates when 'implementation'.
+        title: The issue title string.
+        label_names: List of label name strings on the issue.
+
+    Returns:
+        list[str]: List of error message strings. Empty list means PASS.
+    """
+    if issue_kind != "implementation":
+        return []
+
+    errors: list = []
+
+    if not title.startswith(_IMPLEMENTATION_TITLE_PREFIXES):
+        errors.append(
+            f"implementation issue title must start with '実装:' or 'implement:'. Got: {title!r}"
+        )
+
+    if _IMPLEMENTATION_REQUIRED_LABEL not in set(label_names):
+        errors.append(
+            f"implementation issue must have label '{_IMPLEMENTATION_REQUIRED_LABEL}'"
+        )
+
+    return errors
+
+
+def guard_ready_tuple(issue_kind, title: str, label_names: list) -> dict:
+    """Guard check for implementation issue ready tuple.
+
+    Returns a guard result dict integrated with the existing checks array schema:
+        {name: "ready_tuple", passed: bool, errors: [...]}
+
+    This guard only applies to implementation kind issues.
+    For other kinds, passed=True with empty errors list.
+    """
+    errors = check_ready_tuple(issue_kind, title, label_names)
+    return {
+        "name": "ready_tuple",
+        "passed": len(errors) == 0,
+        "errors": errors,
+    }
+
+
 def guard_vc_compound_shell_disallowed(body: str) -> dict:
     """
     ## Verification Commands セクションの fenced bash block から
@@ -634,7 +689,159 @@ def main() -> None:
         default=None,
         help="Issue kind for template-based guard (implementation/research/parent)"
     )
+    parser.add_argument(
+        "--check-ready-tuple",
+        dest="check_ready_tuple",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, adds a ready_tuple guard check: verifies that implementation issues "
+            "have correct title prefix ('実装:' or 'implement:') and 'phase/implementation' label. "
+            "Requires --title and --label options when checking implementation kind."
+        )
+    )
+    parser.add_argument(
+        "--title",
+        dest="title",
+        type=str,
+        default=None,
+        help="Issue title (used with --check-ready-tuple for ready_tuple guard)"
+    )
+    parser.add_argument(
+        "--label",
+        dest="labels",
+        action="append",
+        default=[],
+        metavar="LABEL",
+        help="Issue label name (may be specified multiple times; used with --check-ready-tuple)"
+    )
+    parser.add_argument(
+        "--readback-json",
+        dest="readback_json",
+        type=validate_path,
+        default=None,
+        help=(
+            "Path to JSON file produced by 'gh issue view --json title,labels'. "
+            "Path must match ^[A-Za-z0-9._/-]+$ (safe chars only). "
+            "When provided with --check-ready-tuple, extracts title and label names from the file "
+            "instead of requiring --title and --label arguments."
+        )
+    )
     args = parser.parse_args()
+
+    # Resolve title and labels for --check-ready-tuple:
+    # --readback-json takes precedence over --title / --label when both are provided.
+    rt_title: str = args.title or ""
+    rt_labels: list = list(args.labels)
+    if args.readback_json is not None:
+        # args.readback_json is already a Path (validated by validate_path type=)
+        rb_path: Path = args.readback_json
+        try:
+            rb_raw = rb_path.read_text(encoding="utf-8")
+            rb_data = json.loads(rb_raw)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"ERROR: Failed to parse --readback-json: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        # Schema validation: root must be dict
+        if not isinstance(rb_data, dict):
+            # Return guard result instead of hard exit so callers get structured output
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: root must be a dict, got {type(rb_data).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # title must be str (missing treated as empty string)
+        rb_title_raw = rb_data.get("title", "")
+        if rb_title_raw is not None and not isinstance(rb_title_raw, str):
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: 'title' must be str, got {type(rb_title_raw).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # labels must be list
+        rb_labels_raw = rb_data.get("labels", [])
+        if not isinstance(rb_labels_raw, list):
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: 'labels' must be list, got {type(rb_labels_raw).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # each label must be dict with name: str
+        for i, lbl in enumerate(rb_labels_raw):
+            if not isinstance(lbl, dict):
+                _rb_error_result = {
+                    "name": "ready_tuple",
+                    "passed": False,
+                    "errors": [f"malformed readback JSON: labels[{i}] must be dict, got {type(lbl).__name__!r}"],
+                }
+                output = {"all_passed": False, "guards": [_rb_error_result]}
+                if hasattr(args, 'format') and args.format == "json":
+                    print(json.dumps(output, ensure_ascii=False, indent=2))
+                else:
+                    print("all_passed: false")
+                    print("guards:")
+                    print(f"  - name: ready_tuple")
+                    print(f"    passed: false")
+                    print(f"    errors:")
+                    print(f"      - {_rb_error_result['errors'][0]!r}")
+                sys.exit(2)
+            if not isinstance(lbl.get("name"), str):
+                _rb_error_result = {
+                    "name": "ready_tuple",
+                    "passed": False,
+                    "errors": [f"malformed readback JSON: labels[{i}].name must be str, got {type(lbl.get('name')).__name__!r}"],
+                }
+                output = {"all_passed": False, "guards": [_rb_error_result]}
+                if hasattr(args, 'format') and args.format == "json":
+                    print(json.dumps(output, ensure_ascii=False, indent=2))
+                else:
+                    print("all_passed: false")
+                    print("guards:")
+                    print(f"  - name: ready_tuple")
+                    print(f"    passed: false")
+                    print(f"    errors:")
+                    print(f"      - {_rb_error_result['errors'][0]!r}")
+                sys.exit(2)
+
+        rt_title = rb_title_raw or ""
+        rt_labels = [lbl["name"] for lbl in rb_labels_raw]
 
     body = args.body_file.read_text(encoding="utf-8")
 
@@ -680,6 +887,9 @@ def main() -> None:
             "vc_ac_count": vc_ac_count,
         })
         results.append(guard_vc_compound_shell_disallowed(body))
+        # ready_tuple guard (when --check-ready-tuple is set)
+        if args.check_ready_tuple:
+            results.append(guard_ready_tuple(issue_kind, rt_title, rt_labels))
     else:
         results = []
         results.append(guard_template(body, issue_kind))
@@ -691,6 +901,9 @@ def main() -> None:
 
         results.append(guard_ac_vc_alignment(body, issue_kind))
         results.append(guard_vc_compound_shell_disallowed(body))
+        # ready_tuple guard (when --check-ready-tuple is set)
+        if args.check_ready_tuple:
+            results.append(guard_ready_tuple(issue_kind, rt_title, rt_labels))
 
     all_passed = all(r["passed"] for r in results)
     output = {

@@ -11,6 +11,8 @@ guard-issue-body.py のユニットテスト。
 - PyYAML は yaml.safe_load() のみ使用
 """
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,9 +33,13 @@ _spec.loader.exec_module(_mod)
 guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
 guard_vc_compound_shell_disallowed = _mod.guard_vc_compound_shell_disallowed
+guard_ready_tuple = _mod.guard_ready_tuple
+check_ready_tuple = _mod.check_ready_tuple
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
 validate_issue_kind = _mod.validate_issue_kind
+validate_path = _mod.validate_path
+_MODULE_PATH_STR = str(_MODULE_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -1205,3 +1211,282 @@ cmd && echo done  # AC2
     assert result["violations"][0]["ac_label"] == "AC2"
     # command から inline suffix が除去されていること
     assert "# AC2" not in result["violations"][0]["command"]
+
+
+# ---------------------------------------------------------------------------
+# check_ready_tuple / guard_ready_tuple tests (AC5, AC10, AC12)
+# ---------------------------------------------------------------------------
+
+class TestCheckReadyTuple:
+    """Tests for check_ready_tuple() function — AC5, AC10, AC12."""
+
+    @pytest.mark.parametrize("issue_kind,title,label_names,expected_pass", [
+        # AC5 case 1: implementation + 実装: prefix + phase/implementation => pass
+        (
+            "implementation",
+            "実装: foo bar",
+            ["phase/implementation", "enhancement"],
+            True,
+        ),
+        # AC5 case 2: implementation + implement: prefix + phase/implementation => pass
+        (
+            "implementation",
+            "implement: foo bar",
+            ["phase/implementation"],
+            True,
+        ),
+        # AC5 case 3: implementation + non-compliant title + phase/implementation => fail
+        (
+            "implementation",
+            "feat: foo",
+            ["phase/implementation"],
+            False,
+        ),
+        # AC10 case: implementation + 実装: prefix + NO phase/implementation => fail
+        (
+            "implementation",
+            "実装: foo",
+            ["enhancement"],
+            False,
+        ),
+        # AC5 case 4: research kind => pass (LP031/ready_tuple not applicable)
+        (
+            "research",
+            "調査: foo",
+            [],
+            True,
+        ),
+        # AC5 case 5: research kind with no phase/implementation => pass
+        (
+            "research",
+            "調査: foo",
+            ["phase/implementation"],
+            True,
+        ),
+        # non-implementation kind (parent) => pass
+        (
+            "parent",
+            "なんでもよい",
+            [],
+            True,
+        ),
+        # None kind => pass (no check)
+        (
+            None,
+            "feat: foo",
+            [],
+            True,
+        ),
+    ])
+    def test_check_ready_tuple_parametrized(self, issue_kind, title, label_names, expected_pass):
+        """Parametrized test for check_ready_tuple() covering all AC5/AC10 cases."""
+        errors = check_ready_tuple(issue_kind, title, label_names)
+        if expected_pass:
+            assert errors == [], f"Expected PASS but got errors: {errors}"
+        else:
+            assert len(errors) > 0, f"Expected FAIL but got no errors"
+
+    def test_check_ready_tuple_title_error_message_contains_got(self):
+        """Error message for title mismatch should contain the actual title."""
+        errors = check_ready_tuple("implementation", "chore: cleanup", ["phase/implementation"])
+        assert len(errors) == 1
+        assert "chore: cleanup" in errors[0]
+
+    def test_check_ready_tuple_label_error_message_contains_label_name(self):
+        """Error message for missing label should mention 'phase/implementation'."""
+        errors = check_ready_tuple("implementation", "実装: foo", [])
+        assert len(errors) == 1
+        assert "phase/implementation" in errors[0]
+
+    def test_check_ready_tuple_both_errors_when_both_missing(self):
+        """When both title prefix and label are wrong, two errors are returned."""
+        errors = check_ready_tuple("implementation", "feat: foo", ["enhancement"])
+        assert len(errors) == 2
+
+    def test_check_ready_tuple_empty_labels_list(self):
+        """Empty label list for implementation kind should fail."""
+        errors = check_ready_tuple("implementation", "実装: bar", [])
+        assert len(errors) == 1
+        assert "phase/implementation" in errors[0]
+
+
+class TestGuardReadyTuple:
+    """Tests for guard_ready_tuple() — AC12 output schema integration."""
+
+    def test_guard_ready_tuple_schema_pass(self):
+        """guard_ready_tuple returns {name, passed, errors} schema when passing."""
+        result = guard_ready_tuple("implementation", "実装: foo", ["phase/implementation"])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is True
+        assert result["errors"] == []
+
+    def test_guard_ready_tuple_schema_fail(self):
+        """guard_ready_tuple returns {name, passed, errors} schema when failing."""
+        result = guard_ready_tuple("implementation", "feat: foo", ["phase/implementation"])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is False
+        assert len(result["errors"]) > 0
+
+    def test_guard_ready_tuple_non_implementation_always_pass(self):
+        """Non-implementation kind always returns passed=True."""
+        result = guard_ready_tuple("research", "調査: foo", [])
+        assert result["name"] == "ready_tuple"
+        assert result["passed"] is True
+        assert result["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# --readback-json path validation and schema validation tests (Blocker 1)
+# ---------------------------------------------------------------------------
+
+class TestReadbackJsonPathValidation:
+    """Tests for --readback-json validate_path type and schema validation.
+
+    validate_path rejects unsafe chars via argparse, returning SystemExit.
+    Schema validation returns structured guard result on malformed JSON.
+    """
+
+    def test_readback_json_rejects_unsafe_path_semicolon(self, tmp_path):
+        """GIVEN a path with semicolon WHEN passed as --readback-json THEN SystemExit (argparse rejects)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/foo;bar.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 (argparse error) for unsafe path, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_rejects_unsafe_path_space(self, tmp_path):
+        """GIVEN a path with a space WHEN passed as --readback-json THEN SystemExit (argparse rejects)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/foo bar.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for path with space, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_rejects_unsafe_path_shell_meta(self, tmp_path):
+        """GIVEN a path with shell metachar ($) WHEN passed as --readback-json THEN argparse rejects."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/$foo.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for path with $, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_malformed_not_dict(self, tmp_path):
+        """GIVEN readback JSON where root is a list WHEN guard runs THEN error result returned."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        rb_file.write_text(json.dumps([{"title": "実装: foo"}]), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        output = json.loads(result.stdout)
+        assert output["all_passed"] is False
+        errors = output["guards"][0]["errors"]
+        assert any("malformed readback JSON" in e for e in errors)
+
+    def test_readback_json_missing_labels_key(self, tmp_path):
+        """GIVEN readback JSON without 'labels' key WHEN guard runs THEN defaults to empty labels (no error)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        # title present but no labels key -> defaults to [] -> passes schema validation
+        rb_file.write_text(json.dumps({"title": "実装: foo"}), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        # Schema is valid (missing labels defaults to []), but ready_tuple itself may fail
+        # because phase/implementation label is absent — that's a logic fail, not schema error
+        output = json.loads(result.stdout)
+        guards = {g["name"]: g for g in output["guards"]}
+        if "ready_tuple" in guards:
+            # errors should NOT mention "malformed readback JSON"
+            for e in guards["ready_tuple"].get("errors", []):
+                assert "malformed readback JSON" not in e
+
+    def test_readback_json_label_not_dict(self, tmp_path):
+        """GIVEN readback JSON where a label element is not a dict WHEN guard runs THEN error result."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        rb_file.write_text(
+            json.dumps({"title": "実装: foo", "labels": ["phase/implementation"]}),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        output = json.loads(result.stdout)
+        assert output["all_passed"] is False
+        errors = output["guards"][0]["errors"]
+        assert any("malformed readback JSON" in e for e in errors)
