@@ -1,0 +1,5 @@
+{
+  "env": { "SRRS_SECRETS_MODE": "current" },
+  "expectedExitCode": 1,
+  "expectedDiagnostic": "FAIL:secrets_mode_non_none"
+}
