@@ -138,6 +138,7 @@ type CollisionPair = {
   enemyId: number;
   priorityKey: string;
   // Opaque dedupe/debug key. MUST NOT be parsed. MUST NOT be used for sorting.
+  // For debug display and snapshot stability only; not a reversible serialization format.
   // Canonical format:
   // - projectile-enemy: `projectile-enemy-${projectileId}-${enemyId}`
   // - player-enemy: `player-enemy-${playerId}-${enemyId}`

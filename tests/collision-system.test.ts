@@ -522,7 +522,7 @@ describe('collision + combat pipeline (AC15 regression)', () => {
     expect(state.enemies[0].defeated).toBe(true)
   })
 
-  it('does not use priorityKey lexical order for collision ordering (AC5 regression)', () => {
+  it('does not use priorityKey lexical order for collision ordering (#525 AC5 regression)', () => {
     // "projectile-enemy-10-1" < "projectile-enemy-2-1" lexically (because "1" < "2"),
     // but compareCollisionPair must use numeric projectileId ASC, so id=2 comes first.
     const pairs: CollisionPair[] = [
