@@ -53,6 +53,10 @@ interface LoopE2EState {
     elapsedTicks: number
     result: 'victory' | 'defeat' | null
   }
+  arena: {
+    width: number
+    height: number
+  }
 }
 
 async function getGameState(page: Page): Promise<LoopE2EState> {
@@ -179,10 +183,32 @@ test('GIVEN enemy spawned WHEN ticks elapse THEN enemy approaches player (distan
   const enemyLater = stateLater.enemies.find((e) => e.id === aliveEnemy.id)
 
   if (!enemyLater || enemyLater.defeatedAtTick !== null) {
-    // Enemy was defeated within 1 second — this confirms combat is active.
-    // Defeated = enemy approached and was hit, which implies it moved toward player.
-    // Assert that the game tick has advanced (simulation is running).
-    expect(stateLater.tick).toBeGreaterThan(stateWithEnemy.tick)
+    // Target enemy was defeated — find a different alive enemy and check it approached
+    const anotherAlive = stateLater.enemies.find((e) => e.defeatedAtTick === null)
+    if (!anotherAlive) {
+      // All enemies defeated: combat is clearly active (they approached and were killed)
+      // Assert at least one defeat occurred as proof of approach
+      expect(stateLater.enemies.some((e) => e.defeatedAtTick !== null)).toBe(true)
+      return
+    }
+    // Wait another 60 ticks for the new target
+    const tickBefore = stateLater.tick
+    const distBefore = Math.hypot(
+      anotherAlive.x - stateLater.player.x,
+      anotherAlive.y - stateLater.player.y,
+    )
+    await waitForTicks(page, tickBefore, 60)
+    const stateEvenLater = await getGameState(page)
+    const targetEvenLater = stateEvenLater.enemies.find((e) => e.id === anotherAlive.id)
+    if (!targetEvenLater || targetEvenLater.defeatedAtTick !== null) {
+      expect(stateEvenLater.enemies.some((e) => e.defeatedAtTick !== null)).toBe(true)
+      return
+    }
+    const distAfter = Math.hypot(
+      targetEvenLater.x - stateEvenLater.player.x,
+      targetEvenLater.y - stateEvenLater.player.y,
+    )
+    expect(distAfter).toBeLessThan(distBefore)
     return
   }
 
@@ -249,13 +275,15 @@ test('GIVEN enemy exists WHEN projectile hits THEN enemy hp decreases or enemy d
   const box = await canvas.boundingBox()
   expect(box).not.toBeNull()
 
-  // Aim at enemy world position relative to canvas.
-  // Coordinate system note: enemy.x / enemy.y are world coordinates that map
-  // 1:1 to canvas CSS pixels (no separate camera transform). The canvas origin
-  // is at box.x, box.y in page coordinates, so the page-space target is
-  // box.x + enemy.x, box.y + enemy.y.
-  const targetX = box!.x + enemy0.x
-  const targetY = box!.y + enemy0.y
+  // Coordinate system: world coordinates (enemy.x/y) map to canvas CSS pixels.
+  // Verify the mapping is 1:1 by comparing arena size to canvas bounding box.
+  // If the ratio is not 1:1, world-to-CSS coordinate conversion is needed.
+  const s = await getGameState(page)
+  const scaleX = box!.width / s.arena.width
+  const scaleY = box!.height / s.arena.height
+
+  const targetX = box!.x + enemy0.x * scaleX
+  const targetY = box!.y + enemy0.y * scaleY
 
   await page.mouse.move(targetX, targetY)
   await page.mouse.down({ button: 'left' })
@@ -345,4 +373,64 @@ test('GIVEN sortie running WHEN sortie state machine checked THEN victory and de
     elapsedTicks: expect.any(Number),
     // result is null | 'victory' | 'defeat'
   })
+})
+
+test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is victory', async ({
+  page,
+}) => {
+  test.setTimeout(15_000)
+  // Inject short-sortie flag before page load (targetTicks ≈ 30 ticks / 0.5s)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('victory')
+
+  const finalState = await getGameState(page)
+  expect(finalState.sortie.result).toBe('victory')
+})
+
+test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat', async ({
+  page,
+}) => {
+  test.setTimeout(30_000)
+  // Inject 1HP override before page load — first enemy contact triggers defeat
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+  })
+  await page.goto('/')
+
+  // Verify player starts with 1 HP
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.player.maxHp
+      },
+      { timeout: 5_000, intervals: [50] },
+    )
+    .toBe(1)
+
+  // Wait for first enemy contact to trigger defeat
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 25_000, intervals: [200] },
+    )
+    .toBe('defeat')
+
+  const finalState = await getGameState(page)
+  expect(finalState.sortie.result).toBe('defeat')
 })
