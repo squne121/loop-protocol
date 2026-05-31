@@ -25,9 +25,16 @@ import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import yaml as _yaml_module
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +70,51 @@ SCOPE_SIGNAL_REASON_NO_SIGNAL = "no_scope_signal"
 
 FAIL_CLOSED_REASON_MALFORMED_CONTRACT = "malformed_machine_readable_contract"
 FAIL_CLOSED_REASON_MISSING_SECTION = "missing_required_section"
+FAIL_CLOSED_REASON_MISSING_PARENT_SECTION = "missing_required_parent_section"
 FAIL_CLOSED_REASON_AMBIGUOUS_SIGNAL = "ambiguous_scope_signal"
 FAIL_CLOSED_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
 FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
+FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE = "template_required_sections_unavailable"
+FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND = "unknown_issue_kind"
+
+# Allowlist for valid issue_kind values (Blocker 3: path traversal prevention)
+ISSUE_KIND_ALLOWLIST = frozenset({"implementation", "parent", "research"})
+
+
+# ---------------------------------------------------------------------------
+# Template load result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TemplateLoadResult:
+    """Result of loading required section labels from a template file.
+
+    Blocker 2: distinguishes success (error=None) from failure (error=reason_code).
+    An empty required_labels with error=None means the template genuinely has 0
+    required sections — that is valid. An error means we cannot trust the result.
+    """
+
+    required_labels: list[str]
+    error: Optional[str]  # None = success; str = fail_closed reason code
+
+
+# ---------------------------------------------------------------------------
+# Repository root resolution
+# ---------------------------------------------------------------------------
+
+def _find_repo_root() -> Path:
+    """Find repository root by walking up to find .git directory."""
+    current = Path(__file__).resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    # Fallback: assume we are in .claude/skills/issue-refinement-loop/scripts/
+    return Path(__file__).resolve().parent.parent.parent.parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -126,21 +175,68 @@ def _canonical_json(obj: Any) -> str:
 
 
 def _extract_sections(text: str) -> dict[str, str]:
-    """Extract markdown sections (e.g., ## Outcome) from text."""
+    """Extract markdown sections (e.g., ## Outcome) from text.
+
+    AC4: fenced-code-aware — headings inside ``` or ~~~ fences are NOT treated
+    as section headings. Only ## lines outside any fence are recognized.
+
+    Per CommonMark spec, the opening fence marker is the run of backticks (or
+    tildes) at the start of the line.  The closing fence must use the same
+    character and have at least as many characters.  We capture the full
+    opening-marker length so that a fence opened with `````markdown` (4 backticks)
+    is NOT closed by a bare ` ``` ` (3 backticks) that appears inside it.
+    """
     sections = {}
     current_section = None
     current_content = []
+    in_fence = False
+    fence_char = ""      # The backtick/tilde character used to open the fence
+    fence_len = 0        # Minimum number of chars needed to close the fence
 
     for line in text.splitlines():
+        # Detect fence open/close (``` or ~~~, optionally followed by language)
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                # Capture the full run of the fence character (could be 3+)
+                fc = stripped[0]
+                run_len = 0
+                for ch in stripped:
+                    if ch == fc:
+                        run_len += 1
+                    else:
+                        break
+                fence_char = fc
+                fence_len = run_len
+                in_fence = True
+                if current_section is not None:
+                    current_content.append(line)
+                continue
+        else:
+            # Inside fence: look for a closing fence (same char, >= same length,
+            # with no trailing non-whitespace chars other than the fence char itself).
+            if stripped and all(c == fence_char for c in stripped) and len(stripped) >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                if current_section is not None:
+                    current_content.append(line)
+                continue
+            # Inside fence: pass line through without heading detection
+            if current_section is not None:
+                current_content.append(line)
+            continue
+
+        # Outside fence: detect headings
         if line.startswith("## "):
-            if current_section:
+            if current_section is not None:
                 sections[current_section] = "\n".join(current_content).strip()
             current_section = line[3:].strip()
             current_content = []
-        elif current_section:
+        elif current_section is not None:
             current_content.append(line)
 
-    if current_section:
+    if current_section is not None:
         sections[current_section] = "\n".join(current_content).strip()
 
     return sections
@@ -481,19 +577,187 @@ def _check_malformed_contract(issue_body: str) -> bool:
 
 
 def _check_missing_outcome(issue_body: str) -> bool:
-    """Check if Outcome section is missing."""
-    return "## Outcome" not in issue_body
+    """Check if Outcome section is missing (fence-aware heading detection)."""
+    sections = _extract_sections(issue_body)
+    return "Outcome" not in sections
 
 
 def _check_missing_ac(issue_body: str) -> bool:
-    """Check if Acceptance Criteria section is missing."""
-    return "## Acceptance Criteria" not in issue_body
+    """Check if Acceptance Criteria section is missing (fence-aware heading detection)."""
+    sections = _extract_sections(issue_body)
+    return "Acceptance Criteria" not in sections
 
 
 def _check_missing_vc(issue_body: str) -> bool:
-    """Check if Verification Commands section is missing."""
-    return "## Verification Commands" not in issue_body
+    """Check if Verification Commands section is missing (fence-aware heading detection)."""
+    sections = _extract_sections(issue_body)
+    return "Verification Commands" not in sections
 
+
+# Heading pattern for extracting headings (AC4: fenced-code-aware)
+HEADING_RE = re.compile(r"^[ \t]{0,3}##[ \t]+(?P<title>.+?)[ \t#]*$", re.MULTILINE)
+
+
+def _extract_machine_contract(issue_body: str) -> dict | None:
+    """
+    Extract Machine-Readable Contract from issue body.
+
+    Finds the fenced YAML block that is the value of the
+    'Machine-Readable Contract' section and parses it with yaml.safe_load.
+
+    Returns None if:
+    - No Machine-Readable Contract section found
+    - No YAML fenced block found in that section
+    - yaml.safe_load fails
+    - Result is not a dict (AC3: must be dict)
+    - yaml module is unavailable
+
+    AC4: Only parses the YAML in the Machine-Readable Contract section,
+    not any arbitrary fenced code block.
+    """
+    if not _YAML_AVAILABLE:
+        return None
+
+    sections = _extract_sections(issue_body)
+    contract_section = sections.get("Machine-Readable Contract", "")
+    if not contract_section:
+        return None
+
+    # Extract the first fenced yaml block from the contract section
+    yaml_match = re.search(r"```yaml\n([\s\S]*?)\n```", contract_section)
+    if not yaml_match:
+        return None
+
+    yaml_content = yaml_match.group(1)
+    try:
+        parsed = _yaml_module.safe_load(yaml_content)
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    return parsed
+
+
+def resolve_issue_template(issue_kind: str, repo_root: Path) -> Path | None:
+    """
+    Resolve the issue template file for the given issue_kind.
+
+    Blocker 3: issue_kind is validated against ISSUE_KIND_ALLOWLIST before
+    being used in path construction. Unknown values return None (caller must
+    handle as unknown_issue_kind).
+
+    Returns the Path to .github/ISSUE_TEMPLATE/<issue_kind>.yml,
+    or None if the file does not exist or issue_kind is not in the allowlist.
+    """
+    if issue_kind not in ISSUE_KIND_ALLOWLIST:
+        return None
+
+    template_dir = (repo_root / ".github" / "ISSUE_TEMPLATE").resolve()
+    template_path = (template_dir / f"{issue_kind}.yml").resolve()
+
+    # Path traversal guard: resolved template must be inside template_dir
+    try:
+        template_path.relative_to(template_dir)
+    except ValueError:
+        return None
+
+    if template_path.exists():
+        return template_path
+    return None
+
+
+def load_required_section_labels(template_path: Path) -> TemplateLoadResult:
+    """
+    Load required section labels from an issue template YAML file.
+
+    Returns TemplateLoadResult with:
+    - required_labels: list of label strings where validations.required == True
+    - error: None on success; FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE on failure
+
+    Blocker 2: failure modes are distinguished from "zero required sections".
+    - yaml unavailable → error=template_required_sections_unavailable
+    - file missing / unreadable → error=template_required_sections_unavailable
+    - parse error → error=template_required_sections_unavailable
+    - body not a list → error=template_required_sections_unavailable
+    - template exists with 0 required items → error=None, required_labels=[]
+
+    AC5: Must not hardcode section names — derive from template.
+    AC6: When template changes, detection changes without script modification.
+    """
+    if not _YAML_AVAILABLE:
+        return TemplateLoadResult(
+            required_labels=[],
+            error=FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE,
+        )
+
+    try:
+        with open(template_path, encoding="utf-8") as f:
+            data = _yaml_module.safe_load(f)
+    except Exception:
+        return TemplateLoadResult(
+            required_labels=[],
+            error=FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE,
+        )
+
+    if not isinstance(data, dict):
+        return TemplateLoadResult(
+            required_labels=[],
+            error=FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE,
+        )
+
+    body = data.get("body", [])
+    if not isinstance(body, list):
+        return TemplateLoadResult(
+            required_labels=[],
+            error=FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE,
+        )
+
+    required_labels = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes", {})
+        if not isinstance(attrs, dict):
+            continue
+        label = attrs.get("label")
+        validations = item.get("validations", {})
+        if not isinstance(validations, dict):
+            continue
+        if label and validations.get("required") is True:
+            required_labels.append(label)
+
+    return TemplateLoadResult(required_labels=required_labels, error=None)
+
+
+def _check_missing_sections_from_template(
+    issue_body: str,
+    required_labels: list[str],
+) -> list[str]:
+    """
+    Check which required sections (from template labels) are missing in issue body.
+
+    Blocker 4: Uses the heading map from _extract_sections() for exact-match
+    detection instead of substring search. This prevents false-positives where
+    a label name appears in the body text (not as a ## heading).
+
+    Returns list of missing section labels.
+    Skips 'Machine-Readable Contract' label (it's checked separately).
+    """
+    # Build a set of known heading titles from the body (fence-aware)
+    sections = _extract_sections(issue_body)
+    present_headings = set(sections.keys())
+
+    missing = []
+    for label in required_labels:
+        # Machine-Readable Contract is validated separately
+        if label == "Machine-Readable Contract":
+            continue
+        # Exact-match against heading map (Blocker 4: no partial match)
+        if label not in present_headings:
+            missing.append(label)
+    return missing
 
 
 def _validate_input_schema(data: Any) -> bool:
@@ -603,8 +867,55 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         if _check_malformed_contract(issue_body):
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MALFORMED_CONTRACT)
 
-        if _check_missing_outcome(issue_body):
-            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+        # Extract machine contract to determine issue_kind and parent_mode
+        machine_contract = _extract_machine_contract(issue_body)
+        issue_kind = machine_contract.get("issue_kind") if machine_contract else None
+        parent_mode = machine_contract.get("parent_mode") if machine_contract else None
+
+        # Determine if this is a parent delivery-rollup (AC1: exempt from Outcome check)
+        is_parent_delivery_rollup = (
+            issue_kind == "parent" and parent_mode == "delivery-rollup"
+        )
+
+        repo_root = _find_repo_root()
+
+        if issue_kind and not is_parent_delivery_rollup:
+            # Blocker 3: Validate issue_kind against allowlist before template lookup
+            if issue_kind not in ISSUE_KIND_ALLOWLIST:
+                fail_closed_reasons.append(FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND)
+            else:
+                # For known non-parent-delivery-rollup issue kinds: use template-derived required sections
+                template_path = resolve_issue_template(issue_kind, repo_root)
+                if template_path:
+                    load_result = load_required_section_labels(template_path)
+                    if load_result.error:
+                        # Blocker 2: template load failure → fail_closed
+                        fail_closed_reasons.append(load_result.error)
+                    else:
+                        missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
+                        if missing:
+                            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+                else:
+                    # Template not found: fall back to Outcome check
+                    if _check_missing_outcome(issue_body):
+                        fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+        elif is_parent_delivery_rollup:
+            # AC1: parent delivery-rollup — check parent template sections (not Outcome)
+            # AC7: Use separate reason_code for missing parent sections
+            template_path = resolve_issue_template("parent", repo_root)
+            if template_path:
+                load_result = load_required_section_labels(template_path)
+                if load_result.error:
+                    # Blocker 2: template load failure → fail_closed
+                    fail_closed_reasons.append(load_result.error)
+                else:
+                    missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
+                    if missing:
+                        fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_PARENT_SECTION)
+        else:
+            # No machine contract or unknown issue_kind: fall back to Outcome check
+            if _check_missing_outcome(issue_body):
+                fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
 
         if fail_closed_reasons:
             # B3: Return schema-valid decisions with unknown confidence even in fail_closed
