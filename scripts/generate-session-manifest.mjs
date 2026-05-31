@@ -385,6 +385,26 @@ function generateManifest(opts) {
     summary: opts['human-intervention-reason'] || null,
   }
 
+  // Static producer contract. This MUST NOT be interpreted as runtime attestation.
+  // See docs/schemas/agent-session-manifest.schema.json for field semantics.
+  manifest.secret_policy = {
+    value_exposed: false,
+    mode: 'presence_only',
+    producer_contract: {
+      declared: true,
+      id: 'presence_only_no_secret_values',
+      version: 'v1',
+      claims: {
+        secret_values_not_serialized: true,
+        presence_only: true,
+      },
+    },
+    runtime_boundary: {
+      attested: false,
+      evidence_ref: null,
+    },
+  }
+
   return manifest
 }
 
