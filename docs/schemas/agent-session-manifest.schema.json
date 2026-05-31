@@ -685,7 +685,8 @@
         "runtime_boundary": {
           "type": "object",
           "required": [
-            "attested"
+            "attested",
+            "evidence_ref"
           ],
           "additionalProperties": false,
           "description": "Runtime attestation status for secret boundary enforcement.",
@@ -721,7 +722,8 @@
                 "properties": {
                   "evidence_ref": {
                     "type": "string",
-                    "minLength": 1
+                    "minLength": 1,
+                    "pattern": "\\S"
                   }
                 }
               }

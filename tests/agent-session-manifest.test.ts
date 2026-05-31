@@ -233,6 +233,50 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     expect(result.valid).toBe(true)
     expect(result.errors).toEqual([])
   })
+
+  it('GIVEN unattested runtime boundary without evidence_ref WHEN validating THEN explicit null evidence_ref is required', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: false,
+        },
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path.includes('/secret_policy/runtime_boundary'))).toBe(true)
+  })
+
+  it('GIVEN manifest with whitespace-only attested evidence WHEN validating THEN whitespace evidence is rejected', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: true,
+          evidence_ref: '   ',
+        },
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path.includes('/secret_policy/runtime_boundary/evidence_ref'))).toBe(true)
+  })
+
+  it('GIVEN manifest mixing legacy boundary_enforced with new fields WHEN validating THEN mixed legacy shape is rejected', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        boundary_enforced: true,
+      },
+    }
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.message?.includes('must NOT have additional properties'))).toBe(true)
+  })
 })
 
 describe('agent-session-manifest semantic validation', () => {
@@ -358,6 +402,46 @@ describe('agent-session-manifest semantic validation', () => {
         source_ref: null,
       },
       sanitization_status: 'sanitized',
+    }
+    const result = validateManifest(manifest)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  it('GIVEN attested runtime boundary with evidence_ref not linked to evidence list WHEN validating semantics THEN it is rejected', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: true,
+          evidence_ref: 'artifacts/runtime-boundary.log',
+        },
+      },
+    }
+    const result = validateManifest(manifest)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.path === 'secret_policy.runtime_boundary.evidence_ref')).toBe(true)
+  })
+
+  it('GIVEN attested runtime boundary with linked evidence entry WHEN validating semantics THEN it is accepted', () => {
+    const manifest = {
+      ...createBaseManifest(),
+      secret_policy: {
+        ...createSecretPolicy(),
+        runtime_boundary: {
+          attested: true,
+          evidence_ref: 'artifacts/runtime-boundary.log',
+        },
+      },
+      evidence: [
+        {
+          source_kind: 'artifact',
+          source_ref: 'artifacts/runtime-boundary.log',
+          source_sha256: null,
+          visibility: 'private_artifact',
+        },
+      ],
     }
     const result = validateManifest(manifest)
     expect(result.valid).toBe(true)
