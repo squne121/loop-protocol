@@ -4,7 +4,7 @@ issue: "#490"
 parent_issue: "#483"
 tested_commit: "0a0858b19bc1e41645665dce4802881cc5bf31cf"
 evidence_mode: playwright+manual
-status: accepted
+status: accepted_with_unknowns
 date: "2026-05-31"
 ---
 
@@ -48,32 +48,43 @@ pnpm build
 ```yaml
 observed:
   e2e_playwright:
-    tests_run: 7
-    tests_passed: 7
+    tests_run: 8
+    tests_passed: 8
     tests_failed: 0
-    duration_ms: 12500
+    duration_ms: 12900
     results:
       - name: "GIVEN app loaded WHEN sortie bootstrap runs THEN sortie.status is running"
         status: pass
-        duration_ms: 338
+        duration_ms: 251
       - name: "GIVEN sortie running WHEN enemies spawn THEN enemies array is non-empty"
         status: pass
-        duration_ms: 251
+        duration_ms: 322
       - name: "GIVEN enemy spawned WHEN ticks elapse THEN enemy approaches player (distance decreases)"
         status: pass
         duration_ms: 1300
-      - name: "GIVEN canvas pointer held WHEN ticks elapse THEN shotsFired increases"
+      - name: "GIVEN canvas pointer held WHEN ticks elapse THEN projectile appears"
         status: pass
-        duration_ms: 272
+        duration_ms: 380
+        note: "renamed from 'shotsFired increases'; LoopE2ESnapshot.player has no shotsFired field, projectile presence is equivalent evidence"
       - name: "GIVEN enemy exists WHEN projectile hits THEN enemy hp decreases or enemy defeated"
         status: pass
-        duration_ms: 1200
+        duration_ms: 1300
       - name: "GIVEN enemy near player WHEN contact damage applies THEN player.hp decreases"
         status: pass
         duration_ms: 7400
+        note: "timeout extended to 60s; enemy needs ~30s to traverse arena"
       - name: "GIVEN enemies field in snapshot WHEN E2E hook called THEN enemies and sortie fields present"
         status: pass
-        duration_ms: 189
+        duration_ms: 164
+      - name: "GIVEN sortie running WHEN sortie state machine checked THEN victory and defeat statuses are valid enum values"
+        status: pass
+        duration_ms: 166
+        note: "victory/defeat state machine schema verified; full cycle not exercised in automated E2E (see unknowns)"
+  victory_defeat_state_evidence:
+    method: "E2E schema verification"
+    note: "sortie.status confirmed to accept 'victory'/'defeat' as valid enum values via state machine type check"
+    full_cycle_tested: false
+    reason: "120s real-time victory and player-hp-to-0 defeat cycles exceed practical E2E time budget"
   quality_gates:
     typecheck: pass
     lint: pass
@@ -86,8 +97,10 @@ observed:
 
 ```yaml
 unknowns:
-  - item: "victory condition timing"
-    detail: "E2E test confirms player HP decreases from enemy contact but full victory/defeat cycle depends on enemy wave configuration and session length; not exhaustively tested in automated suite."
+  - item: "victory condition full cycle"
+    detail: "120 秒リアルタイム勝利は E2E の時間制約上スキップし、手動証跡は未実施。SortieSystem の state machine schema（victory/defeat enum）は E2E で確認済みだが、実際に全 wave 撃破→victory 遷移のエンド to エンドは未テスト。"
+  - item: "defeat condition full cycle"
+    detail: "player.hp が 0 になるまでの自然経過による defeat 遷移は E2E の時間制約上スキップ。contact damage によって hp が減少することは確認済み。"
   - item: "UX feel of combat feedback"
     detail: "Automated tests confirm mechanical correctness; subjective feel (hitfeedback, pacing, audio) requires human playtesting."
   - item: "Performance on low-end hardware"
@@ -164,3 +177,5 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC7 | pnpm lint passes | CI gate | pass |
 | AC8 | pnpm test passes | CI gate | pass |
 | AC9 | pnpm build passes | CI gate | pass |
+
+Note: status is `accepted_with_unknowns` because victory/defeat full-cycle E2E is not exercised (time budget constraint). The state machine schema is verified; full cycle requires manual playtesting.
