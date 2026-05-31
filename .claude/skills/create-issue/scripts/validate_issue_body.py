@@ -739,6 +739,108 @@ def _validate_lp017_stop_conditions_incomplete(body: str, kind: str | None = Non
     )]
 
 
+def _extract_mrc_issue_kind(body: str) -> str | None:
+    """Extract issue_kind from Machine-Readable Contract YAML block.
+
+    Returns the issue_kind string if found and valid, or None.
+    """
+    section_info = _extract_section(body, "Machine-Readable Contract")
+    if not section_info:
+        return None
+
+    content, _, _ = section_info
+    yaml_match = re.search(r'```yaml\n(.*?)\n```', content, re.DOTALL)
+    if not yaml_match:
+        return None
+
+    try:
+        data = yaml.safe_load(yaml_match.group(1))
+        if not isinstance(data, dict):
+            return None
+        if data.get("contract_schema_version") != "v1":
+            return None
+        issue_kind = data.get("issue_kind")
+        if isinstance(issue_kind, str) and issue_kind.strip():
+            return issue_kind.strip()
+    except yaml.YAMLError:
+        pass
+    return None
+
+
+# Implementation issue title prefix constants
+_IMPLEMENTATION_TITLE_PREFIXES = ("実装:", "implement:")
+
+
+def _validate_lp031_kind_mismatch(body: str, cli_kind: str | None) -> list[ValidationError]:
+    """LP031 pre-check: Detect mismatch between MRC issue_kind and CLI --kind.
+
+    If both MRC issue_kind and CLI --kind are present and they differ, fail before LP031.
+    Returns errors if mismatch detected.
+    """
+    mrc_kind = _extract_mrc_issue_kind(body)
+
+    if mrc_kind is None or cli_kind is None:
+        return []
+
+    if mrc_kind != cli_kind:
+        return [ValidationError(
+            rule_id="LP031",
+            severity="error",
+            section="Machine-Readable Contract",
+            line_start=1,
+            line_end=1,
+            message=(
+                f"issue_kind mismatch: MRC declares '{mrc_kind}' but CLI --kind is '{cli_kind}'. "
+                "Resolve the conflict before proceeding."
+            ),
+            minimal_context=[f"MRC issue_kind: {mrc_kind}", f"CLI --kind: {cli_kind}"],
+            context_truncated=False,
+            fix_hint=(
+                f"Either update the MRC issue_kind to '{cli_kind}' or "
+                f"change --kind to '{mrc_kind}' to match the body."
+            ),
+            autofixable=False
+        )]
+
+    return []
+
+
+def _validate_lp031_implementation_title_prefix(
+    body: str,
+    title: str | None,
+    effective_kind: str | None,
+) -> list[ValidationError]:
+    """LP031: For implementation kind issues, title must start with '実装:' or 'implement:'.
+
+    Only runs when effective_kind == 'implementation' and title is provided.
+    Returns errors if title prefix is non-compliant.
+    """
+    if effective_kind != "implementation":
+        return []
+
+    if title is None:
+        return []
+
+    if title.startswith(_IMPLEMENTATION_TITLE_PREFIXES):
+        return []
+
+    return [ValidationError(
+        rule_id="LP031",
+        severity="error",
+        section="(global)",
+        line_start=1,
+        line_end=1,
+        message=(
+            f"[LP031] implementation issue title must start with '実装:' or 'implement:'. "
+            f"Got: {title!r}"
+        ),
+        minimal_context=[f"title: {title!r}"],
+        context_truncated=False,
+        fix_hint="Change title to start with '実装: ' or 'implement: '.",
+        autofixable=False
+    )]
+
+
 def _validate_lp030_forbidden_authoring_doc_path(body: str) -> list[ValidationError]:
     """LP030: Detect reference to forbidden authoring doc path."""
     forbidden_paths = ["docs/dev/body-authoring.md"]
@@ -770,24 +872,47 @@ def _validate_lp030_forbidden_authoring_doc_path(body: str) -> list[ValidationEr
 # Main validation dispatcher
 # =============================================================================
 
-def validate_issue_body(body: str, kind: str | None = None) -> ValidationResult:
+def validate_issue_body(
+    body: str,
+    kind: str | None = None,
+    title: str | None = None,
+) -> ValidationResult:
     """Run all validation rules and return aggregated results.
 
     Args:
         body: The issue body text to validate.
-        kind: Optional issue kind (e.g. 'implementation'). When provided,
+        kind: Optional issue kind (CLI --kind). When provided,
               kind-specific rules (LP001 dynamic sections, LP017 Stop Conditions)
               load their requirements from the corresponding ISSUE_TEMPLATE file.
+        title: Optional issue title. When provided, LP031 checks title prefix
+               for implementation kind issues.
+
+    effective_kind resolution:
+        1. CLI kind (--kind) is the authoritative source for LP001/LP017 kind-specific checks.
+        2. MRC issue_kind (from body) is extracted separately for LP031 mismatch detection.
+        3. If both CLI --kind and MRC issue_kind are present and differ, LP031 reports mismatch.
+        4. effective_kind (used for LP001/LP017) is only set when --kind is explicitly provided.
+           MRC issue_kind alone does NOT activate kind-specific LP001/LP017 checks — this
+           prevents regressions when validate_issue_body is called without --kind (e.g. from
+           contract_readiness_check.py which does not forward --kind).
     """
 
     # Compute SHA256 of body
     body_bytes = body.encode('utf-8')
     body_sha256 = f"sha256:{hashlib.sha256(body_bytes).hexdigest()}"
 
+    # effective_kind for LP001/LP017: only use CLI --kind (explicit caller intent).
+    # MRC issue_kind is used only for LP031 mismatch and title prefix checks.
+    effective_kind = kind
+
     # Run all validators
     all_errors: list[ValidationError] = []
 
-    all_errors.extend(_validate_lp001_missing_required_section(body, kind=kind))
+    # LP031 mismatch check: must run before other LP031 checks
+    kind_mismatch_errors = _validate_lp031_kind_mismatch(body, kind)
+    all_errors.extend(kind_mismatch_errors)
+
+    all_errors.extend(_validate_lp001_missing_required_section(body, kind=effective_kind))
     all_errors.extend(_validate_lp002_invalid_machine_readable_contract(body))
     all_errors.extend(_validate_lp010_ac_vc_mismatch(body))
     all_errors.extend(_validate_lp011_verification_command_format(body))
@@ -796,9 +921,17 @@ def validate_issue_body(body: str, kind: str | None = None) -> ValidationResult:
     all_errors.extend(_validate_lp014_markdown_backtick_grep(body))
     all_errors.extend(_validate_lp015_baseline_vc_heading_only(body))
     all_errors.extend(_validate_lp016_vc_ac_marker_with_description(body))
-    all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=kind))
+    all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=effective_kind))
     all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))
+
+    # LP031 title prefix check: use MRC issue_kind when CLI --kind is absent,
+    # so title prefix enforcement works even without explicit --kind.
+    # (LP031 mismatch guard above already ran using CLI kind.)
+    mrc_kind = _extract_mrc_issue_kind(body)
+    lp031_kind = mrc_kind if mrc_kind is not None else kind
+    if not kind_mismatch_errors:
+        all_errors.extend(_validate_lp031_implementation_title_prefix(body, title, lp031_kind))
 
     # Determine overall status
     has_errors = any(e.severity == "error" for e in all_errors)
@@ -848,9 +981,21 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help=(
-            "Issue kind (e.g. 'implementation'). Enables kind-specific rules: "
+            "Issue kind (e.g. 'implementation'). "
+            "--kind enables LP001/LP017 kind-specific checks: "
             "LP001 loads required sections from ISSUE_TEMPLATE/<kind>.yml, "
-            "LP017 checks Stop Conditions against template-defined conditions."
+            "LP017 checks Stop Conditions against template-defined conditions. "
+            "MRC issue_kind (from body) is used for LP031 title-prefix enforcement "
+            "and mismatch detection only; it does NOT activate LP001/LP017 checks."
+        )
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help=(
+            "Issue title. When provided and kind is 'implementation', "
+            "LP031 checks that title starts with '実装:' or 'implement:'."
         )
     )
 
@@ -872,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Validate
-    result = validate_issue_body(body, kind=args.kind)
+    result = validate_issue_body(body, kind=args.kind, title=args.title)
 
     # Output JSON
     output = {
