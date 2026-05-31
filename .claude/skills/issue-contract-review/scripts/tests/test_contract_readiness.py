@@ -1178,3 +1178,86 @@ def test_ac7_rule_with_vcp_prefix_no_double_namespace():
     assert err["rule_id"] == "VCP_SOME_RULE", (
         f"AC7: double namespace detected for VCP_ prefixed rule, got: {err['rule_id']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: kind field consumption in map_preflight_result_to_errors()
+# ---------------------------------------------------------------------------
+
+
+def test_kind_retrieval_error_maps_to_body_retrieval_failed_human_judgment():
+    """Blocker 3: kind=retrieval_error/rule=VC000_BODY_RETRIEVAL_FAILED → category=body_retrieval_failed, aggregate=human_judgment."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "retrieval_error",
+            "rule": "VC000_BODY_RETRIEVAL_FAILED",
+            "message": "Body retrieval failed",
+            "minimal_context": "",
+            "fix_hint": "Check the issue body.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors, "Expected at least one error"
+    err = errors[0]
+    # category must NOT be no_commands_extracted
+    assert err["category"] != "no_commands_extracted", (
+        f"Blocker 3: retrieval_error must not collapse to no_commands_extracted, got: {err['category']}"
+    )
+    assert err["category"] == "body_retrieval_failed", (
+        f"Blocker 3: retrieval_error must map to body_retrieval_failed, got: {err['category']}"
+    )
+    # aggregate must be human_judgment (not needs_fix)
+    assert aggregate == "human_judgment", (
+        f"Blocker 3: retrieval_error aggregate must be human_judgment, got: {aggregate}"
+    )
+
+
+def test_kind_extraction_error_maps_to_needs_fix():
+    """Blocker 3: kind=extraction_error → category=extraction_error, aggregate=needs_fix."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "extraction_error",
+            "rule": "VC001",
+            "message": "Extraction failed",
+            "minimal_context": "",
+            "fix_hint": "Fix the VC format.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors, "Expected at least one error"
+    err = errors[0]
+    assert err["category"] == "extraction_error", (
+        f"Blocker 3: extraction_error must preserve category=extraction_error, got: {err['category']}"
+    )
+    assert aggregate == "needs_fix", (
+        f"Blocker 3: extraction_error aggregate must be needs_fix, got: {aggregate}"
+    )
+
+
+def test_kind_unsupported_vc_format_maps_to_needs_fix_with_category_preserved():
+    """Blocker 3: kind=unsupported_vc_format → category=unsupported_vc_format, aggregate=needs_fix."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "unsupported_vc_format",
+            "rule": "VC002",
+            "message": "Unsupported VC format detected",
+            "minimal_context": "",
+            "fix_hint": "Use ```bash fenced blocks.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors, "Expected at least one error"
+    err = errors[0]
+    # category must be unsupported_vc_format (preserved, not collapsed)
+    assert err["category"] == "unsupported_vc_format", (
+        f"Blocker 3: unsupported_vc_format category must be preserved, got: {err['category']}"
+    )
+    assert aggregate == "needs_fix", (
+        f"Blocker 3: unsupported_vc_format aggregate must be needs_fix, got: {aggregate}"
+    )
