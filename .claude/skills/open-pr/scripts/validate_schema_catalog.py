@@ -30,6 +30,14 @@ from jsonschema import Draft202012Validator
 E_SCHEMA_CATALOG_MISSING = "E_SCHEMA_CATALOG_MISSING"
 E_SCHEMA_CONSUMER_MISMATCH = "E_SCHEMA_CONSUMER_MISMATCH"
 E_SCHEMA_CATALOG_DUPLICATE_KEY = "E_SCHEMA_CATALOG_DUPLICATE_KEY"
+E_SCHEMA_CATALOG_DUPLICATE_YAML_KEY = "E_SCHEMA_CATALOG_DUPLICATE_YAML_KEY"
+E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID = "E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID"
+E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID = "E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID"
+E_SCHEMA_CONSUMER_INVENTORY_MALFORMED = "E_SCHEMA_CONSUMER_INVENTORY_MALFORMED"
+E_SCHEMA_CONSUMER_INVENTORY_EMPTY = "E_SCHEMA_CONSUMER_INVENTORY_EMPTY"
+E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS = (
+    "E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS"
+)
 
 # ---------------------------------------------------------------------------
 # Immutable command registry (AC4)
@@ -140,10 +148,7 @@ class _DuplicateKeyError(Exception):
 
 
 class UniqueKeySafeLoader(yaml.SafeLoader):
-    """YAML SafeLoader that raises _DuplicateKeyError on duplicate mapping keys.
-
-    Production implementation of unique-key detection for catalog.yaml.
-    """
+    """YAML SafeLoader that raises _DuplicateKeyError on duplicate mapping keys."""
 
     def construct_mapping(
         self, node: yaml.MappingNode, deep: bool = False
@@ -170,12 +175,7 @@ UniqueKeySafeLoader.add_constructor(
 # ---------------------------------------------------------------------------
 
 def load_catalog(path: str | Path) -> dict[str, Any]:
-    """Load catalog.yaml using UniqueKeySafeLoader.
-
-    Returns the parsed catalog dict.
-    Raises _DuplicateKeyError if duplicate YAML keys are found.
-    Raises OSError / yaml.YAMLError on I/O or parse errors.
-    """
+    """Load catalog.yaml using UniqueKeySafeLoader."""
     text = Path(path).read_text(encoding="utf-8")
     return yaml.load(text, Loader=UniqueKeySafeLoader)  # type: ignore[return-value]
 
@@ -183,12 +183,7 @@ def load_catalog(path: str | Path) -> dict[str, Any]:
 def validate_catalog_schema(
     catalog: dict[str, Any], schema: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Validate catalog instance against JSON Schema using Draft202012Validator.
-
-    AC6: Uses Draft202012Validator.check_schema() for meta-validation, then
-    instance validation. Returns list of error dicts.
-    """
-    # AC6: validate the schema itself first (meta-validation)
+    """Validate catalog instance against JSON Schema using Draft202012Validator."""
     Draft202012Validator.check_schema(schema)
 
     validator = Draft202012Validator(schema)
@@ -215,12 +210,117 @@ def _is_ambiguous_placeholder(value: str) -> bool:
     return False
 
 
+def _check_placeholder_field(
+    value: Any,
+    path: list[Any],
+    errors: list[dict[str, Any]],
+) -> None:
+    """Check a single string field for ambiguous placeholders, appending errors."""
+    if isinstance(value, str) and _is_ambiguous_placeholder(value):
+        errors.append(
+            {
+                "code": AMBIGUOUS_PLACEHOLDER_LABEL,
+                "path": path,
+                "message": (
+                    f"Ambiguous placeholder in {'.'.join(str(p) for p in path)}: {value!r}"
+                ),
+            }
+        )
+
+
+def _walk_entry_placeholders(
+    entry: dict[str, Any],
+    entry_idx: int,
+    errors: list[dict[str, Any]],
+) -> None:
+    """Walk all string fields of a catalog entry and detect ambiguous placeholders.
+
+    Covers: schema_id, format, source_kind, definition_paths[],
+            producer.id, producer.paths[],
+            consumers[].id, consumers[].paths[],
+            detection_patterns[].id, .pattern, .paths[],
+            required_test_commands[].id, .runner, .target,
+            validation.catalog_lint_commands[].id, .runner, .target,
+            migration.*, last_verified.*
+    """
+    base = ["entries", entry_idx]
+
+    # Top-level string fields
+    for field in ("schema_id", "format", "source_kind"):
+        _check_placeholder_field(entry.get(field, ""), base + [field], errors)
+
+    # definition_paths[]
+    for p_idx, p in enumerate(entry.get("definition_paths", [])):
+        _check_placeholder_field(p, base + ["definition_paths", p_idx], errors)
+
+    # producer
+    producer = entry.get("producer", {})
+    if "owner" in producer:
+        _check_placeholder_field(producer["owner"], base + ["producer", "owner"], errors)
+    for p_idx, p in enumerate(producer.get("paths", [])):
+        _check_placeholder_field(p, base + ["producer", "paths", p_idx], errors)
+
+    # consumers[].id, consumers[].paths[]
+    for c_idx, consumer in enumerate(entry.get("consumers", [])):
+        if "id" in consumer:
+            _check_placeholder_field(
+                consumer["id"], base + ["consumers", c_idx, "id"], errors
+            )
+        for p_idx, p in enumerate(consumer.get("paths", [])):
+            _check_placeholder_field(
+                p, base + ["consumers", c_idx, "paths", p_idx], errors
+            )
+
+    # detection_patterns[].id, .pattern, .paths[]
+    for dp_idx, dp in enumerate(entry.get("detection_patterns", [])):
+        for field in ("id", "pattern"):
+            _check_placeholder_field(
+                dp.get(field, ""), base + ["detection_patterns", dp_idx, field], errors
+            )
+        for p_idx, p in enumerate(dp.get("paths", [])):
+            _check_placeholder_field(
+                p, base + ["detection_patterns", dp_idx, "paths", p_idx], errors
+            )
+
+    # required_test_commands[].id, .runner, .target
+    for rtc_idx, rtc in enumerate(entry.get("required_test_commands", [])):
+        for field in ("id", "runner", "target"):
+            _check_placeholder_field(
+                rtc.get(field, ""), base + ["required_test_commands", rtc_idx, field], errors
+            )
+
+    # validation.catalog_lint_commands[].id, .runner, .target
+    validation = entry.get("validation", {})
+    for clc_idx, clc in enumerate(validation.get("catalog_lint_commands", [])):
+        for field in ("id", "runner", "target"):
+            _check_placeholder_field(
+                clc.get(field, ""),
+                base + ["validation", "catalog_lint_commands", clc_idx, field],
+                errors,
+            )
+
+    # migration.*
+    migration = entry.get("migration", {})
+    if isinstance(migration, dict):
+        for field, val in migration.items():
+            if isinstance(val, str):
+                _check_placeholder_field(val, base + ["migration", field], errors)
+
+    # last_verified.*
+    last_verified = entry.get("last_verified", {})
+    if isinstance(last_verified, dict):
+        for field, val in last_verified.items():
+            if isinstance(val, str):
+                _check_placeholder_field(val, base + ["last_verified", field], errors)
+
+
 def validate_catalog_semantics(catalog: dict[str, Any]) -> list[dict[str, Any]]:
     """Semantic validation: duplicate schema_id, consumer IDs, placeholders, registry IDs.
 
     AC4: Only known command IDs (ALLOWED_COMMANDS) are accepted.
+         runner and target must also match the registry (drift detection).
     AC7: Duplicate schema_id and consumer id detection.
-    AC9: Ambiguous placeholder detection.
+    AC9: Ambiguous placeholder detection across all string fields.
     """
     errors: list[dict[str, Any]] = []
     entries = catalog.get("entries", [])
@@ -234,7 +334,7 @@ def validate_catalog_semantics(catalog: dict[str, Any]) -> list[dict[str, Any]]:
         if schema_id in seen_schema_ids:
             errors.append(
                 {
-                    "code": E_SCHEMA_CATALOG_DUPLICATE_KEY,
+                    "code": E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID,
                     "path": ["entries", entry_idx, "schema_id"],
                     "message": f"Duplicate schema_id: {schema_id!r}",
                 }
@@ -249,40 +349,14 @@ def validate_catalog_semantics(catalog: dict[str, Any]) -> list[dict[str, Any]]:
             if cid in seen_consumer_ids:
                 errors.append(
                     {
-                        "code": E_SCHEMA_CATALOG_DUPLICATE_KEY,
+                        "code": E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID,
                         "path": ["entries", entry_idx, "consumers", c_idx, "id"],
                         "message": f"Duplicate consumer id {cid!r} in schema {schema_id!r}",
                     }
                 )
             seen_consumer_ids.add(cid)
 
-            # AC9: check ambiguous placeholder in consumer id and paths
-            if _is_ambiguous_placeholder(cid):
-                errors.append(
-                    {
-                        "code": AMBIGUOUS_PLACEHOLDER_LABEL,
-                        "path": ["entries", entry_idx, "consumers", c_idx, "id"],
-                        "message": f"Ambiguous placeholder in consumer id: {cid!r}",
-                    }
-                )
-            for p_idx, p in enumerate(consumer.get("paths", [])):
-                if _is_ambiguous_placeholder(p):
-                    errors.append(
-                        {
-                            "code": AMBIGUOUS_PLACEHOLDER_LABEL,
-                            "path": [
-                                "entries",
-                                entry_idx,
-                                "consumers",
-                                c_idx,
-                                "paths",
-                                p_idx,
-                            ],
-                            "message": f"Ambiguous placeholder in consumer path: {p!r}",
-                        }
-                    )
-
-        # AC4: required_test_commands must reference ALLOWED_COMMANDS (immutable registry)
+        # AC4: required_test_commands must reference ALLOWED_COMMANDS with matching runner/target
         rtc_list = entry.get("required_test_commands", [])
         for rtc_idx, rtc in enumerate(rtc_list):
             rtc_id = rtc.get("id", "")
@@ -303,23 +377,135 @@ def validate_catalog_semantics(catalog: dict[str, Any]) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+            else:
+                # Verify runner and target match the registry (drift detection)
+                expected = _COMMAND_REGISTRY[rtc_id]
+                actual_runner = rtc.get("runner", "")
+                actual_target = rtc.get("target", "")
+                if actual_runner != expected["runner"]:
+                    errors.append(
+                        {
+                            "code": "E_COMMAND_RUNNER_DRIFT",
+                            "path": [
+                                "entries",
+                                entry_idx,
+                                "required_test_commands",
+                                rtc_idx,
+                                "runner",
+                            ],
+                            "message": (
+                                f"required_test_commands id={rtc_id!r}: "
+                                f"runner {actual_runner!r} does not match registry "
+                                f"{expected['runner']!r}"
+                            ),
+                        }
+                    )
+                if actual_target != expected["target"]:
+                    errors.append(
+                        {
+                            "code": "E_COMMAND_TARGET_DRIFT",
+                            "path": [
+                                "entries",
+                                entry_idx,
+                                "required_test_commands",
+                                rtc_idx,
+                                "target",
+                            ],
+                            "message": (
+                                f"required_test_commands id={rtc_id!r}: "
+                                f"target {actual_target!r} does not match registry "
+                                f"{expected['target']!r}"
+                            ),
+                        }
+                    )
 
-        # AC9: check schema_id itself for ambiguous placeholder
-        if _is_ambiguous_placeholder(schema_id):
-            errors.append(
-                {
-                    "code": AMBIGUOUS_PLACEHOLDER_LABEL,
-                    "path": ["entries", entry_idx, "schema_id"],
-                    "message": f"Ambiguous placeholder in schema_id: {schema_id!r}",
-                }
-            )
+        # AC4: validation.catalog_lint_commands must also reference ALLOWED_COMMANDS
+        validation = entry.get("validation", {})
+        clc_list = validation.get("catalog_lint_commands", [])
+        for clc_idx, clc in enumerate(clc_list):
+            clc_id = clc.get("id", "")
+            if clc_id not in ALLOWED_COMMANDS:
+                errors.append(
+                    {
+                        "code": "E_UNKNOWN_COMMAND_ID",
+                        "path": [
+                            "entries",
+                            entry_idx,
+                            "validation",
+                            "catalog_lint_commands",
+                            clc_idx,
+                            "id",
+                        ],
+                        "message": (
+                            f"Unknown validation.catalog_lint_commands id: {clc_id!r}. "
+                            "Must be in ALLOWED_COMMANDS."
+                        ),
+                    }
+                )
+            else:
+                # Verify runner and target match the registry (drift detection)
+                expected = _COMMAND_REGISTRY[clc_id]
+                actual_runner = clc.get("runner", "")
+                actual_target = clc.get("target", "")
+                if actual_runner != expected["runner"]:
+                    errors.append(
+                        {
+                            "code": "E_COMMAND_RUNNER_DRIFT",
+                            "path": [
+                                "entries",
+                                entry_idx,
+                                "validation",
+                                "catalog_lint_commands",
+                                clc_idx,
+                                "runner",
+                            ],
+                            "message": (
+                                f"validation.catalog_lint_commands id={clc_id!r}: "
+                                f"runner {actual_runner!r} does not match registry "
+                                f"{expected['runner']!r}"
+                            ),
+                        }
+                    )
+                if actual_target != expected["target"]:
+                    errors.append(
+                        {
+                            "code": "E_COMMAND_TARGET_DRIFT",
+                            "path": [
+                                "entries",
+                                entry_idx,
+                                "validation",
+                                "catalog_lint_commands",
+                                clc_idx,
+                                "target",
+                            ],
+                            "message": (
+                                f"validation.catalog_lint_commands id={clc_id!r}: "
+                                f"target {actual_target!r} does not match registry "
+                                f"{expected['target']!r}"
+                            ),
+                        }
+                    )
+
+        # AC9: walk all string fields for ambiguous placeholders
+        _walk_entry_placeholders(entry, entry_idx, errors)
 
     return errors
 
 
 # ---------------------------------------------------------------------------
-# PR body Schema Consumer Inventory parsing (AC8)
+# GFM table parser helpers
 # ---------------------------------------------------------------------------
+
+class _GFMTableError(Exception):
+    """Raised when a GFM table is structurally malformed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+# Regex for a valid GFM delimiter cell: optional colons, at least one dash
+_DELIMITER_CELL_RE = re.compile(r"^:?-+:?$")
 
 
 def _normalize_cell(cell: str) -> str:
@@ -327,29 +513,105 @@ def _normalize_cell(cell: str) -> str:
     return re.sub(r"`", "", cell).strip()
 
 
+def _split_gfm_row(line: str) -> list[str]:
+    """Split a GFM table row into normalized cells.
+
+    Raises _GFMTableError if the row contains escaped pipes.
+    """
+    if r"\|" in line:
+        raise _GFMTableError(
+            E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+            f"Table row contains escaped pipe (\\|): {line!r}",
+        )
+    return [_normalize_cell(c) for c in line.strip().strip("|").split("|")]
+
+
+def _parse_gfm_table_strict(
+    table_lines: list[str],
+) -> tuple[list[str], list[list[str]]]:
+    """Parse a GFM markdown table strictly, rejecting all malformed forms.
+
+    Returns (header_cells, data_rows_cells).
+    Raises _GFMTableError on any structural problem.
+    """
+    if len(table_lines) < 2:
+        raise _GFMTableError(
+            E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+            "Table has no header and/or delimiter row",
+        )
+
+    # Parse header row
+    header_cells = _split_gfm_row(table_lines[0])
+    n_cols = len(header_cells)
+
+    # Parse and validate delimiter row
+    delimiter_cells = _split_gfm_row(table_lines[1])
+    if len(delimiter_cells) != n_cols:
+        raise _GFMTableError(
+            E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+            f"Delimiter row has {len(delimiter_cells)} cells, header has {n_cols}",
+        )
+    for cell in delimiter_cells:
+        cell_stripped = cell.replace(" ", "")
+        if not cell_stripped or not _DELIMITER_CELL_RE.match(cell_stripped):
+            raise _GFMTableError(
+                E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+                f"Delimiter cell is not valid GFM delimiter: {cell!r}",
+            )
+
+    # Parse data rows
+    data_rows: list[list[str]] = []
+    for line in table_lines[2:]:
+        cells = _split_gfm_row(line)
+        if len(cells) != n_cols:
+            raise _GFMTableError(
+                E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+                f"Data row has {len(cells)} cells, header has {n_cols}: {line!r}",
+            )
+        data_rows.append(cells)
+
+    return header_cells, data_rows
+
+
+# ---------------------------------------------------------------------------
+# PR body Schema Consumer Inventory parsing (AC8)
+# ---------------------------------------------------------------------------
+
+
 def _split_consumer_ids(raw: str) -> list[str]:
     """Split comma-separated consumer IDs from a table cell."""
     return [_normalize_cell(part) for part in raw.split(",") if _normalize_cell(part)]
 
 
-def parse_schema_consumer_inventory(pr_body: str) -> dict[str, list[str]] | None:
-    """Parse the Schema Consumer Inventory table from a PR body.
+class _InventoryParseResult:
+    """Internal result of _parse_inventory_detailed."""
 
-    AC8: Accepts only the canonical table format:
-      | Schema ID | ... | PR Declared Consumers |
-    Returns dict mapping schema_id -> [consumer_id, ...] or None if no valid table found.
+    __slots__ = ("inventory", "errors")
 
-    Fuzzy match is FORBIDDEN - exact match only (column names are matched case-insensitively).
-    Returns None if the inventory section is missing.
-    Returns empty dict {} if section is present but table is malformed.
-    """
+    def __init__(
+        self,
+        inventory: dict[str, list[str]] | None,
+        errors: list[dict[str, Any]],
+    ) -> None:
+        self.inventory = inventory
+        self.errors = errors
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.errors)
+
+
+def _parse_inventory_detailed(pr_body: str) -> _InventoryParseResult:
+    """Internal: parse inventory and return structured result with error list."""
+    errors: list[dict[str, Any]] = []
+
     # Find the Schema Consumer Inventory section
     section_match = re.search(
         r"(?im)^##\s+Schema Consumer Inventory\s*$",
         pr_body,
     )
     if not section_match:
-        return None
+        return _InventoryParseResult(None, [])
 
     # Extract content until next ## section
     section_start = section_match.end()
@@ -359,49 +621,111 @@ def parse_schema_consumer_inventory(pr_body: str) -> dict[str, list[str]] | None
     )
     section_content = pr_body[section_start:section_end]
 
-    # Find a markdown table
-    table_lines = [line for line in section_content.splitlines() if line.strip().startswith("|")]
+    # Find markdown table lines
+    table_lines = [
+        line for line in section_content.splitlines() if line.strip().startswith("|")
+    ]
     if not table_lines:
-        # No table found - malformed
-        return {}
+        errors.append(
+            {
+                "code": E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+                "path": ["inventory"],
+                "message": "Schema Consumer Inventory section found but no table present",
+            }
+        )
+        return _InventoryParseResult({}, errors)
 
-    # Parse header row - find column indices
-    header_row = table_lines[0]
-    raw_headers = [_normalize_cell(h) for h in header_row.strip().strip("|").split("|")]
+    # Parse with strict GFM parser (B5)
+    try:
+        header_cells, data_rows = _parse_gfm_table_strict(table_lines)
+    except _GFMTableError as exc:
+        errors.append(
+            {
+                "code": exc.code,
+                "path": ["inventory"],
+                "message": str(exc),
+            }
+        )
+        return _InventoryParseResult({}, errors)
 
-    # Locate required columns (exact match, case-insensitive)
+    # Locate required columns (B1: exact match, case-insensitive)
     schema_id_col: int | None = None
     consumer_col: int | None = None
-    for i, h in enumerate(raw_headers):
-        if h.lower() == "schema id":
+    for i, h in enumerate(header_cells):
+        normalized = h.strip().lower()
+        if normalized == "schema id":
             schema_id_col = i
-        if "pr declared consumers" in h.lower():
+        if normalized == "pr declared consumers":
             consumer_col = i
 
     if schema_id_col is None or consumer_col is None:
-        # Table header is malformed - return empty dict to trigger mismatch
-        return {}
+        missing = []
+        if schema_id_col is None:
+            missing.append("Schema ID")
+        if consumer_col is None:
+            missing.append("PR Declared Consumers")
+        errors.append(
+            {
+                "code": E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS,
+                "path": ["inventory"],
+                "message": (
+                    f"Missing required columns in Schema Consumer Inventory: {missing!r}. "
+                    "Column names must match exactly (case-insensitive)."
+                ),
+            }
+        )
+        return _InventoryParseResult({}, errors)
 
-    # Skip separator row (lines matching |---|---|... pattern)
-    data_rows = [
-        r
-        for r in table_lines[1:]
-        if not re.match(r"^\s*\|[\s\-|:]+\|\s*$", r.strip())
-    ]
-
+    # Build inventory, checking for duplicate Schema ID rows
     inventory: dict[str, list[str]] = {}
+    seen_schema_ids: set[str] = set()
     for row in data_rows:
-        cells = [_normalize_cell(c) for c in row.strip().strip("|").split("|")]
-        if len(cells) <= max(schema_id_col, consumer_col):
-            continue
-        schema_id = cells[schema_id_col].strip()
-        consumer_raw = cells[consumer_col].strip()
+        schema_id = row[schema_id_col].strip()
+        consumer_raw = row[consumer_col].strip()
         if not schema_id:
             continue
+        if schema_id in seen_schema_ids:
+            errors.append(
+                {
+                    "code": E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+                    "path": ["inventory", schema_id],
+                    "message": f"Duplicate Schema ID row in inventory table: {schema_id!r}",
+                }
+            )
+            return _InventoryParseResult({}, errors)
+        seen_schema_ids.add(schema_id)
         consumer_ids = _split_consumer_ids(consumer_raw) if consumer_raw else []
         inventory[schema_id] = consumer_ids
 
-    return inventory
+    # B2: Empty inventory after parsing is also an error
+    if not inventory:
+        errors.append(
+            {
+                "code": E_SCHEMA_CONSUMER_INVENTORY_EMPTY,
+                "path": ["inventory"],
+                "message": "Schema Consumer Inventory table has no data rows",
+            }
+        )
+        return _InventoryParseResult({}, errors)
+
+    return _InventoryParseResult(inventory, [])
+
+
+def parse_schema_consumer_inventory(pr_body: str) -> dict[str, list[str]] | None:
+    """Parse the Schema Consumer Inventory table from a PR body.
+
+    AC8: Accepts only the canonical table format:
+      | Schema ID | ... | PR Declared Consumers |
+    Returns dict mapping schema_id -> [consumer_id, ...] or None if no valid table found.
+
+    Column name matching: exact match, case-insensitive (no substring match).
+    Returns None if the inventory section is missing.
+    Returns empty dict {} on structural errors (malformed table, missing columns, etc.).
+    """
+    result = _parse_inventory_detailed(pr_body)
+    if result.has_errors:
+        return {} if result.inventory is not None else None
+    return result.inventory
 
 
 def compare_inventory_to_catalog(
@@ -416,7 +740,6 @@ def compare_inventory_to_catalog(
     - Consumer IDs mismatch between inventory and catalog (E_SCHEMA_CONSUMER_MISMATCH)
     """
     if inventory is None:
-        # No inventory section found - no errors from this check
         return []
 
     errors: list[dict[str, Any]] = []
@@ -431,7 +754,6 @@ def compare_inventory_to_catalog(
 
     for inv_schema_id, inv_consumer_ids in inventory.items():
         if inv_schema_id not in catalog_consumers:
-            # AC8: schema ID in PR body not found in catalog
             errors.append(
                 {
                     "code": E_SCHEMA_CATALOG_MISSING,
@@ -530,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     except _DuplicateKeyError as exc:
         errors.append(
             {
-                "code": E_SCHEMA_CATALOG_DUPLICATE_KEY,
+                "code": E_SCHEMA_CATALOG_DUPLICATE_YAML_KEY,
                 "path": [],
                 "message": str(exc),
             }
@@ -611,9 +933,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.pr_body_file:
         try:
             pr_body = Path(args.pr_body_file).read_text(encoding="utf-8")
-            inventory = parse_schema_consumer_inventory(pr_body)
-            inv_errors = compare_inventory_to_catalog(inventory, catalog)
-            errors.extend(inv_errors)
+            inv_result = _parse_inventory_detailed(pr_body)
+            if inv_result.has_errors:
+                errors.extend(inv_result.errors)
+            elif inv_result.inventory is not None:
+                inv_errors = compare_inventory_to_catalog(inv_result.inventory, catalog)
+                errors.extend(inv_errors)
         except OSError as exc:
             print(
                 json.dumps(
@@ -635,10 +960,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Step 6: Output result
     status = "fail" if errors else "valid"
-    result = _build_result(status, errors)
-    print(json.dumps(result, indent=2))
+    result_dict = _build_result(status, errors)
+    print(json.dumps(result_dict, indent=2))
 
-    # AC10: exit 0=valid, 1=fail, 2=error. Warning-only exit 0 is FORBIDDEN.
     sys.exit(1 if errors else 0)
 
 

@@ -18,8 +18,14 @@ sys.path.insert(
 )
 
 from validate_schema_catalog import (  # noqa: E402
+    E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID,
     E_SCHEMA_CATALOG_DUPLICATE_KEY,
+    E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID,
+    E_SCHEMA_CATALOG_DUPLICATE_YAML_KEY,
     E_SCHEMA_CATALOG_MISSING,
+    E_SCHEMA_CONSUMER_INVENTORY_EMPTY,
+    E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
+    E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS,
     E_SCHEMA_CONSUMER_MISMATCH,
     UniqueKeySafeLoader,
     _DuplicateKeyError,
@@ -433,7 +439,10 @@ class TestDuplicatedSchemaId:
         catalog = _make_valid_catalog([entry1, entry2])
 
         errors = validate_catalog_semantics(catalog)
-        dup_errors = [e for e in errors if e["code"] == E_SCHEMA_CATALOG_DUPLICATE_KEY]
+        dup_errors = [
+            e for e in errors
+            if e["code"] in (E_SCHEMA_CATALOG_DUPLICATE_KEY, E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID)
+        ]
         assert len(dup_errors) >= 1, f"Expected duplicate key error but got: {errors}"
 
 
@@ -454,7 +463,13 @@ class TestDuplicatedConsumerId:
         catalog = _make_valid_catalog([entry])
 
         errors = validate_catalog_semantics(catalog)
-        dup_errors = [e for e in errors if e["code"] == E_SCHEMA_CATALOG_DUPLICATE_KEY]
+        dup_errors = [
+            e for e in errors
+            if e["code"] in (
+                E_SCHEMA_CATALOG_DUPLICATE_KEY,
+                E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID,
+            )
+        ]
         assert len(dup_errors) >= 1, f"Expected duplicate consumer id error but got: {errors}"
 
 
@@ -806,4 +821,318 @@ class TestAmbiguousPlaceholderValues:
     def test_valid_value_not_placeholder(self, value: str) -> None:
         assert not _is_ambiguous_placeholder(value), (
             f"Expected {value!r} to NOT be flagged as ambiguous placeholder"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B1: PR Declared Consumers exact match (negative tests)
+# ---------------------------------------------------------------------------
+class TestPRDeclaredConsumersExactMatch:
+    """GIVEN a PR body with a column named almost-but-not-exactly 'PR Declared Consumers'
+    WHEN parse_schema_consumer_inventory is called
+    THEN it returns empty dict (missing required column), not a populated dict."""
+
+    def test_pr_declared_consumers_v2_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | PR Declared Consumers v2 |
+            |-----------|--------------------------|
+            | schema/v1 | consumer-a |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, (
+            "'PR Declared Consumers v2' must not match 'PR Declared Consumers' (exact match only)"
+        )
+
+    def test_not_pr_declared_consumers_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | Not PR Declared Consumers |
+            |-----------|---------------------------|
+            | schema/v1 | consumer-a |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, (
+            "'Not PR Declared Consumers' must not match 'PR Declared Consumers' (exact match only)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B2: malformed / empty inventory — explicit error codes
+# ---------------------------------------------------------------------------
+class TestInventoryMalformedErrorCodes:
+    """GIVEN malformed or empty inventory sections
+    WHEN _parse_inventory_detailed is called
+    THEN specific error codes are returned."""
+
+    def test_missing_table_returns_malformed_error_code(self) -> None:
+        from validate_schema_catalog import _parse_inventory_detailed  # noqa: E402
+
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            No table here, just prose.
+            """
+        )
+        result = _parse_inventory_detailed(pr_body)
+        assert result.has_errors
+        codes = {e["code"] for e in result.errors}
+        assert E_SCHEMA_CONSUMER_INVENTORY_MALFORMED in codes
+
+    def test_missing_required_columns_returns_missing_columns_error(self) -> None:
+        from validate_schema_catalog import _parse_inventory_detailed  # noqa: E402
+
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | Notes |
+            |-----------|-------|
+            | schema/v1 | note |
+            """
+        )
+        result = _parse_inventory_detailed(pr_body)
+        assert result.has_errors
+        codes = {e["code"] for e in result.errors}
+        assert E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS in codes
+
+    def test_malformed_inventory_does_not_silently_pass(self) -> None:
+        """Malformed inventory must not return None (absent) — it must return {} (error)."""
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | Wrong Column |
+            |-----------|-------------|
+            | schema/v1 | consumer-a |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        # Must not return None (that means absent, which skips all checks)
+        assert inventory is not None, (
+            "Malformed inventory must not be treated as absent (None). "
+            "Must return {} so downstream checks see an error state."
+        )
+        assert inventory == {}, "Malformed inventory must return {} not a populated dict"
+
+
+# ---------------------------------------------------------------------------
+# B3: placeholder validation across all fields
+# ---------------------------------------------------------------------------
+class TestPlaceholderValidationAllFields:
+    """GIVEN catalog entries with placeholders in various fields
+    WHEN validate_catalog_semantics is called
+    THEN AMBIGUOUS_PLACEHOLDER is reported for each."""
+
+    def test_producer_paths_tbd_fails(self) -> None:
+        entry = _make_valid_entry()
+        entry["producer"]["paths"] = ["TBD"]
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        assert any(
+            e["code"] == "AMBIGUOUS_PLACEHOLDER" and "producer" in str(e.get("path", ""))
+            for e in errors
+        ), f"Expected AMBIGUOUS_PLACEHOLDER for producer.paths: {errors}"
+
+    def test_definition_paths_unknown_fails(self) -> None:
+        entry = _make_valid_entry()
+        entry["definition_paths"] = ["unknown"]
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        assert any(
+            e["code"] == "AMBIGUOUS_PLACEHOLDER" and "definition_paths" in str(e.get("path", ""))
+            for e in errors
+        ), f"Expected AMBIGUOUS_PLACEHOLDER for definition_paths: {errors}"
+
+    def test_detection_pattern_placeholder_fails(self) -> None:
+        entry = _make_valid_entry()
+        # "N/A" as pattern — forbidden placeholder
+        entry["detection_patterns"][0]["pattern"] = "N/A"
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        assert any(
+            e["code"] == "AMBIGUOUS_PLACEHOLDER"
+            and "detection_patterns" in str(e.get("path", ""))
+            for e in errors
+        ), f"Expected AMBIGUOUS_PLACEHOLDER for detection_patterns[].pattern: {errors}"
+
+    def test_required_test_commands_target_tbd_fails(self) -> None:
+        entry = _make_valid_entry()
+        # Override target with placeholder (id still valid for registry check)
+        # Use a target that is also forbidden placeholder
+        entry["required_test_commands"][0]["target"] = "TBD"
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        assert any(
+            e["code"] == "AMBIGUOUS_PLACEHOLDER"
+            and "required_test_commands" in str(e.get("path", ""))
+            for e in errors
+        ), f"Expected AMBIGUOUS_PLACEHOLDER for required_test_commands[].target: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# B4: validation.catalog_lint_commands allowlist check
+# ---------------------------------------------------------------------------
+class TestCatalogLintCommandsAllowlist:
+    """GIVEN catalog entries with invalid validation.catalog_lint_commands
+    WHEN validate_catalog_semantics is called
+    THEN E_UNKNOWN_COMMAND_ID or E_COMMAND_RUNNER_DRIFT is reported."""
+
+    def test_unknown_catalog_lint_command_id_fails(self) -> None:
+        entry = _make_valid_entry()
+        entry["validation"]["catalog_lint_commands"] = [
+            {
+                "id": "totally_unknown_lint_cmd_xyz",
+                "runner": "pytest",
+                "target": "schemas/tests/test_catalog.py",
+            }
+        ]
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        unknown_errors = [e for e in errors if e["code"] == "E_UNKNOWN_COMMAND_ID"]
+        assert len(unknown_errors) >= 1, (
+            f"Expected E_UNKNOWN_COMMAND_ID for catalog_lint_commands: {errors}"
+        )
+
+    def test_catalog_lint_command_runner_drift_fails(self) -> None:
+        entry = _make_valid_entry()
+        # lint_catalog_yaml is a valid id, but pnpm is wrong runner (should be pytest)
+        entry["validation"]["catalog_lint_commands"] = [
+            {
+                "id": "lint_catalog_yaml",
+                "runner": "pnpm",  # drift: registry says pytest
+                "target": "schemas/tests/test_catalog.py",
+            }
+        ]
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        drift_errors = [e for e in errors if e["code"] == "E_COMMAND_RUNNER_DRIFT"]
+        assert len(drift_errors) >= 1, (
+            f"Expected E_COMMAND_RUNNER_DRIFT for catalog_lint_commands runner: {errors}"
+        )
+
+    def test_catalog_lint_command_target_drift_fails(self) -> None:
+        entry = _make_valid_entry()
+        # lint_catalog_yaml is valid, but target is wrong
+        entry["validation"]["catalog_lint_commands"] = [
+            {
+                "id": "lint_catalog_yaml",
+                "runner": "pytest",
+                "target": "schemas/tests/WRONG_FILE.py",  # drift
+            }
+        ]
+        catalog = _make_valid_catalog([entry])
+        errors = validate_catalog_semantics(catalog)
+        drift_errors = [e for e in errors if e["code"] == "E_COMMAND_TARGET_DRIFT"]
+        assert len(drift_errors) >= 1, (
+            f"Expected E_COMMAND_TARGET_DRIFT for catalog_lint_commands target: {errors}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B5: GFM table parser rejects malformed tables
+# ---------------------------------------------------------------------------
+class TestGFMTableParserHardened:
+    """GIVEN PR bodies with structurally malformed tables
+    WHEN parse_schema_consumer_inventory is called
+    THEN it returns empty dict (reject), not a populated dict."""
+
+    def test_escaped_pipe_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | PR Declared Consumers |
+            |-----------|----------------------|
+            | schema\\|v1 | consumer-a |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, "Table with escaped pipe must be rejected"
+
+    def test_duplicate_schema_id_row_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | PR Declared Consumers |
+            |-----------|----------------------|
+            | schema/v1 | consumer-a |
+            | schema/v1 | consumer-b |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, "Table with duplicate Schema ID rows must be rejected"
+
+    def test_extra_column_in_data_row_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | PR Declared Consumers |
+            |-----------|----------------------|
+            | schema/v1 | consumer-a | extra |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, "Table with mismatched column count must be rejected"
+
+    def test_invalid_delimiter_row_is_rejected(self) -> None:
+        pr_body = textwrap.dedent(
+            """\
+            ## Schema Consumer Inventory
+
+            | Schema ID | PR Declared Consumers |
+            |===|===|
+            | schema/v1 | consumer-a |
+            """
+        )
+        inventory = parse_schema_consumer_inventory(pr_body)
+        assert inventory == {}, "Table with invalid delimiter row must be rejected"
+
+
+# ---------------------------------------------------------------------------
+# B6: Real schemas/catalog.yaml regression test
+# ---------------------------------------------------------------------------
+class TestRealCatalogRegression:
+    """GIVEN the actual schemas/catalog.yaml and schemas/catalog.schema.json
+    WHEN the validator is run
+    THEN the catalog passes all checks (regression guard)."""
+
+    def test_real_catalog_passes(self) -> None:
+        """Regression: actual catalog.yaml + catalog.schema.json must produce no errors."""
+        import json
+        from pathlib import Path
+
+        # Navigate to repo root from this test file location
+        # tests/ -> scripts/ -> open-pr/ -> skills/ -> .claude/ -> repo_root
+        scripts_dir = Path(__file__).parent.parent
+        skills_dir = scripts_dir.parent.parent
+        repo_root = skills_dir.parent.parent
+
+        catalog_path = repo_root / "schemas" / "catalog.yaml"
+        schema_path = repo_root / "schemas" / "catalog.schema.json"
+
+        assert catalog_path.exists(), f"catalog.yaml not found at {catalog_path}"
+        assert schema_path.exists(), f"catalog.schema.json not found at {schema_path}"
+
+        catalog = load_catalog(catalog_path)
+
+        schema_text = schema_path.read_text(encoding="utf-8")
+        schema = json.loads(schema_text)
+
+        schema_errors = validate_catalog_schema(catalog, schema)
+        semantic_errors = validate_catalog_semantics(catalog)
+
+        all_errors = schema_errors + semantic_errors
+        assert all_errors == [], (
+            f"Real catalog.yaml has validation errors:\n"
+            + "\n".join(f"  {e}" for e in all_errors)
         )
