@@ -715,7 +715,35 @@ def main() -> None:
         metavar="LABEL",
         help="Issue label name (may be specified multiple times; used with --check-ready-tuple)"
     )
+    parser.add_argument(
+        "--readback-json",
+        dest="readback_json",
+        type=str,
+        default=None,
+        help=(
+            "Path to JSON file produced by 'gh issue view --json title,labels'. "
+            "When provided with --check-ready-tuple, extracts title and label names from the file "
+            "instead of requiring --title and --label arguments."
+        )
+    )
     args = parser.parse_args()
+
+    # Resolve title and labels for --check-ready-tuple:
+    # --readback-json takes precedence over --title / --label when both are provided.
+    rt_title: str = args.title or ""
+    rt_labels: list = list(args.labels)
+    if args.readback_json is not None:
+        rb_path = Path(args.readback_json)
+        if not rb_path.exists():
+            print(f"ERROR: --readback-json file not found: {args.readback_json}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            rb_data = json.loads(rb_path.read_text(encoding="utf-8"))
+            rt_title = rb_data.get("title", "") or ""
+            rt_labels = [lbl["name"] for lbl in rb_data.get("labels", []) if isinstance(lbl, dict)]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"ERROR: Failed to parse --readback-json: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     body = args.body_file.read_text(encoding="utf-8")
 
@@ -763,7 +791,7 @@ def main() -> None:
         results.append(guard_vc_compound_shell_disallowed(body))
         # ready_tuple guard (when --check-ready-tuple is set)
         if args.check_ready_tuple:
-            results.append(guard_ready_tuple(issue_kind, args.title or "", args.labels))
+            results.append(guard_ready_tuple(issue_kind, rt_title, rt_labels))
     else:
         results = []
         results.append(guard_template(body, issue_kind))
@@ -777,7 +805,7 @@ def main() -> None:
         results.append(guard_vc_compound_shell_disallowed(body))
         # ready_tuple guard (when --check-ready-tuple is set)
         if args.check_ready_tuple:
-            results.append(guard_ready_tuple(issue_kind, args.title or "", args.labels))
+            results.append(guard_ready_tuple(issue_kind, rt_title, rt_labels))
 
     all_passed = all(r["passed"] for r in results)
     output = {

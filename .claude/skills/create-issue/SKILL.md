@@ -211,32 +211,31 @@ helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--depende
 
 `create_issue_txn.py` 実行後、implementation issue の場合は GitHub 上の最終状態を read-back して ready tuple を検証する。pre-create の body 検証と異なり、GitHub に実際に付与された title / labels を確認する。
 
-```bash
-# post-create read-back: GitHub 上の title/labels を確認して ready tuple を guard-issue-body.py で検証する
-CREATED_ISSUE_NUMBER=<create_issue_txn.py から取得>
-READBACK_JSON=$(gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels)
-READBACK_TITLE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['title'])" "$READBACK_JSON")
-LABEL_ARGS=""
-while IFS= read -r lname; do
-  LABEL_ARGS="$LABEL_ARGS --label $lname"
-done < <(python3 -c "import json,sys; [print(l['name']) for l in json.loads(sys.argv[1])['labels']]" "$READBACK_JSON")
+**手順（ステップ分割）**:
 
+1. GitHub から title/labels を read-back する:
+
+```bash
+gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels > /tmp/readback.json
+```
+
+2. `guard-issue-body.py` に `--readback-json` を渡して ready tuple を検証する:
+
+```bash
 uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
   --issue-kind implementation \
   --check-ready-tuple \
-  --title "$READBACK_TITLE" \
-  $LABEL_ARGS
-READY_TUPLE_EXIT=$?
-
-if [ "$READY_TUPLE_EXIT" -ne 0 ]; then
-  gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
-    --body "[create-issue] post-create ready tuple validation FAILED: title prefix or phase/implementation label missing. Manual fix required."
-  echo "[ERROR] post-create ready tuple validation failed. Issue created but not canonical." >&2
-  exit "$READY_TUPLE_EXIT"
-fi
+  --readback-json /tmp/readback.json
 ```
 
-検証失敗時は Issue comment にエラーを書き、成功扱いにしない（起票自体は完了しているが、ready tuple が canonical でないことを明示的に記録する）。
+3. 検証失敗（exit code != 0）の場合、Issue に failure comment を投稿する:
+
+```bash
+gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
+  --body "[create-issue] post-create ready tuple validation FAILED: title prefix or phase/implementation label missing. Manual fix required."
+```
+
+検証失敗時は上記 comment 投稿後に処理を停止し、成功扱いにしない（起票自体は完了しているが、ready tuple が canonical でないことを明示的に記録する）。
 
 **blocking stop**:
 1. Scope が複数に分かれる場合（分割採否は人間判断）
