@@ -718,10 +718,11 @@ def main() -> None:
     parser.add_argument(
         "--readback-json",
         dest="readback_json",
-        type=str,
+        type=validate_path,
         default=None,
         help=(
             "Path to JSON file produced by 'gh issue view --json title,labels'. "
+            "Path must match ^[A-Za-z0-9._/-]+$ (safe chars only). "
             "When provided with --check-ready-tuple, extracts title and label names from the file "
             "instead of requiring --title and --label arguments."
         )
@@ -733,17 +734,114 @@ def main() -> None:
     rt_title: str = args.title or ""
     rt_labels: list = list(args.labels)
     if args.readback_json is not None:
-        rb_path = Path(args.readback_json)
-        if not rb_path.exists():
-            print(f"ERROR: --readback-json file not found: {args.readback_json}", file=sys.stderr)
-            sys.exit(1)
+        # args.readback_json is already a Path (validated by validate_path type=)
+        rb_path: Path = args.readback_json
         try:
-            rb_data = json.loads(rb_path.read_text(encoding="utf-8"))
-            rt_title = rb_data.get("title", "") or ""
-            rt_labels = [lbl["name"] for lbl in rb_data.get("labels", []) if isinstance(lbl, dict)]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            rb_raw = rb_path.read_text(encoding="utf-8")
+            rb_data = json.loads(rb_raw)
+        except (json.JSONDecodeError, OSError) as exc:
             print(f"ERROR: Failed to parse --readback-json: {exc}", file=sys.stderr)
             sys.exit(1)
+
+        # Schema validation: root must be dict
+        if not isinstance(rb_data, dict):
+            # Return guard result instead of hard exit so callers get structured output
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: root must be a dict, got {type(rb_data).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # title must be str (missing treated as empty string)
+        rb_title_raw = rb_data.get("title", "")
+        if rb_title_raw is not None and not isinstance(rb_title_raw, str):
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: 'title' must be str, got {type(rb_title_raw).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # labels must be list
+        rb_labels_raw = rb_data.get("labels", [])
+        if not isinstance(rb_labels_raw, list):
+            _rb_error_result = {
+                "name": "ready_tuple",
+                "passed": False,
+                "errors": [f"malformed readback JSON: 'labels' must be list, got {type(rb_labels_raw).__name__!r}"],
+            }
+            output = {"all_passed": False, "guards": [_rb_error_result]}
+            if hasattr(args, 'format') and args.format == "json":
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+            else:
+                print("all_passed: false")
+                print("guards:")
+                print(f"  - name: ready_tuple")
+                print(f"    passed: false")
+                print(f"    errors:")
+                print(f"      - {_rb_error_result['errors'][0]!r}")
+            sys.exit(2)
+
+        # each label must be dict with name: str
+        for i, lbl in enumerate(rb_labels_raw):
+            if not isinstance(lbl, dict):
+                _rb_error_result = {
+                    "name": "ready_tuple",
+                    "passed": False,
+                    "errors": [f"malformed readback JSON: labels[{i}] must be dict, got {type(lbl).__name__!r}"],
+                }
+                output = {"all_passed": False, "guards": [_rb_error_result]}
+                if hasattr(args, 'format') and args.format == "json":
+                    print(json.dumps(output, ensure_ascii=False, indent=2))
+                else:
+                    print("all_passed: false")
+                    print("guards:")
+                    print(f"  - name: ready_tuple")
+                    print(f"    passed: false")
+                    print(f"    errors:")
+                    print(f"      - {_rb_error_result['errors'][0]!r}")
+                sys.exit(2)
+            if not isinstance(lbl.get("name"), str):
+                _rb_error_result = {
+                    "name": "ready_tuple",
+                    "passed": False,
+                    "errors": [f"malformed readback JSON: labels[{i}].name must be str, got {type(lbl.get('name')).__name__!r}"],
+                }
+                output = {"all_passed": False, "guards": [_rb_error_result]}
+                if hasattr(args, 'format') and args.format == "json":
+                    print(json.dumps(output, ensure_ascii=False, indent=2))
+                else:
+                    print("all_passed: false")
+                    print("guards:")
+                    print(f"  - name: ready_tuple")
+                    print(f"    passed: false")
+                    print(f"    errors:")
+                    print(f"      - {_rb_error_result['errors'][0]!r}")
+                sys.exit(2)
+
+        rt_title = rb_title_raw or ""
+        rt_labels = [lbl["name"] for lbl in rb_labels_raw]
 
     body = args.body_file.read_text(encoding="utf-8")
 

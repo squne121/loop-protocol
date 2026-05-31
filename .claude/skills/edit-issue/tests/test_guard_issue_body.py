@@ -11,6 +11,8 @@ guard-issue-body.py のユニットテスト。
 - PyYAML は yaml.safe_load() のみ使用
 """
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,6 +38,8 @@ check_ready_tuple = _mod.check_ready_tuple
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
 validate_issue_kind = _mod.validate_issue_kind
+validate_path = _mod.validate_path
+_MODULE_PATH_STR = str(_MODULE_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -1329,3 +1333,160 @@ class TestGuardReadyTuple:
         assert result["name"] == "ready_tuple"
         assert result["passed"] is True
         assert result["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# --readback-json path validation and schema validation tests (Blocker 1)
+# ---------------------------------------------------------------------------
+
+class TestReadbackJsonPathValidation:
+    """Tests for --readback-json validate_path type and schema validation.
+
+    validate_path rejects unsafe chars via argparse, returning SystemExit.
+    Schema validation returns structured guard result on malformed JSON.
+    """
+
+    def test_readback_json_rejects_unsafe_path_semicolon(self, tmp_path):
+        """GIVEN a path with semicolon WHEN passed as --readback-json THEN SystemExit (argparse rejects)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/foo;bar.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 (argparse error) for unsafe path, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_rejects_unsafe_path_space(self, tmp_path):
+        """GIVEN a path with a space WHEN passed as --readback-json THEN SystemExit (argparse rejects)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/foo bar.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for path with space, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_rejects_unsafe_path_shell_meta(self, tmp_path):
+        """GIVEN a path with shell metachar ($) WHEN passed as --readback-json THEN argparse rejects."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", "/tmp/$foo.json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for path with $, got {result.returncode}. "
+            f"stderr={result.stderr!r}"
+        )
+
+    def test_readback_json_malformed_not_dict(self, tmp_path):
+        """GIVEN readback JSON where root is a list WHEN guard runs THEN error result returned."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        rb_file.write_text(json.dumps([{"title": "実装: foo"}]), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        output = json.loads(result.stdout)
+        assert output["all_passed"] is False
+        errors = output["guards"][0]["errors"]
+        assert any("malformed readback JSON" in e for e in errors)
+
+    def test_readback_json_missing_labels_key(self, tmp_path):
+        """GIVEN readback JSON without 'labels' key WHEN guard runs THEN defaults to empty labels (no error)."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        # title present but no labels key -> defaults to [] -> passes schema validation
+        rb_file.write_text(json.dumps({"title": "実装: foo"}), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        # Schema is valid (missing labels defaults to []), but ready_tuple itself may fail
+        # because phase/implementation label is absent — that's a logic fail, not schema error
+        output = json.loads(result.stdout)
+        guards = {g["name"]: g for g in output["guards"]}
+        if "ready_tuple" in guards:
+            # errors should NOT mention "malformed readback JSON"
+            for e in guards["ready_tuple"].get("errors", []):
+                assert "malformed readback JSON" not in e
+
+    def test_readback_json_label_not_dict(self, tmp_path):
+        """GIVEN readback JSON where a label element is not a dict WHEN guard runs THEN error result."""
+        body_file = tmp_path / "body.md"
+        body_file.write_text("## Outcome\ntest\n", encoding="utf-8")
+        rb_file = tmp_path / "readback.json"
+        rb_file.write_text(
+            json.dumps({"title": "実装: foo", "labels": ["phase/implementation"]}),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                _MODULE_PATH_STR,
+                str(body_file),
+                "--issue-kind", "implementation",
+                "--check-ready-tuple",
+                "--readback-json", str(rb_file),
+                "--format", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        output = json.loads(result.stdout)
+        assert output["all_passed"] is False
+        errors = output["guards"][0]["errors"]
+        assert any("malformed readback JSON" in e for e in errors)

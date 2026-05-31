@@ -981,11 +981,12 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help=(
-            "Issue kind (e.g. 'implementation'). Enables kind-specific rules: "
+            "Issue kind (e.g. 'implementation'). "
+            "--kind enables LP001/LP017 kind-specific checks: "
             "LP001 loads required sections from ISSUE_TEMPLATE/<kind>.yml, "
             "LP017 checks Stop Conditions against template-defined conditions. "
-            "When MRC issue_kind is present in body, MRC takes priority; "
-            "if both are present and differ, LP031 reports a mismatch error."
+            "MRC issue_kind (from body) is used for LP031 title-prefix enforcement "
+            "and mismatch detection only; it does NOT activate LP001/LP017 checks."
         )
     )
     parser.add_argument(
