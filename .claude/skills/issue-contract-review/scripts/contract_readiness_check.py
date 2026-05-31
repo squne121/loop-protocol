@@ -319,43 +319,76 @@ def map_preflight_result_to_errors(
 
     overall_status = preflight_result.get("status", "blocked")
 
+    # Sentinel for absent "message" key (AC5: distinguish absent from None)
+    _MISSING = object()
+
     # blocked with no results = body-structure issue (needs_fix)
     if overall_status == "blocked" and not preflight_result.get("results"):
-        for err_item in preflight_result.get("errors", []):
+        for err_msg in preflight_result.get("errors", []):
             # B6: handle both structured dict errors and legacy plain strings
-            if isinstance(err_item, dict):
-                msg = err_item.get("message", "unknown error")
-                mc = err_item.get("minimal_context", "")
-                fh = err_item.get("fix_hint", (
+            if isinstance(err_msg, dict):
+                # AC5: fallback to str(err_msg) when "message" key is absent
+                raw_msg = err_msg.get("message", _MISSING)
+                msg = str(err_msg) if raw_msg is _MISSING else str(raw_msg)
+                # AC6: normalize minimal_context — flatten list to avoid nested list
+                raw_mc = err_msg.get("minimal_context", "")
+                if isinstance(raw_mc, list):
+                    mc_items: list[str] = [str(x) for x in raw_mc]
+                elif raw_mc:
+                    mc_items = [str(raw_mc)]
+                else:
+                    mc_items = []
+                fh = err_msg.get("fix_hint", (
                     "Ensure Verification Commands section has fenced ```bash blocks "
                     "with $ prefixed commands."
                 ))
-                rule = err_item.get("rule", "VCP001")
-                # Derive rule_id from structured rule field or fallback
-                rule_id = f"VCP_{rule}" if rule and rule != "VCP001" else "VCP001"
+                rule = err_msg.get("rule", "VCP001")
+                # AC7: avoid double namespace — if rule already has a known prefix,
+                # do not prepend "VCP_" again (e.g. "VC000_BODY_RETRIEVAL_FAILED" stays as-is)
+                if rule and rule != "VCP001":
+                    if rule.startswith("VCP_") or rule.startswith("VC") and "_" in rule:
+                        rule_id = rule
+                    else:
+                        rule_id = f"VCP_{rule}"
+                else:
+                    rule_id = "VCP001"
+                # Blocker 3: consume "kind" field to determine category and readiness_status
+                kind = str(err_msg.get("kind", "extraction_error"))
+                if kind == "retrieval_error":
+                    category = "body_retrieval_failed"
+                    readiness_status = "human_judgment"
+                elif kind in ("extraction_error", "unsupported_vc_format"):
+                    category = kind
+                    readiness_status = "needs_fix"
+                else:
+                    category = kind or "preflight_error"
+                    readiness_status = "human_judgment"
             else:
-                msg = str(err_item)
-                mc = ""
+                msg = str(err_msg)
+                mc_items = []
                 fh = (
                     "Ensure Verification Commands section has fenced ```bash blocks "
                     "with $ prefixed commands."
                 )
                 rule_id = "VCP001"
+                category = "no_commands_extracted"
+                readiness_status = "needs_fix"
             errors.append(
                 {
                     "rule_id": rule_id,
                     "severity": "error",
                     "source_check": "baseline_vc_preflight",
-                    "category": "no_commands_extracted",
+                    "category": category,
                     "section": "Verification Commands",
                     "line_start": 0,
                     "line_end": 0,
-                    "minimal_context": [msg] + ([mc] if mc else []),
+                    "minimal_context": [msg] + mc_items,
                     "fix_hint": fh,
                     "autofixable": False,
                 }
             )
-        return errors, _raise_status(aggregate, "needs_fix")
+            aggregate = _raise_status(aggregate, readiness_status)
+        return errors, aggregate
 
     for r in preflight_result.get("results", []):
         classification = r.get("classification", "")
