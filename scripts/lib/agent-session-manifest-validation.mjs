@@ -129,6 +129,9 @@ function validateSemantics(manifest) {
   const producerMetadataSafetyErrors = validateProducerMetadataSafety(manifest).errors
   errors.push(...producerMetadataSafetyErrors)
 
+  const runtimeBoundaryErrors = validateRuntimeBoundarySemantics(manifest).errors
+  errors.push(...runtimeBoundaryErrors)
+
   return errors
 }
 
@@ -205,6 +208,38 @@ export function validateManifestSemantics(json) {
         },
       ],
     }
+  }
+}
+
+export function validateRuntimeBoundarySemantics(manifest) {
+  const errors = []
+  const runtimeBoundary = manifest.secret_policy?.runtime_boundary
+
+  if (!runtimeBoundary || runtimeBoundary.attested !== true) {
+    return {
+      valid: true,
+      errors,
+    }
+  }
+
+  const evidenceRef = runtimeBoundary.evidence_ref
+  const evidenceList = Array.isArray(manifest.evidence) ? manifest.evidence : []
+  const matched = evidenceList.some((evidence) =>
+    evidence.source_ref === evidenceRef &&
+    PRODUCER_EVIDENCE_SOURCE_KINDS.includes(evidence.source_kind)
+  )
+
+  if (!matched) {
+    errors.push({
+      path: 'secret_policy.runtime_boundary.evidence_ref',
+      message:
+        'runtime_boundary.evidence_ref must match an evidence[].source_ref with source_kind hook_jsonl, ci_check, or artifact',
+    })
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
   }
 }
 

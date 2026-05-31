@@ -432,15 +432,37 @@ redaction:
 - `#241` — Secret Inventory SSOT 化（session recording 前提条件）
 - `#242` — Session Recording Kill Switch policy（session recording 前提条件）
 
-## `secret_policy` オブジェクト（optional, #412 追加）
+## `secret_policy` オブジェクト（optional, #412 follow-up redesign）
 
-Secret boundary policy の状態を記録する。`#412` の fail-closed boundary 実装により追加。
+Secret 値を manifest に含めない static producer contract と、runtime boundary attestation を分離して記録する。
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
-| `value_exposed` | boolean | no | Secret 値がこの manifest に露出しているか。public-safe manifest では必ず `false` |
-| `boundary_enforced` | boolean | no | このセッションで `secret_boundary_guard` PreToolUse hook が有効だったか |
-| `mode` | enum | no | `presence_only \| value_included \| not_applicable`。Secret を presence boolean / metadata のみで扱う場合は `presence_only`。`value_included` は unsafe |
+| `value_exposed` | boolean const false | yes | Secret 値がこの manifest に露出していないこと |
+| `mode` | enum `"presence_only"` | yes | Secret は presence-only metadata として扱う |
+| `producer_contract` | object | yes | static producer declaration。runtime attestation ではない |
+| `runtime_boundary` | object | yes | runtime boundary enforcement の attestation 状態 |
+
+### `producer_contract`
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `declared` | boolean const true | yes | producer が static contract を明示的に宣言したこと |
+| `id` | string const `presence_only_no_secret_values` | yes | machine-readable static contract identifier |
+| `version` | string (`^v[0-9]+$`) | yes | static contract version |
+| `claims.secret_values_not_serialized` | boolean const true | yes | Secret 値を manifest に serialize しない |
+| `claims.presence_only` | boolean const true | yes | presence-only metadata のみを emit する |
+
+### `runtime_boundary`
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `attested` | boolean | yes | runtime secret boundary enforcement が実際に attestation されたか |
+| `evidence_ref` | string \| null | yes | runtime evidence への参照 |
+
+- `attested: true` のとき、`evidence_ref` は非空・非空白 string でなければならない
+- `attested: false` のとき、`evidence_ref` は `null` でなければならない
+- `boundary_enforced` は廃止。旧 shape は invalid
 
 `value_exposed: false` かつ `mode: presence_only` が manifest の public-safe 要件。
-`#412` 完了後、manifest producer は `secret_policy.value_exposed: false` を生成するよう更新される。
+producer 実装の新 shape 追随は Issue #500 / PR #532 側で行う。
