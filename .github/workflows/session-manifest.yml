@@ -67,10 +67,12 @@ jobs:
       - name: Validate generated session manifest schema
         run: pnpm manifest:check artifacts/agent-session-manifest-ci.json
 
-      - name: Verify artifact content is public-safe
+      - name: Verify artifact content is public-safe (belt-and-suspenders)
         run: |
-          # public repo: GitHub Actions artifacts are accessible via REST API.
-          # Manifest content must not contain absolute paths, tokens, or transcript text.
+          # Belt-and-suspenders supplementary check only.
+          # The primary public-safe semantic validation is performed by pnpm manifest:check above.
+          # This step checks known sensitive absolute-path prefixes and token patterns as defense-in-depth.
+          # It does NOT claim to detect all absolute paths — for comprehensive rules see the manifest validator.
           # verification-anchor: FAIL token-like|token-like detected
           # verification-anchor: merge_group|merge queue
           FILE=artifacts/agent-session-manifest-ci.json
@@ -78,12 +80,12 @@ jobs:
             echo "FAIL: no artifact found for public-safe check"
             exit 1
           fi
-          # Detect absolute path patterns (Unix and Windows)
+          # Detect known sensitive absolute path prefixes (Unix and Windows)
           if grep -qE '"/(home|Users|tmp|var|private)/|[A-Za-z]:\\\\|file://' "$FILE"; then
             echo "FAIL: absolute path detected in manifest artifact — public-safe contract violated"
             exit 1
           fi
-          echo "PASS: no absolute path detected"
+          echo "PASS: no known sensitive absolute path detected"
           if grep -qE '(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|[A-Fa-f0-9]{40,})' "$FILE"; then
             echo "FAIL: token-like string detected in manifest artifact"
             exit 1
@@ -94,12 +96,12 @@ jobs:
             exit 1
           fi
           echo "PASS: no transcript/local_file marker detected"
-          echo "PASS: public-safe check complete"
+          echo "PASS: belt-and-suspenders public-safe check complete"
 
       - name: Upload session manifest artifact
         uses: actions/upload-artifact@v4
         with:
-          name: private-agent-session-manifest-${{ github.run_id }}
+          name: agent-session-manifest-${{ github.run_id }}
           path: artifacts/agent-session-manifest-ci.json
           if-no-files-found: error
           retention-days: 7
