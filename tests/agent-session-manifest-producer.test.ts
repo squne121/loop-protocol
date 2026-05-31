@@ -939,3 +939,49 @@ describe('Minor: --dry-run flag in help', () => {
     expect(result.stdout).toContain('--dry-run')
   })
 })
+
+describe('AC5: secret_policy field deep-equal assertion', () => {
+  it('GIVEN producer with standard args WHEN producing json THEN manifest contains secret_policy with correct values', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '500',
+      '--phase-main-loop', 'impl',
+      '--phase-instance-id', 'issue-500:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'implementation-worker',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/test.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.secret_policy).toEqual({
+      value_exposed: false,
+      boundary_enforced: true,
+      mode: 'presence_only',
+    })
+  })
+
+  it('GIVEN producer with github_action actor WHEN producing json THEN secret_policy is present and correct', () => {
+    const result = runProducer([
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '500',
+      '--phase-main-loop', 'pr_review',
+      '--phase-instance-id', 'issue-500:pr_review:001',
+      '--actor-type', 'github_action',
+      '--actor-name', 'ci-validator',
+      '--evidence-source-kind', 'ci_check',
+      '--evidence-source-ref', 'https://github.com/squne121/loop-protocol/actions/runs/1',
+      '--evidence-visibility', 'public_github_comment',
+      '--format', 'json',
+    ])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.secret_policy).toEqual({
+      value_exposed: false,
+      boundary_enforced: true,
+      mode: 'presence_only',
+    })
+  })
+})
