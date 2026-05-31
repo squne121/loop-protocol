@@ -382,6 +382,10 @@ manifest validation gate を main の merge blocker にする場合、required c
 | job name | `validate-generated-artifact` |
 | required check context | `agent-session-manifest / validate-generated-artifact` |
 
+`phase_instance_id` は現行 producer contract が `issue-<N>:<phase>:<seq>` を要求するため、
+CI では `run_id` と `run_attempt` から導出した 3 桁 seq を使って `issue-432:impl:<seq>` を生成する。
+raw の `ci:<workflow>:<run_id>:<run_attempt>` は current schema / validator では受け付けない。
+
 required check の SSOT は **GitHub ruleset** とする。
 legacy branch protection を使う場合も同じ exact check context を登録するが、運用判断・監査の正本は ruleset 側に置く。
 
