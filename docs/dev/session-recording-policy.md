@@ -360,15 +360,81 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 ### GitHub Actions CI lifecycle
 
-`.github/workflows/session-manifest.yml` が `push` / `pull_request` trigger で実行される。
+`.github/workflows/session-manifest.yml` が `push` / `pull_request` / `merge_group` trigger で実行される。
 
 | 設定項目 | 値 |
 |---|---|
-| trigger | `push` + `pull_request`（`pull_request_target` は不使用） |
+| trigger | `push` + `pull_request` + `merge_group`（`pull_request_target` は不使用） |
 | permissions | `contents: read`（read-only、write 権限なし） |
 | persist-credentials | `false` |
 | artifact upload | `actions/upload-artifact@v4`、`retention-days: 7`、`if-no-files-found: error` |
-| artifact name prefix | `private-agent-session-manifest` |
+| artifact name prefix | `agent-session-manifest` |
+
+### required check operational contract (#432)
+
+manifest validation gate を main の merge blocker にする場合、required check の exact context は
+`agent-session-manifest / validate-generated-artifact` とする。
+
+| 項目 | 値 |
+|---|---|
+| workflow name | `agent-session-manifest` |
+| job_id | `validate_generated_artifact` |
+| job name | `validate-generated-artifact` |
+| required check context | `agent-session-manifest / validate-generated-artifact` |
+
+`phase_instance_id` は現行 producer contract が `issue-<N>:<phase>:<seq>` を要求するため、
+CI では `run_id` と `run_attempt` から導出した 3 桁 seq を使って `issue-432:impl:<seq>` を生成する。
+raw の `ci:<workflow>:<run_id>:<run_attempt>` は current schema / validator では受け付けない。
+
+required check の SSOT は **branch protection** とする（ruleset PATCH API が 404 を返すため）。
+ruleset が利用可能になった場合は ruleset 側に required checks を移行し、branch protection fallback を削除する。
+
+<!-- verification-anchor: branch protection|ruleset -->
+
+### required check 設定と確認
+
+1. `agent-session-manifest / validate-generated-artifact` が CI で一度成功してから required check に登録する。
+   GitHub は過去 7 日以内に成功していない check context を required check 候補として扱えないことがある。
+2. branch protection の `required_status_checks` を SSOT として required check を登録する（ruleset の PATCH API が 404 を返すため branch protection を fallback とする）。
+
+確認コマンド:
+
+```bash
+# ruleset 側の確認（admin 権限がある場合）
+gh api repos/squne121/loop-protocol/rulesets
+
+# branch protection の確認（本 repo の SSOT）
+gh api repos/squne121/loop-protocol/branches/main/protection/required_status_checks \
+  --jq '.checks[]?.context // .contexts[]?'
+# 期待値: agent-session-manifest / validate-generated-artifact が含まれること
+```
+
+### required check 登録済み証跡（2026-05-31）
+
+branch protection の required_status_checks に `agent-session-manifest / validate-generated-artifact` を登録済み。
+
+```
+# gh api repos/squne121/loop-protocol/branches/main/protection/required_status_checks --jq '.checks[]?.context // .contexts[]?'
+typecheck
+lint
+test
+build
+python-test
+agent-session-manifest / validate-generated-artifact
+```
+
+ruleset PATCH API（id: 16796903）は 404 を返したため、branch protection を SSOT として登録した。
+ruleset と branch protection の required checks が diverge する場合は人間が調整する。
+
+<!-- verification-anchor: branch protection|ruleset -->
+
+### admin stop condition
+
+ruleset / branch protection の参照または更新に必要な admin 権限がない場合は、required check enforcement の実設定を進めず stop condition とする。
+その場合は docs と workflow だけを更新し、`gh api .../rulesets` または
+`gh api .../required_status_checks` を実行できなかった事実を Issue / PR に記録して人間へ引き継ぐ。
+
+<!-- verification-anchor: required_status_checks|admin stop condition|stop condition admin -->
 
 ---
 
