@@ -11,14 +11,7 @@ import { createLocalGameStorage } from './storage'
 import {
   advanceSimulationLoop,
   clampPlayerToArena,
-  resolveCombatCollisions,
-  runCollisionSystem,
-  runCombatSystem,
-  runEnemyAISystem,
-  runEnemySpawnSystem,
-  runMovementSystem,
-  runProjectileSystem,
-  runSortieSystem,
+  runSortieSimulationStep,
   startSortie,
 } from './systems'
 import { createHudController } from './ui'
@@ -97,21 +90,8 @@ function frame(now: number): void {
 window.requestAnimationFrame(frame)
 
 function stepSimulation(fixedDeltaMs: number): void {
-  // AC13: skip all combat processing if sortie is not running
-  if (state.sortie.status !== 'running') {
-    return
-  }
   const commands = mapInputToCommands(inputState)
-  runMovementSystem(state, commands, fixedDeltaMs)
-  runEnemySpawnSystem(state)
-  runEnemyAISystem(state, fixedDeltaMs)
-  runCombatSystem(state, commands, fixedDeltaMs)
-  runProjectileSystem(state, commands, fixedDeltaMs)
-  const pairs = runCollisionSystem(state)
-  resolveCombatCollisions(state, pairs)
-  runSortieSystem(state, fixedDeltaMs)
-  state.tick += 1
-  state.elapsedMs += fixedDeltaMs
+  runSortieSimulationStep(state, commands, fixedDeltaMs)
 }
 
 function resizeArena(currentState: typeof state): void {

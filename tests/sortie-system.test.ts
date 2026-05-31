@@ -11,9 +11,11 @@ import { createInitialGameState } from '../src/state/GameState'
 import {
   startSortie,
   runSortieSystem,
+  runSortieSimulationStep,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
 import { defaultSimulationConfig } from '../src/state/SimulationConfig'
+import { createInputState, mapInputToCommands } from '../src/input'
 
 const FDT = defaultSimulationConfig.fixedDeltaMs // ~16.667 ms
 
@@ -157,24 +159,52 @@ describe('GIVEN same tick: player hp=0 and elapsedTicks >= targetTicks', () => {
 // terminal-gate
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie has reached terminal state (defeat)', () => {
-  it('terminal-gate: WHEN runSortieSystem called multiple times THEN state does not change', () => {
+  it('terminal-gate: WHEN runSortieSimulationStep called multiple times after defeat THEN state does not change', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
     state.player.hp = 0
-    runSortieSystem(state, FDT)
+
+    const inputState = createInputState()
+    const commands = mapInputToCommands(inputState)
+
+    // First step triggers defeat
+    runSortieSimulationStep(state, commands, FDT)
 
     expect(state.sortie.status).toBe('defeat')
     const snapshotTicks = state.sortie.elapsedTicks
     const snapshotResult = state.sortie.result
 
-    // Call multiple times
+    // Call multiple times via orchestration gate
     for (let i = 0; i < 5; i++) {
-      runSortieSystem(state, FDT)
+      runSortieSimulationStep(state, commands, FDT)
     }
 
     expect(state.sortie.status).toBe('defeat')
     expect(state.sortie.elapsedTicks).toBe(snapshotTicks)
     expect(state.sortie.result).toBe(snapshotResult) // same reference
+  })
+})
+
+// ---------------------------------------------------------------------------
+// playerHpRemaining clamp
+// ---------------------------------------------------------------------------
+describe('GIVEN sortie result playerHpRemaining', () => {
+  it('clamps playerHpRemaining to [0, maxHp] on victory', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.player.hp = state.player.maxHp + 999
+    ;(state.sortie as unknown as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+    expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp)
+  })
+
+  it('records defeat playerHpRemaining as 0 even if hp is negative', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.player.hp = -5
+    runSortieSystem(state, FDT)
+    expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.playerHpRemaining).toBe(0)
   })
 })
 

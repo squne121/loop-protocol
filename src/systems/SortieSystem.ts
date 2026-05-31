@@ -1,4 +1,12 @@
 import type { GameState, SortieResult, SortieState } from '../state/GameState'
+import { mapInputToCommands } from '../input'
+import { runMovementSystem } from './MovementSystem'
+import { runEnemySpawnSystem } from './EnemySpawnSystem'
+import { runEnemyAISystem } from './EnemyAISystem'
+import { runCombatSystem } from './CombatSystem'
+import { runProjectileSystem } from './ProjectileSystem'
+import { runCollisionSystem } from './CollisionSystem'
+import { resolveCombatCollisions } from './CombatSystem'
 
 /** Total sortie duration in milliseconds (120 seconds). */
 export const SORTIE_DURATION_MS = 120_000
@@ -64,16 +72,24 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   const outcome: 'victory' | 'defeat' = isDefeat ? 'defeat' : 'victory'
 
   const kills = state.enemies.filter(
-    (e) => e.defeatedAtTick !== null && e.defeatedAtTick <= terminalTick,
+    (e) =>
+      e.defeated &&
+      e.defeatedAtTick !== null &&
+      e.defeatedAtTick <= terminalTick,
   ).length
 
-  const result: Readonly<SortieResult> = {
+  const playerHpRemaining =
+    outcome === 'defeat'
+      ? 0
+      : Math.min(state.player.maxHp, Math.max(0, state.player.hp))
+
+  const result = Object.freeze({
     outcome,
     durationMs: elapsedTicks * fixedDeltaMs,
     kills,
     shotsFired: state.player.shotsFired,
-    playerHpRemaining: state.player.hp,
-  }
+    playerHpRemaining,
+  } satisfies SortieResult)
 
   const terminalState: SortieState = {
     status: outcome,
@@ -83,4 +99,30 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   }
 
   state.sortie = terminalState
+}
+
+/**
+ * Orchestrates one full simulation step: all sub-systems + sortie state machine.
+ * Used by `src/main.ts` to avoid logic duplication.
+ *
+ * @param state        Mutable game state
+ * @param commands     Input commands for this tick
+ * @param fixedDeltaMs Fixed timestep in milliseconds
+ */
+export function runSortieSimulationStep(
+  state: GameState,
+  commands: ReturnType<typeof mapInputToCommands>,
+  fixedDeltaMs: number,
+): void {
+  if (state.sortie.status !== 'running') return
+  runMovementSystem(state, commands, fixedDeltaMs)
+  runEnemySpawnSystem(state)
+  runEnemyAISystem(state, fixedDeltaMs)
+  runCombatSystem(state, commands, fixedDeltaMs)
+  runProjectileSystem(state, commands, fixedDeltaMs)
+  const pairs = runCollisionSystem(state)
+  resolveCombatCollisions(state, pairs)
+  runSortieSystem(state, fixedDeltaMs)
+  state.tick += 1
+  state.elapsedMs += fixedDeltaMs
 }
