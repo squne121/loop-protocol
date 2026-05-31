@@ -979,3 +979,202 @@ def test_validator_internal_error_maps_to_human_judgment():
     assert status == "human_judgment", (
         f"validator_internal_error must map to human_judgment, got: {status}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #527: map_preflight_result_to_errors — structured errors consumer
+# AC1: message field used as minimal_context head
+# AC2: minimal_context field expanded correctly
+# AC3: fix_hint field used correctly
+# AC4: string fallback maintained
+# AC5: message-absent dict falls back to str(err_msg)
+# AC6: minimal_context as list → flat list[str] (no nested list)
+# AC7: rule with VC000_ prefix → no double namespace
+# ---------------------------------------------------------------------------
+
+
+def _blocked_preflight_with_errors(errors: list) -> dict:
+    """Helper: build a blocked preflight result with no results[] and given errors."""
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [],
+        "errors": errors,
+    }
+
+
+def test_ac1_message_field_used_as_minimal_context_head():
+    """AC1: structured dict errors — message field becomes the first element of minimal_context."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VC001",
+            "message": "Verification Commands section is missing",
+            "minimal_context": "Add a ## Verification Commands section",
+            "fix_hint": "Add the section and re-run.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors, "Expected at least one error"
+    err = errors[0]
+    assert isinstance(err["minimal_context"], list), "minimal_context must be a list"
+    assert err["minimal_context"][0] == "Verification Commands section is missing", (
+        f"First element of minimal_context must be the message field value, got: {err['minimal_context']}"
+    )
+
+
+def test_ac2_minimal_context_field_expanded():
+    """AC2: minimal_context field from structured dict is correctly appended."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VC001",
+            "message": "Missing fenced bash block",
+            "minimal_context": "Use ```bash fencing",
+            "fix_hint": "Wrap your VC commands in ```bash ... ```.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    assert "Use ```bash fencing" in err["minimal_context"], (
+        f"minimal_context content missing: {err['minimal_context']}"
+    )
+
+
+def test_ac3_fix_hint_field_used():
+    """AC3: fix_hint field from structured dict is used as fix_hint in output error."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VC001",
+            "message": "Bad VC format",
+            "minimal_context": "",
+            "fix_hint": "Custom fix hint from structured error",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    assert err["fix_hint"] == "Custom fix hint from structured error", (
+        f"fix_hint not taken from structured error: {err['fix_hint']}"
+    )
+
+
+def test_ac4_string_fallback_maintained():
+    """AC4: plain string errors still work (existing string fallback preserved)."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        "plain string error message"
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors, "Expected at least one error from string input"
+    err = errors[0]
+    assert err["rule_id"] == "VCP001"
+    assert err["minimal_context"][0] == "plain string error message", (
+        f"String error not used as minimal_context head: {err['minimal_context']}"
+    )
+    assert aggregate == "needs_fix"
+
+
+def test_ac5_message_absent_fallback_to_str_err_msg():
+    """AC5: structured dict without 'message' key falls back to str(err_msg), not 'unknown error'."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    err_item = {
+        "kind": "error",
+        "rule": "VC002",
+        # no "message" key
+        "minimal_context": "some context",
+        "fix_hint": "some fix",
+    }
+    preflight = _blocked_preflight_with_errors([err_item])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    # The fallback must be str(err_item), not "unknown error"
+    assert err["minimal_context"][0] != "unknown error", (
+        "AC5 violation: fallback must be str(err_msg), not 'unknown error'"
+    )
+    assert str(err_item) in err["minimal_context"][0], (
+        f"AC5: expected str(err_msg) as fallback, got: {err['minimal_context'][0]}"
+    )
+
+
+def test_ac6_minimal_context_list_normalized_to_flat():
+    """AC6: minimal_context as list in structured dict → flat list[str], no nested list."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VC001",
+            "message": "Header message",
+            "minimal_context": ["line A", "line B", "line C"],
+            "fix_hint": "Fix it.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    mc = err["minimal_context"]
+    assert isinstance(mc, list), "minimal_context must be a list"
+    for item in mc:
+        assert isinstance(item, str), (
+            f"AC6: nested list detected — all items must be str, got {type(item)}: {item}"
+        )
+    assert "line A" in mc, f"AC6: flattened items missing from minimal_context: {mc}"
+    assert "line B" in mc
+    assert "line C" in mc
+
+
+def test_ac7_rule_with_vc_prefix_no_double_namespace():
+    """AC7: rule already prefixed with VC000_ must not become VCP_VC000_ (double namespace)."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VC000_BODY_RETRIEVAL_FAILED",
+            "message": "Body retrieval failed",
+            "minimal_context": "",
+            "fix_hint": "Check the issue body.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    assert err["rule_id"] == "VC000_BODY_RETRIEVAL_FAILED", (
+        f"AC7: double namespace detected — rule_id must be 'VC000_BODY_RETRIEVAL_FAILED', got: {err['rule_id']}"
+    )
+    assert not err["rule_id"].startswith("VCP_VC"), (
+        f"AC7: double namespace 'VCP_VC...' detected in rule_id: {err['rule_id']}"
+    )
+
+
+def test_ac7_rule_with_vcp_prefix_no_double_namespace():
+    """AC7: rule already prefixed with VCP_ must not become VCP_VCP_ (double namespace)."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    preflight = _blocked_preflight_with_errors([
+        {
+            "kind": "error",
+            "rule": "VCP_SOME_RULE",
+            "message": "Some VCP rule",
+            "minimal_context": "",
+            "fix_hint": "Fix it.",
+        }
+    ])
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert errors
+    err = errors[0]
+    assert err["rule_id"] == "VCP_SOME_RULE", (
+        f"AC7: double namespace detected for VCP_ prefixed rule, got: {err['rule_id']}"
+    )

@@ -321,21 +321,36 @@ def map_preflight_result_to_errors(
 
     # blocked with no results = body-structure issue (needs_fix)
     if overall_status == "blocked" and not preflight_result.get("results"):
-        for err_item in preflight_result.get("errors", []):
+        for err_msg in preflight_result.get("errors", []):
             # B6: handle both structured dict errors and legacy plain strings
-            if isinstance(err_item, dict):
-                msg = err_item.get("message", "unknown error")
-                mc = err_item.get("minimal_context", "")
-                fh = err_item.get("fix_hint", (
+            if isinstance(err_msg, dict):
+                # AC5: fallback to str(err_msg) when "message" key is absent
+                msg = err_msg.get("message") if err_msg.get("message") is not None else str(err_msg)
+                # AC6: normalize minimal_context — flatten list to avoid nested list
+                raw_mc = err_msg.get("minimal_context", "")
+                if isinstance(raw_mc, list):
+                    mc_items: list[str] = [str(x) for x in raw_mc]
+                elif raw_mc:
+                    mc_items = [str(raw_mc)]
+                else:
+                    mc_items = []
+                fh = err_msg.get("fix_hint", (
                     "Ensure Verification Commands section has fenced ```bash blocks "
                     "with $ prefixed commands."
                 ))
-                rule = err_item.get("rule", "VCP001")
-                # Derive rule_id from structured rule field or fallback
-                rule_id = f"VCP_{rule}" if rule and rule != "VCP001" else "VCP001"
+                rule = err_msg.get("rule", "VCP001")
+                # AC7: avoid double namespace — if rule already has a known prefix,
+                # do not prepend "VCP_" again (e.g. "VC000_BODY_RETRIEVAL_FAILED" stays as-is)
+                if rule and rule != "VCP001":
+                    if rule.startswith("VCP_") or rule.startswith("VC") and "_" in rule:
+                        rule_id = rule
+                    else:
+                        rule_id = f"VCP_{rule}"
+                else:
+                    rule_id = "VCP001"
             else:
-                msg = str(err_item)
-                mc = ""
+                msg = str(err_msg)
+                mc_items = []
                 fh = (
                     "Ensure Verification Commands section has fenced ```bash blocks "
                     "with $ prefixed commands."
@@ -350,7 +365,7 @@ def map_preflight_result_to_errors(
                     "section": "Verification Commands",
                     "line_start": 0,
                     "line_end": 0,
-                    "minimal_context": [msg] + ([mc] if mc else []),
+                    "minimal_context": [msg] + mc_items,
                     "fix_hint": fh,
                     "autofixable": False,
                 }
