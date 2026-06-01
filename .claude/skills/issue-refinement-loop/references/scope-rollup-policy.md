@@ -111,9 +111,31 @@ scope_context:
 | `none` | パス重複なし | false |
 | `same_anchor_conflicting_operation` | 同一ファイル + 共有 sub-file anchor | **true** |
 | `same_file_disjoint_anchor` | 同一ファイルだが anchor が disjoint（例: #547 が phase_instance_id、#549 が /required） | false |
+| `prefix_overlap_uncertain` | prefix 重複（親子パス関係）のみ。`anchor_paths` に `parent -> child` を記録。共有 anchor があれば escalate | 条件付き |
 | `uncertain` | 完全同一ファイルだが anchor を抽出できず disjoint を証明できない | **true**（fail-safe） |
 
-sub-file anchor は本文中の JSON Pointer（`/required`、`/properties/foo/pattern`）およびバックティック付きプロパティ名（`` `phase_instance_id` ``）から軽量テキスト抽出する。AST / tree-sitter による anchor 解決は本ポリシー対象外（follow-up）。
+`none` は「パス重複なし」のみに限定する。prefix 重複（`.claude/skills/foo` と `.claude/skills/foo/SKILL.md` 等）は `none` にせず `prefix_overlap_uncertain` として `anchor_paths` に親子関係を記録する（#550 Blocker 4）。
+
+#### sub-file anchor 抽出の限界（RFC 6901 非準拠 — #550 Blocker 5）
+
+sub-file anchor は本文中の以下から **軽量テキスト抽出** する:
+
+- JSON Pointer 風トークン: `/required`、`/properties/foo/pattern`
+- バックティック付きプロパティ名 / JSON Pointer: `` `phase_instance_id` ``、`` `/required` ``
+
+これは **厳密な RFC 6901 実装ではない**:
+
+- `~0`（`~`）/ `~1`（`/`）のエスケープ解除を行わない
+- array index（`/items/0`）の意味論を扱わない
+- 構文検証を行わず、正規表現マッチのみ
+
+precise な anchor 解決（AST / tree-sitter による構文木ベースの抽出）は本ポリシー対象外であり、follow-up とする。現状の軽量 extractor は「同一ファイル内の独立変更（#547/#549）を disjoint と判定できる」最小限の精度を目的とし、その境界をここに明文化する。
+
+#### scope rollup は security gate ではない（#550 / 12:00 人間指示）
+
+scope rollup は **汎用の scope collision 判定** であり、security gate ではない。
+secret value のログ出力、GitHub Actions secrets、auth token、credential / permission / access-control などの **real-security-risk escalation は専用 skill の責務** とし、本スクリプトでは判定しない。
+security 語彙の一致は `domain_flags` / `security_match_evidence` に audit 目的で記録するのみ（判定の主因にしない）。
 
 ### `ordering_constraint`
 

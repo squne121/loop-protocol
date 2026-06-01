@@ -78,6 +78,7 @@ DOMAIN_DOCS = "docs"
 # Conflict types for scope_context
 CONFLICT_SAME_ANCHOR_CONFLICTING_OP = "same_anchor_conflicting_operation"
 CONFLICT_SAME_FILE_DISJOINT_ANCHOR = "same_file_disjoint_anchor"
+CONFLICT_PREFIX_OVERLAP_UNCERTAIN = "prefix_overlap_uncertain"
 CONFLICT_UNCERTAIN = "uncertain"
 CONFLICT_NONE = "none"
 
@@ -348,31 +349,66 @@ def _build_scope_context(
     matched_paths: list[str],
     current_paths: frozenset[str],
     item_paths: frozenset[str],
+    prefix_overlap_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build scope_context for a candidate pair.
 
     scope_context captures the structural relationship between the current issue
     and a candidate, including:
-    - anchor_paths: overlapping file paths (structural positions)
+    - anchor_paths: overlapping file paths (structural positions; includes prefix
+      "parent -> child" pairs when only a prefix overlap exists)
     - conflicting_anchors: shared sub-file anchors (JSON Pointers / property names)
     - domain_flags: semantic categories (audit-only, NOT used for escalation)
     - conflict_type: nature of the collision
     - escalation_required: true only for genuine structural conflicts
 
     Escalation policy (the core of #550):
-    - Keyword-only / domain matches (e.g. "secret_policy" property name appearing in
-      both issues, or a shared security keyword) do NOT constitute genuine conflicts.
-      They are recorded in domain_flags / security_match_evidence for audit only.
+    - Keyword-only / domain matches (e.g. a property name like "secret_policy", or a
+      shared security keyword) do NOT constitute genuine conflicts. They are recorded
+      in domain_flags / security_match_evidence for audit only.
+      NOTE: scope rollup is NOT a security gate. Real-security-risk escalation
+      (secret logging, Actions secrets, credential/permission/access-control) is the
+      responsibility of a dedicated skill, not this generic collision detector.
     - same file + shared sub-file anchor -> same_anchor_conflicting_operation -> escalate
     - same file + disjoint sub-file anchors -> same_file_disjoint_anchor -> no escalate
       (this is the #547/#549 case)
     - exact same file set with NO machine-readable anchors to prove disjointness ->
       uncertain -> escalate (fail-safe; we cannot confirm the changes are independent)
     - partial path intersection without anchors -> same_file_disjoint_anchor -> no escalate
+    - prefix-only overlap (no exact intersection) -> prefix_overlap_uncertain; the
+      "parent -> child" pair is recorded in anchor_paths (never collapsed to "none").
+      It escalates only on positive evidence (a shared sub-file anchor), consistent
+      with #550's goal of reducing false escalation.
+
+    Sub-file anchors are extracted with a lightweight text scan (JSON Pointer-like
+    tokens and backtick-quoted names). This is NOT a strict RFC 6901 implementation
+    (no ~0/~1 unescaping, no array-index semantics); precise AST / tree-sitter
+    anchoring is out of scope and tracked as a follow-up.
     """
     domain_flags = _classify_domain_flags(item)
+    current_anchors = _extract_anchor_tokens(current)
+    item_anchors = _extract_anchor_tokens(item)
+    shared_anchors = sorted(current_anchors & item_anchors)
 
+    # No exact path intersection. Either a prefix-only overlap (record it, do not
+    # collapse to "none" — #550 Blocker 4) or no path relationship at all.
     if not matched_paths:
+        if prefix_overlap_paths:
+            if current_anchors and item_anchors and shared_anchors:
+                # Even across a prefix relationship, a shared anchor is positive
+                # evidence of a conflicting operation.
+                conflict_type = CONFLICT_SAME_ANCHOR_CONFLICTING_OP
+                escalation_required = True
+            else:
+                conflict_type = CONFLICT_PREFIX_OVERLAP_UNCERTAIN
+                escalation_required = False
+            return {
+                "anchor_paths": prefix_overlap_paths,
+                "conflicting_anchors": shared_anchors,
+                "domain_flags": domain_flags,
+                "conflict_type": conflict_type,
+                "escalation_required": escalation_required,
+            }
         return {
             "anchor_paths": [],
             "conflicting_anchors": [],
@@ -382,10 +418,6 @@ def _build_scope_context(
         }
 
     exact_same_files = bool(current_paths) and bool(item_paths) and current_paths == item_paths
-
-    current_anchors = _extract_anchor_tokens(current)
-    item_anchors = _extract_anchor_tokens(item)
-    shared_anchors = sorted(current_anchors & item_anchors)
 
     if current_anchors and item_anchors:
         if shared_anchors:
@@ -587,6 +619,22 @@ def _paths_share_prefix(a: frozenset[str], b: frozenset[str]) -> bool:
     return False
 
 
+def _prefix_overlap_pairs(a: frozenset[str], b: frozenset[str]) -> list[str]:
+    """Return normalised "parent -> child" path pairs for prefix overlaps.
+
+    Used so that prefix-overlap candidates record the structural relationship in
+    scope_context.anchor_paths instead of leaving it empty (which previously caused
+    conflict_type to collapse to "none" — see #550 Blocker 4).
+    """
+    pairs: list[str] = []
+    for pa in a:
+        for pb in b:
+            short, long = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
+            if long != short and long.startswith(short.rstrip("/") + "/"):
+                pairs.append(f"{short} -> {long}")
+    return sorted(set(pairs))
+
+
 def _non_mergeable_reasons(item: dict[str, Any], kind: str) -> list[str]:
     """Collect reasons why a candidate may not be directly mergeable."""
     reasons: list[str] = []
@@ -627,6 +675,7 @@ def _build_candidates(
 
         signals: list[str] = []
         matched_paths: list[str] = []
+        prefix_overlap_paths: list[str] = []
 
         # Signal: shared_dedupe_key
         item_dedupe_key = _extract_dedupe_key(item)
@@ -650,6 +699,11 @@ def _build_candidates(
                     signals.append(SIGNAL_ALLOWED_PATH_INTERSECTION)
             elif _paths_share_prefix(current_allowed_paths, item_allowed_paths):
                 signals.append(SIGNAL_ALLOWED_PATH_PREFIX_OVERLAP)
+                # Record the parent -> child relationship so scope_context does not
+                # collapse to conflict_type: none (#550 Blocker 4).
+                prefix_overlap_paths = _prefix_overlap_pairs(
+                    current_allowed_paths, item_allowed_paths
+                )
 
         # Signal: same_parent_issue
         item_parent = _extract_parent_issue(item)
@@ -692,6 +746,7 @@ def _build_candidates(
             matched_paths,
             current_allowed_paths,
             item_allowed_paths,
+            prefix_overlap_paths,
         )
 
         action = _suggested_action(item, signals, confidence, scope_context)

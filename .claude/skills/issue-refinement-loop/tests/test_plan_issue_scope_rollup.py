@@ -752,8 +752,16 @@ def issues_547_549_same_schema_disjoint_anchor_json(tmp_path: Path) -> str:
     - #547 extends the `phase_instance_id` pattern
     - #549 adds `/required` to `secret_policy`
 
-    They also incidentally share a security-adjacent keyword ("permission") so we can
-    assert that the keyword is recorded for audit but does NOT drive escalation.
+    PREMISE CORRECTION (#550 review Blocker 2): the original Issue framing claimed the
+    false-positive came from the property name `secret_policy` being detected as the
+    keyword `secret`. That premise is FALSE under the current SECURITY_RE — `_` is a
+    word character, so `\\bsecret\\b` does NOT match `secret_policy`
+    (see test_secret_policy_property_name_is_not_detected_as_secret_keyword below).
+
+    The realistic false-positive trigger is a *standalone* security keyword appearing
+    in the body (here `permission`, and a standalone `secret` value mention). This
+    fixture reproduces that: a genuine SECURITY_RE match is present, yet escalation must
+    NOT fire because the two issues target disjoint sub-file anchors.
     """
     schema_path = "- `.claude/skills/some-skill/schema/contract.schema.json`\n"
     issues = [
@@ -776,7 +784,9 @@ def issues_547_549_same_schema_disjoint_anchor_json(tmp_path: Path) -> str:
                 + schema_path
                 + "\n## Outcome\n"
                 "`secret_policy` に `/required` を追加する。\n"
-                "permission boundary は据え置き。\n"
+                # Standalone 'permission' / 'secret' words DO match SECURITY_RE — this is
+                # the real trigger, not the `secret_policy` property name itself.
+                "permission boundary は据え置き。secret value の取り扱いは変更しない。\n"
             ),
         },
     ]
@@ -962,3 +972,90 @@ class TestScopeContextGeneralisation:
         # AC7: legacy fields preserved (additive extension)
         for legacy_field in ("kind", "number", "confidence", "signals", "suggested_action", "dedupe_key"):
             assert legacy_field in c, f"Legacy field {legacy_field!r} must be preserved"
+
+    def test_secret_policy_property_name_is_not_detected_as_secret_keyword(self) -> None:
+        """#550 review Blocker 2: correct the false `secret_policy` -> `secret` premise.
+
+        SECURITY_RE uses word boundaries and `_` is a word character, so the property
+        name `secret_policy` does NOT match the keyword `secret`. The original Issue
+        premise ("secret_policy was detected as secret") is therefore FALSE; the real
+        trigger is a *standalone* security keyword.
+        """
+        # The property name alone is NOT detected.
+        for not_detected in ("secret_policy", "add secret_policy to required", "`secret_policy`"):
+            item = {"number": 1, "title": "", "body": not_detected}
+            assert rollup._security_match_evidence(item) == [], (
+                f"{not_detected!r} must NOT match SECURITY_RE (property name, not keyword)"
+            )
+        # A standalone keyword IS detected — this is the real false-positive trigger.
+        item = {"number": 2, "title": "", "body": "the secret value is logged; permission changed"}
+        evidence = rollup._security_match_evidence(item)
+        assert "secret" in evidence and "permission" in evidence, (
+            f"Standalone security keywords must be detected, got {evidence!r}"
+        )
+
+    def test_standalone_security_keyword_in_disjoint_anchor_case_is_recorded_but_not_escalated(
+        self,
+        issues_547_549_same_schema_disjoint_anchor_json: str,
+        empty_prs_json: str,
+    ) -> None:
+        """#550 review Blocker 2 (realistic): a genuine SECURITY_RE match present, yet
+        disjoint anchors mean no escalation. Proves keyword detection != escalation.
+        """
+        plan = _run(
+            issues_547_549_same_schema_disjoint_anchor_json,
+            empty_prs_json,
+            current_issue_number=547,
+        )
+        c = next(c for c in plan["candidates"] if c.get("number") == 549)
+        # A real standalone keyword WAS detected (audit trail present)...
+        assert "secret" in c.get("security_match_evidence", []), (
+            f"Standalone 'secret' must be recorded for audit, got {c.get('security_match_evidence')!r}"
+        )
+        # ...but it does NOT drive escalation (disjoint sub-file anchors).
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_SAME_FILE_DISJOINT_ANCHOR
+        assert c["scope_context"]["escalation_required"] is False
+        assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED
+
+    def test_prefix_overlap_records_anchor_paths_and_is_not_classified_none(
+        self, tmp_path: Path, empty_prs_json: str
+    ) -> None:
+        """#550 review Blocker 4: a prefix (parent->child) path overlap must NOT collapse
+        scope_context to conflict_type: none. The overlap pair is recorded in anchor_paths.
+        """
+        issues = [
+            {
+                "number": 1000,
+                "title": "実装: skill dir 全体を更新する",
+                "body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/foo`\n"
+                    "\n## Outcome\nディレクトリを更新する。\n"
+                ),
+            },
+            {
+                "number": 1001,
+                "title": "実装: skill の SKILL.md を更新する",
+                "body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/foo/SKILL.md`\n"
+                    "\n## Outcome\nSKILL.md を更新する。\n"
+                ),
+            },
+        ]
+        issues_path = tmp_path / "issues_prefix.json"
+        issues_path.write_text(json.dumps(issues), encoding="utf-8")
+
+        plan = _run(str(issues_path), empty_prs_json, current_issue_number=1000)
+        candidates = [c for c in plan["candidates"] if c.get("number") == 1001]
+        assert candidates, "Expected prefix-overlap candidate"
+        c = candidates[0]
+        assert rollup.SIGNAL_ALLOWED_PATH_PREFIX_OVERLAP in c["signals"]
+        sc = c["scope_context"]
+        assert sc["conflict_type"] == rollup.CONFLICT_PREFIX_OVERLAP_UNCERTAIN, (
+            f"Prefix overlap must not be 'none'; got {sc['conflict_type']!r}"
+        )
+        assert sc["anchor_paths"], "Prefix overlap pair must be recorded in anchor_paths"
+        assert any("->" in p for p in sc["anchor_paths"]), (
+            f"Expected a parent->child pair in anchor_paths, got {sc['anchor_paths']!r}"
+        )
