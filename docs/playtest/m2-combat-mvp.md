@@ -3,7 +3,7 @@ doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
 implementation_issue: "#541"
-tested_commit: "HEAD-of-worktree-issue-542-spec-impl-483-mvp-sortie"
+tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
 status: automated_e2e_verified
 date: "2026-05-31"
