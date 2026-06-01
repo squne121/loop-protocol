@@ -1,9 +1,10 @@
 /**
  * tests/sortie-system.test.ts
  *
- * Vitest unit tests for SortieSystem (AC9).
- * Required test cases: bootstrap, no-start, victory, defeat, double-result,
- * timer-authority, defeat-precedence, terminal-gate, kills-boundary.
+ * Vitest unit tests for SortieSystem (AC7–AC12).
+ * Required test cases: bootstrap, no-start, victory (allEnemiesDefeated), defeat,
+ * timeout→defeat, defeat-precedence, vacuous-truth, double-result,
+ * timer-authority, terminal-gate, kills-boundary, playerHpRemaining-clamp.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -16,11 +17,48 @@ import {
 } from '../src/systems/SortieSystem'
 import { defaultSimulationConfig } from '../src/state/SimulationConfig'
 import { createInputState, mapInputToCommands } from '../src/input'
+import type { EnemyState } from '../src/state/GameState'
 
 const FDT = defaultSimulationConfig.fixedDeltaMs // ~16.667 ms
 
-/** Number of ticks required for 120-second victory */
+/** Number of ticks required for 30-second timeout */
 const TARGET_TICKS = Math.ceil(SORTIE_DURATION_MS / FDT)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function makeDefeatedEnemy(id: number, defeatedAtTick: number): EnemyState {
+  return {
+    id,
+    definitionId: 'enemy-basic',
+    hp: 0,
+    maxHp: 5,
+    x: 0,
+    y: 0,
+    radius: 12,
+    speedPxPerSec: 60,
+    contactDamage: 1,
+    defeated: true,
+    defeatedAtTick,
+  }
+}
+
+function makeLiveEnemy(id: number): EnemyState {
+  return {
+    id,
+    definitionId: 'enemy-basic',
+    hp: 5,
+    maxHp: 5,
+    x: 0,
+    y: 0,
+    radius: 12,
+    speedPxPerSec: 60,
+    contactDamage: 1,
+    defeated: false,
+    defeatedAtTick: null,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // bootstrap
@@ -52,18 +90,15 @@ describe('GIVEN sortie is idle', () => {
 })
 
 // ---------------------------------------------------------------------------
-// victory
+// AC7: all enemies defeated → victory
 // ---------------------------------------------------------------------------
-describe('GIVEN sortie is running', () => {
-  it('victory: WHEN TARGET_TICKS elapsed THEN outcome=victory, status=victory', () => {
+describe('GIVEN sortie is running and all enemies are defeated', () => {
+  it('AC7: WHEN all spawned enemies defeated THEN outcome=victory, status=victory', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
-    // Advance enough ticks to trigger victory
-    for (let i = 0; i < TARGET_TICKS; i++) {
-      runSortieSystem(state, FDT)
-      state.tick += 1
-    }
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    runSortieSystem(state, FDT)
 
     expect(state.sortie.status).toBe('victory')
     expect(state.sortie.result).not.toBeNull()
@@ -72,10 +107,10 @@ describe('GIVEN sortie is running', () => {
 })
 
 // ---------------------------------------------------------------------------
-// defeat
+// AC8: defeat when player hp reaches 0
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie is running and player hp reaches 0', () => {
-  it('defeat: WHEN player.hp <= 0 THEN outcome=defeat, status=defeat', () => {
+  it('AC8: WHEN player.hp <= 0 THEN outcome=defeat, status=defeat', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -89,17 +124,94 @@ describe('GIVEN sortie is running and player hp reaches 0', () => {
 })
 
 // ---------------------------------------------------------------------------
-// double-result
+// AC9: 30s timeout → defeat
 // ---------------------------------------------------------------------------
-describe('GIVEN sortie already has a result (victory)', () => {
-  it('double-result: WHEN runSortieSystem called again THEN result is not overwritten', () => {
+describe('GIVEN sortie is running and 30s elapses with enemies remaining', () => {
+  it('AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=defeat', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
-    for (let i = 0; i < TARGET_TICKS; i++) {
-      runSortieSystem(state, FDT)
-      state.tick += 1
-    }
+    // Add a live enemy so allEnemiesDefeated is false
+    state.enemies.push(makeLiveEnemy(1))
+
+    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.status).toBe('defeat')
+    expect(state.sortie.result).not.toBeNull()
+    expect(state.sortie.result!.outcome).toBe('defeat')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC10: defeat-precedence — defeat > victory > timeout
+// ---------------------------------------------------------------------------
+describe('GIVEN same tick: player hp=0 AND all enemies defeated', () => {
+  it('AC10: defeat-precedence: THEN outcome=defeat (defeat beats victory)', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+
+    // All enemies defeated → would be victory, but player.hp=0 → defeat wins
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    state.player.hp = 0
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result).not.toBeNull()
+    expect(state.sortie.result!.outcome).toBe('defeat')
+  })
+})
+
+describe('GIVEN same tick: player hp=0, all enemies defeated, AND elapsedTicks >= targetTicks', () => {
+  it('AC10: defeat-precedence: THEN outcome=defeat (defeat beats victory and timeout)', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    state.player.hp = 0
+    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result!.outcome).toBe('defeat')
+  })
+})
+
+describe('GIVEN same tick: all enemies defeated AND elapsedTicks >= targetTicks, player alive', () => {
+  it('AC10: victory-over-timeout: THEN outcome=victory (victory beats timeout)', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    // No player defeat
+    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result!.outcome).toBe('victory')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// vacuous truth: no enemies → no victory
+// ---------------------------------------------------------------------------
+describe('GIVEN sortie is running with no enemies', () => {
+  it('vacuous-truth: WHEN no enemies in array THEN victory does not trigger', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    // No enemies pushed — allEnemiesDefeated must be false (length === 0 guard)
+    runSortieSystem(state, FDT)
+    expect(state.sortie.status).toBe('running')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC11: double-result (result generated exactly once)
+// ---------------------------------------------------------------------------
+describe('GIVEN sortie already has a result (victory)', () => {
+  it('AC11: double-result: WHEN runSortieSystem called again THEN result is not overwritten', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    runSortieSystem(state, FDT)
 
     const firstResult = state.sortie.result
     expect(firstResult).not.toBeNull()
@@ -112,46 +224,22 @@ describe('GIVEN sortie already has a result (victory)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// timer-authority
+// AC12: timer-authority — durationMs uses elapsedTicks, not elapsedMs
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie victory', () => {
-  it('timer-authority: THEN durationMs = elapsedTicks * fixedDeltaMs (not elapsedMs)', () => {
+  it('AC12: timer-authority: THEN durationMs = elapsedTicks * fixedDeltaMs (not elapsedMs)', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
     // Deliberately set elapsedMs to a wrong value to ensure it is NOT used
     state.elapsedMs = 99999
 
-    for (let i = 0; i < TARGET_TICKS; i++) {
-      runSortieSystem(state, FDT)
-      state.tick += 1
-    }
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    runSortieSystem(state, FDT)
 
     expect(state.sortie.result).not.toBeNull()
     const expected = state.sortie.elapsedTicks * FDT
     expect(state.sortie.result!.durationMs).toBeCloseTo(expected)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// defeat-precedence
-// ---------------------------------------------------------------------------
-describe('GIVEN same tick: player hp=0 and elapsedTicks >= targetTicks', () => {
-  it('defeat-precedence: THEN outcome=defeat', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-
-    // Manually advance elapsedTicks to the brink (TARGET_TICKS - 1)
-    // After runSortieSystem increments, it will reach TARGET_TICKS on this call
-    const mutableSortie = state.sortie as { elapsedTicks: number }
-    mutableSortie.elapsedTicks = TARGET_TICKS - 1
-
-    // Player hp = 0 on the same tick -> defeat should win
-    state.player.hp = 0
-    runSortieSystem(state, FDT)
-
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('defeat')
   })
 })
 
@@ -193,7 +281,7 @@ describe('GIVEN sortie result playerHpRemaining', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
     state.player.hp = state.player.maxHp + 999
-    ;(state.sortie as unknown as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    state.enemies.push(makeDefeatedEnemy(1, 0))
     runSortieSystem(state, FDT)
     expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp)
   })
@@ -206,6 +294,17 @@ describe('GIVEN sortie result playerHpRemaining', () => {
     expect(state.sortie.result!.outcome).toBe('defeat')
     expect(state.sortie.result!.playerHpRemaining).toBe(0)
   })
+
+  it('timeout defeat: playerHpRemaining is HP snapshot, not 0', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.player.hp = state.player.maxHp // player alive with full HP
+    state.enemies.push(makeLiveEnemy(1))   // enemies remain → allEnemiesDefeated = false
+    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+    expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp) // NOT 0
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -215,10 +314,6 @@ describe('GIVEN enemies with various defeatedAtTick values', () => {
   it('kills-boundary: THEN only enemies with defeatedAtTick <= terminalTick count as kills', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    // Advance elapsedTicks to TARGET_TICKS - 1 so victory fires on next call
-    const mutableSortie = state.sortie as { elapsedTicks: number }
-    mutableSortie.elapsedTicks = TARGET_TICKS - 1
 
     // Set current tick to 42 (will be the terminalTick when victory is recorded)
     state.tick = 42
@@ -268,21 +363,7 @@ describe('GIVEN enemies with various defeatedAtTick values', () => {
       defeatedAtTick: 43, // > 42, should NOT count
     })
 
-    // Enemy not yet defeated
-    state.enemies.push({
-      id: 4,
-      definitionId: 'enemy-basic',
-      hp: 5,
-      maxHp: 5,
-      x: 0,
-      y: 0,
-      radius: 12,
-      speedPxPerSec: 60,
-      contactDamage: 1,
-      defeated: false,
-      defeatedAtTick: null,
-    })
-
+    // All 3 enemies are defeated → allEnemiesDefeated = true → victory
     runSortieSystem(state, FDT)
 
     expect(state.sortie.result).not.toBeNull()
