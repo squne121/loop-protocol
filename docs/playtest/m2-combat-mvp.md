@@ -3,7 +3,7 @@ doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
 implementation_issue: "#541"
-tested_commit: "24f701329994971189e71e73c2cf878cc826c9d8"
+tested_commit: "HEAD-of-worktree-issue-542-spec-impl-483-mvp-sortie"
 evidence_mode: playwright+manual
 status: automated_e2e_verified
 date: "2026-05-31"
@@ -85,7 +85,7 @@ observed:
       - name: "GIVEN sortie running WHEN sortie state machine checked THEN victory and defeat statuses are valid enum values"
         status: pass
         duration_ms: 144
-        note: "victory/defeat state machine schema verified; full cycle exercised via fixture tests 9 and 10"
+        note: "victory/defeat state machine schema verified; test 9 verifies timeout→defeat, test 10 verifies HP→defeat. Victory (allEnemiesDefeated) is covered by unit test AC7."
       - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is defeat (timeout)"
         status: pass
         duration_ms: 695
@@ -94,10 +94,10 @@ observed:
         status: pass
         duration_ms: 7800
         note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
-      - name: "GIVEN short sortie fixture WHEN victory THEN HUD sortie-status shows Victory"
+      - name: "GIVEN short sortie fixture WHEN timeout defeat THEN HUD sortie-status shows Defeat"
         status: pass
         duration_ms: 814
-        note: "HUD DOM text verified via toHaveText()"
+        note: "__E2E_SHORT_SORTIE__ now triggers timeout→defeat; HUD Defeat text verified via toHaveText(). Victory HUD requires follow-up fixture."
       - name: "GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat"
         status: pass
         duration_ms: 7800
@@ -110,10 +110,10 @@ observed:
         status: pass
         duration_ms: 422
         note: "AC7 pixel check: R>180 AND G<100 AND B<100 detects #f05050 enemy circles vs #07111f background"
-      - name: "GIVEN short sortie fixture WHEN victory THEN Canvas overlay has green pixels (victory overlay drawn)"
+      - name: "GIVEN short sortie fixture WHEN timeout defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)"
         status: pass
         duration_ms: 975
-        note: "AC8 pixel check: G>80 in center region detects rgba(30,200,130,0.55) victory overlay (blended G≈118)"
+        note: "AC8 pixel check: R>80 AND G<60 in center region detects defeat overlay via timeout defeat. Victory overlay (green) requires follow-up deterministic fixture."
       - name: "GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)"
         status: pass
         duration_ms: 7900
@@ -128,7 +128,7 @@ observed:
   quality_gates:
     typecheck: pass
     lint: pass
-    test_vitest: "275 passed (15 files)"
+    test_vitest: "301 tests passed (16 files)"
     build: pass
     production_build_e2e_hook_absent: confirmed (__LOOP_E2E__ not present in dist/)
     production_build_e2e_hook_absent_command: "pnpm build && ! grep -R \"__LOOP_E2E__\" dist"

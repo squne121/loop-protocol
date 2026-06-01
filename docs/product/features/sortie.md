@@ -211,7 +211,8 @@ interface SortieResult {
 | `kills` 算出元 | `defeatedAtTick <= terminalTick` の敵から導出される（terminal tick 以前に defeated 状態になった敵） |
 | `shotsFired` | terminal tick 時点の snapshot（遷移後の変更を反映しない） |
 | `playerHpRemaining` clamp | `[0, player.maxHp]` にクランプされる |
-| defeat 時の HP | `defeat` 時: `playerHpRemaining === 0` |
+| HP defeat 時の HP | `player.hp <= 0` による defeat 時: `playerHpRemaining === 0` |
+| timeout defeat 時の HP | `elapsedTicks >= targetTicks` による defeat 時: `playerHpRemaining === clamp(player.hp)` |
 | 永続化禁止 | result を persistence / resources / upgrades / localStorage / campaign への書き込みに使用しない |
 
 ### Transient Output

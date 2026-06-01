@@ -294,6 +294,17 @@ describe('GIVEN sortie result playerHpRemaining', () => {
     expect(state.sortie.result!.outcome).toBe('defeat')
     expect(state.sortie.result!.playerHpRemaining).toBe(0)
   })
+
+  it('timeout defeat: playerHpRemaining is HP snapshot, not 0', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.player.hp = state.player.maxHp // player alive with full HP
+    state.enemies.push(makeLiveEnemy(1))   // enemies remain → allEnemiesDefeated = false
+    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
+    runSortieSystem(state, FDT)
+    expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp) // NOT 0
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -83,10 +83,11 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
       e.defeatedAtTick <= terminalTick,
   ).length
 
-  const playerHpRemaining =
-    outcome === 'defeat'
-      ? 0
-      : Math.min(state.player.maxHp, Math.max(0, state.player.hp))
+  // playerHpRemaining is 0 only for HP defeat (player.hp <= 0).
+  // timeout defeat and victory retain the actual HP snapshot.
+  const playerHpRemaining = isDefeat
+    ? 0
+    : Math.min(state.player.maxHp, Math.max(0, state.player.hp))
 
   const result = Object.freeze({
     outcome,
