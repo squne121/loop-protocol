@@ -80,6 +80,23 @@ function createBaseManifest(phaseInstanceId: string) {
       local_paths_included: false,
       secret_scan_status: 'clean',
     },
+    secret_policy: {
+      value_exposed: false,
+      mode: 'presence_only',
+      producer_contract: {
+        declared: true,
+        id: 'presence_only_no_secret_values',
+        version: 'v1',
+        claims: {
+          secret_values_not_serialized: true,
+          presence_only: true,
+        },
+      },
+      runtime_boundary: {
+        attested: false,
+        evidence_ref: null,
+      },
+    },
   }
 }
 
