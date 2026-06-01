@@ -5,11 +5,44 @@
  * AC1: ci:session-manifest:12345678:1 is valid
  * AC2: issue-432:impl:001 is still valid (backward compat)
  * AC3: malformed CI IDs are rejected
+ * AC4: generator CLI accepts ci:session-manifest:12345678:1 with --validate
+ * AC5: generator help/error text lists both formats
  * AC8: phase_instance_id positive/negative cases in TypeScript tests
  */
+import { execFileSync } from 'child_process'
+import { resolve } from 'path'
 import { describe, expect, it } from 'vitest'
 
 import { validateManifestAgainstSchema } from '../scripts/lib/agent-session-manifest-validation.mjs'
+
+const REPO_ROOT = resolve(__dirname, '..')
+const SCRIPTS_DIR = resolve(REPO_ROOT, 'scripts')
+
+function runProducerCLI(args: string[]): { stdout: string; stderr: string; exitCode: number } {
+  try {
+    const stdout = execFileSync(process.execPath, [resolve(SCRIPTS_DIR, 'generate-session-manifest.mjs'), ...args], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    return { stdout, stderr: '', exitCode: 0 }
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; status?: number }
+    return { stdout: err.stdout || '', stderr: err.stderr || '', exitCode: err.status ?? 1 }
+  }
+}
+
+const BASE_PRODUCER_ARGS = [
+  '--repository', 'squne121/loop-protocol',
+  '--phase-main-loop', 'impl',
+  '--phase-ledger-phase', 'post_commit_verification',
+  '--actor-type', 'github_action',
+  '--actor-name', 'session-manifest-workflow',
+  '--evidence-source-kind', 'ci_check',
+  '--evidence-source-ref', 'https://github.com/squne121/loop-protocol/actions/runs/12345678',
+  '--evidence-visibility', 'private_artifact',
+  '--format', 'json',
+  '--validate',
+]
 
 function createBaseManifest(phaseInstanceId: string) {
   return {
@@ -138,5 +171,59 @@ describe('phase_instance_id — CI-native format (AC1, AC2, AC3, AC8)', () => {
     const result = validateManifestAgainstSchema(manifest)
     expect(result.valid).toBe(false)
     expect(result.errors.some((e) => e.path.includes('phase_instance_id') || e.path.includes('/phase'))).toBe(true)
+  })
+})
+
+describe('phase_instance_id — generator CLI integration (AC4, AC5)', () => {
+  // AC4: generator CLI accepts ci:session-manifest:12345678:1 with --validate
+  it('GIVEN CI-native phase_instance_id ci:session-manifest:12345678:1 WHEN generator --validate THEN exits 0 with valid manifest', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'ci:session-manifest:12345678:1'])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.phase.phase_instance_id).toBe('ci:session-manifest:12345678:1')
+  })
+
+  it('GIVEN legacy phase_instance_id issue-432:impl:001 WHEN generator --validate THEN exits 0 (backward compat)', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'issue-432:impl:001'])
+    expect(result.exitCode).toBe(0)
+    const manifest = JSON.parse(result.stdout)
+    expect(manifest.phase.phase_instance_id).toBe('issue-432:impl:001')
+  })
+
+  // AC4 negative: invalid CI IDs are rejected by generator validation
+  it('GIVEN run_id=0 ci:session-manifest:0:1 WHEN generator --validate THEN exits non-zero', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'ci:session-manifest:0:1'])
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('phase_instance_id')
+  })
+
+  it('GIVEN run_attempt=0 ci:session-manifest:12345678:0 WHEN generator --validate THEN exits non-zero', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'ci:session-manifest:12345678:0'])
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('phase_instance_id')
+  })
+
+  it('GIVEN space in slug ci:session manifest:12345678:1 WHEN generator --validate THEN exits non-zero', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'ci:session manifest:12345678:1'])
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('phase_instance_id')
+  })
+
+  // AC5: help text and invalid-format error list both formats
+  it('GIVEN --help flag WHEN running generator THEN output lists issue-<N>:<phase>:<seq> format', () => {
+    const result = runProducerCLI(['--help'])
+    expect(result.stdout + result.stderr).toContain('issue-<N>:<phase>:<seq>')
+  })
+
+  it('GIVEN --help flag WHEN running generator THEN output lists ci:<producer_slug>:<run_id>:<run_attempt> format', () => {
+    const result = runProducerCLI(['--help'])
+    expect(result.stdout + result.stderr).toContain('ci:<producer_slug>:<run_id>:<run_attempt>')
+  })
+
+  it('GIVEN invalid phase_instance_id WHEN generator runs THEN error message lists both accepted formats', () => {
+    const result = runProducerCLI([...BASE_PRODUCER_ARGS, '--phase-instance-id', 'invalid-format'])
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('issue-')
+    expect(result.stderr).toContain('ci:')
   })
 })
