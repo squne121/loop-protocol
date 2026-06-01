@@ -737,3 +737,228 @@ class TestClosedCandidateReported:
         assert "closed_not_planned" in nmr, (
             f"Expected 'closed_not_planned' in non_mergeable_reasons, got: {nmr}"
         )
+
+
+# ---------------------------------------------------------------------------
+# #550: structured scope_context generalises collision detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def issues_547_549_same_schema_disjoint_anchor_json(tmp_path: Path) -> str:
+    """Fixture modelled on the real #547 / #549 collision.
+
+    Both issues touch the SAME schema file but target disjoint sub-file anchors:
+    - #547 extends the `phase_instance_id` pattern
+    - #549 adds `/required` to `secret_policy`
+
+    They also incidentally share a security-adjacent keyword ("permission") so we can
+    assert that the keyword is recorded for audit but does NOT drive escalation.
+    """
+    schema_path = "- `.claude/skills/some-skill/schema/contract.schema.json`\n"
+    issues = [
+        {
+            "number": 547,
+            "title": "実装: phase_instance_id を CI-native 形式に拡張する",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\n"
+                "`phase_instance_id` の `/properties/phase_instance_id/pattern` を拡張する。\n"
+                "permission 関連の挙動は変更しない。\n"
+            ),
+        },
+        {
+            "number": 549,
+            "title": "実装: secret_policy に root required を追加する",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\n"
+                "`secret_policy` に `/required` を追加する。\n"
+                "permission boundary は据え置き。\n"
+            ),
+        },
+    ]
+    p = tmp_path / "issues_547_549.json"
+    p.write_text(json.dumps(issues), encoding="utf-8")
+    return str(p)
+
+
+@pytest.fixture()
+def issues_same_anchor_conflict_json(tmp_path: Path) -> str:
+    """Fixture: two issues both modifying the SAME sub-file anchor (`/required`)."""
+    schema_path = "- `.claude/skills/some-skill/schema/contract.schema.json`\n"
+    issues = [
+        {
+            "number": 910,
+            "title": "実装: schema の root required に field A を追加する",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\n"
+                "`/required` に field A を追加する。\n"
+            ),
+        },
+        {
+            "number": 911,
+            "title": "実装: schema の root required から field B を削除する",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\n"
+                "`/required` から field B を削除する。\n"
+            ),
+        },
+    ]
+    p = tmp_path / "issues_same_anchor_conflict.json"
+    p.write_text(json.dumps(issues), encoding="utf-8")
+    return str(p)
+
+
+@pytest.fixture()
+def issues_exact_same_file_no_anchor_json(tmp_path: Path) -> str:
+    """Fixture: exact same Allowed Paths but NO machine-readable sub-file anchors.
+
+    Disjointness cannot be proven, so the classifier must fail-safe to `uncertain`.
+    """
+    schema_path = "- `.claude/skills/some-skill/schema/contract.schema.json`\n"
+    issues = [
+        {
+            "number": 920,
+            "title": "実装: schema を更新する A",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\nスキーマを更新する。\n"
+            ),
+        },
+        {
+            "number": 921,
+            "title": "実装: schema を更新する B",
+            "body": (
+                "## Allowed Paths\n"
+                + schema_path
+                + "\n## Outcome\nスキーマを別の観点で更新する。\n"
+            ),
+        },
+    ]
+    p = tmp_path / "issues_exact_same_file_no_anchor.json"
+    p.write_text(json.dumps(issues), encoding="utf-8")
+    return str(p)
+
+
+class TestScopeContextGeneralisation:
+    """#550: collision detection is driven by structured scope_context, not keyword match."""
+
+    def test_scope_rollup_treats_schema_property_keyword_as_metadata_not_domain_specific_risk(
+        self,
+        issues_547_549_same_schema_disjoint_anchor_json: str,
+        empty_prs_json: str,
+    ) -> None:
+        """AC4: #547/#549-style — same schema file, disjoint anchors, shared keyword.
+
+        The shared security-adjacent keyword and schema property names must be recorded
+        for audit (domain_flags / security_match_evidence) but MUST NOT cause
+        human_review_required. The conflict is classified as same_file_disjoint_anchor.
+        """
+        plan = _run(
+            issues_547_549_same_schema_disjoint_anchor_json,
+            empty_prs_json,
+            current_issue_number=547,
+        )
+        candidates = [c for c in plan["candidates"] if c.get("number") == 549]
+        assert candidates, "Expected #549 to appear as a candidate of #547"
+        c = candidates[0]
+
+        # The escalation must NOT fire from a keyword / property-name match alone.
+        assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"Keyword/property-name match must not escalate; got {c['suggested_action']!r}"
+        )
+
+        sc = c["scope_context"]
+        assert sc["conflict_type"] == rollup.CONFLICT_SAME_FILE_DISJOINT_ANCHOR, (
+            f"Expected same_file_disjoint_anchor, got {sc['conflict_type']!r}"
+        )
+        assert sc["escalation_required"] is False
+
+        # Audit trail is preserved: domain_flags classifies the change areas, and the
+        # security keyword is still recorded in security_match_evidence (AC7 additive).
+        assert rollup.DOMAIN_SCHEMA in sc["domain_flags"] or rollup.DOMAIN_METADATA in sc["domain_flags"], (
+            f"Expected schema/metadata in domain_flags for audit, got {sc['domain_flags']!r}"
+        )
+        assert "permission" in c.get("security_match_evidence", []), (
+            "Security keyword must still be recorded for audit even when not escalated"
+        )
+
+    def test_scope_rollup_escalates_uncertain_or_boundary_affecting_changes(
+        self,
+        issues_same_anchor_conflict_json: str,
+        issues_exact_same_file_no_anchor_json: str,
+        empty_prs_json: str,
+    ) -> None:
+        """AC5: genuine conflicts escalate.
+
+        Two escalation paths are covered:
+        1. boundary-affecting: both issues modify the SAME sub-file anchor (`/required`)
+           -> same_anchor_conflicting_operation -> human_review_required
+        2. uncertain: exact same file with no machine-readable anchors to prove
+           disjointness -> uncertain -> human_review_required (fail-safe)
+        """
+        # Path 1: same sub-file anchor -> conflicting operation
+        plan_conflict = _run(
+            issues_same_anchor_conflict_json,
+            empty_prs_json,
+            current_issue_number=910,
+        )
+        conflict_candidates = [c for c in plan_conflict["candidates"] if c.get("number") == 911]
+        assert conflict_candidates, "Expected #911 to appear as a candidate of #910"
+        cc = conflict_candidates[0]
+        assert cc["scope_context"]["conflict_type"] == rollup.CONFLICT_SAME_ANCHOR_CONFLICTING_OP, (
+            f"Expected same_anchor_conflicting_operation, got {cc['scope_context']['conflict_type']!r}"
+        )
+        assert cc["scope_context"]["escalation_required"] is True
+        assert cc["suggested_action"] == rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"Same-anchor conflict must escalate; got {cc['suggested_action']!r}"
+        )
+
+        # Path 2: exact same file, no anchors -> uncertain -> escalate
+        plan_uncertain = _run(
+            issues_exact_same_file_no_anchor_json,
+            empty_prs_json,
+            current_issue_number=920,
+        )
+        uncertain_candidates = [c for c in plan_uncertain["candidates"] if c.get("number") == 921]
+        assert uncertain_candidates, "Expected #921 to appear as a candidate of #920"
+        uc = uncertain_candidates[0]
+        assert uc["scope_context"]["conflict_type"] == rollup.CONFLICT_UNCERTAIN, (
+            f"Expected uncertain, got {uc['scope_context']['conflict_type']!r}"
+        )
+        assert uc["suggested_action"] == rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"Uncertain conflict must escalate; got {uc['suggested_action']!r}"
+        )
+
+    def test_scope_context_and_ordering_constraint_are_additive_fields(
+        self,
+        issues_547_549_same_schema_disjoint_anchor_json: str,
+        empty_prs_json: str,
+    ) -> None:
+        """AC1/AC2/AC3/AC7: new fields are present and legacy fields are preserved."""
+        plan = _run(
+            issues_547_549_same_schema_disjoint_anchor_json,
+            empty_prs_json,
+            current_issue_number=547,
+        )
+        assert plan["candidates"], "Expected candidates"
+        c = plan["candidates"][0]
+        # AC1/AC2: scope_context with domain_flags
+        assert "scope_context" in c
+        assert "domain_flags" in c["scope_context"]
+        # AC3: ordering_constraint is a separate top-level candidate field
+        assert "ordering_constraint" in c
+        assert c["ordering_constraint"] != c["suggested_action"], (
+            "ordering_constraint must be a distinct concern from suggested_action"
+        )
+        # AC7: legacy fields preserved (additive extension)
+        for legacy_field in ("kind", "number", "confidence", "signals", "suggested_action", "dedupe_key"):
+            assert legacy_field in c, f"Legacy field {legacy_field!r} must be preserved"

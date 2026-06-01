@@ -67,6 +67,20 @@ SECURITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Domain flag categories for audit purposes (not used for escalation decisions)
+DOMAIN_SECURITY = "security"
+DOMAIN_SCHEMA = "schema"
+DOMAIN_METADATA = "metadata"
+DOMAIN_WORKFLOW = "workflow"
+DOMAIN_RUNTIME = "runtime"
+DOMAIN_DOCS = "docs"
+
+# Conflict types for scope_context
+CONFLICT_SAME_ANCHOR_CONFLICTING_OP = "same_anchor_conflicting_operation"
+CONFLICT_SAME_FILE_DISJOINT_ANCHOR = "same_file_disjoint_anchor"
+CONFLICT_UNCERTAIN = "uncertain"
+CONFLICT_NONE = "none"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -228,6 +242,213 @@ def _is_security_related(item: dict[str, Any]) -> bool:
     return bool(_security_match_evidence(item))
 
 
+def _classify_domain_flags(item: dict[str, Any]) -> list[str]:
+    """Classify domain flags for audit purposes.
+
+    Returns a list of domain categories that describe the change areas.
+    These are audit-only and do NOT drive escalation decisions.
+    Specifically, schema property names or metadata field names that contain
+    security-adjacent words (e.g. "secret_policy") are classified as
+    schema/metadata domains, NOT as security domain risks.
+    """
+    flags: list[str] = []
+    body = _body_text(item)
+    title = str(_extract_field(item, "title", default=""))
+    combined = (title + " " + body).lower()
+    allowed_paths = _extract_allowed_paths(item)
+    paths_text = " ".join(allowed_paths).lower()
+
+    # Security domain: triggered by real security keywords in context
+    if _is_security_related(item):
+        flags.append(DOMAIN_SECURITY)
+
+    # Schema domain: JSON schema, YAML schema, data structure definitions
+    schema_re = re.compile(
+        r"\b(schema|json[_ -]?schema|yaml[_ -]?schema|data[_ -]?model|struct|type[_ -]?def)\b",
+        re.IGNORECASE,
+    )
+    if schema_re.search(combined) or schema_re.search(paths_text):
+        flags.append(DOMAIN_SCHEMA)
+
+    # Metadata domain: configuration, policy files, field names, property names
+    metadata_re = re.compile(
+        r"\b(metadata|config|policy|settings|properties|fields|attributes|frontmatter)\b",
+        re.IGNORECASE,
+    )
+    if metadata_re.search(combined) or metadata_re.search(paths_text):
+        flags.append(DOMAIN_METADATA)
+
+    # Workflow domain: CI/CD, orchestrator, loop, agent workflow
+    workflow_re = re.compile(
+        r"\b(workflow|orchestrat|loop|pipeline|ci[_/]?cd|github[_ -]?action)\b",
+        re.IGNORECASE,
+    )
+    if workflow_re.search(combined) or workflow_re.search(paths_text):
+        flags.append(DOMAIN_WORKFLOW)
+
+    # Runtime domain: .claude/skills/, src/, tests/, scripts/
+    runtime_path_prefixes = (".claude/skills", "src/", "tests/", "scripts/")
+    if any(rp in paths_text for rp in runtime_path_prefixes):
+        flags.append(DOMAIN_RUNTIME)
+
+    # Docs domain: docs/ files
+    if "docs/" in paths_text:
+        flags.append(DOMAIN_DOCS)
+
+    return sorted(set(flags))
+
+
+# Regex for extracting sub-file anchors from issue/PR text.
+# JSON Pointer-like tokens (RFC 6901 style): /required, /properties/foo/pattern.
+# The negative lookbehind prevents matching slashes inside file paths or URLs
+# (e.g. ".claude/skills/foo.py", "https://github.com/...") where the slash is
+# preceded by a word character or backtick.
+_JSON_POINTER_RE = re.compile(r"(?<![\w`])/[A-Za-z_][\w./-]*")
+# Backtick-quoted anchors: property / field / symbol names (`phase_instance_id`,
+# `secret_policy`) or backtick-wrapped JSON Pointers (`/required`,
+# `/properties/foo/pattern`). The optional leading slash captures pointers that the
+# bare _JSON_POINTER_RE skips because the preceding backtick is in its lookbehind set.
+_BACKTICK_TOKEN_RE = re.compile(r"`(/?[A-Za-z_][\w./\-]*)`")
+
+
+def _extract_anchor_tokens(item: dict[str, Any]) -> set[str]:
+    """Extract sub-file anchor tokens from an issue/PR body.
+
+    Anchors are structural positions *within* a file that a change targets:
+    - JSON Pointers (RFC 6901 style): /required, /properties/foo/pattern
+    - Backtick-quoted property / field / symbol names: `phase_instance_id`
+
+    These let us distinguish "same file, different anchor" (disjoint, safe — e.g.
+    #547 extends phase_instance_id while #549 adds /required to secret_policy) from
+    "same file, same anchor" (conflicting operation, escalate).
+
+    This is intentionally a lightweight text scan. AST / tree-sitter anchoring is
+    out of scope and tracked as a follow-up.
+    """
+    body = _body_text(item)
+    title = str(_extract_field(item, "title", default=""))
+    combined = title + "\n" + body
+    tokens: set[str] = set()
+    for m in _JSON_POINTER_RE.finditer(combined):
+        tokens.add(m.group(0).rstrip("/.,):;").lower())
+    for m in _BACKTICK_TOKEN_RE.finditer(combined):
+        tok = m.group(1)
+        # Skip backtick spans that are file paths (have an extension) — those are
+        # anchor_paths, not sub-file anchors. (Paths starting with "." are already
+        # excluded by the leading [A-Za-z_] requirement in the regex.)
+        if re.search(r"\.[A-Za-z0-9]+$", tok):
+            continue
+        tokens.add(tok.lower())
+    return tokens
+
+
+def _build_scope_context(
+    current: dict[str, Any],
+    item: dict[str, Any],
+    matched_paths: list[str],
+    current_paths: frozenset[str],
+    item_paths: frozenset[str],
+) -> dict[str, Any]:
+    """Build scope_context for a candidate pair.
+
+    scope_context captures the structural relationship between the current issue
+    and a candidate, including:
+    - anchor_paths: overlapping file paths (structural positions)
+    - conflicting_anchors: shared sub-file anchors (JSON Pointers / property names)
+    - domain_flags: semantic categories (audit-only, NOT used for escalation)
+    - conflict_type: nature of the collision
+    - escalation_required: true only for genuine structural conflicts
+
+    Escalation policy (the core of #550):
+    - Keyword-only / domain matches (e.g. "secret_policy" property name appearing in
+      both issues, or a shared security keyword) do NOT constitute genuine conflicts.
+      They are recorded in domain_flags / security_match_evidence for audit only.
+    - same file + shared sub-file anchor -> same_anchor_conflicting_operation -> escalate
+    - same file + disjoint sub-file anchors -> same_file_disjoint_anchor -> no escalate
+      (this is the #547/#549 case)
+    - exact same file set with NO machine-readable anchors to prove disjointness ->
+      uncertain -> escalate (fail-safe; we cannot confirm the changes are independent)
+    - partial path intersection without anchors -> same_file_disjoint_anchor -> no escalate
+    """
+    domain_flags = _classify_domain_flags(item)
+
+    if not matched_paths:
+        return {
+            "anchor_paths": [],
+            "conflicting_anchors": [],
+            "domain_flags": domain_flags,
+            "conflict_type": CONFLICT_NONE,
+            "escalation_required": False,
+        }
+
+    exact_same_files = bool(current_paths) and bool(item_paths) and current_paths == item_paths
+
+    current_anchors = _extract_anchor_tokens(current)
+    item_anchors = _extract_anchor_tokens(item)
+    shared_anchors = sorted(current_anchors & item_anchors)
+
+    if current_anchors and item_anchors:
+        if shared_anchors:
+            # Both target the same sub-file region — genuine conflicting operation.
+            conflict_type = CONFLICT_SAME_ANCHOR_CONFLICTING_OP
+            escalation_required = True
+        else:
+            # Same file(s), but disjoint sub-file anchors — independent changes.
+            # This is the #547/#549 pattern that must NOT escalate.
+            conflict_type = CONFLICT_SAME_FILE_DISJOINT_ANCHOR
+            escalation_required = False
+    elif exact_same_files:
+        # Exact same file set but no machine-readable anchors to prove disjointness.
+        # Cannot confirm independence -> fail-safe to human review.
+        conflict_type = CONFLICT_UNCERTAIN
+        escalation_required = True
+    else:
+        # Partial path intersection without anchors — different file scopes overlap;
+        # treat as disjoint to avoid false escalation.
+        conflict_type = CONFLICT_SAME_FILE_DISJOINT_ANCHOR
+        escalation_required = False
+
+    return {
+        "anchor_paths": matched_paths,
+        "conflicting_anchors": shared_anchors,
+        "domain_flags": domain_flags,
+        "conflict_type": conflict_type,
+        "escalation_required": escalation_required,
+    }
+
+
+def _determine_ordering_constraint(
+    current: dict[str, Any],
+    item: dict[str, Any],
+    signals: list[str],
+    confidence: str,
+) -> str:
+    """Determine ordering constraint between current issue and candidate.
+
+    Returns one of:
+    - "current_first": current issue should be merged/closed before candidate
+    - "candidate_first": candidate should be merged/closed before current issue
+    - "parallel_ok": both can proceed in parallel
+    - "sequential_required": one must complete before the other (order TBD by human)
+
+    This is a separate concern from suggested_action (what to do) and represents
+    the temporal ordering recommendation.
+    """
+    if confidence == CONFIDENCE_HIGH:
+        if SIGNAL_SHARED_DEDUPE_KEY in signals:
+            return "parallel_ok"  # deduplication means they're the same change
+        if SIGNAL_SAME_PARENT_ISSUE in signals:
+            return "sequential_required"
+        return "parallel_ok"
+
+    if confidence == CONFIDENCE_MEDIUM:
+        if SIGNAL_SAME_PARENT_ISSUE in signals:
+            return "sequential_required"
+        return "parallel_ok"
+
+    return "parallel_ok"
+
+
 def _determine_confidence(signals: list[str]) -> str:
     """
     Determine confidence level based on active signals.
@@ -294,10 +515,27 @@ def _suggested_action(
     item: dict[str, Any],
     signals: list[str],
     confidence: str,
+    scope_context: dict[str, Any] | None = None,
 ) -> str:
-    """Choose the appropriate suggested_action for a candidate."""
-    if _is_security_related(item):
-        return ACTION_HUMAN_REVIEW_REQUIRED
+    """Choose the appropriate suggested_action for a candidate.
+
+    Escalation logic (revised from keyword-only to scope_context-based):
+    - Previously: any security keyword match -> human_review_required
+    - Now: escalation is driven by scope_context.escalation_required (structural conflict)
+      OR scope_context.conflict_type == uncertain.
+      Security keywords alone (without structural conflict) are recorded in
+      security_match_evidence for audit but do NOT trigger escalation.
+
+    This prevents false positives where schema property names or metadata field names
+    containing security-adjacent words (e.g. "secret_policy") cause spurious stops.
+    The domain_flags field in scope_context serves as the audit trail for keyword matches.
+    """
+    # Use scope_context for escalation decisions if available
+    if scope_context is not None:
+        if scope_context.get("escalation_required", False):
+            return ACTION_HUMAN_REVIEW_REQUIRED
+        if scope_context.get("conflict_type") == CONFLICT_UNCERTAIN:
+            return ACTION_HUMAN_REVIEW_REQUIRED
 
     if confidence == CONFIDENCE_HIGH:
         if SIGNAL_SHARED_DEDUPE_KEY in signals:
@@ -444,12 +682,27 @@ def _build_candidates(
             continue  # no relationship detected
 
         confidence = _determine_confidence(signals)
-        action = _suggested_action(item, signals, confidence)
+
+        # Build scope_context (structural position + domain classification + conflict type).
+        # Pass the resolved Allowed Paths (item_allowed_paths uses PR `files` for PRs) so
+        # scope_context anchors on the same path set used for signal detection.
+        scope_context = _build_scope_context(
+            current,
+            item,
+            matched_paths,
+            current_allowed_paths,
+            item_allowed_paths,
+        )
+
+        action = _suggested_action(item, signals, confidence, scope_context)
+
+        # ordering_constraint: separate from suggested_action (temporal ordering concern)
+        ordering_constraint = _determine_ordering_constraint(current, item, signals, confidence)
 
         # dedupe_key for the candidate itself
         candidate_dedupe_key = item_dedupe_key or f"{kind}-{item_number}"
 
-        # Security evidence (B4)
+        # Security evidence (B4) — kept for audit/backward-compat, not used for escalation
         sec_evidence = _security_match_evidence(item)
 
         # Non-mergeable reasons (closed issues/PRs from --state all)
@@ -466,6 +719,8 @@ def _build_candidates(
             "signals": signals,
             "matched_paths": matched_paths,
             "suggested_action": action,
+            "scope_context": scope_context,
+            "ordering_constraint": ordering_constraint,
         }
         if sec_evidence:
             entry["security_match_evidence"] = sec_evidence
