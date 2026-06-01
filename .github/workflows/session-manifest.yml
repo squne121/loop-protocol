@@ -22,17 +22,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: '11.1.2'
 
@@ -98,7 +98,7 @@ jobs:
           echo "PASS: belt-and-suspenders public-safe check complete"
 
       - name: Upload session manifest artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agent-session-manifest-${{ github.run_id }}
           path: artifacts/agent-session-manifest-ci.json
