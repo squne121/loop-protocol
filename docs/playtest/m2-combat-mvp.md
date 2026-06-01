@@ -85,20 +85,21 @@ observed:
         status: pass
         duration_ms: 144
         note: "victory/defeat state machine schema verified; full cycle exercised via fixture tests 9 and 10"
-      - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is victory"
+      - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is defeat (timeout)"
         status: pass
         duration_ms: 695
-        note: "__E2E_SHORT_SORTIE__ fixture overrides targetTicks to ~30 ticks (0.5s); victory state machine verified end-to-end"
+        note: "__E2E_SHORT_SORTIE__ fixture overrides targetTicks to ~30 ticks (0.5s); timeout→defeat state machine verified end-to-end. Victory (allEnemiesDefeated) is covered by unit tests."
       - name: "GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat"
         status: pass
         duration_ms: 7800
         note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
   victory_defeat_state_evidence:
     method: "E2E deterministic fixture tests (tests 9 and 10)"
-    note: "120s real-time victory replaced by short_sortie fixture (targetTicks≈30); defeat replaced by 1HP player fixture. Both state machine transitions verified end-to-end."
+    note: "Timeout→defeat verified by short_sortie fixture (targetTicks≈30); HP→defeat verified by 1HP player fixture. Victory (allEnemiesDefeated) covered by unit tests (sortie-system.test.ts AC7)."
     full_cycle_tested: true
-    victory_method: "__E2E_SHORT_SORTIE__ fixture (0.5s sortie duration)"
-    defeat_method: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture (first contact triggers defeat)"
+    victory_method: "unit test: allEnemiesDefeated guard (sortie-system.test.ts AC7)"
+    timeout_defeat_method: "__E2E_SHORT_SORTIE__ fixture (0.5s sortie duration → timeout → defeat)"
+    hp_defeat_method: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture (first contact triggers defeat)"
   quality_gates:
     typecheck: pass
     lint: pass
@@ -112,8 +113,8 @@ observed:
 
 ```yaml
 unknowns:
-  - item: "victory condition full cycle — RESOLVED via short_sortie fixture"
-    detail: "120 秒リアルタイム勝利は E2E の時間制約上スキップ。短縮 sortie fixture（__E2E_SHORT_SORTIE__）で targetTicks≈30 に上書きし、0.5s で victory 遷移を自動検証済み（test 9）。"
+  - item: "victory condition full cycle — RESOLVED via unit test (allEnemiesDefeated)"
+    detail: "勝利条件は敵機全滅（allEnemiesDefeated）。unit test (AC7) で全敵撃破→victory 遷移を検証済み。E2E での全敵撃破勝利は時間制約・AI挙動の不確定性により自動化困難なため unit test でカバー。"
   - item: "defeat condition full cycle — RESOLVED via 1HP fixture"
     detail: "player.hp が 0 になるまでの自然経過は E2E の時間制約上スキップ。1HP fixture（__E2E_PLAYER_HP_OVERRIDE__=1）で最初の enemy 接触で defeat 遷移を自動検証済み（test 10）。"
   - item: "UX feel of combat feedback"
@@ -171,13 +172,14 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 
 ### Victory Condition
 
-- [ ] **victory**: After all enemies in the wave are defeated, sortie transitions to `victory` status
-- [ ] **Victory screen/HUD**: UI updates to reflect victory outcome
+- [ ] **victory**: When all spawned enemies are defeated, sortie transitions to `victory` status
+- [ ] **Victory screen/HUD**: UI updates to reflect `sortie.status === "victory"` outcome
 
 ### Defeat Condition
 
-- [ ] **defeat**: When player HP reaches 0, sortie transitions to `defeat` status
-- [ ] **Defeat screen/HUD**: UI updates to reflect defeat outcome
+- [ ] **defeat (HP)**: When player HP reaches 0, sortie transitions to `defeat` status
+- [ ] **defeat (timeout)**: When 30 seconds elapse with enemies remaining, sortie transitions to `defeat` status
+- [ ] **Defeat screen/HUD**: UI updates to reflect `sortie.status === "defeat"` outcome
 
 ## AC Verification Summary
 

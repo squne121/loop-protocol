@@ -375,11 +375,13 @@ test('GIVEN sortie running WHEN sortie state machine checked THEN victory and de
   })
 })
 
-test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is victory', async ({
+test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is defeat (timeout)', async ({
   page,
 }) => {
   test.setTimeout(15_000)
   // Inject short-sortie flag before page load (targetTicks ≈ 30 ticks / 0.5s)
+  // With the new victory condition (allEnemiesDefeated), timer reaching targetTicks
+  // results in defeat (timeout), not victory. Victory requires all enemies to be defeated.
   await page.addInitScript(() => {
     ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
   })
@@ -393,10 +395,10 @@ test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is vi
       },
       { timeout: 10_000, intervals: [100] },
     )
-    .toBe('victory')
+    .toBe('defeat')
 
   const finalState = await getGameState(page)
-  expect(finalState.sortie.result).toBe('victory')
+  expect(finalState.sortie.result).toBe('defeat')
 })
 
 test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat', async ({

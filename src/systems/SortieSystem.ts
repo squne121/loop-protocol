@@ -8,8 +8,8 @@ import { runProjectileSystem } from './ProjectileSystem'
 import { runCollisionSystem } from './CollisionSystem'
 import { resolveCombatCollisions } from './CombatSystem'
 
-/** Total sortie duration in milliseconds (120 seconds). */
-export const SORTIE_DURATION_MS = 120_000
+/** Total sortie duration in milliseconds (30 seconds). */
+export const SORTIE_DURATION_MS = 30_000
 
 /**
  * Initialises the sortie state machine from `idle` to `running`.
@@ -36,9 +36,11 @@ export function startSortie(state: GameState, fixedDeltaMs: number): void {
 /**
  * Advances the sortie state machine by one fixed timestep.
  *
- * Victory / defeat determination:
- * - Defeat is checked first (defeat takes precedence when both conditions hold simultaneously).
- * - Victory: `elapsedTicks >= targetTicks` after increment.
+ * Terminal condition priority: defeat > victory > timeout
+ * - defeat:  `player.hp <= 0`
+ * - victory: all spawned enemies defeated (`state.enemies.length > 0 && every(e => e.defeated)`)
+ *            `state.enemies.length > 0` guard prevents vacuous truth when no enemies have spawned yet.
+ * - timeout: `elapsedTicks >= targetTicks` with enemies remaining → treated as defeat
  * - `durationMs` is derived from `elapsedTicks * fixedDeltaMs` — never from `state.elapsedMs`.
  *
  * Terminal gate: if `status` is not `'running'`, the function returns immediately without mutation.
@@ -61,15 +63,18 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   // Capture terminalTick consistent with #488: defeatedAtTick = state.tick before increment
   const terminalTick = state.tick
 
-  // AC14: defeat precedence — check defeat first
+  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → defeat)
   const isDefeat = state.player.hp <= 0
-  const isVictory = elapsedTicks >= targetTicks
+  const allEnemiesDefeated =
+    state.enemies.length > 0 && state.enemies.every((e) => e.defeated)
+  const isVictory = allEnemiesDefeated
+  const isTimeout = elapsedTicks >= targetTicks
 
-  if (!isDefeat && !isVictory) {
+  if (!isDefeat && !isVictory && !isTimeout) {
     return
   }
 
-  const outcome: 'victory' | 'defeat' = isDefeat ? 'defeat' : 'victory'
+  const outcome: 'victory' | 'defeat' = isDefeat ? 'defeat' : isVictory ? 'victory' : 'defeat'
 
   const kills = state.enemies.filter(
     (e) =>

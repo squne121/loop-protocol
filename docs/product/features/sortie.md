@@ -26,7 +26,7 @@ trace_links:
 
 ## Intent
 
-`docs/product/features/sortie.md` は、1 回の戦闘（Sortie）の開始から終了（120秒生存または自機HP0）までの状態遷移、固定タイムステップタイマーの管理、および Transient Result Object の生成ルールを定義する正本である。永続化・UIレイアウト・upgrade・campaign への定義は持たない。
+`docs/product/features/sortie.md` は、1 回の戦闘（Sortie）の開始から終了（敵機全滅による勝利・自機HP0による敗北・30秒タイムアウトによる敗北）までの状態遷移、固定タイムステップタイマーの管理、および Transient Result Object の生成ルールを定義する正本である。永続化・UIレイアウト・upgrade・campaign への定義は持たない。
 
 ---
 
@@ -35,12 +35,13 @@ trace_links:
 本 spec は M2 Combat MVP ゲートのために `docs/product/game-logic.md` の該当範囲を **refine and override** する。
 
 > For M2 Combat MVP, this document refines and overrides `docs/product/game-logic.md`
-> for sortie lifecycle, timer-based victory, and SortieResult persistence semantics.
+> for sortie lifecycle, enemy-elimination victory, timer-based timeout, and SortieResult persistence semantics.
 
 具体的な override 範囲：
 
-- `elapsedTicks >= targetTicks` が M2 における唯一の victory 条件。
-  `REQ-LOGIC-VICTORY-001` の "outpost destruction" / "all enemies destroyed" は M2 スコープ外に据え置き。
+- 敵機全滅（`allEnemiesDefeated`）が M2 における victory 条件。
+  30秒タイムアウトは defeat（timeout）扱い。
+  `REQ-LOGIC-VICTORY-001` の "outpost destruction" は M2 スコープ外に据え置き。
 - SortieResult は transient output であり MUST NOT be persisted in M2.
   `REQ-LOGIC-PERSISTENCE-001` の "snapshot at debrief" / "campaign state" は M2 スコープ外に据え置き。
 - Resource conversion、debrief rewards、progression、upgrade persistence は後続 Issue に委譲。
@@ -53,13 +54,13 @@ trace_links:
 
 ### States
 
-| State     | Role                                         |
-|-----------|----------------------------------------------|
-| `idle`    | 戦闘未開始（初期状態）                        |
-| `running` | 戦闘進行中。elapsedTicks が加算される         |
-| `victory` | Result-latched state（生存達成）              |
-| `defeat`  | Result-latched state（自機HP0）               |
-| `ended`   | Post-result acknowledgement state（結果確認後）|
+| State     | Role                                                      |
+|-----------|-----------------------------------------------------------|
+| `idle`    | 戦闘未開始（初期状態）                                    |
+| `running` | 戦闘進行中。elapsedTicks が加算される                     |
+| `victory` | Result-latched state（敵機全滅）                          |
+| `defeat`  | Result-latched state（自機HP0 または 30秒タイムアウト）   |
+| `ended`   | Post-result acknowledgement state（結果確認後）           |
 
 **重要**: `victory` と `defeat` は **result-latched states であり、final FSM states ではない**。
 これらの状態は戦闘シミュレーションを停止させ、immutable な SortieResult を 1 度だけ生成する。
@@ -73,13 +74,14 @@ They stop combat simulation and expose exactly one immutable SortieResult.
 
 ### Normative Transition Table
 
-| From          | Event / Guard                                   | To        | Notes                                     |
-|---------------|-------------------------------------------------|-----------|-------------------------------------------|
-| `idle`        | `START_SORTIE`                                  | `running` | 戦闘開始。elapsedTicks=0 にリセット       |
-| `running`     | `FIXED_TICK [playerHp <= 0]`                    | `defeat`  | defeat が victory より優先（同一 tick 時も）|
-| `running`     | `FIXED_TICK [elapsedTicks >= targetTicks]`      | `victory` | playerHp > 0 の場合のみ到達              |
-| `victory`     | `ACK_RESULT`                                    | `ended`   | 結果確認。result は変更されない           |
-| `defeat`      | `ACK_RESULT`                                    | `ended`   | 結果確認。result は変更されない           |
+| From          | Event / Guard                                                       | To        | Notes                                                          |
+|---------------|---------------------------------------------------------------------|-----------|----------------------------------------------------------------|
+| `idle`        | `START_SORTIE`                                                      | `running` | 戦闘開始。elapsedTicks=0 にリセット                            |
+| `running`     | `FIXED_TICK [playerHp <= 0]`                                        | `defeat`  | defeat が最優先（同一 tick で他条件と重なっても defeat が勝つ）|
+| `running`     | `FIXED_TICK [allEnemiesDefeated && playerHp > 0]`                   | `victory` | 全敵撃破。`enemies.length > 0` ガードで vacuous truth を防ぐ   |
+| `running`     | `FIXED_TICK [elapsedTicks >= targetTicks && !allEnemiesDefeated]`   | `defeat`  | 30秒タイムアウト → defeat 扱い。victory より低優先             |
+| `victory`     | `ACK_RESULT`                                                        | `ended`   | 結果確認。result は変更されない                                |
+| `defeat`      | `ACK_RESULT`                                                        | `ended`   | 結果確認。result は変更されない                                |
 
 ---
 
@@ -87,19 +89,26 @@ They stop combat simulation and expose exactly one immutable SortieResult.
 
 ### Victory
 
-- Guard: `elapsedTicks >= targetTicks`（かつ `playerHp > 0`）
-- 意味: 120秒相当の固定ティック数を playerHp > 0 の状態で生存した
+- Guard: `state.enemies.length > 0 && state.enemies.every(e => e.defeated)`（かつ `playerHp > 0`）
+- 意味: スポーン済みの敵機をすべて撃破した
+- `state.enemies.length > 0` ガードにより、敵がスポーンしていないティックでの vacuous truth（空配列 `every()` が true になる問題）を防ぐ
 
 ### Defeat
 
-- Guard: `playerHp <= 0`
-- 意味: 自機の HP が 0 以下になった
+- Guard 1: `playerHp <= 0`
+  - 意味: 自機の HP が 0 以下になった
+- Guard 2: `elapsedTicks >= targetTicks`（敵機が残存している場合）
+  - 意味: 30秒のタイムリミットに達したが勝利条件を満たさなかった（timeout defeat）
 
-### 同一 tick での両条件成立時の裁定
+### 優先順位（同一 tick で複数条件成立時）
 
-同一 `FIXED_TICK` で `playerHp <= 0` と `elapsedTicks >= targetTicks` が同時に成立した場合、**defeat が優先**される。
+```
+1. player.hp <= 0       → defeat  （最優先）
+2. allEnemiesDefeated   → victory （次優先）
+3. elapsedTicks >= targetTicks → defeat（timeout・最低優先）
+```
 
-理由: 最終ティックで自機が被弾して HP が 0 になった場合、プレイヤーは生存しておらず victory 条件を充足していない（"player did not survive the terminal tick"）。
+同一 `FIXED_TICK` で複数条件が成立した場合、上記の順序で先に成立した条件が採用される。
 
 ### Normative Per-Tick Evaluation Order
 
@@ -113,7 +122,8 @@ For each FIXED_TICK while sortie.status == "running":
 3. Increment elapsedTicks by 1.
 4. Evaluate terminal guards in this priority:
    a. if player.hp <= 0 -> latch defeat (generate SortieResult, transition to defeat)
-   b. else if elapsedTicks >= targetTicks -> latch victory (generate SortieResult, transition to victory)
+   b. else if enemies.length > 0 && enemies.every(e => e.defeated) -> latch victory (generate SortieResult, transition to victory)
+   c. else if elapsedTicks >= targetTicks -> latch defeat/timeout (generate SortieResult, transition to defeat)
 5. Once a result is latched (sortie.status != "running"):
    - combat, projectile, enemy AI, spawn, and collision systems MUST NOT mutate state
      on subsequent ticks.
@@ -133,11 +143,11 @@ For each FIXED_TICK while sortie.status == "running":
 ### targetTicks の算出
 
 ```
-targetTicks = ceil(120_000 / fixedDeltaMs)
+targetTicks = ceil(30_000 / fixedDeltaMs)
 ```
 
 - `fixedDeltaMs`: 固定タイムステップの 1 ステップ当たりのミリ秒数（アーキテクチャ定数、ADR 0001）
-- 120_000 ms = 120秒
+- 30_000 ms = 30秒（MVP 戦闘時間）
 
 ### durationMs の算出
 
@@ -218,7 +228,7 @@ SortieResult は transient output として定義される。永続化は本 spe
 - **Upgrade / Progression**: 戦闘結果によるリソース獲得、アップグレードロジック
 - **Campaign**: キャンペーンモード、ステージ進行、マップ遷移
 - **Briefing UI**: 戦闘前ブリーフィング、結果表示 UI のレイアウト定義
-- **Outpost destruction / all-enemy-destroyed victory**: M2 スコープ外（game-logic.md 経由で後続 Issue へ）
+- **Outpost destruction**: M2 スコープ外（game-logic.md 経由で後続 Issue へ）
 
 ---
 
