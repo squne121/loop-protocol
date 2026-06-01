@@ -434,3 +434,276 @@ test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status
   const finalState = await getGameState(page)
   expect(finalState.sortie.result).toBe('defeat')
 })
+
+// ---------------------------------------------------------------------------
+// AC13 — Victory / Defeat HUD display (Issue #541)
+// ---------------------------------------------------------------------------
+
+test('GIVEN short sortie fixture WHEN victory THEN HUD sortie-status shows Victory', async ({
+  page,
+}) => {
+  test.setTimeout(15_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  // Wait for victory state machine transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('victory')
+
+  // HUD sortie-status DOM element must read "Victory" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+
+  // HUD sortie-result DOM element must read "Victory" (AC9: same authority as Canvas overlay)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat', async ({
+  page,
+}) => {
+  test.setTimeout(30_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+  })
+  await page.goto('/')
+
+  // Wait for defeat state machine transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 25_000, intervals: [200] },
+    )
+    .toBe('defeat')
+
+  // HUD sortie-status DOM element must read "Defeat" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+
+  // HUD sortie-result DOM element must read "Defeat" (AC9: same authority as Canvas overlay)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progress', async ({
+  page,
+}) => {
+  // GIVEN the sortie is in running state
+  // WHEN the HUD is rendered
+  // THEN data-field="sortie-status" must be "In Progress" (AC4, AC10)
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('In Progress', {
+    timeout: 3000,
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Canvas bitmap visual verification (AC7, AC8) — Issue #541
+// ---------------------------------------------------------------------------
+
+test('GIVEN sortie running WHEN enemy spawns and ticks elapse THEN Canvas has enemy red pixels (enemies drawn)', async ({
+  page,
+}) => {
+  // GIVEN enemies have spawned and at least one render frame has fired
+  // WHEN we sample the Canvas bitmap for enemy pixels
+  // THEN at least one red pixel (R>180, G<100, B<100) must exist
+  //
+  // CanvasRenderer draws alive enemies with fillStyle '#f05050' (R=240, G=80, B=80).
+  // Background is '#07111f' (R=7, G=17, B=31). These are clearly distinct.
+  // Scanning the full canvas avoids false negatives from enemies near the edge.
+  // getImageData operates on physical pixels (canvas.width × canvas.height),
+  // which already accounts for the DPR transform applied by CanvasRenderer.
+
+  // Wait for sortie to be running
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  // Wait for at least one enemy to spawn so the canvas has enemy circles
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.enemies.length
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBeGreaterThan(0)
+
+  // Allow a few extra render frames to propagate
+  const stateAfterEnemy = await getGameState(page)
+  await waitForTicks(page, stateAfterEnemy.tick, 5)
+
+  // Verify canvas has enemy-red pixels: R>180 AND G<100 AND B<100 (AC7)
+  // This distinguishes '#f05050' enemy circles from the '#07111f' background.
+  const hasEnemyRedPixels = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] > 180 && data[i + 1] < 100 && data[i + 2] < 100) {
+        return true
+      }
+    }
+    return false
+  })
+  expect(hasEnemyRedPixels).toBe(true)
+})
+
+test('GIVEN short sortie fixture WHEN victory THEN Canvas overlay has green pixels (victory overlay drawn)', async ({
+  page,
+}) => {
+  // GIVEN the sortie reaches victory via __E2E_SHORT_SORTIE__ fixture
+  // WHEN the CanvasRenderer paints the victory overlay (AC8)
+  // THEN the canvas center region must contain green-dominant pixels
+  //
+  // CanvasRenderer victory overlay: 'rgba(30, 200, 130, 0.55)' blended over '#07111f'.
+  // Blend result approximation: R≈19, G≈118, B≈85.
+  // G>80 distinguishes victory overlay from background (G=17) and defeat overlay.
+  // Scanning canvas.width/4..3w/4, canvas.height/4..3h/4 avoids edge artifacts.
+  // Physical pixel coordinates: canvas.width and canvas.height are DPR-scaled.
+  test.setTimeout(15_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  // Wait for victory transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('victory')
+
+  // Allow a couple of render frames to ensure the overlay is painted.
+  // waitForTicks is not used here because the simulation loop may pause after
+  // the sortie reaches a terminal state; a short fixed wait is sufficient.
+  await page.waitForTimeout(200)
+
+  // Canvas center region must have green-dominant pixels (G>80) from victory overlay (AC8)
+  const hasVictoryGreenPixels = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const w = canvas.width
+    const h = canvas.height
+    const x0 = Math.floor(w / 4)
+    const y0 = Math.floor(h / 4)
+    const scanW = Math.floor(w / 2)
+    const scanH = Math.floor(h / 2)
+    const { data } = ctx.getImageData(x0, y0, scanW, scanH)
+    for (let i = 0; i < data.length; i += 4) {
+      // Victory overlay blends to G≈118; background G=17; threshold 80 is safe
+      if (data[i + 1] > 80) {
+        return true
+      }
+    }
+    return false
+  })
+  expect(hasVictoryGreenPixels).toBe(true)
+
+  // Additionally confirm the HUD victory label is visible (belt-and-suspenders)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Victory', {
+    timeout: 3000,
+  })
+})
+
+test('GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)', async ({
+  page,
+}) => {
+  // GIVEN the player starts with 1HP so first enemy contact triggers defeat
+  // WHEN the CanvasRenderer paints the defeat overlay (AC8)
+  // THEN the canvas center region must contain red-dominant pixels
+  //
+  // CanvasRenderer defeat overlay: 'rgba(220, 60, 60, 0.55)' blended over '#07111f'.
+  // Blend result approximation: R≈124, G≈41, B≈41.
+  // R>80 AND G<60 distinguishes defeat overlay from background (R=7,G=17) and
+  // from victory overlay (G≈118). Enemy red (#f05050, R=240) is gone after defeat.
+  test.setTimeout(30_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+  })
+  await page.goto('/')
+
+  // Wait for defeat transition
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 25_000, intervals: [200] },
+    )
+    .toBe('defeat')
+
+  // Allow a couple of render frames to ensure the overlay is painted.
+  // waitForTicks is not used here because the simulation loop may pause after
+  // the sortie reaches a terminal state; a short fixed wait is sufficient.
+  await page.waitForTimeout(200)
+
+  // Canvas center region must have red-dominant pixels (R>80 AND G<60) from defeat overlay (AC8)
+  const hasDefeatRedPixels = await page.evaluate(() => {
+    const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) return false
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return false
+    const w = canvas.width
+    const h = canvas.height
+    const x0 = Math.floor(w / 4)
+    const y0 = Math.floor(h / 4)
+    const scanW = Math.floor(w / 2)
+    const scanH = Math.floor(h / 2)
+    const { data } = ctx.getImageData(x0, y0, scanW, scanH)
+    for (let i = 0; i < data.length; i += 4) {
+      // Defeat overlay blends to R≈124, G≈41; background R=7,G=17; threshold R>80,G<60 is safe
+      if (data[i] > 80 && data[i + 1] < 60) {
+        return true
+      }
+    }
+    return false
+  })
+  expect(hasDefeatRedPixels).toBe(true)
+
+  // Additionally confirm the HUD defeat label is visible (belt-and-suspenders)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+    timeout: 3000,
+  })
+})

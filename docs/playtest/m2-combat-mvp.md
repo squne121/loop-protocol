@@ -2,9 +2,10 @@
 doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
-tested_commit: "9f87ac91151513110b5d7fd79e6f63f73e2a792a"
+implementation_issue: "#541"
+tested_commit: "24f701329994971189e71e73c2cf878cc826c9d8"
 evidence_mode: playwright+manual
-status: accepted_with_unknowns
+status: automated_e2e_verified
 date: "2026-05-31"
 ---
 
@@ -51,10 +52,10 @@ pnpm build && ! grep -R "__LOOP_E2E__" dist
 ```yaml
 observed:
   e2e_playwright:
-    tests_run: 10
-    tests_passed: 10
+    tests_run: 16
+    tests_passed: 16
     tests_failed: 0
-    duration_ms: 21000
+    duration_ms: 40000
     results:
       - name: "GIVEN app loaded WHEN sortie bootstrap runs THEN sortie.status is running"
         status: pass
@@ -93,6 +94,30 @@ observed:
         status: pass
         duration_ms: 7800
         note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
+      - name: "GIVEN short sortie fixture WHEN victory THEN HUD sortie-status shows Victory"
+        status: pass
+        duration_ms: 814
+        note: "HUD DOM text verified via toHaveText()"
+      - name: "GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat"
+        status: pass
+        duration_ms: 7800
+        note: "HUD DOM text verified via toHaveText()"
+      - name: "GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progress"
+        status: pass
+        duration_ms: 225
+        note: "HUD DOM text verified via toHaveText()"
+      - name: "GIVEN sortie running WHEN enemy spawns and ticks elapse THEN Canvas has enemy red pixels (enemies drawn)"
+        status: pass
+        duration_ms: 422
+        note: "AC7 pixel check: R>180 AND G<100 AND B<100 detects #f05050 enemy circles vs #07111f background"
+      - name: "GIVEN short sortie fixture WHEN victory THEN Canvas overlay has green pixels (victory overlay drawn)"
+        status: pass
+        duration_ms: 975
+        note: "AC8 pixel check: G>80 in center region detects rgba(30,200,130,0.55) victory overlay (blended G≈118)"
+      - name: "GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)"
+        status: pass
+        duration_ms: 7900
+        note: "AC8 pixel check: R>80 AND G<60 in center region detects rgba(220,60,60,0.55) defeat overlay (blended R≈124,G≈41)"
   victory_defeat_state_evidence:
     method: "E2E deterministic fixture tests (tests 9 and 10)"
     note: "120s real-time victory replaced by short_sortie fixture (targetTicks≈30); defeat replaced by 1HP player fixture. Both state machine transitions verified end-to-end."
@@ -102,10 +127,24 @@ observed:
   quality_gates:
     typecheck: pass
     lint: pass
-    test_vitest: "266 tests passed (15 files)"
+    test_vitest: "275 passed (15 files)"
     build: pass
     production_build_e2e_hook_absent: confirmed (__LOOP_E2E__ not present in dist/)
     production_build_e2e_hook_absent_command: "pnpm build && ! grep -R \"__LOOP_E2E__\" dist"
+  issue_541_static_evidence:
+    note: "Issue #541 implementation — CanvasRenderer enemies+overlay and HudController sortie status/kills/duration/result"
+    typecheck: pass
+    lint: pass
+    test_vitest: "275 passed (15 files)"
+    build: pass
+    ac5_grep_regression: "exit 1 (no DOM/Canvas in src/systems/) — expected baseline fail"
+    e2e_hud_display_tests: "3 new tests added (victory HUD, defeat HUD, in-progress HUD)"
+    runtime_verification_decision: immediate
+    runtime_verification_status: "HUD DOM text verified by E2E toHaveText(); Canvas bitmap rendering verified by E2E pixel check (enemy red pixels R>180,G<100,B<100; victory overlay G>80; defeat overlay R>80,G<60)"
+    canvas_pixel_check:
+      enemy_rendering: "R>180 AND G<100 AND B<100 (CanvasRenderer #f05050 vs background #07111f)"
+      victory_overlay: "G>80 in center region (rgba(30,200,130,0.55) blended; G≈118 vs background G=17)"
+      defeat_overlay: "R>80 AND G<60 in center region (rgba(220,60,60,0.55) blended; R≈124,G≈41 vs background R=7)"
 ```
 
 ## Unknowns
@@ -193,4 +232,18 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC8 | pnpm test passes | CI gate | pass |
 | AC9 | pnpm build passes | CI gate | pass |
 
-Note: status is `accepted_with_unknowns` because victory/defeat full-cycle E2E is not exercised (time budget constraint). The state machine schema is verified; full cycle requires manual playtesting.
+### Issue #541 AC Verification (CanvasRenderer + HudController M2 entities)
+
+| AC | Description | Method | Status |
+|----|-------------|--------|--------|
+| AC5 | src/systems no DOM/Canvas dependency | grep regression (exit 1 = pass) | pass |
+| AC6 | pnpm typecheck+lint+test+build | CI gates | pass |
+| AC7 | CanvasRenderer renders enemies with defeated filter | static code review | pass |
+| AC8 | CanvasRenderer shows victory/defeat overlay on result!=null | static code review | pass |
+| AC9 | Canvas overlay and HUD DOM both use result.outcome as authority | static code review | pass |
+| AC10 | HUD shows sortie-status / kills / duration / result as DOM text | E2E selector tests | pass |
+| AC11 | Terminal duration uses result.durationMs; running uses elapsedTicks | static code review | pass |
+| AC12 | Terminal state latched until reset | state machine inherent (no mutation after terminal) | pass |
+| AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
+
+Note: status is `automated_e2e_verified`. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), defeat overlay red-dominant pixels (R>80,G<60). All 16 E2E tests pass. Issue #541 adds Canvas enemy rendering, victory/defeat overlay, and HUD sortie information display.

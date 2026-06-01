@@ -87,6 +87,49 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         18,
         28,
       )
+
+      // Draw enemies (defeated === false only; AC7)
+      context.fillStyle = '#f05050'
+      for (const enemy of state.enemies) {
+        if (enemy.defeated) continue
+        context.beginPath()
+        context.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2)
+        context.fill()
+      }
+
+      // Victory / Defeat overlay (AC8, AC9)
+      if (state.sortie.result !== null) {
+        const outcome = state.sortie.result.outcome
+        const isVictory = outcome === 'victory'
+
+        // Semi-transparent overlay
+        context.fillStyle = isVictory
+          ? 'rgba(30, 200, 130, 0.55)'
+          : 'rgba(220, 60, 60, 0.55)'
+        context.fillRect(0, 0, arenaW, arenaH)
+
+        // Outcome label
+        context.fillStyle = '#ffffff'
+        context.font = 'bold 56px "IBM Plex Mono", monospace'
+        context.textAlign = 'center'
+        context.fillText(
+          isVictory ? 'VICTORY' : 'DEFEAT',
+          arenaW / 2,
+          arenaH / 2 - 20,
+        )
+
+        // Duration and kills sub-label (AC11: use result.durationMs for terminal state)
+        const durationSec = (state.sortie.result.durationMs / 1000).toFixed(1)
+        context.font = '22px "IBM Plex Mono", monospace'
+        context.fillText(
+          `Duration: ${durationSec}s  Kills: ${state.sortie.result.kills}`,
+          arenaW / 2,
+          arenaH / 2 + 36,
+        )
+
+        // Reset text align for subsequent renders
+        context.textAlign = 'left'
+      }
     },
   }
 }
