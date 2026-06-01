@@ -91,7 +91,10 @@ USAGE:
 REQUIRED OPTIONS:
   --repository REPO              Repository name (e.g., squne121/loop-protocol)
   --phase-main-loop PHASE        Main loop phase: issue_create, issue_review, impl, pr_open, pr_review, merge, followup_create
-  --phase-instance-id ID         Phase instance ID format: issue-<N>:<phase>:<seq>
+  --phase-instance-id ID         Phase instance ID. Two formats accepted:
+                                 (1) issue-<N>:<phase>:<seq>  (e.g., issue-377:impl:001)
+                                 (2) ci:<producer_slug>:<run_id>:<run_attempt>  (e.g., ci:session-manifest:12345678:1)
+                                 producer_slug must be a schema-safe fixed slug, NOT a GitHub Actions workflow name.
   --actor-type TYPE              Actor type (producer limited to): ai_agent, github_action
   --actor-name NAME              Actor name
   --evidence-source-kind KIND    Evidence source kind (producer limited to): hook_jsonl, ci_check, artifact
@@ -222,10 +225,13 @@ function validateEvidenceVisibility(value) {
 }
 
 function validatePhaseInstanceId(value) {
-  const pattern = /^issue-[0-9]+:[a-z_]+:[0-9]{3}$/
+  const pattern = /^(?:issue-[0-9]+:[a-z_]+:[0-9]{3}|ci:[a-z0-9_.-]+:[1-9][0-9]*:[1-9][0-9]*)$/
   if (!pattern.test(value)) {
     throw new Error(
-      `Invalid phase_instance_id format: ${value}. Expected format: issue-<N>:<phase>:<seq> (e.g., issue-377:impl:001)`,
+      `Invalid phase_instance_id format: ${value}. Expected one of:\n` +
+        `  (1) issue-<N>:<phase>:<seq>  (e.g., issue-377:impl:001)\n` +
+        `  (2) ci:<producer_slug>:<run_id>:<run_attempt>  (e.g., ci:session-manifest:12345678:1)\n` +
+        `Note: producer_slug must match [a-z0-9_.-]+; run_id and run_attempt must be >= 1 (0 is rejected).`,
     )
   }
 }
