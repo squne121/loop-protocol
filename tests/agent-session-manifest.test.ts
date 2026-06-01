@@ -198,6 +198,26 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     expect(result.errors).toEqual([])
   })
 
+  // AC4: canonical base manifest fixture が root secret_policy を含み validation を pass する
+  it('GIVEN canonical base manifest fixture WHEN validating THEN canonical base manifest includes root secret_policy and passes', () => {
+    const manifest = createBaseManifest()
+    expect(Object.prototype.hasOwnProperty.call(manifest, 'secret_policy')).toBe(true)
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  // AC3: root secret_policy を欠く manifest は schema validation で reject される（core enforcement）
+  it('GIVEN base manifest with root secret_policy removed WHEN validating THEN missing root secret_policy is rejected', () => {
+    const manifest = createBaseManifest()
+    delete (manifest as Record<string, unknown>)['secret_policy']
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(
+      result.errors.some((error) => error.message?.includes("must have required property 'secret_policy'")),
+    ).toBe(true)
+  })
+
   it('GIVEN manifest with valid producer kind WHEN validating THEN valid producer kind manifest is accepted', () => {
     const manifest = {
       ...createBaseManifest(),
