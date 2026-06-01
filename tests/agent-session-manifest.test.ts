@@ -7,6 +7,7 @@
 import { existsSync, readFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
+import { execFileSync } from 'child_process'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -17,6 +18,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SCHEMA_PATH = resolve(__dirname, '../docs/schemas/agent-session-manifest.schema.json')
+const GENERATOR_SCRIPT = resolve(__dirname, '../scripts/generate-session-manifest.mjs')
 
 function createBaseManifest() {
   return {
@@ -53,6 +55,23 @@ function createBaseManifest() {
       raw_transcript_included: false,
       local_paths_included: false,
       secret_scan_status: 'clean',
+    },
+    secret_policy: {
+      value_exposed: false,
+      mode: 'presence_only',
+      producer_contract: {
+        declared: true,
+        id: 'presence_only_no_secret_values',
+        version: 'v1',
+        claims: {
+          secret_values_not_serialized: true,
+          presence_only: true,
+        },
+      },
+      runtime_boundary: {
+        attested: false,
+        evidence_ref: null,
+      },
     },
   }
 }
@@ -97,6 +116,111 @@ describe('agent-session-manifest schema file', () => {
     expect(producer['additionalProperties']).toBe(false)
     expect(producer['required']).toEqual(['kind'])
   })
+
+  it('root required preserves base fields with secret_policy', () => {
+    // AC2: schema-level exact assertion on root required fields
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const required = schema['required'] as string[]
+    // Exact match: base 7 fields + secret_policy
+    expect(required).toEqual([
+      'schema',
+      'manifest_id',
+      'recorded_at',
+      'repository',
+      'actor',
+      'phase',
+      'redaction',
+      'secret_policy',
+    ])
+  })
+
+  it('secret_policy required shape unchanged', () => {
+    // AC7: schema-level exact assertion on secret_policy.required
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const required = secretPolicy['required'] as string[]
+    expect(required).toEqual([
+      'value_exposed',
+      'mode',
+      'producer_contract',
+      'runtime_boundary',
+    ])
+  })
+
+  it('legacy boundary_enforced shape', () => {
+    // AC8: schema-level assertion that boundary_enforced is NOT in properties
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, unknown>
+    expect(properties).not.toHaveProperty('boundary_enforced')
+  })
+
+  it('secret_policy value_exposed const false', () => {
+    // AC11: schema-level const assertion for value_exposed
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    const valueExposed = properties['value_exposed']
+    expect(valueExposed['type']).toBe('boolean')
+    expect(valueExposed['const']).toBe(false)
+  })
+
+  it('secret_policy mode enum presence_only', () => {
+    // AC11: schema-level enum assertion for mode
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    const mode = properties['mode']
+    expect(mode['type']).toBe('string')
+    expect(mode['enum']).toEqual(['presence_only'])
+  })
+
+  it('secret_policy producer_contract const claims', () => {
+    // AC11: schema-level const assertion for producer_contract.claims
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    const producerContract = properties['producer_contract'] as Record<string, Record<string, unknown>>
+    const contractProperties = producerContract['properties'] as Record<string, Record<string, unknown>>
+    const claims = contractProperties['claims'] as Record<string, Record<string, unknown>>
+    const claimsProperties = claims['properties'] as Record<string, Record<string, unknown>>
+
+    // Both claims MUST be const true
+    expect(claimsProperties['secret_values_not_serialized']['const']).toBe(true)
+    expect(claimsProperties['presence_only']['const']).toBe(true)
+  })
+
+  // AC9: value_exposed=false かつ mode=presence_only の invariant（schema-level + canonical manifest）
+  it('secret_policy presence_only invariant', () => {
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    expect(properties['value_exposed']['const']).toBe(false)
+    expect(properties['mode']['enum']).toEqual(['presence_only'])
+    const manifest = createBaseManifest() as Record<string, unknown>
+    const secret = manifest['secret_policy'] as Record<string, unknown>
+    expect(secret['value_exposed']).toBe(false)
+    expect(secret['mode']).toBe('presence_only')
+    expect(validateManifestAgainstSchema(manifest).valid).toBe(true)
+  })
+
+  // AC11: secret value が manifest に serialize されない契約（schema-level claims + serialization smoke）
+  it('no secret values serialized', () => {
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    const producerContract = properties['producer_contract'] as Record<string, Record<string, unknown>>
+    const contractProperties = producerContract['properties'] as Record<string, Record<string, unknown>>
+    const claims = (contractProperties['claims'] as Record<string, Record<string, unknown>>)[
+      'properties'
+    ] as Record<string, Record<string, unknown>>
+    expect(claims['secret_values_not_serialized']['const']).toBe(true)
+    expect(claims['presence_only']['const']).toBe(true)
+    const serialized = JSON.stringify(createBaseManifest())
+    for (const sentinel of ['sk-', 'ghp_', 'github_pat_']) {
+      expect(serialized.includes(sentinel)).toBe(false)
+    }
+  })
 })
 
 describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
@@ -104,6 +228,26 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     const result = validateManifestAgainstSchema(createBaseManifest())
     expect(result.valid).toBe(true)
     expect(result.errors).toEqual([])
+  })
+
+  // AC4: canonical base manifest fixture が root secret_policy を含み validation を pass する
+  it('GIVEN canonical base manifest fixture WHEN validating THEN canonical base manifest includes root secret_policy and passes', () => {
+    const manifest = createBaseManifest()
+    expect(Object.prototype.hasOwnProperty.call(manifest, 'secret_policy')).toBe(true)
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
+  })
+
+  // AC3: root secret_policy を欠く manifest は schema validation で reject される（core enforcement）
+  it('GIVEN base manifest with root secret_policy removed WHEN validating THEN missing root secret_policy is rejected', () => {
+    const manifest = createBaseManifest()
+    delete (manifest as Record<string, unknown>)['secret_policy']
+    const result = validateManifestAgainstSchema(manifest)
+    expect(result.valid).toBe(false)
+    expect(
+      result.errors.some((error) => error.message?.includes("must have required property 'secret_policy'")),
+    ).toBe(true)
   })
 
   it('GIVEN manifest with valid producer kind WHEN validating THEN valid producer kind manifest is accepted', () => {
@@ -446,5 +590,108 @@ describe('agent-session-manifest semantic validation', () => {
     const result = validateManifest(manifest)
     expect(result.valid).toBe(true)
     expect(result.errors).toEqual([])
+  })
+})
+
+describe('agent-session-manifest generated manifest validation (subprocess)', () => {
+  it('generated manifest json validates against schema', () => {
+    // AC5: Run generator subprocess and validate output against schema
+    try {
+      const output = execFileSync('node', [
+        GENERATOR_SCRIPT,
+        '--repository', 'squne121/loop-protocol',
+        '--issue', '549',
+        '--phase-main-loop', 'impl',
+        '--phase-ledger-phase', 'implementation',
+        '--phase-instance-id', 'issue-549:impl:001',
+        '--actor-type', 'ai_agent',
+        '--actor-name', 'implementation-worker',
+        '--actor-session-id', 'session-001',
+        '--evidence-source-kind', 'artifact',
+        '--evidence-source-ref', 'artifacts/manifest.json',
+        '--evidence-visibility', 'private_artifact',
+        '--format', 'json',
+      ], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] })
+
+      // Parse generated JSON
+      const manifest = JSON.parse(output)
+
+      // Validate against schema
+      const result = validateManifestAgainstSchema(manifest)
+      expect(result.valid).toBe(true)
+      expect(result.errors).toEqual([])
+
+      // Assert secret_policy is included in generated manifest
+      expect(manifest.secret_policy).toBeDefined()
+      expect(manifest.secret_policy.value_exposed).toBe(false)
+      expect(manifest.secret_policy.mode).toBe('presence_only')
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('ENOENT')) {
+        throw new Error(`Generator script not found at ${GENERATOR_SCRIPT}`, { cause: error })
+      }
+      throw error
+    }
+  })
+
+  it('generated github-comment artifact validates against schema', () => {
+    // AC6: Run generator with github-comment format and extract/validate JSON
+    try {
+      const output = execFileSync('node', [
+        GENERATOR_SCRIPT,
+        '--repository', 'squne121/loop-protocol',
+        '--issue', '549',
+        '--phase-main-loop', 'impl',
+        '--phase-ledger-phase', 'implementation',
+        '--phase-instance-id', 'issue-549:impl:001',
+        '--actor-type', 'ai_agent',
+        '--actor-name', 'implementation-worker',
+        '--actor-session-id', 'session-001',
+        '--evidence-source-kind', 'artifact',
+        '--evidence-source-ref', 'artifacts/manifest.json',
+        '--evidence-visibility', 'private_artifact',
+        '--format', 'github-comment',
+      ], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] })
+
+      // Extract JSON from fenced code block (HTML marker style)
+      // Format: <!-- agent_session_manifest:v1 start -->
+      //         ````json
+      //         { ... }
+      //         ````
+      //         <!-- agent_session_manifest:v1 end -->
+      const startMarker = '<!-- agent_session_manifest:v1 start -->'
+      const endMarker = '<!-- agent_session_manifest:v1 end -->'
+      const startIdx = output.indexOf(startMarker)
+      const endIdx = output.indexOf(endMarker)
+
+      if (startIdx === -1 || endIdx === -1) {
+        throw new Error('HTML markers not found in github-comment output')
+      }
+
+      const fencedContent = output.substring(startIdx + startMarker.length, endIdx)
+
+      // Extract JSON from fenced code block (backticks with language tag)
+      const fenceMatch = fencedContent.match(/`{4,}json\n([\s\S]*?)\n`{4,}/)
+      if (!fenceMatch || !fenceMatch[1]) {
+        throw new Error('JSON fenced code block not found in comment output')
+      }
+
+      const jsonStr = fenceMatch[1]
+      const manifest = JSON.parse(jsonStr)
+
+      // Validate against schema
+      const result = validateManifestAgainstSchema(manifest)
+      expect(result.valid).toBe(true)
+      expect(result.errors).toEqual([])
+
+      // Assert secret_policy is included
+      expect(manifest.secret_policy).toBeDefined()
+      expect(manifest.secret_policy.value_exposed).toBe(false)
+      expect(manifest.secret_policy.mode).toBe('presence_only')
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('ENOENT')) {
+        throw new Error(`Generator script not found at ${GENERATOR_SCRIPT}`, { cause: error })
+      }
+      throw error
+    }
   })
 })

@@ -46,6 +46,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `actor` | object | yes | セッション実行者の情報（後述） |
 | `phase` | object | yes | Main Loop phase と SubAgent Execution Ledger phase（後述） |
 | `redaction` | object | yes | 機微情報の redaction 状態（後述） |
+| `secret_policy` | object | yes | Secret 非露出の static producer contract と runtime boundary attestation（後述）。root `required`（#549 で必須化） |
 | `head_sha` | string\|null（40-hex pattern または null） | no | 観測時点の HEAD commit SHA（nullable） |
 | `issue_number` | integer\|null | no | 対象 Issue 番号（optional） |
 | `pr_number` | integer\|null | no | 対象 PR 番号（optional） |
@@ -234,7 +235,7 @@ phase:
 
 ## Phase 別 必須 fields / 任意 fields 表
 
-以下の表は各フェーズで推奨される必須フィールドを示す。グローバル必須（`schema`, `manifest_id`, `recorded_at`, `repository`, `actor`, `phase`, `redaction`）はすべてのフェーズで必須であり、以下の表では省略する。
+以下の表は各フェーズで推奨される必須フィールドを示す。グローバル必須（`schema`, `manifest_id`, `recorded_at`, `repository`, `actor`, `phase`, `redaction`, `secret_policy`）はすべてのフェーズで必須であり、以下の表では省略する。
 
 | `phase.main_loop` | 追加必須 (required) fields | 追加任意 (optional) fields |
 |---|---|---|
@@ -337,6 +338,20 @@ redaction:
   raw_transcript_included: false
   local_paths_included: false
   secret_scan_status: not_applicable
+
+secret_policy:
+  value_exposed: false
+  mode: presence_only
+  producer_contract:
+    declared: true
+    id: presence_only_no_secret_values
+    version: v1
+    claims:
+      secret_values_not_serialized: true
+      presence_only: true
+  runtime_boundary:
+    attested: false
+    evidence_ref: null
 ```
 <!-- agent_session_manifest:v1 end -->
 ````
@@ -417,6 +432,20 @@ redaction:
   raw_transcript_included: false
   local_paths_included: false
   secret_scan_status: not_applicable
+
+secret_policy:
+  value_exposed: false
+  mode: presence_only
+  producer_contract:
+    declared: true
+    id: presence_only_no_secret_values
+    version: v1
+    claims:
+      secret_values_not_serialized: true
+      presence_only: true
+  runtime_boundary:
+    attested: false
+    evidence_ref: null
 ```
 
 ## 関連ドキュメント
@@ -432,9 +461,10 @@ redaction:
 - `#241` — Secret Inventory SSOT 化（session recording 前提条件）
 - `#242` — Session Recording Kill Switch policy（session recording 前提条件）
 
-## `secret_policy` オブジェクト（optional, #412 follow-up redesign）
+## `secret_policy` オブジェクト（global required, #549 で root required 化）
 
 Secret 値を manifest に含めない static producer contract と、runtime boundary attestation を分離して記録する。
+本オブジェクトは root `required` に含まれる**グローバル必須フィールド**であり（#549）、すべての manifest が `secret_policy` を持たなければならない。`secret_policy` を欠く manifest は schema validation で reject される。shape は #412 / PR #537 で確定済み（`producer_contract` / `runtime_boundary` 分離）。
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|

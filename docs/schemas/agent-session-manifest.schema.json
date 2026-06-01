@@ -11,7 +11,8 @@
     "repository",
     "actor",
     "phase",
-    "redaction"
+    "redaction",
+    "secret_policy"
   ],
   "additionalProperties": false,
   "properties": {
