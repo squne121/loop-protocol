@@ -42,16 +42,15 @@ jobs:
       - name: Generate session manifest artifact
         run: |
           mkdir -p artifacts
-          # Producer contract currently requires issue-<N>:<phase>:<seq>.
-          # Derive a CI-run-specific 3-digit sequence from run identity.
-          PHASE_SEQ=$(printf '%03d' $(( (10#${GITHUB_RUN_ID} + 10#${GITHUB_RUN_ATTEMPT}) % 1000 )))
-          # Generate manifest via producer script.
+          # Generate manifest via producer script using CI-native phase_instance_id.
+          # Format: ci:<producer_slug>:<run_id>:<run_attempt> — uniquely identifies this CI run.
+          # producer_slug is a fixed schema-safe slug, NOT the GitHub Actions workflow name.
           # Manifest JSON is written to artifacts/ only — NOT to stdout, log, or any public surface.
           node scripts/generate-session-manifest.mjs \
             --repository "${{ github.repository }}" \
             --phase-main-loop impl \
             --phase-ledger-phase post_commit_verification \
-            --phase-instance-id "issue-432:impl:${PHASE_SEQ}" \
+            --phase-instance-id "ci:session-manifest:${{ github.run_id }}:${{ github.run_attempt }}" \
             --actor-type github_action \
             --actor-name session-manifest-workflow \
             --evidence-source-kind ci_check \

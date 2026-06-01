@@ -215,8 +215,8 @@
         },
         "phase_instance_id": {
           "type": "string",
-          "pattern": "^issue-[0-9]+:[a-z_]+:[0-9]{3}$",
-          "description": "issue-<N>:<main_loop_phase>:<seq> 形式"
+          "pattern": "^(?:issue-[0-9]+:[a-z_]+:[0-9]{3}|ci:[a-z0-9_.-]+:[1-9][0-9]*:[1-9][0-9]*)$",
+          "description": "phase instance を一意に識別する ID。2 形式を受け付ける: (1) issue-<N>:<main_loop_phase>:<seq> — ローカル・AI-driven 実行向け; (2) ci:<producer_slug>:<run_id>:<run_attempt> — GitHub Actions CI 実行向け。producer_slug は GitHub Actions の workflow name ではなく、schema-safe な固定 slug（例: session-manifest）を使用すること。run_id・run_attempt は 1 以上の整数（0 は拒否）。"
         }
       }
     },
