@@ -29,6 +29,15 @@ export function createHudController(
       </dl>
     </section>
     <section class="panel">
+      <p class="eyebrow">Sortie</p>
+      <dl class="stat-grid">
+        <div><dt>Sortie Status</dt><dd data-field="sortie-status"></dd></div>
+        <div><dt>Kills</dt><dd data-field="sortie-kills"></dd></div>
+        <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
+        <div><dt>Result</dt><dd data-field="sortie-result"></dd></div>
+      </dl>
+    </section>
+    <section class="panel">
       <p class="eyebrow">Telemetry</p>
       <p class="status-copy" data-field="status"></p>
       <p class="status-copy status-copy--muted" data-field="command"></p>
@@ -52,6 +61,10 @@ export function createHudController(
   const cooldown = queryField(container, 'cooldown')
   const status = queryField(container, 'status')
   const command = queryField(container, 'command')
+  const sortieStatus = queryField(container, 'sortie-status')
+  const sortieKills = queryField(container, 'sortie-kills')
+  const sortieDuration = queryField(container, 'sortie-duration')
+  const sortieResult = queryField(container, 'sortie-result')
 
   return {
     render(state) {
@@ -61,6 +74,53 @@ export function createHudController(
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
+
+      // Sortie status display (AC4, AC10)
+      const s = state.sortie
+      switch (s.status) {
+        case 'idle':
+          sortieStatus.textContent = 'Idle'
+          break
+        case 'running':
+          sortieStatus.textContent = 'In Progress'
+          break
+        case 'victory':
+          sortieStatus.textContent = 'Victory'
+          break
+        case 'defeat':
+          sortieStatus.textContent = 'Defeat'
+          break
+        case 'ended':
+          sortieStatus.textContent = 'Ended'
+          break
+      }
+
+      // Kills (AC10)
+      if (s.result !== null) {
+        sortieKills.textContent = `${s.result.kills}`
+      } else {
+        // Count defeated enemies for live kills display during running
+        const kills = state.enemies.filter((e) => e.defeated).length
+        sortieKills.textContent = `${kills}`
+      }
+
+      // Duration (AC10, AC11)
+      // Terminal: use result.durationMs; running: use elapsedTicks-derived ticks
+      if (s.result !== null) {
+        const durationSec = (s.result.durationMs / 1000).toFixed(1)
+        sortieDuration.textContent = `${durationSec}s`
+      } else {
+        // running or idle: elapsedTicks / 60 Hz approximation (display only)
+        const approxSec = (s.elapsedTicks / 60).toFixed(1)
+        sortieDuration.textContent = `${approxSec}s`
+      }
+
+      // Result (AC9, AC10): both Canvas overlay and HUD use result.outcome as authority
+      if (s.result !== null) {
+        sortieResult.textContent = s.result.outcome === 'victory' ? 'Victory' : 'Defeat'
+      } else {
+        sortieResult.textContent = '—'
+      }
     },
   }
 }
