@@ -189,6 +189,38 @@ describe('agent-session-manifest schema file', () => {
     expect(claimsProperties['secret_values_not_serialized']['const']).toBe(true)
     expect(claimsProperties['presence_only']['const']).toBe(true)
   })
+
+  // AC9: value_exposed=false かつ mode=presence_only の invariant（schema-level + canonical manifest）
+  it('secret_policy presence_only invariant', () => {
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    expect(properties['value_exposed']['const']).toBe(false)
+    expect(properties['mode']['enum']).toEqual(['presence_only'])
+    const manifest = createBaseManifest() as Record<string, unknown>
+    const secret = manifest['secret_policy'] as Record<string, unknown>
+    expect(secret['value_exposed']).toBe(false)
+    expect(secret['mode']).toBe('presence_only')
+    expect(validateManifestAgainstSchema(manifest).valid).toBe(true)
+  })
+
+  // AC11: secret value が manifest に serialize されない契約（schema-level claims + serialization smoke）
+  it('no secret values serialized', () => {
+    const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
+    const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
+    const properties = secretPolicy['properties'] as Record<string, Record<string, unknown>>
+    const producerContract = properties['producer_contract'] as Record<string, Record<string, unknown>>
+    const contractProperties = producerContract['properties'] as Record<string, Record<string, unknown>>
+    const claims = (contractProperties['claims'] as Record<string, Record<string, unknown>>)[
+      'properties'
+    ] as Record<string, Record<string, unknown>>
+    expect(claims['secret_values_not_serialized']['const']).toBe(true)
+    expect(claims['presence_only']['const']).toBe(true)
+    const serialized = JSON.stringify(createBaseManifest())
+    for (const sentinel of ['sk-', 'ghp_', 'github_pat_']) {
+      expect(serialized.includes(sentinel)).toBe(false)
+    }
+  })
 })
 
 describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
