@@ -24,6 +24,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import subprocess
@@ -1018,7 +1019,7 @@ def result_to_dict(result: CheckerResult) -> dict:
     return {
         "verdict": result.verdict,
         "issue_kind": result.issue_kind,
-        "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "deterministic_checks": {
             "C1_required_sections": result.deterministic_checks.C1_required_sections,
             "C2_stop_conditions_6": result.deterministic_checks.C2_stop_conditions_6,
@@ -1056,17 +1057,25 @@ def main() -> None:
         print("ERROR: --issue には --repo が必要です", file=sys.stderr)
         sys.exit(2)
 
-    if args.file:
-        body, labels, title = load_fixture_file(args.file)
-    else:
-        body, labels, title = fetch_issue_body(args.issue, args.repo)
-
-    result = run_checks(body, labels, title, args.vc_preflight_json)
-    output = result_to_dict(result)
-
     if args.json:
+        # In --json mode: redirect stdout to stderr during fetch/check so that any
+        # incidental stdout (e.g. from sub-libraries) does not pollute the JSON output.
+        with contextlib.redirect_stdout(sys.stderr):
+            if args.file:
+                body, labels, title = load_fixture_file(args.file)
+            else:
+                body, labels, title = fetch_issue_body(args.issue, args.repo)
+            result = run_checks(body, labels, title, args.vc_preflight_json)
+            output = result_to_dict(result)
+        # Emit JSON exclusively to stdout (after redirect is restored)
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
+        if args.file:
+            body, labels, title = load_fixture_file(args.file)
+        else:
+            body, labels, title = fetch_issue_body(args.issue, args.repo)
+        result = run_checks(body, labels, title, args.vc_preflight_json)
+        output = result_to_dict(result)
         print(f"verdict: {result.verdict}")
         print(f"issue_kind: {result.issue_kind}")
         print()
