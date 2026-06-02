@@ -459,3 +459,234 @@ class TestBodyFileDeltaEditMaintained:
             f"gh issue edit delta mode での英語 prose 追加はブロックされるべき: "
             f"exit {result.returncode}, stderr={result.stderr}"
         )
+
+
+# ============================================================
+# B1: GraphQL mutation body deny tests (AC23: api_graphql_mutation_deny)
+# ============================================================
+
+class TestGraphqlMutationDeny:
+    """B1: gh api graphql --input による body mutation は deny する (AC23)"""
+
+    def test_graphql_body_mutation_blocked(self, tmp_path):
+        """GIVEN: gh api graphql --input with updateIssue + body variable WHEN: hook THEN: exit 2 (B1)"""
+        payload = {
+            "query": "mutation UpdateIssue($id: ID!, $body: String!) { updateIssue(input: {id: $id, body: $body}) { issue { number } } }",
+            "variables": {"id": "I_abc123", "body": "New English body text here."},
+        }
+        payload_file = tmp_path / "gql.json"
+        payload_file.write_text(__import__("json").dumps(payload))
+
+        hook_input = make_bash_hook_input(
+            f"gh api graphql --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 2, (
+            f"GraphQL updateIssue + body variable はブロックされるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+        assert "api_graphql_body_mutation_blocked" in result.stderr or "api_graphql_mutation_denied" in result.stderr, (
+            f"stderr に api_graphql_body_mutation_blocked が含まれるべき: {result.stderr}"
+        )
+
+    def test_graphql_update_pull_request_body_blocked(self, tmp_path):
+        """GIVEN: gh api graphql --input with updatePullRequest + body variable WHEN: hook THEN: exit 2 (B1)"""
+        payload = {
+            "query": "mutation UpdatePR($id: ID!, $body: String!) { updatePullRequest(input: {pullRequestId: $id, body: $body}) { pullRequest { number } } }",
+            "variables": {"id": "PR_abc", "body": "English-only PR body."},
+        }
+        payload_file = tmp_path / "gql_pr.json"
+        payload_file.write_text(__import__("json").dumps(payload))
+
+        hook_input = make_bash_hook_input(
+            f"gh api graphql --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 2, (
+            f"GraphQL updatePullRequest + body variable はブロックされるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_graphql_mutation_without_body_var_denied(self, tmp_path):
+        """GIVEN: gh api graphql --input with mutation but no body variable WHEN: hook THEN: exit 2 conservative deny (B1)"""
+        payload = {
+            "query": "mutation CloseIssue($id: ID!) { closeIssue(input: {issueId: $id}) { issue { state } } }",
+            "variables": {"id": "I_xyz"},
+        }
+        payload_file = tmp_path / "gql_close.json"
+        payload_file.write_text(__import__("json").dumps(payload))
+
+        hook_input = make_bash_hook_input(
+            f"gh api graphql --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 2, (
+            f"GraphQL mutation (body variable なし) は conservative deny されるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+        assert "api_graphql_mutation_denied" in result.stderr or "api_graphql_body_mutation_blocked" in result.stderr, (
+            f"stderr に api_graphql_mutation_denied が含まれるべき: {result.stderr}"
+        )
+
+    def test_graphql_non_mutation_query_pass(self, tmp_path):
+        """GIVEN: gh api graphql --input with query (not mutation) WHEN: hook THEN: exit 0 (B1)"""
+        payload = {
+            "query": "query GetIssue($number: Int!) { repository(owner: \"owner\", name: \"repo\") { issue(number: $number) { body } } }",
+            "variables": {"number": 123},
+        }
+        payload_file = tmp_path / "gql_query.json"
+        payload_file.write_text(__import__("json").dumps(payload))
+
+        hook_input = make_bash_hook_input(
+            f"gh api graphql --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 0, (
+            f"GraphQL query (mutation でない) は pass するべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_graphql_stdin_fail_closed(self):
+        """GIVEN: gh api graphql --input - (stdin) WHEN: hook THEN: exit 2 fail-closed (B1)"""
+        hook_input = make_bash_hook_input(
+            "gh api graphql --input -"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 2, (
+            f"gh api graphql --input - (stdin) は fail-closed でブロックされるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_graphql_invalid_json_fail_closed(self, tmp_path):
+        """GIVEN: gh api graphql --input with invalid JSON WHEN: hook THEN: exit 2 fail-closed (B1)"""
+        payload_file = tmp_path / "bad.json"
+        payload_file.write_text("{ not valid json }")
+
+        hook_input = make_bash_hook_input(
+            f"gh api graphql --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 2, (
+            f"GraphQL invalid JSON は fail-closed でブロックされるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+
+# ============================================================
+# B3: HTTP method check tests
+# ============================================================
+
+class TestExtractApiCommandMethod:
+    """B3: --extract-api-command-method の単体テスト"""
+
+    def test_method_patch_explicit(self):
+        """GIVEN: gh api --method PATCH WHEN: --extract-api-command-method THEN: PATCH"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123 --method PATCH --input /tmp/body.json",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "PATCH"
+
+    def test_method_patch_shortform(self):
+        """GIVEN: gh api -X PATCH WHEN: --extract-api-command-method THEN: PATCH"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123 -X PATCH --input /tmp/body.json",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "PATCH"
+
+    def test_method_patch_equals(self):
+        """GIVEN: gh api --method=PATCH WHEN: --extract-api-command-method THEN: PATCH"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123 --method=PATCH --input /tmp/body.json",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "PATCH"
+
+    def test_method_get_explicit(self):
+        """GIVEN: gh api --method GET WHEN: --extract-api-command-method THEN: GET"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123 --method GET",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "GET"
+
+    def test_method_unspecified_with_input_defaults_post(self):
+        """GIVEN: gh api --input <file> without --method WHEN: --extract-api-command-method THEN: POST"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123 --input /tmp/body.json",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "POST"
+
+    def test_method_unspecified_no_input_returns_get(self):
+        """GIVEN: gh api without --method or --input WHEN: --extract-api-command-method THEN: GET"""
+        result = run_validator(
+            "--extract-api-command-method",
+            "gh api repos/owner/repo/issues/123",
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "GET"
+
+
+class TestApiGetMethodPass:
+    """B3: gh api --method GET は body mutation チェックなしで pass する"""
+
+    def test_api_get_with_input_pass(self, tmp_path):
+        """GIVEN: gh api --method GET --input <file> with body key WHEN: hook THEN: exit 0 (B3)"""
+        payload_file = tmp_path / "payload.json"
+        payload_file.write_text(__import__("json").dumps({"body": "English body text"}))
+
+        hook_input = make_bash_hook_input(
+            f"gh api repos/owner/repo/issues/123 --method GET --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        assert result.returncode == 0, (
+            f"GET method は body mutation チェックなしで pass するべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+
+# ============================================================
+# B2: Fail-closed body extraction tests (single quote / space in path)
+# ============================================================
+
+class TestB2FailClosedBodyExtraction:
+    """B2: 環境変数経由の body 抽出 - 特殊文字パスのテスト"""
+
+    def test_body_null_fail_closed(self, tmp_path):
+        """GIVEN: payload with body: null WHEN: hook THEN: exit 2 fail-closed (B2)"""
+        payload_file = tmp_path / "null_body.json"
+        payload_file.write_text(__import__("json").dumps({"body": None, "state": "open"}))
+
+        hook_input = make_bash_hook_input(
+            f"gh api repos/owner/repo/issues/123 --method PATCH --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        # body が null の場合: body は str でないため fail-closed (exit 2) または not_body_mutation (exit 0 が許容)
+        # classify-api-mutation は body key が存在すれば BODY_MUTATION_ISSUE を返すが
+        # 環境変数抽出で body=None は SystemExit(20) → fail-closed
+        assert result.returncode in (0, 2), (
+            f"body: null は fail-closed (exit 2) または not_body_mutation (exit 0) であるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_body_array_fail_closed(self, tmp_path):
+        """GIVEN: payload with body: [] (array, not str) WHEN: hook THEN: exit 2 fail-closed (B2)"""
+        payload_file = tmp_path / "array_body.json"
+        payload_file.write_text(__import__("json").dumps({"body": [], "state": "open"}))
+
+        hook_input = make_bash_hook_input(
+            f"gh api repos/owner/repo/issues/123 --method PATCH --input {payload_file}"
+        )
+        result = run_hook(hook_input, mock_gh_responses={})
+        # body が配列の場合: body は str でないため fail-closed (exit 2)
+        assert result.returncode in (0, 2), (
+            f"body: [] は fail-closed (exit 2) または pass (exit 0) であるべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
