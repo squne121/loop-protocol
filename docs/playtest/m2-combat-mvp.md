@@ -3,9 +3,36 @@ doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
 implementation_issue: "#541"
-tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
+automated_tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
-status: automated_e2e_verified
+status: accepted_with_deferred
+acceptance_verdict:
+  overall: accepted_with_deferred
+  evaluated_against_issue: "#543"
+  passed:
+    - AC1
+    - AC2
+    - AC3
+    - AC4
+    - AC5
+    - AC6
+    - AC7
+    - AC9
+    - AC12
+    - AC13
+    - AC14
+  partial_or_deferred:
+    - ac: AC8
+      status: partial
+      reason: "browser version recorded (Chrome 148.0.7778.179). viewport and device_pixel_ratio were not captured during the human run and must not be backfilled post hoc."
+    - ac: AC10
+      status: accepted
+      reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
+    - ac: AC11
+      status: deferred_exception
+      reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
+  artifact_reviewability: github_attachment
+  artifact_note: "Video files attached to Issue #543 comment (https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599987357). GitHub-hosted URLs recorded in evidence section."
 date: "2026-05-31"
 ---
 
@@ -259,4 +286,84 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC12 | Terminal state latched until reset | state machine inherent (no mutation after terminal) | pass |
 | AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
 
-Note: status is `automated_e2e_verified`. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), defeat overlay red-dominant pixels (R>80,G<60). All 16 E2E tests pass. Issue #541 adds Canvas enemy rendering, victory/defeat overlay, and HUD sortie information display.
+Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_defeat` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), defeat overlay red-dominant pixels (R>80,G<60). Issue #541 adds Canvas enemy rendering, victory/defeat overlay, and HUD sortie information display.
+
+## Human Playtest Evidence
+
+Original playtest comment: https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599352702
+
+```yaml
+manual_operator: squne121
+executed_at: "2026-06-02T15:00:22+09:00"
+provenance:
+  app_under_test_commit: "5227e96dfa94c063c2d55f30d42348eb44522a9b"
+  automated_e2e_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
+  docs_update_pr: 570
+  includes_dependencies:
+    - issue: 541
+      pr: 548
+      description: "CanvasRenderer + HudController M2 combat entities"
+    - issue: 542
+      pr: 552
+      description: "MVP sortie victory/defeat spec"
+tested_commit: "5227e96dfa94c063c2d55f30d42348eb44522a9b"
+git_status_short: ""
+dependency_state: |
+  #541 (feat: CanvasRenderer + HudController M2 combat entities, PR #548) and
+  #542 (spec/impl: MVP sortie victory/defeat spec, PR #552) are both included
+  in tested_commit 5227e96dfa94c063c2d55f30d42348eb44522a9b.
+command:
+  build: pnpm build
+  serve: "pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort"
+preview_url: "http://localhost:4173/"
+environment:
+  os: "Windows 11"
+  browser: "Chrome 148.0.7778.179 (Official Build) (64-bit)"
+  viewport: "unknown (not captured during playtest execution; do not backfill post hoc)"
+  device_pixel_ratio: "unknown (not captured during playtest execution; do not backfill post hoc)"
+  input_device: "keyboard (WASD) + mouse"
+```
+
+### Scenario Results
+
+#### all_enemies_defeated_victory
+
+- artifact_url: "https://github.com/user-attachments/assets/18e1a14d-23dd-4d65-98bc-55ee5c457797"
+- artifact_local: "docs/playtest/playtest-victory- 2026-06-02 150022.mp4"
+- artifact_sha256: "5c92b215d19aed9eee9d919453b7b6e65c8c3845e1f46fd090c8e7dc979feda8"
+- confirmed:
+  - WASD 移動: confirmed
+  - mouse 射撃: confirmed
+  - enemy 可視 (Canvas 描画): confirmed
+  - collision 検出: confirmed
+  - damage 適用: confirmed
+  - HUD HP update: confirmed
+  - Canvas overlay (victory / green): confirmed
+  - HUD sortie-status 結果一致: confirmed
+  - 全敵撃破→victory 遷移: confirmed
+
+#### hp_zero_defeat
+
+- artifact_url: "https://github.com/user-attachments/assets/40498efe-8544-4828-9f94-2b60faeb3d57"
+- artifact_local: "docs/playtest/playtest-defeat-2026-06-02 150402.mp4"
+- artifact_sha256: "9bf912d7d05dd99a92af5c573b79344b8e6641206fa284a765d1304317574813"
+- confirmed:
+  - defeat 遷移 (HP 0): confirmed by human operator squne121
+  - Canvas overlay (defeat / red): confirmed
+  - HUD sortie-status 結果一致: confirmed
+  - contact damage → HP 0 → defeat 遷移: confirmed
+
+#### timeout_30s_defeat
+
+- artifact: deferred
+- reason: "手動動画証跡なし。E2E テストで代替検証済み。"
+- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout defeat 自動検証済み)"
+
+### Human Observations
+
+- 操作性・ロジック: 問題なし（MVP としてよくできている）
+- 武装可視化: 自機中心から射撃方向に伸びる棒 → マウスカーソル追従が未実装の疑い（follow-up 要）
+- 敵 HP 表示: 桁溢れによる表示崩れ確認（follow-up 要）
+- プレイテスト動線: manual-playtest-runbook.md の日本語化要望（follow-up 要）
+- Quick Save UI: 戦闘中に Quick Save が使えることはゲームバランス上問題がある可能性あり。セーブ機能は準備フェーズ限定が望ましく、Quick Load も対の存在として必要。また UI での自己説明より SSOT doc での仕様明示が適切（follow-up 要）
+- viewport/DPR 自動採取: プレイテスト実行時に Chrome version / viewport / device_pixel_ratio を手動記録に依存しており、今回は未記録。次回以降は runbook またはアプリ側での自動採取が必要（follow-up 要）
