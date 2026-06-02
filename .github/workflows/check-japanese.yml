@@ -1,0 +1,140 @@
+name: Check Japanese Content
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  check-pr-body:
+    name: PR Body Japanese Check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Check PR body Japanese ratio
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          echo "$PR_BODY" | python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --threshold 0.1
+
+      - name: Check changed Markdown files
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED_MD=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.md' | grep -v '^\.venv/' | grep -v '^node_modules/' || true)
+
+          if [ -z "$CHANGED_MD" ]; then
+            echo "No changed Markdown files to check."
+            exit 0
+          fi
+
+          FAILED=0
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "Checking: $file"
+              if ! python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --file "$file" --threshold 0.1; then
+                echo "FAIL: $file"
+                FAILED=1
+              fi
+            fi
+          done <<< "$CHANGED_MD"
+
+          exit $FAILED
+
+  check-issue-body:
+    name: Issue Body Japanese Check (retrospective)
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Check issue body Japanese ratio (retrospective)
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "Retrospective check: issue body"
+          if [ -z "$ISSUE_BODY" ]; then
+            echo "No issue body to check."
+            exit 0
+          fi
+          echo "$ISSUE_BODY" | python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --threshold 0.1 || {
+            echo "WARNING: Issue body has insufficient Japanese content (retrospective detection)."
+            exit 0
+          }
+
+  check-issue-comment:
+    name: Issue Comment Japanese Check (retrospective)
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Check issue comment Japanese ratio (retrospective)
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          echo "Retrospective check: issue comment"
+          echo "$COMMENT_BODY" | python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --threshold 0.1 || {
+            echo "WARNING: Issue comment has insufficient Japanese content (retrospective detection)."
+            # retrospective detection のため fail-closed しない（警告のみ）
+            exit 0
+          }
+
+  check-pr-review:
+    name: PR Review Japanese Check (retrospective)
+    if: github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Check PR review body Japanese ratio (retrospective)
+        env:
+          REVIEW_BODY: ${{ github.event.review.body || github.event.comment.body || '' }}
+        run: |
+          echo "Retrospective check: PR review"
+          if [ -z "$REVIEW_BODY" ]; then
+            echo "No review body to check."
+            exit 0
+          fi
+          echo "$REVIEW_BODY" | python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --threshold 0.1 || {
+            echo "WARNING: PR review has insufficient Japanese content (retrospective detection)."
+            # retrospective detection のため fail-closed しない（警告のみ）
+            exit 0
+          }
