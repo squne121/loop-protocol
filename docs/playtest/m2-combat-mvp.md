@@ -162,6 +162,17 @@ unknowns:
     detail: "Tests run on WSL2/Chromium; performance on actual mobile or low-spec desktops not measured."
 ```
 
+## Manual Playtest Runbook
+
+For WSL2/Ubuntu human playtest setup, see:
+[docs/playtest/manual-playtest-runbook.md](./manual-playtest-runbook.md)
+
+Run the preflight script before starting:
+
+```bash
+node scripts/check-manual-playtest-env.mjs
+```
+
 ## Manual Checklist
 
 The following scenarios require human verification. Each item should be checked
