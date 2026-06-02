@@ -76,6 +76,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard-japanese-prose.sh",
+            "args": [],
+            "timeout": 15
+          }
+        ]
       }
     ],
     "Stop": [
