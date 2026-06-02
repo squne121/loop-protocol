@@ -4,11 +4,35 @@
 
 | condition | termination_reason |
 |---|---|
-| Step 2 returns `approve` | `approved` |
+| Step 2 returns `approve` AND latest `CONTRACT_REVIEW_RESULT_V1.status == "go"` confirmed | `approved` |
+| Step 2 returns `approve` BUT latest `CONTRACT_REVIEW_RESULT_V1.status != "go"` | continue (re-run `issue-contract-review`) |
 | Step 2 returns `needs-fix` and `iteration + 1 < max_iterations` | continue to next iteration |
 | Step 2 returns `needs-fix` and `iteration + 1 >= max_iterations` | `human_escalation` (with full blocker summary) |
 | Any step requires human review | `human_escalation` |
 | `final_classification == superseded_by_decision` and close / replacement flow completed | `superseded_by_decision` |
+
+## Final Gate — `CONTRACT_REVIEW_RESULT_V1.status == "go"` 必須
+
+reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.status == "go"` が確認できるまで `approved` 終了としない。
+
+- `approve` 後、`issue-contract-review` を実行し `CONTRACT_REVIEW_RESULT_V1.status == "go"` を確認してから完了とする
+- `status: blocked` または `status: human_judgment` の場合は `approved` ではなく継続または `human_escalation` とする
+- 本ルールは `issue-refinement-loop/SKILL.md` が本ファイルを normative reference として消費するため、SKILL.md を変更せずとも実効性がある
+
+### implement-issue Handoff Gate
+
+| `CONTRACT_REVIEW_RESULT_V1.status` | handoff 判定 |
+|---|---|
+| `go` | `impl-review-loop` へ handoff 可 |
+| `blocked` | 継続（blocker 解消後に再レビュー） |
+| `human_judgment` | `human_escalation` で停止 |
+
+### Contract Snapshot Idempotency
+
+- contract-review snapshot comment は Issue body の `body_sha256` を含む
+- `body_sha256` が現在の Issue body と一致しない場合（stale result）、その snapshot は無効とする
+- stale snapshot を `go` 判定として使用してはならない（`issue-contract-review` を再実行すること）
+- Issue body が 1 文字でも変更された場合は `body_sha256` が変化するため、prior snapshot は自動的に stale となる
 
 ## Human Escalation on max_iterations
 
