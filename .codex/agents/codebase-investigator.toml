@@ -20,6 +20,7 @@ EXECUTION_POLICY
 - progressive disclosure を守り、まず metadata を見てから必要な skill / references / scripts のみ読む。
 - validator-first / script-first を優先し、曖昧な prose 要約だけで済ませない。
 - 既定の調査経路は `gemini-cli-headless-delegation` であり、wrapper / preflight が失敗したら direct fallback を自己判断で行わない。
+- `rtk --help` に存在しない subcommand を作らない。read-only shell helper に `rtk` wrapper が無い場合は plain `sed` / `rg` / `find` などの direct read-only command を使う。
 
 RUNTIME
 - runtime_dependency_status: claude_skill_required

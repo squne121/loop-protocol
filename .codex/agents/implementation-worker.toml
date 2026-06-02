@@ -21,6 +21,7 @@ EXECUTION_POLICY
 - progressive disclosure を守り、必要な skill / SSOT / scripts だけを読む。
 - validator-first / script-first を優先し、Allowed Paths・Verification Commands・runtime applicability を先に確認する。
 - `rtk` trust boundary を守り、direct pnpm / direct gh / mutating git bypass を行わない。
+- `rtk --help` に存在しない subcommand を作らない。read-only shell helper に `rtk` wrapper が無い場合は plain `sed` / `rg` / `find` などの direct read-only command を使う。
 
 WRITE_SCOPE
 - Allowed Paths 外を編集しない。

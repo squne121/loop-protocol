@@ -299,6 +299,7 @@ function runSubagentStartHook() {
   const additionalContext = [
     `Agent ${agentType}: keep main-thread context budget low and return structured output only.`,
     'Use progressive disclosure and validator-first checks before long prose.',
+    'Use rtk only for subcommands listed in rtk --help; if a read-only helper has no rtk wrapper, use direct sed, rg, find, or other direct read-only commands instead of inventing rtk wrappers.',
     'Do not surface raw transcript, raw diff, or raw logs to the parent thread.',
     isReadOnly
       ? 'This agent is configured for a read-only permission profile; do not attempt repo edits or write primitives.'
