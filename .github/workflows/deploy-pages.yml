@@ -1,0 +1,105 @@
+name: deploy-pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: deploy-pages-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build -- --base=/loop-protocol/
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: true
+
+  deploy-pr:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build -- --base=/loop-protocol/pr-${{ github.event.number }}/
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: true
+          destination_dir: pr-${{ github.event.number }}
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const previewUrl = `https://squne121.github.io/loop-protocol/pr-${prNumber}/`;
+            const body = `## Preview URL\n\nThis PR is deployed to: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+  cleanup-pr:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          persist-credentials: true
+      - name: Remove PR preview directory
+        run: |
+          PR_DIR="pr-${{ github.event.number }}"
+          if [ -d "$PR_DIR" ]; then
+            git rm -rf "$PR_DIR"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: remove preview for PR #${{ github.event.number }}"
+            git push
+          else
+            echo "Directory $PR_DIR not found, nothing to clean up."
+          fi

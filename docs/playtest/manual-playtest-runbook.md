@@ -9,6 +9,41 @@ date: "2026-06-02"
 
 # Manual Playtest Runbook — WSL2/Ubuntu
 
+## Online Playtest URLs (GitHub Pages)
+
+You can run a manual playtest directly from a browser without any local setup.
+
+### Main (shared) URL
+
+After a commit is merged to `main`, the latest build is published to:
+
+```
+https://squne121.github.io/loop-protocol/
+```
+
+### PR Preview URL
+
+When a pull request is opened or updated, a preview is deployed to:
+
+```
+https://squne121.github.io/loop-protocol/pr-<PR番号>/
+```
+
+Replace `<PR番号>` with the actual PR number (e.g., `pr-123`).
+The preview URL is also posted as a comment on the PR automatically.
+
+> **Note:** The PR preview is automatically deleted when the PR is closed.
+> After the PR is closed, the preview URL (`/pr-<PR番号>/`) will return 404.
+
+### Prerequisites (first-time setup by repo maintainer)
+
+GitHub Pages must be configured to serve from the `gh-pages` branch:
+`Settings -> Pages -> Source -> Deploy from a branch -> gh-pages (root)`
+
+This is a one-time manual step by the repository owner. After setup, all deploys are automated.
+
+---
+
 This runbook guides a human tester through a manual playtest session on WSL2/Ubuntu.
 Follow steps in order. If any step fails, refer to the [Troubleshooting](#common-failure-cases-and-remedies) section.
 
