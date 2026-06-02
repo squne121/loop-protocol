@@ -107,6 +107,20 @@ class TestCleanProse:
         result = clean_prose(text)
         assert "日本語" in result
 
+    def test_identifier_excluded_by_identifier_re(self):
+        """GIVEN: snake_case 識別子を含む prose WHEN: clean_prose THEN: 識別子が除去される (AC13)"""
+        text = "validate_japanese_content.py を実行してください。"
+        result = clean_prose(text)
+        assert "validate_japanese_content" not in result
+        assert "実行" in result
+
+    def test_kebab_case_identifier_excluded(self):
+        """GIVEN: kebab-case 識別子を含む prose WHEN: clean_prose THEN: 識別子が除去される (AC13)"""
+        text = "guard-japanese-prose.sh を設定します。"
+        result = clean_prose(text)
+        assert "guard-japanese-prose" not in result
+        assert "設定" in result
+
 
 # ============================================================
 # Unit tests: split_into_prose_blocks (prose_block 分割)

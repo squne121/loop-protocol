@@ -44,8 +44,9 @@ HEADING_RE = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)
 # 空白文字（スペース、タブ、改行）
 WHITESPACE_RE = re.compile(r'\s+')
 
-# 識別子・パッケージ名パターン (英数字 + アンダースコア + ハイフン + ドット)
-IDENTIFIER_RE = re.compile(r'\b[a-zA-Z][a-zA-Z0-9_.\-/]*\b')
+# 技術識別子パターン: _・.・- のいずれかを含む snake_case / kebab-case / file.ext 形式のみ対象
+# 通常の英単語（特殊文字なし）は除外しない
+IDENTIFIER_RE = re.compile(r'\b[a-zA-Z][a-zA-Z0-9]*(?:[_.\-][a-zA-Z0-9._\-]*)+\b')
 
 
 @dataclass
@@ -95,6 +96,9 @@ def clean_prose(text: str) -> str:
 
     # CLI コマンド行を除去
     text = CLI_LINE_RE.sub('', text)
+
+    # 識別子・パッケージ名・CLI トークン・file path を除去 (AC13)
+    text = IDENTIFIER_RE.sub('', text)
 
     return text
 

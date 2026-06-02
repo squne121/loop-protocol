@@ -121,7 +121,8 @@ PYEOF
         BODY="$BODY_EXTRACT"
     fi
 
-    # 2. --body-file でファイルを読む場合
+    # 2. --body-file / -F でファイルを読む場合 (AC10)
+    # 対応フォーム: -F|--body-file= (スペース区切り / イコール形式 / stdin "-" は fail-closed)
     BODY_FILE_EXTRACT=$(uv run python3 - "$COMMAND" <<'PYEOF' 2>/dev/null || echo "")
 import sys
 import shlex
@@ -133,15 +134,56 @@ try:
 except ValueError:
     tokens = []
 
+result_path = None
+is_stdin = False
 i = 0
 while i < len(tokens):
-    if tokens[i] == '--body-file' and i + 1 < len(tokens):
-        filepath = tokens[i + 1]
-        if filepath != '-':
-            print(filepath)
+    tok = tokens[i]
+    # --body-file <path>
+    if tok == '--body-file' and i + 1 < len(tokens):
+        fp = tokens[i + 1]
+        if fp == '-':
+            is_stdin = True
+        else:
+            result_path = fp
+        break
+    # --body-file=<path>
+    if tok.startswith('--body-file='):
+        fp = tok[len('--body-file='):]
+        if fp == '-':
+            is_stdin = True
+        else:
+            result_path = fp
+        break
+    # -F <path>
+    if tok == '-F' and i + 1 < len(tokens):
+        fp = tokens[i + 1]
+        if fp == '-':
+            is_stdin = True
+        else:
+            result_path = fp
+        break
+    # -F=<path>
+    if tok.startswith('-F='):
+        fp = tok[len('-F='):]
+        if fp == '-':
+            is_stdin = True
+        else:
+            result_path = fp
         break
     i += 1
+
+if is_stdin:
+    print("STDIN_FAIL_CLOSED")
+elif result_path:
+    print(result_path)
 PYEOF
+
+    # --body-file - (stdin) は fail-closed
+    if [ "$BODY_FILE_EXTRACT" = "STDIN_FAIL_CLOSED" ]; then
+        echo "GUARD: --body-file - (stdin) は検証不可のため fail-closed でブロックします" >&2
+        exit 2
+    fi
 
     if [ -n "$BODY_FILE_EXTRACT" ] && [ -f "$BODY_FILE_EXTRACT" ]; then
         # ファイルの中身が非日本語なら block
@@ -232,15 +274,53 @@ if echo "$TOOL_NAME" | grep -qE '^(Write|Edit|MultiEdit)$'; then
         fi
     fi
 
-    # Edit/MultiEdit の場合はファイルが存在すれば検証（新規ファイルは Write で処理）
-    if [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "MultiEdit" ]; then
-        if [ -f "$FILE_PATH" ]; then
-            if ! uv run python3 "$VALIDATOR" --file "$FILE_PATH" --threshold 0.1 >/dev/null 2>/dev/null; then
-                echo "GUARD: 日本語比率不足 [${TOOL_NAME}: ${FILE_PATH}]" >&2
-                uv run python3 "$VALIDATOR" --file "$FILE_PATH" --threshold 0.1 2>&1 || true
+    # Edit の場合は new_string を検査。old_string が見つからない場合は fail-closed (AC12)
+    if [ "$TOOL_NAME" = "Edit" ]; then
+        NEW_STRING="$(echo "$INPUT" | jq -r '.tool_input.new_string // ""' 2>/dev/null || echo "")"
+        OLD_STRING="$(echo "$INPUT" | jq -r '.tool_input.old_string // ""' 2>/dev/null || echo "")"
+
+        # old_string が指定されてファイルが存在するが old_string が見つからない → fail-closed
+        if [ -n "$OLD_STRING" ] && [ -f "$FILE_PATH" ]; then
+            OLD_CHECK=$(OLD_STRING_ENV="$OLD_STRING" FILE_PATH_ENV="$FILE_PATH" uv run python3 -c "
+import os
+old = os.environ.get('OLD_STRING_ENV', '')
+fp = os.environ.get('FILE_PATH_ENV', '')
+try:
+    with open(fp, 'r', encoding='utf-8') as f:
+        content = f.read()
+    print('found' if old in content else 'notfound')
+except Exception:
+    print('notfound')
+" 2>/dev/null || echo "notfound")
+            if [ "$OLD_CHECK" = "notfound" ]; then
+                echo "GUARD: old_string がファイルに見つかりません (fail-closed) [Edit: ${FILE_PATH}]" >&2
                 exit 2
             fi
         fi
+
+        # new_string を検証
+        if [ -n "$NEW_STRING" ]; then
+            if ! echo "$NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
+                echo "GUARD: 日本語比率不足 [Edit new_string: ${FILE_PATH}]" >&2
+                echo "$NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+                exit 2
+            fi
+        fi
+    fi
+
+    # MultiEdit の場合は各 edit の new_string を検証 (AC12)
+    if [ "$TOOL_NAME" = "MultiEdit" ]; then
+        EDITS_COUNT="$(echo "$INPUT" | jq '.tool_input.edits | length' 2>/dev/null || echo 0)"
+        for idx in $(seq 0 $((EDITS_COUNT - 1))); do
+            EDIT_NEW_STRING="$(echo "$INPUT" | jq -r ".tool_input.edits[${idx}].new_string // \"\"" 2>/dev/null || echo "")"
+            if [ -n "$EDIT_NEW_STRING" ]; then
+                if ! echo "$EDIT_NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
+                    echo "GUARD: 日本語比率不足 [MultiEdit new_string[${idx}]]" >&2
+                    echo "$EDIT_NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+                    exit 2
+                fi
+            fi
+        done
     fi
 
     exit 0

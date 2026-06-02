@@ -3,6 +3,8 @@ name: Check Japanese Content
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  issues:
+    types: [opened, edited]
   issue_comment:
     types: [created, edited]
   pull_request_review:
@@ -57,6 +59,33 @@ jobs:
           done <<< "$CHANGED_MD"
 
           exit $FAILED
+
+  check-issue-body:
+    name: Issue Body Japanese Check (retrospective)
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Check issue body Japanese ratio (retrospective)
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "Retrospective check: issue body"
+          if [ -z "$ISSUE_BODY" ]; then
+            echo "No issue body to check."
+            exit 0
+          fi
+          echo "$ISSUE_BODY" | python3 .claude/skills/create-issue/scripts/validate_japanese_content.py --threshold 0.1 || {
+            echo "WARNING: Issue body has insufficient Japanese content (retrospective detection)."
+            exit 0
+          }
 
   check-issue-comment:
     name: Issue Comment Japanese Check (retrospective)
