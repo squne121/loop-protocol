@@ -126,6 +126,44 @@ def split_into_prose_blocks(text: str) -> list[str]:
     return blocks
 
 
+# machine_yaml の value 側として許容されるパターン（自然文でないもの）
+# boolean, number, identifier, path, URL, enum 等
+_YAML_VALUE_NON_PROSE_RE = re.compile(
+    r'^('
+    r'true|false|yes|no|null|~'             # boolean/null
+    r'|\d[\d._\-]*'                          # number / version
+    r'|[a-zA-Z][a-zA-Z0-9_.\-/]*'           # identifier / path / enum (スペースなし)
+    r'|https?://\S+'                         # URL
+    r'|\[[^\]]*\]'                           # YAML inline list
+    r'|\{[^}]*\}'                            # YAML inline map
+    r'|)'                                    # 空値
+    r'$'
+)
+
+# 自然文の特徴を持つ value かどうかを判定
+# スペースを含みかつ 3 語以上、または句読点（.,;:!?）を含む場合は prose とみなす
+_PROSE_VALUE_RE = re.compile(
+    r'[,;!?]'                               # 句読点
+    r'|(?:\S+\s+){2,}\S+'                  # スペース区切りで 3 語以上
+)
+
+
+def _is_yaml_machine_line(line: str) -> bool:
+    """
+    1 行が machine-readable な key: value 形式かどうかを判定する。
+    自然文スタイルの value（語数が多い・句読点がある）は False を返す。
+    """
+    m = re.match(r'^\s*[a-zA-Z_][a-zA-Z0-9_.]*\s*:\s*(.*)', line)
+    if not m:
+        return False
+    value = m.group(1).strip()
+    # value が自然文的特徴を持つ場合は prose として扱う
+    if _PROSE_VALUE_RE.search(value):
+        return False
+    # value が machine_yaml value パターンに一致するか確認
+    return bool(_YAML_VALUE_NON_PROSE_RE.match(value))
+
+
 def _classify_block(block: str) -> str:
     """
     ブロックの種別を分類する。
@@ -140,12 +178,14 @@ def _classify_block(block: str) -> str:
     if stripped.startswith('```') or stripped.startswith('~~~'):
         return 'code_fence'
 
-    # YAML front matter or machine-readable YAML block (key: value パターンが支配的)
-    yaml_line_re = re.compile(r'^\s*[a-zA-Z_][a-zA-Z0-9_.]*\s*:', re.MULTILINE)
     lines = stripped.splitlines()
+
+    # YAML front matter or machine-readable YAML block
+    # value 側が自然文でない（短い identifier / boolean / number / enum / path / URL）行が支配的な場合のみ
     if lines:
-        yaml_lines = sum(1 for l in lines if yaml_line_re.match(l))
-        if yaml_lines >= max(1, len(lines) * 0.6):
+        machine_yaml_lines = sum(1 for l in lines if _is_yaml_machine_line(l))
+        non_empty_lines = sum(1 for l in lines if l.strip())
+        if non_empty_lines > 0 and machine_yaml_lines >= max(1, non_empty_lines * 0.6):
             return 'machine_yaml'
 
     # shell command block ($ or # prefix lines が支配的)
@@ -155,8 +195,10 @@ def _classify_block(block: str) -> str:
     if non_empty_lines > 0 and shell_lines >= non_empty_lines * 0.5:
         return 'shell_command'
 
-    # grep pattern line (rg/grep コマンドが含まれる行)
-    if re.search(r'\b(grep|rg|egrep|fgrep)\b', stripped):
+    # grep pattern: 行全体がコマンドまたは検索パターンの場合のみ
+    # 行頭が grep/rg/egrep/fgrep / | grep / $ grep など
+    # または slash/regex/metachar 比率が高く自然文でない単一行
+    if _is_grep_pattern_block(stripped):
         return 'grep_pattern'
 
     # URL or identifier only (有効文字がほぼ識別子/URLのみ)
@@ -166,6 +208,33 @@ def _classify_block(block: str) -> str:
         return 'url_or_identifier_only'
 
     return 'prose'
+
+
+def _is_grep_pattern_block(text: str) -> bool:
+    """
+    ブロックが grep/rg コマンド行またはパターン行であるかを判定する。
+    文中に grep が出てくる程度の英語説明文は False を返す。
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return False
+
+    # 行全体がコマンドラインパターンに一致する行の割合
+    cmd_line_re = re.compile(
+        r'^'
+        r'(?:'
+        r'\|?\s*(?:grep|rg|egrep|fgrep)\s+'  # パイプまたは行頭から始まる grep コマンド
+        r'|\$\s+(?:grep|rg|egrep|fgrep)\s+'  # $ grep ... 形式
+        r'|(?:grep|rg|egrep|fgrep)\s+-'      # grep -オプション から始まる
+        r')'
+    )
+
+    cmd_lines = sum(1 for l in lines if cmd_line_re.match(l))
+    if len(lines) == 0:
+        return False
+
+    # 50% 以上の行がコマンドライン形式の場合のみ grep_pattern とみなす
+    return cmd_lines >= max(1, len(lines) * 0.5)
 
 
 def split_markdown_blocks(text: str) -> list[dict]:
@@ -215,12 +284,16 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
     変更が code_fence / machine_yaml / shell_command / grep_pattern /
     url_or_identifier_only だけであれば空リストを返す（pass）。
 
+    multiplicity を考慮する: 旧側に 1 回ある block が新側で 2 回になったら
+    余剰の 1 回を changed として検査対象にする。
+
     Returns:
         list of prose block dict (split_markdown_blocks の 'prose' type のみ)
         新規または変更された prose block。
         変更が prose 以外のみ → 空リスト（pass）
     """
     import hashlib
+    from collections import Counter
 
     def prose_block_hash(block_text: str) -> str:
         return hashlib.sha256(block_text.encode('utf-8')).hexdigest()
@@ -228,19 +301,24 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
     old_blocks = split_markdown_blocks(old)
     new_blocks = split_markdown_blocks(new)
 
-    # old の prose block hash セット
-    old_prose_hashes = {
+    # old の prose block hash を Counter で管理（multiplicity を保持）
+    old_prose_counts: Counter = Counter(
         prose_block_hash(b['text'])
         for b in old_blocks
         if b['type'] == 'prose'
-    }
+    )
 
-    # new の prose block のうち、old に存在しないものを「変更・追加」とみなす
+    # new の prose block のうち、old の multiplicity を超えるものを「変更・追加」とみなす
+    remaining = Counter(old_prose_counts)
     changed = []
     for b in new_blocks:
         if b['type'] == 'prose':
             h = prose_block_hash(b['text'])
-            if h not in old_prose_hashes:
+            if remaining[h] > 0:
+                # 旧側の残余分を消費（同一 block は pass）
+                remaining[h] -= 1
+            else:
+                # 旧側の残余がない = 新規または重複追加
                 changed.append(b)
 
     return changed

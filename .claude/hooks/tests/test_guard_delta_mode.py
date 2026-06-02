@@ -528,3 +528,175 @@ class TestDeltaMode:
         assert 'changed_prose_blocks:' in stderr
         assert 'failed_blocks:' in stderr
         assert 'ratio_min:' in stderr
+
+
+# ============================================================
+# Blocking fix tests (PR #592 review)
+# ============================================================
+
+class TestBlockingFixes:
+    """Blocking 1〜5 の修正テスト (PR #592 review)"""
+
+    # ------------------------------------------------------------------
+    # Blocking 1: machine_yaml 判定が広すぎて英語 prose を素通し
+    # ------------------------------------------------------------------
+
+    def test_delta_blocks_colon_prefixed_english_prose(self):
+        """Blocking 1: Note: ... 形式の英語 prose が machine_yaml に誤分類されない"""
+        old = "日本語の説明です。"
+        new = old + "\n\nNote: This is a new English prose paragraph."
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) > 0, (
+            "Note: ... 形式の英語 prose は prose として検出されるべき"
+        )
+
+    def test_delta_blocks_summary_colon_english_prose(self):
+        """Blocking 1: Summary: ... 形式の英語 prose が machine_yaml に誤分類されない"""
+        old = "日本語の説明です。"
+        new = old + "\n\nSummary: This is an English summary with multiple words."
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) > 0, (
+            "Summary: ... 形式の英語 prose は prose として検出されるべき"
+        )
+
+    def test_machine_yaml_short_value_still_classified(self):
+        """Blocking 1: value が短い identifier/boolean の行は machine_yaml のまま"""
+        text = "status: ok\ndecision: pass\nenabled: true"
+        blocks = split_markdown_blocks(text)
+        assert any(b['type'] == 'machine_yaml' for b in blocks), (
+            "短い identifier/boolean 値の key: value ブロックは machine_yaml であるべき"
+        )
+
+    # ------------------------------------------------------------------
+    # Blocking 2: grep_pattern 判定が広すぎて grep 言及英文を素通し
+    # ------------------------------------------------------------------
+
+    def test_delta_blocks_english_sentence_mentioning_grep(self):
+        """Blocking 2: grep を言及するだけの英語説明文は prose として検出される"""
+        old = "日本語の説明です。"
+        new = old + "\n\nUse grep to find the failed workflow logs and update the issue."
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) > 0, (
+            "grep を言及するだけの英語説明文は prose として検出されるべき"
+        )
+
+    def test_grep_command_line_still_classified(self):
+        """Blocking 2: 行頭から始まる grep コマンド行は grep_pattern として分類される"""
+        from validate_japanese_content import _classify_block
+        block = "grep -n 'pattern' file.sh"
+        result = _classify_block(block)
+        assert result == 'grep_pattern', (
+            f"grep コマンド行は grep_pattern であるべきだが {result} になった"
+        )
+
+    # ------------------------------------------------------------------
+    # Blocking 3: .json / .log の --body-file で guard が完全回避できる
+    # ------------------------------------------------------------------
+
+    def test_gh_issue_create_body_file_json_still_checked(self, tmp_path):
+        """Blocking 3: .json 拡張子でも gh issue create では full-body 検査される"""
+        body_content = (
+            "This is an English-only issue body in a json-named file. "
+            "It should still be blocked."
+        )
+        body_file = tmp_path / "body.json"
+        body_file.write_text(body_content, encoding='utf-8')
+
+        hook_input = make_bash_hook_input(
+            f"gh issue create --title 'Test' --body-file {body_file}"
+        )
+
+        result = run_hook(hook_input)
+        assert result.returncode == 2, (
+            f".json 拡張子でも gh issue create では英語 prose をブロックすべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_gh_issue_edit_body_file_log_delta_still_checked(self, tmp_path):
+        """Blocking 3: .log 拡張子でも gh issue edit では delta 検査される（新規英語 prose はブロック）"""
+        old_body = "既存の日本語 prose です。"
+        new_body = (
+            "既存の日本語 prose です。\n\n"
+            "This is a newly added English prose paragraph in a log-named file."
+        )
+
+        body_file = tmp_path / "body.log"
+        body_file.write_text(new_body, encoding='utf-8')
+
+        hook_input = make_bash_hook_input(
+            f"gh issue edit 400 --body-file {body_file}"
+        )
+
+        mock_responses = {
+            "issue view 400": old_body
+        }
+
+        result = run_hook(hook_input, mock_responses)
+        assert result.returncode == 2, (
+            f".log 拡張子でも新規英語 prose はブロックすべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    # ------------------------------------------------------------------
+    # Blocking 4: 空の旧本文を取得失敗と誤判定
+    # ------------------------------------------------------------------
+
+    def test_delta_allows_empty_old_body_with_japanese_new_body(self, tmp_path):
+        """Blocking 4: 空の旧本文 + 日本語新本文 → pass (exit 0)"""
+        old_body = ""  # 空の旧本文（新規作成直後など）
+        new_body = "これは日本語の本文です。日本語で書かれた内容です。"
+
+        body_file = tmp_path / "body.md"
+        body_file.write_text(new_body, encoding='utf-8')
+
+        hook_input = make_bash_hook_input(
+            f"gh issue edit 500 --body-file {body_file}"
+        )
+
+        mock_responses = {
+            "issue view 500": old_body
+        }
+
+        result = run_hook(hook_input, mock_responses)
+        assert result.returncode == 0, (
+            f"空の旧本文 + 日本語新本文は pass すべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    def test_delta_blocks_empty_old_body_with_english_new_body(self, tmp_path):
+        """Blocking 4: 空の旧本文 + 英語新本文 → block (exit 2)"""
+        old_body = ""  # 空の旧本文
+        new_body = (
+            "This is an entirely English prose body added to an empty issue. "
+            "It should be blocked by the delta check."
+        )
+
+        body_file = tmp_path / "body.md"
+        body_file.write_text(new_body, encoding='utf-8')
+
+        hook_input = make_bash_hook_input(
+            f"gh issue edit 501 --body-file {body_file}"
+        )
+
+        mock_responses = {
+            "issue view 501": old_body
+        }
+
+        result = run_hook(hook_input, mock_responses)
+        assert result.returncode == 2, (
+            f"空の旧本文 + 英語新本文はブロックすべき: "
+            f"exit {result.returncode}, stderr={result.stderr}"
+        )
+
+    # ------------------------------------------------------------------
+    # Blocking 5: 同一英語 block の重複追加が差分検知されない
+    # ------------------------------------------------------------------
+
+    def test_delta_blocks_duplicate_of_existing_english_prose(self):
+        """Blocking 5: 同一内容の prose を重複追加した場合に変更検知される"""
+        old = "This is legacy English prose."
+        new = old + "\n\n" + old  # 同一内容を重複追加
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) > 0, (
+            "同一英語 prose の重複追加は changed として検出されるべき"
+        )

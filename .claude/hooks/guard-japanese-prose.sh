@@ -151,10 +151,9 @@ if [ "$TOOL_NAME" = "Bash" ]; then
 
     # --body-file が指定されている場合の delta mode (AC2)
     if [ -n "$BODY_FILE_EXTRACT" ] && [ -f "$BODY_FILE_EXTRACT" ]; then
-        # log / json ファイルは除外
-        if echo "$BODY_FILE_EXTRACT" | grep -qiE '\.(log|json)$'; then
-            exit 0
-        fi
+        # Mode A (gh issue/pr create/edit/comment/review) では拡張子による無条件 exit 0 は禁止
+        # fixture / tmp draft 除外が必要なら /tmp/ 下の明示的なパスに限定する
+        # (注: Mode B の tmp/ 下書き検査では log/json 除外を維持する)
 
         # gh issue edit / gh pr edit かどうかを判定して delta mode を適用
         IS_DELTA_EDIT=false
@@ -198,22 +197,31 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             TARGET_LABEL="${EDIT_TYPE} #${TARGET_NUM}"
 
             # 既存 body を取得 (AC2, AC15)
+            # API 呼び出しの成否とコンテンツの有無を分離する
+            # 空文字は成功として OLD_BODY="" で delta check に渡す（新本文全体を新規 block として検査）
             OLD_BODY=""
             if [ "$EDIT_TYPE" = "issue" ]; then
-                OLD_BODY="$(gh issue view "$TARGET_NUM" --json body --jq .body 2>/dev/null || echo "")"
+                if ! OLD_BODY="$(gh issue view "$TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
+                    # API 呼び出し失敗: fail-closed (AC11)
+                    echo "GUARD: ${TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                    echo "  target_resolution_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
             else
-                OLD_BODY="$(gh pr view "$TARGET_NUM" --json body --jq .body 2>/dev/null || echo "")"
+                if ! OLD_BODY="$(gh pr view "$TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
+                    # API 呼び出し失敗: fail-closed (AC11)
+                    echo "GUARD: ${TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                    echo "  target_resolution_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
             fi
-
-            if [ -z "$OLD_BODY" ]; then
-                # 既存 body 取得失敗: fail-closed (AC11)
-                echo "GUARD: ${TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
-                echo "  target_resolution_failed" >&2
-                echo "  changed_prose_blocks: unknown" >&2
-                echo "  failed_blocks: unknown" >&2
-                echo "  ratio_min: 0.000" >&2
-                exit 2
-            fi
+            # OLD_BODY が空文字でも続行（新本文全体を新規 block として検査）
 
             # 新 body を読み込む
             NEW_BODY="$(cat "$BODY_FILE_EXTRACT")"
