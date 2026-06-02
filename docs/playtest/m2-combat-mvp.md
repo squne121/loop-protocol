@@ -6,6 +6,33 @@ implementation_issue: "#541"
 automated_tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
 status: accepted_with_deferred
+acceptance_verdict:
+  overall: accepted_with_deferred
+  evaluated_against_issue: "#543"
+  passed:
+    - AC1
+    - AC2
+    - AC3
+    - AC4
+    - AC5
+    - AC6
+    - AC7
+    - AC9
+    - AC12
+    - AC13
+    - AC14
+  partial_or_deferred:
+    - ac: AC8
+      status: partial
+      reason: "browser version recorded (Chrome 148.0.7778.179). viewport and device_pixel_ratio were not captured during the human run and must not be backfilled post hoc."
+    - ac: AC10
+      status: accepted_with_deferred
+      reason: "hp_zero_defeat confirmed by human operator squne121 (PR #570 comment). Local artifact with sha256; no GitHub-hosted artifact URL yet."
+    - ac: AC11
+      status: deferred_exception
+      reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
+  artifact_reviewability: deferred
+  artifact_note: "Video files exist locally (docs/playtest/*.mp4) with sha256 checksums. Not yet uploaded to GitHub. Requires human to attach files to PR/issue comment or commit to repo."
 date: "2026-05-31"
 ---
 
