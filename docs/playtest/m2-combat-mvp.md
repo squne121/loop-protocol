@@ -5,7 +5,7 @@ parent_issue: "#483"
 implementation_issue: "#541"
 tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
-status: automated_e2e_verified
+status: accepted_with_deferred
 date: "2026-05-31"
 ---
 
@@ -260,3 +260,62 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
 
 Note: status is `automated_e2e_verified`. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), defeat overlay red-dominant pixels (R>80,G<60). All 16 E2E tests pass. Issue #541 adds Canvas enemy rendering, victory/defeat overlay, and HUD sortie information display.
+
+## Human Playtest Evidence
+
+```yaml
+manual_operator: squne121
+executed_at: "2026-06-02T15:00:22+09:00"
+tested_commit: "5227e96dfa94c063c2d55f30d42348eb44522a9b"
+git_status_short: ""
+dependency_state: |
+  #541 (feat: CanvasRenderer + HudController M2 combat entities, PR #548) and
+  #542 (spec/impl: MVP sortie victory/defeat spec, PR #552) are both included
+  in tested_commit 5227e96dfa94c063c2d55f30d42348eb44522a9b.
+command:
+  serve: pnpm preview
+environment:
+  os: "Windows 11"
+  browser: "Chrome (version unknown)"
+  viewport: "unknown"
+  device_pixel_ratio: "unknown"
+  input_device: "keyboard (WASD) + mouse"
+```
+
+### Scenario Results
+
+#### all_enemies_defeated_victory
+
+- artifact: "docs/playtest/playtest-victory- 2026-06-02 150022.mp4"
+- confirmed:
+  - WASD 移動: confirmed
+  - mouse 射撃: confirmed
+  - enemy 可視 (Canvas 描画): confirmed
+  - collision 検出: confirmed
+  - damage 適用: confirmed
+  - HUD HP update: confirmed
+  - Canvas overlay (victory / green): confirmed
+  - HUD sortie-status 結果一致: confirmed
+  - 全敵撃破→victory 遷移: confirmed
+
+#### hp_zero_defeat
+
+- artifact: "docs/playtest/playtest-defeat-2026-06-02 150402.mp4"
+- confirmed:
+  - defeat 遷移: confirmed
+  - Canvas overlay (defeat / red): confirmed
+  - HUD sortie-status 結果一致: confirmed
+  - Note: 上記 artifact は defeat シナリオの 1 件。hp_zero_defeat / timeout_30s_defeat のいずれか。
+
+#### timeout_30s_defeat
+
+- artifact: deferred
+- Note: 個別証跡は取得済み artifact では未分離。accepted_with_deferred で閉じる。
+  timeout_30s_defeat は E2E テスト (tests/e2e/m2-combat-mvp.spec.ts, test 9) で自動検証済み。
+
+### Human Observations
+
+- 操作性・ロジック: 問題なし（MVP としてよくできている）
+- 武装可視化: 自機中心から射撃方向に伸びる棒 → マウスカーソル追従が未実装の疑い（follow-up 要）
+- 敵 HP 表示: 桁溢れによる表示崩れ確認（follow-up 要）
+- プレイテスト動線: manual-playtest-runbook.md の日本語化要望（follow-up 要）
