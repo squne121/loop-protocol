@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-subagent-start",
+            "timeout": 30,
+            "statusMessage": "Loading LOOP_PROTOCOL subagent guardrail"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail"
+          }
+        ]
+      },
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
+            "timeout": 30,
+            "statusMessage": "Checking LOOP_PROTOCOL patch guardrail"
+          }
+        ]
+      }
+    ]
+  }
+}
