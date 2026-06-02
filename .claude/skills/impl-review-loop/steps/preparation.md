@@ -2,6 +2,88 @@
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
+## 0. Intake Gate — `CONTRACT_REVIEW_RESULT_V1 status: go` 必須検査
+
+`impl-review-loop` preparation の最初のゲート。以下の 4 サブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。
+
+```yaml
+INTAKE_GATE_RESULT_V1:
+  status: pass | intake_gate_failed
+  subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+  detail: "<人間向け説明>"
+```
+
+### サブ理由の優先順位と判定条件
+
+評価は以下の順序で行い、最初に該当したサブ理由で停止する（複数該当しても最初の 1 つを返す）:
+
+#### 1. `metadata_not_ready`（最高優先）
+
+Issue の routing metadata が `impl-review-loop` の前提を満たさない場合。以下のいずれかが欠落:
+
+- **title prefix** が `実装:` または `implement:` で始まっていない
+- **`phase/implementation` label** が付与されていない
+
+```bash
+gh issue view <issue_number> --json title,labels \
+  --jq '{title: .title, labels: [.labels[].name]}'
+```
+
+どちらか一方でも欠落していれば `intake_gate_failed: metadata_not_ready` で停止。
+
+#### 2. `missing_contract_go`
+
+`contract_snapshot_url` が提供されておらず、Issue コメントにも有効な `CONTRACT_REVIEW_RESULT_V1 status: go` が存在しない場合。
+
+- `contract_snapshot_url` 未提供 → Issue コメントを自動検出しても `status: go` の valid block が見つからない
+- この場合は **`issue-contract-review` を自動実行しない**（fail-only gate）。`intake_gate_failed: missing_contract_go` で停止し、人間に `issue-contract-review` の実行を依頼する
+
+> **設計決定**: #149 実装の自動実行（`status: go` 不在時に `issue-contract-review` を自動呼び出し）は `impl-review-loop` preparation Step 1-b の旧設計。本 Issue（#564）以降は fail-only gate に変更する。自動実行パスは廃止。
+
+#### 3. `stale_contract_review`
+
+`CONTRACT_REVIEW_RESULT_V1.status == "go"` のコメントが存在するが、freshness チェックに失敗した場合:
+
+- `body_sha256` フィールドが go コメントに存在し、かつ現在の Issue body の sha256 と一致しない
+- `body_sha256` フィールドが存在しない場合のフォールバック: `CONTRACT_REVIEW_RESULT_V1.generated_at` < Issue の `updated_at`（go コメント生成後に Issue 本文が更新された）
+
+いずれかの条件が真の場合は `intake_gate_failed: stale_contract_review` で停止し、`issue-contract-review` の再実行を人間に依頼する。
+
+#### 4. `body_snapshot_mismatch`
+
+`contract_snapshot_url` が明示的に提供され、かつ上記 freshness チェックで body_sha256 または generated_at の不一致が検出された場合。  
+（ステップ 3 の freshness チェックがコメント自動検出時に対応し、本サブ理由は明示提供 URL が stale な場合に使用）
+
+#### 5. `request_changes_after_go`（最低優先）
+
+`status: go` のコメントより新しい `CONTRACT_REVIEW_RESULT_V1.status: blocked` または明示的な go 無効化 marker が存在する場合。
+
+**go 無効化 marker の定義**（machine-readable block）:
+
+```yaml
+# go 無効化 marker — このブロックが存在する場合、直前の status: go は無効
+REVIEW_RESULT_INVALIDATION_V1:
+  invalidates_go_at: "<ISO8601 of the go comment>"
+  reason: request_changes | stale | superseded
+  issued_by: "<actor>"
+  issued_at: "<ISO8601>"
+```
+
+上記 fenced yaml block が Issue コメントに存在し、`invalidates_go_at` が直近の `status: go` の `generated_at` と一致する場合は `intake_gate_failed: request_changes_after_go` で停止。
+
+### 全サブ理由なし → `status: pass`
+
+全ての条件を通過した場合のみ `INTAKE_GATE_RESULT_V1.status: pass` を返し、Step 1 へ進む。
+
+`LOOP_STATE.intake_gate` に結果を記録する:
+
+```yaml
+intake_gate:
+  status: pass | intake_gate_failed
+  subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+  evaluated_at: "<ISO8601>"
+```
+
 ## 1. Inputs の確認
 
 ```yaml
@@ -61,20 +143,14 @@ gh api --paginate \
 
 `LOOP_STATE.contract_snapshot_source` に `detected_existing` を記録する。
 
-**ステップ 3: 既存 `status: go` が存在しない場合 — `issue-contract-review` 先行実行**
+**ステップ 3: 既存 `status: go` が存在しない場合**
 
-有効な `status: go` が検出されなかった場合にのみ、`issue-contract-review` を先行実行する。
+> **廃止（#564 以降）**: 旧設計では有効な `status: go` が検出されなかった場合に `issue-contract-review` を自動実行していた。  
+> #564 の intake gate（Step 0）導入後は、この自動実行パスは廃止される。  
+> `status: go` が存在しない場合は Step 0 の intake gate で `intake_gate_failed: missing_contract_go` として停止する。  
+> Step 1-b のステップ 3 は実行されない。
 
-実行後、生成された最新の `CONTRACT_REVIEW_RESULT_V1` を再取得し、以下で分岐する:
-
-- `status: go` かつ `generated_by`, `issue_url`, `generated_at` が妥当:
-  - その comment URL を `contract_snapshot_url` として採用
-  - `LOOP_STATE.contract_snapshot_source` に `materialized_by_issue_contract_review` を記録
-- `status: blocked`:
-  - `contract_snapshot_url` を設定せず停止
-  - `LOOP_STATE.termination_reason` に `human_escalation` を記録
-- 有効な `CONTRACT_REVIEW_RESULT_V1` が見つからない:
-  - 停止し、人間判断を仰ぐ
+（後方互換のためセクションを残すが、Step 0 で停止済みのためここには到達しない）
 
 > **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
@@ -252,6 +328,10 @@ LOOP_STATE:
   blockers_history: []
   external_research_skip_basis: null
   termination_reason: null
+  intake_gate:
+    status: pass | intake_gate_failed
+    subreason: null | metadata_not_ready | missing_contract_go | stale_contract_review | body_snapshot_mismatch | request_changes_after_go
+    evaluated_at: "<ISO8601>"
   product_spec_preflight:
     source: contract_snapshot.checks.product_spec_check
     applicability: applicable | not_applicable | missing
