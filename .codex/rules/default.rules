@@ -1,6 +1,9 @@
 # LOOP_PROTOCOL project-local command policy for Codex.
 # This is intentionally stricter than `.claude/settings.json`: Codex uses `rtk`
 # as the command harness, but only for explicitly allowlisted subcommands.
+# Hooks + rules are a fail-closed local guardrail for repo workflow compliance.
+# Known limitation: they are not a security boundary and can be weakened by
+# parent runtime overrides, untrusted project state, or unsupported tool paths.
 
 prefix_rule(
     pattern = ["rtk", "--help"],
@@ -19,6 +22,25 @@ prefix_rule(
         "rtk git status",
         "rtk gh issue view 1",
         "rtk pnpm test",
+    ],
+)
+
+prefix_rule(
+    pattern = ["node", "scripts/check-codex-agents.mjs"],
+    decision = "allow",
+    justification = "Allow the Codex custom-agent validator and hook entrypoint.",
+    match = [
+        "node scripts/check-codex-agents.mjs",
+    ],
+)
+
+prefix_rule(
+    pattern = ["codex", ["--version", "exec"]],
+    decision = "allow",
+    justification = "Allow documented runtime smoke tests for custom agent spawn and local guardrail behavior.",
+    match = [
+        "codex --version",
+        "codex exec \"Spawn the codebase-investigator custom agent once\"",
     ],
 )
 
