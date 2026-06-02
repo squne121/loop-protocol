@@ -4,8 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = process.cwd();
+// Derive repoRoot from script location so it is stable regardless of cwd.
+// Hooks invoke this script via `$(git rev-parse --show-toplevel)/scripts/...`
+// but shell cwd when the hook fires may be a subdirectory.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agentsDir = path.join(repoRoot, '.codex', 'agents');
 const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
@@ -516,36 +520,51 @@ function denyForBash(command) {
 // Behavior:
 //   - If CODEX_ALLOWED_PATHS is set: enforce strictly — writes outside the set
 //     are denied (fail-closed).
-//   - If CODEX_ALLOWED_PATHS is NOT set: fall back to legacy assets/LICENSES
-//     guard only (backward compatible: does not break standard implementation-
-//     worker invocations where CODEX_ALLOWED_PATHS is not supplied by the
-//     harness).
-// Rationale: Enforcing fail-closed when the env var is absent would break
-// normal worktree-based implementation runs where no Allowed Paths are
-// injected. Strict enforcement is opt-in via CODEX_ALLOWED_PATHS supply.
+//   - If CODEX_ALLOWED_PATHS is NOT set (default): deny all writes except
+//     assets/ and LICENSES/ protection (fail-closed by design).
+//     Set CODEX_LEGACY_ALLOW_WRITES=1 to restore the old allow-by-default
+//     behavior for callers that have not yet adopted CODEX_ALLOWED_PATHS.
+// Rationale: fail-closed is the correct default for a guardrail. Callers
+// must declare allowed paths per Issue contract; the legacy bypass is an
+// explicit opt-out, not the default.
+//
+// KNOWN LIMITATION: path canonicalization uses path.resolve without realpath,
+// so symlinks that escape the repo root are not caught.
 // ---------------------------------------------------------------------------
 function parseAllowedPaths() {
   const raw = process.env.CODEX_ALLOWED_PATHS;
   if (!raw || !raw.trim()) {
-    return null; // not set: use legacy mode
+    return null; // not set: use fail-closed default (or legacy mode if opted in)
   }
-  // Accept newline or colon separated paths
-  return raw.split(/[\n:]+/).map((p) => p.trim()).filter(Boolean);
+  // Accept newline-separated paths (colon is avoided: conflicts with Windows drive letters)
+  return raw.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+}
+
+function resolveInsideRepo(inputPath) {
+  if (!inputPath || inputPath.includes('\0')) return null;
+  const resolved = path.resolve(repoRoot, inputPath);
+  // Reject paths that escape the repo root
+  if (resolved !== repoRoot && !resolved.startsWith(repoRoot + path.sep)) return null;
+  return resolved;
 }
 
 function isPathAllowed(filePath, allowedPaths) {
-  const normalized = filePath.replace(/\\/g, '/');
+  const candidate = resolveInsideRepo(filePath);
+  if (!candidate) return false;
   return allowedPaths.some((allowed) => {
-    const normalizedAllowed = allowed.replace(/\\/g, '/');
-    return normalized === normalizedAllowed ||
-      normalized.startsWith(normalizedAllowed.endsWith('/') ? normalizedAllowed : `${normalizedAllowed}/`);
+    const resolvedAllowed = resolveInsideRepo(allowed);
+    return resolvedAllowed && (candidate === resolvedAllowed || candidate.startsWith(resolvedAllowed + path.sep));
   });
 }
 
 function isProtectedLegacy(filePath) {
+  const candidate = resolveInsideRepo(filePath);
+  if (!candidate) return true; // null path (traversal/NUL) → deny
+  const assetsDir = path.resolve(repoRoot, 'assets');
+  const licensesDir = path.resolve(repoRoot, 'LICENSES');
   return (
-    filePath === 'assets' || filePath.startsWith('assets/') ||
-    filePath === 'LICENSES' || filePath.startsWith('LICENSES/')
+    candidate === assetsDir || candidate.startsWith(assetsDir + path.sep) ||
+    candidate === licensesDir || candidate.startsWith(licensesDir + path.sep)
   );
 }
 
@@ -554,6 +573,8 @@ function extractPatchTouchedPaths(command) {
 }
 
 function denyForWriteTool(toolName, toolInput, allowedPaths) {
+  const legacyMode = process.env.CODEX_LEGACY_ALLOW_WRITES === '1';
+
   // apply_patch: extract touched paths from patch content
   if (toolName === 'apply_patch') {
     const command = normalizeCommand(toolInput?.command);
@@ -565,10 +586,15 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
           return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
         }
       }
-    } else {
-      // Legacy mode: only block assets/LICENSES
+    } else if (legacyMode) {
+      // Legacy opt-in: only block assets/LICENSES
       if (touchedPaths.some((fp) => isProtectedLegacy(fp))) {
         return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
+      }
+    } else {
+      // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
+      if (touchedPaths.length > 0) {
+        return 'CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
       }
     }
     return null;
@@ -585,11 +611,14 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
       if (!isPathAllowed(filePath, allowedPaths)) {
         return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
       }
-    } else {
-      // Legacy mode: only block assets/LICENSES
+    } else if (legacyMode) {
+      // Legacy opt-in: only block assets/LICENSES
       if (isProtectedLegacy(filePath)) {
         return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
       }
+    } else {
+      // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
+      return 'CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
     }
     return null;
   }
@@ -682,18 +711,30 @@ function runSelfTest() {
 
   process.stdout.write('\n=== self-test: Allowed Paths enforcement (Edit/Write) ===\n');
 
-  // Test: CODEX_ALLOWED_PATHS not set — assets/ is denied (legacy mode)
+  // Test: CODEX_ALLOWED_PATHS not set, no legacy opt-in — fail-closed: any write is denied
   {
     delete process.env.CODEX_ALLOWED_PATHS;
-    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null);
-    selfAssert(result !== null, 'Legacy mode: assets/ edit is denied');
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
+    selfAssert(result !== null, 'Fail-closed default: src/main.ts edit is denied when CODEX_ALLOWED_PATHS not set');
   }
 
-  // Test: CODEX_ALLOWED_PATHS not set — normal path is allowed (legacy mode)
+  // Test: CODEX_ALLOWED_PATHS not set, CODEX_LEGACY_ALLOW_WRITES=1 — assets/ is denied
   {
     delete process.env.CODEX_ALLOWED_PATHS;
+    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null);
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    selfAssert(result !== null, 'Legacy opt-in: assets/ edit is denied');
+  }
+
+  // Test: CODEX_ALLOWED_PATHS not set, CODEX_LEGACY_ALLOW_WRITES=1 — normal path is allowed
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
     const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    selfAssert(result === null, 'Legacy mode: src/main.ts edit is allowed');
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    selfAssert(result === null, 'Legacy opt-in: src/main.ts edit is allowed');
   }
 
   // Test: CODEX_ALLOWED_PATHS set — path inside set is allowed
@@ -717,13 +758,46 @@ function runSelfTest() {
     selfAssert(result !== null, 'Strict mode: assets/sprite.png is denied');
   }
 
+  // Test: path traversal escape — denied in strict mode
+  {
+    const allowed = ['scripts'];
+    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, allowed);
+    selfAssert(result !== null, 'Strict mode: path traversal escape scripts/../src/main.ts is denied');
+  }
+
+  // Test: path traversal escape — denied in fail-closed default
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, null);
+    selfAssert(result !== null, 'Fail-closed default: path traversal escape is denied');
+  }
+
+  // Test: NUL byte in path — denied
+  {
+    const allowed = ['scripts'];
+    const result = denyForWriteTool('Write', { file_path: 'scripts/foo\0bar.mjs' }, allowed);
+    selfAssert(result !== null, 'Strict mode: NUL byte in path is denied');
+  }
+
   process.stdout.write('\n=== self-test: Allowed Paths enforcement (apply_patch) ===\n');
 
-  // Test: apply_patch with assets path — legacy mode deny
+  // Test: apply_patch with assets path — fail-closed default deny
   {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
     const patchCmd = '*** Update File: assets/sprite.png\n--- a\n+++ b\n';
     const result = denyForWriteTool('apply_patch', { command: patchCmd }, null);
-    selfAssert(result !== null, 'Legacy mode: apply_patch to assets/ is denied');
+    selfAssert(result !== null, 'Fail-closed default: apply_patch to assets/ is denied');
+  }
+
+  // Test: apply_patch with assets path — legacy opt-in deny
+  {
+    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
+    const patchCmd = '*** Update File: assets/sprite.png\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd }, null);
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    selfAssert(result !== null, 'Legacy opt-in: apply_patch to assets/ is denied');
   }
 
   // Test: apply_patch with allowed path — strict mode allow
@@ -738,6 +812,13 @@ function runSelfTest() {
     const patchCmd = '*** Update File: src/main.ts\n--- a\n+++ b\n';
     const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['.codex/agents', 'scripts']);
     selfAssert(result !== null, 'Strict mode: apply_patch to src/main.ts is denied');
+  }
+
+  // Test: apply_patch path traversal — strict mode deny
+  {
+    const patchCmd = '*** Update File: scripts/../src/main.ts\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['scripts']);
+    selfAssert(result !== null, 'Strict mode: apply_patch path traversal is denied');
   }
 
   process.stdout.write('\n=== self-test: Bash hook ===\n');
