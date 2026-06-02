@@ -196,6 +196,29 @@ uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$NEW_BODY"
 
 スクリプトが exit 2 を返した場合は abort し、ステップ 7 の復旧処理へ進む。
 
+### 4.3. issue_contract_hygiene_autofix を実行（C4/C9 trivial format repair）
+
+`guard-issue-body.py` が pass した後、`contract_readiness_check` の前に `issue_contract_hygiene_autofix.py` を実行して C4/C9 の trivial format blocker を補正する。
+
+```bash
+uv run python3 .claude/skills/edit-issue/scripts/issue_contract_hygiene_autofix.py \
+  --body-file "$NEW_BODY" --out-file "$NEW_BODY"
+HYGIENE_EXIT=$?
+# exit 0: 補正あり（$NEW_BODY がインプレースで更新されている）
+#   → contract_hygiene_repair_applied: true として ISSUE_AUTHOR_RESULT_V1 に記録
+# exit 1: 補正なし（trivial blocker が存在しないか sha256 変化なし）
+#   → contract_hygiene_repair_applied: false
+# exit 2: trivial 以外の blocker または autofixable 判定不能
+#   → 補正せず続行（contract_hygiene_repair_applied: false）
+if [ "$HYGIENE_EXIT" -eq 0 ]; then
+  CONTRACT_HYGIENE_REPAIR_APPLIED=true
+else
+  CONTRACT_HYGIENE_REPAIR_APPLIED=false
+fi
+```
+
+補正ありの場合（`exit 0`）、`$NEW_BODY` は更新済みのため後続の `contract_readiness_check`（Step 4.5）は補正済み本文に対して実行される。
+
 ### 4.5. contract_readiness_check を fail-closed で実行
 
 `guard-issue-body.py` が pass した後、mutation 前に contract readiness を確認する。

@@ -11,6 +11,18 @@
 | Any step requires human review | `human_escalation` |
 | `final_classification == superseded_by_decision` and close / replacement flow completed | `superseded_by_decision` |
 
+## Contract Hygiene Repair Routing Predicate
+
+`ISSUE_AUTHOR_RESULT_V1.contract_hygiene_repair_applied` フラグによる iteration accounting ルール。
+
+| `contract_hygiene_repair_applied` | `no_change` guard | routing |
+|---|---|---|
+| `true` | — | semantic iteration を消費しない。Step 2（reviewer）に戻す（iteration カウントを increment しない） |
+| `false` | — | 通常通り iteration カウント（semantic iteration として処理） |
+| `true` だが body_sha256 が前回と同一（`no_change`） | 同一 | 同一 lane に戻さない。通常 iteration カウントとして処理（無限ループ防止） |
+
+**重要**: orchestrator は C4/C9 の具体修復知識を持たない。`contract_hygiene_repair_applied: true` フラグのみで routing を判断する。修復の詳細は `edit-issue` skill および `issue-author` SubAgent の責務。
+
 ## Handoff State: `refinement_approved_gate_pending` / `implementation_ready`
 
 `issue-reviewer` が `approve` を返しただけでは `implementation_ready` とならない。  
