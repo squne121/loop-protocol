@@ -39,17 +39,21 @@ const allowedRuntimeStatuses = new Set([
 ]);
 
 const expectedProfiles = new Set(['loop-protocol-readonly', 'loop-protocol-rtk']);
+// Model mapping (ChatGPT account Codex CLI, v0.136.0+):
+//   gpt-5.4-mini medium      = Haiku equivalent  (light read-only / cleanup tasks)
+//   gpt-5.4-mini extra-high  = Sonnet equivalent (medium complexity tasks)
+//   gpt-5.4 medium           = Opus equivalent   (heavy implementation / review tasks)
 const reasoningMap = new Map([
-  ['codebase-investigator', { model: 'codex-mini-latest', effort: 'medium' }],
-  ['implementation-worker', { model: 'gpt-5-codex', effort: 'high' }],
-  ['issue-author', { model: 'gpt-5-codex', effort: 'medium' }],
-  ['issue-reviewer', { model: 'codex-mini-latest', effort: 'medium' }],
-  ['post-merge-cleanup-worker', { model: 'codex-mini-latest', effort: 'medium' }],
-  ['pr-reviewer-lite', { model: 'codex-mini-latest', effort: 'medium' }],
-  ['pr-reviewer', { model: 'gpt-5-codex', effort: 'high' }],
-  ['review-issue', { model: 'gpt-5-codex', effort: 'high' }],
-  ['test-runner', { model: 'codex-mini-latest', effort: 'medium' }],
-  ['web-researcher', { model: 'codex-mini-latest', effort: 'medium' }],
+  ['codebase-investigator', { model: 'gpt-5.4-mini', effort: 'medium' }],
+  ['implementation-worker', { model: 'gpt-5.4', effort: 'medium' }],
+  ['issue-author', { model: 'gpt-5.4-mini', effort: 'xhigh' }],
+  ['issue-reviewer', { model: 'gpt-5.4-mini', effort: 'medium' }],
+  ['post-merge-cleanup-worker', { model: 'gpt-5.4-mini', effort: 'medium' }],
+  ['pr-reviewer-lite', { model: 'gpt-5.4-mini', effort: 'medium' }],
+  ['pr-reviewer', { model: 'gpt-5.4', effort: 'medium' }],
+  ['review-issue', { model: 'gpt-5.4', effort: 'medium' }],
+  ['test-runner', { model: 'gpt-5.4-mini', effort: 'medium' }],
+  ['web-researcher', { model: 'gpt-5.4-mini', effort: 'medium' }],
 ]);
 
 const readOnlyAgents = new Set([

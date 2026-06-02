@@ -1,6 +1,6 @@
 name = "codebase-investigator"
 description = "コードベース調査専用の custom agent。Gemini delegation skill を優先し、main thread には構造化された調査結果だけを返す。"
-model = "codex-mini-latest"
+model = "gpt-5.4-mini"
 model_reasoning_effort = "medium"
 default_permissions = "loop-protocol-readonly"
 developer_instructions = """

@@ -1,6 +1,6 @@
 name = "issue-reviewer"
 description = "Issue の contract 品質を read-only でレビューし、verdict と routing 情報だけを返す lightweight custom agent。"
-model = "codex-mini-latest"
+model = "gpt-5.4-mini"
 model_reasoning_effort = "medium"
 default_permissions = "loop-protocol-readonly"
 developer_instructions = """

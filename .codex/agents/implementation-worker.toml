@@ -1,7 +1,7 @@
 name = "implementation-worker"
 description = "承認済み implementation issue を Allowed Paths 内で実装し、検証まで進める write-capable custom agent。"
-model = "gpt-5-codex"
-model_reasoning_effort = "high"
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
 default_permissions = "loop-protocol-rtk"
 developer_instructions = """
 ROLE

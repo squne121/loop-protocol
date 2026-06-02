@@ -1,6 +1,6 @@
 name = "post-merge-cleanup-worker"
 description = "PR マージ後 cleanup を担当し、ブランチ整理と follow-up routing を構造化報告する custom agent。"
-model = "codex-mini-latest"
+model = "gpt-5.4-mini"
 model_reasoning_effort = "medium"
 default_permissions = "loop-protocol-rtk"
 developer_instructions = """

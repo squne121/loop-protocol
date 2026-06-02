@@ -1,6 +1,6 @@
 name = "web-researcher"
 description = "外部仕様・公開 API・公式ドキュメントの fact-check を担当する custom agent。grounded route 不可時は follow-up を明示する。"
-model = "codex-mini-latest"
+model = "gpt-5.4-mini"
 model_reasoning_effort = "medium"
 default_permissions = "loop-protocol-readonly"
 developer_instructions = """
