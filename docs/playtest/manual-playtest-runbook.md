@@ -29,11 +29,16 @@ When a pull request is opened or updated, a preview is deployed to:
 https://squne121.github.io/loop-protocol/pr-<PR番号>/
 ```
 
-Replace `<PR番号>` with the actual PR number (e.g., `pr-123`).
+Replace `<PR番号>` with the numeric PR number. For example, PR #123 becomes:
+`https://squne121.github.io/loop-protocol/pr-123/`
+
 The preview URL is also posted as a comment on the PR automatically.
 
 > **Note:** The PR preview is automatically deleted when the PR is closed.
 > After the PR is closed, the preview URL (`/pr-<PR番号>/`) will return 404.
+
+> **Note:** PR preview is only generated for same-repository PRs. PRs opened from
+> forks do not receive a preview deployment.
 
 ### Prerequisites (first-time setup by repo maintainer)
 

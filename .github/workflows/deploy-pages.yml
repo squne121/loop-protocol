@@ -10,13 +10,12 @@ permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: deploy-pages-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   deploy-main:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -43,7 +42,11 @@ jobs:
   deploy-pr:
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.action != 'closed'
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -73,18 +76,57 @@ jobs:
           script: |
             const prNumber = context.payload.pull_request.number;
             const previewUrl = `https://squne121.github.io/loop-protocol/pr-${prNumber}/`;
-            const body = `## Preview URL\n\nThis PR is deployed to: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`;
-            await github.rest.issues.createComment({
+
+            // Live check: verify the preview URL is actually reachable (best-effort)
+            let liveCheckPassed = false;
+            try {
+              const { execSync } = require('child_process');
+              execSync(
+                `curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null -w "%{http_code}" "${previewUrl}" | grep -q "^200$"`,
+                { stdio: 'inherit' }
+              );
+              liveCheckPassed = true;
+            } catch (_) {
+              // best-effort: live check failed, but do not fail the workflow
+            }
+
+            const body = liveCheckPassed
+              ? `<!-- loop-protocol-pr-preview -->\n## Preview URL\n\nThis PR is deployed to: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`
+              : `<!-- loop-protocol-pr-preview -->\n## Preview URL\n\nPreview publish requested; live URL not yet verified (${previewUrl})\n\n> Pages source setting may be required. See Settings → Pages → Source → gh-pages (root).\n> The preview will be removed when this PR is closed.`;
+
+            // Upsert: update existing bot comment if present, otherwise create
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
-              body,
             });
+            const marker = '<!-- loop-protocol-pr-preview -->';
+            const existing = comments.find(
+              c => c.user.type === 'Bot' && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
 
   cleanup-pr:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.action == 'closed'
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
