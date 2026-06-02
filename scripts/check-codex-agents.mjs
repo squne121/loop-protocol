@@ -3,12 +3,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { execSync } from 'node:child_process';
 
 const repoRoot = process.cwd();
 const agentsDir = path.join(repoRoot, '.codex', 'agents');
 const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
+
+// CODEX_BIN env override for environments without codex on PATH
+const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
 
 const requiredAgentNames = [
   'codebase-investigator',
@@ -69,52 +73,132 @@ function fail(message) {
   process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// Enhanced TOML parser
+// Handles: table headers [section], nested table headers [a.b], key = value,
+// multi-line strings """, duplicate key detection, unclosed string detection.
+// Known limitation: does not implement the full TOML spec (e.g. inline tables,
+// arrays of tables [[...]]), date types, or hex/octal integers). Codex real
+// loader compatibility smoke (codex --strict-config) requires a model call and
+// is deferred to human smoke verification.
+// ---------------------------------------------------------------------------
 function parseTomlFile(filePath) {
   const text = readText(filePath);
-  const result = {};
+  const root = {};
+  // Track defined keys per section object using WeakMap (section identity, not content)
+  const sectionKeys = new WeakMap();
+  let currentSection = root;
+  sectionKeys.set(root, new Set());
   const lines = text.split(/\r?\n/);
+
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i].trim();
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+
     if (!line || line.startsWith('#')) {
       continue;
     }
-    const match = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
-    if (!match) {
+
+    // Table header: [section] or [a.b.c]
+    if (line.startsWith('[') && !line.startsWith('[[')) {
+      const headerMatch = /^\[([^\]]+)\]$/.exec(line);
+      if (headerMatch) {
+        const sectionPath = headerMatch[1].trim().split('.');
+        currentSection = root;
+        for (const part of sectionPath) {
+          if (!(part in currentSection)) {
+            const newSection = {};
+            currentSection[part] = newSection;
+            sectionKeys.set(newSection, new Set());
+          } else if (typeof currentSection[part] !== 'object' || Array.isArray(currentSection[part])) {
+            // Redefining a scalar key as a table is a parse error
+            throw new Error(`${filePath}:${i + 1}: duplicate or conflicting key "${part}" in section path "${headerMatch[1]}"`);
+          }
+          currentSection = currentSection[part];
+        }
+        continue;
+      }
+      throw new Error(`${filePath}:${i + 1}: malformed table header: ${line}`);
+    }
+
+    // Array of tables [[section]]
+    if (line.startsWith('[[')) {
+      // We note it but don't deeply parse; skip to avoid false parse errors
       continue;
     }
-    const [, key, rawValue] = match;
-    if (rawValue === '"""') {
-      const collected = [];
+
+    // Key = value
+    const kvMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/.exec(line);
+    if (!kvMatch) {
+      continue;
+    }
+    const [, key, rawValue] = kvMatch;
+
+    // Duplicate key detection (within current section, by object identity)
+    if (!sectionKeys.has(currentSection)) {
+      sectionKeys.set(currentSection, new Set());
+    }
+    const keysInSection = sectionKeys.get(currentSection);
+    if (keysInSection.has(key)) {
+      throw new Error(`${filePath}:${i + 1}: duplicate key "${key}"`);
+    }
+    keysInSection.add(key);
+
+    // Multi-line string: value starts with triple-quote
+    if (rawValue === '"""' || rawValue.startsWith('"""')) {
+      const inlineRemainder = rawValue.slice(3);
+      if (inlineRemainder.endsWith('"""') && inlineRemainder.length > 0) {
+        currentSection[key] = inlineRemainder.slice(0, -3);
+        continue;
+      }
+      // Multi-line: collect until closing """
+      const collected = inlineRemainder ? [inlineRemainder] : [];
       i += 1;
-      while (i < lines.length && lines[i] !== '"""') {
+      let closed = false;
+      while (i < lines.length) {
+        if (lines[i].trimEnd() === '"""' || lines[i] === '"""') {
+          closed = true;
+          break;
+        }
         collected.push(lines[i]);
         i += 1;
       }
-      result[key] = collected.join('\n');
+      if (!closed) {
+        throw new Error(`${filePath}: unclosed multi-line string for key "${key}" starting at line ${i + 1}`);
+      }
+      currentSection[key] = collected.join('\n');
       continue;
     }
-    if (rawValue.startsWith('"""')) {
-      const remainder = rawValue.slice(3);
-      if (remainder.endsWith('"""')) {
-        result[key] = remainder.slice(0, -3);
-      } else {
-        const collected = [remainder];
-        i += 1;
-        while (i < lines.length && lines[i] !== '"""') {
-          collected.push(lines[i]);
-          i += 1;
-        }
-        result[key] = collected.join('\n');
+
+    // Single-line string
+    if (rawValue.startsWith('"')) {
+      // Check for unclosed single-line string (must end with unescaped ")
+      const closeIdx = rawValue.indexOf('"', 1);
+      if (closeIdx === -1) {
+        throw new Error(`${filePath}:${i + 1}: unclosed string for key "${key}"`);
+      }
+      try {
+        currentSection[key] = JSON.parse(rawValue);
+      } catch {
+        throw new Error(`${filePath}:${i + 1}: invalid string value for key "${key}": ${rawValue}`);
       }
       continue;
     }
-    if (rawValue.startsWith('"')) {
-      result[key] = JSON.parse(rawValue);
+
+    // Literal string
+    if (rawValue.startsWith("'")) {
+      const closeIdx = rawValue.indexOf("'", 1);
+      if (closeIdx === -1) {
+        throw new Error(`${filePath}:${i + 1}: unclosed literal string for key "${key}"`);
+      }
+      currentSection[key] = rawValue.slice(1, closeIdx);
       continue;
     }
-    result[key] = rawValue;
+
+    // Boolean / integer / float / other scalar
+    currentSection[key] = rawValue;
   }
-  return result;
+  return root;
 }
 
 function getAgentFiles() {
@@ -137,15 +221,163 @@ function assert(condition, message, failures) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// hooks.json structural validation (JSON.parse-based, not string includes)
+// ---------------------------------------------------------------------------
+function validateHooksJson(hooksPath, failures) {
+  let parsed;
+  try {
+    parsed = JSON.parse(readText(hooksPath));
+  } catch (error) {
+    failures.push(`hooks.json: JSON parse error: ${error.message}`);
+    return;
+  }
+
+  assert(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed), 'hooks.json: root must be an object', failures);
+  assert(Array.isArray(parsed?.hooks?.SubagentStart), 'hooks.json: must have hooks.SubagentStart array', failures);
+  assert(Array.isArray(parsed?.hooks?.PreToolUse), 'hooks.json: must have hooks.PreToolUse array', failures);
+
+  const allHookCommands = [];
+  for (const eventKey of ['SubagentStart', 'PreToolUse']) {
+    const entries = parsed?.hooks?.[eventKey] ?? [];
+    for (const entry of entries) {
+      const hooks = entry?.hooks ?? [];
+      for (const hook of hooks) {
+        if (hook?.command) {
+          allHookCommands.push(hook.command);
+        }
+      }
+    }
+  }
+
+  const joinedCommands = allHookCommands.join('\n');
+  assert(
+    joinedCommands.includes('scripts/check-codex-agents.mjs'),
+    'hooks.json: at least one hook command must route through scripts/check-codex-agents.mjs',
+    failures,
+  );
+  assert(
+    joinedCommands.includes('$(git rev-parse --show-toplevel)'),
+    'hooks.json: hook command must resolve path from git root via $(git rev-parse --show-toplevel)',
+    failures,
+  );
+  assert(
+    joinedCommands.includes('rtk pnpm exec node'),
+    'hooks.json: hook command must invoke validator through rtk pnpm exec node',
+    failures,
+  );
+
+  // Structural check: PreToolUse must have an entry matching apply_patch|Edit|Write
+  const preToolMatchers = (parsed?.hooks?.PreToolUse ?? []).map((e) => e?.matcher ?? '');
+  assert(
+    preToolMatchers.some((m) => m.includes('apply_patch') || m.includes('Edit') || m.includes('Write')),
+    'hooks.json: PreToolUse must have a matcher covering apply_patch, Edit, and Write tools',
+    failures,
+  );
+
+  // Structural check: SubagentStart must have at least one catch-all or broad matcher
+  const subagentMatchers = (parsed?.hooks?.SubagentStart ?? []).map((e) => e?.matcher ?? '');
+  assert(
+    subagentMatchers.length > 0,
+    'hooks.json: SubagentStart must have at least one hook entry',
+    failures,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// execpolicy smoke validation using codex execpolicy check
+// Fail-closed: if codex binary not found, validator FAIL (not silent skip).
+// ---------------------------------------------------------------------------
+function validateExecpolicy(failures) {
+  // Check codex binary availability
+  let codexAvailable = true;
+  try {
+    execSync(`${CODEX_BIN} --version`, { stdio: 'pipe' });
+  } catch {
+    codexAvailable = false;
+    process.stderr.write(
+      `[execpolicy] SKIP: codex binary not found at ${CODEX_BIN}. ` +
+      'Set CODEX_ALLOW_NO_CODEX=1 to convert to warning, or set CODEX_BIN to override path.\n',
+    );
+    if (!process.env.CODEX_ALLOW_NO_CODEX) {
+      failures.push(
+        'execpolicy: codex binary unavailable (fail-closed). ' +
+        'Set CODEX_ALLOW_NO_CODEX=1 to skip this check in environments without codex.',
+      );
+    }
+    return;
+  }
+
+  // Representative command checks
+  const checks = [
+    // read-only: must be allow
+    { tokens: ['rtk', 'gh', 'issue', 'view', '1'], expectedDecision: 'allow' },
+    { tokens: ['rtk', 'pnpm', 'test'], expectedDecision: 'allow' },
+    // mutations: must NOT be allow (prompt or forbidden)
+    { tokens: ['rtk', 'gh', 'pr', 'merge', '1'], expectedDecision: 'prompt', expectNotAllow: true },
+    { tokens: ['rtk', 'git', 'push'], expectedDecision: 'prompt', expectNotAllow: true },
+    { tokens: ['rtk', 'pnpm', 'add', 'lodash'], expectedDecision: 'prompt', expectNotAllow: true },
+    // direct bypass: must be forbidden
+    { tokens: ['git', 'push'], expectedDecision: 'forbidden' },
+    { tokens: ['pnpm', 'test'], expectedDecision: 'forbidden' },
+    { tokens: ['gh', 'issue', 'create'], expectedDecision: 'forbidden' },
+  ];
+
+  for (const check of checks) {
+    const tokenArgs = check.tokens.map((t) => JSON.stringify(t)).join(' ');
+    try {
+      const output = execSync(
+        `${CODEX_BIN} execpolicy check --rules ${JSON.stringify(rulesPath)} ${check.tokens.map((t) => JSON.stringify(t)).join(' ')}`,
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      ).toString().trim();
+      let result;
+      try {
+        result = JSON.parse(output);
+      } catch {
+        failures.push(`execpolicy: command "${check.tokens.join(' ')}": non-JSON output: ${output.slice(0, 200)}`);
+        continue;
+      }
+      const decision = result?.decision;
+      if (check.expectNotAllow) {
+        // We require NOT allow (prompt or forbidden both acceptable)
+        if (decision === 'allow') {
+          failures.push(
+            `execpolicy: command "${check.tokens.join(' ')}": expected NOT allow (got allow). ` +
+            `rtk trust boundary violation: mutation commands must be prompt or forbidden.`,
+          );
+        }
+      } else {
+        if (decision !== check.expectedDecision) {
+          failures.push(
+            `execpolicy: command "${check.tokens.join(' ')}": expected "${check.expectedDecision}" got "${decision}"`,
+          );
+        }
+      }
+    } catch (error) {
+      failures.push(
+        `execpolicy: failed to run check for "${check.tokens.join(' ')}": ${error.message}`,
+      );
+    }
+  }
+}
+
 function validateAgents() {
   const failures = [];
+  const warnings = [];
   const files = getAgentFiles();
   assert(files.length === requiredAgentNames.length, `expected ${requiredAgentNames.length} agent files, found ${files.length}`, failures);
 
   const seenNames = new Set();
+
+  // config.toml: structural checks via our enhanced TOML parser
+  let configParsed = null;
+  try {
+    configParsed = parseTomlFile(configPath);
+  } catch (error) {
+    failures.push(`config.toml: parse error: ${error.message}`);
+  }
   const configText = readText(configPath);
   const rulesText = readText(rulesPath);
-  const hooksText = readText(hooksPath);
 
   assert(configText.includes('default_permissions = "loop-protocol-rtk"'), 'config.toml must keep default_permissions = "loop-protocol-rtk"', failures);
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
@@ -153,9 +385,12 @@ function validateAgents() {
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
-  assert(hooksText.includes('rtk pnpm exec node'), 'hooks.json must invoke the validator through rtk pnpm exec node', failures);
-  assert(hooksText.includes('scripts/check-codex-agents.mjs'), 'hooks.json must route through scripts/check-codex-agents.mjs', failures);
-  assert(hooksText.includes('$(git rev-parse --show-toplevel)'), 'hooks.json must resolve from git root', failures);
+
+  // hooks.json: JSON structural validation
+  validateHooksJson(hooksPath, failures);
+
+  // execpolicy smoke
+  validateExecpolicy(failures);
 
   for (const requiredName of requiredAgentNames) {
     const filename = `${requiredName}.toml`;
@@ -164,7 +399,13 @@ function validateAgents() {
 
   for (const file of files) {
     const filePath = path.join(agentsDir, file);
-    const parsed = parseTomlFile(filePath);
+    let parsed;
+    try {
+      parsed = parseTomlFile(filePath);
+    } catch (error) {
+      failures.push(`${file}: TOML parse error: ${error.message}`);
+      continue;
+    }
     const name = parsed.name;
     const instructions = parsed.developer_instructions ?? '';
     const runtimeStatus = extractRuntimeStatus(instructions);
@@ -206,9 +447,12 @@ function validateAgents() {
     }
   }
 
-  return { failures };
+  return { failures, warnings };
 }
 
+// ---------------------------------------------------------------------------
+// Hook input parsing
+// ---------------------------------------------------------------------------
 function parseHookInput() {
   const input = fs.readFileSync(0, 'utf8').trim();
   if (!input) {
@@ -267,24 +511,104 @@ function denyForBash(command) {
   return null;
 }
 
-function denyForPatch(command) {
-  const touchedPaths = [...command.matchAll(/\*\*\* (?:Add|Delete|Update) File: (.+)$/gm)].map((match) => match[1].trim());
-  if (touchedPaths.some((filePath) => filePath === 'assets' || filePath.startsWith('assets/') || filePath === 'LICENSES' || filePath.startsWith('LICENSES/'))) {
-    return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
+// ---------------------------------------------------------------------------
+// Allowed Paths enforcement (Fix B)
+// Behavior:
+//   - If CODEX_ALLOWED_PATHS is set: enforce strictly — writes outside the set
+//     are denied (fail-closed).
+//   - If CODEX_ALLOWED_PATHS is NOT set: fall back to legacy assets/LICENSES
+//     guard only (backward compatible: does not break standard implementation-
+//     worker invocations where CODEX_ALLOWED_PATHS is not supplied by the
+//     harness).
+// Rationale: Enforcing fail-closed when the env var is absent would break
+// normal worktree-based implementation runs where no Allowed Paths are
+// injected. Strict enforcement is opt-in via CODEX_ALLOWED_PATHS supply.
+// ---------------------------------------------------------------------------
+function parseAllowedPaths() {
+  const raw = process.env.CODEX_ALLOWED_PATHS;
+  if (!raw || !raw.trim()) {
+    return null; // not set: use legacy mode
   }
+  // Accept newline or colon separated paths
+  return raw.split(/[\n:]+/).map((p) => p.trim()).filter(Boolean);
+}
+
+function isPathAllowed(filePath, allowedPaths) {
+  const normalized = filePath.replace(/\\/g, '/');
+  return allowedPaths.some((allowed) => {
+    const normalizedAllowed = allowed.replace(/\\/g, '/');
+    return normalized === normalizedAllowed ||
+      normalized.startsWith(normalizedAllowed.endsWith('/') ? normalizedAllowed : `${normalizedAllowed}/`);
+  });
+}
+
+function isProtectedLegacy(filePath) {
+  return (
+    filePath === 'assets' || filePath.startsWith('assets/') ||
+    filePath === 'LICENSES' || filePath.startsWith('LICENSES/')
+  );
+}
+
+function extractPatchTouchedPaths(command) {
+  return [...command.matchAll(/\*\*\* (?:Add|Delete|Update) File: (.+)$/gm)].map((match) => match[1].trim());
+}
+
+function denyForWriteTool(toolName, toolInput, allowedPaths) {
+  // apply_patch: extract touched paths from patch content
+  if (toolName === 'apply_patch') {
+    const command = normalizeCommand(toolInput?.command);
+    const touchedPaths = extractPatchTouchedPaths(command);
+    if (allowedPaths !== null) {
+      // Strict mode: check against Allowed Paths
+      for (const filePath of touchedPaths) {
+        if (!isPathAllowed(filePath, allowedPaths)) {
+          return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+        }
+      }
+    } else {
+      // Legacy mode: only block assets/LICENSES
+      if (touchedPaths.some((fp) => isProtectedLegacy(fp))) {
+        return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
+      }
+    }
+    return null;
+  }
+
+  // Edit and Write: check file_path
+  if (toolName === 'Edit' || toolName === 'Write') {
+    const filePath = toolInput?.file_path ?? '';
+    if (!filePath) {
+      return null; // no path to check
+    }
+    if (allowedPaths !== null) {
+      // Strict mode
+      if (!isPathAllowed(filePath, allowedPaths)) {
+        return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+      }
+    } else {
+      // Legacy mode: only block assets/LICENSES
+      if (isProtectedLegacy(filePath)) {
+        return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
+      }
+    }
+    return null;
+  }
+
   return null;
 }
 
 function runPreToolHook() {
   const payload = parseHookInput();
   const toolName = payload.tool_name;
-  const command = normalizeCommand(payload?.tool_input?.command);
+  const toolInput = payload?.tool_input ?? {};
+  const command = normalizeCommand(toolInput?.command);
+  const allowedPaths = parseAllowedPaths();
   let reason = null;
 
   if (toolName === 'Bash') {
     reason = denyForBash(command);
-  } else if (toolName === 'apply_patch') {
-    reason = denyForPatch(command);
+  } else if (toolName === 'apply_patch' || toolName === 'Edit' || toolName === 'Write') {
+    reason = denyForWriteTool(toolName, toolInput, allowedPaths);
   }
 
   if (reason) {
@@ -309,6 +633,150 @@ function runSubagentStartHook() {
   hookAdditionalContext('SubagentStart', additionalContext);
 }
 
+// ---------------------------------------------------------------------------
+// --self-test: synthetic hook payload tests for Allowed Paths enforcement
+// ---------------------------------------------------------------------------
+function runSelfTest() {
+  const selfTestFailures = [];
+
+  function selfAssert(condition, label) {
+    if (condition) {
+      process.stdout.write(`  PASS ${label}\n`);
+    } else {
+      process.stdout.write(`  FAIL ${label}\n`);
+      selfTestFailures.push(label);
+    }
+  }
+
+  process.stdout.write('=== self-test: TOML parser ===\n');
+  // Valid TOML round-trip
+  try {
+    const parsed = parseTomlFile(configPath);
+    selfAssert(typeof parsed === 'object', 'config.toml: parses without error');
+    selfAssert(
+      typeof parsed.default_permissions === 'string',
+      'config.toml: default_permissions is a string',
+    );
+  } catch (e) {
+    selfAssert(false, `config.toml: should parse cleanly (got: ${e.message})`);
+  }
+
+  // Duplicate key detection (synthetic)
+  {
+    const syntheticToml = [
+      'name = "test"',
+      'name = "duplicate"',
+    ].join('\n');
+    // Write a temp file, parse, check for error
+    const tmpPath = path.join(repoRoot, '.codex', '.self-test-tmp.toml');
+    fs.writeFileSync(tmpPath, syntheticToml, 'utf8');
+    let threw = false;
+    try {
+      parseTomlFile(tmpPath);
+    } catch {
+      threw = true;
+    }
+    fs.unlinkSync(tmpPath);
+    selfAssert(threw, 'TOML parser: detects duplicate key');
+  }
+
+  process.stdout.write('\n=== self-test: Allowed Paths enforcement (Edit/Write) ===\n');
+
+  // Test: CODEX_ALLOWED_PATHS not set — assets/ is denied (legacy mode)
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null);
+    selfAssert(result !== null, 'Legacy mode: assets/ edit is denied');
+  }
+
+  // Test: CODEX_ALLOWED_PATHS not set — normal path is allowed (legacy mode)
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
+    selfAssert(result === null, 'Legacy mode: src/main.ts edit is allowed');
+  }
+
+  // Test: CODEX_ALLOWED_PATHS set — path inside set is allowed
+  {
+    const allowed = ['.codex/agents', 'scripts'];
+    const result = denyForWriteTool('Write', { file_path: '.codex/agents/foo.toml' }, allowed);
+    selfAssert(result === null, 'Strict mode: .codex/agents/foo.toml is allowed');
+  }
+
+  // Test: CODEX_ALLOWED_PATHS set — path outside set is denied
+  {
+    const allowed = ['.codex/agents', 'scripts'];
+    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, allowed);
+    selfAssert(result !== null, 'Strict mode: src/main.ts is denied (outside Allowed Paths)');
+  }
+
+  // Test: assets/ is denied even with unrelated Allowed Paths set
+  {
+    const allowed = ['.codex/agents'];
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, allowed);
+    selfAssert(result !== null, 'Strict mode: assets/sprite.png is denied');
+  }
+
+  process.stdout.write('\n=== self-test: Allowed Paths enforcement (apply_patch) ===\n');
+
+  // Test: apply_patch with assets path — legacy mode deny
+  {
+    const patchCmd = '*** Update File: assets/sprite.png\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd }, null);
+    selfAssert(result !== null, 'Legacy mode: apply_patch to assets/ is denied');
+  }
+
+  // Test: apply_patch with allowed path — strict mode allow
+  {
+    const patchCmd = '*** Update File: scripts/check-codex-agents.mjs\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['scripts']);
+    selfAssert(result === null, 'Strict mode: apply_patch to scripts/ is allowed');
+  }
+
+  // Test: apply_patch with disallowed path — strict mode deny
+  {
+    const patchCmd = '*** Update File: src/main.ts\n--- a\n+++ b\n';
+    const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['.codex/agents', 'scripts']);
+    selfAssert(result !== null, 'Strict mode: apply_patch to src/main.ts is denied');
+  }
+
+  process.stdout.write('\n=== self-test: Bash hook ===\n');
+
+  // Test: rtk gh pr merge is NOT denied by bash hook (rtk prefix passes; policy enforced by execpolicy rules)
+  {
+    const result = denyForBash('rtk gh pr merge 1');
+    selfAssert(result === null, 'Bash hook: rtk gh pr merge is not blocked (rtk prefix passes bash check)');
+  }
+
+  // Test: direct gh is denied
+  {
+    const result = denyForBash('gh pr merge 1');
+    selfAssert(result !== null, 'Bash hook: direct gh pr merge is denied');
+  }
+
+  // Test: direct pnpm is denied
+  {
+    const result = denyForBash('pnpm test');
+    selfAssert(result !== null, 'Bash hook: direct pnpm test is denied');
+  }
+
+  // Test: git push is denied
+  {
+    const result = denyForBash('git push');
+    selfAssert(result !== null, 'Bash hook: git push is denied');
+  }
+
+  process.stdout.write('\n');
+  if (selfTestFailures.length > 0) {
+    for (const f of selfTestFailures) {
+      process.stderr.write(`SELF-TEST FAIL: ${f}\n`);
+    }
+    process.exit(1);
+  }
+
+  process.stdout.write(`ok self-test: ${selfTestFailures.length === 0 ? 'all assertions passed' : 'FAILED'}\n`);
+}
+
 function main() {
   const arg = process.argv[2];
   if (arg === '--hook-pretool') {
@@ -317,6 +785,10 @@ function main() {
   }
   if (arg === '--hook-subagent-start') {
     runSubagentStartHook();
+    return;
+  }
+  if (arg === '--self-test') {
+    runSelfTest();
     return;
   }
 

@@ -9,7 +9,7 @@ ROLE
 
 INPUT_CONTRACT
 - `pr_number` と linked issue context を必須とする。
-- 軽量 reviewer の適用条件を満たさない場合は fail closed で sonnet-level reviewer へルーティングする。
+- 軽量 reviewer の適用条件を満たさない場合は fail closed で pr-reviewer（gpt-5-codex, high reasoning）へルーティングする。
 
 OUTPUT_CONTRACT
 - `LOOP_VERDICT` 相当の structured output だけを返す。

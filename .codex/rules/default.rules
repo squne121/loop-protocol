@@ -4,6 +4,8 @@
 # Hooks + rules are a fail-closed local guardrail for repo workflow compliance.
 # Known limitation: they are not a security boundary and can be weakened by
 # parent runtime overrides, untrusted project state, or unsupported tool paths.
+# Known limitation: `rtk` itself does not enforce policy; if `rtk` is absent or
+# untrusted, the blanket-allow rule is removed to prevent bypass via `rtk` wrapping.
 
 prefix_rule(
     pattern = ["rtk", "--help"],
@@ -14,16 +16,111 @@ prefix_rule(
     ],
 )
 
+# --- rtk gh: read / verify operations only ---
+
 prefix_rule(
-    pattern = ["rtk", ["git", "gh", "pnpm"]],
+    pattern = ["rtk", "gh", ["issue", "pr", "api"]],
     decision = "allow",
-    justification = "Allow documented project harness subcommands for git, GitHub, and validation flows.",
+    justification = "Allow read-only GitHub operations via rtk: issue view/list, pr view/list/checks/diff, api GET.",
     match = [
-        "rtk git status",
         "rtk gh issue view 1",
-        "rtk pnpm test",
+        "rtk gh issue list",
+        "rtk gh pr view 1",
+        "rtk gh pr list",
+        "rtk gh pr checks 1",
+        "rtk gh pr diff 1",
+        "rtk gh api repos/squne121/loop-protocol",
     ],
 )
+
+# rtk gh mutation operations: require explicit human review (prompt)
+prefix_rule(
+    pattern = ["rtk", "gh", "pr", ["merge", "create", "close", "edit", "ready", "reopen"]],
+    decision = "prompt",
+    justification = "Mutating GitHub PR operations require explicit human review. More restrictive than the read allow above.",
+    match = [
+        "rtk gh pr merge 1",
+        "rtk gh pr create",
+        "rtk gh pr close 1",
+        "rtk gh pr edit 1",
+        "rtk gh pr ready 1",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "gh", "issue", ["create", "edit", "close", "reopen", "delete"]],
+    decision = "prompt",
+    justification = "Mutating GitHub issue operations require explicit human review.",
+    match = [
+        "rtk gh issue create",
+        "rtk gh issue edit 1",
+        "rtk gh issue close 1",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "gh", "release", ["create", "delete", "edit", "upload"]],
+    decision = "prompt",
+    justification = "GitHub release mutation requires explicit human review.",
+    match = [
+        "rtk gh release create v1.0.0",
+    ],
+)
+
+# --- rtk git: read / verify operations only ---
+
+prefix_rule(
+    pattern = ["rtk", "git", ["status", "log", "diff", "branch", "show", "blame", "describe", "shortlog", "rev-parse", "ls-files", "ls-tree"]],
+    decision = "allow",
+    justification = "Allow read-only git inspection via rtk.",
+    match = [
+        "rtk git status",
+        "rtk git log --oneline -5",
+        "rtk git diff --stat",
+        "rtk git branch --show-current",
+    ],
+)
+
+# rtk git mutation operations: require explicit human review (prompt)
+prefix_rule(
+    pattern = ["rtk", "git", ["push", "commit", "add", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
+    decision = "prompt",
+    justification = "Mutating git operations via rtk require explicit human review.",
+    match = [
+        "rtk git push",
+        "rtk git commit -m update",
+        "rtk git checkout -b topic",
+    ],
+)
+
+# --- rtk pnpm: validation and build operations ---
+
+prefix_rule(
+    pattern = ["rtk", "pnpm", ["test", "lint", "typecheck", "build", "exec", "run"]],
+    decision = "allow",
+    justification = "Allow validation and build rtk pnpm subcommands.",
+    match = [
+        "rtk pnpm test",
+        "rtk pnpm lint",
+        "rtk pnpm typecheck",
+        "rtk pnpm build",
+        "rtk pnpm exec node scripts/check-codex-agents.mjs",
+    ],
+)
+
+# rtk pnpm dependency mutation: require explicit human review (prompt)
+prefix_rule(
+    pattern = ["rtk", "pnpm", ["add", "remove", "install", "uninstall", "update", "upgrade"]],
+    decision = "prompt",
+    justification = "Dependency mutations via rtk pnpm require explicit human review.",
+    match = [
+        "rtk pnpm add lodash",
+        "rtk pnpm remove lodash",
+        "rtk pnpm install",
+    ],
+)
+
+# --- direct node invocation for validator ---
 
 prefix_rule(
     pattern = ["node", "scripts/check-codex-agents.mjs"],
@@ -31,18 +128,24 @@ prefix_rule(
     justification = "Allow the Codex custom-agent validator and hook entrypoint.",
     match = [
         "node scripts/check-codex-agents.mjs",
+        "node scripts/check-codex-agents.mjs --self-test",
     ],
 )
 
+# --- codex runtime smoke ---
+
 prefix_rule(
-    pattern = ["codex", ["--version", "exec"]],
+    pattern = ["codex", ["--version", "execpolicy", "exec"]],
     decision = "allow",
     justification = "Allow documented runtime smoke tests for custom agent spawn and local guardrail behavior.",
     match = [
         "codex --version",
+        "codex execpolicy check --rules .codex/rules/default.rules rtk gh issue view 1",
         "codex exec \"Spawn the codebase-investigator custom agent once\"",
     ],
 )
+
+# --- rtk read-oriented helpers ---
 
 prefix_rule(
     pattern = ["rtk", ["ls", "read", "find", "grep", "wc", "diff", "log", "summary", "json", "test", "tsc", "lint", "vitest", "pytest", "mypy", "ruff", "prettier", "format"]],
@@ -64,6 +167,8 @@ prefix_rule(
         "rtk env",
     ],
 )
+
+# --- direct git read-only (Claude Code environment) ---
 
 prefix_rule(
     pattern = ["git", "branch", "--show-current"],

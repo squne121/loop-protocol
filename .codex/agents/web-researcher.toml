@@ -25,6 +25,11 @@ RUNTIME
 - runtime_dependency_status: followup_required
 - runtime_followup_route: grounded_research_or_direct_web
 
+NETWORK_LIMITATION
+- direct web / direct CLI による外部仕様 fact-check は現 read-only permission profile（network domains が GitHub 系に限定）では保証しない。
+- GitHub 以外の公式ドキュメント（例: openai.com, docs.anthropic.com, npmjs.com）への到達が必要な場合は follow-up routing が必要。
+- 「同等実運用」を主張しない。grounded route が利用可能な場合のみ外部クレームの確認を試みる。
+
 FAIL_CLOSED
 - 裏付けが無い claim を supported 扱いしない。
 - quality gate failed の grounded answer をそのまま採用しない。
