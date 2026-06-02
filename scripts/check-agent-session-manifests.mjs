@@ -15,6 +15,7 @@
  * Default targets (when no explicit args given):
  *   - docs/schemas/examples/**\/*.json
  *   - tests/fixtures/ ** /agent-session-manifest*.json and *.md
+ *   - artifacts/agent-session-manifest-ci.json  (production artifact — see production gate topology below)
  *
  * Explicit targets: any glob patterns or file paths passed as CLI args
  * If explicit targets resolve to 0 files: exit 1 (empty-target green is forbidden)
@@ -22,6 +23,35 @@
  * Exit codes:
  *   0: All manifests pass validation
  *   1: One or more manifests failed, or 0 targets found for explicit arg
+ *
+ * ----------------------------------------------------------------------------
+ * production.gate|production gate topology (A案 — adopted by #434)
+ * ----------------------------------------------------------------------------
+ * A案: `.github/workflows/session-manifest.yml` を production gate の正本とする。
+ *   - session-manifest.yml が generate → validate → upload を一貫して実行する。
+ *   - ci.yml は production gate を主張しない（A案採用）。ci.yml が manifest 生成・
+ *     バリデーション・アップロードを独立で担う構成（B案）は採択していない。
+ *
+ * session-manifest.yml の production gate 構成（変更時は以下を同時更新すること）:
+ *   - generate: node scripts/generate-session-manifest.mjs ... > artifacts/agent-session-manifest-ci.json
+ *   - validate: pnpm manifest:check artifacts/agent-session-manifest-ci.json
+ *   - upload:   actions/upload-artifact  path: artifacts/agent-session-manifest-ci.json
+ *
+ * IMPORTANT: artifact path を変更する場合は session-manifest.yml の generate/validate/upload
+ * の 3 箇所と defaultPatterns（本ファイル）を同時更新しなければならない。
+ * いずれか 1 箇所だけを変更すると silent no-op または validation bypass になる。
+ *
+ * Artifact upload constraints (session-manifest.yml で維持すること):
+ *   upload step: if-no-files-found|retention-days の両制約を維持すること
+ *     - if-no-files-found: error  (upload 先が空の場合は CI を失敗させる)
+ *     - retention-days: 7         (7 日間保持)
+ *   permissions: contents: read のみ（最小 read-only 権限）
+ *   pull_request_target は使用しない（昇格権限・secrets 露出を避けるため）
+ *   secrets.* は使用しない
+ *
+ * Runtime environment (CI 環境前提):
+ *   Node 22|pnpm 11|node-version: '22' — session-manifest.yml の node-version: '22', pnpm: 11.1.2 を前提とする
+ * ----------------------------------------------------------------------------
  */
 
 import { readFileSync, existsSync } from 'fs'
@@ -310,10 +340,18 @@ async function main() {
   const args = rawArgs.filter(a => !a.startsWith('--'))
   const isExplicit = args.length > 0
 
+  // Production artifact path (A案: session-manifest.yml を production gate の正本とする)
+  // CI では session-manifest.yml が explicit target で直接呼ぶため、ここでは
+  // ローカル開発者向けのフォールバックとして defaultPatterns に含める。
+  // NOTE: artifacts/agent-session-manifest-ci.json が存在しない場合（ローカル環境等）は
+  //   expandGlobs によりスキップされる（default patterns の 0 ファイル許容挙動を踏襲）。
+  //   CI では必ず session-manifest.yml の explicit target 呼び出しで検証されるため
+  //   silent no-op にはならない（production gate は session-manifest.yml が正本）。
   const defaultPatterns = [
     'docs/schemas/examples/**/*.json',
     'tests/fixtures/agent-session-manifest/valid-*.json',
     'tests/fixtures/agent-session-manifest/valid-*.md',
+    'artifacts/agent-session-manifest-ci.json', // production artifact (session-manifest.yml 生成物)
   ]
 
   const patterns = isExplicit ? args : defaultPatterns
