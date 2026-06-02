@@ -6,6 +6,12 @@
 # Mode A: Bash ツール + gh コマンドで Issue/PR/comment body を送信しようとする場合
 # Mode B: Write/Edit/MultiEdit ツールで tmp/ 下書き候補 Markdown を書こうとする場合
 #
+# Delta mode (AC2): gh issue edit / gh pr edit + --body-file <path> の場合、
+#   既存 body を取得して prose 差分のみを検査する。
+#   - --body-file - (stdin): fail-closed (AC7)
+#   - target 複数: exit 2 + target_ambiguous (AC10)
+#   - target 解決不可: exit 2 + target_resolution_failed (AC11)
+#
 # Exit codes:
 #   0 = allow (日本語比率 OK、またはガード対象外)
 #   2 = block (日本語比率不足 — blocking error として Claude Code に通知)
@@ -47,7 +53,6 @@ validate_body() {
     if echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
         return 0
     else
-        local exit_code=$?
         # validator の詳細情報を stderr に出力
         local details
         details="$(echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true)"
@@ -55,6 +60,54 @@ validate_body() {
         echo "${details}" >&2
         return 2
     fi
+}
+
+# delta mode: changed prose blocks のみを検査する
+# $1: 新 body テキスト
+# $2: 旧 body テキスト
+# $3: target（issue #N / pr #N の識別子。stderr 出力用）
+validate_delta_prose() {
+    local new_body="$1"
+    local old_body="$2"
+    local target="$3"
+
+    # 一時ファイルに old/new body を書き出して --delta-check サブコマンドに渡す
+    local tmp_old tmp_new
+    tmp_old="$(mktemp /tmp/guard_delta_old_XXXXXX.md)"
+    tmp_new="$(mktemp /tmp/guard_delta_new_XXXXXX.md)"
+
+    printf '%s' "$old_body" > "$tmp_old"
+    printf '%s' "$new_body" > "$tmp_new"
+
+    local result
+    result="$(uv run python3 "$VALIDATOR" --delta-check --old-file "$tmp_old" --new-file "$tmp_new" --threshold 0.1 2>/dev/null || echo "DELTA_ERROR")"
+
+    rm -f "$tmp_old" "$tmp_new"
+
+    if [ "$result" = "DELTA_PASS" ]; then
+        return 0
+    fi
+
+    if echo "$result" | grep -q "^DELTA_FAIL:"; then
+        local changed_count
+        local failed_count
+        changed_count="$(echo "$result" | cut -d: -f2)"
+        failed_count="$(echo "$result" | cut -d: -f3)"
+        echo "GUARD: changed prose block failure [${target}]" >&2
+        echo "  target: ${target}" >&2
+        echo "  changed_prose_blocks: ${changed_count}" >&2
+        echo "  failed_blocks: ${failed_count}" >&2
+        echo "  ratio_min: 0.000" >&2
+        return 2
+    fi
+
+    # DELTA_ERROR や予期しない出力の場合は fail-closed
+    echo "GUARD: delta mode internal error (fail-closed) [${target}]" >&2
+    echo "  target: ${target}" >&2
+    echo "  changed_prose_blocks: unknown" >&2
+    echo "  failed_blocks: unknown" >&2
+    echo "  ratio_min: 0.000" >&2
+    return 2
 }
 
 # ============================================================
@@ -75,122 +128,105 @@ if [ "$TOOL_NAME" = "Bash" ]; then
         exit 0
     fi
 
-    # body を抽出する試み（複数パターン）
-
-    # 1. --body "..." または --body '...' パターン
+    # 1. --body / -b オプションの値を抽出（--parse-body サブコマンド使用）
     BODY=""
-
-    # Python の shlex を使って引数を安全に解析
-    BODY_EXTRACT=$(uv run python3 - "$COMMAND" <<'PYEOF' 2>/dev/null || echo "")
-import sys
-import shlex
-import re
-
-command = sys.argv[1] if len(sys.argv) > 1 else ""
-
-try:
-    tokens = shlex.split(command)
-except ValueError:
-    # shlex 失敗時は正規表現でフォールバック
-    tokens = []
-
-body_value = None
-
-# --body / -b の次のトークン
-i = 0
-while i < len(tokens):
-    if tokens[i] in ('--body', '-b') and i + 1 < len(tokens):
-        body_value = tokens[i + 1]
-        break
-    # --body=value 形式
-    if tokens[i].startswith('--body='):
-        body_value = tokens[i][len('--body='):]
-        break
-    # --field body=... / --raw-field body=... / -f body=
-    if tokens[i] in ('--field', '--raw-field', '-f') and i + 1 < len(tokens):
-        if tokens[i + 1].startswith('body='):
-            body_value = tokens[i + 1][5:]
-            break
-    i += 1
-
-if body_value and body_value != '-':
-    print(body_value)
-PYEOF
-
+    BODY_EXTRACT="$(uv run python3 "$VALIDATOR" --parse-body "$COMMAND" 2>/dev/null || echo "")"
     if [ -n "$BODY_EXTRACT" ]; then
         BODY="$BODY_EXTRACT"
     fi
 
-    # 2. --body-file / -F でファイルを読む場合 (AC10)
-    # 対応フォーム: -F|--body-file= (スペース区切り / イコール形式 / stdin "-" は fail-closed)
-    BODY_FILE_EXTRACT=$(uv run python3 - "$COMMAND" <<'PYEOF' 2>/dev/null || echo "")
-import sys
-import shlex
+    # 2. --body-file / -F でファイルを読む場合（--parse-body-file サブコマンド使用）
+    BODY_FILE_EXTRACT="$(uv run python3 "$VALIDATOR" --parse-body-file "$COMMAND" 2>/dev/null || echo "")"
 
-command = sys.argv[1] if len(sys.argv) > 1 else ""
-
-try:
-    tokens = shlex.split(command)
-except ValueError:
-    tokens = []
-
-result_path = None
-is_stdin = False
-i = 0
-while i < len(tokens):
-    tok = tokens[i]
-    # --body-file <path>
-    if tok == '--body-file' and i + 1 < len(tokens):
-        fp = tokens[i + 1]
-        if fp == '-':
-            is_stdin = True
-        else:
-            result_path = fp
-        break
-    # --body-file=<path>
-    if tok.startswith('--body-file='):
-        fp = tok[len('--body-file='):]
-        if fp == '-':
-            is_stdin = True
-        else:
-            result_path = fp
-        break
-    # -F <path>
-    if tok == '-F' and i + 1 < len(tokens):
-        fp = tokens[i + 1]
-        if fp == '-':
-            is_stdin = True
-        else:
-            result_path = fp
-        break
-    # -F=<path>
-    if tok.startswith('-F='):
-        fp = tok[len('-F='):]
-        if fp == '-':
-            is_stdin = True
-        else:
-            result_path = fp
-        break
-    i += 1
-
-if is_stdin:
-    print("STDIN_FAIL_CLOSED")
-elif result_path:
-    print(result_path)
-PYEOF
-
-    # --body-file - (stdin) は fail-closed
+    # delta mode: --body-file stdin (-) は fail-closed (AC7)
+    # is_delta_edit には stdin body-file を適用しない
     if [ "$BODY_FILE_EXTRACT" = "STDIN_FAIL_CLOSED" ]; then
         echo "GUARD: --body-file - (stdin) は検証不可のため fail-closed でブロックします" >&2
+        echo "  target: unknown" >&2
+        echo "  changed_prose_blocks: unknown" >&2
+        echo "  failed_blocks: unknown" >&2
+        echo "  ratio_min: 0.000" >&2
         exit 2
     fi
 
+    # --body-file が指定されている場合の delta mode (AC2)
     if [ -n "$BODY_FILE_EXTRACT" ] && [ -f "$BODY_FILE_EXTRACT" ]; then
-        # ファイルの中身が非日本語なら block
-        # ただし log / json / fixture ファイルは除外
-        if echo "$BODY_FILE_EXTRACT" | grep -qiE '\.(log|json)$|fixture|test_'; then
+        # log / json ファイルは除外
+        if echo "$BODY_FILE_EXTRACT" | grep -qiE '\.(log|json)$'; then
             exit 0
         fi
+
+        # gh issue edit / gh pr edit かどうかを判定して delta mode を適用
+        IS_DELTA_EDIT=false
+        EDIT_TYPE=""  # "issue" or "pr"
+
+        if echo "$COMMAND" | grep -qE 'gh issue edit'; then
+            IS_DELTA_EDIT=true
+            EDIT_TYPE="issue"
+        elif echo "$COMMAND" | grep -qE 'gh pr edit'; then
+            IS_DELTA_EDIT=true
+            EDIT_TYPE="pr"
+        fi
+
+        if [ "$IS_DELTA_EDIT" = "true" ]; then
+            # target（issue/PR 番号または URL）を解決する (AC10, AC11)
+            # --parse-edit-target サブコマンドで解析
+            DELTA_TARGET_INFO="$(uv run python3 "$VALIDATOR" --parse-edit-target "$COMMAND" --parse-edit-type "$EDIT_TYPE" 2>/dev/null || echo "RESOLVE_ERROR")"
+
+            if [ "$DELTA_TARGET_INFO" = "AMBIGUOUS" ]; then
+                # AC10: 複数 target -> exit 2 + target_ambiguous
+                echo "GUARD: gh ${EDIT_TYPE} edit: 複数 target のため delta 検査対象を一意にできません" >&2
+                echo "  target_ambiguous" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            if [ "$DELTA_TARGET_INFO" = "RESOLVE_ERROR" ] || [ -z "$DELTA_TARGET_INFO" ]; then
+                # AC11: target 解決不可 -> exit 2 + target_resolution_failed
+                echo "GUARD: gh ${EDIT_TYPE} edit: target を解決できません" >&2
+                echo "  target_resolution_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # NUMBER:<N> 形式から番号を取得
+            TARGET_NUM="${DELTA_TARGET_INFO#NUMBER:}"
+            TARGET_LABEL="${EDIT_TYPE} #${TARGET_NUM}"
+
+            # 既存 body を取得 (AC2, AC15)
+            OLD_BODY=""
+            if [ "$EDIT_TYPE" = "issue" ]; then
+                OLD_BODY="$(gh issue view "$TARGET_NUM" --json body --jq .body 2>/dev/null || echo "")"
+            else
+                OLD_BODY="$(gh pr view "$TARGET_NUM" --json body --jq .body 2>/dev/null || echo "")"
+            fi
+
+            if [ -z "$OLD_BODY" ]; then
+                # 既存 body 取得失敗: fail-closed (AC11)
+                echo "GUARD: ${TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                echo "  target_resolution_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # 新 body を読み込む
+            NEW_BODY="$(cat "$BODY_FILE_EXTRACT")"
+
+            # delta mode で changed prose blocks のみ検査 (AC2, AC8)
+            if validate_delta_prose "$NEW_BODY" "$OLD_BODY" "$TARGET_LABEL"; then
+                exit 0
+            else
+                exit 2
+            fi
+        fi
+
+        # delta_mode 非対象（create/comment 等）: full-body 検査
         if ! uv run python3 "$VALIDATOR" --file "$BODY_FILE_EXTRACT" --threshold 0.1 >/dev/null 2>/dev/null; then
             echo "GUARD: 日本語比率不足 [--body-file: ${BODY_FILE_EXTRACT}]" >&2
             uv run python3 "$VALIDATOR" --file "$BODY_FILE_EXTRACT" --threshold 0.1 2>&1 || true

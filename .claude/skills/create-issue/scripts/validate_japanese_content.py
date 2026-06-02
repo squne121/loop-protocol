@@ -126,6 +126,126 @@ def split_into_prose_blocks(text: str) -> list[str]:
     return blocks
 
 
+def _classify_block(block: str) -> str:
+    """
+    ブロックの種別を分類する。
+
+    Returns:
+        'code_fence' | 'machine_yaml' | 'shell_command' | 'grep_pattern' |
+        'url_or_identifier_only' | 'prose'
+    """
+    stripped = block.strip()
+
+    # code fence
+    if stripped.startswith('```') or stripped.startswith('~~~'):
+        return 'code_fence'
+
+    # YAML front matter or machine-readable YAML block (key: value パターンが支配的)
+    yaml_line_re = re.compile(r'^\s*[a-zA-Z_][a-zA-Z0-9_.]*\s*:', re.MULTILINE)
+    lines = stripped.splitlines()
+    if lines:
+        yaml_lines = sum(1 for l in lines if yaml_line_re.match(l))
+        if yaml_lines >= max(1, len(lines) * 0.6):
+            return 'machine_yaml'
+
+    # shell command block ($ or # prefix lines が支配的)
+    shell_line_re = re.compile(r'^\s*[$#]\s+\S', re.MULTILINE)
+    shell_lines = len(shell_line_re.findall(stripped))
+    non_empty_lines = sum(1 for l in lines if l.strip())
+    if non_empty_lines > 0 and shell_lines >= non_empty_lines * 0.5:
+        return 'shell_command'
+
+    # grep pattern line (rg/grep コマンドが含まれる行)
+    if re.search(r'\b(grep|rg|egrep|fgrep)\b', stripped):
+        return 'grep_pattern'
+
+    # URL or identifier only (有効文字がほぼ識別子/URLのみ)
+    cleaned = clean_prose(stripped)
+    effective = count_effective_chars(cleaned)
+    if effective < 5:
+        return 'url_or_identifier_only'
+
+    return 'prose'
+
+
+def split_markdown_blocks(text: str) -> list[dict]:
+    """
+    Markdown テキストをブロック単位に分割し、各ブロックの種別を返す。
+
+    Returns:
+        list of {'text': str, 'type': str}
+        type は 'code_fence' | 'machine_yaml' | 'shell_command' |
+               'grep_pattern' | 'url_or_identifier_only' | 'prose'
+    """
+    result = []
+
+    # まず code fence を先に抽出（順序を保持するため手動分割）
+    code_fence_re = re.compile(
+        r'(```[^\n]*\n.*?```|~~~[^\n]*\n.*?~~~)', re.DOTALL
+    )
+
+    pos = 0
+    for m in code_fence_re.finditer(text):
+        # code fence 前の部分を段落分割
+        before = text[pos:m.start()]
+        if before.strip():
+            for block in re.split(r'\n\s*\n', before):
+                if block.strip():
+                    btype = _classify_block(block)
+                    result.append({'text': block.strip(), 'type': btype})
+        # code fence 自体
+        result.append({'text': m.group(0), 'type': 'code_fence'})
+        pos = m.end()
+
+    # 残り部分を段落分割
+    remainder = text[pos:]
+    if remainder.strip():
+        for block in re.split(r'\n\s*\n', remainder):
+            if block.strip():
+                btype = _classify_block(block)
+                result.append({'text': block.strip(), 'type': btype})
+
+    return result
+
+
+def changed_prose_blocks(old: str, new: str) -> list[dict]:
+    """
+    old/new の prose block を比較し、new 側で追加・実質変更された prose block を返す。
+
+    変更が code_fence / machine_yaml / shell_command / grep_pattern /
+    url_or_identifier_only だけであれば空リストを返す（pass）。
+
+    Returns:
+        list of prose block dict (split_markdown_blocks の 'prose' type のみ)
+        新規または変更された prose block。
+        変更が prose 以外のみ → 空リスト（pass）
+    """
+    import hashlib
+
+    def prose_block_hash(block_text: str) -> str:
+        return hashlib.sha256(block_text.encode('utf-8')).hexdigest()
+
+    old_blocks = split_markdown_blocks(old)
+    new_blocks = split_markdown_blocks(new)
+
+    # old の prose block hash セット
+    old_prose_hashes = {
+        prose_block_hash(b['text'])
+        for b in old_blocks
+        if b['type'] == 'prose'
+    }
+
+    # new の prose block のうち、old に存在しないものを「変更・追加」とみなす
+    changed = []
+    for b in new_blocks:
+        if b['type'] == 'prose':
+            h = prose_block_hash(b['text'])
+            if h not in old_prose_hashes:
+                changed.append(b)
+
+    return changed
+
+
 def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
     """
     テキストの日本語比率を検査する
@@ -227,8 +347,253 @@ def main():
         action='store_true',
         help='詳細な結果を出力する'
     )
+    parser.add_argument(
+        '--parse-body',
+        type=str,
+        default=None,
+        help=(
+            'Parse gh command to extract --body value. '
+            'Returns body text on stdout, or empty string if not found.'
+        ),
+    )
+    parser.add_argument(
+        '--parse-body-file',
+        type=str,
+        default=None,
+        help=(
+            'Parse gh command to extract --body-file path. '
+            'Returns file path, STDIN_FAIL_CLOSED if "-", or empty if not found.'
+        ),
+    )
+    parser.add_argument(
+        '--parse-edit-target',
+        type=str,
+        default=None,
+        help=(
+            'Parse gh issue/pr edit command to extract target number. '
+            'Returns NUMBER:<n>, AMBIGUOUS, or RESOLVE_ERROR on stdout.'
+        ),
+    )
+    parser.add_argument(
+        '--parse-edit-type',
+        type=str,
+        default='issue',
+        choices=['issue', 'pr'],
+        help='Edit type for --parse-edit-target (issue or pr)',
+    )
+    parser.add_argument(
+        '--delta-check',
+        action='store_true',
+        help=(
+            'Delta mode: --old-file と --new-file を比較して changed prose blocks のみを検査する。'
+            'DELTA_PASS / DELTA_FAIL:<changed>:<failed> を stdout に出力し、'
+            'exit 0 = pass, exit 2 = fail を返す。'
+        ),
+    )
+    parser.add_argument(
+        '--old-file',
+        type=str,
+        default=None,
+        help='delta-check: 比較元ファイルパス',
+    )
+    parser.add_argument(
+        '--new-file',
+        type=str,
+        default=None,
+        help='delta-check: 比較先ファイルパス',
+    )
 
     args = parser.parse_args()
+
+    # ============================================================
+    # Parse body mode (--parse-body)
+    # ============================================================
+    if args.parse_body is not None:
+        import shlex as _shlex
+
+        command = args.parse_body
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            tokens = []
+
+        body_value = None
+        i = 0
+        while i < len(tokens):
+            if tokens[i] in ('--body', '-b') and i + 1 < len(tokens):
+                body_value = tokens[i + 1]
+                break
+            if tokens[i].startswith('--body='):
+                body_value = tokens[i][len('--body='):]
+                break
+            if tokens[i] in ('--field', '--raw-field', '-f') and i + 1 < len(tokens):
+                if tokens[i + 1].startswith('body='):
+                    body_value = tokens[i + 1][5:]
+                    break
+            i += 1
+
+        if body_value and body_value != '-':
+            print(body_value)
+        sys.exit(0)
+
+    # ============================================================
+    # Parse body-file mode (--parse-body-file)
+    # ============================================================
+    if args.parse_body_file is not None:
+        import shlex as _shlex
+
+        command = args.parse_body_file
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            tokens = []
+
+        result_path = None
+        is_stdin = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == '--body-file' and i + 1 < len(tokens):
+                fp = tokens[i + 1]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            if tok.startswith('--body-file='):
+                fp = tok[len('--body-file='):]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            if tok == '-F' and i + 1 < len(tokens):
+                fp = tokens[i + 1]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            if tok.startswith('-F='):
+                fp = tok[len('-F='):]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            i += 1
+
+        if is_stdin:
+            print('STDIN_FAIL_CLOSED')
+        elif result_path:
+            print(result_path)
+        sys.exit(0)
+
+    # ============================================================
+    # Parse edit target mode (--parse-edit-target)
+    # ============================================================
+    if args.parse_edit_target is not None:
+        import shlex as _shlex
+
+        command = args.parse_edit_target
+        edit_type = args.parse_edit_type
+
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('RESOLVE_ERROR')
+            sys.exit(0)
+
+        # gh issue edit / gh pr edit の positional target を探す
+        flag_args = {
+            '--body', '-b', '--body-file', '-F', '--title', '-t',
+            '--add-assignee', '--remove-assignee', '--add-label', '--remove-label',
+            '--add-project', '--remove-project', '--milestone', '--repo', '-R',
+        }
+
+        targets = []
+        start_idx = 0
+        for idx, tok in enumerate(tokens):
+            if tok == 'edit' and idx > 0:
+                start_idx = idx + 1
+                break
+
+        skip_next = False
+        i = start_idx
+        while i < len(tokens):
+            tok = tokens[i]
+            if skip_next:
+                skip_next = False
+                i += 1
+                continue
+            if tok.startswith('-'):
+                if tok in flag_args:
+                    skip_next = True
+                i += 1
+                continue
+            targets.append(tok)
+            i += 1
+
+        if len(targets) == 0:
+            print('RESOLVE_ERROR')
+        elif len(targets) > 1:
+            print('AMBIGUOUS')
+        else:
+            target = targets[0]
+            url_m = re.search(r'/(issues|pulls)/(\d+)', target)
+            if url_m:
+                print(f'NUMBER:{url_m.group(2)}')
+            elif re.match(r'^\d+$', target):
+                print(f'NUMBER:{target}')
+            else:
+                print('RESOLVE_ERROR')
+        sys.exit(0)
+
+    # ============================================================
+    # Delta check mode (--delta-check)
+    # ============================================================
+    if args.delta_check:
+        if not args.old_file or not args.new_file:
+            print('ERROR: --delta-check には --old-file と --new-file が必要です', file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            with open(args.old_file, 'r', encoding='utf-8') as f:
+                old_text = f.read()
+        except (FileNotFoundError, IOError) as e:
+            print(f'ERROR: old-file 読み込みエラー: {e}', file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            with open(args.new_file, 'r', encoding='utf-8') as f:
+                new_text = f.read()
+        except (FileNotFoundError, IOError) as e:
+            print(f'ERROR: new-file 読み込みエラー: {e}', file=sys.stderr)
+            sys.exit(1)
+
+        changed = changed_prose_blocks(old_text, new_text)
+
+        if not changed:
+            print('DELTA_PASS')
+            sys.exit(0)
+
+        # 変更された prose block を検証
+        failed = []
+        for block in changed:
+            r = validate_text(block['text'], threshold=args.threshold)
+            if not r.passed:
+                failed.append(block)
+
+        if not failed:
+            print('DELTA_PASS')
+            sys.exit(0)
+        else:
+            print(f'DELTA_FAIL:{len(changed)}:{len(failed)}')
+            sys.exit(2)
+
+    # ============================================================
+    # 通常モード
+    # ============================================================
 
     # テキストの読み込み
     if args.file:
