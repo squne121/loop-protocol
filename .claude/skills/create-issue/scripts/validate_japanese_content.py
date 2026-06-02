@@ -444,6 +444,49 @@ def main():
         ),
     )
     parser.add_argument(
+        '--parse-api-input',
+        type=str,
+        default=None,
+        help=(
+            'Parse gh api command to extract --input file path. '
+            'Returns: '
+            'API_INPUT_STDIN if "--input -", '
+            'API_INPUT_FILE:<path> if file path, '
+            'API_INPUT_NONE if no --input flag found, '
+            'API_INPUT_ERROR on parse failure.'
+        ),
+    )
+    parser.add_argument(
+        '--classify-api-mutation',
+        type=str,
+        default=None,
+        help=(
+            'Given a JSON file path, classify if it is a body mutation. '
+            'Combined with --api-endpoint. '
+            'Returns: '
+            'BODY_MUTATION_ISSUE:<number> if issue body mutation, '
+            'BODY_MUTATION_PR:<number> if PR body mutation, '
+            'NOT_BODY_MUTATION if not a body mutation, '
+            'PAYLOAD_PARSE_FAILED if JSON parse fails, '
+            'ENDPOINT_PARSE_FAILED if endpoint parse fails.'
+        ),
+    )
+    parser.add_argument(
+        '--api-endpoint',
+        type=str,
+        default=None,
+        help='gh api endpoint for --classify-api-mutation (e.g. repos/owner/repo/issues/123)',
+    )
+    parser.add_argument(
+        '--extract-api-command-endpoint',
+        type=str,
+        default=None,
+        help=(
+            'Parse full gh api command line to extract the endpoint. '
+            'Returns the endpoint string, or ENDPOINT_PARSE_FAILED.'
+        ),
+    )
+    parser.add_argument(
         '--parse-edit-target',
         type=str,
         default=None,
@@ -565,6 +608,152 @@ def main():
             print('STDIN_FAIL_CLOSED')
         elif result_path:
             print(result_path)
+        sys.exit(0)
+
+    # ============================================================
+    # Parse api input mode (--parse-api-input)
+    # ============================================================
+    if args.parse_api_input is not None:
+        import shlex as _shlex
+
+        command = args.parse_api_input
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('API_INPUT_ERROR')
+            sys.exit(0)
+
+        result_path = None
+        is_stdin = False
+        found = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == '--input' and i + 1 < len(tokens):
+                found = True
+                fp = tokens[i + 1]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            if tok.startswith('--input='):
+                found = True
+                fp = tok[len('--input='):]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            i += 1
+
+        if is_stdin:
+            print('API_INPUT_STDIN')
+        elif result_path:
+            print(f'API_INPUT_FILE:{result_path}')
+        else:
+            print('API_INPUT_NONE')
+        sys.exit(0)
+
+    # ============================================================
+    # Extract api command endpoint (--extract-api-command-endpoint)
+    # ============================================================
+    if args.extract_api_command_endpoint is not None:
+        import shlex as _shlex
+
+        command = args.extract_api_command_endpoint
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('ENDPOINT_PARSE_FAILED')
+            sys.exit(0)
+
+        # gh api [flags] <endpoint>
+        # endpoint is the first non-flag positional argument after 'api'
+        api_idx = None
+        for idx, tok in enumerate(tokens):
+            if tok == 'api':
+                api_idx = idx
+                break
+
+        if api_idx is None:
+            print('ENDPOINT_PARSE_FAILED')
+            sys.exit(0)
+
+        # Flags that consume the next token
+        consuming_flags = {
+            '--hostname', '-H', '--header', '-f', '--raw-field', '-F', '--field',
+            '-X', '--method', '--input', '--jq', '-q', '--template', '-t',
+            '--cache', '--paginate', '--preview', '-p',
+        }
+
+        endpoint = None
+        i = api_idx + 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith('-'):
+                if tok in consuming_flags:
+                    i += 2  # skip flag + value
+                    continue
+                # single char flag that may take value immediately
+                i += 1
+                continue
+            # First non-flag token is the endpoint
+            endpoint = tok
+            break
+
+        if endpoint:
+            print(endpoint)
+        else:
+            print('ENDPOINT_PARSE_FAILED')
+        sys.exit(0)
+
+    # ============================================================
+    # Classify api mutation (--classify-api-mutation)
+    # ============================================================
+    if args.classify_api_mutation is not None:
+        import json as _json
+
+        payload_file = args.classify_api_mutation
+        endpoint = args.api_endpoint or ''
+
+        # Parse JSON payload
+        try:
+            with open(payload_file, 'r', encoding='utf-8') as f:
+                payload = _json.load(f)
+        except (FileNotFoundError, IOError, _json.JSONDecodeError):
+            print('PAYLOAD_PARSE_FAILED')
+            sys.exit(0)
+
+        # Check if payload contains 'body' key (body mutation indicator)
+        if not isinstance(payload, dict) or 'body' not in payload:
+            print('NOT_BODY_MUTATION')
+            sys.exit(0)
+
+        # Parse endpoint to detect issue/PR body mutation
+        # Patterns:
+        #   repos/{owner}/{repo}/issues/{number}          -> ISSUE PATCH
+        #   repos/{owner}/{repo}/pulls/{number}           -> PR PATCH
+        #   /repos/{owner}/{repo}/issues/{number}         -> ISSUE PATCH (leading slash)
+        #   /repos/{owner}/{repo}/pulls/{number}          -> PR PATCH
+        import re as _re
+        # Strip leading slash
+        ep = endpoint.lstrip('/')
+
+        issue_m = _re.match(
+            r'^repos/[^/]+/[^/]+/issues/(\d+)$', ep
+        )
+        pr_m = _re.match(
+            r'^repos/[^/]+/[^/]+/pulls/(\d+)$', ep
+        )
+
+        if issue_m:
+            print(f'BODY_MUTATION_ISSUE:{issue_m.group(1)}')
+        elif pr_m:
+            print(f'BODY_MUTATION_PR:{pr_m.group(1)}')
+        else:
+            # endpoint not recognized as issue/PR mutation
+            print('NOT_BODY_MUTATION')
         sys.exit(0)
 
     # ============================================================
