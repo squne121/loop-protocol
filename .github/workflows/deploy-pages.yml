@@ -155,13 +155,16 @@ jobs:
   cleanup-pr:
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.action == 'closed'
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     concurrency:
       group: deploy-pages-gh-pages
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - name: Check if gh-pages branch exists
         id: check-branch
@@ -192,3 +195,36 @@ jobs:
       - name: Skip cleanup (gh-pages branch not found)
         if: steps.check-branch.outputs.exists == 'false'
         run: echo "gh-pages branch does not exist yet; no-op cleanup."
+      - name: Update preview URL comment to "Preview removed"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const marker = '<!-- loop-protocol-pr-preview -->';
+
+            // Fetch all comments with pagination
+            const allComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              }
+            );
+
+            // Find the bot preview comment (must be from github-actions[bot] and contain the marker)
+            const target = allComments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+
+            if (target) {
+              // Update to "Preview removed" — do not delete (preserves playtest trail)
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: target.id,
+                body: `${marker}\n## Preview URL\n\nPreview removed (PR #${prNumber} closed).`,
+              });
+            }
+            // No-op if no matching comment found — do not create a new comment
