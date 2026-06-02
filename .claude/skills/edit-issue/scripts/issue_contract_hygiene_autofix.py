@@ -5,32 +5,41 @@ issue_contract_hygiene_autofix.py
 Deterministic autofix for trivial format blockers in Issue contract bodies.
 
 Supported repairs:
-  C4: Add $ prefix to command lines in fenced bash blocks within Verification Commands section
+  C4: Add $ prefix to command lines in fenced bash blocks within Verification Commands section.
+      NOTE: C4 fence parser targets the contract canonical format only (exact ` ```bash` with no
+      leading spaces, no tilde). GFM variants with indentation or tildes are out of scope —
+      issue-contract-review enforces canonical formatting, so non-canonical fences should not
+      appear in a contract body that has passed contract review.
   C9: Insert ## Runtime Verification Applicability section with decision: not_applicable
-      when section is missing and all Allowed Paths are non-runtime
+      when section is missing and all Allowed Paths are known-non-runtime (whitelist).
 
 Exit codes:
   0: Repairs applied (body changed)
   1: No repairs needed (body unchanged, including sha256 no_change)
-  2: Non-trivial blockers detected or autofixable judgment not possible
-
-Usage:
-  python3 issue_contract_hygiene_autofix.py [--body-file <path>] [--out-file <path>]
-  cat body.md | python3 issue_contract_hygiene_autofix.py
+  2: Non-trivial blockers detected, autofixable judgment not possible, or unsafe to autofix
+     (e.g. runtime paths detected, unknown paths, missing Allowed Paths section,
+      or blocking issues other than C4/C9 found)
 """
 
 import argparse
 import hashlib
+import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from typing import Optional
 
 
-# Paths considered "non-runtime" (workflow/docs/scripts only, no product runtime)
-NON_RUNTIME_PATH_PREFIXES = (
-    ".claude/",
+# Whitelist of path prefixes that are known non-runtime (workflow/docs/scripts only).
+# Paths NOT matching any prefix here → exit 2 (fail-closed).
+# NOTE: .github/workflows/** is intentionally excluded from the non-runtime whitelist
+# (CI permission risk — human judgment required).
+NON_RUNTIME_PATH_PREFIXES_WHITELIST = (
+    ".claude/agents/",
+    ".claude/skills/",
     "docs/",
-    ".github/",
     "scripts/",
 )
 
@@ -42,6 +51,12 @@ RUNTIME_PATH_PREFIXES = (
     "public/",
     "dist/",
     "tests/",  # product tests (not .claude/skills/*/tests/)
+)
+
+# Path to check_issue_contract.py (relative to this script's location)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECK_ISSUE_CONTRACT_SCRIPT = os.path.normpath(
+    os.path.join(_SCRIPT_DIR, "../../review-issue/scripts/check_issue_contract.py")
 )
 
 
@@ -76,6 +91,22 @@ def is_runtime_path(path: str) -> bool:
     return False
 
 
+def is_known_non_runtime_path(path: str) -> bool:
+    """
+    Whitelist-based check: return True only if path matches a known non-runtime prefix.
+    Unknown/unclassified paths return False (fail-closed).
+    NOTE: .github/** is intentionally not in the whitelist (CI permission risk).
+    """
+    path = path.strip().lstrip("- ").strip("`")
+    # .claude/skills/*/tests/ is explicitly non-runtime
+    if re.match(r"\.claude/skills/[^/]+/tests/", path):
+        return True
+    for prefix in NON_RUNTIME_PATH_PREFIXES_WHITELIST:
+        if path.startswith(prefix):
+            return True
+    return False
+
+
 def parse_allowed_paths(lines: list[str]) -> Optional[list[str]]:
     """Extract allowed paths from ## Allowed Paths section. Returns None if section missing."""
     start, end = extract_section_lines(lines, "## Allowed Paths")
@@ -90,12 +121,18 @@ def parse_allowed_paths(lines: list[str]) -> Optional[list[str]]:
     return paths
 
 
-def all_paths_non_runtime(paths: list[str]) -> bool:
-    """Return True if all allowed paths are non-runtime."""
+def all_paths_non_runtime(paths: list[str]) -> tuple[bool, Optional[str]]:
+    """
+    Return (all_non_runtime, reason_if_not).
+    Uses whitelist approach: any path not matching NON_RUNTIME_PATH_PREFIXES_WHITELIST
+    is treated as unknown/unsafe → returns (False, reason).
+    """
     for p in paths:
         if is_runtime_path(p):
-            return False
-    return True
+            return False, f"runtime path detected: {p!r}"
+        if not is_known_non_runtime_path(p):
+            return False, f"unknown/unclassified path (not in non-runtime whitelist): {p!r}"
+    return True, None
 
 
 def has_runtime_verification_section(lines: list[str]) -> bool:
@@ -114,26 +151,37 @@ def find_delivery_rule_line(lines: list[str]) -> int:
     return -1
 
 
-def repair_c9(lines: list[str]) -> tuple[list[str], bool]:
+# Sentinel to distinguish "no repair needed" from "unsafe to repair"
+class C9Result:
+    OK = "ok"             # repair applied
+    NO_CHANGE = "no_change"  # already has RVA section — no repair needed
+    NOT_AUTOFIXABLE = "not_autofixable"  # runtime/unknown paths or missing Allowed Paths
+
+
+def repair_c9(lines: list[str]) -> tuple[list[str], str, Optional[str]]:
     """
     C9 repair: Insert ## Runtime Verification Applicability section with
     decision: not_applicable when:
     - Section is missing
-    - All Allowed Paths are non-runtime (or no Allowed Paths section but safe to assume)
+    - All Allowed Paths are known-non-runtime (whitelist)
 
-    Returns (new_lines, repaired).
+    Returns (new_lines, result_code, reason).
+      result_code: C9Result.OK | C9Result.NO_CHANGE | C9Result.NOT_AUTOFIXABLE
+      reason: human-readable explanation when NOT_AUTOFIXABLE
     """
     if has_runtime_verification_section(lines):
-        return lines, False
+        return lines, C9Result.NO_CHANGE, None
 
     allowed_paths = parse_allowed_paths(lines)
     if allowed_paths is None:
-        # No Allowed Paths section — cannot safely auto-classify
-        return lines, False
+        return lines, C9Result.NOT_AUTOFIXABLE, "## Allowed Paths section is missing"
 
-    if not all_paths_non_runtime(allowed_paths):
-        # Contains runtime paths — not safe to auto-insert not_applicable
-        return lines, False
+    if allowed_paths == []:
+        return lines, C9Result.NOT_AUTOFIXABLE, "## Allowed Paths section is empty"
+
+    ok, reason = all_paths_non_runtime(allowed_paths)
+    if not ok:
+        return lines, C9Result.NOT_AUTOFIXABLE, reason
 
     rva_block = [
         "## Runtime Verification Applicability\n",
@@ -153,7 +201,106 @@ def repair_c9(lines: list[str]) -> tuple[list[str], bool]:
         # Append at the end (before last blank line if present)
         new_lines = lines + ["\n"] + rva_block
 
-    return new_lines, True
+    return new_lines, C9Result.OK, None
+
+
+def check_non_c4_c9_blockers(body: str) -> tuple[bool, list[str]]:
+    """
+    Run check_issue_contract.py --json on the body and return
+    (has_other_blockers, other_blocker_codes).
+
+    Returns (True, [codes...]) if there are blocking issues other than C4/C9.
+    Returns (False, []) if only C4/C9 blockers (or no blockers).
+    Returns (True, ["check_error"]) if check_issue_contract.py cannot be invoked.
+
+    C4 and C9 are the only codes this script can autofix — other blockers must
+    be resolved by a human before running this autofix.
+    """
+    if not os.path.isfile(CHECK_ISSUE_CONTRACT_SCRIPT):
+        print(
+            f"[WARN] check_issue_contract.py not found at {CHECK_ISSUE_CONTRACT_SCRIPT}; "
+            "skipping non-C4/C9 blocker check (fail-open for this guard only)",
+            file=sys.stderr,
+        )
+        return False, []
+
+    # Write body to a temp file so check_issue_contract.py can read it
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", encoding="utf-8", delete=False
+        ) as tf:
+            tf.write(body)
+            tmp_path = tf.name
+    except OSError as e:
+        print(f"[WARN] Cannot write temp file for contract check: {e}", file=sys.stderr)
+        return False, []
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, CHECK_ISSUE_CONTRACT_SCRIPT, "--file", tmp_path, "--json"],
+            capture_output=True,
+            text=True,
+        )
+        # parse JSON from stdout (exit 0 = all pass, exit 1 = has failures)
+        if proc.stdout.strip():
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                # non-JSON output; cannot parse — skip guard
+                return False, []
+            blocking = data.get("blocking_issues", [])
+            # blocking_issues is a list of strings (human-readable messages).
+            # This script can only autofix C4 ($ prefix) and C9 (RVA section).
+            # Filter out messages that belong to checks this script handles or cannot
+            # meaningfully gate on (structural/section-count checks):
+            #
+            # C4-related:
+            #   - "C4" in message (check code reference)
+            #   - "VC に実行可能コマンドが見当たらない" (C4 check fires when $ is missing
+            #     — this is exactly what this script fixes, so don't gate on it)
+            # C9-related:
+            #   - "C9" in message
+            #   - "Runtime Verification" in message (RVA section messages)
+            #   - "レガシー Issue" (legacy C9 warning)
+            # C1-related (required section absence — structural, not content):
+            #   - "必須セクション" (required section missing)
+            # C2-related (Stop Conditions count — content issue, not autofix target):
+            #   - "Stop Conditions の項目数" (count gate)
+            #   - "## Stop Conditions セクションが存在しない"
+            #   - "## Acceptance Criteria セクションが存在しないか空"
+            #   - "## Outcome セクションが存在しないか空"
+            # These structural/section messages are filtered because:
+            # (a) this autofix is called *after* issue-contract-review approves the body,
+            #     so C1/C2 should already be passing in production use, and
+            # (b) these messages contain no information useful for deciding whether
+            #     C4/C9 are safe to apply.
+            FILTER_PATTERNS = (
+                "C4",
+                "C9",
+                "VC に実行可能コマンドが見当たらない",
+                "Runtime Verification",
+                "レガシー Issue",
+                "必須セクション",
+                "Stop Conditions の項目数",
+                "## Stop Conditions セクションが存在しない",
+                "## Acceptance Criteria セクションが存在しないか空",
+                "## Outcome セクションが存在しないか空",
+            )
+            other_blockers = []
+            for msg in blocking:
+                if not any(pat in msg for pat in FILTER_PATTERNS):
+                    other_blockers.append(msg)
+            return len(other_blockers) > 0, other_blockers
+    except Exception as e:
+        print(f"[WARN] check_issue_contract.py invocation failed: {e}", file=sys.stderr)
+        return False, []
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    return False, []
 
 
 # Patterns for C4 repair (fenced bash block command line detection)
@@ -165,6 +312,10 @@ def repair_c9(lines: list[str]) -> tuple[list[str], bool]:
 #   - Not a shell variable expression at line start (e.g. VAR=..., $VAR)
 #   - Not prose (markdown text outside the bash block)
 #   - Not a heredoc content line (inside EOF block)
+#
+# NOTE: C4 fence detection uses exact ` ```bash` matching (no leading spaces, backtick only).
+# This is intentional: issue-contract-review enforces canonical ` ```bash` format, so
+# non-canonical GFM fences (indented, tilde, info-string variants) are out of scope here.
 
 
 def is_shell_variable_expression(line: str) -> bool:
@@ -196,7 +347,7 @@ def repair_c4_in_vc_block(lines: list[str]) -> tuple[list[str], bool]:
     i = vc_start + 1
     while i < vc_end:
         line = new_lines[i]
-        # Detect start of fenced bash block
+        # Detect start of fenced bash block (canonical format only — see module docstring)
         if re.match(r'^```bash\s*$', line):
             block_start = i
             i += 1
@@ -309,32 +460,49 @@ def main() -> int:
     original_sha256 = sha256_of(original_body)
     lines = original_body.splitlines(keepends=True)
 
+    # AC4: Check for non-C4/C9 blockers first — if found, exit 2
+    # (This script can only autofix C4 and C9; other blockers need human attention)
+    has_other, other_codes = check_non_c4_c9_blockers(original_body)
+    if has_other:
+        print(
+            f"[ERROR] Non-C4/C9 blocking issues detected; cannot autofix: {other_codes}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Apply C4 repair
     lines, c4_repaired = repair_c4_in_vc_block(lines)
 
     # Apply C9 repair
-    lines, c9_repaired = repair_c9(lines)
+    lines, c9_result, c9_reason = repair_c9(lines)
+    c9_repaired = (c9_result == C9Result.OK)
+
+    # If C9 is not autofixable (runtime/unknown paths or missing Allowed Paths) → exit 2
+    if c9_result == C9Result.NOT_AUTOFIXABLE:
+        print(
+            f"[ERROR] C9 autofix not safe: {c9_reason}",
+            file=sys.stderr,
+        )
+        return 2
 
     new_body = "".join(lines)
     new_sha256 = sha256_of(new_body)
 
     # sha256 guard: if body unchanged, return exit 1
     if original_sha256 == new_sha256:
-        result = {
-            "status": "no_change",
-            "c4_repaired": False,
-            "c9_repaired": False,
-            "original_sha256": original_sha256,
-            "new_sha256": new_sha256,
-        }
-        print(f"status: no_change", file=sys.stderr)
+        print("status: no_change", file=sys.stderr)
         return 1
 
-    # Write output
+    # Write output using temp file + os.replace() for atomic write
     if args.out_file:
         try:
-            with open(args.out_file, "w", encoding="utf-8") as f:
-                f.write(new_body)
+            out_dir = os.path.dirname(os.path.abspath(args.out_file))
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=out_dir, delete=False, suffix=".tmp"
+            ) as tf:
+                tf.write(new_body)
+                tmp_out = tf.name
+            os.replace(tmp_out, args.out_file)
         except OSError as e:
             print(f"[ERROR] Cannot write output file: {e}", file=sys.stderr)
             return 2
