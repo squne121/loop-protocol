@@ -187,23 +187,50 @@ def test_ac4_stale_contract_review_defined():
 
 
 # ---------------------------------------------------------------------------
-# AC5: go 無効化 marker (REVIEW_RESULT_INVALIDATION_V1)
+# AC5: go 無効化 marker (GO_INVALIDATION_POLICY_V1)
 # ---------------------------------------------------------------------------
 
 
-def test_ac5_go_invalidation_marker_defined():
-    """AC5: go invalidation marker is defined as machine-readable block."""
+def test_ac5_go_invalidation_policy_defined():
+    """AC5: GO_INVALIDATION_POLICY_V1 is defined as machine-readable block."""
     body = _read(PREPARATION_MD)
-    assert "REVIEW_RESULT_INVALIDATION_V1" in body, (
-        "preparation.md must define REVIEW_RESULT_INVALIDATION_V1 go invalidation marker"
+    assert "GO_INVALIDATION_POLICY_V1" in body, (
+        "preparation.md must define GO_INVALIDATION_POLICY_V1 go invalidation policy"
     )
 
 
-def test_ac5_invalidation_marker_has_invalidates_go_at():
-    """AC5: go invalidation marker includes invalidates_go_at field."""
+def test_ac5_go_invalidation_policy_source_field():
+    """AC5: GO_INVALIDATION_POLICY_V1 includes source: issue_comment field."""
     body = _read(PREPARATION_MD)
-    assert "invalidates_go_at" in body, (
-        "REVIEW_RESULT_INVALIDATION_V1 must include invalidates_go_at field"
+    assert "source: issue_comment" in body, (
+        "GO_INVALIDATION_POLICY_V1 must include 'source: issue_comment' field"
+    )
+
+
+def test_ac5_go_invalidation_policy_accepted_marker_field():
+    """AC5: GO_INVALIDATION_POLICY_V1 includes accepted_marker field."""
+    body = _read(PREPARATION_MD)
+    assert "accepted_marker:" in body, (
+        "GO_INVALIDATION_POLICY_V1 must include 'accepted_marker' field"
+    )
+    assert "REVIEW_RESULT_V1.status == request_changes" in body, (
+        "GO_INVALIDATION_POLICY_V1 accepted_marker must reference REVIEW_RESULT_V1.status == request_changes"
+    )
+
+
+def test_ac5_go_invalidation_policy_target_issue_url_must_match():
+    """AC5: GO_INVALIDATION_POLICY_V1 includes target_issue_url_must_match field."""
+    body = _read(PREPARATION_MD)
+    assert "target_issue_url_must_match: true" in body, (
+        "GO_INVALIDATION_POLICY_V1 must include 'target_issue_url_must_match: true'"
+    )
+
+
+def test_ac5_go_invalidation_policy_ordering_key():
+    """AC5: GO_INVALIDATION_POLICY_V1 includes ordering_key: created_at field."""
+    body = _read(PREPARATION_MD)
+    assert "ordering_key: created_at" in body, (
+        "GO_INVALIDATION_POLICY_V1 must include 'ordering_key: created_at'"
     )
 
 
@@ -244,4 +271,49 @@ def test_ac6_intake_gate_result_schema_defined():
     body = _read(PREPARATION_MD)
     assert "INTAKE_GATE_RESULT_V1" in body, (
         "preparation.md must define INTAKE_GATE_RESULT_V1 schema"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC5/Blocker2: on_intake_gate_failed — LOOP_STATE.termination_reason propagation
+# ---------------------------------------------------------------------------
+
+
+def test_blocker2_on_intake_gate_failed_defined():
+    """Blocker2: on_intake_gate_failed section is defined in preparation.md."""
+    body = _read(PREPARATION_MD)
+    assert "on_intake_gate_failed" in body, (
+        "preparation.md must define on_intake_gate_failed stop processing block"
+    )
+
+
+def test_blocker2_termination_reason_set_to_intake_gate_failed():
+    """Blocker2: on_intake_gate_failed sets LOOP_STATE.termination_reason to intake_gate_failed."""
+    body = _read(PREPARATION_MD)
+    assert "set LOOP_STATE.termination_reason: intake_gate_failed" in body, (
+        "preparation.md must specify 'set LOOP_STATE.termination_reason: intake_gate_failed' "
+        "in on_intake_gate_failed block"
+    )
+
+
+def test_blocker2_do_not_continue_to_step_1():
+    """Blocker2: on_intake_gate_failed blocks continuation to step 1."""
+    body = _read(PREPARATION_MD)
+    assert "do_not_continue_to_step_1: true" in body, (
+        "preparation.md must specify 'do_not_continue_to_step_1: true' in on_intake_gate_failed"
+    )
+
+
+def test_blocker2_termination_reason_valid_values_include_intake_gate_failed():
+    """Blocker2: termination_reason valid values include intake_gate_failed in preparation.md."""
+    body = _read(PREPARATION_MD)
+    assert "intake_gate_failed" in body, (
+        "preparation.md must list intake_gate_failed as a valid termination_reason value"
+    )
+    # Check it appears in termination_reason context
+    idx = body.find("termination_reason")
+    assert idx != -1, "preparation.md must mention termination_reason"
+    context = body[idx : idx + 200]
+    assert "intake_gate_failed" in context, (
+        "intake_gate_failed must appear near termination_reason definition"
     )

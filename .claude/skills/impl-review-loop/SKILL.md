@@ -66,7 +66,7 @@ LOOP_STATE:
   last_loop_verdict: APPROVE | REQUEST_CHANGES | null
   blockers_history: []
   external_research_skip_basis: "<理由 or null>"
-  termination_reason: null | approved | max_iterations | human_escalation
+  termination_reason: null | approved | max_iterations | human_escalation | intake_gate_failed
   product_spec_preflight:
     source: contract_snapshot.checks.product_spec_check
     applicability: applicable | not_applicable | missing

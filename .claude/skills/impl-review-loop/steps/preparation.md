@@ -4,7 +4,7 @@
 
 ## 0. Intake Gate — `CONTRACT_REVIEW_RESULT_V1 status: go` 必須検査
 
-`impl-review-loop` preparation の最初のゲート。以下の 4 サブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。
+`impl-review-loop` preparation の最初のゲート。以下の 5 つのサブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。
 
 ```yaml
 INTAKE_GATE_RESULT_V1:
@@ -58,18 +58,31 @@ gh issue view <issue_number> --json title,labels \
 
 `status: go` のコメントより新しい `CONTRACT_REVIEW_RESULT_V1.status: blocked` または明示的な go 無効化 marker が存在する場合。
 
-**go 無効化 marker の定義**（machine-readable block）:
+**go 無効化 marker の定義**（machine-readable policy block）:
 
 ```yaml
-# go 無効化 marker — このブロックが存在する場合、直前の status: go は無効
-REVIEW_RESULT_INVALIDATION_V1:
-  invalidates_go_at: "<ISO8601 of the go comment>"
-  reason: request_changes | stale | superseded
-  issued_by: "<actor>"
-  issued_at: "<ISO8601>"
+GO_INVALIDATION_POLICY_V1:
+  source: issue_comment
+  accepted_marker: fenced_yaml REVIEW_RESULT_V1.status == request_changes
+  target_issue_url_must_match: true
+  ordering_key: created_at
+  precedence: latest_valid_marker_after_latest_valid_go
 ```
 
-上記 fenced yaml block が Issue コメントに存在し、`invalidates_go_at` が直近の `status: go` の `generated_at` と一致する場合は `intake_gate_failed: request_changes_after_go` で停止。
+上記ポリシーに従い、Issue コメントに `REVIEW_RESULT_V1.status == request_changes` を含む fenced yaml block が存在し、かつ対象 Issue URL が一致し、`created_at` が直近の `status: go` より新しい場合は `intake_gate_failed: request_changes_after_go` で停止。
+
+### Stop 時の必須処理（`on_intake_gate_failed`）
+
+`intake_gate_failed` に該当した場合、以下の処理を行ってから停止する:
+
+```yaml
+on_intake_gate_failed:
+  set LOOP_STATE.termination_reason: intake_gate_failed
+  set LOOP_STATE.intake_gate.status: intake_gate_failed
+  do_not_continue_to_step_1: true
+```
+
+`LOOP_STATE.termination_reason` の有効値: `null | approved | max_iterations | human_escalation | intake_gate_failed`
 
 ### 全サブ理由なし → `status: pass`
 
