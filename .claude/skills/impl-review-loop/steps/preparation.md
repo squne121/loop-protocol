@@ -411,12 +411,16 @@ CONTRACT_BLOCKED_ROUTING_V1:
 
 - `rg "foo" path/to/file` が `path/to/file` のスペルミス（正しくは `path/to/fle`）で blocked → typo fix のみで再実行可
 - AC の VC コマンドに余分な引用符やエスケープが含まれ、exit_code: 1 となっている → format_error として修正可
+- `preflight-scope: pr_review_only` フラグを VC に付与する → VC 意味論は変更せず scope class のみ明示するため `simple_contract_hygiene_fix` 対象
 
 **負例（negative example）**:
 
 - VC が参照する Allowed Path 自体が存在しない → `scope_gap` であり `contract_refinement_required` が必要
 - VC の期待値（grep 対象文字列）が実装内容と乖離している → 意味論変更であり `simple_contract_hygiene_fix` 対象外
-- `preflight-scope: pr_review_only` フラグが設定された VC → scope class 変更は意味論変更であり autonomous fix 禁止
+- 動画証跡 URL を VC コマンドに含める変更 → 証跡保存先の指定は意味論変更であり autonomous fix 禁止
+- 環境情報（OS、node version 等）の記述を VC に追加する変更 → VC 意味論変更であり `simple_contract_hygiene_fix` 対象外
+- `tested_commit:` 由来の値を VC コマンドに組み込む変更 → 実行時依存の注入は意味論変更であり autonomous fix 禁止
+- `accepted` / `deferred` 判定を VC の結果評価に追加する変更 → VC 合否の意味論変更であり `human_decision_required` に該当
 
 #### contract_refinement_required（人間承認が必要な修正フロー）
 
