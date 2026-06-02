@@ -15,6 +15,13 @@ import re
 import sys
 from dataclasses import dataclass
 
+# GraphQL body mutation keywords (B1: #594 blocker fix)
+# gh api graphql --input payload.json の query にこれらが含まれる場合は body mutation として deny する
+GRAPHQL_BODY_MUTATION_KEYWORDS = [
+    "updateIssue", "updatePullRequest", "updateIssueComment",
+    "addComment", "createIssue", "createPullRequest",
+]
+
 
 # 日本語文字の Unicode range
 HIRAGANA_RE = re.compile(r'[぀-ゟ]')
@@ -444,6 +451,75 @@ def main():
         ),
     )
     parser.add_argument(
+        '--parse-api-input',
+        type=str,
+        default=None,
+        help=(
+            'Parse gh api command to extract --input file path. '
+            'Returns: '
+            'API_INPUT_STDIN if "--input -", '
+            'API_INPUT_FILE:<path> if file path, '
+            'API_INPUT_NONE if no --input flag found, '
+            'API_INPUT_ERROR on parse failure.'
+        ),
+    )
+    parser.add_argument(
+        '--classify-api-mutation',
+        type=str,
+        default=None,
+        help=(
+            'Given a JSON file path, classify if it is a body mutation. '
+            'Combined with --api-endpoint. '
+            'Returns: '
+            'BODY_MUTATION_ISSUE:<number> if issue body mutation, '
+            'BODY_MUTATION_PR:<number> if PR body mutation, '
+            'NOT_BODY_MUTATION if not a body mutation, '
+            'PAYLOAD_PARSE_FAILED if JSON parse fails, '
+            'ENDPOINT_PARSE_FAILED if endpoint parse fails.'
+        ),
+    )
+    parser.add_argument(
+        '--api-endpoint',
+        type=str,
+        default=None,
+        help='gh api endpoint for --classify-api-mutation (e.g. repos/owner/repo/issues/123)',
+    )
+    parser.add_argument(
+        '--classify-graphql-mutation',
+        type=str,
+        default=None,
+        help=(
+            'Given a GraphQL payload JSON file path, classify if it is a body mutation. '
+            'Returns: '
+            'GRAPHQL_BODY_MUTATION_BLOCKED if query contains mutation + body mutation keywords + body variable, '
+            'GRAPHQL_MUTATION_DENIED if query contains mutation but no specific body mutation keyword, '
+            'GRAPHQL_NOT_MUTATION if query does not contain mutation keyword, '
+            'GRAPHQL_PARSE_FAILED if JSON parse or query field missing. '
+            '(B1: #594 blocker fix)'
+        ),
+    )
+    parser.add_argument(
+        '--extract-api-command-endpoint',
+        type=str,
+        default=None,
+        help=(
+            'Parse full gh api command line to extract the endpoint. '
+            'Returns the endpoint string, or ENDPOINT_PARSE_FAILED.'
+        ),
+    )
+    parser.add_argument(
+        '--extract-api-command-method',
+        type=str,
+        default=None,
+        help=(
+            'Parse full gh api command line to extract the HTTP method. '
+            'Returns: PATCH, POST, GET, DELETE, or METHOD_UNKNOWN. '
+            'Unspecified + --input present defaults to POST. '
+            'GET is non-mutation. '
+            '(B3: #594 blocker fix)'
+        ),
+    )
+    parser.add_argument(
         '--parse-edit-target',
         type=str,
         default=None,
@@ -565,6 +641,245 @@ def main():
             print('STDIN_FAIL_CLOSED')
         elif result_path:
             print(result_path)
+        sys.exit(0)
+
+    # ============================================================
+    # Parse api input mode (--parse-api-input)
+    # ============================================================
+    if args.parse_api_input is not None:
+        import shlex as _shlex
+
+        command = args.parse_api_input
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('API_INPUT_ERROR')
+            sys.exit(0)
+
+        result_path = None
+        is_stdin = False
+        found = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == '--input' and i + 1 < len(tokens):
+                found = True
+                fp = tokens[i + 1]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            if tok.startswith('--input='):
+                found = True
+                fp = tok[len('--input='):]
+                if fp == '-':
+                    is_stdin = True
+                else:
+                    result_path = fp
+                break
+            i += 1
+
+        if is_stdin:
+            print('API_INPUT_STDIN')
+        elif result_path:
+            print(f'API_INPUT_FILE:{result_path}')
+        else:
+            print('API_INPUT_NONE')
+        sys.exit(0)
+
+    # ============================================================
+    # Classify GraphQL mutation (--classify-graphql-mutation) [B1: #594]
+    # ============================================================
+    if args.classify_graphql_mutation is not None:
+        import json as _json
+
+        payload_file = args.classify_graphql_mutation
+        try:
+            with open(payload_file, 'r', encoding='utf-8') as f:
+                payload = _json.load(f)
+        except (FileNotFoundError, IOError, _json.JSONDecodeError):
+            print('GRAPHQL_PARSE_FAILED')
+            sys.exit(0)
+
+        if not isinstance(payload, dict):
+            print('GRAPHQL_PARSE_FAILED')
+            sys.exit(0)
+
+        query = payload.get('query', '')
+        if not isinstance(query, str):
+            print('GRAPHQL_PARSE_FAILED')
+            sys.exit(0)
+
+        # Check if it's a mutation query
+        if 'mutation' not in query.lower():
+            print('GRAPHQL_NOT_MUTATION')
+            sys.exit(0)
+
+        # Check for body mutation keywords in query
+        has_body_mutation_keyword = any(kw in query for kw in GRAPHQL_BODY_MUTATION_KEYWORDS)
+
+        # Check if variables contain a 'body' field
+        variables = payload.get('variables', {})
+        has_body_variable = isinstance(variables, dict) and 'body' in variables
+
+        if has_body_mutation_keyword and has_body_variable:
+            # Body mutation via GraphQL: blocked (B1)
+            print('GRAPHQL_BODY_MUTATION_BLOCKED')
+        elif has_body_mutation_keyword:
+            # Mutation keyword present but no body variable: conservative deny
+            print('GRAPHQL_MUTATION_DENIED')
+        else:
+            # mutation keyword present but no specific body mutation keyword: conservative deny
+            print('GRAPHQL_MUTATION_DENIED')
+        sys.exit(0)
+
+    # ============================================================
+    # Extract api command endpoint (--extract-api-command-endpoint)
+    # ============================================================
+    if args.extract_api_command_endpoint is not None:
+        import shlex as _shlex
+
+        command = args.extract_api_command_endpoint
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('ENDPOINT_PARSE_FAILED')
+            sys.exit(0)
+
+        # gh api [flags] <endpoint>
+        # endpoint is the first non-flag positional argument after 'api'
+        api_idx = None
+        for idx, tok in enumerate(tokens):
+            if tok == 'api':
+                api_idx = idx
+                break
+
+        if api_idx is None:
+            print('ENDPOINT_PARSE_FAILED')
+            sys.exit(0)
+
+        # Flags that consume the next token
+        consuming_flags = {
+            '--hostname', '-H', '--header', '-f', '--raw-field', '-F', '--field',
+            '-X', '--method', '--input', '--jq', '-q', '--template', '-t',
+            '--cache', '--paginate', '--preview', '-p',
+        }
+
+        endpoint = None
+        i = api_idx + 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.startswith('-'):
+                if tok in consuming_flags:
+                    i += 2  # skip flag + value
+                    continue
+                # single char flag that may take value immediately
+                i += 1
+                continue
+            # First non-flag token is the endpoint
+            endpoint = tok
+            break
+
+        if endpoint:
+            print(endpoint)
+        else:
+            print('ENDPOINT_PARSE_FAILED')
+        sys.exit(0)
+
+    # ============================================================
+    # Classify api mutation (--classify-api-mutation)
+    # ============================================================
+    if args.classify_api_mutation is not None:
+        import json as _json
+
+        payload_file = args.classify_api_mutation
+        endpoint = args.api_endpoint or ''
+
+        # Parse JSON payload
+        try:
+            with open(payload_file, 'r', encoding='utf-8') as f:
+                payload = _json.load(f)
+        except (FileNotFoundError, IOError, _json.JSONDecodeError):
+            print('PAYLOAD_PARSE_FAILED')
+            sys.exit(0)
+
+        # Check if payload contains 'body' key (body mutation indicator)
+        if not isinstance(payload, dict) or 'body' not in payload:
+            print('NOT_BODY_MUTATION')
+            sys.exit(0)
+
+        # Parse endpoint to detect issue/PR body mutation
+        # Patterns:
+        #   repos/{owner}/{repo}/issues/{number}          -> ISSUE PATCH
+        #   repos/{owner}/{repo}/pulls/{number}           -> PR PATCH
+        #   /repos/{owner}/{repo}/issues/{number}         -> ISSUE PATCH (leading slash)
+        #   /repos/{owner}/{repo}/pulls/{number}          -> PR PATCH
+        import re as _re
+        # Strip leading slash
+        ep = endpoint.lstrip('/')
+
+        issue_m = _re.match(
+            r'^repos/[^/]+/[^/]+/issues/(\d+)$', ep
+        )
+        pr_m = _re.match(
+            r'^repos/[^/]+/[^/]+/pulls/(\d+)$', ep
+        )
+
+        if issue_m:
+            print(f'BODY_MUTATION_ISSUE:{issue_m.group(1)}')
+        elif pr_m:
+            print(f'BODY_MUTATION_PR:{pr_m.group(1)}')
+        else:
+            # endpoint not recognized as issue/PR mutation
+            print('NOT_BODY_MUTATION')
+        sys.exit(0)
+
+    # ============================================================
+    # Extract api command method (--extract-api-command-method) [B3: #594]
+    # ============================================================
+    if args.extract_api_command_method is not None:
+        import shlex as _shlex
+
+        command = args.extract_api_command_method
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            print('METHOD_UNKNOWN')
+            sys.exit(0)
+
+        method = None
+        has_input = False
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ('--method', '-X') and i + 1 < len(tokens):
+                method = tokens[i + 1].upper()
+                i += 2
+                continue
+            if tok.startswith('--method='):
+                method = tok[len('--method='):].upper()
+                i += 1
+                continue
+            if tok.startswith('-X') and len(tok) > 2:
+                method = tok[2:].upper()
+                i += 1
+                continue
+            if tok == '--input' or tok.startswith('--input='):
+                has_input = True
+                i += 1
+                continue
+            i += 1
+
+        if method is not None:
+            # Explicit method specified
+            print(method)
+        elif has_input:
+            # gh api with --input but no explicit method: GitHub CLI defaults to POST
+            print('POST')
+        else:
+            # No method, no --input: treat as GET (non-mutation)
+            print('GET')
         sys.exit(0)
 
     # ============================================================
