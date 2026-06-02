@@ -3,7 +3,7 @@ doc_id: playtest-m2-combat-mvp
 issue: "#490"
 parent_issue: "#483"
 implementation_issue: "#541"
-tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
+automated_tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
 status: accepted_with_deferred
 date: "2026-05-31"
@@ -273,12 +273,14 @@ dependency_state: |
   #542 (spec/impl: MVP sortie victory/defeat spec, PR #552) are both included
   in tested_commit 5227e96dfa94c063c2d55f30d42348eb44522a9b.
 command:
+  build: pnpm build
   serve: pnpm preview
+preview_url: "http://localhost:4173/"
 environment:
   os: "Windows 11"
-  browser: "Chrome (version unknown)"
-  viewport: "unknown"
-  device_pixel_ratio: "unknown"
+  browser: "Chrome (TODO: chrome://settings/help でバージョンを確認して記入)"
+  viewport: "TODO: DevTools → Responsive mode で幅×高さを確認して記入 (例: 1920x1080)"
+  device_pixel_ratio: "TODO: DevTools コンソールで window.devicePixelRatio を実行して記入"
   input_device: "keyboard (WASD) + mouse"
 ```
 
@@ -286,7 +288,9 @@ environment:
 
 #### all_enemies_defeated_victory
 
-- artifact: "docs/playtest/playtest-victory- 2026-06-02 150022.mp4"
+- artifact_local: "docs/playtest/playtest-victory- 2026-06-02 150022.mp4"
+- artifact_sha256: "5c92b215d19aed9eee9d919453b7b6e65c8c3845e1f46fd090c8e7dc979feda8"
+- artifact_url: deferred (ローカルファイル; リポジトリ未追跡)
 - confirmed:
   - WASD 移動: confirmed
   - mouse 射撃: confirmed
@@ -300,18 +304,15 @@ environment:
 
 #### hp_zero_defeat
 
-- artifact: "docs/playtest/playtest-defeat-2026-06-02 150402.mp4"
-- confirmed:
-  - defeat 遷移: confirmed
-  - Canvas overlay (defeat / red): confirmed
-  - HUD sortie-status 結果一致: confirmed
-  - Note: 上記 artifact は defeat シナリオの 1 件。hp_zero_defeat / timeout_30s_defeat のいずれか。
+- artifact: deferred
+- reason: "取得済み defeat 動画（playtest-defeat-2026-06-02 150402.mp4, sha256: 9bf912d7d05dd99a92af5c573b79344b8e6641206fa284a765d1304317574813）は defeat 種別（hp_zero / timeout）が未識別。hp_zero_defeat として confirmed できない。"
+- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 10 (__E2E_PLAYER_HP_OVERRIDE__=1 fixture, HP 0 defeat 自動検証済み)"
 
 #### timeout_30s_defeat
 
 - artifact: deferred
-- Note: 個別証跡は取得済み artifact では未分離。accepted_with_deferred で閉じる。
-  timeout_30s_defeat は E2E テスト (tests/e2e/m2-combat-mvp.spec.ts, test 9) で自動検証済み。
+- reason: "個別動画証跡なし。E2E テストで代替検証済み。"
+- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout defeat 自動検証済み)"
 
 ### Human Observations
 
