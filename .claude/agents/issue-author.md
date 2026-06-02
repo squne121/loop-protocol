@@ -48,6 +48,29 @@ permissionMode: acceptEdits
 
 詳細な VC authoring rule は [`.claude/skills/create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL`](.claude/skills/create-issue/references/body-authoring.md#VC_SINGLE_COMMAND_GUARDRAIL) を正本とする。
 
+### Contract Hygiene Repair (pre-mutation hook)
+
+Issue 本文を rewrite した後、`gh issue edit` による mutation を実行する前に、以下の手順で trivial format blocker を deterministic に補正する。
+
+```bash
+# NEW_BODY は edit-issue の Step 3 で生成した新本文ファイル
+uv run python3 .claude/skills/edit-issue/scripts/issue_contract_hygiene_autofix.py \
+  --body-file "$NEW_BODY" --out-file "$NEW_BODY"
+HYGIENE_EXIT=$?
+# exit 0: 補正あり → contract_hygiene_repair_applied: true
+# exit 1: 補正なし → contract_hygiene_repair_applied: false
+# exit 2: trivial 以外の blocker または autofixable 判定不能 → 補正せず続行（フィールドは false）
+if [ "$HYGIENE_EXIT" -eq 0 ]; then
+  CONTRACT_HYGIENE_REPAIR_APPLIED=true
+else
+  CONTRACT_HYGIENE_REPAIR_APPLIED=false
+fi
+```
+
+- `exit 0`（補正あり）の場合、`$NEW_BODY` はインプレースで補正済みの内容に更新されている。
+- `exit 2` の場合、補正は行われていないが実装を停止する Stop Condition ではない。呼び出し元 skill に従い mutation を継続する。
+- `contract_hygiene_repair_applied` の値は `ISSUE_AUTHOR_RESULT_V1` に必ず含める（省略禁止）。
+
 ### Result: ISSUE_AUTHOR_RESULT_V1 (SubAgent-owned)
 
 Issue 本文の更新結果は以下の機械可読契約として報告する。
@@ -69,10 +92,12 @@ ISSUE_AUTHOR_RESULT_V1:
       status: kept_baseline_fail | updated_to_match_new_scope
       reason: <string>
   parser_gap_repaired: <bool>
+  contract_hygiene_repair_applied: <bool>
 ```
 
 - `status: no_change` 時は `unchanged_reason` を必須とする。
 - `status: failed` または `partial_failure` 時は `validation_blockers` を含む。
+- `contract_hygiene_repair_applied` は必須フィールド（省略禁止）。補正あり時は `true`、補正なし時は `false`。
 
 ## task: materialize_children
 

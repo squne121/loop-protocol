@@ -729,3 +729,96 @@ class TestContractReadinessExecuteIntegration:
             "contract_readiness_check.py must not use shell=True. "
             "Existing shell=False convention must be preserved."
         )
+
+
+class TestJsonStdoutPurity:
+    """GIVEN --json flag WHEN checker runs THEN stdout contains only valid JSON (AC1/AC3: #574)."""
+
+    def _run_raw(self, fixture_name: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+        """Run checker with --json and return raw CompletedProcess (stdout/stderr unmodified)."""
+        import os
+        fixture_path = FIXTURES_DIR / fixture_name
+        assert fixture_path.exists(), f"Fixture file not found: {fixture_path}"
+
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--file", str(fixture_path), "--json"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_stdout_is_valid_json_only(self):
+        """GIVEN pass_issue.md with --json flag WHEN checker runs
+        THEN stdout is exactly one valid JSON object with no extra bytes."""
+        result = self._run_raw("pass_issue.md")
+        assert result.returncode in (0, 1), (
+            f"Unexpected exit code {result.returncode}. stderr: {result.stderr}"
+        )
+        # stdout must parse as JSON without any leading/trailing non-JSON text
+        stripped = result.stdout.strip()
+        assert stripped, "stdout must not be empty in --json mode"
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as e:
+            raise AssertionError(
+                f"stdout is not valid JSON: {e}\nstdout repr: {repr(result.stdout[:500])}"
+            ) from e
+        assert isinstance(parsed, dict), f"JSON output must be a dict, got {type(parsed)}"
+        assert "verdict" in parsed, "JSON output must contain 'verdict' field"
+
+    def test_stdout_contains_no_warning_text(self):
+        """GIVEN pass_issue.md with --json flag WHEN checker runs
+        THEN stdout contains no DeprecationWarning or warning text."""
+        result = self._run_raw("pass_issue.md")
+        assert "DeprecationWarning" not in result.stdout, (
+            f"stdout must not contain DeprecationWarning. stdout: {repr(result.stdout[:500])}"
+        )
+        assert "Warning" not in result.stdout, (
+            f"stdout must not contain Warning text. stdout: {repr(result.stdout[:500])}"
+        )
+
+    def test_no_deprecation_warning_with_pythonwarnings_error(self):
+        """GIVEN PYTHONWARNINGS=error::DeprecationWarning WHEN --json checker runs
+        THEN exit code is 0 or 1 (not 2/crash from DeprecationWarning treated as error)."""
+        result = self._run_raw(
+            "pass_issue.md",
+            extra_env={"PYTHONWARNINGS": "error::DeprecationWarning"},
+        )
+        assert result.returncode in (0, 1), (
+            f"DeprecationWarning was raised as an error (exit code {result.returncode}). "
+            f"stderr: {result.stderr}\nstdout: {result.stdout}"
+        )
+        # stdout must still be valid JSON
+        stripped = result.stdout.strip()
+        assert stripped, "stdout must not be empty even with PYTHONWARNINGS=error"
+        parsed = json.loads(stripped)
+        assert "verdict" in parsed
+
+    def test_utcnow_replaced_in_source(self):
+        """GIVEN check_issue_contract.py source WHEN inspected
+        THEN datetime.datetime.utcnow() is not present (AC2: #574)."""
+        script_content = SCRIPT_PATH.read_text(encoding="utf-8")
+        assert "datetime.utcnow()" not in script_content, (
+            "datetime.datetime.utcnow() must be replaced with "
+            "datetime.datetime.now(datetime.timezone.utc) — see Issue #574 AC2."
+        )
+
+    def test_generated_at_field_is_present_in_json_output(self):
+        """GIVEN pass_issue.md with --json flag WHEN checker runs
+        THEN output JSON contains 'generated_at' field with UTC timestamp."""
+        result = self._run_raw(
+            "pass_issue.md",
+            extra_env={"PYTHONWARNINGS": "error::DeprecationWarning"},
+        )
+        assert result.returncode in (0, 1)
+        parsed = json.loads(result.stdout.strip())
+        assert "generated_at" in parsed, "JSON output must contain 'generated_at' field"
+        # Verify it looks like a UTC timestamp (ends with Z)
+        generated_at = parsed["generated_at"]
+        assert generated_at.endswith("Z"), (
+            f"generated_at must end with 'Z' (UTC), got: {generated_at}"
+        )

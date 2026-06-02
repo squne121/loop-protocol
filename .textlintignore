@@ -8,3 +8,6 @@
 # on existing terminology. New docs should comply with textlint rules.
 docs/**
 .github/**
+# Exception: docs/dev/glossary.md is a new file that complies with textlint rules
+# and should be validated. Negation pattern to re-include from the docs/** exclusion above.
+!docs/dev/glossary.md

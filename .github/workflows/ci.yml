@@ -135,11 +135,12 @@ jobs:
       - run: uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
       - name: Check InputCommand docs schema
         run: uv run --locked python scripts/check_input_command_schema.py
-      - run: uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py
+      - run: uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py
       - run: uv run --locked pytest .claude/skills/create-issue/tests/
       - run: uv run --locked pytest .claude/skills/create-issue/scripts/tests/
       - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
       - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
+      - run: uv run --locked pytest .claude/hooks/tests/test_guard_delta_mode.py -q
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
       - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
@@ -159,10 +160,12 @@ jobs:
             --pytest-args \
               .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
               .claude/skills/edit-issue/tests/test_guard_issue_body.py \
+              .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py \
               .claude/skills/create-issue/tests/ \
               .claude/skills/create-issue/scripts/tests/ \
               .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
               .claude/hooks/tests/test_session_recording_policy_guard.py \
+              .claude/hooks/tests/test_guard_delta_mode.py \
               .claude/skills/issue-contract-review/scripts/tests/ \
               .claude/skills/pr-review-judge/scripts/tests/ \
               .claude/skills/open-pr/scripts/tests/ \

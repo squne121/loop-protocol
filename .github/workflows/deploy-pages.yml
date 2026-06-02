@@ -1,0 +1,230 @@
+name: deploy-pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build -- --base=/loop-protocol/
+      - name: Deploy to gh-pages (replace root, preserve pr-*)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if gh-pages branch exists
+          if git ls-remote --exit-code origin gh-pages; then
+            git fetch origin gh-pages
+            git worktree add /tmp/gh-pages origin/gh-pages
+          else
+            # Create orphan gh-pages branch
+            git worktree add --orphan -b gh-pages /tmp/gh-pages
+          fi
+
+          # Sync dist/ to gh-pages root, deleting stale root files but preserving pr-* dirs
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'pr-*' \
+            dist/ /tmp/gh-pages/
+
+          cd /tmp/gh-pages
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to deploy."
+          else
+            git commit -m "chore: deploy main to gh-pages"
+            git push origin HEAD:gh-pages
+          fi
+
+  deploy-pr:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build -- --base=/loop-protocol/pr-${{ github.event.number }}/
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          keep_files: true
+          destination_dir: pr-${{ github.event.number }}
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const previewUrl = `https://squne121.github.io/loop-protocol/pr-${prNumber}/`;
+
+            // Live check: verify the preview URL is actually reachable (best-effort)
+            let liveCheckPassed = false;
+            try {
+              const { execSync } = require('child_process');
+              execSync(
+                `curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null -w "%{http_code}" "${previewUrl}" | grep -q "^200$"`,
+                { stdio: 'inherit' }
+              );
+              liveCheckPassed = true;
+            } catch (_) {
+              // best-effort: live check failed, but do not fail the workflow
+            }
+
+            const marker = '<!-- loop-protocol-pr-preview -->';
+            const body = liveCheckPassed
+              ? `${marker}\n## Preview URL\n\n✅ verified live: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`
+              : `${marker}\n## Preview URL\n\n⏳ publish requested（live URL 未検証 / Pages source 設定後に有効化）: ${previewUrl}\n\n> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)\n> The preview will be removed when this PR is closed.`;
+
+            // Upsert: update existing bot comment if present, otherwise create
+            // Use paginate to scan all pages of comments
+            const allComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              }
+            );
+            const existing = allComments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+
+  cleanup-pr:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    concurrency:
+      group: deploy-pages-gh-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check if gh-pages branch exists
+        id: check-branch
+        run: |
+          if git ls-remote --exit-code origin gh-pages; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v6
+        if: steps.check-branch.outputs.exists == 'true'
+        with:
+          ref: gh-pages
+          persist-credentials: true
+      - name: Remove PR preview directory
+        if: steps.check-branch.outputs.exists == 'true'
+        run: |
+          PR_DIR="pr-${{ github.event.number }}"
+          if [ -d "$PR_DIR" ]; then
+            git rm -rf "$PR_DIR"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: remove preview for PR #${{ github.event.number }}"
+            git push
+          else
+            echo "Directory $PR_DIR not found, nothing to clean up."
+          fi
+      - name: Skip cleanup (gh-pages branch not found)
+        if: steps.check-branch.outputs.exists == 'false'
+        run: echo "gh-pages branch does not exist yet; no-op cleanup."
+      - name: Update preview URL comment to "Preview removed"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const marker = '<!-- loop-protocol-pr-preview -->';
+
+            // Fetch all comments with pagination
+            const allComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              }
+            );
+
+            // Find the bot preview comment (must be from github-actions[bot] and contain the marker)
+            const target = allComments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+
+            if (target) {
+              // Update to "Preview removed" — do not delete (preserves playtest trail)
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: target.id,
+                body: `${marker}\n## Preview URL\n\nPreview removed (PR #${prNumber} closed).`,
+              });
+            }
+            // No-op if no matching comment found — do not create a new comment
