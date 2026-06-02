@@ -26,13 +26,13 @@ acceptance_verdict:
       status: partial
       reason: "browser version recorded (Chrome 148.0.7778.179). viewport and device_pixel_ratio were not captured during the human run and must not be backfilled post hoc."
     - ac: AC10
-      status: accepted_with_deferred
-      reason: "hp_zero_defeat confirmed by human operator squne121 (PR #570 comment). Local artifact with sha256; no GitHub-hosted artifact URL yet."
+      status: accepted
+      reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
     - ac: AC11
       status: deferred_exception
       reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
-  artifact_reviewability: deferred
-  artifact_note: "Video files exist locally (docs/playtest/*.mp4) with sha256 checksums. Not yet uploaded to GitHub. Requires human to attach files to PR/issue comment or commit to repo."
+  artifact_reviewability: github_attachment
+  artifact_note: "Video files attached to Issue #543 comment (https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599987357). GitHub-hosted URLs recorded in evidence section."
 date: "2026-05-31"
 ---
 
@@ -328,9 +328,9 @@ environment:
 
 #### all_enemies_defeated_victory
 
+- artifact_url: "https://github.com/user-attachments/assets/18e1a14d-23dd-4d65-98bc-55ee5c457797"
 - artifact_local: "docs/playtest/playtest-victory- 2026-06-02 150022.mp4"
 - artifact_sha256: "5c92b215d19aed9eee9d919453b7b6e65c8c3845e1f46fd090c8e7dc979feda8"
-- artifact_url: deferred (local file, not committed to repo; see original playtest comment for context)
 - confirmed:
   - WASD 移動: confirmed
   - mouse 射撃: confirmed
@@ -344,9 +344,9 @@ environment:
 
 #### hp_zero_defeat
 
+- artifact_url: "https://github.com/user-attachments/assets/40498efe-8544-4828-9f94-2b60faeb3d57"
 - artifact_local: "docs/playtest/playtest-defeat-2026-06-02 150402.mp4"
 - artifact_sha256: "9bf912d7d05dd99a92af5c573b79344b8e6641206fa284a765d1304317574813"
-- artifact_url: deferred (local file, not committed to repo; see original playtest comment for context)
 - confirmed:
   - defeat 遷移 (HP 0): confirmed by human operator squne121
   - Canvas overlay (defeat / red): confirmed
