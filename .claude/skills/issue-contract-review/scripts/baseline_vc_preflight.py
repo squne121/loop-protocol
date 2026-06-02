@@ -477,6 +477,46 @@ def _is_negated_search_command(command: str) -> bool:
     return any(rest.startswith(util) for util in ["rg", "grep"])
 
 
+def _is_trivially_pass_command(command: str) -> bool:
+    """
+    Detect trivially-pass VC patterns: search commands that use `--paths <value>`
+    to force-include the search target in the result, making the VC trivially pass.
+
+    A search command using `--paths <target>` forces the specified target into the
+    result set regardless of whether the keyword actually exists in that path.
+    This means the VC can return results (exit 0) without the implementation being
+    present — the VC is structurally trivially-passing.
+
+    Affected commands: rg (ripgrep) and grep family.
+
+    Detection logic:
+    - argv[0] basename is rg, grep, fgrep, or egrep
+    - `--paths` option is present in the argument list (rg-specific forced-include option)
+
+    Returns True if the command is a trivially-pass pattern, False otherwise.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not argv:
+        return False
+
+    cmd_basename = Path(argv[0]).name
+    # Only flag rg and grep-family search commands
+    if cmd_basename not in ("rg", "grep", "fgrep", "egrep"):
+        return False
+
+    # Detect --paths option (rg's forced-include path mechanism)
+    # --paths can appear as --paths <value> (separate arg) or --paths=<value>
+    for arg in argv[1:]:
+        if arg == "--paths" or arg.startswith("--paths="):
+            return True
+
+    return False
+
+
 def has_command_substitution(command: str) -> bool:
     """
     B3: Detect command substitution patterns: $(...), `...`, ${...}
@@ -843,6 +883,21 @@ def classify_static_command(
             "baseline_fail_expected",
         )
 
+    # 11. Trivially-pass detection: search command using --paths forced-include
+    # This check runs AFTER the allowlist (rg/grep are allowed commands) to detect
+    # the structural defect where --paths forces the target into search results,
+    # making the VC trivially pass regardless of implementation state.
+    if _is_trivially_pass_command(raw_command):
+        return (
+            "blocked",
+            "trivially_pass",
+            "blocked",
+            "Search command uses '--paths <target>' which forces the target into the result set; "
+            "this makes the VC trivially pass regardless of implementation — "
+            "use '--keywords' / pattern search only and verify the same path appears without '--paths' forcing",
+            "baseline_fail_expected",
+        )
+
     return None  # proceed to execution
 
 
@@ -1030,6 +1085,7 @@ def compute_confidence(category: str) -> str:
         "env_missing_dep",
         "file_not_found_unrunnable",
         "vc_no_tests_collected",
+        "trivially_pass",
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 

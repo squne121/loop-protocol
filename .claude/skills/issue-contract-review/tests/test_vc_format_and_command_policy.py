@@ -959,3 +959,98 @@ def test_pytest_no_tests_exit5_in_preflight():
     assert classification == "blocked"
     assert category == "vc_no_tests_collected"
     assert decision == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# trivially_pass: --paths forced include detection (#201)
+# ---------------------------------------------------------------------------
+
+def test_rg_with_paths_option_is_trivially_pass_blocked():
+    """AC1(#201): rg --paths <target> → blocked / trivially_pass (not executed)"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ rg -n "some_pattern" --paths .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
+    assert r["category"] == "trivially_pass", f"Expected trivially_pass, got {r['category']}"
+    assert r["decision"] == "blocked", f"Expected decision=blocked, got {r['decision']}"
+    # Must not be executed (static classification)
+    assert r["exit_code"] is None, f"Expected exit_code=None (not executed), got {r['exit_code']}"
+    assert r["confidence"] == "high", f"Expected confidence=high, got {r['confidence']}"
+
+
+def test_rg_with_paths_eq_syntax_is_trivially_pass_blocked():
+    """AC1(#201): rg --paths=<target> (= syntax) → blocked / trivially_pass"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ rg "pattern" --paths=some/path/to/file.py
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked"
+    assert r["category"] == "trivially_pass"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_rg_without_paths_is_not_trivially_pass():
+    """AC1(#201): rg without --paths → normal classification (not trivially_pass)"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ rg -n "some_new_function" .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    # Should NOT be trivially_pass — normal rg without --paths is fine
+    assert r["category"] != "trivially_pass", f"Expected not trivially_pass, got {r['category']}"
+
+
+def test_grep_with_paths_option_is_trivially_pass_blocked():
+    """AC1(#201): grep with --paths → blocked / trivially_pass"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ grep -n "new_feature" --paths src/systems/new_system.ts
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked"
+    assert r["category"] == "trivially_pass"
+    assert r["decision"] == "blocked"
+
+
+def test_is_trivially_pass_unit_direct():
+    """Unit test for _is_trivially_pass_command directly."""
+    from baseline_vc_preflight import _is_trivially_pass_command
+
+    # Trivially pass patterns
+    assert _is_trivially_pass_command("rg -n 'pattern' --paths some/file.py") is True
+    assert _is_trivially_pass_command("rg 'pattern' --paths=some/file.py") is True
+    assert _is_trivially_pass_command("grep -n 'pattern' --paths some/file.py") is True
+
+    # Non-trivially pass patterns
+    assert _is_trivially_pass_command("rg -n 'pattern' src/") is False
+    assert _is_trivially_pass_command("rg 'pattern' --keyword foo") is False
+    assert _is_trivially_pass_command("pnpm lint") is False
+    assert _is_trivially_pass_command("test -f somefile") is False
