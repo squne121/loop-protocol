@@ -11,6 +11,30 @@
 | Any step requires human review | `human_escalation` |
 | `final_classification == superseded_by_decision` and close / replacement flow completed | `superseded_by_decision` |
 
+## Handoff State: `refinement_approved_gate_pending` / `implementation_ready`
+
+`issue-reviewer` が `approve` を返しただけでは `implementation_ready` とならない。  
+以下の 2 段階を経て初めて handoff 状態が `implementation_ready` に遷移する:
+
+| handoff 状態 | 条件 |
+|---|---|
+| `refinement_approved_gate_pending` | `issue-reviewer approve` を受け取ったが、`CONTRACT_REVIEW_RESULT_V1.status == "go"` がまだ確認されていない |
+| `implementation_ready` | `approve` かつ `CONTRACT_REVIEW_RESULT_V1.status == "go"` かつ freshness 確認済み（`body_sha256` 一致、またはフォールバックとして `generated_at >= issue.updated_at`） |
+
+**重要制約**: `issue-reviewer approve` のみを根拠に `implementation_ready` を返してはならない。  
+`issue-contract-review` の `status: go` 確認なしに `impl-review-loop` へ handoff することは禁止（#561 型 handoff gap の防止）。
+
+```yaml
+HANDOFF_STATE_V1:
+  refinement_approved_gate_pending:
+    description: "issue-reviewer approve 済みだが CONTRACT_REVIEW_RESULT_V1.status == go 未確認"
+    allowed_next: [run_issue_contract_review, human_escalation]
+    forbidden_next: [impl_review_loop_handoff]
+  implementation_ready:
+    description: "approve かつ status: go かつ freshness 確認済み"
+    allowed_next: [impl_review_loop_handoff]
+```
+
 ## Final Gate — `CONTRACT_REVIEW_RESULT_V1.status == "go"` 必須
 
 reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.status == "go"` が確認できるまで `approved` 終了としない。
