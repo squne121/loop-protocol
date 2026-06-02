@@ -962,16 +962,19 @@ def test_pytest_no_tests_exit5_in_preflight():
 
 
 # ---------------------------------------------------------------------------
-# trivially_pass: --paths forced include detection (#201)
+# trivially_pass: ssot-discovery script --keywords + --paths detection (#201)
 # ---------------------------------------------------------------------------
 
-def test_rg_with_paths_option_is_trivially_pass_blocked():
-    """AC1(#201): rg --paths <target> → blocked / trivially_pass (not executed)"""
+def test_match_ssot_with_keywords_and_paths_is_trivially_pass_blocked():
+    """AC1(#201): bash match-ssot.sh --keywords ... --paths ... → blocked / trivially_pass
+
+    Regression test for the original failing case from Issue #201 background section.
+    """
     body = """## Verification Commands
 
 ```bash
 # AC1
-$ rg -n "some_pattern" --paths .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py
+$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "milestone,github-milestone" --paths "docs/dev/milestone-ops.md"
 ```
 """
     data = run_preflight(body)
@@ -981,18 +984,18 @@ $ rg -n "some_pattern" --paths .claude/skills/issue-contract-review/scripts/base
     assert r["classification"] == "blocked", f"Expected blocked, got {r['classification']}"
     assert r["category"] == "trivially_pass", f"Expected trivially_pass, got {r['category']}"
     assert r["decision"] == "blocked", f"Expected decision=blocked, got {r['decision']}"
-    # Must not be executed (static classification)
+    # Must not be executed (static classification before denied-command check)
     assert r["exit_code"] is None, f"Expected exit_code=None (not executed), got {r['exit_code']}"
     assert r["confidence"] == "high", f"Expected confidence=high, got {r['confidence']}"
 
 
-def test_rg_with_paths_eq_syntax_is_trivially_pass_blocked():
-    """AC1(#201): rg --paths=<target> (= syntax) → blocked / trivially_pass"""
+def test_match_ssot_direct_invocation_is_trivially_pass_blocked():
+    """AC1(#201): direct execution of match-ssot.sh → blocked / trivially_pass"""
     body = """## Verification Commands
 
 ```bash
 # AC1
-$ rg "pattern" --paths=some/path/to/file.py
+$ .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "foo" --paths "docs/dev/bar.md"
 ```
 """
     data = run_preflight(body)
@@ -1005,8 +1008,65 @@ $ rg "pattern" --paths=some/path/to/file.py
     assert r["exit_code"] is None
 
 
+def test_match_ssot_py_via_python3_is_trivially_pass_blocked():
+    """AC1(#201): python3 .../match_ssot.py --keywords ... --paths ... → blocked / trivially_pass"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ python3 .claude/skills/ssot-discovery/scripts/match_ssot.py --keywords "foo,bar" --paths "docs/dev/baz.md"
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    assert r["classification"] == "blocked"
+    assert r["category"] == "trivially_pass"
+    assert r["decision"] == "blocked"
+    assert r["exit_code"] is None
+
+
+def test_match_ssot_keywords_only_is_not_trivially_pass():
+    """AC1(#201): match-ssot.sh --keywords only (no --paths) → NOT trivially_pass"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "milestone,github-milestone"
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    # --keywords alone does not create a trivially-pass structure
+    assert r["category"] != "trivially_pass", (
+        f"Expected NOT trivially_pass for --keywords only, got {r['category']}"
+    )
+
+
+def test_match_ssot_paths_only_is_not_trivially_pass():
+    """AC1(#201): match-ssot.sh --paths only (no --keywords) → NOT trivially_pass"""
+    body = """## Verification Commands
+
+```bash
+# AC1
+$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --paths "docs/dev/milestone-ops.md"
+```
+"""
+    data = run_preflight(body)
+    results = data["results"]
+    assert len(results) == 1
+    r = results[0]
+    # --paths alone does not create the trivially-pass structure
+    assert r["category"] != "trivially_pass", (
+        f"Expected NOT trivially_pass for --paths only, got {r['category']}"
+    )
+
+
 def test_rg_without_paths_is_not_trivially_pass():
-    """AC1(#201): rg without --paths → normal classification (not trivially_pass)"""
+    """AC1(#201): rg without discovery script → NOT trivially_pass"""
     body = """## Verification Commands
 
 ```bash
@@ -1018,39 +1078,54 @@ $ rg -n "some_new_function" .claude/skills/issue-contract-review/scripts/baselin
     results = data["results"]
     assert len(results) == 1
     r = results[0]
-    # Should NOT be trivially_pass — normal rg without --paths is fine
+    # Normal rg search is NOT trivially_pass regardless of path arguments
     assert r["category"] != "trivially_pass", f"Expected not trivially_pass, got {r['category']}"
 
 
-def test_grep_with_paths_option_is_trivially_pass_blocked():
-    """AC1(#201): grep with --paths → blocked / trivially_pass"""
-    body = """## Verification Commands
+def test_rg_literal_paths_pattern_is_not_trivially_pass():
+    """AC1(#201): rg searching for '--paths' as a literal string must NOT be flagged as trivially_pass.
 
-```bash
-# AC1
-$ grep -n "new_feature" --paths src/systems/new_system.ts
-```
-"""
-    data = run_preflight(body)
-    results = data["results"]
-    assert len(results) == 1
-    r = results[0]
-    assert r["classification"] == "blocked"
-    assert r["category"] == "trivially_pass"
-    assert r["decision"] == "blocked"
+    False positive guard: 'rg -e "--paths" file' and 'rg -- "--paths" file' are
+    legitimate VC searches for the literal text '--paths' and must not be blocked
+    as trivially_pass (rg has no --paths option; this is a search pattern argument).
+    """
+    from baseline_vc_preflight import _is_trivially_pass_command
+    # Searching for the text "--paths" with -e flag
+    assert _is_trivially_pass_command('rg -n -e "--paths" docs/dev/dor.md') is False
+    # Using -- to separate pattern from file arguments
+    assert _is_trivially_pass_command('rg -n -- "--paths" docs/dev/dor.md') is False
+    # Plain grep searching for --paths text
+    assert _is_trivially_pass_command('grep -n "--paths" docs/dev/dor.md') is False
 
 
 def test_is_trivially_pass_unit_direct():
-    """Unit test for _is_trivially_pass_command directly."""
+    """Unit tests for _is_trivially_pass_command directly."""
     from baseline_vc_preflight import _is_trivially_pass_command
 
-    # Trivially pass patterns
-    assert _is_trivially_pass_command("rg -n 'pattern' --paths some/file.py") is True
-    assert _is_trivially_pass_command("rg 'pattern' --paths=some/file.py") is True
-    assert _is_trivially_pass_command("grep -n 'pattern' --paths some/file.py") is True
+    # Trivially pass patterns: discovery script + --keywords + --paths
+    assert _is_trivially_pass_command(
+        "bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords foo --paths bar.md"
+    ) is True
+    assert _is_trivially_pass_command(
+        ".claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords=foo --paths=bar.md"
+    ) is True
+    assert _is_trivially_pass_command(
+        "python3 .claude/skills/ssot-discovery/scripts/match_ssot.py --keywords foo --paths bar"
+    ) is True
 
-    # Non-trivially pass patterns
+    # NOT trivially pass: discovery script with only one of the flags
+    assert _is_trivially_pass_command(
+        "bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords foo"
+    ) is False
+    assert _is_trivially_pass_command(
+        "bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --paths bar.md"
+    ) is False
+
+    # NOT trivially pass: rg/grep are not discovery scripts
     assert _is_trivially_pass_command("rg -n 'pattern' src/") is False
-    assert _is_trivially_pass_command("rg 'pattern' --keyword foo") is False
+    assert _is_trivially_pass_command("rg 'pattern' --paths=some/file.py") is False
+    assert _is_trivially_pass_command("grep -n 'pattern' --paths some/file.py") is False
+
+    # NOT trivially pass: unrelated commands
     assert _is_trivially_pass_command("pnpm lint") is False
     assert _is_trivially_pass_command("test -f somefile") is False
