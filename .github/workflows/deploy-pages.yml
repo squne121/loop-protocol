@@ -7,8 +7,7 @@ on:
     types: [opened, synchronize, reopened, closed]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   deploy-main:
@@ -17,10 +16,13 @@ jobs:
       group: deploy-pages-gh-pages
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
-          persist-credentials: false
+          persist-credentials: true
+          fetch-depth: 0
       - uses: pnpm/action-setup@v6
         with:
           version: 11
@@ -33,11 +35,34 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build -- --base=/loop-protocol/
-      - uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./dist
-          keep_files: true
+      - name: Deploy to gh-pages (replace root, preserve pr-*)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if gh-pages branch exists
+          if git ls-remote --exit-code origin gh-pages; then
+            git fetch origin gh-pages
+            git worktree add /tmp/gh-pages origin/gh-pages
+          else
+            # Create orphan gh-pages branch
+            git worktree add --orphan -b gh-pages /tmp/gh-pages
+          fi
+
+          # Sync dist/ to gh-pages root, deleting stale root files but preserving pr-* dirs
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'pr-*' \
+            dist/ /tmp/gh-pages/
+
+          cd /tmp/gh-pages
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to deploy."
+          else
+            git commit -m "chore: deploy main to gh-pages"
+            git push origin HEAD:gh-pages
+          fi
 
   deploy-pr:
     if: >-
@@ -48,6 +73,9 @@ jobs:
       group: deploy-pages-gh-pages
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -90,19 +118,23 @@ jobs:
               // best-effort: live check failed, but do not fail the workflow
             }
 
+            const marker = '<!-- loop-protocol-pr-preview -->';
             const body = liveCheckPassed
-              ? `<!-- loop-protocol-pr-preview -->\n## Preview URL\n\nThis PR is deployed to: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`
-              : `<!-- loop-protocol-pr-preview -->\n## Preview URL\n\nPreview publish requested; live URL not yet verified (${previewUrl})\n\n> Pages source setting may be required. See Settings → Pages → Source → gh-pages (root).\n> The preview will be removed when this PR is closed.`;
+              ? `${marker}\n## Preview URL\n\n✅ verified live: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`
+              : `${marker}\n## Preview URL\n\n⏳ publish requested（live URL 未検証 / Pages source 設定後に有効化）: ${previewUrl}\n\n> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)\n> The preview will be removed when this PR is closed.`;
 
             // Upsert: update existing bot comment if present, otherwise create
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-            });
-            const marker = '<!-- loop-protocol-pr-preview -->';
-            const existing = comments.find(
-              c => c.user.type === 'Bot' && c.body.includes(marker)
+            // Use paginate to scan all pages of comments
+            const allComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              }
+            );
+            const existing = allComments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
             );
             if (existing) {
               await github.rest.issues.updateComment({
@@ -128,12 +160,24 @@ jobs:
       group: deploy-pages-gh-pages
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - name: Check if gh-pages branch exists
+        id: check-branch
+        run: |
+          if git ls-remote --exit-code origin gh-pages; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v6
+        if: steps.check-branch.outputs.exists == 'true'
         with:
           ref: gh-pages
           persist-credentials: true
       - name: Remove PR preview directory
+        if: steps.check-branch.outputs.exists == 'true'
         run: |
           PR_DIR="pr-${{ github.event.number }}"
           if [ -d "$PR_DIR" ]; then
@@ -145,3 +189,6 @@ jobs:
           else
             echo "Directory $PR_DIR not found, nothing to clean up."
           fi
+      - name: Skip cleanup (gh-pages branch not found)
+        if: steps.check-branch.outputs.exists == 'false'
+        run: echo "gh-pages branch does not exist yet; no-op cleanup."

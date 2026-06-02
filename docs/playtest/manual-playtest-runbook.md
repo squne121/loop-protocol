@@ -34,8 +34,8 @@ Replace `<PR番号>` with the numeric PR number. For example, PR #123 becomes:
 
 The preview URL is also posted as a comment on the PR automatically.
 
-> **Note:** The PR preview is automatically deleted when the PR is closed.
-> After the PR is closed, the preview URL (`/pr-<PR番号>/`) will return 404.
+> **Note:** The PR preview is automatically removed when the PR is closed.
+> After the cleanup workflow completes successfully, the preview URL (`/pr-<PR番号>/`) will return 404.
 
 > **Note:** PR preview is only generated for same-repository PRs. PRs opened from
 > forks do not receive a preview deployment.
@@ -46,6 +46,30 @@ GitHub Pages must be configured to serve from the `gh-pages` branch:
 `Settings -> Pages -> Source -> Deploy from a branch -> gh-pages (root)`
 
 This is a one-time manual step by the repository owner. After setup, all deploys are automated.
+
+### Stale Artifact Inspection (gh-pages branch maintenance)
+
+The main deploy workflow replaces only the root application files while preserving `pr-*` preview
+directories. If stale files accumulate in the `gh-pages` branch root (e.g., from a previous deploy
+strategy), clean them up manually:
+
+```bash
+# Clone gh-pages branch locally
+git clone --branch gh-pages --single-branch https://github.com/squne121/loop-protocol.git gh-pages-work
+cd gh-pages-work
+
+# Inspect root contents (should only contain current Vite output + pr-* dirs)
+ls -la
+
+# If unexpected files exist (old hashed assets, orphaned HTML files, etc.),
+# remove them and push:
+git rm <stale-file>
+git commit -m "chore: remove stale artifact from gh-pages root"
+git push origin gh-pages
+```
+
+Automated deploys via the `deploy-main` job use `rsync --delete` semantics for the root,
+so future deploys will not re-introduce previously removed files.
 
 ---
 
