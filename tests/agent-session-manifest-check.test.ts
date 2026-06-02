@@ -8,9 +8,9 @@
  */
 
 import { execFileSync } from 'child_process'
-import { writeFileSync, mkdirSync } from 'fs'
+import { writeFileSync, mkdirSync, rmSync } from 'fs'
 import { resolve } from 'path'
-import { describe, expect, it, beforeAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll } from 'vitest'
 
 const REPO_ROOT = resolve(__dirname, '..')
 const SCRIPTS_DIR = resolve(REPO_ROOT, 'scripts')
@@ -44,11 +44,31 @@ function runManifestCheck(args: string[]): { stdout: string; stderr: string; exi
 }
 
 // ============================================================================
-// Setup
+// Temp fixture paths
+// ============================================================================
+
+const TEMP_FIXTURE_PATHS = [
+  resolve(FIXTURES_DIR, 'temp-unsupported.txt'),
+  resolve(FIXTURES_DIR, 'temp-invalid-no-markers.md'),
+]
+
+function cleanupTempFixtures(): void {
+  for (const p of TEMP_FIXTURE_PATHS) {
+    rmSync(p, { force: true })
+  }
+}
+
+// ============================================================================
+// Setup / Teardown
 // ============================================================================
 
 beforeAll(() => {
   mkdirSync(FIXTURES_DIR, { recursive: true })
+  cleanupTempFixtures()
+})
+
+afterAll(() => {
+  cleanupTempFixtures()
 })
 
 // ============================================================================
