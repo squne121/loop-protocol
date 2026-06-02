@@ -477,6 +477,117 @@ def _is_negated_search_command(command: str) -> bool:
     return any(rest.startswith(util) for util in ["rg", "grep"])
 
 
+def _is_discovery_script(argv: List[str]) -> bool:
+    """
+    Detect if a command invokes a repository-local ssot-discovery script.
+
+    Discovery scripts are identified by:
+    - basename being 'match-ssot.sh' or 'match_ssot.py'
+    - OR the script path containing 'ssot-discovery/scripts/'
+
+    Handles invocation forms:
+    - bash .claude/skills/ssot-discovery/scripts/match-ssot.sh ...
+    - .claude/skills/ssot-discovery/scripts/match-ssot.sh ... (direct)
+    - python3 .../match_ssot.py ...
+    - uv run python3 .../match_ssot.py ...
+    """
+    if not argv:
+        return False
+
+    # Unwrap 'bash' / 'sh' prefix: argv[0] is shell, look for script in rest
+    leading = argv[0]
+    script_candidates = []
+
+    cmd_basename = Path(leading).name
+    if cmd_basename in ("bash", "sh", "zsh"):
+        # Script is first non-option argument after shell invocator
+        script_candidates = [a for a in argv[1:] if not a.startswith("-")]
+    elif cmd_basename in ("python", "python3"):
+        # python3 .../match_ssot.py ... or python3 -m <module>
+        # For file-based invocation, script is first non-option positional arg
+        script_candidates = [a for a in argv[1:] if not a.startswith("-")]
+    elif cmd_basename == "uv":
+        # uv run [options] python3 .../match_ssot.py ...
+        # Unwrap uv run options
+        unwrapped = _strip_uv_run_options(argv)
+        if unwrapped and Path(unwrapped[0]).name in ("python", "python3"):
+            script_candidates = [a for a in unwrapped[1:] if not a.startswith("-")]
+        elif unwrapped:
+            script_candidates = [unwrapped[0]]
+    else:
+        # Direct invocation: check argv[0] itself
+        script_candidates = [leading]
+
+    for candidate in script_candidates:
+        bname = Path(candidate).name
+        if bname in ("match-ssot.sh", "match_ssot.py"):
+            return True
+        if "ssot-discovery/scripts/" in candidate:
+            return True
+
+    return False
+
+
+def _has_arg(argv: List[str], flag: str) -> bool:
+    """
+    Check if flag (e.g. '--keywords' or '--paths') appears in argv,
+    either as a standalone argument or as the key in '--flag=value' form.
+    """
+    for arg in argv:
+        if arg == flag or arg.startswith(flag + "="):
+            return True
+    return False
+
+
+def _is_trivially_pass_command(command: str) -> bool:
+    """
+    Detect trivially-pass VC patterns: repository-local ssot-discovery scripts
+    called with BOTH --keywords and --paths options simultaneously.
+
+    Root cause (Issue #201):
+      match-ssot.sh / match_ssot.py implements a directory mapping that forces
+      --paths targets into matched_documents at low relevance, regardless of
+      whether --keywords actually appear in that path. When both --keywords and
+      --paths are supplied, the VC can return the target path (exit 0) even
+      when the keywords are absent — making the VC trivially-passing.
+
+    Detection logic:
+    - The command invokes a discovery script (match-ssot.sh / match_ssot.py /
+      any script under ssot-discovery/scripts/)
+    - AND the argument list contains BOTH --keywords (or --keywords=...) AND
+      --paths (or --paths=...)
+
+    Only the combination of --keywords + --paths creates the trivially-pass
+    structure. --keywords alone or --paths alone does not trigger this.
+
+    Note: rg/grep have no '--paths' option. rg uses positional PATH arguments
+    and -g/--glob for path filtering. Positional paths in rg/grep are not
+    forced-includes and are NOT trivially-pass. The previous implementation
+    that flagged rg/grep + '--paths' was based on an incorrect premise and
+    caused false positives for queries like 'rg -e "--paths" file' or
+    'rg -- "--paths" file'. That logic has been removed.
+
+    Returns True if the command is a trivially-pass pattern, False otherwise.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not argv:
+        return False
+
+    # Step 1: Identify whether this is a discovery script invocation
+    if not _is_discovery_script(argv):
+        return False
+
+    # Step 2: Check for --keywords AND --paths both present
+    # Only the combination creates the forced-include trivially-pass structure.
+    has_keywords = _has_arg(argv, "--keywords")
+    has_paths = _has_arg(argv, "--paths")
+    return has_keywords and has_paths
+
+
 def has_command_substitution(command: str) -> bool:
     """
     B3: Detect command substitution patterns: $(...), `...`, ${...}
@@ -720,6 +831,26 @@ def classify_static_command(
             "compound_command_disallowed",
             "blocked",
             "Compound shell commands are not supported in baseline_vc_preflight/v1",
+            "baseline_fail_expected",
+        )
+
+    # 3.5. Trivially-pass detection: discovery script with --keywords + --paths.
+    # NOTE: This check runs BEFORE denied-command detection (step 4) so that
+    # 'bash match-ssot.sh --keywords ... --paths ...' is reported as
+    # category: trivially_pass rather than category: unsafe_command.
+    # Both results are classification: blocked / decision: blocked / exit_code: None
+    # (neither is executed), so moving this check earlier is a category-label
+    # correction, not a safety relaxation.
+    if _is_trivially_pass_command(raw_command):
+        return (
+            "blocked",
+            "trivially_pass",
+            "blocked",
+            "Discovery script (match-ssot.sh / match_ssot.py) is called with both "
+            "--keywords and --paths; the directory mapping in match-ssot forces --paths "
+            "targets into matched_documents regardless of keyword presence, making the VC "
+            "trivially pass. Use --keywords only (without --paths) and verify the same path "
+            "appears in results to confirm keyword presence.",
             "baseline_fail_expected",
         )
 
@@ -1030,6 +1161,7 @@ def compute_confidence(category: str) -> str:
         "env_missing_dep",
         "file_not_found_unrunnable",
         "vc_no_tests_collected",
+        "trivially_pass",
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
