@@ -75,7 +75,7 @@ rules:
   #       として使用するため置換対象外。人間向け説明文に現れる trivially-pass (hyphen) のみ対象。
   - expected: 自明PASS
     patterns:
-      - trivially-pass
+      - /trivially-pass/
     specs:
       - from: trivially-pass
         to: 自明PASS
@@ -86,7 +86,7 @@ rules:
   #       大小文字バリエーション（baseline FAIL / Baseline fail 等）も含む。
   - expected: 変更前FAIL
     patterns:
-      - /[Bb]aseline [Ff][Aa][Ii][Ll]/
+      - /\b[Bb]aseline [Ff][Aa][Ii][Ll]\b/
     specs:
       - from: baseline fail
         to: 変更前FAIL
@@ -94,11 +94,13 @@ rules:
         to: 変更前FAIL
       - from: Baseline fail
         to: 変更前FAIL
+      - from: baseline failover
+        to: baseline failover
 
   # baseline pass -> 変更前PASS
   - expected: 変更前PASS
     patterns:
-      - /[Bb]aseline [Pp][Aa][Ss][Ss]/
+      - /\b[Bb]aseline [Pp][Aa][Ss][Ss]\b/
     specs:
       - from: baseline pass
         to: 変更前PASS
@@ -106,3 +108,5 @@ rules:
         to: 変更前PASS
       - from: Baseline pass
         to: 変更前PASS
+      - from: baseline passing
+        to: baseline passing

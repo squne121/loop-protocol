@@ -12,7 +12,7 @@ LOOP_PROTOCOL プロジェクトで使用する VC（Verification Commands）周
 
 ### 自明PASS
 
-- **英語表記**: trivially-pass（人間向け説明文での表記）
+- **英語表記**: `trivially-pass`（人間向け説明文での表記）
 - **定義**: 検証対象の実装が存在しない、または常に成功する状態であるために VC が PASS してしまうこと。真に実装を検証していない「見かけ上の PASS」を指す。
 - **用途**: Issue contract レビュー、VC preflight 判定で使用する。
 - **注意**: `trivially_pass` は machine-readable token（enum / YAML key / script / grep pattern）として使用し、名称変更は禁止。人間向け説明文では「自明PASS」を使う。
@@ -26,14 +26,14 @@ LOOP_PROTOCOL プロジェクトで使用する VC（Verification Commands）周
 
 ### 変更前FAIL
 
-- **英語表記**: baseline fail（VC 文脈での表記）
+- **英語表記**: `baseline fail`（VC 文脈での表記）
 - **定義**: 変更前状態（実装前）では VC が失敗すること。TDD における「先にテストを書き、実装前は Red になる」状態に相当する。正しい VC 設計では変更前FAIL が期待される。
 - **用途**: VC 設計レビューで「実装前に VC が失敗するか」を確認する際に使用する。
 
 ### 変更前PASS
 
-- **英語表記**: baseline PASS / baseline pass（VC 文脈での表記）
-- **定義**: 変更前状態（実装前）であるにもかかわらず VC が PASS してしまうこと。実装がなくても通る VC は自明PASS（trivially-pass）の疑いがある。
+- **英語表記**: `baseline PASS` / `baseline pass`（VC 文脈での表記）
+- **定義**: 変更前状態（実装前）であるにもかかわらず VC が PASS してしまうこと。実装がなくても通る VC は自明PASS（`trivially-pass`）の疑いがある。
 - **用途**: VC レビューで「変更前状態でも PASS している場合は VC の有効性を疑うべき」という判断基準として使用する。
 
 ## standalone baseline の自動置換について
