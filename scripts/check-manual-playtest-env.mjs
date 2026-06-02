@@ -35,20 +35,69 @@ function warn(label, detail) {
 }
 
 // --- WSL2 Detection ---
+// Distinguishes WSL2 from WSL1 and non-WSL environments.
+// WSL2: /proc/sys/kernel/osrelease contains 'WSL2' or 'microsoft' (lowercase), AND /proc/version contains 'WSL2'
+// WSL1: /proc/version contains 'Microsoft' but NOT 'WSL2'
+// Returns { detected: boolean, wsl2: boolean, method, value }
 function detectWSL2() {
-  const wslDistro = process.env.WSL_DISTRO_NAME;
-  if (wslDistro) {
-    return { detected: true, method: 'WSL_DISTRO_NAME', value: wslDistro };
-  }
+  let osrelease = '';
+  let procVersion = '';
+
   try {
-    const procVersion = readFileSync('/proc/version', 'utf8');
-    if (/microsoft/i.test(procVersion)) {
-      return { detected: true, method: '/proc/version', value: procVersion.trim().slice(0, 80) };
+    osrelease = readFileSync('/proc/sys/kernel/osrelease', 'utf8').trim();
+  } catch {
+    // Not readable (non-Linux or permission denied)
+  }
+
+  try {
+    procVersion = readFileSync('/proc/version', 'utf8').trim();
+  } catch {
+    // Not readable
+  }
+
+  // WSL2 detection: osrelease contains 'WSL2' or 'microsoft' (case-insensitive)
+  // AND (procVersion contains 'WSL2' OR osrelease contains 'WSL2')
+  const osreleaseIsWSL2 = /WSL2/i.test(osrelease) || /microsoft/i.test(osrelease);
+  const procVersionIsWSL2 = /WSL2/i.test(procVersion);
+  const isWSL2 = osreleaseIsWSL2 || procVersionIsWSL2;
+
+  // WSL1 detection: procVersion has 'Microsoft' but no 'WSL2' signature
+  const isWSL1 = /microsoft/i.test(procVersion) && !isWSL2;
+
+  if (isWSL2) {
+    const method = osreleaseIsWSL2 ? '/proc/sys/kernel/osrelease' : '/proc/version';
+    const value = osreleaseIsWSL2 ? osrelease : procVersion.slice(0, 80);
+    return { detected: true, wsl2: true, wsl1: false, method, value };
+  }
+
+  if (isWSL1) {
+    return { detected: true, wsl2: false, wsl1: true, method: '/proc/version', value: procVersion.slice(0, 80) };
+  }
+
+  // WSL_DISTRO_NAME without confirmed WSL2 kernel — treat as unknown, fail-closed
+  const wslDistro = process.env.WSL_DISTRO_NAME;
+  if (wslDistro && !isWSL1) {
+    // Could not confirm WSL2 via kernel — fail-closed
+    return { detected: false, wsl2: false, wsl1: false, method: 'WSL_DISTRO_NAME-unconfirmed', value: wslDistro };
+  }
+
+  return { detected: false, wsl2: false, wsl1: false };
+}
+
+// --- Ubuntu Detection ---
+// Reads /etc/os-release and checks for ID=ubuntu
+function detectUbuntu() {
+  try {
+    const osRelease = readFileSync('/etc/os-release', 'utf8');
+    const idMatch = osRelease.match(/^ID=(.+)$/m);
+    if (idMatch) {
+      const id = idMatch[1].replace(/["']/g, '').toLowerCase();
+      return { isUbuntu: id === 'ubuntu', id };
     }
   } catch {
-    // /proc/version not readable (non-Linux)
+    // /etc/os-release not readable
   }
-  return { detected: false };
+  return { isUbuntu: false, id: 'unknown' };
 }
 
 // --- Node Version Check ---
@@ -64,16 +113,41 @@ function checkNodeVersion() {
   }
 }
 
-// --- pnpm Availability ---
+// --- pnpm Availability and Compatibility ---
+// Compatibility matrix:
+//   Node 20 + pnpm 9–10: supported
+//   Node 22+ + pnpm 9–11: supported
+//   pnpm 11+ requires Node 22+
+//   pnpm <= 8: too old
 function checkPnpmAvailability() {
+  let pnpmVersion;
   try {
-    const version = execSync('pnpm --version', { stdio: ['pipe', 'pipe', 'pipe'] }).toString().trim();
-    pass('pnpm-available', `pnpm ${version} found`);
-    return true;
+    pnpmVersion = execSync('pnpm --version', { stdio: ['pipe', 'pipe', 'pipe'] }).toString().trim();
   } catch {
-    fail('pnpm-available', 'pnpm not found in PATH — install via `corepack enable && corepack prepare pnpm@latest --activate`');
+    fail('pnpm-available', 'pnpm not found in PATH — install via `corepack enable pnpm && corepack prepare pnpm@latest-10 --activate` (Node 20) or `pnpm@latest-11` (Node 22+)');
     return false;
   }
+
+  const pnpmMajor = parseInt(pnpmVersion.split('.')[0], 10);
+  const nodeMajor = process.versions.node ? parseInt(process.versions.node.split('.')[0], 10) : 0;
+
+  if (pnpmMajor >= 11 && nodeMajor < 22) {
+    fail(
+      'node-pnpm-compatibility',
+      `pnpm ${pnpmVersion} requires Node 22+; current Node is ${process.versions.node}`,
+    );
+    return false;
+  }
+  if (pnpmMajor <= 8) {
+    fail(
+      'node-pnpm-compatibility',
+      `pnpm ${pnpmVersion} is too old; need pnpm 9+ (Node 20) or pnpm 11+ (Node 22+)`,
+    );
+    return false;
+  }
+
+  pass('pnpm-available', `pnpm ${pnpmVersion} found (node ${process.versions.node} — compatible)`);
+  return true;
 }
 
 // --- pnpm-lock.yaml Existence ---
@@ -135,16 +209,30 @@ function checkPreviewPort() {
 async function main() {
   console.log('[check-manual-playtest-env] Starting preflight checks...\n');
 
-  // WSL2 detection — if not WSL2, exit 2 (unsupported)
+  // WSL2 detection — if not confirmed WSL2, exit 2 (unsupported)
   const wsl = detectWSL2();
-  if (!wsl.detected) {
-    console.log('[unsupported] Not running in WSL2 environment.');
+  if (!wsl.detected || !wsl.wsl2) {
+    console.log('[unsupported] Not running in a confirmed WSL2 environment.');
     console.log('  This runbook and preflight script targets WSL2 + Ubuntu.');
     console.log('  Detected platform: ' + process.platform);
-    console.log('  WSL_DISTRO_NAME: ' + (process.env.WSL_DISTRO_NAME || '(not set)'));
+    if (wsl.wsl1) {
+      console.log('  Detected WSL1 (not WSL2) — upgrade to WSL2: `wsl --set-version <distro> 2`');
+    } else {
+      console.log('  WSL_DISTRO_NAME: ' + (process.env.WSL_DISTRO_NAME || '(not set)'));
+      console.log('  Could not confirm WSL2 kernel via /proc/sys/kernel/osrelease or /proc/version.');
+    }
     process.exit(2);
   }
-  pass('wsl2-detected', `WSL2 detected via ${wsl.method}: ${wsl.value}`);
+  pass('wsl2-detected', `WSL2 confirmed via ${wsl.method}: ${wsl.value}`);
+
+  // Ubuntu detection — if not Ubuntu, exit 2 (unsupported)
+  const ubuntu = detectUbuntu();
+  if (!ubuntu.isUbuntu) {
+    console.log(`[unsupported] Non-Ubuntu distro detected: ID=${ubuntu.id}`);
+    console.log('  This runbook targets Ubuntu on WSL2. Other distros are not supported.');
+    process.exit(2);
+  }
+  pass('ubuntu-detected', `Ubuntu distro confirmed (ID=${ubuntu.id}`);
 
   // Synchronous checks
   checkNodeVersion();

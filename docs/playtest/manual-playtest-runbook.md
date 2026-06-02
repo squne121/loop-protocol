@@ -188,14 +188,21 @@ Update `docs/playtest/m2-combat-mvp.md` with your playtest results:
 
 ### `pnpm: command not found`
 
-Install pnpm via corepack:
+Install pnpm via corepack. Use the version appropriate for your Node major:
 
 ```bash
-corepack enable
-corepack prepare pnpm@latest --activate
+# Node 20.x
+corepack enable pnpm
+corepack prepare pnpm@latest-10 --activate
+
+# Node 22+
+corepack enable pnpm
+corepack prepare pnpm@latest-11 --activate
 ```
 
-Or install globally:
+Avoid `pnpm@latest` on Node 20 — it may resolve pnpm 11 which requires Node 22+.
+
+Or install globally with npm:
 
 ```bash
 npm install -g pnpm
@@ -233,12 +240,23 @@ Fix any reported errors before retrying `pnpm build`.
 WSL2 typically forwards localhost automatically on Windows 11 and modern Windows 10.
 If forwarding does not work:
 
-1. Open PowerShell (Admin) and run:
+1. Open PowerShell (Admin) and run (use `wsl.exe -l -v` first to confirm your distro name):
    ```powershell
-   netsh interface portproxy add v4tov4 listenport=4173 listenaddress=0.0.0.0 connectport=4173 connectaddress=<wsl2-ip>
+   $wslIp = (wsl.exe -d Ubuntu hostname -I).Trim().Split()[0]
+   netsh interface portproxy add v4tov4 listenport=4173 listenaddress=0.0.0.0 connectport=4173 connectaddress=$wslIp
    ```
-   Find your WSL2 IP with: `ip addr show eth0 | grep "inet " | awk '{print $2}' | cut -d/ -f1`
 2. Access via the WSL2 IP directly in the Windows browser: `http://<wsl2-ip>:4173`
+
+### Windows browser cannot reach WSL2 localhost even though preview is running
+
+Check `%UserProfile%\.wslconfig` on Windows. If `[wsl2] localhostForwarding=false`
+is set, remove it or set it to `true`, then run:
+
+```powershell
+wsl --shutdown
+```
+
+Restart Ubuntu and rerun the preflight + preview command.
 
 ### `check-manual-playtest-env.mjs` exits with code 2 (unsupported)
 
