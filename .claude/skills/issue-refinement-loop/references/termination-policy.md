@@ -4,11 +4,41 @@
 
 | condition | termination_reason |
 |---|---|
-| Step 2 returns `approve` | `approved` |
+| Step 2 returns `approve` AND latest `CONTRACT_REVIEW_RESULT_V1.status == "go"` confirmed | `approved` |
+| Step 2 returns `approve` BUT latest `CONTRACT_REVIEW_RESULT_V1.status != "go"` | continue (re-run `issue-contract-review`) |
 | Step 2 returns `needs-fix` and `iteration + 1 < max_iterations` | continue to next iteration |
 | Step 2 returns `needs-fix` and `iteration + 1 >= max_iterations` | `human_escalation` (with full blocker summary) |
 | Any step requires human review | `human_escalation` |
 | `final_classification == superseded_by_decision` and close / replacement flow completed | `superseded_by_decision` |
+
+## Final Gate — `CONTRACT_REVIEW_RESULT_V1.status == "go"` 必須
+
+reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.status == "go"` が確認できるまで `approved` 終了としない。
+
+- `approve` 後、`issue-contract-review` を実行し `CONTRACT_REVIEW_RESULT_V1.status == "go"` を確認してから完了とする
+- `status: blocked` の場合は `approved` ではなく継続（blocker 解消後に `issue-contract-review` 再実行）とする
+- `next_action: human_judgment` の場合は `human_escalation` とする（`CONTRACT_REVIEW_RESULT_V1.status` は `go | blocked` のみ。`human_judgment` は `next_action` フィールドで表現）
+- 本ルールは `issue-refinement-loop/SKILL.md` が本ファイルを normative reference として消費するため、SKILL.md を変更せずとも実効性がある
+
+### implement-issue Handoff Gate
+
+| `CONTRACT_REVIEW_RESULT_V1` フィールド | handoff 判定 |
+|---|---|
+| `status: go` | `impl-review-loop` へ handoff 可 |
+| `status: blocked` AND `next_action: propose_refinement_loop` | 継続（blocker 解消後に `issue-contract-review` 再実行） |
+| `status: blocked` AND `next_action: human_judgment` | `human_escalation` で停止 |
+
+`CONTRACT_REVIEW_RESULT_V1.status` の有効値は `go | blocked`。`human_judgment` は `next_action` フィールドに現れる（`status` フィールドには存在しない）。
+
+### Contract Snapshot Idempotency
+
+- contract-review snapshot comment は Issue body の `body_sha256` を含む
+- `body_sha256` が現在の Issue body と一致しない場合（stale result）、その snapshot は無効とする
+- stale snapshot を `go` 判定として使用してはならない（`issue-contract-review` を再実行すること）
+- Issue body が 1 文字でも変更された場合は `body_sha256` が変化するため、prior snapshot は自動的に stale となる
+
+**Note（policy-only — follow-up 依存）**: `body_sha256` フィールドの producer-side 実装（`issue-contract-review/SKILL.md` の `CONTRACT_REVIEW_RESULT_V1` 出力への追加）は本 Issue のスコープ外。現時点では本セクションは policy constraint として機能し、実装は follow-up Issue で対応する（`issue-contract-review` の out-of-scope 修正として別 Issue を起票すること）。
+それまでの間、consumer 側は `CONTRACT_REVIEW_RESULT_V1.generated_at` と Issue の `updated_at` の比較を用いた暫定的な stale 検知を行う。
 
 ## Human Escalation on max_iterations
 
@@ -75,8 +105,12 @@ LOOP_POLICY_V1:
   routes:
     - when: hard_stop_triggered
       action: human_escalation
-    - when: verdict == "approve"
+    - when: "verdict == 'approve' and contract_review.status == 'go' and contract_review.body_sha256 == issue.body_sha256"
       action: done
+    - when: "verdict == 'approve' and contract_review.status != 'go'"
+      action: rerun_issue_contract_review
+    - when: "contract_review.body_sha256 != issue.body_sha256"
+      action: rerun_issue_contract_review
     - when: "verdict == 'needs-fix' and iteration_plus_one < max_iterations"
       action: continue
     - when: "verdict == 'needs-fix' and iteration_plus_one >= max_iterations"

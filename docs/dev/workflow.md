@@ -206,6 +206,15 @@ implementation_triage_profile:
   - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
 - `state/needs-human` 等の human escalation 条件が残っていないこと
 
+### human_escalation 後の Issue 本文変更と contract review 再実行
+
+`human_escalation` で停止した後、Issue 本文を **1 文字でも変更した場合**は prior contract-review result が stale となる。
+
+- prior `CONTRACT_REVIEW_RESULT_V1.status: go` は無効化される
+- `issue-contract-review` を最初から再実行すること
+- stale な prior result を `go` として流用して `impl-review-loop` / `implement-issue` へ handoff してはならない
+- Issue 本文の変更は `body_sha256` の変化として検出される（`issue-contract-review` の snapshot idempotency 機構参照）
+
 ### Scope Collision Preflight
 
 Allowed Paths overlap 単独では hard stop ではない。OPEN な他 Implementation Issue と Allowed Paths が重複する場合は、即停止ではなく Scope Collision Preflight を実施し、以下の class を判定する。
