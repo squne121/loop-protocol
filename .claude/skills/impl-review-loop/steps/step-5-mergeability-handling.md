@@ -16,9 +16,13 @@ V2 consumer path では top-level の `mergeStateStatus` / `recommendations` フ
 | （なし） | `merge_ready` |
 
 parse 手順:
-1. コメント本文から ` ```yaml ` と ` ``` ` で囲まれた `LOOP_VERDICT_V2:` ブロックを抽出する
-2. 抽出できない場合は LOOP_VERDICT 不正として `human_review_required` で停止する
-3. V2 ブロック内の各フィールドを読み取る（以下のフィールド抽出セクション参照）
+1. コメント本文全体から **`LOOP_VERDICT_V2:` キーを含む fenced YAML block（` ```yaml ... ``` `）を全て列挙する**。「最初の ```yaml block」に依存してはならない。
+2. 複数ブロックが存在する場合は最新 review comment の block を採用する。
+3. prose 中（コードブロック外）に `LOOP_VERDICT_V2:` テキストが出現しても無視する。
+4. 対象ブロックが抽出できない場合は LOOP_VERDICT 不正として `human_review_required` で停止する。
+5. malformed YAML（parse エラー）は `human_escalation` として停止する。
+6. top-level の `mergeStateStatus` / `recommendations` フィールド（V1 形式）は V2 consumer path で無視する。
+7. V2 ブロック内の各フィールドを読み取る（以下のフィールド抽出セクション参照）。
 
 ## 最新コメント抽出
 

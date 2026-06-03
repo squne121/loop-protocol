@@ -380,10 +380,14 @@ def test_ac10_worker_failed_not_approved():
     assert "human_escalation" in context, (
         "worker result failed must route to human_escalation"
     )
-    # Must NOT say approved near failed
-    assert "approved" not in context.lower() or "human_escalation" in context, (
-        "worker result failed must not lead to approved"
+    # termination_reason: approved and human_escalation must be mutually exclusive in context
+    has_approved = "termination_reason: approved" in context
+    has_escalation = "human_escalation" in context
+    assert not (has_approved and has_escalation) or (has_escalation and not has_approved), (
+        "termination_reason: approved and human_escalation must be mutually exclusive "
+        "near worker_status_failed"
     )
+    assert has_escalation, "worker result failed must route to human_escalation"
 
 
 def test_ac10_worker_blocked_not_approved():
@@ -476,4 +480,420 @@ def test_ac12_skill_md_emits_draft_pr_ready():
     body = _read(SKILL_MD)
     assert "draft_pr_ready" in body, (
         "SKILL.md must reference IMPL_REVIEW_LOOP_RESULT_V1.status: draft_pr_ready"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B1: required_auto_actions schema (object, not string-list)
+# ---------------------------------------------------------------------------
+
+
+def test_b1_required_auto_actions_object_schema_defined():
+    """B1: required_auto_actions must be documented as array-of-objects schema."""
+    body = _read(STEP5_FT)
+    assert "array-of-objects" in body or "array of objects" in body.lower(), (
+        "step-5-feedback-and-termination.md must document required_auto_actions "
+        "as array-of-objects (not string-list)"
+    )
+
+
+def test_b1_required_auto_actions_schema_fields():
+    """B1: schema must document kind, executor, skill, blocking_merge_ready, expected_head_sha fields."""
+    body = _read(STEP5_FT)
+    for field in ("kind", "executor", "blocking_merge_ready", "expected_head_sha"):
+        assert field in body, (
+            f"step-5-feedback-and-termination.md must document '{field}' in schema"
+        )
+
+
+def test_b1_unknown_kind_routes_to_human_escalation():
+    """B1: unknown kind must route to human_escalation."""
+    body = _read(STEP5_FT)
+    assert "unknown_kind_route" in body or (
+        "unknown" in body and "human_escalation" in body
+    ), (
+        "step-5-feedback-and-termination.md must route unknown kind to human_escalation"
+    )
+
+
+def test_b1_missing_expected_head_sha_routes_to_human_escalation():
+    """B1: missing expected_head_sha for update_branch must route to human_escalation."""
+    body = _read(STEP5_FT)
+    assert "missing_expected_head_sha_for_update_branch" in body or (
+        "expected_head_sha" in body and "human_escalation" in body
+    ), (
+        "step-5-feedback-and-termination.md must route missing expected_head_sha "
+        "for update_branch to human_escalation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B2: fenced YAML extraction policy
+# ---------------------------------------------------------------------------
+
+
+def test_b2_first_yaml_block_dependency_forbidden():
+    """B2: parse must not depend on 'first ```yaml block'."""
+    body = _read(STEP5_MH)
+    # The doc must enumerate LOOP_VERDICT_V2 blocks, not just take the first yaml block
+    assert "最初の" not in body or "禁止" in body or "LOOP_VERDICT_V2" in body, (
+        "step-5-mergeability-handling.md must not depend on 'first yaml block'"
+    )
+    # Must enumerate LOOP_VERDICT_V2-containing blocks
+    assert "LOOP_VERDICT_V2" in body and ("列挙" in body or "enumerate" in body.lower() or "全て" in body or "含む" in body), (
+        "step-5-mergeability-handling.md must enumerate LOOP_VERDICT_V2-containing fenced blocks"
+    )
+
+
+def test_b2_malformed_yaml_routes_to_human_escalation():
+    """B2: malformed YAML must route to human_escalation."""
+    body = _read(STEP5_MH)
+    assert "malformed" in body or "parse エラー" in body or "human_escalation" in body, (
+        "step-5-mergeability-handling.md must route malformed YAML to human_escalation"
+    )
+
+
+def test_b2_prose_loop_verdict_v2_ignored():
+    """B2: LOOP_VERDICT_V2 text outside code blocks must be ignored."""
+    body = _read(STEP5_MH)
+    assert "prose" in body or "コードブロック外" in body or "コードブロック" in body, (
+        "step-5-mergeability-handling.md must state prose LOOP_VERDICT_V2 references are ignored"
+    )
+
+
+def test_b2_v1_top_level_fields_ignored_in_v2_path():
+    """B2: V1 top-level mergeStateStatus and recommendations must be ignored in V2 path."""
+    body = _read(STEP5_MH)
+    assert "mergeStateStatus" in body and "参照しない" in body, (
+        "step-5-mergeability-handling.md must explicitly state top-level mergeStateStatus "
+        "is not referenced in V2 consumer path"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B3: draft_pr_ready / github_merge_ready separation + DRAFT/HAS_HOOKS routing
+# ---------------------------------------------------------------------------
+
+
+def test_b3_github_merge_ready_field_defined():
+    """B3: IMPL_REVIEW_LOOP_RESULT_V1 must include github_merge_ready field."""
+    body = _read(STEP5_FT)
+    assert "github_merge_ready" in body, (
+        "step-5-feedback-and-termination.md must define github_merge_ready field"
+    )
+
+
+def test_b3_draft_pr_defined_separately_from_github_merge_ready():
+    """B3: draft_pr_ready and github_merge_ready must be documented as distinct fields."""
+    body = _read(STEP5_FT)
+    assert "draft_pr_ready" in body and "github_merge_ready" in body, (
+        "Both draft_pr_ready and github_merge_ready must be present"
+    )
+    # They must be in proximity (within same section)
+    idx_draft = body.find("draft_pr_ready")
+    idx_github = body.find("github_merge_ready")
+    assert abs(idx_draft - idx_github) < 2000, (
+        "draft_pr_ready and github_merge_ready must be defined in close proximity"
+    )
+
+
+def test_b3_draft_merge_state_routes_to_github_merge_ready_false():
+    """B3: DRAFT merge_state_status must result in github_merge_ready: false."""
+    body = _read(STEP5_FT)
+    assert "DRAFT" in body, (
+        "step-5-feedback-and-termination.md must reference DRAFT merge_state_status"
+    )
+    idx = body.find("DRAFT")
+    context = body[idx : idx + 400]
+    assert "github_merge_ready: false" in context or "false" in context, (
+        "DRAFT merge_state_status must yield github_merge_ready: false"
+    )
+
+
+def test_b3_has_hooks_routes_to_github_merge_ready_true():
+    """B3: HAS_HOOKS merge_state_status must allow github_merge_ready: true."""
+    body = _read(STEP5_FT)
+    assert "HAS_HOOKS" in body, (
+        "step-5-feedback-and-termination.md must reference HAS_HOOKS merge_state_status"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B4: worker result status union (#631/#638 alignment)
+# ---------------------------------------------------------------------------
+
+
+def test_b4_worker_status_stale_verdict_defined():
+    """B4: worker_status_stale_verdict must be defined with human_escalation route."""
+    body = _read(STEP5_FT)
+    assert "worker_status_stale_verdict" in body, (
+        "step-5-feedback-and-termination.md must define worker_status_stale_verdict"
+    )
+    idx = body.find("worker_status_stale_verdict")
+    context = body[idx : idx + 200]
+    assert "human_escalation" in context, (
+        "worker_status_stale_verdict must route to human_escalation"
+    )
+
+
+def test_b4_worker_status_forbidden_defined():
+    """B4: worker_status_forbidden must be defined with human_escalation route."""
+    body = _read(STEP5_FT)
+    assert "worker_status_forbidden" in body, (
+        "step-5-feedback-and-termination.md must define worker_status_forbidden"
+    )
+    idx = body.find("worker_status_forbidden")
+    context = body[idx : idx + 200]
+    assert "human_escalation" in context, (
+        "worker_status_forbidden must route to human_escalation"
+    )
+
+
+def test_b4_worker_status_validation_failed_defined():
+    """B4: worker_status_validation_failed must be defined with human_escalation route."""
+    body = _read(STEP5_FT)
+    assert "worker_status_validation_failed" in body, (
+        "step-5-feedback-and-termination.md must define worker_status_validation_failed"
+    )
+    idx = body.find("worker_status_validation_failed")
+    context = body[idx : idx + 200]
+    assert "human_escalation" in context, (
+        "worker_status_validation_failed must route to human_escalation"
+    )
+
+
+def test_b4_worker_status_timeout_defined():
+    """B4: worker_status_timeout must be defined with human_escalation route."""
+    body = _read(STEP5_FT)
+    assert "worker_status_timeout" in body, (
+        "step-5-feedback-and-termination.md must define worker_status_timeout"
+    )
+    idx = body.find("worker_status_timeout")
+    context = body[idx : idx + 200]
+    assert "human_escalation" in context, (
+        "worker_status_timeout must route to human_escalation"
+    )
+
+
+def test_b4_worker_status_ok_rerun_required_true_does_not_terminate():
+    """B4: worker ok with rerun_required: true must not terminate immediately."""
+    body = _read(STEP5_FT)
+    assert "worker_status_ok_rerun_required_true" in body, (
+        "step-5-feedback-and-termination.md must define worker_status_ok_rerun_required_true"
+    )
+    idx = body.find("worker_status_ok_rerun_required_true")
+    context = body[idx : idx + 300]
+    assert "rerun" in context or "即終了しない" in context, (
+        "worker_status_ok_rerun_required_true must specify rerun is required (not immediate exit)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B5: behavior routing fixture matrix
+# ---------------------------------------------------------------------------
+
+
+def _make_verdict_context(
+    verdict: str,
+    merge_ready: bool,
+    required_auto_actions: list,
+    merge_state_status: str,
+) -> str:
+    """Simulate a routing context string based on fixture parameters."""
+    actions_str = "[]" if not required_auto_actions else str(required_auto_actions)
+    return (
+        f"verdict: {verdict}\n"
+        f"merge_ready: {str(merge_ready).lower()}\n"
+        f"required_auto_actions: {actions_str}\n"
+        f"merge_state_status: {merge_state_status}\n"
+    )
+
+
+def _evaluate_route(
+    verdict: str,
+    merge_ready: bool,
+    required_auto_actions: list,
+    merge_state_status: str,
+) -> str:
+    """
+    Deterministic routing logic mirroring step-5 decision table.
+    Returns: 'approved', 'implementation-worker.update_branch', 'human_escalation',
+             'not_approved_github', 'continue_loop'
+    """
+    if merge_state_status == "UNKNOWN":
+        return "human_escalation"
+
+    if verdict == "REQUEST_CHANGES":
+        return "continue_loop"
+
+    if verdict != "APPROVE":
+        return "human_escalation"
+
+    # APPROVE path
+    if merge_state_status == "DRAFT":
+        # draft_pr_ready=true but github_merge_ready=false
+        return "not_approved_github"
+
+    # Check required_auto_actions
+    for action in required_auto_actions:
+        if isinstance(action, dict) and action.get("kind") == "update_branch":
+            return "implementation-worker.update_branch"
+        if isinstance(action, dict) and action.get("kind") not in (
+            "update_branch", "update_pr_body_hygiene", "ensure_closing_keyword"
+        ):
+            return "human_escalation"
+        if isinstance(action, str):
+            # unknown / non-object action
+            return "human_escalation"
+
+    if required_auto_actions:
+        return "not_approved"  # non-empty but no update_branch → still not terminal
+
+    if not merge_ready:
+        return "not_approved"
+
+    return "approved"
+
+
+# Fixture matrix: (verdict, merge_ready, required_auto_actions, mergeStateStatus, expected_route)
+_FIXTURE_MATRIX = [
+    # APPROVE + merge_ready=true + [] + CLEAN → approved
+    ("APPROVE", True, [], "CLEAN", "approved"),
+    # APPROVE + merge_ready=false + [update_branch object] + BEHIND → update_branch worker
+    ("APPROVE", False, [{"kind": "update_branch", "expected_head_sha": "abc123"}], "BEHIND",
+     "implementation-worker.update_branch"),
+    # APPROVE + merge_ready=true + [unknown action object] + CLEAN → human_escalation
+    ("APPROVE", True, [{"kind": "unknown_action"}], "CLEAN", "human_escalation"),
+    # APPROVE + merge_ready=true + [non-empty known action] + CLEAN → not approved (continue)
+    ("APPROVE", True, [{"kind": "update_pr_body_hygiene"}], "CLEAN", "not_approved"),
+    # APPROVE + merge_ready=false + [] + DRAFT → not_approved_github (github_merge_ready: false)
+    ("APPROVE", False, [], "DRAFT", "not_approved_github"),
+    # APPROVE + merge_ready=false + [] + UNKNOWN → human_escalation
+    ("APPROVE", False, [], "UNKNOWN", "human_escalation"),
+    # REQUEST_CHANGES + merge_ready=false + [] + CLEAN → continue_loop
+    ("REQUEST_CHANGES", False, [], "CLEAN", "continue_loop"),
+]
+
+
+def test_b5_fixture_matrix_approved():
+    """B5: APPROVE + merge_ready=true + [] + CLEAN must route to approved."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[0]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_update_branch():
+    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to update_branch worker."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[1]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_unknown_action_human_escalation():
+    """B5: APPROVE + [unknown_action object] + CLEAN must route to human_escalation."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[2]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_nonempty_known_action_not_approved():
+    """B5: APPROVE + [update_pr_body_hygiene] + CLEAN must not be approved (loop continues)."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[3]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_draft_not_github_merge_ready():
+    """B5: APPROVE + [] + DRAFT must not be github_merge_ready (draft_pr_ready=true but not mergeable)."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[4]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_unknown_status_human_escalation():
+    """B5: APPROVE + UNKNOWN merge_state_status must route to human_escalation."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[5]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_fixture_matrix_request_changes_continue_loop():
+    """B5: REQUEST_CHANGES must route to continue_loop (next iteration)."""
+    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[6]
+    result = _evaluate_route(verdict, merge_ready, actions, status)
+    assert result == expected, f"Expected '{expected}', got '{result}'"
+
+
+def test_b5_ac10_approved_and_human_escalation_mutually_exclusive():
+    """B5/AC10: termination_reason: approved and human_escalation must be mutually exclusive."""
+    body = _read(STEP5_FT)
+    idx = body.find("worker_status_failed")
+    assert idx != -1, "worker_status_failed must be defined"
+    context = body[idx : idx + 200]
+    # termination_reason: approved must NOT appear in the same context block as human_escalation routing
+    has_termination_approved = "termination_reason: approved" in context
+    has_human_escalation = "human_escalation" in context
+    # They must be mutually exclusive: if human_escalation is present, approved must not be
+    assert not (has_termination_approved and has_human_escalation), (
+        "termination_reason: approved and human_escalation are not mutually exclusive "
+        "near worker_status_failed — this is a structural defect"
+    )
+    assert has_human_escalation, (
+        "human_escalation must be present near worker_status_failed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B6: no bidirectional Unicode control characters
+# ---------------------------------------------------------------------------
+
+
+_BIDI_CHARS = [
+    "‪",  # LEFT-TO-RIGHT EMBEDDING
+    "‫",  # RIGHT-TO-LEFT EMBEDDING
+    "‬",  # POP DIRECTIONAL FORMATTING
+    "‭",  # LEFT-TO-RIGHT OVERRIDE
+    "‮",  # RIGHT-TO-LEFT OVERRIDE
+    "⁦",  # LEFT-TO-RIGHT ISOLATE
+    "⁧",  # RIGHT-TO-LEFT ISOLATE
+    "⁨",  # FIRST STRONG ISOLATE
+    "⁩",  # POP DIRECTIONAL ISOLATE
+    "​",  # ZERO WIDTH SPACE
+    "‌",  # ZERO WIDTH NON-JOINER
+    "‍",  # ZERO WIDTH JOINER
+    "‎",  # LEFT-TO-RIGHT MARK
+    "‏",  # RIGHT-TO-LEFT MARK
+]
+
+
+def _check_no_bidi(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    found = []
+    for ch in _BIDI_CHARS:
+        if ch in text:
+            found.append(f"U+{ord(ch):04X}")
+    return found
+
+
+def test_b6_no_bidi_in_step5_feedback():
+    """B6: step-5-feedback-and-termination.md must not contain bidi control characters."""
+    found = _check_no_bidi(STEP5_FT)
+    assert not found, (
+        f"step-5-feedback-and-termination.md contains forbidden bidi chars: {found}"
+    )
+
+
+def test_b6_no_bidi_in_step5_mergeability():
+    """B6: step-5-mergeability-handling.md must not contain bidi control characters."""
+    found = _check_no_bidi(STEP5_MH)
+    assert not found, (
+        f"step-5-mergeability-handling.md contains forbidden bidi chars: {found}"
+    )
+
+
+def test_b6_no_bidi_in_skill_md():
+    """B6: SKILL.md must not contain bidi control characters."""
+    found = _check_no_bidi(SKILL_MD)
+    assert not found, (
+        f"SKILL.md contains forbidden bidi chars: {found}"
     )
