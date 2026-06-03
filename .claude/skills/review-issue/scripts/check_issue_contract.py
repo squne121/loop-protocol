@@ -42,6 +42,144 @@ class CheckResult(str, Enum):
     LEGACY_MISSING = "legacy_missing_applicability"
 
 
+class PreflightScope(str, Enum):
+    """Valid values for # preflight-scope: annotation on VC commands."""
+    PR_REVIEW_ONLY = "pr_review_only"
+    RUNTIME_ONLY = "runtime_only"
+    UNKNOWN = "unknown"  # fail-closed / human_judgment
+
+
+@dataclass
+class ParsedVcCommand:
+    """A VC command parsed from the Verification Commands section, with optional annotation metadata.
+
+    Fields:
+        command: the raw command string (e.g. "$ rg -n foo bar.py")
+        preflight_scope: PreflightScope value if # preflight-scope: annotation was directly above;
+                         None if no annotation present.
+        trivially_pass_reason: non-empty reason string if # trivially_pass: annotation was directly
+                                above the command; None otherwise.
+        classification: "executable" | "skipped"
+        skip_reason_type: "preflight_scope" | "trivially_pass" | None (only set when skipped)
+    """
+    command: str
+    preflight_scope: Optional[PreflightScope] = None
+    trivially_pass_reason: Optional[str] = None
+    classification: str = "executable"
+    skip_reason_type: Optional[str] = None
+
+
+def parse_vc_commands(vc_section: str) -> list[ParsedVcCommand]:
+    """Parse VC commands from a Verification Commands section with annotation support.
+
+    Rules:
+    - Commands are lines starting with "$" inside ```bash code blocks.
+    - A command directly preceded (no blank lines or non-annotation comments between) by:
+        # preflight-scope: <value>  → sets preflight_scope, classification: skipped
+        # trivially_pass: <reason>  → sets trivially_pass_reason, classification: skipped
+    - Annotation comments themselves are NOT extracted as commands.
+    - If a blank line or a non-annotation comment appears between annotation and command,
+      the annotation is invalidated (annotation must be immediately above the command).
+    - unknown preflight-scope values → PreflightScope.UNKNOWN, classification: skipped,
+      skip_reason_type: "preflight_scope_human_judgment"
+
+    Returns a list of ParsedVcCommand, one per extracted command.
+    """
+    results: list[ParsedVcCommand] = []
+
+    # Extract all code blocks (bash or untyped)
+    code_blocks = re.findall(r'```[^\n]*\n(.*?)```', vc_section, re.DOTALL)
+
+    _preflight_scope_re = re.compile(r'^#\s*preflight-scope:\s*(.+)$')
+    _trivially_pass_re = re.compile(r'^#\s*trivially_pass:\s*(.+)$')
+    _annotation_re = re.compile(r'^#\s*(preflight-scope|trivially_pass):')
+
+    for block in code_blocks:
+        lines = block.splitlines()
+        # State: pending annotation for the next command line
+        pending_preflight_scope: Optional[str] = None
+        pending_trivially_pass: Optional[str] = None
+        # Track whether last non-blank line was an annotation (for invalidation)
+        last_was_annotation = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            if not stripped:
+                # Blank line: invalidate pending annotations
+                pending_preflight_scope = None
+                pending_trivially_pass = None
+                last_was_annotation = False
+                continue
+
+            ps_match = _preflight_scope_re.match(stripped)
+            tp_match = _trivially_pass_re.match(stripped)
+
+            if ps_match:
+                # This line is a # preflight-scope: annotation — do not emit as command
+                # Invalidate any previously pending annotation (only last one counts)
+                pending_preflight_scope = ps_match.group(1).strip()
+                pending_trivially_pass = None  # reset other annotation
+                last_was_annotation = True
+                continue
+
+            if tp_match:
+                # This line is a # trivially_pass: annotation — do not emit as command
+                pending_trivially_pass = tp_match.group(1).strip()
+                pending_preflight_scope = None  # reset other annotation
+                last_was_annotation = True
+                continue
+
+            # Non-annotation comment line: invalidate pending annotations (AC6)
+            if stripped.startswith('#') and not _annotation_re.match(stripped):
+                pending_preflight_scope = None
+                pending_trivially_pass = None
+                last_was_annotation = False
+                continue
+
+            # Command line: must start with "$" to be considered a VC command
+            if stripped.startswith('$'):
+                cmd = ParsedVcCommand(command=stripped)
+
+                if pending_preflight_scope is not None:
+                    scope_val = pending_preflight_scope
+                    if scope_val == PreflightScope.PR_REVIEW_ONLY.value:
+                        cmd.preflight_scope = PreflightScope.PR_REVIEW_ONLY
+                        cmd.classification = "skipped"
+                        cmd.skip_reason_type = "preflight_scope"
+                    elif scope_val == PreflightScope.RUNTIME_ONLY.value:
+                        cmd.preflight_scope = PreflightScope.RUNTIME_ONLY
+                        cmd.classification = "skipped"
+                        cmd.skip_reason_type = "preflight_scope"
+                    else:
+                        # unknown value: fail-closed as human_judgment
+                        cmd.preflight_scope = PreflightScope.UNKNOWN
+                        cmd.classification = "skipped"
+                        cmd.skip_reason_type = "preflight_scope_human_judgment"
+
+                elif pending_trivially_pass is not None:
+                    reason = pending_trivially_pass
+                    if reason:
+                        cmd.trivially_pass_reason = reason
+                        cmd.classification = "skipped"
+                        cmd.skip_reason_type = "trivially_pass"
+
+                results.append(cmd)
+                # Reset pending annotations after consuming
+                pending_preflight_scope = None
+                pending_trivially_pass = None
+                last_was_annotation = False
+            else:
+                # Non-command, non-annotation, non-blank line: invalidate annotations
+                # (e.g. a comment like "# some other remark" — already handled above,
+                # but also handles output lines etc.)
+                pending_preflight_scope = None
+                pending_trivially_pass = None
+                last_was_annotation = False
+
+    return results
+
+
 # --- scope_cvs_in_scope_mismatch tokenization constants (Issue #396) ---
 
 PATH_TOKEN_EXTENSIONS = (".md", ".py", ".ts", ".tsx", ".js", ".json", ".yml", ".yaml", ".toml", ".sh")
@@ -193,6 +331,7 @@ class CheckerResult:
     non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
     diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
     issue_kind: str = "implementation"
+    parsed_vc_commands: list = field(default_factory=list)  # list[ParsedVcCommand] (serialized dicts)
 
 
 PLACEHOLDER_VALUES = {"", "tbd", "todo", "none", "n/a", "na", "<tbd>", "<todo>"}
@@ -890,6 +1029,11 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     checks.C4_vc_commands_present, issues = check_c4_vc_commands_present(body)
     result.blocking_issues.extend(issues)
 
+    # annotation-aware VC parse (Issue #599)
+    vc_section = extract_section(body, "Verification Commands")
+    if vc_section:
+        result.parsed_vc_commands = parse_vc_commands(vc_section)
+
     # C5
     checks.C5_ac_vc_number_alignment, issues = check_c5_ac_vc_alignment(body)
     result.blocking_issues.extend(issues)
@@ -1016,6 +1160,16 @@ def load_fixture_file(path: str) -> tuple[str, str, str]:
 def result_to_dict(result: CheckerResult) -> dict:
     """Convert CheckerResult to a dict for JSON output."""
     import datetime
+
+    def _serialize_parsed_vc_cmd(cmd: ParsedVcCommand) -> dict:
+        return {
+            "command": cmd.command,
+            "preflight_scope": cmd.preflight_scope.value if cmd.preflight_scope is not None else None,
+            "trivially_pass_reason": cmd.trivially_pass_reason,
+            "classification": cmd.classification,
+            "skip_reason_type": cmd.skip_reason_type,
+        }
+
     return {
         "verdict": result.verdict,
         "issue_kind": result.issue_kind,
@@ -1038,6 +1192,7 @@ def result_to_dict(result: CheckerResult) -> dict:
         "blocking_issues": result.blocking_issues,
         "non_blocking_improvements": result.non_blocking_improvements,
         "diff_proposal": result.diff_proposal,
+        "parsed_vc_commands": [_serialize_parsed_vc_cmd(c) for c in result.parsed_vc_commands],
     }
 
 
