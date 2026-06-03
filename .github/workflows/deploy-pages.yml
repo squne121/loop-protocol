@@ -19,14 +19,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: true
           fetch-depth: 0
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
         with:
           version: 11
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
           cache: pnpm
@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
-          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
+          if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
       - name: Deploy to gh-pages (replace root, preserve pr-*)
         run: |
           git config user.name "github-actions[bot]"
@@ -98,13 +98,13 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
         with:
           version: 11
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
           cache: pnpm
@@ -133,8 +133,8 @@ jobs:
           set -euo pipefail
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
-          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
-      - uses: peaceiris/actions-gh-pages@v4
+          if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
+      - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
@@ -153,7 +153,7 @@ jobs:
             "${preview_url}?cache_bust=${GITHUB_SHA}" \
             -o /tmp/preview-index.html
           grep -F "${base}assets/" /tmp/preview-index.html
-          ! grep -E 'src="/assets/|href="/assets/' /tmp/preview-index.html
+          if grep -qE 'src="/assets/|href="/assets/' /tmp/preview-index.html; then exit 1; fi
           mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
           if [ "${#asset_paths[@]}" -eq 0 ]; then
             echo "No asset paths found in /tmp/preview-index.html" >&2
@@ -170,7 +170,7 @@ jobs:
             curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}"
           done
       - name: Comment preview URL on PR
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PAGES_BASE_PATH: ${{ steps.vite-base.outputs.base }}
           PREVIEW_ASSET_LIVE_STATUS: ${{ steps.preview-assets-live.outcome }}
@@ -182,21 +182,10 @@ jobs:
             const assetLivePassed = process.env.PREVIEW_ASSET_LIVE_STATUS === 'success';
 
             const marker = '<!-- loop-protocol-pr-preview -->';
+            const closingNote = 'The preview will be removed when this PR is closed.';
             const body = assetLivePassed
-              ? `${marker}
-## Preview URL
-
-✅ verified live assets: ${previewUrl}
-
-> The preview will be removed when this PR is closed.`
-              : `${marker}
-## Preview URL
-
-⏳ publish requested（asset-level live check 未検証 / Pages source 設定後に有効化）: ${previewUrl}
-
-> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)
-> base path 修正だけでは hosted runtime 復旧を保証しません。publish trigger / source fault は別問題として切り分けてください。
-> The preview will be removed when this PR is closed.`;
+              ? [marker, '## Preview URL', '', `✅ verified live assets: ${previewUrl}`, '', closingNote].join('\n')
+              : [marker, '## Preview URL', '', `⏳ publish requested（asset-level live check 未検証 / Pages source 設定後に有効化）: ${previewUrl}`, '', 'Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)', 'base path 修正だけでは hosted runtime 復旧を保証しません。publish trigger / source fault は別問題として切り分けてください。', closingNote].join('\n');
 
             const allComments = await github.paginate(
               github.rest.issues.listComments,
@@ -247,7 +236,7 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         if: steps.check-branch.outputs.exists == 'true'
         with:
           ref: gh-pages
@@ -269,7 +258,7 @@ jobs:
         if: steps.check-branch.outputs.exists == 'false'
         run: echo "gh-pages branch does not exist yet; no-op cleanup."
       - name: Update preview URL comment to "Preview removed"
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const prNumber = context.payload.pull_request.number;
