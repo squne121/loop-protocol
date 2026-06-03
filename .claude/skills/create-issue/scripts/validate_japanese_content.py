@@ -331,6 +331,52 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
     return changed
 
 
+def classify_borderline(text: str, threshold: float = 0.1, lower_threshold: float = 0.05) -> str:
+    """
+    テキストが borderline か否かを判定する。
+
+    borderline の定義:
+      - aggregate_ratio >= threshold: PASS（border 判定不要）
+      - lower_threshold <= aggregate_ratio < threshold: BORDERLINE
+      - aggregate_ratio < lower_threshold: CLEAR_FAIL
+
+    prose block が存在しない場合は CLEAR_FAIL を返す。
+
+    Returns:
+        'PASS' | 'BORDERLINE' | 'CLEAR_FAIL'
+    """
+    # コードフェンスを除去
+    cleaned_text, _ = extract_code_fences(text)
+
+    # prose block に分割
+    raw_blocks = split_into_prose_blocks(cleaned_text)
+
+    total_japanese = 0
+    total_chars = 0
+    has_prose = False
+
+    for block in raw_blocks:
+        clean_block = clean_prose(block)
+        effective_chars = count_effective_chars(clean_block)
+        if effective_chars < 5:
+            continue
+        has_prose = True
+        total_japanese += count_japanese_chars(clean_block)
+        total_chars += effective_chars
+
+    if not has_prose or total_chars == 0:
+        return 'CLEAR_FAIL'
+
+    aggregate_ratio = total_japanese / total_chars
+
+    if aggregate_ratio >= threshold:
+        return 'PASS'
+    elif aggregate_ratio >= lower_threshold:
+        return 'BORDERLINE'
+    else:
+        return 'CLEAR_FAIL'
+
+
 def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
     """
     テキストの日本語比率を検査する
@@ -556,8 +602,38 @@ def main():
         default=None,
         help='delta-check: 比較先ファイルパス',
     )
+    parser.add_argument(
+        '--borderline-check',
+        action='store_true',
+        help=(
+            'Borderline check mode: stdin から prose を読んで borderline か否かを判定する。'
+            'stdout に PASS / BORDERLINE / CLEAR_FAIL を出力し exit 0 で終了する。'
+            '--threshold と組み合わせて閾値を指定できる。'
+            '--lower-threshold で borderline 下限を指定できる（デフォルト: threshold * 0.5）。'
+        ),
+    )
+    parser.add_argument(
+        '--lower-threshold',
+        type=float,
+        default=None,
+        help=(
+            'Borderline check の下限閾値（デフォルト: threshold * 0.5）。'
+            'lower_threshold <= ratio < threshold の場合 BORDERLINE を返す。'
+        ),
+    )
 
     args = parser.parse_args()
+
+    # ============================================================
+    # Borderline check mode (--borderline-check)
+    # ============================================================
+    if args.borderline_check:
+        text = sys.stdin.read()
+        threshold = args.threshold
+        lower = args.lower_threshold if args.lower_threshold is not None else threshold * 0.5
+        result = classify_borderline(text, threshold=threshold, lower_threshold=lower)
+        print(result)
+        sys.exit(0)
 
     # ============================================================
     # Parse body mode (--parse-body)
