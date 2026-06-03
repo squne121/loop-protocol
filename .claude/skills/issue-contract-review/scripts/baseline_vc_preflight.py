@@ -133,25 +133,55 @@ def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Op
 
 def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -> Optional[str]:
     """
-    VC コマンド行（target_line_idx）の直前複数行から `# vc-regex-intent: <value>` annotation を抽出。
+    VC コマンド行（target_line_idx）の直前の連続 annotation/comment ブロックから
+    `# vc-regex-intent: <value>` annotation を抽出。
 
     AC3 (Issue #589): backslash-pipe (\\|) を含む regex-bearing command（rg / egrep 等）に対して、
     `literal-pipe-ok` annotation が付与されている場合は regex_literal_pipe_suspected を免除する。
 
     形式: `# vc-regex-intent: literal-pipe-ok reason="..."`
     戻り値: annotation value（"literal-pipe-ok" 等）または None
+
+    スコープルール（Blocker 1 修正）:
+    - annotation は VC コマンド行の直前の連続 annotation/comment ブロック内のみ有効。
+    - 途中に空行・$ コマンド行・通常コメントではない行があった時点でブロックを打ち切る。
+    - `# preflight-scope:` は同一ブロック内として透過する（coexistence を許す）。
+    - 空行や $ コマンド行（コマンド行）を跨ぐことはない。
     """
-    # Look back up to 3 lines for the annotation (to allow preflight-scope + vc-regex-intent on adjacent lines)
-    look_back = min(target_line_idx, 3)
-    for offset in range(1, look_back + 1):
+    found_annotation = None
+    # Walk backwards from the line immediately before target_line_idx
+    for offset in range(1, target_line_idx + 1):
         line_idx = target_line_idx - offset
         if line_idx < 0:
             break
         line = lines[line_idx].strip()
+
+        # Empty line: stop scanning (annotation scope ended)
+        if not line:
+            break
+
+        # $ command line: stop scanning (another command intervened)
+        if re.match(r"^\$\s+", line) or re.match(r"^\$\s*$", line):
+            break
+
+        # vc-regex-intent annotation line: record it and continue scanning the block
         match = re.match(r"^#\s*vc-regex-intent:\s*(\S+)", line)
         if match:
-            return match.group(1)
-    return None
+            found_annotation = match.group(1)
+            continue
+
+        # preflight-scope marker: transparent (allowed in the same block)
+        if re.match(r"^#\s*preflight-scope:\s*\S+", line):
+            continue
+
+        # AC marker line (# AC1 etc): transparent (allowed in the same block)
+        if re.match(r"^#\s*AC\d+\s*:?\s*$", line):
+            continue
+
+        # Any other line (regular comment or non-comment non-command): stop scanning
+        break
+
+    return found_annotation
 
 
 def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str], Optional[str]]]:
@@ -819,9 +849,12 @@ def _is_regex_bearing_command_for_literal_pipe(argv: List[str]) -> bool:
     backslash-pipe is a literal pipe (not alternation).
 
     Coverage:
-    - rg: Rust regex engine, x|y is alternation, backslash-pipe is literal pipe
-    - egrep / fgrep: ERE, backslash-pipe is literal pipe character (not alternation)
-    - grep -E / grep -P: Extended/Perl regex, backslash-pipe is literal pipe in ERE
+    - rg: Rust regex engine, x|y is alternation, backslash-pipe is literal pipe.
+      EXCEPT: rg -F / rg --fixed-strings disables regex entirely → return False.
+    - egrep: ERE, backslash-pipe is literal pipe character (not alternation) → True.
+    - fgrep: fixed-string grep (no regex engine) → always False (Blocker 2 fix).
+    - grep -E / grep -P: Extended/Perl regex → True.
+      EXCEPT: grep -F / grep --fixed-strings disables regex → return False (Blocker 2 fix).
 
     Note: grep (basic mode, BRE) also treats \\| as literal, but since BRE
     uses | as literal anyway (alternation needs \\|), this check focuses on
@@ -831,56 +864,209 @@ def _is_regex_bearing_command_for_literal_pipe(argv: List[str]) -> bool:
     if not argv:
         return False
     cmd_basename = Path(argv[0]).name
-    if cmd_basename in ("rg", "egrep", "fgrep"):
-        return True
-    if cmd_basename == "grep":
+
+    if cmd_basename == "rg":
+        # rg -F / --fixed-strings: not a regex-bearing command
         for arg in argv[1:]:
-            if arg in ("-E", "-P", "--extended-regexp", "--perl-regexp"):
-                return True
-            if arg.startswith("-") and not arg.startswith("--"):
+            if arg in ("-F", "--fixed-strings"):
+                return False
+            # Combined short flags like -Fn, -nF etc.
+            if arg.startswith("-") and not arg.startswith("--") and "F" in arg[1:]:
+                return False
+        return True
+
+    if cmd_basename == "egrep":
+        # egrep is always ERE → True
+        return True
+
+    if cmd_basename == "fgrep":
+        # fgrep is fixed-string grep → not regex-bearing (Blocker 2 fix)
+        return False
+
+    if cmd_basename == "grep":
+        has_fixed_strings = False
+        has_extended_or_perl = False
+        for arg in argv[1:]:
+            if arg in ("-F", "--fixed-strings"):
+                has_fixed_strings = True
+            elif arg in ("-E", "-P", "--extended-regexp", "--perl-regexp"):
+                has_extended_or_perl = True
+            elif arg.startswith("-") and not arg.startswith("--"):
                 flags = arg[1:]
+                if "F" in flags:
+                    has_fixed_strings = True
                 if "E" in flags or "P" in flags:
-                    return True
+                    has_extended_or_perl = True
+        # -F takes precedence: fixed-string mode, not regex-bearing
+        if has_fixed_strings:
+            return False
+        return has_extended_or_perl
+
     return False
 
 
 def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
     r"""
-    Check if any non-flag argument (pattern argument) in argv contains \\|.
+    Check if the PATTERN argument (only) in argv contains \\|.
 
     This detects the case where a user wrote \\| intending regex literal pipe,
     which in most regex engines (rg, egrep, grep -E) is NOT needed — | alone
     is alternation in ERE/Rust regex, and \\| is a literal pipe.
 
-    Heuristic: check all positional arguments (non-option strings) after the
-    command name for the presence of \\|.
+    Blocker 3 fix: Only the PATTERN argument is inspected, not PATH/GLOB/option values.
+
+    For rg:
+      - -e PATTERN / --regexp PATTERN → the value is a pattern
+      - -g GLOB / --glob GLOB → not inspected (glob, not regex pattern)
+      - -F / --fixed-strings → caller already returns False from _is_regex_bearing_command
+      - -- PATTERN PATH... → first positional after -- is PATTERN; the rest are PATHs
+      - Without -e/--regexp: first non-flag positional argument is PATTERN; rest are PATHs
+
+    For grep / egrep:
+      - -e PATTERN / --regexp PATTERN → the value is a pattern
+      - Without -e/--regexp: first non-flag positional argument is PATTERN; rest are PATHs
+      - File PATH arguments are NOT inspected.
     """
     if not argv:
         return False
 
-    # Collect non-flag arguments starting from argv[1]
-    i = 1
+    cmd_basename = Path(argv[0]).name
     n = len(argv)
+
+    # Flags that take a value argument for both rg and grep families.
+    # We need to skip these flag+value pairs to correctly identify positional args.
+    # Value-taking flags common to rg/grep (non-exhaustive; focus on pattern-relevant ones):
+    _RG_VALUE_FLAGS = frozenset([
+        "-e", "--regexp",          # pattern (handled specially below)
+        "-g", "--glob",            # glob (NOT a pattern)
+        "-A", "--after-context",
+        "-B", "--before-context",
+        "-C", "--context",
+        "-m", "--max-count",
+        "-M", "--max-columns",
+        "--max-depth",
+        "-l", "--files-with-matches",
+        "--color", "--colours",
+        "--type", "-t",
+        "--type-not", "-T",
+        "--encoding", "-E",        # Note: -E in rg is --encoding, not --extended-regexp
+        "--field-match-separator",
+        "--field-context-separator",
+        "--replace", "-r",
+        "--pre",
+        "--iglob",
+    ])
+
+    _GREP_VALUE_FLAGS = frozenset([
+        "-e", "--regexp",          # pattern (handled specially below)
+        "-f", "--file",
+        "-A", "--after-context",
+        "-B", "--before-context",
+        "-C", "--context",
+        "-m", "--max-count",
+        "--label",
+        "--color", "--colour",
+        "--binary-files",
+        "-D", "--devices",
+        "-d", "--directories",
+        "--include",
+        "--exclude",
+        "--exclude-from",
+        "--exclude-dir",
+    ])
+
+    # Collect explicit pattern arguments from -e/--regexp
+    explicit_patterns: List[str] = []
+
+    if cmd_basename == "rg":
+        value_flags = _RG_VALUE_FLAGS
+    else:
+        # grep, egrep, fgrep
+        value_flags = _GREP_VALUE_FLAGS
+
+    i = 1
+    after_double_dash = False
+    first_positional_seen = False
+
     while i < n:
         arg = argv[i]
+
         if arg == "--":
-            # Everything after -- is positional
-            for j in range(i + 1, n):
-                if "\\|" in argv[j]:
-                    return True
-            return False
-        if arg.startswith("-") and len(arg) > 1:
-            # It's a flag — skip it (and its value if it takes one)
-            # We don't try to parse all possible flags; just check if next arg
-            # looks like a value (doesn't start with -) for common value-flags.
-            # Simple heuristic: single-char flags with a value (-n 5, -A 3, etc.)
-            # For this check we are conservative and only skip the flag itself.
+            after_double_dash = True
             i += 1
             continue
-        # It's a positional argument — check for \\|
-        if "\\|" in arg:
-            return True
+
+        if after_double_dash:
+            # After --: first arg is PATTERN (if no -e was given), rest are PATHs
+            if not first_positional_seen and not explicit_patterns:
+                # This is the PATTERN
+                if "\\|" in arg:
+                    return True
+                first_positional_seen = True
+            # Remaining args after -- are PATHs: do NOT inspect
+            i += 1
+            continue
+
+        # Handle -e PATTERN / --regexp PATTERN (explicit pattern flag)
+        if arg in ("-e", "--regexp"):
+            if i + 1 < n:
+                explicit_patterns.append(argv[i + 1])
+            i += 2
+            continue
+
+        # Handle --regexp=PATTERN form
+        if arg.startswith("--regexp="):
+            explicit_patterns.append(arg[len("--regexp="):])
+            i += 1
+            continue
+
+        # Handle -eXXX (short flag with value concatenated, e.g. -e"foo\|bar")
+        if arg.startswith("-e") and len(arg) > 2:
+            explicit_patterns.append(arg[2:])
+            i += 1
+            continue
+
+        # Skip -g / --glob and their values (NOT pattern) for rg
+        if cmd_basename == "rg" and arg in ("-g", "--glob", "--iglob"):
+            i += 2  # skip flag and value
+            continue
+        if cmd_basename == "rg" and (arg.startswith("--glob=") or arg.startswith("--iglob=")):
+            i += 1  # skip flag=value
+            continue
+
+        # Skip other known value-taking flags and their values
+        if arg in value_flags:
+            i += 2  # skip flag and value
+            continue
+
+        # Handle --flag=value forms for value-taking flags
+        for flag in value_flags:
+            if flag.startswith("--") and arg.startswith(flag + "="):
+                i += 1
+                arg = None  # consumed
+                break
+        if arg is None:
+            continue
+
+        # Combined short flags (e.g. -nq, -rn): skip (no value taken beyond the flag itself)
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            i += 1
+            continue
+
+        # Positional argument
+        if not first_positional_seen and not explicit_patterns:
+            # This is the PATTERN (only if no -e was given)
+            if "\\|" in arg:
+                return True
+            first_positional_seen = True
+        # else: it's a PATH → do NOT inspect
         i += 1
+
+    # Check any explicitly collected patterns
+    for pat in explicit_patterns:
+        if "\\|" in pat:
+            return True
+
     return False
 
 

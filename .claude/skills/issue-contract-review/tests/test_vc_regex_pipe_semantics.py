@@ -414,3 +414,285 @@ class TestAC6Fixture578Style:
         )
         assert r["decision"] == "blocked"
         assert data.get("status") == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: Annotation scope leak regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlocker1AnnotationScopeContainment:
+    r"""Blocker 1: annotation must NOT leak across $ command lines or empty lines."""
+
+    def test_annotation_exempts_only_immediately_following_command(self):
+        r"""Blocker 1: annotation on line 1 exempts line 2 command, NOT line 4 command."""
+        from baseline_vc_preflight import extract_vc_regex_intent_annotation
+
+        # Block:
+        #   line 0: # vc-regex-intent: literal-pipe-ok reason="fixture"
+        #   line 1: $ rg -n "a\|b" fixtures                    <- annotated (idx=1, prev=0)
+        #   line 2: (empty)
+        #   line 3: $ rg -n "foo\|bar" src                     <- NOT annotated (idx=3, prev=2=empty)
+        lines = [
+            '# vc-regex-intent: literal-pipe-ok reason="fixture"',
+            '$ rg -n "a\\|b" fixtures',
+            '',
+            '$ rg -n "foo\\|bar" src',
+        ]
+        # Command at index 1 (0-based) should be annotated
+        annotation_for_first = extract_vc_regex_intent_annotation(lines, 1)
+        assert annotation_for_first == "literal-pipe-ok", (
+            f"First command should be annotated, got: {annotation_for_first}"
+        )
+        # Command at index 3 should NOT be annotated (empty line at index 2 breaks scope)
+        annotation_for_second = extract_vc_regex_intent_annotation(lines, 3)
+        assert annotation_for_second is None, (
+            f"Second command must NOT be annotated (empty line breaks scope), "
+            f"got: {annotation_for_second}"
+        )
+
+    def test_annotation_does_not_cross_intervening_dollar_command(self):
+        r"""Blocker 1: $ command between annotation and target breaks annotation scope."""
+        from baseline_vc_preflight import extract_vc_regex_intent_annotation
+
+        # Block:
+        #   line 0: # vc-regex-intent: literal-pipe-ok reason="fixture"
+        #   line 1: $ rg -n "a\|b" fixtures                    <- annotated (first command)
+        #   line 2: $ rg -n "foo\|bar" src                     <- NOT annotated ($ at index 1 breaks)
+        lines = [
+            '# vc-regex-intent: literal-pipe-ok reason="literal pipe fixture"',
+            '$ rg -n "a\\|b" fixtures',
+            '$ rg -n "foo\\|bar" src',
+        ]
+        annotation_for_first = extract_vc_regex_intent_annotation(lines, 1)
+        assert annotation_for_first == "literal-pipe-ok", (
+            f"First command (idx=1) should be annotated; got: {annotation_for_first}"
+        )
+        # Second command (idx=2): prev line at idx=1 is a $ command → scope broken
+        annotation_for_second = extract_vc_regex_intent_annotation(lines, 2)
+        assert annotation_for_second is None, (
+            f"Second command must NOT be annotated ($ command at idx=1 breaks scope); "
+            f"got: {annotation_for_second}"
+        )
+
+    def test_annotation_scope_end_to_end_second_command_is_blocked(self):
+        r"""Blocker 1: end-to-end: annotation exempts 1st rg, 2nd rg (after empty line) is blocked."""
+        body = (
+            "## Outcome\n\nSome outcome.\n\n"
+            "## Acceptance Criteria\n\n- [ ] AC1: some condition\n\n"
+            "## Verification Commands\n\n"
+            "```bash\n"
+            "# AC1\n"
+            '# vc-regex-intent: literal-pipe-ok reason="literal pipe fixture"\n'
+            '$ rg -n "a\\|b" fixtures\n'
+            "\n"
+            '$ rg -n "foo\\|bar" src\n'
+            "```\n\n"
+            "## Runtime Verification Applicability\n\n"
+            "- decision: not_applicable\n"
+        )
+        data = run_preflight(body)
+        results = data.get("results", [])
+        assert len(results) >= 2, f"Expected at least 2 results, got: {results}"
+        # First command: should NOT be blocked as regex_literal_pipe_suspected (annotated)
+        r0 = results[0]
+        assert not (
+            r0["category"] == "regex_literal_pipe_suspected" and r0["decision"] == "blocked"
+        ), (
+            f"First command with annotation should not be blocked as regex_literal_pipe_suspected; "
+            f"got category={r0['category']}, decision={r0['decision']}"
+        )
+        # Second command: should be blocked as regex_literal_pipe_suspected (no annotation)
+        r1 = results[1]
+        assert r1["category"] == "regex_literal_pipe_suspected", (
+            f"Second command without annotation must be regex_literal_pipe_suspected; "
+            f"got category={r1['category']}"
+        )
+        assert r1["decision"] == "blocked", (
+            f"Second command must be blocked; got decision={r1['decision']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: Fixed-string mode false positive regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlocker2FixedStringFalsePositive:
+    r"""Blocker 2: -F / --fixed-strings / fgrep must NOT be regex-bearing."""
+
+    def test_rg_capital_F_flag_is_not_blocked(self):
+        r"""Blocker 2: rg -F "foo\|bar" must NOT be blocked (fixed-string mode)."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'rg -F "foo\|bar" fixtures', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'rg -F should not be blocked as regex_literal_pipe_suspected; got: {result}'
+        )
+
+    def test_rg_fixed_strings_long_flag_is_not_blocked(self):
+        r"""Blocker 2: rg --fixed-strings "foo\|bar" must NOT be blocked."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'rg --fixed-strings "foo\|bar" fixtures', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'rg --fixed-strings should not be blocked as regex_literal_pipe_suspected; got: {result}'
+        )
+
+    def test_fgrep_is_not_blocked(self):
+        r"""Blocker 2: fgrep "foo\|bar" must NOT be blocked (fixed-string grep)."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'fgrep "foo\|bar" fixtures', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'fgrep should not be blocked as regex_literal_pipe_suspected; got: {result}'
+        )
+
+    def test_grep_capital_F_is_not_blocked(self):
+        r"""Blocker 2: grep -F "foo\|bar" must NOT be blocked."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'grep -F "foo\|bar" fixtures', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'grep -F should not be blocked as regex_literal_pipe_suspected; got: {result}'
+        )
+
+    def test_rg_without_fixed_string_is_still_blocked(self):
+        r"""Blocker 2: rg without -F is still blocked when \| is in pattern."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'rg "foo\|bar" src', Path("."))
+        assert result is not None, r'rg without -F must be blocked for \| pattern'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_grep_E_is_still_blocked(self):
+        r"""Blocker 2: grep -E "foo\|bar" must still be blocked (ERE mode)."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'grep -E "foo\|bar" file.txt', Path("."))
+        assert result is not None, r'grep -E must be blocked for \| pattern'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_egrep_is_still_blocked(self):
+        r"""Blocker 2: egrep "foo\|bar" must still be blocked."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command(r'egrep "foo\|bar" file.txt', Path("."))
+        assert result is not None, r'egrep must be blocked for \| pattern'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_is_regex_bearing_fgrep_is_false(self):
+        """Blocker 2: _is_regex_bearing_command_for_literal_pipe returns False for fgrep."""
+        from baseline_vc_preflight import _is_regex_bearing_command_for_literal_pipe
+
+        assert not _is_regex_bearing_command_for_literal_pipe(["fgrep", r"foo\|bar", "file.txt"])
+
+    def test_is_regex_bearing_rg_fixed_strings_is_false(self):
+        """Blocker 2: _is_regex_bearing_command_for_literal_pipe returns False for rg -F."""
+        from baseline_vc_preflight import _is_regex_bearing_command_for_literal_pipe
+
+        assert not _is_regex_bearing_command_for_literal_pipe(["rg", "-F", r"foo\|bar"])
+        assert not _is_regex_bearing_command_for_literal_pipe(["rg", "--fixed-strings", r"foo\|bar"])
+
+    def test_is_regex_bearing_grep_fixed_strings_is_false(self):
+        """Blocker 2: _is_regex_bearing_command_for_literal_pipe returns False for grep -F."""
+        from baseline_vc_preflight import _is_regex_bearing_command_for_literal_pipe
+
+        assert not _is_regex_bearing_command_for_literal_pipe(["grep", "-F", r"foo\|bar"])
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: Pattern vs Path/Glob false positive regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlocker3PatternVsPathDistinction:
+    r"""Blocker 3: \\| in path/glob arguments must NOT trigger regex_literal_pipe_suspected."""
+
+    def test_rg_backslash_pipe_in_path_not_blocked(self):
+        r"""Blocker 3: rg "needle" "fixtures/foo\|bar.txt" — path-side \| must not block."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('rg "needle" "fixtures/foo\\|bar.txt"', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'rg with \\| in path (not pattern) must not be blocked as regex_literal_pipe_suspected; '
+            f'got: {result}'
+        )
+
+    def test_rg_backslash_pipe_in_glob_not_blocked(self):
+        r"""Blocker 3: rg -g "foo\|bar.md" "needle" . — glob-side \| must not block."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('rg -g "foo\\|bar.md" "needle" .', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'rg with \\| in glob (-g) must not be blocked as regex_literal_pipe_suspected; '
+            f'got: {result}'
+        )
+
+    def test_grep_E_backslash_pipe_in_path_not_blocked(self):
+        r"""Blocker 3: grep -E "needle" "fixtures/foo\|bar.txt" — path-side \| must not block."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('grep -E "needle" "fixtures/foo\\|bar.txt"', Path("."))
+        assert result is None or (result is not None and result[1] != "regex_literal_pipe_suspected"), (
+            f'grep -E with \\| in path (not pattern) must not be blocked as regex_literal_pipe_suspected; '
+            f'got: {result}'
+        )
+
+    def test_rg_explicit_e_pattern_with_backslash_pipe_is_blocked(self):
+        r"""Blocker 3 true positive: rg -e "foo\|bar" . must still be blocked."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('rg -e "foo\\|bar" .', Path("."))
+        assert result is not None, r'rg -e "foo\|bar" must be blocked'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_grep_E_explicit_e_pattern_with_backslash_pipe_is_blocked(self):
+        r"""Blocker 3 true positive: grep -E -e "foo\|bar" file.txt must still be blocked."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('grep -E -e "foo\\|bar" file.txt', Path("."))
+        assert result is not None, r'grep -E -e "foo\|bar" must be blocked'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_rg_positional_pattern_with_backslash_pipe_is_blocked(self):
+        r"""Blocker 3 true positive: rg "foo\|bar" . must still be blocked (first positional is pattern)."""
+        from baseline_vc_preflight import classify_static_command
+
+        result = classify_static_command('rg "foo\\|bar" .', Path("."))
+        assert result is not None, r'rg "foo\|bar" . must be blocked'
+        _, category, decision, _, _ = result
+        assert category == "regex_literal_pipe_suspected"
+        assert decision == "blocked"
+
+    def test_command_pattern_contains_backslash_pipe_path_excluded(self):
+        r"""Blocker 3: _command_pattern_contains_backslash_pipe must not flag path arguments."""
+        from baseline_vc_preflight import _command_pattern_contains_backslash_pipe
+        import shlex
+
+        # rg "needle" "fixtures/foo\|bar.txt" — path arg has \|, pattern does not
+        argv = shlex.split('rg "needle" "fixtures/foo\\|bar.txt"')
+        assert not _command_pattern_contains_backslash_pipe(argv), (
+            f"Path-side \\| must not trigger backslash pipe detection; argv={argv}"
+        )
+
+    def test_command_pattern_contains_backslash_pipe_glob_excluded(self):
+        r"""Blocker 3: _command_pattern_contains_backslash_pipe must not flag -g glob arguments."""
+        from baseline_vc_preflight import _command_pattern_contains_backslash_pipe
+        import shlex
+
+        # rg -g "foo\|bar.md" "needle" . — glob has \|, pattern does not
+        argv = shlex.split('rg -g "foo\\|bar.md" "needle" .')
+        assert not _command_pattern_contains_backslash_pipe(argv), (
+            f"-g glob \\| must not trigger backslash pipe detection; argv={argv}"
+        )
