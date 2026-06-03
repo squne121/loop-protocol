@@ -182,21 +182,10 @@ jobs:
             const assetLivePassed = process.env.PREVIEW_ASSET_LIVE_STATUS === 'success';
 
             const marker = '<!-- loop-protocol-pr-preview -->';
+            const closingNote = 'The preview will be removed when this PR is closed.';
             const body = assetLivePassed
-              ? `${marker}
-## Preview URL
-
-✅ verified live assets: ${previewUrl}
-
-> The preview will be removed when this PR is closed.`
-              : `${marker}
-## Preview URL
-
-⏳ publish requested（asset-level live check 未検証 / Pages source 設定後に有効化）: ${previewUrl}
-
-> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)
-> base path 修正だけでは hosted runtime 復旧を保証しません。publish trigger / source fault は別問題として切り分けてください。
-> The preview will be removed when this PR is closed.`;
+              ? [marker, '## Preview URL', '', `✅ verified live assets: ${previewUrl}`, '', closingNote].join('\n')
+              : [marker, '## Preview URL', '', `⏳ publish requested（asset-level live check 未検証 / Pages source 設定後に有効化）: ${previewUrl}`, '', 'Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)', 'base path 修正だけでは hosted runtime 復旧を保証しません。publish trigger / source fault は別問題として切り分けてください。', closingNote].join('\n');
 
             const allComments = await github.paginate(
               github.rest.issues.listComments,

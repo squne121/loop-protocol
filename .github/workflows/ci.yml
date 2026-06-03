@@ -191,4 +191,4 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash | bash -s -- 1.7.12
           sudo mv actionlint /usr/local/bin/actionlint
       - name: Run actionlint
-        run: actionlint -ignore 'deploy-pages\.yml.*syntax-check'
+        run: actionlint
