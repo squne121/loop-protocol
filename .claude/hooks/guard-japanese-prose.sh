@@ -49,6 +49,11 @@ fi
 # 日本語比率を検証する
 # $1: チェック対象の本文テキスト
 # $2: 対象の説明（stderr 出力用）
+# 戻り値:
+#   0 = pass
+#   2 = fail (borderline または clear fail)
+# stderr に reason code を出力する:
+#   borderline case: "borderline_japanese_prose_repair_required" reason code を含める
 validate_body() {
     local body="$1"
     local context="$2"
@@ -57,17 +62,28 @@ validate_body() {
         return 0
     fi
 
-    # validator を実行
-    if echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
+    # まず borderline チェック（PASS / BORDERLINE / CLEAR_FAIL を取得）
+    local borderline_result
+    borderline_result="$(echo "$body" | uv run python3 "$VALIDATOR" --borderline-check --threshold 0.1 2>/dev/null || echo "CLEAR_FAIL")"
+
+    if [ "$borderline_result" = "PASS" ]; then
         return 0
-    else
-        # validator の詳細情報を stderr に出力
-        local details
-        details="$(echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true)"
-        echo "GUARD: 日本語比率不足 [${context}]" >&2
-        echo "${details}" >&2
+    fi
+
+    if [ "$borderline_result" = "BORDERLINE" ]; then
+        echo "GUARD: borderline_japanese_prose_repair_required [${context}]" >&2
+        echo "  reason: borderline_japanese_prose_repair_required" >&2
+        echo "  action: 日本語 prose に修正して再試行してください（code fence / inline code / identifier / URL は英語許容）" >&2
+        echo "  context: ${context}" >&2
         return 2
     fi
+
+    # CLEAR_FAIL: 通常のブロック
+    local details
+    details="$(echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true)"
+    echo "GUARD: 日本語比率不足 [${context}]" >&2
+    echo "${details}" >&2
+    return 2
 }
 
 # delta mode: changed prose blocks のみを検査する
@@ -101,11 +117,25 @@ validate_delta_prose() {
         local failed_count
         changed_count="$(echo "$result" | cut -d: -f2)"
         failed_count="$(echo "$result" | cut -d: -f3)"
-        echo "GUARD: changed prose block failure [${target}]" >&2
-        echo "  target: ${target}" >&2
-        echo "  changed_prose_blocks: ${changed_count}" >&2
-        echo "  failed_blocks: ${failed_count}" >&2
-        echo "  ratio_min: 0.000" >&2
+
+        # changed prose が borderline か確認する
+        local borderline_result
+        borderline_result="$(printf '%s' "$new_body" | uv run python3 "$VALIDATOR" --borderline-check --threshold 0.1 2>/dev/null || echo "CLEAR_FAIL")"
+
+        if [ "$borderline_result" = "BORDERLINE" ]; then
+            echo "GUARD: borderline_japanese_prose_repair_required [${target}]" >&2
+            echo "  reason: borderline_japanese_prose_repair_required" >&2
+            echo "  action: 日本語 prose に修正して再試行してください（code fence / inline code / identifier / URL は英語許容）" >&2
+            echo "  target: ${target}" >&2
+            echo "  changed_prose_blocks: ${changed_count}" >&2
+            echo "  failed_blocks: ${failed_count}" >&2
+        else
+            echo "GUARD: changed prose block failure [${target}]" >&2
+            echo "  target: ${target}" >&2
+            echo "  changed_prose_blocks: ${changed_count}" >&2
+            echo "  failed_blocks: ${failed_count}" >&2
+            echo "  ratio_min: 0.000" >&2
+        fi
         return 2
     fi
 
@@ -243,9 +273,10 @@ if [ "$TOOL_NAME" = "Bash" ]; then
         fi
 
         # delta_mode 非対象（create/comment 等）: full-body 検査
-        if ! uv run python3 "$VALIDATOR" --file "$BODY_FILE_EXTRACT" --threshold 0.1 >/dev/null 2>/dev/null; then
-            echo "GUARD: 日本語比率不足 [--body-file: ${BODY_FILE_EXTRACT}]" >&2
-            uv run python3 "$VALIDATOR" --file "$BODY_FILE_EXTRACT" --threshold 0.1 2>&1 || true
+        FILE_BODY="$(cat "$BODY_FILE_EXTRACT" 2>/dev/null || echo "")"
+        if validate_body "$FILE_BODY" "--body-file: ${BODY_FILE_EXTRACT}"; then
+            : # pass
+        else
             exit 2
         fi
     fi
@@ -456,9 +487,9 @@ PY
 
     # body が取れた場合に検証
     if [ -n "$BODY" ]; then
-        if ! echo "$BODY" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
-            echo "GUARD: 日本語比率不足 [gh body]" >&2
-            echo "$BODY" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+        if validate_body "$BODY" "gh body"; then
+            : # pass
+        else
             exit 2
         fi
     fi
@@ -523,9 +554,9 @@ if echo "$TOOL_NAME" | grep -qE '^(Write|Edit|MultiEdit)$'; then
             exit 0
         fi
 
-        if ! echo "$CONTENT" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
-            echo "GUARD: 日本語比率不足 [Write: ${FILE_PATH}]" >&2
-            echo "$CONTENT" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+        if validate_body "$CONTENT" "Write: ${FILE_PATH}"; then
+            : # pass
+        else
             exit 2
         fi
     fi
@@ -556,9 +587,9 @@ except Exception:
 
         # new_string を検証
         if [ -n "$NEW_STRING" ]; then
-            if ! echo "$NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
-                echo "GUARD: 日本語比率不足 [Edit new_string: ${FILE_PATH}]" >&2
-                echo "$NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+            if validate_body "$NEW_STRING" "Edit new_string: ${FILE_PATH}"; then
+                : # pass
+            else
                 exit 2
             fi
         fi
@@ -570,9 +601,9 @@ except Exception:
         for idx in $(seq 0 $((EDITS_COUNT - 1))); do
             EDIT_NEW_STRING="$(echo "$INPUT" | jq -r ".tool_input.edits[${idx}].new_string // \"\"" 2>/dev/null || echo "")"
             if [ -n "$EDIT_NEW_STRING" ]; then
-                if ! echo "$EDIT_NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
-                    echo "GUARD: 日本語比率不足 [MultiEdit new_string[${idx}]]" >&2
-                    echo "$EDIT_NEW_STRING" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true
+                if validate_body "$EDIT_NEW_STRING" "MultiEdit new_string[${idx}]"; then
+                    : # pass
+                else
                     exit 2
                 fi
             fi
