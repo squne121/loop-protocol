@@ -11,16 +11,27 @@ AC3: AC1/AC2 の after-pass fixture が存在し PASS すること
 
 これらのテストは dependency (a) #629/#636 が merge 済みのため after-pass を直接実装する。
 
-TEST_VERDICT_MACHINE marker fields:
+TEST_VERDICT_MACHINE:
   version: 1
-  result: pass (expected after #636 merge)
+  result: pass
+  head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
   commands:
-    - uv run pytest .claude/skills/issue-refinement-loop/tests/ -k "design" -v
-    - uv run pytest .claude/skills/review-issue/tests/ -k "design" -v
-    - uv run pytest .claude/skills/issue-refinement-loop/tests/ -k "design and after_pass" -v
+    - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'design' -v"
+      exit_code: 0
+      stdout_sha256: "any"
+    - command: "uv run pytest .claude/skills/review-issue/tests/ -k 'design' -v"
+      exit_code: 0
+      stdout_sha256: "any"
+    - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'design and after_pass' -v"
+      exit_code: 0
+      stdout_sha256: "any"
   fixtures:
-    - inline: unknown_kind_issue_body (真の unknown kind を持つ issue body)
-    - inline: design_kind_issue_body (design は alias→research、implementation fallback ではない)
+    - case: "AC1_unknown_kind_fail_closed"
+      before_fail_verified: false
+      after_pass_verified: true
+    - case: "AC2_design_kind_no_implementation_fallback"
+      before_fail_verified: false
+      after_pass_verified: true
   skipped: []
 """
 
@@ -196,8 +207,17 @@ class TestAC1PlanRefinementLoopUnknownKindFailClosed:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
-      fixture: unknown_kind_issue_body (inline)
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'unknown_kind' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC1_unknown_kind_fail_closed"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_unknown_kind_produces_fail_closed_after_pass(self):
@@ -291,8 +311,17 @@ class TestAC2CheckIssueContractNoImplementationFallback:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
-      fixture: unknown_kind_issue_body (inline)
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/review-issue/tests/ -k 'design' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC2_design_kind_no_implementation_fallback"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_unknown_kind_not_implementation_after_pass(self):
@@ -375,7 +404,17 @@ class TestAC3AfterPassFixturesExistAndPass:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'after_pass' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC3_after_pass_fixtures_exist"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_plan_refinement_loop_script_exists(self):

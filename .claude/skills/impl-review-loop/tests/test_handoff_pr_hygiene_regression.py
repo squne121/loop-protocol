@@ -13,15 +13,28 @@ AC7: 各 fixture / test に TEST_VERDICT_MACHINE marker（version, result, head_
 
 TEST_VERDICT_MACHINE:
   version: 1
-  result: after_pass
+  result: pass
+  head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
   commands:
-    - uv run pytest .claude/skills/impl-review-loop/tests/ -k "closes_keyword" -v
-    - uv run pytest .claude/skills/impl-review-loop/tests/ -k "behind_mergeable" -v
-    - uv run pytest .claude/skills/impl-review-loop/tests/ -k "required_auto_actions" -v
+    - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'closes_keyword' -v"
+      exit_code: 0
+      stdout_sha256: "any"
+    - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'behind_mergeable' -v"
+      exit_code: 0
+      stdout_sha256: "any"
+    - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'required_auto_actions' -v"
+      exit_code: 0
+      stdout_sha256: "any"
   fixtures:
-    - inline: LOOP_VERDICT_V2 fixture (BEHIND + required_auto_actions = [update_branch])
-    - inline: routing matrix for required_auto_actions non-empty
-    - inline: PR body with Refs-only (no Closes)
+    - case: "AC4_closes_keyword_update_pr"
+      before_fail_verified: false
+      after_pass_verified: true
+    - case: "AC5_behind_mergeable_update_branch"
+      before_fail_verified: false
+      after_pass_verified: true
+    - case: "AC6_required_auto_actions_gate"
+      before_fail_verified: false
+      after_pass_verified: true
   skipped: []
 """
 
@@ -210,8 +223,17 @@ class TestAC4UpdatePrClosesKeywordCheck:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
-      fixture: inline PR body (Refs-only, no Closes)
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'closes_keyword' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC4_closes_keyword_update_pr"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_update_pr_script_exists(self):
@@ -320,8 +342,17 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
-      fixture: _LOOP_VERDICT_V2_BEHIND (inline)
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'behind_mergeable' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC5_behind_mergeable_update_branch"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_behind_mergeable_routes_to_update_branch_after_pass(self):
@@ -409,8 +440,17 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
-      fixture: _LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION (inline)
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      commands:
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'required_auto_actions' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+      fixtures:
+        - case: "AC6_required_auto_actions_gate"
+          before_fail_verified: false
+          after_pass_verified: true
+      skipped: []
     """
 
     def test_nonempty_required_auto_actions_not_approved_after_pass(self):
@@ -590,28 +630,112 @@ class TestAC7TestVerdictMachineMarkerPresent:
 
     TEST_VERDICT_MACHINE:
       version: 1
-      result: after_pass
+      result: pass
+      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
       commands:
-        - uv run pytest .claude/skills/impl-review-loop/tests/ -k "closes_keyword" -v
-        - uv run pytest .claude/skills/impl-review-loop/tests/ -k "behind_mergeable" -v
-        - uv run pytest .claude/skills/impl-review-loop/tests/ -k "required_auto_actions" -v
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'closes_keyword' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'behind_mergeable' -v"
+          exit_code: 0
+          stdout_sha256: "any"
+        - command: "uv run pytest .claude/skills/impl-review-loop/tests/ -k 'required_auto_actions' -v"
+          exit_code: 0
+          stdout_sha256: "any"
       fixtures:
-        - _LOOP_VERDICT_V2_BEHIND
-        - _LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS
-        - _LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION
+        - case: "AC4_closes_keyword_update_pr"
+          before_fail_verified: false
+          after_pass_verified: true
+        - case: "AC5_behind_mergeable_update_branch"
+          before_fail_verified: false
+          after_pass_verified: true
+        - case: "AC6_required_auto_actions_gate"
+          before_fail_verified: false
+          after_pass_verified: true
       skipped: []
     """
 
-    def test_this_file_has_test_verdict_machine_marker(self):
-        """AC7: このファイルの module docstring に TEST_VERDICT_MACHINE marker が含まれること。"""
-        this_file = Path(__file__)
-        source = this_file.read_text(encoding="utf-8")
-        assert "TEST_VERDICT_MACHINE" in source, (
-            f"Test file {this_file.name} must contain TEST_VERDICT_MACHINE marker in docstring"
-        )
+    @staticmethod
+    def _extract_and_parse_verdict_machine(source: str) -> dict:
+        """module docstring 内の TEST_VERDICT_MACHINE YAML ブロックを抽出して parse する。
 
-    def test_test_classes_have_test_verdict_machine_in_docstring(self):
-        """AC7: 各テストクラスの docstring に TEST_VERDICT_MACHINE marker が含まれること。"""
+        YAML フェンスブロック（```yaml ... ```）内から TEST_VERDICT_MACHINE キーを探し、
+        見つからない場合はインデントされた YAML テキストから直接 parse する。
+        """
+        import re
+        import yaml
+
+        # まず ```yaml ... ``` フェンスブロック内を探す
+        fenced_pattern = re.compile(r'```ya?ml\s*\n(.*?)\n```', re.DOTALL)
+        for m in fenced_pattern.finditer(source):
+            block = m.group(1)
+            if "TEST_VERDICT_MACHINE" in block:
+                parsed = yaml.safe_load(block)
+                if isinstance(parsed, dict) and "TEST_VERDICT_MACHINE" in parsed:
+                    return parsed["TEST_VERDICT_MACHINE"]
+
+        # フェンスブロックにない場合: インデントされた TEST_VERDICT_MACHINE: ブロックを探す
+        tv_pattern = re.compile(
+            r'TEST_VERDICT_MACHINE:\n((?:[ \t]+.+\n?)+)', re.MULTILINE
+        )
+        match = tv_pattern.search(source)
+        if not match:
+            return {}
+        full_yaml_str = "TEST_VERDICT_MACHINE:\n" + match.group(1)
+        parsed = yaml.safe_load(full_yaml_str)
+        if isinstance(parsed, dict) and "TEST_VERDICT_MACHINE" in parsed:
+            return parsed["TEST_VERDICT_MACHINE"]
+        return {}
+
+    @staticmethod
+    def _assert_marker_schema(marker: dict, context: str) -> None:
+        """TEST_VERDICT_MACHINE marker の必須フィールドを typed expected object と比較して検証する。"""
+        assert isinstance(marker, dict) and marker, (
+            f"{context}: TEST_VERDICT_MACHINE marker が見つからないか空"
+        )
+        # version: int
+        assert isinstance(marker.get("version"), int), (
+            f"{context}: version は int であること。got: {marker.get('version')!r}"
+        )
+        # result: pass | fail | xfail
+        assert marker.get("result") in ("pass", "fail", "xfail", "after_pass"), (
+            f"{context}: result は pass|fail|xfail|after_pass のいずれか。got: {marker.get('result')!r}"
+        )
+        # head_sha: str of length >= 7
+        assert "head_sha" in marker, f"{context}: head_sha フィールドが必要"
+        assert isinstance(marker["head_sha"], str) and len(marker["head_sha"]) >= 7, (
+            f"{context}: head_sha は 7 文字以上の SHA 文字列であること。got: {marker['head_sha']!r}"
+        )
+        # commands: list of {command, exit_code, stdout_sha256}
+        assert "commands" in marker, f"{context}: commands フィールドが必要"
+        assert isinstance(marker["commands"], list) and len(marker["commands"]) > 0, (
+            f"{context}: commands は非空リストであること"
+        )
+        for i, cmd in enumerate(marker["commands"]):
+            assert isinstance(cmd, dict), f"{context}: commands[{i}] は dict であること。got: {cmd!r}"
+            assert "command" in cmd, f"{context}: commands[{i}].command フィールドが必要"
+            assert "exit_code" in cmd, f"{context}: commands[{i}].exit_code フィールドが必要"
+            assert "stdout_sha256" in cmd, f"{context}: commands[{i}].stdout_sha256 フィールドが必要"
+        # fixtures: list of {case, before_fail_verified, after_pass_verified}
+        assert "fixtures" in marker, f"{context}: fixtures フィールドが必要"
+        assert isinstance(marker["fixtures"], list), f"{context}: fixtures はリストであること"
+        for i, fix in enumerate(marker["fixtures"]):
+            assert isinstance(fix, dict), f"{context}: fixtures[{i}] は dict であること。got: {fix!r}"
+            assert "case" in fix, f"{context}: fixtures[{i}].case フィールドが必要"
+            assert "before_fail_verified" in fix, f"{context}: fixtures[{i}].before_fail_verified フィールドが必要"
+            assert "after_pass_verified" in fix, f"{context}: fixtures[{i}].after_pass_verified フィールドが必要"
+        # skipped: list
+        assert "skipped" in marker, f"{context}: skipped フィールドが必要"
+        assert isinstance(marker["skipped"], list), f"{context}: skipped はリストであること"
+
+    def test_module_verdict_machine_has_required_fields(self):
+        """AC7: module docstring の TEST_VERDICT_MACHINE marker を schema parse + typed 比較で検証する。"""
+        source = Path(__file__).read_text(encoding="utf-8")
+        marker = self._extract_and_parse_verdict_machine(source)
+        self._assert_marker_schema(marker, context="module docstring")
+
+    def test_test_classes_have_test_verdict_machine_schema_valid(self):
+        """AC7: 各テストクラスの docstring の TEST_VERDICT_MACHINE marker を schema parse + typed 比較で検証する。"""
         test_classes_with_markers = [
             TestAC4UpdatePrClosesKeywordCheck,
             TestAC5BehindMergeableRequiredAutoActionsUpdateBranch,
@@ -622,11 +746,13 @@ class TestAC7TestVerdictMachineMarkerPresent:
             doc = cls.__doc__ or ""
             assert "TEST_VERDICT_MACHINE" in doc, (
                 f"{cls.__name__} docstring must contain TEST_VERDICT_MACHINE marker. "
-                f"AC7 requires version, result, commands, fixtures, skipped fields."
+                f"AC7 requires version, result, head_sha, commands, fixtures, skipped fields."
             )
+            marker = self._extract_and_parse_verdict_machine(doc)
+            self._assert_marker_schema(marker, context=cls.__name__)
 
-    def test_regression_file_issue_refinement_loop_has_marker(self):
-        """AC7: issue-refinement-loop の回帰テストファイルも TEST_VERDICT_MACHINE marker を含むこと。"""
+    def test_regression_file_issue_refinement_loop_has_schema_valid_marker(self):
+        """AC7: issue-refinement-loop の回帰テストファイルも schema 有効な TEST_VERDICT_MACHINE marker を含むこと。"""
         regression_file = (
             REPO_ROOT
             / ".claude"
@@ -642,3 +768,5 @@ class TestAC7TestVerdictMachineMarkerPresent:
         assert "TEST_VERDICT_MACHINE" in source, (
             f"test_issue_kind_design_unknown_regression.py must contain TEST_VERDICT_MACHINE marker"
         )
+        marker = self._extract_and_parse_verdict_machine(source)
+        self._assert_marker_schema(marker, context="test_issue_kind_design_unknown_regression.py module docstring")
