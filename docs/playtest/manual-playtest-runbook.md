@@ -108,6 +108,53 @@ http://localhost:4173/?playtest_evidence=1
 
 - **Download YAML** ボタンをクリックすると `loop-protocol-playtest-evidence-<ISO8601>.yaml` ファイルがダウンロードされる。
 
+### Evidence Panel 出力スキーマと ADR 提出スキーマの対応
+
+Evidence Panel が生成する YAML と、GitHub への最終提出 YAML はスキーマキーが異なる。以下の対応に従ってマッピングする。
+
+**Evidence Panel 出力（`playtest_evidence_schema_version: v1`）:**
+
+```yaml
+playtest_evidence_schema_version: v1
+browser:
+  name: "Chrome"
+  version: "125.0.0.0"
+  version_source: "automatic"
+  unknown_reason: null
+environment:
+  viewport: "1920x1080"
+  device_pixel_ratio: 1
+  os: "Windows 11 + WSL2/Ubuntu"
+  commit: "abc1234..."
+  commit_unknown_reason: null
+```
+
+**GitHub 最終提出（`schema_version: playtest_evidence_v1`）:**
+
+```yaml
+schema_version: "playtest_evidence_v1"
+environment:
+  browser: "Chrome 125.0.0.0"
+  version_source: "automatic"
+  unknown_reason: null
+  viewport: "1920x1080"
+  device_pixel_ratio: 1
+  os: "Windows 11 + WSL2/Ubuntu"
+```
+
+**マッピング規則:**
+
+| Evidence Panel フィールド | ADR 提出フィールド |
+|--------------------------|-------------------|
+| `browser.name` + `browser.version` | `environment.browser`（結合して "Name Version" 形式） |
+| `browser.version_source` | `environment.version_source` |
+| `browser.unknown_reason` | `environment.unknown_reason` |
+| `environment.viewport` | `environment.viewport` |
+| `environment.device_pixel_ratio` | `environment.device_pixel_ratio` |
+| `environment.os` | `environment.os` |
+| `environment.commit` | `tested_commit`（トップレベルフィールド） |
+| `environment.commit_unknown_reason` | `tested_commit_unknown_reason`（トップレベル） |
+
 ### Chrome でブラウザバージョンが `unknown` になる場合
 
 `navigator.userAgentData.getHighEntropyValues()` は experimental API であり、Chrome でも取得できない場合がある。`unknown` となった場合は、以下を手動で記録し `version_source` と `unknown_reason` を明示する（無条件 pass は禁止）:
@@ -168,6 +215,8 @@ https://github.com/user-attachments/assets/<UUID>/playtest-577-2026-06-04-victor
 この URL が証跡の正本ロケーターとなる。コメントを投稿する前に URL が挿入されたことを確認する。
 
 > **重要**: ローカルパス（例: `docs/playtest/foo.mp4`）は証跡の正本ではない。GitHub attachment URL を必ず取得すること。
+
+> **URL 記録ルール（自動挿入のみ・手入力禁止）**: `artifact_url` には GitHub がコメント欄に**自動挿入した URL をそのまま**記録すること。URL の手入力・推測・整形は禁止。`artifact_url` と `artifact_sha256` は必ず同一ファイルに対応させること（別ファイルの URL を使い回さない）。
 
 ---
 
@@ -256,7 +305,8 @@ artifact:
   bytes: 1234567
   mime_type: "video/mp4"
   codec_profile: "H.264"
-tested_commit: "<git sha>"
+tested_commit: "<git sha または unknown>"
+tested_commit_unknown_reason: null  # tested_commit が unknown の場合は必須記述
 manual_operator: "<GitHub username>"
 executed_at: "<ISO 8601 datetime>"
 environment:
@@ -274,25 +324,54 @@ scenarios:
     review_points:
       - timestamp: "00:00:12"
         tolerance_window_sec: 1
-        output_frame_path: "artifacts/all-enemies-defeated-victory-exact.jpg"
-        frame_sha256: "<sha256hex>"
-        observed_result: "victory overlay and HUD result match"
+        frames:
+          minus_1s:
+            output_frame_path: "artifacts/all-enemies-defeated-victory-minus_1s.jpg"
+            frame_sha256: "<sha256hex>"
+            observed_result: "victory overlay visible (approaching)"
+          exact:
+            output_frame_path: "artifacts/all-enemies-defeated-victory-exact.jpg"
+            frame_sha256: "<sha256hex>"
+            observed_result: "victory overlay and HUD result match"
+          plus_1s:
+            output_frame_path: "artifacts/all-enemies-defeated-victory-plus_1s.jpg"
+            frame_sha256: "<sha256hex>"
+            observed_result: "victory overlay still visible (fading)"
   - id: "hp_zero_defeat"
     status: deferred
     deferred_reason: "reviewable timestamp/frame evidence not yet attached"
 ```
 ````
 
+### tested_commit の記録方法
+
+```yaml
+# ローカルビルドの場合: git rev-parse HEAD で取得
+tested_commit: "abc1234def5678..."
+tested_commit_unknown_reason: null
+
+# GitHub Pages / PR Preview の場合: commit SHA を取得できないときは以下を明示
+tested_commit: "unknown"
+tested_commit_unknown_reason: "GitHub Pages では実行時に commit SHA を取得できないため"
+```
+
+`tested_commit` を空欄のままにすることは禁止。commit SHA が不明な場合は必ず `"unknown"` + `tested_commit_unknown_reason` を記録する。
+
+Evidence Panel の `environment.commit` フィールドが `unknown` になった場合も同様に `tested_commit_unknown_reason` を明記する。
+
 ### 必須フィールド一覧
 
 | フィールド | 説明 |
 |-----------|------|
 | `schema_version` | `playtest_evidence_v1` 固定 |
-| `artifact.url` | GitHub attachment URL（ローカルパス禁止） |
+| `artifact.url` | GitHub attachment URL（ローカルパス禁止・自動挿入のみ） |
 | `artifact.sha256` | ダウンロード後に `sha256sum` で取得 |
 | `artifact.bytes` | ダウンロード後に `wc -c` で取得 |
-| `review_points` | scenarios ごとの timestamp + tolerance_window_sec |
+| `tested_commit` | git SHA または `"unknown"`（空欄禁止） |
+| `tested_commit_unknown_reason` | `tested_commit` が `"unknown"` の場合は必須記述 |
+| `review_points` | scenarios ごとの timestamp + tolerance_window_sec + frames（3 点） |
 | `tolerance_window_sec` | 1（ADR 0004 固定値） |
+| `frames.minus_1s` / `frames.exact` / `frames.plus_1s` | tolerance-based review の 3 フレームすべて必須 |
 
 ---
 
