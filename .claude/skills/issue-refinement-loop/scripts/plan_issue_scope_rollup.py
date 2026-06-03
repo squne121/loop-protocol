@@ -55,6 +55,7 @@ ACTION_AMEND_CURRENT_ISSUE = "amend_current_issue"
 ACTION_CREATE_PARENT_ROLLUP_ISSUE = "create_parent_rollup_issue"
 ACTION_KEEP_SEPARATE_WITH_REASON = "keep_separate_with_reason"
 ACTION_HUMAN_REVIEW_REQUIRED = "human_review_required"
+ACTION_PROCEED_WITH_COORDINATION = "proceed_with_coordination"
 
 # Regex for security-related keyword detection (word-boundary based).
 # "auth" and "token" are intentionally excluded to avoid false positives on
@@ -431,9 +432,10 @@ def _build_scope_context(
             escalation_required = False
     elif exact_same_files:
         # Exact same file set but no machine-readable anchors to prove disjointness.
-        # Cannot confirm independence -> fail-safe to human review.
+        # Disjointness cannot be proven, but this is not a genuine structural conflict
+        # (no shared anchors). Proceed with coordination instead of blocking.
         conflict_type = CONFLICT_UNCERTAIN
-        escalation_required = True
+        escalation_required = False
     else:
         # Partial path intersection without anchors — different file scopes overlap;
         # treat as disjoint to avoid false escalation.
@@ -567,7 +569,10 @@ def _suggested_action(
         if scope_context.get("escalation_required", False):
             return ACTION_HUMAN_REVIEW_REQUIRED
         if scope_context.get("conflict_type") == CONFLICT_UNCERTAIN:
-            return ACTION_HUMAN_REVIEW_REQUIRED
+            # uncertain = same file set, no machine-readable anchors to prove disjointness.
+            # This is NOT a genuine structural conflict (escalation_required=False).
+            # Proceed with coordination rather than blocking.
+            return ACTION_PROCEED_WITH_COORDINATION
 
     if confidence == CONFIDENCE_HIGH:
         if SIGNAL_SHARED_DEDUPE_KEY in signals:
