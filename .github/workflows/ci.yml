@@ -144,6 +144,7 @@ jobs:
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
       - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
+      - run: uv run --locked pytest .claude/skills/impl-review-loop/tests/ -q
       - run: uv run --locked pytest .claude/skills/review-issue/tests/ -q
       - run: uv run --locked pytest schemas/tests/ -q
       - name: Kill Switch smoke test
