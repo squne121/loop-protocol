@@ -77,8 +77,100 @@ FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
 FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE = "template_required_sections_unavailable"
 FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND = "unknown_issue_kind"
 
-# Allowlist for valid issue_kind values (Blocker 3: path traversal prevention)
-ISSUE_KIND_ALLOWLIST = frozenset({"implementation", "parent", "research"})
+# ---------------------------------------------------------------------------
+# ISSUE_KIND_POLICY_V1 SSOT loader
+# ---------------------------------------------------------------------------
+# Canonical source: docs/dev/github-ops.md ## ISSUE_KIND_POLICY_V1
+# Local ISSUE_KIND_ALLOWLIST definition is prohibited (SSOT single-source rule).
+# Consumer MUST call _get_issue_kind_allowlist() to get the allowlist.
+
+_ISSUE_KIND_POLICY_CACHE: "dict | None" = None
+
+
+def _load_issue_kind_policy(repo_root: "Path | None" = None) -> dict:
+    """Load ISSUE_KIND_POLICY_V1 from docs/dev/github-ops.md.
+
+    Returns a dict with keys:
+      - canonical_kinds: frozenset[str]
+      - aliases: dict[str, str]
+      - unknown_kind_policy: str  ("block")
+      - unknown_kind_reason_code: str
+
+    Falls back to hardcoded defaults if the SSOT cannot be loaded
+    (ensures fail-safe behavior in CI / test environments where the file
+    may be unavailable). The fallback matches the SSOT values at the time
+    of this implementation — a mismatch is caught by test_issue_kind_ssot.py.
+    """
+    global _ISSUE_KIND_POLICY_CACHE
+    if _ISSUE_KIND_POLICY_CACHE is not None:
+        return _ISSUE_KIND_POLICY_CACHE
+
+    _FALLBACK: dict = {
+        "canonical_kinds": frozenset({"implementation", "parent", "research"}),
+        "aliases": {"design": "research", "tracking": "parent"},
+        "unknown_kind_policy": "block",
+        "unknown_kind_reason_code": "unknown_issue_kind",
+    }
+
+    if repo_root is None:
+        repo_root = _find_repo_root()
+
+    ssot_path = repo_root / "docs" / "dev" / "github-ops.md"
+    if not ssot_path.exists():
+        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+        return _FALLBACK
+
+    if not _YAML_AVAILABLE:
+        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+        return _FALLBACK
+
+    try:
+        text = ssot_path.read_text(encoding="utf-8")
+        # Extract the ISSUE_KIND_POLICY_V1 YAML block
+        match = re.search(r"```yaml\s*\nISSUE_KIND_POLICY_V1:(.*?)```", text, re.DOTALL)
+        if not match:
+            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+            return _FALLBACK
+
+        yaml_content = "ISSUE_KIND_POLICY_V1:" + match.group(1)
+        parsed = _yaml_module.safe_load(yaml_content)
+        if not isinstance(parsed, dict) or "ISSUE_KIND_POLICY_V1" not in parsed:
+            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+            return _FALLBACK
+
+        policy = parsed["ISSUE_KIND_POLICY_V1"]
+        if not isinstance(policy, dict):
+            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+            return _FALLBACK
+
+        canonical_kinds = frozenset(policy.get("canonical_kinds") or [])
+        aliases_raw = policy.get("aliases") or {}
+        aliases = {str(k): str(v) for k, v in aliases_raw.items()} if isinstance(aliases_raw, dict) else {}
+        unknown_kind_policy = str(policy.get("unknown_kind_policy", "block"))
+        unknown_kind_reason_code = str(policy.get("unknown_kind_reason_code", "unknown_issue_kind"))
+
+        result: dict = {
+            "canonical_kinds": canonical_kinds,
+            "aliases": aliases,
+            "unknown_kind_policy": unknown_kind_policy,
+            "unknown_kind_reason_code": unknown_kind_reason_code,
+        }
+        _ISSUE_KIND_POLICY_CACHE = result
+        return result
+    except Exception:
+        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
+        return _FALLBACK
+
+
+def _get_issue_kind_allowlist() -> frozenset:
+    """Return the canonical_kinds frozenset from SSOT (docs/dev/github-ops.md)."""
+    return _load_issue_kind_policy()["canonical_kinds"]
+
+
+def _clear_issue_kind_policy_cache() -> None:
+    """Clear the SSOT cache (for testing only)."""
+    global _ISSUE_KIND_POLICY_CACHE
+    _ISSUE_KIND_POLICY_CACHE = None
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +743,7 @@ def resolve_issue_template(issue_kind: str, repo_root: Path) -> Path | None:
     Returns the Path to .github/ISSUE_TEMPLATE/<issue_kind>.yml,
     or None if the file does not exist or issue_kind is not in the allowlist.
     """
-    if issue_kind not in ISSUE_KIND_ALLOWLIST:
+    if issue_kind not in _get_issue_kind_allowlist():
         return None
 
     template_dir = (repo_root / ".github" / "ISSUE_TEMPLATE").resolve()
@@ -881,7 +973,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         if issue_kind and not is_parent_delivery_rollup:
             # Blocker 3: Validate issue_kind against allowlist before template lookup
-            if issue_kind not in ISSUE_KIND_ALLOWLIST:
+            if issue_kind not in _get_issue_kind_allowlist():
                 fail_closed_reasons.append(FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND)
             else:
                 # For known non-parent-delivery-rollup issue kinds: use template-derived required sections

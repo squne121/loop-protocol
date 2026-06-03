@@ -7,6 +7,34 @@
 > `docs/dev/milestone-ops.md` が正本である。本ドキュメントは `gh` CLI の共通規約を扱い、
 > Milestone 固有の判断基準・命名規則・AI 操作フローは `docs/dev/milestone-ops.md` を参照すること。
 
+## ISSUE_KIND_POLICY_V1
+
+Issue の `issue_kind` taxonomy の正本。`plan_refinement_loop.py` / `check_issue_contract.py` はここを SSOT として参照する。
+
+```yaml
+ISSUE_KIND_POLICY_V1:
+  schema_version: "1"
+  canonical_kinds:
+    - implementation
+    - research
+    - parent
+  aliases:
+    design: research      # deprecated alias — design は research として正規化する
+    tracking: parent      # label legacy alias — tracking は parent として正規化する
+  unknown_kind_policy: block  # allowlist / aliases に存在しない kind は silent fallback 禁止
+  unknown_kind_reason_code: unknown_issue_kind
+  consumer_requirements:
+    - plan_refinement_loop.py must not define a local ISSUE_KIND_ALLOWLIST
+    - check_issue_contract.py detect_issue_kind must not silently return "implementation" for unknown kinds
+```
+
+### SSOT 利用規約
+
+- **canonical_kinds**: template 検索・section 検証に使う確定 kind 集合。
+- **aliases**: 入力 kind がここにあれば対応する canonical kind に正規化して扱う。
+- **unknown_kind_policy: block**: canonical_kinds にも aliases にも存在しない kind を受け取った場合、`implementation` への silent fallback は禁止。`unknown_issue_kind` reason_code で fail_closed を返すか、呼び出し元に block を返す。
+- ローカル allowlist 定義を consumer script 内に持つことは禁止（SSOT 二重管理防止）。
+
 ## Body File Guidance（`gh issue edit` / `gh pr edit` / `gh issue comment` 共通）
 
 Issue / PR 本文の長文・多行更新時は **必ず body-file 経由** で操作する。inline `--body "..."` はクォート崩壊・HEREDOC 由来エスケープ混入を招くため使わない。
