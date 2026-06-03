@@ -12,6 +12,14 @@
 #   - target 複数: exit 2 + target_ambiguous (AC10)
 #   - target 解決不可: exit 2 + target_resolution_failed (AC11)
 #
+# API input mode (#594 AC4): gh api --input <file> の場合、
+#   payload を解析して Issue/PR body mutation か判定し、delta 検査を適用する。
+#   - --input - (stdin): fail-closed (AC19)
+#   - invalid JSON payload: fail-closed + api_payload_parse_failed (AC20)
+#   - body mutation でない場合: pass (AC5)
+#   - PATCH repos/{owner}/{repo}/issues/{n} + body key: delta check (AC17)
+#   - PATCH repos/{owner}/{repo}/pulls/{n} + body key: delta check (AC18)
+#
 # Exit codes:
 #   0 = allow (日本語比率 OK、またはガード対象外)
 #   2 = block (日本語比率不足 — blocking error として Claude Code に通知)
@@ -240,6 +248,210 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             uv run python3 "$VALIDATOR" --file "$BODY_FILE_EXTRACT" --threshold 0.1 2>&1 || true
             exit 2
         fi
+    fi
+
+    # gh api graphql --input の検査 (B1: GraphQL body mutation deny)
+    # SCOPE 外 note (B4): comment/review body mutation via GraphQL は scope 外
+    if [ -z "$BODY_FILE_EXTRACT" ] && echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
+        GRAPHQL_INPUT_RESULT="$(uv run python3 "$VALIDATOR" --parse-api-input "$COMMAND" 2>/dev/null || echo "API_INPUT_ERROR")"
+
+        if [ "$GRAPHQL_INPUT_RESULT" = "API_INPUT_STDIN" ]; then
+            echo "GUARD: gh api graphql --input - (stdin) は検証不可のため fail-closed でブロックします" >&2
+            echo "  target: unknown" >&2
+            echo "  changed_prose_blocks: unknown" >&2
+            echo "  failed_blocks: unknown" >&2
+            echo "  ratio_min: 0.000" >&2
+            exit 2
+        fi
+
+        if echo "$GRAPHQL_INPUT_RESULT" | grep -q "^API_INPUT_FILE:"; then
+            GRAPHQL_INPUT_FILE="${GRAPHQL_INPUT_RESULT#API_INPUT_FILE:}"
+            if [ ! -f "$GRAPHQL_INPUT_FILE" ]; then
+                echo "GUARD: gh api graphql --input file not found: ${GRAPHQL_INPUT_FILE} (fail-closed)" >&2
+                echo "  api_graphql_body_mutation_blocked" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            GRAPHQL_CLASS="$(uv run python3 "$VALIDATOR" --classify-graphql-mutation "$GRAPHQL_INPUT_FILE" 2>/dev/null || echo "GRAPHQL_PARSE_FAILED")"
+
+            if [ "$GRAPHQL_CLASS" = "GRAPHQL_BODY_MUTATION_BLOCKED" ]; then
+                echo "GUARD: gh api graphql body mutation はブロックします (api_graphql_body_mutation_blocked)" >&2
+                echo "  target: graphql" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            if [ "$GRAPHQL_CLASS" = "GRAPHQL_MUTATION_DENIED" ]; then
+                echo "GUARD: gh api graphql mutation は conservative deny します (api_graphql_mutation_denied)" >&2
+                echo "  target: graphql" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            if [ "$GRAPHQL_CLASS" = "GRAPHQL_PARSE_FAILED" ]; then
+                echo "GUARD: gh api graphql payload 解析失敗 (fail-closed)" >&2
+                echo "  api_graphql_body_mutation_blocked" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # GRAPHQL_NOT_MUTATION: query が mutation でない場合は pass
+            exit 0
+        fi
+        # API_INPUT_NONE: --input なし graphql → 通常 body 検査へ
+    fi
+
+    # gh api --input の検査 (AC4, AC10, AC17, AC18, AC19, AC20)
+    # --body-file が指定されていない場合のみ gh api --input を検査する
+    if [ -z "$BODY_FILE_EXTRACT" ] && echo "$COMMAND" | grep -qE 'gh.*api'; then
+        API_INPUT_RESULT="$(uv run python3 "$VALIDATOR" --parse-api-input "$COMMAND" 2>/dev/null || echo "API_INPUT_ERROR")"
+
+        if [ "$API_INPUT_RESULT" = "API_INPUT_STDIN" ]; then
+            # AC19: --input - (stdin) は fail-closed
+            echo "GUARD: gh api --input - (stdin) は検証不可のため fail-closed でブロックします" >&2
+            echo "  target: unknown" >&2
+            echo "  changed_prose_blocks: unknown" >&2
+            echo "  failed_blocks: unknown" >&2
+            echo "  ratio_min: 0.000" >&2
+            exit 2
+        fi
+
+        if echo "$API_INPUT_RESULT" | grep -q "^API_INPUT_FILE:"; then
+            API_INPUT_FILE="${API_INPUT_RESULT#API_INPUT_FILE:}"
+
+            if [ ! -f "$API_INPUT_FILE" ]; then
+                # ファイルが存在しない: fail-closed (AC20)
+                echo "GUARD: gh api --input file not found: ${API_INPUT_FILE} (fail-closed)" >&2
+                echo "  api_payload_parse_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # endpoint を解析して body mutation かどうかを判定 (AC4, AC5, AC17, AC18)
+            API_ENDPOINT="$(uv run python3 "$VALIDATOR" --extract-api-command-endpoint "$COMMAND" 2>/dev/null || echo "ENDPOINT_PARSE_FAILED")"
+
+            if [ "$API_ENDPOINT" = "ENDPOINT_PARSE_FAILED" ]; then
+                # endpoint 解析失敗: fail-closed (AC20)
+                echo "GUARD: gh api endpoint を解析できません (fail-closed)" >&2
+                echo "  api_payload_parse_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # HTTP method を確認して GET は non-mutation として pass (B3: #594 blocker fix)
+            API_METHOD="$(uv run python3 "$VALIDATOR" --extract-api-command-method "$COMMAND" 2>/dev/null || echo "METHOD_UNKNOWN")"
+
+            if [ "$API_METHOD" = "GET" ]; then
+                # GET は body mutation の可能性なし -> pass
+                exit 0
+            fi
+            # PATCH / POST / METHOD_UNKNOWN は body mutation チェックを継続する
+
+            # payload を分類 (AC17, AC18, AC20)
+            MUTATION_CLASS="$(uv run python3 "$VALIDATOR" --classify-api-mutation "$API_INPUT_FILE" --api-endpoint "$API_ENDPOINT" 2>/dev/null || echo "PAYLOAD_PARSE_FAILED")"
+
+            if [ "$MUTATION_CLASS" = "PAYLOAD_PARSE_FAILED" ]; then
+                # JSON parse 失敗: fail-closed (AC20)
+                echo "GUARD: gh api --input payload の JSON 解析失敗 (fail-closed)" >&2
+                echo "  api_payload_parse_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            if [ "$MUTATION_CLASS" = "NOT_BODY_MUTATION" ]; then
+                # AC5: body mutation でない場合は guard 対象外として pass
+                exit 0
+            fi
+
+            # BODY_MUTATION_ISSUE:<N> or BODY_MUTATION_PR:<N>
+            if echo "$MUTATION_CLASS" | grep -q "^BODY_MUTATION_ISSUE:"; then
+                API_TARGET_NUM="${MUTATION_CLASS#BODY_MUTATION_ISSUE:}"
+                API_TARGET_LABEL="issue #${API_TARGET_NUM}"
+                API_TARGET_TYPE="issue"
+            elif echo "$MUTATION_CLASS" | grep -q "^BODY_MUTATION_PR:"; then
+                API_TARGET_NUM="${MUTATION_CLASS#BODY_MUTATION_PR:}"
+                API_TARGET_LABEL="pr #${API_TARGET_NUM}"
+                API_TARGET_TYPE="pr"
+            else
+                # 不明な分類: fail-closed
+                echo "GUARD: gh api --input mutation 分類不明 (fail-closed): ${MUTATION_CLASS}" >&2
+                echo "  api_payload_parse_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            fi
+
+            # 既存 body を取得して delta 検査 (AC4, AC17, AC18)
+            OLD_BODY=""
+            if [ "$API_TARGET_TYPE" = "issue" ]; then
+                if ! OLD_BODY="$(gh issue view "$API_TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
+                    echo "GUARD: ${API_TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                    echo "  target_resolution_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
+            else
+                if ! OLD_BODY="$(gh pr view "$API_TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
+                    echo "GUARD: ${API_TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                    echo "  target_resolution_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
+            fi
+
+            # payload の body フィールドを抽出して delta 検査 (B2: 環境変数経由 fail-closed)
+            NEW_BODY="$(GUARD_API_INPUT_FILE="$API_INPUT_FILE" uv run python3 - <<'PY'
+import json, os, sys
+fp = os.environ.get("GUARD_API_INPUT_FILE", "")
+if not fp:
+    raise SystemExit(20)
+try:
+    with open(fp, encoding="utf-8") as f:
+        payload = json.load(f)
+except Exception:
+    raise SystemExit(20)
+body = payload.get("body")
+if not isinstance(body, str):
+    raise SystemExit(20)
+print(body, end="")
+PY
+)" || {
+                echo "GUARD: api_input_body_extract_failed (fail-closed)" >&2
+                echo "  api_payload_parse_failed" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
+            }
+
+            # delta mode で changed prose blocks のみ検査 (AC4, AC17, AC18)
+            if validate_delta_prose "$NEW_BODY" "$OLD_BODY" "${API_TARGET_LABEL}"; then
+                exit 0
+            else
+                exit 2
+            fi
+        fi
+        # API_INPUT_NONE: --input なし → 通常の body 検査へ
     fi
 
     # body が取れた場合に検証

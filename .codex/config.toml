@@ -1,6 +1,10 @@
 approval_policy = "on-request"
 default_permissions = "loop-protocol-rtk"
 
+# Project-local custom agents use default_permissions plus [permissions.*].
+# Repo-local hooks live in `.codex/hooks.json`; do not mix inline hooks here.
+# Known limitation: this is a fail-closed local guardrail, not a security boundary.
+
 [permissions.loop-protocol-rtk.filesystem]
 ":minimal" = "read"
 
@@ -13,6 +17,22 @@ default_permissions = "loop-protocol-rtk"
 enabled = true
 
 [permissions.loop-protocol-rtk.network.domains]
+"github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+
+[permissions.loop-protocol-readonly.filesystem]
+":minimal" = "read"
+
+[permissions.loop-protocol-readonly.filesystem.":workspace_roots"]
+"." = "read"
+"assets" = "read"
+"LICENSES" = "read"
+
+[permissions.loop-protocol-readonly.network]
+enabled = true
+
+[permissions.loop-protocol-readonly.network.domains]
 "github.com" = "allow"
 "api.github.com" = "allow"
 "objects.githubusercontent.com" = "allow"
