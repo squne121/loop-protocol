@@ -932,7 +932,7 @@ class TestScopeContextGeneralisation:
             f"Same-anchor conflict must escalate; got {cc['suggested_action']!r}"
         )
 
-        # Path 2: exact same file, no anchors -> uncertain -> escalate
+        # Path 2: exact same file, no anchors -> uncertain -> proceed_with_coordination (not escalate)
         plan_uncertain = _run(
             issues_exact_same_file_no_anchor_json,
             empty_prs_json,
@@ -944,8 +944,11 @@ class TestScopeContextGeneralisation:
         assert uc["scope_context"]["conflict_type"] == rollup.CONFLICT_UNCERTAIN, (
             f"Expected uncertain, got {uc['scope_context']['conflict_type']!r}"
         )
-        assert uc["suggested_action"] == rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
-            f"Uncertain conflict must escalate; got {uc['suggested_action']!r}"
+        assert uc["scope_context"]["escalation_required"] is False, (
+            "uncertain conflict_type must have escalation_required=False"
+        )
+        assert uc["suggested_action"] == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"Uncertain conflict must return proceed_with_coordination; got {uc['suggested_action']!r}"
         )
 
     def test_scope_context_and_ordering_constraint_are_additive_fields(
@@ -1058,4 +1061,253 @@ class TestScopeContextGeneralisation:
         assert sc["anchor_paths"], "Prefix overlap pair must be recorded in anchor_paths"
         assert any("->" in p for p in sc["anchor_paths"]), (
             f"Expected a parent->child pair in anchor_paths, got {sc['anchor_paths']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# #607: proceed_with_coordination replaces uncertain escalation
+# ---------------------------------------------------------------------------
+
+
+class TestProceedWithCoordination:
+    """#607: uncertain conflict type returns proceed_with_coordination, not human_review_required."""
+
+    def test_same_allowed_paths_no_anchor_should_proceed_with_coordination(
+        self, tmp_path: Path, empty_prs_json: str
+    ) -> None:
+        """GIVEN exact same Allowed Paths AND no machine-readable sub-file anchors,
+        WHEN plan is generated,
+        THEN suggested_action is proceed_with_coordination (not human_review_required).
+        """
+        schema_path = "- `.claude/skills/some-skill/SKILL.md`\n"
+        issues = [
+            {
+                "number": 1100,
+                "title": "実装: SKILL.md を更新する X",
+                "body": (
+                    "## Allowed Paths\n"
+                    + schema_path
+                    + "\n## Outcome\nSKILL.md を更新する。\n"
+                ),
+            },
+            {
+                "number": 1101,
+                "title": "実装: SKILL.md を更新する Y",
+                "body": (
+                    "## Allowed Paths\n"
+                    + schema_path
+                    + "\n## Outcome\nSKILL.md を別の観点で更新する。\n"
+                ),
+            },
+        ]
+        issues_path = tmp_path / "issues_same_paths_no_anchor.json"
+        issues_path.write_text(json.dumps(issues), encoding="utf-8")
+
+        plan = _run(str(issues_path), empty_prs_json, current_issue_number=1100)
+        candidates = [c for c in plan["candidates"] if c.get("number") == 1101]
+        assert candidates, "Expected #1101 to appear as a candidate of #1100"
+        c = candidates[0]
+
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_UNCERTAIN, (
+            f"Expected uncertain, got {c['scope_context']['conflict_type']!r}"
+        )
+        assert c["scope_context"]["escalation_required"] is False, (
+            "uncertain conflict must have escalation_required=False"
+        )
+        assert c["suggested_action"] == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"Expected proceed_with_coordination, got {c['suggested_action']!r}"
+        )
+
+    def test_permission_keyword_only_should_not_escalate(self) -> None:
+        """GIVEN body contains standalone 'permission' (SECURITY_RE match) AND
+        scope_context has conflict_type=uncertain AND escalation_required=False,
+        WHEN _suggested_action is called,
+        THEN action is proceed_with_coordination (not human_review_required).
+
+        This exercises the actual word-boundary `permission` keyword path (unlike
+        'permissionMode' which does NOT match \\bpermission\\b). The test verifies that
+        security_match_evidence containing "permission" does NOT drive escalation — only
+        escalation_required (genuine structural conflict) drives human_review_required.
+        This reproduces the #569/#597 false-positive: an unrelated Issue containing
+        standalone 'permission' caused human_escalation due to keyword+same-paths match.
+        """
+        # Directly test _suggested_action with a scope_context that includes the
+        # standalone 'permission' evidence but CONFLICT_UNCERTAIN (no shared anchors).
+        # CONFLICT_UNCERTAIN must be evaluated before escalation_required.
+        action = rollup._suggested_action(
+            item={},
+            signals=[],
+            confidence=rollup.CONFIDENCE_MEDIUM,
+            scope_context={
+                "conflict_type": rollup.CONFLICT_UNCERTAIN,
+                "security_match_evidence": ["permission"],
+                "escalation_required": False,
+            },
+        )
+        assert action == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"permission keyword in security_match_evidence must not escalate; "
+            f"got {action!r}"
+        )
+
+    def test_permission_keyword_word_boundary_triggers_security_match_evidence(
+        self, tmp_path: Path, empty_prs_json: str
+    ) -> None:
+        """Verify that standalone 'permission' (not 'permissionMode') is detected by
+        SECURITY_RE and recorded in security_match_evidence — but does NOT escalate.
+
+        Integration path: body with standalone 'permission' + same Allowed Paths + no
+        anchors -> CONFLICT_UNCERTAIN -> proceed_with_coordination.
+        """
+        shared_path = "- `.claude/skills/impl-review-loop/steps/preparation.md`\n"
+        issues = [
+            {
+                "number": 1200,
+                "title": "実装: preparation.md に proceed_with_coordination を追加する",
+                "body": (
+                    "## Allowed Paths\n"
+                    + shared_path
+                    + "\n## Outcome\nキーワードベース停止を廃止する。\n"
+                ),
+            },
+            {
+                "number": 1201,
+                "title": "実装: preparation.md の permission 設定を更新する",
+                "body": (
+                    "## Allowed Paths\n"
+                    + shared_path
+                    + "\n## Outcome\npermission チェックの挙動を変更する。\n"
+                ),
+            },
+        ]
+        issues_path = tmp_path / "issues_permission_keyword_integration.json"
+        issues_path.write_text(json.dumps(issues), encoding="utf-8")
+
+        plan = _run(str(issues_path), empty_prs_json, current_issue_number=1200)
+        candidates = [c for c in plan["candidates"] if c.get("number") == 1201]
+        assert candidates, "Expected #1201 to appear as a candidate of #1200"
+        c = candidates[0]
+
+        # The standalone 'permission' keyword IS detected by SECURITY_RE
+        assert "permission" in c.get("security_match_evidence", []), (
+            "Standalone 'permission' must be recorded in security_match_evidence for audit"
+        )
+        # But it must NOT cause escalation — CONFLICT_UNCERTAIN -> proceed_with_coordination
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_UNCERTAIN, (
+            f"Expected uncertain (same paths, no anchors), got {c['scope_context']['conflict_type']!r}"
+        )
+        assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"permission keyword alone must not escalate; got {c['suggested_action']!r}"
+        )
+        assert c["suggested_action"] == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"Expected proceed_with_coordination, got {c['suggested_action']!r}"
+        )
+
+    def test_same_anchor_conflicting_op_should_escalate(
+        self, tmp_path: Path, empty_prs_json: str
+    ) -> None:
+        """GIVEN both issues target the same sub-file anchor,
+        WHEN plan is generated,
+        THEN suggested_action is human_review_required (genuine structural conflict).
+        """
+        shared_path = "- `.claude/skills/some-skill/schema/contract.schema.json`\n"
+        issues = [
+            {
+                "number": 1300,
+                "title": "実装: schema の `/required` に field A を追加する",
+                "body": (
+                    "## Allowed Paths\n"
+                    + shared_path
+                    + "\n## Outcome\n`/required` に field A を追加する。\n"
+                ),
+            },
+            {
+                "number": 1301,
+                "title": "実装: schema の `/required` から field B を削除する",
+                "body": (
+                    "## Allowed Paths\n"
+                    + shared_path
+                    + "\n## Outcome\n`/required` から field B を削除する。\n"
+                ),
+            },
+        ]
+        issues_path = tmp_path / "issues_same_anchor_escalate.json"
+        issues_path.write_text(json.dumps(issues), encoding="utf-8")
+
+        plan = _run(str(issues_path), empty_prs_json, current_issue_number=1300)
+        candidates = [c for c in plan["candidates"] if c.get("number") == 1301]
+        assert candidates, "Expected #1301 to appear as a candidate of #1300"
+        c = candidates[0]
+
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_SAME_ANCHOR_CONFLICTING_OP, (
+            f"Expected same_anchor_conflicting_operation, got {c['scope_context']['conflict_type']!r}"
+        )
+        assert c["scope_context"]["escalation_required"] is True
+        assert c["suggested_action"] == rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"Genuine structural conflict must escalate; got {c['suggested_action']!r}"
+        )
+
+    def test_prefix_overlap_uncertain_should_not_escalate(
+        self, tmp_path: Path, empty_prs_json: str
+    ) -> None:
+        """GIVEN prefix-only path overlap (no exact intersection) AND no shared anchors,
+        WHEN plan is generated,
+        THEN conflict_type is prefix_overlap_uncertain AND suggested_action is NOT human_review_required.
+        """
+        issues = [
+            {
+                "number": 1400,
+                "title": "実装: skill dir を更新する",
+                "body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/some-skill`\n"
+                    "\n## Outcome\nディレクトリ全体を更新する。\n"
+                ),
+            },
+            {
+                "number": 1401,
+                "title": "実装: skill の README を更新する",
+                "body": (
+                    "## Allowed Paths\n"
+                    "- `.claude/skills/some-skill/README.md`\n"
+                    "\n## Outcome\nREADME.md を更新する。\n"
+                ),
+            },
+        ]
+        issues_path = tmp_path / "issues_prefix_overlap.json"
+        issues_path.write_text(json.dumps(issues), encoding="utf-8")
+
+        plan = _run(str(issues_path), empty_prs_json, current_issue_number=1400)
+        candidates = [c for c in plan["candidates"] if c.get("number") == 1401]
+        assert candidates, "Expected #1401 to appear as a candidate of #1400"
+        c = candidates[0]
+
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_PREFIX_OVERLAP_UNCERTAIN, (
+            f"Expected prefix_overlap_uncertain, got {c['scope_context']['conflict_type']!r}"
+        )
+        assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
+            f"Prefix overlap without shared anchors must not escalate; got {c['suggested_action']!r}"
+        )
+
+    def test_uncertain_conflict_takes_precedence_over_stale_escalation_flag(self) -> None:
+        """GIVEN conflict_type is CONFLICT_UNCERTAIN AND escalation_required is True
+        (stale / erroneously-set flag),
+        WHEN _suggested_action is called,
+        THEN action is proceed_with_coordination — CONFLICT_UNCERTAIN is evaluated first.
+
+        This guards against a regression where escalation_required=True could override
+        the CONFLICT_UNCERTAIN routing even though CONFLICT_UNCERTAIN is definitionally
+        NOT a genuine structural conflict.
+        """
+        action = rollup._suggested_action(
+            item={},
+            signals=[],
+            confidence=rollup.CONFIDENCE_HIGH,
+            scope_context={
+                "conflict_type": rollup.CONFLICT_UNCERTAIN,
+                "escalation_required": True,
+            },
+        )
+        assert action == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"CONFLICT_UNCERTAIN must take precedence over stale escalation_required=True; "
+            f"got {action!r}"
         )
