@@ -167,16 +167,16 @@ LOOP_POLICY_V1:
 
 ### Output Format
 
-出力は HTML comment + fenced YAML の 2 行セットで構成する:
+出力は HTML comment と fenced YAML block の 2 要素で構成する:
 
-```
+````
 <!-- LOOP_HANDOFF_RESULT_V1 -->
 ```yaml
 LOOP_HANDOFF_RESULT_V1:
   status: impl_ready | human_judgment_required | blocked
   ...
 ```
-```
+````
 
 `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment が marker の開始行を示す。  
 fenced YAML ブロックが marker の内容を保持する。
@@ -197,9 +197,10 @@ LOOP_HANDOFF_RESULT_V1:
     title_prefix_ready: bool
     phase_label_ready: bool
   auto_fixes:
+    result: auto_fixed | human_judgment_required | blocked
     required:
       - kind: template_hygiene | metadata_hygiene | known_marker_fix | stale_state_label_cleanup | contract_snapshot_materialization
-        executor: string           # SubAgent ID
+        executor: implementation-worker
         result: applied | skipped | failed
         evidence:
           before: string
@@ -226,7 +227,7 @@ LOOP_HANDOFF_RESULT_V1:
 6. `blockers` が空
 7. `routing_action == run_impl_review_loop`
 
-**Title prefix / phase label 不在のみを理由に `impl_ready` を拒否してはならない** — deterministic fixer SubAgent が auto-fix evidence を添付していれば `impl_ready` は許可される。
+**Title prefix / phase label 不在のみを理由に `impl_ready` を拒否してはならない** — implementation-worker (repair mode) が auto-fix evidence を添付していれば `impl_ready` は許可される。
 
 `auto_fixes.required` / `auto_fixes.skipped` の各エントリは `kind` / `executor` / `result` / `evidence`（`before` / `after` / `comment_url`）を含む。`result: skipped` または `evidence` 欠如 → `impl_ready` 禁止。
 
@@ -248,15 +249,15 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 
 ### Hygiene Delegation Contract（routing 定義のみ）
 
-以下の 5 種 hygiene は deterministic fixer SubAgent に委譲する（SubAgent 実装自体は Out of Scope）:
+以下の 5 種 hygiene は implementation-worker (repair mode) に委譲する:
 
 | kind | 委譲先 | 委譲条件 |
 |---|---|---|
-| `template_hygiene` | deterministic-fixer SubAgent | 既定テンプレートセクション欠落 |
-| `metadata_hygiene` | deterministic-fixer SubAgent | title prefix / phase label 不在 |
-| `known_marker_fix` | deterministic-fixer SubAgent | 既知の壊れた marker 形式を検出 |
-| `stale_state_label_cleanup` | deterministic-fixer SubAgent | stale `state/blocked` / `state/queued` を検出 |
-| `contract_snapshot_materialization` | deterministic-fixer SubAgent | contract snapshot comment 未作成 |
+| `template_hygiene` | implementation-worker (repair mode) | 既定テンプレートセクション欠落 |
+| `metadata_hygiene` | implementation-worker (repair mode) | title prefix / phase label 不在 |
+| `known_marker_fix` | implementation-worker (repair mode) | 既知の壊れた marker 形式を検出 |
+| `stale_state_label_cleanup` | implementation-worker (repair mode) | stale `state/blocked` / `state/queued` を検出 |
+| `contract_snapshot_materialization` | implementation-worker (repair mode) | contract snapshot comment 未作成 |
 
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 

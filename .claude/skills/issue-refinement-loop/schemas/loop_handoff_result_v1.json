@@ -4,112 +4,149 @@
   "title": "LOOP_HANDOFF_RESULT_V1",
   "description": "Terminal output of issue-refinement-loop on approved termination. SSOT: references/termination-policy.md",
   "type": "object",
-  "required": [
-    "status",
-    "routing_action",
-    "contract_review",
-    "metadata",
-    "auto_fixes",
-    "blockers",
-    "permissions",
-    "generated_at"
-  ],
+  "required": ["LOOP_HANDOFF_RESULT_V1"],
   "additionalProperties": false,
   "properties": {
-    "status": {
-      "type": "string",
-      "enum": ["impl_ready", "human_judgment_required", "blocked"]
-    },
-    "routing_action": {
-      "type": "string",
-      "enum": ["run_impl_review_loop", "ask_human", "blocked"]
-    },
-    "contract_review": {
+    "LOOP_HANDOFF_RESULT_V1": {
       "type": "object",
-      "required": ["status", "gate_result", "latest_comment_url", "generated_at", "body_sha256"],
+      "required": [
+        "status",
+        "routing_action",
+        "contract_review",
+        "metadata",
+        "auto_fixes",
+        "blockers",
+        "permissions",
+        "generated_at"
+      ],
       "additionalProperties": false,
       "properties": {
         "status": {
           "type": "string",
-          "enum": ["go", "blocked"],
-          "description": "Mirrors CONTRACT_REVIEW_RESULT_V1.status. Does not collide with top-level LOOP_HANDOFF_RESULT_V1.status."
+          "enum": ["impl_ready", "human_judgment_required", "blocked"]
         },
-        "gate_result": {
+        "routing_action": {
           "type": "string",
-          "enum": [
-            "fresh_go",
-            "missing_go",
-            "stale_go",
-            "invalidated_by_request_changes",
-            "blocked"
-          ]
+          "enum": ["run_impl_review_loop", "ask_human", "blocked"]
         },
-        "latest_comment_url": {
-          "type": "string"
+        "contract_review": {
+          "type": "object",
+          "required": ["status", "gate_result", "latest_comment_url", "generated_at", "body_sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["go", "blocked"],
+              "description": "Mirrors CONTRACT_REVIEW_RESULT_V1.status. Does not collide with top-level LOOP_HANDOFF_RESULT_V1.status."
+            },
+            "gate_result": {
+              "type": "string",
+              "enum": [
+                "fresh_go",
+                "missing_go",
+                "stale_go",
+                "invalidated_by_request_changes",
+                "blocked"
+              ]
+            },
+            "latest_comment_url": {
+              "type": "string"
+            },
+            "generated_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "body_sha256": {
+              "type": "string"
+            }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "required": ["title_prefix_ready", "phase_label_ready"],
+          "additionalProperties": false,
+          "properties": {
+            "title_prefix_ready": {
+              "type": "boolean"
+            },
+            "phase_label_ready": {
+              "type": "boolean"
+            }
+          }
+        },
+        "auto_fixes": {
+          "type": "object",
+          "required": ["result", "required", "skipped"],
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "type": "string",
+              "enum": ["auto_fixed", "human_judgment_required", "blocked"]
+            },
+            "required": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/auto_fix_item" }
+            },
+            "skipped": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/auto_fix_item" }
+            }
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "description"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "permissions": {
+          "type": "object",
+          "required": ["unavailable"],
+          "additionalProperties": false,
+          "properties": {
+            "unavailable": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
         },
         "generated_at": {
           "type": "string",
           "format": "date-time"
-        },
-        "body_sha256": {
-          "type": "string"
         }
-      }
-    },
-    "metadata": {
-      "type": "object",
-      "required": ["title_prefix_ready", "phase_label_ready"],
-      "additionalProperties": false,
-      "properties": {
-        "title_prefix_ready": {
-          "type": "boolean"
-        },
-        "phase_label_ready": {
-          "type": "boolean"
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "impl_ready" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "routing_action": { "const": "run_impl_review_loop" },
+              "contract_review": {
+                "properties": {
+                  "status": { "const": "go" },
+                  "gate_result": { "const": "fresh_go" }
+                }
+              },
+              "blockers": { "maxItems": 0 },
+              "permissions": {
+                "properties": { "unavailable": { "maxItems": 0 } }
+              },
+              "auto_fixes": {
+                "properties": { "skipped": { "maxItems": 0 } }
+              }
+            }
+          }
         }
-      }
-    },
-    "auto_fixes": {
-      "type": "object",
-      "required": ["required", "skipped"],
-      "additionalProperties": false,
-      "properties": {
-        "required": {
-          "type": "array",
-          "items": { "$ref": "#/definitions/auto_fix_item" }
-        },
-        "skipped": {
-          "type": "array",
-          "items": { "$ref": "#/definitions/auto_fix_item" }
-        }
-      }
-    },
-    "blockers": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["kind", "description"],
-        "additionalProperties": false,
-        "properties": {
-          "kind": { "type": "string" },
-          "description": { "type": "string" }
-        }
-      }
-    },
-    "permissions": {
-      "type": "object",
-      "required": ["unavailable"],
-      "additionalProperties": false,
-      "properties": {
-        "unavailable": {
-          "type": "array",
-          "items": { "type": "string" }
-        }
-      }
-    },
-    "generated_at": {
-      "type": "string",
-      "format": "date-time"
+      ]
     }
   },
   "definitions": {
@@ -128,7 +165,10 @@
             "contract_snapshot_materialization"
           ]
         },
-        "executor": { "type": "string" },
+        "executor": {
+          "type": "string",
+          "enum": ["implementation-worker"]
+        },
         "result": {
           "type": "string",
           "enum": ["applied", "skipped", "failed"]
