@@ -1,275 +1,326 @@
 ---
 doc_id: manual-playtest-runbook
 status: active
-issue: "#561"
+issue: "#577"
 parent_issue: "#543"
 required_os: "WSL2 + Ubuntu"
-date: "2026-06-02"
+date: "2026-06-04"
+adr: "docs/adr/0004-video-evidence-policy.md"
 ---
 
-# Manual Playtest Runbook — WSL2/Ubuntu
+# 手動プレイテスト Runbook — WSL2/Ubuntu + Windows Chrome
 
-## Online Playtest URLs (GitHub Pages)
+## 目的
 
-You can run a manual playtest directly from a browser without any local setup.
+このドキュメントは、WSL2/Ubuntu + Windows Chrome 環境で手動プレイテストを実施し、ADR 0004 に準拠した動画証跡を GitHub へ提出するまでの操作手順を定める。
 
-### Main (shared) URL
+証跡の正本は **GitHub attachment URL + SHA256 + bytes** である。ローカルファイルパス（`docs/playtest/*.mp4` 等）は証跡の正本とならない。
 
-After a commit is merged to `main`, the latest build is published to:
+---
+
+## 前提環境
+
+| 項目 | 要件 |
+|------|------|
+| OS | WSL2 + Ubuntu（必須） |
+| ブラウザ | Windows Chrome（主経路） |
+| Node | v20 以上（v22 推奨） |
+| pnpm | v9–v10（Node 20）または v11+（Node 22+） |
+| ffmpeg | フレーム抽出に必要（`ffmpeg -version` で確認） |
+
+オプション（WSLg 経由）: Linux GUI ブラウザ（Ubuntu 上の Firefox 等）
+
+---
+
+## 対象 URL
+
+### main（共有）URL
+
+`main` へのコミットがマージされると、最新ビルドが以下に公開される:
 
 ```
 https://squne121.github.io/loop-protocol/
 ```
 
-### PR Preview URL
+### PR プレビュー URL
 
-When a pull request is opened or updated, a preview is deployed to:
+PR が作成または更新されると、プレビューが以下にデプロイされる:
 
 ```
 https://squne121.github.io/loop-protocol/pr-<PR番号>/
 ```
 
-Replace `<PR番号>` with the numeric PR number. For example, PR #123 becomes:
-`https://squne121.github.io/loop-protocol/pr-123/`
+`<PR番号>` を実際の数字に置き換える（例: PR #123 → `/pr-123/`）。プレビュー URL は PR のコメントに自動投稿される。
 
-The preview URL is also posted as a comment on the PR automatically.
+> PR クローズ後、クリーンアップワークフロー完了後にプレビュー URL は 404 になる。
+> フォーク PR ではプレビューデプロイは生成されない。
 
-> **Note:** The PR preview is automatically removed when the PR is closed.
-> After the cleanup workflow completes successfully, the preview URL (`/pr-<PR番号>/`) will return 404.
+### GitHub Pages セットアップ（初回のみ）
 
-> **Note:** PR preview is only generated for same-repository PRs. PRs opened from
-> forks do not receive a preview deployment.
-
-### Prerequisites (first-time setup by repo maintainer)
-
-GitHub Pages must be configured to serve from the `gh-pages` branch:
-`Settings -> Pages -> Source -> Deploy from a branch -> gh-pages (root)`
-
-This is a one-time manual step by the repository owner. After setup, all deploys are automated.
-
-### Stale Artifact Inspection (gh-pages branch maintenance)
-
-The main deploy workflow replaces only the root application files while preserving `pr-*` preview
-directories. If stale files accumulate in the `gh-pages` branch root (e.g., from a previous deploy
-strategy), clean them up manually:
-
-```bash
-# Clone gh-pages branch locally
-git clone --branch gh-pages --single-branch https://github.com/squne121/loop-protocol.git gh-pages-work
-cd gh-pages-work
-
-# Inspect root contents (should only contain current Vite output + pr-* dirs)
-ls -la
-
-# If unexpected files exist (old hashed assets, orphaned HTML files, etc.),
-# remove them and push:
-git rm <stale-file>
-git commit -m "chore: remove stale artifact from gh-pages root"
-git push origin gh-pages
-```
-
-Automated deploys via the `deploy-main` job use `rsync --delete` semantics for the root,
-so future deploys will not re-introduce previously removed files.
+`Settings → Pages → Source → Deploy from a branch → gh-pages (root)` を設定する（リポジトリオーナーによる一回限りの手動手順）。
 
 ---
 
-This runbook guides a human tester through a manual playtest session on WSL2/Ubuntu.
-Follow steps in order. If any step fails, refer to the [Troubleshooting](#common-failure-cases-and-remedies) section.
+## 実行前チェック
 
-## Required OS/Runtime
-
-- **Required OS/runtime: WSL2 + Ubuntu** (primary path)
-- Node: v20 or later (v22+ recommended)
-- pnpm: v9–v10 (compatible with Node 20) or v11+ (with Node 22+)
-
-Optional (WSLg path): Linux GUI browser (e.g., Firefox on Ubuntu with WSLg)
-
----
-
-## Step 1: Environment Preflight
-
-Run the preflight script to verify your environment before starting:
+プレイテスト開始前に環境確認スクリプトを実行する:
 
 ```bash
 node scripts/check-manual-playtest-env.mjs
 ```
 
-Expected output: `[ok] All checks passed.` with exit code 0.
+期待される出力: `[ok] All checks passed.`（終了コード 0）
 
-If the exit code is 1 (fail) or 2 (unsupported), follow the remedies in the [Troubleshooting](#common-failure-cases-and-remedies) section before continuing.
+終了コード 1（失敗）または 2（非対応環境）の場合は「トラブルシュート」セクションを参照する。
 
 ---
 
-## Step 2: Install Dependencies
+## Evidence Panel で環境情報を取得する
+
+Evidence Panel は `?playtest_evidence=1` クエリパラメータを付けることで有効化される。
+
+```
+# main URL の例
+https://squne121.github.io/loop-protocol/?playtest_evidence=1
+
+# PR プレビューの例（PR #123）
+https://squne121.github.io/loop-protocol/pr-123/?playtest_evidence=1
+
+# ローカルプレビューの例
+http://localhost:4173/?playtest_evidence=1
+```
+
+クエリパラメータなしでアクセスした場合、Evidence Panel は表示されない（opt-in 設計）。
+
+### 操作手順
+
+1. 上記 URL をブラウザで開く。
+2. 画面右上に **Playtest Evidence Panel** が表示される。
+3. YAML データがテキストエリアに自動生成される。
+
+### Copy YAML to Clipboard
+
+- **Copy YAML to Clipboard** ボタンをクリックすると YAML がクリップボードにコピーされる。
+- ボタンが「Copied!」に変わったらコピー成功。
+- Clipboard API が利用できない場合は「Use textarea to copy manually」と表示される。その場合はテキストエリアを手動で選択してコピーする。
+
+### Download YAML
+
+- **Download YAML** ボタンをクリックすると `loop-protocol-playtest-evidence-<ISO8601>.yaml` ファイルがダウンロードされる。
+
+### Chrome でブラウザバージョンが `unknown` になる場合
+
+`navigator.userAgentData.getHighEntropyValues()` は experimental API であり、Chrome でも取得できない場合がある。`unknown` となった場合は、以下を手動で記録し `version_source` と `unknown_reason` を明示する（無条件 pass は禁止）:
+
+```yaml
+environment:
+  browser: "Chrome 125.0.0.0"      # chrome://version で確認
+  version_source: "manual_input"   # automatic / manual_input / unknown
+  unknown_reason: null             # version_source が unknown の場合は必須記述
+```
+
+### ローカル環境メタデータ採取（CLI）
+
+GitHub Pages を使わずローカルでビルドした場合は、CLI スクリプトで環境メタデータを採取できる:
 
 ```bash
-pnpm install
-```
+# YAML 出力（デフォルト）
+node scripts/collect-playtest-env.mjs
 
-This installs all Node dependencies. Skip if `node_modules/` is already up to date.
+# JSON 出力
+node scripts/collect-playtest-env.mjs --json
+```
 
 ---
 
-## Step 3: Build the Production Bundle
+## 動画証跡を録画する
+
+### Windows（推奨）
+
+- **Xbox Game Bar** (`Win + G`) → キャプチャ → 録画開始（ブラウザウィンドウを選択）
+- **OBS Studio**: ウィンドウキャプチャソースでブラウザを指定して録画
+
+### WSLg（オプション）
 
 ```bash
-pnpm build
+# recordmydesktop 等（WSLg が利用可能な場合のみ）
+recordmydesktop --output playtest.ogv
 ```
 
-This runs TypeScript compilation followed by Vite build. The output is placed in `dist/`.
+### 動画の要件
+
+- フォーマット: **H.264 エンコードの mp4**（`video/mp4`）を推奨
+- サイズ: **10,000,000 bytes 以下**（プロジェクトポリシー）
+- ファイル名例: `playtest-577-2026-06-04-victory.mp4`
 
 ---
 
-## Step 4: Start the Preview Server
+## GitHub コメントへ動画を添付する
+
+ローカルに保存した動画ファイルを **GitHub の Issue または PR コメント欄にドラッグ＆ドロップ**（またはファイル選択ダイアログ）で添付する。
+
+添付が完了すると、コメント欄に以下のような URL が挿入される:
+
+```
+https://github.com/user-attachments/assets/<UUID>/playtest-577-2026-06-04-victory.mp4
+```
+
+この URL が証跡の正本ロケーターとなる。コメントを投稿する前に URL が挿入されたことを確認する。
+
+> **重要**: ローカルパス（例: `docs/playtest/foo.mp4`）は証跡の正本ではない。GitHub attachment URL を必ず取得すること。
+
+---
+
+## 添付 URL・bytes・SHA256 を検証する
+
+GitHub attachment URL を取得した後、以下のコマンドで内容を検証する:
 
 ```bash
-pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort
+artifact_url="https://github.com/user-attachments/assets/<UUID>/playtest.mp4"
+
+# ダウンロード
+curl -L --fail --output evidence.mp4 "$artifact_url"
+
+# SHA256 ハッシュ取得
+actual_sha256="$(sha256sum evidence.mp4 | awk '{print $1}')"
+
+# バイト数取得
+actual_bytes="$(wc -c < evidence.mp4 | tr -d ' ')"
+
+echo "sha256: $actual_sha256"
+echo "bytes:  $actual_bytes"
 ```
 
-- `--host 127.0.0.1`: Binds to localhost only (WSL2 loopback, accessible from Windows browser via `localhost`)
-- `--port 4173`: Fixed port for playtest
-- `--strictPort`: Fail immediately if port 4173 is already in use (prevents silent port shifting)
+取得した値を証跡 YAML の `artifact.sha256` と `artifact.bytes` に記録する。
 
-Expected output:
-
-```
-  ➜  Local:   http://127.0.0.1:4173/
-```
-
-Keep this terminal open during the entire playtest session.
-
-### Expected Ports and Host Binding
-
-| Binding | Port | Protocol |
-|---------|------|----------|
-| `127.0.0.1` (primary) | `4173` | HTTP |
-
-The `--strictPort` flag is mandatory. If the server starts on a different port, the test is invalid.
-
----
-
-## Step 5: Access in Browser
-
-### Primary Browser Route (Windows Browser → `http://localhost:4173`)
-
-Open a browser on your **Windows host** (Edge, Chrome, Firefox) and navigate to:
-
-```
-http://localhost:4173
-```
-
-WSL2 automatically bridges `localhost` from Windows to the WSL2 loopback interface. No additional configuration is required.
-
-This is the **primary browser route** for manual playtest.
-
-
-## Base Path Revalidation URLs
-
-Use these URLs when validating the Evidence Panel after the base path fix.
-
-- Local preview: `http://localhost:4173/?playtest_evidence=1`
-- GitHub Pages main: `https://squne121.github.io/loop-protocol/?playtest_evidence=1`
-- GitHub Pages PR preview: `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1`
-
-Validation split:
-
-- `http://localhost:4173/?playtest_evidence=1` confirms the production bundle still works with the default `/` base during local `pnpm build && pnpm preview`.
-- `https://squne121.github.io/loop-protocol/?playtest_evidence=1` confirms the hosted main build resolved `/loop-protocol/` correctly.
-- `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1` confirms the hosted PR preview build resolved `/loop-protocol/pr-<PR番号>/` correctly.
-
-Base path 修正だけでは #571 の deferred verification 完了を意味しない。Pages source / publish trigger fault は別問題として切り分け、hosted runtime が更新されない場合は follow-up issue で扱う。
-
-### Optional Browser Route (WSLg / Linux Browser)
-
-If your system has WSLg (Windows Subsystem for Linux GUI) installed, you can use a Linux browser (e.g., Firefox, Chromium) running inside WSL2:
+動画収集時のハッシュ生成（ローカルファイルから）:
 
 ```bash
-# Example: launch Firefox from Ubuntu terminal (WSLg required)
-firefox http://localhost:4173 &
+sha256sum <video_file>
+# macOS の場合
+shasum -a 256 <video_file>
 ```
 
-This route is **optional**. If WSLg is not available, use the Windows browser route above.
+---
+
+## タイムスタンプを記録する
+
+確認したいシーンのタイムスタンプ（`HH:MM:SS` 形式）を記録する。
+
+例:
+- `00:00:12` — 全敵撃破 → ビクトリー表示
+
+タイムスタンプは証跡 YAML の `scenarios[].review_points[].timestamp` に記録し、ffmpeg フレーム抽出の基準点として使用する。
 
 ---
 
-## Step 6: Execute Manual Checklist
+## ffmpeg で確認フレームを抽出する
 
-With the game loaded in your browser, verify the items in `docs/playtest/m2-combat-mvp.md` under **Manual Checklist**:
-
-1. WASD movement — player moves in all 4 directions
-2. Mouse click fires projectiles toward cursor
-3. Enemy spawns within a few seconds of sortie start
-4. Enemy moves toward the player
-5. Projectile hits reduce enemy HP / enemy is defeated
-6. Contact damage reduces player HP
-7. Victory: all enemies defeated → victory status shown in HUD
-8. Defeat (timeout): 30s elapse → defeat status shown
-9. Defeat (HP): player HP = 0 → defeat status shown
-
-Mark each checklist item with your observation result.
-
----
-
-## Step 7: Screenshot and Video Evidence Capture
-
-After completing the manual checklist, capture evidence for the playtest record.
-
-### Screenshot (Windows)
-
-- **Windows Snipping Tool**: Press `Win + Shift + S` to capture a region screenshot.
-- **Full-screen screenshot**: Press `PrtScn` or `Win + PrtScn` (saved to `Pictures/Screenshots`).
-- **Browser DevTools**: Right-click on the game canvas → Inspect → Console → `document.querySelector('canvas').toDataURL()` for inline base64 screenshot.
-
-### Screenshot (WSLg / Linux)
+ADR 0004 の ffmpeg フレーム抽出コントラクトに従い、指定 timestamp の前後 1 秒（`tolerance_window_sec: 1`）を抽出する:
 
 ```bash
-# gnome-screenshot (if available)
-gnome-screenshot -a -f ~/playtest-screenshot.png
+timestamp="00:00:12"
+video_path="evidence.mp4"
 
-# scrot (if available)
-scrot -s ~/playtest-screenshot.png
+# timestamp の前後 1 秒を計算
+timestamp_minus_1s="00:00:11"
+timestamp_plus_1s="00:00:13"
+
+# 3 点抽出
+ffmpeg -hide_banner -loglevel error -ss "$timestamp_minus_1s" -i "$video_path" -frames:v 1 -q:v 2 "frame_minus_1s.jpg"
+ffmpeg -hide_banner -loglevel error -ss "$timestamp"          -i "$video_path" -frames:v 1 -q:v 2 "frame_exact.jpg"
+ffmpeg -hide_banner -loglevel error -ss "$timestamp_plus_1s"  -i "$video_path" -frames:v 1 -q:v 2 "frame_plus_1s.jpg"
+
+# フレームの SHA256 確認
+sha256sum frame_minus_1s.jpg frame_exact.jpg frame_plus_1s.jpg
 ```
 
-### Video Evidence
+> ffmpeg の `-ss` は入力シークのため exact frame を常に保証しない。そのため 3 点抽出による tolerance-based review を標準とする（ADR 0004 Policy 4）。
 
-- **Windows**: Use Xbox Game Bar (`Win + G`) → Capture → Start recording while the game is open in the browser.
-- **OBS Studio**: Open OBS, add a Window Capture source pointing to your browser, and record a short clip.
-- **WSLg**: Use `recordmydesktop` or similar tools if available.
-
-### Saving Evidence
-
-Save screenshots and videos with filenames that include the date and issue number, for example:
-
-```
-playtest-561-2026-06-02-movement.png
-playtest-561-2026-06-02-victory.mp4
-```
-
-Add these files to `docs/playtest/` or attach them to the related GitHub issue/PR comment.
+エージェントによる動画全体の自律スキャン・解析は禁止。timestamp は人間が明示的に指定する。
 
 ---
 
-## Step 8: Record Results in m2-combat-mvp.md
+## 提出コメントの YAML schema
 
-Update `docs/playtest/m2-combat-mvp.md` with your playtest results:
+GitHub コメントに以下の形式で証跡 YAML を貼り付ける（`schema_version: playtest_evidence_v1`）:
 
-1. Check off completed items in the **Manual Checklist** section.
-2. Add a new entry under `observed.human_playtest` (YAML block) with:
-   - `tester`: your GitHub handle
-   - `date`: ISO date
-   - `platform`: `WSL2 + Ubuntu`
-   - `browser`: browser name and version
-   - `result`: `pass` / `partial` / `fail`
-   - `notes`: any observations or issues found
-3. Attach screenshot/video filenames or links to the same PR comment.
+````markdown
+## Playtest Evidence
+
+```yaml
+schema_version: "playtest_evidence_v1"
+artifact:
+  url: "https://github.com/user-attachments/assets/<UUID>/playtest.mp4"
+  sha256: "<sha256hex>"
+  bytes: 1234567
+  mime_type: "video/mp4"
+  codec_profile: "H.264"
+tested_commit: "<git sha>"
+manual_operator: "<GitHub username>"
+executed_at: "<ISO 8601 datetime>"
+environment:
+  browser: "Chrome 125.0.0.0"
+  version_source: "manual_input"   # automatic / manual_input / unknown
+  unknown_reason: null             # version_source が unknown の場合は必須記述
+  viewport: "1920x1080"
+  device_pixel_ratio: 1
+  os: "Windows 11 + WSL2/Ubuntu"
+scenarios:
+  - id: "all_enemies_defeated_victory"
+    status: confirmed
+    human_confirmed_claims:
+      - "victory overlay is visible"
+    review_points:
+      - timestamp: "00:00:12"
+        tolerance_window_sec: 1
+        output_frame_path: "artifacts/all-enemies-defeated-victory-exact.jpg"
+        frame_sha256: "<sha256hex>"
+        observed_result: "victory overlay and HUD result match"
+  - id: "hp_zero_defeat"
+    status: deferred
+    deferred_reason: "reviewable timestamp/frame evidence not yet attached"
+```
+````
+
+### 必須フィールド一覧
+
+| フィールド | 説明 |
+|-----------|------|
+| `schema_version` | `playtest_evidence_v1` 固定 |
+| `artifact.url` | GitHub attachment URL（ローカルパス禁止） |
+| `artifact.sha256` | ダウンロード後に `sha256sum` で取得 |
+| `artifact.bytes` | ダウンロード後に `wc -c` で取得 |
+| `review_points` | scenarios ごとの timestamp + tolerance_window_sec |
+| `tolerance_window_sec` | 1（ADR 0004 固定値） |
 
 ---
 
-## Common Failure Cases and Remedies
+## pass / fail / deferred 判定
+
+| 状態 | 条件 |
+|------|------|
+| **pass** | `artifact.url` が GitHub attachment URL、`sha256`/`bytes` が検証済み、すべての scenario に `review_points`（timestamp + frame）が添付されている |
+| **fail** | `artifact.url` がローカルパス、`sha256` 検証失敗、動画 URL はあるが `review_points` なし |
+| **accepted_with_deferred** | 一部 scenario が `status: deferred` だが `deferred_reason` を明記し、残りは `confirmed` |
+
+### `unknown` フィールドの扱い
+
+`environment.browser` 等が `unknown` になった場合、**無条件 pass は禁止**。以下を必ず明示する:
+
+```yaml
+browser: "unknown"
+version_source: "unknown"
+unknown_reason: "userAgentData.getHighEntropyValues() が利用不可かつ手動入力もできなかった"
+```
+
+`version_source: unknown` かつ `unknown_reason` が空の場合は fail 扱いとする。
+
+---
+
+## トラブルシュート
 
 ### `pnpm: command not found`
-
-Install pnpm via corepack. Use the version appropriate for your Node major:
 
 ```bash
 # Node 20.x
@@ -281,165 +332,96 @@ corepack enable pnpm
 corepack prepare pnpm@latest-11 --activate
 ```
 
-Avoid `pnpm@latest` on Node 20 — it may resolve pnpm 11 which requires Node 22+.
-
-Or install globally with npm:
+または:
 
 ```bash
 npm install -g pnpm
 ```
 
-### `Port 4173 is already in use` (strictPort error)
-
-Find and kill the process occupying port 4173:
+### `Port 4173 is already in use`
 
 ```bash
 lsof -ti:4173 | xargs kill -9
 ```
 
-Then retry `pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort`.
+その後 `pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort` を再実行。
 
-### Browser shows `ERR_CONNECTION_REFUSED` on `http://localhost:4173`
+### ブラウザが `ERR_CONNECTION_REFUSED`
 
-1. Confirm the preview server is running (check your terminal for the `➜ Local: http://127.0.0.1:4173/` line).
-2. Verify you are using `http://` not `https://`.
-3. If using Windows browser, check if a VPN or firewall is blocking localhost access.
-4. As a fallback, try `http://127.0.0.1:4173` directly in the Windows browser.
+1. プレビューサーバーが起動中か確認（`➜ Local: http://127.0.0.1:4173/` の表示を確認）。
+2. `http://` を使用しているか確認（`https://` ではない）。
+3. VPN やファイアウォールが localhost をブロックしていないか確認。
+4. `http://127.0.0.1:4173` を直接試す。
 
-### `pnpm build` fails with TypeScript errors
+### WSL2 `localhost` が Windows に転送されない
 
-Run `pnpm typecheck` first to get readable error messages:
+```powershell
+$wslIp = (wsl.exe -d Ubuntu hostname -I).Trim().Split()[0]
+netsh interface portproxy add v4tov4 listenport=4173 listenaddress=0.0.0.0 connectport=4173 connectaddress=$wslIp
+```
+
+または `%UserProfile%\.wslconfig` の `localhostForwarding=false` を削除して `wsl --shutdown` を実行。
+
+### `pnpm build` が TypeScript エラーで失敗
 
 ```bash
 pnpm typecheck
 ```
 
-Fix any reported errors before retrying `pnpm build`.
+で読みやすいエラーメッセージを確認してから修正し、再度 `pnpm build` を実行。
 
-### WSL2 `localhost` not forwarding to Windows
+### `check-manual-playtest-env.mjs` 終了コード 2（非対応環境）
 
-WSL2 typically forwards localhost automatically on Windows 11 and modern Windows 10.
-If forwarding does not work:
+非 WSL2 環境（ネイティブ Linux、macOS、Windows CMD 等）が検出された。本 Runbook は WSL2/Ubuntu 専用。
 
-1. Open PowerShell (Admin) and run (use `wsl.exe -l -v` first to confirm your distro name):
-   ```powershell
-   $wslIp = (wsl.exe -d Ubuntu hostname -I).Trim().Split()[0]
-   netsh interface portproxy add v4tov4 listenport=4173 listenaddress=0.0.0.0 connectport=4173 connectaddress=$wslIp
-   ```
-2. Access via the WSL2 IP directly in the Windows browser: `http://<wsl2-ip>:4173`
+### `ffmpeg: command not found`
 
-### Windows browser cannot reach WSL2 localhost even though preview is running
-
-Check `%UserProfile%\.wslconfig` on Windows. If `[wsl2] localhostForwarding=false`
-is set, remove it or set it to `true`, then run:
-
-```powershell
-wsl --shutdown
+```bash
+sudo apt install ffmpeg
 ```
 
-Restart Ubuntu and rerun the preflight + preview command.
-
-### `check-manual-playtest-env.mjs` exits with code 2 (unsupported)
-
-The preflight script detected a non-WSL2 environment (e.g., native Linux, macOS, Windows CMD).
-This runbook is designed for WSL2/Ubuntu. Use the appropriate runbook for your OS.
-
-### `pnpm-lock.yaml` not found
-
-The lock file is missing. Run:
+### `pnpm-lock.yaml` が見つからない
 
 ```bash
 pnpm install
 ```
 
-This regenerates `pnpm-lock.yaml`. If the issue persists, check if you are in the correct repository root directory.
+で `pnpm-lock.yaml` を再生成する。
 
----
+### Evidence Panel が表示されない
 
-## GitHub Pages / PR Preview での証跡採取手順 (Evidence Panel)
+URL に `?playtest_evidence=1` が付いているか確認。ローカルプレビューの場合は `http://localhost:4173/?playtest_evidence=1` でアクセスする。
 
-### Evidence Panel の有効化
+### GitHub コメントへの動画添付がアップロードエラーになる
 
-GitHub Pages または PR Preview の URL に `?playtest_evidence=1` クエリパラメータを付けてアクセスします。
-
-```
-# main URL の例
-https://squne121.github.io/loop-protocol/?playtest_evidence=1
-
-# PR Preview の例（PR #123）
-https://squne121.github.io/loop-protocol/pr-123/?playtest_evidence=1
-```
-
-クエリパラメータなしでアクセスした場合、Evidence Panel は表示されません（opt-in 設計）。
-
-### Evidence Panel の操作手順
-
-1. 上記 URL をブラウザで開きます。
-2. 画面右上に **Playtest Evidence Panel** が表示されます。
-3. YAML データがテキストエリアに自動生成されます。
-
-#### Copy YAML to Clipboard
-
-- **Copy YAML to Clipboard** ボタンをクリックすると YAML がクリップボードにコピーされます。
-- ボタンが「Copied!」に変わったらコピー成功です。
-- Clipboard API が利用できない場合は「Use textarea to copy manually」と表示されます。その場合はテキストエリアを手動で選択してコピーしてください。
-
-#### Download YAML
-
-- **Download YAML** ボタンをクリックすると `loop-protocol-playtest-evidence-<ISO8601>.yaml` という名前のファイルがダウンロードされます。
-- ダウンロードしたファイルをローカルで確認・保管できます。
-
-### PR コメントへの証跡添付 workflow
-
-1. Evidence Panel の YAML を Copy または Download で取得します。
-2. 対象 PR の「Conversation」タブを開きます。
-3. コメントボックスに以下の形式で貼り付けます。
-
-````markdown
-## Playtest Evidence
-
-```yaml
-# ここに YAML を貼り付ける
-playtest_evidence_schema_version: v1
-generated_at: "2026-06-03T..."
-...
-```
-````
-
-4. 必要に応じてスクリーンショットや動画ファイルを添付します。
-
-### ローカル環境メタデータ採取（CLI）
-
-GitHub Pages を使わずローカルでビルドした場合は、CLI スクリプトで環境メタデータを採取できます。
+動画が 10,000,000 bytes を超えていないか確認。超えている場合は圧縮してから再添付する:
 
 ```bash
-# YAML 出力（デフォルト）
-node scripts/collect-playtest-env.mjs
-
-# JSON 出力
-node scripts/collect-playtest-env.mjs --json
+# H.264 再エンコードで圧縮（例）
+ffmpeg -i input.mp4 -vcodec libx264 -crf 28 output.mp4
 ```
 
-出力例（YAML）:
+### gh-pages ブランチの古いアーティファクト削除
 
-```yaml
-# Loop Protocol — Playtest Environment Metadata (AC1)
-
-executed_at: 2026-06-03T10:00:00.000Z
-tested_commit: aef9a0a...
-node_version: v22.3.0
-pnpm_version: 10.x.x
-platform: linux
-os_type: Linux
-os_release: 6.6.x
-arch: x64
+```bash
+git clone --branch gh-pages --single-branch https://github.com/squne121/loop-protocol.git gh-pages-work
+cd gh-pages-work
+ls -la
+# 不要なファイルを確認して削除
+git rm <stale-file>
+git commit -m "chore: remove stale artifact from gh-pages root"
+git push origin gh-pages
 ```
 
 ---
 
-## Reference
+## 関連 Issue / ADR
 
-- Playtest log: `docs/playtest/m2-combat-mvp.md`
-- Preflight script: `scripts/check-manual-playtest-env.mjs`
-- CLI 証跡採取: `scripts/collect-playtest-env.mjs`
-- Issue: #561 (this runbook), #543 (human manual playtest requirement), #571 (evidence panel)
+| リンク | 内容 |
+|--------|------|
+| [ADR 0004 (0004-video-evidence-policy)](../adr/0004-video-evidence-policy.md) | 動画証跡ポリシー正本（GitHub attachment + SHA256 必須、ffmpeg フレーム抽出コントラクト、`playtest_evidence_v1` schema） |
+| Issue #576 | ADR 0004 実装 Issue |
+| Issue #543 | 人間プレイテスト動画証跡管理の問題発見と GitHub attachment 解決 |
+| Issue #570 | ローカルパス配置の問題が発覚したプレイテスト PR |
+| Issue #571 | 環境メタデータ collector（Evidence Panel 実装） |
+| Issue #577 | 本 Runbook 更新（日本語化 + ADR 0004 証跡フロー統合） |
