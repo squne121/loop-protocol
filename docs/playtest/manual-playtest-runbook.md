@@ -339,8 +339,90 @@ This regenerates `pnpm-lock.yaml`. If the issue persists, check if you are in th
 
 ---
 
+## GitHub Pages / PR Preview での証跡採取手順 (Evidence Panel)
+
+### Evidence Panel の有効化
+
+GitHub Pages または PR Preview の URL に `?playtest_evidence=1` クエリパラメータを付けてアクセスします。
+
+```
+# main URL の例
+https://squne121.github.io/loop-protocol/?playtest_evidence=1
+
+# PR Preview の例（PR #123）
+https://squne121.github.io/loop-protocol/pr-123/?playtest_evidence=1
+```
+
+クエリパラメータなしでアクセスした場合、Evidence Panel は表示されません（opt-in 設計）。
+
+### Evidence Panel の操作手順
+
+1. 上記 URL をブラウザで開きます。
+2. 画面右上に **Playtest Evidence Panel** が表示されます。
+3. YAML データがテキストエリアに自動生成されます。
+
+#### Copy YAML to Clipboard
+
+- **Copy YAML to Clipboard** ボタンをクリックすると YAML がクリップボードにコピーされます。
+- ボタンが「Copied!」に変わったらコピー成功です。
+- Clipboard API が利用できない場合は「Use textarea to copy manually」と表示されます。その場合はテキストエリアを手動で選択してコピーしてください。
+
+#### Download YAML
+
+- **Download YAML** ボタンをクリックすると `loop-protocol-playtest-evidence-<ISO8601>.yaml` という名前のファイルがダウンロードされます。
+- ダウンロードしたファイルをローカルで確認・保管できます。
+
+### PR コメントへの証跡添付 workflow
+
+1. Evidence Panel の YAML を Copy または Download で取得します。
+2. 対象 PR の「Conversation」タブを開きます。
+3. コメントボックスに以下の形式で貼り付けます。
+
+````markdown
+## Playtest Evidence
+
+```yaml
+# ここに YAML を貼り付ける
+playtest_evidence_schema_version: v1
+generated_at: "2026-06-03T..."
+...
+```
+````
+
+4. 必要に応じてスクリーンショットや動画ファイルを添付します。
+
+### ローカル環境メタデータ採取（CLI）
+
+GitHub Pages を使わずローカルでビルドした場合は、CLI スクリプトで環境メタデータを採取できます。
+
+```bash
+# YAML 出力（デフォルト）
+node scripts/collect-playtest-env.mjs
+
+# JSON 出力
+node scripts/collect-playtest-env.mjs --json
+```
+
+出力例（YAML）:
+
+```yaml
+# Loop Protocol — Playtest Environment Metadata (AC1)
+
+executed_at: 2026-06-03T10:00:00.000Z
+tested_commit: aef9a0a...
+node_version: v22.3.0
+pnpm_version: 10.x.x
+platform: linux
+os_type: Linux
+os_release: 6.6.x
+arch: x64
+```
+
+---
+
 ## Reference
 
 - Playtest log: `docs/playtest/m2-combat-mvp.md`
 - Preflight script: `scripts/check-manual-playtest-env.mjs`
-- Issue: #561 (this runbook), #543 (human manual playtest requirement)
+- CLI 証跡採取: `scripts/collect-playtest-env.mjs`
+- Issue: #561 (this runbook), #543 (human manual playtest requirement), #571 (evidence panel)
