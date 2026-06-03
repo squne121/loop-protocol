@@ -8,6 +8,11 @@ export interface InputState {
   primaryPressed: boolean
   /** Tracks the currently captured pointer id. null when no pointer is captured. */
   activePointerId: number | null
+  /**
+   * True once the pointer has entered the canvas via pointermove at least once.
+   * Used by InputMapper to suppress aim commands before the first hover.
+   */
+  pointerKnown: boolean
 }
 
 export function createInputState(): InputState {
@@ -20,5 +25,6 @@ export function createInputState(): InputState {
     pointerY: 0,
     primaryPressed: false,
     activePointerId: null,
+    pointerKnown: false,
   }
 }

@@ -14,6 +14,7 @@ describe('mapInputToCommands', () => {
       pointerY: 340,
       primaryPressed: true,
       activePointerId: null,
+      pointerKnown: true,
     })
 
     expect(commands).toEqual([
@@ -33,9 +34,42 @@ describe('mapInputToCommands', () => {
       pointerY: 0,
       primaryPressed: false,
       activePointerId: null,
+      pointerKnown: true,
     })
 
     expect(commands.some((c) => c.type === 'move')).toBe(false)
+  })
+
+  it('GIVEN pointerKnown=false WHEN mapInputToCommands THEN no aim command emitted (AC3)', () => {
+    const commands = mapInputToCommands({
+      moveUp: false,
+      moveDown: false,
+      moveLeft: false,
+      moveRight: false,
+      pointerX: 120,
+      pointerY: 340,
+      primaryPressed: false,
+      activePointerId: null,
+      pointerKnown: false,
+    })
+
+    expect(commands.some((c) => c.type === 'aim')).toBe(false)
+  })
+
+  it('GIVEN pointerKnown=true WHEN mapInputToCommands THEN aim command emitted', () => {
+    const commands = mapInputToCommands({
+      moveUp: false,
+      moveDown: false,
+      moveLeft: false,
+      moveRight: false,
+      pointerX: 200,
+      pointerY: 100,
+      primaryPressed: false,
+      activePointerId: null,
+      pointerKnown: true,
+    })
+
+    expect(commands).toContainEqual({ type: 'aim', x: 200, y: 100 })
   })
 })
 
@@ -189,25 +223,44 @@ describe('bindInput (PointerEvent lifecycle)', () => {
     bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
 
     canvas.dispatchPointer('pointerdown', { isPrimary: true, button: 0, pointerId: 3 })
-    canvas.dispatchPointer('pointermove', { pointerId: 3, clientX: 480, clientY: 270 })
+    canvas.dispatchPointer('pointermove', { pointerId: 3, isPrimary: true, clientX: 480, clientY: 270 })
 
     expect(input.pointerX).toBeCloseTo(480)
     expect(input.pointerY).toBeCloseTo(270)
   })
 
-  it('GIVEN captured pointerId=3 WHEN pointermove with different pointerId THEN aim NOT updated', () => {
+  it('GIVEN no pointerdown WHEN primary pointermove THEN aim updates (AC1: hover without click)', () => {
     const canvas = makeFakeCanvas()
     const keyTarget = makeFakeKeyTarget()
     const input = createInputState()
     bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
 
-    canvas.dispatchPointer('pointerdown', { isPrimary: true, button: 0, pointerId: 3 })
+    // No pointerdown — pure hover
+    canvas.dispatchPointer('pointermove', { isPrimary: true, clientX: 300, clientY: 150 })
+
+    expect(input.pointerX).toBeCloseTo(300)
+    expect(input.pointerY).toBeCloseTo(150)
+    expect(input.pointerKnown).toBe(true)
+  })
+
+  it('GIVEN no pointermove yet WHEN createInputState THEN pointerKnown is false (AC1)', () => {
+    const input = createInputState()
+    expect(input.pointerKnown).toBe(false)
+  })
+
+  it('GIVEN non-primary pointermove WHEN pointermove THEN aim NOT updated', () => {
+    const canvas = makeFakeCanvas()
+    const keyTarget = makeFakeKeyTarget()
+    const input = createInputState()
+    bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
+
     input.pointerX = 100
     input.pointerY = 100
-    canvas.dispatchPointer('pointermove', { pointerId: 99, clientX: 999, clientY: 999 })
+    canvas.dispatchPointer('pointermove', { isPrimary: false, clientX: 999, clientY: 999 })
 
     expect(input.pointerX).toBe(100)
     expect(input.pointerY).toBe(100)
+    expect(input.pointerKnown).toBe(false)
   })
 
   it('GIVEN primary pointer down WHEN pointerup THEN primaryPressed is cleared', () => {
