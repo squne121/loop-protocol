@@ -302,24 +302,71 @@ gh pr view <PR番号> --json title --jq '.title' | grep -iE "\bsafe\b|\bread-onl
 
 self-authored PR の場合は **verdict 値に関わらず `--comment` で投稿**（GitHub 制約）。
 
-#### recommendations の決定（APPROVE 時のみ）
+#### required_auto_actions の決定
 
-verdict が `APPROVE` に確定した後、以下のロジックで `recommendations` フィールドを決定する:
+`required_auto_actions` は `mechanical: true`（人間判断不要・副作用が冪等・失敗が 422 等の検証可能なエラーで復旧可能）なアクションのみを分類する。
+
+以下のロジックで `required_auto_actions` を決定する:
 
 ```
-BRANCH_BEHIND_MAIN=$(echo "$TEST_VERDICT_BODY" | grep "branch_behind_main:" | head -n1 | sed -E 's/.*branch_behind_main:[[:space:]]*//; s/[[:space:]]*//')
+REQUIRED_AUTO_ACTIONS=[]
 
-if [ "$VERDICT" = "APPROVE" ] && [ "$MERGEABLE" = "MERGEABLE" ] && [ "$BRANCH_BEHIND_MAIN" = "true" ]; then
-  RECOMMENDATIONS="[update_branch]"
-else
-  RECOMMENDATIONS="[]"
+# 1. Closes #N 不足の検出
+PR_BODY=$(gh pr view <PR番号> --json body --jq '.body')
+if ! echo "$PR_BODY" | grep -iE "(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved) #[0-9]+" > /dev/null; then
+  # ensure_closing_keyword: PR body に GitHub 公式 closing keyword が存在しない
+  REQUIRED_AUTO_ACTIONS に追加: {kind: ensure_closing_keyword, executor: implementation-worker, blocking_merge_ready: true, mechanical: true}
+fi
+
+# 2. PR body validator failure（mechanical: true のもののみ）
+# mechanical: false（Safety Claim Matrix 不足・Consumer Inventory 不足・Evidence 不足等）は blockers に残す
+if <PR body の機械的フォーマット不備（空セクション・placeholder 残存等）を検出>; then
+  REQUIRED_AUTO_ACTIONS に追加: {kind: update_pr_body_hygiene, executor: implementation-worker, blocking_merge_ready: true, mechanical: true}
+fi
+
+# 3. BEHIND branch の検出
+BRANCH_BEHIND_MAIN=$(echo "$TEST_VERDICT_BODY" | grep "branch_behind_main:" | head -n1 | sed -E 's/.*branch_behind_main:[[:space:]]*//; s/[[:space:]]*//')
+if [ "$MERGEABLE" = "MERGEABLE" ] && [ "$BRANCH_BEHIND_MAIN" = "true" ]; then
+  # update_branch: head ref が base branch より古い（merge update で解消可能）
+  REQUIRED_AUTO_ACTIONS に追加: {kind: update_branch, executor: implementation-worker, blocking_merge_ready: true, mechanical: true, expected_head_sha: <reviewed_head_sha>}
 fi
 ```
 
-- `APPROVE` かつ `mergeable=MERGEABLE` かつ `branch_behind_main: true` のとき → `recommendations: [update_branch]`
-- それ以外 → `recommendations: []`
+**分類ルール（`required_auto_actions` vs `blockers` vs `follow_up_issue_requests`）:**
 
-この `recommendations` を LOOP_VERDICT YAML に含めることで、Step 5（impl-review-loop）が `update_branch` routing signal を受け取り `gh pr update-branch` を実行する。
+| 検出事象 | 分類先 | 理由 |
+|---|---|---|
+| `Closes #N` 不足（GitHub 公式 keyword なし） | `required_auto_actions` (kind: `ensure_closing_keyword`) | mechanical: true（字句解析で判定可能・冪等） |
+| PR body の機械的フォーマット不備 | `required_auto_actions` (kind: `update_pr_body_hygiene`) | mechanical: true（テンプレート照合で判定可能） |
+| `mergeStateStatus=BEHIND && mergeable=MERGEABLE` | `required_auto_actions` (kind: `update_branch`) | mechanical: true（REST API merge update で解消可能） |
+| Safety Claim Matrix 不足 | `blockers` | mechanical: false（人間判断が必要） |
+| Schema Consumer Inventory 不足 | `blockers` | mechanical: false（人間判断が必要） |
+| Evidence 不足 | `blockers` | mechanical: false（人間判断が必要） |
+| 現在 PR の merge readiness に不要な恒久的改善 | `follow_up_issue_requests` (blocking_merge_ready: false) | merge を blocking しない任意改善 |
+
+**`merge_ready` 決定ルール:**
+
+```
+merge_ready = (
+  verdict == APPROVE
+  AND blockers == []
+  AND required_auto_actions == []
+  AND mergeability.mergeable == MERGEABLE
+  AND mergeability.merge_state_status in [CLEAN, UNSTABLE]
+)
+```
+
+- `required_auto_actions` が 1 件以上存在する場合は `merge_ready: false` を強制する（verdict が APPROVE でも同様）
+- `follow_up_issue_requests` の存在は `merge_ready` に影響しない
+- `follow_up_issue_requests` 内のエントリはすべて `blocking_merge_ready: false` でなければならない
+
+**`ensure_closing_keyword` の判定について:**
+- GitHub 公式 closing keyword（`close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved`）の字句解析で判定する
+- `closingIssuesReferences` API への依存は Out of Scope（`gh pr view --json closingIssuesReferences` は補助確認としてのみ使用可）
+
+**`auto_fix_applied` フィールドについて:**
+- `pr-review-judge` の初回出力では `auto_fix_applied` は常に `[]` とする
+- `implementation-worker` が `required_auto_actions` を実行した後に verdict comment を mutate して埋めるフィールドであり、`pr-review-judge` 自身は空配列で出力する（verdict comment の mutate は実行しない）
 
 ### 6. verdict コメントを投稿
 
@@ -332,13 +379,89 @@ gh pr review <PR番号> --approve --body-file /tmp/pr-verdict-<PR番号>.md
 gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>.md
 ```
 
+## LOOP_VERDICT_V2 スキーマ定義
+
+```yaml
+# LOOP_VERDICT_V2 スキーマ（snake_case のみ使用。camelCase は V2 では禁止）
+# V2 禁止フィールド: mergeStateStatus（camelCase）、recommendations（V2 では required_auto_actions に昇格）
+LOOP_VERDICT_V2:
+  verdict: APPROVE | REQUEST_CHANGES
+  reviewed_head_sha: <SHA>
+  merge_ready: true | false  # required_auto_actions==[] && blockers==[] && verdict==APPROVE && mergeability.mergeable==MERGEABLE && mergeability.merge_state_status in [CLEAN, UNSTABLE] の場合のみ true
+  mergeability:
+    mergeable: MERGEABLE | CONFLICTING | UNKNOWN
+    merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+  blockers: []  # mechanical: false な問題（人間判断が必要なブロッカー）
+  required_auto_actions:
+    - kind: ensure_closing_keyword | update_branch | update_pr_body_hygiene
+      executor: implementation-worker
+      blocking_merge_ready: true  # required_auto_actions のエントリは常に true
+      mechanical: true  # required_auto_actions に分類できるのは mechanical: true のみ
+      # update_branch の場合のみ追加フィールド:
+      expected_head_sha: <reviewed_head_sha>  # update_branch 時のみ（race guard 用）
+  auto_fix_applied: []  # pr-review-judge 初回出力では常に []。implementation-worker が実行後に mutate して埋める
+  follow_up_issue_requests:
+    - title: "<follow-up タイトル>"
+      issue_kind: implementation | research | parent
+      severity: mandatory_follow_up | optional_follow_up | note_only
+      blocking_merge_ready: false  # follow_up_issue_requests のエントリは必ず false（merge をブロックしない）
+      source:
+        kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
+        url: "<PR コメント URL または PR URL>"
+        note_id: "<Non-blockers セクション内の通し番号（1-indexed）>"
+      dedupe_key: "follow-up:<repo>:<source-url-or-pr>:<note-id>"
+      desired_destination: "<この Issue を解決したあとの状態（Outcome 1文）>"
+      validated_scope_delta: "<create-issue に渡す In Scope の概要>"
+      origin_skill: pr-review-judge
+      labels:
+        - triage-required
+      initial_label_profile: <string>
+      materialization: <string>
+```
+
+### LOOP_VERDICT_V2 スキーマ制約
+
+- **snake_case 専用**: V2 フィールドは snake_case のみ（`merge_state_status`, `required_auto_actions` 等）。`mergeStateStatus`（camelCase）は V2 では禁止。
+- **recommendations 廃止**: V2 では `recommendations` フィールドを出力しない（`required_auto_actions` に昇格済み）。
+- **merge_ready 充足条件**: `verdict==APPROVE && blockers==[] && required_auto_actions==[] && mergeability.mergeable==MERGEABLE && mergeability.merge_state_status in [CLEAN, UNSTABLE]` の場合のみ `merge_ready: true`。
+- **required_auto_actions 強制**: `required_auto_actions` が 1 件以上存在する場合は `merge_ready: false` を強制する。
+- **follow_up_issue_requests 制約**: 全エントリに `blocking_merge_ready: false` を必須とする（merge を blocking する問題は `blockers` または `required_auto_actions` に分類）。
+- **auto_fix_applied 初期値**: `pr-review-judge` の初回出力では `auto_fix_applied: []`。`implementation-worker` が mutate して埋める（`pr-review-judge` は verdict comment を mutate しない）。
+
+### Schema Consumer Inventory
+
+```yaml
+consumer_inventory:
+  schema: LOOP_VERDICT_V2
+  consumers:
+    - id: impl-review-loop
+      path: .claude/skills/impl-review-loop/SKILL.md
+      usage: verdict routing（step-5 の APPROVE/REQUEST_CHANGES 分岐・required_auto_actions dispatch）
+      update_status: pending（#631/child-5 で対応）
+    - id: pr-reviewer-agent
+      path: .claude/agents/pr-reviewer.md
+      usage: LOOP_VERDICT_V2 出力の参照先スキーマ
+      update_status: updated（本 Issue #630 で対応）
+    - id: schema-governance
+      path: docs/dev/schema-governance.md
+      usage: Initial Known Schemas への登録
+      update_status: pending（#631 で対応）
+    - id: test-loop-verdict-v2
+      path: .claude/skills/pr-review-judge/scripts/tests/test_loop_verdict_v2.py
+      usage: スキーマ検証・分類ルールのユニットテスト
+      update_status: updated（本 Issue #630 で対応）
+  cutover_note: |
+    #630 マージ後もカットオーバー（#631/#632 完了）まで consumer は旧 LOOP_VERDICT 互換読み込みを維持する。
+    #631（impl-review-loop step-5 消費ロジック更新）が完了するまで runtime behavior は変わらない。
+```
+
 ## Verdict コメントテンプレート
 
 ````markdown
 ## Verdict: APPROVE | REQUEST_CHANGES
 
 ### Mergeability
-- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, mergeStateStatus=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
+- mergeable=<MERGEABLE|CONFLICTING|UNKNOWN>, merge_state_status=<CLEAN|UNSTABLE|BEHIND|DIRTY|BLOCKED|UNKNOWN>
 
 ### Evidence Check
 - AC coverage: <○/△/×、根拠>
@@ -353,18 +476,22 @@ gh pr review <PR番号> --request-changes --body-file /tmp/pr-verdict-<PR番号>
 ### Non-blockers（任意改善）
 - なし / <改善提案>
 
-## LOOP_VERDICT
+## LOOP_VERDICT_V2
 ```yaml
 verdict: APPROVE | REQUEST_CHANGES
-blockers: []
-mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
 reviewed_head_sha: <SHA>
-recommendations: []  # APPROVE + MERGEABLE + BEHIND のとき [update_branch]。有効値: update_branch
+merge_ready: false
+mergeability:
+  mergeable: MERGEABLE | CONFLICTING | UNKNOWN
+  merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+blockers: []
+required_auto_actions: []
+auto_fix_applied: []
 follow_up_issue_requests:
   - title: "<follow-up タイトル>"
     issue_kind: implementation | research | parent
     severity: mandatory_follow_up | optional_follow_up | note_only
+    blocking_merge_ready: false
     source:
       kind: pr_body | pr_review | issue_comment | post_merge_cleanup | refinement
       url: "<PR コメント URL または PR URL>"
@@ -375,26 +502,29 @@ follow_up_issue_requests:
     origin_skill: pr-review-judge
     labels:
       - triage-required
+    initial_label_profile: <string>
+    materialization: <string>
 ```
 ````
 
-### LOOP_VERDICT YAML の制約
+### LOOP_VERDICT_V2 YAML の制約
 
 1. `reviewed_head_sha` は YAML ブロック **内** に記載する（外側は禁止）
 2. コメント本文全体で `reviewed_head_sha:` 行は 1 つだけ（複数だと parse が最初の行のみ採用）
 3. コードフェンス（` ``` `）は `\` でエスケープしない（heredoc 内でもそのまま書く）
 4. `follow_up_issue_requests` は non-blocker observations を構造化したフィールド。pr-review-judge は **起票を実行しない**。起票責務は impl-review-loop Step 5 等の main thread が担う（詳細は `docs/dev/agent-skill-boundaries.md` の `FOLLOW_UP_ISSUE_REQUEST_V1` を参照）。
-5. **negative rule**: pr-review-judge は `follow_up_issues`（materialize 結果フィールド）を出力してはならない。`LOOP_VERDICT` に出力するのは `follow_up_issue_requests`（起票前候補）のみ。`follow_up_issues` は Issue 起票後の materialize 結果であり、起票を行わない pr-review-judge が正しく埋めることはできない。
+5. **negative rule**: pr-review-judge は `follow_up_issues`（materialize 結果フィールド）を出力してはならない。`LOOP_VERDICT_V2` に出力するのは `follow_up_issue_requests`（起票前候補）のみ。`follow_up_issues` は Issue 起票後の materialize 結果であり、起票を行わない pr-review-judge が正しく埋めることはできない。
 
    ```yaml
-   # INVALID — LOOP_VERDICT に follow_up_issues を出してはならない
+   # INVALID — LOOP_VERDICT_V2 に follow_up_issues を出してはならない
    follow_up_issues:
      - issue_number: 123
 
-   # VALID — LOOP_VERDICT には follow_up_issue_requests のみを出す
+   # VALID — LOOP_VERDICT_V2 には follow_up_issue_requests のみを出す
    follow_up_issue_requests:
      - title: "..."
        severity: optional_follow_up
+       blocking_merge_ready: false
    ```
 
 ## Stop Conditions
@@ -435,6 +565,8 @@ GitHub surface:
 
 stdout: 実行ログと verdict サマリ。verdict の正本は GitHub コメント側。
 
+verdict コメントには `LOOP_VERDICT_V2` ブロックを含める（`LOOP_VERDICT` (V1) は deprecated）。
+
 ## Deterministic Gates (G1-G5)
 
 PR review miss-type（見落とし・誤判断）を構造的に防ぐ 5 つの deterministic gate:
@@ -464,4 +596,4 @@ Tests: pytest unit tests `.claude/skills/pr-review-judge/scripts/tests/`
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
-`LOOP_VERDICT` の全フィールドは必ず含める（routing 必須フィールド）。
+`LOOP_VERDICT_V2` の全フィールドは必ず含める（routing 必須フィールド）。
