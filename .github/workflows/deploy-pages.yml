@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
-          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
+          grep -qE 'src="/assets/|href="/assets/' dist/index.html && exit 1 || true
       - name: Deploy to gh-pages (replace root, preserve pr-*)
         run: |
           git config user.name "github-actions[bot]"
@@ -133,7 +133,7 @@ jobs:
           set -euo pipefail
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
-          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
+          grep -qE 'src="/assets/|href="/assets/' dist/index.html && exit 1 || true
       - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -153,7 +153,7 @@ jobs:
             "${preview_url}?cache_bust=${GITHUB_SHA}" \
             -o /tmp/preview-index.html
           grep -F "${base}assets/" /tmp/preview-index.html
-          ! grep -E 'src="/assets/|href="/assets/' /tmp/preview-index.html
+          grep -qE 'src="/assets/|href="/assets/' /tmp/preview-index.html && exit 1 || true
           mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
           if [ "${#asset_paths[@]}" -eq 0 ]; then
             echo "No asset paths found in /tmp/preview-index.html" >&2
