@@ -87,6 +87,13 @@ FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND = "unknown_issue_kind"
 _ISSUE_KIND_POLICY_CACHE: "dict | None" = None
 
 
+class IssueKindPolicyLoadError(RuntimeError):
+    """Raised when ISSUE_KIND_POLICY_V1 cannot be loaded from SSOT.
+
+    Fail-closed: callers must not silently substitute a hardcoded fallback.
+    """
+
+
 def _load_issue_kind_policy(repo_root: "Path | None" = None) -> dict:
     """Load ISSUE_KIND_POLICY_V1 from docs/dev/github-ops.md.
 
@@ -96,52 +103,51 @@ def _load_issue_kind_policy(repo_root: "Path | None" = None) -> dict:
       - unknown_kind_policy: str  ("block")
       - unknown_kind_reason_code: str
 
-    Falls back to hardcoded defaults if the SSOT cannot be loaded
-    (ensures fail-safe behavior in CI / test environments where the file
-    may be unavailable). The fallback matches the SSOT values at the time
-    of this implementation — a mismatch is caught by test_issue_kind_ssot.py.
+    Raises IssueKindPolicyLoadError if the SSOT file is missing, the
+    ISSUE_KIND_POLICY_V1 block cannot be found/parsed, or the yaml library
+    is unavailable.  No silent fallback — callers must handle the error.
     """
     global _ISSUE_KIND_POLICY_CACHE
     if _ISSUE_KIND_POLICY_CACHE is not None:
         return _ISSUE_KIND_POLICY_CACHE
-
-    _FALLBACK: dict = {
-        "canonical_kinds": frozenset({"implementation", "parent", "research"}),
-        "aliases": {"design": "research", "tracking": "parent"},
-        "unknown_kind_policy": "block",
-        "unknown_kind_reason_code": "unknown_issue_kind",
-    }
 
     if repo_root is None:
         repo_root = _find_repo_root()
 
     ssot_path = repo_root / "docs" / "dev" / "github-ops.md"
     if not ssot_path.exists():
-        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-        return _FALLBACK
+        raise IssueKindPolicyLoadError(
+            f"SSOT file not found: {ssot_path}. "
+            "Cannot load ISSUE_KIND_POLICY_V1 — fail-closed."
+        )
 
     if not _YAML_AVAILABLE:
-        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-        return _FALLBACK
+        raise IssueKindPolicyLoadError(
+            "PyYAML is not available; cannot parse ISSUE_KIND_POLICY_V1."
+        )
 
     try:
         text = ssot_path.read_text(encoding="utf-8")
         # Extract the ISSUE_KIND_POLICY_V1 YAML block
         match = re.search(r"```yaml\s*\nISSUE_KIND_POLICY_V1:(.*?)```", text, re.DOTALL)
         if not match:
-            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-            return _FALLBACK
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 fenced YAML block not found in {ssot_path}. "
+                "Ensure the block starts with ```yaml on a line followed by 'ISSUE_KIND_POLICY_V1:'."
+            )
 
         yaml_content = "ISSUE_KIND_POLICY_V1:" + match.group(1)
         parsed = _yaml_module.safe_load(yaml_content)
         if not isinstance(parsed, dict) or "ISSUE_KIND_POLICY_V1" not in parsed:
-            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-            return _FALLBACK
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 YAML parse produced unexpected structure in {ssot_path}."
+            )
 
         policy = parsed["ISSUE_KIND_POLICY_V1"]
         if not isinstance(policy, dict):
-            _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-            return _FALLBACK
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 value is not a mapping in {ssot_path}."
+            )
 
         canonical_kinds = frozenset(policy.get("canonical_kinds") or [])
         aliases_raw = policy.get("aliases") or {}
@@ -157,14 +163,49 @@ def _load_issue_kind_policy(repo_root: "Path | None" = None) -> dict:
         }
         _ISSUE_KIND_POLICY_CACHE = result
         return result
-    except Exception:
-        _ISSUE_KIND_POLICY_CACHE = _FALLBACK
-        return _FALLBACK
+    except IssueKindPolicyLoadError:
+        raise
+    except Exception as exc:
+        raise IssueKindPolicyLoadError(
+            f"Unexpected error while loading ISSUE_KIND_POLICY_V1 from {ssot_path}: {exc}"
+        ) from exc
 
 
 def _get_issue_kind_allowlist() -> frozenset:
-    """Return the canonical_kinds frozenset from SSOT (docs/dev/github-ops.md)."""
+    """Return the canonical_kinds frozenset from SSOT (docs/dev/github-ops.md).
+
+    Raises IssueKindPolicyLoadError if SSOT cannot be loaded.
+    """
     return _load_issue_kind_policy()["canonical_kinds"]
+
+
+def _normalize_issue_kind(kind: str) -> "str | None":
+    """Normalize an issue_kind string against SSOT canonical_kinds and aliases.
+
+    Returns:
+      - The canonical kind if ``kind`` is already canonical.
+      - The alias target if ``kind`` is in SSOT aliases (e.g. "design" → "research").
+      - None if ``kind`` is unknown (not canonical and not an alias).
+      - None if the SSOT cannot be loaded (IssueKindPolicyLoadError).
+
+    Callers should treat None as FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND.
+    """
+    try:
+        policy = _load_issue_kind_policy()
+    except IssueKindPolicyLoadError:
+        return None
+
+    canonical_kinds = policy["canonical_kinds"]
+    aliases = policy["aliases"]
+
+    if kind in canonical_kinds:
+        return kind
+    if kind in aliases:
+        target = aliases[kind]
+        # Only return the alias target if it is itself canonical
+        if target in canonical_kinds:
+            return target
+    return None
 
 
 def _clear_issue_kind_policy_cache() -> None:
@@ -743,7 +784,11 @@ def resolve_issue_template(issue_kind: str, repo_root: Path) -> Path | None:
     Returns the Path to .github/ISSUE_TEMPLATE/<issue_kind>.yml,
     or None if the file does not exist or issue_kind is not in the allowlist.
     """
-    if issue_kind not in _get_issue_kind_allowlist():
+    try:
+        allowlist = _get_issue_kind_allowlist()
+    except IssueKindPolicyLoadError:
+        return None
+    if issue_kind not in allowlist:
         return None
 
     template_dir = (repo_root / ".github" / "ISSUE_TEMPLATE").resolve()
@@ -961,8 +1006,12 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         # Extract machine contract to determine issue_kind and parent_mode
         machine_contract = _extract_machine_contract(issue_body)
-        issue_kind = machine_contract.get("issue_kind") if machine_contract else None
+        raw_issue_kind = machine_contract.get("issue_kind") if machine_contract else None
         parent_mode = machine_contract.get("parent_mode") if machine_contract else None
+
+        # Apply alias normalization (design→research, tracking→parent, etc.)
+        # _normalize_issue_kind returns None for unknown/unresolvable kinds.
+        issue_kind = _normalize_issue_kind(raw_issue_kind) if raw_issue_kind else None
 
         # Determine if this is a parent delivery-rollup (AC1: exempt from Outcome check)
         is_parent_delivery_rollup = (
@@ -971,9 +1020,9 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         repo_root = _find_repo_root()
 
-        if issue_kind and not is_parent_delivery_rollup:
-            # Blocker 3: Validate issue_kind against allowlist before template lookup
-            if issue_kind not in _get_issue_kind_allowlist():
+        if raw_issue_kind and not is_parent_delivery_rollup:
+            # Apply alias normalization: unknown/unresolvable → fail_closed
+            if issue_kind is None:
                 fail_closed_reasons.append(FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND)
             else:
                 # For known non-parent-delivery-rollup issue kinds: use template-derived required sections

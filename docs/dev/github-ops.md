@@ -24,8 +24,8 @@ ISSUE_KIND_POLICY_V1:
   unknown_kind_policy: block  # allowlist / aliases に存在しない kind は silent fallback 禁止
   unknown_kind_reason_code: unknown_issue_kind
   consumer_requirements:
-    - plan_refinement_loop.py must not define a local ISSUE_KIND_ALLOWLIST
-    - check_issue_contract.py detect_issue_kind must not silently return "implementation" for unknown kinds
+    - plan_refinement_loop.py
+    - check_issue_contract.py
 ```
 
 ### SSOT 利用規約

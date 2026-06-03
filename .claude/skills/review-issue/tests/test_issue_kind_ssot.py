@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -232,4 +234,210 @@ def test_check_issue_contract_ssot_policy_unknown_kind_policy_is_block():
     policy = cic._load_issue_kind_policy()
     assert policy["unknown_kind_policy"] == "block", (
         f"unknown_kind_policy must be 'block', got: {policy['unknown_kind_policy']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4 — Strengthened tests: loader reads from docs, not hardcoded
+# ---------------------------------------------------------------------------
+
+def _make_github_ops_fixture(canonical_kinds: list, aliases: dict, tmp_dir: Path) -> Path:
+    """Write a minimal docs/dev/github-ops.md fixture with the given SSOT values."""
+    kinds_lines = "\n".join(f"  - {k}" for k in canonical_kinds)
+    aliases_lines = "\n".join(f"  {k}: {v}" for k, v in aliases.items())
+    # Build the YAML block body without leading indentation so the fenced block
+    # starts at column 0 (required by the loader regex).
+    yaml_body = (
+        "ISSUE_KIND_POLICY_V1:\n"
+        "  schema_version: \"1\"\n"
+        "  canonical_kinds:\n"
+        f"{kinds_lines}\n"
+        "  aliases:\n"
+        f"{aliases_lines}\n"
+        "  unknown_kind_policy: block\n"
+        "  unknown_kind_reason_code: unknown_issue_kind\n"
+        "  consumer_requirements:\n"
+        "  - plan_refinement_loop.py\n"
+        "  - check_issue_contract.py\n"
+    )
+    content = (
+        "# GitHub Ops\n\n"
+        "## ISSUE_KIND_POLICY_V1\n\n"
+        "```yaml\n"
+        + yaml_body
+        + "```\n"
+    )
+    docs_dev = tmp_dir / "docs" / "dev"
+    docs_dev.mkdir(parents=True, exist_ok=True)
+    ssot_path = docs_dev / "github-ops.md"
+    ssot_path.write_text(content, encoding="utf-8")
+    return tmp_dir
+
+
+def test_loader_reads_from_docs_not_hardcoded_cic():
+    """Blocker 4: Changing canonical_kinds in docs fixture changes what check_issue_contract loader returns.
+
+    Proves the loader reads from docs/dev/github-ops.md, not a hardcoded value.
+    """
+    import importlib
+    import check_issue_contract as cic
+    importlib.reload(cic)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        # Use a custom kind that is NOT in the real SSOT
+        _make_github_ops_fixture(
+            canonical_kinds=["implementation", "research", "parent", "custom_kind_xyz"],
+            aliases={"design": "research"},
+            tmp_dir=tmp_path,
+        )
+        cic._clear_issue_kind_policy_cache()
+        policy = cic._load_issue_kind_policy(repo_root=tmp_path)
+        assert "custom_kind_xyz" in policy["canonical_kinds"], (
+            "Loader must return canonical_kinds from the fixture file, not hardcoded defaults. "
+            f"Got: {policy['canonical_kinds']}"
+        )
+
+
+def test_loader_reads_from_docs_not_hardcoded_prl():
+    """Blocker 4: Changing canonical_kinds in docs fixture changes what plan_refinement_loop loader returns.
+
+    Proves the loader reads from docs/dev/github-ops.md, not a hardcoded value.
+    """
+    import importlib
+    import plan_refinement_loop as prl
+    importlib.reload(prl)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        _make_github_ops_fixture(
+            canonical_kinds=["implementation", "research", "parent", "custom_kind_abc"],
+            aliases={"design": "research"},
+            tmp_dir=tmp_path,
+        )
+        prl._clear_issue_kind_policy_cache()
+        allowlist = prl._load_issue_kind_policy(repo_root=tmp_path)["canonical_kinds"]
+        assert "custom_kind_abc" in allowlist, (
+            "Loader must return canonical_kinds from the fixture file, not hardcoded defaults. "
+            f"Got: {allowlist}"
+        )
+
+
+def test_malformed_ssot_block_fail_closed_cic():
+    """Blocker 4: Malformed/missing SSOT block causes fail-closed (IssueKindPolicyLoadError), not silent fallback.
+
+    check_issue_contract._load_issue_kind_policy must raise IssueKindPolicyLoadError
+    when the ISSUE_KIND_POLICY_V1 block is absent from github-ops.md.
+    """
+    import importlib
+    import check_issue_contract as cic
+    importlib.reload(cic)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        docs_dev = tmp_path / "docs" / "dev"
+        docs_dev.mkdir(parents=True, exist_ok=True)
+        # Write a github-ops.md WITHOUT the ISSUE_KIND_POLICY_V1 block
+        (docs_dev / "github-ops.md").write_text(
+            "# GitHub Ops\n\nNo policy block here.\n",
+            encoding="utf-8",
+        )
+        cic._clear_issue_kind_policy_cache()
+        with pytest.raises(cic.IssueKindPolicyLoadError):
+            cic._load_issue_kind_policy(repo_root=tmp_path)
+
+
+def test_malformed_ssot_block_fail_closed_prl():
+    """Blocker 4: Malformed/missing SSOT block causes fail-closed (IssueKindPolicyLoadError) in plan_refinement_loop.
+
+    plan_refinement_loop._load_issue_kind_policy must raise IssueKindPolicyLoadError
+    when the ISSUE_KIND_POLICY_V1 block is absent from github-ops.md.
+    """
+    import importlib
+    import plan_refinement_loop as prl
+    importlib.reload(prl)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        docs_dev = tmp_path / "docs" / "dev"
+        docs_dev.mkdir(parents=True, exist_ok=True)
+        (docs_dev / "github-ops.md").write_text(
+            "# GitHub Ops\n\nNo policy block here.\n",
+            encoding="utf-8",
+        )
+        prl._clear_issue_kind_policy_cache()
+        with pytest.raises(prl.IssueKindPolicyLoadError):
+            prl._load_issue_kind_policy(repo_root=tmp_path)
+
+
+def test_missing_ssot_file_fail_closed_cic():
+    """Blocker 4: Missing github-ops.md file causes fail-closed, not silent fallback to 'implementation'."""
+    import importlib
+    import check_issue_contract as cic
+    importlib.reload(cic)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        # Do NOT create docs/dev/github-ops.md
+        cic._clear_issue_kind_policy_cache()
+        with pytest.raises(cic.IssueKindPolicyLoadError):
+            cic._load_issue_kind_policy(repo_root=tmp_path)
+
+        # detect_issue_kind must return UNKNOWN_ISSUE_KIND_SENTINEL, not "implementation"
+        cic._clear_issue_kind_policy_cache()
+        body = textwrap.dedent("""\
+            ## Machine-Readable Contract
+
+            ```yaml
+            contract_schema_version: v1
+            issue_kind: implementation
+            ```
+            """)
+        # We can't force repo_root in detect_issue_kind directly, but we verify
+        # that detect_issue_kind returns UNKNOWN when SSOT is unavailable
+        # by monkey-patching the repo root finder temporarily.
+        original_find_root = cic._find_repo_root_for_contract
+        try:
+            cic._find_repo_root_for_contract = lambda: tmp_path  # type: ignore[assignment]
+            cic._clear_issue_kind_policy_cache()
+            result = cic.detect_issue_kind(body, labels="", title="")
+            assert result == cic.UNKNOWN_ISSUE_KIND_SENTINEL, (
+                f"detect_issue_kind must return UNKNOWN_ISSUE_KIND_SENTINEL when SSOT is missing, "
+                f"got: {result!r}"
+            )
+        finally:
+            cic._find_repo_root_for_contract = original_find_root  # type: ignore[assignment]
+            cic._clear_issue_kind_policy_cache()
+
+
+def test_plan_refinement_loop_normalizes_design_to_research():
+    """Blocker 4: plan_refinement_loop._normalize_issue_kind normalizes 'design' to 'research'.
+
+    Verifies that plan_refinement_loop applies alias normalization (not just allowlist check).
+    """
+    import importlib
+    import plan_refinement_loop as prl
+    importlib.reload(prl)
+    prl._clear_issue_kind_policy_cache()
+
+    assert hasattr(prl, "_normalize_issue_kind"), (
+        "plan_refinement_loop.py must expose _normalize_issue_kind()"
+    )
+    result = prl._normalize_issue_kind("design")
+    assert result == "research", (
+        f"_normalize_issue_kind('design') must return 'research' (alias normalization), "
+        f"got: {result!r}"
+    )
+
+
+def test_plan_refinement_loop_normalize_unknown_returns_none():
+    """Blocker 4: plan_refinement_loop._normalize_issue_kind returns None for unknown kind."""
+    import importlib
+    import plan_refinement_loop as prl
+    importlib.reload(prl)
+    prl._clear_issue_kind_policy_cache()
+
+    result = prl._normalize_issue_kind("foobar_unknown_xyz")
+    assert result is None, (
+        f"_normalize_issue_kind for unknown kind must return None, got: {result!r}"
     )
