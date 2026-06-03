@@ -8,10 +8,10 @@ trace_links:
   parent_issue: "#483"
   background_pr: "#570"
   future_issues:
-    - 準備フェーズ制限・状態遷移定義（未起票）
-    - Quick Load 実装（未起票）
-    - 壊れたセーブデータ・欠損・容量超過時の処理（未起票）
-    - アクセシビリティ互換の保存代替案（中断セーブ・チェックポイント等）（未起票）
+    - "#619: Quick Save を準備フェーズ限定に制限し Quick Load を実装する"
+    - "#620: Quick Save ボタンの有効/無効表示と最小限のフィードバックを実装する"
+    - "#621: LocalGameStorage の例外処理を実装する（QuotaExceededError / parse 失敗）"
+    - "#622: Quick Save のアクセシビリティ互換代替案（中断セーブ・チェックポイント等）を調査する"
 acceptance:
   - AC1: docs/product/features/quick-save.md が存在する
   - AC2: progression-only スナップショットであると明記されている
@@ -57,7 +57,20 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 - **enemies**: 敵の位置・HP・状態は保存しない
 - **projectiles**: 飛翔体（弾）の状態は保存しない
 - **戦闘中の状態**: その他の in-combat runtime state は保存しない
-- **プレイテスト証跡メタデータ**: `PlaytestEvidence` 等の証跡フィールドは保存しない
+- **プレイテスト証跡メタデータ**: `PlaytestEvidence` 等の証跡フィールドは保存しない（Issue #571 参照）
+
+### Issue #571 との境界
+
+プレイテスト証跡メタデータ（`PlaytestEvidence`）は Quick Save の対象外。証跡エクスポートは Issue #571 で実装済みの export panel が担う（game state / Quick Save との統合は禁止）。
+
+## 現行 Load 動作
+
+- 起動時のみ `storage.load()` を呼び、`createInitialGameState(snapshot)` に渡す
+- 手動 Quick Load UI/action は現行実装に存在しない
+- 復元対象: `resources`, `weaponPower`, `playerMaxHp` のみ
+- `player.hp` は保存時 HP ではなく `playerMaxHp` で初期化される
+- sortie / enemies / projectiles / cooldown / result / runtime は復元されない
+- JSON parse 失敗または required number field 欠落時は `null` 扱いとなり、default initial state へ fallback する
 
 ## ストレージ仕様
 
@@ -72,6 +85,17 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 ### 将来課題（ストレージ）
 
 欠損・破損・ブロック・容量超過時の処理（エラーハンドリング・フォールバック）は将来の実装 Issue で定義する。
+
+## Storage 失敗モード / Trust Model
+
+| 失敗・脅威 | 現行挙動 | 将来対応 |
+|---|---|---|
+| localStorage 利用不可 | load は null fallback。save は storage 未取得なら no-op | UI feedback を将来 Issue で定義する |
+| SecurityError | browser policy / invalid origin で発生し得る | save/load 初期化を crash させない |
+| QuotaExceededError | `setItem` で発生し得る。現行 save は未捕捉 | try/catch + user-visible failure feedback（#621 の対象） |
+| private/incognito | 永続保存を保証できない | "durable save" と誤記しない |
+| same-origin sharing | path 単位で隔離されない | key namespace と schemaVersion を維持する |
+| ユーザー / XSS による改変 | save data は信頼できない | parse/validate/clamp してから state に反映する |
 
 ## ゲームデザイン方針
 
@@ -101,7 +125,7 @@ Quick Save の役割や保存の意味を説明するコピー（テキスト）
 
 以下の項目は現行スコープ外であり、それぞれ別 Issue で実装・定義する:
 
-1. **準備フェーズ制限の実装**: Quick Save / Quick Load を出撃中に無効化する状態遷移定義（localStorage キー `loop-protocol.mvp.save` の読み書きタイミング制御を含む）
-2. **Quick Load の実装**: セーブデータを localStorage から読み出し、ゲーム状態を復元する機能
-3. **壊れたセーブデータの処理**: 欠損・破損・ブロック・容量超過時のエラーハンドリングとフォールバック
-4. **アクセシビリティ互換の保存代替案**: 中断セーブ・チェックポイント等、ブラウザ localStorage に依存しない保存方式の検討
+1. **準備フェーズ制限の実装** (#619): Quick Save / Quick Load を出撃中に無効化する状態遷移定義（localStorage キー `loop-protocol.mvp.save` の読み書きタイミング制御を含む）
+2. **UI フィードバック** (#620): Quick Save ボタンの有効/無効表示（準備フェーズ外では無効化）および最小限の成功/失敗フィードバック
+3. **壊れたセーブデータの処理** (#621): 欠損・破損・ブロック・容量超過時のエラーハンドリングとフォールバック
+4. **アクセシビリティ互換の保存代替案** (#622): 中断セーブ・チェックポイント等、ブラウザ localStorage に依存しない保存方式の検討
