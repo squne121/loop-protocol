@@ -1,5 +1,6 @@
 import './style.css'
 
+import { initPlaytestEvidencePanel } from './ui/playtestEvidence'
 import { bindInput, createInputState, mapInputToCommands } from './input'
 import { createCanvasRenderer } from './render'
 import {
@@ -37,6 +38,9 @@ app.innerHTML = `
     <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
 `
+
+// AC2: opt-in evidence panel — visible only when ?playtest_evidence=1
+initPlaytestEvidencePanel(document.body, window.location.search)
 
 const canvas = app.querySelector<HTMLCanvasElement>('.battle-stage__canvas')
 const commandRail = app.querySelector<HTMLElement>('.command-rail')
