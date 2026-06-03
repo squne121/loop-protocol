@@ -131,16 +131,40 @@ def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Op
     return None
 
 
-def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str]]]:
+def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -> Optional[str]:
+    """
+    VC コマンド行（target_line_idx）の直前複数行から `# vc-regex-intent: <value>` annotation を抽出。
+
+    AC3 (Issue #589): backslash-pipe (\\|) を含む regex-bearing command（rg / egrep 等）に対して、
+    `literal-pipe-ok` annotation が付与されている場合は regex_literal_pipe_suspected を免除する。
+
+    形式: `# vc-regex-intent: literal-pipe-ok reason="..."`
+    戻り値: annotation value（"literal-pipe-ok" 等）または None
+    """
+    # Look back up to 3 lines for the annotation (to allow preflight-scope + vc-regex-intent on adjacent lines)
+    look_back = min(target_line_idx, 3)
+    for offset in range(1, look_back + 1):
+        line_idx = target_line_idx - offset
+        if line_idx < 0:
+            break
+        line = lines[line_idx].strip()
+        match = re.match(r"^#\s*vc-regex-intent:\s*(\S+)", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str], Optional[str]]]:
     """
     bash ブロックからコマンドを抽出。
-    AC マーカーとコマンドの行番号と preflight-scope marker を返す。
+    AC マーカーとコマンドの行番号と preflight-scope marker と vc-regex-intent annotation を返す。
 
-    戻り値: [(ac_label, command, line_number, preflight_scope), ...]
+    戻り値: [(ac_label, command, line_number, preflight_scope, vc_regex_intent), ...]
       - ac_label: "AC1", "AC2", ... または None
       - command: raw command ($ prefix 除去済み、suffix marker 除去済み)
       - line_number: block 内での行番号
       - preflight_scope: 'pr_review_only' / 'runtime_only' / None
+      - vc_regex_intent: 'literal-pipe-ok' / None (AC3: Issue #589)
     """
     commands = []
     lines = block.split("\n")
@@ -155,6 +179,10 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
 
         # preflight-scope marker はスキップ（コマンドではない）
         if re.match(r"^\s*#\s*preflight-scope:\s*\S+\s*$", line):
+            continue
+
+        # vc-regex-intent annotation はスキップ（コマンドではない）
+        if re.match(r"^\s*#\s*vc-regex-intent:\s*\S+", line):
             continue
 
         # コマンド行の抽出（$ prefix 除去）
@@ -177,7 +205,10 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
                 # 直前行から preflight-scope marker を抽出
                 preflight_scope = extract_preflight_scope_marker(lines, i - 1)
 
-                commands.append((current_ac, cmd, i, preflight_scope))
+                # 直前行から vc-regex-intent annotation を抽出 (AC3: Issue #589)
+                vc_regex_intent = extract_vc_regex_intent_annotation(lines, i - 1)
+
+                commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent))
 
     return commands
 
@@ -777,6 +808,82 @@ def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
     return key in _ALLOWED_PNPM_SUBCOMMANDS
 
 
+# ---------------------------------------------------------------------------
+# Regex-bearing command detection for backslash-pipe (regex_literal_pipe_suspected) — Issue #589
+# ---------------------------------------------------------------------------
+
+
+def _is_regex_bearing_command_for_literal_pipe(argv: List[str]) -> bool:
+    """
+    Return True if the command is regex-bearing and uses a regex engine where
+    backslash-pipe is a literal pipe (not alternation).
+
+    Coverage:
+    - rg: Rust regex engine, x|y is alternation, backslash-pipe is literal pipe
+    - egrep / fgrep: ERE, backslash-pipe is literal pipe character (not alternation)
+    - grep -E / grep -P: Extended/Perl regex, backslash-pipe is literal pipe in ERE
+
+    Note: grep (basic mode, BRE) also treats \\| as literal, but since BRE
+    uses | as literal anyway (alternation needs \\|), this check focuses on
+    the cases where \\| is clearly wrong intent (author likely intended |
+    as alternation).
+    """
+    if not argv:
+        return False
+    cmd_basename = Path(argv[0]).name
+    if cmd_basename in ("rg", "egrep", "fgrep"):
+        return True
+    if cmd_basename == "grep":
+        for arg in argv[1:]:
+            if arg in ("-E", "-P", "--extended-regexp", "--perl-regexp"):
+                return True
+            if arg.startswith("-") and not arg.startswith("--"):
+                flags = arg[1:]
+                if "E" in flags or "P" in flags:
+                    return True
+    return False
+
+
+def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
+    r"""
+    Check if any non-flag argument (pattern argument) in argv contains \\|.
+
+    This detects the case where a user wrote \\| intending regex literal pipe,
+    which in most regex engines (rg, egrep, grep -E) is NOT needed — | alone
+    is alternation in ERE/Rust regex, and \\| is a literal pipe.
+
+    Heuristic: check all positional arguments (non-option strings) after the
+    command name for the presence of \\|.
+    """
+    if not argv:
+        return False
+
+    # Collect non-flag arguments starting from argv[1]
+    i = 1
+    n = len(argv)
+    while i < n:
+        arg = argv[i]
+        if arg == "--":
+            # Everything after -- is positional
+            for j in range(i + 1, n):
+                if "\\|" in argv[j]:
+                    return True
+            return False
+        if arg.startswith("-") and len(arg) > 1:
+            # It's a flag — skip it (and its value if it takes one)
+            # We don't try to parse all possible flags; just check if next arg
+            # looks like a value (doesn't start with -) for common value-flags.
+            # Simple heuristic: single-char flags with a value (-n 5, -A 3, etc.)
+            # For this check we are conservative and only skip the flag itself.
+            i += 1
+            continue
+        # It's a positional argument — check for \\|
+        if "\\|" in arg:
+            return True
+        i += 1
+    return False
+
+
 def classify_static_command(
     raw_command: str, cwd: Path
 ) -> Optional[Tuple[str, str, str, Optional[str], str]]:
@@ -853,6 +960,25 @@ def classify_static_command(
             "appears in results to confirm keyword presence.",
             "baseline_fail_expected",
         )
+
+    # 3.6. Regex literal pipe detection: rg/egrep/grep -E with \\| in pattern (AC3: Issue #589)
+    # \\| in a regex-bearing command pattern is likely a mistake (intending literal pipe
+    # while the engine treats | as alternation and \\| as literal pipe).
+    # This is classified as regex_literal_pipe_suspected and blocked unless the caller
+    # supplies a literal-pipe-ok annotation (handled at parse/caller level).
+    if _is_regex_bearing_command_for_literal_pipe(argv):
+        if _command_pattern_contains_backslash_pipe(argv):
+            return (
+                "blocked",
+                "regex_literal_pipe_suspected",
+                "blocked",
+                "Pattern argument contains \\| in a regex-bearing command (rg/egrep/grep -E). "
+                "In ripgrep and ERE-mode grep, | is alternation and \\| is a literal pipe. "
+                "If you intend regex alternation, use | (without backslash). "
+                "If you truly need a literal pipe in the pattern, add "
+                "# vc-regex-intent: literal-pipe-ok reason=\"...\" on the preceding line.",
+                "baseline_fail_expected",
+            )
 
     # 4. Check denied commands (unsafe, AC2)
     if cmd_basename in _DENIED_COMMANDS:
@@ -1162,6 +1288,7 @@ def compute_confidence(category: str) -> str:
         "file_not_found_unrunnable",
         "vc_no_tests_collected",
         "trivially_pass",
+        "regex_literal_pipe_suspected",  # AC3: Issue #589
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -1475,7 +1602,7 @@ def main() -> int:
         "extraction_errors": 0,
     }
 
-    for ac_label, command, line_no, preflight_scope in commands:
+    for ac_label, command, line_no, preflight_scope, vc_regex_intent in commands:
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
         if preflight_scope is not None:
@@ -1525,6 +1652,14 @@ def main() -> int:
                 # AC1-AC3: classify_static_command checks unsafe/unsupported commands
                 # BEFORE any execution attempt
                 static_result = classify_static_command(command, Path(args.cwd))
+                # AC3 (Issue #589): If regex_literal_pipe_suspected and literal-pipe-ok
+                # annotation is present, skip the blocked classification and proceed to execute.
+                if (
+                    static_result is not None
+                    and static_result[1] == "regex_literal_pipe_suspected"
+                    and vc_regex_intent == "literal-pipe-ok"
+                ):
+                    static_result = None  # annotation exempts from blocked
                 if static_result is not None:
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result

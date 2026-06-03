@@ -199,3 +199,24 @@ TEST_VERDICT:
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
 `TEST_VERDICT_MACHINE/v1` の全フィールドは必ず含める（routing 必須フィールド）。
+
+## VC 逐語実行規則（Issue #589）
+
+Issue 本文の `## Verification Commands` に記載された VC コマンドは **逐語実行（verbatim）** する。
+
+- パターン削除・簡略化・置換は禁止する。`rg -n "foo|bar"` は `rg foo` に簡略化してはならない
+- VC コマンドの一部を省略して実行することを禁止する
+- VC に記載された引数・フラグをすべてそのまま使用すること
+- regex-bearing command（rg / grep -E / egrep）のパターン引数内 `|` は regex alternation として扱い、shell pipeline と混同しない
+
+違反例（禁止）:
+```
+# VC に rg -n "foo|bar" .claude/ とある場合
+rg foo .claude/   # NG: パターンを簡略化している
+rg -n "foo" .claude/ | rg "bar"  # NG: pipeline に分割している
+```
+
+正しい実行:
+```
+rg -n "foo|bar" .claude/   # OK: 逐語実行
+```
