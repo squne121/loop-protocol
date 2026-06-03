@@ -29,6 +29,11 @@ AUTONOMY_POLICY_V1:
       - permissionMode 単体はセキュリティ境界として機能しない
       - parent の auto / acceptEdits / bypassPermissions override リスクが docs で明示されていること
       - 出力は marker-only result（IMPL_REVIEW_LOOP_RESULT_V1 等）であること
+    bash_write_path_residual_risk: |
+      read-only agents の検証は Edit / Write / MultiEdit の直接ツールアクセスのみを対象とする。
+      Bash ツール経由の書き込みパス（tee、シェルリダイレクト、インライン Python 等）は
+      このバリデーターでは制御されない既知の残存リスクである。
+      Bash 経由の書き込みを制限する場合は disallowedTools: [Bash] を使用することを推奨する。
     checked_subagents:
       - .claude/agents/implementation-worker.md
       - .claude/agents/test-runner.md

@@ -182,23 +182,31 @@ fix_delta:
 非ゼロ終了（exit 1）の場合は `termination_reason: approved` を禁止し、`human_escalation` として停止する。
 
 ```bash
-# validate_autonomy_policy_result.py を実行する前に、終了報告コメント本文を一時ファイルに書き出す
-TERMINAL_OUTPUT_FILE=$(mktemp)
-cat > "$TERMINAL_OUTPUT_FILE" << 'EOF'
-```yaml
-IMPL_REVIEW_LOOP_RESULT_V1:
-  schema_version: 1
-  status: draft_pr_ready
-  termination_reason: approved
-EOF
+# validate_autonomy_policy_result.py は、ループが生成した実際の終了報告ファイルを受け取る。
+# $RESULT_FILE は、終了報告コメント本文を gh issue comment で投稿する前に
+# 一時ファイルとして書き出したものを指す（自己生成のダミー入力ではない）。
+#
+# 終了報告コメント本文の例（$RESULT_FILE に書き込む実際の内容）:
+#   ## impl-review-loop: 完了 (2024-01-01T00:00:00Z)
+#
+#   <!-- IMPL_REVIEW_LOOP_RESULT_V1 -->
+#   ```yaml
+#   IMPL_REVIEW_LOOP_RESULT_V1:
+#     schema_version: 1
+#     status: draft_pr_ready
+#     termination_reason: approved
+#     merge_ready: true
+#     pr_url: "https://github.com/..."
+#   ```
+#
+# RESULT_FILE は既にループの終了フローで生成されているファイルへのパスを参照する。
 
 uv run python3 .claude/skills/impl-review-loop/scripts/validate_autonomy_policy_result.py \
   --policy docs/dev/autonomy-policy.md \
   --agent-dir .claude/agents \
-  --terminal-output-file "$TERMINAL_OUTPUT_FILE"
+  --terminal-output-file "$RESULT_FILE"
 
 VALIDATOR_EXIT=$?
-rm -f "$TERMINAL_OUTPUT_FILE"
 
 if [ "$VALIDATOR_EXIT" -ne 0 ]; then
   echo "AUTONOMY_POLICY_V1 validation failed (exit $VALIDATOR_EXIT). termination_reason: approved is prohibited."
