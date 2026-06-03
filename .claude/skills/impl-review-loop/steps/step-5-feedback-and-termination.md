@@ -176,6 +176,40 @@ fix_delta:
   pr_review_comment_url: <pr-reviewer が投稿した verdict コメントの URL>
 ```
 
+## AUTONOMY_POLICY_V1 validator gate（termination_reason: approved 前に必須）
+
+`termination_reason: approved` を立てる前に、`validate_autonomy_policy_result.py` を実行する。
+非ゼロ終了（exit 1）の場合は `termination_reason: approved` を禁止し、`human_escalation` として停止する。
+
+```bash
+# validate_autonomy_policy_result.py を実行する前に、終了報告コメント本文を一時ファイルに書き出す
+TERMINAL_OUTPUT_FILE=$(mktemp)
+cat > "$TERMINAL_OUTPUT_FILE" << 'EOF'
+```yaml
+IMPL_REVIEW_LOOP_RESULT_V1:
+  schema_version: 1
+  status: draft_pr_ready
+  termination_reason: approved
+EOF
+
+uv run python3 .claude/skills/impl-review-loop/scripts/validate_autonomy_policy_result.py \
+  --policy docs/dev/autonomy-policy.md \
+  --agent-dir .claude/agents \
+  --terminal-output-file "$TERMINAL_OUTPUT_FILE"
+
+VALIDATOR_EXIT=$?
+rm -f "$TERMINAL_OUTPUT_FILE"
+
+if [ "$VALIDATOR_EXIT" -ne 0 ]; then
+  echo "AUTONOMY_POLICY_V1 validation failed (exit $VALIDATOR_EXIT). termination_reason: approved is prohibited."
+  echo "termination_reason: human_escalation"
+  exit 1
+fi
+```
+
+validator が exit 0 を返した場合のみ、次の終了処理（approved）に進む。
+詳細スキーマ: `docs/dev/autonomy-policy.md` の AUTONOMY_POLICY_VALIDATION_RESULT_V1 マーカースキーマ参照。
+
 ## 終了処理（approved）
 
 ```bash
