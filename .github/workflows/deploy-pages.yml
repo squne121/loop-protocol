@@ -34,7 +34,28 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
-      - run: pnpm build -- --base=/loop-protocol/
+      - name: Resolve Vite base path
+        id: vite-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          base="/${repo_name}/"
+          case "$base" in
+            /*/) ;;
+            *) echo "Invalid Vite base: $base" >&2; exit 1 ;;
+          esac
+          echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
+          echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+      - run: pnpm build
+      - name: Verify main build asset base path
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ steps.vite-base.outputs.base }}"
+          grep -F "${base}assets/" dist/index.html
+          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
       - name: Deploy to gh-pages (replace root, preserve pr-*)
         run: |
           git config user.name "github-actions[bot]"
@@ -91,40 +112,92 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
-      - run: pnpm build -- --base=/loop-protocol/pr-${{ github.event.number }}/
+      - name: Resolve Vite base path
+        id: vite-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          base="/${repo_name}/pr-${{ github.event.number }}/"
+          case "$base" in
+            /*/) ;;
+            *) echo "Invalid Vite base: $base" >&2; exit 1 ;;
+          esac
+          echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
+          echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+      - run: pnpm build
+      - name: Verify PR preview build asset base path
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ steps.vite-base.outputs.base }}"
+          grep -F "${base}assets/" dist/index.html
+          ! grep -E 'src="/assets/|href="/assets/' dist/index.html
       - uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./dist
           keep_files: true
           destination_dir: pr-${{ github.event.number }}
+      - name: Verify preview assets are live
+        id: preview-assets-live
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ steps.vite-base.outputs.base }}"
+          preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${base}"
+          curl -fsSL --retry 5 --retry-delay 10 --max-time 90 \
+            -H 'Cache-Control: no-cache' \
+            "${preview_url}?cache_bust=${GITHUB_SHA}" \
+            -o /tmp/preview-index.html
+          grep -F "${base}assets/" /tmp/preview-index.html
+          ! grep -E 'src="/assets/|href="/assets/' /tmp/preview-index.html
+          mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
+          if [ "${#asset_paths[@]}" -eq 0 ]; then
+            echo "No asset paths found in /tmp/preview-index.html" >&2
+            exit 1
+          fi
+          for asset_path in "${asset_paths[@]}"; do
+            case "$asset_path" in
+              "$base"assets/*) ;;
+              *)
+                echo "Unexpected asset path outside expected base: $asset_path" >&2
+                exit 1
+                ;;
+            esac
+            curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}"
+          done
       - name: Comment preview URL on PR
         uses: actions/github-script@v7
+        env:
+          PAGES_BASE_PATH: ${{ steps.vite-base.outputs.base }}
+          PREVIEW_ASSET_LIVE_STATUS: ${{ steps.preview-assets-live.outcome }}
         with:
           script: |
             const prNumber = context.payload.pull_request.number;
-            const previewUrl = `https://squne121.github.io/loop-protocol/pr-${prNumber}/`;
-
-            // Live check: verify the preview URL is actually reachable (best-effort)
-            let liveCheckPassed = false;
-            try {
-              const { execSync } = require('child_process');
-              execSync(
-                `curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null -w "%{http_code}" "${previewUrl}" | grep -q "^200$"`,
-                { stdio: 'inherit' }
-              );
-              liveCheckPassed = true;
-            } catch (_) {
-              // best-effort: live check failed, but do not fail the workflow
-            }
+            const basePath = process.env.PAGES_BASE_PATH;
+            const previewUrl = `https://${context.repo.owner}.github.io${basePath}`;
+            const assetLivePassed = process.env.PREVIEW_ASSET_LIVE_STATUS === 'success';
 
             const marker = '<!-- loop-protocol-pr-preview -->';
-            const body = liveCheckPassed
-              ? `${marker}\n## Preview URL\n\n✅ verified live: ${previewUrl}\n\n> The preview will be removed when this PR is closed.`
-              : `${marker}\n## Preview URL\n\n⏳ publish requested（live URL 未検証 / Pages source 設定後に有効化）: ${previewUrl}\n\n> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)\n> The preview will be removed when this PR is closed.`;
+            const body = assetLivePassed
+              ? `${marker}
+## Preview URL
 
-            // Upsert: update existing bot comment if present, otherwise create
-            // Use paginate to scan all pages of comments
+✅ verified live assets: ${previewUrl}
+
+> The preview will be removed when this PR is closed.`
+              : `${marker}
+## Preview URL
+
+⏳ publish requested（asset-level live check 未検証 / Pages source 設定後に有効化）: ${previewUrl}
+
+> Pages source の設定が必要な場合: Settings → Pages → Source → gh-pages (root)
+> base path 修正だけでは hosted runtime 復旧を保証しません。publish trigger / source fault は別問題として切り分けてください。
+> The preview will be removed when this PR is closed.`;
+
             const allComments = await github.paginate(
               github.rest.issues.listComments,
               {
