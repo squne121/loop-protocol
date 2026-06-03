@@ -15,7 +15,11 @@
 
 interface NavigatorUAData {
   platform: string
-  getHighEntropyValues(hints: string[]): Promise<{ fullVersionList?: Array<{ brand: string; version: string }>; uaFullVersion?: string }>
+  getHighEntropyValues(hints: string[]): Promise<{
+    fullVersionList?: Array<{ brand: string; version: string }>
+    uaFullVersion?: string
+    platformVersion?: string
+  }>
 }
 
 declare global {
@@ -95,9 +99,8 @@ function collectBrowserInfo(): BrowserInfo {
       ? (navigator.userAgentData?.platform ?? navigator.platform ?? 'unknown')
       : 'unknown'
 
-  // AC4: try getHighEntropyValues first, synchronous fallback
-  // Note: getHighEntropyValues is async; for synchronous collection we parse userAgent
-  // as the sync fallback. Async path is handled in collectBrowserInfoAsync.
+  // AC4: synchronous initial collection — parses userAgent as best-effort.
+  // Chrome full version is obtained asynchronously via collectBrowserInfoAsync().
   const versionFromUA = parseVersionFromUA(ua)
 
   if (versionFromUA) {
@@ -113,7 +116,79 @@ function collectBrowserInfo(): BrowserInfo {
     version: 'unknown',
     version_source: 'unknown',
     unknown_reason:
-      'navigator.userAgent did not contain a recognizable version token and getHighEntropyValues is async',
+      'navigator.userAgent did not contain a recognizable version token; getHighEntropyValues will be attempted asynchronously',
+    platform,
+    user_agent: ua,
+  }
+}
+
+/**
+ * AC4: Async browser info collection using getHighEntropyValues.
+ * Attempts to obtain the full Chrome version (e.g. "124.0.6367.82") via the
+ * User-Agent Client Hints API. Falls back to userAgent parse on failure.
+ */
+async function collectBrowserInfoAsync(): Promise<BrowserInfo> {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
+  const platform =
+    typeof navigator !== 'undefined'
+      ? (navigator.userAgentData?.platform ?? navigator.platform ?? 'unknown')
+      : 'unknown'
+
+  if (
+    typeof navigator !== 'undefined' &&
+    navigator.userAgentData &&
+    typeof navigator.userAgentData.getHighEntropyValues === 'function'
+  ) {
+    try {
+      const hints = await navigator.userAgentData.getHighEntropyValues([
+        'fullVersionList',
+        'uaFullVersion',
+        'platformVersion',
+      ])
+      // Prefer fullVersionList for Chromium-based browsers (highest fidelity)
+      if (hints.fullVersionList && hints.fullVersionList.length > 0) {
+        // Pick the entry with the longest version string (most specific)
+        const best = hints.fullVersionList.reduce((a, b) =>
+          a.version.length >= b.version.length ? a : b,
+        )
+        if (best.version && !best.brand.includes('Not')) {
+          return {
+            version: best.version,
+            version_source: 'userAgentData',
+            platform,
+            user_agent: ua,
+          }
+        }
+      }
+      if (hints.uaFullVersion) {
+        return {
+          version: hints.uaFullVersion,
+          version_source: 'userAgentData',
+          platform,
+          user_agent: ua,
+        }
+      }
+    } catch {
+      // getHighEntropyValues rejected — fall through to userAgent parse
+    }
+  }
+
+  // Fallback: parse userAgent
+  const versionFromUA = parseVersionFromUA(ua)
+  if (versionFromUA) {
+    return {
+      version: versionFromUA,
+      version_source: 'userAgent',
+      platform,
+      user_agent: ua,
+    }
+  }
+
+  return {
+    version: 'unknown',
+    version_source: 'unknown',
+    unknown_reason:
+      'getHighEntropyValues unavailable or rejected, and navigator.userAgent did not contain a recognizable version token',
     platform,
     user_agent: ua,
   }
@@ -310,8 +385,10 @@ function downloadString(content: string, filename: string): void {
 
 /** Build and mount the Evidence Panel DOM node (AC2, AC9, AC10) */
 function mountPanel(container: HTMLElement): void {
+  // Initial synchronous render — browser version may be userAgent-parsed initially
   const data = buildEvidenceData()
-  const yaml = toYaml(data)
+  // Mutable reference so async update can refresh textarea / download
+  let currentYaml = toYaml(data)
 
   const panel = document.createElement('aside')
   panel.setAttribute('data-playtest-evidence', 'true')
@@ -344,7 +421,7 @@ function mountPanel(container: HTMLElement): void {
   // Textarea fallback for manual copy (AC9 fallback)
   const textarea = document.createElement('textarea')
   textarea.setAttribute('data-playtest-fallback', 'true')
-  textarea.value = yaml
+  textarea.value = currentYaml
   textarea.readOnly = true
   textarea.style.cssText = [
     'width:100%',
@@ -367,7 +444,7 @@ function mountPanel(container: HTMLElement): void {
     'margin-right:8px;padding:6px 12px;background:#4a9eff;color:#000;border:none;cursor:pointer;font-size:12px'
   copyBtn.addEventListener('click', () => {
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(yaml).then(
+      navigator.clipboard.writeText(currentYaml).then(
         () => {
           copyBtn.textContent = 'Copied!'
           setTimeout(() => {
@@ -393,7 +470,7 @@ function mountPanel(container: HTMLElement): void {
   downloadBtn.style.cssText =
     'padding:6px 12px;background:#2a6e2a;color:#fff;border:none;cursor:pointer;font-size:12px'
   downloadBtn.addEventListener('click', () => {
-    downloadString(yaml, evidenceFilename(data.generated_at))
+    downloadString(currentYaml, evidenceFilename(data.generated_at))
   })
 
   const btnRow = document.createElement('div')
@@ -407,6 +484,18 @@ function mountPanel(container: HTMLElement): void {
   panel.appendChild(textarea)
 
   container.appendChild(panel)
+
+  // AC4: async update — fetch high-entropy browser version and refresh panel content
+  collectBrowserInfoAsync().then((asyncBrowser) => {
+    if (asyncBrowser.version_source === 'userAgentData') {
+      // Replace browser info in data and re-render YAML
+      const updatedData: PlaytestEvidenceData = { ...data, browser: asyncBrowser }
+      currentYaml = toYaml(updatedData)
+      textarea.value = currentYaml
+    }
+  }).catch(() => {
+    // Async update failed silently — initial sync render remains
+  })
 }
 
 /**
