@@ -331,6 +331,7 @@ class CheckerResult:
     non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
     diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
     issue_kind: str = "implementation"
+    parsed_vc_commands: list = field(default_factory=list)  # list[ParsedVcCommand] (serialized dicts)
 
 
 PLACEHOLDER_VALUES = {"", "tbd", "todo", "none", "n/a", "na", "<tbd>", "<todo>"}
@@ -1028,6 +1029,11 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     checks.C4_vc_commands_present, issues = check_c4_vc_commands_present(body)
     result.blocking_issues.extend(issues)
 
+    # annotation-aware VC parse (Issue #599)
+    vc_section = extract_section(body, "Verification Commands")
+    if vc_section:
+        result.parsed_vc_commands = parse_vc_commands(vc_section)
+
     # C5
     checks.C5_ac_vc_number_alignment, issues = check_c5_ac_vc_alignment(body)
     result.blocking_issues.extend(issues)
@@ -1154,6 +1160,16 @@ def load_fixture_file(path: str) -> tuple[str, str, str]:
 def result_to_dict(result: CheckerResult) -> dict:
     """Convert CheckerResult to a dict for JSON output."""
     import datetime
+
+    def _serialize_parsed_vc_cmd(cmd: ParsedVcCommand) -> dict:
+        return {
+            "command": cmd.command,
+            "preflight_scope": cmd.preflight_scope.value if cmd.preflight_scope is not None else None,
+            "trivially_pass_reason": cmd.trivially_pass_reason,
+            "classification": cmd.classification,
+            "skip_reason_type": cmd.skip_reason_type,
+        }
+
     return {
         "verdict": result.verdict,
         "issue_kind": result.issue_kind,
@@ -1176,6 +1192,7 @@ def result_to_dict(result: CheckerResult) -> dict:
         "blocking_issues": result.blocking_issues,
         "non_blocking_improvements": result.non_blocking_improvements,
         "diff_proposal": result.diff_proposal,
+        "parsed_vc_commands": [_serialize_parsed_vc_cmd(c) for c in result.parsed_vc_commands],
     }
 
 

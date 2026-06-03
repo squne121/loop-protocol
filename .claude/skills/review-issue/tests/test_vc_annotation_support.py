@@ -235,16 +235,23 @@ $ test -f pyproject.toml
         assert commands[0].skip_reason_type == "trivially_pass"
 
     def test_trivially_pass_not_unexpected_pass(self):
-        """AC4: trivially_pass command must not be classified as unexpected_pass."""
+        """AC4: trivially_pass command must not be classified as unexpected_pass.
+        Also verifies trivially_pass_reason is non-empty and skip_reason_type is correct."""
         vc_section = """
 ```bash
-# trivially_pass: always exits 0
-$ true
+# trivially_pass: already exists in baseline
+$ rg 'foo' bar.py
 ```
 """
         commands = parse_vc_commands(vc_section)
-        # classification must not be "unexpected_pass"
-        assert commands[0].classification != "unexpected_pass"
+        cmd = commands[0]
+        assert cmd.classification == "skipped"
+        assert cmd.skip_reason_type == "trivially_pass"
+        assert cmd.trivially_pass_reason is not None
+        assert cmd.trivially_pass_reason != ""
+        assert cmd.trivially_pass_reason == "already exists in baseline"
+        # Core of B4: must not be classified as unexpected_pass
+        assert cmd.classification != "unexpected_pass"
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +561,78 @@ class TestJsonContractNotBroken:
 
 
 # ---------------------------------------------------------------------------
+# Test: --json output contains parsed_vc_commands (B2 fix — E2E connection test)
+# ---------------------------------------------------------------------------
+
+class TestJsonOutputContainsParsedVcCommands:
+    """GIVEN a VC section with annotation
+    WHEN check_issue_contract.py --json --file runs
+    THEN the JSON output contains a 'parsed_vc_commands' field with annotation metadata."""
+
+    def test_json_output_has_parsed_vc_commands_key(self):
+        """B2: --json output must include 'parsed_vc_commands' key (E2E connection test)."""
+        issue_body = _MINIMAL_PASS_ISSUE.replace(
+            "```bash\n# AC1\n$ python foo.py | grep bar\n```",
+            "```bash\n# AC1\n# preflight-scope: pr_review_only\n$ rg -n \"foo\" bar.py\n```",
+        )
+        output = _run_checker_json(issue_body)
+        assert "parsed_vc_commands" in output, (
+            f"'parsed_vc_commands' key missing from --json output. Keys present: {list(output.keys())}"
+        )
+
+    def test_json_parsed_vc_commands_is_list(self):
+        """B2: parsed_vc_commands must be a list in --json output."""
+        output = _run_checker_json(_MINIMAL_PASS_ISSUE)
+        assert isinstance(output.get("parsed_vc_commands"), list)
+
+    def test_json_parsed_vc_commands_preflight_scope_annotation(self):
+        """B2: parsed_vc_commands entries include preflight_scope annotation metadata."""
+        issue_body = _MINIMAL_PASS_ISSUE.replace(
+            "```bash\n# AC1\n$ python foo.py | grep bar\n```",
+            "```bash\n# AC1\n# preflight-scope: pr_review_only\n$ rg -n \"foo\" bar.py\n```",
+        )
+        output = _run_checker_json(issue_body)
+        cmds = output["parsed_vc_commands"]
+        assert len(cmds) >= 1
+        annotated = [c for c in cmds if c.get("preflight_scope") == "pr_review_only"]
+        assert len(annotated) >= 1, (
+            f"Expected at least one command with preflight_scope=pr_review_only, got: {cmds}"
+        )
+        cmd = annotated[0]
+        assert cmd["classification"] == "skipped"
+        assert cmd["skip_reason_type"] == "preflight_scope"
+
+    def test_json_parsed_vc_commands_trivially_pass_annotation(self):
+        """B2+B4: parsed_vc_commands entries include trivially_pass_reason (non-empty) via E2E path."""
+        issue_body = _MINIMAL_PASS_ISSUE.replace(
+            "```bash\n# AC1\n$ python foo.py | grep bar\n```",
+            "```bash\n# AC1\n# trivially_pass: already validated in prior iteration\n$ python foo.py | grep bar\n```",
+        )
+        output = _run_checker_json(issue_body)
+        cmds = output["parsed_vc_commands"]
+        assert len(cmds) >= 1
+        tp_cmds = [c for c in cmds if c.get("skip_reason_type") == "trivially_pass"]
+        assert len(tp_cmds) >= 1, (
+            f"Expected at least one command with skip_reason_type=trivially_pass, got: {cmds}"
+        )
+        cmd = tp_cmds[0]
+        assert cmd["classification"] == "skipped"
+        assert cmd["trivially_pass_reason"] is not None
+        assert cmd["trivially_pass_reason"] != ""
+        assert cmd["trivially_pass_reason"] == "already validated in prior iteration"
+
+    def test_json_unannotated_command_is_executable(self):
+        """B2: unannotated commands appear in parsed_vc_commands with classification=executable."""
+        output = _run_checker_json(_MINIMAL_PASS_ISSUE)
+        cmds = output["parsed_vc_commands"]
+        assert len(cmds) >= 1
+        executable = [c for c in cmds if c.get("classification") == "executable"]
+        assert len(executable) >= 1, (
+            f"Expected at least one executable command, got: {cmds}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Standalone test function targeted by VC: -k "json_contract_not_broken"
 # Note: pytest -k parses "not" as a keyword operator. Using a standalone function
 # avoids the class name "NotBroken" matching issue.
@@ -575,6 +654,7 @@ def test_json_contract_not_broken_standalone():
         "blocking_issues",
         "non_blocking_improvements",
         "diff_proposal",
+        "parsed_vc_commands",
     }
     missing = required_keys - set(output.keys())
     assert not missing, f"Missing keys in --json output: {missing}"
