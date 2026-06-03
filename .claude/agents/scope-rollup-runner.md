@@ -163,11 +163,23 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     pr_count: <PR_COUNT>
   result:
     plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
-    result_sha256: "<RESULT_SHA>"
+    raw_plan_location: "/tmp/scope_rollup_<invocation_id>.json"
+    result_sha256: "<ファイルバイト列の sha256>"
+    suggested_actions_summary: "<1-3行の候補サマリ>"
     candidate_count: <候補数>
     high_confidence_count: <confidence:high の候補数>
-  plan: <plan_issue_scope_rollup.py の JSON 出力>
 ```
+
+**result_sha256 の計算方法**（ファイルバイト列 sha256）:
+
+```bash
+# result_sha256 計算（ファイルバイト列 sha256）
+sha256sum /tmp/scope_rollup_<invocation_id>.json | awk '{print $1}'
+```
+
+`result_sha256` は `raw_plan_location` のファイルバイト列の sha256 であり、RFC 8785 正規化は不要。`sha256sum` コマンドと同一の計算で算出する。
+
+**`plan:` フィールドは含めない**。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
 
 ## 禁止操作（GitHub mutation / repo mutation の禁止）
 
