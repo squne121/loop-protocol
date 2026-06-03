@@ -320,6 +320,22 @@
     - "## CombatSystem Contract"
     - "## Defeat Policy"
 
+- id: feature-quick-save
+  path: docs/product/features/quick-save.md
+  title: Quick Save Feature Spec
+  keywords:
+    - quick-save
+    - quick-load
+    - localStorage
+    - GameSnapshot
+    - progression
+    - save-load
+    - resources
+    - weaponPower
+    - playerMaxHp
+    - preparation-phase
+  description: Quick Save / Load の progression-only 保存境界、現行 localStorage 実装、現行 boot-time load 動作、保存対象外フィールド、storage 失敗モード、将来実装 issue を定義する。
+
 ---
 
 ## ディレクトリ → SSOT マッピング
