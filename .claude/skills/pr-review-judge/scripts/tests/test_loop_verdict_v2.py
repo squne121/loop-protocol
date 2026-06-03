@@ -32,6 +32,33 @@ def read_skill_md() -> str:
     return SKILL_MD_PATH.read_text(encoding="utf-8")
 
 
+def extract_verdict_template(skill_text: str) -> str:
+    """Extract the Verdict comment template section from SKILL.md.
+
+    The template is wrapped in a ````markdown ... ```` fenced block.
+    We locate the section header, then extract from the opening fence
+    to the matching closing fence (the one on its own line at the end).
+    """
+    # Find the section start
+    section_start = skill_text.find("## Verdict コメントテンプレート")
+    if section_start == -1:
+        return ""
+
+    # Find the opening ````markdown fence after the section header
+    fence_open = skill_text.find("````markdown", section_start)
+    if fence_open == -1:
+        return ""
+
+    # Find the closing ```` fence (a line containing only ```` after the opening fence)
+    search_from = fence_open + len("````markdown")
+    fence_close = skill_text.find("\n````", search_from)
+    if fence_close == -1:
+        return ""
+
+    # Return from the section header to (and including) the closing fence line
+    return skill_text[section_start:fence_close + len("\n````")]
+
+
 def read_pr_reviewer() -> str:
     return PR_REVIEWER_PATH.read_text(encoding="utf-8")
 
@@ -700,6 +727,60 @@ class TestConsumerInventory:
         skill = read_skill_md()
         # Should mention that consumers maintain compatibility until cutover
         assert "#631" in skill or "cutover" in skill or "runtime behavior" in skill
+
+
+# ---------------------------------------------------------------------------
+# B4: Verdict template must be V2-only (no V1 remnants)
+# ---------------------------------------------------------------------------
+
+class TestVerdictTemplateIsV2Only:
+    """B4: SKILL.md Verdict template contains only LOOP_VERDICT_V2, no V1 remnants."""
+
+    def test_verdict_template_is_v2_only(self):
+        """SKILL.md Verdict コメントテンプレートに V1 残骸がないことを確認。"""
+        skill = read_skill_md()
+        verdict_template = extract_verdict_template(skill)
+
+        assert verdict_template, "Verdict コメントテンプレートセクションが SKILL.md に存在すること"
+        assert "## LOOP_VERDICT\n" not in verdict_template, \
+            "Verdict template に V1 '## LOOP_VERDICT' ヘッダーが残存していない"
+        assert "mergeStateStatus:" not in verdict_template, \
+            "Verdict template に camelCase 'mergeStateStatus:' が残存していない"
+        assert "recommendations:" not in verdict_template, \
+            "Verdict template に廃止フィールド 'recommendations:' が残存していない"
+        assert "## LOOP_VERDICT_V2" in verdict_template, \
+            "Verdict template に '## LOOP_VERDICT_V2' ヘッダーが存在すること"
+        assert "merge_state_status:" in verdict_template, \
+            "Verdict template に snake_case 'merge_state_status:' が存在すること"
+        assert "required_auto_actions:" in verdict_template, \
+            "Verdict template に 'required_auto_actions:' フィールドが存在すること"
+
+    def test_verdict_template_has_no_v1_mergeable_camelcase(self):
+        """Verdict template に 'mergeable:' 行は存在するが 'mergeStateStatus:' は存在しない。"""
+        skill = read_skill_md()
+        verdict_template = extract_verdict_template(skill)
+
+        # mergeable (lowercase, acceptable) is allowed
+        assert "mergeable:" in verdict_template, \
+            "Verdict template に 'mergeable:' フィールドが存在すること"
+        # mergeStateStatus (camelCase, V1 remnant) must not appear
+        assert "mergeStateStatus:" not in verdict_template, \
+            "Verdict template に camelCase 'mergeStateStatus:' を含まないこと（V2 では merge_state_status を使う）"
+
+    def test_skill_md_skill_field_in_required_auto_actions(self):
+        """required_auto_actions の各エントリに skill フィールドが定義されていること。"""
+        skill = read_skill_md()
+        # The schema definition should mention skill field for required_auto_actions
+        assert "skill: open-pr.update_pr" in skill or "skill: implement-issue.update_branch" in skill, \
+            "required_auto_actions のアクション定義に skill フィールドが含まれていること"
+
+    def test_merge_ready_draft_pr_semantics_documented(self):
+        """SKILL.md に Draft PR と merge_ready: true の意味が説明されていること。"""
+        skill = read_skill_md()
+        assert "Draft PR" in skill, \
+            "SKILL.md に Draft PR と merge_ready の関係説明が存在すること"
+        assert "impl-review-loop の終端条件" in skill or "ループの終端" in skill, \
+            "SKILL.md に merge_ready がループ終端条件であることが説明されていること"
 
 
 if __name__ == "__main__":

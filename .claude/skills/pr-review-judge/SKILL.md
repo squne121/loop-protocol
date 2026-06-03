@@ -62,7 +62,7 @@ gh pr view <PR番号> --json mergeable,mergeStateStatus
 - `mergeable=CONFLICTING` または `mergeStateStatus=DIRTY` → **Conflict blocker**（REQUEST_CHANGES）
 - `mergeStateStatus=BLOCKED` → **Merge blocker**（review/protection 待ち等、REQUEST_CHANGES）
 - `mergeable=UNKNOWN`（retry 後も） → **Unknown blocker**（REQUEST_CHANGES）
-- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、APPROVE 時に `recommendations: [update_branch]` を出力する（後述）
+- `mergeStateStatus=BEHIND` → head ref が base branch より古いだけであり、Conflict blocker / Merge blocker に該当しない（REQUEST_CHANGES しない）。update-branch / rebase 自動化は Step 5 / #67 の責務。TEST_VERDICT の `branch_behind_main: true` を確認し、`required_auto_actions` に `kind: update_branch` を追加する（Step 5 で決定）
 - `mergeable=MERGEABLE` かつ `mergeStateStatus=CLEAN|UNSTABLE|BEHIND` → 次へ進む
 
 ## VC 証跡判定ポリシー（PR_REVIEW_JUDGE_VC_EVIDENCE_POLICY）
@@ -315,20 +315,20 @@ REQUIRED_AUTO_ACTIONS=[]
 PR_BODY=$(gh pr view <PR番号> --json body --jq '.body')
 if ! echo "$PR_BODY" | grep -iE "(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved) #[0-9]+" > /dev/null; then
   # ensure_closing_keyword: PR body に GitHub 公式 closing keyword が存在しない
-  REQUIRED_AUTO_ACTIONS に追加: {kind: ensure_closing_keyword, executor: implementation-worker, blocking_merge_ready: true, mechanical: true}
+  REQUIRED_AUTO_ACTIONS に追加: {kind: ensure_closing_keyword, executor: implementation-worker, skill: open-pr.update_pr, blocking_merge_ready: true, mechanical: true}
 fi
 
 # 2. PR body validator failure（mechanical: true のもののみ）
 # mechanical: false（Safety Claim Matrix 不足・Consumer Inventory 不足・Evidence 不足等）は blockers に残す
 if <PR body の機械的フォーマット不備（空セクション・placeholder 残存等）を検出>; then
-  REQUIRED_AUTO_ACTIONS に追加: {kind: update_pr_body_hygiene, executor: implementation-worker, blocking_merge_ready: true, mechanical: true}
+  REQUIRED_AUTO_ACTIONS に追加: {kind: update_pr_body_hygiene, executor: implementation-worker, skill: open-pr.update_pr, blocking_merge_ready: true, mechanical: true}
 fi
 
 # 3. BEHIND branch の検出
 BRANCH_BEHIND_MAIN=$(echo "$TEST_VERDICT_BODY" | grep "branch_behind_main:" | head -n1 | sed -E 's/.*branch_behind_main:[[:space:]]*//; s/[[:space:]]*//')
 if [ "$MERGEABLE" = "MERGEABLE" ] && [ "$BRANCH_BEHIND_MAIN" = "true" ]; then
   # update_branch: head ref が base branch より古い（merge update で解消可能）
-  REQUIRED_AUTO_ACTIONS に追加: {kind: update_branch, executor: implementation-worker, blocking_merge_ready: true, mechanical: true, expected_head_sha: <reviewed_head_sha>}
+  REQUIRED_AUTO_ACTIONS に追加: {kind: update_branch, executor: implementation-worker, skill: implement-issue.update_branch, blocking_merge_ready: true, mechanical: true, expected_head_sha: <reviewed_head_sha>}
 fi
 ```
 
@@ -359,6 +359,10 @@ merge_ready = (
 - `required_auto_actions` が 1 件以上存在する場合は `merge_ready: false` を強制する（verdict が APPROVE でも同様）
 - `follow_up_issue_requests` の存在は `merge_ready` に影響しない
 - `follow_up_issue_requests` 内のエントリはすべて `blocking_merge_ready: false` でなければならない
+
+**`merge_ready` と Draft PR について:**
+
+`merge_ready: true` は `impl-review-loop` の終端条件（レビュー・修正ループが完了した状態）であり、GitHub UI 上の即時マージ可能性とは独立する。Draft PR であっても `impl-review-loop` の終端条件（verdict==APPROVE かつ blockers==[] かつ required_auto_actions==[] かつ mergeability 条件を満たす）を満たせば `merge_ready: true` を出力できる。実際のマージは人間が Draft を外して実行する。`merge_ready: true` はマージを命令するものではなく、ループの終端を示すシグナルである。
 
 **`ensure_closing_keyword` の判定について:**
 - GitHub 公式 closing keyword（`close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved`）の字句解析で判定する
@@ -395,6 +399,7 @@ LOOP_VERDICT_V2:
   required_auto_actions:
     - kind: ensure_closing_keyword | update_branch | update_pr_body_hygiene
       executor: implementation-worker
+      skill: open-pr.update_pr | implement-issue.update_branch  # 実行 skill を明示（executor が委譲する skill）
       blocking_merge_ready: true  # required_auto_actions のエントリは常に true
       mechanical: true  # required_auto_actions に分類できるのは mechanical: true のみ
       # update_branch の場合のみ追加フィールド:
@@ -422,7 +427,7 @@ LOOP_VERDICT_V2:
 ### LOOP_VERDICT_V2 スキーマ制約
 
 - **snake_case 専用**: V2 フィールドは snake_case のみ（`merge_state_status`, `required_auto_actions` 等）。`mergeStateStatus`（camelCase）は V2 では禁止。
-- **recommendations 廃止**: V2 では `recommendations` フィールドを出力しない（`required_auto_actions` に昇格済み）。
+- **recommendations 廃止**: V2 では `recommendations` フィールドを出力しない（`required_auto_actions` に昇格済み）。新規出力では emit しないこと。旧 consumer（V1 読み込みを実装しているもの）はカットオーバー（#631/#632 完了）まで旧 LOOP_VERDICT を読み続けることができるが、pr-review-judge は V2 出力では `recommendations` を含めない。
 - **merge_ready 充足条件**: `verdict==APPROVE && blockers==[] && required_auto_actions==[] && mergeability.mergeable==MERGEABLE && mergeability.merge_state_status in [CLEAN, UNSTABLE]` の場合のみ `merge_ready: true`。
 - **required_auto_actions 強制**: `required_auto_actions` が 1 件以上存在する場合は `merge_ready: false` を強制する。
 - **follow_up_issue_requests 制約**: 全エントリに `blocking_merge_ready: false` を必須とする（merge を blocking する問題は `blockers` または `required_auto_actions` に分類）。
