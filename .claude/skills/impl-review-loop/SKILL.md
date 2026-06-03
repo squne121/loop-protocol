@@ -102,13 +102,15 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 
 `checks.product_spec_check` を contract snapshot から読み取り、Step 1 delegation 前に `LOOP_STATE.product_spec_preflight` に正規化して格納する。以下のルールに従う:
 
-- `checks.product_spec_check` が snapshot に存在しない場合は stale / incomplete snapshot として `refresh_contract_snapshot` へ route（`issue-contract-review` 再実行）
+> **注意**: `refresh_contract_snapshot` へ route する場合は **route only; no auto-run** — AI が `issue-contract-review` を自動実行してはならない。停止して人間に `issue-contract-review` の再実行を依頼する。
+
+- `checks.product_spec_check` が snapshot に存在しない場合は stale / incomplete snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run — 停止して人間に `issue-contract-review` の再実行を依頼する）
 - `applicability == not_applicable && decision == pass` の場合のみ、無関係 Issue として `continue` へ継続
-- `applicability == not_applicable && decision != pass` は inconsistent snapshot として `refresh_contract_snapshot` へ route
+- `applicability == not_applicable && decision != pass` は inconsistent snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run）
 - `decision == fail` → fail-closed で停止、`routing_action: stop_human`
 - `decision == human_judgment` → 人間判断へ escalate、`routing_action: stop_human`
 - `decision == pass` かつ `applicability == applicable` → 続行、`routing_action: continue`
-- 不正な enum 値 → stale / invalid snapshot として `refresh_contract_snapshot` へ route
+- 不正な enum 値 → stale / invalid snapshot として `refresh_contract_snapshot` へ route する（route only; no auto-run）
 
 **実装例**: `.claude/skills/impl-review-loop/scripts/evaluate_product_spec_gate.py` が mutation-free CLI として `PRODUCT_SPEC_GATE_DECISION_V1` を出力する（routing_action: continue | stop_human | refresh_contract_snapshot）。
 
