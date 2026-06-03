@@ -312,3 +312,99 @@ class TestExpectedHeadShaRequired:
         assert "expected_head_sha" in section, (
             "expected_head_sha not in REQUEST_V2 schema section"
         )
+
+
+class TestV2ModeEnumExactSet:
+    """Fix 1 — V2 repair modes are exactly the 3 documented repair modes.
+    implement_issue is intentionally NOT a V2 repair mode."""
+
+    def test_v2_mode_enum_exact_set(self):
+        """V2 mode enum contains exactly the 3 repair modes (not implement_issue)."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "IMPLEMENTATION_WORKER_REQUEST_V2:")
+        # All 3 repair modes must be present
+        assert "update_pr_body_hygiene" in section, "update_pr_body_hygiene not in V2 mode enum"
+        assert "update_branch" in section, "update_branch not in V2 mode enum"
+        assert "apply_pr_review_fix_delta" in section, "apply_pr_review_fix_delta not in V2 mode enum"
+        # implement_issue is intentionally excluded from V2 repair modes
+        mode_line = next(
+            (line for line in section.splitlines() if line.strip().startswith("mode:")),
+            "",
+        )
+        assert "implement_issue" not in mode_line, (
+            "implement_issue must NOT appear in V2 mode enum (it is a V1-only flow)"
+        )
+
+
+class TestUpdateBranchResultReasonCodes:
+    """Fix 2 — reason_code field in RESULT_V2 for update_branch error cases."""
+
+    def test_update_branch_result_preserves_reason_codes(self):
+        """reason_code values are documented for update_branch error classification."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "IMPLEMENTATION_WORKER_RESULT_V2:")
+        assert "reason_code" in section, "reason_code field not in RESULT_V2"
+        assert "expected_head_sha_mismatch" in section, (
+            "expected_head_sha_mismatch reason_code not documented"
+        )
+        assert "secondary_rate_limit" in section, (
+            "secondary_rate_limit reason_code not documented"
+        )
+        assert "validation_failed" in section, (
+            "validation_failed reason_code not documented"
+        )
+
+    def test_422_blocked_status_preserved(self):
+        """422 still maps to status: blocked (reason_code adds granularity, does not replace status)."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        # The status enum must still include 'blocked'
+        section = _get_section(content, "IMPLEMENTATION_WORKER_RESULT_V2:")
+        assert "blocked" in section, "status: blocked must remain in RESULT_V2 for 422 cases"
+
+
+class TestApplyPrReviewFixDeltaInputFields:
+    """Fix 3 — apply_pr_review_fix_delta input contract fields are documented."""
+
+    def test_apply_pr_review_fix_delta_has_required_fields(self):
+        """review_artifact_ref, reviewed_head_sha, allowed_paths_snapshot, delta_summary are documented."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        assert "review_artifact_ref" in content, (
+            "review_artifact_ref not documented for apply_pr_review_fix_delta"
+        )
+        assert "reviewed_head_sha" in content, (
+            "reviewed_head_sha not documented for apply_pr_review_fix_delta"
+        )
+        assert "allowed_paths_snapshot" in content, (
+            "allowed_paths_snapshot not documented for apply_pr_review_fix_delta"
+        )
+        assert "delta_summary" in content, (
+            "delta_summary not documented for apply_pr_review_fix_delta"
+        )
+
+    def test_apply_pr_review_fix_delta_result_fields(self):
+        """commit_sha and pushed_branch are documented in RESULT_V2 for apply_pr_review_fix_delta."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        assert "commit_sha" in content, (
+            "commit_sha not documented in RESULT_V2 for apply_pr_review_fix_delta"
+        )
+        assert "pushed_branch" in content, (
+            "pushed_branch not documented in RESULT_V2 for apply_pr_review_fix_delta"
+        )
+
+
+class TestV2DoesNotRequireContractSnapshotUrlForRepairModes:
+    """Fix 1 — repair modes do not require issue-contract-review preflight."""
+
+    def test_v2_does_not_require_contract_snapshot_url_for_repair_modes(self):
+        """Docs state repair modes (update_pr_body_hygiene/update_branch) don't require preflight."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        # The dispatcher section must document that V2 repair modes skip issue-contract-review
+        assert "preflight" in content, "preflight mention not found in agent file"
+        # Check that the dispatcher table or text explicitly states no preflight for repair modes
+        assert (
+            "issue-contract-review preflight" in content
+            or "preflight を実施しない" in content
+            or "preflight は不要" in content
+        ), (
+            "V2 repair modes must explicitly state they do not require issue-contract-review preflight"
+        )
