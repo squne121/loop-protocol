@@ -366,3 +366,135 @@ class TestEnglishAllowlist:
         assert result == "CLEAR_FAIL", (
             f"Expected CLEAR_FAIL for English prose, got {result}"
         )
+
+
+# ============================================================
+# Regression tests: mixed-block bypass prevention (Blocker 4)
+# ============================================================
+
+# 英語のみの prose block（明確に日本語比率 0）
+ENGLISH_ONLY_PROSE_BLOCK = (
+    "This section describes the implementation details of the feature. "
+    "It is written entirely in English with no Japanese characters whatsoever."
+)
+
+# 長い日本語 block（aggregate ratio を稼ぐ）
+LONG_JAPANESE_BLOCK = (
+    "これは非常に長い日本語の段落です。この段落は主に日本語で書かれており、"
+    "英語の比率は非常に低いです。日本語の文字が多く含まれているため、"
+    "aggregate の日本語比率はかなり高くなります。この段落だけで見ると、"
+    "日本語比率は閾値を十分に超えています。"
+)
+
+# 混在テキスト: 英語 prose block + 長い日本語 block
+# aggregate ratio は高いが英語のみの prose block が存在する
+MIXED_BLOCKS_WITH_ENGLISH_PROSE = LONG_JAPANESE_BLOCK + "\n\n" + ENGLISH_ONLY_PROSE_BLOCK
+
+
+class TestMixedBlockBypassPrevention:
+    """
+    Blocker 4: 英語 prose block + 長い日本語 block の混在入力で
+    英語 block が通過しないことを確認する regression test。
+
+    問題の核心: aggregate ratio が閾値以上でも英語のみの prose block は
+    per-block gate でブロックされるべき。
+    """
+
+    def test_mixed_blocks_english_prose_is_blocked(self):
+        """
+        英語 prose block と長い日本語 block の混在で hook が exit 2 を返すこと。
+        aggregate ratio が閾値以上でも英語 prose block のせいでブロックされる。
+        (Blocker 4 regression)
+        """
+        result = run_hook(
+            "Bash",
+            f"gh issue create --title 'Test' --body '{MIXED_BLOCKS_WITH_ENGLISH_PROSE}'"
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for mixed blocks with English prose, got {result.returncode}\n"
+            f"stderr: {result.stderr}\n"
+            f"This may indicate aggregate-pass bypass (Blocker 2 regression)"
+        )
+
+    def test_per_block_validator_is_primary_gate(self):
+        """
+        aggregate ratio が高くても英語のみ prose block が存在する場合はブロックされること。
+        --borderline-check (aggregate) が primary gate として機能していないことを検証。
+        (Blocker 2 regression)
+        """
+        # 長い日本語 block だけなら pass するはず
+        japanese_only_result = run_hook(
+            "Bash",
+            f"gh issue create --title 'Test' --body '{LONG_JAPANESE_BLOCK}'"
+        )
+        assert japanese_only_result.returncode == 0, (
+            f"Expected exit 0 for Japanese-only prose, got {japanese_only_result.returncode}\n"
+            f"stderr: {japanese_only_result.stderr}"
+        )
+
+        # 英語 prose block が混在するとブロックされるはず
+        mixed_result = run_hook(
+            "Bash",
+            f"gh issue create --title 'Test' --body '{MIXED_BLOCKS_WITH_ENGLISH_PROSE}'"
+        )
+        assert mixed_result.returncode == 2, (
+            f"Expected exit 2 for mixed blocks (Japanese + English prose), got {mixed_result.returncode}\n"
+            f"stderr: {mixed_result.stderr}\n"
+            f"aggregate-pass bypass detected: per-block gate is not primary"
+        )
+
+    def test_english_only_prose_block_is_blocked_regardless_of_aggregate(self):
+        """
+        英語のみの prose block は aggregate ratio に関わらずブロックされること。
+        (Blocker 2 regression: per-block gate must be primary)
+        """
+        result = run_hook(
+            "Bash",
+            f"gh issue create --title 'Test' --body '{ENGLISH_ONLY_PROSE_BLOCK}'"
+        )
+        assert result.returncode == 2, (
+            f"Expected exit 2 for English-only prose, got {result.returncode}\n"
+            f"stderr: {result.stderr}"
+        )
+
+    def test_borderline_check_is_not_primary_gate(self):
+        """
+        --borderline-check が primary gate として使われていないことの検証。
+        validate_japanese_content.py の --borderline-check は aggregate ベースなので、
+        英語 prose block + 長い日本語 block の混在で PASS を返す可能性がある。
+        hook は per-block gate を通してからのみ borderline 分類すべき。
+        (Blocker 2 regression)
+        """
+        # --borderline-check (aggregate) 単体では PASS を返す可能性がある
+        borderline_check_result = subprocess.run(
+            [
+                "uv", "run", "python3", str(VALIDATOR),
+                "--borderline-check", "--threshold", "0.1",
+            ],
+            input=MIXED_BLOCKS_WITH_ENGLISH_PROSE,
+            capture_output=True,
+            text=True,
+        )
+        # aggregate check が PASS を返すかもしれないが...
+        aggregate_result = borderline_check_result.stdout.strip()
+
+        # hook は aggregate PASS でもブロックするはず（per-block gate が primary）
+        hook_result = run_hook(
+            "Bash",
+            f"gh issue create --title 'Test' --body '{MIXED_BLOCKS_WITH_ENGLISH_PROSE}'"
+        )
+
+        if aggregate_result == "PASS":
+            # aggregate が PASS でも hook がブロックすれば per-block gate が正しく動いている
+            assert hook_result.returncode == 2, (
+                f"aggregate check returned PASS but hook should block (per-block gate).\n"
+                f"hook returncode: {hook_result.returncode}\n"
+                f"hook stderr: {hook_result.stderr}\n"
+                f"This confirms Blocker 2: aggregate-pass bypass"
+            )
+        # aggregate が PASS でない場合も hook は exit 2 を返すはず
+        assert hook_result.returncode == 2, (
+            f"Expected hook to block mixed blocks, got {hook_result.returncode}\n"
+            f"aggregate_result: {aggregate_result}\n"
+            f"hook stderr: {hook_result.stderr}"
+        )

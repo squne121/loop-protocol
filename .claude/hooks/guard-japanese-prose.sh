@@ -62,28 +62,34 @@ validate_body() {
         return 0
     fi
 
-    # まず borderline チェック（PASS / BORDERLINE / CLEAR_FAIL を取得）
+    # Step 1: per-block validator を primary gate として使用する
+    # per-block gate: 全 prose block が threshold を満たす場合のみ pass
+    if printf '%s' "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 >/dev/null 2>/dev/null; then
+        return 0  # per-block gate 通過 → allow
+    fi
+
+    # Step 2: per-block gate が fail した場合のみ borderline 分類する
     local borderline_result
-    borderline_result="$(echo "$body" | uv run python3 "$VALIDATOR" --borderline-check --threshold 0.1 2>/dev/null || echo "CLEAR_FAIL")"
+    borderline_result="$(printf '%s' "$body" | uv run python3 "$VALIDATOR" \
+        --borderline-check \
+        --threshold 0.1 \
+        --lower-threshold 0.05 2>/dev/null || echo "BORDERLINE_ERROR")"
 
-    if [ "$borderline_result" = "PASS" ]; then
-        return 0
-    fi
-
-    if [ "$borderline_result" = "BORDERLINE" ]; then
-        echo "GUARD: borderline_japanese_prose_repair_required [${context}]" >&2
-        echo "  reason: borderline_japanese_prose_repair_required" >&2
-        echo "  action: 日本語 prose に修正して再試行してください（code fence / inline code / identifier / URL は英語許容）" >&2
-        echo "  context: ${context}" >&2
-        return 2
-    fi
-
-    # CLEAR_FAIL: 通常のブロック
-    local details
-    details="$(echo "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true)"
-    echo "GUARD: 日本語比率不足 [${context}]" >&2
-    echo "${details}" >&2
-    return 2
+    case "$borderline_result" in
+        BORDERLINE)
+            echo "GUARD: 日本語比率不足 (borderline - 自己修正してください) [${context}]" >&2
+            echo "  borderline_japanese_prose_repair_required: 日本語 prose への修正・再試行が必要です" >&2
+            return 2
+            ;;
+        *)
+            # PASS 以外（CLEAR_FAIL, BORDERLINE_ERROR など）は既存の fail-closed ロジックに従う
+            local details
+            details="$(printf '%s' "$body" | uv run python3 "$VALIDATOR" --threshold 0.1 2>&1 || true)"
+            echo "GUARD: 日本語比率不足 [${context}]" >&2
+            echo "${details}" >&2
+            return 2
+            ;;
+    esac
 }
 
 # delta mode: changed prose blocks のみを検査する
@@ -118,24 +124,13 @@ validate_delta_prose() {
         changed_count="$(echo "$result" | cut -d: -f2)"
         failed_count="$(echo "$result" | cut -d: -f3)"
 
-        # changed prose が borderline か確認する
-        local borderline_result
-        borderline_result="$(printf '%s' "$new_body" | uv run python3 "$VALIDATOR" --borderline-check --threshold 0.1 2>/dev/null || echo "CLEAR_FAIL")"
-
-        if [ "$borderline_result" = "BORDERLINE" ]; then
-            echo "GUARD: borderline_japanese_prose_repair_required [${target}]" >&2
-            echo "  reason: borderline_japanese_prose_repair_required" >&2
-            echo "  action: 日本語 prose に修正して再試行してください（code fence / inline code / identifier / URL は英語許容）" >&2
-            echo "  target: ${target}" >&2
-            echo "  changed_prose_blocks: ${changed_count}" >&2
-            echo "  failed_blocks: ${failed_count}" >&2
-        else
-            echo "GUARD: changed prose block failure [${target}]" >&2
-            echo "  target: ${target}" >&2
-            echo "  changed_prose_blocks: ${changed_count}" >&2
-            echo "  failed_blocks: ${failed_count}" >&2
-            echo "  ratio_min: 0.000" >&2
-        fi
+        # delta mode では fail-closed: changed prose block の失敗は常に exit 2
+        # aggregate ratio による borderline バイパスを行わない（新規追加の英語 prose が通過しないよう）
+        echo "GUARD: changed prose block failure [${target}]" >&2
+        echo "  target: ${target}" >&2
+        echo "  changed_prose_blocks: ${changed_count}" >&2
+        echo "  failed_blocks: ${failed_count}" >&2
+        echo "  ratio_min: 0.000" >&2
         return 2
     fi
 
