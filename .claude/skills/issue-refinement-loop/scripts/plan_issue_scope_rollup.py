@@ -374,7 +374,8 @@ def _build_scope_context(
     - same file + disjoint sub-file anchors -> same_file_disjoint_anchor -> no escalate
       (this is the #547/#549 case)
     - exact same file set with NO machine-readable anchors to prove disjointness ->
-      uncertain -> escalate (fail-safe; we cannot confirm the changes are independent)
+      uncertain -> proceed_with_coordination (escalation_required=False; disjointness
+      cannot be proven but this is not a genuine structural conflict)
     - partial path intersection without anchors -> same_file_disjoint_anchor -> no escalate
     - prefix-only overlap (no exact intersection) -> prefix_overlap_uncertain; the
       "parent -> child" pair is recorded in anchor_paths (never collapsed to "none").
@@ -555,24 +556,43 @@ def _suggested_action(
 
     Escalation logic (revised from keyword-only to scope_context-based):
     - Previously: any security keyword match -> human_review_required
-    - Now: escalation is driven by scope_context.escalation_required (structural conflict)
-      OR scope_context.conflict_type == uncertain.
+    - Now: escalation is driven by scope_context.escalation_required (genuine structural
+      conflict — same_anchor_conflicting_operation with shared sub-file anchors).
       Security keywords alone (without structural conflict) are recorded in
       security_match_evidence for audit but do NOT trigger escalation.
+
+    Evaluation order (CONFLICT_UNCERTAIN is checked BEFORE escalation_required):
+    1. conflict_type == uncertain -> proceed_with_coordination
+       uncertain = same file set, no machine-readable anchors to prove disjointness.
+       This is NOT a genuine structural conflict; escalation_required is always False
+       for CONFLICT_UNCERTAIN. However, the order is explicit so that a stale or
+       erroneously-set escalation_required flag cannot override the CONFLICT_UNCERTAIN
+       routing to proceed_with_coordination.
+    2. escalation_required == True -> human_review_required
+       Genuine structural conflict (same_anchor_conflicting_operation).
+
+    Responsibility boundary:
+    - CONFLICT_UNCERTAIN: "same file set, cannot prove disjointness" — proceed with
+      coordination, NOT blocked. Coordination evidence is recorded in
+      LOOP_STATE.scope_rollup_decision.related_coordination[].
+    - same_anchor_conflicting_operation: both issues target the same sub-file anchor
+      (JSON Pointer / property name) — genuine conflict, escalate.
 
     This prevents false positives where schema property names or metadata field names
     containing security-adjacent words (e.g. "secret_policy") cause spurious stops.
     The domain_flags field in scope_context serves as the audit trail for keyword matches.
     """
-    # Use scope_context for escalation decisions if available
+    # Use scope_context for escalation decisions if available.
+    # CONFLICT_UNCERTAIN is evaluated FIRST to prevent a stale escalation_required flag
+    # from overriding the proceed_with_coordination routing.
     if scope_context is not None:
-        if scope_context.get("escalation_required", False):
-            return ACTION_HUMAN_REVIEW_REQUIRED
         if scope_context.get("conflict_type") == CONFLICT_UNCERTAIN:
             # uncertain = same file set, no machine-readable anchors to prove disjointness.
             # This is NOT a genuine structural conflict (escalation_required=False).
             # Proceed with coordination rather than blocking.
             return ACTION_PROCEED_WITH_COORDINATION
+        if scope_context.get("escalation_required", False):
+            return ACTION_HUMAN_REVIEW_REQUIRED
 
     if confidence == CONFIDENCE_HIGH:
         if SIGNAL_SHARED_DEDUPE_KEY in signals:

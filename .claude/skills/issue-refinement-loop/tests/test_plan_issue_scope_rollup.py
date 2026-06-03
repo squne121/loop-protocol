@@ -1118,15 +1118,45 @@ class TestProceedWithCoordination:
             f"Expected proceed_with_coordination, got {c['suggested_action']!r}"
         )
 
-    def test_permission_keyword_only_should_not_escalate(
+    def test_permission_keyword_only_should_not_escalate(self) -> None:
+        """GIVEN body contains standalone 'permission' (SECURITY_RE match) AND
+        scope_context has conflict_type=uncertain AND escalation_required=False,
+        WHEN _suggested_action is called,
+        THEN action is proceed_with_coordination (not human_review_required).
+
+        This exercises the actual word-boundary `permission` keyword path (unlike
+        'permissionMode' which does NOT match \\bpermission\\b). The test verifies that
+        security_match_evidence containing "permission" does NOT drive escalation — only
+        escalation_required (genuine structural conflict) drives human_review_required.
+        This reproduces the #569/#597 false-positive: an unrelated Issue containing
+        standalone 'permission' caused human_escalation due to keyword+same-paths match.
+        """
+        # Directly test _suggested_action with a scope_context that includes the
+        # standalone 'permission' evidence but CONFLICT_UNCERTAIN (no shared anchors).
+        # CONFLICT_UNCERTAIN must be evaluated before escalation_required.
+        action = rollup._suggested_action(
+            item={},
+            signals=[],
+            confidence=rollup.CONFIDENCE_MEDIUM,
+            scope_context={
+                "conflict_type": rollup.CONFLICT_UNCERTAIN,
+                "security_match_evidence": ["permission"],
+                "escalation_required": False,
+            },
+        )
+        assert action == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"permission keyword in security_match_evidence must not escalate; "
+            f"got {action!r}"
+        )
+
+    def test_permission_keyword_word_boundary_triggers_security_match_evidence(
         self, tmp_path: Path, empty_prs_json: str
     ) -> None:
-        """GIVEN 'permissionMode' appears in body AND same Allowed Paths AND no anchors,
-        WHEN plan is generated,
-        THEN suggested_action is proceed_with_coordination (not human_review_required).
+        """Verify that standalone 'permission' (not 'permissionMode') is detected by
+        SECURITY_RE and recorded in security_match_evidence — but does NOT escalate.
 
-        This reproduces the #569/#597 false-positive: an unrelated Issue containing
-        'permissionMode' caused human_escalation due to keyword+same-paths match.
+        Integration path: body with standalone 'permission' + same Allowed Paths + no
+        anchors -> CONFLICT_UNCERTAIN -> proceed_with_coordination.
         """
         shared_path = "- `.claude/skills/impl-review-loop/steps/preparation.md`\n"
         issues = [
@@ -1141,15 +1171,15 @@ class TestProceedWithCoordination:
             },
             {
                 "number": 1201,
-                "title": "実装: permissionMode 設定を更新する",
+                "title": "実装: preparation.md の permission 設定を更新する",
                 "body": (
                     "## Allowed Paths\n"
                     + shared_path
-                    + "\n## Outcome\npermissionMode の挙動を変更する。\n"
+                    + "\n## Outcome\npermission チェックの挙動を変更する。\n"
                 ),
             },
         ]
-        issues_path = tmp_path / "issues_permission_keyword.json"
+        issues_path = tmp_path / "issues_permission_keyword_integration.json"
         issues_path.write_text(json.dumps(issues), encoding="utf-8")
 
         plan = _run(str(issues_path), empty_prs_json, current_issue_number=1200)
@@ -1157,6 +1187,14 @@ class TestProceedWithCoordination:
         assert candidates, "Expected #1201 to appear as a candidate of #1200"
         c = candidates[0]
 
+        # The standalone 'permission' keyword IS detected by SECURITY_RE
+        assert "permission" in c.get("security_match_evidence", []), (
+            "Standalone 'permission' must be recorded in security_match_evidence for audit"
+        )
+        # But it must NOT cause escalation — CONFLICT_UNCERTAIN -> proceed_with_coordination
+        assert c["scope_context"]["conflict_type"] == rollup.CONFLICT_UNCERTAIN, (
+            f"Expected uncertain (same paths, no anchors), got {c['scope_context']['conflict_type']!r}"
+        )
         assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
             f"permission keyword alone must not escalate; got {c['suggested_action']!r}"
         )
@@ -1248,4 +1286,28 @@ class TestProceedWithCoordination:
         )
         assert c["suggested_action"] != rollup.ACTION_HUMAN_REVIEW_REQUIRED, (
             f"Prefix overlap without shared anchors must not escalate; got {c['suggested_action']!r}"
+        )
+
+    def test_uncertain_conflict_takes_precedence_over_stale_escalation_flag(self) -> None:
+        """GIVEN conflict_type is CONFLICT_UNCERTAIN AND escalation_required is True
+        (stale / erroneously-set flag),
+        WHEN _suggested_action is called,
+        THEN action is proceed_with_coordination — CONFLICT_UNCERTAIN is evaluated first.
+
+        This guards against a regression where escalation_required=True could override
+        the CONFLICT_UNCERTAIN routing even though CONFLICT_UNCERTAIN is definitionally
+        NOT a genuine structural conflict.
+        """
+        action = rollup._suggested_action(
+            item={},
+            signals=[],
+            confidence=rollup.CONFIDENCE_HIGH,
+            scope_context={
+                "conflict_type": rollup.CONFLICT_UNCERTAIN,
+                "escalation_required": True,
+            },
+        )
+        assert action == rollup.ACTION_PROCEED_WITH_COORDINATION, (
+            f"CONFLICT_UNCERTAIN must take precedence over stale escalation_required=True; "
+            f"got {action!r}"
         )

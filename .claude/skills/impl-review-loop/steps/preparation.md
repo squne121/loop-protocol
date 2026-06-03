@@ -286,6 +286,8 @@ python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py 
 - `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認し、統合実施可否を判断してから次ステップに進む。自動実行しない。
 - `suggested_action: human_review_required`（`escalation_required: True` の genuine structural conflict）: 即時停止して人間が判断する（`termination_reason: human_escalation`）。
 - `suggested_action: proceed_with_coordination` の候補: 関連 Issue 番号を `LOOP_STATE.scope_rollup_decision.related_coordination[]` に構造化保存して次ステップへ継続する。PR body への `## Related coordination` 反映は PR 作成・更新フェーズの責務とし、preparation フェーズでは担わない。
+  - **`proceed_with_coordination` の意味**: 「安全に並行可能」ではなく「停止せず、coordination 証跡付きで進める」に限定する。同一ファイルの変更が独立していることは証明されていない（machine-readable anchors がなく CONFLICT_UNCERTAIN）。
+  - **PR 作成・更新フェーズ（open-pr skill）の責務**: `LOOP_STATE.scope_rollup_decision.related_coordination[]` を読み取り、PR body の `## Related coordination` セクションに関連 Issue 番号とメモを反映すること。`related_coordination` が空の場合はセクションを省略してよい。
 - `confidence: medium` の候補: LOOP_STATE に記録し、推奨アクションを提示するが自動実行しない。
 - `confidence: low` または候補なし: 記録してそのまま次ステップに進む。
 
