@@ -146,14 +146,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${{ steps.vite-base.outputs.base }}"
-          curl -fsSL --retry 5 --retry-delay 10 --max-time 90 "$preview_url" -o /tmp/preview-index.html
-          mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' dist/index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
+          base="${{ steps.vite-base.outputs.base }}"
+          preview_url="https://${GITHUB_REPOSITORY_OWNER}.github.io${base}"
+          curl -fsSL --retry 5 --retry-delay 10 --max-time 90 \
+            -H 'Cache-Control: no-cache' \
+            "${preview_url}?cache_bust=${GITHUB_SHA}" \
+            -o /tmp/preview-index.html
+          grep -F "${base}assets/" /tmp/preview-index.html
+          ! grep -E 'src="/assets/|href="/assets/' /tmp/preview-index.html
+          mapfile -t asset_paths < <(grep -oE '(src|href)="[^"]+assets/[^"]+"' /tmp/preview-index.html | sed -E 's/^[^"]+"([^"]+)"/\1/' | sort -u)
           if [ "${#asset_paths[@]}" -eq 0 ]; then
-            echo "No asset paths found in dist/index.html" >&2
+            echo "No asset paths found in /tmp/preview-index.html" >&2
             exit 1
           fi
           for asset_path in "${asset_paths[@]}"; do
+            case "$asset_path" in
+              "$base"assets/*) ;;
+              *)
+                echo "Unexpected asset path outside expected base: $asset_path" >&2
+                exit 1
+                ;;
+            esac
             curl -fsSL --retry 5 --retry-delay 10 --max-time 90 -o /dev/null "https://${GITHUB_REPOSITORY_OWNER}.github.io${asset_path}"
           done
       - name: Comment preview URL on PR
