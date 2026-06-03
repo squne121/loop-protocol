@@ -242,46 +242,113 @@ gh issue view <issue_number> --json title,labels --jq '.title + " | " + (.labels
 
 不一致なら停止し、人間判断を仰ぐ。blocker / dependency の close 状態が primary signal であり、state labels の有無は ready 判定に影響しない。ただし `phase/implementation` は issue kind / workflow routing の前提として維持する（`docs/dev/github-ops.md` 参照）。
 
-## 2.5. scope rollup preflight（`plan_issue_scope_rollup.py` 実行）
+## 2.5. scope rollup preflight（`scope-rollup-runner` 委譲）
 
 worktree 作成前に scope rollup preflight を実行し、同一 Allowed Paths / 同一 skill family / 同一 parent_issue / 同一 dedupe_key を持つ OPEN Issue / PR の統合候補を確認する。
 preflight は mutation-free（Issue 作成・編集・クローズ禁止）。
 
+### 委譲手順
+
+main conversation は raw `gh issue/pr list` output を直接展開せず、`scope-rollup-runner` SubAgent に委譲する。
+
+**1. invocation_id を生成する**（重複排除用）:
+
 ```bash
+INVOCATION_ID=$(date -u +%Y%m%dT%H%M%SZ)_$$
 REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
-
-# 対象 Issue を個別取得（current_issue として使用）
-gh issue view <issue_number> \
-  --repo "$REPO_FULL_NAME" \
-  --json number,title,body,labels,state,stateReason,url \
-  > /tmp/current_issue.json
-
-# issues と PRs の一覧を全状態（open + closed）で取得（デフォルト 30 件制限を回避するため --limit 1000）
-gh issue list \
-  --repo "$REPO_FULL_NAME" \
-  --state all \
-  --limit 1000 \
-  --json number,title,body,labels,state,stateReason,url \
-  > /tmp/issues_all.json
-
-gh pr list \
-  --repo "$REPO_FULL_NAME" \
-  --state all \
-  --limit 1000 \
-  --json number,title,body,labels,state,url,files,closingIssuesReferences \
-  > /tmp/prs_all.json
-
-# scope rollup preflight を実行（read-only — mutation なし）
-python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
-  --issues-json /tmp/issues_all.json \
-  --prs-json /tmp/prs_all.json \
-  --current-issue <issue_number> \
-  --repo "$REPO_FULL_NAME"
 ```
 
-出力（`ISSUE_SCOPE_ROLLUP_PLAN_V2`）を `LOOP_STATE.scope_rollup_plan` に格納する。
+**2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う）:
 
-**orchestrator の判断ルール**:
+以下の入力を渡して起動する:
+
+```yaml
+issue_number: <issue_number>
+repo: <REPO_FULL_NAME>
+invocation_id: <INVOCATION_ID>
+```
+
+runner は `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に返す。
+
+### ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 仕様
+
+runner が返す marker のスキーマ（ref-based 設計）:
+
+```yaml
+ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
+  status: ok | failed | runner_unavailable
+  schema_version: 1
+  repo: "<owner/repo>"
+  current_issue: <issue_number>
+  invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  git_head_sha: "<sha>"
+  script_path: ".claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py"
+  script_blob_sha256: "<sha256>"
+  inputs:
+    current_issue_sha256: "<sha256>"
+    issues_all_sha256: "<sha256>"
+    prs_all_sha256: "<sha256>"
+    issue_count: <int>
+    pr_count: <int>
+  result:
+    plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
+    raw_plan_location: "/tmp/scope_rollup_<invocation_id>.json"
+    result_sha256: "<ファイルバイト列の sha256>"
+    suggested_actions_summary: "<1-3行の候補サマリ>"
+    candidate_count: <int>
+    high_confidence_count: <int>
+```
+
+`plan:` フィールドは含まれない（ref-based 設計）。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+
+`result_sha256` は `raw_plan_location` のファイルバイト列の sha256 であり、`sha256sum` コマンドと同一の計算で算出する（RFC 8785 正規化は不要）。
+
+### main conversation の marker 検証（採用判定）
+
+runner から marker を受け取った後、main conversation は以下の検証を行う。
+いずれかの検証に失敗した場合は marker を **採用しない**（reject / mismatch）。
+
+| 検証項目 | 合格条件 |
+|---|---|
+| `status: ok` | `status` が `ok` であること |
+| repo mismatch | `repo` が現在の `REPO_FULL_NAME` と一致すること |
+| current_issue mismatch | `current_issue` が `issue_number` と一致すること |
+| invocation_id mismatch | `invocation_id` が step 1 で生成した `INVOCATION_ID` と一致すること |
+| stale（生成時刻が古い） | `generated_at` が `requested_at` より後であること |
+| script_blob_sha256 mismatch | `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha256 と一致すること |
+| result_sha256 mismatch | `result.result_sha256` が `result.raw_plan_location` のファイルバイト列の sha256 と一致すること |
+
+### marker 検証・採用（ref-based フロー）
+
+検証通過後、main conversation は以下の手順で marker を採用する:
+
+1. `repo` が現在のリポジトリと一致することを確認
+2. `current_issue` が対象 Issue 番号と一致することを確認
+3. `invocation_id` が重複していないことを確認（前回値と異なること）
+4. `script_blob_sha256` が `plan_issue_scope_rollup.py` の現在のバイト列 sha256 と一致することを確認
+5. `result.raw_plan_location` のファイルを読み取り、バイト列 sha256 を計算して `result.result_sha256` と照合する
+6. いずれかの不一致・欠損・stale の場合は marker を **採用しない**
+
+検証通過後:
+- `result.suggested_actions_summary` を `LOOP_STATE.scope_rollup_plan.summary` に採用する
+- `result.raw_plan_location` は debug 専用とし、default では main context に展開しない
+- `ISSUE_SCOPE_ROLLUP_DECISION_V2` を記録して次ステップへ進む
+
+### runner unavailable / permission denied 時の fallback
+
+runner が `status: runner_unavailable` を返した場合、または marker 検証に失敗した場合:
+
+- **silent fallback（main が raw `gh issue/pr list` output を直接展開すること）は禁止**
+- main は以下のいずれかを選択する:
+  1. `LOOP_STATE.scope_rollup_decision.decision: deferred` として scope rollup をスキップし、Step 3 へ進む（scope rollup は non-blocking）
+  2. 人間に `scope-rollup-runner` の環境整備または再実行を依頼する（`termination_reason: human_escalation`）
+- fallback の選択理由を `LOOP_STATE.scope_rollup_decision.skipped_reason` に記録する
+
+### orchestrator の判断ルール（marker 採用後）
+
+marker 採用後、`result.suggested_actions_summary` および必要に応じて `result.raw_plan_location` のファイル内容（debug 時のみ）に基づいて以下の判断を行う:
 
 - `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認し、統合実施可否を判断してから次ステップに進む。自動実行しない。
 - `suggested_action: human_review_required`（`escalation_required: True` の genuine structural conflict）: 即時停止して人間が判断する（`termination_reason: human_escalation`）。
@@ -300,9 +367,14 @@ ISSUE_SCOPE_ROLLUP_DECISION_V2:
   rollup_plan_ref:
     body_sha256: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.body_sha256>"
     generated_at: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.generated_at>"
+  runner_result:
+    invocation_id: "<INVOCATION_ID>"
+    status: ok | runner_unavailable | rejected
+    reject_reason: null | repo_mismatch | issue_mismatch | invocation_id_mismatch | stale | script_sha_mismatch | result_sha_mismatch
   decision: executed | skipped | deferred | human_review_required
   executed_actions: []
   skipped_reason: null
+  related_coordination: []
   candidates_reviewed:
     - kind: "issue|pr"
       number: <int>
