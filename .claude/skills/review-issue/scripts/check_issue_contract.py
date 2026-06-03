@@ -31,7 +31,127 @@ import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# ISSUE_KIND_POLICY_V1 SSOT loader
+# ---------------------------------------------------------------------------
+# Canonical source: docs/dev/github-ops.md ## ISSUE_KIND_POLICY_V1
+# Local allowlist definitions are prohibited (SSOT single-source rule).
+
+_ISSUE_KIND_POLICY_CACHE: "dict | None" = None
+
+
+def _find_repo_root_for_contract() -> Path:
+    """Find repository root by walking up to find .git directory."""
+    current = Path(__file__).resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    # Fallback: assume .claude/skills/review-issue/scripts/
+    return Path(__file__).resolve().parent.parent.parent.parent.parent
+
+
+class IssueKindPolicyLoadError(RuntimeError):
+    """Raised when ISSUE_KIND_POLICY_V1 cannot be loaded from SSOT.
+
+    Fail-closed: callers must not silently substitute a hardcoded fallback.
+    If this exception escapes to detect_issue_kind, it returns UNKNOWN_ISSUE_KIND_SENTINEL.
+    """
+
+
+def _load_issue_kind_policy(repo_root: "Path | None" = None) -> dict:
+    """Load ISSUE_KIND_POLICY_V1 from docs/dev/github-ops.md.
+
+    Returns a dict with keys:
+      - canonical_kinds: frozenset[str]
+      - aliases: dict[str, str]
+      - unknown_kind_policy: str  ("block")
+      - unknown_kind_reason_code: str
+
+    Raises IssueKindPolicyLoadError if the SSOT file is missing, the
+    ISSUE_KIND_POLICY_V1 block cannot be found/parsed, or the yaml library
+    is unavailable.  No silent fallback — callers must handle the error.
+    """
+    global _ISSUE_KIND_POLICY_CACHE
+    if _ISSUE_KIND_POLICY_CACHE is not None:
+        return _ISSUE_KIND_POLICY_CACHE
+
+    if repo_root is None:
+        repo_root = _find_repo_root_for_contract()
+
+    ssot_path = repo_root / "docs" / "dev" / "github-ops.md"
+    if not ssot_path.exists():
+        raise IssueKindPolicyLoadError(
+            f"SSOT file not found: {ssot_path}. "
+            "Cannot load ISSUE_KIND_POLICY_V1 — fail-closed."
+        )
+
+    try:
+        import yaml as _yaml
+    except ImportError as exc:
+        raise IssueKindPolicyLoadError(
+            "PyYAML is not available; cannot parse ISSUE_KIND_POLICY_V1."
+        ) from exc
+
+    try:
+        text = ssot_path.read_text(encoding="utf-8")
+        match = re.search(r"```yaml\s*\nISSUE_KIND_POLICY_V1:(.*?)```", text, re.DOTALL)
+        if not match:
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 fenced YAML block not found in {ssot_path}. "
+                "Ensure the block starts with ```yaml on a line followed by 'ISSUE_KIND_POLICY_V1:'."
+            )
+
+        yaml_content = "ISSUE_KIND_POLICY_V1:" + match.group(1)
+        parsed = _yaml.safe_load(yaml_content)
+        if not isinstance(parsed, dict) or "ISSUE_KIND_POLICY_V1" not in parsed:
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 YAML parse produced unexpected structure in {ssot_path}."
+            )
+
+        policy = parsed["ISSUE_KIND_POLICY_V1"]
+        if not isinstance(policy, dict):
+            raise IssueKindPolicyLoadError(
+                f"ISSUE_KIND_POLICY_V1 value is not a mapping in {ssot_path}."
+            )
+
+        canonical_kinds = frozenset(policy.get("canonical_kinds") or [])
+        aliases_raw = policy.get("aliases") or {}
+        aliases = {str(k): str(v) for k, v in aliases_raw.items()} if isinstance(aliases_raw, dict) else {}
+        unknown_kind_policy = str(policy.get("unknown_kind_policy", "block"))
+        unknown_kind_reason_code = str(policy.get("unknown_kind_reason_code", "unknown_issue_kind"))
+
+        result: dict = {
+            "canonical_kinds": canonical_kinds,
+            "aliases": aliases,
+            "unknown_kind_policy": unknown_kind_policy,
+            "unknown_kind_reason_code": unknown_kind_reason_code,
+        }
+        _ISSUE_KIND_POLICY_CACHE = result
+        return result
+    except IssueKindPolicyLoadError:
+        raise
+    except Exception as exc:
+        raise IssueKindPolicyLoadError(
+            f"Unexpected error while loading ISSUE_KIND_POLICY_V1 from {ssot_path}: {exc}"
+        ) from exc
+
+
+def _clear_issue_kind_policy_cache() -> None:
+    """Clear the SSOT cache (for testing only)."""
+    global _ISSUE_KIND_POLICY_CACHE
+    _ISSUE_KIND_POLICY_CACHE = None
+
+
+# Sentinel value returned by detect_issue_kind when kind is not in SSOT allowlist/aliases.
+UNKNOWN_ISSUE_KIND_SENTINEL = "unknown_issue_kind"
 
 
 class CheckResult(str, Enum):
@@ -360,7 +480,33 @@ def extract_section(body: str, section_name: str) -> str:
 
 
 def detect_issue_kind(body: str, labels: str = "", title: str = "") -> str:
-    """Issue kind を検出する。Machine-Readable Contract を最優先で参照。"""
+    """Issue kind を検出する。Machine-Readable Contract を最優先で参照。
+
+    SSOT: docs/dev/github-ops.md ## ISSUE_KIND_POLICY_V1
+
+    - canonical_kinds（implementation / research / parent）はそのまま返す。
+    - aliases（design → research, tracking → parent）は正規化して返す。
+    - allowlist にも aliases にも存在しない未知の kind は UNKNOWN_ISSUE_KIND_SENTINEL を返す
+      （silent "implementation" fallback は禁止）。
+    - SSOT が読み込めない場合（IssueKindPolicyLoadError）は UNKNOWN_ISSUE_KIND_SENTINEL を返す
+      （SSOT 不在を "implementation" に誤解させない）。
+    """
+    try:
+        policy = _load_issue_kind_policy()
+    except IssueKindPolicyLoadError:
+        return UNKNOWN_ISSUE_KIND_SENTINEL
+
+    canonical_kinds = policy["canonical_kinds"]
+    aliases = policy["aliases"]
+
+    def _normalize(kind: str) -> str:
+        """Normalize kind: apply alias or return UNKNOWN_ISSUE_KIND_SENTINEL."""
+        if kind in canonical_kinds:
+            return kind
+        if kind in aliases:
+            return aliases[kind]
+        return UNKNOWN_ISSUE_KIND_SENTINEL
+
     # 最優先: Machine-Readable Contract の issue_kind フィールド
     # ```yaml ... contract_schema_version ... issue_kind: <value> ... ``` を探す
     contract_match = re.search(
@@ -370,12 +516,11 @@ def detect_issue_kind(body: str, labels: str = "", title: str = "") -> str:
     )
     if contract_match:
         kind = contract_match.group(1).strip().rstrip('"\'')
-        if kind in ("implementation", "research", "tracking", "parent"):
-            return kind
+        return _normalize(kind)
 
     # fallback: labels
     if "tracking" in labels or "parent" in labels:
-        return "tracking"
+        return _normalize("tracking")
     if "phase/research" in labels or title.startswith("調査:"):
         return "research"
     if "phase/implementation" in labels or title.startswith("実装:"):
@@ -385,8 +530,8 @@ def detect_issue_kind(body: str, labels: str = "", title: str = "") -> str:
     if title.startswith(("実装:", "implement:", "perf:", "fix:", "docs:")):
         return "implementation"
 
-    # Default to implementation for unknown
-    return "implementation"
+    # Unknown: do NOT silently return "implementation"
+    return UNKNOWN_ISSUE_KIND_SENTINEL
 
 
 def check_c1_required_sections(body: str, issue_kind: str) -> tuple[str, list[str]]:
