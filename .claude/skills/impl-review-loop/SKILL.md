@@ -120,6 +120,7 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - `max_iterations` 超過時は必ず fail-close（無限ループ防止）
 - adversarial review は採用しないため `LOOP_VERDICT` 判定は pr-review-judge の APPROVE 一本で完結
 - 全 SubAgent 出力は構造化フォーマット（YAML / KEY=VALUE）で受け取り、散文サマリで上書きしない
+- **issue-contract-review 自動実行しない（fail-only gate）**: `status: go` が存在しない場合に `issue-contract-review` を自動実行する旧設計（auto run deprecated）は #564 以降廃止。`missing_contract_go` 判定時は人間に `issue-contract-review` 実行を依頼して停止する（#564 整合）。
 
 ## Related
 
