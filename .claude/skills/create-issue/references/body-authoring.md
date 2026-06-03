@@ -236,6 +236,24 @@ rg -q "<field>" <file>
 
 VC に `rg` が含まれる場合、`rg "foo\|bar"` の `\|` は `|` に修正する（rg の OR 演算子）。
 
+**Issue #589 追記**: `baseline_vc_preflight.py` は `\|` を含む rg / egrep / grep -E コマンドを
+`regex_literal_pipe_suspected` として `blocked` に分類する。`\|` は ripgrep / ERE では alternation を
+意図するなら `|` のみで十分であり、`\|` は literal pipe 文字のため。
+
+VC を修正できない正当な理由（例: BRE モードで literal pipe が必要）がある場合は、
+コマンド行の直前行に以下の annotation を付与することで exempt できる:
+
+```bash
+# vc-regex-intent: literal-pipe-ok reason="BRE mode: \| is literal pipe (intentional)"
+$ grep "foo\|bar" file.txt
+```
+
+annotation 構文:
+- 形式: `# vc-regex-intent: literal-pipe-ok reason="<理由>"`
+- 位置: VC コマンド行の直前行（bash ブロック内）
+- `reason` フィールドは任意だが強く推奨（レビュー時の根拠として使用）
+- annotation がない場合: `baseline_vc_preflight` は `decision: blocked` を返す
+
 ### rg を用いた VC 作成コマンド構築
 
 VC 内でファイルのパターン存在確認を行う際は `grep` より `rg` を優先する。`grep` は GNU 拡張差や Perl 互換構文の扱いが環境によって分かれるため、決定論性が低い。
