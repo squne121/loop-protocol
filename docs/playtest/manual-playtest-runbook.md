@@ -162,6 +162,23 @@ WSL2 automatically bridges `localhost` from Windows to the WSL2 loopback interfa
 
 This is the **primary browser route** for manual playtest.
 
+
+## Base Path Revalidation URLs
+
+Use these URLs when validating the Evidence Panel after the base path fix.
+
+- Local preview: `http://localhost:4173/?playtest_evidence=1`
+- GitHub Pages main: `https://squne121.github.io/loop-protocol/?playtest_evidence=1`
+- GitHub Pages PR preview: `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1`
+
+Validation split:
+
+- `http://localhost:4173/?playtest_evidence=1` confirms the production bundle still works with the default `/` base during local `pnpm build && pnpm preview`.
+- `https://squne121.github.io/loop-protocol/?playtest_evidence=1` confirms the hosted main build resolved `/loop-protocol/` correctly.
+- `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1` confirms the hosted PR preview build resolved `/loop-protocol/pr-<PR番号>/` correctly.
+
+Base path 修正だけでは #571 の deferred verification 完了を意味しない。Pages source / publish trigger fault は別問題として切り分け、hosted runtime が更新されない場合は follow-up issue で扱う。
+
 ### Optional Browser Route (WSLg / Linux Browser)
 
 If your system has WSLg (Windows Subsystem for Linux GUI) installed, you can use a Linux browser (e.g., Firefox, Chromium) running inside WSL2:
