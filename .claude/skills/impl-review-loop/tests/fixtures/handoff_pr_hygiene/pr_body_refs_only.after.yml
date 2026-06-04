@@ -1,0 +1,18 @@
+# After-pass fixture: GitHub closing keyword が LP057 を pass すること
+scenario: pr_body_refs_only_after_pass
+description: "AC4 after-pass: GitHub closing keyword（Closes, Fixes, Resolves）は LP057 を pass する"
+input:
+  pr_body_keyword: "Closes #634"
+  linked_issue: 634
+expected:
+  lp057_result: pass
+  closing_keywords_supported:
+    - "close"
+    - "closes"
+    - "closed"
+    - "fix"
+    - "fixes"
+    - "fixed"
+    - "resolve"
+    - "resolves"
+    - "resolved"

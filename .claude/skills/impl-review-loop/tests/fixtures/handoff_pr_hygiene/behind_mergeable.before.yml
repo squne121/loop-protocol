@@ -1,0 +1,12 @@
+# Before-fail fixture: LOOP_VERDICT_V1 形式（required_auto_actions なし）で BEHIND が検出されない
+scenario: behind_mergeable_before_fail
+description: "AC5 before-fail: LOOP_VERDICT_V1形式（required_auto_actions なし）でBEHINDが検出されない"
+input:
+  # V1 形式（required_auto_actions フィールドなし）
+  verdict: APPROVE
+  mergeable: MERGEABLE
+  merge_state_status: BEHIND
+  # required_auto_actions が存在しない = V1 形式のバグ
+expected:
+  termination_reason: "NOT approved (BEHIND 状態は終了すべきでない)"
+  update_branch_triggered: false  # V1では BEHIND が検出されずバグとなる

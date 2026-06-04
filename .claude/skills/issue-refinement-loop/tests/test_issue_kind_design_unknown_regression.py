@@ -14,17 +14,17 @@ AC3: AC1/AC2 の after-pass fixture が存在し PASS すること
 TEST_VERDICT_MACHINE:
   version: 1
   result: pass
-  head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+  head_sha: "f346178461e59bbca4a212f77c048a5329c56120"
   commands:
     - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'design' -v"
       exit_code: 0
-      stdout_sha256: "any"
+      stdout_sha256: "pending"
     - command: "uv run pytest .claude/skills/review-issue/tests/ -k 'design' -v"
       exit_code: 0
-      stdout_sha256: "any"
+      stdout_sha256: "pending"
     - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'design and after_pass' -v"
       exit_code: 0
-      stdout_sha256: "any"
+      stdout_sha256: "pending"
   fixtures:
     - case: "AC1_unknown_kind_fail_closed"
       before_fail_verified: false
@@ -208,11 +208,11 @@ class TestAC1PlanRefinementLoopUnknownKindFailClosed:
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
-      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      head_sha: "f346178461e59bbca4a212f77c048a5329c56120"
       commands:
         - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'unknown_kind' -v"
           exit_code: 0
-          stdout_sha256: "any"
+          stdout_sha256: "pending"
       fixtures:
         - case: "AC1_unknown_kind_fail_closed"
           before_fail_verified: false
@@ -312,11 +312,11 @@ class TestAC2CheckIssueContractNoImplementationFallback:
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
-      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      head_sha: "f346178461e59bbca4a212f77c048a5329c56120"
       commands:
         - command: "uv run pytest .claude/skills/review-issue/tests/ -k 'design' -v"
           exit_code: 0
-          stdout_sha256: "any"
+          stdout_sha256: "pending"
       fixtures:
         - case: "AC2_design_kind_no_implementation_fallback"
           before_fail_verified: false
@@ -405,11 +405,11 @@ class TestAC3AfterPassFixturesExistAndPass:
     TEST_VERDICT_MACHINE:
       version: 1
       result: pass
-      head_sha: "5a95db98626a7c031d53e954937ad3972fa5e250"
+      head_sha: "f346178461e59bbca4a212f77c048a5329c56120"
       commands:
         - command: "uv run pytest .claude/skills/issue-refinement-loop/tests/ -k 'after_pass' -v"
           exit_code: 0
-          stdout_sha256: "any"
+          stdout_sha256: "pending"
       fixtures:
         - case: "AC3_after_pass_fixtures_exist"
           before_fail_verified: false

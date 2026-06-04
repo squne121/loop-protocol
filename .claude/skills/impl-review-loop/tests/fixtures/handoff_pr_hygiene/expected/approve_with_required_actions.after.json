@@ -1,0 +1,10 @@
+{
+  "scenario": "approve_with_required_actions_after_pass",
+  "termination_reason": "approved",
+  "loop_ends": true,
+  "conditions": {
+    "verdict": "APPROVE",
+    "merge_ready": true,
+    "required_auto_actions": []
+  }
+}

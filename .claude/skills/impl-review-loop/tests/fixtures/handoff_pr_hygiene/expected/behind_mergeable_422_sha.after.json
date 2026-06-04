@@ -1,0 +1,8 @@
+{
+  "scenario": "behind_mergeable_422_sha_mismatch_after_pass",
+  "http_status": 422,
+  "error_message": "expected_head_sha does not match the head commit",
+  "route": "stale_verdict_rerun_review",
+  "reason_code": "expected_head_sha_mismatch",
+  "auto_fix_applied": false
+}

@@ -1,0 +1,7 @@
+{
+  "scenario": "behind_mergeable_403_after_pass",
+  "http_status": 403,
+  "route": "human_escalation",
+  "termination_reason": "human_escalation",
+  "auto_fix_applied": false
+}
