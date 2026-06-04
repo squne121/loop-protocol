@@ -380,8 +380,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             # HTTP method を確認して GET は non-mutation として pass (B3: #594 blocker fix)
             API_METHOD="$(uv run python3 "$VALIDATOR" --extract-api-command-method "$COMMAND" 2>/dev/null || echo "METHOD_UNKNOWN")"
 
-            if [ "$API_METHOD" = "GET" ]; then
-                # GET は body mutation の可能性なし -> pass
+            if [ "$API_METHOD" = "GET" ] || [ "$API_METHOD" = "DELETE" ]; then
+                # GET / DELETE は body mutation の可能性なし -> pass
                 exit 0
             fi
             # PATCH / POST / METHOD_UNKNOWN は body mutation チェックを継続する
@@ -404,7 +404,14 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 exit 0
             fi
 
-            # BODY_MUTATION_ISSUE:<N> or BODY_MUTATION_PR:<N>
+            # BODY_MUTATION_ISSUE:<N>, BODY_MUTATION_PR:<N>,
+            # BODY_MUTATION_ISSUE_COMMENT:<owner>:<repo>:<comment_id>,
+            # BODY_MUTATION_PR_REVIEW_COMMENT:<owner>:<repo>:<comment_id>
+            API_TARGET_NUM=""
+            API_TARGET_OWNER=""
+            API_TARGET_REPO=""
+            API_TARGET_COMMENT_ID=""
+            API_TARGET_FETCH_PATH=""
             if echo "$MUTATION_CLASS" | grep -q "^BODY_MUTATION_ISSUE:"; then
                 API_TARGET_NUM="${MUTATION_CLASS#BODY_MUTATION_ISSUE:}"
                 API_TARGET_LABEL="issue #${API_TARGET_NUM}"
@@ -413,6 +420,38 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 API_TARGET_NUM="${MUTATION_CLASS#BODY_MUTATION_PR:}"
                 API_TARGET_LABEL="pr #${API_TARGET_NUM}"
                 API_TARGET_TYPE="pr"
+            elif echo "$MUTATION_CLASS" | grep -q "^BODY_MUTATION_ISSUE_COMMENT:"; then
+                API_TARGET_META="${MUTATION_CLASS#BODY_MUTATION_ISSUE_COMMENT:}"
+                IFS=':' read -r API_TARGET_OWNER API_TARGET_REPO API_TARGET_COMMENT_ID <<EOF
+$API_TARGET_META
+EOF
+                if [ -z "$API_TARGET_OWNER" ] || [ -z "$API_TARGET_REPO" ] || [ -z "$API_TARGET_COMMENT_ID" ]; then
+                    echo "GUARD: gh api --input issue comment 分類の payload が不正です (fail-closed): ${MUTATION_CLASS}" >&2
+                    echo "  api_payload_parse_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
+                API_TARGET_LABEL="issue comment #${API_TARGET_COMMENT_ID}"
+                API_TARGET_TYPE="issue_comment"
+                API_TARGET_FETCH_PATH="repos/${API_TARGET_OWNER}/${API_TARGET_REPO}/issues/comments/${API_TARGET_COMMENT_ID}"
+            elif echo "$MUTATION_CLASS" | grep -q "^BODY_MUTATION_PR_REVIEW_COMMENT:"; then
+                API_TARGET_META="${MUTATION_CLASS#BODY_MUTATION_PR_REVIEW_COMMENT:}"
+                IFS=':' read -r API_TARGET_OWNER API_TARGET_REPO API_TARGET_COMMENT_ID <<EOF
+$API_TARGET_META
+EOF
+                if [ -z "$API_TARGET_OWNER" ] || [ -z "$API_TARGET_REPO" ] || [ -z "$API_TARGET_COMMENT_ID" ]; then
+                    echo "GUARD: gh api --input PR review comment 分類の payload が不正です (fail-closed): ${MUTATION_CLASS}" >&2
+                    echo "  api_payload_parse_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
+                API_TARGET_LABEL="pr review comment #${API_TARGET_COMMENT_ID}"
+                API_TARGET_TYPE="pr_review_comment"
+                API_TARGET_FETCH_PATH="repos/${API_TARGET_OWNER}/${API_TARGET_REPO}/pulls/comments/${API_TARGET_COMMENT_ID}"
             else
                 # 不明な分類: fail-closed
                 echo "GUARD: gh api --input mutation 分類不明 (fail-closed): ${MUTATION_CLASS}" >&2
@@ -423,7 +462,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 exit 2
             fi
 
-            # 既存 body を取得して delta 検査 (AC4, AC17, AC18)
+            # 既存 body を取得して delta 検査 (AC3, AC4, AC17, AC18)
             OLD_BODY=""
             if [ "$API_TARGET_TYPE" = "issue" ]; then
                 if ! OLD_BODY="$(gh issue view "$API_TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
@@ -434,10 +473,19 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                     echo "  ratio_min: 0.000" >&2
                     exit 2
                 fi
-            else
+            elif [ "$API_TARGET_TYPE" = "pr" ]; then
                 if ! OLD_BODY="$(gh pr view "$API_TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
                     echo "GUARD: ${API_TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
                     echo "  target_resolution_failed" >&2
+                    echo "  changed_prose_blocks: unknown" >&2
+                    echo "  failed_blocks: unknown" >&2
+                    echo "  ratio_min: 0.000" >&2
+                    exit 2
+                fi
+            else
+                if ! OLD_BODY="$(gh api "$API_TARGET_FETCH_PATH" --jq .body 2>/dev/null)"; then
+                    echo "GUARD: ${API_TARGET_LABEL} の既存 body を取得できません (fail-closed)" >&2
+                    echo "  comment_old_body_fetch_failed" >&2
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2

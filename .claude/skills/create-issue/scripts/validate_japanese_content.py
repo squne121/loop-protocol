@@ -896,18 +896,38 @@ def main():
         ep = endpoint.lstrip('/')
 
         issue_m = _re.match(
-            r'^repos/[^/]+/[^/]+/issues/(\d+)$', ep
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)$', ep
         )
         pr_m = _re.match(
-            r'^repos/[^/]+/[^/]+/pulls/(\d+)$', ep
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/(?P<number>\d+)$', ep
+        )
+        issue_comment_m = _re.match(
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/comments/(?P<comment_id>\d+)$', ep
+        )
+        pr_review_comment_m = _re.match(
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/comments/(?P<comment_id>\d+)$', ep
         )
 
         if issue_m:
-            print(f'BODY_MUTATION_ISSUE:{issue_m.group(1)}')
+            print(f"BODY_MUTATION_ISSUE:{issue_m.group('number')}")
         elif pr_m:
-            print(f'BODY_MUTATION_PR:{pr_m.group(1)}')
+            print(f"BODY_MUTATION_PR:{pr_m.group('number')}")
+        elif issue_comment_m:
+            print(
+                "BODY_MUTATION_ISSUE_COMMENT:"
+                f"{issue_comment_m.group('owner')}:"
+                f"{issue_comment_m.group('repo')}:"
+                f"{issue_comment_m.group('comment_id')}"
+            )
+        elif pr_review_comment_m:
+            print(
+                "BODY_MUTATION_PR_REVIEW_COMMENT:"
+                f"{pr_review_comment_m.group('owner')}:"
+                f"{pr_review_comment_m.group('repo')}:"
+                f"{pr_review_comment_m.group('comment_id')}"
+            )
         else:
-            # endpoint not recognized as issue/PR mutation
+            # endpoint not recognized as issue/PR/comment PATCH mutation
             print('NOT_BODY_MUTATION')
         sys.exit(0)
 
