@@ -198,14 +198,7 @@ class TestPlanRefinementLoop:
         """
         B3: All fixture outputs validate against JSON Schema.
         Uses FormatChecker to validate date-time format.
-        Skipped when schema predates FailClosedRewriteConstraintsV1 (#647).
         """
-        if not schema_supports_rewrite_constraints():
-            pytest.skip(
-                "Schema does not include FailClosedRewriteConstraintsV1; "
-                "schema update is deferred (schemas/ outside Allowed Paths for #647). "
-                "Re-enable after schemas/refinement_loop_plan_v1.json is updated."
-            )
         schema = load_schema()
         format_checker = jsonschema.FormatChecker()
         validator = jsonschema.Draft202012Validator(schema, format_checker=format_checker)
@@ -240,14 +233,7 @@ class TestPlanRefinementLoop:
     def test_fail_closed_is_schema_valid(self):
         """
         B3: fail_closed outputs with required=true are still schema-valid.
-        Skipped when schema predates FailClosedRewriteConstraintsV1 (#647).
         """
-        if not schema_supports_rewrite_constraints():
-            pytest.skip(
-                "Schema does not include FailClosedRewriteConstraintsV1; "
-                "schema update is deferred (schemas/ outside Allowed Paths for #647). "
-                "Re-enable after schemas/refinement_loop_plan_v1.json is updated."
-            )
         schema = load_schema()
         format_checker = jsonschema.FormatChecker()
         validator = jsonschema.Draft202012Validator(schema, format_checker=format_checker)
@@ -413,6 +399,229 @@ class TestPlanRefinementLoop:
         assert (
             output["decisions"]["web_research_policy"]["required"] is False
         ), "Internal documentation should not trigger web_research"
+
+
+class TestSchemaValidity:
+    """AC7: Schema self-validation and negative tests for FailClosedRewriteConstraintsV1."""
+
+    def test_schema_self_validation(self):
+        """
+        AC7: Draft202012Validator.check_schema(schema) passes without errors.
+        """
+        schema = load_schema()
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+    def test_rewrite_constraints_unknown_key_rejected(self):
+        """
+        AC9: rewrite_constraints with unknown key fails schema validation.
+        """
+        schema = load_schema()
+        validator = jsonschema.Draft202012Validator(schema)
+
+        # Build a minimal valid planner output with rewrite_constraints containing unknown key
+        invalid_rewrite_constraints = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+                "unknown_extra_key": "should_fail",  # unknown key
+            },
+            "override_policy": {
+                "allowed_reason_codes": [],
+                "never_override_reason_codes": [],
+                "overridable_in_current_result": [],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        # Validate only the definition portion via $defs path
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+        errors = list(sub_validator.iter_errors(invalid_rewrite_constraints))
+        assert len(errors) > 0, "Unknown key in rewrite_constraints should fail schema validation"
+
+    def test_freeform_rewrite_forbidden_false_rejected(self):
+        """
+        AC9: freeform_rewrite_forbidden: false fails schema validation (const: true).
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": False,  # must be true
+            },
+            "override_policy": {
+                "allowed_reason_codes": [],
+                "never_override_reason_codes": [],
+                "overridable_in_current_result": [],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, "freeform_rewrite_forbidden: false should fail (const: true)"
+
+    def test_schema_version_typo_rejected(self):
+        """
+        AC9: schema_version typo fails schema validation (const: FAIL_CLOSED_REWRITE_CONSTRAINTS_V1).
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V2",  # typo/wrong version
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": [],
+                "never_override_reason_codes": [],
+                "overridable_in_current_result": [],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, "schema_version typo should fail (const: FAIL_CLOSED_REWRITE_CONSTRAINTS_V1)"
+
+    def test_unknown_reason_code_rejected(self):
+        """
+        AC9: unknown reason_code in fail_closed fails schema validation.
+        """
+        schema = load_schema()
+        validator = jsonschema.Draft202012Validator(schema)
+
+        # Build a minimal but otherwise valid plan output structure
+        invalid_reason_code_output = {
+            "schema_version": "refinement_loop_plan/v1",
+            "source": {
+                "issue_number": 1,
+                "issue_body_sha256": "a" * 64,
+                "comments_sha256": None,
+                "known_context_sha256": None,
+                "generated_at": "2025-05-25T12:00:00+00:00",
+            },
+            "decisions": {
+                "investigation_policy": {
+                    "required": False,
+                    "reason_code": "no_repo_fact_claim",
+                    "target_paths": [],
+                    "repo_claims": [],
+                    "evidence_spans": [],
+                    "confidence": "deterministic",
+                },
+                "web_research_policy": {
+                    "required": False,
+                    "reason_code": "no_critical_external_claim",
+                    "critical_external_claims": [],
+                    "evidence_spans": [],
+                    "confidence": "deterministic",
+                },
+                "scope_signal_guard": {
+                    "triggered": False,
+                    "reason_code": "no_scope_signal",
+                    "excluded_by_anchor_reframe": False,
+                    "evidence_spans": [],
+                },
+                "delivery_rollup": {
+                    "applicable": False,
+                    "unmaterialized_slots": [],
+                    "evidence_spans": [],
+                },
+                "follow_up_materialization": {
+                    "candidates": [],
+                },
+            },
+            "fail_closed": {
+                "required": True,
+                "reason_codes": ["completely_unknown_reason_code"],  # invalid
+                "human_message": "test",
+            },
+        }
+
+        errors = list(validator.iter_errors(invalid_reason_code_output))
+        assert len(errors) > 0, "Unknown reason_code should fail schema validation"
+
+    def test_max_rewrite_attempts_wrong_value_rejected(self):
+        """
+        AC9: max_rewrite_attempts: 3 fails schema validation (const: 2).
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": [],
+                "never_override_reason_codes": [],
+                "overridable_in_current_result": [],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 3,  # must be 2 (const)
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, "max_rewrite_attempts: 3 should fail (const: 2)"
+
+    def test_valid_rewrite_constraints_passes(self):
+        """
+        AC7/AC9: A well-formed FailClosedRewriteConstraintsV1 passes schema validation.
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        valid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": ["Outcome", "Acceptance Criteria"],
+            "required_contract_keys": ["contract_schema_version"],
+            "rewrite_constraints": {
+                "must_add_sections": ["Outcome"],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": ["missing_required_section"],
+                "never_override_reason_codes": ["unknown_issue_kind"],
+                "overridable_in_current_result": ["missing_required_section"],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(valid_payload))
+        assert len(errors) == 0, f"Valid FailClosedRewriteConstraintsV1 should pass: {errors}"
 
 
 class TestSkillMdWiring:
