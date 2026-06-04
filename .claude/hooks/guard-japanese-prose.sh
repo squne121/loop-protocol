@@ -377,17 +377,15 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 exit 2
             fi
 
-            # HTTP method を確認して GET は non-mutation として pass (B3: #594 blocker fix)
+            # HTTP method を確認して GET / DELETE は non-mutation として pass
             API_METHOD="$(uv run python3 "$VALIDATOR" --extract-api-command-method "$COMMAND" 2>/dev/null || echo "METHOD_UNKNOWN")"
 
             if [ "$API_METHOD" = "GET" ] || [ "$API_METHOD" = "DELETE" ]; then
-                # GET / DELETE は body mutation の可能性なし -> pass
                 exit 0
             fi
-            # PATCH / POST / METHOD_UNKNOWN は body mutation チェックを継続する
 
-            # payload を分類 (AC17, AC18, AC20)
-            MUTATION_CLASS="$(uv run python3 "$VALIDATOR" --classify-api-mutation "$API_INPUT_FILE" --api-endpoint "$API_ENDPOINT" 2>/dev/null || echo "PAYLOAD_PARSE_FAILED")"
+            # payload を分類 (comment route は PATCH 限定)
+            MUTATION_CLASS="$(uv run python3 "$VALIDATOR" --classify-api-mutation "$API_INPUT_FILE" --api-endpoint "$API_ENDPOINT" --api-method "$API_METHOD" 2>/dev/null || echo "PAYLOAD_PARSE_FAILED")"
 
             if [ "$MUTATION_CLASS" = "PAYLOAD_PARSE_FAILED" ]; then
                 # JSON parse 失敗: fail-closed (AC20)
@@ -400,8 +398,17 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             fi
 
             if [ "$MUTATION_CLASS" = "NOT_BODY_MUTATION" ]; then
-                # AC5: body mutation でない場合は guard 対象外として pass
+                # PATCH 対象外 route / method は guard 対象外として pass
                 exit 0
+            fi
+
+            if [ "$MUTATION_CLASS" = "INVALID_BODY_TYPE" ]; then
+                echo "GUARD: gh api --input body 型が不正です (fail-closed)" >&2
+                echo "  api_input_invalid_body_type" >&2
+                echo "  changed_prose_blocks: unknown" >&2
+                echo "  failed_blocks: unknown" >&2
+                echo "  ratio_min: 0.000" >&2
+                exit 2
             fi
 
             # BODY_MUTATION_ISSUE:<N>, BODY_MUTATION_PR:<N>,
@@ -506,7 +513,7 @@ except Exception:
     raise SystemExit(20)
 body = payload.get("body")
 if not isinstance(body, str):
-    raise SystemExit(20)
+    raise SystemExit(21)
 print(body, end="")
 PY
 )" || {

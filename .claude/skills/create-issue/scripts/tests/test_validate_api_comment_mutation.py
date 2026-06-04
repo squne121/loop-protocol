@@ -16,7 +16,7 @@ def run_validator(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_issue_comment_body_mutation_classified(tmp_path):
+def test_issue_comment_body_mutation_classified_for_patch(tmp_path):
     payload_file = tmp_path / "payload.json"
     payload_file.write_text(json.dumps({"body": "test body"}))
 
@@ -25,13 +25,15 @@ def test_issue_comment_body_mutation_classified(tmp_path):
         str(payload_file),
         "--api-endpoint",
         "repos/owner/repo/issues/comments/123",
+        "--api-method",
+        "PATCH",
     )
 
     assert result.returncode == 0
     assert result.stdout.strip() == "BODY_MUTATION_ISSUE_COMMENT:owner:repo:123"
 
 
-def test_pr_review_comment_body_mutation_classified(tmp_path):
+def test_pr_review_comment_body_mutation_classified_for_patch(tmp_path):
     payload_file = tmp_path / "payload.json"
     payload_file.write_text(json.dumps({"body": "test body"}))
 
@@ -40,6 +42,8 @@ def test_pr_review_comment_body_mutation_classified(tmp_path):
         str(payload_file),
         "--api-endpoint",
         "repos/owner/repo/pulls/comments/456",
+        "--api-method",
+        "PATCH",
     )
 
     assert result.returncode == 0
@@ -55,10 +59,29 @@ def test_comment_endpoint_no_body_key_non_mutation(tmp_path):
         str(payload_file),
         "--api-endpoint",
         "repos/owner/repo/issues/comments/123",
+        "--api-method",
+        "PATCH",
     )
 
     assert result.returncode == 0
     assert result.stdout.strip() == "NOT_BODY_MUTATION"
+
+
+def test_comment_endpoint_non_string_body_invalid_type(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": 123}))
+
+    result = run_validator(
+        "--classify-api-mutation",
+        str(payload_file),
+        "--api-endpoint",
+        "repos/owner/repo/issues/comments/123",
+        "--api-method",
+        "PATCH",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "INVALID_BODY_TYPE"
 
 
 def test_post_issue_comment_endpoint_non_mutation(tmp_path):
@@ -70,6 +93,42 @@ def test_post_issue_comment_endpoint_non_mutation(tmp_path):
         str(payload_file),
         "--api-endpoint",
         "repos/owner/repo/issues/123/comments",
+        "--api-method",
+        "POST",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "NOT_BODY_MUTATION"
+
+
+def test_issue_comment_patch_scope_excludes_implicit_post(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "comment body"}))
+
+    result = run_validator(
+        "--classify-api-mutation",
+        str(payload_file),
+        "--api-endpoint",
+        "repos/owner/repo/issues/comments/123",
+        "--api-method",
+        "POST",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "NOT_BODY_MUTATION"
+
+
+def test_pr_review_comment_patch_scope_excludes_explicit_post(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "comment body"}))
+
+    result = run_validator(
+        "--classify-api-mutation",
+        str(payload_file),
+        "--api-endpoint",
+        "repos/owner/repo/pulls/comments/456",
+        "--api-method",
+        "POST",
     )
 
     assert result.returncode == 0

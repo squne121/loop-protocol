@@ -114,6 +114,23 @@ def test_api_input_issue_comment_enum_only_pass(tmp_path):
     assert result.returncode == 0
 
 
+def test_api_input_issue_comment_machine_readable_contract_heading_pass(tmp_path):
+    old_body = "## Machine-Readable Contract\n\n- 既存の日本語要約です。"
+    new_body = old_body + "\n\n## Acceptance Criteria\n- 追加の日本語説明です。"
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": new_body}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/comments/123 --method PATCH --input {payload_file}"
+    )
+    result = run_hook(
+        hook_input,
+        {"api repos/owner/repo/issues/comments/123 --jq .body": old_body},
+    )
+
+    assert result.returncode == 0
+
+
 def test_api_input_comment_payload_parse_failure_blocked(tmp_path):
     payload_file = tmp_path / "payload.json"
     payload_file.write_text("{ invalid json }")
@@ -151,3 +168,88 @@ def test_api_input_issue_comment_old_body_fetch_failure_blocked(tmp_path):
 
     assert result.returncode == 2
     assert "comment_old_body_fetch_failed" in result.stderr
+
+
+def test_api_input_issue_comment_post_create_route_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "This create route stays out of scope."}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/123/comments --method POST --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_issue_comment_get_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "ignored"}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/comments/456 --method GET --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_pr_review_comment_delete_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "ignored"}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/pulls/comments/789 --method DELETE --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_issue_comment_method_implicit_post_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "implicit post should stay outside PATCH scope"}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/comments/456 --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_pr_review_comment_explicit_post_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": "explicit post should stay outside PATCH scope"}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/pulls/comments/789 --method POST --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_comment_payload_without_body_key_passes(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"title": "not a body mutation"}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/comments/456 --method PATCH --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 0
+
+
+def test_api_input_comment_non_string_body_fail_closed(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps({"body": 123}))
+
+    hook_input = make_bash_hook_input(
+        f"gh api repos/owner/repo/issues/comments/456 --method PATCH --input {payload_file}"
+    )
+    result = run_hook(hook_input, {})
+
+    assert result.returncode == 2
+    assert "api_input_invalid_body_type" in result.stderr
