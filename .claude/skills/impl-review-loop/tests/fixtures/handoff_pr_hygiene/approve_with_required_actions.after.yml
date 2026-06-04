@@ -1,0 +1,12 @@
+# After-pass fixture: required_auto_actions が空かつ merge_ready=true で approved になる
+scenario: approve_with_required_actions_after_pass
+description: "AC6 after-pass: required_auto_actions=[] かつ merge_ready=true なら approved になること"
+input:
+  verdict: APPROVE
+  merge_ready: true
+  required_auto_actions: []
+  mergeable: MERGEABLE
+  merge_state_status: CLEAN
+expected:
+  termination_reason: approved
+  loop_ends: true

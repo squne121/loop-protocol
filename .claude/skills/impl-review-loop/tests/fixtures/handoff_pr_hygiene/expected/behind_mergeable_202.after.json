@@ -1,0 +1,8 @@
+{
+  "scenario": "behind_mergeable_202_after_pass",
+  "auto_fix_applied": true,
+  "review_rerun_required": true,
+  "termination_reason": null,
+  "http_status": 202,
+  "route": "rerun_verification_and_review"
+}

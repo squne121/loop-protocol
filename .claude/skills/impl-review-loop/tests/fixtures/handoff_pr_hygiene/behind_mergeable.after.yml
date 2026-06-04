@@ -1,0 +1,18 @@
+# After-pass fixture: update_branch API 202 Accepted → review rerun
+scenario: behind_mergeable_202_after_pass
+description: "AC5 after-pass: update_branch API 202 Accepted → review rerun"
+input:
+  verdict: APPROVE
+  merge_ready: false
+  required_auto_actions:
+    - kind: update_branch
+      method: merge_only
+  mergeable: MERGEABLE
+  merge_state_status: BEHIND
+  api_response:
+    status_code: 202
+    body: {}
+expected:
+  auto_fix_applied: true
+  review_rerun_required: true
+  termination_reason: null

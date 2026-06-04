@@ -1,0 +1,5 @@
+{
+  "scenario": "pr_body_refs_only_before_fail",
+  "lp057_result": "fail",
+  "note": "xfail: LP057 currently accepts Refs-only; should require Closes for child PR closing"
+}
