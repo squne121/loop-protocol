@@ -208,25 +208,14 @@
             "enum": [
               "malformed_machine_readable_contract",
               "missing_required_section",
-              "missing_required_parent_section",
-              "missing_required_contract_key",
               "ambiguous_scope_signal",
               "unknown_input_schema",
-              "planner_internal_error",
-              "unknown_issue_kind",
-              "issue_kind_policy_load_error",
-              "contract_schema_parse_error",
-              "template_resolution_error",
-              "checker_internal_error",
-              "template_required_sections_unavailable"
+              "planner_internal_error"
             ]
           }
         },
         "human_message": {
           "type": "string"
-        },
-        "rewrite_constraints": {
-          "$ref": "#/definitions/FailClosedRewriteConstraintsV1"
         }
       }
     }
@@ -308,74 +297,6 @@
         },
         "source_evidence": {
           "$ref": "#/definitions/EvidenceSpan"
-        }
-      }
-    },
-    "FailClosedRewriteConstraintsV1": {
-      "type": "object",
-      "required": ["schema_version", "required_sections", "required_contract_keys", "rewrite_constraints", "override_policy", "max_rewrite_attempts", "no_progress_route"],
-      "additionalProperties": false,
-      "properties": {
-        "schema_version": {
-          "type": "string",
-          "enum": ["FAIL_CLOSED_REWRITE_CONSTRAINTS_V1"]
-        },
-        "required_sections": {
-          "type": "array",
-          "items": {"type": "string"}
-        },
-        "required_contract_keys": {
-          "type": "array",
-          "items": {"type": "string"}
-        },
-        "rewrite_constraints": {
-          "type": "object",
-          "required": ["must_add_sections", "must_add_contract_keys", "freeform_rewrite_forbidden"],
-          "additionalProperties": false,
-          "properties": {
-            "must_add_sections": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "must_add_contract_keys": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "freeform_rewrite_forbidden": {
-              "type": "boolean"
-            }
-          }
-        },
-        "override_policy": {
-          "type": "object",
-          "required": ["allowed_reason_codes", "never_override_reason_codes", "overridable_in_current_result", "non_overridable_in_current_result"],
-          "additionalProperties": false,
-          "properties": {
-            "allowed_reason_codes": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "never_override_reason_codes": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "overridable_in_current_result": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "non_overridable_in_current_result": {
-              "type": "array",
-              "items": {"type": "string"}
-            }
-          }
-        },
-        "max_rewrite_attempts": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "no_progress_route": {
-          "type": "string",
-          "enum": ["human_judgment_required"]
         }
       }
     }
