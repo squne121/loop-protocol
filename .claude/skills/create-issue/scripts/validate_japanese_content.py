@@ -15,6 +15,8 @@ import re
 import sys
 from dataclasses import dataclass
 
+import prose_boundary_policy as _pbp
+
 # GraphQL body mutation keywords (B1: #594 blocker fix)
 # gh api graphql --input payload.json の query にこれらが含まれる場合は body mutation として deny する
 GRAPHQL_BODY_MUTATION_KEYWORDS = [
@@ -175,73 +177,24 @@ def _classify_block(block: str) -> str:
     """
     ブロックの種別を分類する。
 
+    prose_boundary_policy.classify_block_legacy() に委譲し、
+    既存 consumer（changed_prose_blocks 等）向けの legacy 分類名を返す。
+
     Returns:
         'code_fence' | 'machine_yaml' | 'shell_command' | 'grep_pattern' |
         'url_or_identifier_only' | 'prose'
     """
-    stripped = block.strip()
-
-    # code fence
-    if stripped.startswith('```') or stripped.startswith('~~~'):
-        return 'code_fence'
-
-    lines = stripped.splitlines()
-
-    # YAML front matter or machine-readable YAML block
-    # value 側が自然文でない（短い identifier / boolean / number / enum / path / URL）行が支配的な場合のみ
-    if lines:
-        machine_yaml_lines = sum(1 for l in lines if _is_yaml_machine_line(l))
-        non_empty_lines = sum(1 for l in lines if l.strip())
-        if non_empty_lines > 0 and machine_yaml_lines >= max(1, non_empty_lines * 0.6):
-            return 'machine_yaml'
-
-    # shell command block ($ or # prefix lines が支配的)
-    shell_line_re = re.compile(r'^\s*[$#]\s+\S', re.MULTILINE)
-    shell_lines = len(shell_line_re.findall(stripped))
-    non_empty_lines = sum(1 for l in lines if l.strip())
-    if non_empty_lines > 0 and shell_lines >= non_empty_lines * 0.5:
-        return 'shell_command'
-
-    # grep pattern: 行全体がコマンドまたは検索パターンの場合のみ
-    # 行頭が grep/rg/egrep/fgrep / | grep / $ grep など
-    # または slash/regex/metachar 比率が高く自然文でない単一行
-    if _is_grep_pattern_block(stripped):
-        return 'grep_pattern'
-
-    # URL or identifier only (有効文字がほぼ識別子/URLのみ)
-    cleaned = clean_prose(stripped)
-    effective = count_effective_chars(cleaned)
-    if effective < 5:
-        return 'url_or_identifier_only'
-
-    return 'prose'
+    return _pbp.classify_block_legacy(block)
 
 
 def _is_grep_pattern_block(text: str) -> bool:
     """
     ブロックが grep/rg コマンド行またはパターン行であるかを判定する。
     文中に grep が出てくる程度の英語説明文は False を返す。
+
+    prose_boundary_policy._is_grep_pattern_block() に委譲する。
     """
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
-        return False
-
-    # 行全体がコマンドラインパターンに一致する行の割合
-    cmd_line_re = re.compile(
-        r'^'
-        r'(?:'
-        r'\|?\s*(?:grep|rg|egrep|fgrep)\s+'  # パイプまたは行頭から始まる grep コマンド
-        r'|\$\s+(?:grep|rg|egrep|fgrep)\s+'  # $ grep ... 形式
-        r'|(?:grep|rg|egrep|fgrep)\s+-'      # grep -オプション から始まる
-        r')'
-    )
-
-    cmd_lines = sum(1 for l in lines if cmd_line_re.match(l))
-    if len(lines) == 0:
-        return False
-
-    # 50% 以上の行がコマンドライン形式の場合のみ grep_pattern とみなす
-    return cmd_lines >= max(1, len(lines) * 0.5)
+    return _pbp._is_grep_pattern_block(text)
 
 
 def split_markdown_blocks(text: str) -> list[dict]:
