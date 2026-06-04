@@ -189,16 +189,42 @@ def _classify_block(block: str) -> str:
 
 def _is_heading_block(block: str) -> bool:
     """
-    ブロックが canonical_heading または bilingual_heading かどうかを判定する。
+    ブロックが heading_policy（SSOT）に登録された canonical / bilingual heading かどうかを判定する。
 
-    heading_policy (#654): canonical_heading / bilingual_heading は
-    delta mode の prose ratio 判定から除外するために使う。
+    heading_policy (#654 B1_B4):
+    - classify_block() が canonical_heading / bilingual_heading を返しても、
+      heading_policy に存在しない見出し（非 canonical）は False を返す。
+    - HEADING_POLICY に登録された見出しのみ prose ratio 判定から除外される。
+    - 非 canonical 英語見出し（例: ## Outcome Risks / ## This is a long English sentence）は
+      False を返し、prose delta 対象に残る（AC7）。
+    - heading_policy は validate_japanese_content.py / check_issue_contract.py の
+      唯一の許可リスト（SSOT）として機能する（B1_B4）。
+
+    Note: classify_block() 公開 API は AC1 により変更しない（旧動作維持）。
+    heading_policy 参照はこの関数でのみ行う。
     """
     kind = _pbp.classify_block(block.strip())
-    return kind in (
+    if kind not in (
         _pbp.BLOCK_KIND_CANONICAL_HEADING,
         _pbp.BLOCK_KIND_BILINGUAL_HEADING,
-    )
+    ):
+        return False
+
+    # heading_policy SSOT で照合（B1_B4: inventory に存在しない見出しは False）
+    # parse_atx_heading_line() で heading text を正規化してから lookup する
+    parsed = _pbp.parse_atx_heading_line(block.strip())
+    if parsed is None:
+        # classify_block() が heading と判定したが parse_atx_heading_line() が None
+        # → _HEADING_RE の先頭一致に基づく旧判定として lookup を試みる
+        hm = HEADING_RE.match(block.strip())
+        if hm:
+            heading_text = hm.group(1).strip()
+        else:
+            return False
+    else:
+        heading_text = parsed['text']
+
+    return _pbp.lookup_heading_policy(heading_text) is not None
 
 
 def _is_grep_pattern_block(text: str) -> bool:
@@ -335,12 +361,9 @@ def classify_borderline(text: str, threshold: float = 0.1, lower_threshold: floa
     has_prose = False
 
     for block in raw_blocks:
-        # heading_policy (#654): canonical_heading / bilingual_heading を除外
-        block_kind = _pbp.classify_block(block.strip())
-        if block_kind in (
-            _pbp.BLOCK_KIND_CANONICAL_HEADING,
-            _pbp.BLOCK_KIND_BILINGUAL_HEADING,
-        ):
+        # heading_policy (#654 B1_B4): SSOT 参照で canonical heading のみ除外
+        # _is_heading_block() は heading_policy を参照し、非 canonical 見出しは False を返す
+        if _is_heading_block(block.strip()):
             continue
         clean_block = clean_prose(block)
         effective_chars = count_effective_chars(clean_block)
@@ -386,14 +409,10 @@ def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
     total_chars = 0
 
     for block in raw_blocks:
-        # heading_policy (#654): canonical_heading / bilingual_heading は
-        # full-body mode でも prose block から除外する。
-        # heading は日本語比率判定の対象外（prose guard の誤検出を防ぐ）。
-        block_kind = _pbp.classify_block(block.strip())
-        if block_kind in (
-            _pbp.BLOCK_KIND_CANONICAL_HEADING,
-            _pbp.BLOCK_KIND_BILINGUAL_HEADING,
-        ):
+        # heading_policy (#654 B1_B4): SSOT 参照で canonical heading のみ除外
+        # _is_heading_block() は heading_policy を参照し、非 canonical 見出しは False を返す。
+        # 非 canonical 見出し（例: ## Outcome Risks）は prose block として残る（AC7）。
+        if _is_heading_block(block.strip()):
             continue
 
         # 各ブロックをクリーン化

@@ -313,10 +313,53 @@ def lookup_heading_policy(heading_text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# GFM ATX heading parser（B2: #654）
+# ---------------------------------------------------------------------------
+
+# GFM ATX heading: 0-3 leading spaces, #{1,6}, at least one space, heading text
+# trailing "空白 + #{1,} + trailing spaces" is optional closing sequence
+_ATX_HEADING_RE = re.compile(
+    r'^( {0,3})(#{1,6})(?:\s+(.+?))?(?:\s+#+\s*)?$'
+)
+
+
+def parse_atx_heading_line(line: str) -> dict | None:
+    """
+    1 行を GFM ATX heading として解析し、結果を返す。
+
+    GFM ATX heading 仕様（CommonMark §4.2）:
+      - 先頭 0〜3 スペースの indent が許容される（4 スペース以上は code block）
+      - marker は #{1,6}
+      - marker の後に少なくとも 1 つの空白、またはそれ以降が空（空見出し）
+      - 末尾の「空白 + #{1,} + trailing spaces」は closing sequence として除去
+      - closing sequence は heading text の一部として扱わない
+
+    Returns:
+        dict with keys:
+          'level': int (1-6)
+          'text':  str  (正規化後の heading text)
+        または None（ATX heading でない場合）
+    """
+    m = _ATX_HEADING_RE.match(line)
+    if not m:
+        return None
+    indent = m.group(1) or ''
+    # 4 spaces 以上は code block（code block ではない ATX heading ではない）
+    # ここでは 0-3 spaces のみ許可
+    if len(indent) >= 4:
+        return None
+    level = len(m.group(2))
+    raw_text = m.group(3) or ''
+    # closing sequence 除去（末尾の空白 + # + 空白）
+    text = re.sub(r'\s+#+\s*$', '', raw_text).strip()
+    return {'level': level, 'text': text}
+
+
+# ---------------------------------------------------------------------------
 # 内部正規表現
 # ---------------------------------------------------------------------------
 
-# Markdown 見出し
+# Markdown 見出し（後方互換用; classify_block 内では parse_atx_heading_line を使用）
 _HEADING_RE = re.compile(r'^(#{1,6})\s+(.+)$')
 
 # 日本語文字（ひらがな・カタカナ・CJK）
@@ -499,8 +542,12 @@ def classify_block(block: str) -> str:
         return BLOCK_KIND_CODE_FENCE
 
     # -----------------------------------------------------------------------
-    # 見出しチェック
+    # 見出しチェック（classify_block 公開 API; AC1 維持）
     # -----------------------------------------------------------------------
+    # NOTE: classify_block() の heading 分類ロジック（ATX 形式 → canonical/bilingual）は
+    # AC1 により変更しない。heading_policy の SSOT 参照による非 canonical 見出しの
+    # prose 残留判定は _is_heading_block()（validate_japanese_content.py）で行う（B1_B4）。
+    # classify_block() での heading_policy 参照は行わない（旧動作維持）。
     if len(lines) == 1 or (len(lines) >= 1 and _HEADING_RE.match(lines[0])):
         # 見出し行のみ、または先頭行が見出し
         heading_line = lines[0]

@@ -48,12 +48,18 @@ if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
 
 try:
-    from prose_boundary_policy import lookup_heading_policy as _lookup_heading_policy
+    from prose_boundary_policy import (
+        lookup_heading_policy as _lookup_heading_policy,
+        parse_atx_heading_line as _parse_atx_heading_line,
+    )
     _HEADING_POLICY_AVAILABLE = True
 except ImportError:
     _HEADING_POLICY_AVAILABLE = False
 
     def _lookup_heading_policy(heading_text: str):  # type: ignore[misc]
+        return None
+
+    def _parse_atx_heading_line(line: str):  # type: ignore[misc]
         return None
 
 
@@ -495,40 +501,48 @@ def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: li
 def extract_section(body: str, section_name: str) -> str:
     """Extract text under a ## section heading until the next ## heading.
 
-    heading_policy (#654): bilingual heading（例: ## 成果物 (Outcome)）も
+    heading_policy (#654 B2): bilingual heading（例: ## 成果物 (Outcome)）も
     canonical_en（"Outcome"）として認識する。
-    HEADING_POLICY の accepted_forms と lookup_heading_policy() を使い、
-    英語正規名でセクションを抽出できる。
+    GFM ATX heading 仕様（0-3 spaces indent / 任意 closing #）に対応した
+    parse_atx_heading_line() を使って各行を解析し、heading_policy の
+    lookup_heading_policy() で canonical_en を照合する（SSOT 共用）。
     """
-    # 1. exact match（英語正規見出し）
-    pattern = rf"^## {re.escape(section_name)}\s*$(.*?)(?=^## |\Z)"
-    match = re.search(pattern, body, re.MULTILINE | re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    lines = body.splitlines(keepends=True)
+    n = len(lines)
 
-    # 2. heading_policy の accepted_forms を使って bilingual heading も検索
-    if _HEADING_POLICY_AVAILABLE:
-        entry = _lookup_heading_policy(section_name)
-        if entry:
-            for form in entry.get("accepted_forms", []):
-                alt_pattern = rf"^## {re.escape(form)}\s*$(.*?)(?=^## |\Z)"
-                alt_match = re.search(alt_pattern, body, re.MULTILINE | re.DOTALL)
-                if alt_match:
-                    return alt_match.group(1).strip()
+    # 各行を走査して section_name に対応する見出しを探す
+    for i, line in enumerate(lines):
+        # GFM ATX heading として解析（B2: leading spaces / closing # 対応）
+        parsed = _parse_atx_heading_line(line.rstrip('\n'))
+        if parsed is None:
+            continue
 
-    # 3. 各 ## heading を解析して bilingual heading の英語キーを確認
-    # ## <japanese> (EnglishKey) または ## <japanese>（EnglishKey）の形式を検索
-    heading_re = re.compile(r'^## (.+?)\s*$', re.MULTILINE)
-    for m in heading_re.finditer(body):
-        heading_text = m.group(1).strip()
-        policy = _lookup_heading_policy(heading_text)
-        if policy and policy.get("canonical_en") == section_name:
-            # この見出しの下のテキストを抽出
-            start = m.end()
-            rest = body[start:]
-            next_heading = re.search(r'^## ', rest, re.MULTILINE)
-            section_body = rest[:next_heading.start()] if next_heading else rest
-            return section_body.strip()
+        heading_text = parsed['text']
+
+        # セクション名と照合: exact match (英語正規見出し) + heading_policy（bilingual）
+        matched = False
+        if heading_text == section_name:
+            matched = True
+        elif _HEADING_POLICY_AVAILABLE:
+            policy = _lookup_heading_policy(heading_text)
+            if policy and policy.get("canonical_en") == section_name:
+                matched = True
+
+        if not matched:
+            continue
+
+        # 見出しの次の行から次の ## heading（または EOF）までを収集
+        start = i + 1
+        end = n
+        for j in range(start, n):
+            # 次の heading を GFM ATX parser で検出（heading level 不問）
+            nxt = _parse_atx_heading_line(lines[j].rstrip('\n'))
+            if nxt is not None:
+                end = j
+                break
+
+        section_body = ''.join(lines[start:end])
+        return section_body.strip()
 
     return ""
 

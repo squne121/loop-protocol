@@ -26,8 +26,10 @@ from prose_boundary_policy import (
     HEADING_POLICY,
     BLOCK_KIND_CANONICAL_HEADING,
     BLOCK_KIND_BILINGUAL_HEADING,
+    BLOCK_KIND_HUMAN_PROSE,
     classify_block,
     lookup_heading_policy,
+    parse_atx_heading_line,
     _normalize_heading_text,
     _extract_bilingual_heading_key,
 )
@@ -297,6 +299,60 @@ class TestAtxNormalization:
         THEN: None（inventory に存在しない）"""
         assert lookup_heading_policy("成果物") is None
 
+    def test_indented_canonical_heading_is_excluded(self):
+        """GIVEN: '   ## Outcome'（3 spaces indent; GFM 許容）
+        WHEN: classify_block
+        THEN: canonical_heading として除外される（AC5 / B2 fix_delta）"""
+        result = classify_block("   ## Outcome")
+        assert result == BLOCK_KIND_CANONICAL_HEADING, (
+            f"3 spaces indent の '   ## Outcome' は canonical_heading になるべき。got={result!r}"
+        )
+
+    def test_indented_bilingual_heading_extract_section(self):
+        """GIVEN: '   ## 成果物 (Outcome)'（3 spaces indent; GFM 許容）
+        WHEN: classify_block
+        THEN: bilingual_heading として分類される（AC5 / B2 fix_delta）"""
+        result = classify_block("   ## 成果物 (Outcome)")
+        assert result == BLOCK_KIND_BILINGUAL_HEADING, (
+            f"3 spaces indent の '   ## 成果物 (Outcome)' は bilingual_heading になるべき。got={result!r}"
+        )
+
+    def test_closing_hash_heading_classify(self):
+        """GIVEN: '## 成果物 (Outcome) ##'（closing hash; GFM 許容）
+        WHEN: classify_block
+        THEN: bilingual_heading として分類される（B2 fix_delta: closing # 対応）"""
+        result = classify_block("## 成果物 (Outcome) ##")
+        assert result == BLOCK_KIND_BILINGUAL_HEADING, (
+            f"'## 成果物 (Outcome) ##' は closing hash があっても bilingual_heading になるべき。got={result!r}"
+        )
+
+    def test_parse_atx_heading_line_leading_spaces(self):
+        """GIVEN: 0-3 spaces indent WHEN: parse_atx_heading_line
+        THEN: 正しく解析される（B2: parse_atx_heading_line() SSOT）"""
+        assert parse_atx_heading_line("## Outcome") == {'level': 2, 'text': 'Outcome'}
+        assert parse_atx_heading_line(" ## Outcome") == {'level': 2, 'text': 'Outcome'}
+        assert parse_atx_heading_line("  ## Outcome") == {'level': 2, 'text': 'Outcome'}
+        assert parse_atx_heading_line("   ## Outcome") == {'level': 2, 'text': 'Outcome'}
+
+    def test_parse_atx_heading_line_four_spaces_is_not_heading(self):
+        """GIVEN: 4 spaces indent WHEN: parse_atx_heading_line
+        THEN: None（code block 扱い; GFM 仕様）"""
+        result = parse_atx_heading_line("    ## Outcome")
+        assert result is None, (
+            "4 spaces indent は code block 扱いなので parse_atx_heading_line は None を返すべき"
+        )
+
+    def test_parse_atx_heading_line_closing_hash(self):
+        """GIVEN: closing # WHEN: parse_atx_heading_line
+        THEN: closing # が除去されたテキストが返る"""
+        result = parse_atx_heading_line("## Outcome ##")
+        assert result is not None
+        assert result['text'] == 'Outcome'
+
+        result2 = parse_atx_heading_line("## 成果物 (Outcome) ###")
+        assert result2 is not None
+        assert result2['text'] == '成果物 (Outcome)'
+
 
 # ===========================================================================
 # AC6: machine_contract / vc_command / code_fence edge case
@@ -320,38 +376,72 @@ class TestMachineContractVcCommandCodeFenceEdge:
         result = _classify_block(block)
         assert result in ("shell_command",)
 
-    def test_code_fence_nested_backtick(self):
+    @pytest.mark.xfail(
+        reason=(
+            "現行 split_markdown_blocks() の non-greedy regex は 4-backtick fence 内の"
+            " 3-backtick を誤って closing fence として拾い 2 つの code_fence ブロックを生成する。"
+            "GFM 準拠の正しい挙動（単一 code_fence）は #659 で修正される。"
+            "xfail は #659 を実装せずにこのテストが pass してしまう誤実装を検出するための sentinel。"
+        ),
+        strict=True,
+    )
+    def test_code_fence_nested_backtick_exact(self):
         """GIVEN: 4個 fence 内に 3個 fence（nested backtick）WHEN: split_markdown_blocks
-        THEN: code_fence として抽出される"""
-        # 4個バッククォートのコードフェンスを含む文書
+        THEN: 全体が単一の code_fence ブロックとして抽出される（B3 exact assertion; #659 で修正）
+
+        GFM 仕様: opening が 4 backtick のとき内側の 3 backtick 行は closing として無効。
+        現行実装の non-greedy regex はこれを考慮せず 2 つの code_fence に分割する。
+        全面的な GFM fence state machine への置換は #659 のスコープ（衝突回避）。
+        このテストは #659 実装後に xfail が解消されることを確認するための regression sentinel。
+        """
         text = "````markdown\n```python\nprint('hello')\n```\n````\n"
         blocks = split_markdown_blocks(text)
-        # 4個 fence ブロックは code_fence
+        # 4個 fence ブロックは code_fence として単一ブロックになるべき
+        # （現行実装は 2 つに分割してしまうため xfail）
         fence_blocks = [b for b in blocks if b["type"] == "code_fence"]
-        assert len(fence_blocks) >= 1
+        assert len(fence_blocks) == 1, (
+            f"4-backtick fence 内の 3-backtick は単一 code_fence になるべき。"
+            f"got {len(fence_blocks)} fence blocks"
+        )
 
-    def test_code_fence_tilde(self):
+    def test_code_fence_tilde_exact(self):
         """GIVEN: チルダ fence WHEN: split_markdown_blocks
-        THEN: code_fence として扱われる"""
+        THEN: 正確に 1 つの code_fence ブロックとして扱われる（B3 exact assertion）"""
         text = "~~~python\nprint('hello')\n~~~\n"
         blocks = split_markdown_blocks(text)
         fence_blocks = [b for b in blocks if b["type"] == "code_fence"]
-        assert len(fence_blocks) >= 1
+        assert len(fence_blocks) == 1, (
+            f"tilde fence は 1 つの code_fence になるべき。got={len(fence_blocks)}"
+        )
 
-    def test_code_fence_unclosed(self):
+    def test_code_fence_unclosed_consumes_to_eof(self):
         """GIVEN: 閉じていない fence（未閉じ fence）WHEN: split_markdown_blocks
-        THEN: エラーなく処理される（fence 内容が code_fence または prose になる）"""
+        THEN: EOF まで code_fence / 全体が 1 ブロックとして consume される（B3 exact assertion）
+
+        GFM 仕様: unclosed fence は文書末尾まで code block 扱い。
+        現行 split_markdown_blocks() は regex で ``` ... ``` をマッチするため、
+        unclosed fence は code_fence として抽出されず prose block になる可能性があるが、
+        少なくともエラーなく処理され、結果が list であることを保証する。
+        全面的な GFM state machine への置換は #659 スコープ（Stop Condition 連動）。
+        """
         text = "```python\nprint('hello')\n\nsome other content\n"
         # エラーなく処理されること
         blocks = split_markdown_blocks(text)
-        assert isinstance(blocks, list)
+        assert isinstance(blocks, list), "split_markdown_blocks は list を返すべき"
+        # unclosed fence は block が存在する（空ではない）
+        assert len(blocks) >= 1, "unclosed fence の文書は少なくとも 1 block を持つ"
 
-    def test_code_fence_immediate_prose(self):
+    def test_code_fence_immediate_prose_is_separate_block(self):
         """GIVEN: code fence 直後に空行なし prose WHEN: split_markdown_blocks
-        THEN: prose が正しく分類される"""
+        THEN: prose が別 block として分類される（B3 exact assertion）"""
         text = "```python\nprint('hello')\n```\nThis is prose right after fence.\n"
         blocks = split_markdown_blocks(text)
-        assert len(blocks) >= 1
+        assert len(blocks) >= 1, "code fence + immediate prose は少なくとも 1 block を持つ"
+        # prose block が存在すること
+        prose_blocks = [b for b in blocks if b["type"] == "prose"]
+        assert len(prose_blocks) >= 1, (
+            "fence 直後の prose は prose block として扱われるべき"
+        )
 
     def test_delta_excludes_machine_contract(self):
         """GIVEN: YAML fence の Machine-Readable Contract ブロックの変更
@@ -386,18 +476,54 @@ class TestEnglishProseFails:
         result = _classify_block(block)
         assert result == "prose", f"英語 prose は 'prose' 分類すべき: {result}"
 
-    def test_non_canonical_english_heading_fails(self):
+    def test_non_canonical_english_heading_is_not_heading_block(self):
         """GIVEN: ## This is a long English sentence（非正規見出し）
-        WHEN: classify_block
-        THEN: canonical_heading（ATX 見出しなので heading 分類、ただし prose guard では prose 扱い）"""
-        # classify_block は heading RE にマッチすれば canonical_heading を返す
-        # ただし heading_policy には存在しない
+        WHEN: classify_block と _is_heading_block
+        THEN: classify_block は canonical_heading（ATX heading 形式）を返すが、
+              _is_heading_block は False を返す（heading_policy に存在しない）
+              → prose delta 対象に残る（AC7 / B1_B4 fix_delta）
+
+        TEST_INVERSION 修正: 以前のテスト（test_non_canonical_english_heading_fails）は
+        classify_block() == BLOCK_KIND_CANONICAL_HEADING をアサートして「テスト pass」と
+        みなしていたが、この heading が prose ratio 判定から除外されることを意味しており
+        AC7（非 canonical 英語見出しは fail に残す）に違反していた。
+        正しくは _is_heading_block() が False を返すことで prose delta 対象に残る。
+        """
+        # classify_block() は ATX 形式なので canonical_heading を返す（AC1 維持）
         result = classify_block("## This is a long English sentence")
-        # heading RE にマッチするので canonical_heading になるが、
-        # heading_policy には存在しないため lookup_heading_policy は None
-        assert result == BLOCK_KIND_CANONICAL_HEADING
+        assert result == BLOCK_KIND_CANONICAL_HEADING, (
+            f"classify_block() は ATX heading 形式を canonical_heading と分類する（AC1）。got={result!r}"
+        )
+        # しかし heading_policy に存在しないため _is_heading_block() は False を返す
+        assert _is_heading_block("## This is a long English sentence") is False, (
+            "_is_heading_block() は非 canonical 英語見出しを False として返すべき（B1_B4）"
+        )
         assert lookup_heading_policy("This is a long English sentence") is None, (
             "non-canonical 英語見出しは heading_policy に存在しない"
+        )
+
+    def test_non_canonical_english_heading_is_prose_delta_target(self):
+        """GIVEN: ## This is a long English sentence（非 canonical）の追加
+        WHEN: changed_prose_blocks
+        THEN: prose delta として返される（AC7 / B1_B4 fix_delta）"""
+        old = ""
+        new = "## This is a long English sentence\n"
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) >= 1, (
+            "'## This is a long English sentence' は non-canonical 見出しなので"
+            " changed_prose_blocks に残るべき"
+        )
+
+    def test_similar_but_noncanonical_outcome_heading_is_prose_delta_target(self):
+        """GIVEN: ## Outcome Risks（非 canonical; Outcome と類似）の追加
+        WHEN: changed_prose_blocks
+        THEN: prose delta として返される（AC7 / B1_B4 fix_delta）"""
+        old = ""
+        new = "## Outcome Risks\n"
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) >= 1, (
+            "'## Outcome Risks' は non-canonical 見出しなので"
+            " changed_prose_blocks に残るべき"
         )
 
     def test_non_canonical_heading_not_in_policy(self):

@@ -79,6 +79,36 @@ class TestExtractSectionBilingual:
         sc = extract_section(body, "Stop Conditions")
         assert "条件1" in sc
 
+    def test_indented_bilingual_heading_extract_section(self):
+        """GIVEN: '   ## 成果物 (Outcome)'（3 spaces indent）WHEN: extract_section
+        THEN: Outcome セクションが抽出できる（B2 fix_delta: GFM ATX leading spaces 対応）"""
+        body = (
+            "   ## 成果物 (Outcome)\n\n"
+            "インデント付き bilingual 見出しの内容。\n\n"
+            "## 背景 (Background)\n\n"
+            "背景セクション\n"
+        )
+        result = extract_section(body, "Outcome")
+        assert result != "", (
+            "3 spaces indent の '   ## 成果物 (Outcome)' は extract_section で Outcome として認識されるべき"
+        )
+        assert "インデント付き bilingual 見出しの内容" in result
+
+    def test_closing_hash_heading_extract_section(self):
+        """GIVEN: '## 成果物 (Outcome) ##'（closing hash）WHEN: extract_section
+        THEN: Outcome セクションが抽出できる（B2 fix_delta: GFM ATX closing # 対応）"""
+        body = (
+            "## 成果物 (Outcome) ##\n\n"
+            "closing hash 付き bilingual 見出しの内容。\n\n"
+            "## 背景 (Background)\n\n"
+            "背景セクション\n"
+        )
+        result = extract_section(body, "Outcome")
+        assert result != "", (
+            "'## 成果物 (Outcome) ##' は closing hash があっても extract_section で Outcome として認識されるべき"
+        )
+        assert "closing hash 付き bilingual 見出しの内容" in result
+
     def test_extract_section_not_found_returns_empty(self):
         """GIVEN: 存在しないセクション名 WHEN: extract_section
         THEN: 空文字列を返す"""
