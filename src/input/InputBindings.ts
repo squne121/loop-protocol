@@ -94,6 +94,7 @@ export function bindInput(
     input.activePointerId = event.pointerId
     canvasElement.setPointerCapture(event.pointerId)
     updatePointerCoords(event, canvasElement, input, getArena)
+    input.pointerKnown = true
     input.primaryPressed = true
   })
 

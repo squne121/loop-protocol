@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { mapInputToCommands, bindInput, createInputState } from '../src/input'
+import { computeAimDirection } from '../src/render/CanvasRenderer'
 import type { CanvasLike, KeyEventTarget } from '../src/input/InputBindings'
 
 describe('mapInputToCommands', () => {
@@ -189,6 +190,67 @@ describe('bindInput (KeyboardEvent.code)', () => {
 
     keyTarget.emit('keydown', 'ArrowUp')
     expect(input.moveUp).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// BLOCKER-3: computeAimDirection unit tests
+// Verifies that aimX/aimY is prioritised over lastAimDirection (BLOCKER-1 fix)
+// ---------------------------------------------------------------------------
+
+describe('computeAimDirection — aimX/aimY priority over lastAimDirection', () => {
+  it('GIVEN aimX/aimY far from player WHEN lastAimDirection points differently THEN aimX/aimY direction wins', () => {
+    // Player at (100, 100); aim at (200, 100) → expected dirX=1, dirY=0
+    // lastAimDirection points up (0, -1) — should be ignored
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 200,
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: -1,
+    })
+    expect(result.dirX).toBeCloseTo(1)
+    expect(result.dirY).toBeCloseTo(0)
+  })
+
+  it('GIVEN aimX/aimY at 45-degree angle THEN direction vector is normalised', () => {
+    const result = computeAimDirection({
+      playerX: 0,
+      playerY: 0,
+      aimX: 10,
+      aimY: 10,
+      lastAimDirectionX: 1,
+      lastAimDirectionY: 0,
+    })
+    expect(result.dirX).toBeCloseTo(Math.SQRT1_2)
+    expect(result.dirY).toBeCloseTo(Math.SQRT1_2)
+  })
+
+  it('GIVEN aimX/aimY very close to player (dist <= AIM_EPSILON_PX) WHEN lastAimDirection is non-zero THEN fallback to lastAimDirection', () => {
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 100.5, // dist = 0.5 < AIM_EPSILON_PX=1.0
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: -1,
+    })
+    expect(result.dirX).toBeCloseTo(0)
+    expect(result.dirY).toBeCloseTo(-1)
+  })
+
+  it('GIVEN aimX/aimY at player AND lastAimDirection is zero THEN final fallback is right (1,0)', () => {
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 100,
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: 0,
+    })
+    expect(result.dirX).toBeCloseTo(1)
+    expect(result.dirY).toBeCloseTo(0)
   })
 })
 

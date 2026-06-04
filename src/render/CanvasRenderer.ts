@@ -7,6 +7,39 @@ export interface CanvasRenderer {
 /** Fixed length of the aim indicator line in logical pixels (AC2). */
 export const AIM_INDICATOR_LENGTH_PX = 60
 
+/**
+ * Threshold below which the pointer-to-player distance is considered "at player".
+ * When dist <= AIM_EPSILON_PX, we fall back to lastAimDirection to avoid zero-length vectors.
+ */
+export const AIM_EPSILON_PX = 1.0
+
+/**
+ * Pure helper: compute normalised aim direction vector.
+ * Priority: aimX/aimY (current frame) → lastAimDirectionX/Y (fallback) → right (default).
+ *
+ * Exported for unit testing only; CanvasRenderer is the sole production caller.
+ */
+export function computeAimDirection(params: {
+  playerX: number
+  playerY: number
+  aimX: number
+  aimY: number
+  lastAimDirectionX: number
+  lastAimDirectionY: number
+}): { dirX: number; dirY: number } {
+  const dx = params.aimX - params.playerX
+  const dy = params.aimY - params.playerY
+  const dist = Math.hypot(dx, dy)
+
+  if (dist > AIM_EPSILON_PX) {
+    return { dirX: dx / dist, dirY: dy / dist }
+  }
+  if (params.lastAimDirectionX !== 0 || params.lastAimDirectionY !== 0) {
+    return { dirX: params.lastAimDirectionX, dirY: params.lastAimDirectionY }
+  }
+  return { dirX: 1, dirY: 0 }
+}
+
 export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer {
   const context = canvas.getContext('2d')
 
@@ -62,24 +95,16 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       // AC5: Isolated with save()/restore() to avoid leaking canvas state.
       // Visual-only: does not interact with collision or combat systems (AC3).
       {
-        const dx = state.player.aimX - state.player.x
-        const dy = state.player.aimY - state.player.y
-        const dist = Math.sqrt(dx * dx + dy * dy)
-
-        // Derive direction from lastAimDirectionX/Y (set by CombatSystem) when available;
-        // fall back to aimX/aimY vector; final fallback to pointing right.
-        let dirX: number
-        let dirY: number
-        if (state.player.lastAimDirectionX !== 0 || state.player.lastAimDirectionY !== 0) {
-          dirX = state.player.lastAimDirectionX
-          dirY = state.player.lastAimDirectionY
-        } else if (dist > 0) {
-          dirX = dx / dist
-          dirY = dy / dist
-        } else {
-          dirX = 1
-          dirY = 0
-        }
+        // Derive direction from aimX/aimY every frame (AC1: hover always updates aim).
+        // lastAimDirectionX/Y is used only as fallback when pointer is too close to player.
+        const { dirX, dirY } = computeAimDirection({
+          playerX: state.player.x,
+          playerY: state.player.y,
+          aimX: state.player.aimX,
+          aimY: state.player.aimY,
+          lastAimDirectionX: state.player.lastAimDirectionX,
+          lastAimDirectionY: state.player.lastAimDirectionY,
+        })
 
         context.save()
         context.strokeStyle = '#f4c25b'

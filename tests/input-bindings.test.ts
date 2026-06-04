@@ -6,7 +6,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 
-import { bindInput, createInputState } from '../src/input'
+import { bindInput, createInputState, mapInputToCommands } from '../src/input'
 import type { CanvasLike, KeyEventTarget } from '../src/input/InputBindings'
 
 // ---------------------------------------------------------------------------
@@ -131,5 +131,42 @@ describe('pointer hover tracking — AC1 (pointerKnown + pointermove always proc
     canvas.dispatchPointer('pointermove', { isPrimary: true, clientX: 300, clientY: 200 })
     expect(input.pointerX).toBeCloseTo(300)
     expect(input.pointerY).toBeCloseTo(200)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// BLOCKER-3 regression tests: lastAimDirection bug detection
+// ---------------------------------------------------------------------------
+
+describe('BLOCKER-3 regression — aim direction priority and pointerdown pointerKnown', () => {
+  it('GIVEN no fire WHEN pointermove only THEN aim command is emitted by InputMapper (AC1)', () => {
+    const canvas = makeFakeCanvas()
+    const input = createInputState()
+    bindInput(canvas, input, () => ({ width: 960, height: 540 }), makeFakeKeyTarget())
+
+    // pointermove only — no pointerdown, no fire
+    canvas.dispatchPointer('pointermove', { isPrimary: true, clientX: 400, clientY: 300 })
+
+    const commands = mapInputToCommands(input)
+    expect(commands.some((c) => c.type === 'aim')).toBe(true)
+    expect(commands.find((c) => c.type === 'aim')).toMatchObject({
+      type: 'aim',
+      x: 400,
+      y: 300,
+    })
+  })
+
+  it('GIVEN first pointerdown WHEN dispatched THEN pointerKnown becomes true and aim+fire can coexist', () => {
+    const canvas = makeFakeCanvas()
+    const input = createInputState()
+    bindInput(canvas, input, () => ({ width: 960, height: 540 }), makeFakeKeyTarget())
+
+    // First event is pointerdown (no prior pointermove)
+    canvas.dispatchPointer('pointerdown', { isPrimary: true, button: 0, pointerId: 1, clientX: 500, clientY: 250 })
+
+    expect(input.pointerKnown).toBe(true)
+    const commands = mapInputToCommands(input)
+    expect(commands.some((c) => c.type === 'aim')).toBe(true)
+    expect(commands.some((c) => c.type === 'fire')).toBe(true)
   })
 })
