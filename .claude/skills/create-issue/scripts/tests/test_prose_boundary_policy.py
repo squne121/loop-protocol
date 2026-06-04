@@ -548,12 +548,8 @@ class TestClassifyBlockLegacy:
 
 
 class TestGfmSegmentationLimits:
-    """B4: split_markdown_blocks() の GFM セグメンテーション既知限界（xfail）"""
+    """B4: split_markdown_blocks() の GFM セグメンテーション（#659 で修正済み）"""
 
-    @pytest.mark.xfail(
-        reason="GFM-correct segmentation（`````markdown 内に ```yaml を含むネスト形式）は #659 で対応",
-        strict=False,
-    )
     def test_split_nested_markdown_fence_is_single_block(self):
         """GIVEN: `````markdown fence 内に ```yaml を含むネスト WHEN: split_markdown_blocks THEN: 単一 code_fence ブロック
 
@@ -561,10 +557,8 @@ class TestGfmSegmentationLimits:
         内側の ``` (3個) は fence を閉じない（closing は opening と同じ長さ以上が必要）。
         したがってこの全体は単一の code_fence ブロックとして扱われるべき。
 
-        現状の regex (```[^\n]*\\n.*?```) は backtick 数を考慮しないため
-        内側の ``` を見つけた時点で fence 終了と誤判断し、4ブロックに分割してしまう。
-        GFM-correct セグメンテーションは #659 で対応予定。
-        #659 で fix されたら strict=True に変更して回帰防止とすること。
+        #659 で GFM-correct segmentation（iter_markdown_blocks SSOT）が実装され、
+        xfail を解除して回帰防止テストに変更した（AC10）。
         """
         # `````markdown
         # ```yaml
@@ -574,6 +568,160 @@ class TestGfmSegmentationLimits:
         text = "`````markdown\n```yaml\ncontract_schema_version: v1\n```\n`````"
         blocks = split_markdown_blocks(text)
         # 期待（GFM 的正当性）: 単一ブロックで type が code_fence
-        # 現状: regex が内側 ``` で終了と誤判断して 4 ブロックになる（xfail 理由）
         assert len(blocks) == 1
         assert blocks[0]["type"] == "code_fence"
+
+
+# ===========================================================================
+# #659: GFM 準拠 iter_markdown_blocks セグメンテーション golden corpus
+# ===========================================================================
+
+
+class TestIterMarkdownBlocksGfm:
+    """#659: iter_markdown_blocks の GFM 準拠 segmentation テスト"""
+
+    def test_split_four_backtick_inner_three_is_single_block(self):
+        """GIVEN: 4 backtick fence 内に 3 backtick 行 WHEN: split_markdown_blocks THEN: 単一 code_fence
+
+        GFM spec: opening が ```` (4個) の場合、内側の ``` (3個) は closing として無効。
+        全体は単一の code_fence ブロックとして分割されるべき（split_markdown_blocks レベルで検証）。
+        AC3 / VC 要件: test_split_four_backtick_inner_three_is_single_block
+        """
+        text = "````python\n```\nsome code\n```\n````"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_unclosed_fence_to_eof_is_single_block(self):
+        """GIVEN: 未閉 fence（EOF まで closing なし）WHEN: split_markdown_blocks THEN: 単一 code_fence
+
+        GFM spec: 未閉 fence は EOF まで単一 code block として扱う。
+        AC4 / VC 要件: test_split_unclosed_fence_to_eof_is_single_block
+        """
+        text = "```python\nprint('unclosed')\nno closing fence"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_closing_longer_than_opening_is_valid(self):
+        """GIVEN: opening より長い closing（5 backtick で 4 backtick fence を閉じる）
+        WHEN: split_markdown_blocks THEN: 単一 code_fence に正しく分割される
+
+        GFM spec: closing fence は opening と同長以上なら有効。
+        """
+        text = "````python\nsome code\n`````"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_tilde_backtick_mismatch_no_close(self):
+        """GIVEN: backtick fence を tilde で閉じようとした場合 WHEN: split_markdown_blocks
+        THEN: fence は閉じない（未閉として EOF まで code_fence）"""
+        text = "```python\nsome code\n~~~"
+        blocks = split_markdown_blocks(text)
+        # tilde は backtick fence の closing として無効 → 全体が未閉 code_fence
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_backtick_tilde_mismatch_no_close(self):
+        """GIVEN: tilde fence を backtick で閉じようとした場合 WHEN: split_markdown_blocks
+        THEN: fence は閉じない（未閉として EOF まで code_fence）"""
+        text = "~~~bash\necho hello\n```"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_four_spaces_indent_not_fence(self):
+        """GIVEN: 4 spaces indent の ``` WHEN: iter_markdown_blocks THEN: opening fence として認識しない
+
+        GFM spec: 4 spaces indent は fence として無効。
+        この opening ``` は prose として扱われる。その後の standalone ``` は
+        opening（未閉）として扱われる。
+        """
+        import prose_boundary_policy as _pbp_mod
+        text = "    ```python\nsome indented text"
+        # iter_markdown_blocks レベル: 4 spaces indent ``` は prose として yield
+        result = list(_pbp_mod.iter_markdown_blocks(text))
+        assert len(result) == 1
+        assert result[0][1] == _pbp_mod.BLOCK_KIND_HUMAN_PROSE
+
+    def test_split_closing_four_spaces_indent_invalid(self):
+        """GIVEN: closing fence に 4 spaces indent WHEN: split_markdown_blocks THEN: closing として無効"""
+        text = "```python\nsome code\n    ```"
+        blocks = split_markdown_blocks(text)
+        # closing fence に 4 spaces indent は無効 → fence は未閉（EOF まで code_fence）
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_closing_trailing_non_space_invalid(self):
+        """GIVEN: closing fence に trailing non-space WHEN: split_markdown_blocks THEN: closing として無効"""
+        text = "```python\nsome code\n``` extra"
+        blocks = split_markdown_blocks(text)
+        # closing fence に trailing non-space があるため無効 → fence は未閉
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_fence_followed_by_prose(self):
+        """GIVEN: code fence 直後に空行なしで prose WHEN: split_markdown_blocks THEN: code_fence と prose に分割"""
+        text = "```python\nprint('hello')\n```\nこれは prose です。"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "code_fence"
+        assert blocks[1]["type"] == "prose"
+
+    def test_split_prose_before_fence(self):
+        """GIVEN: prose の後に code fence WHEN: split_markdown_blocks THEN: prose と code_fence に分割"""
+        text = "これは prose テキストです。\n\n```python\ncode\n```"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "prose"
+        assert blocks[1]["type"] == "code_fence"
+
+    def test_split_zero_indent_fence_is_valid(self):
+        """GIVEN: 0 spaces indent fence WHEN: split_markdown_blocks THEN: 単一 code_fence"""
+        text = "```bash\necho hello\n```"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_three_spaces_indent_fence_is_valid(self):
+        """GIVEN: 3 spaces indent fence WHEN: split_markdown_blocks THEN: code_fence として認識"""
+        text = "   ```bash\necho hello\n   ```"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_four_backtick_closed_by_four_backtick(self):
+        """GIVEN: 4 backtick fence が 4 backtick で正しく閉じる WHEN: split_markdown_blocks THEN: 単一 code_fence"""
+        text = "````python\nsome code\n````"
+        blocks = split_markdown_blocks(text)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_split_multiple_fences(self):
+        """GIVEN: 複数の code fence WHEN: split_markdown_blocks THEN: 各 fence が独立した code_fence ブロック"""
+        text = "```python\ncode1\n```\n\n```bash\ncode2\n```"
+        blocks = split_markdown_blocks(text)
+        fence_blocks = [b for b in blocks if b["type"] == "code_fence"]
+        assert len(fence_blocks) == 2
+
+    def test_iter_markdown_blocks_yields_tuples(self):
+        """GIVEN: prose と code fence WHEN: iter_markdown_blocks THEN: (text, kind) タプルを yield"""
+        import prose_boundary_policy as _pbp_mod
+        text = "prose text\n```python\ncode\n```\nmore prose"
+        result = list(_pbp_mod.iter_markdown_blocks(text))
+        assert len(result) >= 2
+        for item in result:
+            assert isinstance(item, tuple)
+            assert len(item) == 2
+            text_part, kind_part = item
+            assert isinstance(text_part, str)
+            assert kind_part in (_pbp_mod.BLOCK_KIND_CODE_FENCE, _pbp_mod.BLOCK_KIND_HUMAN_PROSE)
+
+    def test_split_blocks_returns_list(self):
+        """GIVEN: テキスト WHEN: split_blocks THEN: list of tuples"""
+        import prose_boundary_policy as _pbp_mod
+        text = "```python\ncode\n```"
+        result = _pbp_mod.split_blocks(text)
+        assert isinstance(result, list)
+        assert len(result) >= 1

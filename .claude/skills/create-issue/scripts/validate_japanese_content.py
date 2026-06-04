@@ -71,24 +71,21 @@ class ValidationResult:
 
 
 def extract_code_fences(text: str) -> tuple[str, list[str]]:
-    """コードフェンスを取り除いてテキストと取り除いた部分を返す"""
+    """コードフェンスを取り除いてテキストと取り除いた部分を返す。
+
+    prose_boundary_policy.iter_markdown_blocks() の GFM 準拠セグメンテーションに委譲し、
+    独自 non-greedy fence regex（triple_backtick / tilde_fence）を撤去している（#659）。
+    """
     removed = []
-    result = text
+    prose_parts = []
 
-    # トリプルバッククォートフェンス
-    triple_backtick = re.compile(r'```[^\n]*\n.*?```', re.DOTALL)
-    for m in triple_backtick.finditer(result):
-        removed.append(m.group(0))
+    for block_text, block_kind in _pbp.iter_markdown_blocks(text):
+        if block_kind == _pbp.BLOCK_KIND_CODE_FENCE:
+            removed.append(block_text)
+        else:
+            prose_parts.append(block_text)
 
-    result = triple_backtick.sub('', result)
-
-    # チルダフェンス
-    tilde_fence = re.compile(r'~~~[^\n]*\n.*?~~~', re.DOTALL)
-    for m in tilde_fence.finditer(result):
-        removed.append(m.group(0))
-
-    result = tilde_fence.sub('', result)
-
+    result = ''.join(prose_parts)
     return result, removed
 
 
@@ -201,6 +198,9 @@ def split_markdown_blocks(text: str) -> list[dict]:
     """
     Markdown テキストをブロック単位に分割し、各ブロックの種別を返す。
 
+    GFM 準拠のセグメンテーションを使用するため prose_boundary_policy.iter_markdown_blocks()
+    に委譲し、独自 non-greedy fence regex を撤去している（#659）。
+
     Returns:
         list of {'text': str, 'type': str}
         type は 'code_fence' | 'machine_yaml' | 'shell_command' |
@@ -208,31 +208,16 @@ def split_markdown_blocks(text: str) -> list[dict]:
     """
     result = []
 
-    # まず code fence を先に抽出（順序を保持するため手動分割）
-    code_fence_re = re.compile(
-        r'(```[^\n]*\n.*?```|~~~[^\n]*\n.*?~~~)', re.DOTALL
-    )
-
-    pos = 0
-    for m in code_fence_re.finditer(text):
-        # code fence 前の部分を段落分割
-        before = text[pos:m.start()]
-        if before.strip():
-            for block in re.split(r'\n\s*\n', before):
-                if block.strip():
-                    btype = _classify_block(block)
-                    result.append({'text': block.strip(), 'type': btype})
-        # code fence 自体
-        result.append({'text': m.group(0), 'type': 'code_fence'})
-        pos = m.end()
-
-    # 残り部分を段落分割
-    remainder = text[pos:]
-    if remainder.strip():
-        for block in re.split(r'\n\s*\n', remainder):
-            if block.strip():
-                btype = _classify_block(block)
-                result.append({'text': block.strip(), 'type': btype})
+    for block_text, _raw_kind in _pbp.iter_markdown_blocks(text):
+        if _raw_kind == _pbp.BLOCK_KIND_CODE_FENCE:
+            # code fence ブロック: 独自分割は行わず直接追加
+            result.append({'text': block_text.strip(), 'type': 'code_fence'})
+        else:
+            # prose 領域: 空行で段落分割してから各ブロックを分類
+            for sub_block in re.split(r'\n\s*\n', block_text):
+                if sub_block.strip():
+                    btype = _classify_block(sub_block)
+                    result.append({'text': sub_block.strip(), 'type': btype})
 
     return result
 
