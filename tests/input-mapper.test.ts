@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { mapInputToCommands, bindInput, createInputState } from '../src/input'
+import { computeAimDirection } from '../src/render/CanvasRenderer'
 import type { CanvasLike, KeyEventTarget } from '../src/input/InputBindings'
 
 describe('mapInputToCommands', () => {
@@ -14,6 +15,7 @@ describe('mapInputToCommands', () => {
       pointerY: 340,
       primaryPressed: true,
       activePointerId: null,
+      pointerKnown: true,
     })
 
     expect(commands).toEqual([
@@ -33,9 +35,42 @@ describe('mapInputToCommands', () => {
       pointerY: 0,
       primaryPressed: false,
       activePointerId: null,
+      pointerKnown: true,
     })
 
     expect(commands.some((c) => c.type === 'move')).toBe(false)
+  })
+
+  it('GIVEN pointerKnown=false WHEN mapInputToCommands THEN no aim command emitted (AC3)', () => {
+    const commands = mapInputToCommands({
+      moveUp: false,
+      moveDown: false,
+      moveLeft: false,
+      moveRight: false,
+      pointerX: 120,
+      pointerY: 340,
+      primaryPressed: false,
+      activePointerId: null,
+      pointerKnown: false,
+    })
+
+    expect(commands.some((c) => c.type === 'aim')).toBe(false)
+  })
+
+  it('GIVEN pointerKnown=true WHEN mapInputToCommands THEN aim command emitted', () => {
+    const commands = mapInputToCommands({
+      moveUp: false,
+      moveDown: false,
+      moveLeft: false,
+      moveRight: false,
+      pointerX: 200,
+      pointerY: 100,
+      primaryPressed: false,
+      activePointerId: null,
+      pointerKnown: true,
+    })
+
+    expect(commands).toContainEqual({ type: 'aim', x: 200, y: 100 })
   })
 })
 
@@ -158,6 +193,67 @@ describe('bindInput (KeyboardEvent.code)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// BLOCKER-3: computeAimDirection unit tests
+// Verifies that aimX/aimY is prioritised over lastAimDirection (BLOCKER-1 fix)
+// ---------------------------------------------------------------------------
+
+describe('computeAimDirection — aimX/aimY priority over lastAimDirection', () => {
+  it('GIVEN aimX/aimY far from player WHEN lastAimDirection points differently THEN aimX/aimY direction wins', () => {
+    // Player at (100, 100); aim at (200, 100) → expected dirX=1, dirY=0
+    // lastAimDirection points up (0, -1) — should be ignored
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 200,
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: -1,
+    })
+    expect(result.dirX).toBeCloseTo(1)
+    expect(result.dirY).toBeCloseTo(0)
+  })
+
+  it('GIVEN aimX/aimY at 45-degree angle THEN direction vector is normalised', () => {
+    const result = computeAimDirection({
+      playerX: 0,
+      playerY: 0,
+      aimX: 10,
+      aimY: 10,
+      lastAimDirectionX: 1,
+      lastAimDirectionY: 0,
+    })
+    expect(result.dirX).toBeCloseTo(Math.SQRT1_2)
+    expect(result.dirY).toBeCloseTo(Math.SQRT1_2)
+  })
+
+  it('GIVEN aimX/aimY very close to player (dist <= AIM_EPSILON_PX) WHEN lastAimDirection is non-zero THEN fallback to lastAimDirection', () => {
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 100.5, // dist = 0.5 < AIM_EPSILON_PX=1.0
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: -1,
+    })
+    expect(result.dirX).toBeCloseTo(0)
+    expect(result.dirY).toBeCloseTo(-1)
+  })
+
+  it('GIVEN aimX/aimY at player AND lastAimDirection is zero THEN final fallback is right (1,0)', () => {
+    const result = computeAimDirection({
+      playerX: 100,
+      playerY: 100,
+      aimX: 100,
+      aimY: 100,
+      lastAimDirectionX: 0,
+      lastAimDirectionY: 0,
+    })
+    expect(result.dirX).toBeCloseTo(1)
+    expect(result.dirY).toBeCloseTo(0)
+  })
+})
+
 describe('bindInput (PointerEvent lifecycle)', () => {
   it('GIVEN primary pointer button 0 WHEN pointerdown THEN primaryPressed is set and setPointerCapture called', () => {
     const canvas = makeFakeCanvas()
@@ -189,25 +285,44 @@ describe('bindInput (PointerEvent lifecycle)', () => {
     bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
 
     canvas.dispatchPointer('pointerdown', { isPrimary: true, button: 0, pointerId: 3 })
-    canvas.dispatchPointer('pointermove', { pointerId: 3, clientX: 480, clientY: 270 })
+    canvas.dispatchPointer('pointermove', { pointerId: 3, isPrimary: true, clientX: 480, clientY: 270 })
 
     expect(input.pointerX).toBeCloseTo(480)
     expect(input.pointerY).toBeCloseTo(270)
   })
 
-  it('GIVEN captured pointerId=3 WHEN pointermove with different pointerId THEN aim NOT updated', () => {
+  it('GIVEN no pointerdown WHEN primary pointermove THEN aim updates (AC1: hover without click)', () => {
     const canvas = makeFakeCanvas()
     const keyTarget = makeFakeKeyTarget()
     const input = createInputState()
     bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
 
-    canvas.dispatchPointer('pointerdown', { isPrimary: true, button: 0, pointerId: 3 })
+    // No pointerdown — pure hover
+    canvas.dispatchPointer('pointermove', { isPrimary: true, clientX: 300, clientY: 150 })
+
+    expect(input.pointerX).toBeCloseTo(300)
+    expect(input.pointerY).toBeCloseTo(150)
+    expect(input.pointerKnown).toBe(true)
+  })
+
+  it('GIVEN no pointermove yet WHEN createInputState THEN pointerKnown is false (AC1)', () => {
+    const input = createInputState()
+    expect(input.pointerKnown).toBe(false)
+  })
+
+  it('GIVEN non-primary pointermove WHEN pointermove THEN aim NOT updated', () => {
+    const canvas = makeFakeCanvas()
+    const keyTarget = makeFakeKeyTarget()
+    const input = createInputState()
+    bindInput(canvas, input, () => ({ width: 960, height: 540 }), keyTarget)
+
     input.pointerX = 100
     input.pointerY = 100
-    canvas.dispatchPointer('pointermove', { pointerId: 99, clientX: 999, clientY: 999 })
+    canvas.dispatchPointer('pointermove', { isPrimary: false, clientX: 999, clientY: 999 })
 
     expect(input.pointerX).toBe(100)
     expect(input.pointerY).toBe(100)
+    expect(input.pointerKnown).toBe(false)
   })
 
   it('GIVEN primary pointer down WHEN pointerup THEN primaryPressed is cleared', () => {
