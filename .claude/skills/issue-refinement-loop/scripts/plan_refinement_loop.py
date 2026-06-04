@@ -76,6 +76,43 @@ FAIL_CLOSED_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
 FAIL_CLOSED_REASON_INTERNAL_ERROR = "planner_internal_error"
 FAIL_CLOSED_REASON_TEMPLATE_UNAVAILABLE = "template_required_sections_unavailable"
 FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND = "unknown_issue_kind"
+FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY = "missing_required_contract_key"
+FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR = "contract_schema_parse_error"
+FAIL_CLOSED_REASON_ISSUE_KIND_POLICY_LOAD_ERROR = "issue_kind_policy_load_error"
+FAIL_CLOSED_REASON_CHECKER_INTERNAL_ERROR = "checker_internal_error"
+FAIL_CLOSED_REASON_TEMPLATE_RESOLUTION_ERROR = "template_resolution_error"
+
+# Override policy: which fail_closed reason codes can be overridden by human_decision_reframe
+# AC7: missing_required_section and missing_required_contract_key only
+# unknown_issue_kind, issue_kind_policy_load_error, contract_schema_parse_error,
+# template_resolution_error, checker_internal_error are never overridable.
+OVERRIDE_POLICY = {
+    "allowed_reason_codes": [
+        FAIL_CLOSED_REASON_MISSING_SECTION,
+        FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY,
+    ],
+    "never_override_reason_codes": [
+        FAIL_CLOSED_REASON_UNKNOWN_ISSUE_KIND,
+        FAIL_CLOSED_REASON_ISSUE_KIND_POLICY_LOAD_ERROR,
+        FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR,
+        FAIL_CLOSED_REASON_TEMPLATE_RESOLUTION_ERROR,
+        FAIL_CLOSED_REASON_CHECKER_INTERNAL_ERROR,
+    ],
+}
+
+# Required machine-readable contract keys that must be present when a YAML contract exists
+REQUIRED_CONTRACT_KEYS = [
+    "contract_schema_version",
+    "issue_kind",
+]
+
+# Standard required sections for implementation issues
+STANDARD_REQUIRED_SECTIONS = [
+    "Outcome",
+    "Acceptance Criteria",
+    "Verification Commands",
+    "Allowed Paths",
+]
 
 # ---------------------------------------------------------------------------
 # ISSUE_KIND_POLICY_V1 SSOT loader
@@ -937,6 +974,77 @@ def _stable_sort_dedupe(items: list[str]) -> list[str]:
     return sorted(set(items))
 
 
+def _extract_missing_contract_keys(issue_body: str) -> list[str]:
+    """
+    Extract missing required contract keys from the Machine-Readable Contract.
+
+    Returns a list of required keys that are absent from the parsed contract dict.
+    Returns an empty list if no Machine-Readable Contract section or YAML block exists
+    (absence of contract is handled separately by section checks, not here).
+    Only returns missing keys when a contract block IS present but keys are absent.
+    """
+    if not _YAML_AVAILABLE:
+        return []
+
+    sections = _extract_sections(issue_body)
+    # Only check for missing keys if a Machine-Readable Contract section exists
+    if "Machine-Readable Contract" not in sections:
+        return []
+
+    machine_contract = _extract_machine_contract(issue_body)
+    if machine_contract is None:
+        # Contract section exists but YAML couldn't be parsed — schema parse error
+        # Return all required keys as missing so the caller knows what to add
+        return list(REQUIRED_CONTRACT_KEYS)
+
+    missing = []
+    for key in REQUIRED_CONTRACT_KEYS:
+        if key not in machine_contract or machine_contract[key] is None:
+            missing.append(key)
+    return missing
+
+
+def _build_fail_closed_rewrite_constraints(
+    fail_closed_reasons: list[str],
+    missing_sections: list[str],
+    missing_contract_keys: list[str],
+) -> dict[str, Any]:
+    """
+    Build FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 payload.
+
+    AC1/AC2/AC8: Returned when fail_closed is triggered, to guide issue-author
+    rewrite toward deterministic repair instead of freeform editing.
+    """
+    # Determine which reasons are overridable (AC7)
+    overridable_reasons = [
+        r for r in fail_closed_reasons
+        if r in OVERRIDE_POLICY["allowed_reason_codes"]
+    ]
+    non_overridable_reasons = [
+        r for r in fail_closed_reasons
+        if r in OVERRIDE_POLICY["never_override_reason_codes"]
+    ]
+
+    return {
+        "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+        "required_sections": missing_sections,
+        "required_contract_keys": missing_contract_keys,
+        "rewrite_constraints": {
+            "must_add_sections": missing_sections,
+            "must_add_contract_keys": missing_contract_keys,
+            "freeform_rewrite_forbidden": True,
+        },
+        "override_policy": {
+            "allowed_reason_codes": OVERRIDE_POLICY["allowed_reason_codes"],
+            "never_override_reason_codes": OVERRIDE_POLICY["never_override_reason_codes"],
+            "overridable_in_current_result": overridable_reasons,
+            "non_overridable_in_current_result": non_overridable_reasons,
+        },
+        "max_rewrite_attempts": 2,
+        "no_progress_route": "human_judgment_required",
+    }
+
+
 def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], int]:
     """
     Main planner function.
@@ -1000,6 +1108,9 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
 
         # Check for malformations
         fail_closed_reasons = []
+        # Track missing sections and contract keys for FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
+        accumulated_missing_sections: list[str] = []
+        accumulated_missing_contract_keys: list[str] = []
 
         if _check_malformed_contract(issue_body):
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MALFORMED_CONTRACT)
@@ -1008,6 +1119,12 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         machine_contract = _extract_machine_contract(issue_body)
         raw_issue_kind = machine_contract.get("issue_kind") if machine_contract else None
         parent_mode = machine_contract.get("parent_mode") if machine_contract else None
+
+        # Check for missing required contract keys (AC2/AC11)
+        missing_contract_keys = _extract_missing_contract_keys(issue_body)
+        if missing_contract_keys:
+            accumulated_missing_contract_keys = missing_contract_keys
+            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
 
         # Apply alias normalization (design→research, tracking→parent, etc.)
         # _normalize_issue_kind returns None for unknown/unresolvable kinds.
@@ -1035,10 +1152,12 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     else:
                         missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
                         if missing:
+                            accumulated_missing_sections = missing
                             fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
                 else:
                     # Template not found: fall back to Outcome check
                     if _check_missing_outcome(issue_body):
+                        accumulated_missing_sections = ["Outcome"]
                         fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
         elif is_parent_delivery_rollup:
             # AC1: parent delivery-rollup — check parent template sections (not Outcome)
@@ -1052,13 +1171,21 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 else:
                     missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
                     if missing:
+                        accumulated_missing_sections = missing
                         fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_PARENT_SECTION)
         else:
             # No machine contract or unknown issue_kind: fall back to Outcome check
             if _check_missing_outcome(issue_body):
+                accumulated_missing_sections = ["Outcome"]
                 fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
 
         if fail_closed_reasons:
+            # Build FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 for AC1/AC2/AC8
+            rewrite_constraints = _build_fail_closed_rewrite_constraints(
+                fail_closed_reasons,
+                accumulated_missing_sections,
+                accumulated_missing_contract_keys,
+            )
             # B3: Return schema-valid decisions with unknown confidence even in fail_closed
             return (
                 {
@@ -1105,6 +1232,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                         "required": True,
                         "reason_codes": fail_closed_reasons,
                         "human_message": f"Issue contract malformation detected: {', '.join(fail_closed_reasons)}",
+                        "rewrite_constraints": rewrite_constraints,
                     },
                 },
                 0,
