@@ -178,6 +178,13 @@ def iter_markdown_blocks(text: str):
             fence_chars = m.group(2)  # e.g. "```" or "~~~~"
             fence_char = fence_chars[0]  # '`' or '~'
             fence_len = len(fence_chars)
+            info = m.group(5)  # info string（optional）
+
+            # GFM spec: backtick fence の info string は backtick を含んではならない
+            if fence_char == "`" and "`" in info:
+                prose_lines.append(line)
+                i += 1
+                continue
 
             # flush any accumulated prose
             if prose_lines:
@@ -188,7 +195,6 @@ def iter_markdown_blocks(text: str):
             fence_line_buf: list[str] = [line]
             i += 1
 
-            closed = False
             while i < n:
                 inner_line = lines[i]
                 inner_stripped = inner_line.rstrip('\n').rstrip('\r')
@@ -204,7 +210,6 @@ def iter_markdown_blocks(text: str):
                         # valid closing fence
                         fence_line_buf.append(inner_line)
                         i += 1
-                        closed = True
                         break
                 # not a valid closing fence — part of code block content
                 fence_line_buf.append(inner_line)

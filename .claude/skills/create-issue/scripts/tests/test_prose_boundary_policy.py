@@ -858,3 +858,30 @@ class TestGfmClosingFenceGoldenCorpus:
             f"tilde が backtick fence の closing として誤認識された: blocks={blocks}"
         )
         assert blocks[0]["type"] == "code_fence"
+
+
+# ===========================================================================
+# GFM: backtick fence の info string 制約（#669 レビュー指摘修正）
+# ===========================================================================
+
+
+def test_backtick_fence_info_string_must_not_contain_backtick():
+    """GFM: backtick fence の info string に backtick は禁止"""
+    import prose_boundary_policy as _pbp_mod
+    text = "``` invalid `info`\nEnglish prose\n```\n"
+    blocks = list(_pbp_mod.iter_markdown_blocks(text))
+    # backtick in info → opening fence として無効 → prose として扱う（line 1, 2 が prose 蓄積）
+    # 3行目の ``` は info なし valid opening として認識されるが EOF → 未閉 code_fence
+    # → prose 1 block + 未閉 code_fence 1 block = 2 blocks
+    assert len(blocks) == 2
+    assert blocks[0][1] == _pbp_mod.BLOCK_KIND_HUMAN_PROSE
+    assert blocks[1][1] == _pbp_mod.BLOCK_KIND_CODE_FENCE
+
+
+def test_tilde_fence_info_string_may_contain_backtick():
+    """GFM: tilde fence の info string は backtick を含んでもよい"""
+    import prose_boundary_policy as _pbp_mod
+    text = "~~~ md `ok`\ncode\n~~~\n"
+    blocks = list(_pbp_mod.iter_markdown_blocks(text))
+    assert len(blocks) == 1
+    assert blocks[0][1] == _pbp_mod.BLOCK_KIND_CODE_FENCE
