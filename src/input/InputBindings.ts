@@ -94,15 +94,19 @@ export function bindInput(
     input.activePointerId = event.pointerId
     canvasElement.setPointerCapture(event.pointerId)
     updatePointerCoords(event, canvasElement, input, getArena)
+    input.pointerKnown = true
     input.primaryPressed = true
   })
 
   canvasElement.addEventListener('pointermove', (rawEvent: Event) => {
     const event = rawEvent as PointerEvent
-    if (input.activePointerId === null || event.pointerId !== input.activePointerId) {
+    // AC1: Always update aim coordinates on hover (independent of activePointerId).
+    // Non-primary pointers (e.g. second finger on touch) are skipped.
+    if (!event.isPrimary) {
       return
     }
     updatePointerCoords(event, canvasElement, input, getArena)
+    input.pointerKnown = true
   })
 
   canvasElement.addEventListener('pointerup', (rawEvent: Event) => {

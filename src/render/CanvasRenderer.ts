@@ -4,6 +4,42 @@ export interface CanvasRenderer {
   render(state: GameState): void
 }
 
+/** Fixed length of the aim indicator line in logical pixels (AC2). */
+export const AIM_INDICATOR_LENGTH_PX = 60
+
+/**
+ * Threshold below which the pointer-to-player distance is considered "at player".
+ * When dist <= AIM_EPSILON_PX, we fall back to lastAimDirection to avoid zero-length vectors.
+ */
+export const AIM_EPSILON_PX = 1.0
+
+/**
+ * Pure helper: compute normalised aim direction vector.
+ * Priority: aimX/aimY (current frame) → lastAimDirectionX/Y (fallback) → right (default).
+ *
+ * Exported for unit testing only; CanvasRenderer is the sole production caller.
+ */
+export function computeAimDirection(params: {
+  playerX: number
+  playerY: number
+  aimX: number
+  aimY: number
+  lastAimDirectionX: number
+  lastAimDirectionY: number
+}): { dirX: number; dirY: number } {
+  const dx = params.aimX - params.playerX
+  const dy = params.aimY - params.playerY
+  const dist = Math.hypot(dx, dy)
+
+  if (dist > AIM_EPSILON_PX) {
+    return { dirX: dx / dist, dirY: dy / dist }
+  }
+  if (params.lastAimDirectionX !== 0 || params.lastAimDirectionY !== 0) {
+    return { dirX: params.lastAimDirectionX, dirY: params.lastAimDirectionY }
+  }
+  return { dirX: 1, dirY: 0 }
+}
+
 export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer {
   const context = canvas.getContext('2d')
 
@@ -33,9 +69,11 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.setTransform(dpr, 0, 0, dpr, 0, 0)
       }
 
+      // --- Layer 1: background ---
       context.fillStyle = '#07111f'
       context.fillRect(0, 0, arenaW, arenaH)
 
+      // --- Layer 2: grid ---
       context.strokeStyle = 'rgba(92, 219, 190, 0.08)'
       context.lineWidth = 1
       for (let x = 0; x <= arenaW; x += 40) {
@@ -52,15 +90,36 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.stroke()
       }
 
-      // Draw projectiles
-      context.fillStyle = '#f4c25b'
-      for (const projectile of state.projectiles) {
+      // --- Layer 3: aim indicator (above background/grid, below actors/projectiles) ---
+      // AC2: Fixed length via AIM_INDICATOR_LENGTH_PX constant.
+      // AC5: Isolated with save()/restore() to avoid leaking canvas state.
+      // Visual-only: does not interact with collision or combat systems (AC3).
+      {
+        // Derive direction from aimX/aimY every frame (AC1: hover always updates aim).
+        // lastAimDirectionX/Y is used only as fallback when pointer is too close to player.
+        const { dirX, dirY } = computeAimDirection({
+          playerX: state.player.x,
+          playerY: state.player.y,
+          aimX: state.player.aimX,
+          aimY: state.player.aimY,
+          lastAimDirectionX: state.player.lastAimDirectionX,
+          lastAimDirectionY: state.player.lastAimDirectionY,
+        })
+
+        context.save()
+        context.strokeStyle = '#f4c25b'
+        context.lineWidth = 3
         context.beginPath()
-        context.arc(projectile.x, projectile.y, projectile.radius, 0, Math.PI * 2)
-        context.fill()
+        context.moveTo(state.player.x, state.player.y)
+        context.lineTo(
+          state.player.x + dirX * AIM_INDICATOR_LENGTH_PX,
+          state.player.y + dirY * AIM_INDICATOR_LENGTH_PX,
+        )
+        context.stroke()
+        context.restore()
       }
 
-      // Draw player
+      // --- Layer 4: player ---
       context.fillStyle = '#70f0d0'
       context.beginPath()
       context.arc(
@@ -72,23 +131,7 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       )
       context.fill()
 
-      // Draw aim line
-      context.strokeStyle = '#f4c25b'
-      context.lineWidth = 3
-      context.beginPath()
-      context.moveTo(state.player.x, state.player.y)
-      context.lineTo(state.player.aimX, state.player.aimY)
-      context.stroke()
-
-      context.fillStyle = '#dce8f8'
-      context.font = '14px "IBM Plex Mono", monospace'
-      context.fillText(
-        `${state.progress.stageLabel}  T+${Math.floor(state.elapsedMs / 1000)}s`,
-        18,
-        28,
-      )
-
-      // Draw enemies (defeated === false only; AC7)
+      // --- Layer 5: enemies (defeated === false only) ---
       context.fillStyle = '#f05050'
       for (const enemy of state.enemies) {
         if (enemy.defeated) continue
@@ -97,7 +140,24 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.fill()
       }
 
-      // Victory / Defeat overlay (AC8, AC9)
+      // --- Layer 6: projectiles ---
+      context.fillStyle = '#f4c25b'
+      for (const projectile of state.projectiles) {
+        context.beginPath()
+        context.arc(projectile.x, projectile.y, projectile.radius, 0, Math.PI * 2)
+        context.fill()
+      }
+
+      // --- Layer 7: HUD ---
+      context.fillStyle = '#dce8f8'
+      context.font = '14px "IBM Plex Mono", monospace'
+      context.fillText(
+        `${state.progress.stageLabel}  T+${Math.floor(state.elapsedMs / 1000)}s`,
+        18,
+        28,
+      )
+
+      // --- Layer 8: Victory / Defeat overlay ---
       if (state.sortie.result !== null) {
         const outcome = state.sortie.result.outcome
         const isVictory = outcome === 'victory'

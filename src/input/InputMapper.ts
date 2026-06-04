@@ -28,11 +28,14 @@ export function mapInputToCommands(input: InputState): InputCommand[] {
     })
   }
 
-  commands.push({
-    type: 'aim',
-    x: input.pointerX,
-    y: input.pointerY,
-  })
+  // AC3: Only emit aim command once the pointer position is known (first pointermove).
+  if (input.pointerKnown) {
+    commands.push({
+      type: 'aim',
+      x: input.pointerX,
+      y: input.pointerY,
+    })
+  }
 
   if (input.primaryPressed) {
     commands.push({ type: 'fire' })

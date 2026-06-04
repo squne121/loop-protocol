@@ -37,6 +37,57 @@ related_tests:
 
 ---
 
+## Aim Indicator — Visual-Only Invariants（Issue #580）
+
+aim indicator は **visual-only** な描画要素であり、以下の不変条件が成立する:
+
+### Tracking Target
+
+aim indicator は `PlayerState.aimX` / `aimY` をマウスカーソル位置として追跡する。
+`InputBindings.ts` の `pointermove` および `pointerdown` ハンドラが `activePointerId` 依存なしに常時 `pointerX` / `pointerY` を更新し、
+`pointerKnown = true` を設定する。
+`CanvasRenderer` は **毎フレーム `aimX/aimY` から方向ベクトルを計算する**（`dist > AIM_EPSILON_PX` の場合）。
+`lastAimDirectionX/Y`（`CombatSystem` が fire 時に正規化して保持）は、ポインターがプレイヤー位置に重なる場合（`dist <= AIM_EPSILON_PX`）の **fallback にのみ** 使用する。
+
+### Fixed Length
+
+aim indicator の描画長は `AIM_INDICATOR_LENGTH_PX`（= 60 px）定数で固定する。
+`lineTo(aimX, aimY)` のような可変長描画は禁止。
+方向ベクトルを正規化して `AIM_INDICATOR_LENGTH_PX` を乗じた端点へ `lineTo` する。
+
+### Draw Layer
+
+描画レイヤー順序は以下の通り:
+
+1. background（fill）
+2. grid
+3. **aim indicator**（← この層）
+4. player
+5. enemies
+6. projectiles
+7. HUD text
+8. Victory / Defeat overlay
+
+aim indicator は background / grid より上、actors / projectiles より下に描画する。
+`context.save()` / `context.restore()` で描画状態を隔離し、周辺レイヤーに strokeStyle / lineWidth の副作用を及ぼさない。
+
+### No Hitbox
+
+aim indicator はヒットボックスを持たない。
+- `CollisionSystem` の衝突判定対象ではない
+- `CombatSystem` の damage 処理対象ではない
+- `GameState` へのエンティティ追加なし
+
+### Fallback Behavior
+
+`pointerKnown === false`（ポインターがまだ canvas に入っていない）の間は:
+- `InputMapper` が aim command を送出しない（`CombatSystem` に aim 座標が伝達されない）
+- aim indicator は `lastAimDirectionX/Y` の初期値（`0, 0`）に基づき右方向フォールバックで描画される
+
+`pointerKnown` は `InputState` に保持されるフラグであり、最初の `pointermove` で `true` になる。
+
+---
+
 ## M2 範囲
 
 M2（v0.2.x）の Combat 最小仕様は以下を含む:
