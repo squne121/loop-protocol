@@ -534,16 +534,14 @@ class TestClassifyBlockLegacy:
 
 
 # ===========================================================================
-# GFM segmentation 限界テスト（B4）
+# B4: GFM セグメンテーション回帰防止テスト（#659 修正済み）
 # split_markdown_blocks() レベルの GFM 正当性確認
-# NOTE: 以下テストは現状 regex ベースの split_markdown_blocks() では誤分割が発生する
-#       ことが判明している既知の限界を xfail として記録する。
-#       GFM-correct セグメンテーション修正は follow-up #659 で対応する予定であり、
-#       #659 で fix されたら strict=True に変更して回帰防止とする。
+# NOTE: #659 で iter_markdown_blocks SSOT が実装され、以下のテストは
+#       通常の passing test として維持する（回帰防止）。
 #
 #       golden corpus が固定しているのは classify_block（分類 API）であり、
 #       split_markdown_blocks() レベルの GFM 正当性（opening より長い closing /
-#       未閉 fence の境界）は follow-up #659 の責務。
+#       未閉 fence の境界）は iter_markdown_blocks SSOT で保証される。
 # ===========================================================================
 
 
@@ -725,3 +723,138 @@ class TestIterMarkdownBlocksGfm:
         result = _pbp_mod.split_blocks(text)
         assert isinstance(result, list)
         assert len(result) >= 1
+
+
+# ===========================================================================
+# AC7: validate_text / classify_borderline がフェンス内を prose として扱わない
+# ===========================================================================
+
+
+class TestValidateFenceIgnored:
+    """AC7: validate_text() / classify_borderline() が code fence 内コンテンツを prose ratio 判定に含めない"""
+
+    def test_validate_text_ignores_fence(self):
+        """GIVEN: 4-backtick fence 内に英語のみの行 WHEN: validate_text THEN: fence 内は prose ratio fail しない
+
+        GFM SSOT (iter_markdown_blocks) 経由でフェンス内を除外しているため、
+        英語のみのコード行は prose ratio の判定対象にならない。
+        prose block が残らない場合は passed=False（prose-zero）だが、
+        fence 内の英語行が ratio fail を引き起こすことはない。
+        """
+        from validate_japanese_content import validate_text
+
+        # 4-backtick fence 内はすべて英語。prose として扱われなければ ratio fail は起きない。
+        text = "````python\nall_english_code = True\nmore_english_here()\n````"
+        result = validate_text(text)
+        # fence 内のみ → prose block 0件 → passed=False（prose-zero）
+        # 重要: failed_blocks に fence 内コンテンツが含まれないこと
+        for fb in result.failed_blocks:
+            assert "all_english_code" not in fb.get("original", ""), (
+                "fence 内の英語行が prose ratio fail として記録された（fence 除外が機能していない）"
+            )
+
+    def test_classify_borderline_ignores_fence(self):
+        """GIVEN: 未閉 fence / tilde-backtick mismatch 内の英語 WHEN: classify_borderline THEN: prose として誤検査しない
+
+        未閉 fence（GFM: EOF まで code block）内の英語行は prose ratio 計算に含まれない。
+        tilde-backtick mismatch（fence が閉じない）の場合も同様。
+        """
+        from validate_japanese_content import classify_borderline
+
+        # 未閉 backtick fence: 内部は英語のみ（GFM: EOF まで code_fence）
+        unclosed = "```python\nonly_english = True\nno_japanese_here()\n"
+        result_unclosed = classify_borderline(unclosed)
+        # prose block が 0 件 → CLEAR_FAIL（prose-zero）
+        # 英語行が prose として扱われ BORDERLINE/PASS になってはいけない
+        assert result_unclosed == "CLEAR_FAIL", (
+            f"未閉 fence 内の英語行が prose として扱われた: classify_borderline={result_unclosed!r}"
+        )
+
+        # tilde-backtick mismatch: backtick fence を tilde で閉じようとしても閉じない
+        mismatch = "```python\nonly_english = True\n~~~\n"
+        result_mismatch = classify_borderline(mismatch)
+        assert result_mismatch == "CLEAR_FAIL", (
+            f"tilde-backtick mismatch で fence 内英語行が prose 扱いされた: {result_mismatch!r}"
+        )
+
+
+# ===========================================================================
+# AC8: 未閉 fence による prose-zero fail
+# ===========================================================================
+
+
+class TestUnclosedFenceProseZero:
+    """AC8: 未閉 fence で prose block が 0 件になった場合は prose-zero として fail"""
+
+    def test_prose_zero_on_unclosed_fence(self):
+        """GIVEN: 本文の大部分が未閉 fence + 少量 prose WHEN: validate_text THEN: prose-zero fail
+
+        未閉 fence 内の英語行は prose ratio fail しないが、
+        prose block が残らなければ prose-zero として passed=False になる。
+        fence 内コンテンツが prose として誤検査されないことを合わせて確認する。
+        """
+        from validate_japanese_content import validate_text
+
+        # 未閉 fence: 内部は英語のみ。fence 後に prose はない。
+        text = "```python\nall_english_code()\nanother_line = True\n"
+        result = validate_text(text)
+        # prose block が 0 件 → passed=False
+        assert result.passed is False, "未閉 fence 本文が prose-zero で pass してはいけない"
+        # fence 内が prose として failed_blocks に入っていないこと
+        assert len(result.failed_blocks) == 0 or all(
+            "all_english_code" not in fb.get("original", "") for fb in result.failed_blocks
+        ), "fence 内の英語行が prose ratio fail として誤記録された"
+
+    def test_full_body_unclosed_fence(self):
+        """GIVEN: 本文全体が未閉 fence WHEN: validate_text THEN: prose-zero として passed=False
+
+        本文全体が ``` で始まり closing なし → iter_markdown_blocks は全体を code_fence として yield。
+        extract_code_fences 後に prose block なし → prose-zero fail。
+        """
+        from validate_japanese_content import validate_text
+
+        # 本文全体が未閉 fence
+        text = "```bash\necho hello\ngit push\nuv run pytest\n"
+        result = validate_text(text)
+        assert result.passed is False, "本文全体が未閉 fence の場合も prose-zero で fail すること"
+        assert result.total_chars == 0, (
+            f"fence 内コンテンツが prose として計上された: total_chars={result.total_chars}"
+        )
+
+
+# ===========================================================================
+# AC9: GFM 仕様の golden corpus（closing fence の厳密ルール）
+# ===========================================================================
+
+
+class TestGfmClosingFenceGoldenCorpus:
+    """AC9: iter_markdown_blocks / split_blocks の GFM 仕様準拠確認（golden corpus）"""
+
+    def test_gfm_closing_trailing_nonspace(self):
+        """GIVEN: closing fence 後に非空白文字がある WHEN: split_markdown_blocks THEN: closing として無効
+
+        GFM spec 4.5: closing fence の後に空白以外の文字があれば closing として認識されない。
+        例: ``` abc は closing fence ではなく fence は未閉のまま続く。
+        """
+        # ``` python の後に closing ``` abc（trailing non-space → 無効）
+        text = "```python\nsome code\n``` abc\nmore content"
+        blocks = split_markdown_blocks(text)
+        # ``` abc は closing 無効 → 全体が未閉 code_fence として単一ブロック
+        assert len(blocks) == 1, (
+            f"trailing non-space を持つ closing fence が有効と判定された: blocks={blocks}"
+        )
+        assert blocks[0]["type"] == "code_fence"
+
+    def test_gfm_tilde_backtick_mismatch(self):
+        """GIVEN: backtick fence を tilde で閉じようとする WHEN: split_markdown_blocks THEN: fence は閉じない
+
+        GFM spec 4.5: backtick fence の closing には backtick のみを使用できる。
+        tilde（~~~）で backtick fence（```）を閉じることはできない（mismatch）。
+        """
+        text = "```python\nsome code\n~~~"
+        blocks = split_markdown_blocks(text)
+        # tilde は backtick fence の closing として無効 → 全体が未閉 code_fence
+        assert len(blocks) == 1, (
+            f"tilde が backtick fence の closing として誤認識された: blocks={blocks}"
+        )
+        assert blocks[0]["type"] == "code_fence"
