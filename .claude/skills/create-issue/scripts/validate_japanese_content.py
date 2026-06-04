@@ -531,6 +531,16 @@ def main():
         help='gh api endpoint for --classify-api-mutation (e.g. repos/owner/repo/issues/123)',
     )
     parser.add_argument(
+        '--api-method',
+        type=str,
+        default=None,
+        help=(
+            'HTTP method for --classify-api-mutation. '
+            'When omitted, classification is method-agnostic for backward compatibility. '
+            'Comment PATCH routes should pass PATCH explicitly.'
+        ),
+    )
+    parser.add_argument(
         '--classify-graphql-mutation',
         type=str,
         default=None,
@@ -885,6 +895,16 @@ def main():
             print('NOT_BODY_MUTATION')
             sys.exit(0)
 
+        body_value = payload.get('body')
+        if not isinstance(body_value, str):
+            print('INVALID_BODY_TYPE')
+            sys.exit(0)
+
+        method = (args.api_method or '').strip().upper()
+        if method in {'GET', 'DELETE'}:
+            print('NOT_BODY_MUTATION')
+            sys.exit(0)
+
         # Parse endpoint to detect issue/PR body mutation
         # Patterns:
         #   repos/{owner}/{repo}/issues/{number}          -> ISSUE PATCH
@@ -896,18 +916,44 @@ def main():
         ep = endpoint.lstrip('/')
 
         issue_m = _re.match(
-            r'^repos/[^/]+/[^/]+/issues/(\d+)$', ep
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)$', ep
         )
         pr_m = _re.match(
-            r'^repos/[^/]+/[^/]+/pulls/(\d+)$', ep
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/(?P<number>\d+)$', ep
+        )
+        issue_comment_m = _re.match(
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/comments/(?P<comment_id>\d+)$', ep
+        )
+        pr_review_comment_m = _re.match(
+            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/comments/(?P<comment_id>\d+)$', ep
         )
 
         if issue_m:
-            print(f'BODY_MUTATION_ISSUE:{issue_m.group(1)}')
+            print(f"BODY_MUTATION_ISSUE:{issue_m.group('number')}")
         elif pr_m:
-            print(f'BODY_MUTATION_PR:{pr_m.group(1)}')
+            print(f"BODY_MUTATION_PR:{pr_m.group('number')}")
+        elif issue_comment_m:
+            if method and method != 'PATCH':
+                print('NOT_BODY_MUTATION')
+            else:
+                print(
+                    "BODY_MUTATION_ISSUE_COMMENT:"
+                    f"{issue_comment_m.group('owner')}:"
+                    f"{issue_comment_m.group('repo')}:"
+                    f"{issue_comment_m.group('comment_id')}"
+                )
+        elif pr_review_comment_m:
+            if method and method != 'PATCH':
+                print('NOT_BODY_MUTATION')
+            else:
+                print(
+                    "BODY_MUTATION_PR_REVIEW_COMMENT:"
+                    f"{pr_review_comment_m.group('owner')}:"
+                    f"{pr_review_comment_m.group('repo')}:"
+                    f"{pr_review_comment_m.group('comment_id')}"
+                )
         else:
-            # endpoint not recognized as issue/PR mutation
+            # endpoint not recognized as issue/PR/comment PATCH mutation
             print('NOT_BODY_MUTATION')
         sys.exit(0)
 
