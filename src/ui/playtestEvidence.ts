@@ -383,12 +383,21 @@ function downloadString(content: string, filename: string): void {
   URL.revokeObjectURL(url)
 }
 
+interface MountPanelResult {
+  panel: HTMLElement
+  /** Call once when the panel is first shown to lock the evidence snapshot. */
+  initSnapshot: () => void
+}
+
 /** Build and mount the Evidence Panel DOM node (AC2, AC9, AC10) */
-function mountPanel(container: HTMLElement, initiallyHidden: boolean): HTMLElement {
-  // Initial synchronous render -- browser version may be userAgent-parsed initially
-  const data = buildEvidenceData()
+function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPanelResult {
+  // AC12: lazy-initialize snapshot on first open.
+  // buildEvidenceData() is NOT called here (mount time); it is called the first time
+  // the toggle opens the panel so that viewport/generated_at reflect the actual open moment.
+  // Once locked, the same snapshot is reused across close/reopen cycles.
+  let snapshotData: ReturnType<typeof buildEvidenceData> | null = null
   // Mutable reference so async update can refresh textarea / download
-  let currentYaml = toYaml(data)
+  let currentYaml: string = ''
 
   const panelId = 'playtest-evidence-panel'
 
@@ -418,7 +427,7 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): HTMLEleme
   closeBtn.type = 'button'
   closeBtn.setAttribute('data-playtest-close', 'true')
   closeBtn.setAttribute('aria-label', 'Close Playtest Evidence Panel')
-  closeBtn.textContent = 'x'
+  closeBtn.textContent = '×'
   closeBtn.style.cssText = [
     'position:absolute',
     'top:8px',
@@ -444,7 +453,7 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): HTMLEleme
   // Textarea fallback for manual copy (AC9 fallback)
   const textarea = document.createElement('textarea')
   textarea.setAttribute('data-playtest-fallback', 'true')
-  textarea.value = currentYaml
+  textarea.value = ''
   textarea.readOnly = true
   textarea.style.cssText = [
     'width:100%',
@@ -493,7 +502,9 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): HTMLEleme
   downloadBtn.style.cssText =
     'padding:6px 12px;background:#2a6e2a;color:#fff;border:none;cursor:pointer;font-size:12px'
   downloadBtn.addEventListener('click', () => {
-    downloadString(currentYaml, evidenceFilename(data.generated_at))
+    if (snapshotData) {
+      downloadString(currentYaml, evidenceFilename(snapshotData.generated_at))
+    }
   })
 
   const btnRow = document.createElement('div')
@@ -509,23 +520,47 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): HTMLEleme
 
   container.appendChild(panel)
 
-  // AC4: async update -- fetch high-entropy browser version and refresh panel content
+  // AC4: async browser version enrichment.
+  // We store the async browser result so it can be applied when the snapshot is first generated.
+  let asyncBrowserCache: Awaited<ReturnType<typeof collectBrowserInfoAsync>> | null = null
   collectBrowserInfoAsync().then((asyncBrowser) => {
-    if (asyncBrowser.version_source === 'userAgentData') {
-      // Replace browser info in data and re-render YAML
-      const updatedData: PlaytestEvidenceData = { ...data, browser: asyncBrowser }
+    asyncBrowserCache = asyncBrowser
+    // If snapshot was already generated (panel opened before async resolved), refresh it.
+    if (snapshotData && asyncBrowser.version_source === 'userAgentData') {
+      const updatedData: PlaytestEvidenceData = { ...snapshotData, browser: asyncBrowser }
+      snapshotData = updatedData
       currentYaml = toYaml(updatedData)
       textarea.value = currentYaml
     }
   }).catch(() => {
-    // Async update failed silently -- initial sync render remains
+    // Async update failed silently -- sync render remains
   })
 
-  return panel
+  /**
+   * AC12: Initialize the evidence snapshot on first open.
+   * Subsequent calls are no-ops (snapshot is locked after first call).
+   */
+  function initSnapshot(): void {
+    if (snapshotData !== null) return  // already locked
+    let data = buildEvidenceData()
+    // Apply async browser info if already resolved
+    if (asyncBrowserCache && asyncBrowserCache.version_source === 'userAgentData') {
+      data = { ...data, browser: asyncBrowserCache }
+    }
+    snapshotData = data
+    currentYaml = toYaml(data)
+    textarea.value = currentYaml
+  }
+
+  return { panel, initSnapshot }
 }
 
 /** Build and mount the always-visible toggle button (AC1, AC2, AC10) */
-function mountToggle(container: HTMLElement, panel: HTMLElement): HTMLElement {
+function mountToggle(
+  container: HTMLElement,
+  panel: HTMLElement,
+  initSnapshot: () => void,
+): HTMLElement {
   const panelId = panel.id || 'playtest-evidence-panel'
 
   const toggleBtn = document.createElement('button')
@@ -551,9 +586,13 @@ function mountToggle(container: HTMLElement, panel: HTMLElement): HTMLElement {
   ].join(';')
 
   // Wire up toggle button click: show/hide panel, update aria-expanded
+  // AC12: call initSnapshot() when opening so snapshot is lazy-initialized on first open.
   toggleBtn.addEventListener('click', () => {
     panel.hidden = !panel.hidden
     toggleBtn.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true')
+    if (!panel.hidden) {
+      initSnapshot()
+    }
   })
 
   // Wire up close button inside panel: hide panel, update toggle aria-expanded
@@ -603,8 +642,13 @@ export function initPlaytestEvidencePanel(
   const panelOpen = shouldShowPanel(q)
 
   // Mount panel (initially hidden unless ?playtest_evidence=1)
-  const panel = mountPanel(container, !panelOpen)
+  const { panel, initSnapshot } = mountPanel(container, !panelOpen)
+
+  // AC12: if panel is initially open (e.g. ?playtest_evidence=1), initialize snapshot immediately.
+  if (panelOpen) {
+    initSnapshot()
+  }
 
   // Always mount the toggle button
-  mountToggle(container, panel)
+  mountToggle(container, panel, initSnapshot)
 }
