@@ -220,7 +220,14 @@ class TestGoldenCorpusCodeFence:
         assert classify_block(block) == BLOCK_KIND_CODE_FENCE
 
     def test_code_fence_opening_longer_than_closing(self):
-        """GIVEN: opening より長い closing fence WHEN: classify_block THEN: code_fence"""
+        """GIVEN: opening より長い closing fence WHEN: classify_block THEN: code_fence
+
+        注意（B4）: この test は classify_block（既にセグメント済み単一ブロックの先頭行判定）
+        のみを検証しており、split_markdown_blocks() レベルでセグメンテーションが正しく
+        行われるかは検証していない。GFM spec 的に opening より長い closing fence や
+        未閉 fence の境界が正しくセグメントされるかは follow-up #659 で固定する予定。
+        split レベルの GFM 正当性テストは TestGfmSegmentationLimits を参照。
+        """
         # GFM spec: opening が ``` の場合、同じ or longer closing で閉じる
         # classify_block はブロック単体を受け取るため opening 行で判定
         block = "````python\nsome code\n```"
@@ -237,9 +244,15 @@ class TestGoldenCorpusCodeFence:
         assert classify_block(block) == BLOCK_KIND_MACHINE_CONTRACT
 
     def test_contract_schema_in_plain_fence(self):
-        """GIVEN: ``` + contract_schema_version WHEN: classify_block THEN: machine_contract"""
+        """GIVEN: ``` (no lang) + contract_schema_version WHEN: classify_block THEN: code_fence
+
+        以前の実装（N1 修正前）は yaml prefix なしの plain fence でも
+        contract_schema_version 文字列があれば machine_contract に分類していた（過剰一致）。
+        修正後は yaml/yml prefix を必須とするため、plain fence は code_fence になる。
+        machine_contract として分類されるには ```yaml または ```yml prefix が必要。
+        """
         block = "```\ncontract_schema_version: v1\ngoal_ref: test\n```"
-        assert classify_block(block) == BLOCK_KIND_MACHINE_CONTRACT
+        assert classify_block(block) == BLOCK_KIND_CODE_FENCE
 
 
 class TestGoldenCorpusHeadings:
@@ -412,13 +425,15 @@ class TestGoldenCorpusEdgeCases:
     """AC4 golden: GFM edge case の特殊ケース"""
 
     def test_four_space_indent_code_block(self):
-        """GIVEN: 4スペースインデントコードブロック WHEN: classify_block THEN: human_prose (非fence扱い)"""
-        # 4スペースインデントは split_markdown_blocks レベルでは段落として扱われる
-        # classify_block は fence 先頭行を見るため code_fence には分類されない
+        """GIVEN: 4スペースインデントコードブロック WHEN: classify_block THEN: url_or_identifier"""
+        # 4スペースインデントは split_markdown_blocks レベルでは段落として扱われる。
+        # classify_block は fence 先頭行を見るため code_fence には分類されない。
+        # _clean_for_effective_char_count で識別子（some_function / another_line）が除去され
+        # 有効文字数が 5 未満になるため url_or_identifier に分類される。
+        # （以前のコメントで "human_prose 想定" と記載していたが、実測は url_or_identifier）
         block = "    some_function()\n    another_line()"
         result = classify_block(block)
-        # shell_command / human_prose のどちらかになりうる（インデントによる分岐）
-        assert result in ALL_BLOCK_KINDS
+        assert result == BLOCK_KIND_URL_OR_IDENTIFIER
 
     def test_unclosed_fence_treated_as_code_fence(self):
         """GIVEN: 閉じていない fence WHEN: classify_block THEN: code_fence"""
@@ -516,3 +531,49 @@ class TestClassifyBlockLegacy:
         for block in test_blocks:
             result = classify_block_legacy(block)
             assert result in valid_legacy, f"block={block!r}, result={result!r}"
+
+
+# ===========================================================================
+# GFM segmentation 限界テスト（B4）
+# split_markdown_blocks() レベルの GFM 正当性確認
+# NOTE: 以下テストは現状 regex ベースの split_markdown_blocks() では誤分割が発生する
+#       ことが判明している既知の限界を xfail として記録する。
+#       GFM-correct セグメンテーション修正は follow-up #659 で対応する予定であり、
+#       #659 で fix されたら strict=True に変更して回帰防止とする。
+#
+#       golden corpus が固定しているのは classify_block（分類 API）であり、
+#       split_markdown_blocks() レベルの GFM 正当性（opening より長い closing /
+#       未閉 fence の境界）は follow-up #659 の責務。
+# ===========================================================================
+
+
+class TestGfmSegmentationLimits:
+    """B4: split_markdown_blocks() の GFM セグメンテーション既知限界（xfail）"""
+
+    @pytest.mark.xfail(
+        reason="GFM-correct segmentation（`````markdown 内に ```yaml を含むネスト形式）は #659 で対応",
+        strict=False,
+    )
+    def test_split_nested_markdown_fence_is_single_block(self):
+        """GIVEN: `````markdown fence 内に ```yaml を含むネスト WHEN: split_markdown_blocks THEN: 単一 code_fence ブロック
+
+        GFM spec では、opening が ````` (5個) の場合、
+        内側の ``` (3個) は fence を閉じない（closing は opening と同じ長さ以上が必要）。
+        したがってこの全体は単一の code_fence ブロックとして扱われるべき。
+
+        現状の regex (```[^\n]*\\n.*?```) は backtick 数を考慮しないため
+        内側の ``` を見つけた時点で fence 終了と誤判断し、4ブロックに分割してしまう。
+        GFM-correct セグメンテーションは #659 で対応予定。
+        #659 で fix されたら strict=True に変更して回帰防止とすること。
+        """
+        # `````markdown
+        # ```yaml
+        # contract_schema_version: v1
+        # ```
+        # `````
+        text = "`````markdown\n```yaml\ncontract_schema_version: v1\n```\n`````"
+        blocks = split_markdown_blocks(text)
+        # 期待（GFM 的正当性）: 単一ブロックで type が code_fence
+        # 現状: regex が内側 ``` で終了と誤判断して 4 ブロックになる（xfail 理由）
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "code_fence"

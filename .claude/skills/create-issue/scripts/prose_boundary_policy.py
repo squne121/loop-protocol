@@ -174,15 +174,20 @@ def _count_effective_chars(text: str) -> int:
 def _is_machine_contract_fence(fence_text: str) -> bool:
     """
     code_fence ブロックが YAML Machine-Readable Contract かどうかを判定する。
-    条件: ```yaml または ``` で始まり、contract_schema_version を含む
+    条件: fence prefix が yaml / yml であり、かつ contract_schema_version を行頭の key として含む。
+
+    注意: 以前の実装は `'contract_schema_version' in content or (...)` という形で
+    or のため、fence の言語指定を無視して任意のフェンス内に
+    `contract_schema_version` 文字列があれば machine_contract に分類していた。
+    この実装では yaml/yml prefix を必須条件とすることで過剰一致を排除する。
     """
     first_line = fence_text.splitlines()[0] if fence_text.splitlines() else ''
     if not _CODE_FENCE_OPEN_RE.match(first_line.strip()):
         return False
     content = fence_text
-    return 'contract_schema_version' in content or (
-        first_line.strip().lstrip('`~').strip().lower() == 'yaml'
-        and 'contract_schema_version' in content
+    return (
+        first_line.strip().lstrip('`~').strip().lower() in {'yaml', 'yml'}
+        and bool(re.search(r'(?m)^\s*contract_schema_version\s*:', content))
     )
 
 
