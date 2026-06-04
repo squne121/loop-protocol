@@ -1,0 +1,14 @@
+# Before-fail fixture: required_auto_actions が残る状態で termination_reason: approved になる
+scenario: approve_with_required_actions_before_fail
+description: "AC6 before-fail: #640 merge 前は required_auto_actions を無視して APPROVE のみで終了していた"
+input:
+  verdict: APPROVE
+  merge_ready: true
+  required_auto_actions:
+    - kind: ensure_closing_keyword
+      executor: implementation-worker
+  mergeable: MERGEABLE
+  merge_state_status: CLEAN
+expected:
+  # Before-fix: この verdict が誤って approved になっていた
+  termination_reason: "NOT approved (required_auto_actions が残るため終了不可)"

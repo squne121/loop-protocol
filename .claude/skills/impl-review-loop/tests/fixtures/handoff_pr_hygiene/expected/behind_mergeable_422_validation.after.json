@@ -1,0 +1,8 @@
+{
+  "scenario": "behind_mergeable_422_validation_failed_after_pass",
+  "http_status": 422,
+  "error_message": "Validation failed",
+  "route": "retry_or_blocked",
+  "reason_code": "validation_failed",
+  "auto_fix_applied": false
+}

@@ -1,0 +1,10 @@
+# Before-fail fixture: PR body に Refs #N のみで Closes #N がない場合
+# validate_pr_body.py の LP057 は現在 Refs-only を valid として扱う（バグ）
+scenario: pr_body_refs_only_before_fail
+description: "AC4 before-fail: Refs-only は Closes がないため LP057 failure になるべきだが現在は pass する"
+input:
+  pr_body_pattern: "Refs #634"  # Closes なし
+  linked_issue: 634
+expected:
+  lp057_result: fail  # 本来は fail であるべき
+  # NOTE: 現在の validate_pr_body.py は Refs-only を pass として扱うためこの期待は xfail
