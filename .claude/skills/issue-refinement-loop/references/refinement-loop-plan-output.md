@@ -148,12 +148,88 @@ When `fail_closed.required == true`:
 2. Output is still valid JSON, but should not be used for decisions
 3. Human escalation is required with `fail_closed.reason_codes` and `human_message`
 4. The orchestrator should NOT attempt to infer missing policy
+5. `fail_closed.rewrite_constraints` contains `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` — the orchestrator MUST forward this payload to `issue-author` when routing to Rewrite
 
 **reason_codes**:
 - `malformed_machine_readable_contract`: YAML block missing `contract_schema_version`
 - `missing_required_section`: Outcome or other critical section missing
+- `missing_required_contract_key`: Machine-Readable Contract missing required keys (`contract_schema_version`, `issue_kind`)
 - `unknown_input_schema`: Input didn't match `REFINEMENT_LOOP_PLANNER_INPUT_V1`
 - `planner_internal_error`: Unexpected exception during processing
+- `unknown_issue_kind`: `issue_kind` field present but not in SSOT allowlist
+- `issue_kind_policy_load_error`: ISSUE_KIND_POLICY_V1 SSOT could not be loaded
+- `contract_schema_parse_error`: Machine-Readable Contract YAML could not be parsed
+- `template_resolution_error`: Issue template file could not be resolved or loaded
+- `checker_internal_error`: Internal error in the contract checker
+
+## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
+
+When `fail_closed.required == true`, the planner includes `fail_closed.rewrite_constraints` with the following schema:
+
+```json
+{
+  "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+  "required_sections": ["Outcome", "Acceptance Criteria"],
+  "required_contract_keys": ["contract_schema_version", "issue_kind"],
+  "rewrite_constraints": {
+    "must_add_sections": ["Outcome", "Acceptance Criteria"],
+    "must_add_contract_keys": ["contract_schema_version", "issue_kind"],
+    "freeform_rewrite_forbidden": true
+  },
+  "override_policy": {
+    "allowed_reason_codes": ["missing_required_section", "missing_required_contract_key"],
+    "never_override_reason_codes": [
+      "unknown_issue_kind",
+      "issue_kind_policy_load_error",
+      "contract_schema_parse_error",
+      "template_resolution_error",
+      "checker_internal_error"
+    ],
+    "overridable_in_current_result": ["missing_required_section"],
+    "non_overridable_in_current_result": []
+  },
+  "max_rewrite_attempts": 2,
+  "no_progress_route": "human_judgment_required"
+}
+```
+
+### Field Semantics
+
+- `required_sections`: sections that must be added to the Issue body (missing from template check)
+- `required_contract_keys`: keys that must be present in the Machine-Readable Contract block
+- `rewrite_constraints.freeform_rewrite_forbidden`: `issue-author` MUST NOT accept freeform rewrite requests; only structured repair against `must_add_sections` / `must_add_contract_keys`
+- `override_policy.allowed_reason_codes`: reason codes that `human_decision_reframe` can override
+- `override_policy.never_override_reason_codes`: reason codes that are always blocked (no override)
+- `max_rewrite_attempts`: loop router enforces this limit; after N attempts without progress, routes to `human_judgment_required`
+- `no_progress_route`: destination when rewrite produces no forward progress
+
+## human_decision_reframe Override Contract
+
+`human_decision_reframe` is the mechanism by which a human anchor comment overrides a `fail_closed` verdict. This is NOT a validation bypass — it is a permission to continue rewriting under the constraint of `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`.
+
+### Override is permitted when:
+1. The `fail_closed.reason_codes` contain only codes in `override_policy.allowed_reason_codes`
+2. The human anchor comment explicitly acknowledges the missing sections/keys
+3. The rewrite is constrained to `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1.rewrite_constraints`
+
+### Override is NEVER permitted when:
+- Any `fail_closed.reason_code` is in `override_policy.never_override_reason_codes`
+- `unknown_issue_kind`, `issue_kind_policy_load_error`, `contract_schema_parse_error`, `template_resolution_error`, `checker_internal_error` always block, regardless of human instruction
+
+### Post-override Rewrite Contract
+After `human_decision_reframe` triggers Rewrite:
+1. The orchestrator forwards `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` to `issue-author`
+2. `issue-author` executes structured repair (adds missing sections/keys)
+3. After `issue-author` completes, a contract checker re-runs automatically (pre-mutation dry-run + post-mutation fresh check)
+4. If `post-mutation fresh checker` exits non-zero: Rewrite loop continues (up to `max_rewrite_attempts`)
+5. If `max_rewrite_attempts` exceeded with no progress: route to `human_judgment_required`
+
+### Terminal Result Fields (AC11)
+The terminal/handoff result must include:
+- `checked_body_sha256`: SHA256 of the Issue body that was checked
+- `checker_exit_code`: exit code of the post-mutation checker
+- `missing_sections`: list of sections still missing after rewrite (empty if all resolved)
+- `missing_contract_keys`: list of contract keys still missing after rewrite (empty if all resolved)
 
 ## Idempotency Guarantee
 
