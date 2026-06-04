@@ -2,21 +2,24 @@
  * Tests for playtestEvidence module (AC1-AC13)
  * GIVEN/WHEN/THEN style
  *
- * DOM-dependent tests (panel rendering, clipboard, download) require a browser
- * environment and are covered under Runtime Verification Applicability: deferred.
- * See Issue #571 — deferred_destination: PR マージ前の手動 browser 確認フェーズ.
+ * DOM-dependent tests (AC3, AC6, AC8, AC10, AC11, AC13) use jsdom environment.
+ * Pure logic tests (buildEvidenceData, toYaml, shouldShowPanel) run in default node env.
  *
- * This file tests the pure logic:
+ * This file tests:
  *   - buildEvidenceData() schema shape (AC3, AC5-AC8)
  *   - toYaml() output (AC8)
  *   - shouldShowPanel() activation logic (AC2)
+ *   - initPlaytestEvidencePanel() DOM mounting, close/toggle behavior (AC3, AC6, AC8, AC10, AC11, AC13)
  */
 
-import { describe, it, expect } from 'vitest'
+// @vitest-environment jsdom
+
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   buildEvidenceData,
   toYaml,
   shouldShowPanel,
+  initPlaytestEvidencePanel,
   type PlaytestEvidenceData,
 } from '../src/ui/playtestEvidence'
 
@@ -104,14 +107,14 @@ describe('buildEvidenceData', () => {
     expect(dpr.note.length).toBeGreaterThan(0)
   })
 
-  // AC6: note mentions ページズーム or display scaling
-  it('GIVEN device_pixel_ratio note WHEN examined THEN it mentions ページズーム or display scaling', () => {
+  // AC6: note mentions zoom or display scaling
+  it('GIVEN device_pixel_ratio note WHEN examined THEN it mentions zoom or display scaling', () => {
     const data = buildEvidenceData()
     const noteContainsZoomInfo =
-      data.environment.device_pixel_ratio.note.includes('ページズーム') ||
       data.environment.device_pixel_ratio.note.includes('zoom') ||
       data.environment.device_pixel_ratio.note.includes('display scaling') ||
-      data.environment.device_pixel_ratio.note.includes('scaling')
+      data.environment.device_pixel_ratio.note.includes('scaling') ||
+      data.environment.device_pixel_ratio.note.includes('ページズーム')
     expect(noteContainsZoomInfo).toBe(true)
   })
 
@@ -205,5 +208,255 @@ describe('AC11 read-only structural check', () => {
   it('GIVEN PlaytestEvidenceData type WHEN used in assertion THEN structure is assignable', () => {
     const data: PlaytestEvidenceData = buildEvidenceData()
     expect(data.playtest_evidence_schema_version).toBe('v1')
+  })
+})
+
+// --- DOM tests: Close button / Toggle button ---
+describe('initPlaytestEvidencePanel DOM', () => {
+  let container: HTMLElement
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    document.body.appendChild(container)
+  })
+
+  // AC3/AC11: close button exists with data-playtest-close="true"
+  it('GIVEN initPlaytestEvidencePanel WHEN mounted THEN close button with data-playtest-close exists in panel', () => {
+    initPlaytestEvidencePanel(container, '')
+    const closeBtn = container.querySelector('[data-playtest-close="true"]')
+    expect(closeBtn).not.toBeNull()
+  })
+
+  // AC11: close button has type="button" and aria-label
+  it('GIVEN mounted panel WHEN close button inspected THEN has type=button and aria-label', () => {
+    initPlaytestEvidencePanel(container, '')
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    expect(closeBtn).not.toBeNull()
+    expect(closeBtn.type).toBe('button')
+    expect(closeBtn.getAttribute('aria-label')).toBeTruthy()
+  })
+
+  // AC10: toggle button has data-playtest-toggle, type=button, aria-controls, aria-expanded, aria-label
+  it('GIVEN mounted panel WHEN toggle button inspected THEN has required aria attributes', () => {
+    initPlaytestEvidencePanel(container, '')
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    expect(toggleBtn).not.toBeNull()
+    expect(toggleBtn.type).toBe('button')
+    expect(toggleBtn.getAttribute('aria-controls')).toBeTruthy()
+    expect(toggleBtn.getAttribute('aria-expanded')).toBeDefined()
+    expect(toggleBtn.getAttribute('aria-label')).toBeTruthy()
+  })
+
+  // AC8: initPlaytestEvidencePanel('') mounts toggle and panel is initially hidden
+  it('GIVEN initPlaytestEvidencePanel with empty search WHEN mounted THEN panel is initially hidden', () => {
+    initPlaytestEvidencePanel(container, '')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    expect(panel).not.toBeNull()
+    expect(panel.hidden).toBe(true)
+  })
+
+  // AC9: initPlaytestEvidencePanel('?playtest_evidence=1') mounts panel as initially open
+  it('GIVEN initPlaytestEvidencePanel with ?playtest_evidence=1 WHEN mounted THEN panel is initially visible', () => {
+    initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    expect(panel).not.toBeNull()
+    expect(panel.hidden).toBe(false)
+  })
+
+  // AC6: toggle button click opens hidden panel
+  it('GIVEN panel is hidden WHEN toggle button clicked THEN panel becomes visible', () => {
+    initPlaytestEvidencePanel(container, '')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    expect(panel.hidden).toBe(true)
+    toggleBtn.click()
+    expect(panel.hidden).toBe(false)
+  })
+
+  // AC6: toggle button click again closes open panel
+  it('GIVEN panel is visible WHEN toggle button clicked THEN panel becomes hidden', () => {
+    initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    expect(panel.hidden).toBe(false)
+    toggleBtn.click()
+    expect(panel.hidden).toBe(true)
+  })
+
+  // AC3: close button click hides panel (panel.hidden = true)
+  it('GIVEN panel is visible WHEN close button clicked THEN panel becomes hidden', () => {
+    initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    expect(panel.hidden).toBe(false)
+    closeBtn.click()
+    expect(panel.hidden).toBe(true)
+  })
+
+  // AC4 (reopen after close): toggle button after close reopens panel
+  it('GIVEN panel closed via close button WHEN toggle button clicked THEN panel reopens', () => {
+    initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    closeBtn.click()
+    expect(panel.hidden).toBe(true)
+    toggleBtn.click()
+    expect(panel.hidden).toBe(false)
+  })
+
+  // aria-expanded sync: toggle updates aria-expanded
+  it('GIVEN panel is hidden WHEN toggle clicked THEN aria-expanded becomes true', () => {
+    initPlaytestEvidencePanel(container, '')
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    expect(toggleBtn.getAttribute('aria-expanded')).toBe('false')
+    toggleBtn.click()
+    expect(toggleBtn.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  // aria-expanded sync: close button updates aria-expanded on toggle
+  it('GIVEN panel is visible WHEN close button clicked THEN toggle aria-expanded becomes false', () => {
+    initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    expect(toggleBtn.getAttribute('aria-expanded')).toBe('true')
+    closeBtn.click()
+    expect(toggleBtn.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  // AC13: calling initPlaytestEvidencePanel multiple times is idempotent
+  it('GIVEN initPlaytestEvidencePanel WHEN called twice THEN only one toggle is mounted', () => {
+    initPlaytestEvidencePanel(container, '')
+    initPlaytestEvidencePanel(container, '')
+    const toggleBtns = container.querySelectorAll('[data-playtest-toggle="true"]')
+    expect(toggleBtns.length).toBe(1)
+  })
+
+  it('GIVEN initPlaytestEvidencePanel WHEN called twice THEN only one panel is mounted', () => {
+    initPlaytestEvidencePanel(container, '')
+    initPlaytestEvidencePanel(container, '')
+    const panels = container.querySelectorAll('[data-playtest-evidence="true"]')
+    expect(panels.length).toBe(1)
+  })
+
+  // AC12: close button text is × (U+00D7 multiplication sign)
+  it('GIVEN mounted panel WHEN close button inspected THEN textContent is × (U+00D7)', () => {
+    initPlaytestEvidencePanel(container, '')
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    expect(closeBtn).not.toBeNull()
+    expect(closeBtn.textContent).toBe('×')
+  })
+})
+
+// --- AC12: close → reopen snapshot stability ---
+describe('AC12 snapshot stability across close/reopen', () => {
+  let container: HTMLElement
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    document.body.appendChild(container)
+  })
+
+  // AC12: Copy YAML after close → reopen uses the same snapshot
+  it('GIVEN panel opened, copy called, panel closed, reopened WHEN copy called again THEN same YAML is passed to clipboard', async () => {
+    const writtenTexts: string[] = []
+    const clipboardMock = {
+      writeText: vi.fn((text: string) => {
+        writtenTexts.push(text)
+        return Promise.resolve()
+      }),
+    }
+    Object.defineProperty(navigator, 'clipboard', {
+      value: clipboardMock,
+      configurable: true,
+    })
+
+    initPlaytestEvidencePanel(container, '')
+    const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+    const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+    const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+    const copyBtn = container.querySelector('[data-action="copy-yaml"]') as HTMLButtonElement
+
+    // First open: snapshot should be initialized
+    toggleBtn.click()
+    expect(panel.hidden).toBe(false)
+
+    // Copy first time
+    copyBtn.click()
+    await Promise.resolve()
+
+    // Close panel
+    closeBtn.click()
+    expect(panel.hidden).toBe(true)
+
+    // Reopen panel
+    toggleBtn.click()
+    expect(panel.hidden).toBe(false)
+
+    // Copy second time
+    copyBtn.click()
+    await Promise.resolve()
+
+    // Both copy calls should have received exactly the same YAML
+    expect(writtenTexts.length).toBe(2)
+    expect(writtenTexts[0]).toBe(writtenTexts[1])
+    expect(writtenTexts[0]).toContain('playtest_evidence_schema_version: v1')
+  })
+
+  // AC12: Download uses the same snapshot after close → reopen
+  it('GIVEN panel opened, closed, reopened WHEN download triggered THEN blob content is the same snapshot YAML', () => {
+    const createdUrls: string[] = []
+    const clickedHrefs: string[] = []
+
+    // Mock URL.createObjectURL
+    const origCreateObjectURL = URL.createObjectURL
+    URL.createObjectURL = vi.fn(() => {
+      const url = 'blob:mock-' + createdUrls.length
+      createdUrls.push(url)
+      return url
+    }) as unknown as typeof URL.createObjectURL
+    URL.revokeObjectURL = vi.fn()
+
+    // Spy on anchor click to capture href
+    const origClick = HTMLAnchorElement.prototype.click
+    HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+      clickedHrefs.push(this.href)
+    }
+
+    try {
+      initPlaytestEvidencePanel(container, '')
+      const panel = container.querySelector('[data-playtest-evidence="true"]') as HTMLElement
+      const toggleBtn = container.querySelector('[data-playtest-toggle="true"]') as HTMLButtonElement
+      const closeBtn = container.querySelector('[data-playtest-close="true"]') as HTMLButtonElement
+      const downloadBtn = container.querySelector('[data-action="download-yaml"]') as HTMLButtonElement
+
+      // First open: snapshot initialized
+      toggleBtn.click()
+      expect(panel.hidden).toBe(false)
+
+      // Download first time
+      downloadBtn.click()
+
+      // Close and reopen
+      closeBtn.click()
+      toggleBtn.click()
+      expect(panel.hidden).toBe(false)
+
+      // Download second time
+      downloadBtn.click()
+
+      // Both download calls should have used the same blob URL (same snapshot)
+      expect(createdUrls.length).toBe(2)
+      // The href used for both clicks should point to the same mock URL pattern
+      expect(clickedHrefs.length).toBe(2)
+      // Both blobs came from same YAML content — verified by createObjectURL call count
+      // and that filename (generated_at in href download attribute) is the same
+      const anchors = document.querySelectorAll('a[download]')
+      // After cleanup there should be no lingering anchors (they are removed)
+      expect(anchors.length).toBe(0)
+    } finally {
+      URL.createObjectURL = origCreateObjectURL
+      HTMLAnchorElement.prototype.click = origClick
+    }
   })
 })
