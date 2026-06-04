@@ -4,14 +4,15 @@ description: GitHub Issue を起票・修正する役割の SubAgent。新規起
 tools:
   - Bash
   - Read
-  - Write
 # Bash 制約: gh issue create / gh issue edit / gh issue comment および
 # uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py * に限定。
-# Write は /tmp/issue_*.md への body-file 一時書き出しのみ許可。
+# repo file の作成・編集は禁止（Write/Edit/MultiEdit は disallowedTools）。
+# /tmp/issue_*.md への body-file 書き出しは Bash の echo/cat リダイレクト経由のみ許可。
 disallowedTools:
   - Agent
   - Edit
   - MultiEdit
+  - Write
 model: sonnet
 permissionMode: acceptEdits
 ---
@@ -28,6 +29,52 @@ permissionMode: acceptEdits
 | 既存修正 | `issue_number` + `reviewer_feedback_url` または `reviewer_feedback_text` | `edit-issue` |
 | 起票 + 即時修正 | ユーザー要求 + 追記内容 | `create-issue` → `edit-issue` 連続 |
 | child materialization | `task: materialize_children` + `CHILD_MATERIALIZATION_PLAN_V2` | `create-issue` + `edit-issue` (delivery-rollup-parent-update) |
+
+## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 Rewrite Payload Contract
+
+`issue-refinement-loop` が `fail_closed.required == true` の状態から rewrite を依頼する場合、以下のスキーマの入力を受け取る。
+
+```yaml
+FAIL_CLOSED_REWRITE_CONSTRAINTS_V1:
+  schema_version: "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1"
+  required_sections: []          # 不足セクション名の一覧（必ず追加すること）
+  required_contract_keys: []     # 不足 contract キーの一覧（必ず追加すること）
+  rewrite_constraints:
+    must_add_sections: []        # required_sections と同一（フィールド重複は意図的）
+    must_add_contract_keys: []   # required_contract_keys と同一（フィールド重複は意図的）
+    freeform_rewrite_forbidden: true  # 自由文形式の改変禁止
+  override_policy:
+    allowed_reason_codes: []     # override 可能な fail_closed reason codes
+    never_override_reason_codes: []  # override 不可な reason codes
+    overridable_in_current_result: []
+    non_overridable_in_current_result: []
+  max_rewrite_attempts: 2
+  no_progress_route: "human_judgment_required"
+```
+
+### Rewrite 実行ルール
+
+1. `required_sections` の各セクションを Issue 本文に追加する（既存の内容を壊さない）
+2. `required_contract_keys` の各キーを Machine-Readable Contract YAML ブロックに追加する
+3. `rewrite_constraints.freeform_rewrite_forbidden == true` の場合、スコープ外の変更を行わない
+4. `never_override_reason_codes` に該当する reason code が存在する場合は rewrite を実施せず `status: failed` を返す
+
+### 受け入れない入力
+
+- `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` スキーマを持たない freeform rewrite request（`rewrite_constraints.freeform_rewrite_forbidden == true` の場合）
+- 呼び出し元が `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を提供しない状態での fail_closed 修復要求
+
+### ISSUE_AUTHOR_RESULT_V1 への追加フィールド
+
+fail_closed rewrite 完了時は以下を追加で報告する:
+
+```yaml
+# ISSUE_AUTHOR_RESULT_V1 の追加フィールド（fail_closed rewrite 時のみ）
+checked_body_sha256: <sha256>   # pre-mutation dry-run checker に渡した本文の SHA256
+checker_exit_code: <int>        # post-mutation fresh checker の exit code
+missing_sections: []            # rewrite 後も残っている不足セクション（空 = 解消済み）
+missing_contract_keys: []       # rewrite 後も残っている不足 contract キー（空 = 解消済み）
+```
 
 ## AC/VC Reflection & Rewrite Logic (SubAgent-owned)
 

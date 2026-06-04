@@ -43,6 +43,39 @@
     "reason_codes": [
       "missing_required_section"
     ],
-    "human_message": "Issue contract malformation detected: missing_required_section"
+    "human_message": "Issue contract malformation detected: missing_required_section",
+    "rewrite_constraints": {
+      "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+      "required_sections": [
+        "Outcome"
+      ],
+      "required_contract_keys": [],
+      "rewrite_constraints": {
+        "must_add_sections": [
+          "Outcome"
+        ],
+        "must_add_contract_keys": [],
+        "freeform_rewrite_forbidden": true
+      },
+      "override_policy": {
+        "allowed_reason_codes": [
+          "missing_required_section",
+          "missing_required_contract_key"
+        ],
+        "never_override_reason_codes": [
+          "unknown_issue_kind",
+          "issue_kind_policy_load_error",
+          "contract_schema_parse_error",
+          "template_resolution_error",
+          "checker_internal_error"
+        ],
+        "overridable_in_current_result": [
+          "missing_required_section"
+        ],
+        "non_overridable_in_current_result": []
+      },
+      "max_rewrite_attempts": 2,
+      "no_progress_route": "human_judgment_required"
+    }
   }
 }
