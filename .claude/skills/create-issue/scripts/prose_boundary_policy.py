@@ -51,6 +51,268 @@ ALL_BLOCK_KINDS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# heading_policy inventory（#654 追加データ）
+#
+# 各 entry は以下のフィールドを持つ:
+#   canonical_en   : 英語見出し名（## の後のテキスト）
+#   canonical_ja   : 標準的な日本語訳（空文字 = 翻訳なし）
+#   accepted_forms : 許容される見出し形式のリスト（normalize 後マッチ）
+#   prose_guard_kind  : validate_japanese_content が使う block_kind
+#   contract_checker_kind : check_issue_contract が section 抽出に使う key
+#
+# この inventory を追加しても classify_block() 公開 API と既存 block_kind
+# 定数の意味は変更しない（AC1 固定契約）。
+# ---------------------------------------------------------------------------
+
+
+def _normalize_heading_text(text: str) -> str:
+    """
+    GFM ATX heading のテキスト部分を正規化する。
+
+    - 先頭・末尾の空白を除去
+    - 末尾の closing `#` を除去（GFM 仕様: 末尾 # はオプション）
+    - 括弧内テキストを正規化（半角・全角括弧を統一して比較用に保持）
+    - 正規化後のテキストを返す
+    """
+    t = text.strip()
+    # 末尾 closing # を除去（GFM: heading text の末尾スペース + # は無視）
+    t = re.sub(r'\s+#+\s*$', '', t).strip()
+    return t
+
+
+def _extract_bilingual_heading_key(heading_text: str) -> str | None:
+    """
+    bilingual heading（日英混在）から英語キーを抽出する。
+
+    対応形式:
+      ## 日本語テキスト (EnglishKey)     ← 半角括弧
+      ## 日本語テキスト（EnglishKey）    ← 全角括弧
+
+    Returns:
+        英語キー文字列（括弧内のテキスト）、または None
+    """
+    # 半角括弧
+    m = re.search(r'\(([A-Za-z][A-Za-z0-9 _\-]*)\)\s*$', heading_text)
+    if m:
+        return m.group(1).strip()
+    # 全角括弧
+    m = re.search(r'（([A-Za-z][A-Za-z0-9 _\-]*）\s*$)', heading_text)
+    if m:
+        return m.group(1).rstrip('）').strip()
+    m = re.search(r'（([A-Za-z][A-Za-z0-9 _\-]*)）\s*$', heading_text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+# heading_policy inventory
+# key = canonical_en（正規化後の英語見出し名）
+HEADING_POLICY: dict[str, dict] = {
+    "Machine-Readable Contract": {
+        "canonical_en": "Machine-Readable Contract",
+        "canonical_ja": "機械可読コントラクト",
+        "accepted_forms": [
+            "Machine-Readable Contract",
+            "機械可読コントラクト (Machine-Readable Contract)",
+            "機械可読コントラクト（Machine-Readable Contract）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Machine-Readable Contract",
+    },
+    "Parent Issue": {
+        "canonical_en": "Parent Issue",
+        "canonical_ja": "親 Issue",
+        "accepted_forms": [
+            "Parent Issue",
+            "親 Issue (Parent Issue)",
+            "親 Issue（Parent Issue）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Parent Issue",
+    },
+    "Parent Goal Ref": {
+        "canonical_en": "Parent Goal Ref",
+        "canonical_ja": "親ゴール参照",
+        "accepted_forms": [
+            "Parent Goal Ref",
+            "親ゴール参照 (Parent Goal Ref)",
+            "親ゴール参照（Parent Goal Ref）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Parent Goal Ref",
+    },
+    "Current Validated Scope": {
+        "canonical_en": "Current Validated Scope",
+        "canonical_ja": "現在の検証済みスコープ",
+        "accepted_forms": [
+            "Current Validated Scope",
+            "現在の検証済みスコープ (Current Validated Scope)",
+            "現在の検証済みスコープ（Current Validated Scope）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Current Validated Scope",
+    },
+    "Remaining Parent Gaps": {
+        "canonical_en": "Remaining Parent Gaps",
+        "canonical_ja": "残存ギャップ",
+        "accepted_forms": [
+            "Remaining Parent Gaps",
+            "残存ギャップ (Remaining Parent Gaps)",
+            "残存ギャップ（Remaining Parent Gaps）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Remaining Parent Gaps",
+    },
+    "Outcome": {
+        "canonical_en": "Outcome",
+        "canonical_ja": "成果物",
+        "accepted_forms": [
+            "Outcome",
+            "成果物 (Outcome)",
+            "成果物（Outcome）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Outcome",
+    },
+    "Background": {
+        "canonical_en": "Background",
+        "canonical_ja": "背景",
+        "accepted_forms": [
+            "Background",
+            "背景 (Background)",
+            "背景（Background）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Background",
+    },
+    "In Scope": {
+        "canonical_en": "In Scope",
+        "canonical_ja": "スコープ内",
+        "accepted_forms": [
+            "In Scope",
+            "スコープ内 (In Scope)",
+            "スコープ内（In Scope）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "In Scope",
+    },
+    "Out of Scope": {
+        "canonical_en": "Out of Scope",
+        "canonical_ja": "スコープ外",
+        "accepted_forms": [
+            "Out of Scope",
+            "スコープ外 (Out of Scope)",
+            "スコープ外（Out of Scope）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Out of Scope",
+    },
+    "Acceptance Criteria": {
+        "canonical_en": "Acceptance Criteria",
+        "canonical_ja": "受け入れ条件",
+        "accepted_forms": [
+            "Acceptance Criteria",
+            "受け入れ条件 (Acceptance Criteria)",
+            "受け入れ条件（Acceptance Criteria）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Acceptance Criteria",
+    },
+    "Verification Commands": {
+        "canonical_en": "Verification Commands",
+        "canonical_ja": "検証コマンド",
+        "accepted_forms": [
+            "Verification Commands",
+            "検証コマンド (Verification Commands)",
+            "検証コマンド（Verification Commands）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Verification Commands",
+    },
+    "Allowed Paths": {
+        "canonical_en": "Allowed Paths",
+        "canonical_ja": "許可パス",
+        "accepted_forms": [
+            "Allowed Paths",
+            "許可パス (Allowed Paths)",
+            "許可パス（Allowed Paths）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Allowed Paths",
+    },
+    "Stop Conditions": {
+        "canonical_en": "Stop Conditions",
+        "canonical_ja": "停止条件",
+        "accepted_forms": [
+            "Stop Conditions",
+            "停止条件 (Stop Conditions)",
+            "停止条件（Stop Conditions）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Stop Conditions",
+    },
+    "Required Skills": {
+        "canonical_en": "Required Skills",
+        "canonical_ja": "必要スキル",
+        "accepted_forms": [
+            "Required Skills",
+            "必要スキル (Required Skills)",
+            "必要スキル（Required Skills）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Required Skills",
+    },
+    "Runtime Verification Applicability": {
+        "canonical_en": "Runtime Verification Applicability",
+        "canonical_ja": "実行時検証適用性",
+        "accepted_forms": [
+            "Runtime Verification Applicability",
+            "実行時検証適用性 (Runtime Verification Applicability)",
+            "実行時検証適用性（Runtime Verification Applicability）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Runtime Verification Applicability",
+    },
+}
+
+# canonical_en のセット（高速ルックアップ用）
+_CANONICAL_HEADING_KEYS: frozenset[str] = frozenset(HEADING_POLICY.keys())
+
+
+def lookup_heading_policy(heading_text: str) -> dict | None:
+    """
+    heading text（## より後のテキスト）から heading_policy entry を引く。
+
+    手順:
+    1. _normalize_heading_text() で正規化
+    2. canonical_en の直接一致を確認
+    3. bilingual heading の括弧内テキストを抽出して一致確認
+    4. accepted_forms（正規化後）を確認
+
+    Returns:
+        HEADING_POLICY entry dict、または None（inventory に存在しない場合）
+    """
+    normalized = _normalize_heading_text(heading_text)
+
+    # 直接一致（英語正規見出し）
+    if normalized in HEADING_POLICY:
+        return HEADING_POLICY[normalized]
+
+    # bilingual heading（括弧内の英語キー）
+    key = _extract_bilingual_heading_key(normalized)
+    if key and key in HEADING_POLICY:
+        return HEADING_POLICY[key]
+
+    # accepted_forms との照合
+    for entry in HEADING_POLICY.values():
+        for form in entry["accepted_forms"]:
+            if _normalize_heading_text(form) == normalized:
+                return entry
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 内部正規表現
 # ---------------------------------------------------------------------------
 

@@ -187,6 +187,20 @@ def _classify_block(block: str) -> str:
     return _pbp.classify_block_legacy(block)
 
 
+def _is_heading_block(block: str) -> bool:
+    """
+    ブロックが canonical_heading または bilingual_heading かどうかを判定する。
+
+    heading_policy (#654): canonical_heading / bilingual_heading は
+    delta mode の prose ratio 判定から除外するために使う。
+    """
+    kind = _pbp.classify_block(block.strip())
+    return kind in (
+        _pbp.BLOCK_KIND_CANONICAL_HEADING,
+        _pbp.BLOCK_KIND_BILINGUAL_HEADING,
+    )
+
+
 def _is_grep_pattern_block(text: str) -> bool:
     """
     ブロックが grep/rg コマンド行またはパターン行であるかを判定する。
@@ -261,18 +275,30 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
     old_blocks = split_markdown_blocks(old)
     new_blocks = split_markdown_blocks(new)
 
+    def _is_prose_delta_target(b: dict) -> bool:
+        """prose delta 判定対象かどうか。
+        type == 'prose' かつ heading でないブロック（#654 heading_policy）。
+        canonical_heading / bilingual_heading は delta 対象外とする。
+        """
+        if b['type'] != 'prose':
+            return False
+        # heading_policy (#654): heading block を prose delta から除外
+        if _is_heading_block(b['text']):
+            return False
+        return True
+
     # old の prose block hash を Counter で管理（multiplicity を保持）
     old_prose_counts: Counter = Counter(
         prose_block_hash(b['text'])
         for b in old_blocks
-        if b['type'] == 'prose'
+        if _is_prose_delta_target(b)
     )
 
     # new の prose block のうち、old の multiplicity を超えるものを「変更・追加」とみなす
     remaining = Counter(old_prose_counts)
     changed = []
     for b in new_blocks:
-        if b['type'] == 'prose':
+        if _is_prose_delta_target(b):
             h = prose_block_hash(b['text'])
             if remaining[h] > 0:
                 # 旧側の残余分を消費（同一 block は pass）
@@ -309,6 +335,13 @@ def classify_borderline(text: str, threshold: float = 0.1, lower_threshold: floa
     has_prose = False
 
     for block in raw_blocks:
+        # heading_policy (#654): canonical_heading / bilingual_heading を除外
+        block_kind = _pbp.classify_block(block.strip())
+        if block_kind in (
+            _pbp.BLOCK_KIND_CANONICAL_HEADING,
+            _pbp.BLOCK_KIND_BILINGUAL_HEADING,
+        ):
+            continue
         clean_block = clean_prose(block)
         effective_chars = count_effective_chars(clean_block)
         if effective_chars < 5:
@@ -353,6 +386,16 @@ def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
     total_chars = 0
 
     for block in raw_blocks:
+        # heading_policy (#654): canonical_heading / bilingual_heading は
+        # full-body mode でも prose block から除外する。
+        # heading は日本語比率判定の対象外（prose guard の誤検出を防ぐ）。
+        block_kind = _pbp.classify_block(block.strip())
+        if block_kind in (
+            _pbp.BLOCK_KIND_CANONICAL_HEADING,
+            _pbp.BLOCK_KIND_BILINGUAL_HEADING,
+        ):
+            continue
+
         # 各ブロックをクリーン化
         clean_block = clean_prose(block)
 

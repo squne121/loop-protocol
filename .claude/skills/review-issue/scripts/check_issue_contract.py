@@ -36,6 +36,28 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
+# prose_boundary_policy の heading_policy を import（#654）
+# ---------------------------------------------------------------------------
+# check_issue_contract.py の scripts/ は review-issue/scripts/ にあるが、
+# prose_boundary_policy.py は create-issue/scripts/ にある。
+# sys.path に create-issue/scripts/ を追加してから import する。
+_CREATE_ISSUE_SCRIPTS = (
+    Path(__file__).resolve().parent.parent.parent / "create-issue" / "scripts"
+)
+if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
+
+try:
+    from prose_boundary_policy import lookup_heading_policy as _lookup_heading_policy
+    _HEADING_POLICY_AVAILABLE = True
+except ImportError:
+    _HEADING_POLICY_AVAILABLE = False
+
+    def _lookup_heading_policy(heading_text: str):  # type: ignore[misc]
+        return None
+
+
+# ---------------------------------------------------------------------------
 # ISSUE_KIND_POLICY_V1 SSOT loader
 # ---------------------------------------------------------------------------
 # Canonical source: docs/dev/github-ops.md ## ISSUE_KIND_POLICY_V1
@@ -471,11 +493,43 @@ def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: li
 
 
 def extract_section(body: str, section_name: str) -> str:
-    """Extract text under a ## section heading until the next ## heading."""
+    """Extract text under a ## section heading until the next ## heading.
+
+    heading_policy (#654): bilingual heading（例: ## 成果物 (Outcome)）も
+    canonical_en（"Outcome"）として認識する。
+    HEADING_POLICY の accepted_forms と lookup_heading_policy() を使い、
+    英語正規名でセクションを抽出できる。
+    """
+    # 1. exact match（英語正規見出し）
     pattern = rf"^## {re.escape(section_name)}\s*$(.*?)(?=^## |\Z)"
     match = re.search(pattern, body, re.MULTILINE | re.DOTALL)
     if match:
         return match.group(1).strip()
+
+    # 2. heading_policy の accepted_forms を使って bilingual heading も検索
+    if _HEADING_POLICY_AVAILABLE:
+        entry = _lookup_heading_policy(section_name)
+        if entry:
+            for form in entry.get("accepted_forms", []):
+                alt_pattern = rf"^## {re.escape(form)}\s*$(.*?)(?=^## |\Z)"
+                alt_match = re.search(alt_pattern, body, re.MULTILINE | re.DOTALL)
+                if alt_match:
+                    return alt_match.group(1).strip()
+
+    # 3. 各 ## heading を解析して bilingual heading の英語キーを確認
+    # ## <japanese> (EnglishKey) または ## <japanese>（EnglishKey）の形式を検索
+    heading_re = re.compile(r'^## (.+?)\s*$', re.MULTILINE)
+    for m in heading_re.finditer(body):
+        heading_text = m.group(1).strip()
+        policy = _lookup_heading_policy(heading_text)
+        if policy and policy.get("canonical_en") == section_name:
+            # この見出しの下のテキストを抽出
+            start = m.end()
+            rest = body[start:]
+            next_heading = re.search(r'^## ', rest, re.MULTILINE)
+            section_body = rest[:next_heading.start()] if next_heading else rest
+            return section_body.strip()
+
     return ""
 
 
