@@ -37,6 +37,7 @@
     "ajv": "^8",
     "ajv-formats": "^3",
     "eslint": "^10.3.0",
+    "jsdom": "^29.1.1",
     "markdownlint-cli2": "^0.17.2",
     "textlint": "^14.4.2",
     "textlint-rule-preset-japanese": "^10.0.4",
