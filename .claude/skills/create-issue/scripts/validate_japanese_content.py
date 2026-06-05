@@ -200,27 +200,17 @@ def _is_heading_block(block: str) -> bool:
     Note: classify_block() 公開 API は AC1 により変更しない（旧動作維持）。
     heading_policy 参照はこの関数でのみ行う。
     """
-    kind = _pbp.classify_block(block.strip())
-    if kind not in (
-        _pbp.BLOCK_KIND_CANONICAL_HEADING,
-        _pbp.BLOCK_KIND_BILINGUAL_HEADING,
-    ):
+    # B1 fix (#654): leading whitespace を strip しない。raw line（rstrip("\r\n") のみ）を
+    # parse_atx_heading_line() に渡す。4-space indented code block を誤って heading 扱いしないため。
+    raw_line = block.rstrip('\r\n')
+    parsed = _pbp.parse_atx_heading_line(raw_line)
+    if parsed is None:
+        # parse_atx_heading_line() が None → GFM 上は heading ではない（code block 等）
         return False
 
-    # heading_policy SSOT で照合（B1_B4: inventory に存在しない見出しは False）
-    # parse_atx_heading_line() で heading text を正規化してから lookup する
-    parsed = _pbp.parse_atx_heading_line(block.strip())
-    if parsed is None:
-        # classify_block() が heading と判定したが parse_atx_heading_line() が None
-        # → _HEADING_RE の先頭一致に基づく旧判定として lookup を試みる
-        hm = HEADING_RE.match(block.strip())
-        if hm:
-            heading_text = hm.group(1).strip()
-        else:
-            return False
-    else:
-        heading_text = parsed['text']
+    heading_text = parsed['text']
 
+    # heading_policy SSOT で照合（B1_B4: inventory に存在しない見出しは False）
     return _pbp.lookup_heading_policy(heading_text) is not None
 
 
@@ -257,7 +247,15 @@ def split_markdown_blocks(text: str) -> list[dict]:
             for sub_block in re.split(r'\n\s*\n', block_text):
                 if sub_block.strip():
                     btype = _classify_block(sub_block)
-                    result.append({'text': sub_block.strip(), 'type': btype})
+                    # B1 fix (#654): raw_text は leading whitespace を保持（strip しない）。
+                    # _is_heading_block() は raw_text を構文判定に使うことで
+                    # 4-space indented code block を誤って heading 扱いしない。
+                    # 'text' は後方互換のため strip 後を維持（hash / display 用）。
+                    result.append({
+                        'text': sub_block.strip(),
+                        'raw_text': sub_block.rstrip('\r\n'),
+                        'type': btype,
+                    })
 
     return result
 
@@ -293,8 +291,11 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
         """
         if b['type'] != 'prose':
             return False
-        # heading_policy (#654): heading block を prose delta から除外
-        if _is_heading_block(b['text']):
+        # heading_policy (#654 B1 fix): raw_text（leading whitespace 保持）で判定。
+        # 'text' は strip 済みのため 4-space indented code block の leading spaces が
+        # 失われ誤 heading 判定が生じる。raw_text があればそれを優先する。
+        heading_check_text = b.get('raw_text', b['text'])
+        if _is_heading_block(heading_check_text):
             return False
         return True
 
@@ -348,7 +349,7 @@ def classify_borderline(text: str, threshold: float = 0.1, lower_threshold: floa
     for block in raw_blocks:
         # heading_policy (#654 B1_B4): SSOT 参照で canonical heading のみ除外
         # _is_heading_block() は heading_policy を参照し、非 canonical 見出しは False を返す
-        if _is_heading_block(block.strip()):
+        if _is_heading_block(block):
             continue
         clean_block = clean_prose(block)
         effective_chars = count_effective_chars(clean_block)
@@ -397,7 +398,7 @@ def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
         # heading_policy (#654 B1_B4): SSOT 参照で canonical heading のみ除外
         # _is_heading_block() は heading_policy を参照し、非 canonical 見出しは False を返す。
         # 非 canonical 見出し（例: ## Outcome Risks）は prose block として残る（AC7）。
-        if _is_heading_block(block.strip()):
+        if _is_heading_block(block):
             continue
 
         # 各ブロックをクリーン化

@@ -13,6 +13,7 @@ AC7: 英語 prose / non-canonical 英語見出しが引き続き fail
 AC8: heading_policy は validate_japanese_content.py 経由で適用
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -20,6 +21,30 @@ import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# implementation.yml のパス（テスト実行ディレクトリに依存しない絶対パス）
+_REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent.parent
+_IMPLEMENTATION_YML = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "implementation.yml"
+
+
+def _extract_template_labels(yml_path: Path) -> list[str]:
+    """
+    implementation.yml の body セクションから label: 値を動的に抽出する。
+
+    GitHub Forms YAML の構造:
+      body:
+        - type: textarea / input
+          attributes:
+            label: <label_value>
+
+    Returns:
+        label 値のリスト（出現順）
+    """
+    if not yml_path.exists():
+        return []
+    text = yml_path.read_text(encoding="utf-8")
+    # label: の値を抽出（インデント付き）
+    return re.findall(r'^\s+label:\s+(.+)$', text, re.MULTILINE)
 
 import prose_boundary_policy as pbp
 from prose_boundary_policy import (
@@ -106,34 +131,98 @@ class TestHeadingPolicyExists:
 
 
 class TestInventoryCoversTemplateHeadings:
-    """AC2: 現行 implementation テンプレートの canonical heading を全て含む"""
+    """AC2: implementation テンプレートの canonical heading を HEADING_POLICY が網羅する（M2: SSOT 化）
 
-    TEMPLATE_HEADINGS = [
-        "Machine-Readable Contract",
-        "Parent Issue",
-        "Parent Goal Ref",
-        "Current Validated Scope",
-        "Remaining Parent Gaps",
-        "Outcome",
+    M2 fix (#654): テストは .github/ISSUE_TEMPLATE/implementation.yml の label: 値を
+    動的に抽出して HEADING_POLICY との被覆を exact assert する。
+    hard-code された TEMPLATE_HEADINGS は silent drift を起こすため廃止。
+
+    heading の出所区別:
+      - template_derived: implementation.yml の textarea/input の label: 値に由来
+      - scaffolding_headings: create-issue scaffolding により実装 issue 本文に出現するが
+        GitHub template の textarea label ではない canonical heading
+        （Background, Runtime Verification Applicability）
+
+    HEADING_POLICY は以下の条件を満たすこと:
+      HEADING_POLICY ⊇ (template_derived_canonical_headings ∪ scaffolding_headings)
+
+    Scope Delta（任意）: implementation.yml に label として存在する任意項目。
+    label 値 "Scope Delta（任意）" の canonical_en は "Scope Delta" として HEADING_POLICY に登録済み。
+    """
+
+    # create-issue scaffolding 由来の canonical heading。
+    # GitHub template の textarea label ではないが、実装 issue 本文に create-issue により挿入される。
+    # これらは template label 抽出では取得されないため明示的な定数として保持する。
+    SCAFFOLDING_HEADINGS = [
         "Background",
-        "In Scope",
-        "Out of Scope",
-        "Acceptance Criteria",
-        "Verification Commands",
-        "Allowed Paths",
-        "Stop Conditions",
-        "Required Skills",
         "Runtime Verification Applicability",
     ]
 
+    # implementation.yml の label から HEADING_POLICY key に変換するマッピング。
+    # label 値が canonical_en と異なる場合のみ記載。
+    # "Scope Delta（任意）" → "Scope Delta" など。
+    _LABEL_TO_CANONICAL: dict[str, str] = {
+        "Scope Delta（任意）": "Scope Delta",
+    }
+
+    def _get_template_canonical_headings(self) -> list[str]:
+        """implementation.yml から label: 値を抽出し canonical heading key に変換する"""
+        raw_labels = _extract_template_labels(_IMPLEMENTATION_YML)
+        result = []
+        for label in raw_labels:
+            canonical = self._LABEL_TO_CANONICAL.get(label, label)
+            result.append(canonical)
+        return result
+
+    def test_implementation_yml_exists(self):
+        """GIVEN: .github/ISSUE_TEMPLATE/implementation.yml WHEN: ファイル存在確認
+        THEN: ファイルが存在する（M2: SSOT）"""
+        assert _IMPLEMENTATION_YML.exists(), (
+            f"implementation.yml が見つかりません: {_IMPLEMENTATION_YML}"
+        )
+
+    def test_template_labels_extracted(self):
+        """GIVEN: implementation.yml WHEN: label: 値を抽出
+        THEN: 1 つ以上の label が抽出される"""
+        labels = _extract_template_labels(_IMPLEMENTATION_YML)
+        assert len(labels) > 0, "implementation.yml から label が抽出されなかった"
+
     def test_inventory_covers_template_headings(self):
-        """GIVEN: implementation テンプレートの全 canonical heading
+        """GIVEN: implementation.yml から動的抽出した canonical heading 群
         WHEN: HEADING_POLICY で検索
-        THEN: 全て inventory に存在する"""
-        for heading in self.TEMPLATE_HEADINGS:
+        THEN: 全て inventory に存在する（M2: SSOT 被覆）"""
+        canonical_headings = self._get_template_canonical_headings()
+        assert len(canonical_headings) > 0, "template から canonical heading を抽出できなかった"
+        for heading in canonical_headings:
             assert heading in HEADING_POLICY, (
-                f"Template heading '{heading}' not found in HEADING_POLICY"
+                f"Template heading '{heading}' not found in HEADING_POLICY. "
+                f"Label-to-canonical mapping may need updating in _LABEL_TO_CANONICAL."
             )
+
+    def test_inventory_covers_scaffolding_headings(self):
+        """GIVEN: create-issue scaffolding 由来の canonical heading 群
+        WHEN: HEADING_POLICY で検索
+        THEN: 全て inventory に存在する（M2: scaffolding headings 被覆）"""
+        for heading in self.SCAFFOLDING_HEADINGS:
+            assert heading in HEADING_POLICY, (
+                f"Scaffolding heading '{heading}' not found in HEADING_POLICY. "
+                f"Note: scaffolding headings are inserted by create-issue, "
+                f"not from GitHub template textarea labels."
+            )
+
+    def test_inventory_superset_of_template_union_scaffolding(self):
+        """GIVEN: template-derived ∪ scaffolding-headings
+        WHEN: HEADING_POLICY との被覆を確認
+        THEN: HEADING_POLICY ⊇ (template-derived ∪ scaffolding-headings)（M2: exact assert）"""
+        template_headings = set(self._get_template_canonical_headings())
+        scaffolding_headings = set(self.SCAFFOLDING_HEADINGS)
+        required = template_headings | scaffolding_headings
+        policy_keys = set(HEADING_POLICY.keys())
+        missing = required - policy_keys
+        assert missing == set(), (
+            f"HEADING_POLICY に不足している heading: {missing}. "
+            f"template-derived: {template_headings}, scaffolding: {scaffolding_headings}"
+        )
 
     def test_each_entry_canonical_en_matches_key(self):
         """GIVEN: HEADING_POLICY の各 entry WHEN: canonical_en フィールド確認
@@ -571,3 +660,139 @@ class TestHeadingPolicyAppliedViaValidate:
         changed = changed_prose_blocks(old, new)
         # heading 変更は prose delta に含まれない（_is_heading_block でフィルタ）
         assert all(not _is_heading_block(b["text"]) for b in changed)
+
+
+# ===========================================================================
+# B1 fix: 4-space indented line は GFM code block → heading 誤除外してはならない
+# ===========================================================================
+
+
+class TestFourSpaceIndentedHeadingNotExcluded:
+    """B1 fix (#654): 4-space indented code block が heading 誤除外される問題の修正確認"""
+
+    def test_four_space_indented_heading_is_not_heading_block(self):
+        """GIVEN: '    ## Outcome'（先頭 4 spaces; GFM code block 扱い）
+        WHEN: _is_heading_block
+        THEN: False（code block 扱いなので heading ではない）
+
+        B1 fix: _is_heading_block() は block.strip() してから parse_atx_heading_line()
+        に渡さず、raw line（rstrip only）を渡す。parse_atx_heading_line() が None を
+        返す（4-space = code block）ため False になる。
+        """
+        assert _is_heading_block("    ## Outcome") is False, (
+            "4-space indented '    ## Outcome' は GFM code block 扱い。"
+            "_is_heading_block() は False を返すべき（B1 fix）"
+        )
+
+    def test_four_space_indented_heading_remains_prose_delta_target(self):
+        """GIVEN: '    ## Outcome\n'（先頭 4 spaces）の追加
+        WHEN: changed_prose_blocks
+        THEN: prose delta として返される（heading 誤除外されない）
+
+        B1 fix: split_markdown_blocks() が raw_text（leading spaces 保持）を保持し、
+        _is_prose_delta_target() が raw_text で _is_heading_block() を判定する。
+        """
+        old = ""
+        new = "    ## Outcome\n"
+        changed = changed_prose_blocks(old, new)
+        assert changed != [], (
+            "4-space indented '    ## Outcome' は GFM code block 扱い。"
+            "changed_prose_blocks に含まれるべき（B1 fix）"
+        )
+
+    def test_three_space_indented_canonical_heading_still_excluded(self):
+        """GIVEN: '   ## Outcome'（先頭 3 spaces; GFM 有効 ATX heading）
+        WHEN: changed_prose_blocks
+        THEN: canonical heading として除外される（3 spaces は GFM 許容）"""
+        old = ""
+        new = "   ## Outcome\n"
+        changed = changed_prose_blocks(old, new)
+        assert changed == [], (
+            "3-space indented '   ## Outcome' は有効な ATX heading。"
+            "changed_prose_blocks には含まれない（canonical heading 除外）"
+        )
+
+    def test_raw_text_preserved_in_split_markdown_blocks(self):
+        """GIVEN: '    ## Outcome\n' WHEN: split_markdown_blocks
+        THEN: raw_text が leading spaces を保持し text は strip 済み"""
+        from validate_japanese_content import split_markdown_blocks
+        blocks = split_markdown_blocks("    ## Outcome\n")
+        assert len(blocks) >= 1
+        # text は strip 済み（後方互換）
+        assert blocks[0]["text"] == "## Outcome"
+        # raw_text は leading spaces を保持（B1 fix）
+        assert "raw_text" in blocks[0]
+        assert blocks[0]["raw_text"].startswith("    ")
+
+
+# ===========================================================================
+# B2 fix: bilingual accepted_forms バイパス修正
+# ===========================================================================
+
+
+class TestBilingualAcceptedFormsBypassFixed:
+    """B2 fix (#654): 任意 prefix + (CanonicalEnglish) の括弧内キー単独一致で
+    accepted_forms をバイパスする問題の修正確認"""
+
+    @pytest.mark.parametrize("heading_text", [
+        "適当な日本語 (Outcome)",
+        "成果物ではない（Outcome）",
+        "English Prefix (Outcome)",
+        "全く関係ない文章 (In Scope)",
+        "Something Else (Background)",
+    ])
+    def test_arbitrary_prefix_bilingual_not_accepted(self, heading_text):
+        """GIVEN: 任意 prefix + (CanonicalEnglish) 形式の見出し
+        WHEN: lookup_heading_policy
+        THEN: None（accepted_forms exact match のみで accept; B2 fix）"""
+        result = lookup_heading_policy(heading_text)
+        assert result is None, (
+            f"'{heading_text}' は accepted_forms に登録されていない。"
+            f"None を返すべき（B2 fix）。got={result!r}"
+        )
+
+    def test_accepted_forms_exact_match_still_works(self):
+        """GIVEN: accepted_forms に登録された bilingual heading
+        WHEN: lookup_heading_policy
+        THEN: 正しい entry が返る（B2 fix 後も正常動作）"""
+        assert lookup_heading_policy("成果物 (Outcome)") is not None
+        assert lookup_heading_policy("成果物（Outcome）") is not None
+        assert lookup_heading_policy("Outcome") is not None
+
+    def test_canonical_en_direct_match_still_works(self):
+        """GIVEN: canonical_en（英語見出し）
+        WHEN: lookup_heading_policy
+        THEN: entry が返る（direct match は B2 fix 後も維持）"""
+        for key in ["Outcome", "Background", "In Scope", "Out of Scope"]:
+            assert lookup_heading_policy(key) is not None, (
+                f"canonical_en '{key}' の direct match は B2 fix 後も動作すべき"
+            )
+
+
+# ===========================================================================
+# M1 fix: code fence shorter closing does not close
+# ===========================================================================
+
+
+class TestCodeFenceShorterClosingDoesNotClose:
+    """M1 fix (#654): closing が opening より短い fence は閉じない（GFM 仕様）"""
+
+    def test_code_fence_shorter_closing_does_not_close(self):
+        """GIVEN: ````python ... ``` ... ```` の構造
+        WHEN: split_markdown_blocks
+        THEN: 単一の code_fence ブロックとして扱われ、内部の ``` は closing にならない
+
+        GFM 仕様: closing fence は opening と同長以上でなければならない。
+        3-backtick closing は 4-backtick opening を閉じない。
+        #659 の iter_markdown_blocks GFM 準拠委譲後はこれが PASS する。
+        """
+        text = "````python\nprint('x')\n```\nthis is still code\n````\n"
+        blocks = split_markdown_blocks(text)
+        fence_blocks = [b for b in blocks if b["type"] == "code_fence"]
+        assert len(fence_blocks) == 1, (
+            f"4-backtick fence 内の 3-backtick は closing にならない。"
+            f"単一 fence block になるべき。got {len(fence_blocks)} fence blocks"
+        )
+        assert "this is still code" in fence_blocks[0]["text"], (
+            "3-backtick の後のコンテンツは fence 内に含まれるべき"
+        )

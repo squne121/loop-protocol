@@ -262,6 +262,22 @@ HEADING_POLICY: dict[str, dict] = {
         "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
         "contract_checker_kind": "Required Skills",
     },
+    # Scope Delta は implementation template の任意セクション（required: false）。
+    # GitHub template の label は "Scope Delta（任意）" だが、
+    # Issue 本文中の heading テキストは "Scope Delta（任意）" または "Scope Delta" として現れる。
+    # 両形式を accepted_forms に含め prose ratio 判定から除外する。
+    "Scope Delta": {
+        "canonical_en": "Scope Delta",
+        "canonical_ja": "スコープ差分",
+        "accepted_forms": [
+            "Scope Delta",
+            "Scope Delta（任意）",
+            "スコープ差分 (Scope Delta)",
+            "スコープ差分（Scope Delta）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Scope Delta",
+    },
     "Runtime Verification Applicability": {
         "canonical_en": "Runtime Verification Applicability",
         "canonical_ja": "実行時検証適用性",
@@ -283,31 +299,29 @@ def lookup_heading_policy(heading_text: str) -> dict | None:
     """
     heading text（## より後のテキスト）から heading_policy entry を引く。
 
+    B2 fix (#654): accepted_forms の exact normalized match のみで accept する。
+    任意 prefix + (CanonicalEnglish) の括弧内キー単独一致では accept しない。
+    これにより「適当な日本語 (Outcome)」「成果物ではない（Outcome）」等が
+    誤って Outcome として HIT する問題を修正する。
+
     手順:
     1. _normalize_heading_text() で正規化
-    2. canonical_en の直接一致を確認
-    3. bilingual heading の括弧内テキストを抽出して一致確認
-    4. accepted_forms（正規化後）を確認
+    2. canonical_en（= HEADING_POLICY key）との直接一致を確認
+    3. accepted_forms（正規化後）との exact match を確認
 
     Returns:
         HEADING_POLICY entry dict、または None（inventory に存在しない場合）
     """
     normalized = _normalize_heading_text(heading_text)
 
-    # 直接一致（英語正規見出し）
+    # 直接一致（canonical_en = HEADING_POLICY key）
     if normalized in HEADING_POLICY:
         return HEADING_POLICY[normalized]
 
-    # bilingual heading（括弧内の英語キー）
-    key = _extract_bilingual_heading_key(normalized)
-    if key and key in HEADING_POLICY:
-        return HEADING_POLICY[key]
-
-    # accepted_forms との照合
+    # accepted_forms との exact normalized match のみ（B2 fix: bilingual key bypass 除去）
     for entry in HEADING_POLICY.values():
-        for form in entry["accepted_forms"]:
-            if _normalize_heading_text(form) == normalized:
-                return entry
+        if any(_normalize_heading_text(form) == normalized for form in entry["accepted_forms"]):
+            return entry
 
     return None
 
