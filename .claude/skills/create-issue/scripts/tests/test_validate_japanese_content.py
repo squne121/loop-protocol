@@ -21,6 +21,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / "validate_japanese_content.py"
 # validate_japanese_content モジュールを直接インポート
 sys.path.insert(0, str(SCRIPT_PATH.parent))
 from validate_japanese_content import (
+    changed_prose_blocks,
     clean_prose,
     count_japanese_chars,
     extract_code_fences,
@@ -289,3 +290,149 @@ class TestCLIExitCodes:
         # 日本語の多いテキスト → デフォルト 0.1 → pass
         text_jp = "これは日本語で書かれたドキュメントです。実装の概要を説明します。"
         assert self.run_validator(text_jp) == 0
+
+
+# ============================================================
+# changed_prose_blocks: #672 code fence heading delta tests
+# ============================================================
+
+
+class TestChangedProseBlocksCodeFenceHeading:
+    """#672: code fence 直後の canonical heading が delta prose target に含まれない"""
+
+    def test_code_fence_following_heading_delta(self):
+        """GIVEN: code fence 直後に canonical heading がある WHEN: changed_prose_blocks THEN: heading は含まれない (AC3)
+
+        code fence の後の prose 領域は leading \\n 付きで返るため（iter_markdown_blocks の挙動）、
+        _strip_leading_line_endings_only() で \\r\\n を除去してから heading 判定することが必要。
+        """
+        # code fence 直後の ## Background は変化しておらず、prose-only 変更もない
+        old = (
+            "## Outcome\n\n"
+            "これは概要です。\n\n"
+            "```bash\n"
+            "echo old_command\n"
+            "```\n\n"
+            "## Background\n\n"
+            "背景テキスト。\n"
+        )
+        new = (
+            "## Outcome\n\n"
+            "これは概要です。\n\n"
+            "```bash\n"
+            "echo new_command\n"
+            "```\n\n"
+            "## Background\n\n"
+            "背景テキスト。\n"
+        )
+        result = changed_prose_blocks(old, new)
+        # code fence の内容変更のみ → prose delta なし
+        assert result == [], f"Expected empty list but got: {result}"
+
+    def test_code_fence_following_heading_delta_allowed_paths(self):
+        """GIVEN: code fence 直後に ## Allowed Paths heading がある WHEN: prose 追加 THEN: heading は delta に含まれない (AC3)"""
+        old = (
+            "## Outcome\n\n"
+            "変更内容の説明。\n\n"
+            "```bash\n"
+            "echo hello\n"
+            "```\n\n"
+            "## Allowed Paths\n\n"
+            "- path/to/file\n"
+        )
+        new = (
+            "## Outcome\n\n"
+            "変更内容の説明。\n\n"
+            "```bash\n"
+            "echo hello\n"
+            "```\n\n"
+            "## Allowed Paths\n\n"
+            "- path/to/file\n"
+            "- path/to/other\n"
+        )
+        result = changed_prose_blocks(old, new)
+        # ## Allowed Paths heading 自体は delta に含まれない（heading_policy 登録済み）
+        result_texts = [b['text'] for b in result]
+        assert "## Allowed Paths" not in result_texts, (
+            f"canonical heading should not appear in delta: {result_texts}"
+        )
+
+    def test_escaped_fence_delta(self):
+        """GIVEN: エスケープ fence を triple backtick に修正する変更 WHEN: changed_prose_blocks THEN: 後続 canonical heading が false-fail しない (AC4)
+
+        エスケープされた fence (\\`\\`\\`) を triple backtick (```) に修正する編集で、
+        後続の ## Background heading が delta prose target に誤って含まれないことを確認する。
+        """
+        # old: エスケープ fence（GFM 上は code fence として解釈されない）
+        old = (
+            "## Outcome\n\n"
+            "変更内容の説明。\n\n"
+            r"\`\`\`bash" + "\n"
+            "echo hello\n"
+            r"\`\`\`" + "\n\n"
+            "## Background\n\n"
+            "背景テキスト。\n"
+        )
+        # new: 正しい triple backtick fence
+        new = (
+            "## Outcome\n\n"
+            "変更内容の説明。\n\n"
+            "```bash\n"
+            "echo hello\n"
+            "```\n\n"
+            "## Background\n\n"
+            "背景テキスト。\n"
+        )
+        result = changed_prose_blocks(old, new)
+        # fence 修正後の ## Background は canonical heading → delta に含まれない
+        result_texts = [b['text'] for b in result]
+        assert "## Background" not in result_texts, (
+            f"## Background canonical heading must not appear as prose delta after fence fix: {result_texts}"
+        )
+
+    def test_indented_heading_delta(self):
+        """GIVEN: 4-space indented `    ## Background` WHEN: changed_prose_blocks THEN: delta prose target として扱われる (#654 B1 回帰防止) (AC2)
+
+        4-space indented heading は GFM 上 code block であり canonical heading ではない。
+        _is_heading_block() が leading whitespace を保持して判定することで、
+        4-space indented block を prose として正しく扱う必要がある。
+        """
+        old = "元の文章。\n"
+        new = (
+            "元の文章。\n\n"
+            "    ## Background\n\n"
+            "追加テキスト。\n"
+        )
+        result = changed_prose_blocks(old, new)
+        result_texts = [b['text'] for b in result]
+        # 4-space indented ## Background は prose delta target に含まれる
+        assert any("## Background" in t for t in result_texts), (
+            f"4-space indented ## Background should be a prose delta target, got: {result_texts}"
+        )
+
+    def test_heading_prose_not_hidden_after_heading_exclusion(self):
+        """GIVEN: canonical heading の次行に英語 prose WHEN: changed_prose_blocks THEN: heading 除外が後続 prose を隠さない (AC5)
+
+        heading block は delta 除外されるが、同一 heading block と別の paragraph に属する prose は
+        引き続き delta として検査対象になることを確認する。
+        """
+        old = (
+            "## Background\n\n"
+            "古い背景説明。\n"
+        )
+        new = (
+            "## Background\n\n"
+            "This is new English prose text that should be detected as prose delta.\n"
+        )
+        result = changed_prose_blocks(old, new)
+        result_texts = [b['text'] for b in result]
+        # prose 段落は heading 除外の影響を受けず delta に含まれる
+        assert any(
+            "This is new English prose text" in t for t in result_texts
+        ), (
+            f"Prose after canonical heading should appear in delta: {result_texts}"
+        )
+        # ## Background heading 自体は delta に含まれない
+        assert "## Background" not in result_texts, (
+            f"canonical heading itself should not appear in delta: {result_texts}"
+        )
