@@ -89,6 +89,42 @@ def extract_verification_commands_section(body: str) -> Optional[str]:
     return None
 
 
+def extract_allowed_paths(body: str) -> List[str]:
+    """
+    Parse the `## Allowed Paths` section from an Issue body.
+
+    Returns a list of path strings (stripped, without leading '- ').
+    Empty list if section not found or no paths listed.
+
+    Example section:
+      ## Allowed Paths
+      - .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py
+      - .claude/skills/issue-contract-review/tests/
+    """
+    match = re.search(
+        r"^##\s+Allowed Paths\s*$(.+?)(?=^##|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return []
+
+    section = match.group(1)
+    paths = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        # Lines starting with '- ' are list items
+        if stripped.startswith("- "):
+            path = stripped[2:].strip()
+            if path:
+                paths.append(path)
+        # Also handle lines without '- ' prefix (plain paths)
+        elif stripped and not stripped.startswith("#"):
+            paths.append(stripped)
+
+    return paths
+
+
 def extract_fenced_bash_blocks(section: str) -> List[str]:
     """
     セクションから ```bash ... ``` ブロックを抽出。
@@ -600,6 +636,235 @@ def _has_arg(argv: List[str], flag: str) -> bool:
     return False
 
 
+def _rg_has_include_option(argv: List[str]) -> bool:
+    """
+    AC1 (Issue #648): Detect if an `rg` command uses the `--include` / `--include=...` option.
+
+    `rg` does not have an `--include` option (that is a grep option, not ripgrep).
+    When a VC author writes `rg --include=...`, it is likely a mistake (confused with grep).
+
+    Rules:
+    - Only applies when argv[0] basename is 'rg'
+    - Matches '--include' (standalone) or '--include=...' (value-embedded)
+    - Does NOT match '--include-zero' (a different option with different semantics)
+    - grep --include is NOT matched (only rg is in scope)
+
+    Returns True if the rg command has an --include option, False otherwise.
+    """
+    if not argv:
+        return False
+    if Path(argv[0]).name != "rg":
+        return False
+    for arg in argv[1:]:
+        # Match --include or --include=... but NOT --include-zero
+        if arg == "--include":
+            return True
+        if arg.startswith("--include="):
+            return True
+        # --include-zero: explicitly excluded
+    return False
+
+
+def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]] = None) -> bool:
+    """
+    AC2 (Issue #648): Detect if an `rg` command has a broad or unbounded search path.
+
+    Containment-based logic (replaces fixed _BROAD_RG_PATHS list):
+
+    - No positional path argument → broad (ブロック)
+    - '.' or '/' path → always broad (ブロック)
+
+    When allowed_paths is given (from Issue body ## Allowed Paths):
+    - rg_path == allowed_path (same) → 許可
+    - rg_path is a parent of some allowed_path (allowed.startswith(rg_path+"/")) → ブロック (broad)
+    - allowed_path is a parent of rg_path (rg_path.startswith(allowed+"/")) → 許可 (narrowed)
+    - rg_path not covered by any allowed_path at all → ブロック
+
+    When allowed_paths is None or empty (fallback):
+    - Only '.' and '/' are blocked (conservative behavior preserved).
+
+    This function only inspects rg commands (argv[0] basename 'rg').
+    grep / egrep / fgrep are NOT in scope.
+
+    Returns True if the rg command has a broad/unbounded search path.
+    """
+    if not argv:
+        return False
+    if Path(argv[0]).name != "rg":
+        return False
+
+    # Collect positional path arguments (non-option, non-pattern args after pattern)
+    # For rg: rg [options] PATTERN [PATH ...]
+    # We need to identify the positional args that are paths (after the first positional=PATTERN)
+    i = 1
+    n = len(argv)
+    after_double_dash = False
+    first_positional_seen = False
+    path_args: List[str] = []
+
+    # Value-taking flags for rg (we need to skip them to find positional args).
+    # NOTE: -l / --files-with-matches is a BOOLEAN flag (not value-taking).
+    # Including it in value-taking flags would cause the next positional (the pattern)
+    # to be consumed as a value, breaking path extraction.
+    _RG_VALUE_FLAGS_FOR_PATH = frozenset([
+        "-e", "--regexp",
+        "-g", "--glob",
+        "--iglob",
+        "-A", "--after-context",
+        "-B", "--before-context",
+        "-C", "--context",
+        "-m", "--max-count",
+        "-M", "--max-columns",
+        "--max-depth",
+        "--color", "--colours",
+        "--type", "-t",
+        "--type-not", "-T",
+        "--encoding",
+        "--field-match-separator",
+        "--field-context-separator",
+        "--replace", "-r",
+        "--pre",
+        "--include",   # (invalid for rg but skip gracefully)
+        "--exclude",
+        "--sortr", "--sort",
+        "--threads", "-j",
+        "--max-filesize",
+        "--context-separator",
+        # NOTE: -l (--files-with-matches) is boolean, intentionally excluded here
+    ])
+
+    explicit_pattern_given = any(
+        arg in ("-e", "--regexp") or arg.startswith("--regexp=") or (arg.startswith("-e") and len(arg) > 2)
+        for arg in argv[1:]
+    )
+
+    while i < n:
+        arg = argv[i]
+
+        if arg == "--":
+            after_double_dash = True
+            i += 1
+            continue
+
+        if after_double_dash:
+            if not first_positional_seen and not explicit_pattern_given:
+                # First arg after -- is PATTERN (skip it)
+                first_positional_seen = True
+                i += 1
+                continue
+            else:
+                # These are PATHs
+                path_args.append(arg)
+                i += 1
+                continue
+
+        # Handle -e/--regexp: skip value (it's a pattern, not a path)
+        if arg in ("-e", "--regexp"):
+            explicit_pattern_given = True
+            i += 2
+            continue
+        if arg.startswith("--regexp="):
+            explicit_pattern_given = True
+            i += 1
+            continue
+        if arg.startswith("-e") and len(arg) > 2:
+            explicit_pattern_given = True
+            i += 1
+            continue
+
+        # Skip -g/--glob and value
+        if arg in ("-g", "--glob", "--iglob"):
+            i += 2
+            continue
+        if arg.startswith("--glob=") or arg.startswith("--iglob="):
+            i += 1
+            continue
+
+        # Skip other value-taking flags
+        if arg in _RG_VALUE_FLAGS_FOR_PATH:
+            i += 2
+            continue
+
+        # Handle --flag=value forms
+        skip_flag_value = False
+        for flag in _RG_VALUE_FLAGS_FOR_PATH:
+            if flag.startswith("--") and arg.startswith(flag + "="):
+                skip_flag_value = True
+                break
+        if skip_flag_value:
+            i += 1
+            continue
+
+        # Combined short flags (e.g. -nq, -lq): just a flag, no value taken
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            i += 1
+            continue
+
+        # Positional argument
+        if not first_positional_seen and not explicit_pattern_given:
+            # This is the PATTERN (skip)
+            first_positional_seen = True
+            i += 1
+            continue
+        else:
+            # This is a PATH argument
+            path_args.append(arg)
+            i += 1
+            continue
+
+    # No path arguments: searches the entire repo → broad
+    if not path_args:
+        return True
+
+    # Normalize: strip trailing slash for comparison
+    def _normalize_path(p: str) -> str:
+        return p.rstrip("/")
+
+    # Build allowed path set (normalized) from allowed_paths
+    allowed_normalized: List[str] = []
+    if allowed_paths:
+        for ap in allowed_paths:
+            allowed_normalized.append(_normalize_path(ap))
+
+    for path_arg in path_args:
+        normalized = _normalize_path(path_arg)
+
+        # '.' or '/' always broad regardless of allowed_paths
+        if normalized in (".", "", "/"):
+            return True
+
+        if not allowed_normalized:
+            # Fallback (no Allowed Paths in Issue): only '.' and '/' are blocked.
+            # Any explicit path is conservatively allowed.
+            continue
+
+        # Containment check using allowed_paths:
+        # - rg_path == allowed_path → allowed (same target)
+        # - allowed_path starts with rg_path+"/" → rg_path is a PARENT of allowed → broad (blocked)
+        # - rg_path starts with allowed_path+"/" → rg_path is UNDER allowed → allowed (narrowed)
+        is_covered = False
+        is_parent_of_allowed = False
+        for ap in allowed_normalized:
+            if normalized == ap:
+                is_covered = True
+                break
+            if normalized != "" and ap.startswith(normalized + "/"):
+                # rg_path is a parent directory of some allowed_path → broad
+                is_parent_of_allowed = True
+            if normalized.startswith(ap + "/"):
+                # rg_path is a sub-path of allowed_path → narrowed, covered
+                is_covered = True
+                break
+
+        if is_parent_of_allowed and not is_covered:
+            return True
+        if not is_covered and not is_parent_of_allowed:
+            # Path not covered by any allowed_path at all → broad
+            return True
+
+    return False
+
+
 def _is_trivially_pass_command(command: str) -> bool:
     """
     Detect trivially-pass VC patterns: repository-local ssot-discovery scripts
@@ -945,7 +1210,9 @@ def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
         "-m", "--max-count",
         "-M", "--max-columns",
         "--max-depth",
-        "-l", "--files-with-matches",
+        # NOTE: -l / --files-with-matches is a BOOLEAN flag, NOT value-taking.
+        # Do NOT include -l here — it would cause the pattern positional arg to be
+        # consumed as the value of -l, breaking pattern detection.
         "--color", "--colours",
         "--type", "-t",
         "--type-not", "-T",
@@ -1071,7 +1338,7 @@ def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
 
 
 def classify_static_command(
-    raw_command: str, cwd: Path
+    raw_command: str, cwd: Path, allowed_paths: Optional[List[str]] = None
 ) -> Optional[Tuple[str, str, str, Optional[str], str]]:
     """
     Perform static pre-execution classification of a VC command.
@@ -1082,6 +1349,13 @@ def classify_static_command(
 
     This is called BEFORE run_command() to prevent dangerous commands from
     being executed. AC1-AC3 enforcement happens here.
+
+    Args:
+        raw_command: the raw command string from the VC block
+        cwd: working directory
+        allowed_paths: list of Allowed Paths from Issue body ## Allowed Paths section.
+            Used by _rg_has_broad_search_path for containment-based broad path detection.
+            If None or empty, falls back to conservative behavior (block '.' and '/' only).
     """
     # 1. Check for unsupported shell syntax: $(...), `...`, ${...}  (AC1)
     if has_command_substitution(raw_command):
@@ -1152,6 +1426,8 @@ def classify_static_command(
     # while the engine treats | as alternation and \\| as literal pipe).
     # This is classified as regex_literal_pipe_suspected and blocked unless the caller
     # supplies a literal-pipe-ok annotation (handled at parse/caller level).
+    # NOTE: This check runs BEFORE broad_search_path_unbounded (3.6b) to preserve #589 behavior:
+    # a command with both \\| in pattern AND a broad path is reported as regex_literal_pipe_suspected.
     if _is_regex_bearing_command_for_literal_pipe(argv):
         if _command_pattern_contains_backslash_pipe(argv):
             return (
@@ -1165,6 +1441,36 @@ def classify_static_command(
                 "# vc-regex-intent: literal-pipe-ok reason=\"...\" on the preceding line.",
                 "baseline_fail_expected",
             )
+
+    # 3.6a. rg --include option mismatch detection (AC1: Issue #648)
+    # rg does not have --include (that is a grep option). Using --include with rg is a VC mistake.
+    # --include-zero is a valid rg option and is excluded from detection.
+    # grep --include is valid (grep syntax) and is excluded.
+    if _rg_has_include_option(argv):
+        return (
+            "blocked",
+            "rg_option_mismatch",
+            "blocked",
+            "rg does not have --include / --include=... (that is a grep option). "
+            "Use -g / --glob for file filtering in ripgrep (e.g., rg -g '*.py' pattern). "
+            "If you intended grep, use grep --include instead.",
+            "baseline_fail_expected",
+        )
+
+    # 3.6b. rg broad search path detection (AC2: Issue #648)
+    # rg without path or with repo-root/broad-dir path searches the entire repo,
+    # making the VC pass on unrelated existing assets.
+    if _rg_has_broad_search_path(argv, allowed_paths=allowed_paths):
+        return (
+            "blocked",
+            "broad_search_path_unbounded",
+            "blocked",
+            "rg search path is too broad (no path / repo root / broad directory like docs/ or src/). "
+            "Narrow the search path to the Allowed Paths or a specific file/directory "
+            "(e.g., rg 'pattern' .claude/skills/... or rg 'pattern' docs/product/specific-file.md). "
+            "Broad searches may produce false positives from existing assets unrelated to this Issue.",
+            "baseline_fail_expected",
+        )
 
     # 4. Check denied commands (unsafe, AC2)
     if cmd_basename in _DENIED_COMMANDS:
@@ -1475,6 +1781,8 @@ def compute_confidence(category: str) -> str:
         "vc_no_tests_collected",
         "trivially_pass",
         "regex_literal_pipe_suspected",  # AC3: Issue #589
+        "rg_option_mismatch",            # AC1: Issue #648
+        "broad_search_path_unbounded",   # AC2: Issue #648
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -1723,6 +2031,9 @@ def main() -> int:
         # C2: exit code 2 for extraction errors
         return 2
 
+    # AC2: parse Allowed Paths from Issue body for containment-based broad path detection
+    allowed_paths_from_body = extract_allowed_paths(body)
+
     # B4: bash ブロックからコマンドを抽出 (```bash のみ canonical format)
     blocks = extract_fenced_bash_blocks(vc_section)
     commands = []
@@ -1837,7 +2148,9 @@ def main() -> int:
             else:
                 # AC1-AC3: classify_static_command checks unsafe/unsupported commands
                 # BEFORE any execution attempt
-                static_result = classify_static_command(command, Path(args.cwd))
+                static_result = classify_static_command(
+                    command, Path(args.cwd), allowed_paths=allowed_paths_from_body
+                )
                 # AC3 (Issue #589): If regex_literal_pipe_suspected and literal-pipe-ok
                 # annotation is present, skip the blocked classification and proceed to execute.
                 if (

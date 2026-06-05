@@ -665,9 +665,13 @@ def test_classify_static_command_blocks_npm_install():
 
 
 def test_classify_static_command_allows_rg():
-    """classify_static_command returns None (proceed) for rg"""
+    """classify_static_command returns None (proceed) for rg with a specific path"""
     from baseline_vc_preflight import classify_static_command
-    result = classify_static_command("rg 'pattern' src/", Path("."))
+    # Use a specific (non-broad) path to avoid broad_search_path_unbounded (AC2: Issue #648)
+    result = classify_static_command(
+        "rg 'pattern' .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py",
+        Path("."),
+    )
     assert result is None, f"rg should be allowed, but got: {result}"
 
 

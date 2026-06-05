@@ -26,6 +26,30 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 _REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent.parent
 _IMPLEMENTATION_YML = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "implementation.yml"
 
+# create-issue scaffolding 由来の canonical heading。
+# GitHub template の textarea label ではないが、実装 issue 本文に create-issue により挿入される。
+SCAFFOLDING_HEADINGS = {
+    "Background",
+    "Runtime Verification Applicability",
+}
+
+# implementation.yml の label から HEADING_POLICY key に変換するマッピング。
+# label 値が canonical_en と異なる場合のみ記載する。
+_LABEL_TO_CANONICAL: dict[str, str] = {
+    "Scope Delta（任意）": "Scope Delta",
+}
+
+# HEADING_POLICY may only contain:
+# - labels emitted by .github/ISSUE_TEMPLATE/implementation.yml
+# - headings inserted by create-issue scaffolding
+# - explicitly reviewed extras below
+#
+# Empty by default: no non-template/non-scaffolding English heading is currently
+# allowed to be prose-exempt. Adding a key here expands the prose-exemption
+# surface and must explain why it cannot be represented as a template label or
+# scaffolding heading.
+ALLOWED_EXTRAS: set[str] = set()
+
 
 def _extract_template_labels(yml_path: Path) -> list[str]:
     """
@@ -45,6 +69,26 @@ def _extract_template_labels(yml_path: Path) -> list[str]:
     text = yml_path.read_text(encoding="utf-8")
     # label: の値を抽出（インデント付き）
     return re.findall(r'^\s+label:\s+(.+)$', text, re.MULTILINE)
+
+
+def _get_template_canonical_headings() -> list[str]:
+    """implementation.yml から label: 値を抽出し canonical heading key に変換する"""
+    raw_labels = _extract_template_labels(_IMPLEMENTATION_YML)
+    return [_LABEL_TO_CANONICAL.get(label, label) for label in raw_labels]
+
+
+def _expected_heading_policy_keys() -> set[str]:
+    """HEADING_POLICY に許可される canonical heading 集合を返す"""
+    return set(_get_template_canonical_headings()) | SCAFFOLDING_HEADINGS | ALLOWED_EXTRAS
+
+
+def _assert_heading_policy_near_equivalence(policy_keys: set[str]) -> None:
+    """HEADING_POLICY key 集合が許可集合と完全一致することを確認する"""
+    expected = _expected_heading_policy_keys()
+    missing = expected - policy_keys
+    extra = policy_keys - expected
+    assert missing == set(), f"HEADING_POLICY に不足している heading: {missing}"
+    assert extra == set(), f"HEADING_POLICY に余分な heading がある: {extra}"
 
 import prose_boundary_policy as pbp
 from prose_boundary_policy import (
@@ -149,30 +193,6 @@ class TestInventoryCoversTemplateHeadings:
     label 値 "Scope Delta（任意）" の canonical_en は "Scope Delta" として HEADING_POLICY に登録済み。
     """
 
-    # create-issue scaffolding 由来の canonical heading。
-    # GitHub template の textarea label ではないが、実装 issue 本文に create-issue により挿入される。
-    # これらは template label 抽出では取得されないため明示的な定数として保持する。
-    SCAFFOLDING_HEADINGS = [
-        "Background",
-        "Runtime Verification Applicability",
-    ]
-
-    # implementation.yml の label から HEADING_POLICY key に変換するマッピング。
-    # label 値が canonical_en と異なる場合のみ記載。
-    # "Scope Delta（任意）" → "Scope Delta" など。
-    _LABEL_TO_CANONICAL: dict[str, str] = {
-        "Scope Delta（任意）": "Scope Delta",
-    }
-
-    def _get_template_canonical_headings(self) -> list[str]:
-        """implementation.yml から label: 値を抽出し canonical heading key に変換する"""
-        raw_labels = _extract_template_labels(_IMPLEMENTATION_YML)
-        result = []
-        for label in raw_labels:
-            canonical = self._LABEL_TO_CANONICAL.get(label, label)
-            result.append(canonical)
-        return result
-
     def test_implementation_yml_exists(self):
         """GIVEN: .github/ISSUE_TEMPLATE/implementation.yml WHEN: ファイル存在確認
         THEN: ファイルが存在する（M2: SSOT）"""
@@ -190,7 +210,7 @@ class TestInventoryCoversTemplateHeadings:
         """GIVEN: implementation.yml から動的抽出した canonical heading 群
         WHEN: HEADING_POLICY で検索
         THEN: 全て inventory に存在する（M2: SSOT 被覆）"""
-        canonical_headings = self._get_template_canonical_headings()
+        canonical_headings = _get_template_canonical_headings()
         assert len(canonical_headings) > 0, "template から canonical heading を抽出できなかった"
         for heading in canonical_headings:
             assert heading in HEADING_POLICY, (
@@ -202,26 +222,26 @@ class TestInventoryCoversTemplateHeadings:
         """GIVEN: create-issue scaffolding 由来の canonical heading 群
         WHEN: HEADING_POLICY で検索
         THEN: 全て inventory に存在する（M2: scaffolding headings 被覆）"""
-        for heading in self.SCAFFOLDING_HEADINGS:
+        for heading in SCAFFOLDING_HEADINGS:
             assert heading in HEADING_POLICY, (
                 f"Scaffolding heading '{heading}' not found in HEADING_POLICY. "
                 f"Note: scaffolding headings are inserted by create-issue, "
                 f"not from GitHub template textarea labels."
             )
 
-    def test_inventory_superset_of_template_union_scaffolding(self):
-        """GIVEN: template-derived ∪ scaffolding-headings
-        WHEN: HEADING_POLICY との被覆を確認
-        THEN: HEADING_POLICY ⊇ (template-derived ∪ scaffolding-headings)（M2: exact assert）"""
-        template_headings = set(self._get_template_canonical_headings())
-        scaffolding_headings = set(self.SCAFFOLDING_HEADINGS)
-        required = template_headings | scaffolding_headings
-        policy_keys = set(HEADING_POLICY.keys())
-        missing = required - policy_keys
-        assert missing == set(), (
-            f"HEADING_POLICY に不足している heading: {missing}. "
-            f"template-derived: {template_headings}, scaffolding: {scaffolding_headings}"
-        )
+    def test_heading_policy_near_equivalence(self):
+        """GIVEN: template-derived ∪ scaffolding ∪ allowed-extras
+        WHEN: HEADING_POLICY key 集合を helper で検証
+        THEN: 許可集合と exact match する"""
+        _assert_heading_policy_near_equivalence(set(HEADING_POLICY.keys()))
+
+    def test_heading_policy_rejects_unknown_heading(self):
+        """GIVEN: unknown canonical English heading を含む key 集合
+        WHEN: near-equivalence helper を実行
+        THEN: AssertionError で拒否される"""
+        policy_keys = set(HEADING_POLICY.keys()) | {"Arbitrary English Heading"}
+        with pytest.raises(AssertionError):
+            _assert_heading_policy_near_equivalence(policy_keys)
 
     def test_each_entry_canonical_en_matches_key(self):
         """GIVEN: HEADING_POLICY の各 entry WHEN: canonical_en フィールド確認

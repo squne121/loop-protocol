@@ -288,6 +288,10 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
     old_blocks = split_markdown_blocks(old)
     new_blocks = split_markdown_blocks(new)
 
+    def _strip_leading_line_endings_only(text: str) -> str:
+        """leading \r\n のみを除去する（space/tab は保持）。#672 fix."""
+        return text.lstrip('\r\n')
+
     def _is_prose_delta_target(b: dict) -> bool:
         """prose delta 判定対象かどうか。
         type == 'prose' かつ heading でないブロック（#654 heading_policy）。
@@ -298,8 +302,11 @@ def changed_prose_blocks(old: str, new: str) -> list[dict]:
         # heading_policy (#654 B1 fix): raw_text（leading whitespace 保持）で判定。
         # 'text' は strip 済みのため 4-space indented code block の leading spaces が
         # 失われ誤 heading 判定が生じる。raw_text があればそれを優先する。
+        # #672 fix: code fence 直後の prose 領域は leading \n 付きで返るため、
+        # heading 判定前に \r\n のみを除去する（space/tab は保持して B1 fix を維持）。
         heading_check_text = b.get('raw_text', b['text'])
-        if _is_heading_block(heading_check_text):
+        heading_probe = _strip_leading_line_endings_only(heading_check_text)
+        if _is_heading_block(heading_probe):
             return False
         return True
 
