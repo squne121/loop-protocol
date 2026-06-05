@@ -600,6 +600,223 @@ def _has_arg(argv: List[str], flag: str) -> bool:
     return False
 
 
+def _rg_has_include_option(argv: List[str]) -> bool:
+    """
+    AC1 (Issue #648): Detect if an `rg` command uses the `--include` / `--include=...` option.
+
+    `rg` does not have an `--include` option (that is a grep option, not ripgrep).
+    When a VC author writes `rg --include=...`, it is likely a mistake (confused with grep).
+
+    Rules:
+    - Only applies when argv[0] basename is 'rg'
+    - Matches '--include' (standalone) or '--include=...' (value-embedded)
+    - Does NOT match '--include-zero' (a different option with different semantics)
+    - grep --include is NOT matched (only rg is in scope)
+
+    Returns True if the rg command has an --include option, False otherwise.
+    """
+    if not argv:
+        return False
+    if Path(argv[0]).name != "rg":
+        return False
+    for arg in argv[1:]:
+        # Match --include or --include=... but NOT --include-zero
+        if arg == "--include":
+            return True
+        if arg.startswith("--include="):
+            return True
+        # --include-zero: explicitly excluded
+    return False
+
+
+# AC2 (Issue #648): Broad search path detection for rg commands
+# These path patterns are considered "broad" (repo-wide or domain-wide)
+# when the Allowed Paths in the Issue contract do NOT explicitly cover them.
+_BROAD_RG_PATHS: frozenset = frozenset([
+    ".",          # repo root
+    "./",         # repo root (trailing slash)
+    "docs",       # docs root
+    "docs/",      # docs root (trailing slash)
+    ".claude",    # all of .claude
+    ".claude/",
+    "src",        # all of src
+    "src/",
+    "tests",      # all of tests
+    "tests/",
+])
+
+
+def _rg_has_broad_search_path(argv: List[str], allowed_paths: Optional[List[str]] = None) -> bool:
+    """
+    AC2 (Issue #648): Detect if an `rg` command has a broad or unbounded search path.
+
+    A "broad" path is:
+    - No positional path argument (searches entire repo)
+    - Path is repo root ('.' or './')
+    - Path is a broad directory (docs/, .claude/, src/, tests/)
+
+    Exception: If `allowed_paths` explicitly includes the broad path (e.g., Allowed Paths
+    includes 'docs/' or 'docs/product/'), then that broad path is allowed.
+
+    This function only inspects rg commands (argv[0] basename 'rg').
+    grep / egrep / fgrep are NOT in scope.
+
+    Returns True if the rg command has a broad/unbounded search path.
+    """
+    if not argv:
+        return False
+    if Path(argv[0]).name != "rg":
+        return False
+
+    # Collect positional path arguments (non-option, non-pattern args after pattern)
+    # For rg: rg [options] PATTERN [PATH ...]
+    # We need to identify the positional args that are paths (after the first positional=PATTERN)
+    i = 1
+    n = len(argv)
+    after_double_dash = False
+    first_positional_seen = False
+    path_args: List[str] = []
+
+    # Value-taking flags for rg (we need to skip them to find positional args)
+    _RG_VALUE_FLAGS_FOR_PATH = frozenset([
+        "-e", "--regexp",
+        "-g", "--glob",
+        "--iglob",
+        "-A", "--after-context",
+        "-B", "--before-context",
+        "-C", "--context",
+        "-m", "--max-count",
+        "-M", "--max-columns",
+        "--max-depth",
+        "--color", "--colours",
+        "--type", "-t",
+        "--type-not", "-T",
+        "--encoding",
+        "--field-match-separator",
+        "--field-context-separator",
+        "--replace", "-r",
+        "--pre",
+        "--include",   # (invalid for rg but skip gracefully)
+        "--exclude",
+        "--sortr", "--sort",
+        "--threads", "-j",
+        "--max-filesize",
+        "--context-separator",
+        "-l",
+    ])
+
+    explicit_pattern_given = any(
+        arg in ("-e", "--regexp") or arg.startswith("--regexp=") or (arg.startswith("-e") and len(arg) > 2)
+        for arg in argv[1:]
+    )
+
+    while i < n:
+        arg = argv[i]
+
+        if arg == "--":
+            after_double_dash = True
+            i += 1
+            continue
+
+        if after_double_dash:
+            if not first_positional_seen and not explicit_pattern_given:
+                # First arg after -- is PATTERN (skip it)
+                first_positional_seen = True
+                i += 1
+                continue
+            else:
+                # These are PATHs
+                path_args.append(arg)
+                i += 1
+                continue
+
+        # Handle -e/--regexp: skip value (it's a pattern, not a path)
+        if arg in ("-e", "--regexp"):
+            explicit_pattern_given = True
+            i += 2
+            continue
+        if arg.startswith("--regexp="):
+            explicit_pattern_given = True
+            i += 1
+            continue
+        if arg.startswith("-e") and len(arg) > 2:
+            explicit_pattern_given = True
+            i += 1
+            continue
+
+        # Skip -g/--glob and value
+        if arg in ("-g", "--glob", "--iglob"):
+            i += 2
+            continue
+        if arg.startswith("--glob=") or arg.startswith("--iglob="):
+            i += 1
+            continue
+
+        # Skip other value-taking flags
+        if arg in _RG_VALUE_FLAGS_FOR_PATH:
+            i += 2
+            continue
+
+        # Handle --flag=value forms
+        skip_flag_value = False
+        for flag in _RG_VALUE_FLAGS_FOR_PATH:
+            if flag.startswith("--") and arg.startswith(flag + "="):
+                skip_flag_value = True
+                break
+        if skip_flag_value:
+            i += 1
+            continue
+
+        # Combined short flags (e.g. -nq): just a flag, no value taken
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            i += 1
+            continue
+
+        # Positional argument
+        if not first_positional_seen and not explicit_pattern_given:
+            # This is the PATTERN (skip)
+            first_positional_seen = True
+            i += 1
+            continue
+        else:
+            # This is a PATH argument
+            path_args.append(arg)
+            i += 1
+            continue
+
+    # No path arguments: searches the entire repo → broad
+    if not path_args:
+        return True
+
+    # Check each path against the broad list
+    # Normalize: strip trailing slash for comparison
+    def _normalize_path(p: str) -> str:
+        return p.rstrip("/")
+
+    # Build allowed path set (normalized) from allowed_paths
+    allowed_normalized: set = set()
+    if allowed_paths:
+        for ap in allowed_paths:
+            allowed_normalized.add(_normalize_path(ap))
+
+    for path_arg in path_args:
+        normalized = _normalize_path(path_arg)
+        if normalized in {_normalize_path(b) for b in _BROAD_RG_PATHS}:
+            # It's a broad path — check if it's explicitly in Allowed Paths
+            if normalized in allowed_normalized:
+                continue  # explicitly allowed
+            # Also allow if any allowed path is a sub-path of this broad path
+            # e.g., Allowed Paths includes "docs/product/" → "docs/" is accepted
+            explicitly_covered = any(
+                ap.startswith(normalized + "/") or ap == normalized
+                for ap in allowed_normalized
+            )
+            if not explicitly_covered:
+                return True
+
+    return False
+
+
 def _is_trivially_pass_command(command: str) -> bool:
     """
     Detect trivially-pass VC patterns: repository-local ssot-discovery scripts
@@ -1152,6 +1369,8 @@ def classify_static_command(
     # while the engine treats | as alternation and \\| as literal pipe).
     # This is classified as regex_literal_pipe_suspected and blocked unless the caller
     # supplies a literal-pipe-ok annotation (handled at parse/caller level).
+    # NOTE: This check runs BEFORE broad_search_path_unbounded (3.6b) to preserve #589 behavior:
+    # a command with both \\| in pattern AND a broad path is reported as regex_literal_pipe_suspected.
     if _is_regex_bearing_command_for_literal_pipe(argv):
         if _command_pattern_contains_backslash_pipe(argv):
             return (
@@ -1165,6 +1384,36 @@ def classify_static_command(
                 "# vc-regex-intent: literal-pipe-ok reason=\"...\" on the preceding line.",
                 "baseline_fail_expected",
             )
+
+    # 3.6a. rg --include option mismatch detection (AC1: Issue #648)
+    # rg does not have --include (that is a grep option). Using --include with rg is a VC mistake.
+    # --include-zero is a valid rg option and is excluded from detection.
+    # grep --include is valid (grep syntax) and is excluded.
+    if _rg_has_include_option(argv):
+        return (
+            "blocked",
+            "rg_option_mismatch",
+            "blocked",
+            "rg does not have --include / --include=... (that is a grep option). "
+            "Use -g / --glob for file filtering in ripgrep (e.g., rg -g '*.py' pattern). "
+            "If you intended grep, use grep --include instead.",
+            "baseline_fail_expected",
+        )
+
+    # 3.6b. rg broad search path detection (AC2: Issue #648)
+    # rg without path or with repo-root/broad-dir path searches the entire repo,
+    # making the VC pass on unrelated existing assets.
+    if _rg_has_broad_search_path(argv):
+        return (
+            "blocked",
+            "broad_search_path_unbounded",
+            "blocked",
+            "rg search path is too broad (no path / repo root / broad directory like docs/ or src/). "
+            "Narrow the search path to the Allowed Paths or a specific file/directory "
+            "(e.g., rg 'pattern' .claude/skills/... or rg 'pattern' docs/product/specific-file.md). "
+            "Broad searches may produce false positives from existing assets unrelated to this Issue.",
+            "baseline_fail_expected",
+        )
 
     # 4. Check denied commands (unsafe, AC2)
     if cmd_basename in _DENIED_COMMANDS:
@@ -1475,6 +1724,8 @@ def compute_confidence(category: str) -> str:
         "vc_no_tests_collected",
         "trivially_pass",
         "regex_literal_pipe_suspected",  # AC3: Issue #589
+        "rg_option_mismatch",            # AC1: Issue #648
+        "broad_search_path_unbounded",   # AC2: Issue #648
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
