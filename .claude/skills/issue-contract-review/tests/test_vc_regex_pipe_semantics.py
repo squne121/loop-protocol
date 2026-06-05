@@ -152,8 +152,10 @@ class TestAC1QuotedPipeIsNotShellPipeline:
         """AC1: preflight classify_static_command returns None for rg "foo|bar" (proceed to execute)."""
         from baseline_vc_preflight import classify_static_command
 
-        # rg with quoted alternation should proceed to execution (not be statically blocked)
-        result = classify_static_command('rg -n "foo|bar" .claude/', Path("."))
+        # rg with quoted alternation should proceed to execution (not be statically blocked).
+        # Use a specific (non-broad) path to avoid broad_search_path_unbounded (AC2: Issue #648).
+        specific_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+        result = classify_static_command(f'rg -n "foo|bar" {specific_path}', Path("."))
         assert result is None, (
             f'rg with quoted alternation should be allowed (return None), got: {result}'
         )
@@ -358,7 +360,9 @@ class TestAC5BaselineVcPreflightRegexLiteralPipe:
         r"""AC5: rg without \| is allowed (returns None, proceeds to execute)."""
         from baseline_vc_preflight import classify_static_command
 
-        result = classify_static_command('rg "foo|bar" src/', Path("."))
+        # Use a specific (non-broad) path to avoid broad_search_path_unbounded (AC2: Issue #648)
+        specific_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+        result = classify_static_command(f'rg "foo|bar" {specific_path}', Path("."))
         assert result is None, (
             f'rg "foo|bar" should be allowed (None), got: {result}'
         )
@@ -376,7 +380,9 @@ class TestAC6Fixture578Style:
         r"""AC6: rg -n "foo|bar" -> classify_static_command returns None (allowed)."""
         from baseline_vc_preflight import classify_static_command
 
-        result = classify_static_command('rg -n "foo|bar" .', Path("."))
+        # Use a specific (non-broad) path to avoid broad_search_path_unbounded (AC2: Issue #648)
+        specific_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+        result = classify_static_command(f'rg -n "foo|bar" {specific_path}', Path("."))
         assert result is None, (
             f'rg -n "foo|bar" (regex alternation) must be allowed; got: {result}'
         )
