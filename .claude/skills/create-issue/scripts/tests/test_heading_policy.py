@@ -56,7 +56,6 @@ from prose_boundary_policy import (
     lookup_heading_policy,
     parse_atx_heading_line,
     _normalize_heading_text,
-    _extract_bilingual_heading_key,
 )
 from validate_japanese_content import (
     changed_prose_blocks,
@@ -367,17 +366,6 @@ class TestAtxNormalization:
         assert entry is not None
         assert entry["canonical_en"] == "Outcome"
 
-    def test_extract_bilingual_heading_key_halfwidth(self):
-        """GIVEN: 半角括弧の bilingual heading WHEN: _extract_bilingual_heading_key
-        THEN: 英語キーが返る"""
-        assert _extract_bilingual_heading_key("成果物 (Outcome)") == "Outcome"
-        assert _extract_bilingual_heading_key("スコープ内 (In Scope)") == "In Scope"
-
-    def test_extract_bilingual_heading_key_fullwidth(self):
-        """GIVEN: 全角括弧の bilingual heading WHEN: _extract_bilingual_heading_key
-        THEN: 英語キーが返る"""
-        assert _extract_bilingual_heading_key("成果物（Outcome）") == "Outcome"
-
     def test_plain_english_not_bilingual(self):
         """GIVEN: 英語のみの見出し WHEN: classify_block
         THEN: bilingual_heading ではなく canonical_heading"""
@@ -627,6 +615,34 @@ class TestEnglishProseFails:
         changed = changed_prose_blocks(old, new)
         # prose 変更は changed_prose_blocks の対象
         assert len(changed) >= 1, "英語 prose の変更は delta 対象になる"
+
+    def test_non_canonical_heading_not_excluded_via_classify_block(self):
+        """GIVEN: 非 canonical 英語見出し「## Outcome Risks」
+        WHEN: guard 判定（_is_heading_block / changed_prose_blocks）を通す
+        THEN: prose 除外されない（prose delta に残る）
+
+        regression: classify_block() が BLOCK_KIND_CANONICAL_HEADING を返しても、
+        guard 判定（_is_heading_block）が依拠するのは heading_policy であり
+        classify_block() の戻り値だけで prose 除外してはならないことを確認する。
+        「classify_block(...) == BLOCK_KIND_CANONICAL_HEADING だから prose 除外」は誤動作。
+        """
+        heading = "## Outcome Risks"
+        # classify_block() は構文的に canonical_heading と返す（ATX heading 形式）
+        assert classify_block(heading) == BLOCK_KIND_CANONICAL_HEADING, (
+            "classify_block() は ATX heading 形式を canonical_heading と分類する（構文分類のみ）"
+        )
+        # しかし _is_heading_block()（guard 判定）は heading_policy を参照するため False
+        assert _is_heading_block(heading) is False, (
+            "_is_heading_block() は heading_policy 未登録見出しを False として返す（prose 除外しない）"
+        )
+        # changed_prose_blocks（guard 経路）でも prose delta 対象に残る
+        old = ""
+        new = heading + "\n"
+        changed = changed_prose_blocks(old, new)
+        assert len(changed) >= 1, (
+            "'## Outcome Risks' は non-canonical 見出しなので changed_prose_blocks（guard 経路）"
+            " に残るべき。classify_block() の戻り値に依存した誤除外が発生していない。"
+        )
 
 
 # ===========================================================================

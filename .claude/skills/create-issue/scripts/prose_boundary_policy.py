@@ -80,31 +80,6 @@ def _normalize_heading_text(text: str) -> str:
     return t
 
 
-def _extract_bilingual_heading_key(heading_text: str) -> str | None:
-    """
-    bilingual heading（日英混在）から英語キーを抽出する。
-
-    対応形式:
-      ## 日本語テキスト (EnglishKey)     ← 半角括弧
-      ## 日本語テキスト（EnglishKey）    ← 全角括弧
-
-    Returns:
-        英語キー文字列（括弧内のテキスト）、または None
-    """
-    # 半角括弧
-    m = re.search(r'\(([A-Za-z][A-Za-z0-9 _\-]*)\)\s*$', heading_text)
-    if m:
-        return m.group(1).strip()
-    # 全角括弧
-    m = re.search(r'（([A-Za-z][A-Za-z0-9 _\-]*）\s*$)', heading_text)
-    if m:
-        return m.group(1).rstrip('）').strip()
-    m = re.search(r'（([A-Za-z][A-Za-z0-9 _\-]*)）\s*$', heading_text)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
 # heading_policy inventory
 # key = canonical_en（正規化後の英語見出し名）
 HEADING_POLICY: dict[str, dict] = {
@@ -644,6 +619,18 @@ def _is_url_or_identifier_line(line: str) -> bool:
 def classify_block(block: str) -> str:
     """
     Markdown ブロックの block_kind を返す。
+
+    **注意: この関数は構文分類のみを行う。prose 除外可否（guard 判定）には使わないこと。**
+
+    英語 ATX 見出し（例: ``## Outcome Risks``）は構文上 ``BLOCK_KIND_CANONICAL_HEADING``
+    として分類されるが、これは prose ratio 判定から除外してよいという意味ではない。
+    prose 除外可否（guard 判定）は heading_policy（``lookup_heading_policy`` /
+    ``_is_heading_block``）に登録された見出しのみ行われる。
+
+    **「classify_block(...) == BLOCK_KIND_CANONICAL_HEADING だから prose 除外してよい」
+    という判定は誤り。** prose 除外が必要な consumer は必ず
+    ``validate_japanese_content._is_heading_block()``（または同等の
+    ``lookup_heading_policy()`` 参照）を経由すること。
 
     Args:
         block: 分類対象の Markdown ブロック文字列（前後空白はあってもよい）

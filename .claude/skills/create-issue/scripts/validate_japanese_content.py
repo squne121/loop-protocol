@@ -188,6 +188,10 @@ def _is_heading_block(block: str) -> bool:
     """
     ブロックが heading_policy（SSOT）に登録された canonical / bilingual heading かどうかを判定する。
 
+    **この関数が prose 除外可否（guard 判定）の正本である。**
+    ``classify_block()`` の戻り値（``BLOCK_KIND_CANONICAL_HEADING`` 等）は構文分類のみであり、
+    prose 除外の根拠として使ってはならない。prose 除外が必要な場合は必ずこの関数を経由すること。
+
     heading_policy (#654 B1_B4):
     - classify_block() が canonical_heading / bilingual_heading を返しても、
       heading_policy に存在しない見出し（非 canonical）は False を返す。
