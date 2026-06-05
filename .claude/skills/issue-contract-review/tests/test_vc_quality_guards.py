@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import List, Optional
 
 import pytest
 
@@ -69,8 +70,15 @@ def run_preflight(body_content: str, issue_num: int = 999) -> dict:
         os.unlink(fixture_file)
 
 
-def make_body(vc_block: str) -> str:
-    """Wrap a VC block in a minimal Issue body."""
+def make_body(vc_block: str, allowed_paths: Optional[List[str]] = None) -> str:
+    """Wrap a VC block in a minimal Issue body.
+
+    allowed_paths: list of path strings for ## Allowed Paths section.
+                   Defaults to ["some/path.py"] for backward compatibility.
+    """
+    if allowed_paths is None:
+        allowed_paths = ["some/path.py"]
+    paths_section = "\n".join(f"- {p}" for p in allowed_paths)
     return f"""## Outcome
 Test outcome.
 
@@ -84,7 +92,7 @@ Test outcome.
 ```
 
 ## Allowed Paths
-- some/path.py
+{paths_section}
 
 ## Stop Conditions
 - none
@@ -183,26 +191,32 @@ def test_rg_docs_root_is_broad_when_allowed_paths_are_specific():
 
 
 def test_rg_specific_allowed_file_is_not_broad():
-    """AC2: rg pattern with a specific file path must NOT be broad_search_path_unbounded."""
-    # A specific file path that exists in the repo
+    """AC2: rg pattern with a specific file path covered by Allowed Paths must NOT be broad_search_path_unbounded."""
+    # A specific file path that exists in the repo, AND is in Allowed Paths
     specific_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
-    body = make_body(f"rg some_pattern {specific_path}")
+    body = make_body(
+        f"rg some_pattern {specific_path}",
+        allowed_paths=[specific_path],
+    )
     data = run_preflight(body)
     r = data["results"][0]
     assert r["category"] != "broad_search_path_unbounded", (
-        f"Specific file path must NOT be broad_search_path_unbounded; got {r['category']}"
+        f"Specific file path in Allowed Paths must NOT be broad_search_path_unbounded; got {r['category']}"
     )
 
 
 def test_rg_specific_allowed_dir_nested_is_not_broad():
-    """AC2: rg with a specific nested directory path must NOT be broad_search_path_unbounded."""
-    # A specific subdirectory is narrow enough
+    """AC2: rg with a specific nested directory path covered by Allowed Paths must NOT be broad_search_path_unbounded."""
+    # The nested dir is listed in Allowed Paths → allowed (same path)
     specific_dir = ".claude/skills/issue-contract-review/"
-    body = make_body(f"rg some_pattern {specific_dir}")
+    body = make_body(
+        f"rg some_pattern {specific_dir}",
+        allowed_paths=[specific_dir],
+    )
     data = run_preflight(body)
     r = data["results"][0]
     assert r["category"] != "broad_search_path_unbounded", (
-        f"Specific nested directory must NOT be broad_search_path_unbounded; got {r['category']}"
+        f"Specific nested directory in Allowed Paths must NOT be broad_search_path_unbounded; got {r['category']}"
     )
 
 
@@ -291,8 +305,9 @@ def test_existing_asset_hit_is_unexpected_pass():
     # classify_result is a function that already exists in baseline_vc_preflight.py.
     # Running rg on it returns exit 0 even before any new implementation.
     existing_file = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
-    # Use a pattern that definitely exists in the current codebase
-    body = make_body(f'rg "def classify_result" {existing_file}')
+    # Use a pattern that definitely exists in the current codebase.
+    # Set Allowed Paths to include the file so broad path check doesn't block it first.
+    body = make_body(f'rg "def classify_result" {existing_file}', allowed_paths=[existing_file])
     data = run_preflight(body)
     # This should run (not be statically blocked) and return exit_code=0
     r = data["results"][0]
@@ -308,7 +323,7 @@ def test_existing_asset_hit_is_unexpected_pass():
 def test_unexpected_pass_classification_no_new_schema():
     """AC4: unexpected_pass must use the existing classification schema (no new top-level key)."""
     existing_file = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
-    body = make_body(f'rg "def classify_result" {existing_file}')
+    body = make_body(f'rg "def classify_result" {existing_file}', allowed_paths=[existing_file])
     data = run_preflight(body)
 
     # Verify the top-level schema hasn't changed
@@ -330,6 +345,70 @@ def test_unexpected_pass_classification_no_new_schema():
 
 
 # ---------------------------------------------------------------------------
+# AC2 (PR review fix): Allowed Paths containment-based broad path detection
+# ---------------------------------------------------------------------------
+
+
+def test_rg_docs_dir_with_allowed_paths_docs_is_not_broad():
+    """AC2: rg pattern docs/ with Allowed Paths: docs/ → NOT broad (same path = covered)."""
+    body = make_body("rg some_pattern docs/", allowed_paths=["docs/"])
+    data = run_preflight(body)
+    r = data["results"][0]
+    assert r["category"] != "broad_search_path_unbounded", (
+        f"docs/ with Allowed Paths docs/ must NOT be broad; got category={r['category']}"
+    )
+
+
+def test_rg_docs_dir_with_allowed_paths_specific_file_is_broad():
+    """AC2: rg pattern docs/ with Allowed Paths: docs/foo.md → broad (docs/ is parent of docs/foo.md)."""
+    body = make_body("rg some_pattern docs/", allowed_paths=["docs/foo.md"])
+    data = run_preflight(body)
+    r = data["results"][0]
+    assert r["classification"] == "blocked", (
+        f"docs/ with Allowed Paths docs/foo.md must be blocked; got {r['classification']}"
+    )
+    assert r["category"] == "broad_search_path_unbounded", (
+        f"Expected broad_search_path_unbounded; got {r['category']}"
+    )
+
+
+def test_rg_claude_skills_dir_with_allowed_some_path_is_broad():
+    """AC2: rg pattern .claude/skills/ with Allowed Paths: some/path.py → broad (no containment)."""
+    body = make_body("rg some_pattern .claude/skills/", allowed_paths=["some/path.py"])
+    data = run_preflight(body)
+    r = data["results"][0]
+    assert r["classification"] == "blocked", (
+        f"Expected blocked; got {r['classification']}"
+    )
+    assert r["category"] == "broad_search_path_unbounded", (
+        f"Expected broad_search_path_unbounded; got {r['category']}"
+    )
+
+
+def test_rg_src_dir_with_allowed_paths_src_file_is_broad():
+    """AC2: rg pattern src/ with Allowed Paths: src/foo.ts → broad (src/ is parent of src/foo.ts)."""
+    body = make_body("rg some_pattern src/", allowed_paths=["src/foo.ts"])
+    data = run_preflight(body)
+    r = data["results"][0]
+    assert r["classification"] == "blocked", (
+        f"Expected blocked; got {r['classification']}"
+    )
+    assert r["category"] == "broad_search_path_unbounded", (
+        f"Expected broad_search_path_unbounded; got {r['category']}"
+    )
+
+
+def test_rg_src_file_with_allowed_paths_src_dir_is_not_broad():
+    """AC2: rg pattern src/foo.ts with Allowed Paths: src/ → NOT broad (file is under src/)."""
+    body = make_body("rg some_pattern src/foo.ts", allowed_paths=["src/"])
+    data = run_preflight(body)
+    r = data["results"][0]
+    assert r["category"] != "broad_search_path_unbounded", (
+        f"src/foo.ts with Allowed Paths src/ must NOT be broad; got category={r['category']}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC5: All named tests exist and are collected by pytest
 # (This is verified implicitly by the presence of the test functions above,
 # but we add an explicit meta-test to confirm the required test names exist.)
@@ -337,7 +416,7 @@ def test_unexpected_pass_classification_no_new_schema():
 
 
 def test_all_required_test_names_exist_in_this_module():
-    """AC5: Verify that all 9 required test names from the contract are present in this module."""
+    """AC5: Verify that all required test names from the contract are present in this module."""
     required_names = [
         "test_rg_include_is_rg_option_mismatch_blocked",
         "test_rg_include_zero_is_not_rg_option_mismatch",
@@ -348,9 +427,14 @@ def test_all_required_test_names_exist_in_this_module():
         "test_rg_docs_root_is_broad_when_allowed_paths_are_specific",
         "test_rg_specific_allowed_file_is_not_broad",
         "test_existing_asset_hit_is_unexpected_pass",
+        # PR review fix: containment-based tests
+        "test_rg_docs_dir_with_allowed_paths_docs_is_not_broad",
+        "test_rg_docs_dir_with_allowed_paths_specific_file_is_broad",
+        "test_rg_claude_skills_dir_with_allowed_some_path_is_broad",
+        "test_rg_src_dir_with_allowed_paths_src_file_is_broad",
+        "test_rg_src_file_with_allowed_paths_src_dir_is_not_broad",
     ]
     import inspect
-    import importlib
     current_module = sys.modules[__name__]
     module_functions = {name for name, _ in inspect.getmembers(current_module, inspect.isfunction)}
 
