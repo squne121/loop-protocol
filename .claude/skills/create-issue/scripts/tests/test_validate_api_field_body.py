@@ -132,3 +132,41 @@ def test_unreadable_field_file(tmp_path):
     assert r.source_kind == BODY_SOURCE_FIELD_FILE
     assert r.deny_reason == DENY_UNREADABLE_FILE
     assert r.body_text is None
+
+
+# ============================================================
+# B2: --raw-field / --field long option alias
+# ============================================================
+
+def test_raw_field_long_option_body_literal():
+    """B2: --raw-field body=TEXT -> api_raw_field_body_literal"""
+    r = resolve_body_source("gh api repos/o/r/issues/1 -X PATCH --raw-field 'body=English text'")
+    assert r.source_kind == BODY_SOURCE_RAW_FIELD_LITERAL
+    assert r.body_text == "English text"
+    assert r.deny_reason is None
+
+
+def test_field_long_option_body_literal():
+    """B2: --field body=TEXT -> api_field_body_literal"""
+    r = resolve_body_source("gh api repos/o/r/issues/1 -X PATCH --field 'body=English text'")
+    assert r.source_kind == BODY_SOURCE_FIELD_LITERAL
+    assert r.body_text == "English text"
+    assert r.deny_reason is None
+
+
+def test_field_long_option_file_expand(tmp_path):
+    """B2: --field body=@file -> api_field_body_file (dereferences file like -F)"""
+    f = tmp_path / "body.md"
+    f.write_text("日本語のテキスト")
+    r = resolve_body_source(f"gh api repos/o/r/issues/1 -X PATCH --field body=@{f}")
+    assert r.source_kind == BODY_SOURCE_FIELD_FILE
+    assert r.body_text == "日本語のテキスト"
+    assert r.deny_reason is None
+
+
+def test_raw_field_long_option_no_expand():
+    """B2: --raw-field body=@file -> literal '@file' (no dereference like -f)"""
+    r = resolve_body_source("gh api repos/o/r/issues/1 -X PATCH --raw-field body=@some_file.md")
+    assert r.source_kind == BODY_SOURCE_RAW_FIELD_LITERAL
+    assert r.body_text == "@some_file.md"
+    assert r.deny_reason is None

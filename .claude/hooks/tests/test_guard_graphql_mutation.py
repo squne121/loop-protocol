@@ -92,3 +92,35 @@ def test_graphql_invalid_json_fail_closed(tmp_path):
     payload.write_text("not valid json")
     r = run_hook(bash(f"gh api graphql --input {payload}"), {})
     assert r.returncode == 2, f"Expected fail-closed for invalid JSON graphql, got {r.returncode}\n{r.stderr}"
+
+
+# ============================================================
+# B1: -f / --raw-field / -F / --field の inline query 形式
+# ============================================================
+
+def test_graphql_conservative_deny_inline_f():
+    """B1: gh api graphql -f query='mutation {...}' -> deny_graphql_mutation_unsupported"""
+    r = run_hook(bash("gh api graphql -f query='mutation UpdateIssue($id: ID!) { updateIssue(input: {id: $id}) { issue { id } } }'"), {})
+    assert r.returncode == 2, f"Expected deny, got {r.returncode}\n{r.stderr}"
+    assert "deny_graphql_mutation_unsupported" in r.stderr, f"Expected reason code\n{r.stderr}"
+
+
+def test_graphql_conservative_deny_inline_raw_field():
+    """B1: gh api graphql --raw-field query='mutation {...}' -> deny_graphql_mutation_unsupported"""
+    r = run_hook(bash("gh api graphql --raw-field query='mutation AddLabel($id: ID!) { addLabelsToLabelable(input: {labelableId: $id, labelIds: []}) { labelable { id } } }'"), {})
+    assert r.returncode == 2, f"Expected deny, got {r.returncode}\n{r.stderr}"
+    assert "deny_graphql_mutation_unsupported" in r.stderr, f"Expected reason code\n{r.stderr}"
+
+
+def test_graphql_all_deny_inline_F():
+    """B1: gh api graphql -F query='mutation {...}' -> deny_graphql_mutation_unsupported"""
+    r = run_hook(bash("gh api graphql -F query='mutation CreateComment($id: ID!) { addComment(input: {subjectId: $id, body: \"test\"}) { commentEdge { node { id } } } }'"), {})
+    assert r.returncode == 2, f"Expected deny, got {r.returncode}\n{r.stderr}"
+    assert "deny_graphql_mutation_unsupported" in r.stderr
+
+
+def test_graphql_all_deny_inline_field():
+    """B1: gh api graphql --field query='mutation {...}' -> deny_graphql_mutation_unsupported"""
+    r = run_hook(bash("gh api graphql --field query='mutation RemoveLabel($id: ID!) { removeLabelsFromLabelable(input: {labelableId: $id, labelIds: []}) { labelable { id } } }'"), {})
+    assert r.returncode == 2, f"Expected deny, got {r.returncode}\n{r.stderr}"
+    assert "deny_graphql_mutation_unsupported" in r.stderr

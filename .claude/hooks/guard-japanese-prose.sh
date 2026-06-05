@@ -411,7 +411,10 @@ if [ "$TOOL_NAME" = "Bash" ]; then
     # gh api graphql の検査 (#655 AC4/AC14: Phase 1 conservative deny)
     # mutation_route_matrix.py の graphql_mutation_phase1 route:
     #   validation=conservative_deny, action=deny, reason=deny_graphql_mutation_unsupported
-    if [ -z "$BODY_FILE_EXTRACT" ] && echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
+    # graphql コマンドは -F/-f query=... のインライン形式も使用するため、
+    # --parse-body-file が -F query=... を誤って body file として解析する場合があっても
+    # graphql 判定を優先する（BODY_FILE_EXTRACT 条件を graphql では除外）。
+    if echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
         GRAPHQL_RESULT="$(uv run python3 "$MATRIX" classify-graphql "$COMMAND" 2>/dev/null || echo "deny_invalid_json")"
 
         if [ "$GRAPHQL_RESULT" = "deny_graphql_mutation_unsupported" ]; then
@@ -666,17 +669,11 @@ fi
 # ============================================================
 
 if echo "$TOOL_NAME" | grep -qE '^(Write|Edit|MultiEdit)$'; then
-    # file_path を取得（Write: file_path, Edit: file_path, MultiEdit: edits[0].file_path 等）
-    FILE_PATH="$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.edits[0].file_path // ""' 2>/dev/null || echo "")"
-
-    if [ -z "$FILE_PATH" ]; then
-        exit 0
-    fi
-
-    # #655 AC2: tmp 下書きファイルは公開 mutation でないため block しない
-    # is_tmp_draft_path() は mutation_route_matrix.py (SSOT) で定義されており、
-    # tmp_draft_write_edit route の public_side_effect=false を根拠に pass する。
-    # Mode B は Write/Edit/MultiEdit に対して guard を適用しない。
+    # #655 AC2 / AC15: Write/Edit/MultiEdit は全て tmp_draft_write_edit route として扱う。
+    # mutation_route_matrix.py の tmp_draft_write_edit route: public_side_effect=false, action=pass。
+    # ファイルシステムへの書き込みは GitHub への公開送信ではないため guard 対象外。
+    # is_tmp_draft_path() は path-based のヒューリスティックだが、Write/Edit/MultiEdit 全体が
+    # public_side_effect=false であるためパス判定不要（AC15 SSOT 整合）。
     exit 0
 fi
 

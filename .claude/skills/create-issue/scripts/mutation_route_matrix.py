@@ -326,20 +326,39 @@ def _extract_input_flag(tokens: list[str]) -> str | None:
 
 def _extract_field_body(tokens: list[str], capitalize: bool) -> tuple[str, bool] | None:
     """
-    -F body=<value> (capitalize=True) または -f body=<value> (capitalize=False) を抽出する。
+    -F body=<value> / --field body=<value> (capitalize=True) または
+    -f body=<value> / --raw-field body=<value> (capitalize=False) を抽出する。
 
+    GitHub CLI では -F = --field、-f = --raw-field。
     Returns (value, is_file_ref) または None。
     is_file_ref は capitalize=True かつ value が '@' で始まる場合 True。
     """
-    flag = "-F" if capitalize else "-f"
+    short_flag = "-F" if capitalize else "-f"
+    long_flag = "--field" if capitalize else "--raw-field"
     for i, tok in enumerate(tokens):
-        if tok == flag and i + 1 < len(tokens):
+        # short flag: -F body=<value> or -f body=<value>
+        if tok == short_flag and i + 1 < len(tokens):
             next_tok = tokens[i + 1]
             if next_tok.startswith("body="):
                 raw_value = next_tok[5:]
                 if capitalize and raw_value.startswith("@"):
                     return raw_value[1:], True
                 return raw_value, False
+        # long flag: --field body=<value> or --raw-field body=<value>
+        if tok == long_flag and i + 1 < len(tokens):
+            next_tok = tokens[i + 1]
+            if next_tok.startswith("body="):
+                raw_value = next_tok[5:]
+                if capitalize and raw_value.startswith("@"):
+                    return raw_value[1:], True
+                return raw_value, False
+        # inline long flag: --field=body=<value> or --raw-field=body=<value>
+        prefix = long_flag + "=body="
+        if tok.startswith(prefix):
+            raw_value = tok[len(prefix):]
+            if capitalize and raw_value.startswith("@"):
+                return raw_value[1:], True
+            return raw_value, False
     return None
 
 
@@ -435,14 +454,51 @@ def _resolve_field_file_source(file_path: str) -> BodySourceResult:
 # GraphQL Classification
 # ============================================================
 
+def _extract_graphql_query_from_tokens(tokens: list[str]) -> str | None:
+    """
+    gh api graphql コマンドのトークンリストから query 文字列を抽出する。
+
+    GitHub CLI では以下の形式が使用される:
+    - -f query='...'          (-f = --raw-field)
+    - --raw-field query='...'
+    - -F query='...'          (-F = --field)
+    - --field query='...'
+
+    Returns: query 文字列または None（見つからない場合）
+    """
+    # -f/-F と long form --raw-field/--field の両方を検索する
+    flag_pairs = [("-f", "--raw-field"), ("-F", "--field")]
+    for short_flag, long_flag in flag_pairs:
+        for i, tok in enumerate(tokens):
+            # short flag: -f query=... / -F query=...
+            if tok == short_flag and i + 1 < len(tokens):
+                next_tok = tokens[i + 1]
+                if next_tok.startswith("query="):
+                    return next_tok[6:]
+            # long flag: --raw-field query=... / --field query=...
+            if tok == long_flag and i + 1 < len(tokens):
+                next_tok = tokens[i + 1]
+                if next_tok.startswith("query="):
+                    return next_tok[6:]
+            # inline long flag: --raw-field=query=... / --field=query=...
+            for prefix in (long_flag + "=query=",):
+                if tok.startswith(prefix):
+                    return tok[len(prefix):]
+    return None
+
+
 def classify_graphql_command(command: str) -> str:
     """
     gh api graphql コマンドを Phase 1 conservative deny で分類する。
 
+    query の取得元（優先順位）:
+    1. --input <file> の JSON payload の "query" フィールド
+    2. -f query=... / --raw-field query=... / -F query=... / --field query=... のインライン指定
+
     Returns:
         DENY_GRAPHQL:           mutation キーワードを含む
         'graphql_not_mutation': query / subscription
-        'graphql_no_input':    --input なし
+        'graphql_no_input':    --input なし かつ インライン query もなし
         DENY_STDIN_BODY:        --input -
         DENY_INVALID_JSON:      JSON parse 失敗
     """
@@ -452,28 +508,116 @@ def classify_graphql_command(command: str) -> str:
         return DENY_INVALID_JSON
 
     input_file = _extract_input_flag(tokens)
-    if input_file is None:
-        return "graphql_no_input"
     if input_file == "-":
         return DENY_STDIN_BODY
 
-    try:
-        with open(input_file, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (FileNotFoundError, IOError, json.JSONDecodeError):
-        return DENY_INVALID_JSON
+    if input_file is not None:
+        # --input <file> から query を取得する
+        try:
+            with open(input_file, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (FileNotFoundError, IOError, json.JSONDecodeError):
+            return DENY_INVALID_JSON
 
-    if not isinstance(payload, dict):
-        return DENY_INVALID_JSON
+        if not isinstance(payload, dict):
+            return DENY_INVALID_JSON
 
-    query = payload.get("query", "")
-    if not isinstance(query, str):
-        return DENY_INVALID_JSON
+        query = payload.get("query", "")
+        if not isinstance(query, str):
+            return DENY_INVALID_JSON
 
-    if "mutation" in query.lower():
+        if "mutation" in query.lower():
+            return DENY_GRAPHQL
+
+        return "graphql_not_mutation"
+
+    # --input なし: -f/-F / --raw-field/--field query= のインライン形式を確認する
+    inline_query = _extract_graphql_query_from_tokens(tokens)
+    if inline_query is None:
+        return "graphql_no_input"
+
+    if "mutation" in inline_query.lower():
         return DENY_GRAPHQL
 
     return "graphql_not_mutation"
+
+
+# ============================================================
+# API Mutation Classification（SSOT）
+# ============================================================
+
+def classify_api_mutation(payload_file: str, endpoint: str, method: str = "") -> str:
+    """
+    gh api --input <file> の payload を解析して body mutation かどうかを分類する。
+
+    SSOT: guard-japanese-prose.sh の --classify-api-mutation 呼び出しは
+    validate_japanese_content.py を経由せず、このモジュールを直接参照する。
+
+    Returns:
+        'BODY_MUTATION_ISSUE:<n>'                          Issue body mutation
+        'BODY_MUTATION_PR:<n>'                             PR body mutation
+        'BODY_MUTATION_ISSUE_COMMENT:<owner>:<repo>:<id>' Issue comment mutation
+        'BODY_MUTATION_PR_REVIEW_COMMENT:<owner>:<repo>:<id>' PR review comment mutation
+        'NOT_BODY_MUTATION'                                body key なし / method が GET/DELETE
+        'INVALID_BODY_TYPE'                                body の型が非 str
+        'PAYLOAD_PARSE_FAILED'                             JSON parse 失敗
+    """
+    try:
+        with open(payload_file, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (FileNotFoundError, IOError, json.JSONDecodeError):
+        return "PAYLOAD_PARSE_FAILED"
+
+    if not isinstance(payload, dict) or "body" not in payload:
+        return "NOT_BODY_MUTATION"
+
+    body_value = payload.get("body")
+    if not isinstance(body_value, str):
+        return "INVALID_BODY_TYPE"
+
+    method_upper = method.strip().upper() if method else ""
+    if method_upper in {"GET", "DELETE"}:
+        return "NOT_BODY_MUTATION"
+
+    ep = endpoint.lstrip("/")
+
+    issue_m = re.match(
+        r"^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)$", ep
+    )
+    pr_m = re.match(
+        r"^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/(?P<number>\d+)$", ep
+    )
+    issue_comment_m = re.match(
+        r"^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/comments/(?P<comment_id>\d+)$", ep
+    )
+    pr_review_comment_m = re.match(
+        r"^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/comments/(?P<comment_id>\d+)$", ep
+    )
+
+    if issue_m:
+        return f"BODY_MUTATION_ISSUE:{issue_m.group('number')}"
+    if pr_m:
+        return f"BODY_MUTATION_PR:{pr_m.group('number')}"
+    if issue_comment_m:
+        if method_upper and method_upper != "PATCH":
+            return "NOT_BODY_MUTATION"
+        return (
+            "BODY_MUTATION_ISSUE_COMMENT:"
+            f"{issue_comment_m.group('owner')}:"
+            f"{issue_comment_m.group('repo')}:"
+            f"{issue_comment_m.group('comment_id')}"
+        )
+    if pr_review_comment_m:
+        if method_upper and method_upper != "PATCH":
+            return "NOT_BODY_MUTATION"
+        return (
+            "BODY_MUTATION_PR_REVIEW_COMMENT:"
+            f"{pr_review_comment_m.group('owner')}:"
+            f"{pr_review_comment_m.group('repo')}:"
+            f"{pr_review_comment_m.group('comment_id')}"
+        )
+
+    return "NOT_BODY_MUTATION"
 
 
 # ============================================================
@@ -525,6 +669,11 @@ def main() -> None:
     gp = sub.add_parser("classify-graphql")
     gp.add_argument("command")
 
+    ap = sub.add_parser("classify-api-mutation")
+    ap.add_argument("payload_file")
+    ap.add_argument("--api-endpoint", default="")
+    ap.add_argument("--api-method", default="")
+
     args = parser.parse_args()
 
     if args.cmd == "classify-rest":
@@ -542,6 +691,9 @@ def main() -> None:
 
     elif args.cmd == "classify-graphql":
         print(classify_graphql_command(args.command))
+
+    elif args.cmd == "classify-api-mutation":
+        print(classify_api_mutation(args.payload_file, args.api_endpoint, args.api_method))
 
     else:
         parser.print_help()
