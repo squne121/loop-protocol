@@ -623,6 +623,108 @@ class TestSchemaValidity:
         errors = list(sub_validator.iter_errors(valid_payload))
         assert len(errors) == 0, f"Valid FailClosedRewriteConstraintsV1 should pass: {errors}"
 
+    def test_override_policy_rejects_unknown_issue_kind_as_allowed_reason(self):
+        """
+        AC9 / blocker_1+blocker_2: allowed_reason_codes に non-overridable code を入れると
+        schema が reject すること。enum 境界による override escalation 防止の検証。
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": ["unknown_issue_kind"],  # non-overridable code — must fail
+                "never_override_reason_codes": ["unknown_issue_kind"],
+                "overridable_in_current_result": [],
+                "non_overridable_in_current_result": ["unknown_issue_kind"],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, (
+            "allowed_reason_codes に non-overridable code 'unknown_issue_kind' を入れると "
+            "schema が reject すべき（enum 境界違反）"
+        )
+
+    def test_overridable_in_current_result_rejects_checker_internal_error(self):
+        """
+        AC9 / blocker_1+blocker_2: overridable_in_current_result に non-overridable code を
+        入れると schema が reject すること。
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": [],
+                "never_override_reason_codes": ["checker_internal_error"],
+                "overridable_in_current_result": ["checker_internal_error"],  # must fail
+                "non_overridable_in_current_result": ["checker_internal_error"],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, (
+            "overridable_in_current_result に non-overridable code 'checker_internal_error' を入れると "
+            "schema が reject すべき（enum 境界違反）"
+        )
+
+    def test_never_override_reason_codes_rejects_missing_required_section(self):
+        """
+        AC9 / blocker_1+blocker_2: never_override_reason_codes に overridable code を
+        入れると schema が reject すること。
+        """
+        schema = load_schema()
+        rewrite_constraints_schema = schema["definitions"]["FailClosedRewriteConstraintsV1"]
+        sub_validator = jsonschema.Draft202012Validator(rewrite_constraints_schema)
+
+        invalid_payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": [],
+            "required_contract_keys": [],
+            "rewrite_constraints": {
+                "must_add_sections": [],
+                "must_add_contract_keys": [],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": ["missing_required_section"],
+                "never_override_reason_codes": ["missing_required_section"],  # must fail
+                "overridable_in_current_result": ["missing_required_section"],
+                "non_overridable_in_current_result": [],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+
+        errors = list(sub_validator.iter_errors(invalid_payload))
+        assert len(errors) > 0, (
+            "never_override_reason_codes に overridable code 'missing_required_section' を入れると "
+            "schema が reject すべき（enum 境界違反）"
+        )
+
 
 class TestSkillMdWiring:
     """
