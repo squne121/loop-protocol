@@ -376,28 +376,17 @@ class TestMachineContractVcCommandCodeFenceEdge:
         result = _classify_block(block)
         assert result in ("shell_command",)
 
-    @pytest.mark.xfail(
-        reason=(
-            "現行 split_markdown_blocks() の non-greedy regex は 4-backtick fence 内の"
-            " 3-backtick を誤って closing fence として拾い 2 つの code_fence ブロックを生成する。"
-            "GFM 準拠の正しい挙動（単一 code_fence）は #659 で修正される。"
-            "xfail は #659 を実装せずにこのテストが pass してしまう誤実装を検出するための sentinel。"
-        ),
-        strict=True,
-    )
     def test_code_fence_nested_backtick_exact(self):
         """GIVEN: 4個 fence 内に 3個 fence（nested backtick）WHEN: split_markdown_blocks
-        THEN: 全体が単一の code_fence ブロックとして抽出される（B3 exact assertion; #659 で修正）
+        THEN: 全体が単一の code_fence ブロックとして抽出される（B3 exact assertion）
 
         GFM 仕様: opening が 4 backtick のとき内側の 3 backtick 行は closing として無効。
-        現行実装の non-greedy regex はこれを考慮せず 2 つの code_fence に分割する。
-        全面的な GFM fence state machine への置換は #659 のスコープ（衝突回避）。
-        このテストは #659 実装後に xfail が解消されることを確認するための regression sentinel。
+        #659 で iter_markdown_blocks() GFM 準拠セグメンテーションに委譲されたため
+        このテストは通常の passing test（exact assertion）として成立する。
         """
         text = "````markdown\n```python\nprint('hello')\n```\n````\n"
         blocks = split_markdown_blocks(text)
         # 4個 fence ブロックは code_fence として単一ブロックになるべき
-        # （現行実装は 2 つに分割してしまうため xfail）
         fence_blocks = [b for b in blocks if b["type"] == "code_fence"]
         assert len(fence_blocks) == 1, (
             f"4-backtick fence 内の 3-backtick は単一 code_fence になるべき。"
@@ -416,20 +405,27 @@ class TestMachineContractVcCommandCodeFenceEdge:
 
     def test_code_fence_unclosed_consumes_to_eof(self):
         """GIVEN: 閉じていない fence（未閉じ fence）WHEN: split_markdown_blocks
-        THEN: EOF まで code_fence / 全体が 1 ブロックとして consume される（B3 exact assertion）
+        THEN: EOF まで単一 code_fence として消費され、fence 直後内容が prose に漏れない（B3 exact assertion）
 
         GFM 仕様: unclosed fence は文書末尾まで code block 扱い。
-        現行 split_markdown_blocks() は regex で ``` ... ``` をマッチするため、
-        unclosed fence は code_fence として抽出されず prose block になる可能性があるが、
-        少なくともエラーなく処理され、結果が list であることを保証する。
-        全面的な GFM state machine への置換は #659 スコープ（Stop Condition 連動）。
+        #659 で iter_markdown_blocks() GFM 準拠セグメンテーションに委譲されたため
+        unclosed fence は EOF まで単一 code_fence ブロックとして扱われることを確認する。
         """
         text = "```python\nprint('hello')\n\nsome other content\n"
-        # エラーなく処理されること
         blocks = split_markdown_blocks(text)
         assert isinstance(blocks, list), "split_markdown_blocks は list を返すべき"
-        # unclosed fence は block が存在する（空ではない）
-        assert len(blocks) >= 1, "unclosed fence の文書は少なくとも 1 block を持つ"
+        # GFM: unclosed fence は EOF まで単一 code_fence として扱われる
+        assert len(blocks) == 1, (
+            f"unclosed fence は EOF まで単一 code_fence になるべき。got {len(blocks)} blocks"
+        )
+        assert blocks[0]["type"] == "code_fence", (
+            f"unclosed fence ブロックは code_fence 型になるべき。got type={blocks[0]['type']!r}"
+        )
+        # fence 直後の内容が prose として漏れないこと
+        prose_blocks = [b for b in blocks if b["type"] == "prose"]
+        assert len(prose_blocks) == 0, (
+            "未閉じ fence の内容が prose に漏れてはならない（GFM: EOF まで code_fence）"
+        )
 
     def test_code_fence_immediate_prose_is_separate_block(self):
         """GIVEN: code fence 直後に空行なし prose WHEN: split_markdown_blocks
