@@ -30,6 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VALIDATOR="${PROJECT_DIR}/.claude/skills/create-issue/scripts/validate_japanese_content.py"
+MATRIX="${PROJECT_DIR}/.claude/skills/create-issue/scripts/mutation_route_matrix.py"
 
 # stdin から JSON を読む
 INPUT="$(cat)"
@@ -39,6 +40,11 @@ TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null || echo "")"
 
 # validator が存在しない場合は通す（bootstrap時の安全弁）
 if [ ! -f "$VALIDATOR" ]; then
+    exit 0
+fi
+
+# mutation_route_matrix.py が存在しない場合は通す（bootstrap時の安全弁）
+if [ ! -f "$MATRIX" ]; then
     exit 0
 fi
 
@@ -276,64 +282,171 @@ if [ "$TOOL_NAME" = "Bash" ]; then
         fi
     fi
 
-    # gh api graphql --input の検査 (B1: GraphQL body mutation deny)
-    # SCOPE 外 note (B4): comment/review body mutation via GraphQL は scope 外
-    if [ -z "$BODY_FILE_EXTRACT" ] && echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
-        GRAPHQL_INPUT_RESULT="$(uv run python3 "$VALIDATOR" --parse-api-input "$COMMAND" 2>/dev/null || echo "API_INPUT_ERROR")"
+    # (#655 AC3/AC8/AC9/AC10/AC11) gh api -f/-F body= フィールドの検査
+    # mutation_route_matrix.py の resolve_body_source() に委譲して body source を解決する。
+    # --input が指定されている場合は --input 側が body source になり、-f/-F は query param 扱い（AC8）。
+    # -F body=@<file>: ファイル内容を読んで検査（AC9）
+    # -f body=@file: literal "@file"（@ dereference なし）として検査（AC9）
+    # -F body=@-: stdin fail-closed (AC10)
+    # gh api コマンドでは -F は field フラグ。BODY_FILE_EXTRACT は gh api には適用しない。
+    IS_GH_API_CMD=false
+    if echo "$COMMAND" | grep -qE 'gh[[:space:]].*api' && ! echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
+        IS_GH_API_CMD=true
+    fi
+    if [ "$IS_GH_API_CMD" = "true" ]; then
+        FIELD_BODY_RESULT="$(uv run python3 "$MATRIX" resolve-body-source "$COMMAND" 2>/dev/null || echo '{"deny_reason":"deny_invalid_json"}')"
 
-        if [ "$GRAPHQL_INPUT_RESULT" = "API_INPUT_STDIN" ]; then
-            echo "GUARD: gh api graphql --input - (stdin) は検証不可のため fail-closed でブロックします" >&2
-            echo "  target: unknown" >&2
+        FIELD_DENY_REASON="$(echo "$FIELD_BODY_RESULT" | uv run python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('deny_reason') or '')" 2>/dev/null || echo "")"
+        FIELD_SOURCE_KIND="$(echo "$FIELD_BODY_RESULT" | uv run python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('source_kind') or '')" 2>/dev/null || echo "")"
+        FIELD_BODY_TEXT="$(echo "$FIELD_BODY_RESULT" | uv run python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('body_text') or '')" 2>/dev/null || echo "")"
+
+        # body source が解決できた場合（-f/-F body= 系）
+        # source_kind が field body 系（-f/-F body=）のときのみ処理する
+        # --input 系は既存の gh api --input 検査ブロックで処理する
+        if echo "$FIELD_SOURCE_KIND" | grep -qE '^api_(raw_field_body_literal|field_body_literal|field_body_file|field_body_stdin)$'; then
+            # fail-closed 系 reason codes
+            if [ -n "$FIELD_DENY_REASON" ]; then
+                case "$FIELD_DENY_REASON" in
+                    deny_stdin_body_uninspectable)
+                        echo "GUARD: stdin body は検証不可のため fail-closed でブロックします (${FIELD_DENY_REASON})" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    deny_unreadable_body_file)
+                        echo "GUARD: body ファイルを読み取れません (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    deny_null_body_public_mutation)
+                        echo "GUARD: body が null です (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    deny_empty_body_public_mutation)
+                        echo "GUARD: body が空です (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    deny_missing_body_for_public_body_route)
+                        echo "GUARD: body キーが欠落しています (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    deny_invalid_json)
+                        echo "GUARD: JSON 解析失敗 (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  source_kind: ${FIELD_SOURCE_KIND}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                    *)
+                        # unknown deny reason: fail-closed
+                        echo "GUARD: 不明な deny reason (${FIELD_DENY_REASON}, fail-closed)" >&2
+                        echo "  reason: ${FIELD_DENY_REASON}" >&2
+                        echo "  changed_prose_blocks: unknown" >&2
+                        echo "  failed_blocks: unknown" >&2
+                        echo "  ratio_min: 0.000" >&2
+                        exit 2
+                        ;;
+                esac
+            fi
+
+            # body_text が取れた場合のみ検証
+            # source_kind が api_raw_field_body_literal / api_field_body_literal / api_field_body_file の場合に body_text がある
+            if [ -n "$FIELD_BODY_TEXT" ]; then
+                # REST endpoint を確認して public body route かどうかを判定
+                FIELD_ENDPOINT="$(uv run python3 "$VALIDATOR" --extract-api-command-endpoint "$COMMAND" 2>/dev/null || echo "ENDPOINT_PARSE_FAILED")"
+                FIELD_METHOD="$(uv run python3 "$VALIDATOR" --extract-api-command-method "$COMMAND" 2>/dev/null || echo "GET")"
+
+                # GET / DELETE は non-mutation として pass
+                if [ "$FIELD_METHOD" = "GET" ] || [ "$FIELD_METHOD" = "DELETE" ]; then
+                    exit 0
+                fi
+
+                # route matrix で endpoint を分類（公開 body route かどうか）
+                ROUTE_CLASS="$(uv run python3 "$MATRIX" classify-rest "$FIELD_ENDPOINT" --method "$FIELD_METHOD" 2>/dev/null || echo "no_match")"
+
+                if [ "$ROUTE_CLASS" = "no_match" ]; then
+                    # 認識できない endpoint: body がある → full body 検査
+                    if validate_body "$FIELD_BODY_TEXT" "field-body: ${FIELD_SOURCE_KIND}"; then
+                        exit 0
+                    else
+                        exit 2
+                    fi
+                fi
+
+                # 公開 body route: full body 検査
+                if validate_body "$FIELD_BODY_TEXT" "field-body: ${ROUTE_CLASS}"; then
+                    exit 0
+                else
+                    exit 2
+                fi
+            fi
+        fi
+        # source_kind が empty の場合（-f/-F body= なし）: 通常の body / --input 検査へ
+    fi
+
+    # gh api graphql の検査 (#655 AC4/AC14: Phase 1 conservative deny)
+    # mutation_route_matrix.py の graphql_mutation_phase1 route:
+    #   validation=conservative_deny, action=deny, reason=deny_graphql_mutation_unsupported
+    if [ -z "$BODY_FILE_EXTRACT" ] && echo "$COMMAND" | grep -qE 'gh.*api.*graphql'; then
+        GRAPHQL_RESULT="$(uv run python3 "$MATRIX" classify-graphql "$COMMAND" 2>/dev/null || echo "deny_invalid_json")"
+
+        if [ "$GRAPHQL_RESULT" = "deny_graphql_mutation_unsupported" ]; then
+            echo "GUARD: gh api graphql mutation は Phase 1 conservative deny します (deny_graphql_mutation_unsupported)" >&2
+            echo "  target: graphql" >&2
+            echo "  reason: deny_graphql_mutation_unsupported" >&2
+            echo "  api_graphql_mutation_denied api_graphql_body_mutation_blocked (legacy compat)" >&2
             echo "  changed_prose_blocks: unknown" >&2
             echo "  failed_blocks: unknown" >&2
             echo "  ratio_min: 0.000" >&2
             exit 2
         fi
 
-        if echo "$GRAPHQL_INPUT_RESULT" | grep -q "^API_INPUT_FILE:"; then
-            GRAPHQL_INPUT_FILE="${GRAPHQL_INPUT_RESULT#API_INPUT_FILE:}"
-            if [ ! -f "$GRAPHQL_INPUT_FILE" ]; then
-                echo "GUARD: gh api graphql --input file not found: ${GRAPHQL_INPUT_FILE} (fail-closed)" >&2
-                echo "  api_graphql_body_mutation_blocked" >&2
-                echo "  changed_prose_blocks: unknown" >&2
-                echo "  failed_blocks: unknown" >&2
-                echo "  ratio_min: 0.000" >&2
-                exit 2
-            fi
-
-            GRAPHQL_CLASS="$(uv run python3 "$VALIDATOR" --classify-graphql-mutation "$GRAPHQL_INPUT_FILE" 2>/dev/null || echo "GRAPHQL_PARSE_FAILED")"
-
-            if [ "$GRAPHQL_CLASS" = "GRAPHQL_BODY_MUTATION_BLOCKED" ]; then
-                echo "GUARD: gh api graphql body mutation はブロックします (api_graphql_body_mutation_blocked)" >&2
-                echo "  target: graphql" >&2
-                echo "  changed_prose_blocks: unknown" >&2
-                echo "  failed_blocks: unknown" >&2
-                echo "  ratio_min: 0.000" >&2
-                exit 2
-            fi
-
-            if [ "$GRAPHQL_CLASS" = "GRAPHQL_MUTATION_DENIED" ]; then
-                echo "GUARD: gh api graphql mutation は conservative deny します (api_graphql_mutation_denied)" >&2
-                echo "  target: graphql" >&2
-                echo "  changed_prose_blocks: unknown" >&2
-                echo "  failed_blocks: unknown" >&2
-                echo "  ratio_min: 0.000" >&2
-                exit 2
-            fi
-
-            if [ "$GRAPHQL_CLASS" = "GRAPHQL_PARSE_FAILED" ]; then
-                echo "GUARD: gh api graphql payload 解析失敗 (fail-closed)" >&2
-                echo "  api_graphql_body_mutation_blocked" >&2
-                echo "  changed_prose_blocks: unknown" >&2
-                echo "  failed_blocks: unknown" >&2
-                echo "  ratio_min: 0.000" >&2
-                exit 2
-            fi
-
-            # GRAPHQL_NOT_MUTATION: query が mutation でない場合は pass
-            exit 0
+        if [ "$GRAPHQL_RESULT" = "deny_stdin_body_uninspectable" ]; then
+            echo "GUARD: gh api graphql --input - (stdin) は検証不可のため fail-closed でブロックします (deny_stdin_body_uninspectable)" >&2
+            echo "  target: graphql" >&2
+            echo "  reason: deny_stdin_body_uninspectable" >&2
+            echo "  changed_prose_blocks: unknown" >&2
+            echo "  failed_blocks: unknown" >&2
+            echo "  ratio_min: 0.000" >&2
+            exit 2
         fi
-        # API_INPUT_NONE: --input なし graphql → 通常 body 検査へ
+
+        if [ "$GRAPHQL_RESULT" = "deny_invalid_json" ]; then
+            echo "GUARD: gh api graphql payload 解析失敗 (deny_invalid_json, fail-closed)" >&2
+            echo "  target: graphql" >&2
+            echo "  reason: deny_invalid_json" >&2
+            echo "  changed_prose_blocks: unknown" >&2
+            echo "  failed_blocks: unknown" >&2
+            echo "  ratio_min: 0.000" >&2
+            exit 2
+        fi
+
+        # graphql_not_mutation または graphql_no_input: 通常の body 検査へ
+        exit 0
     fi
 
     # gh api --input の検査 (AC4, AC10, AC17, AC18, AC19, AC20)
@@ -549,6 +662,7 @@ fi
 
 # ============================================================
 # Mode B: Write/Edit/MultiEdit ツールの tmp/ 下書きファイルガード
+# (#655: tmp 下書きは public_side_effect=false → block せずに pass する)
 # ============================================================
 
 if echo "$TOOL_NAME" | grep -qE '^(Write|Edit|MultiEdit)$'; then
@@ -559,109 +673,13 @@ if echo "$TOOL_NAME" | grep -qE '^(Write|Edit|MultiEdit)$'; then
         exit 0
     fi
 
-    # tmp/ 下書き候補パターンに一致するか確認
-    # 対象: tmp/**/*.md, /tmp/*issue*body*.md, /tmp/*pr*body*.md, /tmp/*comment*.md, *_draft.md
-    IS_DRAFT=false
-
-    case "$FILE_PATH" in
-        tmp/*.md|tmp/**/*.md)
-            IS_DRAFT=true
-            ;;
-        /tmp/*.md)
-            # /tmp/ 配下の Issue/PR/comment 下書き候補
-            if echo "$FILE_PATH" | grep -qiE '(issue.*body|pr.*body|comment|draft)'; then
-                IS_DRAFT=true
-            fi
-            ;;
-        *_draft.md)
-            IS_DRAFT=true
-            ;;
-    esac
-
-    if [ "$IS_DRAFT" = "false" ]; then
-        exit 0
-    fi
-
-    # 誤検知回避: log / json / fixture / test_ ファイルはスキップ
-    # AC9: tmp/ 配下のログ、JSON、test fixture、code block 主体ファイルは誤検知しない
-    if echo "$FILE_PATH" | grep -qiE '\.(log|json)$|fixture|test_'; then
-        exit 0
-    fi
-
-    # Write ツールの場合は content から検証
-    if [ "$TOOL_NAME" = "Write" ]; then
-        CONTENT="$(echo "$INPUT" | jq -r '.tool_input.content // ""' 2>/dev/null || echo "")"
-
-        if [ -z "$CONTENT" ]; then
-            exit 0
-        fi
-
-        # content の大部分がコードブロックならスキップ（code block 主体ファイル）
-        # コードブロック行数が全行数の 50% 超なら code block 主体とみなす
-        CODE_LINES=$(echo "$CONTENT" | grep -c '^\s*```' 2>/dev/null || echo 0)
-        TOTAL_LINES=$(echo "$CONTENT" | wc -l 2>/dev/null || echo 1)
-        if [ "$TOTAL_LINES" -gt 0 ] && [ "$((CODE_LINES * 2))" -gt "$TOTAL_LINES" ]; then
-            exit 0
-        fi
-
-        if validate_body "$CONTENT" "Write: ${FILE_PATH}"; then
-            : # pass
-        else
-            exit 2
-        fi
-    fi
-
-    # Edit の場合は new_string を検査。old_string が見つからない場合は fail-closed (AC12)
-    if [ "$TOOL_NAME" = "Edit" ]; then
-        NEW_STRING="$(echo "$INPUT" | jq -r '.tool_input.new_string // ""' 2>/dev/null || echo "")"
-        OLD_STRING="$(echo "$INPUT" | jq -r '.tool_input.old_string // ""' 2>/dev/null || echo "")"
-
-        # old_string が指定されてファイルが存在するが old_string が見つからない → fail-closed
-        if [ -n "$OLD_STRING" ] && [ -f "$FILE_PATH" ]; then
-            OLD_CHECK=$(OLD_STRING_ENV="$OLD_STRING" FILE_PATH_ENV="$FILE_PATH" uv run python3 -c "
-import os
-old = os.environ.get('OLD_STRING_ENV', '')
-fp = os.environ.get('FILE_PATH_ENV', '')
-try:
-    with open(fp, 'r', encoding='utf-8') as f:
-        content = f.read()
-    print('found' if old in content else 'notfound')
-except Exception:
-    print('notfound')
-" 2>/dev/null || echo "notfound")
-            if [ "$OLD_CHECK" = "notfound" ]; then
-                echo "GUARD: old_string がファイルに見つかりません (fail-closed) [Edit: ${FILE_PATH}]" >&2
-                exit 2
-            fi
-        fi
-
-        # new_string を検証
-        if [ -n "$NEW_STRING" ]; then
-            if validate_body "$NEW_STRING" "Edit new_string: ${FILE_PATH}"; then
-                : # pass
-            else
-                exit 2
-            fi
-        fi
-    fi
-
-    # MultiEdit の場合は各 edit の new_string を検証 (AC12)
-    if [ "$TOOL_NAME" = "MultiEdit" ]; then
-        EDITS_COUNT="$(echo "$INPUT" | jq '.tool_input.edits | length' 2>/dev/null || echo 0)"
-        for idx in $(seq 0 $((EDITS_COUNT - 1))); do
-            EDIT_NEW_STRING="$(echo "$INPUT" | jq -r ".tool_input.edits[${idx}].new_string // \"\"" 2>/dev/null || echo "")"
-            if [ -n "$EDIT_NEW_STRING" ]; then
-                if validate_body "$EDIT_NEW_STRING" "MultiEdit new_string[${idx}]"; then
-                    : # pass
-                else
-                    exit 2
-                fi
-            fi
-        done
-    fi
-
+    # #655 AC2: tmp 下書きファイルは公開 mutation でないため block しない
+    # is_tmp_draft_path() は mutation_route_matrix.py (SSOT) で定義されており、
+    # tmp_draft_write_edit route の public_side_effect=false を根拠に pass する。
+    # Mode B は Write/Edit/MultiEdit に対して guard を適用しない。
     exit 0
 fi
+
 
 # ガード対象外は通す
 exit 0
