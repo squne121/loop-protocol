@@ -121,9 +121,121 @@ _GREP_CMD_LINE_RE = re.compile(
 # code fence の開始行パターン（3個以上のバッククォート / チルダ）
 _CODE_FENCE_OPEN_RE = re.compile(r'^(`{3,}|~{3,})[^\n]*$')
 
+# GFM 準拠 fence opening 行パターン（0-3 spaces indent + 3以上の backtick or tilde）
+# 0-3 spaces indent + fence chars (backtick or tilde) + optional info string
+_GFM_FENCE_OPEN_LINE_RE = re.compile(
+    r'^( {0,3})((`{3,})|(~{3,}))(.*?)$'
+)
+
+# GFM 準拠 fence closing 行パターン
+# closing fence は 0-3 spaces + fence chars のみ（trailing non-space は無効）
+_GFM_FENCE_CLOSE_LINE_RE = re.compile(
+    r'^( {0,3})((`{3,})|(~{3,}))\s*$'
+)
+
 # Machine-Readable Contract ブロック（```yaml で始まりかつ contract_schema_version を含む、
 # または ``` の後が yaml/YAML のもの）
 # ただしここでは code_fence 内の特別な判定として扱う
+
+# ---------------------------------------------------------------------------
+# GFM 準拠 block セグメンテーション API（#659 追加）
+# ---------------------------------------------------------------------------
+
+
+def iter_markdown_blocks(text: str):
+    """
+    GFM 準拠の block セグメンテーション API。
+
+    テキストを行単位で走査し、GFM fenced code block の境界を正確に判定して
+    (text, block_kind) のタプルを yield する。
+
+    GFM 仕様準拠の fence 判定:
+    - opening fence: 0-3 spaces indent + 3以上の backtick or tilde + optional info string
+    - closing fence: opening と同種（backtick/tilde）かつ同長以上、0-3 spaces indent、
+      trailing non-space なし
+    - 未閉 fence: EOF まで code block として扱う（prose ではない）
+    - 4 spaces indent: fence として認識しない
+    - backtick/tilde mismatch: closing として認識しない（異なる文字種）
+
+    Yields:
+        tuple[str, str]: (block_text, block_kind)
+            block_kind は BLOCK_KIND_CODE_FENCE または BLOCK_KIND_HUMAN_PROSE
+            （分類の精緻化は classify_block() が行う）
+    """
+    lines = text.splitlines(keepends=True)
+    n = len(lines)
+    i = 0
+    prose_lines: list[str] = []
+
+    while i < n:
+        line = lines[i]
+        # rstrip newlines for pattern matching, but keep original line for output
+        stripped = line.rstrip('\n').rstrip('\r')
+
+        # GFM fence opening line を検出
+        m = _GFM_FENCE_OPEN_LINE_RE.match(stripped)
+        if m:
+            fence_chars = m.group(2)  # e.g. "```" or "~~~~"
+            fence_char = fence_chars[0]  # '`' or '~'
+            fence_len = len(fence_chars)
+            info = m.group(5)  # info string（optional）
+
+            # GFM spec: backtick fence の info string は backtick を含んではならない
+            if fence_char == "`" and "`" in info:
+                prose_lines.append(line)
+                i += 1
+                continue
+
+            # flush any accumulated prose
+            if prose_lines:
+                yield ''.join(prose_lines), BLOCK_KIND_HUMAN_PROSE
+                prose_lines = []
+
+            # collect the code fence block
+            fence_line_buf: list[str] = [line]
+            i += 1
+
+            while i < n:
+                inner_line = lines[i]
+                inner_stripped = inner_line.rstrip('\n').rstrip('\r')
+
+                # closing fence: same char type, length >= opening length,
+                # 0-3 spaces indent, no trailing non-space
+                cm = _GFM_FENCE_CLOSE_LINE_RE.match(inner_stripped)
+                if cm:
+                    close_chars = cm.group(2)
+                    close_char = close_chars[0]
+                    close_len = len(close_chars)
+                    if close_char == fence_char and close_len >= fence_len:
+                        # valid closing fence
+                        fence_line_buf.append(inner_line)
+                        i += 1
+                        break
+                # not a valid closing fence — part of code block content
+                fence_line_buf.append(inner_line)
+                i += 1
+
+            # yield code fence (closed or unclosed / EOF)
+            yield ''.join(fence_line_buf), BLOCK_KIND_CODE_FENCE
+        else:
+            # regular (non-fence) line — accumulate into prose buffer
+            prose_lines.append(line)
+            i += 1
+
+    # flush remaining prose
+    if prose_lines:
+        yield ''.join(prose_lines), BLOCK_KIND_HUMAN_PROSE
+
+
+def split_blocks(text: str) -> list[tuple[str, str]]:
+    """
+    iter_markdown_blocks のリスト版。
+
+    Returns:
+        list of (block_text, block_kind) tuples
+    """
+    return list(iter_markdown_blocks(text))
+
 
 # ---------------------------------------------------------------------------
 # ヘルパー関数
