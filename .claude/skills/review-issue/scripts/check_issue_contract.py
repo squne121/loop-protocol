@@ -51,6 +51,8 @@ try:
     from prose_boundary_policy import (
         lookup_heading_policy as _lookup_heading_policy,
         parse_atx_heading_line as _parse_atx_heading_line,
+        iter_markdown_blocks as _iter_markdown_blocks,
+        BLOCK_KIND_CODE_FENCE as _BLOCK_KIND_CODE_FENCE,
     )
     _HEADING_POLICY_AVAILABLE = True
 except ImportError:
@@ -61,6 +63,13 @@ except ImportError:
 
     def _parse_atx_heading_line(line: str):  # type: ignore[misc]
         return None
+
+    def _iter_markdown_blocks(text: str):  # type: ignore[misc]
+        """Fallback: yield entire text as a single prose block."""
+        if text:
+            yield text, "human_prose"
+
+    _BLOCK_KIND_CODE_FENCE = "code_fence"
 
 
 # ---------------------------------------------------------------------------
@@ -506,15 +515,37 @@ def extract_section(body: str, section_name: str) -> str:
     GFM ATX heading 仕様（0-3 spaces indent / 任意 closing #）に対応した
     parse_atx_heading_line() を使って各行を解析し、heading_policy の
     lookup_heading_policy() で canonical_en を照合する（SSOT 共用）。
+
+    fence 対応 (#654 iter3): iter_markdown_blocks() で fence ブロックを識別し、
+    code fence 内の行を見出し境界判定から除外する（SSOT: prose_boundary_policy）。
+    境界は旧実装同様 level-2（##）見出しに限定する（level-1 等を境界扱いしない）。
     """
     lines = body.splitlines(keepends=True)
     n = len(lines)
 
-    # 各行を走査して section_name に対応する見出しを探す
+    # fence 内行の行番号セットを構築（iter_markdown_blocks SSOT 利用）
+    fence_line_indices: set[int] = set()
+    current_line_idx = 0
+    for block_text, block_kind in _iter_markdown_blocks(body):
+        block_lines = block_text.splitlines(keepends=True)
+        if block_kind == _BLOCK_KIND_CODE_FENCE:
+            for k in range(len(block_lines)):
+                fence_line_indices.add(current_line_idx + k)
+        current_line_idx += len(block_lines)
+
+    # 各行を走査して section_name に対応する level-2 見出しを探す
     for i, line in enumerate(lines):
+        # fence 内行はスキップ（見出し境界判定から除外）
+        if i in fence_line_indices:
+            continue
+
         # GFM ATX heading として解析（B2: leading spaces / closing # 対応）
         parsed = _parse_atx_heading_line(line.rstrip('\n'))
         if parsed is None:
+            continue
+
+        # 境界は level-2（##）のみ（旧実装の ^## セマンティクスを維持）
+        if parsed['level'] != 2:
             continue
 
         heading_text = parsed['text']
@@ -531,13 +562,17 @@ def extract_section(body: str, section_name: str) -> str:
         if not matched:
             continue
 
-        # 見出しの次の行から次の ## heading（または EOF）までを収集
+        # 見出しの次の行から次の level-2 heading（または EOF）までを収集
+        # fence 内行も収集対象（セクション本文の一部）だが、境界判定には使わない
         start = i + 1
         end = n
         for j in range(start, n):
-            # 次の heading を GFM ATX parser で検出（heading level 不問）
+            # fence 内行は境界判定をスキップ
+            if j in fence_line_indices:
+                continue
+            # 次の level-2 heading を GFM ATX parser で検出
             nxt = _parse_atx_heading_line(lines[j].rstrip('\n'))
-            if nxt is not None:
+            if nxt is not None and nxt['level'] == 2:
                 end = j
                 break
 
