@@ -410,6 +410,74 @@ class TestChangedProseBlocksCodeFenceHeading:
             f"4-space indented ## Background should be a prose delta target, got: {result_texts}"
         )
 
+    @pytest.mark.parametrize(
+        ("indent", "should_be_excluded_as_heading"),
+        [
+            ("", True),      # 0 spaces: valid heading
+            (" ", True),     # 1 space: valid heading
+            ("   ", True),   # 3 spaces: valid heading
+            ("    ", False), # 4 spaces: NOT a heading (indented code)
+        ],
+    )
+    def test_heading_indent_boundary_after_code_fence(
+        self,
+        indent,
+        should_be_excluded_as_heading,
+    ):
+        old = "元の文章。\n"
+        new = (
+            "元の文章。\n\n"
+            "```bash\n"
+            "echo hello\n"
+            "```\n\n"
+            f"{indent}## Background\n\n"
+            "追加テキスト。\n"
+        )
+
+        result = changed_prose_blocks(old, new)
+        joined = "\n".join(block["text"] for block in result)
+
+        if should_be_excluded_as_heading:
+            assert "## Background" not in joined
+        else:
+            assert "## Background" in joined
+
+    def test_code_fence_heading_without_blank_line_after_closing_fence(self):
+        """GIVEN: code fence closing 直後に blank line なしで heading が来る WHEN: changed_prose_blocks THEN: heading は delta に含まれない"""
+        old = "元の文章。\n"
+        new = (
+            "元の文章。\n\n"
+            "```bash\n"
+            "echo hello\n"
+            "```\n"          # blank line なし
+            "## Background\n\n"
+            "追加テキスト。\n"
+        )
+
+        result = changed_prose_blocks(old, new)
+        joined = "\n".join(block["text"] for block in result)
+
+        assert "## Background" not in joined
+        assert "追加テキスト" in joined
+
+    def test_tilde_code_fence_following_heading_delta(self):
+        """GIVEN: tilde fence 直後に canonical heading がある WHEN: changed_prose_blocks THEN: heading は delta に含まれない"""
+        old = "元の文章。\n"
+        new = (
+            "元の文章。\n\n"
+            "~~~bash\n"
+            "echo hello\n"
+            "~~~\n\n"
+            "## Background\n\n"
+            "追加テキスト。\n"
+        )
+
+        result = changed_prose_blocks(old, new)
+        joined = "\n".join(block["text"] for block in result)
+
+        assert "## Background" not in joined
+        assert "追加テキスト" in joined
+
     def test_heading_prose_not_hidden_after_heading_exclusion(self):
         """GIVEN: canonical heading の次行に英語 prose WHEN: changed_prose_blocks THEN: heading 除外が後続 prose を隠さない (AC5)
 
