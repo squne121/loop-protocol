@@ -261,3 +261,83 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 
+
+## Termination Report Render Flow（#656 規約）
+
+終了レポートの生成は `render_termination_report.py` が担い、以下のフローに従う。
+
+### TERMINATION_REPORT_INPUT_V1
+
+```yaml
+TERMINATION_REPORT_INPUT_V1:
+  termination_reason: approved | human_escalation | superseded_by_decision  # 必須
+  termination_cause: needs_fix_at_iteration_limit | max_iterations_exceeded | human_judgment_required | null  # 任意
+  issue_number: <int>       # 任意
+  iteration: <int>          # 任意
+  blockers_summary: []      # 任意（human_escalation 時に使用）
+```
+
+### TERMINATION_REPORT_RENDER_RESULT_V1
+
+```yaml
+TERMINATION_REPORT_RENDER_RESULT_V1:
+  schema: TERMINATION_REPORT_RENDER_RESULT_V1
+  schema_version: 1
+  publishable: true | false
+  body: <markdown string> | null   # publishable=false のとき null
+  reason_code: null | guard_fail_limit_exceeded | invalid_input | internal_error
+  termination_reason: approved | human_escalation | superseded_by_decision
+  termination_cause: <string> | null
+  attempts: 1 | 2
+  attempts_log:
+    - attempt: 1
+      template: normal
+      guard_pass: true | false
+      errors: []
+    - attempt: 2
+      template: fallback_minimal
+      guard_pass: true | false
+      errors: []
+  generated_at: <ISO-8601>
+```
+
+### Render 試行ルール（dry-run guard 付き）
+
+1. attempt 1: normal template でレポート生成
+2. `prose_boundary_policy` 公開 API（`classify_block` / `iter_markdown_blocks`）で dry-run guard を実行
+3. guard pass → `publishable=true`, `body=<markdown>` を返す
+4. guard fail → attempt 2: fallback minimal template に切り替え
+5. attempt 2 guard pass → `publishable=true`, `body=<markdown>` を返す
+6. attempt 2 guard fail → `publishable=false`, `body=null`, `reason_code="guard_fail_limit_exceeded"` を返す
+
+**最大試行回数は 2 回**。再生成・LLM・ask・network・gh command を呼ばない。
+
+### termination_reason と termination_cause の分離
+
+| フィールド | 値 | 説明 |
+|---|---|---|
+| `termination_reason` | `approved` | reviewer が approve し、contract review status: go を確認した |
+| `termination_reason` | `human_escalation` | 人間の判断が必要 |
+| `termination_reason` | `superseded_by_decision` | 先行決定により Issue が無効化された |
+| `termination_cause` | `needs_fix_at_iteration_limit` | needs-fix がイテレーション上限で停止 |
+| `termination_cause` | `max_iterations_exceeded` | イテレーション数が max_iterations を超えた |
+| `termination_cause` | `human_judgment_required` | human judgment が必要と判定 |
+| `termination_cause` | `null` | 原因なし（approved / superseded 等） |
+
+`needs_fix_at_iteration_limit` / `max_iterations_exceeded` は `termination_cause` として扱う。`termination_reason` に設定してはならない。
+
+### GFM Fence Injection 防御（dynamic fence）
+
+- `_make_dynamic_fence(content)`: コンテンツ内の最長バッククォート列 + 1 の長さを持つ fence を生成（最小 3）
+- これにより adversarial input（` ``` ` 含む blockers_summary 等）がテンプレート構造を破壊しない
+
+### stderr / stdout 制約
+
+- stdout: machine JSON のみ（`TERMINATION_REPORT_RENDER_RESULT_V1`）
+- stderr: diagnostics のみ（guard fail メッセージ・内部エラー等）
+- `publishable=false` 時でも stderr にも投稿可能 markdown 本文を出力しない
+
+### callsite integration
+
+本フロー（`render_termination_report.py` の呼び出し）は follow-up Issue に委譲する。
+本 policy セクションは renderer ライブラリの規約として機能し、callsite integration 前でも実効性がある。
