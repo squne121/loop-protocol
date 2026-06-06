@@ -2,6 +2,7 @@
 test_heading_policy.py
 
 Issue #654: canonical / bilingual heading 除外と heading_policy の単体テスト。
+Issue #678: _extract_template_labels() を YAML schema-aware parsing に置き換え。
 
 AC1: heading_policy が prose_boundary_policy.py に存在し、
      classify_block() 公開 API とブロック定数が変更されていない
@@ -13,11 +14,11 @@ AC7: 英語 prose / non-canonical 英語見出しが引き続き fail
 AC8: heading_policy は validate_japanese_content.py 経由で適用
 """
 
-import re
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _SCRIPTS_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -51,24 +52,67 @@ _LABEL_TO_CANONICAL: dict[str, str] = {
 ALLOWED_EXTRAS: set[str] = set()
 
 
+_KNOWN_FIELD_TYPES = frozenset(
+    {"textarea", "input", "dropdown", "checkboxes", "upload", "markdown"}
+)
+
+
 def _extract_template_labels(yml_path: Path) -> list[str]:
     """
-    implementation.yml の body セクションから label: 値を動的に抽出する。
+    implementation.yml の body セクションから label: 値を YAML schema-aware parsing で抽出する。
 
-    GitHub Forms YAML の構造:
+    GitHub Issue Forms YAML の構造:
       body:
-        - type: textarea / input
+        - type: textarea / input / dropdown / checkboxes / upload
           attributes:
             label: <label_value>
+        - type: markdown   # skip — heading 化されない
+          attributes:
+            value: ...
+
+    処理方針:
+    - yaml.safe_load() で YAML 全体をパースする
+    - data["body"] を list として走査する
+    - type が "markdown" の要素は skip する
+    - type が textarea/input/dropdown/checkboxes/upload の要素は
+      attributes.label を収集する
+    - 上記以外の未知の type は ValueError を raise する
+    - yml_path が存在しない / YAML malformed / body が list でない場合は ValueError を raise する
 
     Returns:
         label 値のリスト（出現順）
+
+    Raises:
+        ValueError: yml_path 不在、YAML parse error、body が list でない、unknown type の場合
     """
     if not yml_path.exists():
-        return []
+        raise ValueError(f"yml_path が存在しません: {yml_path}")
     text = yml_path.read_text(encoding="utf-8")
-    # label: の値を抽出（インデント付き）
-    return re.findall(r'^\s+label:\s+(.+)$', text, re.MULTILINE)
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"YAML parse error: {yml_path}: {exc}") from exc
+    body = data.get("body") if isinstance(data, dict) else None
+    if not isinstance(body, list):
+        raise ValueError(
+            f"implementation.yml の 'body' が list ではありません: {type(body)!r}"
+        )
+    labels: list[str] = []
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "")
+        if item_type == "markdown":
+            continue
+        if item_type not in _KNOWN_FIELD_TYPES:
+            raise ValueError(
+                f"unknown type: {item_type!r}。"
+                f"サポート対象: {sorted(_KNOWN_FIELD_TYPES)}"
+            )
+        attrs = item.get("attributes")
+        if isinstance(attrs, dict) and "label" in attrs:
+            labels.append(str(attrs["label"]))
+    return labels
 
 
 def _get_template_canonical_headings() -> list[str]:
@@ -831,4 +875,189 @@ class TestCodeFenceShorterClosingDoesNotClose:
         )
         assert "this is still code" in fence_blocks[0]["text"], (
             "3-backtick の後のコンテンツは fence 内に含まれるべき"
+        )
+
+
+# ===========================================================================
+# #678: _extract_template_labels YAML schema-aware parsing regression tests
+# ===========================================================================
+
+
+class TestExtractTemplateLabelsSchemaAware:
+    """#678: _extract_template_labels() の YAML schema-aware parsing regression test
+
+    AC3: tmp_path に synthetic issue form YAML（type: markdown, checkboxes, textarea）を
+         生成し、_extract_template_labels() が top-level non-markdown attributes.label
+         のみを返すことを検証する。
+    """
+
+    def test_schema_aware_returns_textarea_and_input_labels(self, tmp_path: Path):
+        """GIVEN: markdown + checkboxes + textarea を含む synthetic YAML
+        WHEN: _extract_template_labels()
+        THEN: type: markdown は skip、checkboxes.options[].label は取り込まない、
+              top-level attributes.label（textarea/input）のみ返す"""
+        yml = tmp_path / "issue_form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "description: Test form\n"
+            "body:\n"
+            "  - type: markdown\n"
+            "    attributes:\n"
+            "      value: |\n"
+            "        Please fill in all required fields.\n"
+            "  - type: checkboxes\n"
+            "    id: options\n"
+            "    attributes:\n"
+            "      label: Options\n"
+            "      options:\n"
+            "        - label: Option A\n"
+            "        - label: Option B\n"
+            "  - type: textarea\n"
+            "    id: description\n"
+            "    attributes:\n"
+            "      label: Outcome\n"
+            "  - type: input\n"
+            "    id: parent\n"
+            "    attributes:\n"
+            "      label: Parent Issue\n",
+            encoding="utf-8",
+        )
+        labels = _extract_template_labels(yml)
+        # markdown は skip される
+        assert "Please fill in all required fields." not in labels
+        # checkboxes.options[].label は取り込まない
+        assert "Option A" not in labels
+        assert "Option B" not in labels
+        # top-level attributes.label のみ取り込む
+        assert "Options" in labels
+        assert "Outcome" in labels
+        assert "Parent Issue" in labels
+        # 順序が保持されている
+        assert labels.index("Options") < labels.index("Outcome")
+        assert labels.index("Outcome") < labels.index("Parent Issue")
+
+    def test_schema_aware_skips_markdown_type(self, tmp_path: Path):
+        """GIVEN: type: markdown のみの YAML
+        WHEN: _extract_template_labels()
+        THEN: 空リストを返す（markdown は skip）"""
+        yml = tmp_path / "form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  - type: markdown\n"
+            "    attributes:\n"
+            "      value: Some instruction text.\n"
+            "  - type: markdown\n"
+            "    attributes:\n"
+            "      value: Another markdown block.\n",
+            encoding="utf-8",
+        )
+        labels = _extract_template_labels(yml)
+        assert labels == [], (
+            "type: markdown のみの YAML は空リストを返すべき"
+        )
+
+    def test_schema_aware_includes_dropdown_label(self, tmp_path: Path):
+        """GIVEN: type: dropdown を含む YAML
+        WHEN: _extract_template_labels()
+        THEN: dropdown の top-level attributes.label を返す"""
+        yml = tmp_path / "form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  - type: dropdown\n"
+            "    id: priority\n"
+            "    attributes:\n"
+            "      label: Priority Level\n"
+            "      options:\n"
+            "        - Low\n"
+            "        - High\n",
+            encoding="utf-8",
+        )
+        labels = _extract_template_labels(yml)
+        assert "Priority Level" in labels
+        assert "Low" not in labels
+        assert "High" not in labels
+
+
+class TestExtractTemplateLabelsFailFast:
+    """#678: _extract_template_labels() の fail-fast テスト（AC4）
+
+    AC4: yml_path 不在・YAML malformed・body が list でない場合の fail-fast。
+    """
+
+    def test_yml_path_not_found_raises_value_error(self, tmp_path: Path):
+        """GIVEN: 存在しない yml_path
+        WHEN: _extract_template_labels()
+        THEN: ValueError を raise する（fail-fast）"""
+        nonexistent = tmp_path / "nonexistent.yml"
+        with pytest.raises(ValueError, match="yml_path が存在しません"):
+            _extract_template_labels(nonexistent)
+
+    def test_yaml_malformed_raises_value_error(self, tmp_path: Path):
+        """GIVEN: YAML として不正なファイル（malformed YAML）
+        WHEN: _extract_template_labels()
+        THEN: ValueError を raise する（fail-fast）"""
+        yml = tmp_path / "malformed.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  - type: textarea\n"
+            "    attributes: {\n"
+            "      invalid yaml here\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="YAML parse error"):
+            _extract_template_labels(yml)
+
+    def test_body_not_list_raises_value_error(self, tmp_path: Path):
+        """GIVEN: body が list でない YAML（dict など）
+        WHEN: _extract_template_labels()
+        THEN: ValueError を raise する（fail-fast）"""
+        yml = tmp_path / "form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  type: textarea\n"
+            "  attributes:\n"
+            "    label: Something\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="'body' が list ではありません"):
+            _extract_template_labels(yml)
+
+    def test_unknown_type_raises_value_error(self, tmp_path: Path):
+        """GIVEN: 未知の type（known type 以外）を含む YAML
+        WHEN: _extract_template_labels()
+        THEN: ValueError を raise する（fail-fast; unknown type は許容しない）"""
+        yml = tmp_path / "form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  - type: unknown_custom_widget\n"
+            "    attributes:\n"
+            "      label: Something\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="unknown type"):
+            _extract_template_labels(yml)
+
+    def test_yaml_safe_load_used_for_parsing(self, tmp_path: Path):
+        """GIVEN: 有効な YAML（AC1 の確認）
+        WHEN: _extract_template_labels()
+        THEN: yaml.safe_load() ベースの実装が label を正しく返す
+              （regex の space+label:space+ に依存しない）"""
+        yml = tmp_path / "form.yml"
+        yml.write_text(
+            "name: Test\n"
+            "body:\n"
+            "  - type: textarea\n"
+            "    attributes:\n"
+            "      label: My Label\n"
+            "      description: Some description\n",
+            encoding="utf-8",
+        )
+        labels = _extract_template_labels(yml)
+        assert labels == ["My Label"], (
+            "yaml.safe_load ベースの実装は attributes.label を正しく返すべき"
         )
