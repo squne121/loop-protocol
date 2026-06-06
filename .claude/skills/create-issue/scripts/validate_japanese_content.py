@@ -82,6 +82,9 @@ def extract_code_fences(text: str) -> tuple[str, list[str]]:
     for block_text, block_kind in _pbp.iter_markdown_blocks(text):
         if block_kind == _pbp.BLOCK_KIND_CODE_FENCE:
             removed.append(block_text)
+        elif block_kind == _pbp.BLOCK_KIND_TABLE:
+            # GFM パイプテーブル（Safety Claim Matrix 等）は機械可読なので prose 判定から除外する（#685）
+            removed.append(block_text)
         else:
             prose_parts.append(block_text)
 
@@ -246,6 +249,9 @@ def split_markdown_blocks(text: str) -> list[dict]:
         if _raw_kind == _pbp.BLOCK_KIND_CODE_FENCE:
             # code fence ブロック: 独自分割は行わず直接追加
             result.append({'text': block_text.strip(), 'type': 'code_fence'})
+        elif _raw_kind == _pbp.BLOCK_KIND_TABLE:
+            # GFM テーブルブロック: 直接 table として追加（#685）
+            result.append({'text': block_text.strip(), 'type': 'table'})
         else:
             # prose 領域: 空行で段落分割してから各ブロックを分類
             for sub_block in re.split(r'\n\s*\n', block_text):
@@ -443,8 +449,26 @@ def validate_text(text: str, threshold: float = 0.1) -> ValidationResult:
     # aggregate 比率
     aggregate_ratio = total_japanese / total_chars if total_chars > 0 else 0.0
 
-    # prose block が全く存在しない場合はfail
+    # prose block が全く存在しない場合
     if not prose_blocks:
+        # table-only body: machine-readable table のみの場合は passed=True（#685）
+        # empty body / whitespace-only body は引き続き passed=False
+        # extract_code_fences が table を除外済みのため、prose_blocks が空 = prose がない状態
+        # ただし元のテキストにテーブルが含まれるか否かで分岐する
+        has_table = any(
+            bk == _pbp.BLOCK_KIND_TABLE
+            for _, bk in _pbp.iter_markdown_blocks(text)
+        )
+        if has_table:
+            return ValidationResult(
+                passed=True,
+                aggregate_ratio=1.0,
+                prose_blocks=[],
+                failed_blocks=[],
+                total_chars=0,
+                japanese_chars=0,
+                threshold=threshold,
+            )
         return ValidationResult(
             passed=False,
             aggregate_ratio=0.0,

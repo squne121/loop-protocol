@@ -533,9 +533,15 @@ sys.exit(1)
         Verify that the main settings.json file contains hook handlers for Stop and SubagentStop
         with exact matching:
         - type: "command"
-        - command == "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh"
+        - command == "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh"
+          (single coordinator only; guard/producer are NOT wired directly — AC1/AC8)
         - args: [] (empty list)
         - timeout >= 30
+
+        Note: As of #651, Stop/SubagentStop use session_manifest_coordinator.sh (single
+        coordinator only). session_recording_policy_guard.sh and
+        generate_session_manifest_from_hook.mjs are invoked by the coordinator internally
+        and must NOT appear as direct siblings in settings.json Stop/SubagentStop hooks.
         """
         assert SETTINGS_JSON_PATH.exists(), \
             f"settings.json not found at {SETTINGS_JSON_PATH}"
@@ -559,37 +565,65 @@ sys.exit(1)
         assert isinstance(subagent_stop_handlers, list), "SubagentStop handlers should be a list"
         assert len(subagent_stop_handlers) > 0, "SubagentStop handlers should not be empty"
 
-        expected_command = "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh"
+        # AC1: coordinator is the single hook entry-point
+        expected_command = "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh"
+        # AC8: these must NOT appear as direct siblings in Stop/SubagentStop
+        forbidden_guard = "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_recording_policy_guard.sh"
 
-        # Validate Stop handler structure (exact match)
+        def collect_hook_commands(handlers: list) -> list:
+            cmds = []
+            for handler_group in handlers:
+                for hook in handler_group.get("hooks", []):
+                    cmds.append(hook.get("command", ""))
+                    # node + args pattern
+                    if hook.get("command") == "node":
+                        cmds.extend(hook.get("args", []))
+            return cmds
+
+        # AC8: guard/producer must not be direct siblings in Stop/SubagentStop
+        for event, handlers in [("Stop", stop_handlers), ("SubagentStop", subagent_stop_handlers)]:
+            cmds = collect_hook_commands(handlers)
+            assert forbidden_guard not in cmds, (
+                f"{event}: session_recording_policy_guard.sh must not be wired directly "
+                f"(single coordinator only since #651). Found in: {cmds}"
+            )
+            for cmd in cmds:
+                assert "generate_session_manifest_from_hook.mjs" not in cmd, (
+                    f"{event}: generate_session_manifest_from_hook.mjs must not be wired directly "
+                    f"(single coordinator only since #651). Found in: {cmds}"
+                )
+
+        # AC1: coordinator is present in Stop
         stop_found = False
         for handler_group in stop_handlers:
-            if "hooks" in handler_group and isinstance(handler_group["hooks"], list):
-                for hook in handler_group["hooks"]:
-                    if (hook.get("type") == "command" and
+            for hook in handler_group.get("hooks", []):
+                if (hook.get("type") == "command" and
                         hook.get("command") == expected_command and
                         hook.get("args") == [] and
                         hook.get("timeout", 0) >= 30):
-                        stop_found = True
-                        break
+                    stop_found = True
+                    break
 
-        assert stop_found, \
-            f"Stop handler does not have proper structure: type=command, command={expected_command}, args=[], timeout>=30"
+        assert stop_found, (
+            f"Stop handler does not have proper structure: "
+            f"type=command, command={expected_command}, args=[], timeout>=30"
+        )
 
-        # Validate SubagentStop handler structure (exact match)
+        # AC1: coordinator is present in SubagentStop
         subagent_found = False
         for handler_group in subagent_stop_handlers:
-            if "hooks" in handler_group and isinstance(handler_group["hooks"], list):
-                for hook in handler_group["hooks"]:
-                    if (hook.get("type") == "command" and
+            for hook in handler_group.get("hooks", []):
+                if (hook.get("type") == "command" and
                         hook.get("command") == expected_command and
                         hook.get("args") == [] and
                         hook.get("timeout", 0) >= 30):
-                        subagent_found = True
-                        break
+                    subagent_found = True
+                    break
 
-        assert subagent_found, \
-            f"SubagentStop handler does not have proper structure: type=command, command={expected_command}, args=[], timeout>=30"
+        assert subagent_found, (
+            f"SubagentStop handler does not have proper structure: "
+            f"type=command, command={expected_command}, args=[], timeout>=30"
+        )
 
 
 if __name__ == "__main__":
