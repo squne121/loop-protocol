@@ -413,6 +413,7 @@ SSOT identifiers: `number_display_policy`, `formatCombatNumber` (see `src/render
 number_display_policy:
   hp:
     input_domain: integer >= 0
+    invalid_input: "0 扱い（NaN / Infinity / 負数 / 非整数は 0 として表示）— レンダリング層のため throw より safe fallback を選択"
     exact_display_until: 9999
     compact_from: 10000
     rounding: floor

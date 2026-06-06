@@ -35,9 +35,15 @@ export const HP_LABEL_PADDING = 2
  *     10000 -> "10k", 999999 -> "999k", 1000000 -> "1M"
  *
  * Input domain: integer >= 0.
+ * Invalid inputs (NaN, Infinity, negative, non-integer) are treated as 0.
+ * Safe fallback is used rather than throwing — this is a rendering-layer function
+ * (docs/product/features/combat-core.md number_display_policy: invalid input → 0).
  * Output is locale-independent.
  */
 export function formatCombatNumber(value: number): string {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    return '0'
+  }
   if (value < 10_000) {
     return String(Math.floor(value))
   }
@@ -155,24 +161,27 @@ export function drawEnemyHpLabel(params: DrawEnemyHpLabelParams): void {
   const label = formatCombatNumber(enemyHp)
 
   ctx.save()
-  ctx.font = HP_LABEL_FONT
-  ctx.fillStyle = HP_LABEL_COLOR
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
+  try {
+    ctx.font = HP_LABEL_FONT
+    ctx.fillStyle = HP_LABEL_COLOR
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
 
-  const measured = ctx.measureText(label)
-  const textWidth = measured.width
+    const measured = ctx.measureText(label)
+    const textWidth = measured.width
 
-  const enemyTopY = enemyY - enemyRadius
+    const enemyTopY = enemyY - enemyRadius
 
-  const { x, y } = computeHpLabelPosition({
-    enemyX,
-    enemyTopY,
-    textWidth,
-    arenaWidth,
-    arenaHeight,
-  })
+    const { x, y } = computeHpLabelPosition({
+      enemyX,
+      enemyTopY,
+      textWidth,
+      arenaWidth,
+      arenaHeight,
+    })
 
-  ctx.fillText(label, x, y)
-  ctx.restore()
+    ctx.fillText(label, x, y)
+  } finally {
+    ctx.restore()
+  }
 }

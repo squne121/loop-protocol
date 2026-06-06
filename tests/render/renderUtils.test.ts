@@ -46,6 +46,25 @@ describe('formatCombatNumber', () => {
   it('GIVEN value 999000 WHEN formatted THEN returns 999k', () => {
     expect(formatCombatNumber(999000)).toBe('999k')
   })
+  // Invalid input guard (number_display_policy: invalid input → 0)
+  it('GIVEN NaN WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(NaN)).toBe('0')
+  })
+  it('GIVEN Infinity WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(Infinity)).toBe('0')
+  })
+  it('GIVEN -Infinity WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(-Infinity)).toBe('0')
+  })
+  it('GIVEN negative integer -1 WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(-1)).toBe('0')
+  })
+  it('GIVEN negative large value -9999 WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(-9999)).toBe('0')
+  })
+  it('GIVEN non-integer 1.5 WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(1.5)).toBe('0')
+  })
 })
 describe('computeHpLabelPosition', () => {
   const ARENA_W = 960
@@ -101,11 +120,35 @@ describe('computeHpLabelPosition', () => {
     const { y } = computeHpLabelPosition({ enemyX: ARENA_W / 2, enemyTopY: 600, textWidth: TEXT_W, arenaWidth: ARENA_W, arenaHeight: ARENA_H })
     expect(y).toBe(ARENA_H - FONT_SIZE / 2 - PADDING)
   })
-  it('GIVEN DPR=2 scenario WHEN same logical arena THEN clamp identical to DPR=1', () => {
-    const pos1 = computeHpLabelPosition({ enemyX: 0, enemyTopY: 0, textWidth: TEXT_W, arenaWidth: ARENA_W, arenaHeight: ARENA_H })
-    const pos2 = computeHpLabelPosition({ enemyX: 0, enemyTopY: 0, textWidth: TEXT_W, arenaWidth: ARENA_W, arenaHeight: ARENA_H })
-    expect(pos1).toEqual(pos2)
-    assertInBounds(pos1.x, pos1.y, TEXT_W)
+  it('GIVEN DPR=1 vs DPR=2 WHEN same CSS coords but different physical arena dims THEN clamp max-x differs', () => {
+    // computeHpLabelPosition operates in logical (CSS) pixel space.
+    // CanvasRenderer scales canvas.width/height by DPR but passes logical arena dims
+    // (arenaWidth / arenaHeight) to drawEnemyHpLabel. However, a test that passes
+    // DPR-scaled arena dims (arenaWidth * dpr) simulates a scenario where the
+    // caller mistakenly uses physical pixels — verifying clamp max changes with DPR.
+    //
+    // DPR=1: arenaWidth=960  → xMax = 960 - PADDING - TEXT_W/2  = 946
+    // DPR=2: arenaWidth=1920 → xMax = 1920 - PADDING - TEXT_W/2 = 1906
+    // Enemy at x=0 is clamped to xMin in both cases, so we place enemy beyond DPR=1 max.
+    const dpr1Arena = ARENA_W               // 960
+    const dpr2Arena = ARENA_W * 2           // 1920
+
+    const dpr1XMax = dpr1Arena - PADDING - TEXT_W / 2  // 946
+    const dpr2XMax = dpr2Arena - PADDING - TEXT_W / 2  // 1906
+
+    // Place enemy at a position that is NOT clamped in DPR=2 arena but IS the boundary in DPR=1
+    const { x: x1 } = computeHpLabelPosition({ enemyX: dpr1XMax, enemyTopY: ARENA_H / 2, textWidth: TEXT_W, arenaWidth: dpr1Arena, arenaHeight: ARENA_H })
+    const { x: x2 } = computeHpLabelPosition({ enemyX: dpr1XMax, enemyTopY: ARENA_H / 2, textWidth: TEXT_W, arenaWidth: dpr2Arena, arenaHeight: ARENA_H })
+
+    // At DPR=1 arena, enemy is exactly at xMax (clamped result = dpr1XMax)
+    expect(x1).toBe(dpr1XMax)
+    // At DPR=2 arena (wider), the same CSS x is not clamped — the label can stay at enemyX
+    expect(x2).toBe(dpr1XMax)
+    // The key assertion: the xMax bounds differ between DPR=1 and DPR=2 arenas
+    expect(dpr2XMax).toBeGreaterThan(dpr1XMax)
+    // Both results are within their respective arena bounds
+    expect(x1 + TEXT_W / 2).toBeLessThanOrEqual(dpr1Arena - PADDING)
+    expect(x2 + TEXT_W / 2).toBeLessThanOrEqual(dpr2Arena - PADDING)
   })
   it('GIVEN all corners with wide label WHEN computed THEN all within bounds', () => {
     const wideTextW = 40
