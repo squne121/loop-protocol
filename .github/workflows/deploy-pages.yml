@@ -48,7 +48,17 @@ jobs:
           echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "base=$base" >> "$GITHUB_OUTPUT"
+      - name: Resolve and inject commit SHA
+        id: commit-sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "VITE_LOOP_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - run: pnpm build
+        env:
+          VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
       - name: Verify main build asset base path
         shell: bash
         run: |
@@ -56,6 +66,16 @@ jobs:
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
           if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
+      - name: Verify commit SHA in dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ steps.commit-sha.outputs.sha }}"
+          if ! grep -rq "$expected_sha" dist/; then
+            echo "ERROR: commit SHA $expected_sha not found in dist/" >&2
+            exit 1
+          fi
+          echo "OK: commit SHA $expected_sha found in dist/"
       - name: Deploy to gh-pages (replace root, preserve pr-*)
         run: |
           git config user.name "github-actions[bot]"
@@ -101,6 +121,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6
         with:
           version: 11
@@ -126,7 +147,17 @@ jobs:
           echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "base=$base" >> "$GITHUB_OUTPUT"
+      - name: Resolve and inject commit SHA
+        id: commit-sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "VITE_LOOP_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - run: pnpm build
+        env:
+          VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
       - name: Verify PR preview build asset base path
         shell: bash
         run: |
@@ -134,6 +165,16 @@ jobs:
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
           if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
+      - name: Verify commit SHA in dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ steps.commit-sha.outputs.sha }}"
+          if ! grep -rq "$expected_sha" dist/; then
+            echo "ERROR: commit SHA $expected_sha not found in dist/" >&2
+            exit 1
+          fi
+          echo "OK: commit SHA $expected_sha found in dist/"
       - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
