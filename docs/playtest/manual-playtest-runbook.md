@@ -75,20 +75,29 @@ node scripts/check-manual-playtest-env.mjs
 
 ---
 
+## Base Path Revalidation URLs
+
+base path の解決を確認するための環境別 URL を以下に示す。
+
+- Local preview: `http://localhost:4173/?playtest_evidence=1`
+- GitHub Pages main: `https://squne121.github.io/loop-protocol/?playtest_evidence=1`
+- GitHub Pages PR preview: `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1`
+
+### 環境別 Validation split
+
+| 環境 | 目的 |
+|------|------|
+| Local preview | production bundle 動作確認（`pnpm build` + `pnpm preview` による） |
+| GitHub Pages main | `/loop-protocol/` base 解決の確認 |
+| GitHub Pages PR preview | `/loop-protocol/pr-<N>/` base 解決の確認 |
+
+> **切り分け注記**: base path 修正だけでは #571 の deferred verification 完了を意味しない。Pages source / publish trigger fault は別問題として切り分ける。
+
+---
+
 ## Evidence Panel で環境情報を取得する
 
-Evidence Panel は `?playtest_evidence=1` クエリパラメータを付けることで有効化される。
-
-```
-# main URL の例
-https://squne121.github.io/loop-protocol/?playtest_evidence=1
-
-# PR プレビューの例（PR #123）
-https://squne121.github.io/loop-protocol/pr-123/?playtest_evidence=1
-
-# ローカルプレビューの例
-http://localhost:4173/?playtest_evidence=1
-```
+Evidence Panel は `?playtest_evidence=1` クエリパラメータを付けることで有効化される。上記「Base Path Revalidation URLs」の URL を使用してアクセスする。
 
 クエリパラメータなしでアクセスした場合、Evidence Panel は表示されない（opt-in 設計）。
 
