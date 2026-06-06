@@ -153,10 +153,12 @@ class TestGhBodyFile:
     def test_gh_called_with_body_file(self, tmp_path):
         fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
         gh_calls: list[list] = []
+        gh_kwargs_list: list[dict] = []
 
         def fake_run(cmd, **kwargs):
             if isinstance(cmd, list) and cmd[0] == "gh":
                 gh_calls.append(cmd)
+                gh_kwargs_list.append(kwargs)
                 m = MagicMock()
                 m.returncode = 0
                 m.stderr = ""
@@ -174,23 +176,21 @@ class TestGhBodyFile:
         assert "issue" == gh_cmd[1]
         assert "comment" == gh_cmd[2]
         assert "--body-file" in gh_cmd
+        # Must use "--body-file -" (stdin), not a file path
+        assert gh_cmd[gh_cmd.index("--body-file") + 1] == "-"
         # --body must NOT appear as a standalone flag
         assert "--body" not in gh_cmd
 
     def test_gh_body_file_receives_correct_content(self, tmp_path):
+        """Body is passed via stdin (input= kwarg), not a file path."""
         expected_body = "## Refinement Loop: Approved\n\nApproved."
         fake_proc = _fake_renderer_proc(_make_render_result(body=expected_body))
-        received_body_content: list[str] = []
+        received_stdin: list[str] = []
 
         def fake_run(cmd, **kwargs):
             if isinstance(cmd, list) and cmd[0] == "gh":
-                # Read the body file content
-                body_file_idx = cmd.index("--body-file") + 1
-                body_file_path = cmd[body_file_idx]
-                try:
-                    received_body_content.append(Path(body_file_path).read_text())
-                except Exception:
-                    pass
+                # New implementation passes body via input= kwarg (stdin)
+                received_stdin.append(kwargs.get("input", ""))
                 m = MagicMock()
                 m.returncode = 0
                 m.stderr = ""
@@ -200,8 +200,51 @@ class TestGhBodyFile:
         with patch("subprocess.run", side_effect=fake_run):
             pub.publish(issue_number=42, input_data=_make_input())
 
-        assert len(received_body_content) == 1
-        assert received_body_content[0] == expected_body
+        assert len(received_stdin) == 1
+        assert received_stdin[0] == expected_body
+
+    def test_gh_has_prompt_disabled_env(self, tmp_path):
+        """gh call must have GH_PROMPT_DISABLED=1 in env."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        gh_envs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                gh_envs.append(kwargs.get("env", {}))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        with patch("subprocess.run", side_effect=fake_run):
+            pub.publish(issue_number=42, input_data=_make_input())
+
+        assert len(gh_envs) == 1
+        assert gh_envs[0].get("GH_PROMPT_DISABLED") == "1"
+
+    def test_gh_timeout_fail_closed(self, tmp_path):
+        """gh timeout (30s) must fail closed (return -1, record artifact)."""
+        import subprocess as _subprocess
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                raise _subprocess.TimeoutExpired(cmd, 30)
+            return fake_proc
+
+        artifact_calls: list[dict] = []
+
+        def capture_artifact(**kwargs):
+            artifact_calls.append(kwargs)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            with patch.object(pub, "_record_artifact", side_effect=capture_artifact):
+                exit_code = pub.publish(issue_number=42, input_data=_make_input())
+
+        assert exit_code == 1
+        assert len(artifact_calls) == 1
+        assert artifact_calls[0]["reason_code"] == "gh_comment_timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +407,37 @@ class TestArtifactRecording:
         assert len(artifact_calls) == 1
         # body is None in publishable=false result; artifact should NOT contain any markdown prose
         call_kw = artifact_calls[0]
-        # renderer_stderr is diagnostic (ok to log)
+        # renderer_stderr is passed as kwarg for hashing (ok)
         assert "renderer_stderr" in call_kw
         # The artifact kwargs must not contain a 'body' key with publishable content
         assert "body" not in call_kw
+
+    def test_artifact_stderr_stored_as_hash_not_raw(self, tmp_path):
+        """B2: renderer stderr fragment must NOT appear in artifact JSON or publisher stderr."""
+        secret_fragment = "SENSITIVE_BODY_FRAGMENT_XYZ"
+        result = _make_render_result(
+            publishable=False, body=None, reason_code="guard_fail_limit_exceeded"
+        )
+        # Renderer emits body fragment in stderr
+        fake_proc = _fake_renderer_proc(result, stderr=secret_fragment)
+
+        with patch("subprocess.run", return_value=fake_proc):
+            with patch.object(pub, "ARTIFACT_DIR", tmp_path / "artifacts"):
+                pub.publish(issue_number=99, input_data=_make_input())
+
+        # Artifact JSON must not contain the raw fragment
+        artifact_dir = tmp_path / "artifacts"
+        files = list(artifact_dir.glob("termination_report_publish_*.json"))
+        assert files, "artifact file should have been written"
+        artifact_data = json.loads(files[0].read_text())
+        artifact_text = json.dumps(artifact_data)
+        assert secret_fragment not in artifact_text, (
+            "renderer stderr fragment must not appear raw in artifact JSON"
+        )
+        # Artifact must have stderr_len and stderr_sha256 instead
+        assert "stderr_len" in artifact_data
+        assert "stderr_sha256" in artifact_data
+        assert "renderer_stderr" not in artifact_data
 
 
 # ---------------------------------------------------------------------------
@@ -580,3 +650,36 @@ class TestValidateRenderResult:
         result["publishable"] = "true"  # string, not bool
         err = pub._validate_render_result(result)
         assert err != ""
+
+    def test_result_list_returns_error(self):
+        """B3: renderer stdout that is a list (not dict) must fail validation."""
+        err = pub._validate_render_result([])  # type: ignore[arg-type]
+        assert err != ""
+        assert "object" in err.lower() or "dict" in err.lower()
+
+    def test_result_string_returns_error(self):
+        """B3: renderer stdout that is a plain string must fail validation."""
+        err = pub._validate_render_result("ok")  # type: ignore[arg-type]
+        assert err != ""
+
+    def test_publishable_false_reason_code_missing_returns_error(self):
+        """B3: publishable=false with missing reason_code must fail."""
+        result = _make_render_result(publishable=False, body=None, reason_code=None)
+        err = pub._validate_render_result(result)
+        assert err != ""
+        assert "reason_code" in err.lower()
+
+    def test_publishable_false_reason_code_list_returns_error(self):
+        """B3: publishable=false with reason_code=[] (non-string) must fail."""
+        result = _make_render_result(publishable=False, body=None, reason_code=None)
+        result["reason_code"] = []  # type: ignore[assignment]
+        err = pub._validate_render_result(result)
+        assert err != ""
+        assert "reason_code" in err.lower()
+
+    def test_publishable_true_reason_code_nonnull_returns_error(self):
+        """B3: publishable=true with non-null reason_code must fail."""
+        result = _make_render_result(publishable=True, body="## body", reason_code="some_code")
+        err = pub._validate_render_result(result)
+        assert err != ""
+        assert "reason_code" in err.lower()

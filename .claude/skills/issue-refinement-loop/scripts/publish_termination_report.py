@@ -8,6 +8,8 @@ and conditionally posts the rendered body to GitHub as an issue comment.
 Usage:
     python3 publish_termination_report.py --issue-number <int> [--input-file <path>]
 
+Note: --renderer CLI flag has been removed. Override RENDERER_SCRIPT module attribute in tests.
+
 Input:
     TERMINATION_REPORT_INPUT_V1 JSON (stdin or --input-file)
 
@@ -25,11 +27,11 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,23 +74,25 @@ def _record_artifact(
 
     IMPORTANT: Does NOT write publishable body to stderr or any log.
     Only reason_code, diagnostics, returncode, and issue_number are recorded.
+    renderer_stderr is stored only as length and sha256 (never raw content).
     """
     timestamp = _now_iso()
+    stderr_bytes = renderer_stderr.encode("utf-8") if renderer_stderr else b""
     artifact = {
         "timestamp": timestamp,
         "issue_number": issue_number,
         "reason_code": reason_code,
-        "renderer_returncode": renderer_returncode,
-        "renderer_stderr": renderer_stderr,
+        "returncode": renderer_returncode,
+        "stderr_len": len(stderr_bytes),
+        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
     }
     if extra:
         artifact.update(extra)
 
-    # Write to stderr (diagnostic only, no publishable body)
+    # Write to stderr (diagnostic only — reason_code / returncode / artifact path only)
     print(
-        f"[publish_termination_report] non-publish artifact: "
-        f"reason_code={reason_code!r} issue={issue_number} "
-        f"returncode={renderer_returncode} timestamp={timestamp}",
+        f"[publish_termination_report] reason_code={reason_code!r} "
+        f"returncode={renderer_returncode}",
         file=sys.stderr,
     )
 
@@ -160,10 +164,14 @@ def _validate_render_result(result: dict) -> str:
 
     Returns empty string on success, error message on failure.
     """
+    if not isinstance(result, dict):
+        return "render result must be a JSON object"
+
     schema = result.get("schema")
     schema_version = result.get("schema_version")
     publishable = result.get("publishable")
     body = result.get("body")
+    reason_code = result.get("reason_code")
 
     if schema != EXPECTED_SCHEMA:
         return f"schema mismatch: expected {EXPECTED_SCHEMA!r}, got {schema!r}"
@@ -185,6 +193,14 @@ def _validate_render_result(result: dict) -> str:
     if publishable is False and body is not None:
         return f"publishable=false but body is non-null: {type(body).__name__}"
 
+    # reason_code invariants
+    if publishable:
+        if reason_code is not None:
+            return "publishable=true must have reason_code=null"
+    else:
+        if not isinstance(reason_code, str) or not reason_code:
+            return "publishable=false requires non-empty reason_code"
+
     return ""
 
 
@@ -196,44 +212,41 @@ def _post_github_comment(*, issue_number: int, body: str) -> int:
     """
     Post body as a GitHub issue comment via gh CLI.
 
-    Uses --body-file only (never --body with direct string).
+    Uses --body-file - with stdin input (no temp file, no NamedTemporaryFile).
+    Sets GH_PROMPT_DISABLED=1 and GH_NO_UPDATE_NOTIFIER=1 to avoid interactive prompts.
+    Enforces a 30-second timeout; on timeout fails closed.
 
-    Returns gh exit code.
+    Returns gh exit code (or -1 on timeout).
     """
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".md",
-        prefix="termination_report_",
-        delete=False,
-        encoding="utf-8",
-    ) as f:
-        f.write(body)
-        body_file = f.name
+    env = os.environ.copy()
+    env["GH_PROMPT_DISABLED"] = "1"
+    env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
 
     try:
         proc = subprocess.run(
-            [
-                "gh", "issue", "comment",
-                str(issue_number),
-                "--body-file", body_file,
-            ],
+            ["gh", "issue", "comment", str(issue_number), "--body-file", "-"],
+            input=body,
             capture_output=True,
             text=True,
             check=False,
             shell=False,
+            timeout=30,
+            env=env,
         )
-        if proc.returncode != 0:
-            print(
-                f"[publish_termination_report] gh issue comment failed "
-                f"(exit {proc.returncode}): {proc.stderr[:200]}",
-                file=sys.stderr,
-            )
-        return proc.returncode
-    finally:
-        try:
-            Path(body_file).unlink()
-        except Exception:
-            pass
+    except subprocess.TimeoutExpired:
+        print(
+            "[publish_termination_report] gh issue comment timed out (30s) — fail-closed",
+            file=sys.stderr,
+        )
+        return -1
+
+    if proc.returncode != 0:
+        print(
+            f"[publish_termination_report] gh issue comment failed "
+            f"(exit {proc.returncode})",
+            file=sys.stderr,
+        )
+    return proc.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -244,17 +257,14 @@ def publish(
     *,
     issue_number: int,
     input_data: dict,
-    _renderer_override: str | None = None,
 ) -> int:
     """
     Core publish flow.
 
     Returns 0 on successful post, 1 on fail-closed (no gh call).
+    To override the renderer path in tests, set publish_termination_report.RENDERER_SCRIPT
+    directly before calling publish().
     """
-    global RENDERER_SCRIPT
-    if _renderer_override is not None:
-        RENDERER_SCRIPT = Path(_renderer_override)
-
     # Invoke renderer
     result, renderer_stderr, returncode = _invoke_renderer(input_data)
 
@@ -303,9 +313,10 @@ def publish(
     # publishable=true and body is non-empty string — post comment
     gh_exit = _post_github_comment(issue_number=issue_number, body=body)
     if gh_exit != 0:
+        reason = "gh_comment_timeout" if gh_exit == -1 else "gh_comment_failed"
         _record_artifact(
             issue_number=issue_number,
-            reason_code="gh_comment_failed",
+            reason_code=reason,
             renderer_stderr=renderer_stderr,
             renderer_returncode=returncode,
             extra={"gh_exit_code": gh_exit},
@@ -339,12 +350,6 @@ def main() -> int:
         default=None,
         help="Path to TERMINATION_REPORT_INPUT_V1 JSON file (default: stdin)",
     )
-    parser.add_argument(
-        "--renderer",
-        type=str,
-        default=None,
-        help="Override path to render_termination_report.py (for testing)",
-    )
     args = parser.parse_args()
 
     # Read input
@@ -364,7 +369,6 @@ def main() -> int:
     return publish(
         issue_number=args.issue_number,
         input_data=input_data,
-        _renderer_override=args.renderer,
     )
 
 
