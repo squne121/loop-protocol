@@ -502,3 +502,45 @@ def test_rg_broad_paths_still_detected():
     # Parent directory of allowed path → broad
     assert _rg_has_broad_search_path(["rg", "pattern", "tests/render"], allowed_paths=allowed_paths)
     assert _rg_has_broad_search_path(["rg", "pattern", "src"], allowed_paths=allowed_paths)
+
+
+def test_extract_allowed_paths_markdown_bullet_variants():
+    """AC1 extension: +/* bullets are also handled."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+* `src/render/CanvasRenderer.ts`（描画）
++ `tests/render/foo.test.ts` (test)
+- `docs/dev/body-authoring.md`
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == [
+        "src/render/CanvasRenderer.ts",
+        "tests/render/foo.test.ts",
+        "docs/dev/body-authoring.md",
+    ]
+
+
+def test_extract_allowed_paths_plain_backtick_line_no_bullet():
+    """AC1 extension: bare `path`（注釈）lines without bullet marker."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+`src/render/CanvasRenderer.ts`（敵描画）
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == ["src/render/CanvasRenderer.ts"]
+
+
+def test_extract_allowed_paths_annotation_no_backtick():
+    """AC1 extension: path（annotation）without backtick strips annotation."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- src/render/CanvasRenderer.ts（描画ループに追加）
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == ["src/render/CanvasRenderer.ts"]

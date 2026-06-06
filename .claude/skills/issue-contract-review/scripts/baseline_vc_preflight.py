@@ -89,6 +89,31 @@ def extract_verification_commands_section(body: str) -> Optional[str]:
     return None
 
 
+_ALLOWED_PATH_BULLET_RE = re.compile(r"^\s*[-+*]\s+")
+_ALLOWED_PATH_CODE_RE = re.compile(r"^`([^`]+)`\s*(?:[（(].*)?$")
+
+
+def _normalize_allowed_path_entry(line: str) -> str:
+    """Normalize one Allowed Paths list entry to a bare path string.
+
+    Handles:
+    - bullet markers: -, +, * (GFM spec)
+    - backtick-wrapped: `path`（注釈）or `path` (description)
+    - trailing full-width/half-width parens annotation
+    """
+    s = line.strip()
+    # Strip bullet marker (-, +, *)
+    s = _ALLOWED_PATH_BULLET_RE.sub("", s)
+    s = s.strip()
+    # Strip backtick wrapping with optional annotation
+    m = _ALLOWED_PATH_CODE_RE.match(s)
+    if m:
+        return m.group(1).strip()
+    # Strip trailing full-width or half-width paren annotation (no backtick)
+    s = re.sub(r"\s*[（(][^）)]*[）)]\s*$", "", s)
+    return s.strip()
+
+
 def extract_allowed_paths(body: str) -> List[str]:
     """
     Parse the `## Allowed Paths` section from an Issue body.
@@ -113,18 +138,16 @@ def extract_allowed_paths(body: str) -> List[str]:
     paths = []
     for line in section.splitlines():
         stripped = line.strip()
-        # Lines starting with '- ' are list items
-        if stripped.startswith("- "):
-            path = stripped[2:].strip()
-            # Strip backtick-wrapped format: `path`（description）or `path` (description)
-            m = re.match(r'^`([^`]+)`', path)
-            if m:
-                path = m.group(1)
+        # Lines starting with a bullet marker (-, +, *) are list items
+        if _ALLOWED_PATH_BULLET_RE.match(stripped):
+            path = _normalize_allowed_path_entry(stripped)
             if path:
                 paths.append(path)
-        # Also handle lines without '- ' prefix (plain paths)
+        # Also handle lines without bullet prefix (plain paths or backtick-wrapped)
         elif stripped and not stripped.startswith("#"):
-            paths.append(stripped)
+            path = _normalize_allowed_path_entry(stripped)
+            if path:
+                paths.append(path)
 
     return paths
 
