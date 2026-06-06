@@ -215,15 +215,48 @@ LOOP_HANDOFF_RESULT_V1:
   generated_at: ISO-8601
   # --- AC11 フィールド（SSOT: 本セクション） ---
   # 以下 4 フィールドは issue-contract-review の終了チェックスクリプトが生成・消費する。
-  # runtime enforcement（max_rewrite_attempts / no-progress detection）は #664 の責務であり、
-  # 本ファイルはスキーマ定義（SSOT）のみを担う。
+  # この 4 フィールド + attempt counter に対する runtime enforcement（max_rewrite_attempts /
+  # no-progress detection）は #664 で decide_rewrite_route.py として実装済み。下記
+  # 「Rewrite Loop Runtime Router」セクションが orchestrator invocation 手順の SSOT。
   checked_body_sha256: string    # チェック対象の Issue body の SHA-256 ハッシュ
   checker_exit_code: int         # チェックスクリプトの終了コード（0: pass, 1: fail）
   missing_sections: []           # 不足しているセクション名のリスト（pass 時は空）
   missing_contract_keys: []      # 不足している contract キーのリスト（pass 時は空）
 ```
 
-**Note**: `checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys` の 4 フィールドに対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection 等）は **#664 の責務** であり、本 Issue のスコープ外。本セクションはスキーマの SSOT として機能するのみ。
+**Note**: 上記 4 フィールド（`checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys`）はスキーマの SSOT として本セクションが定義する。これら 4 フィールド + attempt counter に対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection）は #664 で `decide_rewrite_route.py` として実装済みであり、その orchestrator からの invocation 手順は直下の「Rewrite Loop Runtime Router」セクションが normative SSOT となる。
+
+### Rewrite Loop Runtime Router（#664）
+
+Step 4（Rewrite）の rewrite ループにおいて、orchestrator は **checker を実行するたびに** `decide_rewrite_route.py` を呼び出し、その出力に従って routing する。これにより `max_rewrite_attempts` 超過・body hash 変化なし・missing set の単調減少なしを runtime で確定的に強制する（planner payload の値を宣言するだけでなく、実経路で enforcement する）。
+
+**invocation 手順**（rewrite loop の各反復で実行）:
+
+1. **persisted state の復元（replay-safe）**: `load_rewrite_router_state(state_path, current_source_body_sha256)` で前回の attempt counter / `previous_*` を復元する。
+   - file 不在 → `None`（attempt 0 で新規開始）
+   - 破損 / schema 違反 → `RewriteRouterStateError`（fail-closed。attempt counter を **silent reset しない**）
+   - source issue body が人間により変更（sha 不一致）→ `source_body_reset: true` の reset state（attempt 0）。reset 事実は route result に残る
+2. **checker を実行**して当該反復の `checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys` を得る。
+3. **attempt counter を increment** し、復元した state と当該反復の checker 結果を合成して `LOOP_REWRITE_ROUTER_STATE_V1` を組み立てる（前回の missing set は `previous_missing_*` に入れる）。
+4. **router を呼ぶ**:
+
+   ```bash
+   echo '<LOOP_REWRITE_ROUTER_STATE_V1 JSON>' | \
+     python3 .claude/skills/issue-refinement-loop/scripts/decide_rewrite_route.py
+   ```
+
+   exit 0 で `RouteResult` JSON（`route` / `reason_code` / 端末フィールド）を返す。exit 2 は schema 違反入力（fail-closed）。
+5. **route に従って分岐**:
+
+   | `route` | orchestrator のアクション |
+   |---|---|
+   | `continue_rewrite` | issue-author に rewrite を委譲（Step 4 継続）。次反復へ |
+   | `proceed_to_review` | rewrite ループを抜けて Review / handoff 判定へ進む |
+   | `human_judgment_required` | `termination_reason: human_escalation` で停止。`reason_code`（`max_attempts_exceeded` / `body_hash_unchanged` / `missing_contract_no_progress`）を終了コメントに添付 |
+
+6. **state を永続化**: `save_rewrite_router_state(state, state_path)` で attempt counter を atomic write（tmp + fsync + `os.replace`）で保存する。これにより session 再起動 / CI rerun を跨いで attempt counter が 0 に戻らない。
+
+**routing の正準性**: rewrite ループの停止判断は `decide_rewrite_route` の `route` を SSOT とする。orchestrator は prose で attempt 数や no-progress を再判定しない（thin entrypoint 原則）。`route: human_judgment_required` は本ファイルの `human_escalation` 経路と連動する。
 
 ### `impl_ready` 定義
 
