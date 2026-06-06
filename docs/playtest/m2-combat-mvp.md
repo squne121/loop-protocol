@@ -29,8 +29,8 @@ acceptance_verdict:
       owner: squne121
       approved_by: squne121
       approved_at: "2026-06-06"
-      expiry_issue: "#571"
-      expiry_condition: "Next human playtest evidence must use Evidence Panel or equivalent browser-side capture for viewport/DPR."
+      expiry_issue: "#689"
+      expiry_condition: "Next human manual playtest must capture viewport/DPR using Evidence Panel or equivalent browser-side capture and attach exported evidence YAML to the playtest evidence document."
       residual_risk: "Video evidence cannot be replayed under the exact original viewport/DPR; resolution/DPR-specific rendering defects may have gone unobserved."
       risk_acceptance: "Accept as M2 deferred evidence only. Do not assert 1280x720 or DPR 1.0 for the human run."
       compensating_evidence:
@@ -47,8 +47,8 @@ acceptance_verdict:
       owner: squne121
       approved_by: squne121
       approved_at: "2026-06-06"
-      expiry_issue: "TBD-REQUIRED"
-      expiry_condition: "Next manual playtest before the M3 gate must capture timeout_30s_defeat human video."
+      expiry_issue: "#690"
+      expiry_condition: "Before the M3 gate, the next manual playtest must capture timeout_30s_defeat human video and attach a GitHub-hosted artifact URL to the playtest evidence document."
       residual_risk: "Timeout UI/HUD/canvas outcome may differ in an actual 30-second human run; automated tests verify logic but not human UX observation."
       risk_acceptance: "Accept only as deferred M2 evidence based on automated compensating evidence. Do not treat automated evidence as a human playtest substitute."
       compensating_evidence:
