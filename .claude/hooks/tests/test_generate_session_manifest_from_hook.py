@@ -186,13 +186,13 @@ def _get_hook_commands(data: dict, event: str) -> list[str]:
 
 
 def test_hook_config_policy_guard_before_producer_in_stop():
-    """GIVEN Stop hooks are configured (AC5),
-    WHEN checking hook ordering,
-    THEN session_recording_policy_guard.sh must appear before generate_session_manifest_from_hook."""
+    """GIVEN Stop hooks are configured,
+    WHEN checking hook ordering (single coordinator wiring since #651),
+    THEN session_manifest_coordinator.sh must be the sole hook entry for Stop,
+    and guard/producer must NOT appear as direct siblings (AC1/AC8).
+    Guard → producer ordering is enforced internally by the coordinator script."""
     data = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
 
-    # In exec-form, command is "node" and args[0] is the script path.
-    # Search both command and args for identifying strings.
     hooks_section = data.get("hooks", {})
     event_entries = hooks_section.get("Stop", [])
     hook_entries = []
@@ -203,22 +203,32 @@ def test_hook_config_policy_guard_before_producer_in_stop():
             combined = cmd + " " + " ".join(args)
             hook_entries.append(combined)
 
+    # AC1: coordinator must be present
+    coordinator_indices = [i for i, s in enumerate(hook_entries) if "session_manifest_coordinator" in s]
+    assert coordinator_indices, (
+        "session_manifest_coordinator.sh not found in Stop hooks "
+        "(single coordinator only since #651)"
+    )
+
+    # AC8: guard and producer must NOT be wired as direct siblings
     guard_indices = [i for i, s in enumerate(hook_entries) if "session_recording_policy_guard" in s]
     producer_indices = [i for i, s in enumerate(hook_entries) if "generate_session_manifest_from_hook" in s]
-
-    assert guard_indices, "session_recording_policy_guard.sh not found in Stop hooks"
-    assert producer_indices, "generate_session_manifest_from_hook not found in Stop hooks"
-
-    assert min(guard_indices) < min(producer_indices), (
-        f"session_recording_policy_guard.sh (index {min(guard_indices)}) must appear "
-        f"before generate_session_manifest_from_hook (index {min(producer_indices)}) in Stop hooks"
+    assert not guard_indices, (
+        "session_recording_policy_guard.sh must NOT be wired directly in Stop hooks "
+        "(single coordinator only since #651)"
+    )
+    assert not producer_indices, (
+        "generate_session_manifest_from_hook must NOT be wired directly in Stop hooks "
+        "(single coordinator only since #651)"
     )
 
 
 def test_hook_config_policy_guard_before_producer_in_subagent_stop():
-    """GIVEN SubagentStop hooks are configured (AC5),
-    WHEN checking hook ordering,
-    THEN session_recording_policy_guard.sh must appear before generate_session_manifest_from_hook."""
+    """GIVEN SubagentStop hooks are configured,
+    WHEN checking hook ordering (single coordinator wiring since #651),
+    THEN session_manifest_coordinator.sh must be the sole hook entry for SubagentStop,
+    and guard/producer must NOT appear as direct siblings (AC1/AC8).
+    Guard → producer ordering is enforced internally by the coordinator script."""
     data = json.loads(SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
 
     hooks_section = data.get("hooks", {})
@@ -231,15 +241,23 @@ def test_hook_config_policy_guard_before_producer_in_subagent_stop():
             combined = cmd + " " + " ".join(args)
             hook_entries.append(combined)
 
+    # AC1: coordinator must be present
+    coordinator_indices = [i for i, s in enumerate(hook_entries) if "session_manifest_coordinator" in s]
+    assert coordinator_indices, (
+        "session_manifest_coordinator.sh not found in SubagentStop hooks "
+        "(single coordinator only since #651)"
+    )
+
+    # AC8: guard and producer must NOT be wired as direct siblings
     guard_indices = [i for i, s in enumerate(hook_entries) if "session_recording_policy_guard" in s]
     producer_indices = [i for i, s in enumerate(hook_entries) if "generate_session_manifest_from_hook" in s]
-
-    assert guard_indices, "session_recording_policy_guard.sh not found in SubagentStop hooks"
-    assert producer_indices, "generate_session_manifest_from_hook not found in SubagentStop hooks"
-
-    assert min(guard_indices) < min(producer_indices), (
-        f"session_recording_policy_guard.sh (index {min(guard_indices)}) must appear "
-        f"before generate_session_manifest_from_hook (index {min(producer_indices)}) in SubagentStop hooks"
+    assert not guard_indices, (
+        "session_recording_policy_guard.sh must NOT be wired directly in SubagentStop hooks "
+        "(single coordinator only since #651)"
+    )
+    assert not producer_indices, (
+        "generate_session_manifest_from_hook must NOT be wired directly in SubagentStop hooks "
+        "(single coordinator only since #651)"
     )
 
 
