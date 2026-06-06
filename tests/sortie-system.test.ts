@@ -5,6 +5,8 @@
  * Required test cases: bootstrap, no-start, victory (allEnemiesDefeated), defeat,
  * timeout→defeat, defeat-precedence, vacuous-truth, double-result,
  * timer-authority, terminal-gate, kills-boundary, playerHpRemaining-clamp.
+ *
+ * Updated for Issue #680: endReason discriminated union (AC4–AC8, AC10).
  */
 
 import { describe, it, expect } from 'vitest'
@@ -90,10 +92,10 @@ describe('GIVEN sortie is idle', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC7: all enemies defeated → victory
+// AC6 / AC7: all enemies defeated → victory + endReason=all_enemies_defeated
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie is running and all enemies are defeated', () => {
-  it('AC7: WHEN all spawned enemies defeated THEN outcome=victory, status=victory', () => {
+  it('AC6/AC7: WHEN all spawned enemies defeated THEN outcome=victory, endReason=all_enemies_defeated, status=victory', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -103,14 +105,15 @@ describe('GIVEN sortie is running and all enemies are defeated', () => {
     expect(state.sortie.status).toBe('victory')
     expect(state.sortie.result).not.toBeNull()
     expect(state.sortie.result!.outcome).toBe('victory')
+    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
   })
 })
 
 // ---------------------------------------------------------------------------
-// AC8: defeat when player hp reaches 0
+// AC4 / AC8: defeat when player hp reaches 0 + endReason=player_hp_zero
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie is running and player hp reaches 0', () => {
-  it('AC8: WHEN player.hp <= 0 THEN outcome=defeat, status=defeat', () => {
+  it('AC4/AC8: WHEN player.hp <= 0 THEN outcome=defeat, endReason=player_hp_zero, status=defeat', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -120,14 +123,15 @@ describe('GIVEN sortie is running and player hp reaches 0', () => {
     expect(state.sortie.status).toBe('defeat')
     expect(state.sortie.result).not.toBeNull()
     expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
   })
 })
 
 // ---------------------------------------------------------------------------
-// AC9: 30s timeout → defeat
+// AC5 / AC9: 30s timeout → defeat + endReason=timeout
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie is running and 30s elapses with enemies remaining', () => {
-  it('AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=defeat', () => {
+  it('AC5/AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=defeat, endReason=timeout', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -140,14 +144,15 @@ describe('GIVEN sortie is running and 30s elapses with enemies remaining', () =>
     expect(state.sortie.status).toBe('defeat')
     expect(state.sortie.result).not.toBeNull()
     expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.endReason).toBe('timeout')
   })
 })
 
 // ---------------------------------------------------------------------------
-// AC10: defeat-precedence — defeat > victory > timeout
+// AC7 (priority) / AC10: defeat-precedence — defeat > victory > timeout
 // ---------------------------------------------------------------------------
 describe('GIVEN same tick: player hp=0 AND all enemies defeated', () => {
-  it('AC10: defeat-precedence: THEN outcome=defeat (defeat beats victory)', () => {
+  it('AC7/AC10: defeat-precedence: THEN outcome=defeat, endReason=player_hp_zero (defeat beats victory)', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -158,11 +163,12 @@ describe('GIVEN same tick: player hp=0 AND all enemies defeated', () => {
 
     expect(state.sortie.result).not.toBeNull()
     expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
   })
 })
 
 describe('GIVEN same tick: player hp=0, all enemies defeated, AND elapsedTicks >= targetTicks', () => {
-  it('AC10: defeat-precedence: THEN outcome=defeat (defeat beats victory and timeout)', () => {
+  it('AC7/AC10: defeat-precedence: THEN outcome=defeat, endReason=player_hp_zero (defeat beats victory and timeout)', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -172,11 +178,13 @@ describe('GIVEN same tick: player hp=0, all enemies defeated, AND elapsedTicks >
     runSortieSystem(state, FDT)
 
     expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
   })
 })
 
+// AC8: same tick: all enemies defeated AND timeout, player alive → victory / all_enemies_defeated
 describe('GIVEN same tick: all enemies defeated AND elapsedTicks >= targetTicks, player alive', () => {
-  it('AC10: victory-over-timeout: THEN outcome=victory (victory beats timeout)', () => {
+  it('AC8/AC10: victory-over-timeout: THEN outcome=victory, endReason=all_enemies_defeated (victory beats timeout)', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -186,6 +194,7 @@ describe('GIVEN same tick: all enemies defeated AND elapsedTicks >= targetTicks,
     runSortieSystem(state, FDT)
 
     expect(state.sortie.result!.outcome).toBe('victory')
+    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
   })
 })
 
@@ -203,10 +212,10 @@ describe('GIVEN sortie is running with no enemies', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC11: double-result (result generated exactly once)
+// AC10 / AC11: double-result (result generated exactly once, endReason preserved)
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie already has a result (victory)', () => {
-  it('AC11: double-result: WHEN runSortieSystem called again THEN result is not overwritten', () => {
+  it('AC10/AC11: double-result: WHEN runSortieSystem called again THEN result is not overwritten, endReason preserved', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -215,11 +224,13 @@ describe('GIVEN sortie already has a result (victory)', () => {
 
     const firstResult = state.sortie.result
     expect(firstResult).not.toBeNull()
+    expect(firstResult!.endReason).toBe('all_enemies_defeated')
 
     // Extra tick after terminal state
     runSortieSystem(state, FDT)
 
     expect(state.sortie.result).toBe(firstResult) // same reference
+    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
   })
 })
 
