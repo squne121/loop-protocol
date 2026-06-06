@@ -197,7 +197,7 @@ class TestHeadingPolicyExists:
 
     def test_block_kind_constants_unchanged(self):
         """GIVEN: block_kind 定数セット WHEN: 全定数を確認
-        THEN: ALL_BLOCK_KINDS の 9 種類が存在する"""
+        THEN: ALL_BLOCK_KINDS の 10 種類が存在する（#685: table 追加）"""
         expected = {
             "human_prose",
             "canonical_heading",
@@ -208,6 +208,7 @@ class TestHeadingPolicyExists:
             "shell_command",
             "code_fence",
             "url_or_identifier",
+            "table",
         }
         assert pbp.ALL_BLOCK_KINDS == frozenset(expected)
 
