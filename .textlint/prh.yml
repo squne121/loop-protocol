@@ -110,3 +110,50 @@ rules:
         to: 変更前PASS
       - from: baseline passing
         to: baseline passing
+  # === AI運用語 post-processing ===
+  # safe auto-fix
+  - expected: 自動修正可能
+    patterns:
+      - /auto[-]fixable/
+    specs:
+      - from: auto-fixable
+        to: 自動修正可能
+
+  - expected: 体裁不備
+    patterns:
+      - hygiene failure
+    specs:
+      - from: hygiene failure
+        to: 体裁不備
+
+  # contextual auto-fix
+  - expected: 着手前確認
+    patterns:
+      - /\bintake gate\b/
+    specs:
+      - from: intake gate
+        to: 着手前確認
+      - from: intake_gate
+        to: intake_gate
+
+  - expected: 決定的修正 SubAgent
+    patterns:
+      - /\bdeterministic fixer SubAgent\b/
+    specs:
+      - from: deterministic fixer SubAgent
+        to: 決定的修正 SubAgent
+      - from: deterministic_fixer_SubAgent
+        to: deterministic_fixer_SubAgent
+
+  - expected: snapshot の鮮度
+    patterns:
+      - /\bsnapshot freshness\b/
+    specs:
+      - from: snapshot freshness
+        to: snapshot の鮮度
+      - from: snapshot_freshness
+        to: snapshot_freshness
+
+  # glossary-only / no blanket fix
+  # enum / mutation / stale / intake / gate / freshness / snapshot / SubAgent
+  # These tokens are documented in docs/dev/glossary.md but intentionally have no blanket prh rule.

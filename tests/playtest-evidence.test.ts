@@ -20,6 +20,7 @@ import {
   toYaml,
   shouldShowPanel,
   initPlaytestEvidencePanel,
+  resolveAppUnderTestCommit,
   type PlaytestEvidenceData,
 } from '../src/ui/playtestEvidence'
 
@@ -43,12 +44,19 @@ describe('buildEvidenceData', () => {
     expect(isNaN(d.getTime())).toBe(false)
   })
 
-  // AC8: app_under_test.commit is unknown with reason
-  it('GIVEN Pages context WHEN buildEvidenceData THEN app_under_test.commit is "unknown" with reason', () => {
+  // AC4: app_under_test.commit fallback when VITE_LOOP_COMMIT_SHA is not set
+  it('GIVEN VITE_LOOP_COMMIT_SHA is not set at build time WHEN buildEvidenceData THEN app_under_test.commit is "unknown" with reason', () => {
     const data = buildEvidenceData()
-    expect(data.app_under_test.commit).toBe('unknown')
-    expect(typeof data.app_under_test.commit_unknown_reason).toBe('string')
-    expect(data.app_under_test.commit_unknown_reason.length).toBeGreaterThan(0)
+    // In the test environment import.meta.env.VITE_LOOP_COMMIT_SHA is not set
+    // so we expect the fallback behavior
+    if (data.app_under_test.commit === 'unknown') {
+      expect(typeof data.app_under_test.commit_unknown_reason).toBe('string')
+      expect((data.app_under_test.commit_unknown_reason ?? '').length).toBeGreaterThan(0)
+    } else {
+      // SHA was injected — it must be a 40-char hex string
+      expect(data.app_under_test.commit).toMatch(/^[0-9a-f]{40}$/)
+      expect('commit_unknown_reason' in data.app_under_test).toBe(false)
+    }
   })
 
   // AC3: OS/platform
@@ -133,6 +141,69 @@ describe('buildEvidenceData', () => {
     const data = buildEvidenceData()
     expect(typeof data.hashes).toBe('object')
     expect(data.hashes).not.toBeNull()
+  })
+})
+
+
+// --- AC3, AC4, AC5: resolveAppUnderTestCommit ---
+// Note: import.meta.env is statically replaced by Vite at build time and cannot be mutated in
+// tests. Instead, resolveAppUnderTestCommit accepts an optional overrideEnvValue parameter for
+// unit test injection. Production code calls resolveAppUnderTestCommit() with no argument.
+describe('resolveAppUnderTestCommit', () => {
+  // AC3: valid SHA injection
+  it('GIVEN VITE_LOOP_COMMIT_SHA is a valid 40-char hex SHA WHEN resolveAppUnderTestCommit THEN commit is the SHA and commit_unknown_reason is absent', () => {
+    const validSha = 'a'.repeat(40)
+    const result = resolveAppUnderTestCommit(validSha)
+    expect(result.commit).toBe(validSha)
+    expect('commit_unknown_reason' in result).toBe(false)
+  })
+
+  // AC4: fallback when not set (null = explicit "not set" sentinel)
+  it('GIVEN VITE_LOOP_COMMIT_SHA is undefined WHEN resolveAppUnderTestCommit THEN commit is "unknown" and commit_unknown_reason is present', () => {
+    const result = resolveAppUnderTestCommit(null)
+    expect(result.commit).toBe('unknown')
+    expect(typeof result.commit_unknown_reason).toBe('string')
+    expect((result.commit_unknown_reason ?? '').length).toBeGreaterThan(0)
+  })
+
+  // AC4: fallback when value is not 40-char hex
+  it('GIVEN VITE_LOOP_COMMIT_SHA is an invalid value WHEN resolveAppUnderTestCommit THEN commit is "unknown" and commit_unknown_reason mentions the invalid value', () => {
+    const result = resolveAppUnderTestCommit('not-a-sha')
+    expect(result.commit).toBe('unknown')
+    expect(typeof result.commit_unknown_reason).toBe('string')
+    expect(result.commit_unknown_reason).toContain('not-a-sha')
+  })
+
+  // AC5: commit_unknown_reason key is absent on success (object shape)
+  it('GIVEN valid SHA WHEN resolveAppUnderTestCommit THEN object does NOT have commit_unknown_reason key at all', () => {
+    const validSha = '0123456789abcdef'.repeat(2) + '01234567'
+    const result = resolveAppUnderTestCommit(validSha)
+    expect(Object.prototype.hasOwnProperty.call(result, 'commit_unknown_reason')).toBe(false)
+  })
+
+  // AC3: 40-char hex validation — exactly 40 chars of 0-9a-f
+  it('GIVEN a 39-char hex string WHEN resolveAppUnderTestCommit THEN falls back to unknown', () => {
+    const result = resolveAppUnderTestCommit('a'.repeat(39))
+    expect(result.commit).toBe('unknown')
+  })
+
+  // AC3: uppercase hex should not match (must be lowercase)
+  it('GIVEN a 40-char uppercase hex string WHEN resolveAppUnderTestCommit THEN falls back to unknown', () => {
+    const result = resolveAppUnderTestCommit('A'.repeat(40))
+    expect(result.commit).toBe('unknown')
+  })
+
+  // AC3: valid boundary — exactly 40 lowercase hex chars
+  it('GIVEN exactly 40 lowercase hex chars WHEN resolveAppUnderTestCommit THEN commit matches the SHA', () => {
+    const validSha = '0123456789abcdef0123456789abcdef01234567'
+    const result = resolveAppUnderTestCommit(validSha)
+    expect(result.commit).toBe(validSha)
+  })
+
+  // AC3: 41-char hex string should not match
+  it('GIVEN a 41-char hex string WHEN resolveAppUnderTestCommit THEN falls back to unknown', () => {
+    const result = resolveAppUnderTestCommit('a'.repeat(41))
+    expect(result.commit).toBe('unknown')
   })
 })
 

@@ -66,8 +66,8 @@ export interface BrowserInfo {
 
 export interface AppUnderTest {
   name: string
-  commit: 'unknown'
-  commit_unknown_reason: string
+  commit: string
+  commit_unknown_reason?: string
 }
 
 export interface EnvironmentInfo {
@@ -86,6 +86,55 @@ export interface PlaytestEvidenceData {
   browser: BrowserInfo
   environment: EnvironmentInfo
   hashes: Record<string, string>
+}
+
+
+// ---------------------------------------------------------------------------
+// App Under Test commit resolution (AC3, AC4, AC5)
+// ---------------------------------------------------------------------------
+
+const SHA_REGEX = /^[0-9a-f]{40}$/
+
+/**
+ * Resolve the commit SHA for the app under test.
+ *
+ * AC3: Returns 40-char hex SHA when VITE_LOOP_COMMIT_SHA is injected at build time.
+ * AC4: Falls back to commit: "unknown" with commit_unknown_reason when unset or invalid.
+ * AC5: commit_unknown_reason key is absent (object shape branched) on success.
+ */
+/**
+ * @param overrideEnvValue - Injectable for unit testing only. Pass undefined in production.
+ *   In production the value comes from import.meta.env.VITE_LOOP_COMMIT_SHA (Vite build-time replace).
+ */
+export function resolveAppUnderTestCommit(overrideEnvValue?: string | null): AppUnderTest {
+  // import.meta.env.VITE_LOOP_COMMIT_SHA is replaced at build time by Vite.
+  // overrideEnvValue is used only in unit tests to inject a controlled value.
+  const raw: string | undefined =
+    overrideEnvValue !== undefined && overrideEnvValue !== null
+      ? overrideEnvValue
+      : typeof import.meta !== 'undefined' && import.meta.env
+        ? import.meta.env.VITE_LOOP_COMMIT_SHA
+        : undefined
+
+  if (raw !== undefined && SHA_REGEX.test(raw)) {
+    // AC5: object shape has no commit_unknown_reason key on success
+    return {
+      name: 'loop-protocol',
+      commit: raw,
+    }
+  }
+
+  // AC4: fallback branch — include commit_unknown_reason
+  const reason =
+    raw === undefined
+      ? 'VITE_LOOP_COMMIT_SHA was not set at build time'
+      : `VITE_LOOP_COMMIT_SHA value "${raw}" is not a valid 40-character hex SHA`
+
+  return {
+    name: 'loop-protocol',
+    commit: 'unknown',
+    commit_unknown_reason: reason,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,12 +317,7 @@ export function buildEvidenceData(): PlaytestEvidenceData {
 
   const source_url = typeof location !== 'undefined' ? location.href : 'unknown'
 
-  const app_under_test: AppUnderTest = {
-    name: 'loop-protocol',
-    commit: 'unknown',
-    commit_unknown_reason:
-      'GitHub Pages / PR Preview 上のブラウザからは build-time commit SHA を確定できません。commit SHA の注入には別途 workflow 対応（別 Issue）が必要です。',
-  }
+  const app_under_test = resolveAppUnderTestCommit()
 
   const browser = collectBrowserInfo()
 
