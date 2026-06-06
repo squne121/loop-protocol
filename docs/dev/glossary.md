@@ -45,3 +45,23 @@ LOOP_PROTOCOL プロジェクトで使用する VC（Verification Commands）周
 3. **段階的対応**: 完全な用語統一は別 Issue で段階的に対応する。
 
 `baseline fail` / `baseline pass`（複合語）については prh ルールで `変更前FAIL` / `変更前PASS` へ変換する。
+
+## AI運用語の扱い
+
+AI 運用語は、複合語の blanket replacement ではなく atomic term 単位で扱う。`CLAUDE.md` / `AGENTS.md` / agent prompt に長い用語表を増やさず、repo 側の glossary / prh で post-processing する。
+
+| 用語 | 分類 | 扱い |
+| --- | --- | --- |
+| `auto-fixable` | safe auto-fix | `自動修正可能` に寄せる |
+| `hygiene failure` | safe auto-fix | `体裁不備` に寄せる |
+| `intake gate` | contextual auto-fix | `着手前確認` に寄せる |
+| `deterministic fixer SubAgent` | contextual auto-fix | `決定的修正 SubAgent` に寄せる |
+| `snapshot freshness` | contextual auto-fix | `snapshot の鮮度` に寄せる |
+| `enum` | glossary-only | schema / code token としてそのまま維持する |
+| `mutation` | glossary-only | code / contract token としてそのまま維持する |
+| `stale` | glossary-only | 文脈依存が強いため単独自動置換しない |
+| `intake` / `gate` / `freshness` / `snapshot` / `SubAgent` | glossary-only | 単独では自動置換しない |
+
+`prose` / `heading` / `handoff` / `enforcement` も atomic term として文脈依存が強いので、単独の blanket replacement では扱わず、必要なら別の contextual rule に分離する。
+
+GitHub に投稿済みの Issue / PR コメントは遡及修正しない。人間向け prose の整形は、投稿前 Markdown または repo 内文書に限定する。
