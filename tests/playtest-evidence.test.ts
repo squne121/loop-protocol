@@ -93,7 +93,7 @@ describe('buildEvidenceData', () => {
     }
   })
 
-  // AC5: viewport has all 6 required fields
+  // AC5: viewport has all required fields including visual_viewport_scale
   it('GIVEN buildEvidenceData WHEN called THEN environment.viewport has all required fields', () => {
     const data = buildEvidenceData()
     const vp = data.environment.viewport
@@ -104,6 +104,7 @@ describe('buildEvidenceData', () => {
     expect('client_height' in vp).toBe(true)
     expect('visual_viewport_width' in vp).toBe(true)
     expect('visual_viewport_height' in vp).toBe(true)
+    expect('visual_viewport_scale' in vp).toBe(true)
   })
 
   // AC6: device_pixel_ratio has value and note
@@ -124,6 +125,12 @@ describe('buildEvidenceData', () => {
       data.environment.device_pixel_ratio.note.includes('scaling') ||
       data.environment.device_pixel_ratio.note.includes('ページズーム')
     expect(noteContainsZoomInfo).toBe(true)
+  })
+
+  // AC2: visual_viewport_scale is null when window.visualViewport is not available
+  it('GIVEN Node.js environment (no window.visualViewport) WHEN buildEvidenceData THEN viewport.visual_viewport_scale is null', () => {
+    const data = buildEvidenceData()
+    expect(data.environment.viewport.visual_viewport_scale).toBeNull()
   })
 
   // AC7: screen has width/height/avail_width/avail_height
@@ -244,6 +251,13 @@ describe('toYaml', () => {
     const data = buildEvidenceData()
     const yaml = toYaml(data)
     expect(yaml.endsWith('\n')).toBe(true)
+  })
+
+  // AC3: YAML output includes visual_viewport_scale in viewport
+  it('GIVEN buildEvidenceData WHEN toYaml THEN output contains visual_viewport_scale key', () => {
+    const data = buildEvidenceData()
+    const yaml = toYaml(data)
+    expect(yaml).toContain('visual_viewport_scale:')
   })
 })
 
@@ -528,6 +542,88 @@ describe('AC12 snapshot stability across close/reopen', () => {
     } finally {
       URL.createObjectURL = origCreateObjectURL
       HTMLAnchorElement.prototype.click = origClick
+    }
+  })
+})
+
+// --- AC2/AC3: visual_viewport_scale collection ---
+describe('visual_viewport_scale collection', () => {
+  // AC2(a): visual_viewport_scale passthrough non-1 value (1.75)
+  it('GIVEN window.visualViewport.scale = 1.75 WHEN buildEvidenceData THEN viewport.visual_viewport_scale = 1.75', () => {
+    // Mock window.visualViewport with scale = 1.75
+    const origVisualViewport = window.visualViewport
+    Object.defineProperty(window, 'visualViewport', {
+      value: { scale: 1.75, width: 800, height: 600 },
+      configurable: true,
+    })
+
+    try {
+      const data = buildEvidenceData()
+      expect(data.environment.viewport.visual_viewport_scale).toBe(1.75)
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: origVisualViewport,
+        configurable: true,
+      })
+    }
+  })
+
+  // AC2(b): visual_viewport_scale = 0 is preserved (not converted to null)
+  it('GIVEN window.visualViewport.scale = 0 WHEN buildEvidenceData THEN viewport.visual_viewport_scale = 0 (not null)', () => {
+    const origVisualViewport = window.visualViewport
+    Object.defineProperty(window, 'visualViewport', {
+      value: { scale: 0, width: 800, height: 600 },
+      configurable: true,
+    })
+
+    try {
+      const data = buildEvidenceData()
+      expect(data.environment.viewport.visual_viewport_scale).toBe(0)
+      expect(data.environment.viewport.visual_viewport_scale).not.toBeNull()
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: origVisualViewport,
+        configurable: true,
+      })
+    }
+  })
+
+  // AC2(b): visual_viewport_scale is null when visualViewport is absent
+  it('GIVEN window.visualViewport is null WHEN buildEvidenceData THEN viewport.visual_viewport_scale = null', () => {
+    const origVisualViewport = window.visualViewport
+    Object.defineProperty(window, 'visualViewport', {
+      value: null,
+      configurable: true,
+    })
+
+    try {
+      const data = buildEvidenceData()
+      expect(data.environment.viewport.visual_viewport_scale).toBeNull()
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: origVisualViewport,
+        configurable: true,
+      })
+    }
+  })
+
+  // AC3(c): YAML output includes visual_viewport_scale when scale value exists
+  it('GIVEN window.visualViewport.scale = 1.75 WHEN toYaml is called THEN YAML contains visual_viewport_scale: 1.75', () => {
+    const origVisualViewport = window.visualViewport
+    Object.defineProperty(window, 'visualViewport', {
+      value: { scale: 1.75, width: 800, height: 600 },
+      configurable: true,
+    })
+
+    try {
+      const data = buildEvidenceData()
+      const yaml = toYaml(data)
+      expect(yaml).toContain('visual_viewport_scale: 1.75')
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: origVisualViewport,
+        configurable: true,
+      })
     }
   })
 })
