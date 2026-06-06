@@ -11,6 +11,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { createInitialGameState } from '../src/state/GameState'
+import type { SortieResult } from '../src/state/GameState'
 import {
   startSortie,
   runSortieSystem,
@@ -382,3 +383,63 @@ describe('GIVEN enemies with various defeatedAtTick values', () => {
     expect(state.sortie.result!.kills).toBe(2) // ids 1 and 2 only
   })
 })
+
+// ---- Type-level regression fixtures ----
+// discriminated union の整合を compile-time に検証する（runtime では何も実行しない）
+
+const _validVictory = Object.freeze({
+  outcome: 'victory',
+  endReason: 'all_enemies_defeated',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult)
+
+const _validDefeatByHpZero = Object.freeze({
+  outcome: 'defeat',
+  endReason: 'player_hp_zero',
+  durationMs: 1000,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 0,
+} satisfies SortieResult)
+
+const _validDefeatByTimeout = Object.freeze({
+  outcome: 'defeat',
+  endReason: 'timeout',
+  durationMs: 30000,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult)
+
+// @ts-expect-error outcome: 'victory' に endReason: 'timeout' は型エラー
+const _invalidVictoryByTimeout = {
+  outcome: 'victory',
+  endReason: 'timeout',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult
+
+// @ts-expect-error outcome: 'victory' に endReason: 'player_hp_zero' は型エラー
+const _invalidVictoryByHpZero = {
+  outcome: 'victory',
+  endReason: 'player_hp_zero',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult
+
+// @ts-expect-error outcome: 'defeat' に endReason: 'all_enemies_defeated' は型エラー
+const _invalidDefeatByAllEnemiesDefeated = {
+  outcome: 'defeat',
+  endReason: 'all_enemies_defeated',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 0,
+} satisfies SortieResult
