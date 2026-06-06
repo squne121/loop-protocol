@@ -440,3 +440,107 @@ def test_all_required_test_names_exist_in_this_module():
 
     missing = [name for name in required_names if name not in module_functions]
     assert not missing, f"Required test names not found in module: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# #683: extract_allowed_paths backtick normalization
+# ---------------------------------------------------------------------------
+
+
+def test_extract_allowed_paths_backtick():
+    """AC1: extract_allowed_paths strips backtick wrapping and annotations."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- `src/render/CanvasRenderer.ts`（敵描画ループに HP ラベル描画呼び出しを追加）
+- `src/render/renderUtils.ts`（新規・数値フォーマットと描画ヘルパー）
+- `tests/render/renderUtils.test.ts`（新規・format / bounds / save-restore の回帰テスト）
+- `tests/e2e/m2-combat-mvp.spec.ts`（最大 HP 敵の描画 bounds 検証を追加）
+- `docs/product/features/combat-core.md`（数値表示ポリシーを追記）
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == [
+        "src/render/CanvasRenderer.ts",
+        "src/render/renderUtils.ts",
+        "tests/render/renderUtils.test.ts",
+        "tests/e2e/m2-combat-mvp.spec.ts",
+        "docs/product/features/combat-core.md",
+    ]
+
+
+def test_rg_not_broad_with_backtick_allowed_paths():
+    """AC2: rg with file in backtick-annotated Allowed Paths is not broad."""
+    from baseline_vc_preflight import extract_allowed_paths, _rg_has_broad_search_path
+
+    body = """## Allowed Paths
+
+- `tests/render/renderUtils.test.ts`（新規・回帰テスト）
+- `src/render/renderUtils.ts`（新規・ヘルパー）
+"""
+    allowed_paths = extract_allowed_paths(body)
+    # These should NOT be broad (specific files in Allowed Paths)
+    assert not _rg_has_broad_search_path(
+        ["rg", "-n", "formatCombatNumber", "tests/render/renderUtils.test.ts"],
+        allowed_paths=allowed_paths,
+    )
+    assert not _rg_has_broad_search_path(
+        ["rg", "-n", "save|restore", "src/render/renderUtils.ts"],
+        allowed_paths=allowed_paths,
+    )
+
+
+def test_rg_broad_paths_still_detected():
+    """AC3: True broad paths (., /, no path, parent dir) still detected."""
+    from baseline_vc_preflight import _rg_has_broad_search_path
+
+    allowed_paths = ["tests/render/renderUtils.test.ts", "src/render/renderUtils.ts"]
+    # No path argument → broad
+    assert _rg_has_broad_search_path(["rg", "pattern"], allowed_paths=allowed_paths)
+    # '.' → broad
+    assert _rg_has_broad_search_path(["rg", "pattern", "."], allowed_paths=allowed_paths)
+    # Parent directory of allowed path → broad
+    assert _rg_has_broad_search_path(["rg", "pattern", "tests/render"], allowed_paths=allowed_paths)
+    assert _rg_has_broad_search_path(["rg", "pattern", "src"], allowed_paths=allowed_paths)
+
+
+def test_extract_allowed_paths_markdown_bullet_variants():
+    """AC1 extension: +/* bullets are also handled."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+* `src/render/CanvasRenderer.ts`（描画）
++ `tests/render/foo.test.ts` (test)
+- `docs/dev/body-authoring.md`
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == [
+        "src/render/CanvasRenderer.ts",
+        "tests/render/foo.test.ts",
+        "docs/dev/body-authoring.md",
+    ]
+
+
+def test_extract_allowed_paths_plain_backtick_line_no_bullet():
+    """AC1 extension: bare `path`（注釈）lines without bullet marker."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+`src/render/CanvasRenderer.ts`（敵描画）
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == ["src/render/CanvasRenderer.ts"]
+
+
+def test_extract_allowed_paths_annotation_no_backtick():
+    """AC1 extension: path（annotation）without backtick strips annotation."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- src/render/CanvasRenderer.ts（描画ループに追加）
+"""
+    paths = extract_allowed_paths(body)
+    assert paths == ["src/render/CanvasRenderer.ts"]
