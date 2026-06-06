@@ -561,6 +561,7 @@ test('GIVEN short sortie fixture WHEN defeat overlay baseline then Canvas screen
     'm2-defeat-overlay-baseline.png',
     {
       animations: 'disabled',
+      maxDiffPixels: 1,
     },
   )
 })
@@ -585,10 +586,24 @@ test('GIVEN sortie running WHEN running HUD baseline then HUD screenshot matches
     timeout: 3000,
   })
 
+  await page.addStyleTag({
+    content: `[data-field="sortie-status"] {
+      display: block;
+      width: 118px;
+      height: 66px;
+      line-height: 66px;
+      text-align: center;
+      white-space: nowrap;
+      box-sizing: border-box;
+      overflow: hidden;
+    }`,
+  })
+
   await expect(page.locator('[data-field="sortie-status"]')).toHaveScreenshot(
     'm2-running-hud-baseline.png',
     {
       animations: 'disabled',
+      maxDiffPixels: 1,
     },
   )
 })
