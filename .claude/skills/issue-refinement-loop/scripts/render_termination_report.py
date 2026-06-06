@@ -181,13 +181,19 @@ def _render_normal_template(data: dict[str, Any]) -> str:
     lines.append("")
 
     # Blockers section (human_escalation only)
+    # Use _make_dynamic_fence to prevent GFM fence injection (B1).
+    # Each blocker is wrapped in a literal block with a fence that cannot
+    # appear inside the blocker text, regardless of backtick sequences.
     if termination_reason == "human_escalation" and blockers_summary:
         lines.append("## Blockers")
         lines.append("")
         for b in blockers_summary:
-            sanitized = b.strip()
-            lines.append(f"- {sanitized}")
-        lines.append("")
+            serialized = json.dumps(b, ensure_ascii=False)
+            fence = _make_dynamic_fence(serialized)
+            lines.append(f"{fence}text")
+            lines.append(serialized)
+            lines.append(fence)
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -243,16 +249,26 @@ def _now_iso() -> str:
 # Main render logic (AC4: max 2 attempts, no LLM/ask/network/gh)
 # ---------------------------------------------------------------------------
 
+class InputValidationError(ValueError):
+    """Raised when input fails validation (used internally)."""
+
+
 def render(data: dict[str, Any]) -> dict[str, Any]:
     """
     Attempt to render the termination report with guard validation.
 
+    Validates input first (N1: validation runs even when called as library).
     Attempt 1: normal template
     Attempt 2 (if guard fails): fallback minimal template
     If both fail: publishable=false, body=null, reason_code=GUARD_FAIL_REASON_CODE
 
     Returns TERMINATION_REPORT_RENDER_RESULT_V1 dict.
     """
+    # N1: validate input at render() entry so library callers also get validation
+    _, err = _validate_input(data)
+    if err:
+        raise InputValidationError(err)
+
     generated_at = _now_iso()
     data = dict(data)
     data.setdefault("generated_at", generated_at)
@@ -379,22 +395,30 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
         )
 
     issue_number = raw.get("issue_number")
-    if issue_number is not None and not isinstance(issue_number, int):
-        return None, (
-            f"issue_number must be int or null, got {type(issue_number).__name__}"
-        )
+    if issue_number is not None:
+        # Use type() not isinstance() so bool (subclass of int) is rejected (B3)
+        if type(issue_number) is not int:
+            return None, (
+                f"issue_number must be int or null, got {type(issue_number).__name__}"
+            )
 
     iteration = raw.get("iteration")
-    if iteration is not None and not isinstance(iteration, int):
-        return None, (
-            f"iteration must be int or null, got {type(iteration).__name__}"
-        )
+    if iteration is not None:
+        # Use type() not isinstance() so bool (subclass of int) is rejected (B3)
+        if type(iteration) is not int:
+            return None, (
+                f"iteration must be int or null, got {type(iteration).__name__}"
+            )
 
     blockers_summary = raw.get("blockers_summary")
-    if blockers_summary is not None and not isinstance(blockers_summary, list):
-        return None, (
-            f"blockers_summary must be list or null, got {type(blockers_summary).__name__}"
-        )
+    if blockers_summary is not None:
+        if not isinstance(blockers_summary, list):
+            return None, (
+                f"blockers_summary must be list or null, got {type(blockers_summary).__name__}"
+            )
+        # Each element must be a string (B3)
+        if not all(isinstance(x, str) for x in blockers_summary):
+            return None, "blockers_summary must be a list of strings"
 
     return raw, ""
 

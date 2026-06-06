@@ -370,6 +370,7 @@ class TestFenceAndAdversarialInput:
             assert result["body"] is not None
 
     def test_tilde_fence_injection_in_blockers(self):
+        # B2: tilde fence injection - body must pass guard and not expose shell_command block
         adversarial = "~~~shell\nrm -rf /\n~~~"
         result = rtr.render(_make_input(
             "human_escalation",
@@ -377,8 +378,20 @@ class TestFenceAndAdversarialInput:
             blockers_summary=[adversarial],
         ))
         assert result["attempts"] >= 1
+        # Body must be publishable and pass guard
+        assert result["publishable"] is True, "tilde fence injection should be contained"
+        ok, errs = rtr._run_guard(result["body"])
+        assert ok, f"Body with tilde fence injection failed guard: {errs}"
+        # The blocker payload must not appear as an independent shell_command block
+        # (verify by checking no block in body is classified as shell_command)
+        for block_text, _ in rtr.iter_markdown_blocks(result["body"]):
+            kind = rtr.classify_block(block_text)
+            assert kind not in ("shell_command", "vc_command"), (
+                f"tilde fence injection leaked as '{kind}' block: {block_text[:80]!r}"
+            )
 
     def test_english_stack_trace_in_blockers(self):
+        # B2: multiline stack trace - body must pass guard
         adversarial = (
             "Traceback (most recent call last):\n"
             '  File "foo.py", line 1, in <module>\n'
@@ -390,6 +403,59 @@ class TestFenceAndAdversarialInput:
             blockers_summary=[adversarial],
         ))
         assert result["attempts"] >= 1
+        assert result["publishable"] is True, "stack trace should be safely encoded"
+        ok, errs = rtr._run_guard(result["body"])
+        assert ok, f"Body with stack trace failed guard: {errs}"
+
+    def test_triple_backtick_shell_injection_guard_pass(self):
+        # B2: explicit regression - ```shell block injection in blocker
+        adversarial = "```shell\nrm -rf /\n```"
+        result = rtr.render(_make_input(
+            "human_escalation",
+            termination_cause="needs_fix_at_iteration_limit",
+            blockers_summary=[adversarial],
+        ))
+        assert result["publishable"] is True
+        ok, errs = rtr._run_guard(result["body"])
+        assert ok, f"```shell injection leaked through guard: {errs}"
+        for block_text, _ in rtr.iter_markdown_blocks(result["body"]):
+            kind = rtr.classify_block(block_text)
+            assert kind not in ("shell_command", "vc_command"), (
+                f"```shell injection classified as '{kind}': {block_text[:80]!r}"
+            )
+
+    def test_loop_handoff_marker_in_blocker_guard_pass(self):
+        # B2: LOOP_HANDOFF_RESULT_V1 marker injection in blocker
+        adversarial = "<!-- LOOP_HANDOFF_RESULT_V1 --> injected"
+        result = rtr.render(_make_input(
+            "human_escalation",
+            termination_cause="human_judgment_required",
+            blockers_summary=[adversarial],
+        ))
+        assert result["publishable"] is True
+        ok, errs = rtr._run_guard(result["body"])
+        assert ok, f"HTML marker injection failed guard: {errs}"
+
+    def test_dynamic_fence_used_in_blocker_output(self):
+        # B2: verify _make_dynamic_fence is actually used in blocker rendering
+        # by checking that a blocker with backticks is wrapped in a fence
+        # longer than the backtick sequence
+        adversarial = "has `````five backtick````` sequence"
+        result = rtr.render(_make_input(
+            "human_escalation",
+            termination_cause="needs_fix_at_iteration_limit",
+            blockers_summary=[adversarial],
+        ))
+        assert result["publishable"] is True
+        body = result["body"]
+        # The body must contain a fence of length >= 6 (five backticks + 1)
+        import re
+        fences = re.findall(r"^(`{6,})", body, re.MULTILINE)
+        assert fences, (
+            "Expected a dynamic fence of length >= 6 in body when blocker contains "
+            "a 5-backtick sequence, but none found. "
+            "This suggests _make_dynamic_fence is not being used."
+        )
 
     def test_dynamic_fence_length_increases_with_content(self):
         # _make_dynamic_fence must return >= max backtick run + 1
@@ -529,3 +595,57 @@ class TestInputValidation:
             data = {"termination_reason": "approved", "termination_cause": cause}
             validated, err = rtr._validate_input(data)
             assert err == "", f"Cause '{cause}' should be valid"
+
+    # B3: blockers_summary element type validation
+    def test_blockers_summary_with_none_element_rejected(self):
+        data = {
+            "termination_reason": "human_escalation",
+            "termination_cause": "needs_fix_at_iteration_limit",
+            "blockers_summary": [None],
+        }
+        validated, err = rtr._validate_input(data)
+        assert err != "", "None element in blockers_summary must be rejected"
+        assert validated is None
+
+    def test_blockers_summary_with_dict_element_rejected(self):
+        data = {
+            "termination_reason": "human_escalation",
+            "termination_cause": "needs_fix_at_iteration_limit",
+            "blockers_summary": [{"key": "value"}],
+        }
+        validated, err = rtr._validate_input(data)
+        assert err != "", "dict element in blockers_summary must be rejected"
+        assert validated is None
+
+    def test_blockers_summary_with_int_element_rejected(self):
+        data = {
+            "termination_reason": "human_escalation",
+            "termination_cause": "needs_fix_at_iteration_limit",
+            "blockers_summary": [42],
+        }
+        validated, err = rtr._validate_input(data)
+        assert err != "", "int element in blockers_summary must be rejected"
+        assert validated is None
+
+    def test_blockers_summary_with_string_elements_valid(self):
+        data = {
+            "termination_reason": "human_escalation",
+            "termination_cause": "needs_fix_at_iteration_limit",
+            "blockers_summary": ["blocker one", "blocker two"],
+        }
+        validated, err = rtr._validate_input(data)
+        assert err == "", "list of strings should be valid"
+
+    # B3: bool rejection for issue_number and iteration
+    def test_issue_number_bool_rejected(self):
+        # isinstance(True, int) is True in Python, so we must use type() check
+        data = {"termination_reason": "approved", "issue_number": True}
+        validated, err = rtr._validate_input(data)
+        assert err != "", "bool must not be accepted as issue_number"
+        assert validated is None
+
+    def test_iteration_bool_rejected(self):
+        data = {"termination_reason": "approved", "iteration": False}
+        validated, err = rtr._validate_input(data)
+        assert err != "", "bool must not be accepted as iteration"
+        assert validated is None
