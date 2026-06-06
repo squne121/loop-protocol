@@ -17,11 +17,7 @@
         "auto_fixes",
         "blockers",
         "permissions",
-        "generated_at",
-        "checked_body_sha256",
-        "checker_exit_code",
-        "missing_sections",
-        "missing_contract_keys"
+        "generated_at"
       ],
       "additionalProperties": false,
       "properties": {

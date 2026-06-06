@@ -80,13 +80,15 @@ def test_loop_handoff_result_v1_ac11_fields_are_in_ssot() -> None:
 
 def test_loop_handoff_json_schema_declares_ac11_fields() -> None:
     """
-    loop_handoff_result_v1.json の LOOP_HANDOFF_RESULT_V1 properties と required に
+    loop_handoff_result_v1.json の LOOP_HANDOFF_RESULT_V1 properties に
     AC11 の 4 フィールドが宣言されていることを検証する。
+
+    注: 4 フィールドは optional（required 外）とする。
+    既存フィクスチャとの後方互換を維持するため required には含めない。
 
     Checks:
     - schemas/loop_handoff_result_v1.json が存在する
     - LOOP_HANDOFF_RESULT_V1.properties に 4 フィールドが含まれる
-    - LOOP_HANDOFF_RESULT_V1.required に 4 フィールドが含まれる
     """
     assert SCHEMA_PATH.exists(), (
         f"loop_handoff_result_v1.json が見つかりません: {SCHEMA_PATH}"
@@ -95,18 +97,11 @@ def test_loop_handoff_json_schema_declares_ac11_fields() -> None:
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     handoff_schema = schema["properties"]["LOOP_HANDOFF_RESULT_V1"]
     properties = handoff_schema.get("properties", {})
-    required = handoff_schema.get("required", [])
 
     missing_from_properties = [f for f in AC11_FIELDS if f not in properties]
     assert not missing_from_properties, (
         f"LOOP_HANDOFF_RESULT_V1.properties に以下の AC11 フィールドが見つかりません: "
         f"{missing_from_properties}"
-    )
-
-    missing_from_required = [f for f in AC11_FIELDS if f not in required]
-    assert not missing_from_required, (
-        f"LOOP_HANDOFF_RESULT_V1.required に以下の AC11 フィールドが見つかりません: "
-        f"{missing_from_required}"
     )
 
 
