@@ -24,12 +24,13 @@ acceptance_verdict:
   partial_or_deferred:
     - ac: AC8
       status: accepted
-      reason: "viewport and device_pixel_ratio captured via Evidence Panel (?playtest_evidence=1) during the 2026-06-06 manual playtest on GitHub Pages main (commit 59dbc33eb42b66406d96c01af10cb513e09ab879). Recorded raw metrics: viewport inner 958x910 / client 943x910 / visual 943x910, device_pixel_ratio 1, screen 1920x1080, Chrome 149.0.7827.54 on Windows. The original 2026-06-02 evidence remains unchanged; this is resolved by a separate new evidence block, not by backfilling the prior run."
+      reason: "viewport and device_pixel_ratio captured via Evidence Panel (?playtest_evidence=1) across two 2026-06-06 sessions: Session 1 on GitHub Pages main (commit 59dbc33eb42b66406d96c01af10cb513e09ab879, viewport inner 958x910, with screenshot/video) and Session 2 on PR Preview (commit d0377c29ce18d1d605ebf30547671d61b43faab2, viewport inner 1920x911, with a downloaded YAML artifact whose bytes/sha256 are recorded). See 'Human Playtest Evidence (2026-06-06, AC8 viewport/DPR recapture)'. The original 2026-06-02 evidence remains unchanged; resolved by a separate new evidence block, not by backfilling the prior run."
       owner: squne121
       approved_by: squne121
       approved_at: "2026-06-07"
       resolved_by_evidence: "https://github.com/squne121/loop-protocol/issues/689#issuecomment-4640697498"
-      note: "Raw viewport metrics are recorded as captured. 1280x720 and DPR 1.0 are not asserted for the human run; the captured device_pixel_ratio value of 1 reflects the operator's display and zoom condition at capture time per the Evidence Panel note, not a normative assertion."
+      download_artifact_sha256: "e981687a87ef4b794b96ca397f4fb529f4ec47898710e462b5021ad0a02a206d"
+      note: "Raw viewport metrics are recorded as captured for both sessions. AC4 (screenshot/video) is satisfied by Session 1 and AC5 (Download artifact bytes/sha256) by Session 2; the two sessions use different routes/commits/viewports and are recorded as-is, not stitched. 1280x720 and DPR 1.0 are not asserted for the human run."
     - ac: AC10
       status: accepted
       reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
@@ -390,15 +391,32 @@ environment:
 This is a **new, separate** evidence block added to resolve the AC8 viewport/DPR waiver (per #689).
 It does **not** modify or backfill the original 2026-06-02 evidence above.
 
+The viewport/DPR recapture was performed across **two distinct Evidence Panel sessions** on 2026-06-06.
+They are recorded transparently below as separate sessions; AC4 (screenshot/video) is satisfied by
+Session 1 and AC5 (Download artifact `bytes`/`sha256`) by Session 2. The two sessions use different
+routes (Pages main vs PR Preview), commits, and viewport sizes; this is recorded as-is and **not**
+stitched into a single synthetic session.
+
+| AC | Coverage | Session |
+|---|---|---|
+| AC1 capture conditions | both | S1, S2 |
+| AC2 raw YAML fields | both | S1, S2 |
+| AC3 40-char commit (not `unknown`) | both | S1 (`59dbc33…`), S2 (`d0377c2…`) |
+| AC4 screenshot/video same session | video | S1 |
+| AC5 Copy result | Copy success | S1 |
+| AC5 Download artifact `bytes`/`sha256` | download file | S2 |
+
+### Session 1 — GitHub Pages main (2026-06-06T22:55:12Z)
+
 Source playtest comment: https://github.com/squne121/loop-protocol/issues/689#issuecomment-4640697498
 
-### Capture conditions (AC1)
+#### Capture conditions (AC1)
 
-- `?playtest_evidence=1` Evidence Panel opened during the same manual playtest session.
+- `?playtest_evidence=1` Evidence Panel opened during the manual playtest session.
 - Browser zoom / window size / DPR condition were fixed before opening the panel; no resize / zoom / display move was performed after opening until capture completed.
 - canonical route: **GitHub Pages main** (`https://squne121.github.io/loop-protocol/`) — hosted distribution (not a local preview).
 
-### Raw Evidence Panel YAML (AC2, AC3)
+#### Raw Evidence Panel YAML (AC2, AC3)
 
 ```yaml
 # Loop Protocol Playtest Evidence
@@ -439,18 +457,86 @@ hashes: {}
 - `app_under_test.commit`: `59dbc33eb42b66406d96c01af10cb513e09ab879` — 40-char SHA, recorded directly by the Evidence Panel (not `unknown`). This commit is present on `main`.
 - `browser.version_source: userAgentData` — version derived from `navigator.userAgentData`, not a UA-string fallback or manual entry.
 
-### Screenshot / video (AC4)
+#### Screenshot / video (AC4)
 
 - artifact_url: "https://github.com/user-attachments/assets/b4b9fd7a-38bd-46dc-bdc7-ce6f60941d47"
-- Captured in the same session as the YAML above; the running game screen, Evidence Panel, execution URL (`https://squne121.github.io/loop-protocol/`), and viewport/DPR are observable together.
+- Captured in the same session as the Session 1 YAML above; the running game screen, Evidence Panel, execution URL (`https://squne121.github.io/loop-protocol/`), and viewport/DPR are observable together.
 
-### Copy / Download results (AC5)
+#### Copy result (AC5, Copy path)
 
-- Copy YAML: success — the raw YAML above was copied from the Evidence Panel and pasted verbatim into the source playtest comment (no `error.name` recorded).
-- Download YAML: the exported artifact's `bytes` / `sha256` were not separately recorded by the operator for this run. The Copy-path YAML above is the canonical captured artifact for this evidence block.
+- Copy YAML: success — the Session 1 raw YAML above was copied from the Evidence Panel and pasted verbatim into the source playtest comment (no `error.name` recorded).
+
+### Session 2 — PR Preview (2026-06-06T23:36:16Z, Download artifact)
+
+Source attachment comment: https://github.com/squne121/loop-protocol/pull/723#issuecomment-4640794955
+
+#### Capture conditions (AC1)
+
+- `?playtest_evidence=1` Evidence Panel opened on the PR Preview deployment of this PR.
+- canonical route: **PR Preview** (`https://squne121.github.io/loop-protocol/pr-723/`) — hosted distribution (not a local preview).
+
+#### Raw Evidence Panel YAML (AC2, AC3) — exact bytes of the downloaded artifact
+
+```yaml
+# Loop Protocol Playtest Evidence
+# Generated by playtestEvidence panel (AC8)
+
+playtest_evidence_schema_version: v1
+generated_at: "2026-06-06T23:36:16.975Z"
+source_url: "https://squne121.github.io/loop-protocol/pr-723/"
+app_under_test:
+  name: loop-protocol
+  commit: d0377c29ce18d1d605ebf30547671d61b43faab2
+browser:
+  version: 149.0.7827.54
+  version_source: userAgentData
+  platform: Windows
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36
+environment:
+  viewport:
+    inner_width: 1920
+    inner_height: 911
+    client_width: 1905
+    client_height: 911
+    visual_viewport_width: 1905
+    visual_viewport_height: 911
+  device_pixel_ratio:
+    value: 1
+    note: device_pixel_ratio はページズームおよび OS の display scaling 設定によって変化します。1.0 が物理ピクセル等倍とは限りません。
+  screen:
+    width: 1920
+    height: 1080
+    avail_width: 1920
+    avail_height: 1032
+  timezone: Asia/Tokyo
+  language: ja
+hashes: {}
+```
+
+- `app_under_test.commit`: `d0377c29ce18d1d605ebf30547671d61b43faab2` — 40-char SHA recorded directly by the Evidence Panel on the PR Preview build (not `unknown`).
+
+#### Download artifact (AC5, Download path)
+
+The Evidence Panel "Download YAML" artifact was exported and uploaded to GitHub. `bytes` and `sha256`
+below were computed from the uploaded file (the YAML rendered above is the exact content of that file).
+
+```yaml
+download_artifact:
+  file_name: "loop-protocol-playtest-evidence-2026-06-06T23-36-16-975Z.yaml"
+  mime_type: application/x-yaml
+  url: "https://github.com/user-attachments/files/28673772/loop-protocol-playtest-evidence-2026-06-06T23-36-16-975Z.yaml"
+  bytes: 1047
+  sha256: "e981687a87ef4b794b96ca397f4fb529f4ec47898710e462b5021ad0a02a206d"
+  result: success
+```
+
+> Note on `hashes: {}`: the Evidence Panel currently exports an empty `hashes` map, so the YAML carries
+> no self-reported integrity hash. The `download_artifact.sha256` above is the sha256 of the full
+> downloaded file bytes (computed externally via `sha256sum`), which provides the AC5-required
+> integrity reference without the self-referential-hash problem.
 
 ### Resolution note (AC6, AC7)
 
-- AC8 viewport/DPR waiver is resolved against this new evidence block; the #689 expiry entry has been removed from `acceptance_verdict.partial_or_deferred[AC8]` and the entry is now `status: accepted`.
-- Raw viewport metrics are recorded as-is. `1280x720` and DPR `1.0` are not asserted for the human run.
+- AC8 viewport/DPR waiver is resolved against the combined evidence above; the #689 expiry entry has been removed from `acceptance_verdict.partial_or_deferred[AC8]` and the entry is now `status: accepted`.
+- Raw viewport metrics are recorded as-is for both sessions. `1280x720` and DPR `1.0` are not asserted for the human run.
 - AC11 timeout_30s_defeat (tracked by #690) is **not** modified by this block.
