@@ -887,86 +887,26 @@ def main():
 
     # ============================================================
     # Classify api mutation (--classify-api-mutation)
+    # SSOT: mutation_route_matrix.py の classify_api_mutation() に委譲する。
+    # AC15: mutation route matrix を SSOT として扱い、ロジックの重複を排除する。
     # ============================================================
     if args.classify_api_mutation is not None:
-        import json as _json
+        import importlib.util as _ilu
+        import os as _os
+
+        _matrix_path = _os.path.join(_os.path.dirname(__file__), 'mutation_route_matrix.py')
+        _spec = _ilu.spec_from_file_location('mutation_route_matrix', _matrix_path)
+        _matrix_mod = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+        # dataclass が __module__ を解決できるよう sys.modules に登録する
+        sys.modules['mutation_route_matrix'] = _matrix_mod
+        _spec.loader.exec_module(_matrix_mod)  # type: ignore[union-attr]
 
         payload_file = args.classify_api_mutation
         endpoint = args.api_endpoint or ''
+        method = args.api_method or ''
 
-        # Parse JSON payload
-        try:
-            with open(payload_file, 'r', encoding='utf-8') as f:
-                payload = _json.load(f)
-        except (FileNotFoundError, IOError, _json.JSONDecodeError):
-            print('PAYLOAD_PARSE_FAILED')
-            sys.exit(0)
-
-        # Check if payload contains 'body' key (body mutation indicator)
-        if not isinstance(payload, dict) or 'body' not in payload:
-            print('NOT_BODY_MUTATION')
-            sys.exit(0)
-
-        body_value = payload.get('body')
-        if not isinstance(body_value, str):
-            print('INVALID_BODY_TYPE')
-            sys.exit(0)
-
-        method = (args.api_method or '').strip().upper()
-        if method in {'GET', 'DELETE'}:
-            print('NOT_BODY_MUTATION')
-            sys.exit(0)
-
-        # Parse endpoint to detect issue/PR body mutation
-        # Patterns:
-        #   repos/{owner}/{repo}/issues/{number}          -> ISSUE PATCH
-        #   repos/{owner}/{repo}/pulls/{number}           -> PR PATCH
-        #   /repos/{owner}/{repo}/issues/{number}         -> ISSUE PATCH (leading slash)
-        #   /repos/{owner}/{repo}/pulls/{number}          -> PR PATCH
-        import re as _re
-        # Strip leading slash
-        ep = endpoint.lstrip('/')
-
-        issue_m = _re.match(
-            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)$', ep
-        )
-        pr_m = _re.match(
-            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/(?P<number>\d+)$', ep
-        )
-        issue_comment_m = _re.match(
-            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/comments/(?P<comment_id>\d+)$', ep
-        )
-        pr_review_comment_m = _re.match(
-            r'^repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls/comments/(?P<comment_id>\d+)$', ep
-        )
-
-        if issue_m:
-            print(f"BODY_MUTATION_ISSUE:{issue_m.group('number')}")
-        elif pr_m:
-            print(f"BODY_MUTATION_PR:{pr_m.group('number')}")
-        elif issue_comment_m:
-            if method and method != 'PATCH':
-                print('NOT_BODY_MUTATION')
-            else:
-                print(
-                    "BODY_MUTATION_ISSUE_COMMENT:"
-                    f"{issue_comment_m.group('owner')}:"
-                    f"{issue_comment_m.group('repo')}:"
-                    f"{issue_comment_m.group('comment_id')}"
-                )
-        elif pr_review_comment_m:
-            if method and method != 'PATCH':
-                print('NOT_BODY_MUTATION')
-            else:
-                print(
-                    "BODY_MUTATION_PR_REVIEW_COMMENT:"
-                    f"{pr_review_comment_m.group('owner')}:"
-                    f"{pr_review_comment_m.group('repo')}:"
-                    f"{pr_review_comment_m.group('comment_id')}"
-                )
-        else:
-            # endpoint not recognized as issue/PR/comment PATCH mutation
-            print('NOT_BODY_MUTATION')
+        result = _matrix_mod.classify_api_mutation(payload_file, endpoint, method)
+        print(result)
         sys.exit(0)
 
     # ============================================================
