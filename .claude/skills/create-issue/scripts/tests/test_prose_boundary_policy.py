@@ -47,7 +47,7 @@ class TestBlockKindConstants:
     """AC1: block_kind 列挙が正しく定義されている"""
 
     def test_all_required_kinds_exist(self):
-        """GIVEN: block_kind 定数セット WHEN: 存在確認 THEN: 9種類すべて存在する"""
+        """GIVEN: block_kind 定数セット WHEN: 存在確認 THEN: 10種類すべて存在する（#685: table 追加）"""
         required = {
             "human_prose",
             "canonical_heading",
@@ -58,6 +58,7 @@ class TestBlockKindConstants:
             "shell_command",
             "code_fence",
             "url_or_identifier",
+            "table",
         }
         assert required == ALL_BLOCK_KINDS
 
