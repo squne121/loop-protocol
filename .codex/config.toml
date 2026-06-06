@@ -20,6 +20,8 @@ enabled = true
 "github.com" = "allow"
 "api.github.com" = "allow"
 "objects.githubusercontent.com" = "allow"
+# release / upload endpoints only; keep readonly/bootstrap narrower.
+"uploads.github.com" = "allow"
 
 [permissions.loop-protocol-readonly.filesystem]
 ":minimal" = "read"
