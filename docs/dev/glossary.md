@@ -50,17 +50,21 @@ LOOP_PROTOCOL プロジェクトで使用する VC（Verification Commands）周
 
 AI 運用語は、複合語の blanket replacement ではなく atomic term 単位で扱う。`CLAUDE.md` / `AGENTS.md` / agent prompt に長い用語表を増やさず、repo 側の glossary / prh で post-processing する。
 
-| 用語 | 分類 | 扱い |
-| --- | --- | --- |
-| `auto-fixable` | safe auto-fix | `自動修正可能` に寄せる |
-| `hygiene failure` | safe auto-fix | `体裁不備` に寄せる |
-| `intake gate` | contextual auto-fix | `着手前確認` に寄せる |
-| `deterministic fixer SubAgent` | contextual auto-fix | `決定的修正 SubAgent` に寄せる |
-| `snapshot freshness` | contextual auto-fix | `snapshot の鮮度` に寄せる |
-| `enum` | glossary-only | schema / code token としてそのまま維持する |
-| `mutation` | glossary-only | code / contract token としてそのまま維持する |
-| `stale` | glossary-only | 文脈依存が強いため単独自動置換しない |
-| `intake` / `gate` / `freshness` / `snapshot` / `SubAgent` | glossary-only | 単独では自動置換しない |
+| 英語表記 | 日本語表示 | 分類 | 定義 | 自動修正方針 |
+| --- | --- | --- | --- | --- |
+| `auto-fixable` | 自動修正可能 | 安全自動修正 | プロセス・フック・VC の正確性を損なわない自動修正対象 | 複合語のみ置換 |
+| `hygiene failure` | 体裁不備 | 安全自動修正 | コード体裁・書式の不統一 | 複合語のみ置換 |
+| `intake gate` | 着手前確認 | 文脈限定自動修正 | 実装着手前に確認・判断が必要な gate / decision point | 複合語のみ置換、`intake_gate` は不変、`` `intake_gate` `` は不変 |
+| `deterministic fixer SubAgent` | 決定的修正サブエージェント | 文脈限定自動修正 | 確定的・決定的な修正を行う SubAgent（複数経路がなく、結果が一意に定まるもの） | 複合語のみ置換、snake_case 不変、code span 不変 |
+| `snapshot freshness` | スナップショット鮮度 | 文脈限定自動修正 | snapshot / contract / state の取得時点が現在の状態とどれだけ齟齬がないか | 複合語のみ置換、snake_case 不変、code span 不変 |
+| `enum` | enum | 用語集のみ | schema / code token としてそのまま維持する | 単独自動修正しない |
+| `mutation` | mutation | 用語集のみ | code / contract token としてそのまま維持する | 単独自動修正しない |
+| `stale` | stale | 用語集のみ | 文脈依存が強いため単独自動置換しない | 単独自動修正しない |
+| `intake` | intake | 用語集のみ | 単独では自動置換しない（複合語 `intake gate` で使用） | 単独自動修正しない |
+| `gate` | gate | 用語集のみ | 単独では自動置換しない（複合語 `intake gate` で使用） | 単独自動修正しない |
+| `freshness` | freshness | 用語集のみ | 単独では自動置換しない（複合語 `snapshot freshness` で使用） | 単独自動修正しない |
+| `snapshot` | snapshot | 用語集のみ | 単独では自動置換しない（複合語 `snapshot freshness` で使用） | 単独自動修正しない |
+| `SubAgent` | SubAgent | 用語集のみ | 単独では自動置換しない（複合語で使用） | 単独自動修正しない |
 
 `prose` / `heading` / `handoff` / `enforcement` も atomic term として文脈依存が強いので、単独の blanket replacement では扱わず、必要なら別の contextual rule に分離する。
 

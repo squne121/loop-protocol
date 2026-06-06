@@ -127,6 +127,10 @@ rules:
         to: 体裁不備
 
   # contextual auto-fix
+  # intake gate -> 着手前確認
+  # NOTE: "intake gate" (spaced, prose) は置換対象。
+  #       "intake_gate" (snake_case, machine token) は不変。
+  #       "`intake_gate`" (backtick, code span) は不変。
   - expected: 着手前確認
     patterns:
       - /\bintake gate\b/
@@ -135,24 +139,38 @@ rules:
         to: 着手前確認
       - from: intake_gate
         to: intake_gate
+      - from: "`intake_gate`"
+        to: "`intake_gate`"
 
-  - expected: 決定的修正 SubAgent
+  # deterministic fixer SubAgent -> 決定的修正サブエージェント
+  # NOTE: "deterministic fixer SubAgent" (spaced, prose) は置換対象。
+  #       "deterministic_fixer_SubAgent" (snake_case, machine token) は不変。
+  #       "`deterministic_fixer_SubAgent`" (backtick, code span) は不変。
+  - expected: 決定的修正サブエージェント
     patterns:
       - /\bdeterministic fixer SubAgent\b/
     specs:
       - from: deterministic fixer SubAgent
-        to: 決定的修正 SubAgent
+        to: 決定的修正サブエージェント
       - from: deterministic_fixer_SubAgent
         to: deterministic_fixer_SubAgent
+      - from: "`deterministic_fixer_SubAgent`"
+        to: "`deterministic_fixer_SubAgent`"
 
-  - expected: snapshot の鮮度
+  # snapshot freshness -> スナップショット鮮度
+  # NOTE: "snapshot freshness" (spaced, prose) は置換対象。
+  #       "snapshot_freshness" (snake_case, machine token) は不変。
+  #       "`snapshot_freshness`" (backtick, code span) は不変。
+  - expected: スナップショット鮮度
     patterns:
       - /\bsnapshot freshness\b/
     specs:
       - from: snapshot freshness
-        to: snapshot の鮮度
+        to: スナップショット鮮度
       - from: snapshot_freshness
         to: snapshot_freshness
+      - from: "`snapshot_freshness`"
+        to: "`snapshot_freshness`"
 
   # glossary-only / no blanket fix
   # enum / mutation / stale / intake / gate / freshness / snapshot / SubAgent
