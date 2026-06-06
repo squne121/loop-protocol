@@ -31,8 +31,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-GUARD_SCRIPT="${SCRIPT_DIR}/session_recording_policy_guard.sh"
-PRODUCER_SCRIPT="${SCRIPT_DIR}/generate_session_manifest_from_hook.mjs"
+GUARD_SCRIPT="${SESSION_MANIFEST_GUARD:-${SCRIPT_DIR}/session_recording_policy_guard.sh}"
+PRODUCER_SCRIPT="${SESSION_MANIFEST_PRODUCER:-${SCRIPT_DIR}/generate_session_manifest_from_hook.mjs}"
+NODE_BIN="${SESSION_MANIFEST_NODE:-node}"
 
 # ---------------------------------------------------------------------------
 # Temporary workspace — cleaned up on exit
@@ -68,7 +69,8 @@ fi
 # ---------------------------------------------------------------------------
 _GUARD_EXIT=0
 # Feed the saved stdin to the guard script
-"${GUARD_SCRIPT}" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
+"${GUARD_SCRIPT}" < "$_STDIN_FILE" >"$_TMPDIR/guard.stdout" 2>"$_TMPDIR/guard.stderr" || _GUARD_EXIT=$?
+cat "$_TMPDIR/guard.stderr" >&2 2>/dev/null || true
 
 if [[ "$_GUARD_EXIT" -ne 0 ]]; then
     # AC4: guard failure → skip producer, exit 0 (do not block Stop/SubagentStop)
@@ -80,7 +82,8 @@ fi
 # AC3 / AC5: guard passed → run producer
 # ---------------------------------------------------------------------------
 _PRODUCER_EXIT=0
-node "${PRODUCER_SCRIPT}" < "$_STDIN_FILE" 2>&1 || _PRODUCER_EXIT=$?
+"$NODE_BIN" "${PRODUCER_SCRIPT}" < "$_STDIN_FILE" >"$_TMPDIR/producer.stdout" 2>"$_TMPDIR/producer.stderr" || _PRODUCER_EXIT=$?
+cat "$_TMPDIR/producer.stderr" >&2 2>/dev/null || true
 
 if [[ "$_PRODUCER_EXIT" -ne 0 ]]; then
     # AC5: producer failure → exit 0 (do not block Stop/SubagentStop)

@@ -10,12 +10,13 @@ Tests verify coordinator AC items:
 - coordinator_stdin: coordinator saves stdin once and passes same payload to guard + producer (AC7)
 - coordinator_sibling_absent: settings.json Stop/SubagentStop does NOT reference guard or producer directly (AC8)
 - coordinator_smoke: basic smoke for guard failure + producer failure + pass-through (AC10)
+- coordinator_stdout_empty: coordinator stdout is always empty (AC safety claim)
+- coordinator_stderr_passthrough: guard/producer stderr is forwarded to coordinator stderr
 """
 
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -62,22 +63,6 @@ def run_coordinator(
     return result.returncode, result.stdout, result.stderr
 
 
-def make_stub_guard(exit_code: int, record_stdin: bool = False) -> str:
-    """Return bash script content for a stub guard that exits with given code."""
-    stdin_record = ""
-    if record_stdin:
-        stdin_record = 'cat > /tmp/coordinator_test_guard_stdin.json\n'
-    return f"#!/usr/bin/env bash\n{stdin_record}exit {exit_code}\n"
-
-
-def make_stub_producer(exit_code: int, record_stdin: bool = False) -> str:
-    """Return bash/node-compatible script content for a stub producer."""
-    stdin_record = ""
-    if record_stdin:
-        stdin_record = 'cat > /tmp/coordinator_test_producer_stdin.json\n'
-    return f"#!/usr/bin/env bash\n{stdin_record}exit {exit_code}\n"
-
-
 class TestCoordinatorGuardOrder:
     """AC2: coordinator runs guard before producer."""
 
@@ -97,51 +82,16 @@ class TestCoordinatorGuardOrder:
         )
         producer_stub.chmod(0o755)
 
-        # Build a coordinator that uses the stubs
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    exit 0
-fi
-
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || true
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
-        result = subprocess.run(
-            [str(coord_script)],
-            input='{"hook_event_name":"Stop"}',
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop"},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0
+        assert returncode == 0
         assert order_file.exists(), "Execution order file was not created"
         lines = order_file.read_text().strip().splitlines()
         assert lines == ["guard", "producer"], (
@@ -166,50 +116,16 @@ class TestCoordinatorGuardExit0:
         )
         producer_stub.chmod(0o755)
 
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    exit 0
-fi
-
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || true
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
-        result = subprocess.run(
-            [str(coord_script)],
-            input='{"hook_event_name":"Stop"}',
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop"},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0
+        assert returncode == 0
         assert producer_marker.exists(), (
             "Producer should have been called when guard exits 0"
         )
@@ -232,124 +148,52 @@ class TestCoordinatorGuardFailure:
         )
         producer_stub.chmod(0o755)
 
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    echo "[coordinator] guard failed, skipping producer" >&2
-    exit 0
-fi
-
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || true
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
-        result = subprocess.run(
-            [str(coord_script)],
-            input='{"hook_event_name":"Stop"}',
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop"},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0, (
+        assert returncode == 0, (
             "Coordinator must exit 0 even when guard fails (fail-open)"
         )
         assert not producer_marker.exists(), (
             "Producer must NOT be called when guard fails"
         )
-        assert "guard" in result.stderr.lower() or "skip" in result.stderr.lower(), (
+        assert "guard" in stderr.lower() or "skip" in stderr.lower(), (
             "Coordinator should log guard failure reason to stderr"
         )
 
-    def test_coordinator_guard_failure_on_real_coordinator(self) -> None:
-        """Real coordinator: guard failure (via mock env) -> exit 0, producer suppressed.
-
-        Uses the actual coordinator script with a GUARD_SCRIPT override via env
-        to simulate guard failure.
-        """
+    def test_coordinator_guard_failure_on_real_coordinator(self, tmp_path: Path) -> None:
+        """Real coordinator: guard failure (via env override) -> exit 0, producer suppressed."""
         assert COORDINATOR_PATH.exists(), f"Coordinator not found at {COORDINATOR_PATH}"
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            producer_marker = Path(tmpdir) / "producer_called.txt"
+        producer_marker = tmp_path / "producer_called.txt"
 
-            guard_stub = Path(tmpdir) / "guard.sh"
-            guard_stub.write_text("#!/usr/bin/env bash\nexit 2\n")
-            guard_stub.chmod(0o755)
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 2\n")
+        guard_stub.chmod(0o755)
 
-            # The real coordinator uses SCRIPT_DIR-relative paths.
-            # To test guard failure without modifying the real guard, we create a
-            # temporary coordinator script that embeds the stub paths.
-            coord_script = Path(tmpdir) / "coordinator_with_stub.sh"
-            coord_script.write_text(
-                f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="echo"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text(
+            f"#!/usr/bin/env bash\ntouch {producer_marker}\nexit 0\n"
+        )
+        producer_stub.chmod(0o755)
 
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
 
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    echo "[coordinator] guard failed, skipping producer" >&2
-    exit 0
-fi
-
-touch "{producer_marker}"
-exit 0
-"""
-            )
-            coord_script.chmod(0o755)
-
-            result = subprocess.run(
-                [str(coord_script)],
-                input='{"hook_event_name":"Stop","stop_hook_active":false}',
-                text=True,
-                capture_output=True,
-            )
-
-            assert result.returncode == 0
-            assert not producer_marker.exists()
+        assert returncode == 0
+        assert not producer_marker.exists()
 
 
 class TestCoordinatorProducerFailure:
@@ -365,59 +209,19 @@ class TestCoordinatorProducerFailure:
         producer_stub.write_text("#!/usr/bin/env bash\nexit 1\n")
         producer_stub.chmod(0o755)
 
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    exit 0
-fi
-
-_PRODUCER_EXIT=0
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || _PRODUCER_EXIT=$?
-if [[ "$_PRODUCER_EXIT" -ne 0 ]]; then
-    echo "[coordinator] producer failed, best-effort exit 0" >&2
-    exit 0
-fi
-
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
-        result = subprocess.run(
-            [str(coord_script)],
-            input='{"hook_event_name":"Stop"}',
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop"},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0, (
+        assert returncode == 0, (
             "Coordinator must exit 0 even when producer fails (best-effort telemetry)"
         )
-        assert "producer" in result.stderr.lower() or "best-effort" in result.stderr.lower()
+        assert "producer" in stderr.lower() or "best-effort" in stderr.lower()
 
 
 class TestCoordinatorStopHookActive:
@@ -440,51 +244,16 @@ class TestCoordinatorStopHookActive:
         )
         producer_stub.chmod(0o755)
 
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    echo "[coordinator] stop_hook_active=true short-circuit" >&2
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    exit 0
-fi
-
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || true
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
-        result = subprocess.run(
-            [str(coord_script)],
-            input='{"hook_event_name":"Stop","stop_hook_active":true}',
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": True},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0
+        assert returncode == 0
         assert not guard_marker.exists(), "Guard must NOT be called when stop_hook_active=true"
         assert not producer_marker.exists(), "Producer must NOT be called when stop_hook_active=true"
 
@@ -521,52 +290,18 @@ class TestCoordinatorStdin:
         )
         producer_stub.chmod(0o755)
 
-        coord_script = tmp_path / "coordinator_test.sh"
-        coord_script.write_text(
-            f"""#!/usr/bin/env bash
-set -euo pipefail
-GUARD_SCRIPT="{guard_stub}"
-PRODUCER_SCRIPT="{producer_stub}"
-_TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$_TMPDIR"' EXIT
-_STDIN_FILE="$_TMPDIR/stdin.json"
-cat > "$_STDIN_FILE"
-
-_STOP_HOOK_ACTIVE=$(python3 -c "
-import json
-try:
-    data = json.load(open('${{_STDIN_FILE}}'))
-    print('true' if data.get('stop_hook_active') is True else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null || echo "false")
-
-if [[ "$_STOP_HOOK_ACTIVE" == "true" ]]; then
-    exit 0
-fi
-
-_GUARD_EXIT=0
-"$GUARD_SCRIPT" < "$_STDIN_FILE" 2>&1 || _GUARD_EXIT=$?
-if [[ "$_GUARD_EXIT" -ne 0 ]]; then
-    exit 0
-fi
-
-bash "$PRODUCER_SCRIPT" < "$_STDIN_FILE" 2>&1 || true
-exit 0
-"""
-        )
-        coord_script.chmod(0o755)
-
         payload = {"hook_event_name": "Stop", "session_id": "test-123", "stop_hook_active": False}
 
-        result = subprocess.run(
-            [str(coord_script)],
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
+        returncode, stdout, stderr = run_coordinator(
+            payload,
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
         )
 
-        assert result.returncode == 0
+        assert returncode == 0
         assert guard_stdin_capture.exists(), "Guard stdin capture file not found"
         assert producer_stdin_capture.exists(), "Producer stdin capture file not found"
 
@@ -738,6 +473,208 @@ class TestCoordinatorSmoke:
         assert COORDINATOR_PATH.exists(), f"Coordinator not found: {COORDINATOR_PATH}"
         assert os.access(COORDINATOR_PATH, os.X_OK), (
             f"Coordinator is not executable: {COORDINATOR_PATH}"
+        )
+
+
+class TestCoordinatorStdoutEmpty:
+    """coordinator は常に stdout を空にする（AC のうち安全クレーム）"""
+
+    def test_stdout_empty_guard_pass_producer_pass(self, tmp_path: Path) -> None:
+        """guard exit 0, producer exit 0 -> stdout empty."""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"Coordinator stdout must be empty, got: {stdout!r}"
+
+    def test_stdout_empty_guard_failure(self, tmp_path: Path) -> None:
+        """guard exit 2 -> stdout empty."""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 2\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"Coordinator stdout must be empty on guard failure, got: {stdout!r}"
+
+    def test_stdout_empty_producer_failure(self, tmp_path: Path) -> None:
+        """producer exit 1 -> stdout empty."""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 1\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"Coordinator stdout must be empty on producer failure, got: {stdout!r}"
+
+    def test_stdout_empty_stop_hook_active(self, tmp_path: Path) -> None:
+        """stop_hook_active=true -> stdout empty."""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": True},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"Coordinator stdout must be empty with stop_hook_active=true, got: {stdout!r}"
+
+
+class TestCoordinatorStderrPassthrough:
+    """guard / producer の stderr が coordinator の stderr に転送されることを確認。"""
+
+    def test_stderr_passthrough_from_guard(self, tmp_path: Path) -> None:
+        """guard の stderr が coordinator の stderr に転送される。"""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text(
+            '#!/usr/bin/env bash\necho "guard-diagnostic-msg" >&2\nexit 0\n'
+        )
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"stdout must be empty, got: {stdout!r}"
+        assert "guard-diagnostic-msg" in stderr, (
+            f"Guard stderr should be forwarded to coordinator stderr, got: {stderr!r}"
+        )
+
+    def test_stderr_passthrough_from_producer(self, tmp_path: Path) -> None:
+        """producer の stderr が coordinator の stderr に転送される。"""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text(
+            '#!/usr/bin/env bash\necho "producer-diagnostic-msg" >&2\nexit 0\n'
+        )
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", f"stdout must be empty, got: {stdout!r}"
+        assert "producer-diagnostic-msg" in stderr, (
+            f"Producer stderr should be forwarded to coordinator stderr, got: {stderr!r}"
+        )
+
+    def test_stdout_from_guard_not_leaked_to_coordinator_stdout(self, tmp_path: Path) -> None:
+        """guard の stdout が coordinator の stdout に漏れない。"""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text(
+            '#!/usr/bin/env bash\necho "guard-stdout-content"\nexit 0\n'
+        )
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", (
+            f"Guard stdout must NOT leak to coordinator stdout, got: {stdout!r}"
+        )
+
+    def test_stdout_from_producer_not_leaked_to_coordinator_stdout(self, tmp_path: Path) -> None:
+        """producer の stdout が coordinator の stdout に漏れない。"""
+        guard_stub = tmp_path / "guard.sh"
+        guard_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        guard_stub.chmod(0o755)
+
+        producer_stub = tmp_path / "producer.sh"
+        producer_stub.write_text(
+            '#!/usr/bin/env bash\necho "producer-stdout-content"\nexit 0\n'
+        )
+        producer_stub.chmod(0o755)
+
+        returncode, stdout, stderr = run_coordinator(
+            {"hook_event_name": "Stop", "stop_hook_active": False},
+            env_overrides={
+                "SESSION_MANIFEST_GUARD": str(guard_stub),
+                "SESSION_MANIFEST_PRODUCER": str(producer_stub),
+                "SESSION_MANIFEST_NODE": "bash",
+            },
+        )
+
+        assert returncode == 0
+        assert stdout == "", (
+            f"Producer stdout must NOT leak to coordinator stdout, got: {stdout!r}"
         )
 
 

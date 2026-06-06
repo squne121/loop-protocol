@@ -122,8 +122,8 @@ function ensureArtifactsDir() {
  * Key format: {hookEventName}:{toolName}:{phase}
  * Encoded as URL-safe base64 for use in filename.
  */
-function buildStableKey(hookEventName, toolName, ledgerPhase) {
-  const rawKey = `${hookEventName}:${toolName || ''}:${ledgerPhase}`
+function buildStableKey(hookEventName, sessionId, toolName, ledgerPhase) {
+  const rawKey = `${hookEventName}:${sessionId || 'nosession'}:${toolName || ''}:${ledgerPhase}`
   return Buffer.from(rawKey).toString('base64url').slice(0, 32)
 }
 
@@ -169,7 +169,7 @@ async function main() {
   const phaseInfo = EVENT_PHASE_MAP[hookEventName] ?? EVENT_PHASE_MAP['Stop']
 
   // Build stable duplicate key (not timestamp-dependent)
-  const stableKeySegment = buildStableKey(hookEventName, toolName, phaseInfo.ledgerPhase)
+  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase)
 
   // Check for duplicate before doing any work
   if (hasDuplicateArtifact(stableKeySegment)) {
