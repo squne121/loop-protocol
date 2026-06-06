@@ -25,12 +25,36 @@ acceptance_verdict:
     - ac: AC8
       status: partial
       reason: "browser version recorded (Chrome 148.0.7778.179). viewport and device_pixel_ratio were not captured during the human run and must not be backfilled post hoc."
+      deferred_reason: "Human playtest did not capture viewport or devicePixelRatio at execution time."
+      owner: squne121
+      approved_by: squne121
+      approved_at: "2026-06-06"
+      expiry_issue: "#689"
+      expiry_condition: "Next human manual playtest must capture viewport/DPR using Evidence Panel or equivalent browser-side capture and attach exported evidence YAML to the playtest evidence document."
+      residual_risk: "Video evidence cannot be replayed under the exact original viewport/DPR; resolution/DPR-specific rendering defects may have gone unobserved."
+      risk_acceptance: "Accept as M2 deferred evidence only. Do not assert 1280x720 or DPR 1.0 for the human run."
+      compensating_evidence:
+        - "Browser version was recorded in the human playtest evidence."
+        - "Scenario video artifacts exist for all_enemies_defeated_victory and hp_zero_defeat."
+      substitution_allowed: false
     - ac: AC10
       status: accepted
       reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
     - ac: AC11
       status: deferred_exception
       reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
+      deferred_reason: "Human timeout defeat recording was not captured."
+      owner: squne121
+      approved_by: squne121
+      approved_at: "2026-06-06"
+      expiry_issue: "#690"
+      expiry_condition: "Before the M3 gate, the next manual playtest must capture timeout_30s_defeat human video and attach a GitHub-hosted artifact URL to the playtest evidence document."
+      residual_risk: "Timeout UI/HUD/canvas outcome may differ in an actual 30-second human run; automated tests verify logic but not human UX observation."
+      risk_acceptance: "Accept only as deferred M2 evidence based on automated compensating evidence. Do not treat automated evidence as a human playtest substitute."
+      compensating_evidence:
+        - "E2E short-sortie fixture verifies timeout-to-defeat state transition."
+        - "HUD/canvas defeat output is covered by E2E."
+      substitution_allowed: false
   artifact_reviewability: github_attachment
   artifact_note: "Video files attached to Issue #543 comment (https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599987357). GitHub-hosted URLs recorded in evidence section."
 date: "2026-05-31"
