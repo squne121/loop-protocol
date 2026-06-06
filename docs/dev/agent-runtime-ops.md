@@ -9,6 +9,44 @@ Codex local runtime 運用の主文書。
 - repo の正本は引き続き `CLAUDE.md`、`docs/dev/workflow.md`、`docs/product/requirements.md` などの SSOT 群にある
 - Codex 向けの project-local guidance は `AGENTS.md` に集約し、この文書はその runtime 前提と復旧手順を補足する
 
+## Network-Only Auto Allow
+
+この節は **network boundary の差分例** であり、permission profile 全体を列挙する complete profile ではない。
+`uploads.github.com` は GitHub の release asset / upload 系 endpoint 向けで、issue / PR の投稿やコメントの主経路ではない。
+GitHub issue / PR の更新・コメントは引き続き [github-ops.md](github-ops.md) と `rtk gh` を使う。
+
+### Modern example
+
+```toml
+approval_policy = "on-request"
+default_permissions = "loop-protocol-rtk"
+
+[permissions.loop-protocol-rtk.network]
+enabled = true
+
+[permissions.loop-protocol-rtk.network.domains]
+"github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+"uploads.github.com" = "allow"
+```
+
+- この例は filesystem boundary を広げず、network allowlist の差分だけを示す
+- `default_permissions` と `[permissions.*]` だけを使い、legacy `sandbox_workspace_write` には依存しない
+- `uploads.github.com` は release asset / upload 系の経路に限定して追加している
+- `loop-protocol-readonly` と `loop-protocol-bootstrap` には追加しない。どちらも upload / release asset の許可を必要としないため、read-only / bootstrap の境界を狭く保つ
+
+### Legacy compatibility note
+
+```toml
+# legacy runtime only
+[sandbox_workspace_write]
+network_access = true
+```
+
+- `network_access = true` は legacy runtime のみの表現で、modern `default_permissions` と混在させない
+- GitHub issue / PR updates and comments still use [github-ops.md](github-ops.md) and `rtk gh`
+
 ## WSL2 / standalone install の self-binary ENOENT 復旧
 
 ### 症状
