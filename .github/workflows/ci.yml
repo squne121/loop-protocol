@@ -143,6 +143,9 @@ jobs:
       - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
       - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
       - run: uv run --locked pytest .claude/hooks/tests/test_guard_delta_mode.py -q
+      - run: uv run --locked pytest .claude/hooks/tests/test_guard_shadow_mode.py -q
+      - run: uv run --locked pytest .claude/hooks/tests/test_replay_scenarios.py -q
+      - run: uv run --locked pytest .claude/hooks/tests/test_shadow_log.py -q
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/issue-contract-review/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
@@ -171,6 +174,9 @@ jobs:
               .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
               .claude/hooks/tests/test_session_recording_policy_guard.py \
               .claude/hooks/tests/test_guard_delta_mode.py \
+              .claude/hooks/tests/test_guard_shadow_mode.py \
+              .claude/hooks/tests/test_replay_scenarios.py \
+              .claude/hooks/tests/test_shadow_log.py \
               .claude/skills/issue-contract-review/scripts/tests/ \
               .claude/skills/issue-contract-review/tests/ \
               .claude/skills/pr-review-judge/scripts/tests/ \

@@ -3,6 +3,11 @@
 #
 # Claude Code PreToolUse hook: 日本語 prose 比率不足の GitHub 送信・下書きファイルをブロックする
 #
+# GUARD_JAPANESE_PROSE_MODE の動作:
+#   未設定 / shadow: block せず exit 0、would-block 判定を JSONL に記録する（AC1, AC4, AC7）
+#   enforce:         従来どおり block する（AC3）
+#   不正値:          shadow として動作 + invalid_mode を JSONL に記録（AC7）
+#
 # Mode A: Bash ツール + gh コマンドで Issue/PR/comment body を送信しようとする場合
 # Mode B: Write/Edit/MultiEdit ツールで tmp/ 下書き候補 Markdown を書こうとする場合
 #
@@ -21,8 +26,8 @@
 #   - PATCH repos/{owner}/{repo}/pulls/{n} + body key: delta check (AC18)
 #
 # Exit codes:
-#   0 = allow (日本語比率 OK、またはガード対象外)
-#   2 = block (日本語比率不足 — blocking error として Claude Code に通知)
+#   0 = allow (日本語比率 OK、またはガード対象外、または shadow mode)
+#   2 = block (日本語比率不足 — blocking error として Claude Code に通知 / enforce mode のみ)
 
 set -euo pipefail
 
@@ -31,6 +36,137 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VALIDATOR="${PROJECT_DIR}/.claude/skills/create-issue/scripts/validate_japanese_content.py"
 MATRIX="${PROJECT_DIR}/.claude/skills/create-issue/scripts/mutation_route_matrix.py"
+SHADOW_LOG_PY="${SCRIPT_DIR}/shadow_log.py"
+
+# ============================================================
+# GUARD_JAPANESE_PROSE_MODE の解決（AC4, AC7）
+# 未設定 = shadow（default）
+# shadow / enforce は有効値
+# 不正値 = shadow として動作（invalid_mode フラグ付き）
+# ============================================================
+_GUARD_MODE_RAW="${GUARD_JAPANESE_PROSE_MODE:-}"
+_GUARD_MODE_EFFECTIVE="shadow"   # default
+_GUARD_MODE_INVALID=false
+
+if [ -z "$_GUARD_MODE_RAW" ]; then
+    _GUARD_MODE_EFFECTIVE="shadow"
+elif [ "$_GUARD_MODE_RAW" = "shadow" ]; then
+    _GUARD_MODE_EFFECTIVE="shadow"
+elif [ "$_GUARD_MODE_RAW" = "enforce" ]; then
+    _GUARD_MODE_EFFECTIVE="enforce"
+else
+    # 不正値: shadow として動作 + invalid_mode 記録
+    _GUARD_MODE_EFFECTIVE="shadow"
+    _GUARD_MODE_INVALID=true
+fi
+
+# JSONL 出力先（環境変数でオーバーライド可能、デフォルトは PROJECT_DIR 直下）
+SHADOW_LOG_FILE="${GUARD_JAPANESE_PROSE_SHADOW_LOG:-${PROJECT_DIR}/.guard_shadow_log.jsonl}"
+
+# ============================================================
+# shadow_log ヘルパー関数（AC9: instrumentation 失敗は silent allow しない）
+# ============================================================
+_guard_shadow_log() {
+    # $1: JSON フィールド文字列
+    local fields_json="$1"
+    if [ -f "$SHADOW_LOG_PY" ]; then
+        if ! uv run python3 "$SHADOW_LOG_PY" \
+            --log-file "$SHADOW_LOG_FILE" \
+            --fields-json "$fields_json" 2>&1; then
+            # AC9: instrumentation 失敗を stderr に記録する（silent allow しない）
+            echo "GUARD: shadow_log instrumentation_error (logging failed)" >&2
+            echo "  instrumentation_error: shadow_log.py write failed" >&2
+        fi
+    else
+        # shadow_log.py が存在しない場合も stderr に記録（AC9）
+        echo "GUARD: shadow_log instrumentation_error (shadow_log.py not found)" >&2
+        echo "  instrumentation_error: shadow_log.py not found at ${SHADOW_LOG_PY}" >&2
+    fi
+}
+
+# shadow mode で would-block 判定を記録して exit 0 で通過する
+# $1: route_id  $2: body_source  $3: public_mutation  $4: reason_code
+# $5: failed_block_count（数値、不明なら -1）  $6: duration_ms  $7: body_sha256  $8: body_bytes
+_shadow_allow() {
+    local route_id="$1"
+    local body_source="$2"
+    local public_mutation="$3"
+    local reason_code="$4"
+    local failed_block_count="${5:--1}"
+    local duration_ms="${6:-0}"
+    local body_sha256="${7:-}"
+    local body_bytes="${8:-0}"
+
+    local mode_configured="$_GUARD_MODE_RAW"
+    local mode_effective="$_GUARD_MODE_EFFECTIVE"
+
+    # invalid_mode の場合は reason_code に付記
+    if [ "$_GUARD_MODE_INVALID" = "true" ]; then
+        reason_code="${reason_code}+invalid_mode"
+    fi
+
+    # AC8: raw body / full command / token / Authorization header は記録しない
+    local fields_json
+    fields_json="$(cat <<EOF
+{
+  "hook_event": "PreToolUse",
+  "mode_configured": "${mode_configured}",
+  "mode_effective": "${mode_effective}",
+  "tool_name": "${TOOL_NAME}",
+  "route_id": "${route_id}",
+  "body_source": "${body_source}",
+  "public_mutation": ${public_mutation},
+  "decision_would_be": "deny",
+  "reason_code": "${reason_code}",
+  "failed_block_count": ${failed_block_count},
+  "duration_ms": ${duration_ms},
+  "body_sha256": "${body_sha256}",
+  "body_bytes": ${body_bytes}
+}
+EOF
+)"
+    _guard_shadow_log "$fields_json"
+    exit 0
+}
+
+# shadow mode での allow pass（would-block でない場合の計測記録）
+# $1: route_id  $2: body_source  $3: public_mutation
+_shadow_pass() {
+    local route_id="$1"
+    local body_source="$2"
+    local public_mutation="$3"
+
+    local mode_configured="$_GUARD_MODE_RAW"
+    local mode_effective="$_GUARD_MODE_EFFECTIVE"
+
+    if [ "$_GUARD_MODE_INVALID" = "true" ]; then
+        local extra_reason="invalid_mode"
+    else
+        local extra_reason=""
+    fi
+
+    local fields_json
+    fields_json="$(cat <<EOF
+{
+  "hook_event": "PreToolUse",
+  "mode_configured": "${mode_configured}",
+  "mode_effective": "${mode_effective}",
+  "tool_name": "${TOOL_NAME}",
+  "route_id": "${route_id}",
+  "body_source": "${body_source}",
+  "public_mutation": ${public_mutation},
+  "decision_would_be": "allow",
+  "reason_code": "${extra_reason}",
+  "failed_block_count": 0,
+  "duration_ms": 0,
+  "body_sha256": "",
+  "body_bytes": 0
+}
+EOF
+)"
+    _guard_shadow_log "$fields_json"
+    exit 0
+}
 
 # stdin から JSON を読む
 INPUT="$(cat)"
@@ -51,6 +187,37 @@ fi
 # ============================================================
 # ヘルパー関数
 # ============================================================
+
+# shadow / enforce モード判定で block または allow を返す
+# enforce mode: exit 2（従来どおり block）
+# shadow mode:  _shadow_allow 経由で JSONL 記録 + exit 0
+# $1: route_id  $2: body_source  $3: public_mutation（true|false）
+# $4: reason_code  $5: failed_block_count  $6: body_text（sha256/bytes 計算用）
+_block_or_shadow() {
+    local route_id="$1"
+    local body_source="$2"
+    local public_mutation="$3"
+    local reason_code="$4"
+    local failed_block_count="${5:-1}"
+    local body_text="${6:-}"
+
+    local body_sha256=""
+    local body_bytes=0
+    if [ -n "$body_text" ]; then
+        body_sha256="$(printf '%s' "$body_text" | sha256sum | awk '{print $1}')"
+        body_bytes="${#body_text}"
+    fi
+
+    if [ "$_GUARD_MODE_EFFECTIVE" = "enforce" ]; then
+        # enforce mode: 従来どおり exit 2 でブロック（stderr は呼び出し元が出力済み）
+        exit 2
+    else
+        # shadow mode: JSONL 記録 + exit 0
+        _shadow_allow "$route_id" "$body_source" "$public_mutation" \
+            "$reason_code" "$failed_block_count" "0" "$body_sha256" "$body_bytes"
+        # _shadow_allow 内で exit 0 するので以下には到達しない
+    fi
+}
 
 # 日本語比率を検証する
 # $1: チェック対象の本文テキスト
@@ -185,7 +352,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
         echo "  changed_prose_blocks: unknown" >&2
         echo "  failed_blocks: unknown" >&2
         echo "  ratio_min: 0.000" >&2
-        exit 2
+        _block_or_shadow "body_file_stdin" "body_file_stdin" "true" "stdin_fail_closed" 1 ""
     fi
 
     # --body-file が指定されている場合の delta mode (AC2)
@@ -218,7 +385,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "delta_edit_${EDIT_TYPE}" "body_file" "true" "target_ambiguous" 1 ""
             fi
 
             if [ "$DELTA_TARGET_INFO" = "RESOLVE_ERROR" ] || [ -z "$DELTA_TARGET_INFO" ]; then
@@ -228,7 +395,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "delta_edit_${EDIT_TYPE}" "body_file" "true" "target_resolution_failed" 1 ""
             fi
 
             # NUMBER:<N> 形式から番号を取得
@@ -247,7 +414,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "delta_edit_issue" "body_file" "true" "target_resolution_failed" 1 ""
                 fi
             else
                 if ! OLD_BODY="$(gh pr view "$TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
@@ -257,7 +424,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "delta_edit_pr" "body_file" "true" "target_resolution_failed" 1 ""
                 fi
             fi
             # OLD_BODY が空文字でも続行（新本文全体を新規 block として検査）
@@ -269,7 +436,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             if validate_delta_prose "$NEW_BODY" "$OLD_BODY" "$TARGET_LABEL"; then
                 exit 0
             else
-                exit 2
+                _block_or_shadow "delta_edit_${EDIT_TYPE}" "body_file" "true" \
+                    "delta_prose_failed" 1 "$NEW_BODY"
             fi
         fi
 
@@ -278,7 +446,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
         if validate_body "$FILE_BODY" "--body-file: ${BODY_FILE_EXTRACT}"; then
             : # pass
         else
-            exit 2
+            _block_or_shadow "gh_body_file" "body_file" "true" \
+                "japanese_prose_insufficient" 1 "$FILE_BODY"
         fi
     fi
 
@@ -314,7 +483,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     deny_unreadable_body_file)
                         echo "GUARD: body ファイルを読み取れません (${FIELD_DENY_REASON}, fail-closed)" >&2
@@ -323,7 +492,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     deny_null_body_public_mutation)
                         echo "GUARD: body が null です (${FIELD_DENY_REASON}, fail-closed)" >&2
@@ -332,7 +501,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     deny_empty_body_public_mutation)
                         echo "GUARD: body が空です (${FIELD_DENY_REASON}, fail-closed)" >&2
@@ -341,7 +510,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     deny_missing_body_for_public_body_route)
                         echo "GUARD: body キーが欠落しています (${FIELD_DENY_REASON}, fail-closed)" >&2
@@ -350,7 +519,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     deny_invalid_json)
                         echo "GUARD: JSON 解析失敗 (${FIELD_DENY_REASON}, fail-closed)" >&2
@@ -359,7 +528,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                     *)
                         # unknown deny reason: fail-closed
@@ -368,7 +537,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                         echo "  changed_prose_blocks: unknown" >&2
                         echo "  failed_blocks: unknown" >&2
                         echo "  ratio_min: 0.000" >&2
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" "$FIELD_DENY_REASON" 1 ""
                         ;;
                 esac
             fi
@@ -393,7 +562,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                     if validate_body "$FIELD_BODY_TEXT" "field-body: ${FIELD_SOURCE_KIND}"; then
                         exit 0
                     else
-                        exit 2
+                        _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" \
+                            "japanese_prose_insufficient" 1 "$FIELD_BODY_TEXT"
                     fi
                 fi
 
@@ -401,7 +571,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 if validate_body "$FIELD_BODY_TEXT" "field-body: ${ROUTE_CLASS}"; then
                     exit 0
                 else
-                    exit 2
+                    _block_or_shadow "api_field_body" "${FIELD_SOURCE_KIND}" "true" \
+                        "japanese_prose_insufficient" 1 "$FIELD_BODY_TEXT"
                 fi
             fi
         fi
@@ -425,7 +596,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             echo "  changed_prose_blocks: unknown" >&2
             echo "  failed_blocks: unknown" >&2
             echo "  ratio_min: 0.000" >&2
-            exit 2
+            _block_or_shadow "graphql_mutation" "graphql" "true" "deny_graphql_mutation_unsupported" 1 ""
         fi
 
         if [ "$GRAPHQL_RESULT" = "deny_stdin_body_uninspectable" ]; then
@@ -435,7 +606,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             echo "  changed_prose_blocks: unknown" >&2
             echo "  failed_blocks: unknown" >&2
             echo "  ratio_min: 0.000" >&2
-            exit 2
+            _block_or_shadow "graphql_mutation" "graphql_stdin" "true" "deny_stdin_body_uninspectable" 1 ""
         fi
 
         if [ "$GRAPHQL_RESULT" = "deny_invalid_json" ]; then
@@ -445,7 +616,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             echo "  changed_prose_blocks: unknown" >&2
             echo "  failed_blocks: unknown" >&2
             echo "  ratio_min: 0.000" >&2
-            exit 2
+            _block_or_shadow "graphql_mutation" "graphql" "true" "deny_invalid_json" 1 ""
         fi
 
         # graphql_not_mutation または graphql_no_input: 通常の body 検査へ
@@ -464,7 +635,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
             echo "  changed_prose_blocks: unknown" >&2
             echo "  failed_blocks: unknown" >&2
             echo "  ratio_min: 0.000" >&2
-            exit 2
+            _block_or_shadow "api_input" "api_input_stdin" "true" "stdin_fail_closed" 1 ""
         fi
 
         if echo "$API_INPUT_RESULT" | grep -q "^API_INPUT_FILE:"; then
@@ -477,7 +648,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input" "api_input_file" "true" "api_payload_parse_failed" 1 ""
             fi
 
             # endpoint を解析して body mutation かどうかを判定 (AC4, AC5, AC17, AC18)
@@ -490,7 +661,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input" "api_input_file" "true" "api_payload_parse_failed" 1 ""
             fi
 
             # HTTP method を確認して GET / DELETE は non-mutation として pass
@@ -510,7 +681,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input" "api_input_file" "true" "api_payload_parse_failed" 1 ""
             fi
 
             if [ "$MUTATION_CLASS" = "NOT_BODY_MUTATION" ]; then
@@ -524,7 +695,7 @@ if [ "$TOOL_NAME" = "Bash" ]; then
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input" "api_input_file" "true" "api_input_invalid_body_type" 1 ""
             fi
 
             # BODY_MUTATION_ISSUE:<N>, BODY_MUTATION_PR:<N>,
@@ -554,7 +725,7 @@ EOF
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "api_input_comment" "api_input_file" "true" "api_payload_parse_failed" 1 ""
                 fi
                 API_TARGET_LABEL="issue comment #${API_TARGET_COMMENT_ID}"
                 API_TARGET_TYPE="issue_comment"
@@ -570,7 +741,7 @@ EOF
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "api_input_pr_review_comment" "api_input_file" "true" "api_payload_parse_failed" 1 ""
                 fi
                 API_TARGET_LABEL="pr review comment #${API_TARGET_COMMENT_ID}"
                 API_TARGET_TYPE="pr_review_comment"
@@ -582,7 +753,7 @@ EOF
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input_unknown" "api_input_file" "true" "api_payload_parse_failed" 1 ""
             fi
 
             # 既存 body を取得して delta 検査 (AC3, AC4, AC17, AC18)
@@ -594,7 +765,7 @@ EOF
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "api_input_issue" "api_input_file" "true" "target_resolution_failed" 1 ""
                 fi
             elif [ "$API_TARGET_TYPE" = "pr" ]; then
                 if ! OLD_BODY="$(gh pr view "$API_TARGET_NUM" --json body --jq .body 2>/dev/null)"; then
@@ -603,7 +774,7 @@ EOF
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "api_input_pr" "api_input_file" "true" "target_resolution_failed" 1 ""
                 fi
             else
                 if ! OLD_BODY="$(gh api "$API_TARGET_FETCH_PATH" --jq .body 2>/dev/null)"; then
@@ -612,7 +783,7 @@ EOF
                     echo "  changed_prose_blocks: unknown" >&2
                     echo "  failed_blocks: unknown" >&2
                     echo "  ratio_min: 0.000" >&2
-                    exit 2
+                    _block_or_shadow "api_input_comment" "api_input_file" "true" "comment_old_body_fetch_failed" 1 ""
                 fi
             fi
 
@@ -638,14 +809,15 @@ PY
                 echo "  changed_prose_blocks: unknown" >&2
                 echo "  failed_blocks: unknown" >&2
                 echo "  ratio_min: 0.000" >&2
-                exit 2
+                _block_or_shadow "api_input_${API_TARGET_TYPE}" "api_input_file" "true" "api_input_body_extract_failed" 1 ""
             }
 
             # delta mode で changed prose blocks のみ検査 (AC4, AC17, AC18)
             if validate_delta_prose "$NEW_BODY" "$OLD_BODY" "${API_TARGET_LABEL}"; then
                 exit 0
             else
-                exit 2
+                _block_or_shadow "api_input_${API_TARGET_TYPE}" "api_input_file" "true" \
+                    "delta_prose_failed" 1 "$NEW_BODY"
             fi
         fi
         # API_INPUT_NONE: --input なし → 通常の body 検査へ
@@ -656,7 +828,8 @@ PY
         if validate_body "$BODY" "gh body"; then
             : # pass
         else
-            exit 2
+            _block_or_shadow "gh_inline_body" "gh_body_inline" "true" \
+                "japanese_prose_insufficient" 1 "$BODY"
         fi
     fi
 
