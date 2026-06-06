@@ -145,8 +145,20 @@ def test_sentinel_producer_injection_does_not_leak(tmp_path):
         "session_id": "test-session-412",
         "secret_policy": {
             "value_exposed": False,
-            "boundary_enforced": True,
             "mode": "presence_only",
+            "producer_contract": {
+                "declared": True,
+                "id": "presence_only_no_secret_values",
+                "version": "v1",
+                "claims": {
+                    "secret_values_not_serialized": True,
+                    "presence_only": True,
+                },
+            },
+            "runtime_boundary": {
+                "attested": False,
+                "evidence_ref": None,
+            },
         },
         "hook_inputs": {
             "gh_token_present": True,   # presence only — value not included
@@ -547,11 +559,47 @@ def test_manifest_schema_has_secret_policy_property():
     assert "value_exposed" in sp_props, (
         "'secret_policy.value_exposed' field not defined in schema"
     )
-    assert "boundary_enforced" in sp_props, (
-        "'secret_policy.boundary_enforced' field not defined in schema"
-    )
     assert "mode" in sp_props, (
         "'secret_policy.mode' field not defined in schema"
+    )
+    assert "producer_contract" in sp_props, (
+        "'secret_policy.producer_contract' field not defined in schema"
+    )
+    assert "runtime_boundary" in sp_props, (
+        "'secret_policy.runtime_boundary' field not defined in schema"
+    )
+    assert "boundary_enforced" not in sp_props, (
+        "'secret_policy.boundary_enforced' was deprecated in #536/#537 and must not exist in schema"
+    )
+
+    # required フィールドが正しく宣言されているか確認
+    sp_required = set(sp.get("required", []))
+    assert {"value_exposed", "mode", "producer_contract", "runtime_boundary"} <= sp_required, (
+        f"secret_policy.required must include all 4 fields, got: {sp_required}"
+    )
+
+    # additionalProperties: false が設定されているか確認
+    assert sp.get("additionalProperties") is False, (
+        "secret_policy must have additionalProperties: false"
+    )
+
+    # producer_contract の必須フィールド確認
+    pc = sp_props.get("producer_contract", {})
+    assert pc.get("type") == "object", "producer_contract must be type object"
+    pc_required = set(pc.get("required", []))
+    assert {"declared", "id", "version", "claims"} <= pc_required, (
+        f"producer_contract.required must include declared/id/version/claims, got: {pc_required}"
+    )
+
+    # runtime_boundary の必須フィールドと条件制約確認
+    rb = sp_props.get("runtime_boundary", {})
+    assert rb.get("type") == "object", "runtime_boundary must be type object"
+    rb_required = set(rb.get("required", []))
+    assert {"attested", "evidence_ref"} <= rb_required, (
+        f"runtime_boundary.required must include attested/evidence_ref, got: {rb_required}"
+    )
+    assert rb.get("allOf") or rb.get("if"), (
+        "runtime_boundary must have allOf or if/then for conditional evidence_ref contract"
     )
 
 
@@ -568,8 +616,20 @@ def test_manifest_fixture_with_secret_policy_validates_sentinel_absence():
         "session_id": "contract-test-412",
         "secret_policy": {
             "value_exposed": False,
-            "boundary_enforced": True,
             "mode": "presence_only",
+            "producer_contract": {
+                "declared": True,
+                "id": "presence_only_no_secret_values",
+                "version": "v1",
+                "claims": {
+                    "secret_values_not_serialized": True,
+                    "presence_only": True,
+                },
+            },
+            "runtime_boundary": {
+                "attested": False,
+                "evidence_ref": None,
+            },
         },
         "metadata": {
             "issue": 412,
