@@ -301,7 +301,8 @@ def _classify_domain_flags(item: dict[str, Any]) -> list[str]:
 
 
 # Regex for extracting sub-file anchors from issue/PR text.
-# JSON Pointer-like tokens (RFC 6901 style): /required, /properties/foo/pattern.
+# This is a lexical coordination detector, not an RFC 6901 strict parser.
+# RFC 6901 strict parser ではない。The scan only finds JSON Pointer-like tokens.
 # The negative lookbehind prevents matching slashes inside file paths or URLs
 # (e.g. ".claude/skills/foo.py", "https://github.com/...") where the slash is
 # preceded by a word character or backtick.
@@ -324,8 +325,10 @@ def _extract_anchor_tokens(item: dict[str, Any]) -> set[str]:
     #547 extends phase_instance_id while #549 adds /required to secret_policy) from
     "same file, same anchor" (conflicting operation, escalate).
 
-    This is intentionally a lightweight text scan. AST / tree-sitter anchoring is
-    out of scope and tracked as a follow-up.
+    This extractor is a lexical coordination detector, not a semantic merge detector.
+    RFC 6901 strict parser ではないし、coordination detector であり semantic merge
+    detector ではない。It is intentionally a lightweight text scan. AST /
+    tree-sitter anchoring is out of scope and tracked as a follow-up.
     """
     body = _body_text(item)
     title = str(_extract_field(item, "title", default=""))
