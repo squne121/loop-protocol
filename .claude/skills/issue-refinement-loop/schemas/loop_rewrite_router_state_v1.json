@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "loop_rewrite_router_state/v1",
+  "title": "LOOP_REWRITE_ROUTER_STATE_V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rewrite_attempt_count",
+    "max_rewrite_attempts",
+    "checker_exit_code",
+    "checked_body_sha256"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "rewrite_attempt_count": {"type": "integer", "minimum": 0},
+    "max_rewrite_attempts": {"type": "integer", "minimum": 1},
+    "checker_exit_code": {"type": "integer"},
+    "checked_body_sha256": {"type": "string"},
+    "missing_sections": {"type": "array", "items": {"type": "string"}},
+    "missing_contract_keys": {"type": "array", "items": {"type": "string"}},
+    "previous_checked_body_sha256": {"type": ["string", "null"]},
+    "previous_missing_sections": {"type": "array", "items": {"type": "string"}},
+    "previous_missing_contract_keys": {"type": "array", "items": {"type": "string"}},
+    "source_issue_body_sha256": {"type": ["string", "null"]},
+    "replay_safe": {"type": "boolean"}
+  }
+}
