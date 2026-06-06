@@ -596,6 +596,9 @@ test('GIVEN sortie running WHEN running HUD baseline then HUD screenshot matches
       white-space: nowrap;
       box-sizing: border-box;
       overflow: hidden;
+      font-family: monospace;
+      font-size: 18px;
+      font-weight: 600;
     }`,
   })
 
