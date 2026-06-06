@@ -387,7 +387,7 @@ describe('GIVEN enemies with various defeatedAtTick values', () => {
 // ---- Type-level regression fixtures ----
 // discriminated union の整合を compile-time に検証する（runtime では何も実行しない）
 
-const _validVictory = Object.freeze({
+void Object.freeze({
   outcome: 'victory',
   endReason: 'all_enemies_defeated',
   durationMs: 0,
@@ -396,7 +396,7 @@ const _validVictory = Object.freeze({
   playerHpRemaining: 1,
 } satisfies SortieResult)
 
-const _validDefeatByHpZero = Object.freeze({
+void Object.freeze({
   outcome: 'defeat',
   endReason: 'player_hp_zero',
   durationMs: 1000,
@@ -405,7 +405,7 @@ const _validDefeatByHpZero = Object.freeze({
   playerHpRemaining: 0,
 } satisfies SortieResult)
 
-const _validDefeatByTimeout = Object.freeze({
+void Object.freeze({
   outcome: 'defeat',
   endReason: 'timeout',
   durationMs: 30000,
@@ -415,31 +415,31 @@ const _validDefeatByTimeout = Object.freeze({
 } satisfies SortieResult)
 
 // @ts-expect-error outcome: 'victory' に endReason: 'timeout' は型エラー
-const _invalidVictoryByTimeout = {
+void ({
   outcome: 'victory',
   endReason: 'timeout',
   durationMs: 0,
   kills: 0,
   shotsFired: 0,
   playerHpRemaining: 1,
-} satisfies SortieResult
+} satisfies SortieResult)
 
 // @ts-expect-error outcome: 'victory' に endReason: 'player_hp_zero' は型エラー
-const _invalidVictoryByHpZero = {
+void ({
   outcome: 'victory',
   endReason: 'player_hp_zero',
   durationMs: 0,
   kills: 0,
   shotsFired: 0,
   playerHpRemaining: 1,
-} satisfies SortieResult
+} satisfies SortieResult)
 
 // @ts-expect-error outcome: 'defeat' に endReason: 'all_enemies_defeated' は型エラー
-const _invalidDefeatByAllEnemiesDefeated = {
+void ({
   outcome: 'defeat',
   endReason: 'all_enemies_defeated',
   durationMs: 0,
   kills: 0,
   shotsFired: 0,
   playerHpRemaining: 0,
-} satisfies SortieResult
+} satisfies SortieResult)
