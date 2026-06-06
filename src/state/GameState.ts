@@ -87,13 +87,40 @@ export interface TelemetryState {
 
 export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
 
-export interface SortieResult {
-  readonly outcome: 'victory' | 'defeat'
-  readonly durationMs: number
-  readonly kills: number
-  readonly shotsFired: number
-  readonly playerHpRemaining: number
-}
+/**
+ * Reason why a sortie ended. Discriminates the three terminal conditions.
+ * - `all_enemies_defeated`: victory — all spawned enemies were defeated
+ * - `player_hp_zero`:       defeat  — player HP reached 0
+ * - `timeout`:              defeat  — 30-second time limit elapsed with enemies remaining
+ *
+ * `survival_timer` is intentionally excluded (M2 scope — see Issue #542).
+ */
+export type SortieEndReason =
+  | 'all_enemies_defeated'
+  | 'player_hp_zero'
+  | 'timeout'
+
+type SortieResultBase = Readonly<{
+  durationMs: number
+  kills: number
+  shotsFired: number
+  playerHpRemaining: number
+}>
+
+/**
+ * Discriminated union for sortie result.
+ * `outcome` and `endReason` are constrained together to prevent invalid combinations
+ * such as `{ outcome: 'victory', endReason: 'timeout' }`.
+ */
+export type SortieResult =
+  | (SortieResultBase & {
+      readonly outcome: 'victory'
+      readonly endReason: 'all_enemies_defeated'
+    })
+  | (SortieResultBase & {
+      readonly outcome: 'defeat'
+      readonly endReason: 'player_hp_zero' | 'timeout'
+    })
 
 /**
  * Discriminated union for sortie state.

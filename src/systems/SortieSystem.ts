@@ -74,8 +74,6 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
     return
   }
 
-  const outcome: 'victory' | 'defeat' = isDefeat ? 'defeat' : isVictory ? 'victory' : 'defeat'
-
   const kills = state.enemies.filter(
     (e) =>
       e.defeated &&
@@ -83,22 +81,49 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
       e.defeatedAtTick <= terminalTick,
   ).length
 
-  // playerHpRemaining is 0 only for HP defeat (player.hp <= 0).
-  // timeout defeat and victory retain the actual HP snapshot.
-  const playerHpRemaining = isDefeat
-    ? 0
-    : Math.min(state.player.maxHp, Math.max(0, state.player.hp))
+  const durationMs = elapsedTicks * fixedDeltaMs
+  const shotsFired = state.player.shotsFired
 
-  const result = Object.freeze({
-    outcome,
-    durationMs: elapsedTicks * fixedDeltaMs,
-    kills,
-    shotsFired: state.player.shotsFired,
-    playerHpRemaining,
-  } satisfies SortieResult)
+  // Build a narrowed SortieResult with correct outcome/endReason pairing.
+  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → defeat).
+  // Each branch returns a concrete union member so TypeScript can verify the discriminated union.
+  let result: SortieResult
+  if (isDefeat) {
+    // player_hp_zero: playerHpRemaining is always 0
+    result = Object.freeze({
+      outcome: 'defeat',
+      endReason: 'player_hp_zero',
+      durationMs,
+      kills,
+      shotsFired,
+      playerHpRemaining: 0,
+    } satisfies SortieResult)
+  } else if (isVictory) {
+    // all_enemies_defeated: retain actual HP snapshot
+    const playerHpRemaining = Math.min(state.player.maxHp, Math.max(0, state.player.hp))
+    result = Object.freeze({
+      outcome: 'victory',
+      endReason: 'all_enemies_defeated',
+      durationMs,
+      kills,
+      shotsFired,
+      playerHpRemaining,
+    } satisfies SortieResult)
+  } else {
+    // timeout defeat: retain actual HP snapshot
+    const playerHpRemaining = Math.min(state.player.maxHp, Math.max(0, state.player.hp))
+    result = Object.freeze({
+      outcome: 'defeat',
+      endReason: 'timeout',
+      durationMs,
+      kills,
+      shotsFired,
+      playerHpRemaining,
+    } satisfies SortieResult)
+  }
 
   const terminalState: SortieState = {
-    status: outcome,
+    status: result.outcome,
     elapsedTicks,
     targetTicks,
     result,
