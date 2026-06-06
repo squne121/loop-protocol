@@ -11,17 +11,24 @@
     "checked_body_sha256"
   ],
   "properties": {
-    "schema_version": {"type": "string"},
+    "schema_version": {
+      "type": "string",
+      "const": "loop_rewrite_router_state/v1"
+    },
     "rewrite_attempt_count": {"type": "integer", "minimum": 0},
     "max_rewrite_attempts": {"type": "integer", "minimum": 1},
     "checker_exit_code": {"type": "integer"},
-    "checked_body_sha256": {"type": "string"},
+    "checked_body_sha256": {
+      "type": "string",
+      "pattern": "^(sha256:)?[A-Fa-f0-9]{64}$"
+    },
     "missing_sections": {"type": "array", "items": {"type": "string"}},
     "missing_contract_keys": {"type": "array", "items": {"type": "string"}},
     "previous_checked_body_sha256": {"type": ["string", "null"]},
     "previous_missing_sections": {"type": "array", "items": {"type": "string"}},
     "previous_missing_contract_keys": {"type": "array", "items": {"type": "string"}},
     "source_issue_body_sha256": {"type": ["string", "null"]},
-    "replay_safe": {"type": "boolean"}
+    "replay_safe": {"type": "boolean"},
+    "source_body_reset": {"type": "boolean"}
   }
 }

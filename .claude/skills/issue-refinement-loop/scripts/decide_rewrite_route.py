@@ -25,10 +25,11 @@ Exit codes (CLI):
 
 from __future__ import annotations
 
-import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,11 @@ class LOOP_REWRITE_ROUTER_STATE_V1:
 
         replay_safe: If True, this state has been restored from persistent storage
             and is safe to replay (attempt count has not been reset to 0).
+
+        source_body_reset: True if this state was produced by a reset because the
+            human changed the source issue body (source_issue_body_sha256 mismatch
+            at load time). When True, rewrite_attempt_count has been reset to 0 and
+            the route result records the reset fact (AC7).
     """
 
     rewrite_attempt_count: int
@@ -109,6 +115,7 @@ class LOOP_REWRITE_ROUTER_STATE_V1:
     previous_missing_contract_keys: list[str] = field(default_factory=list)
     source_issue_body_sha256: Optional[str] = None
     replay_safe: bool = False
+    source_body_reset: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -183,16 +190,45 @@ def _normalize_set(items: list[str]) -> frozenset[str]:
     return frozenset(items)
 
 
-def _set_decreased(current: list[str], previous: list[str]) -> bool:
+def _missing_universe(
+    sections: list[str], keys: list[str]
+) -> frozenset[tuple[str, str]]:
     """
-    Return True if current missing set is strictly smaller than previous.
+    Build a single tagged universe of all missing items.
 
-    Progress means at least one item was resolved.
+    Sections and contract keys are namespaced with a tag so that they never
+    collide and are compared together as one set. This lets no-progress
+    detection treat "one section resolved but one contract key newly missing"
+    as NO progress, instead of letting per-category OR logic pass it.
     """
-    current_set = _normalize_set(current)
-    previous_set = _normalize_set(previous)
-    # Progress: current is a proper subset of previous OR current is smaller
-    return len(current_set) < len(previous_set)
+    return frozenset(
+        [("section", s) for s in sections] + [("contract_key", k) for k in keys]
+    )
+
+
+def _strictly_decreased(
+    current_sections: list[str],
+    current_keys: list[str],
+    previous_sections: list[str],
+    previous_keys: list[str],
+) -> bool:
+    """
+    Return True only if the combined missing universe strictly shrank.
+
+    Progress (monotonic decrease) requires the current missing universe to be a
+    PROPER SUBSET of the previous one. This means:
+      - every still-missing item was already missing before (no replacements), AND
+      - at least one previously-missing item is now resolved.
+
+    A replacement (e.g. previous {A, B} -> current {C}) is NOT progress, because
+    {C} is not a subset of {A, B}. A same-size or grown set is NOT progress.
+
+    AC4: comparison is set-based (sort + unique + exact match via frozenset),
+    not length-based.
+    """
+    current = _missing_universe(current_sections, current_keys)
+    previous = _missing_universe(previous_sections, previous_keys)
+    return current < previous  # strict (proper) subset
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +257,13 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
 
     AC5: terminal result includes all required fields.
 
-    AC7: source_issue_body_sha256 mismatch is a reset condition.
+    AC7: source_issue_body_sha256 mismatch is a reset condition. When the state
+    was produced by such a reset, state.source_body_reset is True and the fact is
+    propagated to every RouteResult so the reset is observable in the terminal
+    result (not silently swallowed at load time).
     """
 
-    source_body_reset = False
+    source_body_reset = state.source_body_reset
 
     # --- AC2: max_rewrite_attempts enforcement ---
     if state.rewrite_attempt_count >= state.max_rewrite_attempts:
@@ -258,19 +297,25 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             source_body_reset=source_body_reset,
         )
 
-    # Check missing set no-progress (body changed but missing set did not decrease)
+    # Check missing set no-progress (body changed but missing set did not strictly shrink)
     if state.previous_checked_body_sha256 is not None:
-        # Body hash changed — now check if missing set decreased
-        sections_progress = _set_decreased(state.missing_sections, state.previous_missing_sections)
-        keys_progress = _set_decreased(state.missing_contract_keys, state.previous_missing_contract_keys)
-
-        # No progress if NEITHER set decreased (when both were non-empty previously)
-        prev_sections_nonempty = len(state.previous_missing_sections) > 0
-        prev_keys_nonempty = len(state.previous_missing_contract_keys) > 0
-
-        if prev_sections_nonempty and prev_keys_nonempty:
-            # Both had items — need at least one to decrease
-            if not sections_progress and not keys_progress:
+        previous_universe = _missing_universe(
+            state.previous_missing_sections, state.previous_missing_contract_keys
+        )
+        # Only evaluate progress when there was something missing to resolve.
+        # If nothing was missing previously, a body change is fine — continue.
+        if len(previous_universe) > 0:
+            progressed = _strictly_decreased(
+                state.missing_sections,
+                state.missing_contract_keys,
+                state.previous_missing_sections,
+                state.previous_missing_contract_keys,
+            )
+            # No progress if the combined missing universe did not strictly shrink.
+            # This catches: same set, grown set, AND replacement (one resolved /
+            # another newly missing), and the cross-category case where sections
+            # shrink but contract keys grow.
+            if not progressed:
                 return RouteResult(
                     route=ROUTE_HUMAN_JUDGMENT_REQUIRED,
                     reason_code=REASON_CODE_MISSING_CONTRACT_NO_PROGRESS,
@@ -282,35 +327,6 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
                     missing_contract_keys=state.missing_contract_keys,
                     source_body_reset=source_body_reset,
                 )
-        elif prev_sections_nonempty:
-            # Only sections had items — sections must decrease
-            if not sections_progress:
-                return RouteResult(
-                    route=ROUTE_HUMAN_JUDGMENT_REQUIRED,
-                    reason_code=REASON_CODE_MISSING_CONTRACT_NO_PROGRESS,
-                    rewrite_attempt_count=state.rewrite_attempt_count,
-                    max_rewrite_attempts=state.max_rewrite_attempts,
-                    checked_body_sha256=state.checked_body_sha256,
-                    checker_exit_code=state.checker_exit_code,
-                    missing_sections=state.missing_sections,
-                    missing_contract_keys=state.missing_contract_keys,
-                    source_body_reset=source_body_reset,
-                )
-        elif prev_keys_nonempty:
-            # Only contract keys had items — keys must decrease
-            if not keys_progress:
-                return RouteResult(
-                    route=ROUTE_HUMAN_JUDGMENT_REQUIRED,
-                    reason_code=REASON_CODE_MISSING_CONTRACT_NO_PROGRESS,
-                    rewrite_attempt_count=state.rewrite_attempt_count,
-                    max_rewrite_attempts=state.max_rewrite_attempts,
-                    checked_body_sha256=state.checked_body_sha256,
-                    checker_exit_code=state.checker_exit_code,
-                    missing_sections=state.missing_sections,
-                    missing_contract_keys=state.missing_contract_keys,
-                    source_body_reset=source_body_reset,
-                )
-        # If both were empty previously and body changed — that's fine, continue
 
     # --- AC3: checker_exit_code gating ---
     if state.checker_exit_code != 0:
@@ -342,6 +358,67 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
 
 
 # ---------------------------------------------------------------------------
+# Schema validation (AC8 enforcement at runtime)
+# ---------------------------------------------------------------------------
+
+
+class RewriteRouterStateError(Exception):
+    """
+    Raised when a persisted router state file is present but corrupt, invalid,
+    or schema-violating.
+
+    This is deliberately distinct from a missing file (which returns None). A
+    corrupt attempt-counter file must NOT be silently reset to 0, because that
+    would let a process bypass the max_rewrite_attempts stop condition simply by
+    truncating the state file. Callers must treat this as fail-closed.
+    """
+
+
+_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "schemas"
+    / "loop_rewrite_router_state_v1.json"
+)
+
+
+def _load_schema() -> dict[str, Any]:
+    """Load the LOOP_REWRITE_ROUTER_STATE_V1 JSON Schema from disk."""
+    with open(_SCHEMA_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_state_dict(data: Any) -> tuple[bool, str]:
+    """
+    Validate a state dict against loop_rewrite_router_state_v1.json.
+
+    Unlike the previous required-fields-only check, this enforces the FULL
+    schema: types, ranges (rewrite_attempt_count >= 0, max_rewrite_attempts >= 1),
+    additionalProperties: false, sha256 format, and schema_version const.
+
+    Returns (valid, error_message). Never raises for ordinary validation
+    failures so callers can decide routing.
+    """
+    try:
+        import jsonschema
+    except ImportError:  # pragma: no cover - jsonschema is a declared dependency
+        return False, "jsonschema is not available; cannot validate state"
+
+    if not isinstance(data, dict):
+        return False, "Input must be a JSON object"
+
+    try:
+        schema = _load_schema()
+    except OSError as e:  # pragma: no cover - schema ships with the repo
+        return False, f"Cannot load state schema: {e}"
+
+    try:
+        jsonschema.validate(instance=data, schema=schema)
+    except jsonschema.ValidationError as e:
+        return False, f"State schema validation failed: {e.message}"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Router state persistence helpers (AC7)
 # ---------------------------------------------------------------------------
 
@@ -353,53 +430,78 @@ def load_rewrite_router_state(
     """
     Load LOOP_REWRITE_ROUTER_STATE_V1 from a JSON file.
 
-    AC7: Supports replay-safe restoration — attempt count does NOT reset to 0.
-    If current_source_body_sha256 is provided and differs from
-    state.source_issue_body_sha256, returns None (reset condition — human
-    changed the source body).
+    AC7: Supports replay-safe restoration — attempt count does NOT reset to 0
+    across sessions / CI reruns.
 
-    Returns None if the file does not exist, is invalid, or reset condition met.
+    Return semantics (deliberately distinct so resets are never silent):
+      - file missing            -> None (caller starts a fresh loop at attempt 0)
+      - corrupt / invalid / schema-violating
+                                -> raise RewriteRouterStateError (fail-closed;
+                                   never silently reset the attempt counter)
+      - source body changed     -> return a reset state with source_body_reset=True
+                                   and rewrite_attempt_count=0; the reset fact is
+                                   carried into the route result (AC7)
+      - otherwise               -> restored state (replay_safe=True)
     """
-    import os
-
     if not os.path.exists(state_path):
         return None
 
     try:
         with open(state_path, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+    except json.JSONDecodeError as e:
+        raise RewriteRouterStateError(
+            f"Corrupt router state file {state_path}: {e}"
+        ) from e
+    except OSError as e:
+        raise RewriteRouterStateError(
+            f"Cannot read router state file {state_path}: {e}"
+        ) from e
 
-    if not isinstance(data, dict):
-        return None
+    valid, error_msg = validate_state_dict(data)
+    if not valid:
+        raise RewriteRouterStateError(
+            f"Invalid router state file {state_path}: {error_msg}"
+        )
 
-    # AC7: reset condition — source body changed by human
     stored_source_sha = data.get("source_issue_body_sha256")
+
+    # AC7: reset condition — human changed the source issue body. We do NOT
+    # silently drop the state; we return a reset state that records the fact.
     if (
         current_source_body_sha256 is not None
         and stored_source_sha is not None
         and current_source_body_sha256 != stored_source_sha
     ):
-        # Source body changed — reset state
-        return None
-
-    try:
         return LOOP_REWRITE_ROUTER_STATE_V1(
-            rewrite_attempt_count=data["rewrite_attempt_count"],
+            rewrite_attempt_count=0,
             max_rewrite_attempts=data["max_rewrite_attempts"],
             checker_exit_code=data["checker_exit_code"],
             checked_body_sha256=data["checked_body_sha256"],
             missing_sections=data.get("missing_sections", []),
             missing_contract_keys=data.get("missing_contract_keys", []),
-            previous_checked_body_sha256=data.get("previous_checked_body_sha256"),
-            previous_missing_sections=data.get("previous_missing_sections", []),
-            previous_missing_contract_keys=data.get("previous_missing_contract_keys", []),
-            source_issue_body_sha256=stored_source_sha,
+            previous_checked_body_sha256=None,
+            previous_missing_sections=[],
+            previous_missing_contract_keys=[],
+            source_issue_body_sha256=current_source_body_sha256,
             replay_safe=True,
+            source_body_reset=True,
         )
-    except (KeyError, TypeError):
-        return None
+
+    return LOOP_REWRITE_ROUTER_STATE_V1(
+        rewrite_attempt_count=data["rewrite_attempt_count"],
+        max_rewrite_attempts=data["max_rewrite_attempts"],
+        checker_exit_code=data["checker_exit_code"],
+        checked_body_sha256=data["checked_body_sha256"],
+        missing_sections=data.get("missing_sections", []),
+        missing_contract_keys=data.get("missing_contract_keys", []),
+        previous_checked_body_sha256=data.get("previous_checked_body_sha256"),
+        previous_missing_sections=data.get("previous_missing_sections", []),
+        previous_missing_contract_keys=data.get("previous_missing_contract_keys", []),
+        source_issue_body_sha256=stored_source_sha,
+        replay_safe=True,
+        source_body_reset=False,
+    )
 
 
 def save_rewrite_router_state(
@@ -407,9 +509,13 @@ def save_rewrite_router_state(
     state_path: str,
 ) -> None:
     """
-    Save LOOP_REWRITE_ROUTER_STATE_V1 to a JSON file.
+    Save LOOP_REWRITE_ROUTER_STATE_V1 to a JSON file atomically.
 
-    AC7: Persists attempt count so it survives session restarts.
+    AC7: Persists attempt count so it survives session restarts. The write is
+    crash-safe: data is written to a temp file in the same directory, flushed and
+    fsync'd, then os.replace()'d over the target. os.replace() is an atomic rename
+    on success, so a crash mid-write can never leave a truncated / partial JSON
+    file that load_rewrite_router_state would then treat as corrupt.
     """
     data = {
         "schema_version": SCHEMA_VERSION,
@@ -424,9 +530,17 @@ def save_rewrite_router_state(
         "previous_missing_contract_keys": state.previous_missing_contract_keys,
         "source_issue_body_sha256": state.source_issue_body_sha256,
         "replay_safe": True,
+        "source_body_reset": state.source_body_reset,
     }
-    with open(state_path, "w", encoding="utf-8") as f:
+
+    target_dir = os.path.dirname(os.path.abspath(state_path))
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = f"{state_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, state_path)
 
 
 # ---------------------------------------------------------------------------
@@ -435,21 +549,14 @@ def save_rewrite_router_state(
 
 
 def _validate_cli_input(data: Any) -> tuple[bool, str]:
-    """Validate CLI input schema. Returns (valid, error_message)."""
-    if not isinstance(data, dict):
-        return False, "Input must be a JSON object"
+    """
+    Validate CLI input against the full LOOP_REWRITE_ROUTER_STATE_V1 schema.
 
-    required = [
-        "rewrite_attempt_count",
-        "max_rewrite_attempts",
-        "checker_exit_code",
-        "checked_body_sha256",
-    ]
-    for field_name in required:
-        if field_name not in data:
-            return False, f"Missing required field: {field_name}"
-
-    return True, ""
+    This enforces types, ranges, additionalProperties: false, sha256 format, and
+    schema_version const — not just required-field presence. Invalid input is
+    rejected with an explicit reason (exit 2) rather than silently coerced.
+    """
+    return validate_state_dict(data)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -481,6 +588,7 @@ def main(argv: list[str] | None = None) -> None:
             previous_missing_contract_keys=input_data.get("previous_missing_contract_keys", []),
             source_issue_body_sha256=input_data.get("source_issue_body_sha256"),
             replay_safe=input_data.get("replay_safe", False),
+            source_body_reset=input_data.get("source_body_reset", False),
         )
 
         result = decide_rewrite_route(state)
