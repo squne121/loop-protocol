@@ -119,6 +119,25 @@
         "generated_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "checked_body_sha256": {
+          "type": "string",
+          "description": "チェック対象の Issue body の SHA-256 ハッシュ（sha256: プレフィックス付き）"
+        },
+        "checker_exit_code": {
+          "type": "integer",
+          "description": "チェックスクリプトの終了コード（0: pass, 1: fail）",
+          "enum": [0, 1]
+        },
+        "missing_sections": {
+          "type": "array",
+          "description": "不足しているセクション名のリスト（pass 時は空）",
+          "items": {"type": "string"}
+        },
+        "missing_contract_keys": {
+          "type": "array",
+          "description": "不足している contract キーのリスト（pass 時は空）",
+          "items": {"type": "string"}
         }
       },
       "allOf": [
