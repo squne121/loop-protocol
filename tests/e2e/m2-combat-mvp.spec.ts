@@ -530,6 +530,70 @@ test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progres
 })
 
 // ---------------------------------------------------------------------------
+// Playwright screenshot baselines (AC2, AC3) — Issue #681
+// ---------------------------------------------------------------------------
+
+test('GIVEN short sortie fixture WHEN defeat overlay baseline then Canvas screenshot matches', async ({
+  page,
+}) => {
+  // GIVEN the sortie reaches timeout defeat via __E2E_SHORT_SORTIE__ fixture (targetTicks≈30)
+  // WHEN the canvas overlay settles after defeat
+  // THEN the canvas screenshot should match the defeat overlay baseline
+  test.setTimeout(15_000)
+  await page.addInitScript(() => {
+    ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+  })
+  await page.goto('/')
+
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe('defeat')
+
+  await page.waitForTimeout(200)
+
+  await expect(page.locator('canvas.battle-stage__canvas')).toHaveScreenshot(
+    'm2-defeat-overlay-baseline.png',
+    {
+      animations: 'disabled',
+    },
+  )
+})
+
+test('GIVEN sortie running WHEN running HUD baseline then HUD screenshot matches', async ({
+  page,
+}) => {
+  // GIVEN the sortie is in running state
+  // WHEN the HUD is rendered
+  // THEN the status locator screenshot should match the running HUD baseline
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 3000, intervals: [50] },
+    )
+    .toBe('running')
+
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('In Progress', {
+    timeout: 3000,
+  })
+
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveScreenshot(
+    'm2-running-hud-baseline.png',
+    {
+      animations: 'disabled',
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // Canvas bitmap visual verification (AC7, AC8) — Issue #541
 // ---------------------------------------------------------------------------
 
