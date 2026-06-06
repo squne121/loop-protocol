@@ -116,6 +116,10 @@ def extract_allowed_paths(body: str) -> List[str]:
         # Lines starting with '- ' are list items
         if stripped.startswith("- "):
             path = stripped[2:].strip()
+            # Strip backtick-wrapped format: `path`（description）or `path` (description)
+            m = re.match(r'^`([^`]+)`', path)
+            if m:
+                path = m.group(1)
             if path:
                 paths.append(path)
         # Also handle lines without '- ' prefix (plain paths)
