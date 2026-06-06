@@ -213,7 +213,17 @@ LOOP_HANDOFF_RESULT_V1:
   permissions:
     unavailable: []
   generated_at: ISO-8601
+  # --- AC11 フィールド（SSOT: 本セクション） ---
+  # 以下 4 フィールドは issue-contract-review の終了チェックスクリプトが生成・消費する。
+  # runtime enforcement（max_rewrite_attempts / no-progress detection）は #664 の責務であり、
+  # 本ファイルはスキーマ定義（SSOT）のみを担う。
+  checked_body_sha256: string    # チェック対象の Issue body の SHA-256 ハッシュ
+  checker_exit_code: int         # チェックスクリプトの終了コード（0: pass, 1: fail）
+  missing_sections: []           # 不足しているセクション名のリスト（pass 時は空）
+  missing_contract_keys: []      # 不足している contract キーのリスト（pass 時は空）
 ```
+
+**Note**: `checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys` の 4 フィールドに対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection 等）は **#664 の責務** であり、本 Issue のスコープ外。本セクションはスキーマの SSOT として機能するのみ。
 
 ### `impl_ready` 定義
 
