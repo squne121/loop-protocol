@@ -319,6 +319,7 @@ Kill Switch を実行した場合は `required_end_state` の達成状況も Git
 | 人間導入手順書（onboarding）| 実装済み | #245 |
 | manifest producer hook wiring（Stop/SubagentStop/PostToolUse）| 実装済み | #402 |
 | GitHub Actions artifact workflow（private artifact のみ）| 実装済み | #402 |
+| coordinator hook（guard → producer 直列化、blocked attempt 抑止）| 実装済み | #651 |
 | pilot smoke test（Kill Switch 動作確認）| 未実装 | #246 |
 
 > **重要**: deterministic manifest producer、manifest schema validation path、
@@ -336,12 +337,24 @@ manifest producer（`scripts/generate-session-manifest.mjs`）は以下の自動
 
 `.claude/settings.json` の hooks セクションで以下のイベントが wiring されている。
 
-| イベント | hooks（順序固定） |
+> **設計原則（#651）**: Stop / SubagentStop には `session_manifest_coordinator.sh` のみを wiring する（single coordinator only）。
+> `session_recording_policy_guard.sh` や `generate_session_manifest_from_hook.mjs` を Stop / SubagentStop の sibling hooks として直接追加してはならない。
+> **session manifest hook は best-effort telemetry であり、AI agent 作業をブロックしない**（coordinator は常に exit 0 で終了する）。
+
+| イベント | hooks |
 |---|---|
-| Stop | 1. `session_recording_policy_guard.sh`（policy guard、先行評価）→ 2. `generate_session_manifest_from_hook.mjs`（producer） |
-| SubagentStop | 1. `session_recording_policy_guard.sh`（policy guard、先行評価）→ 2. `generate_session_manifest_from_hook.mjs`（producer） |
+| Stop | `session_manifest_coordinator.sh`（single coordinator only） |
+| SubagentStop | `session_manifest_coordinator.sh`（single coordinator only） |
 | PostToolUse | `generate_session_manifest_from_hook.mjs`（matcher で対象 tool を限定） |
 | SessionStart | 対象外（context 混入リスクが高いため除外） |
+
+coordinator（`session_manifest_coordinator.sh`）の動作:
+- stdin を一度だけ読み取り、guard と producer の両方に同一 payload を渡す
+- guard（`session_recording_policy_guard.sh`）を producer より先に実行する（順序固定）
+- guard が exit 0 の場合のみ producer を実行する（guard failure → 標準 manifest を生成しない）
+- guard failure / producer failure のいずれでも exit 0 で終了し、Stop / SubagentStop をブロックしない
+- `stop_hook_active: true` の場合は producer を呼ばず即時 exit 0（short-circuit）
+- 失敗理由は stderr にのみ出力する（stdout は空）
 
 hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 - stdin の hook JSON を読み取り、producer CLI 引数へ変換する（hook_event_name / session_id / tool_name / tool_use_id / agent_id を抽出）
@@ -355,8 +368,6 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 > 現状は `secrets_mode: none` 前提で運用する。
 > "private artifact channel" とは「Issue / PR comment ではない非コメント面（retention-limited GitHub Actions artifact）」を指す。
 > **public repo では artifact は REST API 経由で公開アクセス可能**。manifest content は public-safe contract（絶対パスなし、token なし、transcript 本文なし）を満たすこと。
-
-`session_recording_policy_guard.sh` は Stop / SubagentStop で producer hook より前に評価される（順序固定）。
 
 ### GitHub Actions CI lifecycle
 
