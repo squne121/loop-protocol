@@ -547,11 +547,17 @@ def test_manifest_schema_has_secret_policy_property():
     assert "value_exposed" in sp_props, (
         "'secret_policy.value_exposed' field not defined in schema"
     )
-    assert "boundary_enforced" in sp_props, (
-        "'secret_policy.boundary_enforced' field not defined in schema"
-    )
     assert "mode" in sp_props, (
         "'secret_policy.mode' field not defined in schema"
+    )
+    assert "producer_contract" in sp_props, (
+        "'secret_policy.producer_contract' field not defined in schema"
+    )
+    assert "runtime_boundary" in sp_props, (
+        "'secret_policy.runtime_boundary' field not defined in schema"
+    )
+    assert "boundary_enforced" not in sp_props, (
+        "'secret_policy.boundary_enforced' was deprecated in #536/#537 and must not exist in schema"
     )
 
 
