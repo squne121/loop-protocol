@@ -148,11 +148,11 @@ describe('agent-session-manifest schema file', () => {
   })
 
   it('legacy boundary_enforced shape', () => {
-    // AC8: schema-level assertion that boundary_enforced is NOT in properties
+    // AC8: schema-level assertion that boundary_enforced IS in properties (added for backward-compat, #699)
     const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf-8')) as Record<string, unknown>
     const secretPolicy = (schema['properties'] as Record<string, Record<string, unknown>>)['secret_policy']
     const properties = secretPolicy['properties'] as Record<string, unknown>
-    expect(properties).not.toHaveProperty('boundary_enforced')
+    expect(properties).toHaveProperty('boundary_enforced')
   })
 
   it('secret_policy value_exposed const false', () => {
@@ -331,7 +331,7 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     expect(result.errors).toEqual([])
   })
 
-  it('GIVEN manifest with legacy boundary_enforced shape WHEN validating THEN legacy shape is rejected', () => {
+  it('GIVEN manifest with legacy boundary_enforced shape WHEN validating THEN legacy shape is rejected due to missing required fields', () => {
     const manifest = {
       ...createBaseManifest(),
       secret_policy: {
@@ -341,9 +341,10 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
       },
     }
     const result = validateManifestAgainstSchema(manifest)
+    // boundary_enforced is now a known schema property (#699), so additionalProperties error no longer fires.
+    // However, producer_contract and runtime_boundary are still required, so schema still rejects this shape.
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.message?.includes('must have required property'))).toBe(true)
-    expect(result.errors.some((error) => error.message?.includes('must NOT have additional properties'))).toBe(true)
   })
 
   it('GIVEN manifest with attested runtime boundary and null evidence WHEN validating THEN missing runtime evidence is rejected', () => {
@@ -409,7 +410,7 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
     expect(result.errors.some((error) => error.path.includes('/secret_policy/runtime_boundary/evidence_ref'))).toBe(true)
   })
 
-  it('GIVEN manifest mixing legacy boundary_enforced with new fields WHEN validating THEN mixed legacy shape is rejected', () => {
+  it('GIVEN manifest mixing legacy boundary_enforced with new fields WHEN validating THEN mixed shape is accepted', () => {
     const manifest = {
       ...createBaseManifest(),
       secret_policy: {
@@ -418,8 +419,10 @@ describe('agent-session-manifest schema validation (Ajv 2020-12)', () => {
       },
     }
     const result = validateManifestAgainstSchema(manifest)
-    expect(result.valid).toBe(false)
-    expect(result.errors.some((error) => error.message?.includes('must NOT have additional properties'))).toBe(true)
+    // boundary_enforced is now a known schema property (#699), so a manifest with all required fields
+    // plus boundary_enforced is valid.
+    expect(result.valid).toBe(true)
+    expect(result.errors).toEqual([])
   })
 })
 

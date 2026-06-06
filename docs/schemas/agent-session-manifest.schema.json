@@ -628,6 +628,10 @@
           "const": false,
           "description": "Whether any Secret value was exposed in this manifest. MUST be false — value_exposed: true is prohibited."
         },
+        "boundary_enforced": {
+          "type": "boolean",
+          "description": "Backward-compatible structural marker for legacy secret boundary tests. This field is not runtime attestation; consumers MUST use secret_policy.runtime_boundary.attested and runtime_boundary.evidence_ref for runtime enforcement evidence."
+        },
         "mode": {
           "type": "string",
           "enum": [
