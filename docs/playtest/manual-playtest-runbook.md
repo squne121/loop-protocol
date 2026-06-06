@@ -83,6 +83,19 @@ base path の解決を確認するための環境別 URL を以下に示す。
 - GitHub Pages main: `https://squne121.github.io/loop-protocol/?playtest_evidence=1`
 - GitHub Pages PR preview: `https://squne121.github.io/loop-protocol/pr-<PR番号>/?playtest_evidence=1`
 
+> **`<PR番号>` の置換**: PR Preview URL を開く前に `<PR番号>` を実際の PR 番号に置き換える（例: `pr-707`）。
+
+### Local preview の起動方法
+
+ポートが競合すると URL が変わるため、固定ポートで起動する:
+
+```bash
+pnpm build
+pnpm preview -- --host 127.0.0.1 --port 4173 --strictPort
+```
+
+ポートが使用中の場合は別プロセスを停止してから再実行する（自動的に別ポートへ移行しない）。
+
 ### 環境別 Validation split
 
 | 環境 | 目的 |
@@ -90,6 +103,8 @@ base path の解決を確認するための環境別 URL を以下に示す。
 | Local preview | production bundle 動作確認（`pnpm build` + `pnpm preview` による） |
 | GitHub Pages main | `/loop-protocol/` base 解決の確認 |
 | GitHub Pages PR preview | `/loop-protocol/pr-<N>/` base 解決の確認 |
+
+> **Local preview は GitHub Pages base path 検証ではない**: Local preview は production bundle の動作確認に限定される。`/loop-protocol/` や `/loop-protocol/pr-<N>/` という公開パスの検証は GitHub Pages main / PR Preview URL で行う。
 
 > **切り分け注記**: base path 修正だけでは #571 の deferred verification 完了を意味しない。Pages source / publish trigger fault は別問題として切り分ける。
 
