@@ -501,73 +501,121 @@ def _is_gfm_table_block(text: str) -> bool:
 
     return True
 
+# GFM block-level 要素の開始パターン（テーブル終了トリガー）
+# GFM 仕様では、テーブルは以下の block-level 要素の開始で終了する:
+#   - 空行
+#   - blockquote（>）
+#   - ATX heading（# ）
+#   - fenced code block（``` 、~~~）
+#   - list item（- 、* 、+ 、1. ）
+#   - HTML block
+#   - 4-space indented code
+_BLOCK_LEVEL_STARTERS = re.compile(
+    r'^(?:'
+    r'>{1}'              # blockquote
+    r'|#{1,6}\s'        # ATX heading
+    r'|```|~~~'          # fenced code
+    r'|[-*+]\s'          # unordered list
+    r'|\d+[.)]\s'        # ordered list
+    r'|<[a-zA-Z]'        # HTML block
+    r'|    '             # 4-space indented code
+    r')'
+)
+
+
+def _is_block_level_starter(line: str) -> bool:
+    """
+    行が GFM の block-level 要素の開始行かどうかを判定する。
+    テーブルの data row 収集を終了させるトリガーとして使用する。
+    """
+    return bool(_BLOCK_LEVEL_STARTERS.match(line))
+
+
 # ---------------------------------------------------------------------------
 # GFM 準拠 block セグメンテーション API（#659 追加）
 # ---------------------------------------------------------------------------
 
 def _yield_prose_with_table_splits(prose_text: str):
     """
-    prose テキストを走査して GFM テーブルブロックを検出し、
+    prose テキストを行単位で走査して GFM テーブルブロックを検出し、
     テーブル部分は BLOCK_KIND_TABLE として、残りは BLOCK_KIND_HUMAN_PROSE として yield する。
 
-    テーブル検出条件:
-    - 空行区切りでブロックを分割し、各ブロックが GFM テーブルかチェックする
-    - GFM テーブルと判定されたブロックは BLOCK_KIND_TABLE を返す
-    - それ以外は BLOCK_KIND_HUMAN_PROSE を返す（まとめてではなく元のテキスト構造を保持）
+    GFM 仕様準拠のテーブル検出条件（B1 fix: #685）:
+    - 現在行 + 次行が GFM table の header/delimiter として成立する場合にのみ table 開始
+    - header/delimiter のセル数一致を確認
+    - data row は GFM 仕様どおりセル数不足・過剰を許容
+    - 空行または block-level 要素（blockquote、ATX heading、fenced code、list 等）で table 終了
+    - table slice のみ BLOCK_KIND_TABLE として yield し、残りは通常 prose 判定へ
+
+    修正前の実装は空行単位でのみ分割していたため、以下のような入力で
+    blockquote が誤って BLOCK_KIND_TABLE に含まれていた:
+        | Claim | Evidence |
+        | --- | --- |
+        | safe | ci green |
+        > This should be prose, not table.
     """
-    import re as _re
-    # 空行でブロックを分割するが、元の空行テキストを保持する
-    # splitlines で行単位処理し、空行グループをブロック境界として扱う
     lines = prose_text.splitlines(keepends=True)
+    n = len(lines)
+    i = 0
+    prose_buffer: list[str] = []
 
-    current_block_lines: list[str] = []
+    def _flush_prose(buf: list[str]):
+        if buf:
+            yield ''.join(buf), BLOCK_KIND_HUMAN_PROSE
 
-    def flush_block(block_lines: list[str]):
-        if not block_lines:
-            return
-        block_text = ''.join(block_lines)
-        stripped = block_text.strip()
-        if stripped and _is_gfm_table_block(stripped):
-            yield block_text, BLOCK_KIND_TABLE
-        else:
-            yield block_text, BLOCK_KIND_HUMAN_PROSE
+    while i < n:
+        line = lines[i]
+        stripped_line = line.rstrip('\n').rstrip('\r')
 
-    pending_empty_lines: list[str] = []
+        # 空行: prose バッファに追加してインデックスを進める
+        if not stripped_line.strip():
+            prose_buffer.append(line)
+            i += 1
+            continue
 
-    for line in lines:
-        if not line.strip():
-            # 空行: ブロック境界の候補
-            pending_empty_lines.append(line)
-        else:
-            # 非空行: 現在のブロックへ追加
-            # 空行が溜まっていたら現在のブロックを flush してから空行を処理
-            if pending_empty_lines and current_block_lines:
-                # 溜まった空行をブロック分割として扱う
-                yield from flush_block(current_block_lines)
-                current_block_lines = []
-                # 空行は HUMAN_PROSE として追加（後続ブロックに含める）
-                pending_empty_lines_text = ''.join(pending_empty_lines)
-                # 空行自体は次のブロックの前に追加するが、単独では yield しない
-                # 次の非空行と一緒に処理する
-                current_block_lines = pending_empty_lines + [line]
-                pending_empty_lines = []
-            elif pending_empty_lines:
-                # 現在のブロックが空の状態で空行が来た場合
-                current_block_lines.extend(pending_empty_lines)
-                current_block_lines.append(line)
-                pending_empty_lines = []
-            else:
-                current_block_lines.append(line)
+        # block-level 要素の開始: prose バッファに追加してインデックスを進める
+        # （blockquote、heading 等はテーブルを終了させ、prose として扱う）
+        if _is_block_level_starter(stripped_line):
+            prose_buffer.append(line)
+            i += 1
+            continue
 
-    # 残った空行をフラッシュ
-    if pending_empty_lines and current_block_lines:
-        yield from flush_block(current_block_lines)
-        # trailing empty lines
-        yield ''.join(pending_empty_lines), BLOCK_KIND_HUMAN_PROSE
-    elif pending_empty_lines:
-        yield ''.join(pending_empty_lines), BLOCK_KIND_HUMAN_PROSE
-    elif current_block_lines:
-        yield from flush_block(current_block_lines)
+        # テーブル開始チェック: 現在行（header）+ 次行（delimiter）
+        if i + 1 < n:
+            next_line = lines[i + 1].rstrip('\n').rstrip('\r')
+            if (
+                _TABLE_ROW_RE.match(stripped_line)
+                and _TABLE_DELIMITER_RE.match(next_line)
+            ):
+                header_cells = _count_table_cells(stripped_line)
+                delim_cells = _count_table_cells(next_line)
+                if header_cells == delim_cells and header_cells > 0:
+                    # prose バッファを先に flush
+                    yield from _flush_prose(prose_buffer)
+                    prose_buffer = []
+
+                    # table rows を収集
+                    table_lines = [line, lines[i + 1]]
+                    j = i + 2
+                    while j < n:
+                        data_line = lines[j]
+                        data_stripped = data_line.rstrip('\n').rstrip('\r')
+                        # 空行または block-level 要素で table 終了
+                        if not data_stripped.strip() or _is_block_level_starter(data_stripped):
+                            break
+                        table_lines.append(data_line)
+                        j += 1
+
+                    yield ''.join(table_lines), BLOCK_KIND_TABLE
+                    i = j
+                    continue
+
+        # 通常の prose 行
+        prose_buffer.append(line)
+        i += 1
+
+    # 残った prose バッファを flush
+    yield from _flush_prose(prose_buffer)
 
 
 

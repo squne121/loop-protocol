@@ -361,3 +361,101 @@ class TestGoldenCorpus:
         )
         result = validate_text(text)
         assert result.passed is True
+
+
+# ===========================================================================
+# B1 fix: テーブル後の block-level 要素がテーブルに含まれない（#685）
+# ===========================================================================
+
+
+class TestBlockLevelStarterTerminatesTable:
+    """
+    B1 fix (#685): _yield_prose_with_table_splits が行単位で走査し、
+    blockquote・ATX heading 等の block-level 要素の開始でテーブルを終了させることを確認する。
+
+    修正前は空行単位のみで分割していたため、テーブル直後の blockquote や heading が
+    誤ってテーブルブロック内に取り込まれ、prose として検査されなかった。
+    """
+
+    def test_blockquote_after_table_is_not_in_table(self):
+        """GIVEN: テーブル直後（空行なし）に blockquote WHEN: iter_markdown_blocks
+        THEN: blockquote は table に含まれず BLOCK_KIND_HUMAN_PROSE として yield される"""
+        text = (
+            "| Claim | Evidence |\n"
+            "| --- | --- |\n"
+            "| safe | ci green |\n"
+            "> This English prose should be checked, but current splitting can hide it as table.\n"
+        )
+        blocks = list(iter_markdown_blocks(text))
+        kinds = [kind for _, kind in blocks]
+        # blockquote がある部分は table でなく human_prose として yield される
+        assert BLOCK_KIND_TABLE in kinds
+        # blockquote 行を含む human_prose ブロックが存在すること
+        prose_blocks = [(t, k) for t, k in blocks if k == BLOCK_KIND_HUMAN_PROSE]
+        blockquote_in_prose = any("> This English prose" in t for t, _ in prose_blocks)
+        assert blockquote_in_prose, "blockquote が prose ブロックに含まれていない"
+
+    def test_atx_heading_after_table_is_not_in_table(self):
+        """GIVEN: テーブル直後（空行なし）に ATX heading WHEN: iter_markdown_blocks
+        THEN: heading は table に含まれず BLOCK_KIND_HUMAN_PROSE として yield される"""
+        text = (
+            "| AC | Status |\n"
+            "|---|---|\n"
+            "| AC1 | pass |\n"
+            "## Next Section\n"
+        )
+        blocks = list(iter_markdown_blocks(text))
+        kinds = [kind for _, kind in blocks]
+        assert BLOCK_KIND_TABLE in kinds
+        prose_blocks = [(t, k) for t, k in blocks if k == BLOCK_KIND_HUMAN_PROSE]
+        heading_in_prose = any("## Next Section" in t for t, _ in prose_blocks)
+        assert heading_in_prose, "ATX heading が prose ブロックに含まれていない"
+
+    def test_data_row_cell_count_mismatch_allowed_in_table(self):
+        """GIVEN: data row のセル数が header と異なるテーブル WHEN: iter_markdown_blocks
+        THEN: GFM 仕様でセル数不足・過剰は許容（data row は table に含まれる）"""
+        # GFM spec: data rows may have fewer or more cells than the header
+        text = (
+            "| AC | Claim | Status |\n"
+            "|---|---|---|\n"
+            "| AC1 | only two cells |\n"          # セル数不足（2 < 3）
+            "| AC2 | extra | extra | extra |\n"   # セル数過剰（4 > 3）
+        )
+        blocks = list(iter_markdown_blocks(text))
+        kinds = [kind for _, kind in blocks]
+        # data rows はセル数不一致でもテーブルの継続行として扱う
+        assert BLOCK_KIND_TABLE in kinds
+        # テーブルブロックに data rows が含まれること
+        table_blocks = [(t, k) for t, k in blocks if k == BLOCK_KIND_TABLE]
+        table_text = ''.join(t for t, _ in table_blocks)
+        assert "AC1" in table_text
+        assert "AC2" in table_text
+
+    def test_fenced_code_inside_code_fence_not_table(self):
+        """GIVEN: fenced code block 内のテーブル風コンテンツ WHEN: iter_markdown_blocks
+        THEN: code_fence として扱われ BLOCK_KIND_TABLE にならない（既存挙動の確認）"""
+        text = (
+            "```\n"
+            "| col1 | col2 |\n"
+            "|---|---|\n"
+            "| a | b |\n"
+            "```\n"
+        )
+        blocks = list(iter_markdown_blocks(text))
+        kinds = [kind for _, kind in blocks]
+        assert BLOCK_KIND_CODE_FENCE in kinds
+        assert BLOCK_KIND_TABLE not in kinds
+
+    def test_escaped_pipe_in_table_detected(self):
+        """GIVEN: escaped pipe（\\|）を含むテーブル WHEN: iter_markdown_blocks
+        THEN: escaped pipe はセル区切りとして扱われず、テーブルとして正しく検出される"""
+        # escaped pipe はセル区切りでないので cell 数の計算に影響しない
+        text = (
+            "| Header\\|A | Header B |\n"
+            "|---|---|\n"
+            "| cell \\| data | val |\n"
+        )
+        blocks = list(iter_markdown_blocks(text))
+        kinds = [kind for _, kind in blocks]
+        # escaped pipe を含んでいてもテーブルとして認識される
+        assert BLOCK_KIND_TABLE in kinds
