@@ -184,6 +184,26 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 
 `approved` 終了時は `LOOP_HANDOFF_RESULT_V1` marker を終了コメントに出力する（形式・routing rules は `references/termination-policy.md#LOOP_HANDOFF_RESULT_V1` 参照）。出力は `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment と fenced YAML block の 2 要素。
 
+#### Termination Report Publish Flow
+
+終了レポートの GitHub 投稿は `publish_termination_report.py` を経由して行う。
+
+```bash
+# TERMINATION_REPORT_INPUT_V1 JSON を stdin から渡す
+echo '{"termination_reason":"approved","issue_number":42}' | \
+  python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+    --issue-number 42
+```
+
+`publish_termination_report.py` は以下の責務を持つ:
+
+1. `render_termination_report.py` を `subprocess.run([sys.executable, ...], shell=False, ...)` で呼び出す
+2. stdout JSON の `schema` / `schema_version` / `publishable` / `body` / `reason_code` を検証する
+3. `publishable=true` かつ `body` が非空文字列の場合のみ `gh issue comment --body-file` を呼ぶ
+4. `publishable=false`、renderer 異常、validation 失敗の場合は gh を呼ばず fail-closed で終了し、reason_code / timestamp をローカル artifact に記録する
+
+詳細な publisher 仕様は `.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py` を参照する。
+
 ## Reference Map
 
 | topic | primary reference |

@@ -45,6 +45,43 @@ related_issue: "#135"
 | `pr_body_schema/schema_consumer_inventory/v1` | `.github/pull_request_template.md`, `.claude/skills/open-pr/SKILL.md` | PR author / open-pr skill | pr-review-judge, open-pr procedure, future open_pr.py (#170) | `rg -n "Schema Consumer Inventory\|Consumer 更新状況\|Compatibility Decision" .` |
 | `agent_session_manifest/v1` | `docs/schemas/agent-session-manifest.md` | Claude Code hook-based ledger, human/AI GitHub Issue or PR comment | pr-review-judge, impl-review-loop, pilot smoke test issue, future aggregation script | `rg -n "agent_session_manifest/v1\|agent_session_manifest:v1\|agent-session-manifest" .` |
 | `PR_REVIEW_GATE_RESULT_V1` | `.claude/skills/pr-review-judge/references/pr-review-gate-result-schema.yml` | check_pr_review_gates.py | pr-review-judge, impl-review-loop | `rg -n "PR_REVIEW_GATE_RESULT_V1\|schema_version.*RESULT" .` |
+| `TERMINATION_REPORT_RENDER_RESULT_V1` | `.claude/skills/issue-refinement-loop/scripts/render_termination_report.py` | render_termination_report.py | publish_termination_report.py, issue-refinement-loop Step 5 | `rg -n "TERMINATION_REPORT_RENDER_RESULT_V1" .claude/skills/issue-refinement-loop/` |
+
+## TERMINATION_REPORT_RENDER_RESULT_V1 詳細登録
+
+```yaml
+schema_id: TERMINATION_REPORT_RENDER_RESULT_V1
+definition: .claude/skills/issue-refinement-loop/scripts/render_termination_report.py
+related_issue: "#692"
+producer:
+  - render_termination_report.py
+consumer:
+  - publish_termination_report.py (subprocess caller)
+  - issue-refinement-loop Step 5 (termination report publish flow)
+compatibility:
+  breaking_changes:
+    - schema field rename or removal
+    - schema_version increment
+    - publishable semantics change (true/false invariant)
+    - body=null when publishable=true (invariant violation)
+  non_breaking_changes:
+    - adding new optional fields
+    - adding new reason_code values
+    - adding new termination_reason values
+detection_patterns:
+  - 'TERMINATION_REPORT_RENDER_RESULT_V1'
+  - 'publishable.*true.*body'
+  - 'reason_code.*guard_fail'
+validation_commands:
+  - "rg 'TERMINATION_REPORT_RENDER_RESULT_V1' .claude/skills/issue-refinement-loop/scripts/render_termination_report.py"
+  - "rg 'TERMINATION_REPORT_RENDER_RESULT_V1' .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+  - "uv run pytest .claude/skills/issue-refinement-loop/tests/test_publish_termination_report.py -q"
+notes:
+  - "publishable=true requires body to be non-null non-empty string (AC4 invariant)"
+  - "publishable=false requires body to be null (AC4 invariant)"
+  - "publisher (publish_termination_report.py) must validate schema/schema_version before posting"
+  - "stdout: machine JSON only; stderr: diagnostics only (no publishable body to stderr)"
+```
 
 ## agent_session_manifest/v1 詳細登録
 
