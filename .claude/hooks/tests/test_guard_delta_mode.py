@@ -165,6 +165,7 @@ def run_hook(hook_input: dict, mock_gh_responses: dict = None) -> subprocess.Com
 
     env = os.environ.copy()
     env['PROJECT_DIR'] = str(PROJECT_DIR)
+    env['GUARD_JAPANESE_PROSE_MODE'] = 'enforce'
 
     # gh コマンドを mock するための wrapper script を一時ディレクトリに作成
     with tempfile.TemporaryDirectory() as tmpdir:

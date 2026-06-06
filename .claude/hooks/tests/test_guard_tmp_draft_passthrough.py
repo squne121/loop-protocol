@@ -45,6 +45,7 @@ def _build_fake_gh(responses):
 def run_hook(hook_input, mock_gh=None):
     env = os.environ.copy()
     env["PROJECT_DIR"] = str(PROJECT_DIR)
+    env["GUARD_JAPANESE_PROSE_MODE"] = "enforce"
     with tempfile.TemporaryDirectory() as d:
         if mock_gh is not None:
             fp = os.path.join(d, "gh")

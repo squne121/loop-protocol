@@ -84,6 +84,7 @@ def run_hook(hook_input: dict, mock_gh_responses: dict = None) -> subprocess.Com
     input_json = json.dumps(hook_input)
     env = os.environ.copy()
     env["PROJECT_DIR"] = str(PROJECT_DIR)
+    env["GUARD_JAPANESE_PROSE_MODE"] = "enforce"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         if mock_gh_responses is not None:
