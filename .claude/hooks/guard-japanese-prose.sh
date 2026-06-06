@@ -107,24 +107,33 @@ _shadow_allow() {
 
     # AC8: raw body / full command / token / Authorization header は記録しない
     local fields_json
-    fields_json="$(cat <<EOF
-{
-  "hook_event": "PreToolUse",
-  "mode_configured": "${mode_configured}",
-  "mode_effective": "${mode_effective}",
-  "tool_name": "${TOOL_NAME}",
-  "route_id": "${route_id}",
-  "body_source": "${body_source}",
-  "public_mutation": ${public_mutation},
-  "decision_would_be": "deny",
-  "reason_code": "${reason_code}",
-  "failed_block_count": ${failed_block_count},
-  "duration_ms": ${duration_ms},
-  "body_sha256": "${body_sha256}",
-  "body_bytes": ${body_bytes}
-}
-EOF
-)"
+    fields_json="$(jq -n \
+        --arg hook_event "PreToolUse" \
+        --arg mode_configured "$mode_configured" \
+        --arg mode_effective "$mode_effective" \
+        --arg tool_name "$TOOL_NAME" \
+        --arg route_id "$route_id" \
+        --arg body_source "$body_source" \
+        --argjson public_mutation "$public_mutation" \
+        --arg decision_would_be "deny" \
+        --arg reason_code "$reason_code" \
+        --argjson failed_block_count "$failed_block_count" \
+        --argjson duration_ms "$duration_ms" \
+        --arg body_sha256 "$body_sha256" \
+        --argjson body_bytes "$body_bytes" \
+        '{ hook_event: $hook_event,
+           mode_configured: $mode_configured,
+           mode_effective: $mode_effective,
+           tool_name: $tool_name,
+           route_id: $route_id,
+           body_source: $body_source,
+           public_mutation: $public_mutation,
+           decision_would_be: $decision_would_be,
+           reason_code: $reason_code,
+           failed_block_count: $failed_block_count,
+           duration_ms: $duration_ms,
+           body_sha256: $body_sha256,
+           body_bytes: $body_bytes }')"
     _guard_shadow_log "$fields_json"
     exit 0
 }
@@ -146,24 +155,33 @@ _shadow_pass() {
     fi
 
     local fields_json
-    fields_json="$(cat <<EOF
-{
-  "hook_event": "PreToolUse",
-  "mode_configured": "${mode_configured}",
-  "mode_effective": "${mode_effective}",
-  "tool_name": "${TOOL_NAME}",
-  "route_id": "${route_id}",
-  "body_source": "${body_source}",
-  "public_mutation": ${public_mutation},
-  "decision_would_be": "allow",
-  "reason_code": "${extra_reason}",
-  "failed_block_count": 0,
-  "duration_ms": 0,
-  "body_sha256": "",
-  "body_bytes": 0
-}
-EOF
-)"
+    fields_json="$(jq -n \
+        --arg hook_event "PreToolUse" \
+        --arg mode_configured "$mode_configured" \
+        --arg mode_effective "$mode_effective" \
+        --arg tool_name "$TOOL_NAME" \
+        --arg route_id "$route_id" \
+        --arg body_source "$body_source" \
+        --argjson public_mutation "$public_mutation" \
+        --arg decision_would_be "allow" \
+        --arg reason_code "$extra_reason" \
+        --argjson failed_block_count 0 \
+        --argjson duration_ms 0 \
+        --arg body_sha256 "" \
+        --argjson body_bytes 0 \
+        '{ hook_event: $hook_event,
+           mode_configured: $mode_configured,
+           mode_effective: $mode_effective,
+           tool_name: $tool_name,
+           route_id: $route_id,
+           body_source: $body_source,
+           public_mutation: $public_mutation,
+           decision_would_be: $decision_would_be,
+           reason_code: $reason_code,
+           failed_block_count: $failed_block_count,
+           duration_ms: $duration_ms,
+           body_sha256: $body_sha256,
+           body_bytes: $body_bytes }')"
     _guard_shadow_log "$fields_json"
     exit 0
 }
@@ -194,6 +212,9 @@ fi
 # $1: route_id  $2: body_source  $3: public_mutation（true|false）
 # $4: reason_code  $5: failed_block_count  $6: body_text（sha256/bytes 計算用）
 _block_or_shadow() {
+    local _bos_start_ms
+    _bos_start_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+
     local route_id="$1"
     local body_source="$2"
     local public_mutation="$3"
@@ -205,7 +226,7 @@ _block_or_shadow() {
     local body_bytes=0
     if [ -n "$body_text" ]; then
         body_sha256="$(printf '%s' "$body_text" | sha256sum | awk '{print $1}')"
-        body_bytes="${#body_text}"
+        body_bytes="$(printf '%s' "$body_text" | wc -c | tr -d ' ')"
     fi
 
     if [ "$_GUARD_MODE_EFFECTIVE" = "enforce" ]; then
@@ -213,8 +234,12 @@ _block_or_shadow() {
         exit 2
     else
         # shadow mode: JSONL 記録 + exit 0
+        local _bos_end_ms
+        _bos_end_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+        local duration_ms=$(( _bos_end_ms - _bos_start_ms ))
+
         _shadow_allow "$route_id" "$body_source" "$public_mutation" \
-            "$reason_code" "$failed_block_count" "0" "$body_sha256" "$body_bytes"
+            "$reason_code" "$failed_block_count" "$duration_ms" "$body_sha256" "$body_bytes"
         # _shadow_allow 内で exit 0 するので以下には到達しない
     fi
 }

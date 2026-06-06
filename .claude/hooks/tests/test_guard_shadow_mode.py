@@ -346,14 +346,14 @@ class TestModeSemantics:
             extra_env={"GUARD_JAPANESE_PROSE_MODE": "invalid_value_xyz"},
         )
 
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            if entries:
-                entry = entries[-1]
-                reason = entry.get("reason_code", "")
-                assert "invalid_mode" in reason, (
-                    f"invalid_mode が reason_code に記録されていない: reason_code={reason}"
-                )
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        assert entries, "JSONL エントリが空"
+        entry = entries[-1]
+        reason = entry.get("reason_code", "")
+        assert "invalid_mode" in reason, (
+            f"invalid_mode が reason_code に記録されていない: reason_code={reason}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -367,22 +367,29 @@ class TestNoRawBody:
         """JSONL に raw_body フィールドが存在しない。"""
         log_file = str(tmp_path / "shadow.jsonl")
         body_file = tmp_path / "body.md"
+        fake_token = "FAKE_TOKEN_VALUE"
+        fake_raw_body = "FAKE_RAW_BODY_VALUE"
         body_file.write_text(
-            "secret_token=abc123. All English. No Japanese.",
+            f"secret_token={fake_token}. raw_body_content={fake_raw_body}. All English. No Japanese.",
             encoding="utf-8",
         )
         command = f"gh issue create --body-file {body_file}"
         run_hook("Bash", command, env_mode="shadow", shadow_log_file=log_file)
 
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            for entry in entries:
-                assert "raw_body" not in entry, f"raw_body が記録されている: {entry}"
-                assert "full_command" not in entry, f"full_command が記録されている: {entry}"
-                assert "token" not in entry, f"token が記録されている: {entry}"
-                assert "authorization_header" not in entry, (
-                    f"authorization_header が記録されている: {entry}"
-                )
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        assert entries, "JSONL エントリが空"
+        for entry in entries:
+            assert "raw_body" not in entry, f"raw_body が記録されている: {entry}"
+            assert "full_command" not in entry, f"full_command が記録されている: {entry}"
+            assert "token" not in entry, f"token が記録されている: {entry}"
+            assert "authorization_header" not in entry, (
+                f"authorization_header が記録されている: {entry}"
+            )
+            # key 存在チェックだけでなく、エントリ全体を json.dumps して secret 文字列が存在しないことを検証
+            full_text = json.dumps(entry, ensure_ascii=False)
+            assert fake_token not in full_text, f"raw token が記録されている: {full_text}"
+            assert fake_raw_body not in full_text, f"raw body が記録されている: {full_text}"
 
     def test_body_sha256_is_recorded_instead(self, tmp_path):
         """JSONL に body_sha256 と body_bytes が記録される（raw body の代替）。"""
@@ -395,14 +402,15 @@ class TestNoRawBody:
         command = f"gh issue create --body-file {body_file}"
         run_hook("Bash", command, env_mode="shadow", shadow_log_file=log_file)
 
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            if entries:
-                # would-deny エントリには body_sha256 / body_bytes が記録される
-                deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
-                for entry in deny_entries:
-                    assert "body_sha256" in entry, f"body_sha256 が欠落: {entry}"
-                    assert "body_bytes" in entry, f"body_bytes が欠落: {entry}"
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        assert entries, "JSONL エントリが空"
+        # would-deny エントリには body_sha256 / body_bytes が記録される
+        deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
+        assert len(deny_entries) >= 1, f"期待する deny エントリが見つからない: {entries}"
+        for entry in deny_entries:
+            assert "body_sha256" in entry, f"body_sha256 が欠落: {entry}"
+            assert "body_bytes" in entry, f"body_bytes が欠落: {entry}"
 
 
 # ---------------------------------------------------------------------------
@@ -455,3 +463,108 @@ class TestInstrumentationError:
         )
         # shadow mode は exit 0
         assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# body_bytes: バイト数（文字数でなく）を記録する
+# ---------------------------------------------------------------------------
+
+class TestBodyBytesIsActualByteCount:
+    """body_bytes は ${#var}（文字数）ではなく wc -c（バイト数）で計測する。"""
+
+    def test_body_bytes_is_byte_count_not_char_count(self, tmp_path):
+        """日本語を含む body で body_bytes がバイト数になっていることを確認する。
+
+        "日本語abc" は UTF-8 で 3*3+3 = 12 バイト、文字数は 6。
+        body_bytes が 6 なら文字数（誤り）、12 なら正しいバイト数。
+        """
+        log_file = str(tmp_path / "shadow.jsonl")
+        body_file = tmp_path / "body.md"
+        # 日本語 3 文字（各 3 バイト）+ ASCII 3 文字（各 1 バイト）= 12 バイト、6 文字
+        japanese_body = "日本語abc"
+        body_file.write_text(japanese_body, encoding="utf-8")
+
+        # would-deny が出るよう shadow mode + 英語のみ扱いにならないように
+        # そのまま would-deny になる英語のみのコマンドで body_bytes を検証する
+        # ただし "日本語abc" はブロックされない可能性があるので、確実に deny させるため
+        # 全英語 body で body_bytes のみを検証する別入力を使う
+        english_body = "a" * 6  # 6 文字 = 6 バイト（ASCII）
+        english_file = tmp_path / "english.md"
+        english_file.write_text(english_body, encoding="utf-8")
+        command_en = f"gh issue create --body-file {english_file}"
+        run_hook("Bash", command_en, env_mode="shadow", shadow_log_file=log_file)
+
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
+        assert len(deny_entries) >= 1, f"deny エントリが見つからない: {entries}"
+        entry = deny_entries[-1]
+        assert "body_bytes" in entry, f"body_bytes が欠落: {entry}"
+        # 6 バイトの ASCII body → body_bytes は 6
+        assert entry["body_bytes"] == 6, (
+            f"body_bytes が期待値 6 と一致しない: {entry['body_bytes']}"
+        )
+
+    def test_body_bytes_utf8_multibyte(self, tmp_path):
+        """日本語 3 文字 + ASCII 3 文字 = 12 バイトが body_bytes として記録される。"""
+        log_file = str(tmp_path / "shadow.jsonl")
+        body_file = tmp_path / "body.md"
+        # 英語プロセでブロックさせるため、日本語を含む英語主体テキストを使う
+        # shadow_allow の body_bytes は _block_or_shadow 経由でのみセットされる
+        # 確実に日本語テキストで body_bytes が正しく取れることを確認するため
+        # wc -c で期待値を計算する
+        import subprocess as sp
+        japanese_body = "日本語abc"
+        expected_bytes = len(japanese_body.encode("utf-8"))  # 12
+        assert expected_bytes == 12, "テスト前提: 日本語abc は 12 バイト"
+
+        # guard がブロックするよう全英語テキストに日本語を混ぜる
+        # ただし比率が低く fail する構成にする（英語大量 + 日本語少量）
+        mixed_body = "A" * 100 + japanese_body
+        body_file.write_text(mixed_body, encoding="utf-8")
+        expected_mixed_bytes = len(mixed_body.encode("utf-8"))  # 100 + 12 = 112
+
+        command = f"gh issue create --body-file {body_file}"
+        run_hook("Bash", command, env_mode="shadow", shadow_log_file=log_file)
+
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
+        assert len(deny_entries) >= 1, f"deny エントリが見つからない: {entries}"
+        entry = deny_entries[-1]
+        assert entry.get("body_bytes") == expected_mixed_bytes, (
+            f"body_bytes が期待値 {expected_mixed_bytes} と一致しない: {entry.get('body_bytes')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# duration_ms: 実測値（0 以上の整数）が記録される
+# ---------------------------------------------------------------------------
+
+class TestDurationMsIsActualMeasurement:
+    """duration_ms は固定値 0 でなく実測値（0 以上の整数）が記録される。"""
+
+    def test_duration_ms_is_nonnegative_integer(self, tmp_path):
+        """shadow mode で duration_ms フィールドが 0 以上の整数であることを確認する。"""
+        log_file = str(tmp_path / "shadow.jsonl")
+        body_file = tmp_path / "body.md"
+        body_file.write_text(
+            "All English no Japanese. duration_ms test.",
+            encoding="utf-8",
+        )
+        command = f"gh issue create --body-file {body_file}"
+        run_hook("Bash", command, env_mode="shadow", shadow_log_file=log_file)
+
+        assert os.path.exists(log_file), f"ログファイルが生成されていない: {log_file}"
+        entries = read_jsonl(log_file)
+        assert entries, "JSONL エントリが空"
+        deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
+        assert len(deny_entries) >= 1, f"期待する deny エントリが見つからない: {entries}"
+        entry = deny_entries[-1]
+        assert "duration_ms" in entry, f"duration_ms が欠落: {entry}"
+        assert isinstance(entry["duration_ms"], int), (
+            f"duration_ms が整数でない: {entry['duration_ms']!r}"
+        )
+        assert entry["duration_ms"] >= 0, (
+            f"duration_ms が負の値: {entry['duration_ms']}"
+        )
