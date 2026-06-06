@@ -7,9 +7,11 @@
  * - AC2c: .stat-grid does not push the parent right rail / app shell wider than its container
  *
  * Test strategy:
- * - Override player hp / maxHp via window.__LOOP_TEST_OVERRIDE__ before page load
+ * - Directly inject long Hull text into the rendered HUD element.
+ *   This isolates CSS overflow behavior from game-state setup.
  * - Check DOM element scrollWidth <= clientWidth for each dd and the stat-grid container
- * - Check app-shell / right rail does not overflow body
+ * - Check page-level horizontal overflow: document/body scrollWidth <= viewport clientWidth,
+ *   and app-shell bounding rect stays within viewport bounds (AC2c)
  */
 
 import { test, expect, type Page } from '@playwright/test'
@@ -60,20 +62,44 @@ async function measureStatGridOverflow(
 }
 
 /**
- * Check that .stat-grid container does not push parent wider than body.
- * Returns true if no overflow detected.
+ * Measure page-level horizontal overflow for AC2c.
+ * Checks both document/body scrollWidth vs viewport clientWidth,
+ * and app-shell bounding rect vs viewport bounds.
+ * body.scrollWidth includes overflow content, so the reference must be
+ * document.documentElement.clientWidth (the actual viewport inner width).
  */
-async function measureAppShellOverflow(page: Page): Promise<{ overflowed: boolean; bodyW: number; appShellW: number }> {
+async function measurePageHorizontalOverflow(
+  page: Page,
+): Promise<{
+  overflowed: boolean
+  viewportW: number
+  docScrollW: number
+  bodyScrollW: number
+  appShellLeft: number | null
+  appShellRight: number | null
+}> {
   return page.evaluate(() => {
+    const doc = document.documentElement
     const body = document.body
     const appShell = document.querySelector<HTMLElement>('.app-shell')
-    const bodyW = body.scrollWidth
-    const appShellW = appShell ? appShell.scrollWidth : 0
-    // Allow 1px rounding tolerance
+    const rect = appShell?.getBoundingClientRect()
+
+    const viewportW = doc.clientWidth
+    const docScrollW = doc.scrollWidth
+    const bodyScrollW = body.scrollWidth
+
+    // Page has horizontal overflow if content is wider than viewport
+    const pageOverflowed = Math.max(docScrollW, bodyScrollW) > viewportW + 1
+    // App-shell escapes viewport if its rect exceeds viewport bounds
+    const shellEscapedViewport = rect != null && (rect.left < -1 || rect.right > viewportW + 1)
+
     return {
-      overflowed: appShellW > bodyW + 1,
-      bodyW,
-      appShellW,
+      overflowed: pageOverflowed || shellEscapedViewport,
+      viewportW,
+      docScrollW,
+      bodyScrollW,
+      appShellLeft: rect?.left ?? null,
+      appShellRight: rect?.right ?? null,
     }
   })
 }
@@ -115,21 +141,25 @@ test.describe('hud overflow: stat-grid dd does not overflow in any viewport', ()
         // Inject large hull text (AC2a)
         await injectHullText(page, hullText)
 
-        // Small settle time for layout recalculation
-        await page.waitForTimeout(100)
-
         // AC2b: scrollWidth <= clientWidth for all .stat-grid dd
-        const { overflowed, details } = await measureStatGridOverflow(page)
-        expect(
-          overflowed,
-          `Overflow detected in viewport ${vp.label} with hull="${hullText}": ${details.join('; ')}`,
-        ).toBe(false)
+        // Use expect.poll to retry until layout settles (avoids fixed sleep flakiness)
+        await expect
+          .poll(
+            async () => {
+              const r = await measureStatGridOverflow(page)
+              return r
+            },
+            { message: `stat-grid dd should not overflow in viewport ${vp.label} hull="${hullText}"` },
+          )
+          .toMatchObject({ overflowed: false })
 
-        // AC2c: app-shell not pushed wider than body
-        const { overflowed: appOverflowed, bodyW, appShellW } = await measureAppShellOverflow(page)
+        // AC2c: page has no horizontal overflow; app-shell stays within viewport
+        const shell = await measurePageHorizontalOverflow(page)
         expect(
-          appOverflowed,
-          `app-shell pushed wider than body in viewport ${vp.label}: appShellW=${appShellW} bodyW=${bodyW}`,
+          shell.overflowed,
+          `horizontal overflow in viewport ${vp.label} hull="${hullText}": ` +
+            `viewportW=${shell.viewportW} docScroll=${shell.docScrollW} bodyScroll=${shell.bodyScrollW} ` +
+            `appShell=[${shell.appShellLeft}, ${shell.appShellRight}]`,
         ).toBe(false)
       })
     }
