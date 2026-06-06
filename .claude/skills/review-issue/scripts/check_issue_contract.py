@@ -15,6 +15,13 @@ Usage:
     # JSON 出力
     python check_issue_contract.py --file <path> --json
 
+Caller contract for --json mode:
+    - stdout carries the contract-check JSON ONLY (a single final JSON object).
+    - stderr carries diagnostics (warnings, deprecation notices, progress output).
+    - Callers MUST parse JSON from stdout only and MUST NOT merge stderr into
+      stdout (e.g. do not use stderr=subprocess.STDOUT). Treating stderr
+      diagnostics as part of the JSON payload will break parsing.
+
 Exit codes:
     0: すべてのチェックが pass（verdict: approve）
     1: 1 つ以上のチェックが fail（verdict: needs-fix）
@@ -1452,7 +1459,14 @@ def main() -> None:
     group.add_argument("--file", "-f", help="フィクスチャファイルパス（テスト用）")
     group.add_argument("--issue", "-i", type=int, help="GitHub Issue 番号")
     parser.add_argument("--repo", "-r", help="GitHub repo (owner/repo)。--issue と共に使用")
-    parser.add_argument("--json", action="store_true", help="JSON 出力モード")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "JSON 出力モード（stdout = JSON only / stderr = diagnostics）。"
+            "caller は stdout のみを parse し stderr を stdout に merge しないこと。"
+        ),
+    )
     parser.add_argument("--vc-preflight-json", help="VC preflight JSON path for C13 check")
     args = parser.parse_args()
 
