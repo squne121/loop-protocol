@@ -53,9 +53,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha=$(git rev-parse HEAD)
-          echo "VITE_LOOP_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          sha=$(git rev-parse --verify HEAD^{commit})
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: invalid commit SHA: $sha" >&2
+            exit 1
+          fi
+          printf 'VITE_LOOP_COMMIT_SHA=%s\n' "$sha" >> "$GITHUB_ENV"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
@@ -152,9 +156,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha=$(git rev-parse HEAD)
-          echo "VITE_LOOP_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          sha=$(git rev-parse --verify HEAD^{commit})
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: invalid commit SHA: $sha" >&2
+            exit 1
+          fi
+          printf 'VITE_LOOP_COMMIT_SHA=%s\n' "$sha" >> "$GITHUB_ENV"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}

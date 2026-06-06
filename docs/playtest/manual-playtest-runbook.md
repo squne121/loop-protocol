@@ -395,14 +395,17 @@ scenarios:
 tested_commit: "abc1234def5678..."
 tested_commit_unknown_reason: null
 
-# GitHub Pages / PR Preview の場合: commit SHA を取得できないときは以下を明示
-tested_commit: "unknown"
-tested_commit_unknown_reason: "GitHub Pages では実行時に commit SHA を取得できないため"
+# GitHub Pages / PR Preview の場合（通常系）: Evidence Panel の app_under_test.commit に 40文字 SHA が入るため、それを転記する
+tested_commit: "3d643396c8144438148a8fe55727cc30c8aed417"  # app_under_test.commit の値をそのまま使う
+
+# GitHub Pages / PR Preview の場合（fallback）: commit が "unknown" のときのみ以下を明示
+# tested_commit: "unknown"
+# tested_commit_unknown_reason: "VITE_LOOP_COMMIT_SHA が未注入のため（deploy workflow を確認すること）"
 ```
 
 `tested_commit` を空欄のままにすることは禁止。commit SHA が不明な場合は必ず `"unknown"` + `tested_commit_unknown_reason` を記録する。
 
-Evidence Panel の `app_under_test.commit` フィールドが `unknown` になった場合も同様に `tested_commit_unknown_reason` を明記する。
+Evidence Panel の `app_under_test.commit` フィールドが 40文字 SHA の場合はそれを `tested_commit` に転記する。`"unknown"` の場合のみ `tested_commit_unknown_reason` を明記する。
 
 ### 必須フィールド一覧
 
