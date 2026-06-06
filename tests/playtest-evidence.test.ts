@@ -431,6 +431,27 @@ describe('initPlaytestEvidencePanel DOM', () => {
     expect(closeBtn).not.toBeNull()
     expect(closeBtn.textContent).toBe('×')
   })
+
+  // Integration smoke test: evidence collection -> snapshot -> panel textarea -> YAML serialization
+  it('GIVEN panel opened with visualViewport.scale = 1.75 WHEN initPlaytestEvidencePanel THEN textarea YAML contains visual_viewport_scale: 1.75', () => {
+    const origVisualViewport = window.visualViewport
+    Object.defineProperty(window, 'visualViewport', {
+      value: { scale: 1.75, width: 800, height: 600 },
+      configurable: true,
+    })
+
+    try {
+      initPlaytestEvidencePanel(container, '?playtest_evidence=1')
+      const textarea = container.querySelector('[data-playtest-fallback="true"]') as HTMLTextAreaElement
+      expect(textarea).not.toBeNull()
+      expect(textarea.value).toContain('visual_viewport_scale: 1.75')
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: origVisualViewport,
+        configurable: true,
+      })
+    }
+  })
 })
 
 // --- AC12: close → reopen snapshot stability ---
