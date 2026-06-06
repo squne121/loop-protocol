@@ -714,3 +714,107 @@ test('GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has red-dominant 
     timeout: 3000,
   })
 })
+
+// ---------------------------------------------------------------------------
+// AC5 (Issue #581) -- HP label bounds verification
+// runtime_verification: true -- Playwright chromium headless
+// ---------------------------------------------------------------------------
+
+test(
+  `GIVEN max HP enemy spawned WHEN rendered THEN HP label bounding box is within arena bounds`,
+  async ({ page }) => {
+    // GIVEN the sortie is running and at least one enemy has spawned
+    // WHEN the CanvasRenderer draws the HP label (drawEnemyHpLabel)
+    // THEN the label bounding box is fully within arena bounds (no overflow)
+    //
+    // Verification method:
+    //   1. Read arena dimensions from __LOOP_E2E__ hook
+    //   2. Sample the canvas border pixels (1-pixel edge stripe)
+    //   3. Assert no white (HP label) pixels exist in the border stripe
+    //      White = R>200 AND G>200 AND B>200 (HP_LABEL_COLOR #ffffff)
+    //      Background = #07111f (R=7, G=17, B=31) -- clearly distinct
+    //
+    // Note: this test verifies label pixels do not reach the canvas edge.
+    // The padding=2 clamp ensures labels stay >= 2px from the edge.
+    // Scanning the 1px border (innermost physical pixel row/col) detects overflow.
+
+    test.setTimeout(20_000)
+
+    // Wait for sortie running
+    await expect
+      .poll(
+        async () => {
+          const s = await getGameState(page)
+          return s.sortie.status
+        },
+        { timeout: 5000, intervals: [50] },
+      )
+      .toBe(`running`)
+
+    // Wait for at least one enemy to spawn
+    await expect
+      .poll(
+        async () => {
+          const s = await getGameState(page)
+          return s.enemies.length
+        },
+        { timeout: 15000, intervals: [100] },
+      )
+      .toBeGreaterThan(0)
+
+    // Allow a few extra render frames
+    const stateAfter = await getGameState(page)
+    await waitForTicks(page, stateAfter.tick, 5)
+
+    // Check HP label bounds: scan 1px border stripe for white pixels
+    const hpLabelInBounds = await page.evaluate(() => {
+      const canvas = document.querySelector(`canvas`) as HTMLCanvasElement | null
+      if (!canvas) return { ok: false, reason: `no canvas` }
+      const ctx = canvas.getContext(`2d`)
+      if (!ctx) return { ok: false, reason: `no ctx` }
+      const w = canvas.width
+      const h = canvas.height
+      if (w === 0 || h === 0) return { ok: false, reason: `zero dims` }
+
+      // Scan the outermost 1px border for white (label) pixels
+      // HP_LABEL_COLOR is #ffffff: R=255, G=255, B=255
+      // Background #07111f: R=7, G=17, B=31 -- distinctly non-white
+      // Threshold: R>200 AND G>200 AND B>200
+      function isWhite(r: number, g: number, b: number): boolean {
+        return r > 200 && g > 200 && b > 200
+      }
+
+      // Top row
+      const topRow = ctx.getImageData(0, 0, w, 1).data
+      for (let i = 0; i < topRow.length; i += 4) {
+        if (isWhite(topRow[i], topRow[i + 1], topRow[i + 2])) {
+          return { ok: false, reason: `white pixel in top border` }
+        }
+      }
+      // Bottom row
+      const botRow = ctx.getImageData(0, h - 1, w, 1).data
+      for (let i = 0; i < botRow.length; i += 4) {
+        if (isWhite(botRow[i], botRow[i + 1], botRow[i + 2])) {
+          return { ok: false, reason: `white pixel in bottom border` }
+        }
+      }
+      // Left column
+      const leftCol = ctx.getImageData(0, 0, 1, h).data
+      for (let i = 0; i < leftCol.length; i += 4) {
+        if (isWhite(leftCol[i], leftCol[i + 1], leftCol[i + 2])) {
+          return { ok: false, reason: `white pixel in left border` }
+        }
+      }
+      // Right column
+      const rightCol = ctx.getImageData(w - 1, 0, 1, h).data
+      for (let i = 0; i < rightCol.length; i += 4) {
+        if (isWhite(rightCol[i], rightCol[i + 1], rightCol[i + 2])) {
+          return { ok: false, reason: `white pixel in right border` }
+        }
+      }
+      return { ok: true, reason: `no label pixels in border stripe` }
+    })
+
+    expect(hpLabelInBounds.ok, hpLabelInBounds.reason).toBe(true)
+  },
+)

@@ -1,4 +1,5 @@
 import type { GameState } from '../state'
+import { drawEnemyHpLabel } from './renderUtils'
 
 export interface CanvasRenderer {
   render(state: GameState): void
@@ -138,6 +139,20 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.beginPath()
         context.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2)
         context.fill()
+      }
+
+      // --- Layer 5b: enemy HP labels (above enemy circles, below projectiles) ---
+      for (const enemy of state.enemies) {
+        if (enemy.defeated) continue
+        drawEnemyHpLabel({
+          ctx: context,
+          enemyX: enemy.x,
+          enemyY: enemy.y,
+          enemyRadius: enemy.radius,
+          enemyHp: enemy.hp,
+          arenaWidth: arenaW,
+          arenaHeight: arenaH,
+        })
       }
 
       // --- Layer 6: projectiles ---
