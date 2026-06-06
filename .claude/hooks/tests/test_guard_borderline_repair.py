@@ -48,6 +48,7 @@ def run_hook(tool_name: str, command: str, env: dict | None = None) -> subproces
     """
     hook_input = json.dumps({"tool_name": tool_name, "tool_input": {"command": command}})
     run_env = os.environ.copy()
+    run_env["GUARD_JAPANESE_PROSE_MODE"] = "enforce"
     if env:
         run_env.update(env)
     return subprocess.run(
@@ -65,12 +66,14 @@ def run_hook_write(file_path: str, content: str) -> subprocess.CompletedProcess:
         "tool_name": "Write",
         "tool_input": {"file_path": file_path, "content": content},
     })
+    run_env = os.environ.copy()
+    run_env["GUARD_JAPANESE_PROSE_MODE"] = "enforce"
     return subprocess.run(
         ["bash", str(HOOK_SCRIPT)],
         input=hook_input,
         capture_output=True,
         text=True,
-        env=os.environ.copy(),
+        env=run_env,
     )
 
 

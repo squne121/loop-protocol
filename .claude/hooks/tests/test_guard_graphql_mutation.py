@@ -23,6 +23,7 @@ MATRIX = PROJECT_DIR / ".claude/skills/create-issue/scripts/mutation_route_matri
 def run_hook(hook_input, mock_gh=None):
     env = os.environ.copy()
     env["PROJECT_DIR"] = str(PROJECT_DIR)
+    env["GUARD_JAPANESE_PROSE_MODE"] = "enforce"
     with tempfile.TemporaryDirectory() as d:
         if mock_gh is not None:
             fp = os.path.join(d, "gh")
