@@ -14,6 +14,7 @@ block_kind 一覧（AC1 固定契約・変更禁止）:
   shell_command         シェルコマンドブロック（$ / # prefix）
   code_fence            ``` / ~~~ フェンスで囲まれたコードブロック
   url_or_identifier     URL・識別子のみの行
+  table                 GFM パイプテーブル（Safety Claim Matrix 等）
 
 Out of scope:
   body source / route 分類（child-2 以降で扱う）はこのモジュールの block_kind に含めない。
@@ -36,6 +37,7 @@ BLOCK_KIND_VC_COMMAND = "vc_command"
 BLOCK_KIND_SHELL_COMMAND = "shell_command"
 BLOCK_KIND_CODE_FENCE = "code_fence"
 BLOCK_KIND_URL_OR_IDENTIFIER = "url_or_identifier"
+BLOCK_KIND_TABLE = "table"
 
 # すべての block_kind の集合（型検証・テスト用）
 ALL_BLOCK_KINDS: frozenset[str] = frozenset({
@@ -48,6 +50,7 @@ ALL_BLOCK_KINDS: frozenset[str] = frozenset({
     BLOCK_KIND_SHELL_COMMAND,
     BLOCK_KIND_CODE_FENCE,
     BLOCK_KIND_URL_OR_IDENTIFIER,
+    BLOCK_KIND_TABLE,
 })
 
 # ---------------------------------------------------------------------------
@@ -431,9 +434,141 @@ _GFM_FENCE_CLOSE_LINE_RE = re.compile(
 # または ``` の後が yaml/YAML のもの）
 # ただしここでは code_fence 内の特別な判定として扱う
 
+
+# ---------------------------------------------------------------------------
+# GFM パイプテーブル検出（#685）
+# ---------------------------------------------------------------------------
+
+# GFM パイプテーブルのヘッダ行: | で区切られたセルを持つ行
+# 少なくとも1本の | を含む行（テーブル行の基本条件）
+_TABLE_ROW_RE = re.compile(r'.*\|.*')
+
+# GFM テーブルのデリミタ行: | :---: | --- | :--- | --- のような行
+# 各セルは `:?-+:?` またはスペース only
+_TABLE_DELIMITER_RE = re.compile(r'^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$')
+
+
+def _count_table_cells(row: str) -> int:
+    """
+    GFM テーブル行のセル数を数える。
+    optional leading/trailing pipe を考慮する。
+    """
+    # エスケープされた | を一時的に置き換える
+    row = row.replace('\\|', '\x00')
+    # leading/trailing pipe を除去
+    row = row.strip()
+    if row.startswith('|'):
+        row = row[1:]
+    if row.endswith('|'):
+        row = row[:-1]
+    # セルに分割
+    cells = row.split('|')
+    return len(cells)
+
+
+def _is_gfm_table_block(text: str) -> bool:
+    """
+    テキストが GFM パイプテーブルかどうかを判定する。
+
+    GFM テーブルの条件:
+    - 1行目がヘッダ行（| で区切られた複数セルを持つ）
+    - 2行目がデリミタ行（:?-+:? で区切られた）
+    - ヘッダとデリミタのセル数が一致する
+    - fenced code block 内の | は無視（iter_markdown_blocks で処理済み）
+
+    Returns:
+        True if text is a GFM pipe table, False otherwise
+    """
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+
+    # 1行目がテーブル行かチェック
+    header_line = lines[0]
+    if not _TABLE_ROW_RE.match(header_line):
+        return False
+
+    # 2行目がデリミタ行かチェック
+    delimiter_line = lines[1]
+    if not _TABLE_DELIMITER_RE.match(delimiter_line):
+        return False
+
+    # ヘッダとデリミタのセル数チェック
+    header_cells = _count_table_cells(header_line)
+    delimiter_cells = _count_table_cells(delimiter_line)
+    if header_cells != delimiter_cells:
+        return False
+
+    return True
+
 # ---------------------------------------------------------------------------
 # GFM 準拠 block セグメンテーション API（#659 追加）
 # ---------------------------------------------------------------------------
+
+def _yield_prose_with_table_splits(prose_text: str):
+    """
+    prose テキストを走査して GFM テーブルブロックを検出し、
+    テーブル部分は BLOCK_KIND_TABLE として、残りは BLOCK_KIND_HUMAN_PROSE として yield する。
+
+    テーブル検出条件:
+    - 空行区切りでブロックを分割し、各ブロックが GFM テーブルかチェックする
+    - GFM テーブルと判定されたブロックは BLOCK_KIND_TABLE を返す
+    - それ以外は BLOCK_KIND_HUMAN_PROSE を返す（まとめてではなく元のテキスト構造を保持）
+    """
+    import re as _re
+    # 空行でブロックを分割するが、元の空行テキストを保持する
+    # splitlines で行単位処理し、空行グループをブロック境界として扱う
+    lines = prose_text.splitlines(keepends=True)
+
+    current_block_lines: list[str] = []
+
+    def flush_block(block_lines: list[str]):
+        if not block_lines:
+            return
+        block_text = ''.join(block_lines)
+        stripped = block_text.strip()
+        if stripped and _is_gfm_table_block(stripped):
+            yield block_text, BLOCK_KIND_TABLE
+        else:
+            yield block_text, BLOCK_KIND_HUMAN_PROSE
+
+    pending_empty_lines: list[str] = []
+
+    for line in lines:
+        if not line.strip():
+            # 空行: ブロック境界の候補
+            pending_empty_lines.append(line)
+        else:
+            # 非空行: 現在のブロックへ追加
+            # 空行が溜まっていたら現在のブロックを flush してから空行を処理
+            if pending_empty_lines and current_block_lines:
+                # 溜まった空行をブロック分割として扱う
+                yield from flush_block(current_block_lines)
+                current_block_lines = []
+                # 空行は HUMAN_PROSE として追加（後続ブロックに含める）
+                pending_empty_lines_text = ''.join(pending_empty_lines)
+                # 空行自体は次のブロックの前に追加するが、単独では yield しない
+                # 次の非空行と一緒に処理する
+                current_block_lines = pending_empty_lines + [line]
+                pending_empty_lines = []
+            elif pending_empty_lines:
+                # 現在のブロックが空の状態で空行が来た場合
+                current_block_lines.extend(pending_empty_lines)
+                current_block_lines.append(line)
+                pending_empty_lines = []
+            else:
+                current_block_lines.append(line)
+
+    # 残った空行をフラッシュ
+    if pending_empty_lines and current_block_lines:
+        yield from flush_block(current_block_lines)
+        # trailing empty lines
+        yield ''.join(pending_empty_lines), BLOCK_KIND_HUMAN_PROSE
+    elif pending_empty_lines:
+        yield ''.join(pending_empty_lines), BLOCK_KIND_HUMAN_PROSE
+    elif current_block_lines:
+        yield from flush_block(current_block_lines)
+
 
 
 def iter_markdown_blocks(text: str):
@@ -480,9 +615,9 @@ def iter_markdown_blocks(text: str):
                 i += 1
                 continue
 
-            # flush any accumulated prose
+            # flush any accumulated prose (detect and split table blocks)
             if prose_lines:
-                yield ''.join(prose_lines), BLOCK_KIND_HUMAN_PROSE
+                yield from _yield_prose_with_table_splits(''.join(prose_lines))
                 prose_lines = []
 
             # collect the code fence block
@@ -516,9 +651,9 @@ def iter_markdown_blocks(text: str):
             prose_lines.append(line)
             i += 1
 
-    # flush remaining prose
+    # flush remaining prose (detect and split table blocks)
     if prose_lines:
-        yield ''.join(prose_lines), BLOCK_KIND_HUMAN_PROSE
+        yield from _yield_prose_with_table_splits(''.join(prose_lines))
 
 
 def split_blocks(text: str) -> list[tuple[str, str]]:
@@ -655,6 +790,12 @@ def classify_block(block: str) -> str:
         return BLOCK_KIND_CODE_FENCE
 
     # -----------------------------------------------------------------------
+    # GFM パイプテーブルチェック（#685）
+    # -----------------------------------------------------------------------
+    if _is_gfm_table_block(stripped):
+        return BLOCK_KIND_TABLE
+
+    # -----------------------------------------------------------------------
     # 見出しチェック（classify_block 公開 API; AC1 維持）
     # -----------------------------------------------------------------------
     # NOTE: classify_block() の heading 分類ロジック（ATX 形式 → canonical/bilingual）は
@@ -759,5 +900,7 @@ def classify_block_legacy(block: str) -> str:
         return 'shell_command'
     elif kind == BLOCK_KIND_URL_OR_IDENTIFIER:
         return 'url_or_identifier_only'
+    elif kind == BLOCK_KIND_TABLE:
+        return 'table'
     else:
         return 'prose'
