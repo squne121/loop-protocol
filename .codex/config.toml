@@ -20,6 +20,7 @@ enabled = true
 "github.com" = "allow"
 "api.github.com" = "allow"
 "objects.githubusercontent.com" = "allow"
+"uploads.github.com" = "allow"
 
 [permissions.loop-protocol-readonly.filesystem]
 ":minimal" = "read"

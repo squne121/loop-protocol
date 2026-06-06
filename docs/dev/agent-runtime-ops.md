@@ -101,6 +101,46 @@ routine 操作は bounded な profile / rules / wrapper に寄せ、境界外だ
 - secret / environment の広い参照
 - sandbox bypass や runtime policy の再設計
 
+## Network-Only Auto Allow
+
+この節は、Codex の repo-local 既定を「network だけを最小限 allow する」方向に寄せるための例を示す。
+GitHub posting path 自体の正本は `docs/dev/github-ops.md` で、Codex session では `rtk gh` を low-approval boundary として使う。
+
+### Modern profile example
+
+```toml
+approval_policy = "on-request"
+default_permissions = "loop-protocol-rtk"
+
+[permissions.loop-protocol-rtk.network]
+enabled = true
+
+[permissions.loop-protocol-rtk.network.domains]
+"github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+"uploads.github.com" = "allow"
+```
+
+この modern 例では、`default_permissions` と `[permissions.*]` だけを使い、filesystem 境界は広げない。
+GitHub への issue / PR 更新やコメント投稿は、`docs/dev/github-ops.md` の body-file guidance に従って `rtk gh` へ寄せる。
+
+### Legacy compatibility note
+
+```toml
+# legacy runtime only
+[sandbox_workspace_write]
+network_access = true
+```
+
+`network_access = true` は legacy 互換の説明であり、modern の `default_permissions = "loop-protocol-rtk"` と同じスニペットに混ぜない。
+`sandbox_workspace_write` を使う場合でも、`danger-full-access` や `approval_policy = "never"` を既定にしない。
+
+### GitHub Posting Boundary
+
+GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/dev/github-ops.md` を正本にし、`rtk gh` の low-approval boundary に寄せる。
+`gh` 直叩きや `rtk curl` のような arbitrary network 操作は、この節の対象外とする。
+
 ## Official References
 
 - Codex permissions: https://developers.openai.com/codex/permissions
