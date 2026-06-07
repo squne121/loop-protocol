@@ -36,13 +36,13 @@ acceptance_verdict:
       reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
     - ac: AC11
       status: deferred_exception
-      reason: "timeout_30s_timeout: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
+      reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
       deferred_reason: "Human timeout recording was not captured."
       owner: squne121
       approved_by: squne121
       approved_at: "2026-06-06"
       expiry_issue: "#690"
-      expiry_condition: "Before the M3 gate, the next manual playtest must capture timeout_30s_timeout human video and attach a GitHub-hosted artifact URL to the playtest evidence document."
+      expiry_condition: "Before the M3 gate, the next manual playtest must capture timeout_30s_defeat human video and attach a GitHub-hosted artifact URL to the playtest evidence document."
       residual_risk: "Timeout UI/HUD/canvas outcome may differ in an actual 30-second human run; automated tests verify logic but not human UX observation."
       risk_acceptance: "Accept only as deferred M2 evidence based on automated compensating evidence. Do not treat automated evidence as a human playtest substitute."
       compensating_evidence:
@@ -139,10 +139,10 @@ observed:
         status: pass
         duration_ms: 7800
         note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
-      - name: "GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows Timeout"
+      - name: "GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows 戦闘終了"
         status: pass
         duration_ms: 814
-        note: "__E2E_SHORT_SORTIE__ now triggers timeout→timeout; HUD Timeout text verified via toHaveText(). Victory HUD requires follow-up fixture."
+        note: "__E2E_SHORT_SORTIE__ now triggers timeout→timeout; HUD 戦闘終了 text verified via toHaveText(). Victory HUD requires follow-up fixture."
       - name: "GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat"
         status: pass
         duration_ms: 7800
@@ -304,7 +304,7 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC12 | Terminal state latched until reset | state machine inherent (no mutation after terminal) | pass |
 | AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
 
-Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_timeout` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), timeout overlay blue-dominant pixels (B>80,B>R/G). Issue #541 adds Canvas enemy rendering, victory/timeout overlay, and HUD sortie information display.
+Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_defeat` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), timeout overlay blue-dominant pixels (B>80,B>R/G). Issue #541 adds Canvas enemy rendering, victory/timeout overlay, and HUD sortie information display.
 
 ## Human Playtest Evidence
 
@@ -371,7 +371,7 @@ environment:
   - HUD sortie-status 結果一致: confirmed
   - contact damage → HP 0 → defeat 遷移: confirmed
 
-#### timeout_30s_timeout
+#### timeout_30s_defeat
 
 - artifact: deferred
 - reason: "手動動画証跡なし。E2E テストで代替検証済み。"
@@ -539,4 +539,4 @@ download_artifact:
 
 - AC8 viewport/DPR waiver is resolved against the combined evidence above; the #689 expiry entry has been removed from `acceptance_verdict.partial_or_deferred[AC8]` and the entry is now `status: accepted`.
 - Raw viewport metrics are recorded as-is for both sessions. `1280x720` and DPR `1.0` are not asserted for the human run.
-- AC11 timeout_30s_timeout (tracked by #690) is **not** modified by this block.
+- AC11 timeout_30s_defeat (tracked by #690) is **not** modified by this block.

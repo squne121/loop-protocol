@@ -91,7 +91,7 @@ export function createHudController(
           sortieStatus.textContent = 'Defeat'
           break
         case 'timeout':
-          sortieStatus.textContent = 'Timeout'
+          sortieStatus.textContent = '戦闘終了'
           break
         case 'ended':
           sortieStatus.textContent = 'Ended'
@@ -128,7 +128,7 @@ export function createHudController(
             sortieResult.textContent = 'Defeat'
             break
           case 'timeout':
-            sortieResult.textContent = 'Timeout'
+            sortieResult.textContent = '戦闘終了'
             break
         }
       } else {

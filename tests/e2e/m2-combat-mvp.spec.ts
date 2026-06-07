@@ -49,9 +49,9 @@ interface LoopE2EState {
     defeatedAtTick: number | null
   }>
   sortie: {
-    status: 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+    status: 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
     elapsedTicks: number
-    result: 'victory' | 'defeat' | null
+    result: 'victory' | 'defeat' | 'timeout' | null
   }
   arena: {
     width: number
@@ -441,7 +441,7 @@ test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status
 // AC13 — Victory / Defeat HUD display (Issue #541)
 // ---------------------------------------------------------------------------
 
-test('GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows Timeout', async ({
+test('GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows 戦闘終了', async ({
   page,
 }) => {
   // __E2E_SHORT_SORTIE__ sets targetTicks≈30 (0.5s). With the neutral timeout terminal
@@ -466,13 +466,13 @@ test('GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status sh
     )
     .toBe('timeout')
 
-  // HUD sortie-status DOM element must read "Timeout" (AC4, AC10)
-  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Timeout', {
+  // HUD sortie-status DOM element must read "戦闘終了" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 
-  // HUD sortie-result DOM element must read "Timeout" (AC9)
-  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Timeout', {
+  // HUD sortie-result DOM element must read "戦闘終了" (AC9)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 })
@@ -730,7 +730,7 @@ test('GIVEN short sortie fixture WHEN timeout terminal THEN Canvas overlay has b
   expect(hasNeutralBluePixels).toBe(true)
 
   // Additionally confirm the HUD timeout label is visible (belt-and-suspenders)
-  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Timeout', {
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 })
