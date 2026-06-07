@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha=$(git rev-parse --verify HEAD^{commit})
+          sha=$(git rev-parse --verify "HEAD^{commit}")
           if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "ERROR: invalid commit SHA: $sha" >&2
             exit 1
@@ -156,7 +156,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha=$(git rev-parse --verify HEAD^{commit})
+          sha=$(git rev-parse --verify "HEAD^{commit}")
           if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "ERROR: invalid commit SHA: $sha" >&2
             exit 1
