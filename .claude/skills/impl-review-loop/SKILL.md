@@ -175,6 +175,8 @@ blocking と advisory の境界が曖昧な case が判明した場合:
 
 ## Loop-prevention invariant（AC9）
 
+この loop-prevention 規則は、Stop / SubagentStop / TeammateIdle hook が表現・言語・報告品質の不足を理由に継続実行を強制しないことを要求する重要な不変条件である。同時に、block する場合は理由が machine-readable で、次 action が有限・一意かつ human_escalation path を持つ:
+
 Stop / SubagentStop / TeammateIdle hook は表現・言語・報告品質の不足を理由に継続実行を強制しない。同時に、block する場合は理由が machine-readable で、次 action が有限・一意かつ human_escalation path を持つ:
 
 - Stop / SubagentStop：自動 block による無限停止を防ぐ

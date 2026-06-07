@@ -9,12 +9,17 @@ Tests the following invariants:
 
 AC8: Validates that hook handlers correctly distinguish hard invariants (blocking) from
 advisory conditions (non-blocking) with fixture-based deterministic tests.
+
+IMPORTANT: Tests import evaluation functions from allowed_paths_gate module (not inline helpers).
+This prevents tautological self-validation and ensures tests are genuine regression tests.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from importlib.util import spec_from_file_location, module_from_spec
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +27,24 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 IMPL_REVIEW_LOOP_SKILL = REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "SKILL.md"
+
+# Import the canonical gate evaluator module (NOT inline helpers)
+_gate_module_path = (
+    REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "scripts" / "allowed_paths_gate.py"
+)
+if not _gate_module_path.exists():
+    raise ImportError(f"Gate module not found: {_gate_module_path}")
+
+_spec = spec_from_file_location("allowed_paths_gate", _gate_module_path)
+_gate_module = module_from_spec(_spec)
+sys.modules["allowed_paths_gate"] = _gate_module
+_spec.loader.exec_module(_gate_module)
+
+# Import canonical functions
+evaluate_allowed_paths_gate = _gate_module.evaluate_allowed_paths_gate
+classify_command = _gate_module.classify_command
+classify_path = _gate_module.classify_path
+classify_quality_issue = _gate_module.classify_quality_issue
 
 
 def read_skill_content() -> str:
@@ -42,10 +65,10 @@ class TestAllowedPathsGatePasses:
         ]
         file_changed = ".claude/agents/implementation-worker.md"
 
-        # Evaluator: check if file_changed matches any pattern in allowed_paths
-        result = self._matches_allowed_paths(file_changed, allowed_paths)
-        assert result is True, (
-            f"File {file_changed} within Allowed Paths should be ALLOWED, got {result}"
+        # Evaluator: call canonical gate module (not inline helper)
+        result = evaluate_allowed_paths_gate(allowed_paths, [file_changed])
+        assert result["status"] == "ok", (
+            f"File {file_changed} within Allowed Paths should be ALLOWED, got {result['status']}"
         )
 
     def test_allowed_paths_nested_directory_allowed(self):
@@ -53,8 +76,8 @@ class TestAllowedPathsGatePasses:
         allowed_paths = [".claude/skills/**"]
         file_changed = ".claude/skills/impl-review-loop/tests/test_hook.py"
 
-        result = self._matches_allowed_paths(file_changed, allowed_paths)
-        assert result is True, (
+        result = evaluate_allowed_paths_gate(allowed_paths, [file_changed])
+        assert result["status"] == "ok", (
             f"Nested file {file_changed} should match {allowed_paths}"
         )
 
@@ -70,9 +93,8 @@ class TestAllowedPathsGatePasses:
             ".claude/skills/impl-review-loop/tests/test_hook.py",
         ]
 
-        for file_changed in files:
-            result = self._matches_allowed_paths(file_changed, allowed_paths)
-            assert result is True, f"File {file_changed} should be allowed"
+        result = evaluate_allowed_paths_gate(allowed_paths, files)
+        assert result["status"] == "ok", f"All files should be allowed: {result['violations']}"
 
     def test_typecheck_lint_test_build_commands_allowed(self):
         """Standard verification commands (pnpm typecheck, lint, test, build) must not be blocked."""
@@ -86,11 +108,11 @@ class TestAllowedPathsGatePasses:
             "pnpm lint --fix",
         ]
 
-        # Evaluator: these are standard verification, non-blocked operations
+        # Evaluator: use canonical classify_command (not inline helper)
         for cmd in commands:
-            is_allowed = self._is_standard_verification_command(cmd)
-            assert is_allowed is True, (
-                f"Standard verification command '{cmd}' must be allowed"
+            classification = classify_command(cmd)
+            assert classification == "allow", (
+                f"Standard verification command '{cmd}' must be classified as allow"
             )
 
     def test_git_diff_git_status_inspection_allowed(self):
@@ -104,8 +126,8 @@ class TestAllowedPathsGatePasses:
         ]
 
         for cmd in commands:
-            is_allowed = self._is_read_only_inspection(cmd)
-            assert is_allowed is True, (
+            classification = classify_command(cmd)
+            assert classification == "allow", (
                 f"Inspection command '{cmd}' should be allowed"
             )
 
@@ -119,52 +141,11 @@ class TestAllowedPathsGatePasses:
         ]
 
         for cmd in commands:
-            is_allowed = self._is_read_only_gh_command(cmd)
-            assert is_allowed is True, (
+            classification = classify_command(cmd)
+            assert classification == "allow", (
                 f"Read-only gh command '{cmd}' should be allowed"
             )
 
-    def _matches_allowed_paths(self, file_path: str, allowed_paths: list[str]) -> bool:
-        """Deterministic evaluator: file matches Allowed Paths glob patterns."""
-        import fnmatch
-
-        for pattern in allowed_paths:
-            if fnmatch.fnmatch(file_path, pattern):
-                return True
-        return False
-
-    def _is_standard_verification_command(self, cmd: str) -> bool:
-        """Evaluator: is this a standard (non-blocking) verification command?"""
-        standard_patterns = [
-            "pnpm typecheck",
-            "pnpm lint",
-            "pnpm test",
-            "pnpm build",
-        ]
-        for pattern in standard_patterns:
-            if cmd.startswith(pattern):
-                return True
-        return False
-
-    def _is_read_only_inspection(self, cmd: str) -> bool:
-        """Evaluator: is this a read-only git inspection (non-blocking)?"""
-        mutation_keywords = [
-            "add", "commit", "push", "reset", "rebase", "merge", "checkout",
-            "branch -D", "rm", "mv",
-        ]
-        if any(kw in cmd for kw in mutation_keywords):
-            return False
-        # Assume git diff / status / log / show are read-only
-        return cmd.startswith("git ")
-
-    def _is_read_only_gh_command(self, cmd: str) -> bool:
-        """Evaluator: is this a read-only gh command (non-blocking)?"""
-        # Mutation keywords in gh commands
-        mutation_keywords = ["edit", "create", "delete", "close", "merge", "push"]
-        if any(kw in cmd for kw in mutation_keywords):
-            return False
-        # Assume gh view / list are read-only
-        return "view" in cmd or "list" in cmd
 
 
 class TestAllowedPathsViolationsBlocked:
@@ -179,8 +160,8 @@ class TestAllowedPathsViolationsBlocked:
         ]
         file_changed = "src/systems/game-loop.ts"  # NOT in Allowed Paths
 
-        result = self._matches_allowed_paths(file_changed, allowed_paths)
-        assert result is False, (
+        result = evaluate_allowed_paths_gate(allowed_paths, [file_changed])
+        assert result["status"] == "fail_closed", (
             f"File {file_changed} is OUTSIDE Allowed Paths and must be DENIED"
         )
 
@@ -190,18 +171,21 @@ class TestAllowedPathsViolationsBlocked:
             ".claude/agents/**",
             ".claude/skills/**",
         ]
-        files_with_expectations = [
-            (".claude/agents/test.md", True),  # allowed
-            (".claude/skills/test.py", True),  # allowed
-            ("src/systems/test.ts", False),  # VIOLATION
-            ("docs/dev/test.md", False),  # VIOLATION (docs not in Allowed Paths)
+        files = [
+            ".claude/agents/test.md",
+            ".claude/skills/test.py",
+            "src/systems/test.ts",
+            "docs/dev/test.md",
         ]
 
-        for file_path, should_be_allowed in files_with_expectations:
-            result = self._matches_allowed_paths(file_path, allowed_paths)
-            assert result == should_be_allowed, (
-                f"File {file_path}: expected allowed={should_be_allowed}, got {result}"
-            )
+        result = evaluate_allowed_paths_gate(allowed_paths, files)
+        # Should have violations for src/systems/test.ts and docs/dev/test.md
+        assert result["status"] == "fail_closed", (
+            f"Gate should detect violations; got {result}"
+        )
+        assert set(result["violations"]) == {"src/systems/test.ts", "docs/dev/test.md"}, (
+            f"Expected violations for src/systems/test.ts and docs/dev/test.md, got {result['violations']}"
+        )
 
     def test_secret_files_blocked(self):
         """Changes to .env, .git, credentials must be DENIED."""
@@ -213,9 +197,9 @@ class TestAllowedPathsViolationsBlocked:
         ]
 
         for pattern in sensitive_patterns:
-            is_dangerous = self._is_sensitive_file(pattern)
-            assert is_dangerous is True, (
-                f"File {pattern} must be flagged as sensitive"
+            classification = classify_path(pattern)
+            assert classification == "hard_invariant_block", (
+                f"File {pattern} must be classified as hard_invariant_block"
             )
 
     def test_destructive_commands_blocked(self):
@@ -230,35 +214,11 @@ class TestAllowedPathsViolationsBlocked:
         ]
 
         for cmd in dangerous_commands:
-            is_dangerous = self._is_destructive_command(cmd)
-            assert is_dangerous is True, (
-                f"Command '{cmd}' must be flagged as destructive"
+            classification = classify_command(cmd)
+            assert classification == "hard_invariant_block", (
+                f"Command '{cmd}' must be classified as hard_invariant_block"
             )
 
-    def _matches_allowed_paths(self, file_path: str, allowed_paths: list[str]) -> bool:
-        """Deterministic evaluator: file matches Allowed Paths glob patterns."""
-        import fnmatch
-
-        for pattern in allowed_paths:
-            if fnmatch.fnmatch(file_path, pattern):
-                return True
-        return False
-
-    def _is_sensitive_file(self, file_path: str) -> bool:
-        """Evaluator: is this a sensitive file that must be protected?"""
-        sensitive_patterns = [
-            ".env", "credentials", "secret", "private", "api_key", ".git",
-        ]
-        file_lower = file_path.lower()
-        return any(pat in file_lower for pat in sensitive_patterns)
-
-    def _is_destructive_command(self, cmd: str) -> bool:
-        """Evaluator: is this a dangerous destructive command?"""
-        dangerous_patterns = [
-            "reset --hard", "push --force", "rm -rf /", "dd if=/dev/zero",
-            "chmod 000 /",
-        ]
-        return any(pat in cmd for pat in dangerous_patterns)
 
 
 class TestLoopPreventionAdvisoryGuard:
@@ -267,115 +227,59 @@ class TestLoopPreventionAdvisoryGuard:
     def test_japanese_language_issue_not_blocking(self):
         """Violation of Japanese language rules is advisory, NOT blocking."""
         # Fixture: comment/docstring not in Japanese
-        comment_text = "This is an English comment in a Japanese project"
-
-        # Evaluator: detect language mismatch, but mark as advisory
-        language_quality = self._check_language_consistency(comment_text)
-        assert language_quality["has_issue"] is True
-        assert language_quality["should_block"] is False, (
+        # Evaluator: use canonical classify_quality_issue (not inline helper)
+        result = classify_quality_issue("language")
+        assert result["category"] == "advisory", (
+            "Language issues must be advisory"
+        )
+        assert result["should_block"] is False, (
             "Language mismatch should be advisory, not blocking"
         )
 
     def test_commit_message_format_issue_not_blocking(self):
         """Non-Conventional Commits format is advisory, NOT blocking."""
-        # Fixture: non-standard commit message
-        commit_msg = "fixed the bug"  # should be "fix: description (#issue)"
-
-        format_check = self._check_commit_format(commit_msg)
-        assert format_check["conforms"] is False
-        assert format_check["should_block"] is False, (
+        # Evaluator: use canonical classify_quality_issue
+        result = classify_quality_issue("commit_format")
+        assert result["category"] == "advisory", (
+            "Commit format issues must be advisory"
+        )
+        assert result["should_block"] is False, (
             "Commit format issue should be advisory, not blocking"
         )
 
     def test_pr_body_format_inconsistency_not_blocking(self):
         """PR body format inconsistency is advisory, NOT blocking."""
-        # Fixture: PR body with non-standard section order
-        pr_body = "## Summary\nSome text\n## Verification\nDone\n## Testing\nTests pass"
-
-        format_ok = self._check_pr_format(pr_body)
-        assert format_ok["is_readable"] is True
-        assert format_ok["should_block"] is False, (
+        # Evaluator: use canonical classify_quality_issue
+        result = classify_quality_issue("pr_body_format")
+        assert result["category"] == "advisory", (
+            "PR body format issues must be advisory"
+        )
+        assert result["should_block"] is False, (
             "PR format inconsistency should be advisory"
         )
 
     def test_test_naming_convention_issue_not_blocking(self):
         """Non-GIVEN/WHEN/THEN test naming is advisory, NOT blocking."""
-        # Fixture: test with non-standard naming
-        test_name = "test_the_function"  # should be "test_given_when_then_..."
-
-        naming_check = self._check_test_naming(test_name)
-        assert naming_check["follows_convention"] is False
-        assert naming_check["should_block"] is False, (
+        # Evaluator: use canonical classify_quality_issue
+        result = classify_quality_issue("test_naming")
+        assert result["category"] == "advisory", (
+            "Test naming issues must be advisory"
+        )
+        assert result["should_block"] is False, (
             "Test naming issue should be advisory, not blocking"
         )
 
     def test_yaml_key_order_difference_not_blocking(self):
         """YAML/JSON key ordering difference is advisory, NOT blocking."""
-        # Fixture: YAML with different key order
-        yaml_content = """
-status: ok
-reason: null
-mode: update_pr_body_hygiene
-action_kind: update_pr_body_hygiene
-"""
-        ordering_ok = self._check_yaml_structure(yaml_content)
-        assert ordering_ok["is_valid"] is True
-        assert ordering_ok["should_block"] is False, (
+        # Evaluator: use canonical classify_quality_issue
+        result = classify_quality_issue("yaml_key_order")
+        assert result["category"] == "advisory", (
+            "YAML key order issues must be advisory"
+        )
+        assert result["should_block"] is False, (
             "YAML key ordering difference should be advisory"
         )
 
-    def _check_language_consistency(self, text: str) -> dict[str, Any]:
-        """Evaluator: check for language consistency (advisory, non-blocking)."""
-        # Simplified: if contains English words, mark as advisory
-        has_english = any(word in text.lower() for word in ["is", "the", "this"])
-        return {
-            "has_issue": has_english,
-            "should_block": False,  # ADVISORY: never block
-        }
-
-    def _check_commit_format(self, msg: str) -> dict[str, Any]:
-        """Evaluator: check Conventional Commits format (advisory, non-blocking)."""
-        valid_prefixes = ["feat", "fix", "refactor", "docs", "chore", "test"]
-        conforms = any(msg.startswith(p + ":") for p in valid_prefixes)
-        return {
-            "conforms": conforms,
-            "should_block": False,  # ADVISORY
-        }
-
-    def _check_pr_format(self, body: str) -> dict[str, Any]:
-        """Evaluator: PR body is readable and structured (advisory, non-blocking)."""
-        # Check for minimal structure (has some content)
-        is_readable = len(body) > 20 and "##" in body
-        return {
-            "is_readable": is_readable,
-            "should_block": False,  # ADVISORY: format is best-effort
-        }
-
-    def _check_test_naming(self, test_name: str) -> dict[str, Any]:
-        """Evaluator: check test naming convention (advisory, non-blocking)."""
-        # Check if matches GIVEN/WHEN/THEN pattern
-        follows = ("given" in test_name.lower() and "when" in test_name.lower()
-                   and "then" in test_name.lower())
-        return {
-            "follows_convention": follows,
-            "should_block": False,  # ADVISORY
-        }
-
-    def _check_yaml_structure(self, content: str) -> dict[str, Any]:
-        """Evaluator: YAML/JSON structure validity (advisory, non-blocking)."""
-        try:
-            # Try minimal YAML parse
-            lines = content.strip().split("\n")
-            has_keys = all(":" in line for line in lines if line.strip())
-            return {
-                "is_valid": has_keys,
-                "should_block": False,  # Key order difference is not blocking
-            }
-        except Exception:
-            return {
-                "is_valid": False,
-                "should_block": False,  # Parse error is advisory, escalate to human
-            }
 
 
 class TestOverblockingRiskDocumentation:
@@ -488,7 +392,7 @@ class TestAllowedPathsGateDeterministicEvaluation:
     def test_gate_evaluator_distinguishes_pass_fail(self):
         """Gate evaluator must correctly distinguish pass from fail cases."""
         # Pass case: file in Allowed Paths
-        pass_result = self._evaluate_gate(
+        pass_result = evaluate_allowed_paths_gate(
             allowed_paths=[".claude/agents/**"],
             changed_files=[".claude/agents/test.md"],
         )
@@ -497,7 +401,7 @@ class TestAllowedPathsGateDeterministicEvaluation:
         )
 
         # Fail case: file outside Allowed Paths
-        fail_result = self._evaluate_gate(
+        fail_result = evaluate_allowed_paths_gate(
             allowed_paths=[".claude/agents/**"],
             changed_files=["src/systems/test.ts"],
         )
@@ -507,12 +411,15 @@ class TestAllowedPathsGateDeterministicEvaluation:
 
     def test_gate_evaluator_requires_manifest_hash(self):
         """Gate result must include manifest snapshot hash (stale detection)."""
-        result = self._evaluate_gate(
+        result = evaluate_allowed_paths_gate(
             allowed_paths=[".claude/agents/**"],
             changed_files=[".claude/agents/test.md"],
         )
-        assert "manifest_snapshot_sha256" in result or "manifest" in str(result), (
-            "Gate result must include manifest snapshot for stale detection"
+        assert "manifest_snapshot_sha256" in result, (
+            "Gate result must include manifest_snapshot_sha256 for stale detection"
+        )
+        assert result["manifest_snapshot_sha256"] is not None, (
+            "Manifest hash must not be None"
         )
 
     def test_gate_handles_glob_patterns_correctly(self):
@@ -534,34 +441,3 @@ class TestAllowedPathsGateDeterministicEvaluation:
                 f"Pattern matching failed for {file_path}: expected {should_match}, got {matches}"
             )
 
-    def _evaluate_gate(
-        self, allowed_paths: list[str], changed_files: list[str]
-    ) -> dict[str, Any]:
-        """Deterministic gate evaluator (no circular logic)."""
-        import fnmatch
-        import hashlib
-
-        # Compute manifest hash
-        manifest_str = "|".join(sorted(allowed_paths))
-        manifest_hash = hashlib.sha256(manifest_str.encode()).hexdigest()
-
-        # Check all files
-        violations = []
-        for file_path in changed_files:
-            matched = False
-            for pattern in allowed_paths:
-                if fnmatch.fnmatch(file_path, pattern):
-                    matched = True
-                    break
-            if not matched:
-                violations.append(file_path)
-
-        # Determine status
-        status = "fail_closed" if violations else "ok"
-
-        return {
-            "status": status,
-            "manifest_snapshot_sha256": manifest_hash,
-            "final_diff_paths": changed_files,
-            "violations": violations,
-        }
