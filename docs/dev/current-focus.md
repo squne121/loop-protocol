@@ -2,46 +2,49 @@
 doc_id: DOC-FOCUS-001
 title: Current Focus
 status: active
-milestone: M1 Foundation Gate (v0.1.x)
-last_updated_by_issue: 3
+milestone: M3 Result Persistence (v0.3.x)
+last_updated_by_issue: 734
 ---
 
 # Current Focus
 
 ## Current Phase
 
-- 現在は開発基盤整備フェーズ。
-- 目的は「動く戦闘を増やすこと」ではなく、「AI と人間が壊しにくい土台を閉じること」。
+- 現在は `M3: Result Persistence (v0.3.x)` を進行中。
+- 目的は、sortie 結果から報酬を獲得し resource として localStorage へ永続化し、reload 後に進行を復元する MVP Loop を閉じること。
+- M1 Foundation Gate の基盤・運用ルール・guardrail は確立済みであり、その上に M3 の永続化スライスを載せる。
 
 ## Current Milestone
 
-- `M1: Foundation Gate (v0.1.x)`
-- 完了条件は、基盤、運用ルール、guardrail、最小仕様正本が揃い、既存品質ゲートを安定して通せること。
+- `M3: Result Persistence (v0.3.x)`
+- 完了条件は、報酬 → resource → localStorage 永続化 → reload 復元までの最小 Loop が成立し、既存品質ゲートを安定して通せること。
+- M3 / M4 の境界の参照元は `docs/product/playable-roadmap.md`、global scope / non-goals の正本は `docs/product/requirements.md`。
 
 ## Priority Order
 
-1. `#3` AI運用憲法と最小仕様正本を整備する
-2. `#4` Issue駆動実装 skill と workflow 文書を整備する
-3. `#5` Claude Code ガードレールを `.claude` に実装する
-4. `#2` movement + projectile の最小仕様を固定する
-5. `#1` 自機移動と Projectile 射撃システムを実装する
+1. `#735` M3 feature spec（resource / persistence）を作成する
+2. `#736` 以降で reward / persistence の実装を進める
+
+## M3 Gate 前提（M2 持ち越し）
+
+- `#690` は M3 gate 前に解消する M2 follow-up であり、M3 close 判定前の手動確認項目として扱う（AC11 `timeout_30s_defeat` の人間動画採取・waiver 解消、parent `#733` の close 条件）。
 
 ## Do Now
 
-- `#3` で docs の正本と優先順位を確定する。
-- `#4` で Issue から Plan、実装、PR までの標準手順を固定する。
-- `#5` で `.claude` の実効ガードレールを強化する。
+- `#735` で resource / persistence の詳細仕様（初期値・上限・負値禁止・reward 計算式）を feature spec に固定する。
+- 報酬 → resource → localStorage → reload 復元の最小 Loop を `src/storage` の snapshot 境界経由で実装する準備を整える。
 
-## Do Not Do Yet
+## Do Not Do in M3
 
-- `#1` の Combat 実装を先に広げない。
-- 敵 AI、当たり判定、ダメージ、勝敗処理を追加しない。
+- weapon upgrade（武器強化）を M3 に持ち込まない。武器1種のパラメータ強化（resource 消費）は `M4: Upgrade Loop` のスコープ。
+- resource consumption（resource 消費）による強化導線を M3 で実装しない（M4）。
+- upgrade UI / upgrade tree（アップグレードツリー）を M3 に追加しない。
+- 複数武器の追加を M3 で行わない。
 - campaign / territory / network / audio / 高品質アセット前提の作業へ広げない。
-- hooks や skill の実装を、対応 Issue 以外へ押し込まない。
 
 ## Decision Notes
 
 - NotebookLM は運用の主役ではなく、必要時のレビュー支援として使う。
 - `docs/product/game-overview.md` は概要文書であり、全体要件の正本ではない。
 - 個別機能 spec の標準配置は `docs/product/features/<feature>.md` とする。
-- `movement + projectile` は `#2` の仕様固定を経てから `#1` へ入る。
+- global scope / global non-goals の正本は `docs/product/requirements.md`、M3 / M4 milestone 境界の参照元は `docs/product/playable-roadmap.md`。

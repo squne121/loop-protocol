@@ -43,6 +43,9 @@ tmp/edit_issue_*.md
 # .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
 .claude/skills/nlm-skill/
 .claude/skills/*-workspace/
+# Local-only Codex skill symlink. Do not add trailing slash:
+# the path may be a symlink, and shared repo skills live under .agents/skills/.
+/.codex/skills
 .claude/worktrees/
 .claude/plans/
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す
