@@ -10,6 +10,7 @@ Tests cover:
   - Combined C4+C9 repair
 """
 
+import importlib.util
 import subprocess
 import sys
 import textwrap
@@ -20,6 +21,19 @@ import pytest
 SCRIPT = (
     Path(__file__).parent.parent / "scripts" / "issue_contract_hygiene_autofix.py"
 )
+
+
+def _load_autofix_module():
+    """Import issue_contract_hygiene_autofix.py as a module for monkeypatching.
+
+    The other tests in this file invoke the script as a subprocess; the
+    stream-separation / fail-closed regression tests need to monkeypatch
+    ``subprocess.run`` on the module itself, so we import it directly here.
+    """
+    spec = importlib.util.spec_from_file_location("_hygiene_autofix_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # ---------------------------------------------------------------------------
 # Minimal complete contract body helpers
@@ -408,3 +422,118 @@ def test_c4_skips_continuation_lines():
     # Continuation lines should not be prefixed
     assert "$   --arg1" not in out
     assert "$   --arg2" not in out
+
+
+# ---------------------------------------------------------------------------
+# check_non_c4_c9_blockers caller-contract regression tests (#598)
+#
+# These tests monkeypatch subprocess.run on the imported module to fix the
+# caller contract with check_issue_contract.py --json:
+#   - stdout/stderr are captured separately (capture_output=True, text=True);
+#     stderr is NOT merged into stdout (no stderr=subprocess.STDOUT).
+#   - JSON is parsed from stdout only; stderr diagnostics never affect parsing.
+#   - When stdout is not valid JSON, the function fails CLOSED
+#     (return True, ["check_error"]) instead of failing open (return False, []).
+# ---------------------------------------------------------------------------
+
+
+def test_check_non_c4_c9_blockers_stream_separation(monkeypatch):
+    """GIVEN check_non_c4_c9_blockers / WHEN it invokes check_issue_contract.py /
+    THEN it uses capture_output=True, text=True and does NOT merge stderr into stdout."""
+    module = _load_autofix_module()
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout='{"blocking_issues": []}', stderr=""
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    has_other, codes = module.check_non_c4_c9_blockers("## Outcome\nx\n")
+
+    # Stream-separation contract: capture_output=True, text=True, no stderr merge.
+    assert seen["kwargs"]["capture_output"] is True
+    assert "stderr" not in seen["kwargs"]
+    assert seen["kwargs"]["text"] is True
+    # Argument contract: the consumer must actually invoke check_issue_contract.py
+    # in --json mode (otherwise the stream-separation guarantee is meaningless).
+    # Pin the argv shape so dropping --json / --file is caught as a regression.
+    assert seen["args"][0] == sys.executable
+    assert seen["args"][1] == module.CHECK_ISSUE_CONTRACT_SCRIPT
+    assert "--file" in seen["args"]
+    assert "--json" in seen["args"]
+    # Valid JSON with empty blocking_issues → no other blockers.
+    assert has_other is False
+    assert codes == []
+
+
+def test_check_non_c4_c9_blockers_stderr_diagnostic_ignored(monkeypatch):
+    """GIVEN stdout=<valid JSON> and stderr=<diagnostic warning> /
+    WHEN check_non_c4_c9_blockers runs / THEN it parses stdout only and succeeds."""
+    module = _load_autofix_module()
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='{"blocking_issues": []}',
+            stderr="[WARN] DeprecationWarning: datetime.utcnow() is deprecated\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    has_other, codes = module.check_non_c4_c9_blockers("## Outcome\nx\n")
+
+    # Diagnostics on stderr must NOT affect JSON parsing of stdout.
+    assert has_other is False
+    assert codes == []
+
+
+def test_check_non_c4_c9_blockers_stderr_diagnostic_with_real_blocker(monkeypatch):
+    """GIVEN stderr=<diagnostic warning> and stdout=<valid JSON with a non-C4/C9 blocker> /
+    WHEN check_non_c4_c9_blockers runs / THEN it parses stdout only and still reports the
+    blocker — locking the junction between stdout-only parsing and blocker detection so
+    stderr noise neither suppresses nor fabricates a blocker."""
+    module = _load_autofix_module()
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout='{"blocking_issues": ["unrelated blocker message for testing"]}',
+            stderr="[WARN] DeprecationWarning: datetime.utcnow() is deprecated\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    has_other, codes = module.check_non_c4_c9_blockers("## Outcome\nx\n")
+
+    # stderr diagnostics are ignored; the stdout blocker is still surfaced.
+    assert has_other is True
+    assert codes == ["unrelated blocker message for testing"]
+
+
+def test_check_non_c4_c9_blockers_fail_closed_on_non_json(monkeypatch):
+    """GIVEN stdout=<diagnostic text + JSON> (contract violated) /
+    WHEN check_non_c4_c9_blockers runs / THEN it fails CLOSED with (True, ["check_error"])."""
+    module = _load_autofix_module()
+
+    def fake_run(args, **kwargs):
+        # Diagnostics leaked into stdout, breaking JSON purity.
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='[WARN] some diagnostic leaked\n{"blocking_issues": []}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    has_other, codes = module.check_non_c4_c9_blockers("## Outcome\nx\n")
+
+    # Fail-closed: keep the non-C4/C9 blocker guard active, do not fail open.
+    assert has_other is True
+    assert codes == ["check_error"]
