@@ -49,9 +49,9 @@ interface LoopE2EState {
     defeatedAtTick: number | null
   }>
   sortie: {
-    status: 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+    status: 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
     elapsedTicks: number
-    result: 'victory' | 'defeat' | null
+    result: 'victory' | 'defeat' | 'timeout' | null
   }
   arena: {
     width: number
@@ -351,37 +351,37 @@ test('GIVEN sortie running WHEN sortie state machine checked THEN victory and de
 }) => {
   // GIVEN the sortie is running
   // WHEN the snapshot is inspected
-  // THEN sortie.status must be one of the valid enum values including victory/defeat
+  // THEN sortie.status must be one of the valid enum values including victory/defeat/timeout
   //
   // This test confirms that the SortieSystem state machine exposes the correct
-  // schema for victory/defeat transitions. Full end-to-end victory (defeat all
-  // enemies in 120s) and defeat (player hp → 0) cycles are not exercised in
+  // schema for victory/defeat/timeout transitions. Full end-to-end victory (defeat all
+  // enemies in 120s), defeat (player hp → 0), and timeout cycles are not exercised in
   // automated E2E due to time constraints; see unknowns in m2-combat-mvp.md.
   const s = await getGameState(page)
 
-  const validStatuses = ['idle', 'running', 'victory', 'defeat', 'ended']
+  const validStatuses = ['idle', 'running', 'victory', 'defeat', 'timeout', 'ended']
   expect(validStatuses).toContain(s.sortie.status)
 
-  // sortie.result is null while running, or 'victory'/'defeat' after conclusion
+  // sortie.result is null while running, or 'victory'/'defeat'/'timeout' after conclusion
   if (s.sortie.result !== null) {
-    expect(['victory', 'defeat']).toContain(s.sortie.result)
+    expect(['victory', 'defeat', 'timeout']).toContain(s.sortie.result)
   }
 
-  // Confirm the schema is structurally complete for defeat/victory outcomes
+  // Confirm the schema is structurally complete for defeat/victory/timeout outcomes
   expect(s.sortie).toMatchObject({
     status: expect.any(String),
     elapsedTicks: expect.any(Number),
-    // result is null | 'victory' | 'defeat'
+    // result is null | 'victory' | 'defeat' | 'timeout'
   })
 })
 
-test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is defeat (timeout)', async ({
+test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is timeout (neutral terminal)', async ({
   page,
 }) => {
   test.setTimeout(15_000)
   // Inject short-sortie flag before page load (targetTicks ≈ 30 ticks / 0.5s)
-  // With the new victory condition (allEnemiesDefeated), timer reaching targetTicks
-  // results in defeat (timeout), not victory. Victory requires all enemies to be defeated.
+  // With the neutral timeout terminal, timer reaching targetTicks
+  // results in timeout, not victory. Victory requires all enemies to be defeated.
   await page.addInitScript(() => {
     ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
   })
@@ -395,10 +395,10 @@ test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is de
       },
       { timeout: 10_000, intervals: [100] },
     )
-    .toBe('defeat')
+    .toBe('timeout')
 
   const finalState = await getGameState(page)
-  expect(finalState.sortie.result).toBe('defeat')
+  expect(finalState.sortie.result).toBe('timeout')
 })
 
 test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat', async ({
@@ -441,12 +441,12 @@ test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status
 // AC13 — Victory / Defeat HUD display (Issue #541)
 // ---------------------------------------------------------------------------
 
-test('GIVEN short sortie fixture WHEN timeout defeat THEN HUD sortie-status shows Defeat', async ({
+test('GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows 戦闘終了', async ({
   page,
 }) => {
-  // __E2E_SHORT_SORTIE__ sets targetTicks≈30 (0.5s). With the new victory condition
-  // (allEnemiesDefeated), timer expiry results in defeat (timeout), not victory.
-  // This test verifies the HUD updates correctly for timeout defeat.
+  // __E2E_SHORT_SORTIE__ sets targetTicks≈30 (0.5s). With the neutral timeout terminal
+  // (allEnemiesDefeated), timer expiry results in timeout, not victory.
+  // This test verifies the HUD updates correctly for the neutral timeout terminal.
   // NOTE: Victory HUD display requires a deterministic all-enemies-defeated fixture
   // which is tracked as a follow-up (main.ts Allowed Path not in #542 scope).
   test.setTimeout(15_000)
@@ -455,7 +455,7 @@ test('GIVEN short sortie fixture WHEN timeout defeat THEN HUD sortie-status show
   })
   await page.goto('/')
 
-  // Wait for timeout defeat state machine transition
+  // Wait for timeout terminal state machine transition
   await expect
     .poll(
       async () => {
@@ -464,15 +464,15 @@ test('GIVEN short sortie fixture WHEN timeout defeat THEN HUD sortie-status show
       },
       { timeout: 10_000, intervals: [100] },
     )
-    .toBe('defeat')
+    .toBe('timeout')
 
-  // HUD sortie-status DOM element must read "Defeat" (AC4, AC10)
-  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('Defeat', {
+  // HUD sortie-status DOM element must read "戦闘終了" (AC4, AC10)
+  await expect(page.locator('[data-field="sortie-status"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 
-  // HUD sortie-result DOM element must read "Defeat" (AC9)
-  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+  // HUD sortie-result DOM element must read "戦闘終了" (AC9)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 })
@@ -502,7 +502,7 @@ test('GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat',
     timeout: 3000,
   })
 
-  // HUD sortie-result DOM element must read "Defeat" (AC9: same authority as Canvas overlay)
+  // HUD sortie-result DOM element must read "Defeat" (AC9)
   await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
     timeout: 3000,
   })
@@ -533,12 +533,12 @@ test('GIVEN sortie running WHEN HUD rendered THEN sortie-status shows In Progres
 // Playwright screenshot baselines (AC2, AC3) — Issue #681
 // ---------------------------------------------------------------------------
 
-test('GIVEN short sortie fixture WHEN defeat overlay baseline then Canvas screenshot matches', async ({
+test('GIVEN short sortie fixture WHEN timeout overlay baseline then Canvas screenshot matches', async ({
   page,
 }) => {
-  // GIVEN the sortie reaches timeout defeat via __E2E_SHORT_SORTIE__ fixture (targetTicks≈30)
-  // WHEN the canvas overlay settles after defeat
-  // THEN the canvas screenshot should match the defeat overlay baseline
+  // GIVEN the sortie reaches timeout via __E2E_SHORT_SORTIE__ fixture (targetTicks≈30)
+  // WHEN the canvas overlay settles after timeout
+  // THEN the canvas screenshot should match the timeout overlay baseline
   test.setTimeout(15_000)
   await page.addInitScript(() => {
     ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
@@ -553,12 +553,12 @@ test('GIVEN short sortie fixture WHEN defeat overlay baseline then Canvas screen
       },
       { timeout: 10_000, intervals: [100] },
     )
-    .toBe('defeat')
+    .toBe('timeout')
 
   await page.waitForTimeout(200)
 
   await expect(page.locator('canvas.battle-stage__canvas')).toHaveScreenshot(
-    'm2-defeat-overlay-baseline.png',
+    'm2-timeout-overlay-baseline.png',
     {
       animations: 'disabled',
       maxDiffPixels: 1,
@@ -672,27 +672,27 @@ test('GIVEN sortie running WHEN enemy spawns and ticks elapse THEN Canvas has en
   expect(hasEnemyRedPixels).toBe(true)
 })
 
-test('GIVEN short sortie fixture WHEN timeout defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)', async ({
+test('GIVEN short sortie fixture WHEN timeout terminal THEN Canvas overlay has blue-dominant pixels (neutral overlay drawn)', async ({
   page,
 }) => {
-  // GIVEN the sortie reaches timeout defeat via __E2E_SHORT_SORTIE__ fixture (targetTicks≈30)
-  // WHEN the CanvasRenderer paints the defeat overlay (AC8)
-  // THEN the canvas center region must contain red-dominant pixels
+  // GIVEN the sortie reaches timeout via __E2E_SHORT_SORTIE__ fixture (targetTicks≈30)
+  // WHEN the CanvasRenderer paints the neutral timeout overlay (AC8)
+  // THEN the canvas center region must contain blue-dominant pixels
   //
-  // NOTE: __E2E_SHORT_SORTIE__ now triggers timeout→defeat (not victory).
+  // NOTE: __E2E_SHORT_SORTIE__ now triggers timeout→timeout (not victory).
   // Victory overlay (green) is not testable via E2E until a deterministic
   // all-enemies-defeated fixture is added (follow-up, main.ts not in #542 scope).
   //
-  // CanvasRenderer defeat overlay: 'rgba(220, 60, 60, 0.55)' blended over '#07111f'.
-  // Blend result approximation: R≈124, G≈41, B≈41.
-  // R>80 AND G<60 distinguishes defeat overlay from background and victory overlay.
+  // CanvasRenderer neutral timeout overlay: 'rgba(78, 118, 190, 0.55)' blended over '#07111f'.
+  // Blend result approximation: B dominates the center region.
+  // B>80 AND B>R/G distinguishes timeout overlay from background and victory overlay.
   test.setTimeout(15_000)
   await page.addInitScript(() => {
     ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
   })
   await page.goto('/')
 
-  // Wait for timeout defeat transition
+  // Wait for timeout terminal transition
   await expect
     .poll(
       async () => {
@@ -701,13 +701,13 @@ test('GIVEN short sortie fixture WHEN timeout defeat THEN Canvas overlay has red
       },
       { timeout: 10_000, intervals: [100] },
     )
-    .toBe('defeat')
+    .toBe('timeout')
 
   // Allow a couple of render frames to ensure the overlay is painted.
   await page.waitForTimeout(200)
 
-  // Canvas center region must have red-dominant pixels (R>80 AND G<60) from defeat overlay (AC8)
-  const hasDefeatRedPixels = await page.evaluate(() => {
+  // Canvas center region must have blue-dominant pixels (B>80 and greater than R/G) from timeout overlay (AC8)
+  const hasNeutralBluePixels = await page.evaluate(() => {
     const canvas = document.querySelector('canvas') as HTMLCanvasElement | null
     if (!canvas) return false
     const ctx = canvas.getContext('2d')
@@ -720,17 +720,17 @@ test('GIVEN short sortie fixture WHEN timeout defeat THEN Canvas overlay has red
     const scanH = Math.floor(h / 2)
     const { data } = ctx.getImageData(x0, y0, scanW, scanH)
     for (let i = 0; i < data.length; i += 4) {
-      // Defeat overlay blends to R≈124, G≈41; background R=7, G=17
-      if (data[i] > 80 && data[i + 1] < 60) {
+      // Timeout overlay blends to a blue-dominant center region.
+      if (data[i + 2] > 80 && data[i + 2] > data[i] && data[i + 2] > data[i + 1]) {
         return true
       }
     }
     return false
   })
-  expect(hasDefeatRedPixels).toBe(true)
+  expect(hasNeutralBluePixels).toBe(true)
 
-  // Additionally confirm the HUD defeat label is visible (belt-and-suspenders)
-  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('Defeat', {
+  // Additionally confirm the HUD timeout label is visible (belt-and-suspenders)
+  await expect(page.locator('[data-field="sortie-result"]')).toHaveText('戦闘終了', {
     timeout: 3000,
   })
 })

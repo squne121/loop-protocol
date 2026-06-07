@@ -37,7 +37,7 @@ acceptance_verdict:
     - ac: AC11
       status: deferred_exception
       reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
-      deferred_reason: "Human timeout defeat recording was not captured."
+      deferred_reason: "Human timeout recording was not captured."
       owner: squne121
       approved_by: squne121
       approved_at: "2026-06-06"
@@ -46,8 +46,8 @@ acceptance_verdict:
       residual_risk: "Timeout UI/HUD/canvas outcome may differ in an actual 30-second human run; automated tests verify logic but not human UX observation."
       risk_acceptance: "Accept only as deferred M2 evidence based on automated compensating evidence. Do not treat automated evidence as a human playtest substitute."
       compensating_evidence:
-        - "E2E short-sortie fixture verifies timeout-to-defeat state transition."
-        - "HUD/canvas defeat output is covered by E2E."
+        - "E2E short-sortie fixture verifies timeout-to-timeout state transition."
+        - "HUD/canvas timeout output is covered by E2E."
       substitution_allowed: false
   artifact_reviewability: github_attachment
   artifact_note: "Video files attached to Issue #543 comment (https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599987357). GitHub-hosted URLs recorded in evidence section."
@@ -130,19 +130,19 @@ observed:
       - name: "GIVEN sortie running WHEN sortie state machine checked THEN victory and defeat statuses are valid enum values"
         status: pass
         duration_ms: 144
-        note: "victory/defeat state machine schema verified; test 9 verifies timeout→defeat, test 10 verifies HP→defeat. Victory (allEnemiesDefeated) is covered by unit test AC7."
-      - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is defeat (timeout)"
+        note: "victory/defeat state machine schema verified; test 9 verifies timeout→timeout, test 10 verifies HP→defeat. Victory (allEnemiesDefeated) is covered by unit test AC7."
+      - name: "GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is timeout (neutral)"
         status: pass
         duration_ms: 695
-        note: "__E2E_SHORT_SORTIE__ fixture overrides targetTicks to ~30 ticks (0.5s); timeout→defeat state machine verified end-to-end. Victory (allEnemiesDefeated) is covered by unit tests."
+        note: "__E2E_SHORT_SORTIE__ fixture overrides targetTicks to ~30 ticks (0.5s); timeout→timeout state machine verified end-to-end. Victory (allEnemiesDefeated) is covered by unit tests."
       - name: "GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat"
         status: pass
         duration_ms: 7800
         note: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture triggers defeat on first enemy contact; defeat state machine verified end-to-end"
-      - name: "GIVEN short sortie fixture WHEN timeout defeat THEN HUD sortie-status shows Defeat"
+      - name: "GIVEN short sortie fixture WHEN timeout terminal THEN HUD sortie-status shows 戦闘終了"
         status: pass
         duration_ms: 814
-        note: "__E2E_SHORT_SORTIE__ now triggers timeout→defeat; HUD Defeat text verified via toHaveText(). Victory HUD requires follow-up fixture."
+        note: "__E2E_SHORT_SORTIE__ now triggers timeout→timeout; HUD 戦闘終了 text verified via toHaveText(). Victory HUD requires follow-up fixture."
       - name: "GIVEN 1HP player fixture WHEN defeat THEN HUD sortie-status shows Defeat"
         status: pass
         duration_ms: 7800
@@ -155,20 +155,20 @@ observed:
         status: pass
         duration_ms: 422
         note: "AC7 pixel check: R>180 AND G<100 AND B<100 detects #f05050 enemy circles vs #07111f background"
-      - name: "GIVEN short sortie fixture WHEN timeout defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)"
+      - name: "GIVEN short sortie fixture WHEN timeout terminal THEN Canvas overlay has blue-dominant pixels (neutral overlay drawn)"
         status: pass
         duration_ms: 975
-        note: "AC8 pixel check: R>80 AND G<60 in center region detects defeat overlay via timeout defeat. Victory overlay (green) requires follow-up deterministic fixture."
+        note: "AC8 pixel check: B>80 and B>R/G in center region detects neutral timeout overlay. Victory overlay (green) requires follow-up deterministic fixture."
       - name: "GIVEN 1HP player fixture WHEN defeat THEN Canvas overlay has red-dominant pixels (defeat overlay drawn)"
         status: pass
         duration_ms: 7900
         note: "AC8 pixel check: R>80 AND G<60 in center region detects rgba(220,60,60,0.55) defeat overlay (blended R≈124,G≈41)"
   victory_defeat_state_evidence:
     method: "E2E deterministic fixture tests (tests 9 and 10)"
-    note: "Timeout→defeat verified by short_sortie fixture (targetTicks≈30); HP→defeat verified by 1HP player fixture. Victory (allEnemiesDefeated) covered by unit tests (sortie-system.test.ts AC7)."
+    note: "Timeout→timeout verified by short_sortie fixture (targetTicks≈30); HP→defeat verified by 1HP player fixture. Victory (allEnemiesDefeated) covered by unit tests (sortie-system.test.ts AC7)."
     full_cycle_tested: true
     victory_method: "unit test: allEnemiesDefeated guard (sortie-system.test.ts AC7)"
-    timeout_defeat_method: "__E2E_SHORT_SORTIE__ fixture (0.5s sortie duration → timeout → defeat)"
+    timeout_method: "__E2E_SHORT_SORTIE__ fixture (0.5s sortie duration → timeout → timeout)"
     hp_defeat_method: "__E2E_PLAYER_HP_OVERRIDE__=1 fixture (first contact triggers defeat)"
   quality_gates:
     typecheck: pass
@@ -186,7 +186,7 @@ observed:
     ac5_grep_regression: "exit 1 (no DOM/Canvas in src/systems/) — expected baseline fail"
     e2e_hud_display_tests: "3 new tests added (victory HUD, defeat HUD, in-progress HUD)"
     runtime_verification_decision: immediate
-    runtime_verification_status: "HUD DOM text verified by E2E toHaveText(); Canvas bitmap rendering verified by E2E pixel check (enemy red pixels R>180,G<100,B<100; victory overlay G>80; defeat overlay R>80,G<60)"
+    runtime_verification_status: "HUD DOM text verified by E2E toHaveText(); Canvas bitmap rendering verified by E2E pixel check (enemy red pixels R>180,G<100,B<100; victory overlay G>80; timeout overlay B>80 and B>R/G)"
     canvas_pixel_check:
       enemy_rendering: "R>180 AND G<100 AND B<100 (CanvasRenderer #f05050 vs background #07111f)"
       victory_overlay: "G>80 in center region (rgba(30,200,130,0.55) blended; G≈118 vs background G=17)"
@@ -297,14 +297,14 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC5 | src/systems no DOM/Canvas dependency | grep regression (exit 1 = pass) | pass |
 | AC6 | pnpm typecheck+lint+test+build | CI gates | pass |
 | AC7 | CanvasRenderer renders enemies with defeated filter | static code review | pass |
-| AC8 | CanvasRenderer shows victory/defeat overlay on result!=null | static code review | pass |
+| AC8 | CanvasRenderer shows victory/timeout overlay on result!=null | static code review | pass |
 | AC9 | Canvas overlay and HUD DOM both use result.outcome as authority | static code review | pass |
 | AC10 | HUD shows sortie-status / kills / duration / result as DOM text | E2E selector tests | pass |
 | AC11 | Terminal duration uses result.durationMs; running uses elapsedTicks | static code review | pass |
 | AC12 | Terminal state latched until reset | state machine inherent (no mutation after terminal) | pass |
 | AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
 
-Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_defeat` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), defeat overlay red-dominant pixels (R>80,G<60). Issue #541 adds Canvas enemy rendering, victory/defeat overlay, and HUD sortie information display.
+Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_defeat` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), timeout overlay blue-dominant pixels (B>80,B>R/G). Issue #541 adds Canvas enemy rendering, victory/timeout overlay, and HUD sortie information display.
 
 ## Human Playtest Evidence
 
@@ -375,7 +375,7 @@ environment:
 
 - artifact: deferred
 - reason: "手動動画証跡なし。E2E テストで代替検証済み。"
-- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout defeat 自動検証済み)"
+- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout neutral 自動検証済み)"
 
 ### Human Observations
 

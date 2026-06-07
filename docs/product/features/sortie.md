@@ -40,7 +40,7 @@ trace_links:
 具体的な override 範囲：
 
 - 敵機全滅（`allEnemiesDefeated`）が M2 における victory 条件。
-  30秒タイムアウトは defeat（timeout）扱い。
+  30秒タイムアウトは timeout（neutral terminal）扱い。
   `REQ-LOGIC-VICTORY-001` の "outpost destruction" は M2 スコープ外に据え置き。
 - SortieResult は transient output であり MUST NOT be persisted in M2.
   `REQ-LOGIC-PERSISTENCE-001` の "snapshot at debrief" / "campaign state" は M2 スコープ外に据え置き。
@@ -59,15 +59,16 @@ trace_links:
 | `idle`    | 戦闘未開始（初期状態）                                    |
 | `running` | 戦闘進行中。elapsedTicks が加算される                     |
 | `victory` | Result-latched state（敵機全滅）                          |
-| `defeat`  | Result-latched state（自機HP0 または 30秒タイムアウト）   |
+| `defeat`  | Result-latched state（自機HP0）                           |
+| `timeout` | Result-latched state（30秒タイムアウト）                  |
 | `ended`   | Post-result acknowledgement state（結果確認後）           |
 
-**重要**: `victory` と `defeat` は **result-latched states であり、final FSM states ではない**。
+**重要**: `victory` / `defeat` / `timeout` は **result-latched states であり、final FSM states ではない**。
 これらの状態は戦闘シミュレーションを停止させ、immutable な SortieResult を 1 度だけ生成する。
 `ended` が final state であり、`ACK_RESULT` イベントにより到達する。
 
 ```
-`victory` and `defeat` are result-latched states, not final FSM states.
+`victory`, `defeat`, and `timeout` are result-latched states, not final FSM states.
 They stop combat simulation and expose exactly one immutable SortieResult.
 `ended` is the acknowledged post-result state and is the true terminal state.
 ```
@@ -79,9 +80,10 @@ They stop combat simulation and expose exactly one immutable SortieResult.
 | `idle`        | `START_SORTIE`                                                      | `running` | 戦闘開始。elapsedTicks=0 にリセット                            |
 | `running`     | `FIXED_TICK [playerHp <= 0]`                                        | `defeat`  | defeat が最優先（同一 tick で他条件と重なっても defeat が勝つ）|
 | `running`     | `FIXED_TICK [allEnemiesDefeated && playerHp > 0]`                   | `victory` | 全敵撃破。`enemies.length > 0` ガードで vacuous truth を防ぐ   |
-| `running`     | `FIXED_TICK [elapsedTicks >= targetTicks && !allEnemiesDefeated]`   | `defeat`  | 30秒タイムアウト → defeat 扱い。victory より低優先             |
+| `running`     | `FIXED_TICK [elapsedTicks >= targetTicks && !allEnemiesDefeated]`   | `timeout` | 30秒タイムアウト → timeout。victory より低優先              |
 | `victory`     | `ACK_RESULT`                                                        | `ended`   | 結果確認。result は変更されない                                |
 | `defeat`      | `ACK_RESULT`                                                        | `ended`   | 結果確認。result は変更されない                                |
+| `timeout`     | `ACK_RESULT`                                                        | `ended`   | 結果確認。result は変更されない                                |
 
 ---
 
@@ -95,17 +97,23 @@ They stop combat simulation and expose exactly one immutable SortieResult.
 
 ### Defeat
 
+- 意味: 自機HPが 0 になった即時終了。
+- HUD ラベル: `DEFEAT`。
+
+### Timeout
+
 - Guard 1: `playerHp <= 0`
   - 意味: 自機の HP が 0 以下になった
 - Guard 2: `elapsedTicks >= targetTicks`（敵機が残存している場合）
-  - 意味: 30秒のタイムリミットに達したが勝利条件を満たさなかった（timeout defeat）
+  - 意味: 30秒のタイムリミットに達した。勝利条件を満たしていない場合は `timeout` で終端する
+- HUD ラベル: `戦闘終了`
 
 ### 優先順位（同一 tick で複数条件成立時）
 
 ```
 1. player.hp <= 0       → defeat  （最優先）
 2. allEnemiesDefeated   → victory （次優先）
-3. elapsedTicks >= targetTicks → defeat（timeout・最低優先）
+3. elapsedTicks >= targetTicks → timeout（最低優先）
 ```
 
 同一 `FIXED_TICK` で複数条件が成立した場合、上記の順序で先に成立した条件が採用される。
@@ -123,7 +131,7 @@ For each FIXED_TICK while sortie.status == "running":
 4. Evaluate terminal guards in this priority:
    a. if player.hp <= 0 -> latch defeat (generate SortieResult, transition to defeat)
    b. else if enemies.length > 0 && enemies.every(e => e.defeated) -> latch victory (generate SortieResult, transition to victory)
-   c. else if elapsedTicks >= targetTicks -> latch defeat/timeout (generate SortieResult, transition to defeat)
+   c. else if elapsedTicks >= targetTicks -> latch timeout (generate SortieResult, transition to timeout)
 5. Once a result is latched (sortie.status != "running"):
    - combat, projectile, enemy AI, spawn, and collision systems MUST NOT mutate state
      on subsequent ticks.
@@ -173,7 +181,7 @@ outer render/infrastructure loop to produce frame deltas for the SimulationLoop 
 ```
 They MUST NOT be used to:
 - increment sortie elapsed time (elapsedTicks),
-- decide victory or defeat,
+- decide victory, defeat, or timeout,
 - populate SortieResult.durationMs,
 - persist or compare sortie outcome duration.
 
@@ -214,7 +222,11 @@ export type SortieResult =
     })
   | (SortieResultBase & {
       readonly outcome: 'defeat'
-      readonly endReason: 'player_hp_zero' | 'timeout'
+      readonly endReason: 'player_hp_zero'
+    })
+  | (SortieResultBase & {
+      readonly outcome: 'timeout'
+      readonly endReason: 'timeout'
     })
 ```
 
@@ -226,7 +238,7 @@ export type SortieResult =
 |----------|---------|-----------|
 | 全敵撃破（`allEnemiesDefeated && playerHp > 0`） | `'victory'` | `'all_enemies_defeated'` |
 | HP ゼロ（`player.hp <= 0`） | `'defeat'` | `'player_hp_zero'` |
-| タイムアウト（`elapsedTicks >= targetTicks`、敵残存） | `'defeat'` | `'timeout'` |
+| タイムアウト（`elapsedTicks >= targetTicks`、敵残存） | `'timeout'` | `'timeout'` |
 
 同一 tick で複数条件が成立した場合は「優先順位」セクションの順で先に成立した条件の `endReason` が採用される。
 
@@ -234,14 +246,14 @@ export type SortieResult =
 
 | 不変条件 | 規則 |
 |----------|------|
-| 生成回数 | result は `running` → `victory` または `running` → `defeat` への初回遷移で一度だけ生成される |
+| 生成回数 | result は `running` → `victory` / `defeat` / `timeout` への初回遷移で一度だけ生成される |
 | immutability | result は生成後 MUST NOT be mutated（再生成・上書き禁止） |
-| `outcome` / `endReason` 整合 | `outcome: 'victory'` は `endReason: 'all_enemies_defeated'` のみ。`outcome: 'defeat'` は `endReason: 'player_hp_zero' \| 'timeout'` のみ（型で保証） |
+| `outcome` / `endReason` 整合 | `outcome: 'victory'` は `endReason: 'all_enemies_defeated'` のみ。`outcome: 'defeat'` は `endReason: 'player_hp_zero'` のみ。`outcome: 'timeout'` は `endReason: 'timeout'` のみ（型で保証） |
 | `kills` 算出元 | `defeatedAtTick <= terminalTick` の敵から導出される（terminal tick 以前に defeated 状態になった敵） |
 | `shotsFired` | terminal tick 時点の snapshot（遷移後の変更を反映しない） |
 | `playerHpRemaining` clamp | `[0, player.maxHp]` にクランプされる |
 | HP defeat 時の HP | `player.hp <= 0` による defeat 時: `playerHpRemaining === 0` |
-| timeout defeat 時の HP | `elapsedTicks >= targetTicks` による defeat 時: `playerHpRemaining === clamp(player.hp)` |
+| timeout 時の HP | `elapsedTicks >= targetTicks` による timeout 時: `playerHpRemaining === clamp(player.hp)` |
 | 永続化禁止 | result を persistence / resources / upgrades / localStorage / campaign への書き込みに使用しない |
 
 ### Transient Output
@@ -272,7 +284,7 @@ Planned:
     - transition: idle -> running
     - victory at target tick
     - defeat when player HP reaches 0
-    - same-tick defeat precedence (defeat wins)
+    - same-tick defeat precedence (defeat wins); timeout is neutral and lower priority than victory
     - SortieResult generated exactly once
     - no combat mutation after terminal result
     - timer authority uses executed fixed ticks, not wall clock

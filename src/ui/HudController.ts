@@ -90,6 +90,9 @@ export function createHudController(
         case 'defeat':
           sortieStatus.textContent = 'Defeat'
           break
+        case 'timeout':
+          sortieStatus.textContent = '戦闘終了'
+          break
         case 'ended':
           sortieStatus.textContent = 'Ended'
           break
@@ -117,7 +120,17 @@ export function createHudController(
 
       // Result (AC9, AC10): both Canvas overlay and HUD use result.outcome as authority
       if (s.result !== null) {
-        sortieResult.textContent = s.result.outcome === 'victory' ? 'Victory' : 'Defeat'
+        switch (s.result.outcome) {
+          case 'victory':
+            sortieResult.textContent = 'Victory'
+            break
+          case 'defeat':
+            sortieResult.textContent = 'Defeat'
+            break
+          case 'timeout':
+            sortieResult.textContent = '戦闘終了'
+            break
+        }
       } else {
         sortieResult.textContent = '—'
       }

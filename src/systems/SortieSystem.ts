@@ -40,7 +40,7 @@ export function startSortie(state: GameState, fixedDeltaMs: number): void {
  * - defeat:  `player.hp <= 0`
  * - victory: all spawned enemies defeated (`state.enemies.length > 0 && every(e => e.defeated)`)
  *            `state.enemies.length > 0` guard prevents vacuous truth when no enemies have spawned yet.
- * - timeout: `elapsedTicks >= targetTicks` with enemies remaining → treated as defeat
+ * - timeout: `elapsedTicks >= targetTicks` with enemies remaining → emits timeout
  * - `durationMs` is derived from `elapsedTicks * fixedDeltaMs` — never from `state.elapsedMs`.
  *
  * Terminal gate: if `status` is not `'running'`, the function returns immediately without mutation.
@@ -63,7 +63,7 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   // Capture terminalTick consistent with #488: defeatedAtTick = state.tick before increment
   const terminalTick = state.tick
 
-  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → defeat)
+  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → timeout)
   const isDefeat = state.player.hp <= 0
   const allEnemiesDefeated =
     state.enemies.length > 0 && state.enemies.every((e) => e.defeated)
@@ -85,7 +85,7 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   const shotsFired = state.player.shotsFired
 
   // Build a narrowed SortieResult with correct outcome/endReason pairing.
-  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → defeat).
+  // Priority: defeat (player.hp <= 0) > victory (all enemies defeated) > timeout (30s → timeout).
   // Each branch returns a concrete union member so TypeScript can verify the discriminated union.
   let result: SortieResult
   if (isDefeat) {
@@ -110,10 +110,10 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
       playerHpRemaining,
     } satisfies SortieResult)
   } else {
-    // timeout defeat: retain actual HP snapshot
+    // timeout: retain actual HP snapshot
     const playerHpRemaining = Math.min(state.player.maxHp, Math.max(0, state.player.hp))
     result = Object.freeze({
-      outcome: 'defeat',
+      outcome: 'timeout',
       endReason: 'timeout',
       durationMs,
       kills,
