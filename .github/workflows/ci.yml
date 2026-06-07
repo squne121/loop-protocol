@@ -98,22 +98,65 @@ jobs:
         run: pnpm playwright:install:ci
       - name: Run E2E tests
         run: pnpm test:e2e:ci
-      - name: Upload Playwright report on failure
-        if: failure()
+      # Visual regression evidence pipeline — docs/dev/visual-baseline-registry.md §5
+      # Upload on success AND failure (not just failure()) so baseline evidence is
+      # always retained. Uses !cancelled() (not always()) — see registry §5 for rationale.
+      - name: Upload Playwright report
+        id: upload-playwright-report
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v6
         with:
           name: playwright-report
           path: playwright-report/
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Upload test traces on failure
-        if: failure()
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload test results
+        id: upload-test-results
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v6
         with:
           name: test-results
           path: test-results/
-          if-no-files-found: ignore
-          retention-days: 14
+          if-no-files-found: warn
+          retention-days: 30
+      # Summary step MUST be after upload steps: outputs.artifact-url is only
+      # available once upload-artifact has run, and $GITHUB_STEP_SUMMARY is
+      # per-step (a later step cannot edit an earlier step's summary).
+      - name: Summarize visual regression evidence
+        if: ${{ !cancelled() }}
+        env:
+          PLAYWRIGHT_REPORT_URL: ${{ steps.upload-playwright-report.outputs.artifact-url || 'N/A' }}
+          TEST_RESULTS_URL: ${{ steps.upload-test-results.outputs.artifact-url || 'N/A' }}
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
+          {
+            echo "## Visual regression evidence"
+            echo ""
+            echo "Visual baseline 契約は docs/dev/visual-baseline-registry.md を参照。"
+            echo ""
+            echo "### Environment fingerprint"
+            echo "- runner: ${RUNNER_OS} ${RUNNER_ARCH} (image ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+            echo "- node: $(node -p 'process.version')"
+            echo "- Playwright: ${PW_VERSION}"
+            echo "- browser: chromium"
+            echo "- project: chromium (Desktop Chrome)"
+            echo "- viewport: 1280x720"
+            echo "- deviceScaleFactor: 1 (Desktop Chrome default; not overridden)"
+            echo "- snapshotPathTemplate: {testDir}/__screenshots__/{testFilePath}/{arg}{ext}"
+            echo "- baseline path: tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/"
+            echo "- screenshot options: animations=disabled, maxDiffPixels=1"
+            echo ""
+            echo "### Artifacts"
+            echo "- playwright-report: ${PLAYWRIGHT_REPORT_URL}"
+            echo "- test-results: ${TEST_RESULTS_URL}"
+            echo ""
+            echo "### actual / expected / diff"
+            if [ -d test-results ] && find test-results -name '*-diff.png' -print -quit | grep -q .; then
+              echo "- visual mismatch detected: see *-actual.png / *-expected.png / *-diff.png in the test-results artifact above"
+            else
+              echo "- N/A (no visual mismatch; expected/actual/diff are only emitted on toHaveScreenshot failure)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   python-test:
     runs-on: ubuntu-latest
