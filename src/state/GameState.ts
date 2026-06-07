@@ -174,7 +174,10 @@ export interface GameState {
   sortie: SortieState
 }
 
+export const gameSnapshotSchemaVersion = 1 as const
+
 export interface GameSnapshot {
+  schemaVersion: typeof gameSnapshotSchemaVersion
   resources: number
   weaponPower: number
   playerMaxHp: number
@@ -233,6 +236,7 @@ export function createInitialGameState(
 
 export function createGameSnapshot(state: GameState): GameSnapshot {
   return {
+    schemaVersion: gameSnapshotSchemaVersion,
     resources: state.progress.resources,
     weaponPower: state.progress.weaponPower,
     playerMaxHp: state.player.maxHp,
