@@ -196,19 +196,21 @@ jobs:
       - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
       - name: Run Claude hook tests
         run: uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
-      - name: Check unregistered hook tests
+      - name: Verify hook test discovery exclusions
         run: |
           python3 - <<PY
           import subprocess
           from pathlib import Path
 
+          # Tracked separately by Issue #412; remove this ignore once the test is CI-green.
           allowed_unregistered = {
               ".claude/hooks/tests/test_secret_boundary_contract.py",
           }
-          all_hook_tests = {
-              path.as_posix()
-              for path in Path(".claude/hooks/tests").glob("test_*.py")
-              if path.as_posix() not in allowed_unregistered
+          expected = {
+              hook_test.as_posix()
+              for pattern in ("test_*.py", "*_test.py")
+              for hook_test in Path(".claude/hooks/tests").rglob(pattern)
+              if hook_test.as_posix() not in allowed_unregistered
           }
 
           result = subprocess.run(
@@ -234,9 +236,9 @@ jobs:
                   continue
               collected.add(line.split("::", 1)[0])
 
-          missing = sorted(all_hook_tests - collected)
+          missing = sorted(expected - collected)
           if missing:
-              raise SystemExit("Unregistered hook tests in CI:\n" + "\n".join(missing))
+              raise SystemExit("Hook tests missing from pytest discovery:\n" + "\n".join(missing))
           PY
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/issue-contract-review/tests/
@@ -255,6 +257,10 @@ jobs:
       - name: Generate ci_test_selection/v1 artifact
         run: |
           mkdir -p ci_test_selection_artifacts
+          uv run --locked pytest --collect-only -q \
+            .claude/hooks/tests/ \
+            --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
+            > ci_test_selection_artifacts/hook_tests_collect_only.txt
           python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py \
             --output ci_test_selection_artifacts/ci_test_selection_v1.json \
             --pytest-args \
