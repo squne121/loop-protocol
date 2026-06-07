@@ -458,6 +458,13 @@ def test_check_non_c4_c9_blockers_stream_separation(monkeypatch):
     assert seen["kwargs"]["capture_output"] is True
     assert "stderr" not in seen["kwargs"]
     assert seen["kwargs"]["text"] is True
+    # Argument contract: the consumer must actually invoke check_issue_contract.py
+    # in --json mode (otherwise the stream-separation guarantee is meaningless).
+    # Pin the argv shape so dropping --json / --file is caught as a regression.
+    assert seen["args"][0] == sys.executable
+    assert seen["args"][1] == module.CHECK_ISSUE_CONTRACT_SCRIPT
+    assert "--file" in seen["args"]
+    assert "--json" in seen["args"]
     # Valid JSON with empty blocking_issues → no other blockers.
     assert has_other is False
     assert codes == []
@@ -483,6 +490,30 @@ def test_check_non_c4_c9_blockers_stderr_diagnostic_ignored(monkeypatch):
     # Diagnostics on stderr must NOT affect JSON parsing of stdout.
     assert has_other is False
     assert codes == []
+
+
+def test_check_non_c4_c9_blockers_stderr_diagnostic_with_real_blocker(monkeypatch):
+    """GIVEN stderr=<diagnostic warning> and stdout=<valid JSON with a non-C4/C9 blocker> /
+    WHEN check_non_c4_c9_blockers runs / THEN it parses stdout only and still reports the
+    blocker — locking the junction between stdout-only parsing and blocker detection so
+    stderr noise neither suppresses nor fabricates a blocker."""
+    module = _load_autofix_module()
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout='{"blocking_issues": ["unrelated blocker message for testing"]}',
+            stderr="[WARN] DeprecationWarning: datetime.utcnow() is deprecated\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    has_other, codes = module.check_non_c4_c9_blockers("## Outcome\nx\n")
+
+    # stderr diagnostics are ignored; the stdout blocker is still surfaced.
+    assert has_other is True
+    assert codes == ["unrelated blocker message for testing"]
 
 
 def test_check_non_c4_c9_blockers_fail_closed_on_non_json(monkeypatch):
