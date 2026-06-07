@@ -236,6 +236,13 @@ def check_non_c4_c9_blockers(body: str) -> tuple[bool, list[str]]:
         return False, []
 
     try:
+        # Caller contract with check_issue_contract.py --json:
+        #   - stdout carries the contract-check JSON ONLY (the single final JSON object).
+        #   - stderr carries diagnostics (warnings, deprecation notices, progress).
+        #   - This caller MUST NOT merge stderr into stdout (i.e. do not use
+        #     stderr=subprocess.STDOUT). capture_output=True keeps stdout/stderr
+        #     separated; we parse JSON from stdout only, so diagnostics emitted on
+        #     stderr never affect JSON parsing.
         proc = subprocess.run(
             [sys.executable, CHECK_ISSUE_CONTRACT_SCRIPT, "--file", tmp_path, "--json"],
             capture_output=True,
@@ -246,8 +253,16 @@ def check_non_c4_c9_blockers(body: str) -> tuple[bool, list[str]]:
             try:
                 data = json.loads(proc.stdout)
             except json.JSONDecodeError:
-                # non-JSON output; cannot parse — skip guard
-                return False, []
+                # stdout is not valid JSON — the caller contract (stdout = JSON only)
+                # was violated (e.g. diagnostics leaked into stdout). Fail CLOSED:
+                # keep the non-C4/C9 blocker check active and treat this as a blocker
+                # so autofix does not silently proceed on a broken contract check.
+                print(
+                    "[WARN] check_issue_contract.py --json stdout was not valid JSON; "
+                    "failing closed (treating as non-C4/C9 blocker)",
+                    file=sys.stderr,
+                )
+                return True, ["check_error"]
             blocking = data.get("blocking_issues", [])
             # blocking_issues is a list of strings (human-readable messages).
             # This script can only autofix C4 ($ prefix) and C9 (RVA section).
