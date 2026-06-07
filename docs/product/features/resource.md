@@ -64,6 +64,15 @@ sortie の terminal な結果を、プレイヤー進行に還元される `reso
 報酬計算の **唯一の入力は terminal な `SortieResult`** である。
 
 - `SortieResult` は `outcome`（`'victory' | 'defeat' | 'timeout'`）を discriminator に持つ discriminated union で、`durationMs` / `kills` / `shotsFired` / `playerHpRemaining` を payload に持つ（shape の正本は `sortie.md`）。
+- `outcome` と `endReason` は型レベルでペア固定されており（`sortie.md` / `src/state/GameState.ts` の正本に従う）、reward 区分はこのペアから導出する。**`timeout` は独立した outcome（neutral terminal）であり `defeat` ではない**（#732 で neutral terminal 化済み）:
+
+  | outcome | endReason | 意味 |
+  |---|---|---|
+  | `'victory'` | `'all_enemies_defeated'` | 全敵撃破 |
+  | `'defeat'` | `'player_hp_zero'` | 自機 HP 0 |
+  | `'timeout'` | `'timeout'` | 30 秒タイムアウト（neutral terminal） |
+
+  実装（#737）は `outcome === 'timeout'` を defeat と混同してはならない。
 - RewardSystem は **terminal な（= sortie が終了して確定した）`SortieResult` のみ** を入力に取る。途中状態・非終端な runtime state を入力にしない。
 - reward は `SortieResult` の field のみから決定論的に計算され、wall-clock / 乱数 / 外部 I/O に依存しない（同一 `SortieResult` からは常に同一 reward delta が得られる）。
 
@@ -118,7 +127,8 @@ reward delta の算出（normative, deterministic）:
   - debrief ボタンの連打（button repeat）
   - state update の再実行・冪等再評価
 - `SortieResult` は **永続化しないため、reload 後に同一 result から reward を再計算しない**。reload 後に復元されるのは適用済みの `ProgressState`（resources を含む）のみであり、terminal result の再消費は発生しない。
-- exactly-once を保証する具体的な実装機構（適用済みフラグ / 消費トークン等）の選択は #737 の実装範囲とするが、上記の不変条件（最大 1 回適用・reload 後再計算しない）は本 spec が正本として要求する。
+- **exactly-once の単位は `SortieResult` の値同一性（value identity）ではなく、1 sortie lifecycle の terminal transition event とする**。同一 payload（同じ `outcome` / `kills` 等）を持つ別 sortie の結果は、**別個の reward application** として扱い加算する。実装（#737）は `JSON.stringify(result)` や shallow equality による値ベースの重複排除を行ってはならない（別 sortie の同一 payload を誤って二重適用扱いで握り潰す危険があるため）。
+- exactly-once を保証する具体的な実装機構の選択は #737 の実装範囲とするが、**同一 sortie lifecycle 内の再適用防止は `rewardApplied` latch または consumed transition token で行う**ことを本 spec が正本として要求する（上記の不変条件: 最大 1 回適用・reload 後再計算しない・lifecycle 単位）。これは debrief / preparation 遷移（#738）と整合する。
 
 ## Non-Goals
 
