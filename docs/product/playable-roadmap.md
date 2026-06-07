@@ -20,6 +20,7 @@ last_updated_by_issue: 148
 - **体験概要（非正本）**: `docs/product/game-overview.md` — MVP Loop の参照元として使用するが、要件の正本としては扱わない
 - **Milestone 命名規則**: `docs/dev/milestone-ops.md`
 - 個別機能の stable な仕様は `docs/product/features/<feature>.md` へ昇格させる
+- **M3 / M4 boundary authority**: M3 / M4 の conceptual milestone boundary は本 roadmap の M3 / M4 セクションを参照元とする。ただし global scope / global non-goals の正本は `docs/product/requirements.md` であり、本 roadmap を global 要件の正本へ格上げしない。GitHub Milestone object はこの roadmap を反映する外部メタデータとして扱う。
 
 ---
 
