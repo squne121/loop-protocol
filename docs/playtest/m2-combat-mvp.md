@@ -5,9 +5,9 @@ parent_issue: "#483"
 implementation_issue: "#541"
 automated_tested_commit: "e46be8a5f0f8781f8d22c9d2cc3e5b7ad78e7279"
 evidence_mode: playwright+manual
-status: accepted_with_deferred
+status: accepted
 acceptance_verdict:
-  overall: accepted_with_deferred
+  overall: accepted
   evaluated_against_issue: "#543"
   passed:
     - AC1
@@ -35,20 +35,25 @@ acceptance_verdict:
       status: accepted
       reason: "hp_zero_defeat confirmed by human operator squne121. GitHub-hosted artifact URL recorded (issue #543 comment 4599987357)."
     - ac: AC11
-      status: deferred_exception
-      reason: "timeout_30s_defeat: no human video artifact. E2E test 9 is auxiliary only and not a human substitute per #543. Covered under accepted_with_deferred."
-      deferred_reason: "Human timeout recording was not captured."
+      status: accepted
+      reason: "timeout_30s_terminal: 30秒 timeout 到達時に DEFEAT ではなく中立な terminal state（HUD「戦闘終了」/ outcome=timeout / endReason=timeout / overlay ≠ DEFEAT）へ遷移することを human operator squne121 が観察した動画証跡で解消（#690）。#725 / #732 による契約更新（timeout = 中立 terminal）を反映。E2E test 9 は補助のみで人間観察の代替ではない（#543）。"
       owner: squne121
       approved_by: squne121
-      approved_at: "2026-06-06"
-      expiry_issue: "#690"
-      expiry_condition: "Before the M3 gate, the next manual playtest must capture timeout_30s_defeat human video and attach a GitHub-hosted artifact URL to the playtest evidence document."
-      residual_risk: "Timeout UI/HUD/canvas outcome may differ in an actual 30-second human run; automated tests verify logic but not human UX observation."
-      risk_acceptance: "Accept only as deferred M2 evidence based on automated compensating evidence. Do not treat automated evidence as a human playtest substitute."
-      compensating_evidence:
-        - "E2E short-sortie fixture verifies timeout-to-timeout state transition."
-        - "HUD/canvas timeout output is covered by E2E."
-      substitution_allowed: false
+      approved_at: "2026-06-07"
+      resolved_issue: "#690"
+      resolved_by_evidence: "https://github.com/squne121/loop-protocol/issues/690#issuecomment-4641688172"
+      artifact_url: "https://github.com/user-attachments/assets/af06e34d-6f5d-4b69-b76b-f52e7f79b024"
+      artifact_sha256: "aaea62138a706da43a31c8be6bde9ad70c7577616da622fcd455136fca220c6c"
+      artifact_bytes: 6342336
+      artifact_mime_type: "video/mp4"
+      tested_commit: "f7d66c19d43da9475763637947359214220c605e"
+      tested_commit_includes: "#732 merge a7d74a0f709103c7c5df2e806f80af5a533ad1af (fix(systems): sortie timeout as neutral terminal)"
+      route: "https://squne121.github.io/loop-protocol/pr-743/"
+      browser: "Chrome 149.0.7827.54 / Windows"
+      viewport: "1920x911 (inner)"
+      device_pixel_ratio: 1
+      operator: "squne121 (human)"
+      historical_note: "旧シナリオ名 timeout_30s_defeat は historical note としてのみ保持。現行契約では timeout は defeat ではなく中立な terminal state。"
   artifact_reviewability: github_attachment
   artifact_note: "Video files attached to Issue #543 comment (https://github.com/squne121/loop-protocol/issues/543#issuecomment-4599987357). GitHub-hosted URLs recorded in evidence section."
 date: "2026-05-31"
@@ -270,11 +275,18 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 - [ ] **victory**: When all spawned enemies are defeated, sortie transitions to `victory` status
 - [ ] **Victory screen/HUD**: UI updates to reflect `sortie.status === "victory"` outcome
 
+### Timeout Terminal Condition
+
+> 30秒 timeout は defeat ではなく中立な terminal state（#725 / #732）。旧契約（timeout = defeat）は live label として使用しない。
+
+- [ ] **timeout**: When 30 seconds elapse with enemies remaining, sortie transitions to `timeout` status (neutral terminal, not defeat)
+- [ ] **Timeout result**: `result.outcome === "timeout"` and `result.endReason === "timeout"`
+- [ ] **Timeout HUD/overlay**: HUD shows `戦闘終了`; Canvas overlay is neutral / non-DEFEAT
+
 ### Defeat Condition
 
 - [ ] **defeat (HP)**: When player HP reaches 0, sortie transitions to `defeat` status
-- [ ] **defeat (timeout)**: When 30 seconds elapse with enemies remaining, sortie transitions to `defeat` status
-- [ ] **Defeat screen/HUD**: UI updates to reflect `sortie.status === "defeat"` outcome
+- [ ] **Defeat screen/HUD**: HP-zero defeat UI reflects `sortie.status === "defeat"` outcome
 
 ## AC Verification Summary
 
@@ -304,7 +316,7 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 | AC12 | Terminal state latched until reset | state machine inherent (no mutation after terminal) | pass |
 | AC13 | Victory/Defeat display verified via E2E tests | 3 E2E tests with pixel check | pass |
 
-Note: status is `accepted_with_deferred`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). `accepted_with_deferred` reflects that `timeout_30s_defeat` lacks a human-verifiable artifact; `hp_zero_defeat` and `all_enemies_defeated_victory` are human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), timeout overlay blue-dominant pixels (B>80,B>R/G). Issue #541 adds Canvas enemy rendering, victory/timeout overlay, and HUD sortie information display.
+Note: status is `accepted`. Automated E2E verification (16 tests) was the initial baseline. Human playtest evidence added in Issue #543 (PR #570). The timeout scenario (historically named `timeout_30s_defeat`, now `timeout_30s_terminal` per #725 / #732 — timeout is a neutral terminal state, not a defeat) was the last deferred item; its human-verifiable artifact was captured and recorded under #690, so all scenarios — including `hp_zero_defeat` and `all_enemies_defeated_victory` — are now human-confirmed. HUD DOM text confirmed via E2E `toHaveText()`. Canvas bitmap confirmed via E2E pixel checks: enemy red pixels (R>180,G<100,B<100), victory overlay green pixels (G>80), timeout overlay blue-dominant pixels (B>80,B>R/G). Issue #541 adds Canvas enemy rendering, victory/timeout overlay, and HUD sortie information display.
 
 ## Human Playtest Evidence
 
@@ -371,11 +383,31 @@ environment:
   - HUD sortie-status 結果一致: confirmed
   - contact damage → HP 0 → defeat 遷移: confirmed
 
-#### timeout_30s_defeat
+#### timeout_30s_terminal
 
-- artifact: deferred
-- reason: "手動動画証跡なし。E2E テストで代替検証済み。"
-- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout neutral 自動検証済み)"
+> Historical note: 旧シナリオ名は `timeout_30s_defeat`。現行契約では 30秒 timeout は defeat ではなく中立な terminal state（#725 / #732）。旧名は historical note としてのみ残す。
+
+- artifact_url: "https://github.com/user-attachments/assets/af06e34d-6f5d-4b69-b76b-f52e7f79b024"
+- artifact_sha256: "aaea62138a706da43a31c8be6bde9ad70c7577616da622fcd455136fca220c6c"
+- artifact_bytes: 6342336
+- artifact_mime_type: "video/mp4"
+- tested_commit: "f7d66c19d43da9475763637947359214220c605e"  # includes #732 merge a7d74a0f709103c7c5df2e806f80af5a533ad1af (sortie timeout as neutral terminal)
+- route: "https://squne121.github.io/loop-protocol/pr-743/"
+- route_provenance: "route は PR #743（#726 数値表示フォーマッタ修正, MERGED 2026-06-07）の Pages preview。pr-743 の差分は src/render/renderUtils.ts と src/ui/HudController.ts（HP 数値表示のみ）であり、SortieSystem の timeout 遷移・result.outcome/endReason・Canvas overlay には非影響。撮影時の app_under_test.commit は tested_commit f7d66c1 と一致する。"
+- artifact_type: github_user_attachment  # GitHub Actions artifact（既定 90 日 retention）ではなく issue/PR への user attachment（永続）
+- artifact_persistence: "一次証跡は永続的な GitHub user-attachment 動画（sha256/bytes 記録済み）。route の preview URL は PR close で失効しうるが、動画ファイルと sha256 による検証可能性は保たれる。"
+- browser: "Chrome 149.0.7827.54 / Windows"
+- viewport: "1920x911 (inner)"
+- device_pixel_ratio: 1
+- operator: "squne121 (human)"
+- expected (timeout 中立 terminal): "outcome: timeout / endReason: timeout / HUD「戦闘終了」/ Canvas overlay ≠ DEFEAT（中立・青系）"
+- confirmed (human observation by squne121):
+  - 30秒到達前に victory（全敵撃破）が成立していない: confirmed
+  - HP 0 による defeat ではない: confirmed
+  - timeout 到達時に terminal state へ遷移: confirmed
+  - HUD が「戦闘終了」と読める: confirmed
+  - Canvas overlay が DEFEAT（赤系）ではない（中立・青系）: confirmed
+- e2e_coverage: "tests/e2e/m2-combat-mvp.spec.ts — test 9 (__E2E_SHORT_SORTIE__ fixture, timeout neutral 自動検証済み。補助のみ・人間観察の代替ではない #543)"
 
 ### Human Observations
 
@@ -539,4 +571,4 @@ download_artifact:
 
 - AC8 viewport/DPR waiver is resolved against the combined evidence above; the #689 expiry entry has been removed from `acceptance_verdict.partial_or_deferred[AC8]` and the entry is now `status: accepted`.
 - Raw viewport metrics are recorded as-is for both sessions. `1280x720` and DPR `1.0` are not asserted for the human run.
-- AC11 timeout_30s_defeat (tracked by #690) is **not** modified by this block.
+- AC11 (timeout terminal) is **not** modified by this AC8 block. The AC11 deferred waiver was resolved separately under #690 — see the `timeout_30s_terminal` Scenario Result and `acceptance_verdict.partial_or_deferred[AC11]` (`status: accepted`).
