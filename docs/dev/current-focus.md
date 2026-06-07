@@ -25,6 +25,10 @@ last_updated_by_issue: 734
 1. `#735` M3 feature spec（resource / persistence）を作成する
 2. `#736` 以降で reward / persistence の実装を進める
 
+## M3 Gate 前提（M2 持ち越し）
+
+- `#690` は M3 gate 前に解消する M2 follow-up であり、M3 close 判定前の手動確認項目として扱う（AC11 `timeout_30s_defeat` の人間動画採取・waiver 解消、parent `#733` の close 条件）。
+
 ## Do Now
 
 - `#735` で resource / persistence の詳細仕様（初期値・上限・負値禁止・reward 計算式）を feature spec に固定する。
