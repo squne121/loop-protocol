@@ -39,6 +39,7 @@ export interface ViewportMetrics {
   client_height: number
   visual_viewport_width: number | null
   visual_viewport_height: number | null
+  visual_viewport_scale: number | null
 }
 
 export interface DevicePixelRatio {
@@ -274,6 +275,7 @@ function collectViewport(): ViewportMetrics {
       client_height: 0,
       visual_viewport_width: null,
       visual_viewport_height: null,
+      visual_viewport_scale: null,
     }
   }
   const vv = window.visualViewport
@@ -284,6 +286,7 @@ function collectViewport(): ViewportMetrics {
     client_height: document.documentElement.clientHeight,
     visual_viewport_width: vv ? vv.width : null,
     visual_viewport_height: vv ? vv.height : null,
+    visual_viewport_scale: vv ? vv.scale : null,
   }
 }
 
