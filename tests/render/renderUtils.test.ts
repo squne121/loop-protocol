@@ -56,14 +56,35 @@ describe('formatCombatNumber', () => {
   it('GIVEN -Infinity WHEN formatted THEN returns 0 (safe fallback)', () => {
     expect(formatCombatNumber(-Infinity)).toBe('0')
   })
-  it('GIVEN negative integer -1 WHEN formatted THEN returns 0 (safe fallback)', () => {
-    expect(formatCombatNumber(-1)).toBe('0')
+  it('GIVEN negative integer -3 WHEN formatted THEN returns 0 (safe fallback)', () => {
+    expect(formatCombatNumber(-3)).toBe('0')
   })
   it('GIVEN negative large value -9999 WHEN formatted THEN returns 0 (safe fallback)', () => {
     expect(formatCombatNumber(-9999)).toBe('0')
   })
-  it('GIVEN non-integer 1.5 WHEN formatted THEN returns 0 (safe fallback)', () => {
-    expect(formatCombatNumber(1.5)).toBe('0')
+  // New behavior (Issue #726): Accept fractional inputs with ceil rounding
+  it('GIVEN fractional value 1.5 WHEN formatted THEN returns 2 (ceil)', () => {
+    expect(formatCombatNumber(1.5)).toBe('2')
+  })
+  it('GIVEN fractional value 7.9999 WHEN formatted THEN returns 8 (ceil, handles floating-point artifact)', () => {
+    expect(formatCombatNumber(7.9999)).toBe('8')
+  })
+  it('GIVEN fractional value 0.5 WHEN formatted THEN returns <1 (living unit, not 0)', () => {
+    expect(formatCombatNumber(0.5)).toBe('<1')
+  })
+  it('GIVEN value 10000 WHEN formatted THEN returns 10k (compact after ceil)', () => {
+    expect(formatCombatNumber(10000)).toBe('10k')
+  })
+  // Issue #726 review: compact boundary must be evaluated on the ceiled value,
+  // otherwise 9999.x renders as the 5-digit "10000" instead of "10k".
+  it('GIVEN value 9999 WHEN formatted THEN returns 9999 (exact, below compact)', () => {
+    expect(formatCombatNumber(9999)).toBe('9999')
+  })
+  it('GIVEN fractional value 9999.1 WHEN formatted THEN returns 10k (ceil crosses compact boundary)', () => {
+    expect(formatCombatNumber(9999.1)).toBe('10k')
+  })
+  it('GIVEN fractional value 9999.999 WHEN formatted THEN returns 10k (ceil crosses compact boundary)', () => {
+    expect(formatCombatNumber(9999.999)).toBe('10k')
   })
 })
 describe('computeHpLabelPosition', () => {
@@ -220,6 +241,20 @@ describe('drawEnemyHpLabel', () => {
     const { ctx } = makeMockCtx()
     drawEnemyHpLabel({ ctx: ctx as unknown as CanvasRenderingContext2D, enemyX: 480, enemyY: 270, enemyRadius: 16, enemyHp: 10000, arenaWidth: 960, arenaHeight: 540 })
     expect(ctx.fillText).toHaveBeenCalledWith('10k', expect.any(Number), expect.any(Number))
+  })
+
+  // Issue #726 AC2 review: Canvas enemy HP label must share formatCombatNumber, so a
+  // fractional enemy HP is ceiled (7.9999 -> "8") rather than leaking decimal precision.
+  it('GIVEN fractional enemy HP 7.9999 WHEN drawEnemyHpLabel called THEN fillText receives ceiled "8"', () => {
+    const { ctx } = makeMockCtx()
+    drawEnemyHpLabel({ ctx: ctx as unknown as CanvasRenderingContext2D, enemyX: 480, enemyY: 270, enemyRadius: 16, enemyHp: 7.9999, arenaWidth: 960, arenaHeight: 540 })
+    expect(ctx.fillText).toHaveBeenCalledWith('8', expect.any(Number), expect.any(Number))
+  })
+
+  it('GIVEN fractional enemy HP 0.5 (living) WHEN drawEnemyHpLabel called THEN fillText receives "<1" not "0"', () => {
+    const { ctx } = makeMockCtx()
+    drawEnemyHpLabel({ ctx: ctx as unknown as CanvasRenderingContext2D, enemyX: 480, enemyY: 270, enemyRadius: 16, enemyHp: 0.5, arenaWidth: 960, arenaHeight: 540 })
+    expect(ctx.fillText).toHaveBeenCalledWith('<1', expect.any(Number), expect.any(Number))
   })
 
   it('GIVEN draw call WHEN font set THEN matches HP_LABEL_FONT constant', () => {

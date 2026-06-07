@@ -1,4 +1,5 @@
 import type { GameState } from '../state'
+import { formatCombatNumber } from '../render/renderUtils'
 
 export interface HudActions {
   onQuickSave(): void
@@ -68,7 +69,7 @@ export function createHudController(
 
   return {
     render(state) {
-      hp.textContent = `${state.player.hp}/${state.player.maxHp}`
+      hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
       shots.textContent = `${state.player.shotsFired}`
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
