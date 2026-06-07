@@ -27,30 +27,50 @@ export const HP_LABEL_PADDING = 2
 // ---------------------------------------------------------------------------
 
 /**
- * Format an integer HP value for canvas display.
+ * Format an HP value for display (DOM HUD and Canvas enemy HP labels).
  *
  * Policy (SSOT: docs/product/features/combat-core.md#combat-numeric-display-policy):
- *   0 - 9999  -> exact string ("0", "999", "9999")
- *   10000+    -> compact with floor rounding, lowercase unit
- *     10000 -> "10k", 999999 -> "999k", 1000000 -> "1M"
+ *   NaN / Infinity / negative             -> "0"
+ *   value === 0                           -> "0"
+ *   0 < value < 1                         -> "<1" (avoid showing living unit as "0")
+ *   value >= 1                            -> displayValue = Math.ceil(value), then:
+ *       displayValue < 10000              -> String(displayValue)        ("9999", "8")
+ *       displayValue < 1000000            -> floor(displayValue/1e3)+"k" ("10k", "999k")
+ *       otherwise                         -> floor(displayValue/1e6)+"M" ("1M")
  *
- * Input domain: integer >= 0.
- * Invalid inputs (NaN, Infinity, negative, non-integer) are treated as 0.
- * Safe fallback is used rather than throwing — this is a rendering-layer function
- * (docs/product/features/combat-core.md number_display_policy: invalid input → 0).
+ * The compact boundary is evaluated on the *ceiled* value, so 9999.1 -> ceil 10000
+ * -> "10k" (not the 5-digit "10000"). This is a human-readable display bucket, not
+ * an exact HP value: do not reuse for damage log / balance / persistence / score.
+ *
+ * Input domain: finite non-negative numbers (integers or floats).
+ * Safe fallback is used rather than throwing — this is a rendering-layer function.
  * Output is locale-independent.
  */
 export function formatCombatNumber(value: number): string {
-  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+  // Invalid input guard: NaN, Infinity, negative
+  if (!Number.isFinite(value) || value < 0) {
     return '0'
   }
-  if (value < 10_000) {
-    return String(Math.floor(value))
+  // Exact zero
+  if (value === 0) {
+    return '0'
   }
-  if (value < 1_000_000) {
-    return String(Math.floor(value / 1_000)) + 'k'
+  // 0 < value < 1: show as "<1" to avoid displaying living unit as "0"
+  if (value < 1) {
+    return '<1'
   }
-  return String(Math.floor(value / 1_000_000)) + 'M'
+  // value >= 1: ceil FIRST, then evaluate the compact boundary on the ceiled value.
+  // Branching on the raw value would render 9999.1 as the 5-digit "10000" because
+  // 9999.1 < 10000 is true before rounding; ceiling first makes it 10000 -> "10k",
+  // matching number_display_policy (#581: compact_from 10000).
+  const displayValue = Math.ceil(value)
+  if (displayValue < 10_000) {
+    return String(displayValue)
+  }
+  if (displayValue < 1_000_000) {
+    return String(Math.floor(displayValue / 1_000)) + 'k'
+  }
+  return String(Math.floor(displayValue / 1_000_000)) + 'M'
 }
 
 // ---------------------------------------------------------------------------
