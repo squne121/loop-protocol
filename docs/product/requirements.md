@@ -2,8 +2,8 @@
 doc_id: DOC-REQ-001
 title: LOOP_PROTOCOL Requirements Baseline
 status: active
-capability_gate: M1 Foundation Gate (v0.1.x)
-last_updated_by_issue: 3
+capability_gate: M3 Result Persistence (v0.3.x)
+last_updated_by_issue: 734
 ---
 
 # Requirements Baseline
@@ -21,10 +21,17 @@ last_updated_by_issue: 3
 - `docs/product/game-overview.md`: 体験概要。正本ではない。
 - `docs/dev/current-focus.md`: 一時的な優先順位。正本ではない。
 
+## SSOT 階層
+
+- global scope / global non-goals の正本: この `docs/product/requirements.md`。
+- milestone 間（M3 / M4 など）の境界の参照元: `docs/product/playable-roadmap.md`。境界（boundary）を表すものであり、global 要件の正本ではない。
+- 個別機能の詳細仕様の正本: `docs/product/features/<feature>.md`。
+- この階層を逆転させない。`playable-roadmap.md` を global 要件の正本として上書き扱いしない。
+
 ## Current Capability Gate
 
-- 現在は `M1: Foundation Gate (v0.1.x)` を進行中。
-- この段階では、Combat 実装を広げる前に docs、guardrail、workflow、最小仕様正本を揃える。
+- M1 Foundation Gate (v0.1.x) の基盤・guardrail・workflow・最小仕様正本は確立済み。
+- 現在は `M3: Result Persistence (v0.3.x)` を進行中。報酬から resource への変換と永続化スライスを成立させる。
 
 ## Global Non-Goals
 
@@ -34,6 +41,21 @@ last_updated_by_issue: 3
 - network / multiplayer
 - 高品質アセット前提の演出
 - Issue や spec にない大規模機能の先行追加
+
+## Milestone Scope: M3 Result Persistence (v0.3.x)
+
+- 現行マイルストーン正本は `M3: Result Persistence (v0.3.x)`。
+- sortie 結果から報酬を獲得し、resource として `src/storage` の snapshot 境界経由で localStorage へ永続化し、reload 後に進行を復元するまでを M3 のスコープとする（報酬 → resource → localStorage 永続化 → reload 復元）。
+- M3 は MVP-004（データ駆動と保存境界）を永続化方向に具体化し、戦闘結果が resource として残る MVP Loop の最小実装を成立させる。
+- resource / reward / persistence の詳細仕様（初期値・上限・負値禁止・reward 計算式など）は feature spec（`docs/product/features/<feature>.md`）で定義する。
+
+### M3 Non-Goals
+
+- 武器強化（resource 消費による強化）は `M4: Upgrade Loop (v0.4.x)` のスコープであり M3 には含めない。
+- upgrade tree（アップグレードツリー）の構築。
+- 複数武器の追加・切替。
+- campaign / territory の管理。
+- M3 / M4 境界の詳細は `docs/product/playable-roadmap.md` を参照する。
 
 ## Current MVP Requirements
 
