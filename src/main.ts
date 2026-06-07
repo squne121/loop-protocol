@@ -79,7 +79,7 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
     __E2E_SHORT_SORTIE__?: boolean
     __E2E_PLAYER_HP_OVERRIDE__?: number
   }
-  // Short sortie: override targetTicks to ~0.5s for deterministic victory E2E
+  // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
   if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.sortie.status === 'running') {
     state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
   }
@@ -164,9 +164,9 @@ interface LoopE2ESnapshot {
     defeatedAtTick: number | null
   }>
   sortie: {
-    status: 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+    status: 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
     elapsedTicks: number
-    result: 'victory' | 'defeat' | null
+    result: 'victory' | 'defeat' | 'timeout' | null
   }
   arena: {
     width: number

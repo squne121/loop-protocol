@@ -3,7 +3,7 @@
  *
  * Vitest unit tests for SortieSystem (AC7–AC12).
  * Required test cases: bootstrap, no-start, victory (allEnemiesDefeated), defeat,
- * timeout→defeat, defeat-precedence, vacuous-truth, double-result,
+ * timeout→timeout, defeat-precedence, vacuous-truth, double-result,
  * timer-authority, terminal-gate, kills-boundary, playerHpRemaining-clamp.
  *
  * Updated for Issue #680: endReason discriminated union (AC4–AC8, AC10).
@@ -129,10 +129,10 @@ describe('GIVEN sortie is running and player hp reaches 0', () => {
 })
 
 // ---------------------------------------------------------------------------
-// AC5 / AC9: 30s timeout → defeat + endReason=timeout
+// AC5 / AC9: 30s timeout → timeout + endReason=timeout
 // ---------------------------------------------------------------------------
 describe('GIVEN sortie is running and 30s elapses with enemies remaining', () => {
-  it('AC5/AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=defeat, endReason=timeout', () => {
+  it('AC5/AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=timeout, endReason=timeout', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
 
@@ -142,9 +142,9 @@ describe('GIVEN sortie is running and 30s elapses with enemies remaining', () =>
     ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
     runSortieSystem(state, FDT)
 
-    expect(state.sortie.status).toBe('defeat')
+    expect(state.sortie.status).toBe('timeout')
     expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.outcome).toBe('timeout')
     expect(state.sortie.result!.endReason).toBe('timeout')
   })
 })
@@ -307,14 +307,14 @@ describe('GIVEN sortie result playerHpRemaining', () => {
     expect(state.sortie.result!.playerHpRemaining).toBe(0)
   })
 
-  it('timeout defeat: playerHpRemaining is HP snapshot, not 0', () => {
+  it('timeout terminal: playerHpRemaining is HP snapshot, not 0', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
     state.player.hp = state.player.maxHp // player alive with full HP
     state.enemies.push(makeLiveEnemy(1))   // enemies remain → allEnemiesDefeated = false
     ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
     runSortieSystem(state, FDT)
-    expect(state.sortie.result!.outcome).toBe('defeat')
+    expect(state.sortie.result!.outcome).toBe('timeout')
     expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp) // NOT 0
   })
 })
@@ -406,7 +406,7 @@ void Object.freeze({
 } satisfies SortieResult)
 
 void Object.freeze({
-  outcome: 'defeat',
+  outcome: 'timeout',
   endReason: 'timeout',
   durationMs: 30000,
   kills: 0,
@@ -442,4 +442,14 @@ void ({
   kills: 0,
   shotsFired: 0,
   playerHpRemaining: 0,
+} satisfies SortieResult)
+
+// @ts-expect-error outcome: 'timeout' に endReason: 'player_hp_zero' は型エラー
+void ({
+  outcome: 'timeout',
+  endReason: 'player_hp_zero',
+  durationMs: 30000,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
 } satisfies SortieResult)

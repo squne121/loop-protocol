@@ -85,13 +85,13 @@ export interface TelemetryState {
 // Sortie state machine types (AC1, AC5)
 // ---------------------------------------------------------------------------
 
-export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'ended'
+export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
 
 /**
  * Reason why a sortie ended. Discriminates the three terminal conditions.
  * - `all_enemies_defeated`: victory — all spawned enemies were defeated
  * - `player_hp_zero`:       defeat  — player HP reached 0
- * - `timeout`:              defeat  — 30-second time limit elapsed with enemies remaining
+ * - `timeout`:              timeout — 30-second time limit elapsed with enemies remaining
  *
  * `survival_timer` is intentionally excluded (M2 scope — see Issue #542).
  */
@@ -119,14 +119,18 @@ export type SortieResult =
     })
   | (SortieResultBase & {
       readonly outcome: 'defeat'
-      readonly endReason: 'player_hp_zero' | 'timeout'
+      readonly endReason: 'player_hp_zero'
+    })
+  | (SortieResultBase & {
+      readonly outcome: 'timeout'
+      readonly endReason: 'timeout'
     })
 
 /**
  * Discriminated union for sortie state.
  * - `idle`: not yet started; elapsedTicks fixed at 0, result is null
  * - `running`: in progress; elapsedTicks advances each tick, result is null
- * - `victory` | `defeat`: terminal; result is populated, no further mutation
+ * - `victory` | `defeat` | `timeout`: terminal; result is populated, no further mutation
  * - `ended`: reserved for post-result acknowledgement flows (not used in M2)
  */
 export type SortieState =
@@ -143,7 +147,7 @@ export type SortieState =
       result: null
     }
   | {
-      status: 'victory' | 'defeat'
+      status: 'victory' | 'defeat' | 'timeout'
       elapsedTicks: number
       targetTicks: number
       result: Readonly<SortieResult>
