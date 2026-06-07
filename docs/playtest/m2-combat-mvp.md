@@ -275,11 +275,18 @@ by a human tester running `pnpm preview` or `pnpm dev` in a browser.
 - [ ] **victory**: When all spawned enemies are defeated, sortie transitions to `victory` status
 - [ ] **Victory screen/HUD**: UI updates to reflect `sortie.status === "victory"` outcome
 
+### Timeout Terminal Condition
+
+> 30秒 timeout は defeat ではなく中立な terminal state（#725 / #732）。旧契約（timeout = defeat）は live label として使用しない。
+
+- [ ] **timeout**: When 30 seconds elapse with enemies remaining, sortie transitions to `timeout` status (neutral terminal, not defeat)
+- [ ] **Timeout result**: `result.outcome === "timeout"` and `result.endReason === "timeout"`
+- [ ] **Timeout HUD/overlay**: HUD shows `戦闘終了`; Canvas overlay is neutral / non-DEFEAT
+
 ### Defeat Condition
 
 - [ ] **defeat (HP)**: When player HP reaches 0, sortie transitions to `defeat` status
-- [ ] **defeat (timeout)**: When 30 seconds elapse with enemies remaining, sortie transitions to `defeat` status
-- [ ] **Defeat screen/HUD**: UI updates to reflect `sortie.status === "defeat"` outcome
+- [ ] **Defeat screen/HUD**: HP-zero defeat UI reflects `sortie.status === "defeat"` outcome
 
 ## AC Verification Summary
 
@@ -386,6 +393,9 @@ environment:
 - artifact_mime_type: "video/mp4"
 - tested_commit: "f7d66c19d43da9475763637947359214220c605e"  # includes #732 merge a7d74a0f709103c7c5df2e806f80af5a533ad1af (sortie timeout as neutral terminal)
 - route: "https://squne121.github.io/loop-protocol/pr-743/"
+- route_provenance: "route は PR #743（#726 数値表示フォーマッタ修正, MERGED 2026-06-07）の Pages preview。pr-743 の差分は src/render/renderUtils.ts と src/ui/HudController.ts（HP 数値表示のみ）であり、SortieSystem の timeout 遷移・result.outcome/endReason・Canvas overlay には非影響。撮影時の app_under_test.commit は tested_commit f7d66c1 と一致する。"
+- artifact_type: github_user_attachment  # GitHub Actions artifact（既定 90 日 retention）ではなく issue/PR への user attachment（永続）
+- artifact_persistence: "一次証跡は永続的な GitHub user-attachment 動画（sha256/bytes 記録済み）。route の preview URL は PR close で失効しうるが、動画ファイルと sha256 による検証可能性は保たれる。"
 - browser: "Chrome 149.0.7827.54 / Windows"
 - viewport: "1920x911 (inner)"
 - device_pixel_ratio: 1
