@@ -242,6 +242,50 @@ preflight が pass した場合のみ実装フローを継続する。
 
 これらは「動作検証が形骸化する構造的欠陥」であり、別 Issue でのスコープ分割または contract の再確認が必要。
 
+## Allowed Paths Gate（AC1, AC2, AC3）
+
+### ALLOWED_PATHS_GATE_RESULT_V1（AC1）
+
+worker が実装前に contract snapshot から Allowed Paths を固定し、実装終了時に final diff audit を行って stale snapshot を fail-closed に検知する。以下の構造で gate 結果を生成する:
+
+```yaml
+ALLOWED_PATHS_GATE_RESULT_V1:
+  status: ok | fail_closed | stale_snapshot | indeterminate
+  # status 説明:
+  #   ok: 実装中の全変更が contract の Allowed Paths 内に収まる（pass）
+  #   fail_closed: 変更が Allowed Paths 外に検出（差し戻し）
+  #   stale_snapshot: contract snapshot が古い、または判定根拠が不一致（final audit 時）
+  #   indeterminate: 判定が確定できない、機械可読 contract 欠落（人間判断へ escalate）
+  allowed_paths: [<list of globs from contract>]   # contract から固定（worktree 着手前に snapshot）
+  manifest_snapshot_sha256: "<合計ハッシュ>"          # 実装前に生成したファイルマニフェスト
+  final_diff_paths: [<list of files changed by git diff>]  # PR boundary audit 時に抽出
+  compliance_detail: "<optional explanation>"
+  reason: null | <machine-readable reason>
+```
+
+### advisory としての allowed_paths_compliance（AC2）
+
+`IMPLEMENT_RESULT_V1.allowed_paths_compliance: true | false` は worker の self-report であり、**canonical 判定根拠ではない**。canonical 判定は `ALLOWED_PATHS_GATE_RESULT_V1.status` の値のみを参照する。
+
+- `allowed_paths_compliance` は参考情報（advisory）に留める
+- `ALLOWED_PATHS_GATE_RESULT_V1.status: ok` に対して `allowed_paths_compliance: false` であっても、status が canonical に route される
+- `impl-review-loop` / control-plane は raw diff を canonical 判定根拠にしない（機械可読 gate result だけを参照）
+
+### PreToolUse ベースの worker-side path guard（AC3）
+
+implementation-worker は Edit / Write / MultiEdit ツール呼び出し前に、Allowed Paths に対する PreToolUse 検査を実施する:
+
+```
+PreToolUse hook: tool in (Edit, Write, MultiEdit)
+  → check target path against Allowed Paths manifest
+  → path matches manifest glob → allow
+  → path NOT in manifest → DENY（exit nonzero, emit human escalation）
+```
+
+- Bash 経由の `git add / git rm / cp / mv / rm` コマンドは allowlist（`.claude/skills/implement-issue/**` に許可リスト記載）またはプロセス境界で fail-closed にする
+- Bash 直接実行による `/tmp`、`/home/` 等への無制約書き込みはプロセス境界で検知できないため、contract 着手前に `LD_PRELOAD` / `ptrace` 等の infrastructure 対応を検討する場合は follow-up Issue へ分割する（本 Issue 範囲外）
+- 本 Issue では Edit / Write / MultiEdit PreToolUse path guard を worker-side に実装し、Bash allowlist / fail-closed は `.claude/skills/implement-issue/SKILL.md` で明記する
+
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。

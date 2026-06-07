@@ -408,3 +408,52 @@ class TestV2DoesNotRequireContractSnapshotUrlForRepairModes:
         ), (
             "V2 repair modes must explicitly state they do not require issue-contract-review preflight"
         )
+
+
+class TestAllowedPathsGateResultV1Contract:
+    """AC6 — ALLOWED_PATHS_GATE_RESULT_V1 contract is fixed in regression tests."""
+
+    def test_allowed_paths_gate_result_v1_mentioned_in_agent(self):
+        """ALLOWED_PATHS_GATE_RESULT_V1 marker exists in agent file."""
+        matches = rg("ALLOWED_PATHS_GATE_RESULT_V1", AGENT_FILE)
+        assert len(matches) > 0, (
+            "ALLOWED_PATHS_GATE_RESULT_V1 not found in agent file"
+        )
+
+    def test_allowed_paths_gate_result_v1_in_skill(self):
+        """ALLOWED_PATHS_GATE_RESULT_V1 contract is referenced in SKILL.md."""
+        matches = rg("ALLOWED_PATHS_GATE_RESULT_V1", SKILL_FILE)
+        assert len(matches) > 0, (
+            "ALLOWED_PATHS_GATE_RESULT_V1 not found in SKILL.md"
+        )
+
+    def test_allowed_paths_gate_status_field_documented(self):
+        """ALLOWED_PATHS_GATE_RESULT_V1.status enum is documented."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "ALLOWED_PATHS_GATE_RESULT_V1:")
+        # Status enum must include at least ok and fail_closed
+        assert "ok" in section, "status: ok not documented in ALLOWED_PATHS_GATE_RESULT_V1"
+        assert "fail_closed" in section, "status: fail_closed not documented"
+
+    def test_manifest_snapshot_sha256_documented(self):
+        """manifest_snapshot_sha256 field is documented."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "ALLOWED_PATHS_GATE_RESULT_V1:")
+        assert "manifest_snapshot_sha256" in section or "manifest" in section.lower(), (
+            "manifest snapshot field not documented"
+        )
+
+    def test_allowed_paths_compliance_is_advisory(self):
+        """allowed_paths_compliance is documented as advisory, not canonical."""
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        assert "advisory" in content.lower(), (
+            "advisory status of allowed_paths_compliance not documented"
+        )
+        # Ensure it explicitly says self-report / not canonical
+        assert (
+            "self-report" in content.lower()
+            or "canonical 判定根拠" in content
+            or "reference" in content.lower()
+        ), (
+            "canonical vs advisory distinction for allowed_paths_compliance not clear"
+        )

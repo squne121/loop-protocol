@@ -130,6 +130,66 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - 全 SubAgent 出力は構造化フォーマット（YAML / KEY=VALUE）で受け取り、散文サマリで上書きしない
 - **issue-contract-review 自動実行しない（fail-only gate）**: `status: go` が存在しない場合に `issue-contract-review` を自動実行する旧設計（auto run deprecated）は #564 以降廃止。`missing_contract_go` 判定時は人間に `issue-contract-review` 実行を依頼して停止する（#564 整合）。
 
+## ALLOWED_PATHS_GATE_RESULT_V1 routing（AC5）
+
+Step 1 (Implementation) で worker が emit する `ALLOWED_PATHS_GATE_RESULT_V1` の status field を canonical に route し、raw diff comparison を blocking 判定根拠にしない:
+
+- `ALLOWED_PATHS_GATE_RESULT_V1.status: ok` → 続行（Allowed Paths 内確認）
+- `ALLOWED_PATHS_GATE_RESULT_V1.status: fail_closed` → Step 1 再実行（worker 側で逸脱を修正）
+- `ALLOWED_PATHS_GATE_RESULT_V1.status: stale_snapshot` → human_escalation（contract snapshot 再確認が必要）
+- `ALLOWED_PATHS_GATE_RESULT_V1.status: indeterminate` → human_escalation（機械可読 decision 確定不能）
+
+**重要**: control-plane は raw git diff を参照して「このファイルは Allowed Paths 外では？」などの人間判断を入れない。judgment 根拠は exclusively `ALLOWED_PATHS_GATE_RESULT_V1.status` に限定する。worker の `IMPLEMENT_RESULT_V1.allowed_paths_compliance` は参考情報（advisory）であり、route 判定に使用しない。
+
+## Overblocking risk review（AC7）
+
+hook handler / gate evaluator が blocking decision を出すべき対象と advisory に留めるべき対象を区分する。**正当な AI 作業を過剰に阻止する overblocking は、fail-closed 強化と同じくらい危険である**:
+
+### Hard Invariant — blocking decision を返してよい条件
+
+以下の hard invariant に該当する場合のみ blocking（Stop / SubagentStop / error exit）を返す:
+
+1. **Allowed Paths 逸脱**: Edit / Write / MultiEdit で Allowed Paths 外への変更を検出 → `ALLOWED_PATHS_GATE_RESULT_V1.status: fail_closed` で step を block
+2. **Secret / sensitive file**: `.env`、`.git`、credential、private key、API key containing の変更を検出 → `status: blocked` + human_escalation
+3. **Destructive command**: `git reset --hard`, `git push --force`, `rm -rf /`, `dd if=/dev/zero` 等の危険操作を検出 → exit nonzero + detailed reason
+4. **Routing-critical machine-readable contract 欠落**: `ALLOWED_PATHS_GATE_RESULT_V1.status` が indeterminate で、判定が確定できない → human_escalation
+
+### Advisory に留めるべき条件（blocking してはいけない）
+
+以下の条件では block ではなく advisory / review finding / comment に留める。**正当な AI 作業として認可する**:
+
+- 文体・言語・表現が日本語ルール（`.claude/rules/project-constitution.md`）に不一致
+- PR body の format が慣例と異なる（構成、見出し順序、行折り返し、空行）
+- コミットメッセージが Conventional Commits でない、またはスコープ・型が慣例と異なる
+- レビューコメント / docstring / log メッセージの説明品質が低い
+- テスト名が GIVEN/WHEN/THEN 形式でない
+- 報告フォーマット（YAML / JSON の キー順序）が異なる
+- 参考 URL の引用形式、リスト記号の統一性
+- 以上の「スタイル / 報告形式」を理由に実装を止めてはならない（レビュー後に author が修正判断をする権利がある）
+
+### 区分不可能な case 対応
+
+blocking と advisory の境界が曖昧な case が判明した場合:
+- 即座に決定を下さず人間に escalate（human_judgment_required）
+- 判定基準を `.claude/rules/project-constitution.md` または `.claude/skills/impl-review-loop/references/overblocking-risk-matrix.md` へ追加して deterministic に固定
+
+## Loop-prevention invariant（AC9）
+
+Stop / SubagentStop / TeammateIdle hook は表現・言語・報告品質の不足を理由に継続実行を強制しない。同時に、block する場合は理由が machine-readable で、次 action が有限・一意かつ human_escalation path を持つ:
+
+- Stop / SubagentStop：自動 block による無限停止を防ぐ
+  - 文体 / 言語エラーを理由に Stop してはいけない（代わり review finding に留める）
+  - block する場合：`reason` field は machine-readable enum（例: `Allowed_Paths_violation`）+ human-readable explanation
+  - 次 action：明確（例: "worker rerun + edit path.txt"）、有限（"再試行の上限回数"）、escalation path あり（"3 回目失敗時 human_judgment へ"）
+  
+- SubagentStop：worker から control-plane への transition
+  - advisory feedback（文体指摘等）を理由に SubagentStop してはいけない
+  - fail-closed decision は structured RESULT スキーマ（`IMPLEMENT_RESULT_V1`, `ALLOWED_PATHS_GATE_RESULT_V1` 等）で emit
+  
+- TeammateIdle：agent team 文脈での teammate idling 決定
+  - 表現品質不足を理由に teammate を idle 化し協力を打ち切ってはいけない
+  - block 判定は hard invariant に限定し、fallback skill / escalation path を含める
+
 ## Related
 
 - `.claude/skills/implement-issue/SKILL.md` — Step 1 で使う実装手順

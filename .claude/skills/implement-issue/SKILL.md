@@ -64,6 +64,31 @@ cd "$WORKTREE"
 
 worktree 内で Edit / Write する際は **必ず worktree 内の絶対パス**を指定する。main の絶対パスを指定すると main のファイルが変更される事故が起きる。
 
+### 3.2. Allowed Paths snapshot の生成（AC4）
+
+contract-snapshot から Allowed Paths を抽出し、worktree 作業用の manifest を生成する。以降のすべての Edit / Write / MultiEdit はこの manifest に対して PreToolUse path guard で検査される:
+
+```bash
+# contract snapshot から Allowed Paths セクションを抽出
+ALLOWED_PATHS_MANIFEST="$WORKTREE/.allowed_paths_manifest.txt"
+
+# 例: contract snapshot JSON / YAML の Allowed Paths フィールドを parse して $ALLOWED_PATHS_MANIFEST に出力
+# （contract-review が出力形式を統一するため、ここでは決定論的 parse を想定）
+# 出力形式: 1行 1 glob pattern（例: ".claude/agents/**" "src/systems/**"）
+
+# manifest 完全性チェック
+if [ ! -s "$ALLOWED_PATHS_MANIFEST" ]; then
+  echo "ERROR: Allowed Paths manifest is empty or missing" >&2
+  exit 1
+fi
+
+# manifest hash を記録（final audit 用）
+MANIFEST_SHA256=$(cat "$ALLOWED_PATHS_MANIFEST" | sha256sum | awk '{print $1}')
+echo "$MANIFEST_SHA256" > "$WORKTREE/.manifest_hash.txt"
+```
+
+**重要**: Allowed Paths snapshot は worktree 着手後・実装前に**一度だけ生成**し、以降 Fix iteration でも再生成しない（stale snapshot risk を避けるため）。Fix iteration 時は前回の manifest を再利用する。
+
 ### 3.5. Runtime Verification Applicability の確認
 
 Issue 本文の `## Runtime Verification Applicability` を確認する。
@@ -124,6 +149,64 @@ EOF
 - Conventional Commits 風: `feat` / `fix` / `refactor` / `docs` / `chore` / `test`
 - `--no-verify` 禁止（Git Hooks をすり抜けない）
 - WIP コミットを push しない（push 前に rebase / squash で整理）
+
+### 6.5. PR boundary final audit（ALLOWED_PATHS_GATE_RESULT_V1）（AC4）
+
+push 前に final diff audit を行い、実装が Allowed Paths 内に留まっていることを fail-closed に検証する:
+
+```bash
+# Step 3.2 で生成した manifest を再読み込み
+ALLOWED_PATHS_MANIFEST="$WORKTREE/.allowed_paths_manifest.txt"
+MANIFEST_SHA256=$(cat "$WORKTREE/.manifest_hash.txt")
+
+# PR に含まれるすべての変更ファイルを抽出
+FINAL_CHANGED_FILES=$(git diff main..HEAD --name-only | sort)
+
+# 各ファイルを Allowed Paths manifest に照合
+VIOLATIONS=""
+while read -r file; do
+  matched=false
+  while read -r pattern; do
+    # glob pattern matching（git ls-files --others や find を使う）
+    if [[ "$file" == $pattern ]]; then
+      matched=true
+      break
+    fi
+  done < "$ALLOWED_PATHS_MANIFEST"
+  
+  if [ "$matched" = false ]; then
+    VIOLATIONS="$VIOLATIONS\n  - $file"
+  fi
+done <<< "$FINAL_CHANGED_FILES"
+
+if [ -n "$VIOLATIONS" ]; then
+  echo "ERROR: Files outside Allowed Paths detected:" >&2
+  echo -e "$VIOLATIONS" >&2
+  # ALLOWED_PATHS_GATE_RESULT_V1 を emit
+  cat > "$WORKTREE/.gate_result.json" <<EOF
+{
+  "status": "fail_closed",
+  "reason": "changes_outside_allowed_paths",
+  "violations": [$(echo -e "$VIOLATIONS" | sed 's/^  - //' | sed 's/^/"/g' | sed 's/$/"/' | paste -sd, -)]
+}
+EOF
+  exit 1
+fi
+
+# 成功時
+cat > "$WORKTREE/.gate_result.json" <<EOF
+{
+  "status": "ok",
+  "manifest_snapshot_sha256": "$MANIFEST_SHA256",
+  "final_diff_paths": [$(echo "$FINAL_CHANGED_FILES" | sed 's/^/"/g' | sed 's/$/"/' | paste -sd, -)]
+}
+EOF
+```
+
+**重要**: 
+- stale snapshot（manifest が実装前と異なる場合）を検知したら `status: stale_snapshot` を返す
+- 機械可読 decision が確定できない場合（manifest 生成 failed 等）は `status: indeterminate` を返して人間判断へ escalate
+- fail_closed 判定後は push を実行しない（upstream への不完全 commit 防止）
 
 ### 7. push & PR 起票（`open-pr` skill に委譲）
 
