@@ -186,11 +186,50 @@ jobs:
       - run: uv run --locked pytest .claude/skills/create-issue/tests/
       - run: uv run --locked pytest .claude/skills/create-issue/scripts/tests/
       - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_guard_delta_mode.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_guard_shadow_mode.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_replay_scenarios.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_shadow_log.py -q
+      - name: Run Claude hook tests
+        run: uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
+      - name: Check unregistered hook tests
+        run: |
+          python3 - <<PY
+          import subprocess
+          from pathlib import Path
+
+          allowed_unregistered = {
+              ".claude/hooks/tests/test_secret_boundary_contract.py",
+          }
+          all_hook_tests = {
+              path.as_posix()
+              for path in Path(".claude/hooks/tests").glob("test_*.py")
+              if path.as_posix() not in allowed_unregistered
+          }
+
+          result = subprocess.run(
+              [
+                  "uv",
+                  "run",
+                  "--locked",
+                  "pytest",
+                  "--collect-only",
+                  "-q",
+                  ".claude/hooks/tests/",
+                  "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+              ],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+
+          collected = set()
+          for line in result.stdout.splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              collected.add(line.split("::", 1)[0])
+
+          missing = sorted(all_hook_tests - collected)
+          if missing:
+              raise SystemExit("Unregistered hook tests in CI:\n" + "\n".join(missing))
+          PY
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/issue-contract-review/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
@@ -217,11 +256,8 @@ jobs:
               .claude/skills/create-issue/tests/ \
               .claude/skills/create-issue/scripts/tests/ \
               .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
-              .claude/hooks/tests/test_session_recording_policy_guard.py \
-              .claude/hooks/tests/test_guard_delta_mode.py \
-              .claude/hooks/tests/test_guard_shadow_mode.py \
-              .claude/hooks/tests/test_replay_scenarios.py \
-              .claude/hooks/tests/test_shadow_log.py \
+              .claude/hooks/tests/ \
+              --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
               .claude/skills/issue-contract-review/scripts/tests/ \
               .claude/skills/issue-contract-review/tests/ \
               .claude/skills/pr-review-judge/scripts/tests/ \
