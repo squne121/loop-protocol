@@ -33,38 +33,34 @@ describe('LocalGameStorage', () => {
     })
   })
 
-  it('GIVEN invalid numeric values WHEN a v1 snapshot is parsed THEN resources clamp and other fields fall back', () => {
-    expect(
-      parseSnapshot(
-        JSON.stringify({
-          schemaVersion: 1,
-          resources: 10_000_000,
-          weaponPower: 0,
-          playerMaxHp: Number.NaN,
-        }),
-      ),
-    ).toEqual({
+  it('GIVEN a legacy snapshot missing required fields WHEN it is parsed THEN it falls back to null', () => {
+    expect(parseSnapshot(JSON.stringify({ resources: 5, weaponPower: 2 }))).toBeNull()
+    expect(parseSnapshot(JSON.stringify({}))).toBeNull()
+  })
+
+  it('GIVEN JSON.stringify converted non-finite numbers to null WHEN a v1 snapshot is parsed THEN fields fall back', () => {
+    const raw = JSON.stringify({
       schemaVersion: 1,
-      resources: 9_999_999,
-      weaponPower: 1,
-      playerMaxHp: 8,
+      resources: Number.NaN,
+      weaponPower: Number.POSITIVE_INFINITY,
+      playerMaxHp: Number.NaN,
     })
 
-    expect(
-      parseSnapshot(
-        JSON.stringify({
-          schemaVersion: 1,
-          resources: Number.NaN,
-          weaponPower: Number.POSITIVE_INFINITY,
-          playerMaxHp: 1.5,
-        }),
-      ),
-    ).toEqual({
+    expect(raw).toContain('"resources":null')
+    expect(raw).toContain('"weaponPower":null')
+    expect(raw).toContain('"playerMaxHp":null')
+    expect(parseSnapshot(raw)).toEqual({
       schemaVersion: 1,
       resources: 0,
       weaponPower: 1,
       playerMaxHp: 8,
     })
+  })
+
+  it('GIVEN syntactically invalid non-finite JSON tokens WHEN parsed THEN it falls back to null', () => {
+    expect(
+      parseSnapshot('{"schemaVersion":1,"resources":NaN,"weaponPower":1,"playerMaxHp":8}'),
+    ).toBeNull()
   })
 
   it('GIVEN a v1 snapshot missing required fields WHEN it is parsed THEN it falls back to null', () => {
@@ -94,6 +90,13 @@ describe('LocalGameStorage', () => {
 
   it('GIVEN corrupted JSON WHEN it is parsed THEN it falls back to null', () => {
     expect(parseSnapshot('{not-json')).toBeNull()
+  })
+
+  it('GIVEN top-level non-object JSON values WHEN parsed THEN they fall back to null', () => {
+    expect(parseSnapshot('null')).toBeNull()
+    expect(parseSnapshot('[]')).toBeNull()
+    expect(parseSnapshot('42')).toBeNull()
+    expect(parseSnapshot('"snapshot"')).toBeNull()
   })
 
   it('GIVEN a storage adapter WHEN it saves and loads a v1 snapshot THEN the data round-trips with schemaVersion', () => {

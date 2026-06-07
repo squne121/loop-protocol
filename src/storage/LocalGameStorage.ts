@@ -21,6 +21,14 @@ function hasOwn(record: SnapshotRecord, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key)
 }
 
+function hasSnapshotFields(snapshot: SnapshotRecord): boolean {
+  return (
+    hasOwn(snapshot, 'resources') &&
+    hasOwn(snapshot, 'weaponPower') &&
+    hasOwn(snapshot, 'playerMaxHp')
+  )
+}
+
 function normalizeResources(value: unknown): number {
   if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
     return Math.min(value, RESOURCE_CAP)
@@ -45,7 +53,10 @@ function normalizePlayerMaxHp(value: unknown): number {
   return DEFAULT_PLAYER_MAX_HP
 }
 
-function migrateLegacySnapshot(snapshot: SnapshotRecord): GameSnapshot {
+function migrateLegacySnapshot(snapshot: SnapshotRecord): GameSnapshot | null {
+  if (!hasSnapshotFields(snapshot)) {
+    return null
+  }
   return {
     schemaVersion: gameSnapshotSchemaVersion,
     resources: normalizeResources(snapshot.resources),
@@ -55,7 +66,7 @@ function migrateLegacySnapshot(snapshot: SnapshotRecord): GameSnapshot {
 }
 
 function parseVersionedSnapshot(snapshot: SnapshotRecord): GameSnapshot | null {
-  if (!hasOwn(snapshot, 'resources') || !hasOwn(snapshot, 'weaponPower') || !hasOwn(snapshot, 'playerMaxHp')) {
+  if (!hasSnapshotFields(snapshot)) {
     return null
   }
 
