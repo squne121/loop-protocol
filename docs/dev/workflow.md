@@ -206,6 +206,12 @@ implementation_triage_profile:
   - この判定には DoR 準拠・VC preflight・GitHub native dependency または `Depends on #N` で表現された blocker / dependency の全 close・human escalation 非該当の確認を含む（詳細は `issue-contract-review` skill 参照）
 - `state/needs-human` 等の human escalation 条件が残っていないこと
 
+### Codex custom-agent dispatch guardrail
+
+- Codex CLI では `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent に委譲する
+- repo-side deterministic guardrail の正本は `.codex/agents/*.toml`、`.codex/hooks.json`、dispatch validator、`SUBAGENT_LAUNCH_LEDGER_V1` fixture 群とする
+- live spawn 実証は別スコープの `#601` に deferred し、本 workflow では evidence 不足時に fail-closed する repo-side 監査を成功条件にする
+
 ### human_escalation 後の Issue 本文変更と contract review 再実行
 
 `human_escalation` で停止した後、Issue 本文を **1 文字でも変更した場合**は prior contract-review result が stale となる。

@@ -1,0 +1,34 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "worker",
+  "fixture_expectation": {
+    "status": "fail",
+    "error_codes": [
+      "root_thread_data_plane_execution_observed",
+      "subagent_launch_evidence_missing"
+    ]
+  },
+  "codex_binary_status": "available",
+  "hook_state": "enabled",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [],
+  "root_thread_actions": [
+    {
+      "kind": "test_execution",
+      "command": "rtk run uv run --locked pytest .claude/hooks/tests/test_secret_boundary_contract.py"
+    },
+    {
+      "kind": "file_edit",
+      "command": "apply_patch .github/workflows/ci.yml"
+    },
+    {
+      "kind": "git_commit",
+      "command": "rtk git commit -m \"test: hooks tests の CI 取りこぼしを防ぐ (#682)\""
+    },
+    {
+      "kind": "git_push",
+      "command": "rtk git push -u origin worktree-issue-682-ci-discovery-contract"
+    }
+  ]
+}

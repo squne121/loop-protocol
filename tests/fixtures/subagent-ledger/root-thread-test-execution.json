@@ -1,0 +1,33 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "codex_hook_pipeline",
+  "fixture_expectation": {
+    "status": "fail",
+    "error_codes": [
+      "root_thread_data_plane_execution_observed"
+    ]
+  },
+  "codex_binary_status": "available",
+  "hook_state": "enabled",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [
+    {
+      "agent_name": "implementation-worker",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "evt-impl-001",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-rtk"
+      }
+    }
+  ],
+  "root_thread_actions": [
+    {
+      "kind": "test_execution",
+      "command": "rtk run uv run --locked pytest .claude/hooks/tests"
+    }
+  ]
+}

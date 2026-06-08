@@ -1,0 +1,16 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "worker",
+  "fixture_expectation": {
+    "status": "fail",
+    "error_codes": [
+      "subagent_launch_evidence_missing"
+    ]
+  },
+  "codex_binary_status": "available",
+  "hook_state": "enabled",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [],
+  "root_thread_actions": []
+}

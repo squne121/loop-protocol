@@ -1,0 +1,48 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "codex_hook_pipeline",
+  "codex_binary_status": "available",
+  "fixture_expectation": {
+    "status": "pass",
+    "error_codes": []
+  },
+  "hook_state": "enabled",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [
+    {
+      "agent_name": "implementation-worker",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "evt-impl-001",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-rtk"
+      }
+    },
+    {
+      "agent_name": "test-runner",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "evt-test-001",
+      "runtime": {
+        "model": "gpt-5.4-mini",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-readonly"
+      }
+    },
+    {
+      "agent_name": "pr-reviewer",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "evt-review-001",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-readonly"
+      }
+    }
+  ],
+  "root_thread_actions": []
+}

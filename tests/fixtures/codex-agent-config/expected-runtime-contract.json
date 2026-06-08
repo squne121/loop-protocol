@@ -1,0 +1,54 @@
+{
+  "required_agents": {
+    "implementation-worker": {
+      "path": ".codex/agents/implementation-worker.toml",
+      "claude_agent_path": ".claude/agents/implementation-worker.md",
+      "model": "gpt-5.4",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-rtk",
+      "runtime_dependency_status": "claude_skill_required",
+      "runtime_followup_route": "implement-issue"
+    },
+    "test-runner": {
+      "path": ".codex/agents/test-runner.toml",
+      "claude_agent_path": ".claude/agents/test-runner.md",
+      "model": "gpt-5.4-mini",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none"
+    },
+    "pr-reviewer": {
+      "path": ".codex/agents/pr-reviewer.toml",
+      "claude_agent_path": ".claude/agents/pr-reviewer.md",
+      "model": "gpt-5.4",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "claude_skill_required",
+      "runtime_followup_route": "pr-review-judge"
+    },
+    "post-merge-cleanup-worker": {
+      "path": ".codex/agents/post-merge-cleanup-worker.toml",
+      "claude_agent_path": ".claude/agents/post-merge-cleanup-worker.md",
+      "model": "gpt-5.4-mini",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-rtk",
+      "runtime_dependency_status": "claude_skill_required",
+      "runtime_followup_route": "post-merge-cleanup"
+    }
+  },
+  "required_instruction_tokens": [
+    "ROLE",
+    "INPUT_CONTRACT",
+    "OUTPUT_CONTRACT",
+    "EXECUTION_POLICY",
+    "RUNTIME",
+    "FAIL_CLOSED",
+    "Known limitation"
+  ],
+  "required_hook_events": [
+    "SubagentStart",
+    "PreToolUse"
+  ],
+  "required_hook_command_fragment": "scripts/check-codex-agents.mjs"
+}
