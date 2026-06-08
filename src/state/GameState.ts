@@ -76,6 +76,13 @@ export interface ProgressState {
   weaponPower: number
 }
 
+export type RewardApplicationId = string
+
+export interface RewardClaimState {
+  /** Runtime-only ledger for exactly-once reward application. Not persisted in GameSnapshot. */
+  claimedApplicationIds: Record<RewardApplicationId, true>
+}
+
 export interface TelemetryState {
   status: string
   lastCommandSummary: string
@@ -169,6 +176,7 @@ export interface GameState {
   enemies: EnemyState[]
   nextEnemyId: number
   progress: ProgressState
+  rewardClaims: RewardClaimState
   telemetry: TelemetryState
   /** Sortie state machine (AC1). Managed by SortieSystem. */
   sortie: SortieState
@@ -215,6 +223,9 @@ export function createInitialGameState(
       stageLabel: 'MVP Sortie',
       resources: snapshot.resources ?? 0,
       weaponPower: snapshot.weaponPower ?? 1,
+    },
+    rewardClaims: {
+      claimedApplicationIds: {},
     },
     projectiles: [],
     nextProjectileId: 1,

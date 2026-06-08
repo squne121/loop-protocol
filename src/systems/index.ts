@@ -6,3 +6,5 @@ export * from './SimulationLoop'
 export * from './EnemySpawnSystem'
 export * from './EnemyAISystem'
 export * from './SortieSystem'
+
+export * from './RewardSystem'
