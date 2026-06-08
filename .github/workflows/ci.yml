@@ -261,28 +261,50 @@ jobs:
             .claude/hooks/tests/ \
             --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
             > ci_test_selection_artifacts/hook_tests_collect_only.txt
-          python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py \
-            --output ci_test_selection_artifacts/ci_test_selection_v1.json \
-            --pytest-args \
-              .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
-              .claude/skills/edit-issue/tests/test_guard_issue_body.py \
-              .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py \
-              .claude/skills/create-issue/tests/ \
-              .claude/skills/create-issue/scripts/tests/ \
-              .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
-              .claude/hooks/tests/ \
-              --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
-              .claude/skills/issue-contract-review/scripts/tests/ \
-              .claude/skills/issue-contract-review/tests/ \
-              .claude/skills/pr-review-judge/scripts/tests/ \
-              .claude/skills/open-pr/scripts/tests/ \
-              .claude/skills/impl-review-loop/tests/ \
-              .claude/skills/review-issue/tests/ \
-              .claude/skills/issue-refinement-loop/tests/ \
-            --pr-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --merge-sha "${{ github.sha }}" \
-            --workflow ci --job python-test \
-            --ci-run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python3 - <<'PY'
+          import argparse
+          import importlib.util
+          import pathlib
+          import sys
+
+          script_path = pathlib.Path(
+              ".claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "generate_ci_test_selection_artifact", script_path
+          )
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          args = argparse.Namespace(
+              output="ci_test_selection_artifacts/ci_test_selection_v1.json",
+              pytest_args=[
+                  ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
+                  ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
+                  ".claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py",
+                  ".claude/skills/create-issue/tests/",
+                  ".claude/skills/create-issue/scripts/tests/",
+                  ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
+                  ".claude/hooks/tests/",
+                  "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+                  ".claude/skills/issue-contract-review/scripts/tests/",
+                  ".claude/skills/issue-contract-review/tests/",
+                  ".claude/skills/pr-review-judge/scripts/tests/",
+                  ".claude/skills/open-pr/scripts/tests/",
+                  ".claude/skills/impl-review-loop/tests/",
+                  ".claude/skills/review-issue/tests/",
+                  ".claude/skills/issue-refinement-loop/tests/",
+              ],
+              pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
+              checked_out_sha=None,
+              merge_sha="${{ github.sha }}",
+              workflow="ci",
+              job="python-test",
+              ci_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+          )
+          sys.exit(module.generate_artifact(args))
+          PY
       - uses: actions/upload-artifact@v6
         with:
           name: ci_test_selection
