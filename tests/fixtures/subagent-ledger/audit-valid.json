@@ -1,0 +1,60 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "codex_hook_pipeline",
+  "generated_at": "2026-06-09T03:21:00Z",
+  "ledger_path": "artifacts/codex/subagent-launch-ledger.json",
+  "codex_binary_status": "available",
+  "coverage_scope": {
+    "subagent_start_event_recorded": true,
+    "supported_pretooluse_paths": ["Bash", "Edit", "Write", "apply_patch"],
+    "unsupported_paths_fail_closed": true,
+    "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
+  },
+  "launches": [
+    {
+      "agent_name": "implementation-worker",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "session-1:impl-start",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-rtk"
+      }
+    },
+    {
+      "agent_name": "test-runner",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "session-1:test-start",
+      "runtime": {
+        "model": "gpt-5.4-mini",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-readonly"
+      }
+    },
+    {
+      "agent_name": "pr-reviewer",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "session-1:review-start",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-readonly"
+      }
+    },
+    {
+      "agent_name": "post-merge-cleanup-worker",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "session-1:cleanup-start",
+      "runtime": {
+        "model": "gpt-5.4-mini",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-rtk"
+      }
+    }
+  ],
+  "root_thread_actions": []
+}

@@ -2,6 +2,8 @@
 
 `implementation-worker` SubAgent に委譲し、`implement-issue` skill の手順を実行させる。
 
+Codex CLI: spawn the custom agent named implementation-worker for this step; the root thread must not edit files, run tests, commit, push, or make the review judgment directly.
+
 ## 委譲呼び出し
 
 Agent ツールで以下を呼ぶ:

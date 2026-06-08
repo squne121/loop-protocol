@@ -1,0 +1,34 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "codex_hook_pipeline",
+  "coverage_scope": {
+    "subagent_start_event_recorded": true,
+    "supported_pretooluse_paths": ["Bash", "Edit", "Write", "apply_patch"],
+    "unsupported_paths_fail_closed": true,
+    "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
+  },
+  "codex_binary_status": "available",
+  "fixture_expectation": {
+    "status": "fail",
+    "error_codes": [
+      "hook_evidence_untrusted_or_missing"
+    ]
+  },
+  "hook_state": "skipped",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [
+    {
+      "agent_name": "implementation-worker",
+      "event_type": "SubagentStart",
+      "evidence_source": "event_derived",
+      "event_fingerprint": "evt-impl-001",
+      "runtime": {
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
+        "default_permissions": "loop-protocol-rtk"
+      }
+    }
+  ],
+  "root_thread_actions": []
+}
