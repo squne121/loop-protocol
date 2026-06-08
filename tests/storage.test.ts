@@ -210,25 +210,73 @@ describe('LocalGameStorage', () => {
     })
   })
 
-  it('GIVEN a storage adapter whose accessor probe throws WHEN created THEN load and save report storage unavailable', () => {
+  it('GIVEN localStorage accessor throws WHEN the default storage is resolved THEN load and save report storage unavailable with errorName', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new DOMException('blocked', 'SecurityError')
+      },
+    })
+
+    try {
+      const gameStorage = createLocalGameStorage('test-save')
+
+      expect(gameStorage.load()).toEqual({
+        ok: false,
+        snapshot: null,
+        reason: 'storage-unavailable',
+        errorName: 'SecurityError',
+      })
+      expect(gameStorage.save({
+        schemaVersion: 1,
+        resources: 1,
+        weaponPower: 1,
+        playerMaxHp: 8,
+      })).toEqual({
+        ok: false,
+        reason: 'storage-unavailable',
+        errorName: 'SecurityError',
+      })
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(globalThis, 'localStorage', descriptor)
+      } else {
+        Reflect.deleteProperty(globalThis, 'localStorage')
+      }
+    }
+  })
+
+  it('GIVEN a storage adapter whose writes fail but reads work WHEN load is called THEN it still reads the stored snapshot', () => {
     const storage = {
+      value: serializeSnapshot({
+        schemaVersion: 1,
+        resources: 7,
+        weaponPower: 3,
+        playerMaxHp: 12,
+      }),
       getItem() {
-        return null
+        return this.value
       },
       setItem() {
         throw new DOMException('blocked', 'SecurityError')
       },
       removeItem() {
-        // unreachable because setItem throws first
+        // no-op
       },
     }
     const gameStorage = createLocalGameStorage('test-save', storage)
 
     expect(gameStorage.load()).toEqual({
-      ok: false,
-      snapshot: null,
-      reason: 'storage-unavailable',
-      errorName: 'SecurityError',
+      ok: true,
+      snapshot: {
+        schemaVersion: 1,
+        resources: 7,
+        weaponPower: 3,
+        playerMaxHp: 12,
+      },
+      reason: 'loaded',
     })
     expect(gameStorage.save({
       schemaVersion: 1,
@@ -237,7 +285,7 @@ describe('LocalGameStorage', () => {
       playerMaxHp: 8,
     })).toEqual({
       ok: false,
-      reason: 'storage-unavailable',
+      reason: 'write-error',
       errorName: 'SecurityError',
     })
   })
@@ -264,20 +312,16 @@ describe('LocalGameStorage', () => {
     })
   })
 
-  it('GIVEN setItem throws after a successful probe WHEN save is called THEN it reports write-error', () => {
-    let writes = 0
+  it('GIVEN setItem throws WHEN save is called THEN it reports write-error', () => {
     const storage = {
       getItem() {
         return null
       },
       setItem() {
-        writes += 1
-        if (writes > 1) {
-          throw new DOMException('quota', 'QuotaExceededError')
-        }
+        throw new DOMException('quota', 'QuotaExceededError')
       },
       removeItem() {
-        // probe succeeds
+        // no-op
       },
     }
     const gameStorage = createLocalGameStorage('test-save', storage)
@@ -291,6 +335,15 @@ describe('LocalGameStorage', () => {
       ok: false,
       reason: 'write-error',
       errorName: 'QuotaExceededError',
+    })
+  })
+
+  it('GIVEN an empty string in storage WHEN it is parsed THEN it reports corrupt JSON instead of empty storage', () => {
+    expect(parseSnapshot('')).toEqual({
+      ok: false,
+      snapshot: null,
+      reason: 'corrupt-json',
+      errorName: 'SyntaxError',
     })
   })
 })

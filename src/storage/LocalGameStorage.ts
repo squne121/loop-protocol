@@ -153,59 +153,40 @@ function getErrorName(error: unknown): string | undefined {
   return error instanceof Error ? error.name : undefined
 }
 
-function getDefaultStorage(): StorageAdapter | null {
+function getDefaultStorage(): { storage: StorageAdapter | null; error?: unknown } {
   try {
-    return globalThis.localStorage ?? null
-  } catch {
-    return null
-  }
-}
-
-function probeStorageAvailability(
-  storage: StorageAdapter | null,
-  storageKey: string,
-): { ok: true; storage: StorageAdapter } | { ok: false; error?: unknown } {
-  if (!storage) {
-    return { ok: false }
-  }
-
-  const probeKey = `${storageKey}.__probe__`
-
-  try {
-    storage.setItem(probeKey, '1')
-    storage.removeItem(probeKey)
-    return { ok: true, storage }
+    return { storage: globalThis.localStorage ?? null }
   } catch (error) {
-    return { ok: false, error }
+    return { storage: null, error }
   }
 }
 
 export function createLocalGameStorage(
   storageKey = defaultSaveKey,
-  storage: StorageAdapter | null = getDefaultStorage(),
+  storage: StorageAdapter | null | undefined = undefined,
 ): GameStorage {
-  const availability = probeStorageAvailability(storage, storageKey)
+  const resolvedStorage = storage === undefined ? getDefaultStorage() : { storage }
 
   return {
     load() {
-      if (!availability.ok) {
-        return loadFailureResult('storage-unavailable', availability.error)
+      if (!resolvedStorage.storage) {
+        return loadFailureResult('storage-unavailable', resolvedStorage.error)
       }
 
       try {
-        const raw = availability.storage.getItem(storageKey)
+        const raw = resolvedStorage.storage.getItem(storageKey)
         return parseSnapshot(raw)
       } catch (error) {
         return loadFailureResult('read-error', error)
       }
     },
     save(snapshot) {
-      if (!availability.ok) {
-        return saveFailureResult('storage-unavailable', availability.error)
+      if (!resolvedStorage.storage) {
+        return saveFailureResult('storage-unavailable', resolvedStorage.error)
       }
 
       try {
-        availability.storage.setItem(storageKey, serializeSnapshot(snapshot))
+        resolvedStorage.storage.setItem(storageKey, serializeSnapshot(snapshot))
         return { ok: true, reason: 'saved' }
       } catch (error) {
         return saveFailureResult('write-error', error)
@@ -219,7 +200,7 @@ export function serializeSnapshot(snapshot: GameSnapshot): string {
 }
 
 export function parseSnapshot(raw: string | null): LoadResult {
-  if (!raw) {
+  if (raw === null) {
     return emptySnapshotResult()
   }
 
