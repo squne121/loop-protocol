@@ -8,7 +8,11 @@ import {
   createInitialGameState,
   defaultSimulationConfig,
 } from './state'
-import { createLocalGameStorage } from './storage'
+import {
+  createLocalGameStorage,
+  type LoadResult,
+  type SaveResult,
+} from './storage'
 import {
   advanceSimulationLoop,
   clampPlayerToArena,
@@ -50,11 +54,18 @@ if (!canvas || !commandRail) {
 }
 
 const storage = createLocalGameStorage()
-let state = createInitialGameState(storage.load() ?? undefined)
+const loadResult = storage.load()
+if (!loadResult.ok) {
+  reportStorageFailure('load', loadResult)
+}
+let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefined : undefined)
 const renderer = createCanvasRenderer(canvas)
 const hud = createHudController(commandRail, {
   onQuickSave() {
-    storage.save(createGameSnapshot(state))
+    const saveResult = storage.save(createGameSnapshot(state))
+    if (!saveResult.ok) {
+      reportStorageFailure('save', saveResult)
+    }
   },
   onReset() {
     state = createInitialGameState()
@@ -124,6 +135,16 @@ function resizeArena(currentState: typeof state): void {
   currentState.arena.height = Math.round(width * 0.5625)
   // Re-clamp player after arena resize to prevent out-of-bounds position.
   clampPlayerToArena(currentState)
+}
+
+function reportStorageFailure(
+  operation: 'load' | 'save',
+  result: Extract<LoadResult | SaveResult, { ok: false }>,
+): void {
+  console.warn(`[storage] ${operation} failed`, {
+    reason: result.reason,
+    errorName: result.errorName,
+  })
 }
 
 // ---------------------------------------------------------------------------
