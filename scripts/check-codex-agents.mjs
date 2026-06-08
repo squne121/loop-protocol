@@ -14,6 +14,7 @@ const agentsDir = path.join(repoRoot, '.codex', 'agents');
 const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
 const rulesPath = path.join(repoRoot, '.codex', 'rules', 'default.rules');
+const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-ledger.json');
 
 // CODEX_BIN env override for environments without codex on PATH
 const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
@@ -70,6 +71,16 @@ const writeAgents = new Set([
   'issue-author',
   'post-merge-cleanup-worker',
   'review-issue',
+]);
+
+const supportedPreToolNames = ['Bash', 'apply_patch', 'Edit', 'Write'];
+const prohibitedRootActionKinds = new Set([
+  'file_edit',
+  'test_execution',
+  'git_commit',
+  'git_push',
+  'review_judgment',
+  'cleanup_git_mutation',
 ]);
 
 function readText(filePath) {
@@ -245,6 +256,44 @@ function validateHooksJson(hooksPath, failures) {
   assert(Array.isArray(parsed?.hooks?.SubagentStart), 'hooks.json: must have hooks.SubagentStart array', failures);
   assert(Array.isArray(parsed?.hooks?.PreToolUse), 'hooks.json: must have hooks.PreToolUse array', failures);
 
+  const subagentEntries = parsed?.hooks?.SubagentStart ?? [];
+  assert(subagentEntries.length === 1, 'hooks.json: SubagentStart must have exactly one entry', failures);
+  if (subagentEntries.length === 1) {
+    assert(subagentEntries[0]?.matcher === '.*', 'hooks.json: SubagentStart matcher must be .*', failures);
+    const subagentHooks = subagentEntries[0]?.hooks ?? [];
+    assert(subagentHooks.length === 1, 'hooks.json: SubagentStart must have exactly one command hook', failures);
+    assert(
+      subagentHooks[0]?.command?.includes('--hook-subagent-start'),
+      'hooks.json: SubagentStart command must include --hook-subagent-start',
+      failures,
+    );
+  }
+
+  const preToolEntries = parsed?.hooks?.PreToolUse ?? [];
+  const expectedMatchers = new Map([
+    ['^Bash$', 'Checking LOOP_PROTOCOL Bash guardrail'],
+    ['^(apply_patch|Edit|Write)$', 'Checking LOOP_PROTOCOL patch guardrail'],
+  ]);
+  for (const [matcher, expectedStatusMessage] of expectedMatchers) {
+    const entry = preToolEntries.find((candidate) => candidate?.matcher === matcher);
+    assert(Boolean(entry), `hooks.json: missing PreToolUse matcher ${matcher}`, failures);
+    if (!entry) {
+      continue;
+    }
+    const hooks = entry?.hooks ?? [];
+    assert(hooks.length === 1, `hooks.json: matcher ${matcher} must have exactly one hook`, failures);
+    assert(
+      hooks[0]?.command?.includes('--hook-pretool'),
+      `hooks.json: matcher ${matcher} command must include --hook-pretool`,
+      failures,
+    );
+    assert(
+      hooks[0]?.statusMessage === expectedStatusMessage,
+      `hooks.json: matcher ${matcher} statusMessage must be ${expectedStatusMessage}`,
+      failures,
+    );
+  }
+
   const allHookCommands = [];
   for (const eventKey of ['SubagentStart', 'PreToolUse']) {
     const entries = parsed?.hooks?.[eventKey] ?? [];
@@ -272,22 +321,6 @@ function validateHooksJson(hooksPath, failures) {
   assert(
     joinedCommands.includes('rtk pnpm exec node'),
     'hooks.json: hook command must invoke validator through rtk pnpm exec node',
-    failures,
-  );
-
-  // Structural check: PreToolUse must have an entry matching apply_patch|Edit|Write
-  const preToolMatchers = (parsed?.hooks?.PreToolUse ?? []).map((e) => e?.matcher ?? '');
-  assert(
-    preToolMatchers.some((m) => m.includes('apply_patch') || m.includes('Edit') || m.includes('Write')),
-    'hooks.json: PreToolUse must have a matcher covering apply_patch, Edit, and Write tools',
-    failures,
-  );
-
-  // Structural check: SubagentStart must have at least one catch-all or broad matcher
-  const subagentMatchers = (parsed?.hooks?.SubagentStart ?? []).map((e) => e?.matcher ?? '');
-  assert(
-    subagentMatchers.length > 0,
-    'hooks.json: SubagentStart must have at least one hook entry',
     failures,
   );
 }
@@ -473,6 +506,143 @@ function parseHookInput() {
   }
 }
 
+function ensureLedgerDirectory() {
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+}
+
+function defaultCoverageScope() {
+  return {
+    subagent_start_event_recorded: true,
+    supported_pretooluse_paths: supportedPreToolNames,
+    unsupported_paths_fail_closed: true,
+    scope_note: 'This ledger records event-derived SubagentStart launches and supported PreToolUse paths only.',
+  };
+}
+
+function loadLedger() {
+  if (!fs.existsSync(ledgerPath)) {
+    return {
+      ledger_schema: 'SUBAGENT_LAUNCH_LEDGER_V1',
+      generated_by: 'codex_hook_pipeline',
+      generated_at: new Date().toISOString(),
+      ledger_path: path.relative(repoRoot, ledgerPath),
+      codex_binary_status: 'available',
+      coverage_scope: defaultCoverageScope(),
+      launches: [],
+      root_thread_actions: [],
+    };
+  }
+  try {
+    return JSON.parse(readText(ledgerPath));
+  } catch {
+    return {
+      ledger_schema: 'SUBAGENT_LAUNCH_LEDGER_V1',
+      generated_by: 'codex_hook_pipeline',
+      generated_at: new Date().toISOString(),
+      ledger_path: path.relative(repoRoot, ledgerPath),
+      codex_binary_status: 'available',
+      coverage_scope: defaultCoverageScope(),
+      launches: [],
+      root_thread_actions: [],
+    };
+  }
+}
+
+function saveLedger(ledger) {
+  ensureLedgerDirectory();
+  ledger.generated_at = new Date().toISOString();
+  ledger.ledger_path = path.relative(repoRoot, ledgerPath);
+  fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+}
+
+function getAgentRuntime(agentName) {
+  const filePath = path.join(agentsDir, `${agentName}.toml`);
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+  const parsed = parseTomlFile(filePath);
+  return {
+    model: parsed.model,
+    reasoning_effort: parsed.model_reasoning_effort,
+    default_permissions: parsed.default_permissions,
+  };
+}
+
+function buildEventFingerprint(payload, fallback) {
+  return [
+    payload?.session_id,
+    payload?.agent_id,
+    payload?.tool_use_id,
+    payload?.tool_name,
+    payload?.cwd,
+    fallback,
+  ].filter(Boolean).join(':');
+}
+
+function classifyRootThreadAction(toolName, command) {
+  if (toolName === 'Bash') {
+    if (/\b(uv|pytest|pnpm\s+(test|lint|build|typecheck))\b/.test(command)) {
+      return 'test_execution';
+    }
+    if (/\brtk\s+gh\s+pr\s+review\b/.test(command)) {
+      return 'review_judgment';
+    }
+    if (/\brtk\s+git\s+commit\b/.test(command)) {
+      return 'git_commit';
+    }
+    if (/\brtk\s+git\s+push\b/.test(command)) {
+      return 'git_push';
+    }
+    if (/\brtk\s+git\s+branch\s+-D\b|\brtk\s+git\s+worktree\s+remove\b/.test(command)) {
+      return 'cleanup_git_mutation';
+    }
+    return 'bash_observed';
+  }
+  if (toolName === 'apply_patch' || toolName === 'Edit' || toolName === 'Write') {
+    return 'file_edit';
+  }
+  return 'unsupported_tool_path';
+}
+
+function appendLaunchEvidence(payload) {
+  const agentType = payload.agent_type ?? payload.subagent_type ?? 'unknown-agent';
+  const runtime = getAgentRuntime(agentType);
+  if (!runtime) {
+    return;
+  }
+  const fingerprint = buildEventFingerprint(payload, `SubagentStart:${agentType}`);
+  const ledger = loadLedger();
+  const alreadyPresent = ledger.launches.some((launch) => launch.event_fingerprint === fingerprint);
+  if (!alreadyPresent) {
+    ledger.launches.push({
+      agent_name: agentType,
+      event_type: 'SubagentStart',
+      evidence_source: 'event_derived',
+      event_fingerprint: fingerprint,
+      runtime,
+    });
+  }
+  saveLedger(ledger);
+}
+
+function appendPreToolEvidence(payload, toolName, command) {
+  const ledger = loadLedger();
+  const observedCommand = command || payload?.tool_input?.file_path || payload?.tool_input?.command || '';
+  const action = {
+    kind: classifyRootThreadAction(toolName, command),
+    command: observedCommand,
+    tool_name: toolName,
+    coverage_source: 'supported_pretooluse_path',
+  };
+  const duplicate = ledger.root_thread_actions.some(
+    (entry) => entry.tool_name === action.tool_name && entry.command === action.command,
+  );
+  if (!duplicate) {
+    ledger.root_thread_actions.push(action);
+  }
+  saveLedger(ledger);
+}
+
 function hookDeny(reason) {
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
@@ -638,6 +808,10 @@ function runPreToolHook() {
   const allowedPaths = parseAllowedPaths();
   let reason = null;
 
+  if (supportedPreToolNames.includes(toolName)) {
+    appendPreToolEvidence(payload, toolName, command);
+  }
+
   if (toolName === 'Bash') {
     reason = denyForBash(command);
   } else if (toolName === 'apply_patch' || toolName === 'Edit' || toolName === 'Write') {
@@ -652,6 +826,7 @@ function runPreToolHook() {
 function runSubagentStartHook() {
   const payload = parseHookInput();
   const agentType = payload.agent_type ?? 'unknown-agent';
+  appendLaunchEvidence(payload);
   const isReadOnly = readOnlyAgents.has(agentType);
   const additionalContext = [
     `Agent ${agentType}: keep main-thread context budget low and return structured output only.`,

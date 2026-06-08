@@ -4,6 +4,11 @@ default_permissions = "loop-protocol-rtk"
 # Project-local custom agents use default_permissions plus [permissions.*].
 # Repo-local hooks live in `.codex/hooks.json`; do not mix inline hooks here.
 # Known limitation: this is a fail-closed local guardrail, not a security boundary.
+# Project-local config is not evidence of profile routing; runtime evidence must
+# come from spawned custom-agent events and validated launch-ledger inputs.
+
+[agents]
+max_depth = 1
 
 [permissions.loop-protocol-rtk.filesystem]
 ":minimal" = "read"
