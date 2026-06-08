@@ -164,9 +164,17 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
       - uses: astral-sh/setup-uv@v8.1.0
       - run: uv python install
       - run: uv sync --locked --group dev
+      - run: pnpm install --frozen-lockfile
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version
@@ -186,11 +194,52 @@ jobs:
       - run: uv run --locked pytest .claude/skills/create-issue/tests/
       - run: uv run --locked pytest .claude/skills/create-issue/scripts/tests/
       - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_session_recording_policy_guard.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_guard_delta_mode.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_guard_shadow_mode.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_replay_scenarios.py -q
-      - run: uv run --locked pytest .claude/hooks/tests/test_shadow_log.py -q
+      - name: Run Claude hook tests
+        run: uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
+      - name: Verify hook test discovery exclusions
+        run: |
+          python3 - <<PY
+          import subprocess
+          from pathlib import Path
+
+          # Tracked separately by Issue #412; remove this ignore once the test is CI-green.
+          allowed_unregistered = {
+              ".claude/hooks/tests/test_secret_boundary_contract.py",
+          }
+          expected = {
+              hook_test.as_posix()
+              for pattern in ("test_*.py", "*_test.py")
+              for hook_test in Path(".claude/hooks/tests").rglob(pattern)
+              if hook_test.as_posix() not in allowed_unregistered
+          }
+
+          result = subprocess.run(
+              [
+                  "uv",
+                  "run",
+                  "--locked",
+                  "pytest",
+                  "--collect-only",
+                  "-q",
+                  ".claude/hooks/tests/",
+                  "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+              ],
+              capture_output=True,
+              text=True,
+              check=True,
+          )
+
+          collected = set()
+          for line in result.stdout.splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              collected.add(line.split("::", 1)[0])
+
+          missing = sorted(expected - collected)
+          if missing:
+              raise SystemExit("Hook tests missing from pytest discovery:\n" + "\n".join(missing))
+          PY
       - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
       - run: uv run --locked pytest .claude/skills/issue-contract-review/tests/
       - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
@@ -208,31 +257,54 @@ jobs:
       - name: Generate ci_test_selection/v1 artifact
         run: |
           mkdir -p ci_test_selection_artifacts
-          python3 .claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py \
-            --output ci_test_selection_artifacts/ci_test_selection_v1.json \
-            --pytest-args \
-              .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
-              .claude/skills/edit-issue/tests/test_guard_issue_body.py \
-              .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py \
-              .claude/skills/create-issue/tests/ \
-              .claude/skills/create-issue/scripts/tests/ \
-              .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py \
-              .claude/hooks/tests/test_session_recording_policy_guard.py \
-              .claude/hooks/tests/test_guard_delta_mode.py \
-              .claude/hooks/tests/test_guard_shadow_mode.py \
-              .claude/hooks/tests/test_replay_scenarios.py \
-              .claude/hooks/tests/test_shadow_log.py \
-              .claude/skills/issue-contract-review/scripts/tests/ \
-              .claude/skills/issue-contract-review/tests/ \
-              .claude/skills/pr-review-judge/scripts/tests/ \
-              .claude/skills/open-pr/scripts/tests/ \
-              .claude/skills/impl-review-loop/tests/ \
-              .claude/skills/review-issue/tests/ \
-              .claude/skills/issue-refinement-loop/tests/ \
-            --pr-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --merge-sha "${{ github.sha }}" \
-            --workflow ci --job python-test \
-            --ci-run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          uv run --locked pytest --collect-only -q \
+            .claude/hooks/tests/ \
+            --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
+            > ci_test_selection_artifacts/hook_tests_collect_only.txt
+          python3 - <<'PY'
+          import argparse
+          import importlib.util
+          import pathlib
+          import sys
+
+          script_path = pathlib.Path(
+              ".claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "generate_ci_test_selection_artifact", script_path
+          )
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          args = argparse.Namespace(
+              output="ci_test_selection_artifacts/ci_test_selection_v1.json",
+              pytest_args=[
+                  ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
+                  ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
+                  ".claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py",
+                  ".claude/skills/create-issue/tests/",
+                  ".claude/skills/create-issue/scripts/tests/",
+                  ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
+                  ".claude/hooks/tests/",
+                  "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+                  ".claude/skills/issue-contract-review/scripts/tests/",
+                  ".claude/skills/issue-contract-review/tests/",
+                  ".claude/skills/pr-review-judge/scripts/tests/",
+                  ".claude/skills/open-pr/scripts/tests/",
+                  ".claude/skills/impl-review-loop/tests/",
+                  ".claude/skills/review-issue/tests/",
+                  ".claude/skills/issue-refinement-loop/tests/",
+              ],
+              pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
+              checked_out_sha=None,
+              merge_sha="${{ github.sha }}",
+              workflow="ci",
+              job="python-test",
+              ci_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+          )
+          sys.exit(module.generate_artifact(args))
+          PY
       - uses: actions/upload-artifact@v6
         with:
           name: ci_test_selection
