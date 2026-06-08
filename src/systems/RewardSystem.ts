@@ -1,4 +1,4 @@
-import type { GameState, RewardApplicationId, SortieResult } from '../state/GameState'
+import type { GameState, RewardApplicationId, RewardClaimState, SortieResult } from '../state/GameState'
 
 export const REWARD_FORMULA_VERSION = 1 as const
 export const RESOURCE_CAP = 9_999_999
@@ -37,6 +37,36 @@ function sanitizeNonNegativeSafeInteger(value: unknown): number {
   return value
 }
 
+function createRewardClaimState(): RewardClaimState {
+  return {
+    claimedApplicationIds: Object.create(null) as Record<RewardApplicationId, true>,
+  }
+}
+
+function ensureRewardClaims(state: GameState): RewardClaimState {
+  const stateWithOptionalRewardClaims = state as GameState & {
+    rewardClaims?: RewardClaimState
+  }
+
+  if (!stateWithOptionalRewardClaims.rewardClaims) {
+    stateWithOptionalRewardClaims.rewardClaims = createRewardClaimState()
+  }
+
+  if (!stateWithOptionalRewardClaims.rewardClaims.claimedApplicationIds) {
+    stateWithOptionalRewardClaims.rewardClaims.claimedApplicationIds =
+      Object.create(null) as Record<RewardApplicationId, true>
+  }
+
+  return stateWithOptionalRewardClaims.rewardClaims
+}
+
+function hasClaimed(
+  claimedApplicationIds: Record<RewardApplicationId, true>,
+  applicationId: RewardApplicationId,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(claimedApplicationIds, applicationId)
+}
+
 function isTerminalOutcomePair(result: unknown): result is SortieResult {
   if (!result || typeof result !== 'object') {
     return false
@@ -47,9 +77,9 @@ function isTerminalOutcomePair(result: unknown): result is SortieResult {
   const endReason = candidate.endReason
 
   return (
-    (outcome == 'victory' && endReason == 'all_enemies_defeated')
-    || (outcome == 'defeat' && endReason == 'player_hp_zero')
-    || (outcome == 'timeout' && endReason == 'timeout')
+    (outcome === 'victory' && endReason === 'all_enemies_defeated')
+    || (outcome === 'defeat' && endReason === 'player_hp_zero')
+    || (outcome === 'timeout' && endReason === 'timeout')
   )
 }
 
@@ -95,7 +125,8 @@ function claim(
     return { ok: false, reason: 'not-terminal' }
   }
 
-  if (state.rewardClaims.claimedApplicationIds[applicationId]) {
+  const rewardClaims = ensureRewardClaims(state)
+  if (hasClaimed(rewardClaims.claimedApplicationIds, applicationId)) {
     return { ok: false, reason: 'already-claimed' }
   }
 
@@ -104,7 +135,7 @@ function claim(
   const resourcesAfter = clamp(resourcesBefore + quote.delta, 0, RESOURCE_CAP)
 
   state.progress.resources = resourcesAfter
-  state.rewardClaims.claimedApplicationIds[applicationId] = true
+  rewardClaims.claimedApplicationIds[applicationId] = true
 
   return {
     ok: true,

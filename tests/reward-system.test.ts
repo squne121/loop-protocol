@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-import { createInitialGameState, type SortieResult } from '../src/state/GameState'
+import { createInitialGameState, type GameState, type SortieResult } from '../src/state/GameState'
 import {
   PER_SORTIE_REWARD_CAP,
   RESOURCE_CAP,
@@ -106,6 +106,36 @@ describe('RewardSystem.calculate', () => {
     })
   })
 
+  it.each([
+    {
+      name: 'fractional kills are invalid',
+      result: createResult({ kills: 2.9 as unknown as number }),
+      expected: { killBonus: 0, hpBonus: 5, delta: 105 },
+    },
+    {
+      name: 'fractional hp is invalid',
+      result: createResult({ playerHpRemaining: 10.5 as unknown as number }),
+      expected: { killBonus: 15, hpBonus: 0, delta: 115 },
+    },
+    {
+      name: 'unsafe integer kills are invalid',
+      result: createResult({ kills: (Number.MAX_SAFE_INTEGER + 1) as unknown as number }),
+      expected: { killBonus: 0, hpBonus: 5, delta: 105 },
+    },
+    {
+      name: 'negative infinity kills are invalid',
+      result: createResult({ kills: Number.NEGATIVE_INFINITY }),
+      expected: { killBonus: 0, hpBonus: 5, delta: 105 },
+    },
+  ])('GIVEN $name WHEN calculate is called THEN it falls back to zero for that operand', ({ result, expected }) => {
+    expect(RewardSystem.calculate(result)).toMatchObject({
+      formulaVersion: REWARD_FORMULA_VERSION,
+      outcome: 'victory',
+      base: 100,
+      ...expected,
+    })
+  })
+
   it('GIVEN the same sortie result WHEN calculate is called THEN it stays pure', () => {
     const result = createResult()
     const snapshot = JSON.parse(JSON.stringify(result))
@@ -199,6 +229,17 @@ describe('RewardSystem.claim', () => {
     expect(nearCapState.progress.resources).toBe(RESOURCE_CAP)
   })
 
+  it('GIVEN fractional resourcesBefore WHEN claim is called THEN it falls back to zero before applying reward', () => {
+    const state = createInitialGameState({ resources: 0 })
+    state.progress.resources = 2.5
+
+    expect(RewardSystem.claim(state, 'fractional-resources', createResult({ kills: 0, playerHpRemaining: 0 }))).toMatchObject({
+      ok: true,
+      resourcesBefore: 0,
+      resourcesAfter: 100,
+    })
+  })
+
   it('GIVEN a non-terminal outcome pair WHEN claim is called THEN it rejects the result', () => {
     const state = createInitialGameState()
     const invalidResult = {
@@ -214,6 +255,55 @@ describe('RewardSystem.claim', () => {
       ok: false,
       reason: 'not-terminal',
     })
+  })
+
+  it('GIVEN coercive terminal-looking objects WHEN claim is called THEN it rejects them without mutating state', () => {
+    const state = createInitialGameState({ resources: 7 })
+    const forged = {
+      outcome: { toString: () => 'victory' },
+      endReason: { toString: () => 'all_enemies_defeated' },
+      durationMs: 1,
+      kills: 0,
+      shotsFired: 0,
+      playerHpRemaining: 1,
+    } as unknown as SortieResult
+
+    expect(RewardSystem.claim(state, 'coercive-terminal', forged)).toEqual({
+      ok: false,
+      reason: 'not-terminal',
+    })
+    expect(state.progress.resources).toBe(7)
+    expect(state.rewardClaims.claimedApplicationIds['coercive-terminal']).toBeUndefined()
+  })
+
+  it.each(['toString', 'constructor', '__proto__'])(
+    'GIVEN a prototype-looking application id %s WHEN claim is called THEN it is treated as a normal id',
+    (applicationId) => {
+      const state = createInitialGameState({ resources: 0 })
+      const result = createResult({ kills: 0, playerHpRemaining: 0 })
+
+      expect(RewardSystem.claim(state, applicationId, result)).toMatchObject({
+        ok: true,
+        resourcesAfter: 100,
+      })
+      expect(RewardSystem.claim(state, applicationId, result)).toEqual({
+        ok: false,
+        reason: 'already-claimed',
+      })
+    },
+  )
+
+  it('GIVEN a legacy state without rewardClaims WHEN claim is called THEN it initializes the runtime ledger defensively', () => {
+    const state = createInitialGameState({ resources: 0 }) as GameState & {
+      rewardClaims?: GameState['rewardClaims']
+    }
+    delete state.rewardClaims
+
+    expect(RewardSystem.claim(state as GameState, 'legacy-state', createResult({ kills: 0, playerHpRemaining: 0 }))).toMatchObject({
+      ok: true,
+      resourcesAfter: 100,
+    })
+    expect(state.rewardClaims?.claimedApplicationIds['legacy-state']).toBe(true)
   })
 })
 

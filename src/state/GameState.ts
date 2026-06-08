@@ -225,7 +225,7 @@ export function createInitialGameState(
       weaponPower: snapshot.weaponPower ?? 1,
     },
     rewardClaims: {
-      claimedApplicationIds: {},
+      claimedApplicationIds: Object.create(null) as Record<RewardApplicationId, true>,
     },
     projectiles: [],
     nextProjectileId: 1,
