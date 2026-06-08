@@ -630,11 +630,11 @@ ALLOWED_PATHS_GATE_RESULT_V1:
 | 5 | changed files が `Allowed Paths` 外に存在 | `fail_closed`（merge-blocking） |
 | 6 | `head_sha == reviewed_head_sha` かつ changed files すべて `Allowed Paths` 内 | `ok` |
 
-`stale_snapshot` は `--expected-contract-fingerprint`（snapshot=go 時点の fingerprint）が与えられたときのみ検出される。未指定時は freshness の基準が無いため fresh とみなす（contract-review go 時に fingerprint を記録し、review 時に渡すこと）。
+`--expected-contract-fingerprint` / `--contract-source-kind` / `--contract-source-id` は review 実行の必須 binding とする。いずれかが欠落した場合は stale を見逃さず `indeterminate`（merge-blocking）に倒す。
 
 ### Contract Fingerprint vs Execution Context
 
-- **contract_fingerprint** (freshness 判定に使用): issue_number / contract_source_kind / contract_body_sha256 / allowed_paths_normalized_sha256 / base_ref / base_sha_at_snapshot の正規化 JSON
+- **contract_fingerprint** (freshness 判定に使用): issue_number / contract_source_kind / contract_source_id / contract_body_sha256 / allowed_paths_normalized_sha256 / base_ref / base_sha_at_snapshot の正規化 JSON
   - `generated_at` / `worktree_root` を含めない（これらが変化しても stale と判定しない）
   
 - **execution_context** (監査ログのみ): worktree_root / generated_at / tool_version
@@ -647,7 +647,8 @@ Repo-relative パスの正規化後、以下の規則で照合:
 - **exact file path**: 完全一致 （`src/main.ts` は `src/main.ts` のみ）
 - **trailing `/**`**: recursive subdirectory match （`src/**` は `src/` 配下すべてを match）
 - **`*` (single segment)**: 単一 path segment のみ match、`/` を跨がない （`docs/*` は `docs/README.md` は match するが `docs/guides/README.md` は match しない）
-- **invalid paths**: `..` / absolute path / backslash は fail_closed 扱い
+- **invalid paths**: `..` / absolute path / backslash は fail_closed 扱い（backslash は POSIX へ変換せず reject）
+- **invalid allowed patterns**: unsupported `**` 位置や invalid path は `indeterminate`（merge-blocking）
 
 ### スクリプト
 
@@ -662,8 +663,10 @@ uv run python3 .claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.
   --reviewed-head-sha <sha> \
   --allowed-paths '<json array>' \
   --contract-body-sha256 <sha256> \
+  --contract-source-kind <issue_body|issue_comment> \
+  --contract-source-id <comment_id|issue_body> \
+  --expected-contract-fingerprint '<json object>' \
   [--issue-number <issue>] \
-  [--expected-contract-fingerprint '<json object>'] \
   [--format json|yaml]
 ```
 
