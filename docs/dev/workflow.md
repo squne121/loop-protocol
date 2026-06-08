@@ -209,7 +209,7 @@ implementation_triage_profile:
 ### Codex custom-agent dispatch guardrail
 
 - Codex CLI では `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent に委譲する
-- repo-side deterministic guardrail の正本は `.codex/agents/*.toml`、`.codex/hooks.json`、dispatch validator、`SUBAGENT_LAUNCH_LEDGER_V1` fixture 群とする
+- repo-side deterministic guardrail の正本は `.codex/agents/*.toml`、`.codex/hooks.json`、dispatch validator、`SUBAGENT_LAUNCH_LEDGER_V1` fixture 群、`--audit-mode` で監査する generated ledger artifact とする
 - live spawn 実証は別スコープの `#601` に deferred し、本 workflow では evidence 不足時に fail-closed する repo-side 監査を成功条件にする
 
 ### human_escalation 後の Issue 本文変更と contract review 再実行

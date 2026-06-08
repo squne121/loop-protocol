@@ -7,28 +7,35 @@
     "unsupported_paths_fail_closed": true,
     "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
   },
-  "codex_binary_status": "available",
   "fixture_expectation": {
     "status": "fail",
     "error_codes": [
-      "hook_evidence_untrusted_or_missing"
+      "root_thread_data_plane_execution_observed"
     ]
   },
+  "codex_binary_status": "available",
   "hook_state": "enabled",
   "tool_path_support": true,
-  "project_trust_state": "untrusted",
+  "project_trust_state": "trusted",
   "launches": [
     {
-      "agent_name": "implementation-worker",
+      "agent_name": "post-merge-cleanup-worker",
       "event_type": "SubagentStart",
       "evidence_source": "event_derived",
-      "event_fingerprint": "evt-impl-001",
+      "event_fingerprint": "evt-cleanup-001",
       "runtime": {
-        "model": "gpt-5.4",
+        "model": "gpt-5.4-mini",
         "reasoning_effort": "medium",
         "default_permissions": "loop-protocol-rtk"
       }
     }
   ],
-  "root_thread_actions": []
+  "root_thread_actions": [
+    {
+      "kind": "cleanup_git_mutation",
+      "command": "rtk git branch -D worktree-issue-764-codex-subagent-ledger",
+      "tool_name": "Bash",
+      "coverage_source": "supported_pretooluse_path"
+    }
+  ]
 }

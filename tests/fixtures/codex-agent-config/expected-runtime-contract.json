@@ -3,6 +3,8 @@
     "implementation-worker": {
       "path": ".codex/agents/implementation-worker.toml",
       "claude_agent_path": ".claude/agents/implementation-worker.md",
+      "claude_model": "sonnet",
+      "claude_permission_mode": "acceptEdits",
       "model": "gpt-5.4",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-rtk",
@@ -12,6 +14,8 @@
     "test-runner": {
       "path": ".codex/agents/test-runner.toml",
       "claude_agent_path": ".claude/agents/test-runner.md",
+      "claude_model": "haiku",
+      "claude_permission_mode": "dontAsk",
       "model": "gpt-5.4-mini",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -21,6 +25,8 @@
     "pr-reviewer": {
       "path": ".codex/agents/pr-reviewer.toml",
       "claude_agent_path": ".claude/agents/pr-reviewer.md",
+      "claude_model": "sonnet",
+      "claude_permission_mode": "dontAsk",
       "model": "gpt-5.4",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -30,6 +36,8 @@
     "post-merge-cleanup-worker": {
       "path": ".codex/agents/post-merge-cleanup-worker.toml",
       "claude_agent_path": ".claude/agents/post-merge-cleanup-worker.md",
+      "claude_model": "haiku",
+      "claude_permission_mode": "default",
       "model": "gpt-5.4-mini",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-rtk",

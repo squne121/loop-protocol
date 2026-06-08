@@ -108,12 +108,45 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     if agents_block.get("max_depth") != 1:
         failures.append(".codex/config.toml: [agents].max_depth must be 1")
 
+    hooks_root = hooks.get("hooks", {})
+    subagent_entries = hooks_root.get("SubagentStart")
+    if not isinstance(subagent_entries, list) or not subagent_entries:
+        failures.append(".codex/hooks.json: missing hooks for SubagentStart")
+    else:
+        if len(subagent_entries) != 1:
+            failures.append(".codex/hooks.json: SubagentStart must have exactly one matcher entry")
+        else:
+            entry = subagent_entries[0]
+            if entry.get("matcher") != ".*":
+                failures.append(".codex/hooks.json: SubagentStart matcher must be '.*'")
+            commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
+            if len(commands) != 1 or "--hook-subagent-start" not in commands[0]:
+                failures.append(".codex/hooks.json: SubagentStart must route exactly one command with --hook-subagent-start")
+
+    pretool_entries = hooks_root.get("PreToolUse")
+    if not isinstance(pretool_entries, list) or not pretool_entries:
+        failures.append(".codex/hooks.json: missing hooks for PreToolUse")
+        pretool_entries = []
+    expected_matchers = {
+        "^Bash$": "Checking LOOP_PROTOCOL Bash guardrail",
+        "^(apply_patch|Edit|Write)$": "Checking LOOP_PROTOCOL patch guardrail",
+    }
+    actual_matchers = {entry.get("matcher"): entry for entry in pretool_entries if isinstance(entry, dict)}
+    for matcher, status_message in expected_matchers.items():
+        entry = actual_matchers.get(matcher)
+        if entry is None:
+            failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
+            continue
+        commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
+        if len(commands) != 1 or "--hook-pretool" not in commands[0]:
+            failures.append(f".codex/hooks.json: matcher {matcher} must route exactly one command with --hook-pretool")
+        hook_status = entry.get("hooks", [{}])[0].get("statusMessage") if entry.get("hooks") else None
+        if hook_status != status_message:
+            failures.append(f".codex/hooks.json: matcher {matcher} must use statusMessage {status_message!r}")
+
     all_commands: list[str] = []
     for event_name in expectations["required_hook_events"]:
-        hooks_for_event = hooks.get("hooks", {}).get(event_name)
-        if not isinstance(hooks_for_event, list) or not hooks_for_event:
-            failures.append(f".codex/hooks.json: missing hooks for {event_name}")
-            continue
+        hooks_for_event = hooks_root.get(event_name, [])
         for entry in hooks_for_event:
             for hook in entry.get("hooks", []):
                 command = hook.get("command")

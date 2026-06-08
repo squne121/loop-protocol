@@ -1,6 +1,12 @@
 {
   "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
   "generated_by": "worker",
+  "coverage_scope": {
+    "subagent_start_event_recorded": true,
+    "supported_pretooluse_paths": ["Bash", "Edit", "Write", "apply_patch"],
+    "unsupported_paths_fail_closed": true,
+    "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
+  },
   "fixture_expectation": {
     "status": "fail",
     "error_codes": [

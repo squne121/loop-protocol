@@ -1,6 +1,12 @@
 {
   "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
   "generated_by": "codex_hook_pipeline",
+  "coverage_scope": {
+    "subagent_start_event_recorded": true,
+    "supported_pretooluse_paths": ["Bash", "Edit", "Write", "apply_patch"],
+    "unsupported_paths_fail_closed": true,
+    "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
+  },
   "fixture_expectation": {
     "status": "fail",
     "error_codes": [
@@ -27,7 +33,9 @@
   "root_thread_actions": [
     {
       "kind": "review_judgment",
-      "command": "rtk gh pr review 763 --comment --body LOOP_VERDICT"
+      "command": "rtk gh pr review 763 --comment --body LOOP_VERDICT",
+      "tool_name": "Bash",
+      "coverage_source": "supported_pretooluse_path"
     }
   ]
 }
