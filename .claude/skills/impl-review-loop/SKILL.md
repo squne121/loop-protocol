@@ -96,6 +96,24 @@ LOOP_STATE:
 
 外部仕様調査が必要な場合は `gemini-cli-headless-delegation` skill を default 経路として使い、結果を LOOP_STATE の `external_research_skip_basis` に記録する。LOOP_PROTOCOL は internal-only 変更が多い前提のため、デフォルトはスキップで構わない（スキップ時も判定根拠を記録する）。
 
+## Allowed Paths Gate Routing (LOOP_VERDICT_V2.allowed_paths_gate)
+
+PR review judge（review_subagent）が生成する `ALLOWED_PATHS_GATE_RESULT_V1` の status に基づいて、以下の routing table に従う。
+
+**注意**: impl-review-loop は `allowed_paths_gate.status` のみを route し、worker 自己申告（`allowed_paths_compliance`）は canonical にしない。gate evaluator の正本は pr-review-judge 配下の決定論的スクリプト出力。
+
+| allowed_paths_gate.status | routing | merge-blocking | action |
+|---|---|---|---|
+| `ok` | continue（非 merge-blocking） | false | 次ステップへ |
+| `fail_closed` | REQUEST_CHANGES（merge-blocking） | true | PR レビュー REQUEST_CHANGES、next iteration へ |
+| `stale_snapshot` | REQUEST_CHANGES（merge-blocking） | true | contract snapshot を refresh して PR レビュー再実行 |
+| `indeterminate` | REQUEST_CHANGES（merge-blocking） | true | 人間判断を仰ぐ（head SHA mismatch 等） |
+| result 欠落 | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
+| `producer_role != review_subagent` | indeterminate 扱い（merge-blocking） | true | producer role の確認が必要 |
+| malformed（スキーマ不正） | indeterminate 扱い（merge-blocking） | true | 人間判断を仰ぐ |
+
+`status: ok` 以外の場合は merge-blocking であり、PR merge 前に人間 approval または contract 再確認が必要。
+
 ## Contract Snapshot 参照ルール
 
 preparation step で取得した contract snapshot 内の以下の情報を Step 1-4 で参照する:
