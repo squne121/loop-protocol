@@ -22,11 +22,21 @@ ERROR_CODE_MAP = {
 }
 
 
+def _classify_missing_safety_claim_matrix(error: dict[str, object]) -> bool:
+    return str(error.get("rule_id")) == "LP052" and str(error.get("message", "")).strip() == "Missing required section: Safety Claim Matrix"
+
+
 def _resolve_error_code(result_errors: list[dict[str, object]]) -> str:
     if not result_errors:
         return "E_UNKNOWN"
-    rule_id = str(result_errors[0].get("rule_id", "E_UNKNOWN"))
-    return ERROR_CODE_MAP.get(rule_id, rule_id)
+    if any(_classify_missing_safety_claim_matrix(error) for error in result_errors):
+        return "E_SAFETY_CLAIM_MATRIX_MISSING"
+    for error in result_errors:
+        rule_id = str(error.get("rule_id", "E_UNKNOWN"))
+        mapped = ERROR_CODE_MAP.get(rule_id)
+        if mapped:
+            return mapped
+    return str(result_errors[0].get("rule_id", "E_UNKNOWN"))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR=E_SCHEMA_CHANGE_FLAG_MISMATCH")
         return 1
 
-    result = validate_pr_body(body, changed_paths, args.linked_issue)
+    result = validate_pr_body(body, changed_paths, args.linked_issue, schema_decision_override=args.schema_change)
     payload = {
         "schema": result.schema,
         "target": result.target,

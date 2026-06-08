@@ -225,12 +225,16 @@ def _validate_lp053(body: str, sections: dict[str, tuple[str, int, int]]) -> lis
     return [_error(body, "LP053", "Schema Change Applicability", start_line, end_line, "Schema Change Applicability decision is missing or invalid.", "Set decision to schema_change, not_schema_change, or uncertain.")]
 
 
-def _validate_lp050(body: str, sections: dict[str, tuple[str, int, int]]) -> list[ValidationError]:
+def _validate_lp050(
+    body: str,
+    sections: dict[str, tuple[str, int, int]],
+    schema_decision_override: str | None = None,
+) -> list[ValidationError]:
     schema_info = sections.get("Schema Change Applicability")
     inventory_info = sections.get("Schema Consumer Inventory")
     if not schema_info or not inventory_info:
         return []
-    decision = _parse_schema_decision(schema_info[0])
+    decision = schema_decision_override or _parse_schema_decision(schema_info[0])
     if decision not in SCHEMA_DECISIONS or decision == "not_schema_change":
         return []
     content, start_line, end_line = inventory_info
@@ -337,6 +341,8 @@ def _validate_safety_claims_v1_yaml_contract(body: str, sections: dict[str, tupl
         follow_up = claim.get("follow_up", []) or []
         if not isinstance(follow_up, list) or not all(isinstance(item, str) and item.strip() for item in follow_up):
             return [_error(body, "E_SAFETY_CLAIMS_SCHEMA_INVALID", "Safety Claim Matrix", line_start, line_end, f"safety_claims[{offset}].follow_up must be a list of non-empty strings when present.", "Update SAFETY_CLAIMS_V1 to match docs/dev/runtime-verification-policy.md.")]
+        if not_controlled and not follow_up:
+            return [_error(body, "E_FOLLOW_UP_MISSING_CONTRACT", "Safety Claim Matrix", line_start, line_end, f"safety_claims[{offset}] has not_controlled entries but follow_up is empty or missing.", "Add at least one #<issue> reference to follow_up for every uncontrolled claim.")]
         if not_controlled and not all(FOLLOW_UP_PATTERN.fullmatch(item.strip()) for item in follow_up):
             return [_error(body, "E_FOLLOW_UP_MISSING_CONTRACT", "Safety Claim Matrix", line_start, line_end, f"safety_claims[{offset}] has not_controlled entries but follow_up does not contain only #<issue> references.", "Add #<issue> references to follow_up for every uncontrolled claim.")]
     return []
@@ -372,7 +378,12 @@ def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[Validati
     return [ValidationError("LP058", "error", "(global)", 1, 1, "changed paths could not be resolved deterministically.", ["(changed paths unavailable)"], False, "Pass --changed-paths-file or resolve changed paths from git diff before validation.")]
 
 
-def validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: int | None = None) -> ValidationResult:
+def validate_pr_body(
+    body: str,
+    changed_paths: list[str] | None,
+    linked_issue: int | None = None,
+    schema_decision_override: str | None = None,
+) -> ValidationResult:
     body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
     sections, duplicates = _extract_sections(body)
     is_safety_sensitive = changed_paths is not None and _is_safety_sensitive(changed_paths)
@@ -380,7 +391,7 @@ def validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: i
     errors.extend(_validate_lp052(body, sections))
     errors.extend(_validate_lp054(body, duplicates))
     errors.extend(_validate_lp053(body, sections))
-    errors.extend(_validate_lp050(body, sections))
+    errors.extend(_validate_lp050(body, sections, schema_decision_override))
     errors.extend(_validate_lp051(body, sections, changed_paths))
     errors.extend(_validate_lp055(body, sections, is_safety_sensitive))
     errors.extend(_validate_lp056(body, sections, is_safety_sensitive))

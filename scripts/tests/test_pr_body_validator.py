@@ -98,3 +98,64 @@ def test_wrapper_success_path_outputs_json_only():
     assert result.returncode == 0
     payload = json.loads(result.stdout)
     assert payload["status"] == "pass"
+
+
+def test_wrapper_emits_error_code_for_missing_safety_claim_matrix():
+    body = """## Summary
+
+- test
+
+## Checks
+
+- check
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+
+## Schema Consumer Inventory
+
+N/A
+reason: none
+
+## Notes
+
+- Related issue: #469
+"""
+    result = _run_cli(body, changed_paths_fixture="safety_paths.txt")
+    assert result.returncode == 1
+    assert "ERROR=E_SAFETY_CLAIM_MATRIX_MISSING" in result.stdout
+
+
+def test_wrapper_schema_change_flag_requires_inventory_when_body_decision_invalid():
+    body = """## Summary
+
+- test
+
+## Checks
+
+- check
+
+## Schema Change Applicability
+
+- decision: maybe
+
+## Schema Consumer Inventory
+
+N/A
+reason: none
+
+## Safety Claim Matrix
+
+N/A
+reason: docs only
+
+## Notes
+
+- Related issue: #469
+"""
+    result = _run_cli(body, schema_change="schema_change")
+    assert result.returncode == 1
+    payload = json.loads(result.stdout.split("\nERROR=", 1)[0])
+    rule_ids = {error["rule_id"] for error in payload["errors"]}
+    assert "LP050" in rule_ids

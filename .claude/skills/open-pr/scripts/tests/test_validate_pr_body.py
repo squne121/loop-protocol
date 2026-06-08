@@ -503,34 +503,21 @@ def test_markdown_table_backward_compat():
 
 
 def test_fenced_code_heading_guard():
-    body = """## Summary
-
-- test
-
-## Checks
-
-```md
-## Schema Change Applicability
-```
-
-## Schema Change Applicability
-
-- decision: not_schema_change
-
-## Schema Consumer Inventory
-
-N/A
-reason: none
-
-## Safety Claim Matrix
-
-N/A
-reason: docs only
-
-## Notes
-
-- Related issue: #330
-"""
+    fence = chr(96) * 3
+    body = (
+        "## Summary\n\n"
+        "- test\n\n"
+        "## Checks\n\n"
+        + fence + "md\n## Schema Change Applicability\n" + fence + "\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: none\n\n"
+        "## Safety Claim Matrix\n\n"
+        "N/A\nreason: docs only\n\n"
+        "## Notes\n\n"
+        "- Related issue: #330\n"
+    )
     result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=330)
     errors = [error for error in result.errors if error.rule_id == "LP052"]
     assert result.status == "pass"
@@ -544,7 +531,7 @@ def test_duplicate_heading_guard():
 
 ## Checks
 
-- [ ] `pnpm typecheck`
+- check
 
 ## Schema Change Applicability
 
@@ -570,5 +557,49 @@ reason: docs only
 """
     result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=330)
     errors = [error for error in result.errors if error.rule_id == "LP054"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+
+
+def test_follow_up_missing_contract_when_omitted():
+    fence = chr(96) * 3
+    body = (
+        "## Summary\n\n"
+        "- test\n\n"
+        "## Checks\n\n"
+        "- check\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: none\n\n"
+        "## Safety Claim Matrix\n\n"
+        + fence + "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n  - claim: Narrow safety claim\n    implemented: \"partial\"\n    not_controlled:\n      - Native tool registry\n    evidence:\n      - rg -n \"claim\" .\n" + fence + "\n\n"
+        "## Notes\n\n"
+        "- Related issue: #330\n"
+    )
+    result = validate_pr_body(body, [".github/workflows/ci.yml"], linked_issue=330)
+    errors = [error for error in result.errors if error.rule_id == "E_FOLLOW_UP_MISSING_CONTRACT"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+
+
+def test_follow_up_missing_contract_when_empty_list():
+    fence = chr(96) * 3
+    body = (
+        "## Summary\n\n"
+        "- test\n\n"
+        "## Checks\n\n"
+        "- check\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: none\n\n"
+        "## Safety Claim Matrix\n\n"
+        + fence + "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n  - claim: Narrow safety claim\n    implemented: \"partial\"\n    not_controlled:\n      - Native tool registry\n    evidence:\n      - rg -n \"claim\" .\n    follow_up: []\n" + fence + "\n\n"
+        "## Notes\n\n"
+        "- Related issue: #330\n"
+    )
+    result = validate_pr_body(body, [".github/workflows/ci.yml"], linked_issue=330)
+    errors = [error for error in result.errors if error.rule_id == "E_FOLLOW_UP_MISSING_CONTRACT"]
     assert result.status == "fail"
     assert len(errors) == 1
