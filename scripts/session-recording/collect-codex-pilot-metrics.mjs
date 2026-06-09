@@ -25,33 +25,43 @@ function parseArgs(argv) {
   return args
 }
 
+function isNonNegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0
+}
+
+function buildUnavailableTokenUsage() {
+  return {
+    availability: 'unavailable',
+    source: 'none',
+    prompt: null,
+    completion: null,
+    total: null,
+  }
+}
+
 export function collectCodexPilotMetricsFromEvents(events) {
   const authoritativeUsage = events.find((event) =>
     event?.event_type === 'codex_usage_metadata' &&
-    typeof event?.usage?.prompt_tokens === 'number' &&
-    typeof event?.usage?.completion_tokens === 'number'
+    isNonNegativeInteger(event?.usage?.prompt_tokens) &&
+    isNonNegativeInteger(event?.usage?.completion_tokens)
   )
 
   const manualEvents = events.filter((event) => event?.event_type === 'manual_intervention')
   const monotonicSamples = events
     .map((event) => event?.monotonic_ms)
     .filter((value) => typeof value === 'number')
+  const monotonicOrdered = monotonicSamples.every((value, index) => index === 0 || value >= monotonicSamples[index - 1])
   const latencyMs =
-    monotonicSamples.length >= 2
+    monotonicSamples.length >= 2 && monotonicOrdered
       ? monotonicSamples[monotonicSamples.length - 1] - monotonicSamples[0]
       : null
+  const latencySource = latencyMs !== null ? 'monotonic_event_clock' : 'unavailable'
 
   if (!authoritativeUsage) {
     return {
-      token_usage: {
-        availability: 'unavailable',
-        source: 'none',
-        prompt: null,
-        completion: null,
-        total: null,
-      },
+      token_usage: buildUnavailableTokenUsage(),
       latency_ms: latencyMs,
-      latency_source: monotonicSamples.length >= 2 ? 'monotonic_event_clock' : 'unavailable',
+      latency_source: latencySource,
       human_intervention_count: manualEvents.length,
       human_intervention_source: 'manual_event_ledger',
     }
@@ -68,7 +78,7 @@ export function collectCodexPilotMetricsFromEvents(events) {
       total: prompt + completion,
     },
     latency_ms: latencyMs,
-    latency_source: monotonicSamples.length >= 2 ? 'monotonic_event_clock' : 'unavailable',
+    latency_source: latencySource,
     human_intervention_count: manualEvents.length,
     human_intervention_source: 'manual_event_ledger',
   }

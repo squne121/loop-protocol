@@ -31,19 +31,28 @@ import { validateManifest } from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-// ============================================================================
-// JSON Loading
-// ============================================================================
-
 function collectJsonFiles(targetPath) {
   const stat = statSync(targetPath)
-  if (stat.isDirectory()) {
-    return readdirSync(targetPath)
-      .filter((entry) => entry.endsWith('.json'))
-      .map((entry) => resolve(targetPath, entry))
-      .sort()
+  if (!stat.isDirectory()) {
+    return [targetPath]
   }
-  return [targetPath]
+
+  const files = []
+  const stack = [targetPath]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    const currentStat = statSync(current)
+    if (currentStat.isDirectory()) {
+      for (const entry of readdirSync(current)) {
+        stack.push(resolve(current, entry))
+      }
+      continue
+    }
+    if (current.endsWith('.json')) {
+      files.push(current)
+    }
+  }
+  return files.sort()
 }
 
 function loadJsonFromArgsOrStdin() {
@@ -54,6 +63,10 @@ function loadJsonFromArgsOrStdin() {
     const filePath = args[0]
     try {
       const files = collectJsonFiles(filePath)
+      if (files.length === 0) {
+        console.error(`Error reading file ${filePath}: no JSON files found`)
+        process.exit(1)
+      }
       return files.map((candidate) => ({
         filePath: candidate,
         json: JSON.parse(readFileSync(candidate, 'utf-8')),
@@ -63,12 +76,10 @@ function loadJsonFromArgsOrStdin() {
       process.exit(1)
     }
   } else if (process.stdin.isTTY) {
-    // No file argument and no stdin
     console.error('Usage: validate-agent-session-manifest.mjs <file>')
     console.error('   or: cat manifest.json | validate-agent-session-manifest.mjs')
     process.exit(1)
   } else {
-    // Read from stdin
     jsonContent = readFileSync(0, 'utf-8')
   }
 
@@ -79,10 +90,6 @@ function loadJsonFromArgsOrStdin() {
     process.exit(1)
   }
 }
-
-// ============================================================================
-// Main
-// ============================================================================
 
 async function main() {
   const jsonFiles = loadJsonFromArgsOrStdin()

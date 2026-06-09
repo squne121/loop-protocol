@@ -18,8 +18,62 @@ function loadJson(jsonPath) {
   return JSON.parse(readFileSync(resolve(jsonPath), 'utf8'))
 }
 
-function findCommands(entries) {
-  return (entries ?? []).flatMap((entry) => (entry?.hooks ?? []).map((hook) => hook?.command ?? ''))
+function collectHooks(entries) {
+  return (entries ?? []).flatMap((entry) =>
+    (entry?.hooks ?? []).map((hook) => ({
+      matcher: entry?.matcher ?? null,
+      hook,
+    })),
+  )
+}
+
+function assertExactCompositeHandler(eventName, entries, expectedMatcher, expectedCommand, failures) {
+  assert(Array.isArray(entries), `hooks.${eventName} must exist`, failures)
+  if (!Array.isArray(entries)) {
+    return
+  }
+
+  assert(entries.length === 1, `${eventName} must have exactly one matcher entry`, failures)
+  const flattened = collectHooks(entries)
+  assert(flattened.length === 1, `${eventName} must have exactly one command hook`, failures)
+  if (entries.length !== 1 || flattened.length !== 1) {
+    return
+  }
+
+  const [{ matcher, hook }] = flattened
+  assert(matcher === expectedMatcher, `${eventName} matcher must be exactly ${expectedMatcher}`, failures)
+  assert(hook?.type === 'command', `${eventName} hook type must be command`, failures)
+  assert(hook?.timeout === 30, `${eventName} timeout must be 30`, failures)
+  assert(hook?.command === expectedCommand, `${eventName} command must exactly match the composite handler`, failures)
+}
+
+function assertEntryHookShape(eventName, entry, expectedMatcher, expectedCommands, failures) {
+  assert(entry?.matcher === expectedMatcher, `${eventName} matcher must be exactly ${expectedMatcher}`, failures)
+  const hooks = entry?.hooks
+  assert(Array.isArray(hooks), `${eventName} ${expectedMatcher} hooks must be an array`, failures)
+  if (!Array.isArray(hooks)) {
+    return
+  }
+
+  assert(
+    hooks.length === expectedCommands.length,
+    `${eventName} ${expectedMatcher} must have exactly ${expectedCommands.length} hooks`,
+    failures,
+  )
+  if (hooks.length !== expectedCommands.length) {
+    return
+  }
+
+  for (const [index, expected] of expectedCommands.entries()) {
+    const hook = hooks[index]
+    assert(hook?.type === 'command', `${eventName} ${expectedMatcher} hook ${index} type must be command`, failures)
+    assert(hook?.timeout === 30, `${eventName} ${expectedMatcher} hook ${index} timeout must be 30`, failures)
+    assert(
+      hook?.command === expected.command,
+      `${eventName} ${expectedMatcher} hook ${index} command must exactly match expected handler`,
+      failures,
+    )
+  }
 }
 
 function validateDocs(repoRoot, failures) {
@@ -46,6 +100,10 @@ function main() {
   const parsed = loadJson(jsonPath)
   const failures = []
   const hooks = parsed?.hooks ?? {}
+  const compositeBase =
+    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs"'
+  const checkCodexAgentsBase =
+    'rtk pnpm exec node "$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs"'
 
   assert(Array.isArray(hooks.SubagentStart), 'hooks.SubagentStart must exist', failures)
   assert(Array.isArray(hooks.PreToolUse), 'hooks.PreToolUse must exist', failures)
@@ -53,40 +111,70 @@ function main() {
   assert(Array.isArray(hooks.SubagentStop), 'hooks.SubagentStop must exist', failures)
   assert(Array.isArray(hooks.PermissionRequest), 'hooks.PermissionRequest must exist', failures)
 
-  const subagentStartCommands = findCommands(hooks.SubagentStart)
-  const preToolCommands = findCommands(hooks.PreToolUse)
-  const stopCommands = findCommands(hooks.Stop)
-  const subagentStopCommands = findCommands(hooks.SubagentStop)
-  const permissionCommands = findCommands(hooks.PermissionRequest)
+  const subagentStartCommands = collectHooks(hooks.SubagentStart).map(({ hook }) => hook?.command ?? '')
 
   assert(
     subagentStartCommands.some((command) => command.includes('scripts/check-codex-agents.mjs')),
     'SubagentStart must keep existing check-codex-agents.mjs guardrail',
     failures,
   )
+
   assert(
-    preToolCommands.some((command) => command.includes('scripts/check-codex-agents.mjs')),
-    'PreToolUse must keep existing check-codex-agents.mjs guardrail',
+    Array.isArray(hooks.PreToolUse) && hooks.PreToolUse.length === 2,
+    'PreToolUse must have exactly two matcher entries',
     failures,
   )
+  if (Array.isArray(hooks.PreToolUse) && hooks.PreToolUse.length === 2) {
+    assertEntryHookShape(
+      'PreToolUse',
+      hooks.PreToolUse[0],
+      '^Bash$',
+      [
+        { command: `${checkCodexAgentsBase} --hook-pretool` },
+        { command: `${compositeBase} --event PreToolUse` },
+      ],
+      failures,
+    )
+    assertEntryHookShape(
+      'PreToolUse',
+      hooks.PreToolUse[1],
+      '^(apply_patch|Edit|Write)$',
+      [
+        { command: `${checkCodexAgentsBase} --hook-pretool` },
+        { command: `${compositeBase} --event PreToolUse` },
+      ],
+      failures,
+    )
+  }
+
   assert(
-    stopCommands.some((command) => command.includes('.codex/hooks/session-recording-composite.mjs') && command.includes('--event Stop')),
-    'Stop must use the session-recording composite handler',
+    Array.isArray(hooks.PermissionRequest) && hooks.PermissionRequest.length === 2,
+    'PermissionRequest must have exactly two matcher entries',
     failures,
   )
-  assert(
-    subagentStopCommands.some((command) => command.includes('.codex/hooks/session-recording-composite.mjs') && command.includes('--event SubagentStop')),
-    'SubagentStop must use the session-recording composite handler',
-    failures,
-  )
-  assert(
-    permissionCommands.some((command) => command.includes('--event PermissionRequest')),
-    'PermissionRequest must route through the Codex session-recording adapter',
-    failures,
-  )
-  assert(
-    permissionCommands.every((command) => command.includes('.codex/hooks/session-recording-composite.mjs')),
-    'PermissionRequest hooks must use the composite wrapper',
+  if (Array.isArray(hooks.PermissionRequest) && hooks.PermissionRequest.length === 2) {
+    assertEntryHookShape(
+      'PermissionRequest',
+      hooks.PermissionRequest[0],
+      '^Bash$',
+      [{ command: `${compositeBase} --event PermissionRequest` }],
+      failures,
+    )
+    assertEntryHookShape(
+      'PermissionRequest',
+      hooks.PermissionRequest[1],
+      '^(apply_patch|Edit|Write)$',
+      [{ command: `${compositeBase} --event PermissionRequest` }],
+      failures,
+    )
+  }
+
+  assertExactCompositeHandler('Stop', hooks.Stop, '.*', `${compositeBase} --event Stop`, failures)
+  assertExactCompositeHandler(
+    'SubagentStop',
+    hooks.SubagentStop,
+    '.*',
+    `${compositeBase} --event SubagentStop`,
     failures,
   )
 

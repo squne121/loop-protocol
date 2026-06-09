@@ -10,9 +10,13 @@ import { verifyCodexPostRun } from './codex-postrun-verifier.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
-const producerScript = process.env.CODEX_SESSION_RECORDING_PRODUCER
+const defaultProducerScript = resolve(repoRoot, 'scripts', 'generate-session-manifest.mjs')
+const configuredProducerScript = process.env.CODEX_SESSION_RECORDING_PRODUCER
   ? resolve(process.env.CODEX_SESSION_RECORDING_PRODUCER)
-  : resolve(repoRoot, 'scripts', 'generate-session-manifest.mjs')
+  : defaultProducerScript
+const producerScript = configuredProducerScript.startsWith(repoRoot)
+  ? configuredProducerScript
+  : defaultProducerScript
 
 function parseArgs(argv) {
   const args = { event: null }
@@ -80,8 +84,12 @@ function getCommand(payload) {
   return String(payload?.tool_input?.command ?? payload?.tool_input?.description ?? '')
 }
 
+function sanitizeStopReason(eventName) {
+  return `${eventName}: Codex session recording failed; see private local log.`
+}
+
 function matchesForbiddenPath(command) {
-  return /(^|\s)(assets\/|LICENSES\/|\.env(\.|$))/.test(command)
+  return /(^|[^A-Za-z0-9_./-])((assets|LICENSES)\/|(?:[^\s'"]*\/)?\.env(?:\.[^\s'"]+)*)/.test(command)
 }
 
 function evaluateGuard(payload, eventName) {
@@ -99,7 +107,7 @@ function evaluateGuard(payload, eventName) {
   if (payload?.forbidden_path_touched === true || matchesForbiddenPath(command)) {
     return `${eventName}: forbidden path access blocked`
   }
-  if (/\bgit push\b|\bgh secret\b|\bprintenv\b|\benv\b/.test(command)) {
+  if (/\bgit(?:\s+-C\s+\S+)?\s+push\b|\bgh\s+(?:secret|api\b[^\n]*secrets)\b|\bprintenv\b|\benv\b|python\s+-c\s+['"][^'"]*os\./.test(command)) {
     return `${eventName}: destructive or secret-revealing command blocked`
   }
   return null
@@ -155,14 +163,14 @@ function runManifestFlow(eventName, payload) {
     throw new Error(`${eventName}: synthetic canary leaked into public surface`)
   }
 
-  const written = writeCodexSessionManifest({
+  writeCodexSessionManifest({
     manifest,
     repoRoot,
     eventName,
     fileName,
   })
 
-  const verification = verifyCodexPostRun(payload)
+  const verification = verifyCodexPostRun(payload, { repoRoot })
   if (!verification.ok) {
     return stopEventOutput(`${eventName}: ${verification.failures.join(', ')}`)
   }
@@ -174,7 +182,7 @@ async function main() {
   let payload
   try {
     payload = await readJsonFromStdin()
-  } catch (error) {
+  } catch {
     if (event === 'PreToolUse') {
       emitJson(denyPreToolUse(`Malformed ${event} payload blocked by hook.`))
       return
@@ -213,7 +221,21 @@ async function main() {
   throw new Error(`Unsupported event: ${event}`)
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.message}\n`)
+main().catch(() => {
+  const eventIndex = process.argv.indexOf('--event')
+  const eventName = eventIndex >= 0 ? process.argv[eventIndex + 1] : null
+  if (eventName === 'Stop' || eventName === 'SubagentStop') {
+    emitJson(stopEventOutput(sanitizeStopReason(eventName)))
+    process.exit(0)
+  }
+  if (eventName === 'PreToolUse') {
+    emitJson(denyPreToolUse(`Malformed ${eventName} payload blocked by hook.`))
+    process.exit(0)
+  }
+  if (eventName === 'PermissionRequest') {
+    emitJson(denyPermissionRequest(`Malformed ${eventName} payload blocked by hook.`))
+    process.exit(0)
+  }
+  process.stderr.write('Codex session recording hook failed.\n')
   process.exit(1)
 })

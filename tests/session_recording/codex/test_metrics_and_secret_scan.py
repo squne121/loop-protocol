@@ -23,6 +23,18 @@ def run_node_module(source: str):
     return result.stdout.strip()
 
 
+def run_metrics_fixture_lines(lines: list[str], output_path: Path, fixture_path: Path):
+    fixture_path.write_text("\n".join(lines) + "\n")
+    result = subprocess.run(
+        ["node", str(METRICS), "--fixture", str(fixture_path), "--out", str(output_path)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result
+
+
 def test_secret_exposure_detects_all_canary_transforms():
     output = run_node_module(
         f"import {{ buildSyntheticCanaryVariants, scanTextForSyntheticCanary }} from {json.dumps(str(SCAN_MODULE))};"
@@ -90,3 +102,47 @@ def test_metrics_sources_unavailable_without_authoritative_usage(tmp_path: Path)
         "total": None,
     }
     assert payload["human_intervention_count"] == 1
+
+
+def test_metrics_invalid_usage_values_do_not_report_measured(tmp_path: Path):
+    fixture = tmp_path / "invalid-usage.ndjson"
+    output_path = tmp_path / "metrics.json"
+    result = run_metrics_fixture_lines(
+        [
+            json.dumps({"event_type": "codex_turn_started", "monotonic_ms": 10}),
+            json.dumps({
+                "event_type": "codex_usage_metadata",
+                "usage": {"prompt_tokens": -1, "completion_tokens": 1.5},
+                "monotonic_ms": 20,
+            }),
+            json.dumps({"event_type": "codex_turn_finished", "monotonic_ms": 30}),
+        ],
+        output_path,
+        fixture,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output_path.read_text())
+    assert payload["token_usage"] == {
+        "availability": "unavailable",
+        "source": "none",
+        "prompt": None,
+        "completion": None,
+        "total": None,
+    }
+
+
+def test_metrics_out_of_order_monotonic_samples_do_not_emit_negative_latency(tmp_path: Path):
+    fixture = tmp_path / "out-of-order.ndjson"
+    output_path = tmp_path / "metrics.json"
+    result = run_metrics_fixture_lines(
+        [
+            json.dumps({"event_type": "codex_turn_started", "monotonic_ms": 100}),
+            json.dumps({"event_type": "manual_intervention", "monotonic_ms": 75}),
+            json.dumps({"event_type": "codex_turn_finished", "monotonic_ms": 50}),
+        ],
+        output_path,
+        fixture,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output_path.read_text())
+    assert payload["latency_ms"] is None or payload["latency_ms"] >= 0
