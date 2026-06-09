@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "Stop",
+  "public_checkpoint_enabled": true,
+  "secrets_mode": "none"
+}
