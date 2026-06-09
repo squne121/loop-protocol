@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "SubagentStop",
+  "unknown_visibility_mapping": true,
+  "secrets_mode": "none"
+}

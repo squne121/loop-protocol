@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "secrets_mode": "none",
+  "touched_paths": [
+    "docs/dev/session-recording-policy.md"
+  ]
+}

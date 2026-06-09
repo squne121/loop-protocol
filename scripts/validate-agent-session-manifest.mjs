@@ -24,68 +24,88 @@
  *   1: JSON is invalid
  */
 
-import { readFileSync } from 'fs'
+import { readFileSync, readdirSync, statSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { validateManifest } from './lib/agent-session-manifest-validation.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-// ============================================================================
-// JSON Loading
-// ============================================================================
+function collectJsonFiles(targetPath) {
+  const stat = statSync(targetPath)
+  if (!stat.isDirectory()) {
+    return [targetPath]
+  }
+
+  const files = []
+  const stack = [targetPath]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    const currentStat = statSync(current)
+    if (currentStat.isDirectory()) {
+      for (const entry of readdirSync(current)) {
+        stack.push(resolve(current, entry))
+      }
+      continue
+    }
+    if (current.endsWith('.json')) {
+      files.push(current)
+    }
+  }
+  return files.sort()
+}
 
 function loadJsonFromArgsOrStdin() {
   const args = process.argv.slice(2)
   let jsonContent
 
   if (args.length > 0 && !args[0].startsWith('--')) {
-    // Load from file
     const filePath = args[0]
     try {
-      jsonContent = readFileSync(filePath, 'utf-8')
+      const files = collectJsonFiles(filePath)
+      if (files.length === 0) {
+        console.error(`Error reading file ${filePath}: no JSON files found`)
+        process.exit(1)
+      }
+      return files.map((candidate) => ({
+        filePath: candidate,
+        json: JSON.parse(readFileSync(candidate, 'utf-8')),
+      }))
     } catch (err) {
       console.error(`Error reading file ${filePath}:`, err.message)
       process.exit(1)
     }
   } else if (process.stdin.isTTY) {
-    // No file argument and no stdin
     console.error('Usage: validate-agent-session-manifest.mjs <file>')
     console.error('   or: cat manifest.json | validate-agent-session-manifest.mjs')
     process.exit(1)
   } else {
-    // Read from stdin
     jsonContent = readFileSync(0, 'utf-8')
   }
 
   try {
-    return JSON.parse(jsonContent)
+    return [{ filePath: '<stdin>', json: JSON.parse(jsonContent) }]
   } catch (err) {
     console.error('Error parsing JSON:', err.message)
     process.exit(1)
   }
 }
 
-// ============================================================================
-// Main
-// ============================================================================
-
 async function main() {
-  const jsonData = loadJsonFromArgsOrStdin()
+  const jsonFiles = loadJsonFromArgsOrStdin()
 
-  // Validate using common module
-  const result = validateManifest(jsonData)
+  for (const { filePath, json } of jsonFiles) {
+    const result = validateManifest(json)
 
-  if (!result.valid) {
-    console.error('Validation failed with errors:')
-    for (const error of result.errors) {
-      console.error(`  - ${error.path}: ${error.message}`)
+    if (!result.valid) {
+      console.error(`Validation failed for ${filePath}:`)
+      for (const error of result.errors) {
+        console.error(`  - ${error.path}: ${error.message}`)
+      }
+      process.exit(1)
     }
-    process.exit(1)
-  } else {
-    // Validation passed
-    process.exit(0)
   }
+  process.exit(0)
 }
 
 main().catch((err) => {
