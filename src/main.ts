@@ -17,6 +17,7 @@ import {
   advanceSimulationLoop,
   clampPlayerToArena,
   runSortieSimulationStep,
+  startSortie,
 } from './systems'
 import { createHudController } from './ui'
 
@@ -61,6 +62,10 @@ let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefi
 const renderer = createCanvasRenderer(canvas)
 const hud = createHudController(commandRail, {
   onQuickSave() {
+    if (state.loopPhase !== 'preparation') {
+      return
+    }
+
     const saveResult = storage.save(createGameSnapshot(state))
     if (!saveResult.ok) {
       reportStorageFailure('save', saveResult)
@@ -76,6 +81,8 @@ const inputState = createInputState()
 bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
+
+maybeAutoStartRuntime()
 
 
 // E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
@@ -122,6 +129,16 @@ window.requestAnimationFrame(frame)
 function stepSimulation(fixedDeltaMs: number): void {
   const commands = mapInputToCommands(inputState)
   runSortieSimulationStep(state, commands, fixedDeltaMs)
+}
+
+function maybeAutoStartRuntime(): void {
+  if (import.meta.env.VITE_E2E_MODE !== 'true') {
+    return
+  }
+
+  if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+  }
 }
 
 function resizeArena(currentState: typeof state): void {
@@ -196,9 +213,12 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
   ;(
     window as Window &
       typeof globalThis & {
-        __LOOP_E2E__: { getState: () => LoopE2ESnapshot }
+        __LOOP_E2E__: { getState: () => LoopE2ESnapshot; startSortie: () => void }
       }
   ).__LOOP_E2E__ = {
+    startSortie() {
+      startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    },
     /** Returns a shallow snapshot copy of the current game + input state. Read-only. */
     getState(): LoopE2ESnapshot {
       return {

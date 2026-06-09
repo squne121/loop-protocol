@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createInputState, mapInputToCommands } from '../src/input'
 import { createInitialGameState } from '../src/state/GameState'
-import type { EnemyState } from '../src/state/GameState'
+import type { EnemyState, SortieResult } from '../src/state/GameState'
 import { defaultSimulationConfig } from '../src/state/SimulationConfig'
 import {
   claimPendingReward,
@@ -28,6 +28,11 @@ function makeDefeatedEnemy(id: number, defeatedAtTick: number): EnemyState {
     defeated: true,
     defeatedAtTick,
   }
+}
+
+function expectPendingReward(state: ReturnType<typeof createInitialGameState>): void {
+  expect(state.loopPhase).toBe('debrief_pending_reward')
+  expect(state.pendingRewardApplicationId).not.toBeNull()
 }
 
 function makeLiveEnemy(id: number): EnemyState {
@@ -92,7 +97,7 @@ describe('GIVEN a terminal outcome', () => {
 
     expect(state.sortie.status).toBe('defeat')
     expect(state.sortie.result?.outcome).toBe('defeat')
-    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expectPendingReward(state)
     expect(state.pendingRewardApplicationId).toBe('sortie-reward-1')
   })
 
@@ -106,8 +111,7 @@ describe('GIVEN a terminal outcome', () => {
 
     expect(state.sortie.status).toBe('timeout')
     expect(state.sortie.result?.outcome).toBe('timeout')
-    expect(state.loopPhase).toBe('debrief_pending_reward')
-    expect(state.pendingRewardApplicationId).not.toBeNull()
+    expectPendingReward(state)
   })
 
   it('WHEN victory occurs THEN debrief_pending_reward is entered with a single pendingRewardApplicationId', () => {
@@ -118,8 +122,120 @@ describe('GIVEN a terminal outcome', () => {
     runSortieSystem(state, FDT)
 
     expect(state.sortie.status).toBe('victory')
-    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expectPendingReward(state)
     expect(state.pendingRewardApplicationId).toMatch(/^sortie-/)
+  })
+
+  it('same-tick defeat precedence: WHEN defeat, victory, and timeout all happen together THEN defeat wins', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    state.player.hp = 0
+    state.sortie.elapsedTicks = TARGET_TICKS - 1
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result?.outcome).toBe('defeat')
+    expect(state.sortie.result?.endReason).toBe('player_hp_zero')
+    expectPendingReward(state)
+  })
+
+  it('victory-over-timeout: WHEN all enemies are defeated on the timeout tick with player alive THEN victory wins', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    state.sortie.elapsedTicks = TARGET_TICKS - 1
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result?.outcome).toBe('victory')
+    expect(state.sortie.result?.endReason).toBe('all_enemies_defeated')
+    expectPendingReward(state)
+  })
+
+  it('vacuous truth: WHEN no enemies exist THEN victory does not trigger', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.status).toBe('running')
+    expect(state.sortie.result).toBeNull()
+    expect(state.pendingRewardApplicationId).toBeNull()
+  })
+
+  it('result exactly-once: WHEN runSortieSystem is called again after terminal THEN result reference and pending ID stay stable', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+
+    runSortieSystem(state, FDT)
+    const firstResult = state.sortie.result
+    const firstPendingRewardApplicationId = state.pendingRewardApplicationId
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result).toBe(firstResult)
+    expect(state.pendingRewardApplicationId).toBe(firstPendingRewardApplicationId)
+  })
+
+  it('timer authority: WHEN elapsedMs disagrees with elapsedTicks THEN terminal duration uses elapsedTicks', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.elapsedMs = 99999
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result?.durationMs).toBeCloseTo(state.sortie.elapsedTicks * FDT)
+  })
+
+  it('kills boundary: WHEN defeatedAtTick exceeds terminalTick THEN that enemy does not count as a kill', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.tick = 42
+    state.enemies.push(makeDefeatedEnemy(1, 40))
+    state.enemies.push(makeDefeatedEnemy(2, 42))
+    state.enemies.push(makeDefeatedEnemy(3, 43))
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.result?.outcome).toBe('victory')
+    expect(state.sortie.result?.kills).toBe(2)
+  })
+
+  it('playerHpRemaining clamp: WHEN terminal result samples HP THEN it is clamped into [0, maxHp]', () => {
+    const victoryState = createInitialGameState()
+    startSortie(victoryState, FDT)
+    victoryState.player.hp = victoryState.player.maxHp + 999
+    victoryState.enemies.push(makeDefeatedEnemy(1, 0))
+    runSortieSystem(victoryState, FDT)
+    expect(victoryState.sortie.result?.playerHpRemaining).toBe(victoryState.player.maxHp)
+
+    const defeatState = createInitialGameState()
+    startSortie(defeatState, FDT)
+    defeatState.player.hp = -5
+    runSortieSystem(defeatState, FDT)
+    expect(defeatState.sortie.result?.outcome).toBe('defeat')
+    expect(defeatState.sortie.result?.playerHpRemaining).toBe(0)
+  })
+
+  it('runSortieSystem phase gate: WHEN loopPhase is not running but sortie.status is running THEN system is a no-op', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.loopPhase = 'preparation'
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    const snapshot = {
+      elapsedTicks: state.sortie.elapsedTicks,
+      result: state.sortie.result,
+      pendingRewardApplicationId: state.pendingRewardApplicationId,
+    }
+
+    runSortieSystem(state, FDT)
+
+    expect(state.sortie.elapsedTicks).toBe(snapshot.elapsedTicks)
+    expect(state.sortie.result).toBe(snapshot.result)
+    expect(state.pendingRewardApplicationId).toBe(snapshot.pendingRewardApplicationId)
+    expect(state.sortie.status).toBe('running')
   })
 })
 
@@ -142,6 +258,24 @@ describe('GIVEN debrief_pending_reward', () => {
     expect(state.pendingRewardApplicationId).toBe(pendingRewardApplicationId)
     expect(secondClaim).toEqual({ ok: false, reason: 'already-claimed' })
     expect(state.progress.resources).toBe(afterFirstClaim)
+  })
+
+  it('claimed phase invariant: WHEN ledger is missing for a claimed phase token THEN reward is not applied again', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+    runSortieSystem(state, FDT)
+    const pendingRewardApplicationId = state.pendingRewardApplicationId
+    expect(pendingRewardApplicationId).not.toBeNull()
+
+    state.loopPhase = 'debrief_reward_claimed'
+    delete state.rewardClaims.claimedApplicationIds[pendingRewardApplicationId as string]
+    const resourcesBefore = state.progress.resources
+
+    const claim = claimPendingReward(state)
+
+    expect(claim).toEqual({ ok: false, reason: 'claimed-phase-ledger-miss' })
+    expect(state.progress.resources).toBe(resourcesBefore)
   })
 
   it('terminal halt: WHEN claim succeeds THEN runSortieSimulationStep does not advance after claim', () => {
@@ -213,6 +347,19 @@ describe('GIVEN debrief_reward_claimed', () => {
     expect(state.progress.resources).toBe(resourcesAfterClaim)
     expect(state.progress.weaponPower).toBe(weaponPower)
   })
+
+  it('reward application ID skips claimed collisions: WHEN ledger already contains the next sequence token THEN a fresh token is generated', () => {
+    const state = createInitialGameState()
+    state.rewardClaims.claimedApplicationIds['sortie-reward-1'] = true
+    state.nextRewardApplicationSequence = 1
+    startSortie(state, FDT)
+    state.enemies.push(makeDefeatedEnemy(1, 0))
+
+    runSortieSystem(state, FDT)
+
+    expect(state.pendingRewardApplicationId).toBe('sortie-reward-2')
+    expect(state.nextRewardApplicationSequence).toBe(3)
+  })
 })
 
 describe('GIVEN terminal combat states', () => {
@@ -233,3 +380,40 @@ describe('GIVEN terminal combat states', () => {
     expect(state.elapsedMs).toBe(elapsedBefore)
   })
 })
+
+void Object.freeze({
+  outcome: 'victory',
+  endReason: 'all_enemies_defeated',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult)
+
+void Object.freeze({
+  outcome: 'defeat',
+  endReason: 'player_hp_zero',
+  durationMs: 1000,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 0,
+} satisfies SortieResult)
+
+void Object.freeze({
+  outcome: 'timeout',
+  endReason: 'timeout',
+  durationMs: 30000,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult)
+
+// @ts-expect-error outcome: 'victory' に endReason: 'timeout' は型エラー
+void ({
+  outcome: 'victory',
+  endReason: 'timeout',
+  durationMs: 0,
+  kills: 0,
+  shotsFired: 0,
+  playerHpRemaining: 1,
+} satisfies SortieResult)

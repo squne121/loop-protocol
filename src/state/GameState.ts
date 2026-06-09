@@ -172,6 +172,7 @@ export interface GameState {
   elapsedMs: number
   loopPhase: LoopPhase
   pendingRewardApplicationId: RewardApplicationId | null
+  nextRewardApplicationSequence: number
   arena: ArenaState
   player: PlayerState
   projectiles: ProjectileState[]
@@ -204,6 +205,7 @@ export function createInitialGameState(
     elapsedMs: 0,
     loopPhase: 'preparation',
     pendingRewardApplicationId: null,
+    nextRewardApplicationSequence: 1,
     arena: {
       width: 960,
       height: 540,
