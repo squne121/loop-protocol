@@ -669,6 +669,7 @@ routing_allowed_fields:
   TEST_VERDICT_MACHINE/v1:
     - status     # pass | partial | fail
     - summary    # 統計のみ（raw 出力は参照しない）
+    - branch_behind_main  # impl-review-loop Step 5 の BEHIND reroute 判定で使う routing-critical field
   LOOP_VERDICT:
     - verdict    # APPROVE | REQUEST_CHANGES
     - status     # ok | failed
@@ -677,6 +678,31 @@ routing_allowed_fields:
 ```
 
 詳細な domain judgment（blocking_issues のテキスト / diff_proposal の内容 / test failure の詳細 等）は、後続 SubAgent へ参照（GitHub comment URL / issue_url）として渡す。オーケストレーターが詳細を再解釈しない。
+
+#### impl-review-loop V2 routing boundary
+
+`impl-review-loop` Step 5 は `LOOP_VERDICT_V2.required_auto_actions` を canonical な routing source として扱う。`LOOP_VERDICT.recommendations` は V1 時代の stale wording であり、現行 consumer path の canonical field として復活させてはならない。
+
+```yaml
+impl_review_loop_v2_routing_boundary:
+  TEST_VERDICT_MACHINE/v1.branch_behind_main:
+    classification: routing_critical
+  LOOP_VERDICT_V2.required_auto_actions[].kind:
+    classification: routing_critical
+  LOOP_VERDICT_V2.required_auto_actions[].executor:
+    classification: routing_critical
+  LOOP_VERDICT_V2.required_auto_actions[].skill:
+    classification: routing_critical
+  LOOP_VERDICT_V2.required_auto_actions[].expected_head_sha:
+    classification: routing_critical
+  LOOP_VERDICT_V2:
+    negative_rules:
+      - LOOP_VERDICT.recommendations must not be treated as a canonical routing field
+      - unknown required_auto_actions.kind must fail closed
+      - missing or mismatched expected_head_sha must fail closed before update_branch dispatch
+```
+
+`required_auto_actions[].kind` は action 種別の分岐点、`executor` / `skill` は data-plane 委譲先の決定、`expected_head_sha` は stale verdict を防ぐ race guard であり、いずれも routing-critical である。`branch_behind_main` は test-runner から Step 5 へ渡る補助信号で、BEHIND 状態の reroute 判断を `TEST_VERDICT_MACHINE/v1` 側から補強する field として扱う。
 
 ### 一時例外（temporary_exceptions）
 

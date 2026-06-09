@@ -1,0 +1,17 @@
+scenario: v2_unknown_required_auto_actions_kind
+description: "AC4/AC6: unknown required_auto_actions.kind must fail closed"
+verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: "abc123def456"
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: CLEAN
+  required_auto_actions:
+    - kind: rotate_branch_magic
+      executor: implementation-worker
+      skill: implement-issue
+      expected_head_sha: "abc123def456"
+expected:
+  route: fail_closed_unknown_required_auto_actions_kind
+  fail_closed: true

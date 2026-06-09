@@ -1,0 +1,35 @@
+scenario: v2_update_branch_expected_head_sha_guard
+description: "AC5: expected_head_sha guard must fail closed when missing or mismatched"
+cases:
+  - name: missing_expected_head_sha
+    verdict:
+      verdict: APPROVE
+      merge_ready: false
+      reviewed_head_sha: "abc123def456"
+      mergeability:
+        mergeable: MERGEABLE
+        merge_state_status: BEHIND
+      required_auto_actions:
+        - kind: update_branch
+          executor: implementation-worker
+          skill: implement-issue
+          expected_head_sha: null
+    expected:
+      route: fail_closed_expected_head_sha_guard
+      fail_closed: true
+  - name: mismatched_expected_head_sha
+    verdict:
+      verdict: APPROVE
+      merge_ready: false
+      reviewed_head_sha: "abc123def456"
+      mergeability:
+        mergeable: MERGEABLE
+        merge_state_status: BEHIND
+      required_auto_actions:
+        - kind: update_branch
+          executor: implementation-worker
+          skill: implement-issue
+          expected_head_sha: "zzz999yyy888"
+    expected:
+      route: fail_closed_expected_head_sha_guard
+      fail_closed: true

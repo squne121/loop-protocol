@@ -1,0 +1,17 @@
+scenario: v2_update_branch_behind
+description: "AC3: BEHIND verdict routes to update_branch via LOOP_VERDICT_V2.required_auto_actions"
+verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: "abc123def456"
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: BEHIND
+  required_auto_actions:
+    - kind: update_branch
+      executor: implementation-worker
+      skill: implement-issue
+      expected_head_sha: "abc123def456"
+expected:
+  route: route_to_update_branch
+  fail_closed: false
