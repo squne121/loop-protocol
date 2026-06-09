@@ -18,6 +18,14 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
+## Codex Dispatch Guardrail
+
+- Codex CLI の root thread は control-plane 専用とし、`implementation-worker` / `test-runner` / `pr-reviewer` / `post-merge-cleanup-worker` を明示 spawn して data-plane を委譲する
+- repo-side deterministic guardrail の canonical evidence は event-derived `SUBAGENT_LAUNCH_LEDGER_V1` とし、worker self-report 単独では spawn evidence とみなさない
+- `SUBAGENT_LAUNCH_LEDGER_V1.coverage_scope` は support 済みの `SubagentStart` / `PreToolUse(Bash|apply_patch|Edit|Write)` 観測範囲を明示する。未対応 path の absence を「完全防止」の証拠として主張しない
+- project-local `.codex/config.toml` は profile routing の証拠として扱わず、actual runtime contract と launch-ledger evidence を validator 対象にする
+- live spawn の runtime verification は `#601` に deferred し、この文書で扱うのは evidence 不足時に fail-closed する repo-side 監査境界のみ
+
 ### `review-issue` / `issue-reviewer` の使い分け
 
 | エントリ | 種別 | 呼び出し元 | 役割 |

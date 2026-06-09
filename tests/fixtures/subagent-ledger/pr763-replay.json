@@ -1,0 +1,48 @@
+{
+  "ledger_schema": "SUBAGENT_LAUNCH_LEDGER_V1",
+  "generated_by": "worker",
+  "coverage_scope": {
+    "subagent_start_event_recorded": true,
+    "supported_pretooluse_paths": ["Bash", "Edit", "Write", "apply_patch"],
+    "unsupported_paths_fail_closed": true,
+    "scope_note": "This ledger records event-derived SubagentStart launches and supported PreToolUse paths only."
+  },
+  "fixture_expectation": {
+    "status": "fail",
+    "error_codes": [
+      "root_thread_data_plane_execution_observed",
+      "subagent_launch_evidence_missing"
+    ]
+  },
+  "codex_binary_status": "available",
+  "hook_state": "enabled",
+  "tool_path_support": true,
+  "project_trust_state": "trusted",
+  "launches": [],
+  "root_thread_actions": [
+    {
+      "kind": "test_execution",
+      "command": "rtk run uv run --locked pytest .claude/hooks/tests/test_secret_boundary_contract.py",
+      "tool_name": "Bash",
+      "coverage_source": "supported_pretooluse_path"
+    },
+    {
+      "kind": "file_edit",
+      "command": "apply_patch .github/workflows/ci.yml",
+      "tool_name": "apply_patch",
+      "coverage_source": "supported_pretooluse_path"
+    },
+    {
+      "kind": "git_commit",
+      "command": "rtk git commit -m \"test: hooks tests の CI 取りこぼしを防ぐ (#682)\"",
+      "tool_name": "Bash",
+      "coverage_source": "supported_pretooluse_path"
+    },
+    {
+      "kind": "git_push",
+      "command": "rtk git push -u origin worktree-issue-682-ci-discovery-contract",
+      "tool_name": "Bash",
+      "coverage_source": "supported_pretooluse_path"
+    }
+  ]
+}
