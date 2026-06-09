@@ -62,6 +62,17 @@ def test_positive_fixture_writes_private_manifest_and_returns_continue_true():
     assert validation.returncode == 0, validation.stderr
 
 
+def test_zz_positive_fixture_leaves_manifest_directory_for_followup_validation():
+    payload = json.loads((FIXTURES / "positive_fixture.json").read_text())
+    result = run_adapter("Stop", payload)
+    assert json.loads(result.stdout) == {"continue": True}
+
+    manifest_dir = MANIFEST_ROOT / "stop"
+    files = sorted(manifest_dir.glob("*.json"))
+    assert len(files) == 1
+
+
+
 def test_kill_switch_public_checkpoint_stop():
     payload = json.loads((FIXTURES / "public_checkpoint_enabled.json").read_text())
     result = run_adapter("Stop", payload)
