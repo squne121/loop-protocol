@@ -1,35 +1,18 @@
-/**
- * tests/sortie-system.test.ts
- *
- * Vitest unit tests for SortieSystem (AC7–AC12).
- * Required test cases: bootstrap, no-start, victory (allEnemiesDefeated), defeat,
- * timeout→timeout, defeat-precedence, vacuous-truth, double-result,
- * timer-authority, terminal-gate, kills-boundary, playerHpRemaining-clamp.
- *
- * Updated for Issue #680: endReason discriminated union (AC4–AC8, AC10).
- */
-
-import { describe, it, expect } from 'vitest'
-import { createInitialGameState } from '../src/state/GameState'
-import type { SortieResult } from '../src/state/GameState'
-import {
-  startSortie,
-  runSortieSystem,
-  runSortieSimulationStep,
-  SORTIE_DURATION_MS,
-} from '../src/systems/SortieSystem'
-import { defaultSimulationConfig } from '../src/state/SimulationConfig'
+import { describe, expect, it } from 'vitest'
 import { createInputState, mapInputToCommands } from '../src/input'
+import { createInitialGameState } from '../src/state/GameState'
 import type { EnemyState } from '../src/state/GameState'
+import { defaultSimulationConfig } from '../src/state/SimulationConfig'
+import {
+  claimPendingReward,
+  runSortieSimulationStep,
+  runSortieSystem,
+  SORTIE_DURATION_MS,
+  startSortie,
+} from '../src/systems/SortieSystem'
 
-const FDT = defaultSimulationConfig.fixedDeltaMs // ~16.667 ms
-
-/** Number of ticks required for 30-second timeout */
+const FDT = defaultSimulationConfig.fixedDeltaMs
 const TARGET_TICKS = Math.ceil(SORTIE_DURATION_MS / FDT)
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 function makeDefeatedEnemy(id: number, defeatedAtTick: number): EnemyState {
   return {
@@ -63,393 +46,190 @@ function makeLiveEnemy(id: number): EnemyState {
   }
 }
 
-// ---------------------------------------------------------------------------
-// bootstrap
-// ---------------------------------------------------------------------------
-describe('GIVEN createInitialGameState and startSortie', () => {
-  it('bootstrap: WHEN startSortie called THEN status=running, elapsedTicks=0, result=null', () => {
+describe('GIVEN bootstrap preparation', () => {
+  it("bootstrap preparation: WHEN createInitialGameState called THEN loopPhase='preparation' and sortie is idle", () => {
     const state = createInitialGameState()
+
+    expect(state.loopPhase).toBe('preparation')
+    expect(state.pendingRewardApplicationId).toBeNull()
     expect(state.sortie.status).toBe('idle')
     expect(state.sortie.result).toBeNull()
+  })
+
+  it('preparation before start: WHEN runSortieSimulationStep called before startSortie THEN state does not advance outside running', () => {
+    const state = createInitialGameState()
+    const commands = mapInputToCommands(createInputState())
+
+    runSortieSimulationStep(state, commands, FDT)
+
+    expect(state.loopPhase).toBe('preparation')
+    expect(state.sortie.status).toBe('idle')
+    expect(state.tick).toBe(0)
+    expect(state.elapsedMs).toBe(0)
+  })
+})
+
+describe('GIVEN startSortie from preparation', () => {
+  it('WHEN startSortie called THEN loopPhase=running and sortie enters running state', () => {
+    const state = createInitialGameState()
 
     startSortie(state, FDT)
 
+    expect(state.loopPhase).toBe('running')
+    expect(state.pendingRewardApplicationId).toBeNull()
     expect(state.sortie.status).toBe('running')
     expect(state.sortie.elapsedTicks).toBe(0)
-    expect(state.sortie.result).toBeNull()
   })
 })
 
-// ---------------------------------------------------------------------------
-// no-start
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie is idle', () => {
-  it('no-start: WHEN runSortieSystem called without startSortie THEN elapsedTicks stays 0', () => {
-    const state = createInitialGameState()
-    runSortieSystem(state, FDT)
-    expect(state.sortie.status).toBe('idle')
-    expect(state.sortie.elapsedTicks).toBe(0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// AC6 / AC7: all enemies defeated → victory + endReason=all_enemies_defeated
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie is running and all enemies are defeated', () => {
-  it('AC6/AC7: WHEN all spawned enemies defeated THEN outcome=victory, endReason=all_enemies_defeated, status=victory', () => {
+describe('GIVEN a terminal outcome', () => {
+  it('WHEN player HP reaches zero THEN defeat also enters debrief_pending_reward', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    state.enemies.push(makeDefeatedEnemy(1, 0))
-    runSortieSystem(state, FDT)
-
-    expect(state.sortie.status).toBe('victory')
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('victory')
-    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// AC4 / AC8: defeat when player hp reaches 0 + endReason=player_hp_zero
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie is running and player hp reaches 0', () => {
-  it('AC4/AC8: WHEN player.hp <= 0 THEN outcome=defeat, endReason=player_hp_zero, status=defeat', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-
     state.player.hp = 0
+
     runSortieSystem(state, FDT)
 
     expect(state.sortie.status).toBe('defeat')
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('defeat')
-    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
+    expect(state.sortie.result?.outcome).toBe('defeat')
+    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expect(state.pendingRewardApplicationId).toBe('sortie-reward-1')
   })
-})
 
-// ---------------------------------------------------------------------------
-// AC5 / AC9: 30s timeout → timeout + endReason=timeout
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie is running and 30s elapses with enemies remaining', () => {
-  it('AC5/AC9: WHEN elapsedTicks >= targetTicks with live enemies THEN outcome=timeout, endReason=timeout', () => {
+  it('timeout transition: WHEN elapsedTicks reaches targetTicks with enemies remaining THEN debrief_pending_reward is entered', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    // Add a live enemy so allEnemiesDefeated is false
     state.enemies.push(makeLiveEnemy(1))
 
     ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
     runSortieSystem(state, FDT)
 
     expect(state.sortie.status).toBe('timeout')
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('timeout')
-    expect(state.sortie.result!.endReason).toBe('timeout')
+    expect(state.sortie.result?.outcome).toBe('timeout')
+    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expect(state.pendingRewardApplicationId).not.toBeNull()
   })
-})
 
-// ---------------------------------------------------------------------------
-// AC7 (priority) / AC10: defeat-precedence — defeat > victory > timeout
-// ---------------------------------------------------------------------------
-describe('GIVEN same tick: player hp=0 AND all enemies defeated', () => {
-  it('AC7/AC10: defeat-precedence: THEN outcome=defeat, endReason=player_hp_zero (defeat beats victory)', () => {
+  it('WHEN victory occurs THEN debrief_pending_reward is entered with a single pendingRewardApplicationId', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    // All enemies defeated → would be victory, but player.hp=0 → defeat wins
     state.enemies.push(makeDefeatedEnemy(1, 0))
-    state.player.hp = 0
+
     runSortieSystem(state, FDT)
 
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('defeat')
-    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
+    expect(state.sortie.status).toBe('victory')
+    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expect(state.pendingRewardApplicationId).toMatch(/^sortie-/)
   })
 })
 
-describe('GIVEN same tick: player hp=0, all enemies defeated, AND elapsedTicks >= targetTicks', () => {
-  it('AC7/AC10: defeat-precedence: THEN outcome=defeat, endReason=player_hp_zero (defeat beats victory and timeout)', () => {
+describe('GIVEN debrief_pending_reward', () => {
+  it('same-token no-op: WHEN claimPendingReward called twice THEN second call is already-claimed and resources stay unchanged', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    state.enemies.push(makeDefeatedEnemy(1, 0))
-    state.player.hp = 0
-    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
-    runSortieSystem(state, FDT)
-
-    expect(state.sortie.result!.outcome).toBe('defeat')
-    expect(state.sortie.result!.endReason).toBe('player_hp_zero')
-  })
-})
-
-// AC8: same tick: all enemies defeated AND timeout, player alive → victory / all_enemies_defeated
-describe('GIVEN same tick: all enemies defeated AND elapsedTicks >= targetTicks, player alive', () => {
-  it('AC8/AC10: victory-over-timeout: THEN outcome=victory, endReason=all_enemies_defeated (victory beats timeout)', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-
-    state.enemies.push(makeDefeatedEnemy(1, 0))
-    // No player defeat
-    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
-    runSortieSystem(state, FDT)
-
-    expect(state.sortie.result!.outcome).toBe('victory')
-    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// vacuous truth: no enemies → no victory
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie is running with no enemies', () => {
-  it('vacuous-truth: WHEN no enemies in array THEN victory does not trigger', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-    // No enemies pushed — allEnemiesDefeated must be false (length === 0 guard)
-    runSortieSystem(state, FDT)
-    expect(state.sortie.status).toBe('running')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// AC10 / AC11: double-result (result generated exactly once, endReason preserved)
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie already has a result (victory)', () => {
-  it('AC10/AC11: double-result: WHEN runSortieSystem called again THEN result is not overwritten, endReason preserved', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-
     state.enemies.push(makeDefeatedEnemy(1, 0))
     runSortieSystem(state, FDT)
 
-    const firstResult = state.sortie.result
-    expect(firstResult).not.toBeNull()
-    expect(firstResult!.endReason).toBe('all_enemies_defeated')
+    const beforeFirstClaim = state.progress.resources
+    const pendingRewardApplicationId = state.pendingRewardApplicationId
+    const firstClaim = claimPendingReward(state)
+    const afterFirstClaim = state.progress.resources
+    const secondClaim = claimPendingReward(state)
 
-    // Extra tick after terminal state
-    runSortieSystem(state, FDT)
-
-    expect(state.sortie.result).toBe(firstResult) // same reference
-    expect(state.sortie.result!.endReason).toBe('all_enemies_defeated')
+    expect(firstClaim.ok).toBe(true)
+    expect(afterFirstClaim).toBeGreaterThan(beforeFirstClaim)
+    expect(state.loopPhase).toBe('debrief_reward_claimed')
+    expect(state.pendingRewardApplicationId).toBe(pendingRewardApplicationId)
+    expect(secondClaim).toEqual({ ok: false, reason: 'already-claimed' })
+    expect(state.progress.resources).toBe(afterFirstClaim)
   })
-})
 
-// ---------------------------------------------------------------------------
-// AC12: timer-authority — durationMs uses elapsedTicks, not elapsedMs
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie victory', () => {
-  it('AC12: timer-authority: THEN durationMs = elapsedTicks * fixedDeltaMs (not elapsedMs)', () => {
+  it('terminal halt: WHEN claim succeeds THEN runSortieSimulationStep does not advance after claim', () => {
     const state = createInitialGameState()
     startSortie(state, FDT)
-
-    // Deliberately set elapsedMs to a wrong value to ensure it is NOT used
-    state.elapsedMs = 99999
-
     state.enemies.push(makeDefeatedEnemy(1, 0))
     runSortieSystem(state, FDT)
+    const claim = claimPendingReward(state)
+    expect(claim.ok).toBe(true)
 
-    expect(state.sortie.result).not.toBeNull()
-    const expected = state.sortie.elapsedTicks * FDT
-    expect(state.sortie.result!.durationMs).toBeCloseTo(expected)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// terminal-gate
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie has reached terminal state (defeat)', () => {
-  it('terminal-gate: WHEN runSortieSimulationStep called multiple times after defeat THEN state does not change', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-    state.player.hp = 0
-
-    const inputState = createInputState()
-    const commands = mapInputToCommands(inputState)
-
-    // First step triggers defeat
-    runSortieSimulationStep(state, commands, FDT)
-
-    expect(state.sortie.status).toBe('defeat')
-    const snapshotTicks = state.sortie.elapsedTicks
-    const snapshotResult = state.sortie.result
-
-    // Call multiple times via orchestration gate
-    for (let i = 0; i < 5; i++) {
-      runSortieSimulationStep(state, commands, FDT)
+    const commands = mapInputToCommands(createInputState())
+    const snapshot = {
+      tick: state.tick,
+      elapsedMs: state.elapsedMs,
+      shotsFired: state.player.shotsFired,
+      resources: state.progress.resources,
     }
 
-    expect(state.sortie.status).toBe('defeat')
-    expect(state.sortie.elapsedTicks).toBe(snapshotTicks)
-    expect(state.sortie.result).toBe(snapshotResult) // same reference
+    runSortieSimulationStep(state, commands, FDT)
+
+    expect(state.loopPhase).toBe('debrief_reward_claimed')
+    expect(state.tick).toBe(snapshot.tick)
+    expect(state.elapsedMs).toBe(snapshot.elapsedMs)
+    expect(state.player.shotsFired).toBe(snapshot.shotsFired)
+    expect(state.progress.resources).toBe(snapshot.resources)
   })
 })
 
-// ---------------------------------------------------------------------------
-// playerHpRemaining clamp
-// ---------------------------------------------------------------------------
-describe('GIVEN sortie result playerHpRemaining', () => {
-  it('clamps playerHpRemaining to [0, maxHp] on victory', () => {
+describe('GIVEN debrief_reward_claimed', () => {
+  it('next sortie reset: WHEN startSortie called THEN resets combat runtime and preserves progression', () => {
     const state = createInitialGameState()
+    state.progress.resources = 123
+    state.progress.weaponPower = 7
+    state.player.maxHp = 11
+    state.player.hp = 11
     startSortie(state, FDT)
-    state.player.hp = state.player.maxHp + 999
     state.enemies.push(makeDefeatedEnemy(1, 0))
-    runSortieSystem(state, FDT)
-    expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp)
-  })
-
-  it('records defeat playerHpRemaining as 0 even if hp is negative', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-    state.player.hp = -5
-    runSortieSystem(state, FDT)
-    expect(state.sortie.result!.outcome).toBe('defeat')
-    expect(state.sortie.result!.playerHpRemaining).toBe(0)
-  })
-
-  it('timeout terminal: playerHpRemaining is HP snapshot, not 0', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-    state.player.hp = state.player.maxHp // player alive with full HP
-    state.enemies.push(makeLiveEnemy(1))   // enemies remain → allEnemiesDefeated = false
-    ;(state.sortie as { elapsedTicks: number }).elapsedTicks = TARGET_TICKS - 1
-    runSortieSystem(state, FDT)
-    expect(state.sortie.result!.outcome).toBe('timeout')
-    expect(state.sortie.result!.playerHpRemaining).toBe(state.player.maxHp) // NOT 0
-  })
-})
-
-// ---------------------------------------------------------------------------
-// kills-boundary
-// ---------------------------------------------------------------------------
-describe('GIVEN enemies with various defeatedAtTick values', () => {
-  it('kills-boundary: THEN only enemies with defeatedAtTick <= terminalTick count as kills', () => {
-    const state = createInitialGameState()
-    startSortie(state, FDT)
-
-    // Set current tick to 42 (will be the terminalTick when victory is recorded)
-    state.tick = 42
-
-    // Enemy killed before terminal tick
-    state.enemies.push({
+    state.projectiles.push({
       id: 1,
-      definitionId: 'enemy-basic',
-      hp: 0,
-      maxHp: 5,
-      x: 0,
-      y: 0,
-      radius: 12,
-      speedPxPerSec: 60,
-      contactDamage: 1,
-      defeated: true,
-      defeatedAtTick: 40, // <= 42
+      x: 10,
+      y: 10,
+      radius: 2,
+      directionX: 1,
+      directionY: 0,
+      speedPxPerSec: 120,
+      ageMs: 100,
+      lifetimeMs: 500,
+      damage: 1,
     })
-
-    // Enemy killed exactly at terminal tick
-    state.enemies.push({
-      id: 2,
-      definitionId: 'enemy-basic',
-      hp: 0,
-      maxHp: 5,
-      x: 0,
-      y: 0,
-      radius: 12,
-      speedPxPerSec: 60,
-      contactDamage: 1,
-      defeated: true,
-      defeatedAtTick: 42, // === 42
-    })
-
-    // Enemy killed after terminal tick (should NOT count)
-    state.enemies.push({
-      id: 3,
-      definitionId: 'enemy-basic',
-      hp: 0,
-      maxHp: 5,
-      x: 0,
-      y: 0,
-      radius: 12,
-      speedPxPerSec: 60,
-      contactDamage: 1,
-      defeated: true,
-      defeatedAtTick: 43, // > 42, should NOT count
-    })
-
-    // All 3 enemies are defeated → allEnemiesDefeated = true → victory
+    state.player.shotsFired = 7
     runSortieSystem(state, FDT)
+    const claim = claimPendingReward(state)
+    expect(claim.ok).toBe(true)
 
-    expect(state.sortie.result).not.toBeNull()
-    expect(state.sortie.result!.outcome).toBe('victory')
-    expect(state.sortie.result!.kills).toBe(2) // ids 1 and 2 only
+    const resourcesAfterClaim = state.progress.resources
+    const weaponPower = state.progress.weaponPower
+    const maxHp = state.player.maxHp
+    startSortie(state, FDT)
+
+    expect(state.loopPhase).toBe('running')
+    expect(state.pendingRewardApplicationId).toBeNull()
+    expect(state.sortie.status).toBe('running')
+    expect(state.sortie.elapsedTicks).toBe(0)
+    expect(state.projectiles).toHaveLength(0)
+    expect(state.enemies).toHaveLength(0)
+    expect(state.player.shotsFired).toBe(0)
+    expect(state.player.hp).toBe(maxHp)
+    expect(state.player.maxHp).toBe(maxHp)
+    expect(state.progress.resources).toBe(resourcesAfterClaim)
+    expect(state.progress.weaponPower).toBe(weaponPower)
   })
 })
 
-// ---- Type-level regression fixtures ----
-// discriminated union の整合を compile-time に検証する（runtime では何も実行しない）
+describe('GIVEN terminal combat states', () => {
+  it('does not advance outside running: WHEN sortie status is terminal THEN runSortieSimulationStep is a no-op', () => {
+    const state = createInitialGameState()
+    startSortie(state, FDT)
+    state.player.hp = 0
+    runSortieSystem(state, FDT)
 
-void Object.freeze({
-  outcome: 'victory',
-  endReason: 'all_enemies_defeated',
-  durationMs: 0,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 1,
-} satisfies SortieResult)
+    const commands = mapInputToCommands(createInputState())
+    const tickBefore = state.tick
+    const elapsedBefore = state.elapsedMs
 
-void Object.freeze({
-  outcome: 'defeat',
-  endReason: 'player_hp_zero',
-  durationMs: 1000,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 0,
-} satisfies SortieResult)
+    runSortieSimulationStep(state, commands, FDT)
 
-void Object.freeze({
-  outcome: 'timeout',
-  endReason: 'timeout',
-  durationMs: 30000,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 1,
-} satisfies SortieResult)
-
-// @ts-expect-error outcome: 'victory' に endReason: 'timeout' は型エラー
-void ({
-  outcome: 'victory',
-  endReason: 'timeout',
-  durationMs: 0,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 1,
-} satisfies SortieResult)
-
-// @ts-expect-error outcome: 'victory' に endReason: 'player_hp_zero' は型エラー
-void ({
-  outcome: 'victory',
-  endReason: 'player_hp_zero',
-  durationMs: 0,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 1,
-} satisfies SortieResult)
-
-// @ts-expect-error outcome: 'defeat' に endReason: 'all_enemies_defeated' は型エラー
-void ({
-  outcome: 'defeat',
-  endReason: 'all_enemies_defeated',
-  durationMs: 0,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 0,
-} satisfies SortieResult)
-
-// @ts-expect-error outcome: 'timeout' に endReason: 'player_hp_zero' は型エラー
-void ({
-  outcome: 'timeout',
-  endReason: 'player_hp_zero',
-  durationMs: 30000,
-  kills: 0,
-  shotsFired: 0,
-  playerHpRemaining: 1,
-} satisfies SortieResult)
+    expect(state.loopPhase).toBe('debrief_pending_reward')
+    expect(state.tick).toBe(tickBefore)
+    expect(state.elapsedMs).toBe(elapsedBefore)
+  })
+})

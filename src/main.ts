@@ -17,7 +17,6 @@ import {
   advanceSimulationLoop,
   clampPlayerToArena,
   runSortieSimulationStep,
-  startSortie,
 } from './systems'
 import { createHudController } from './ui'
 
@@ -69,7 +68,6 @@ const hud = createHudController(commandRail, {
   },
   onReset() {
     state = createInitialGameState()
-    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     resizeArena(state)
   },
 })
@@ -79,8 +77,6 @@ bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
 
-// M2 bootstrap: start sortie once after initialisation (AC12)
-startSortie(state, defaultSimulationConfig.fixedDeltaMs)
 
 // E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
 // These are injected via page.addInitScript() in Playwright tests before the
@@ -91,7 +87,7 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
     __E2E_PLAYER_HP_OVERRIDE__?: number
   }
   // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
-  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.sortie.status === 'running') {
+  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.loopPhase === 'running' && state.sortie.status === 'running') {
     state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
   }
   // Player HP override: set hp/maxHp for deterministic defeat E2E
@@ -158,6 +154,7 @@ function reportStorageFailure(
 interface LoopE2ESnapshot {
   tick: number
   elapsedMs: number
+  loopPhase: 'preparation' | 'running' | 'debrief_pending_reward' | 'debrief_reward_claimed'
   player: {
     x: number
     y: number
@@ -207,6 +204,7 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
       return {
         tick: state.tick,
         elapsedMs: state.elapsedMs,
+        loopPhase: state.loopPhase,
         player: {
           x: state.player.x,
           y: state.player.y,
