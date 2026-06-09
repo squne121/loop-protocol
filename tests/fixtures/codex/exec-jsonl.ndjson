@@ -1,0 +1,4 @@
+{"event_type":"codex_turn_started","monotonic_ms":1000}
+{"event_type":"manual_intervention","monotonic_ms":1200}
+{"event_type":"codex_usage_metadata","monotonic_ms":1800,"usage":{"prompt_tokens":11,"completion_tokens":7}}
+{"event_type":"codex_turn_finished","monotonic_ms":2500}

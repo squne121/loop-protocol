@@ -14,6 +14,14 @@ created: "2026-05-24"
 本文書は `session_recording_policy/v1` YAML と Kill Switch 手順の唯一の正本（SSOT）である。
 `secrets_mode` が `none` 以外に遷移した場合の session 記録制御と、Kill Switch の実行手順を定める。
 
+## Codex CLI Hook Boundary
+
+- `.codex/hooks.json` の structural validation は repo-local wiring の確認に限られ、runtime active hook state や trust state の証跡にはならない。
+- Codex CLI では `[features].hooks` を canonical key とし、`codex_hooks` は deprecated alias としてのみ扱う。
+- project `.codex/` layer は trust 済みでなければ load されない。`--dangerously-bypass-hook-trust` は one-off automation 向けの非既定 escape hatch であり、pilot の通常運用では使わない。
+- `PreToolUse` / `PermissionRequest` は予防層であり security boundary ではない。canonical final gate は post-run verifier と private artifact validation に置く。
+- Codex hook command は `rtk pnpm exec node ...` を明示 dependency とし、runtime では `node` と repo script のみで deterministic に再実行できるようにする。
+
 ---
 
 ## 機械可読メタデータ (session_recording_policy/v1)

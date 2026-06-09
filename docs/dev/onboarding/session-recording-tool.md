@@ -16,6 +16,13 @@ created: "2026-05-24"
 導入作業のうち権限・secret・外部契約が必要な部分を明確に分離し、
 AI が実行できる準備作業と人間が判断しなければならない操作を区別する。
 
+## Codex CLI Hook Trust 補足
+
+- Codex repo-local hook の canonical config key は `[features].hooks`。旧 `codex_hooks` alias が残っていても、それを唯一の正本として説明しない。
+- `.codex/hooks.json` を validator が pass しても、runtime active hook state と trust state は別途 `/hooks` 等で確認する必要がある。
+- trusted project でない `.codex/` layer の hook は load されない。pilot で `--dangerously-bypass-hook-trust` を既定運用に組み込まない。
+- Codex session-recording manifest は `tmp/session-manifests/codex/**` の private/local artifact に閉じ、public comment や public checkpoint branch に転載しない。
+
 ---
 
 ## Pilot 開始可否

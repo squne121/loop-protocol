@@ -22,6 +22,12 @@
             "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
             "timeout": 30,
             "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail"
+          },
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PreToolUse",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording PreToolUse guard"
           }
         ]
       },
@@ -33,6 +39,62 @@
             "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
             "timeout": 30,
             "statusMessage": "Checking LOOP_PROTOCOL patch guardrail"
+          },
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PreToolUse",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording patch guard"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PermissionRequest",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording PermissionRequest guard"
+          }
+        ]
+      },
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PermissionRequest",
+            "timeout": 30,
+            "statusMessage": "Checking Codex session-recording PermissionRequest guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event Stop",
+            "timeout": 30,
+            "statusMessage": "Writing Codex session-recording Stop manifest"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event SubagentStop",
+            "timeout": 30,
+            "statusMessage": "Writing Codex session-recording SubagentStop manifest"
           }
         ]
       }
