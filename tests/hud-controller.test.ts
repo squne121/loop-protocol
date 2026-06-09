@@ -125,7 +125,7 @@ describe('HudController', () => {
     expect(queryButton(container, 'quick-load').disabled).toBe(true)
   })
 
-  it('GIVEN running WHEN render called THEN Sortie running disables the full action surface', () => {
+  it('GIVEN running WHEN render called THEN button.disabled marks the full action surface as disabled', () => {
     hudController.render(createState('running'))
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie running')
