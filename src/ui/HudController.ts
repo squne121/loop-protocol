@@ -2,8 +2,13 @@ import type { GameState } from '../state'
 import { formatCombatNumber } from '../render/renderUtils'
 
 export interface HudActions {
+  onStartSortie(): void
+  onClaimReward(): void
+  onNextSortie(): void
   onQuickSave(): void
+  onQuickLoad(): void
   onReset(): void
+  canQuickLoad(): boolean
 }
 
 export interface HudController {
@@ -32,6 +37,7 @@ export function createHudController(
     <section class="panel">
       <p class="eyebrow">Sortie</p>
       <dl class="stat-grid">
+        <div><dt>Loop Phase</dt><dd data-field="loop-phase"></dd></div>
         <div><dt>Sortie Status</dt><dd data-field="sortie-status"></dd></div>
         <div><dt>Kills</dt><dd data-field="sortie-kills"></dd></div>
         <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
@@ -40,18 +46,40 @@ export function createHudController(
     </section>
     <section class="panel">
       <p class="eyebrow">Telemetry</p>
-      <p class="status-copy" data-field="status"></p>
+      <p class="status-copy" data-field="status" role="status" aria-live="polite"></p>
       <p class="status-copy status-copy--muted" data-field="command"></p>
     </section>
     <section class="panel panel--actions">
-      <button type="button" data-action="save">Quick save</button>
-      <button type="button" data-action="reset">Reset sortie</button>
+      <button type="button" data-action="start-sortie">Start sortie</button>
+      <button type="button" data-action="claim-reward">Claim reward</button>
+      <button type="button" data-action="next-sortie">Next sortie</button>
+      <button type="button" data-action="quick-save">Quick Save</button>
+      <button type="button" data-action="quick-load">Quick Load</button>
+      <button
+        type="button"
+        data-action="reset"
+        title="Reset sortie is a destructive boundary and is only available during preparation."
+      >
+        Reset sortie
+      </button>
     </section>
   `
 
   container
-    .querySelector<HTMLButtonElement>('[data-action="save"]')
+    .querySelector<HTMLButtonElement>('[data-action="start-sortie"]')
+    ?.addEventListener('click', actions.onStartSortie)
+  container
+    .querySelector<HTMLButtonElement>('[data-action="claim-reward"]')
+    ?.addEventListener('click', actions.onClaimReward)
+  container
+    .querySelector<HTMLButtonElement>('[data-action="next-sortie"]')
+    ?.addEventListener('click', actions.onNextSortie)
+  container
+    .querySelector<HTMLButtonElement>('[data-action="quick-save"]')
     ?.addEventListener('click', actions.onQuickSave)
+  container
+    .querySelector<HTMLButtonElement>('[data-action="quick-load"]')
+    ?.addEventListener('click', actions.onQuickLoad)
   container
     .querySelector<HTMLButtonElement>('[data-action="reset"]')
     ?.addEventListener('click', actions.onReset)
@@ -62,10 +90,17 @@ export function createHudController(
   const cooldown = queryField(container, 'cooldown')
   const status = queryField(container, 'status')
   const command = queryField(container, 'command')
+  const loopPhase = queryField(container, 'loop-phase')
   const sortieStatus = queryField(container, 'sortie-status')
   const sortieKills = queryField(container, 'sortie-kills')
   const sortieDuration = queryField(container, 'sortie-duration')
   const sortieResult = queryField(container, 'sortie-result')
+  const startSortieButton = queryAction(container, 'start-sortie')
+  const claimRewardButton = queryAction(container, 'claim-reward')
+  const nextSortieButton = queryAction(container, 'next-sortie')
+  const quickSaveButton = queryAction(container, 'quick-save')
+  const quickLoadButton = queryAction(container, 'quick-load')
+  const resetButton = queryAction(container, 'reset')
 
   return {
     render(state) {
@@ -75,6 +110,28 @@ export function createHudController(
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
+
+      switch (state.loopPhase) {
+        case 'preparation':
+          loopPhase.textContent = 'Preparation'
+          break
+        case 'running':
+          loopPhase.textContent = 'Sortie running'
+          break
+        case 'debrief_pending_reward':
+          loopPhase.textContent = 'Debrief: reward pending'
+          break
+        case 'debrief_reward_claimed':
+          loopPhase.textContent = 'Debrief: reward claimed'
+          break
+      }
+
+      startSortieButton.disabled = state.loopPhase !== 'preparation'
+      claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward'
+      nextSortieButton.disabled = state.loopPhase !== 'debrief_reward_claimed'
+      quickSaveButton.disabled = state.loopPhase !== 'preparation'
+      quickLoadButton.disabled = state.loopPhase !== 'preparation' || !actions.canQuickLoad()
+      resetButton.disabled = state.loopPhase !== 'preparation'
 
       // Sortie status display (AC4, AC10)
       const s = state.sortie
@@ -137,6 +194,16 @@ export function createHudController(
       }
     },
   }
+}
+
+function queryAction(container: HTMLElement, name: string): HTMLButtonElement {
+  const element = container.querySelector<HTMLButtonElement>(`[data-action="${name}"]`)
+
+  if (!element) {
+    throw new Error(`HUD action "${name}" is missing.`)
+  }
+
+  return element
 }
 
 function queryField(container: HTMLElement, name: string): HTMLElement {
