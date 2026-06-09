@@ -1,4 +1,4 @@
-import type { GameState, SortieResult, SortieState } from '../state/GameState'
+import type { GameState, RewardApplicationId, SortieResult, SortieState } from '../state/GameState'
 import { mapInputToCommands } from '../input'
 import { runMovementSystem } from './MovementSystem'
 import { runEnemySpawnSystem } from './EnemySpawnSystem'
@@ -7,24 +7,89 @@ import { runCombatSystem } from './CombatSystem'
 import { runProjectileSystem } from './ProjectileSystem'
 import { runCollisionSystem } from './CollisionSystem'
 import { resolveCombatCollisions } from './CombatSystem'
+import { RewardSystem } from './RewardSystem'
 
 /** Total sortie duration in milliseconds (30 seconds). */
 export const SORTIE_DURATION_MS = 30_000
+function buildRewardApplicationId(state: GameState): RewardApplicationId {
+  let nextSequence = Math.max(1, state.nextRewardApplicationSequence)
+  let applicationId: RewardApplicationId = `sortie-reward-${nextSequence}`
+
+  while (Object.prototype.hasOwnProperty.call(state.rewardClaims.claimedApplicationIds, applicationId)) {
+    nextSequence += 1
+    applicationId = `sortie-reward-${nextSequence}`
+  }
+
+  state.nextRewardApplicationSequence = nextSequence + 1
+  return applicationId
+}
+
+function resetCombatRuntime(state: GameState): void {
+  state.tick = 0
+  state.elapsedMs = 0
+  state.player.x = 240
+  state.player.y = 270
+  state.player.hp = state.player.maxHp
+  state.player.aimX = 540
+  state.player.aimY = 270
+  state.player.weaponCooldownMs = 0
+  state.player.shotsFired = 0
+  state.player.lastAimDirectionX = 1
+  state.player.lastAimDirectionY = 0
+  state.projectiles = []
+  state.nextProjectileId = 1
+  state.enemies = []
+  state.nextEnemyId = 1
+}
+
+export function claimPendingReward(
+  state: GameState,
+): ReturnType<typeof RewardSystem.claim> | { ok: false; reason: 'no-pending-reward' | 'claimed-phase-ledger-miss' } {
+  const applicationId = state.pendingRewardApplicationId
+  if (applicationId === null || state.sortie.result === null) {
+    return { ok: false, reason: 'no-pending-reward' }
+  }
+
+  if (state.loopPhase === 'debrief_reward_claimed') {
+    if (Object.prototype.hasOwnProperty.call(state.rewardClaims.claimedApplicationIds, applicationId)) {
+      return { ok: false, reason: 'already-claimed' }
+    }
+
+    return { ok: false, reason: 'claimed-phase-ledger-miss' }
+  }
+
+  if (state.loopPhase !== 'debrief_pending_reward') {
+    return { ok: false, reason: 'no-pending-reward' }
+  }
+
+  const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
+  if (!claimResult.ok && claimResult.reason !== 'already-claimed') {
+    return claimResult
+  }
+
+  state.loopPhase = 'debrief_reward_claimed'
+  return claimResult
+}
+
 
 /**
- * Initialises the sortie state machine from `idle` to `running`.
- * Must be called exactly once after `createInitialGameState()`.
+ * Initialises the sortie state machine from `preparation` or claimed debrief to `running`.
  *
  * @param state        Mutable game state
  * @param fixedDeltaMs Fixed timestep in milliseconds (used to compute targetTicks)
  */
 export function startSortie(state: GameState, fixedDeltaMs: number): void {
-  if (state.sortie.status !== 'idle') {
+  const canStart =
+    state.loopPhase === 'preparation' || state.loopPhase === 'debrief_reward_claimed'
+  if (!canStart) {
     return
   }
 
+  resetCombatRuntime(state)
   const targetTicks = Math.ceil(SORTIE_DURATION_MS / fixedDeltaMs)
 
+  state.loopPhase = 'running'
+  state.pendingRewardApplicationId = null
   state.sortie = {
     status: 'running',
     elapsedTicks: 0,
@@ -50,7 +115,7 @@ export function startSortie(state: GameState, fixedDeltaMs: number): void {
  */
 export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   // AC13: terminal gate — only advance if running
-  if (state.sortie.status !== 'running') {
+  if (state.loopPhase !== 'running' || state.sortie.status !== 'running') {
     return
   }
 
@@ -130,6 +195,10 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   }
 
   state.sortie = terminalState
+  state.loopPhase = 'debrief_pending_reward'
+  if (state.pendingRewardApplicationId === null) {
+    state.pendingRewardApplicationId = buildRewardApplicationId(state)
+  }
 }
 
 /**
@@ -145,7 +214,7 @@ export function runSortieSimulationStep(
   commands: ReturnType<typeof mapInputToCommands>,
   fixedDeltaMs: number,
 ): void {
-  if (state.sortie.status !== 'running') return
+  if (state.loopPhase !== 'running' || state.sortie.status !== 'running') return
   runMovementSystem(state, commands, fixedDeltaMs)
   runEnemySpawnSystem(state)
   runEnemyAISystem(state, fixedDeltaMs)

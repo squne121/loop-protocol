@@ -62,6 +62,10 @@ let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefi
 const renderer = createCanvasRenderer(canvas)
 const hud = createHudController(commandRail, {
   onQuickSave() {
+    if (state.loopPhase !== 'preparation') {
+      return
+    }
+
     const saveResult = storage.save(createGameSnapshot(state))
     if (!saveResult.ok) {
       reportStorageFailure('save', saveResult)
@@ -69,7 +73,6 @@ const hud = createHudController(commandRail, {
   },
   onReset() {
     state = createInitialGameState()
-    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     resizeArena(state)
   },
 })
@@ -79,8 +82,8 @@ bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
 
-// M2 bootstrap: start sortie once after initialisation (AC12)
-startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+maybeAutoStartRuntime()
+
 
 // E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
 // These are injected via page.addInitScript() in Playwright tests before the
@@ -91,7 +94,7 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
     __E2E_PLAYER_HP_OVERRIDE__?: number
   }
   // Short sortie: override targetTicks to ~0.5s for deterministic timeout E2E
-  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.sortie.status === 'running') {
+  if (e2eFlags.__E2E_SHORT_SORTIE__ === true && state.loopPhase === 'running' && state.sortie.status === 'running') {
     state.sortie.targetTicks = Math.ceil(500 / defaultSimulationConfig.fixedDeltaMs)
   }
   // Player HP override: set hp/maxHp for deterministic defeat E2E
@@ -128,6 +131,16 @@ function stepSimulation(fixedDeltaMs: number): void {
   runSortieSimulationStep(state, commands, fixedDeltaMs)
 }
 
+function maybeAutoStartRuntime(): void {
+  if (import.meta.env.VITE_E2E_MODE !== 'true') {
+    return
+  }
+
+  if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+  }
+}
+
 function resizeArena(currentState: typeof state): void {
   const safeSidebar = window.innerWidth > 980 ? 380 : 32
   const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
@@ -158,6 +171,7 @@ function reportStorageFailure(
 interface LoopE2ESnapshot {
   tick: number
   elapsedMs: number
+  loopPhase: 'preparation' | 'running' | 'debrief_pending_reward' | 'debrief_reward_claimed'
   player: {
     x: number
     y: number
@@ -199,14 +213,18 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
   ;(
     window as Window &
       typeof globalThis & {
-        __LOOP_E2E__: { getState: () => LoopE2ESnapshot }
+        __LOOP_E2E__: { getState: () => LoopE2ESnapshot; startSortie: () => void }
       }
   ).__LOOP_E2E__ = {
+    startSortie() {
+      startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    },
     /** Returns a shallow snapshot copy of the current game + input state. Read-only. */
     getState(): LoopE2ESnapshot {
       return {
         tick: state.tick,
         elapsedMs: state.elapsedMs,
+        loopPhase: state.loopPhase,
         player: {
           x: state.player.x,
           y: state.player.y,
