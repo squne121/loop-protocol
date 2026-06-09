@@ -93,6 +93,7 @@ export interface TelemetryState {
 // ---------------------------------------------------------------------------
 
 export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
+export type LoopPhase = 'preparation' | 'running' | 'debrief_pending_reward' | 'debrief_reward_claimed'
 
 /**
  * Reason why a sortie ended. Discriminates the three terminal conditions.
@@ -169,6 +170,9 @@ export type SortieState =
 export interface GameState {
   tick: number
   elapsedMs: number
+  loopPhase: LoopPhase
+  pendingRewardApplicationId: RewardApplicationId | null
+  nextRewardApplicationSequence: number
   arena: ArenaState
   player: PlayerState
   projectiles: ProjectileState[]
@@ -199,6 +203,9 @@ export function createInitialGameState(
   return {
     tick: 0,
     elapsedMs: 0,
+    loopPhase: 'preparation',
+    pendingRewardApplicationId: null,
+    nextRewardApplicationSequence: 1,
     arena: {
       width: 960,
       height: 540,
