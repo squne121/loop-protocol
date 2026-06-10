@@ -16,6 +16,7 @@ import {
 import {
   advanceSimulationLoop,
   clampPlayerToArena,
+  claimPendingReward,
   runSortieSimulationStep,
   startSortie,
 } from './systems'
@@ -55,12 +56,59 @@ if (!canvas || !commandRail) {
 
 const storage = createLocalGameStorage()
 const loadResult = storage.load()
-if (!loadResult.ok) {
-  reportStorageFailure('load', loadResult)
-}
+let hasLoadableSnapshot = loadResult.ok && loadResult.snapshot !== null
 let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefined : undefined)
 const renderer = createCanvasRenderer(canvas)
 const hud = createHudController(commandRail, {
+  onStartSortie() {
+    if (state.loopPhase !== 'preparation') {
+      return
+    }
+
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    setHudFeedback('Sortie started.', 'Preparation controls are now locked until debrief.')
+  },
+  onClaimReward() {
+    if (state.loopPhase !== 'debrief_pending_reward') {
+      return
+    }
+
+    const claimResult = claimPendingReward(state)
+
+    if (claimResult.ok) {
+      setHudFeedback(
+        'Reward claimed for this session.',
+        'Persistence will be handled by issue #739.',
+      )
+      return
+    }
+
+    switch (claimResult.reason) {
+      case 'already-claimed':
+        setHudFeedback(
+          'Reward already claimed for this session.',
+          'Persistence will be handled by issue #739.',
+        )
+        return
+      case 'no-pending-reward':
+        setHudFeedback('No pending reward to claim.', 'Current state unchanged.')
+        return
+      case 'claimed-phase-ledger-miss':
+        setHudFeedback('Reward claim ledger mismatch.', 'Current state unchanged.')
+        return
+    }
+  },
+  onNextSortie() {
+    if (state.loopPhase !== 'debrief_reward_claimed') {
+      return
+    }
+
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    setHudFeedback(
+      'Next sortie started.',
+      'Claimed reward remains available only in this in-memory session until saved.',
+    )
+  },
   onQuickSave() {
     if (state.loopPhase !== 'preparation') {
       return
@@ -69,13 +117,62 @@ const hud = createHudController(commandRail, {
     const saveResult = storage.save(createGameSnapshot(state))
     if (!saveResult.ok) {
       reportStorageFailure('save', saveResult)
+      setHudFeedback('Quick Save failed.', 'Current state unchanged.')
+      return
     }
+
+    hasLoadableSnapshot = true
+    setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
+  },
+  onQuickLoad() {
+    if (state.loopPhase !== 'preparation') {
+      return
+    }
+
+    if (!hasLoadableSnapshot) {
+      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+      return
+    }
+
+    const quickLoadResult = storage.load()
+    if (!quickLoadResult.ok) {
+      reportStorageFailure('load', quickLoadResult)
+      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+      return
+    }
+
+    if (quickLoadResult.snapshot === null) {
+      hasLoadableSnapshot = false
+      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+      return
+    }
+
+    state = createInitialGameState(quickLoadResult.snapshot)
+    resizeArena(state)
+    hasLoadableSnapshot = true
+    setHudFeedback('Quick Load complete.', 'Progression snapshot restored for preparation.')
   },
   onReset() {
+    if (state.loopPhase !== 'preparation') {
+      return
+    }
+
     state = createInitialGameState()
     resizeArena(state)
+    setHudFeedback(
+      'Reset sortie complete.',
+      'Reset sortie is a destructive boundary. Preparation only.',
+    )
+  },
+  canQuickLoad() {
+    return hasLoadableSnapshot
   },
 })
+
+if (!loadResult.ok) {
+  reportStorageFailure('load', loadResult)
+  setHudFeedback('Quick Load unavailable on startup.', 'A fresh preparation state was created.')
+}
 const inputState = createInputState()
 
 bindInput(canvas, inputState, () => state.arena)
@@ -139,6 +236,11 @@ function maybeAutoStartRuntime(): void {
   if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
   }
+}
+
+function setHudFeedback(status: string, summary: string): void {
+  state.telemetry.status = status
+  state.telemetry.lastCommandSummary = summary
 }
 
 function resizeArena(currentState: typeof state): void {
