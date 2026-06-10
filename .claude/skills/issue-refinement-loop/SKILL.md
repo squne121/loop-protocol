@@ -145,7 +145,21 @@ LOOP_STATE:
 
 ### Step 0f: Planner Consumption
 
-`plan_refinement_loop.py` を実行して `REFINEMENT_LOOP_PLAN_V1` を生成し、JSON schema validation を通す。`fail_closed.required == true` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
+`run_refinement_preflight.py` wrapper を実行して Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括で実行する。wrapper は `plan_refinement_loop.py` を SSOT として呼び出す薄い adapter であり、判断ロジックは planner に委譲する。
+
+```bash
+uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
+  --issue-number <N> \
+  --repo <owner/repo> \
+  [--anchor-comment-url <URL>]
+```
+
+wrapper の出力フィールドを確認する:
+- `STATUS: pass | warn | blocked | environment_failure`
+- `NEXT_ACTION:` に従って後続ステップを決定する
+- `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
+
+`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
 参照:
 

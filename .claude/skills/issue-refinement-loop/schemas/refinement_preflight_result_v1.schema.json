@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RefinementPreflightResultV1",
+  "description": "Output schema for run_refinement_preflight.py result artifact. Strict: additionalProperties false.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "issue_number",
+    "repo",
+    "planner_exit_code",
+    "planner_fail_closed",
+    "next_action",
+    "must_read",
+    "do_not_read",
+    "commands",
+    "blockers",
+    "artifacts",
+    "hashes"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "refinement_preflight_result/v1",
+      "description": "Schema version sentinel."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "warn", "blocked", "environment_failure"],
+      "description": "Wrapper-level status after applying exit_code_mapping table."
+    },
+    "issue_number": {
+      "type": "integer",
+      "description": "GitHub Issue number."
+    },
+    "repo": {
+      "type": "string",
+      "description": "owner/repo string."
+    },
+    "planner_exit_code": {
+      "type": ["integer", "null"],
+      "description": "Exit code returned by plan_refinement_loop.py. Null if planner was not invoked."
+    },
+    "planner_fail_closed": {
+      "type": ["boolean", "null"],
+      "description": "Value of plan.fail_closed.required from planner output. Null if planner was not invoked."
+    },
+    "next_action": {
+      "type": "string",
+      "description": "Suggested next action for the orchestrator (e.g. 'proceed', 'human_judgment_required', 'fix_environment')."
+    },
+    "must_read": {
+      "type": "array",
+      "description": "Files/paths the orchestrator must read before proceeding.",
+      "items": {"type": "string"}
+    },
+    "do_not_read": {
+      "type": "array",
+      "description": "Files/paths the orchestrator must not read to conserve context.",
+      "items": {"type": "string"}
+    },
+    "commands": {
+      "type": "array",
+      "description": "Suggested commands. Each item must use argv array only (no shell strings).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "argv", "shell", "source"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Command kind (e.g. 'run_planner', 'validate_schema')."
+          },
+          "argv": {
+            "type": "array",
+            "description": "Argument vector. Must not contain shell-interpolated strings.",
+            "items": {"type": "string"}
+          },
+          "shell": {
+            "type": "boolean",
+            "const": false,
+            "description": "Always false. Shell execution is prohibited."
+          },
+          "source": {
+            "type": "string",
+            "const": "static_wrapper_template",
+            "description": "Origin of this command template."
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Blocker reason codes (e.g. 'ANCHOR_NOT_IN_ISSUE').",
+      "items": {"type": "string"}
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "Paths to artifact files written by this wrapper.",
+      "additionalProperties": {"type": "string"}
+    },
+    "hashes": {
+      "type": "object",
+      "description": "SHA256 hashes of key artifacts for byte-stability verification.",
+      "additionalProperties": {"type": "string"}
+    }
+  }
+}

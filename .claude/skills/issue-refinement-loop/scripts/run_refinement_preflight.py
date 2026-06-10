@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""
+run_refinement_preflight.py
+
+Deterministic entrypoint that assembles planner input from GitHub API data,
+validates anchor comments structurally, invokes plan_refinement_loop.py with
+correctly-formed stdin JSON, and writes a compact result artifact.
+
+Usage:
+    uv run python3 run_refinement_preflight.py \\
+        --issue-number <N> \\
+        --repo <owner/name> \\
+        [--anchor-comment-url <URL> ...] \\
+        [--fixture <path>]
+
+Output (stdout): compact projection of refinement_preflight_result/v1 artifact.
+Artifact (file):  .claude/artifacts/issue-refinement-loop/<issue_number>/
+                  refinement_preflight_result_v1.json  (canonical result)
+                  raw_issue_snapshot.json              (raw issue + comments)
+
+Exit codes:
+    0 - pass (planner succeeded, fail_closed.required == false)
+    1 - warn (pass with human notes needed)
+    2 - blocked (anchor mismatch, planner exit 2, or planner fail_closed.required == true)
+    3 - environment_failure (gh not found / auth / API / timeout / non-JSON)
+
+Planner ↔ Wrapper Exit Code Mapping:
+    anchor comment not in issue                    → blocked  / 2
+    gh not found / auth / API fail / timeout / JSON → environment_failure / 3
+    planner exit 2 (invalid input)                  → blocked  / 2
+    planner exit 3 (internal error)                 → environment_failure / 3
+    planner exit 0 + fail_closed.required == true   → blocked  / 2
+    planner exit 0 (normal)                         → pass     / 0
+    planner exit 0 + human note needed              → warn     / 1
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+PLANNER_SCRIPT = _SCRIPTS_DIR / "plan_refinement_loop.py"
+
+SCHEMA_VERSION_RESULT = "refinement_preflight_result/v1"
+SCHEMA_VERSION_PLANNER_INPUT = "refinement_loop_planner_input/v1"
+
+# Timeout constants (seconds)
+GH_API_TIMEOUT = 30
+PLANNER_TIMEOUT = 60
+
+# Exit codes
+EXIT_PASS = 0
+EXIT_WARN = 1
+EXIT_BLOCKED = 2
+EXIT_ENVIRONMENT_FAILURE = 3
+
+# Blocker reason codes
+BLOCKER_ANCHOR_NOT_IN_ISSUE = "ANCHOR_NOT_IN_ISSUE"
+BLOCKER_ANCHOR_IS_PR_REVIEW = "ANCHOR_IS_PR_REVIEW_COMMENT"
+BLOCKER_GH_FAILURE = "GH_API_FAILURE"
+BLOCKER_PLANNER_INVALID_INPUT = "PLANNER_INVALID_INPUT"
+BLOCKER_PLANNER_INTERNAL_ERROR = "PLANNER_INTERNAL_ERROR"
+BLOCKER_FAIL_CLOSED = "PLANNER_FAIL_CLOSED"
+BLOCKER_ANCHOR_REPO_MISMATCH = "ANCHOR_REPO_MISMATCH"
+BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH = "ANCHOR_ISSUE_NUMBER_MISMATCH"
+BLOCKER_ANCHOR_COMMENT_NOT_FOUND = "ANCHOR_COMMENT_NOT_FOUND"
+BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def _sha256(text: str) -> str:
+    """Compute SHA256 hex digest of UTF-8 encoded text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _find_repo_root() -> Path:
+    """Walk up from this script to find the .git root."""
+    current = Path(__file__).resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    # Fallback: assume .claude/skills/issue-refinement-loop/scripts/
+    return Path(__file__).resolve().parent.parent.parent.parent.parent
+
+
+# ---------------------------------------------------------------------------
+# URL parsing for anchor comment structural validation
+# ---------------------------------------------------------------------------
+
+# Pattern: https://github.com/<owner>/<repo>/issues/<number>#issuecomment-<id>
+_ISSUE_COMMENT_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)"
+    r"/issues/(?P<issue_number>\d+)#issuecomment-(?P<comment_id>\d+)$"
+)
+
+# PR review comment pattern (different from issue comment)
+_PR_REVIEW_COMMENT_RE = re.compile(
+    r"^https://github\.com/[^/]+/[^/]+/pull/\d+#issuecomment-\d+$"
+)
+_PR_REVIEW_DISCUSSION_RE = re.compile(
+    r"^https://github\.com/[^/]+/[^/]+/pull/\d+#discussion_r\d+$"
+)
+
+
+def _parse_anchor_comment_url(url: str) -> dict[str, Any]:
+    """
+    Parse an anchor comment URL into its structural components.
+
+    Returns dict with: owner, repo, issue_number (int), comment_id (int), valid (bool)
+    Does NOT use substring matching — validates URL structure via regex only.
+    """
+    # Reject PR review comment URLs (different endpoint from issue comments)
+    if _PR_REVIEW_DISCUSSION_RE.match(url):
+        return {"valid": False, "error": "pr_review_comment_url"}
+
+    m = _ISSUE_COMMENT_RE.match(url)
+    if not m:
+        return {"valid": False, "error": "url_parse_failure"}
+
+    return {
+        "valid": True,
+        "owner": m.group("owner"),
+        "repo": m.group("repo"),
+        "issue_number": int(m.group("issue_number")),
+        "comment_id": int(m.group("comment_id")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# gh CLI wrappers
+# ---------------------------------------------------------------------------
+
+
+def _run_gh(argv: list[str], timeout: int = GH_API_TIMEOUT) -> tuple[dict | list | None, str]:
+    """
+    Run a gh command and return (parsed_json, error_message).
+
+    Uses subprocess.run([...], shell=False) — never shell=True.
+    Returns (None, error_message) on timeout, non-zero exit, or JSON parse failure.
+    """
+    try:
+        proc = subprocess.run(
+            argv,
+            shell=False,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None, "gh_not_found"
+    except subprocess.TimeoutExpired:
+        return None, f"gh_timeout after {timeout}s"
+    except Exception as exc:
+        return None, f"gh_unexpected_error: {exc}"
+
+    if proc.returncode != 0:
+        stderr_snip = (proc.stderr or "")[:300]
+        return None, f"gh_exit_{proc.returncode}: {stderr_snip}"
+
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"gh_json_decode_error: {exc}"
+
+    return parsed, ""
+
+
+def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
+    """Fetch issue data via gh issue view --json."""
+    data, err = _run_gh(
+        ["gh", "issue", "view", str(issue_number),
+         "--repo", repo,
+         "--json", "number,title,body,labels,url"]
+    )
+    return data, err
+
+
+def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, str]:
+    """Fetch all issue comments via gh api."""
+    data, err = _run_gh(
+        ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
+         "--paginate"]
+    )
+    if data is None:
+        return None, err
+    if not isinstance(data, list):
+        return None, f"gh_comments_unexpected_type: {type(data).__name__}"
+    return data, ""
+
+
+def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]:
+    """Fetch a single issue comment via gh api to validate issue_url field."""
+    data, err = _run_gh(
+        ["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"]
+    )
+    return data, err
+
+
+# ---------------------------------------------------------------------------
+# Anchor comment structural validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_anchor_comment_url(
+    url: str,
+    repo: str,
+    issue_number: int,
+    fixture_comments: Optional[list[dict]] = None,
+) -> tuple[bool, list[str]]:
+    """
+    Validate a single anchor comment URL structurally.
+
+    Checks (all must pass):
+    1. URL owner/repo matches --repo
+    2. URL issue_number matches --issue-number
+    3. Comment id exists (via gh api or fixture)
+    4. Comment's issue_url REST field points to same issue
+    5. Not a PR review comment (different endpoint)
+
+    Returns (is_valid, list_of_blocker_codes).
+    Uses structural URL parsing only — no substring checks.
+    """
+    parsed = _parse_anchor_comment_url(url)
+
+    if not parsed.get("valid"):
+        error = parsed.get("error", "unknown")
+        if error == "pr_review_comment_url":
+            return False, [BLOCKER_ANCHOR_IS_PR_REVIEW]
+        return False, [BLOCKER_ANCHOR_NOT_IN_ISSUE]
+
+    # Check 1: owner/repo match
+    url_owner = parsed["owner"].lower()
+    url_repo_name = parsed["repo"].lower()
+    parts = repo.lower().split("/", 1)
+    if len(parts) != 2:
+        return False, [BLOCKER_ANCHOR_REPO_MISMATCH]
+
+    expected_owner, expected_repo_name = parts
+    if url_owner != expected_owner or url_repo_name != expected_repo_name:
+        return False, [BLOCKER_ANCHOR_REPO_MISMATCH]
+
+    # Check 2: issue number match
+    if parsed["issue_number"] != issue_number:
+        return False, [BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH]
+
+    comment_id = parsed["comment_id"]
+
+    # Check 3 & 4: comment exists and issue_url field matches
+    if fixture_comments is not None:
+        # Fixture mode: look up comment from pre-fetched data
+        comment_data = None
+        for c in fixture_comments:
+            if isinstance(c, dict) and c.get("id") == comment_id:
+                comment_data = c
+                break
+        if comment_data is None:
+            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND]
+    else:
+        # Live mode: fetch via gh api
+        comment_data, err = _fetch_single_comment(repo, comment_id)
+        if comment_data is None:
+            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND]
+
+    # Check 4: issue_url field validation (structural, not substring)
+    issue_url_field = comment_data.get("issue_url", "")
+    # Expected format: https://api.github.com/repos/<owner>/<repo>/issues/<number>
+    # Also accept: https://github.com/<owner>/<repo>/issues/<number>
+    expected_api_url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    expected_html_url = f"https://github.com/{repo}/issues/{issue_number}"
+
+    if issue_url_field not in (expected_api_url, expected_html_url, ""):
+        # Check via structural parsing rather than substring
+        # The URL must end with /issues/<issue_number> for the correct repo
+        parsed_url = urlparse(issue_url_field)
+        path_parts = parsed_url.path.rstrip("/").split("/")
+        if (
+            len(path_parts) >= 4
+            and path_parts[-2] == "issues"
+            and path_parts[-1] == str(issue_number)
+        ):
+            # Repo path should be /<owner>/<repo>/
+            if not (
+                len(path_parts) >= 5
+                and path_parts[-4].lower() == expected_owner
+                and path_parts[-3].lower() == expected_repo_name
+            ):
+                return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH]
+        elif issue_url_field:
+            return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH]
+
+    return True, []
+
+
+def _validate_anchor_comments_batch(
+    anchor_comment_urls: list[str],
+    repo: str,
+    issue_number: int,
+    fixture_comments: Optional[list[dict]] = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Validate all anchor comment URLs. Returns (stable_sorted_unique_valid_urls, all_blockers).
+
+    Stable sort + dedupe per spec. One invalid URL blocks all.
+    """
+    if not anchor_comment_urls:
+        return [], []
+
+    all_blockers: list[str] = []
+    seen_urls: set[str] = set()
+    deduped_urls: list[str] = []
+
+    for url in anchor_comment_urls:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            deduped_urls.append(url)
+
+    # Stable sort
+    sorted_urls = sorted(deduped_urls)
+
+    for url in sorted_urls:
+        valid, blockers = _validate_anchor_comment_url(
+            url, repo, issue_number, fixture_comments=fixture_comments
+        )
+        if not valid:
+            all_blockers.extend(blockers)
+
+    return sorted_urls, all_blockers
+
+
+# ---------------------------------------------------------------------------
+# Planner invocation
+# ---------------------------------------------------------------------------
+
+
+def _build_planner_input(
+    issue: dict,
+    comments: list[dict],
+    known_context: Optional[dict],
+    now: Optional[str] = None,
+) -> dict:
+    """Build REFINEMENT_LOOP_PLANNER_INPUT_V1 from issue/comments data."""
+    labels = []
+    raw_labels = issue.get("labels", [])
+    for lbl in raw_labels:
+        if isinstance(lbl, dict):
+            labels.append(lbl.get("name", ""))
+        elif isinstance(lbl, str):
+            labels.append(lbl)
+
+    planner_input: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION_PLANNER_INPUT,
+        "issue": {
+            "number": issue.get("number"),
+            "title": issue.get("title", ""),
+            "body": issue.get("body", ""),
+            "labels": labels,
+        },
+        "comments": comments,
+    }
+    if known_context is not None:
+        planner_input["known_context"] = known_context
+    if now is not None:
+        planner_input["now"] = now
+
+    return planner_input
+
+
+def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
+    """
+    Invoke plan_refinement_loop.py via subprocess.run([sys.executable, ...], shell=False).
+
+    Returns (plan_dict, exit_code, stderr_text).
+    plan_dict is None on JSON parse failure.
+    """
+    input_json = json.dumps(planner_input, ensure_ascii=False)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(PLANNER_SCRIPT)],
+            input=input_json,
+            shell=False,
+            timeout=PLANNER_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return None, 3, f"planner timeout after {PLANNER_TIMEOUT}s"
+    except FileNotFoundError:
+        return None, 3, f"planner script not found: {PLANNER_SCRIPT}"
+    except Exception as exc:
+        return None, 3, f"planner unexpected error: {exc}"
+
+    stderr_text = proc.stderr or ""
+    exit_code = proc.returncode
+
+    if exit_code not in (0, 2, 3):
+        return None, exit_code, stderr_text
+
+    try:
+        plan = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return None, exit_code, f"planner stdout JSON decode error: {exc}"
+
+    return plan, exit_code, stderr_text
+
+
+# ---------------------------------------------------------------------------
+# Exit code mapping
+# ---------------------------------------------------------------------------
+
+
+def _apply_exit_code_mapping(
+    planner_exit_code: Optional[int],
+    planner_fail_closed: Optional[bool],
+    blockers: list[str],
+) -> tuple[str, int]:
+    """
+    Apply the Planner ↔ Wrapper Exit Code Mapping table.
+
+    Returns (status_str, exit_code_int).
+    """
+    # Pre-planner blockers (anchor mismatch, gh failure)
+    if blockers:
+        anchor_blockers = {
+            BLOCKER_ANCHOR_NOT_IN_ISSUE,
+            BLOCKER_ANCHOR_REPO_MISMATCH,
+            BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH,
+            BLOCKER_ANCHOR_COMMENT_NOT_FOUND,
+            BLOCKER_ANCHOR_ISSUE_URL_MISMATCH,
+            BLOCKER_ANCHOR_IS_PR_REVIEW,
+        }
+        env_blockers = {BLOCKER_GH_FAILURE}
+
+        has_anchor = any(b in anchor_blockers for b in blockers)
+        has_env = any(b in env_blockers for b in blockers)
+
+        if has_env:
+            return "environment_failure", EXIT_ENVIRONMENT_FAILURE
+        if has_anchor:
+            return "blocked", EXIT_BLOCKED
+        # Other pre-planner blockers → blocked
+        return "blocked", EXIT_BLOCKED
+
+    if planner_exit_code is None:
+        return "environment_failure", EXIT_ENVIRONMENT_FAILURE
+
+    if planner_exit_code == 2:
+        return "blocked", EXIT_BLOCKED
+
+    if planner_exit_code == 3:
+        return "environment_failure", EXIT_ENVIRONMENT_FAILURE
+
+    if planner_exit_code == 0:
+        if planner_fail_closed is True:
+            return "blocked", EXIT_BLOCKED
+        return "pass", EXIT_PASS
+
+    # Unknown exit code
+    return "environment_failure", EXIT_ENVIRONMENT_FAILURE
+
+
+# ---------------------------------------------------------------------------
+# Artifact writing
+# ---------------------------------------------------------------------------
+
+
+def _write_artifacts(
+    repo_root: Path,
+    issue_number: int,
+    raw_snapshot: dict,
+    result: dict,
+) -> dict[str, str]:
+    """
+    Write artifacts to .claude/artifacts/issue-refinement-loop/<issue_number>/.
+
+    Returns {artifact_key: absolute_path_str}.
+    issue_number is int-normalized; path is NOT generated from repo name or URL.
+    """
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_path = artifact_dir / "raw_issue_snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    result_path = artifact_dir / "refinement_preflight_result_v1.json"
+    result_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    return {
+        "raw_issue_snapshot": str(snapshot_path),
+        "refinement_preflight_result_v1": str(result_path),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Compact stdout projection
+# ---------------------------------------------------------------------------
+
+
+def _build_compact_stdout(result: dict) -> str:
+    """
+    Build agent-friendly compact projection of result for stdout.
+
+    MUST NOT include raw issue body, raw comments, or any sentinel-containing fields.
+    Only status / next_action / must_read / commands / blockers / artifact paths.
+    """
+    lines = [
+        f"STATUS: {result['status']}",
+        f"NEXT_ACTION: {result['next_action']}",
+    ]
+
+    must_read = result.get("must_read", [])
+    if must_read:
+        lines.append("MUST_READ:")
+        for p in must_read:
+            lines.append(f"  - {p}")
+
+    commands = result.get("commands", [])
+    if commands:
+        lines.append("COMMANDS:")
+        for cmd in commands:
+            argv_str = " ".join(cmd.get("argv", []))
+            lines.append(f"  - [{cmd.get('kind', '?')}] {argv_str}")
+
+    blockers = result.get("blockers", [])
+    if blockers:
+        lines.append("BLOCKERS:")
+        for b in blockers:
+            lines.append(f"  - {b}")
+
+    artifacts = result.get("artifacts", {})
+    if artifacts:
+        lines.append("ARTIFACT:")
+        for k, v in sorted(artifacts.items()):
+            lines.append(f"  {k}: {v}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+
+def _build_result(
+    *,
+    status: str,
+    issue_number: int,
+    repo: str,
+    planner_exit_code: Optional[int],
+    planner_fail_closed: Optional[bool],
+    next_action: str,
+    must_read: list[str],
+    do_not_read: list[str],
+    commands: list[dict],
+    blockers: list[str],
+    artifacts: dict[str, str],
+    hashes: dict[str, str],
+) -> dict:
+    """Build a refinement_preflight_result/v1 compliant dict."""
+    return {
+        "schema_version": SCHEMA_VERSION_RESULT,
+        "status": status,
+        "issue_number": issue_number,
+        "repo": repo,
+        "planner_exit_code": planner_exit_code,
+        "planner_fail_closed": planner_fail_closed,
+        "next_action": next_action,
+        "must_read": must_read,
+        "do_not_read": do_not_read,
+        "commands": commands,
+        "blockers": blockers,
+        "artifacts": artifacts,
+        "hashes": hashes,
+    }
+
+
+def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
+    """Build commands[] from planner output. Argv-only, shell=False, static template."""
+    commands = []
+    # Suggest re-running the wrapper as a standard command template
+    commands.append({
+        "kind": "run_preflight",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", str(issue_number),
+            "--repo", repo,
+        ],
+        "shell": False,
+        "source": "static_wrapper_template",
+    })
+    return commands
+
+
+def run_preflight(
+    issue_number: int,
+    repo: str,
+    anchor_comment_urls: list[str],
+    fixture_path: Optional[Path] = None,
+    known_context: Optional[dict] = None,
+    now: Optional[str] = None,
+) -> tuple[dict, int]:
+    """
+    Main preflight logic.
+
+    Returns (result_dict, exit_code).
+    Writes artifacts and prints compact stdout.
+    """
+    repo_root = _find_repo_root()
+    blockers: list[str] = []
+    planner_exit_code: Optional[int] = None
+    planner_fail_closed: Optional[bool] = None
+
+    # --- Load data (fixture or live gh) ---
+    if fixture_path is not None:
+        # Fixture mode: load pre-fetched snapshot
+        try:
+            fixture_data = json.loads(fixture_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            result = _build_result(
+                status="environment_failure",
+                issue_number=issue_number,
+                repo=repo,
+                planner_exit_code=None,
+                planner_fail_closed=None,
+                next_action="fix_environment",
+                must_read=[],
+                do_not_read=[],
+                commands=[],
+                blockers=[f"FIXTURE_LOAD_ERROR: {exc}"],
+                artifacts={},
+                hashes={},
+            )
+            print(_build_compact_stdout(result))
+            return result, EXIT_ENVIRONMENT_FAILURE
+
+        issue = fixture_data.get("issue", {})
+        comments = fixture_data.get("comments", [])
+        fixture_anchor_comments = fixture_data.get("anchor_comments", [])
+        fixture_anchor_urls = fixture_data.get("anchor_comment_urls", anchor_comment_urls)
+
+        # Use fixture anchor data for structural validation
+        active_anchor_urls = fixture_anchor_urls or anchor_comment_urls
+        fixture_comment_lookup = fixture_anchor_comments if fixture_anchor_comments else comments
+        known_context = known_context or fixture_data.get("known_context")
+        now = now or fixture_data.get("now")
+    else:
+        # Live mode: fetch from GitHub
+        issue, err = _fetch_issue(repo, issue_number)
+        if issue is None:
+            blockers.append(BLOCKER_GH_FAILURE)
+            result = _build_result(
+                status="environment_failure",
+                issue_number=issue_number,
+                repo=repo,
+                planner_exit_code=None,
+                planner_fail_closed=None,
+                next_action="fix_environment",
+                must_read=[],
+                do_not_read=[],
+                commands=[],
+                blockers=blockers,
+                artifacts={},
+                hashes={},
+            )
+            print(_build_compact_stdout(result))
+            return result, EXIT_ENVIRONMENT_FAILURE
+
+        comments, err = _fetch_issue_comments(repo, issue_number)
+        if comments is None:
+            blockers.append(BLOCKER_GH_FAILURE)
+            result = _build_result(
+                status="environment_failure",
+                issue_number=issue_number,
+                repo=repo,
+                planner_exit_code=None,
+                planner_fail_closed=None,
+                next_action="fix_environment",
+                must_read=[],
+                do_not_read=[],
+                commands=[],
+                blockers=blockers,
+                artifacts={},
+                hashes={},
+            )
+            print(_build_compact_stdout(result))
+            return result, EXIT_ENVIRONMENT_FAILURE
+
+        active_anchor_urls = anchor_comment_urls
+        fixture_comment_lookup = None
+
+    # --- Anchor comment structural validation ---
+    if active_anchor_urls:
+        sorted_urls, anchor_blockers = _validate_anchor_comments_batch(
+            active_anchor_urls,
+            repo,
+            issue_number,
+            fixture_comments=fixture_comment_lookup,
+        )
+        if anchor_blockers:
+            blockers.extend(anchor_blockers)
+            status, exit_code = _apply_exit_code_mapping(None, None, blockers)
+            result = _build_result(
+                status=status,
+                issue_number=issue_number,
+                repo=repo,
+                planner_exit_code=None,
+                planner_fail_closed=None,
+                next_action="human_judgment_required",
+                must_read=[],
+                do_not_read=[],
+                commands=[],
+                blockers=blockers,
+                artifacts={},
+                hashes={},
+            )
+            print(_build_compact_stdout(result))
+            return result, exit_code
+
+    # --- Build raw snapshot (for artifact) ---
+    raw_snapshot = {
+        "schema_version": "raw_issue_snapshot/v1",
+        "fetched_at": now or _now_iso(),
+        "issue_number": issue_number,
+        "repo": repo,
+        "issue": issue,
+        "comments": comments,
+    }
+
+    # --- Invoke planner ---
+    planner_input = _build_planner_input(issue, comments, known_context, now=now)
+    plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input)
+
+    if plan is None:
+        # Planner invocation failed
+        if planner_exit_code == 2:
+            blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
+        else:
+            blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
+
+        status, exit_code = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+        result = _build_result(
+            status=status,
+            issue_number=issue_number,
+            repo=repo,
+            planner_exit_code=planner_exit_code,
+            planner_fail_closed=None,
+            next_action="fix_environment" if status == "environment_failure" else "human_judgment_required",
+            must_read=[],
+            do_not_read=[],
+            commands=[],
+            blockers=blockers,
+            artifacts={},
+            hashes={},
+        )
+        # Write artifacts (even on failure, to capture the snapshot)
+        artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, result)
+        result["artifacts"] = artifacts
+        print(_build_compact_stdout(result))
+        return result, exit_code
+
+    # --- Extract planner output fields ---
+    fail_closed = plan.get("fail_closed", {})
+    planner_fail_closed = fail_closed.get("required", False)
+
+    # Build must_read / do_not_read from planner decisions
+    must_read: list[str] = []
+    do_not_read: list[str] = []
+
+    decisions = plan.get("decisions", {})
+    investigation_policy = decisions.get("investigation_policy", {})
+    if investigation_policy.get("required"):
+        target_paths = investigation_policy.get("target_paths", [])
+        must_read.extend(target_paths)
+
+    # Build commands
+    commands = _commands_from_plan(plan, issue_number, repo)
+
+    # Planner blockers
+    if planner_exit_code == 2:
+        blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
+    elif planner_exit_code == 3:
+        blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
+    elif planner_exit_code == 0 and planner_fail_closed:
+        blockers.append(BLOCKER_FAIL_CLOSED)
+        reason_codes = fail_closed.get("reason_codes", [])
+        blockers.extend(reason_codes)
+
+    # --- Apply exit code mapping ---
+    status, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, blockers)
+
+    # Determine next_action
+    if status == "pass":
+        next_action = "proceed"
+    elif status == "warn":
+        next_action = "proceed_with_notes"
+    elif status == "blocked":
+        next_action = "human_judgment_required"
+    else:
+        next_action = "fix_environment"
+
+    # --- Build result ---
+    result = _build_result(
+        status=status,
+        issue_number=issue_number,
+        repo=repo,
+        planner_exit_code=planner_exit_code,
+        planner_fail_closed=planner_fail_closed,
+        next_action=next_action,
+        must_read=sorted(set(must_read)),
+        do_not_read=do_not_read,
+        commands=commands,
+        blockers=blockers,
+        artifacts={},
+        hashes={},
+    )
+
+    # --- Write artifacts ---
+    artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, result)
+    result["artifacts"] = artifacts
+
+    # Compute hashes for byte-stability
+    snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
+    result_text = json.dumps(
+        {k: v for k, v in result.items() if k not in ("artifacts", "hashes")},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    result["hashes"] = {
+        "raw_issue_snapshot_sha256": _sha256(snapshot_text),
+        "result_core_sha256": _sha256(result_text),
+    }
+
+    # Update artifact file with final hashes
+    _write_artifacts(repo_root, issue_number, raw_snapshot, result)
+
+    # Print compact stdout (no raw body/comments/sentinels)
+    print(_build_compact_stdout(result))
+
+    return result, exit_code
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Deterministic preflight wrapper for issue-refinement-loop."
+    )
+    parser.add_argument(
+        "--issue-number", type=int, required=True, help="GitHub Issue number."
+    )
+    parser.add_argument(
+        "--repo", required=True, help="owner/repo string."
+    )
+    parser.add_argument(
+        "--anchor-comment-url",
+        dest="anchor_comment_urls",
+        action="append",
+        default=[],
+        help="Anchor comment URL to validate (can be specified multiple times).",
+    )
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Path to fixture JSON (bypasses gh CLI calls).",
+    )
+
+    args = parser.parse_args(argv)
+
+    _, exit_code = run_preflight(
+        issue_number=args.issue_number,
+        repo=args.repo,
+        anchor_comment_urls=args.anchor_comment_urls,
+        fixture_path=args.fixture,
+    )
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
