@@ -92,8 +92,107 @@ function matchesForbiddenPath(command) {
   return /(^|[^A-Za-z0-9_./-])((assets|LICENSES)\/|(?:[^\s'"]*\/)?\.env(?:\.[^\s'"]+)*)/.test(command)
 }
 
+// ---------------------------------------------------------------------------
+// Command classification helpers (AC2-AC5, #783)
+// Each classifier returns a structured denial descriptor or null.
+// Priority: forbidden_path > secret_boundary > remote_write > read_only pass-through
+// ---------------------------------------------------------------------------
+
+/** AC3: secret-revealing commands - gh secrets / printenv / env dump */
+function classifySecretBoundary(command) {
+  // gh secret list/set/get or gh api .../secrets
+  if (/\bgh\s+(?:secret\b|api\b[^\n]*\bsecrets\b)/.test(command)) {
+    return {
+      reason_code: 'secret_boundary_violation',
+      command_kind: /\bgh\s+api\b/.test(command) ? 'gh_api_actions_secrets' : 'gh_secret',
+    }
+  }
+  // printenv - dumps all env vars including secrets
+  if (/\bprintenv\b/.test(command)) {
+    return { reason_code: 'secret_boundary_violation', command_kind: 'printenv' }
+  }
+  // bare env invocation as a standalone dump command (not env FOO=bar cmd prefix)
+  if (/(?:^|[;&|]\s*|\n\s*)env\s*$/.test(command)) {
+    return { reason_code: 'secret_boundary_violation', command_kind: 'env_dump' }
+  }
+  // python -c with sensitive env variable access patterns
+  if (/\bpython[23]?\s+-c\s+['"][^'"]*os\.environ/.test(command)) {
+    return { reason_code: 'secret_boundary_violation', command_kind: 'python_os_environ' }
+  }
+  return null
+}
+
+/** AC4: remote write commands - git push variants */
+function classifyRemoteWrite(command) {
+  if (/\bgit(?:\s+-C\s+\S+)?\s+push\b/.test(command)) {
+    return { reason_code: 'remote_write_requires_approval', command_kind: 'git_push' }
+  }
+  return null
+}
+
+/** AC2: read-only investigation commands that must NOT be blocked.
+ *  This function is called only AFTER secret/remote classifiers have been
+ *  applied to the stripped command (env prefix already removed by stripEnvPrefix).
+ *  Returns true for commands that are safe read-only investigations. */
+function isReadonlyInvestigation(_command) {
+  // Placeholder — all env-prefix handling is now done via stripEnvPrefix.
+  // This function remains for future read-only pass-through extensions.
+  return false
+}
+
+/** Strip `env VAR=val ...` prefix from a command string.
+ *  Returns { stripped: string, isEnvDump: boolean }.
+ *
+ *  Cases:
+ *    "env"                           → isEnvDump: true
+ *    "env -0"                        → isEnvDump: true
+ *    "env --ignore-environment"      → isEnvDump: true
+ *    "env VAR=val cmd arg"           → stripped: "cmd arg", isEnvDump: false
+ *    anything else starting with env → stripped: original, isEnvDump: false
+ */
+function stripEnvPrefix(command) {
+  const trimmed = command.trim()
+  // bare "env" with no args (possibly trailing whitespace) → env dump
+  if (/^env\s*$/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  // "env" followed by a flag that means dump all vars
+  if (/^env\s+(-0|--ignore-environment|-i)(\s|$)/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  // "env VAR=val ... cmd ..." — strip all leading VAR=val tokens
+  const envPrefixMatch = /^env\s+((?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+)(.+)$/.exec(trimmed)
+  if (envPrefixMatch) {
+    return { stripped: envPrefixMatch[2], isEnvDump: false }
+  }
+  // "env" followed by something that is not VAR=val assignments → treat as env dump
+  if (/^env\s+/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  return { stripped: trimmed, isEnvDump: false }
+}
+
+/** Produce a redacted preview of a command for deny reason strings (AC7). */
+function redactCommandPreview(command) {
+  // Redact secret-like tokens before truncation
+  let redacted = command
+    .replace(/\bsk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
+    .replace(/\bghp_[A-Za-z0-9_]{10,}/g, 'ghp_[REDACTED]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{10,}/g, 'github_pat_[REDACTED]')
+    .replace(/Authorization:\s*Bearer\s+[^\s"']+/gi, 'Authorization: Bearer [REDACTED]')
+    .replace(/\b[A-Z_]*(TOKEN|SECRET|PASSWORD|KEY)=[^\s"']+/g, (match, keyword) => `${keyword}=[REDACTED]`)
+    .replace(/--token\s+[^\s"']+/g, '--token [REDACTED]')
+    .replace(/-H\s+"Authorization:[^"]+/g, '-H "Authorization: [REDACTED]')
+    .replace(/-H\s+'Authorization:[^']+/g, "-H 'Authorization: [REDACTED]")
+
+  const truncated = redacted.length > 80
+    ? `${redacted.slice(0, 80).replace(/\s+/g, ' ')}...`
+    : redacted.replace(/\s+/g, ' ')
+  return truncated
+}
+
 function evaluateGuard(payload, eventName) {
-  const command = getCommand(payload)
+  const rawCommand = getCommand(payload)
 
   if (payload?.public_checkpoint_enabled === true) {
     return `${eventName}: public checkpoint is forbidden`
@@ -104,12 +203,37 @@ function evaluateGuard(payload, eventName) {
   if (payload?.secrets_mode && payload.secrets_mode !== 'none') {
     return `${eventName}: secrets_mode must remain none`
   }
-  if (payload?.forbidden_path_touched === true || matchesForbiddenPath(command)) {
+  if (payload?.forbidden_path_touched === true || matchesForbiddenPath(rawCommand)) {
     return `${eventName}: forbidden path access blocked`
   }
-  if (/\bgit(?:\s+-C\s+\S+)?\s+push\b|\bgh\s+(?:secret|api\b[^\n]*secrets)\b|\bprintenv\b|\benv\b|python\s+-c\s+['"][^'"]*os\./.test(command)) {
-    return `${eventName}: destructive or secret-revealing command blocked`
+
+  // Normalize env VAR=val prefix before classification.
+  // env dump variants (bare "env", "env -0", etc.) are denied immediately.
+  const { stripped: command, isEnvDump } = stripEnvPrefix(rawCommand)
+  if (isEnvDump) {
+    const preview = redactCommandPreview(rawCommand)
+    return `${eventName}: secret_boundary_violation [command_kind=env_dump] blocked_command_preview="${preview}"`
   }
+
+  // AC3: secret boundary - highest priority deny among command classifiers
+  const secretDenial = classifySecretBoundary(command)
+  if (secretDenial) {
+    const preview = redactCommandPreview(rawCommand)
+    return `${eventName}: secret_boundary_violation [command_kind=${secretDenial.command_kind}] blocked_command_preview="${preview}"`
+  }
+
+  // AC4: remote write - deny with remote-write-specific reason (not secret)
+  const remoteWriteDenial = classifyRemoteWrite(command)
+  if (remoteWriteDenial) {
+    const preview = redactCommandPreview(rawCommand)
+    return `${eventName}: remote_write_requires_approval [command_kind=${remoteWriteDenial.command_kind}] blocked_command_preview="${preview}"`
+  }
+
+  // AC2: read-only investigation passes through (no deny)
+  if (isReadonlyInvestigation(command)) {
+    return null
+  }
+
   return null
 }
 

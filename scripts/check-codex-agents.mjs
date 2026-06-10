@@ -281,15 +281,28 @@ function validateHooksJson(hooksPath, failures) {
       continue;
     }
     const hooks = entry?.hooks ?? [];
-    assert(hooks.length === 1, `hooks.json: matcher ${matcher} must have exactly one hook`, failures);
+    // PreToolUse matchers must have exactly 2 hooks (active handler inventory, #783):
+    //   1. scripts/check-codex-agents.mjs --hook-pretool (rtk bypass guard / Allowed Paths enforcement)
+    //   2. .codex/hooks/session-recording-composite.mjs --event PreToolUse (session recording guard)
+    assert(hooks.length >= 2, `hooks.json: matcher ${matcher} must have at least 2 hooks (check-codex-agents + session-recording-composite)`, failures);
+    const pretoolHook = hooks.find((h) => h?.command?.includes('--hook-pretool'));
     assert(
-      hooks[0]?.command?.includes('--hook-pretool'),
-      `hooks.json: matcher ${matcher} command must include --hook-pretool`,
+      Boolean(pretoolHook),
+      `hooks.json: matcher ${matcher} must have a hook command including --hook-pretool`,
       failures,
     );
     assert(
-      hooks[0]?.statusMessage === expectedStatusMessage,
+      pretoolHook?.statusMessage === expectedStatusMessage,
       `hooks.json: matcher ${matcher} statusMessage must be ${expectedStatusMessage}`,
+      failures,
+    );
+    // Verify session-recording-composite.mjs --event PreToolUse is an active handler (#783)
+    const sessionRecordingHook = hooks.find(
+      (h) => h?.command?.includes('session-recording-composite.mjs') && h?.command?.includes('--event PreToolUse'),
+    );
+    assert(
+      Boolean(sessionRecordingHook),
+      `hooks.json: matcher ${matcher} must have session-recording-composite.mjs --event PreToolUse as an active handler (Fix 4 #783)`,
       failures,
     );
   }
@@ -680,11 +693,16 @@ function isDirectBypass(command) {
 }
 
 function denyForBash(command) {
-  if (/^rtk\b/.test(command) || !command) {
+  if (!command) {
     return null;
   }
+  // rtk-prefixed commands pass through (read-only investigation allowed)
+  if (/^rtk\b/.test(command)) {
+    return null; // readonly_investigation_allowed: rtk commands pass through
+  }
   if (isDirectBypass(command)) {
-    return 'Use repo-documented rtk wrappers instead of direct pnpm / gh / mutating git commands.';
+    // direct_bypass_requires_rtk: non-rtk direct invocation of pnpm / gh / mutating git
+    return 'direct_bypass_requires_rtk: Use repo-documented rtk wrappers instead of direct pnpm / gh / mutating git commands.';
   }
   return null;
 }
@@ -757,7 +775,8 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
       // Strict mode: check against Allowed Paths
       for (const filePath of touchedPaths) {
         if (!isPathAllowed(filePath, allowedPaths)) {
-          return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+          // AC5: allowed_paths_violation — path is outside declared Allowed Paths
+          return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
         }
       }
     } else if (legacyMode) {
@@ -768,7 +787,8 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
     } else {
       // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
       if (touchedPaths.length > 0) {
-        return 'CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
+        // AC5: allowed_paths_missing — CODEX_ALLOWED_PATHS not declared
+        return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
       }
     }
     return null;
@@ -783,7 +803,8 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
     if (allowedPaths !== null) {
       // Strict mode
       if (!isPathAllowed(filePath, allowedPaths)) {
-        return `Allowed Paths enforcement: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+        // AC5: allowed_paths_violation — path is outside declared Allowed Paths
+        return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
       }
     } else if (legacyMode) {
       // Legacy opt-in: only block assets/LICENSES
@@ -792,7 +813,8 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
       }
     } else {
       // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
-      return 'CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
+      // AC5: allowed_paths_missing — CODEX_ALLOWED_PATHS not declared
+      return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
     }
     return null;
   }
@@ -1024,6 +1046,27 @@ function runSelfTest() {
   {
     const result = denyForBash('git push');
     selfAssert(result !== null, 'Bash hook: git push is denied');
+  }
+
+  // Test: direct gh is denied with direct_bypass_requires_rtk reason
+  {
+    const result = denyForBash('gh pr merge 1');
+    selfAssert(result !== null && result.includes('direct_bypass_requires_rtk'), 'Bash hook: direct gh denied with direct_bypass_requires_rtk reason');
+  }
+
+  // Test: Edit denied with allowed_paths_missing when CODEX_ALLOWED_PATHS not set
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
+    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Write tool: denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
+  }
+
+  // Test: Write denied with allowed_paths_violation when path is outside Allowed Paths
+  {
+    const allowed = ['scripts'];
+    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, allowed);
+    selfAssert(result !== null && result.includes('allowed_paths_violation'), 'Write tool: denied with allowed_paths_violation when path outside allowed set');
   }
 
   process.stdout.write('\n');

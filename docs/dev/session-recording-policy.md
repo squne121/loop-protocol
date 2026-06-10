@@ -24,6 +24,75 @@ created: "2026-05-24"
 
 ---
 
+## active PreToolUse handlers（#783 追加）
+
+`.codex/hooks.json` に登録されている active PreToolUse handlers とその責務境界。
+
+| matcher | handler | 責務 |
+|---|---|---|
+| `^Bash$` | `scripts/check-codex-agents.mjs --hook-pretool` | rtk bypass guard / Allowed Paths enforcement |
+| `^Bash$` | `.codex/hooks/session-recording-composite.mjs --event PreToolUse` | session recording guard（reason_code taxonomy） |
+| `^(apply_patch\|Edit\|Write)$` | `scripts/check-codex-agents.mjs --hook-pretool` | Allowed Paths enforcement（write tool） |
+| `^(apply_patch\|Edit\|Write)$` | `.codex/hooks/session-recording-composite.mjs --event PreToolUse` | session recording guard（patch/write） |
+
+Codex CLI は同一 event に matching する複数の command hooks を **concurrently launched** する（公式仕様）。
+実行順序・short-circuit・handler 間依存は保証されない。
+各 handler は独立して fail-closed な判定を返す必要があり、他の handler が先に deny することに依存してはならない。
+
+### reason_code taxonomy（#783）
+
+`session-recording-composite.mjs` が返す deny reason の分類。
+
+| reason_code | command_kind | 対象コマンド例 | 意味 |
+|---|---|---|---|
+| `secret_boundary_violation` | `gh_secret` | `gh secret list` | gh secret コマンドによる Secret 参照 |
+| `secret_boundary_violation` | `gh_api_actions_secrets` | `gh api .../secrets` | gh api 経由の GitHub Actions Secret 参照 |
+| `secret_boundary_violation` | `printenv` | `printenv` | 環境変数全ダンプ |
+| `secret_boundary_violation` | `env_dump` | `env`（standalone） | 環境変数全ダンプ（bare env） |
+| `secret_boundary_violation` | `python_os_environ` | `python3 -c '...os.environ...'` | Python 経由の環境変数アクセス |
+| `remote_write_requires_approval` | `git_push` | `git push origin main` | remote への git push |
+| `readonly_investigation_allowed` | — | `env FOO=bar cmd` | variable prefix 付き read-only 調査（通過） |
+
+`env FOO=bar <cmd>` パターン（変数代入プレフィックス）は secret dump ではなく read-only investigation として通過する（AC2）。
+
+### #360 / #639 との境界
+
+- **#360（destination guard policy）**: remote write の許可 policy 自体の見直しは #360 が担当する。本 #783 は deny reason の分類整理のみ。`remote_write_requires_approval` を自動許可に変更する設計は #360 スコープ。
+- **#639（PR body mutation enforcement）**: PR body の mutation 強制実装は #639 が担当する。本 #783 は hook output shape の整形のみ。
+
+---
+
+## codex exec live smoke（diagnostic-only、#783 追加）
+
+`codex exec` を使った live smoke test は **diagnostic-only 手順**とする。CI required gate には含めない。
+
+### 背景
+
+2026-06-10 時点で upstream issue [`openai/codex#26452`](https://github.com/openai/codex/issues/26452) が OPEN であり、
+`codex exec` の hook dispatch 動作が不安定なことが確認されている。
+live smoke の成功/失敗はこの Issue の merge gate に含めない（`decision: not_applicable`）。
+
+### diagnostic 手順（人間が手動確認する場合）
+
+```bash
+# codex exec が利用可能か確認（binary チェック）
+which codex || echo "codex not found"
+codex --version 2>/dev/null || echo "codex version unavailable"
+
+# PreToolUse hook が発火するか確認（diagnostic-only — 成功は保証しない）
+# upstream openai/codex#26452 が open のため hook dispatch が不安定
+codex exec --dangerously-bypass-hook-trust false -- bash -c 'echo test' 2>&1 || true
+
+# hook output を手動確認する場合
+echo '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}' \
+  | node .codex/hooks/session-recording-composite.mjs --event PreToolUse
+# 期待: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}
+```
+
+上記は **diagnostic-only**。CI ゲートや merge 条件には含めない。
+
+---
+
 ## 機械可読メタデータ (session_recording_policy/v1)
 
 ```yaml
