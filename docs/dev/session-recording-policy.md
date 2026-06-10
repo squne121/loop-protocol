@@ -35,7 +35,9 @@ created: "2026-05-24"
 | `^(apply_patch\|Edit\|Write)$` | `scripts/check-codex-agents.mjs --hook-pretool` | Allowed Paths enforcement（write tool） |
 | `^(apply_patch\|Edit\|Write)$` | `.codex/hooks/session-recording-composite.mjs --event PreToolUse` | session recording guard（patch/write） |
 
-両 handler は直列で実行され、いずれかが deny を返した時点でツール実行はブロックされる。
+Codex CLI は同一 event に matching する複数の command hooks を **concurrently launched** する（公式仕様）。
+実行順序・short-circuit・handler 間依存は保証されない。
+各 handler は独立して fail-closed な判定を返す必要があり、他の handler が先に deny することに依存してはならない。
 
 ### reason_code taxonomy（#783）
 

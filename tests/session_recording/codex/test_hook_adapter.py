@@ -305,6 +305,10 @@ def test_supported_output_shape():
     """GIVEN a denied PreToolUse event WHEN adapter emits deny JSON THEN only supported fields are present"""
     result = run_adapter("PreToolUse", {"tool_input": {"command": "git push origin main"}})
     response = json.loads(result.stdout)
+    # Root-level must NOT contain Codex control fields that would interfere with PreToolUse
+    root_unsupported = {"decision", "continue", "stopReason", "suppressOutput"}
+    assert not root_unsupported.intersection(set(response.keys())), \
+        f"Root-level response must not contain {root_unsupported}, got keys: {list(response.keys())}"
     hook_output = response["hookSpecificOutput"]
     # Required fields
     assert "hookEventName" in hook_output
@@ -348,7 +352,7 @@ def test_mixed_priority_secret_before_remote_write():
 def test_env_wrapper_not_secret():
     """GIVEN env FOO=bar <cmd> prefix WHEN PreToolUse fires THEN it is NOT treated as a secret dump"""
     result = run_adapter("PreToolUse", {"tool_input": {"command": "env PAGER=cat gh issue view 1"}})
-    # env FOO=bar prefix is readonly_investigation_allowed - the guard should NOT emit a deny
+    # env FOO=bar prefix should be stripped and gh issue view 1 is allowed (read-only)
     # If stdout is empty, the command passed through (no deny output = allowed behavior)
     if not result.stdout.strip():
         # Empty stdout = no deny emitted = command was allowed
@@ -361,11 +365,107 @@ def test_env_wrapper_not_secret():
 
 
 def test_blocked_command_preview_redacted():
-    """GIVEN a denied command WHEN PreToolUse deny reason is produced THEN blocked_command_preview is present and truncated"""
+    """GIVEN a denied command with secret tokens WHEN PreToolUse deny reason is produced THEN secret tokens are redacted"""
+    # Test 1: sk- token in a git push command (which triggers remote_write deny) — token is redacted
+    # Note: we use a command that is actually blocked by the guard.
+    # For redaction verification we rely on the redactCommandPreview unit behavior via gh secret.
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "gh secret list --token sk-abc123xyz456"}
+    })
+    response = json.loads(result.stdout)
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "blocked_command_preview" in reason
+    assert "sk-abc123xyz456" not in reason
+
+    # Test 2: ghp_ token in gh api secrets command
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "gh api /repos/owner/repo/actions/secrets --header Authorization:ghp_abc123xyz456"}
+    })
+    response = json.loads(result.stdout)
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "blocked_command_preview" in reason
+    assert "ghp_abc123xyz456" not in reason
+
+    # Test 3: MY_SECRET variable in printenv command (printenv → secret_boundary_violation)
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "MY_SECRET=hunter2 printenv"}
+    })
+    response = json.loads(result.stdout)
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "blocked_command_preview" in reason
+    assert "hunter2" not in reason
+
+    # Test 4: long command is truncated
     long_cmd = "git push origin main " + ("x" * 100)
     result = run_adapter("PreToolUse", {"tool_input": {"command": long_cmd}})
     response = json.loads(result.stdout)
     reason = response["hookSpecificOutput"]["permissionDecisionReason"]
     assert "blocked_command_preview" in reason
-    # The preview should be truncated (original command is > 80 chars)
     assert "..." in reason
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: env VAR=value prefix bypass adversarial regression tests
+# ---------------------------------------------------------------------------
+
+def test_env_prefix_does_not_bypass_secret():
+    """GIVEN env VAR=val <secret-command> WHEN PreToolUse fires THEN secret classification still applies"""
+    # env PAGER=cat gh secret list → must deny: secret_boundary_violation
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "env PAGER=cat gh secret list"}
+    })
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "secret_boundary_violation" in reason
+
+    # env FOO=bar printenv → must deny: secret_boundary_violation (printenv dumps env)
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "env FOO=bar printenv"}
+    })
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "secret_boundary_violation" in reason
+
+
+def test_env_prefix_remote_write_not_bypassed():
+    """GIVEN env VAR=val git push WHEN PreToolUse fires THEN remote_write_requires_approval applies"""
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": "env FOO=bar git push origin main"}
+    })
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "remote_write_requires_approval" in reason
+
+
+def test_bare_env_is_env_dump():
+    """GIVEN bare 'env' command WHEN PreToolUse fires THEN env_dump deny is emitted"""
+    # bare "env"
+    result = run_adapter("PreToolUse", {"tool_input": {"command": "env"}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "secret_boundary_violation" in reason
+    assert "env_dump" in reason
+
+    # "env -0" (null-delimited dump)
+    result = run_adapter("PreToolUse", {"tool_input": {"command": "env -0"}})
+    response = json.loads(result.stdout)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "secret_boundary_violation" in reason
+    assert "env_dump" in reason
+
+
+def test_env_prefix_benign_command_allowed():
+    """GIVEN env PAGER=cat gh issue view 1 WHEN PreToolUse fires THEN command is allowed (null = no deny)"""
+    result = run_adapter("PreToolUse", {"tool_input": {"command": "env PAGER=cat gh issue view 1"}})
+    # No deny should be emitted — stdout is empty or no deny in output
+    if not result.stdout.strip():
+        return  # empty stdout = allowed
+    response = json.loads(result.stdout)
+    if "hookSpecificOutput" in response:
+        assert response["hookSpecificOutput"].get("permissionDecision") != "deny", \
+            f"Expected allow but got deny: {response}"

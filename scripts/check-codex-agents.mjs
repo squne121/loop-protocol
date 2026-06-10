@@ -281,10 +281,10 @@ function validateHooksJson(hooksPath, failures) {
       continue;
     }
     const hooks = entry?.hooks ?? [];
-    // PreToolUse matchers may have 1 or 2 hooks:
-    //   1. scripts/check-codex-agents.mjs --hook-pretool (required)
-    //   2. .codex/hooks/session-recording-composite.mjs --event PreToolUse (optional, active PreToolUse handler #783)
-    assert(hooks.length >= 1, `hooks.json: matcher ${matcher} must have at least one hook`, failures);
+    // PreToolUse matchers must have exactly 2 hooks (active handler inventory, #783):
+    //   1. scripts/check-codex-agents.mjs --hook-pretool (rtk bypass guard / Allowed Paths enforcement)
+    //   2. .codex/hooks/session-recording-composite.mjs --event PreToolUse (session recording guard)
+    assert(hooks.length >= 2, `hooks.json: matcher ${matcher} must have at least 2 hooks (check-codex-agents + session-recording-composite)`, failures);
     const pretoolHook = hooks.find((h) => h?.command?.includes('--hook-pretool'));
     assert(
       Boolean(pretoolHook),
@@ -294,6 +294,15 @@ function validateHooksJson(hooksPath, failures) {
     assert(
       pretoolHook?.statusMessage === expectedStatusMessage,
       `hooks.json: matcher ${matcher} statusMessage must be ${expectedStatusMessage}`,
+      failures,
+    );
+    // Verify session-recording-composite.mjs --event PreToolUse is an active handler (#783)
+    const sessionRecordingHook = hooks.find(
+      (h) => h?.command?.includes('session-recording-composite.mjs') && h?.command?.includes('--event PreToolUse'),
+    );
+    assert(
+      Boolean(sessionRecordingHook),
+      `hooks.json: matcher ${matcher} must have session-recording-composite.mjs --event PreToolUse as an active handler (Fix 4 #783)`,
       failures,
     );
   }

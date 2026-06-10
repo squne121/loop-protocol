@@ -131,26 +131,68 @@ function classifyRemoteWrite(command) {
 }
 
 /** AC2: read-only investigation commands that must NOT be blocked.
- *  env FOO=bar cmd is an environment-variable prefix for a sub-command,
- *  not a secret dump - it should pass through. */
-function isReadonlyInvestigation(command) {
-  // env VAR=value ... patterns are variable-assignment prefixes, not env dumps
-  if (/^env\s+[A-Za-z_][A-Za-z0-9_]*=/.test(command)) {
-    return true
-  }
+ *  This function is called only AFTER secret/remote classifiers have been
+ *  applied to the stripped command (env prefix already removed by stripEnvPrefix).
+ *  Returns true for commands that are safe read-only investigations. */
+function isReadonlyInvestigation(_command) {
+  // Placeholder — all env-prefix handling is now done via stripEnvPrefix.
+  // This function remains for future read-only pass-through extensions.
   return false
+}
+
+/** Strip `env VAR=val ...` prefix from a command string.
+ *  Returns { stripped: string, isEnvDump: boolean }.
+ *
+ *  Cases:
+ *    "env"                           → isEnvDump: true
+ *    "env -0"                        → isEnvDump: true
+ *    "env --ignore-environment"      → isEnvDump: true
+ *    "env VAR=val cmd arg"           → stripped: "cmd arg", isEnvDump: false
+ *    anything else starting with env → stripped: original, isEnvDump: false
+ */
+function stripEnvPrefix(command) {
+  const trimmed = command.trim()
+  // bare "env" with no args (possibly trailing whitespace) → env dump
+  if (/^env\s*$/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  // "env" followed by a flag that means dump all vars
+  if (/^env\s+(-0|--ignore-environment|-i)(\s|$)/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  // "env VAR=val ... cmd ..." — strip all leading VAR=val tokens
+  const envPrefixMatch = /^env\s+((?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+)(.+)$/.exec(trimmed)
+  if (envPrefixMatch) {
+    return { stripped: envPrefixMatch[2], isEnvDump: false }
+  }
+  // "env" followed by something that is not VAR=val assignments → treat as env dump
+  if (/^env\s+/.test(trimmed)) {
+    return { stripped: trimmed, isEnvDump: true }
+  }
+  return { stripped: trimmed, isEnvDump: false }
 }
 
 /** Produce a redacted preview of a command for deny reason strings (AC7). */
 function redactCommandPreview(command) {
-  const truncated = command.length > 80
-    ? `${command.slice(0, 80).replace(/\s+/g, ' ')}...`
-    : command.replace(/\s+/g, ' ')
+  // Redact secret-like tokens before truncation
+  let redacted = command
+    .replace(/\bsk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
+    .replace(/\bghp_[A-Za-z0-9_]{10,}/g, 'ghp_[REDACTED]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{10,}/g, 'github_pat_[REDACTED]')
+    .replace(/Authorization:\s*Bearer\s+[^\s"']+/gi, 'Authorization: Bearer [REDACTED]')
+    .replace(/\b[A-Z_]*(TOKEN|SECRET|PASSWORD|KEY)=[^\s"']+/g, (match, keyword) => `${keyword}=[REDACTED]`)
+    .replace(/--token\s+[^\s"']+/g, '--token [REDACTED]')
+    .replace(/-H\s+"Authorization:[^"]+/g, '-H "Authorization: [REDACTED]')
+    .replace(/-H\s+'Authorization:[^']+/g, "-H 'Authorization: [REDACTED]")
+
+  const truncated = redacted.length > 80
+    ? `${redacted.slice(0, 80).replace(/\s+/g, ' ')}...`
+    : redacted.replace(/\s+/g, ' ')
   return truncated
 }
 
 function evaluateGuard(payload, eventName) {
-  const command = getCommand(payload)
+  const rawCommand = getCommand(payload)
 
   if (payload?.public_checkpoint_enabled === true) {
     return `${eventName}: public checkpoint is forbidden`
@@ -161,27 +203,35 @@ function evaluateGuard(payload, eventName) {
   if (payload?.secrets_mode && payload.secrets_mode !== 'none') {
     return `${eventName}: secrets_mode must remain none`
   }
-  if (payload?.forbidden_path_touched === true || matchesForbiddenPath(command)) {
+  if (payload?.forbidden_path_touched === true || matchesForbiddenPath(rawCommand)) {
     return `${eventName}: forbidden path access blocked`
   }
 
-  // AC2: read-only investigation passes through before any deny classification
-  if (isReadonlyInvestigation(command)) {
-    return null
+  // Normalize env VAR=val prefix before classification.
+  // env dump variants (bare "env", "env -0", etc.) are denied immediately.
+  const { stripped: command, isEnvDump } = stripEnvPrefix(rawCommand)
+  if (isEnvDump) {
+    const preview = redactCommandPreview(rawCommand)
+    return `${eventName}: secret_boundary_violation [command_kind=env_dump] blocked_command_preview="${preview}"`
   }
 
   // AC3: secret boundary - highest priority deny among command classifiers
   const secretDenial = classifySecretBoundary(command)
   if (secretDenial) {
-    const preview = redactCommandPreview(command)
+    const preview = redactCommandPreview(rawCommand)
     return `${eventName}: secret_boundary_violation [command_kind=${secretDenial.command_kind}] blocked_command_preview="${preview}"`
   }
 
   // AC4: remote write - deny with remote-write-specific reason (not secret)
   const remoteWriteDenial = classifyRemoteWrite(command)
   if (remoteWriteDenial) {
-    const preview = redactCommandPreview(command)
+    const preview = redactCommandPreview(rawCommand)
     return `${eventName}: remote_write_requires_approval [command_kind=${remoteWriteDenial.command_kind}] blocked_command_preview="${preview}"`
+  }
+
+  // AC2: read-only investigation passes through (no deny)
+  if (isReadonlyInvestigation(command)) {
+    return null
   }
 
   return null
