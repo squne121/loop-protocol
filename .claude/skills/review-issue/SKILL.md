@@ -18,7 +18,7 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 
 1. `gh issue view <番号> --json title,body,labels` で本文を取得する。
 2. 本文を一時ファイルに保存し、以下の 2 スクリプトを順に実行する:
-   - `python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
+   - `uv run python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
    - `uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode execute`
    
    `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、以下のルールで `REVIEW_ISSUE_RESULT_V1` へ合成する：
