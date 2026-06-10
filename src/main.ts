@@ -69,6 +69,10 @@ const hud = createHudController(commandRail, {
     setHudFeedback('Sortie started.', 'Preparation controls are now locked until debrief.')
   },
   onClaimReward() {
+    if (state.loopPhase !== 'debrief_pending_reward') {
+      return
+    }
+
     const claimResult = claimPendingReward(state)
 
     if (claimResult.ok) {
@@ -100,7 +104,10 @@ const hud = createHudController(commandRail, {
     }
 
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
-    setHudFeedback('Next sortie started.', 'Claimed progression has been preserved in memory.')
+    setHudFeedback(
+      'Next sortie started.',
+      'Claimed reward remains available only in this in-memory session until saved.',
+    )
   },
   onQuickSave() {
     if (state.loopPhase !== 'preparation') {

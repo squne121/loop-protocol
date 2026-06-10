@@ -5,17 +5,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController } from '../src/ui/HudController'
-import type { GameState, LoopPhase } from '../src/state'
+import type { GameState, LoopPhase, SortieResult } from '../src/state'
+
+const TERMINAL_SORTIE_RESULT = {
+  outcome: 'victory',
+  endReason: 'all_enemies_defeated',
+  durationMs: 30_000,
+  kills: 4,
+  shotsFired: 18,
+  playerHpRemaining: 6,
+} satisfies SortieResult
 
 function createState(loopPhase: LoopPhase = 'preparation'): GameState {
+  const isDebrief = loopPhase === 'debrief_pending_reward' || loopPhase === 'debrief_reward_claimed'
+
   return {
     tick: 0,
     elapsedMs: 0,
     loopPhase,
-    pendingRewardApplicationId:
-      loopPhase === 'debrief_pending_reward' || loopPhase === 'debrief_reward_claimed'
-        ? 'sortie-reward-1'
-        : null,
+    pendingRewardApplicationId: isDebrief ? 'sortie-reward-1' : null,
     nextRewardApplicationSequence: 2,
     arena: { width: 960, height: 540 },
     player: {
@@ -44,7 +52,10 @@ function createState(loopPhase: LoopPhase = 'preparation'): GameState {
       weaponPower: 1,
     },
     rewardClaims: {
-      claimedApplicationIds: Object.create(null) as Record<string, true>,
+      claimedApplicationIds:
+        loopPhase === 'debrief_reward_claimed'
+          ? ({ 'sortie-reward-1': true } as Record<string, true>)
+          : (Object.create(null) as Record<string, true>),
     },
     telemetry: {
       status: 'Combat systems green',
@@ -58,6 +69,13 @@ function createState(loopPhase: LoopPhase = 'preparation'): GameState {
             targetTicks: 1800,
             result: null,
           }
+        : isDebrief
+          ? {
+              status: 'victory',
+              elapsedTicks: 1800,
+              targetTicks: 1800,
+              result: TERMINAL_SORTIE_RESULT,
+            }
         : {
             status: 'idle',
             elapsedTicks: 0,
@@ -141,6 +159,8 @@ describe('HudController', () => {
     hudController.render(createState('debrief_pending_reward'))
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward pending')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'claim-reward').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
@@ -153,6 +173,8 @@ describe('HudController', () => {
     hudController.render(createState('debrief_reward_claimed'))
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward claimed')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'next-sortie').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
@@ -193,5 +215,15 @@ describe('HudController', () => {
     expect(actions.onQuickSave).not.toHaveBeenCalled()
     expect(actions.onQuickLoad).not.toHaveBeenCalled()
     expect(actions.onReset).toHaveBeenCalledTimes(0)
+  })
+
+  it('GIVEN debrief_reward_claimed WHEN disabled claim button is clicked THEN claim callback remains a no-op surface', () => {
+    hudController.render(createState('debrief_reward_claimed'))
+
+    queryButton(container, 'claim-reward').click()
+    queryButton(container, 'next-sortie').click()
+
+    expect(actions.onClaimReward).not.toHaveBeenCalled()
+    expect(actions.onNextSortie).toHaveBeenCalledTimes(1)
   })
 })
