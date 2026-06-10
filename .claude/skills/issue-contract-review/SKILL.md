@@ -73,7 +73,7 @@ Delivery Rule の条件文・歴史的注記・コメント・Conditional exampl
 **実行方法**
 
 ```bash
-python3 .claude/skills/issue-contract-review/scripts/check_product_spec_contract.py \
+uv run python3 .claude/skills/issue-contract-review/scripts/check_product_spec_contract.py \
   --issue-number <番号> \
   --repo <owner>/<repo>
 ```
@@ -123,7 +123,7 @@ BLOCKED 時は issue comment に以下を記載:
 
 ```bash
 # baseline_vc_preflight.py を使用して Issue 本文から VC を AC 別に抽出・実行
-python3 .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py \
+uv run python3 .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py \
   --issue <番号> --repo <owner>/<repo>
 ```
 
