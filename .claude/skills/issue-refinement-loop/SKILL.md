@@ -193,7 +193,7 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 ```bash
 # TERMINATION_REPORT_INPUT_V1 JSON を stdin から渡す
 echo '{"termination_reason":"approved","issue_number":42}' | \
-  python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+  uv run python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
     --issue-number 42
 ```
 
