@@ -77,10 +77,10 @@ function createState(overrides: { hp?: number; maxHp?: number; loopPhase?: LoopP
       lastCommandSummary: 'test',
     },
     sortie: {
-      status: 'idle',
+      status: isDebrief ? 'completed' : 'idle',
       elapsedTicks: 0,
       targetTicks: 1800,
-      result: null,
+      result: isDebrief ? TERMINAL_SORTIE_RESULT : null,
     },
   }
 }
