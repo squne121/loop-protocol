@@ -1,0 +1,2 @@
+STATUS: ok
+[32mVERDICT: approve[0m

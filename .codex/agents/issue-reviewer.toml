@@ -12,9 +12,10 @@ INPUT_CONTRACT
 - 必須文脈が足りなければ `status: failed` と `failure_reason: INSUFFICIENT_CONTEXT` を返す。
 
 OUTPUT_CONTRACT
-- `REVIEW_ISSUE_RESULT_V1` の verdict / blockers / next_action だけを返す。
-- main thread context budget を守り、structured output の verdict と evidence refs のみを返す。
-- raw transcript、raw diff、raw logs は返さない。
+- `ISSUE_REVIEW_RESULT_COMPACT_V1` のみを返す（compact_review_result.py stdout）。
+- STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / EVIDENCE / ARTIFACT の 7 フィールドのみ。
+- stdout は 2048 UTF-8 bytes 以内。raw review / body / diff / logs は artifact JSON に保存し main context に返さない。
+- full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存する。
 
 EXECUTION_POLICY
 - `review-issue` skill を正本とし、progressive disclosure で必要な references だけを読む。

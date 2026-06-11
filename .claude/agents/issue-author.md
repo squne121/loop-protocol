@@ -233,13 +233,58 @@ CHILD_MATERIALIZATION_RESULT_V2:
 
 詳細 authoring rule は `body-authoring.md#Contract-Readiness-Repair-by-Category` を参照する。
 
+## Mutation 前の check_vc_scope.py 実行（AC0）
+
+Issue 本文を mutation（`gh issue edit`）する前に、必ず `check_vc_scope.py` を実行する。
+
+```bash
+# check_vc_scope.py が存在することを確認してから参照する（#793 成果物）
+uv run python3 .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py \
+  --body-file "$NEW_BODY" \
+  --allowed-paths-file /tmp/allowed_paths.txt  # 利用可能な場合
+```
+
+- exit 2（blocked）: mutation を禁止し、`ISSUE_AUTHOR_RESULT_COMPACT_V1.STATUS: failed` を返す
+- exit 1（warn）: mutation は継続するが、compact output の `SUMMARY` に警告内容を明記する
+- exit 0（pass）: mutation を継続する
+
+`check_vc_scope.py` が存在しない場合（#793 未マージ環境）は skip して warn を記録する。
+
+## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1）
+
+本 SubAgent の最終応答は `compact_author_result.py` の stdout のみとする。
+raw issue body / raw diff / raw log を main context に返してはならない。
+
+出力スキーマ: `ISSUE_AUTHOR_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_author_result.py`）
+
+```text
+STATUS: ok | partial_failure | failed | no_change
+BODY_HASH: <sha256 of updated body>
+COMMENT_URL: <url or empty>
+ARTIFACT: compact_author_result_v1=<path>
+NEXT_ACTION: proceed | human_judgment_required
+```
+
+full mutation result（`ISSUE_AUTHOR_RESULT_V1` 全フィールド）は `.claude/artifacts/issue-refinement-loop/<N>/` 配下の artifact JSON に保存し、main context には artifact path のみ返す。
+
+```bash
+# compact 変換の実行例
+uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_author_result.py \
+  --input-file /tmp/author_result.json \
+  --artifact-dir .claude/artifacts/issue-refinement-loop \
+  --issue-number <N> \
+  --updated-body-file /tmp/updated_body.md
+```
+
 ## 制約
 
 - ネスト委譲禁止（`disallowedTools: [Agent]`）。別 SubAgent への委譲は行わない
 - ファイル編集禁止（`disallowedTools: [Edit, Write, MultiEdit]`）。本文更新は `gh issue edit --body-file` のみ
 - `/tmp/` 以外のリポジトリ内ファイルを作成・編集しない
 - 人間承認なく Issue 本文を書き換えるかどうかは、呼び出し元 skill の Procedure に従う（`create-issue` は guard を全通過時自動起票、`edit-issue` は invoked_as_loop の値や呼び出し元の指示に従う）
+- mutation 前に必ず `check_vc_scope.py` を実行する（blocked 結果は mutation を禁止する）
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
+stdout は 2048 UTF-8 bytes 以内とする。raw body / raw diff / raw log / ANSI escape sequence を stdout に返してはならない。
