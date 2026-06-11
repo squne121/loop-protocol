@@ -10,7 +10,12 @@
     "issue_number",
     "iteration",
     "max_iterations",
-    "last_verdict"
+    "last_verdict",
+    "termination_reason",
+    "scope_signal_guard",
+    "delivery_rollup",
+    "follow_up_materialization",
+    "web_research_policy"
   ],
   "properties": {
     "schema_version": {

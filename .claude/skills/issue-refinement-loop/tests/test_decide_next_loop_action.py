@@ -6,11 +6,13 @@ AC3: decide_next_loop_action.py determines next action from compact review
 result fixture, and iteration limit exceeded → human escalation (exit 2).
 """
 
+import io
 import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -253,3 +255,227 @@ def test_script_does_not_reference_bare_python3_in_skill_md():
     assert not bad_matches, (
         f"SKILL.md contains bare python3 invocation without 'uv run': {bad_matches}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Major 2: Additional input path tests
+# ---------------------------------------------------------------------------
+
+def test_loop_state_file_input(tmp_path):
+    """--loop-state-file reads state from a JSON file."""
+    state = load_fixture()
+    state["iteration"] = 0
+    state["max_iterations"] = 3
+    state_file = tmp_path / "loop_state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-file",
+            str(state_file),
+            "--review-result-verdict",
+            "approve",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "NEXT_ACTION: proceed_to_step_4_5" in result.stdout
+
+
+def test_stdin_input_path():
+    """stdin JSON input is accepted when no --loop-state-file or --loop-state-json."""
+    state = load_fixture()
+    state["iteration"] = 0
+    state["max_iterations"] = 3
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--review-result-verdict",
+            "approve",
+        ],
+        input=json.dumps(state),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "NEXT_ACTION: proceed_to_step_4_5" in result.stdout
+
+
+def test_loop_state_file_is_read_only(tmp_path):
+    """--loop-state-file input must not be modified by the script."""
+    state = load_fixture()
+    state["iteration"] = 0
+    state["max_iterations"] = 3
+    state_file = tmp_path / "loop_state.json"
+    original_content = json.dumps(state, indent=2)
+    state_file.write_text(original_content, encoding="utf-8")
+    mtime_before = state_file.stat().st_mtime
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-file",
+            str(state_file),
+            "--review-result-verdict",
+            "approve",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert state_file.read_text(encoding="utf-8") == original_content, (
+        "loop state file was mutated by the script"
+    )
+    assert state_file.stat().st_mtime == mtime_before, (
+        "loop state file mtime changed (file was written)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: fail-close schema validation tests
+# ---------------------------------------------------------------------------
+
+def test_missing_jsonschema_fails_closed(monkeypatch):
+    """jsonschema import failure → validate_loop_state returns (False, ...) → exit 3."""
+    # Patch builtins.__import__ to raise ImportError for jsonschema
+    original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+    import builtins
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "jsonschema":
+            raise ImportError("mocked: jsonschema not available")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+
+    # Import the module fresh with patched import
+    import importlib
+    import sys as _sys
+
+    # Remove cached module if present
+    module_name = "decide_next_loop_action"
+    for key in list(_sys.modules.keys()):
+        if "decide_next_loop_action" in key:
+            del _sys.modules[key]
+
+    _sys.path.insert(0, str(SCRIPT.parent))
+    try:
+        import decide_next_loop_action as dna
+        importlib.reload(dna)
+        state = load_fixture()
+        valid, err = dna.validate_loop_state(state)
+        assert not valid, "expected validation to fail when jsonschema unavailable"
+        assert "jsonschema" in err.lower()
+    finally:
+        _sys.path.pop(0)
+        for key in list(_sys.modules.keys()):
+            if "decide_next_loop_action" in key:
+                del _sys.modules[key]
+
+
+def test_missing_schema_file_fails_closed(monkeypatch, tmp_path):
+    """Schema file unreadable → validate_loop_state returns (False, ...) → fail closed."""
+    import sys as _sys
+    for key in list(_sys.modules.keys()):
+        if "decide_next_loop_action" in key:
+            del _sys.modules[key]
+    _sys.path.insert(0, str(SCRIPT.parent))
+    try:
+        import decide_next_loop_action as dna
+        import importlib
+        importlib.reload(dna)
+
+        # Patch _SCHEMA_PATH to a non-existent file
+        monkeypatch.setattr(dna, "_SCHEMA_PATH", tmp_path / "nonexistent_schema.json")
+
+        state = load_fixture()
+        valid, err = dna.validate_loop_state(state)
+        assert not valid, "expected validation to fail when schema file is missing"
+        assert "unavailable" in err.lower() or "schema" in err.lower()
+    finally:
+        _sys.path.pop(0)
+        for key in list(_sys.modules.keys()):
+            if "decide_next_loop_action" in key:
+                del _sys.modules[key]
+
+
+# ---------------------------------------------------------------------------
+# Major 1: last_verdict conflict with CLI verdict → exit 3
+# ---------------------------------------------------------------------------
+
+def test_last_verdict_conflict_with_cli_verdict_is_inconsistent():
+    """
+    LOOP_STATE.last_verdict != --review-result-verdict (both non-null) → exit 3.
+    """
+    state = load_fixture()
+    # state fixture has last_verdict: "needs-fix"
+    state["last_verdict"] = "needs-fix"
+    result = run_script(state, verdict="approve")
+    assert result.returncode == 3, (
+        f"Expected exit 3 for verdict conflict, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "inconsistent_state" in result.stdout
+    assert "last_verdict_conflict" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: iteration boundary tests (4 cases, 0-indexed, case B semantics)
+# iteration + 1 >= max_iterations → escalate
+# iteration + 1 <  max_iterations → continue
+# ---------------------------------------------------------------------------
+
+def test_iteration_boundary_0_max_1_escalates():
+    """(iteration=0, max=1): 0+1 >= 1 → escalate (exit 2)."""
+    state = load_fixture()
+    state["iteration"] = 0
+    state["max_iterations"] = 1
+    result = run_script(state, verdict="needs-fix")
+    assert result.returncode == 2, (
+        f"Expected exit 2 for (iter=0, max=1), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "human_escalation" in result.stdout
+
+
+def test_iteration_boundary_1_max_1_escalates():
+    """(iteration=1, max=1): 1+1 >= 1 → escalate (exit 2)."""
+    state = load_fixture()
+    state["iteration"] = 1
+    state["max_iterations"] = 1
+    result = run_script(state, verdict="needs-fix")
+    assert result.returncode == 2, (
+        f"Expected exit 2 for (iter=1, max=1), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "human_escalation" in result.stdout
+
+
+def test_iteration_boundary_1_max_2_escalates():
+    """(iteration=1, max=2): 1+1 >= 2 → escalate (exit 2)."""
+    state = load_fixture()
+    state["iteration"] = 1
+    state["max_iterations"] = 2
+    result = run_script(state, verdict="needs-fix")
+    assert result.returncode == 2, (
+        f"Expected exit 2 for (iter=1, max=2), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "human_escalation" in result.stdout
+
+
+def test_iteration_boundary_2_max_2_escalates():
+    """(iteration=2, max=2): 2+1 >= 2 → escalate (exit 2)."""
+    state = load_fixture()
+    state["iteration"] = 2
+    state["max_iterations"] = 2
+    result = run_script(state, verdict="needs-fix")
+    assert result.returncode == 2, (
+        f"Expected exit 2 for (iter=2, max=2), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "human_escalation" in result.stdout

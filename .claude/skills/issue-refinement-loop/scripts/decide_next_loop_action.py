@@ -91,28 +91,23 @@ def validate_loop_state(data: Any) -> tuple[bool, str]:
     Validate loop state data against loop_state.schema.json.
 
     Returns (valid, error_message). Never raises for ordinary failures.
+
+    Fail-close contract:
+    - If jsonschema is not importable → return (False, "jsonschema not available: ...")
+    - If schema file is unreadable → return (False, "Schema file unavailable: ...")
+    Fallback validation paths are intentionally absent.
     """
     if not isinstance(data, dict):
         return False, "loop state must be a JSON object"
 
     try:
         import jsonschema
-    except ImportError:
-        # jsonschema unavailable — do minimal field check only
-        required = {"issue_number", "iteration", "max_iterations", "last_verdict"}
-        missing = required - data.keys()
-        if missing:
-            return False, f"Missing required fields: {sorted(missing)}"
-        return True, ""
+    except ImportError as exc:
+        return False, f"jsonschema not available: {exc}"
 
     schema = _load_loop_state_schema()
     if schema is None:
-        # Schema file missing — fall back to required-field check
-        required = {"issue_number", "iteration", "max_iterations", "last_verdict"}
-        missing = required - data.keys()
-        if missing:
-            return False, f"Missing required fields: {sorted(missing)}"
-        return True, ""
+        return False, f"Schema file unavailable: {_SCHEMA_PATH}"
 
     try:
         jsonschema.validate(instance=data, schema=schema)
@@ -196,9 +191,9 @@ def decide_next_action(
         )
 
     # --- Priority 2: max_iterations exceeded (human escalation) ---
-    # iteration is already incremented before calling this script.
-    # escalate when iteration >= max_iterations.
-    if review_verdict == VERDICT_NEEDS_FIX and iteration >= max_iterations:
+    # iteration is the current 0-indexed round number.
+    # escalate when there is no next round: iteration + 1 >= max_iterations.
+    if review_verdict == VERDICT_NEEDS_FIX and iteration + 1 >= max_iterations:
         blockers = ["max_iterations_exceeded"]
         return (
             STATUS_HUMAN_ESCALATION,
@@ -355,6 +350,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         verdict: Optional[str] = None
     else:
         verdict = raw_verdict
+
+    # Detect conflict: last_verdict in state vs --review-result-verdict CLI flag.
+    # Both being non-null with different values is an inconsistent state.
+    state_last_verdict = loop_state.get("last_verdict")
+    if (
+        verdict is not None
+        and state_last_verdict is not None
+        and verdict != state_last_verdict
+    ):
+        print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
+        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+        print(
+            f"BLOCKERS: last_verdict_conflict:"
+            f" state={state_last_verdict!r} cli={verdict!r}"
+        )
+        sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Compute next action
     status, next_action, commands, blockers = decide_next_action(

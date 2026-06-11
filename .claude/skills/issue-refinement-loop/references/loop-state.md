@@ -41,7 +41,8 @@ The canonical machine-readable schema is `schemas/loop_state.schema.json`.
 
 ### iteration / max_iterations
 
-`iteration` is 0-indexed and incremented **before** calling `decide_next_loop_action.py`.
+`iteration` is the current 0-indexed round number passed to `decide_next_loop_action.py`.
+Continuation is possible as long as a next round exists: `iteration + 1 < max_iterations`.
 
 | condition | next action |
 |---|---|

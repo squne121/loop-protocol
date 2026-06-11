@@ -3,7 +3,7 @@
   "issue_number": 795,
   "iteration": 1,
   "max_iterations": 3,
-  "last_verdict": "needs-fix",
+  "last_verdict": null,
   "blockers_history": [
     {"iteration": 0, "blockers": ["AC2 missing: outcome section incomplete"]}
   ],
