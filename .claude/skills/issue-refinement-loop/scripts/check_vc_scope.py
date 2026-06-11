@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -149,22 +150,24 @@ def _extract_allowed_paths(body: str) -> list[str]:
 
     Each bullet's first backtick code span is taken as the path.
     Falls back to the raw text after '- ' if no backtick span found.
+    Annotations like （注記）(note) are stripped from non-backtick entries.
     """
     section_lines = _extract_section(body, "Allowed Paths")
     paths = []
     for _, line in section_lines:
         stripped = line.strip()
-        if not stripped.startswith("- "):
+        if not (stripped.startswith("- ") or stripped.startswith("* ")):
             continue
+        # Remove bullet marker (- or *)
         content = stripped[2:].strip()
         # Try to extract first backtick code span
         m = re.search(r"`([^`]+)`", content)
         if m:
             paths.append(m.group(1))
         else:
-            # Use the raw content (may have parenthetical annotations)
-            # Remove parenthetical at end
-            raw = re.sub(r"\s*\(.*?\)\s*$", "", content).strip()
+            # No backtick: take the text up to first space or （ (full-width paren) or ( (ascii paren)
+            # Remove trailing ASCII and full-width parenthetical annotations
+            raw = re.sub(r"\s*[（(].*", "", content).strip()
             if raw:
                 paths.append(raw)
     return paths
@@ -184,21 +187,46 @@ def _has_parent_traversal(p: str) -> bool:
     return ".." in parts
 
 
+def _classify_allowed_path(ap: str) -> str:
+    """Classify an allowed path entry as 'dir' or 'file'.
+
+    - Ends with '/' or '/**' -> 'dir' (descendants allowed)
+    - Contains glob chars -> 'glob' (descendants allowed via glob prefix)
+    - Otherwise -> 'file' (exact match only)
+    """
+    if ap.endswith("/") or ap.endswith("/**"):
+        return "dir"
+    if _GLOB_RE.search(ap):
+        return "glob"
+    return "file"
+
+
 def _path_is_allowed(candidate: str, allowed_paths: list[str]) -> bool:
     """Check if candidate path is within any allowed path.
 
-    - Exact file match: candidate == allowed_path
-    - Directory match: allowed_path ends with / and candidate starts with it
-    - Prefix match: candidate starts with allowed_path + /
-    - Also match if candidate starts with allowed_path (no trailing /)
+    - file entry: exact match only (candidate == allowed_path)
+    - dir entry (ends with / or /**): candidate starts with directory prefix
+    - glob entry: candidate starts with the static prefix of the glob
     """
     for ap in allowed_paths:
-        ap_norm = ap.rstrip("/")
-        cand_norm = candidate.rstrip("/")
-        if cand_norm == ap_norm:
-            return True
-        if cand_norm.startswith(ap_norm + "/"):
-            return True
+        kind = _classify_allowed_path(ap)
+        if kind == "file":
+            # Exact match only — no pseudo-subpath allowed
+            if candidate.rstrip("/") == ap.rstrip("/"):
+                return True
+        elif kind == "dir":
+            ap_prefix = ap.rstrip("/").rstrip("*").rstrip("/")
+            cand_norm = candidate.rstrip("/")
+            if cand_norm == ap_prefix or cand_norm.startswith(ap_prefix + "/"):
+                return True
+        else:
+            # glob: use static prefix
+            prefix = _glob_static_prefix(ap)
+            if prefix:
+                prefix_norm = prefix.rstrip("/")
+                cand_norm = candidate.rstrip("/")
+                if cand_norm == prefix_norm or cand_norm.startswith(prefix_norm + "/"):
+                    return True
     return False
 
 
@@ -252,52 +280,16 @@ def _broad_search_check(path: str, allowed_paths: list[str]) -> bool:
     return True
 
 
-def _extract_paths_from_command(command_stripped: str) -> list[str]:
-    """Heuristically extract file/directory path arguments from a shell command.
+def _split_simple_commands(cmd: str) -> list[str]:
+    """Split a shell command into simple commands on &&, ||, ;, |.
 
-    Returns list of path strings found in the command.
-    This is best-effort; unparseable forms trigger VC_PARSE_INDETERMINATE.
+    Uses a character-level state machine that correctly tracks quotes.
+    The quotes are preserved in the resulting substrings so that
+    shlex.split() can re-parse them correctly.
+    Returns a list of simple command strings.
     """
-    # Remove the leading '$ ' if present
-    cmd = command_stripped
-    if cmd.startswith("$ "):
-        cmd = cmd[2:]
-
-    # Tokenize simply: split on spaces, handling simple quoted strings
-    # For complex quoting, mark as indeterminate
-    try:
-        tokens = _simple_tokenize(cmd)
-    except ValueError:
-        return []
-
-    paths = []
-    skip_next = False
-    for i, token in enumerate(tokens):
-        if skip_next:
-            skip_next = False
-            continue
-        # Skip flags
-        if token.startswith("-"):
-            # Some flags take a value argument (e.g. -n, -F), skip next for those
-            # We can't fully know, so we skip only if next token is not path-like
-            continue
-        # Skip known command names (first token, uv, run, pytest, pnpm, rg, etc.)
-        if i == 0:
-            continue
-        # Skip 'run', '--locked', etc. subcommands/flags
-        if token in ("run", "--locked", "python3", "python", "pytest"):
-            continue
-        # Path-like: contains / or . or starts with .
-        if "/" in token or token.startswith("."):
-            paths.append(token)
-
-    return paths
-
-
-def _simple_tokenize(cmd: str) -> list[str]:
-    """Simple shell tokenizer. Raises ValueError on complex/unparseable quoting."""
-    tokens = []
-    current = []
+    parts: list[str] = []
+    current: list[str] = []
     i = 0
     in_single = False
     in_double = False
@@ -305,48 +297,150 @@ def _simple_tokenize(cmd: str) -> list[str]:
     while i < len(cmd):
         c = cmd[i]
         if in_single:
+            current.append(c)
             if c == "'":
                 in_single = False
-            else:
-                current.append(c)
         elif in_double:
+            current.append(c)
             if c == '"':
                 in_double = False
             elif c == "\\":
                 i += 1
                 if i < len(cmd):
                     current.append(cmd[i])
-            else:
-                current.append(c)
         elif c == "'":
             in_single = True
+            current.append(c)
         elif c == '"':
             in_double = True
+            current.append(c)
         elif c == "\\":
+            current.append(c)
             i += 1
             if i < len(cmd):
                 current.append(cmd[i])
-        elif c in (" ", "\t"):
-            if current:
-                tokens.append("".join(current))
-                current = []
-        elif c in ("|", "&", ";", ">", "<", "(", ")", "`", "$"):
-            # Shell metacharacters - simplified handling
-            if current:
-                tokens.append("".join(current))
-                current = []
-            # Skip metacharacters for our purposes
+        elif c in ("|", "&", ";"):
+            # Consume the operator (&&, ||, |, ;)
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            # Skip consecutive operator chars (&&, ||)
+            while i + 1 < len(cmd) and cmd[i + 1] in ("|", "&"):
+                i += 1
         else:
             current.append(c)
         i += 1
 
-    if in_single or in_double:
-        raise ValueError("Unclosed quote")
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
 
-    if current:
-        tokens.append("".join(current))
 
-    return tokens
+# Allow-listed command names for path extraction
+_PATH_EXTRACT_ALLOWED_CMDS = frozenset({
+    "rg", "ripgrep", "pytest", "uv", "pnpm", "npm", "node",
+    "cat", "ls", "find", "grep", "diff", "cp", "mv", "rm",
+    "mkdir", "touch", "head", "tail", "wc",
+})
+
+# Option flags that take a value argument and should have their value skipped
+_OPTION_WITH_VALUE_RE = re.compile(r"^-[eEfFgGnNoOpPqQrRsStTuUwWxX]$|^--(?:glob|include|exclude|type|file|pattern|replace|regexp|encoding|after-context|before-context|context|max-count|max-depth|threads|sortr?|field-match-separator)$")
+
+
+def _extract_paths_from_simple_command(simple_cmd: str, cmd_text_for_error: str) -> tuple[list[str], bool]:
+    """Extract file/dir path arguments from a single simple command using shlex.
+
+    Returns (paths, parse_error).
+    parse_error=True means shlex raised ValueError (unclosed quote etc.).
+    """
+    try:
+        tokens = shlex.split(simple_cmd, posix=True)
+    except ValueError:
+        return [], True
+
+    if not tokens:
+        return [], False
+
+    # argv[0] is the command
+    argv0 = tokens[0]
+
+    # Only extract paths from allow-listed commands
+    # For 'uv run ...', the effective command is after 'run' and optional flags
+    effective_cmd = argv0
+    token_start = 1
+    if argv0 == "uv" and len(tokens) > 1 and tokens[1] == "run":
+        # Find the effective command after 'uv run [flags]'
+        j = 2
+        while j < len(tokens) and tokens[j].startswith("-"):
+            j += 1
+        if j < len(tokens):
+            effective_cmd = tokens[j]
+            token_start = j + 1
+        else:
+            return [], False
+
+    if effective_cmd not in _PATH_EXTRACT_ALLOWED_CMDS:
+        # Unknown command - skip path extraction to avoid false positives
+        return [], False
+
+    paths = []
+    skip_next = False
+    for idx, token in enumerate(tokens[token_start:], start=token_start):
+        if skip_next:
+            skip_next = False
+            continue
+        if token.startswith("-"):
+            # If this option takes a value, skip the next token
+            if _OPTION_WITH_VALUE_RE.match(token):
+                skip_next = True
+            continue
+        # Skip known subcommand tokens
+        if token in ("run", "--locked", "--frozen", "python3", "python", "pytest"):
+            continue
+        # Heuristic: path-like tokens contain / or start with .
+        # Avoid URL (://) and regex patterns
+        if "://" in token:
+            continue
+        if "/" in token or token.startswith("."):
+            paths.append(token)
+
+    return paths, False
+
+
+def _extract_paths_from_command(command_stripped: str) -> tuple[list[str], bool]:
+    """Heuristically extract file/directory path arguments from a shell command.
+
+    Handles compound commands (&&, ||, ;, |) by splitting into simple commands.
+
+    Returns (paths, parse_error).
+    parse_error=True signals VC_PARSE_INDETERMINATE should be emitted.
+    """
+    # Remove the leading '$ ' if present
+    cmd = command_stripped
+    if cmd.startswith("$ "):
+        cmd = cmd[2:]
+
+    simple_commands = _split_simple_commands(cmd)
+    all_paths: list[str] = []
+    any_error = False
+
+    for simple_cmd in simple_commands:
+        paths, error = _extract_paths_from_simple_command(simple_cmd, cmd)
+        all_paths.extend(paths)
+        if error:
+            any_error = True
+
+    return all_paths, any_error
+
+
+def _simple_tokenize(cmd: str) -> list[str]:
+    """Simple shell tokenizer (legacy, kept for compatibility). Raises ValueError on complex/unparseable quoting."""
+    try:
+        return shlex.split(cmd, posix=True)
+    except ValueError:
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -354,22 +448,25 @@ def _simple_tokenize(cmd: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _check_legacy_python(stripped_cmd: str) -> bool:
-    """Return True if command uses bare python/python3 (not via uv run)."""
+    """Return True if any simple command in stripped_cmd uses bare python/python3 (not via uv run).
+
+    Handles compound commands (&&, ||, ;, |) by checking each simple command individually.
+    A simple command starting with 'uv run ... python/pytest' is allowed.
+    A simple command starting with bare 'python3'/'python' is flagged.
+    """
     cmd = stripped_cmd
     if cmd.startswith("$ "):
         cmd = cmd[2:]
 
-    # If uv run ... python/pytest is present, it's allowed
-    if _UV_RUN_PREFIX_RE.search(cmd):
-        return False
-
-    # Check for bare python/python3/python3.x as a command token
-    # We need to find it as argv[0] or after shell operators
-    # Split on common shell operators to get subcommands
-    subcommands = re.split(r"(?:&&|\|\||;|\|)\s*", cmd)
-    for sub in subcommands:
+    simple_commands = _split_simple_commands(cmd)
+    for sub in simple_commands:
         sub = sub.strip()
-        # Check if subcommand starts with python/python3/python3.x followed by space or EOF
+        if not sub:
+            continue
+        # If this simple command is 'uv run ... python/pytest', it's allowed
+        if _UV_RUN_PREFIX_RE.match(sub):
+            continue
+        # Check if this simple command starts with bare python/python3/python3.x
         if re.match(r"python3?(?:\.\d+)?(?:\s|$)", sub):
             return True
 
@@ -413,10 +510,8 @@ def _check_command(
 
     # Extract paths for scope checking
     if allowed_paths:
-        try:
-            paths = _extract_paths_from_command(cmd_for_analysis)
-        except Exception:
-            paths = []
+        paths, parse_error = _extract_paths_from_command(cmd_for_analysis)
+        if parse_error:
             findings.append({
                 "reason_code": REASON_PARSE_INDETERMINATE,
                 "level": LEVEL_WARN,

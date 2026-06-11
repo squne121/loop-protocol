@@ -712,3 +712,349 @@ $ uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_vc_scop
         """
         exit_code, stdout, stderr, artifact = run_checker("pass_clean.md")
         assert artifact.get("allowed_paths"), f"artifact.allowed_paths should not be empty: {artifact}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Allowed Paths bullet format without backtick code span
+# ---------------------------------------------------------------------------
+
+class TestAllowedPathsBulletFormat:
+    """Fix 1: Bullet entries without backtick code spans are parsed correctly."""
+
+    def test_bullet_without_backtick_parses_path(self):
+        """GIVEN Allowed Paths entries without backtick code spans (e.g. Issue #793 form)
+        WHEN check_vc_scope.py runs
+        THEN allowed_paths are populated and path check works correctly
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+```
+
+## Allowed Paths
+
+- .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/test_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/fixtures/（fixture 追加のみ）
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        assert artifact.get("allowed_paths"), (
+            f"allowed_paths should be populated from bullet-without-backtick form: {artifact}"
+        )
+        paths = artifact.get("allowed_paths", [])
+        # Annotations like （新規） must be stripped
+        for p in paths:
+            assert "（" not in p, f"Full-width paren annotation not stripped from path: {p!r}"
+            assert "(" not in p, f"ASCII paren annotation not stripped from path: {p!r}"
+        # Correct path should appear
+        assert ".claude/skills/issue-refinement-loop/scripts/check_vc_scope.py" in paths, (
+            f"Expected path not found in: {paths}"
+        )
+
+    def test_bullet_without_backtick_scope_check_works(self):
+        """GIVEN Allowed Paths without backtick and a path in the VC that is outside Allowed Paths
+        WHEN check_vc_scope.py runs
+        THEN VC_SCOPE_OUTSIDE_ALLOWED_PATH is still detected (scope check is functional)
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/other-skill/scripts/foo.py
+```
+
+## Allowed Paths
+
+- .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/test_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/fixtures/（fixture 追加のみ）
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        assert exit_code == 2, f"Expected exit 2 (blocked), got {exit_code}"
+        findings = parse_findings_from_artifact(artifact)
+        assert has_reason_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH"), (
+            f"Expected VC_SCOPE_OUTSIDE_ALLOWED_PATH with bullet-without-backtick Allowed Paths: {findings}"
+        )
+
+    def test_bullet_without_backtick_path_within_allowed_passes(self):
+        """GIVEN Allowed Paths without backtick and a VC path within the allowed dir
+        WHEN check_vc_scope.py runs
+        THEN no VC_SCOPE_OUTSIDE_ALLOWED_PATH (path is correctly allowed)
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/issue-refinement-loop/tests/fixtures/vc_scope/sample.md
+```
+
+## Allowed Paths
+
+- .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/test_vc_scope.py（新規）
+- .claude/skills/issue-refinement-loop/tests/fixtures/（fixture 追加のみ）
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        assert not has_reason_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH"), (
+            f"Path within allowed dir should not be blocked: {findings}"
+        )
+
+    def test_fixture_pass_clean_uses_annotation_form(self):
+        """GIVEN pass_clean.md fixture which uses （注記） annotation form
+        WHEN check_vc_scope.py runs
+        THEN allowed_paths are parsed correctly (no （ in paths)
+        """
+        exit_code, stdout, stderr, artifact = run_checker("pass_clean.md")
+        for p in artifact.get("allowed_paths", []):
+            assert "（" not in p, f"Full-width paren annotation not stripped: {p!r}"
+        assert exit_code == 0, f"pass_clean.md should exit 0, got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: VC_PARSE_INDETERMINATE is emitted (not silently swallowed)
+# ---------------------------------------------------------------------------
+
+class TestParseIndeterminateEmitted:
+    """Fix 2: tokenizer failure must emit VC_PARSE_INDETERMINATE finding."""
+
+    def test_parse_indeterminate_finding_present(self):
+        """GIVEN a VC command with unclosed quote
+        WHEN check_vc_scope.py runs
+        THEN VC_PARSE_INDETERMINATE finding is present in artifact
+        """
+        exit_code, stdout, stderr, artifact = run_checker("parse_indeterminate.md")
+        findings = parse_findings_from_artifact(artifact)
+        assert has_reason_code(findings, "VC_PARSE_INDETERMINATE"), (
+            f"Expected VC_PARSE_INDETERMINATE finding: {findings}"
+        )
+
+    def test_parse_indeterminate_exit_is_warn(self):
+        """GIVEN a VC command that triggers VC_PARSE_INDETERMINATE
+        WHEN check_vc_scope.py runs
+        THEN exit code is 1 (warn), not 0 or 2
+        """
+        exit_code, stdout, stderr, artifact = run_checker("parse_indeterminate.md")
+        findings = parse_findings_from_artifact(artifact)
+        parse_findings = findings_with_code(findings, "VC_PARSE_INDETERMINATE")
+        assert parse_findings, "No VC_PARSE_INDETERMINATE findings found"
+        assert exit_code == 1, (
+            f"VC_PARSE_INDETERMINATE should yield exit 1 (warn), got {exit_code}"
+        )
+
+    def test_parse_indeterminate_level_is_warn(self):
+        """GIVEN a VC_PARSE_INDETERMINATE finding
+        WHEN checking level
+        THEN level is 'warn' not 'blocked'
+        """
+        exit_code, stdout, stderr, artifact = run_checker("parse_indeterminate.md")
+        findings = parse_findings_from_artifact(artifact)
+        for f in findings_with_code(findings, "VC_PARSE_INDETERMINATE"):
+            assert f["level"] == "warn", f"Expected level=warn, got {f['level']}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Compound command with bare python3 after && is detected
+# ---------------------------------------------------------------------------
+
+class TestCompoundCommandLegacyPython:
+    """Fix 3: Bare python3 after && in a compound command is flagged."""
+
+    def test_uv_run_and_python3_compound_is_blocked(self):
+        """GIVEN 'uv run pytest ... && python3 ...' compound command
+        WHEN check_vc_scope.py runs
+        THEN VC_LEGACY_PYTHON3 is present (python3 after && is bare)
+        """
+        body = """## Verification Commands
+
+```bash
+$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py && python3 .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        assert exit_code == 2, f"Expected exit 2 (blocked), got {exit_code}"
+        findings = parse_findings_from_artifact(artifact)
+        assert has_reason_code(findings, "VC_LEGACY_PYTHON3"), (
+            f"Expected VC_LEGACY_PYTHON3 for python3 after &&: {findings}"
+        )
+
+    def test_compound_uv_run_only_is_not_blocked(self):
+        """GIVEN 'uv run pytest ... && uv run pytest ...' compound (no bare python3)
+        WHEN check_vc_scope.py runs
+        THEN VC_LEGACY_PYTHON3 is NOT present
+        """
+        body = """## Verification Commands
+
+```bash
+$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -v && uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -k "not slow"
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        assert not has_reason_code(findings, "VC_LEGACY_PYTHON3"), (
+            f"uv run && uv run should not trigger VC_LEGACY_PYTHON3: {findings}"
+        )
+
+    def test_compound_with_fixture(self):
+        """GIVEN compound_legacy_python3.md fixture
+        WHEN check_vc_scope.py runs
+        THEN exit 2 and VC_LEGACY_PYTHON3 is blocked
+        """
+        exit_code, stdout, stderr, artifact = run_checker("compound_legacy_python3.md")
+        assert exit_code == 2, f"Expected exit 2 (blocked), got {exit_code}. stderr: {stderr}"
+        findings = parse_findings_from_artifact(artifact)
+        assert has_reason_code(findings, "VC_LEGACY_PYTHON3"), (
+            f"Expected VC_LEGACY_PYTHON3 in findings: {findings}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: File entry exact match (no pseudo-subpath)
+# ---------------------------------------------------------------------------
+
+class TestFileEntryExactMatch:
+    """Fix 4: file entry in Allowed Paths only allows exact match, not pseudo-subpath."""
+
+    def test_file_entry_pseudo_subpath_is_blocked(self):
+        """GIVEN Allowed Paths contains a file entry (no trailing /)
+        WHEN a VC references a pseudo-subpath of that file entry
+        THEN VC_SCOPE_OUTSIDE_ALLOWED_PATH is triggered (file entry is exact-match only)
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py/evil
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        assert exit_code == 2, (
+            f"Pseudo-subpath of file entry should be blocked (exit 2), got {exit_code}"
+        )
+        findings = parse_findings_from_artifact(artifact)
+        assert has_reason_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH"), (
+            f"Pseudo-subpath should trigger VC_SCOPE_OUTSIDE_ALLOWED_PATH: {findings}"
+        )
+
+    def test_file_entry_exact_match_passes(self):
+        """GIVEN Allowed Paths contains a file entry
+        WHEN a VC references exactly that file
+        THEN no VC_SCOPE_OUTSIDE_ALLOWED_PATH
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        assert not has_reason_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH"), (
+            f"Exact file entry match should not be blocked: {findings}"
+        )
+
+    def test_dir_entry_subpath_passes(self):
+        """GIVEN Allowed Paths contains a dir entry (trailing /)
+        WHEN a VC references a subpath within that directory
+        THEN no VC_SCOPE_OUTSIDE_ALLOWED_PATH (dir entry allows descendants)
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "foo" .claude/skills/issue-refinement-loop/tests/fixtures/vc_scope/sample.md
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        assert not has_reason_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH"), (
+            f"Dir entry subpath should not be blocked: {findings}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: shlex-based tokenizer - URL and regex pattern false positive prevention
+# ---------------------------------------------------------------------------
+
+class TestShlexTokenizerFalsePositives:
+    """Fix 5: shlex-based tokenizer does not confuse URLs or regex patterns for paths."""
+
+    def test_url_in_rg_pattern_not_flagged_as_path(self):
+        """GIVEN a VC command that uses rg with a URL-like string as a pattern
+        WHEN check_vc_scope.py runs
+        THEN the URL is not treated as a file path (no false VC_SCOPE_OUTSIDE_ALLOWED_PATH)
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -n "https://example.com/api" .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        outside = findings_with_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH")
+        # If outside findings exist, none should be due to the URL
+        for f in outside:
+            assert "https://" not in f.get("evidence", ""), (
+                f"URL should not be treated as file path: {f}"
+            )
+
+    def test_rg_e_pattern_option_not_treated_as_path(self):
+        """GIVEN a VC with 'rg -e PATTERN path' where PATTERN contains /
+        WHEN check_vc_scope.py runs
+        THEN the PATTERN is skipped (flag -e takes next token as value)
+        and the actual path is the only one checked
+        """
+        body = """## Verification Commands
+
+```bash
+$ rg -e "some/pattern" .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+```
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/scripts/check_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/test_vc_scope.py`
+- `.claude/skills/issue-refinement-loop/tests/fixtures/`
+"""
+        exit_code, stdout, stderr, artifact = run_checker(body=body)
+        findings = parse_findings_from_artifact(artifact)
+        # "some/pattern" should not be flagged as outside allowed paths
+        outside = findings_with_code(findings, "VC_SCOPE_OUTSIDE_ALLOWED_PATH")
+        pattern_blocked = [f for f in outside if "some/pattern" in f.get("evidence", "")]
+        assert not pattern_blocked, (
+            f"rg -e pattern should not be treated as file path: {pattern_blocked}"
+        )
