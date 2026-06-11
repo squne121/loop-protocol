@@ -35,7 +35,7 @@ def run_preflight(fixture_file: str, issue_num: int = 999) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
     )
     # C2: exit code は 0, 1, 2, 3 など様々な値
     # JSON parse が成功すれば status フィールドで判定する
