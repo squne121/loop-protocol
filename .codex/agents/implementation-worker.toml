@@ -28,8 +28,9 @@ WRITE_SCOPE
 - assets/ と LICENSES/ は human explicit approval が無い限り触らない。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: implement-issue
+- repo_local_skill_surface: .agents/skills/implement-issue/SKILL.md
 
 FAIL_CLOSED
 - contract mismatch、scope expansion、required verification の欠落、nested delegation 必須化を検知したら停止する。

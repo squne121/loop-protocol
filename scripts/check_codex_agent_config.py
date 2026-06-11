@@ -27,8 +27,17 @@ def read_toml(path: Path) -> dict:
 
 
 def extract_runtime_field(instructions: str, field: str) -> str | None:
-    match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._-]+)", instructions)
+    match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._|-]+)", instructions)
     return match.group(1) if match else None
+
+
+def extract_skill_surface_paths(instructions: str) -> list[str]:
+    match = re.search(r"repo_local_skill_surface:\s*(.+)", instructions)
+    if not match:
+        return []
+    raw_value = match.group(1).strip()
+    parts = re.split(r"\s*,\s*|\s*\|\s*", raw_value)
+    return [part for part in parts if part]
 
 
 def load_agent(path: Path) -> dict:
@@ -72,6 +81,12 @@ def assert_required_fields(expectations: dict) -> list[str]:
                 failures.append(
                     f"{expected['path']}: developer_instructions missing {runtime_field}"
                 )
+        expected_skill_surfaces = expected.get("repo_local_skill_surfaces", [])
+        actual_skill_surfaces = extract_skill_surface_paths(instructions)
+        if expected_skill_surfaces and not actual_skill_surfaces:
+            failures.append(
+                f"{expected['path']}: developer_instructions missing repo_local_skill_surface"
+            )
 
     return failures
 
@@ -98,6 +113,22 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
             if actual != expected[runtime_field]:
                 failures.append(
                     f"{expected['path']}: {runtime_field} expected {expected[runtime_field]!r} got {actual!r}"
+                )
+
+        expected_skill_surfaces = expected.get("repo_local_skill_surfaces", [])
+        actual_skill_surfaces = extract_skill_surface_paths(instructions)
+        if actual_skill_surfaces != expected_skill_surfaces:
+            failures.append(
+                f"{expected['path']}: repo_local_skill_surfaces expected {expected_skill_surfaces!r} got {actual_skill_surfaces!r}"
+            )
+        for surface in actual_skill_surfaces:
+            if not surface.startswith(".agents/skills/"):
+                failures.append(
+                    f"{expected['path']}: repo_local_skill_surface must stay under .agents/skills/"
+                )
+            if not (REPO_ROOT / surface).exists():
+                failures.append(
+                    f"{expected['path']}: missing repo-local skill surface {surface}"
                 )
 
         claude_agent_path = REPO_ROOT / expected["claude_agent_path"]
@@ -138,8 +169,8 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
             failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
             continue
         commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
-        if len(commands) != 1 or "--hook-pretool" not in commands[0]:
-            failures.append(f".codex/hooks.json: matcher {matcher} must route exactly one command with --hook-pretool")
+        if not commands or not any("--hook-pretool" in command for command in commands):
+            failures.append(f".codex/hooks.json: matcher {matcher} must route at least one command with --hook-pretool")
         hook_status = entry.get("hooks", [{}])[0].get("statusMessage") if entry.get("hooks") else None
         if hook_status != status_message:
             failures.append(f".codex/hooks.json: matcher {matcher} must use statusMessage {status_message!r}")

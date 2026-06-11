@@ -193,6 +193,8 @@ GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/
 - `.codex/config.toml` の `default_permissions` が repo 既定 profile を選ぶ
 - `.codex/rules/default.rules` が command rules を持つ
 - `AGENTS.md` が Codex 向けの project-local instruction surface になる
+- `.agents/skills/` が Codex custom agent の repo-local shared skill surface になる
+- `.claude/skills/` は Claude 側 prompt / skill surface であり、Codex custom agent の runtime dependency 正本としては扱わない
 
 ### 旧 sandbox 設定との競合
 

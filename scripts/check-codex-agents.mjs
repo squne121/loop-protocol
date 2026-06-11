@@ -35,7 +35,7 @@ const requiredAgentNames = [
 const builtInNames = new Set(['default', 'worker', 'explorer']);
 const allowedRuntimeStatuses = new Set([
   'codex_native',
-  'claude_skill_required',
+  'codex_skill_required',
   'followup_required',
 ]);
 
@@ -232,6 +232,17 @@ function getAgentFiles() {
 function extractRuntimeStatus(instructions) {
   const match = instructions.match(/runtime_dependency_status:\s*([a-z_]+)/);
   return match?.[1] ?? null;
+}
+
+function extractSkillSurfacePaths(instructions) {
+  const match = instructions.match(/repo_local_skill_surface:\s*(.+)/);
+  if (!match) {
+    return [];
+  }
+  return match[1]
+    .split(/[|,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function assert(condition, message, failures) {
@@ -463,6 +474,7 @@ function validateAgents() {
     const name = parsed.name;
     const instructions = parsed.developer_instructions ?? '';
     const runtimeStatus = extractRuntimeStatus(instructions);
+    const skillSurfacePaths = extractSkillSurfacePaths(instructions);
     const expected = reasoningMap.get(name);
 
     assert(Boolean(name), `${file}: missing name`, failures);
@@ -483,6 +495,13 @@ function validateAgents() {
     assert(!('sandbox_mode' in parsed), `${file}: sandbox_mode must not be mixed with permission profiles`, failures);
     assert(Boolean(runtimeStatus), `${file}: runtime_dependency_status is required`, failures);
     assert(allowedRuntimeStatuses.has(runtimeStatus), `${file}: runtime_dependency_status must be one of ${[...allowedRuntimeStatuses].join(', ')}`, failures);
+    if (runtimeStatus === 'codex_skill_required') {
+      assert(skillSurfacePaths.length > 0, `${file}: codex_skill_required agent must declare repo_local_skill_surface`, failures);
+      for (const skillSurfacePath of skillSurfacePaths) {
+        assert(skillSurfacePath.startsWith('.agents/skills/'), `${file}: repo_local_skill_surface must stay under .agents/skills/`, failures);
+        assert(fs.existsSync(path.join(repoRoot, skillSurfacePath)), `${file}: missing repo-local skill surface ${skillSurfacePath}`, failures);
+      }
+    }
     assert(instructions.includes('structured output'), `${file}: developer_instructions must require structured output`, failures);
     assert(instructions.includes('context budget'), `${file}: developer_instructions must mention context budget`, failures);
     assert(instructions.includes('progressive disclosure'), `${file}: developer_instructions must mention progressive disclosure`, failures);
