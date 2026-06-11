@@ -14,13 +14,29 @@ Usage:
         [--fixture <path>]
 
 Output (stdout): compact projection of refinement_preflight_result/v1 artifact.
+
+Canonical stdout fields:
+    STATUS       - pass | warn | blocked | environment_failure (always present)
+    NEXT_ACTION  - routing instruction (always present)
+    MUST_READ    - files/paths to read before proceeding (omitted if empty)
+    COMMANDS     - argv-only command templates (omitted if empty)
+    BLOCKERS     - blocker reason codes (omitted if empty)
+    ARTIFACT     - artifact key: absolute_path pairs (omitted if empty)
+
+Non-canonical / suppressed fields:
+    SUMMARY      - human-only prose, not consumed by orchestrators
+    DO_NOT_READ  - reserved, currently empty; consumers MUST NOT rely on absence
+    EVIDENCE     - raw issue body / comments; NEVER emitted to stdout
+
 Artifact (file):  .claude/artifacts/issue-refinement-loop/<issue_number>/
                   refinement_preflight_result_v1.json  (canonical result)
                   raw_issue_snapshot.json              (raw issue + comments)
+                  planner_input.json                   (planner stdin, byte-stable)
 
 Exit codes:
-    0 - pass (planner succeeded, fail_closed.required == false)
-    1 - warn (pass with human notes needed)
+    0 - pass (planner succeeded, fail_closed.required == false, no unknown confidence)
+    1 - warn (planner exit 0, fail_closed.required == false, >=1 decision with
+              confidence: unknown — human note needed but not blocking)
     2 - blocked (anchor mismatch, planner exit 2, or planner fail_closed.required == true)
     3 - environment_failure (gh not found / auth / API / timeout / non-JSON)
 
@@ -30,8 +46,13 @@ Planner ↔ Wrapper Exit Code Mapping:
     planner exit 2 (invalid input)                  → blocked  / 2
     planner exit 3 (internal error)                 → environment_failure / 3
     planner exit 0 + fail_closed.required == true   → blocked  / 2
-    planner exit 0 (normal)                         → pass     / 0
-    planner exit 0 + human note needed              → warn     / 1
+    planner exit 0, fail_closed=false, no unknown   → pass     / 0
+    planner exit 0, fail_closed=false, >=1 unknown  → warn     / 1
+
+warn (exit 1) definition:
+    planner exit 0 AND fail_closed.required == false
+    AND decisions.*.confidence contains at least one "unknown"
+    → status: warn / exit 1 (human note needed, but not fully blocking)
 """
 
 from __future__ import annotations
@@ -48,14 +69,27 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
+# Runtime schema validation (jsonschema >= 4.0, already in pyproject.toml)
+# ---------------------------------------------------------------------------
+
+try:
+    import jsonschema as _jsonschema
+    _JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    _JSONSCHEMA_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
 PLANNER_SCRIPT = _SCRIPTS_DIR / "plan_refinement_loop.py"
 
 SCHEMA_VERSION_RESULT = "refinement_preflight_result/v1"
 SCHEMA_VERSION_PLANNER_INPUT = "refinement_loop_planner_input/v1"
+SCHEMA_VERSION_INPUT_FIXTURE = "refinement_preflight_input/v1"
 
 # Timeout constants (seconds)
 GH_API_TIMEOUT = 30
@@ -78,6 +112,9 @@ BLOCKER_ANCHOR_REPO_MISMATCH = "ANCHOR_REPO_MISMATCH"
 BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH = "ANCHOR_ISSUE_NUMBER_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_NOT_FOUND = "ANCHOR_COMMENT_NOT_FOUND"
 BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
+BLOCKER_INPUT_SCHEMA_INVALID = "INPUT_SCHEMA_INVALID"
+BLOCKER_RESULT_SCHEMA_INVALID = "RESULT_SCHEMA_INVALID"
+BLOCKER_INVALID_ARGS = "INVALID_ARGS"
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +149,37 @@ def _find_repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent.parent
 
 
+def _load_schema(schema_filename: str) -> dict | None:
+    """Load a JSON schema file from the schemas directory. Returns None if not found."""
+    schema_path = _SCHEMAS_DIR / schema_filename
+    if not schema_path.exists():
+        return None
+    try:
+        return json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _validate_with_schema(
+    data: dict, schema: dict
+) -> tuple[bool, list[str]]:
+    """
+    Validate data against schema using jsonschema.
+
+    Returns (is_valid, error_messages).
+    If jsonschema not available, skips validation (returns True, []).
+    """
+    if not _JSONSCHEMA_AVAILABLE:
+        return True, []
+    try:
+        _jsonschema.validate(data, schema)
+        return True, []
+    except _jsonschema.ValidationError as exc:
+        return False, [f"schema_validation_error: {exc.message}"]
+    except Exception as exc:
+        return False, [f"schema_validation_unexpected: {exc}"]
+
+
 # ---------------------------------------------------------------------------
 # URL parsing for anchor comment structural validation
 # ---------------------------------------------------------------------------
@@ -129,6 +197,12 @@ _PR_REVIEW_COMMENT_RE = re.compile(
 _PR_REVIEW_DISCUSSION_RE = re.compile(
     r"^https://github\.com/[^/]+/[^/]+/pull/\d+#discussion_r\d+$"
 )
+
+# Valid --repo pattern
+_REPO_PATTERN = re.compile(r"^[^/]+/[^/]+$")
+
+# Valid GitHub comment URL prefix
+_GITHUB_URL_PREFIX = "https://github.com/"
 
 
 def _parse_anchor_comment_url(url: str) -> dict[str, Any]:
@@ -205,16 +279,34 @@ def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
 
 
 def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, str]:
-    """Fetch all issue comments via gh api."""
+    """Fetch all issue comments via gh api with --paginate --slurp.
+
+    gh 2.88.1+ --slurp returns [[...page1...], [...page2...]] which must be
+    flattened to a single list.  Single-page results are also wrapped as [[...]].
+    """
     data, err = _run_gh(
-        ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
-         "--paginate"]
+        [
+            "gh", "api",
+            f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
+            "--paginate", "--slurp",
+        ]
     )
     if data is None:
         return None, err
-    if not isinstance(data, list):
-        return None, f"gh_comments_unexpected_type: {type(data).__name__}"
-    return data, ""
+    # --slurp wraps each page as an element: [[page1_comments...], [page2_comments...]]
+    # Flatten one level regardless of page count.
+    if isinstance(data, list):
+        if len(data) == 0:
+            return [], ""
+        # Check if it's a slurp-wrapped list-of-lists
+        if all(isinstance(item, list) for item in data):
+            flattened: list[dict] = []
+            for page in data:
+                flattened.extend(page)
+            return flattened, ""
+        # Already a flat list (e.g. non-paginated gh or mock returning flat list)
+        return data, ""
+    return None, f"gh_comments_unexpected_type: {type(data).__name__}"
 
 
 def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]:
@@ -243,7 +335,7 @@ def _validate_anchor_comment_url(
     1. URL owner/repo matches --repo
     2. URL issue_number matches --issue-number
     3. Comment id exists (via gh api or fixture)
-    4. Comment's issue_url REST field points to same issue
+    4. Comment's issue_url REST field points to same issue (must be present and non-empty)
     5. Not a PR review comment (different endpoint)
 
     Returns (is_valid, list_of_blocker_codes).
@@ -254,7 +346,7 @@ def _validate_anchor_comment_url(
     if not parsed.get("valid"):
         error = parsed.get("error", "unknown")
         if error == "pr_review_comment_url":
-            return False, [BLOCKER_ANCHOR_IS_PR_REVIEW]
+            return False, [BLOCKER_ANCHOR_IS_PR_REVIEW, BLOCKER_ANCHOR_NOT_IN_ISSUE]
         return False, [BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     # Check 1: owner/repo match
@@ -262,15 +354,15 @@ def _validate_anchor_comment_url(
     url_repo_name = parsed["repo"].lower()
     parts = repo.lower().split("/", 1)
     if len(parts) != 2:
-        return False, [BLOCKER_ANCHOR_REPO_MISMATCH]
+        return False, [BLOCKER_ANCHOR_REPO_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     expected_owner, expected_repo_name = parts
     if url_owner != expected_owner or url_repo_name != expected_repo_name:
-        return False, [BLOCKER_ANCHOR_REPO_MISMATCH]
+        return False, [BLOCKER_ANCHOR_REPO_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     # Check 2: issue number match
     if parsed["issue_number"] != issue_number:
-        return False, [BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH]
+        return False, [BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     comment_id = parsed["comment_id"]
 
@@ -283,41 +375,47 @@ def _validate_anchor_comment_url(
                 comment_data = c
                 break
         if comment_data is None:
-            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND]
+            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
     else:
         # Live mode: fetch via gh api
         comment_data, err = _fetch_single_comment(repo, comment_id)
         if comment_data is None:
-            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND]
+            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
-    # Check 4: issue_url field validation (structural, not substring)
-    issue_url_field = comment_data.get("issue_url", "")
+    # Check 4: issue_url field validation — must be present and non-empty
+    issue_url_field = comment_data.get("issue_url")
+
+    # Missing or empty issue_url → blocked (fail-closed)
+    if not issue_url_field:
+        return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
+
     # Expected format: https://api.github.com/repos/<owner>/<repo>/issues/<number>
     # Also accept: https://github.com/<owner>/<repo>/issues/<number>
     expected_api_url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
     expected_html_url = f"https://github.com/{repo}/issues/{issue_number}"
 
-    if issue_url_field not in (expected_api_url, expected_html_url, ""):
-        # Check via structural parsing rather than substring
-        # The URL must end with /issues/<issue_number> for the correct repo
-        parsed_url = urlparse(issue_url_field)
-        path_parts = parsed_url.path.rstrip("/").split("/")
-        if (
-            len(path_parts) >= 4
-            and path_parts[-2] == "issues"
-            and path_parts[-1] == str(issue_number)
-        ):
-            # Repo path should be /<owner>/<repo>/
-            if not (
-                len(path_parts) >= 5
-                and path_parts[-4].lower() == expected_owner
-                and path_parts[-3].lower() == expected_repo_name
-            ):
-                return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH]
-        elif issue_url_field:
-            return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH]
+    if issue_url_field in (expected_api_url, expected_html_url):
+        return True, []
 
-    return True, []
+    # Structural check via urlparse (not substring)
+    parsed_url = urlparse(issue_url_field)
+    path_parts = parsed_url.path.rstrip("/").split("/")
+    if (
+        len(path_parts) >= 4
+        and path_parts[-2] == "issues"
+        and path_parts[-1] == str(issue_number)
+    ):
+        # Repo path should be /<owner>/<repo>/
+        if (
+            len(path_parts) >= 5
+            and path_parts[-4].lower() == expected_owner
+            and path_parts[-3].lower() == expected_repo_name
+        ):
+            return True, []
+        else:
+            return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
+    else:
+        return False, [BLOCKER_ANCHOR_ISSUE_URL_MISMATCH, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
 
 def _validate_anchor_comments_batch(
@@ -330,6 +428,7 @@ def _validate_anchor_comments_batch(
     Validate all anchor comment URLs. Returns (stable_sorted_unique_valid_urls, all_blockers).
 
     Stable sort + dedupe per spec. One invalid URL blocks all.
+    ANCHOR_NOT_IN_ISSUE is always included as canonical blocker when any URL fails.
     """
     if not anchor_comment_urls:
         return [], []
@@ -353,7 +452,15 @@ def _validate_anchor_comments_batch(
         if not valid:
             all_blockers.extend(blockers)
 
-    return sorted_urls, all_blockers
+    # Deduplicate blockers while preserving order
+    seen_b: set[str] = set()
+    deduped_blockers: list[str] = []
+    for b in all_blockers:
+        if b not in seen_b:
+            seen_b.add(b)
+            deduped_blockers.append(b)
+
+    return sorted_urls, deduped_blockers
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +541,25 @@ def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
 
 
 # ---------------------------------------------------------------------------
+# warn condition detection
+# ---------------------------------------------------------------------------
+
+
+def _has_unknown_confidence(plan: dict) -> bool:
+    """
+    Return True if any decision in plan.decisions.*.confidence == "unknown".
+
+    This determines the warn condition:
+    planner exit 0 + fail_closed.required == false + >=1 unknown confidence → warn/1.
+    """
+    decisions = plan.get("decisions", {})
+    for _key, policy in decisions.items():
+        if isinstance(policy, dict) and policy.get("confidence") == "unknown":
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Exit code mapping
 # ---------------------------------------------------------------------------
 
@@ -442,11 +568,15 @@ def _apply_exit_code_mapping(
     planner_exit_code: Optional[int],
     planner_fail_closed: Optional[bool],
     blockers: list[str],
+    plan: Optional[dict] = None,
 ) -> tuple[str, int]:
     """
     Apply the Planner ↔ Wrapper Exit Code Mapping table.
 
     Returns (status_str, exit_code_int).
+
+    warn condition: planner exit 0 AND fail_closed=false AND >=1 unknown confidence
+    → status: warn / exit 1
     """
     # Pre-planner blockers (anchor mismatch, gh failure)
     if blockers:
@@ -457,8 +587,10 @@ def _apply_exit_code_mapping(
             BLOCKER_ANCHOR_COMMENT_NOT_FOUND,
             BLOCKER_ANCHOR_ISSUE_URL_MISMATCH,
             BLOCKER_ANCHOR_IS_PR_REVIEW,
+            BLOCKER_INPUT_SCHEMA_INVALID,
+            BLOCKER_INVALID_ARGS,
         }
-        env_blockers = {BLOCKER_GH_FAILURE}
+        env_blockers = {BLOCKER_GH_FAILURE, BLOCKER_RESULT_SCHEMA_INVALID}
 
         has_anchor = any(b in anchor_blockers for b in blockers)
         has_env = any(b in env_blockers for b in blockers)
@@ -482,6 +614,9 @@ def _apply_exit_code_mapping(
     if planner_exit_code == 0:
         if planner_fail_closed is True:
             return "blocked", EXIT_BLOCKED
+        # Check warn condition: >=1 decision has confidence: unknown
+        if plan is not None and _has_unknown_confidence(plan):
+            return "warn", EXIT_WARN
         return "pass", EXIT_PASS
 
     # Unknown exit code
@@ -497,6 +632,7 @@ def _write_artifacts(
     repo_root: Path,
     issue_number: int,
     raw_snapshot: dict,
+    planner_input: dict,
     result: dict,
 ) -> dict[str, str]:
     """
@@ -504,6 +640,11 @@ def _write_artifacts(
 
     Returns {artifact_key: absolute_path_str}.
     issue_number is int-normalized; path is NOT generated from repo name or URL.
+
+    Writes:
+      - raw_issue_snapshot.json  (raw issue + comments)
+      - planner_input.json       (planner stdin JSON, byte-stable)
+      - refinement_preflight_result_v1.json (canonical result)
     """
     artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +654,11 @@ def _write_artifacts(
         json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    planner_input_path = artifact_dir / "planner_input.json"
+    planner_input_path.write_text(
+        json.dumps(planner_input, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
     result_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -520,6 +666,7 @@ def _write_artifacts(
 
     return {
         "raw_issue_snapshot": str(snapshot_path),
+        "planner_input": str(planner_input_path),
         "refinement_preflight_result_v1": str(result_path),
     }
 
@@ -533,8 +680,12 @@ def _build_compact_stdout(result: dict) -> str:
     """
     Build agent-friendly compact projection of result for stdout.
 
+    Canonical fields (always emitted if present):
+      STATUS, NEXT_ACTION, MUST_READ, COMMANDS, BLOCKERS, ARTIFACT
+
     MUST NOT include raw issue body, raw comments, or any sentinel-containing fields.
-    Only status / next_action / must_read / commands / blockers / artifact paths.
+    DO_NOT_READ is a reserved field and is intentionally not emitted here.
+    EVIDENCE (raw body/comments) is never emitted to stdout.
     """
     lines = [
         f"STATUS: {result['status']}",
@@ -625,6 +776,76 @@ def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
     return commands
 
 
+def _emit_failure_result(
+    *,
+    repo_root: Path,
+    issue_number: int,
+    repo: str,
+    status: str,
+    next_action: str,
+    blockers: list[str],
+    planner_exit_code: Optional[int] = None,
+    planner_fail_closed: Optional[bool] = None,
+    planner_input: Optional[dict] = None,
+    raw_snapshot: Optional[dict] = None,
+) -> tuple[dict, int]:
+    """
+    Build a failure/blocked/environment_failure result, write artifacts if available,
+    print compact stdout, and return (result, exit_code).
+
+    This helper ensures stdout and disk are written from the same final result dict
+    (no post-write mutation).
+    """
+    # Compute hashes if raw_snapshot available
+    hashes: dict[str, str] = {}
+    if raw_snapshot is not None:
+        snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
+        hashes["raw_issue_snapshot_sha256"] = _sha256(snapshot_text)
+    if planner_input is not None:
+        planner_input_text = json.dumps(planner_input, sort_keys=True, ensure_ascii=False)
+        hashes["planner_input_sha256"] = _sha256(planner_input_text)
+
+    artifacts: dict[str, str] = {}
+    if raw_snapshot is not None and planner_input is not None:
+        # Build partial result (without artifacts/hashes) to write
+        result_core = _build_result(
+            status=status,
+            issue_number=issue_number,
+            repo=repo,
+            planner_exit_code=planner_exit_code,
+            planner_fail_closed=planner_fail_closed,
+            next_action=next_action,
+            must_read=[],
+            do_not_read=[],
+            commands=[],
+            blockers=blockers,
+            artifacts={},
+            hashes=hashes,
+        )
+        artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result_core)
+
+    result = _build_result(
+        status=status,
+        issue_number=issue_number,
+        repo=repo,
+        planner_exit_code=planner_exit_code,
+        planner_fail_closed=planner_fail_closed,
+        next_action=next_action,
+        must_read=[],
+        do_not_read=[],
+        commands=[],
+        blockers=blockers,
+        artifacts=artifacts,
+        hashes=hashes,
+    )
+
+    _, exit_code = _apply_exit_code_mapping(
+        planner_exit_code, planner_fail_closed, blockers
+    )
+    print(_build_compact_stdout(result))
+    return result, exit_code
+
+
 def run_preflight(
     issue_number: int,
     repo: str,
@@ -638,17 +859,23 @@ def run_preflight(
 
     Returns (result_dict, exit_code).
     Writes artifacts and prints compact stdout.
+
+    Artifact write guarantee: stdout and disk are written from the same final
+    result dict (no post-write mutation). This ensures AC6 failure-path consistency.
     """
     repo_root = _find_repo_root()
     blockers: list[str] = []
     planner_exit_code: Optional[int] = None
     planner_fail_closed: Optional[bool] = None
+    planner_input_dict: Optional[dict] = None
+    raw_snapshot: Optional[dict] = None
 
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
         # Fixture mode: load pre-fetched snapshot
         try:
-            fixture_data = json.loads(fixture_path.read_text(encoding="utf-8"))
+            fixture_raw = fixture_path.read_text(encoding="utf-8")
+            fixture_data = json.loads(fixture_raw)
         except Exception as exc:
             result = _build_result(
                 status="environment_failure",
@@ -667,6 +894,21 @@ def run_preflight(
             print(_build_compact_stdout(result))
             return result, EXIT_ENVIRONMENT_FAILURE
 
+        # Validate fixture input against input schema (fail-closed on unknown input)
+        input_schema = _load_schema("refinement_preflight_input.schema.json")
+        if input_schema is not None:
+            is_valid, schema_errors = _validate_with_schema(fixture_data, input_schema)
+            if not is_valid:
+                err_detail = "; ".join(schema_errors)
+                return _emit_failure_result(
+                    repo_root=repo_root,
+                    issue_number=issue_number,
+                    repo=repo,
+                    status="blocked",
+                    next_action="human_judgment_required",
+                    blockers=[BLOCKER_INPUT_SCHEMA_INVALID, f"input_schema_errors: {err_detail}"],
+                )
+
         issue = fixture_data.get("issue", {})
         comments = fixture_data.get("comments", [])
         fixture_anchor_comments = fixture_data.get("anchor_comments", [])
@@ -682,42 +924,26 @@ def run_preflight(
         issue, err = _fetch_issue(repo, issue_number)
         if issue is None:
             blockers.append(BLOCKER_GH_FAILURE)
-            result = _build_result(
-                status="environment_failure",
+            return _emit_failure_result(
+                repo_root=repo_root,
                 issue_number=issue_number,
                 repo=repo,
-                planner_exit_code=None,
-                planner_fail_closed=None,
+                status="environment_failure",
                 next_action="fix_environment",
-                must_read=[],
-                do_not_read=[],
-                commands=[],
                 blockers=blockers,
-                artifacts={},
-                hashes={},
             )
-            print(_build_compact_stdout(result))
-            return result, EXIT_ENVIRONMENT_FAILURE
 
         comments, err = _fetch_issue_comments(repo, issue_number)
         if comments is None:
             blockers.append(BLOCKER_GH_FAILURE)
-            result = _build_result(
-                status="environment_failure",
+            return _emit_failure_result(
+                repo_root=repo_root,
                 issue_number=issue_number,
                 repo=repo,
-                planner_exit_code=None,
-                planner_fail_closed=None,
+                status="environment_failure",
                 next_action="fix_environment",
-                must_read=[],
-                do_not_read=[],
-                commands=[],
                 blockers=blockers,
-                artifacts={},
-                hashes={},
             )
-            print(_build_compact_stdout(result))
-            return result, EXIT_ENVIRONMENT_FAILURE
 
         active_anchor_urls = anchor_comment_urls
         fixture_comment_lookup = None
@@ -732,23 +958,14 @@ def run_preflight(
         )
         if anchor_blockers:
             blockers.extend(anchor_blockers)
-            status, exit_code = _apply_exit_code_mapping(None, None, blockers)
-            result = _build_result(
-                status=status,
+            return _emit_failure_result(
+                repo_root=repo_root,
                 issue_number=issue_number,
                 repo=repo,
-                planner_exit_code=None,
-                planner_fail_closed=None,
+                status="blocked",
                 next_action="human_judgment_required",
-                must_read=[],
-                do_not_read=[],
-                commands=[],
                 blockers=blockers,
-                artifacts={},
-                hashes={},
             )
-            print(_build_compact_stdout(result))
-            return result, exit_code
 
     # --- Build raw snapshot (for artifact) ---
     raw_snapshot = {
@@ -761,8 +978,8 @@ def run_preflight(
     }
 
     # --- Invoke planner ---
-    planner_input = _build_planner_input(issue, comments, known_context, now=now)
-    plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input)
+    planner_input_dict = _build_planner_input(issue, comments, known_context, now=now)
+    plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input_dict)
 
     if plan is None:
         # Planner invocation failed
@@ -771,26 +988,18 @@ def run_preflight(
         else:
             blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
 
-        status, exit_code = _apply_exit_code_mapping(planner_exit_code, None, blockers)
-        result = _build_result(
-            status=status,
+        status_str, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+        return _emit_failure_result(
+            repo_root=repo_root,
             issue_number=issue_number,
             repo=repo,
-            planner_exit_code=planner_exit_code,
-            planner_fail_closed=None,
-            next_action="fix_environment" if status == "environment_failure" else "human_judgment_required",
-            must_read=[],
-            do_not_read=[],
-            commands=[],
+            status=status_str,
+            next_action="fix_environment" if status_str == "environment_failure" else "human_judgment_required",
             blockers=blockers,
-            artifacts={},
-            hashes={},
+            planner_exit_code=planner_exit_code,
+            planner_input=planner_input_dict,
+            raw_snapshot=raw_snapshot,
         )
-        # Write artifacts (even on failure, to capture the snapshot)
-        artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, result)
-        result["artifacts"] = artifacts
-        print(_build_compact_stdout(result))
-        return result, exit_code
 
     # --- Extract planner output fields ---
     fail_closed = plan.get("fail_closed", {})
@@ -819,8 +1028,10 @@ def run_preflight(
         reason_codes = fail_closed.get("reason_codes", [])
         blockers.extend(reason_codes)
 
-    # --- Apply exit code mapping ---
-    status, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, blockers)
+    # --- Apply exit code mapping (with plan for warn detection) ---
+    status, exit_code = _apply_exit_code_mapping(
+        planner_exit_code, planner_fail_closed, blockers, plan=plan
+    )
 
     # Determine next_action
     if status == "pass":
@@ -832,7 +1043,33 @@ def run_preflight(
     else:
         next_action = "fix_environment"
 
-    # --- Build result ---
+    # --- Compute hashes for byte-stability (before writing) ---
+    snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
+    planner_input_text = json.dumps(planner_input_dict, sort_keys=True, ensure_ascii=False)
+
+    # Core result (without artifacts/hashes) for hash computation
+    result_core_for_hash = {
+        "schema_version": SCHEMA_VERSION_RESULT,
+        "status": status,
+        "issue_number": issue_number,
+        "repo": repo,
+        "planner_exit_code": planner_exit_code,
+        "planner_fail_closed": planner_fail_closed,
+        "next_action": next_action,
+        "must_read": sorted(set(must_read)),
+        "do_not_read": do_not_read,
+        "commands": commands,
+        "blockers": blockers,
+    }
+    result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False)
+
+    hashes = {
+        "raw_issue_snapshot_sha256": _sha256(snapshot_text),
+        "planner_input_sha256": _sha256(planner_input_text),
+        "result_core_sha256": _sha256(result_core_text),
+    }
+
+    # --- Build final result (once, before writing) ---
     result = _build_result(
         status=status,
         issue_number=issue_number,
@@ -844,30 +1081,35 @@ def run_preflight(
         do_not_read=do_not_read,
         commands=commands,
         blockers=blockers,
-        artifacts={},
-        hashes={},
+        artifacts={},  # filled below
+        hashes=hashes,
     )
 
-    # --- Write artifacts ---
-    artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, result)
+    # --- Validate result against result schema before writing ---
+    result_schema = _load_schema("refinement_preflight_result_v1.schema.json")
+    if result_schema is not None:
+        is_valid, schema_errors = _validate_with_schema(result, result_schema)
+        if not is_valid:
+            err_detail = "; ".join(schema_errors)
+            result["blockers"] = result.get("blockers", []) + [
+                BLOCKER_RESULT_SCHEMA_INVALID, f"result_schema_errors: {err_detail}"
+            ]
+            result["status"] = "environment_failure"
+            result["next_action"] = "fix_environment"
+            exit_code = EXIT_ENVIRONMENT_FAILURE
+
+    # --- Write artifacts (once, after result is fully built) ---
+    artifacts = _write_artifacts(
+        repo_root, issue_number, raw_snapshot, planner_input_dict, result
+    )
     result["artifacts"] = artifacts
 
-    # Compute hashes for byte-stability
-    snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
-    result_text = json.dumps(
-        {k: v for k, v in result.items() if k not in ("artifacts", "hashes")},
-        sort_keys=True,
-        ensure_ascii=False,
-    )
-    result["hashes"] = {
-        "raw_issue_snapshot_sha256": _sha256(snapshot_text),
-        "result_core_sha256": _sha256(result_text),
-    }
+    # Update artifact file with final artifacts field included
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    result_path = artifact_dir / "refinement_preflight_result_v1.json"
+    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Update artifact file with final hashes
-    _write_artifacts(repo_root, issue_number, raw_snapshot, result)
-
-    # Print compact stdout (no raw body/comments/sentinels)
+    # Print compact stdout (no raw body/comments/sentinels) — same result dict
     print(_build_compact_stdout(result))
 
     return result, exit_code
@@ -883,10 +1125,10 @@ def main(argv: list[str] | None = None) -> None:
         description="Deterministic preflight wrapper for issue-refinement-loop."
     )
     parser.add_argument(
-        "--issue-number", type=int, required=True, help="GitHub Issue number."
+        "--issue-number", type=int, required=True, help="GitHub Issue number (positive int)."
     )
     parser.add_argument(
-        "--repo", required=True, help="owner/repo string."
+        "--repo", required=True, help="owner/repo string (must match ^[^/]+/[^/]+$)."
     )
     parser.add_argument(
         "--anchor-comment-url",
@@ -903,6 +1145,44 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     args = parser.parse_args(argv)
+
+    # --- argparse input validation (blocked / exit 2 on contract violation) ---
+    input_errors: list[str] = []
+
+    if args.issue_number is not None and args.issue_number <= 0:
+        input_errors.append(f"--issue-number must be a positive int, got {args.issue_number}")
+
+    if not _REPO_PATTERN.match(args.repo):
+        input_errors.append(
+            f"--repo must match ^[^/]+/[^/]+$, got {args.repo!r}"
+        )
+
+    for url in args.anchor_comment_urls:
+        if not url.startswith(_GITHUB_URL_PREFIX):
+            input_errors.append(
+                f"--anchor-comment-url must start with {_GITHUB_URL_PREFIX!r}, got {url!r}"
+            )
+
+    if input_errors:
+        # Build minimal blocked result for argparse validation failure
+        repo_root = _find_repo_root()
+        err_detail = "; ".join(input_errors)
+        result = _build_result(
+            status="blocked",
+            issue_number=args.issue_number or 0,
+            repo=args.repo or "",
+            planner_exit_code=None,
+            planner_fail_closed=None,
+            next_action="human_judgment_required",
+            must_read=[],
+            do_not_read=[],
+            commands=[],
+            blockers=[BLOCKER_INVALID_ARGS, f"arg_errors: {err_detail}"],
+            artifacts={},
+            hashes={},
+        )
+        print(_build_compact_stdout(result))
+        sys.exit(EXIT_BLOCKED)
 
     _, exit_code = run_preflight(
         issue_number=args.issue_number,

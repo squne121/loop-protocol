@@ -39,27 +39,27 @@
       "description": "Issue comments. Each item must include id and body.",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["id", "body"],
         "properties": {
           "id": {"type": "integer"},
           "body": {"type": "string"},
           "issue_url": {"type": "string"}
-        },
-        "additionalProperties": true
+        }
       }
     },
     "anchor_comments": {
       "type": "array",
-      "description": "Pre-validated anchor comment objects (used in --fixture mode to bypass REST validation).",
+      "description": "Pre-validated anchor comment objects (used in --fixture mode). issue_url is required by anchor validation runtime — absence or empty string triggers ANCHOR_NOT_IN_ISSUE blocked.",
       "items": {
         "type": "object",
-        "required": ["id", "body", "issue_url"],
+        "additionalProperties": false,
+        "required": ["id", "body"],
         "properties": {
           "id": {"type": "integer"},
           "body": {"type": "string"},
           "issue_url": {"type": "string"}
-        },
-        "additionalProperties": true
+        }
       }
     },
     "anchor_comment_urls": {
@@ -69,7 +69,8 @@
     },
     "known_context": {
       "type": ["object", "null"],
-      "description": "Optional known_context forwarded to plan_refinement_loop.py."
+      "description": "Optional known_context forwarded to plan_refinement_loop.py.",
+      "additionalProperties": true
     },
     "now": {
       "type": ["string", "null"],

@@ -98,12 +98,22 @@
     "artifacts": {
       "type": "object",
       "description": "Paths to artifact files written by this wrapper.",
-      "additionalProperties": {"type": "string"}
+      "additionalProperties": false,
+      "properties": {
+        "raw_issue_snapshot": {"type": "string", "description": "Path to raw_issue_snapshot.json"},
+        "planner_input": {"type": "string", "description": "Path to planner_input.json"},
+        "refinement_preflight_result_v1": {"type": "string", "description": "Path to refinement_preflight_result_v1.json"}
+      }
     },
     "hashes": {
       "type": "object",
       "description": "SHA256 hashes of key artifacts for byte-stability verification.",
-      "additionalProperties": {"type": "string"}
+      "additionalProperties": false,
+      "properties": {
+        "raw_issue_snapshot_sha256": {"type": "string", "description": "SHA256 of canonical JSON of raw_issue_snapshot."},
+        "planner_input_sha256": {"type": "string", "description": "SHA256 of canonical JSON of planner_input."},
+        "result_core_sha256": {"type": "string", "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."}
+      }
     }
   }
 }

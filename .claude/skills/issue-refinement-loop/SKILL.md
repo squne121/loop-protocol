@@ -155,9 +155,26 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_prefl
 ```
 
 wrapper の出力フィールドを確認する:
-- `STATUS: pass | warn | blocked | environment_failure`
+
+**canonical stdout フィールド（機械可読）:**
+- `STATUS: pass | warn | blocked | environment_failure` — 常に出力される
+- `NEXT_ACTION: proceed | proceed_with_notes | human_judgment_required | fix_environment` — 常に出力される
+- `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
+- `COMMANDS:` — argv-only コマンドテンプレート（空の場合は省略）
+- `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
+- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）
+
+**非 canonical / 抑制フィールド:**
+- `SUMMARY` — 人間向け prose、オーケストレーターは consume しない
+- `DO_NOT_READ` — 予約済み（現在は常に空）、consumers は欠如に依存してはならない
+- `EVIDENCE` — raw issue body / comments は stdout に出力されない（artifact のみ）
+
+**warn (exit 1) の定義:**
+planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
+
 - `NEXT_ACTION:` に従って後続ステップを決定する
 - `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
+- `ARTIFACT:` の `planner_input` パスで planner へ渡した stdin JSON を確認できる
 
 `STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
