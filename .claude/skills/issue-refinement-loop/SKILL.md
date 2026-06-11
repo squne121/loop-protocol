@@ -145,7 +145,38 @@ LOOP_STATE:
 
 ### Step 0f: Planner Consumption
 
-`plan_refinement_loop.py` を実行して `REFINEMENT_LOOP_PLAN_V1` を生成し、JSON schema validation を通す。`fail_closed.required == true` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
+`run_refinement_preflight.py` wrapper を実行して Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括で実行する。wrapper は `plan_refinement_loop.py` を SSOT として呼び出す薄い adapter であり、判断ロジックは planner に委譲する。
+
+```bash
+uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
+  --issue-number <N> \
+  --repo <owner/repo> \
+  [--anchor-comment-url <URL>]
+```
+
+wrapper の出力フィールドを確認する:
+
+**canonical stdout フィールド（機械可読）:**
+- `STATUS: pass | warn | blocked | environment_failure` — 常に出力される
+- `NEXT_ACTION: proceed | proceed_with_notes | human_judgment_required | fix_environment` — 常に出力される
+- `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
+- `COMMANDS:` — argv-only コマンドテンプレート（空の場合は省略）
+- `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
+- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）
+
+**非 canonical / 抑制フィールド:**
+- `SUMMARY` — 人間向け prose、オーケストレーターは consume しない
+- `DO_NOT_READ` — 予約済み（現在は常に空）、consumers は欠如に依存してはならない
+- `EVIDENCE` — raw issue body / comments は stdout に出力されない（artifact のみ）
+
+**warn (exit 1) の定義:**
+planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
+
+- `NEXT_ACTION:` に従って後続ステップを決定する
+- `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
+- `ARTIFACT:` の `planner_input` パスで planner へ渡した stdin JSON を確認できる
+
+`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
 参照:
 
