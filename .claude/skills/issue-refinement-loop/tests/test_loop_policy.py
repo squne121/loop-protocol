@@ -23,9 +23,15 @@ def test_skill_md_max_iterations_default_is_3():
     # Check Inputs section
     assert re.search(r"max_iterations.*既定\s*3", text), \
         "max_iterations default should be 3 in Inputs section"
-    # Check LOOP_STATE block
-    assert "max_iterations: 3" in text, \
-        "LOOP_STATE.max_iterations should be 3"
+    # LOOP_STATE block was moved to schemas/loop_state.schema.json (Issue #795).
+    # Verify that schema file carries the default value.
+    schema_path = SKILL_MD.parent / "schemas" / "loop_state.schema.json"
+    assert schema_path.exists(), "schemas/loop_state.schema.json must exist"
+    import json
+    schema = json.loads(schema_path.read_text())
+    max_iter_prop = schema.get("properties", {}).get("max_iterations", {})
+    assert max_iter_prop.get("default") == 3, \
+        "loop_state.schema.json max_iterations default must be 3"
 
 
 def test_skill_md_loop_iteration_approval_gate_not_required():

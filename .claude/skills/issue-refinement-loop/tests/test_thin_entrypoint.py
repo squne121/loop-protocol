@@ -83,7 +83,17 @@ def test_step0_orders_scope_rollup_before_hygiene():
 
 
 def test_loop_state_summary_keeps_routing_critical_fields():
-    skill_md = load_skill_md()
+    """
+    Routing-critical LOOP_STATE fields were moved from SKILL.md to
+    schemas/loop_state.schema.json (Issue #795).
+    Verify they are present in the schema properties and that SKILL.md
+    references both the schema and the loop-state reference doc.
+    """
+    import json
+    schema_path = SKILL_MD.parent / "schemas" / "loop_state.schema.json"
+    assert schema_path.exists(), "schemas/loop_state.schema.json must exist"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    props = schema.get("properties", {})
     for field in [
         "scope_rollup_decision",
         "scope_signal_guard",
@@ -91,7 +101,14 @@ def test_loop_state_summary_keeps_routing_critical_fields():
         "follow_up_materialization",
         "superseded_decision",
     ]:
-        assert field in skill_md, f"Missing routing-critical field: {field}"
+        assert field in props, f"Missing routing-critical field in schema: {field}"
+
+    # SKILL.md must reference the schema and loop-state reference
+    skill_md = load_skill_md()
+    assert "schemas/loop_state.schema.json" in skill_md, \
+        "SKILL.md must reference schemas/loop_state.schema.json"
+    assert "references/loop-state.md" in skill_md, \
+        "SKILL.md must reference references/loop-state.md"
 
 
 def test_scope_signal_guard_reference_keeps_tasks_md_fail_closed_routing():
