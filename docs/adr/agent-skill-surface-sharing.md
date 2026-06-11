@@ -1,14 +1,18 @@
 ---
 adr_id: "0005"
 title: "Agent skill surface sharing policy"
-status: accepted
+status: proposed
 decision_date: "2026-06-11"
 confirmed_date: null
-related_issues:
-  - "#779"
-  - "#776"
-  - "#780"
-  - "#381"
+issue_relations:
+  implements:
+    - "#779"
+  downstream_consumers:
+    - "#776"
+    - "#780"
+  non_precedent_references:
+    - issue: "#381"
+      reason: "session-recording-policy-specific SSOT and thin-pointer concern; not precedent for general custom-agent skill surface policy"
 supersedes: []
 superseded_by: null
 ---
@@ -47,23 +51,25 @@ Issue #776 は、Codex custom agent が repo-local skill surface として `.cla
 
 ## Decision
 
-**Option B を採用する。**
+**Option B を採用候補とする。**
 
-Codex custom agent の repo-local shared skill surface は `.agents/skills/` を正本とする。`.codex/skills/` を第二の repo-shared skill surface として導入してはならない。
+Codex custom agent の repo-local shared skill surface は `.agents/skills/` を正本候補とする。`.codex/skills/` を第二の repo-shared skill surface として導入してはならない。
 
 Claude Code 側の project skill surface は `.claude/skills/` のまま維持する。Claude 用 surface を消すことも、#779 時点で `.claude/skills/**` を全面移設することも本方針の目的ではない。
 
-shared workflow を Codex / Claude 間で共有したい場合、`.codex/skills/*/SKILL.md` を separate Codex-only skill body として新設・増殖してはならない。将来 `.codex/skills/*/SKILL.md` が必要になる場合でも、用途は shared skill body への **symlink** または **thin wrapper** に限定する。本文を独立複製した Codex-only body は原則禁止とする。
+shared workflow を Codex / Claude 間で共有したい場合、`.codex/skills/*/SKILL.md` を separate Codex-only skill body として新設・増殖してはならない。将来 `.codex/skills/*/SKILL.md` bridge が必要になる場合でも、用途は shared skill body への **symlink** または **thin wrapper** に限定する。本文を独立複製した tracked Codex-only body は原則禁止とする。
 
 Codex 公式 docs は `.agents/skills` を repository discovery surface とし、symlinked skill folders をサポートしている。一方で、今回確認できた一次情報は skill **folder** の symlink support であり、`SKILL.md` 単体の file symlink portability を同じ強さでは保証していない。このため、portability が未証明な場合の default は thin wrapper とする。
 
 Claude Code 公式 docs は `.claude/skills/*/SKILL.md` を project skill surface とし、`allowed-tools`、`disable-model-invocation`、`user-invocable`、`context: fork`、`agent`、dynamic context injection (`!` command) などの Claude-specific capability を持つ。これらは shared body の portable subset には含めず、Claude-specific wrapper または companion file に残す。
 
+この portable subset は「Claude と Codex の公式共通最小要件」ではなく、**この repo で cross-runtime shared body を扱うための policy** である。特に `name` と `description` を必須にするのは Codex repository skill compatibility を満たすための repo rule であり、Claude Code の最小要件をそのまま言い換えたものではない。
+
 ### Machine-readable policy
 
 ```yaml
 agent_skill_surface_sharing:
-  decision: accepted
+  decision: proposed
   codex_repo_shared_surface: ".agents/skills/"
   claude_project_skill_surface: ".claude/skills/"
   codex_skills_directory_policy:
@@ -71,6 +77,7 @@ agent_skill_surface_sharing:
     allowed_only_as:
       - "symlink_to_shared_skill_body"
       - "thin_wrapper_to_shared_skill_body"
+    tracked_independent_skill_bodies: prohibited
   separate_codex_only_skill_body:
     default: prohibited
     reasons:
@@ -86,6 +93,12 @@ agent_skill_surface_sharing:
       status: portability_not_confirmed_in_current_primary_sources
     thin_wrapper:
       default: preferred_when_portability_is_unproven
+  codex_bridge_requirements:
+    all_of:
+      - "explicitly_marked_as_derived_and_non_canonical"
+      - "contains_no_workflow_procedure_body_beyond_target_resolution_and_runtime_specific_caveats"
+      - "canonical_target_is_.agents/skills/<skill-name>/SKILL.md"
+      - "validator_proves_wrapper_is_thin"
   portable_shared_body_subset:
     required_frontmatter:
       - "name"
@@ -96,6 +109,10 @@ agent_skill_surface_sharing:
       - "runtime-specific dynamic injection syntax when not portable"
   related_but_separate_concerns:
     "#381": "session-recording-policy specific concern; not precedent for general custom-agent skill surface policy"
+  distribution_boundary:
+    repo_scoped_workflow: "direct skill folder under .agents/skills/"
+    installable_reusable_artifact: "package as a plugin"
+    pseudo_distribution_surface_under_dot_codex_skills: prohibited
   downstream_consumers:
     - "#776"
     - "#780"
@@ -111,11 +128,17 @@ agent_skill_surface_sharing:
 4. `.codex/agents/*.toml` は workflow 本文の正本保存先ではなく、thin runtime contract と routing / dependency 記述に留める。
 5. shared workflow を両 runtime で使う場合、まず shared body をどこに置くかを決め、その上で platform-specific wrapper が必要かを判断する。
 
+### Distribution boundary
+
+- repo-scoped workflow は `.agents/skills/` 配下の direct skill folder として管理する
+- 他 repo や他開発者へ再利用可能な installable artifact として配布する場合は plugin packaging を選ぶ
+- `.codex/skills/` を repo-local と distribution の中間のような pseudo-distribution surface として使ってはならない
+
 ### Shared body の最低条件
 
 shared body として許容するのは、両 runtime で同じ意味に読める手順本文だけである。最低条件は次のとおり。
 
-- YAML frontmatter は `name` と `description` を持つ
+- この repo の portable subset policy として YAML frontmatter は `name` と `description` を持つ
 - description は trigger と non-trigger boundary を先頭付近に書く
 - workflow 本文は 1 つの job に絞る
 - 長い reference、examples、補助資料は supporting files に逃がし、本文を過剰に肥大化させない
@@ -134,6 +157,8 @@ shared body に次を直接埋め込んではならない。
 
 これらが必要な場合は、shared body を薄く保ち、platform wrapper または companion file に寄せる。
 
+特に Claude の `allowed-tools` は「利用可能ツールの制限」ではなく、列挙ツールへの pre-approval を与え得る security boundary である。したがって `allowed-tools` を shared body から継承させてはならず、Claude-specific wrapper または companion metadata に留め、明示レビューを必須にする。
+
 ### symlink と thin wrapper の選択基準
 
 **directory symlink を選んでよい条件**
@@ -146,6 +171,15 @@ shared body に次を直接埋め込んではならない。
 - file-level symlink しか実現手段がなく、一次情報上の保証が弱い
 - runtime ごとに frontmatter や companion metadata を分ける必要がある
 - shared body への pointer と platform-specific 注意書きだけで要件を満たせる
+
+### `.codex/skills/` bridge の最低条件
+
+tracked な `.codex/skills/**/SKILL.md` 独立本文は許可しない。将来 `.codex/skills/**/SKILL.md` bridge を許可する場合は、少なくとも次をすべて満たす。
+
+1. derived / non-canonical であることが明示されている
+2. workflow procedure body を持たず、target resolution と runtime-specific caveat だけを持つ
+3. canonical target が `.agents/skills/<skill-name>/SKILL.md` に固定されている
+4. validator で thin wrapper だと証明されている
 
 ### 例外条件
 
@@ -168,7 +202,7 @@ shared body に次を直接埋め込んではならない。
 
 ### #381 との切り分け
 
-#381 は `.agents/skills/session-recording-policy` を session-recording-policy concern として整備する issue であり、general custom-agent skill surface policy の precedent ではない。本 ADR は #381 の実装、配置変更、本文変更を扱わない。後続 issue / PR は、#381 を根拠に `.codex/skills/` を repo-shared surface として追加してはならない。
+#381 は `.agents/skills/session-recording-policy` を session-recording-policy concern として整備する issue であり、general custom-agent skill surface policy の precedent ではない。本 ADR は #381 の実装、配置変更、本文変更を扱わない。後続 issue / PR は、#381 を根拠に `.codex/skills/` を repo-shared surface として追加してはならない。frontmatter でも `#381` は downstream consumer や implementation source ではなく、non-precedent reference としてだけ扱う。
 
 ### #776 / #780 への引き継ぎ
 
