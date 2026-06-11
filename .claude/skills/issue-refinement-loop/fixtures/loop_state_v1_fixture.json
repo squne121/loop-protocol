@@ -1,0 +1,66 @@
+{
+  "schema_version": "loop_state/v1",
+  "issue_number": 795,
+  "iteration": 1,
+  "max_iterations": 3,
+  "last_verdict": null,
+  "blockers_history": [
+    {"iteration": 0, "blockers": ["AC2 missing: outcome section incomplete"]}
+  ],
+  "improvements_applied": ["Added outcome section"],
+  "removed_state_labels": ["state/blocked"],
+  "termination_reason": null,
+  "scope_rollup_decision": null,
+  "anchor_comment": {
+    "url": null,
+    "preliminary_classification": null,
+    "final_classification": null,
+    "classification_reason": null,
+    "verified_claims": [],
+    "unresolved_claims": [],
+    "scope_impact": null,
+    "requires_fact_check": false
+  },
+  "investigation_policy": {
+    "required": false,
+    "codebase_reason": null,
+    "target_paths": [],
+    "repo_claims": [],
+    "skip_reason": "no_repo_fact_claim"
+  },
+  "scope_signal_guard": {
+    "triggered": false,
+    "excluded_by_anchor_reframe": false,
+    "reason_code": null
+  },
+  "web_research_policy": {
+    "required": false,
+    "reason": null,
+    "critical_external_claims": [],
+    "skip_reason": "no_external_claim"
+  },
+  "web_research": {
+    "required": false,
+    "status": null,
+    "failure_class": null,
+    "verification_route": null,
+    "result": null
+  },
+  "product_spec_context": {
+    "detected": false,
+    "work_kind": null,
+    "signals": []
+  },
+  "delivery_rollup": {
+    "applicable": false,
+    "unmaterialized_slots": []
+  },
+  "follow_up_materialization": {
+    "candidates": []
+  },
+  "superseded_decision": {
+    "decision_summary": null,
+    "alternative_issue_number": null,
+    "close_reason": null
+  }
+}
