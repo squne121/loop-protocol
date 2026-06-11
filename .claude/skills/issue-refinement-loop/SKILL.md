@@ -73,65 +73,15 @@ needs-fix を受け取ったとき:
 
 Step 3（adversarial review）と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
 
-## LOOP_STATE Summary
+## LOOP_STATE
 
-```yaml
-LOOP_STATE:
-  issue_number: <int>
-  iteration: <int, 0-indexed>
-  max_iterations: 3
-  last_verdict: approve | needs-fix | null
-  blockers_history: []
-  improvements_applied: []
-  removed_state_labels: []
-  termination_reason: null | approved | human_escalation | superseded_by_decision
-  scope_rollup_decision: null
-  anchor_comment:
-    url: null
-    preliminary_classification: null
-    final_classification: null
-    classification_reason: null
-    verified_claims: []
-    unresolved_claims: []
-    scope_impact: null
-    requires_fact_check: false
-  investigation_policy:
-    required: false
-    codebase_reason: null
-    target_paths: []
-    repo_claims: []
-    skip_reason: null
-  scope_signal_guard:
-    triggered: false
-    excluded_by_anchor_reframe: false
-    reason_code: null
-  web_research_policy:
-    required: false
-    reason: null
-    critical_external_claims: []
-    skip_reason: null
-  web_research:
-    required: false
-    status: null
-    failure_class: null
-    verification_route: null
-    result: null
-  product_spec_context:
-    detected: false
-    work_kind: null
-    signals: []
-  delivery_rollup:
-    applicable: false
-    unmaterialized_slots: []
-  follow_up_materialization:
-    candidates: []
-  superseded_decision:
-    decision_summary: null
-    alternative_issue_number: null
-    close_reason: null
-```
+ループ状態の機械可読スキーマは `schemas/loop_state.schema.json` を参照する。
+フィールド定義・routing semantics・next action 決定手順は `references/loop-state.md` を参照する。
+next action の決定は `scripts/decide_next_loop_action.py` に委譲する（呼び出し手順は `references/loop-state.md` を参照）。
 
-詳細なフィールド定義と routing semantics は `references/` 側の owner file を参照する。
+routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard`、`delivery_rollup`、
+`follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
+orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
 ## Procedure
 
@@ -241,6 +191,8 @@ echo '{"termination_reason":"approved","issue_number":42}' | \
 
 | topic | primary reference |
 |---|---|
+| loop state schema | `schemas/loop_state.schema.json` |
+| loop state field definitions | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
 | scope signal guard | `references/scope-signal-guard.md` |
 | AC/VC reflection | `references/ac-vc-reflection.md` |

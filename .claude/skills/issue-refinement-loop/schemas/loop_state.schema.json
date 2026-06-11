@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "loop_state/v1",
+  "title": "LOOP_STATE_V1",
+  "description": "Runtime state for the issue-refinement-loop orchestrator. Fields are read-only within decide_next_loop_action.py; orchestrator owns mutation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "issue_number",
+    "iteration",
+    "max_iterations",
+    "last_verdict",
+    "termination_reason",
+    "scope_signal_guard",
+    "delivery_rollup",
+    "follow_up_materialization",
+    "web_research_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "loop_state/v1"
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "0-indexed iteration counter. Incremented before decide_next_loop_action is called."
+    },
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 3
+    },
+    "last_verdict": {
+      "type": ["string", "null"],
+      "enum": ["approve", "needs-fix", null]
+    },
+    "blockers_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "default": []
+    },
+    "improvements_applied": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "removed_state_labels": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "termination_reason": {
+      "type": ["string", "null"],
+      "enum": ["approved", "human_escalation", "superseded_by_decision", null]
+    },
+    "scope_rollup_decision": {
+      "type": ["string", "null"]
+    },
+    "anchor_comment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": ["string", "null"] },
+        "preliminary_classification": { "type": ["string", "null"] },
+        "final_classification": { "type": ["string", "null"] },
+        "classification_reason": { "type": ["string", "null"] },
+        "verified_claims": { "type": "array", "items": { "type": "string" } },
+        "unresolved_claims": { "type": "array", "items": { "type": "string" } },
+        "scope_impact": { "type": ["string", "null"] },
+        "requires_fact_check": { "type": "boolean" }
+      }
+    },
+    "investigation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "codebase_reason": { "type": ["string", "null"] },
+        "target_paths": { "type": "array", "items": { "type": "string" } },
+        "repo_claims": { "type": "array", "items": { "type": "string" } },
+        "skip_reason": { "type": ["string", "null"] }
+      }
+    },
+    "scope_signal_guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "triggered": { "type": "boolean" },
+        "excluded_by_anchor_reframe": { "type": "boolean" },
+        "reason_code": { "type": ["string", "null"] }
+      }
+    },
+    "web_research_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "critical_external_claims": { "type": "array", "items": { "type": "string" } },
+        "skip_reason": { "type": ["string", "null"] }
+      }
+    },
+    "web_research": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "status": { "type": ["string", "null"] },
+        "failure_class": { "type": ["string", "null"] },
+        "verification_route": { "type": ["string", "null"] },
+        "result": { "type": ["string", "null"] }
+      }
+    },
+    "product_spec_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "detected": { "type": "boolean" },
+        "work_kind": { "type": ["string", "null"] },
+        "signals": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "delivery_rollup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "applicable": { "type": "boolean" },
+        "unmaterialized_slots": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "follow_up_materialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "candidates": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+    "superseded_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decision_summary": { "type": ["string", "null"] },
+        "alternative_issue_number": { "type": ["integer", "null"] },
+        "close_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
