@@ -43,6 +43,7 @@ tmp/edit_issue_*.md
 # .agents/ 配下: 流用 skill が前提とする rules / shared-agent-skills-governance はリポジトリで管理する
 .agents/skills/nlm-skill/
 # Codex repo-shared skill surface lives under .agents/skills/ and is tracked unless explicitly ignored above.
+# `.codex/skills` は local-only compatibility / symlink 用であり、repo-shared surface としては使わない。
 # .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
 .claude/skills/nlm-skill/
 .claude/skills/*-workspace/

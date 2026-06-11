@@ -6,5 +6,5 @@ description: GitHub Issue 本文を `check_issue_contract.py` で決定論的に
 # Review Issue
 
 Codex custom agent 用の repo-shared skill entrypoint。
-この surface を読んだら、canonical body である `../../../.claude/skills/review-issue/SKILL.md` を続けて全文読む。
-`.agents/skills/` は Codex custom agent の repo-local skill surface、`.claude/skills/` は Claude 側 prompt surface として扱う。
+この surface は discovery 用の thin bridge であり、runtime instruction body の正本は暫定的に `../../../.claude/skills/review-issue/SKILL.md` に残る。
+`.agents/skills/` は Codex custom agent の repo-local discovery surface、`.claude/skills/` は Claude 側 prompt surface 兼 canonical body の保管場所として扱う。
