@@ -13,7 +13,7 @@ INPUT_CONTRACT
 
 OUTPUT_CONTRACT
 - `ISSUE_REVIEW_RESULT_COMPACT_V1` のみを返す（compact_review_result.py stdout）。
-- STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / EVIDENCE / ARTIFACT の 7 フィールドのみ。
+- STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT の 8 フィールド（MUST_READ は空でも常に出力）。
 - stdout は 2048 UTF-8 bytes 以内。raw review / body / diff / logs は artifact JSON に保存し main context に返さない。
 - full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存する。
 

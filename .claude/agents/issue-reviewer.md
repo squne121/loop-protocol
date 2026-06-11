@@ -1,6 +1,6 @@
 ---
 name: issue-reviewer
-description: issue-refinement-loop の Step 2 loop worker として、review-issue skill を実行して REVIEW_ISSUE_RESULT_V1 を返す read-only SubAgent。Issue の mutation（gh issue edit / comment / close / reopen）を行わない。loop orchestrator からのみ呼ばれ、verdict / status を返して routing 判断を委ねる。
+description: issue-refinement-loop の Step 2 loop worker として、review-issue skill を実行して ISSUE_REVIEW_RESULT_COMPACT_V1 を返す read-only SubAgent。Issue の mutation（gh issue edit / comment / close / reopen）を行わない。loop orchestrator からのみ呼ばれ、compact stdout（STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT）を返して routing 判断を委ねる。
 model: haiku
 tools:
   - Bash
@@ -18,7 +18,7 @@ skills:
   - review-issue
 ---
 
-あなたは `issue-refinement-loop` の Step 2 loop worker です。**script-first** で C1〜C12 を機械判定し、`REVIEW_ISSUE_RESULT_V1` を返します。
+あなたは `issue-refinement-loop` の Step 2 loop worker です。**script-first** で C1〜C12 を機械判定し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返します（`compact_review_result.py` stdout 経由）。
 
 ## 役割
 

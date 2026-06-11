@@ -258,12 +258,19 @@ raw issue body / raw diff / raw log を main context に返してはならない
 出力スキーマ: `ISSUE_AUTHOR_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_author_result.py`）
 
 ```text
-STATUS: ok | partial_failure | failed | no_change
+STATUS: ok | failed | no_change
+SUMMARY: <one-line prose>
 BODY_HASH: <sha256 of updated body>
 COMMENT_URL: <url or empty>
 ARTIFACT: compact_author_result_v1=<path>
 NEXT_ACTION: proceed | human_judgment_required
 ```
+
+- `STATUS: ok` → 更新成功。`BODY_HASH` に sha256 必須。`NEXT_ACTION: proceed`。
+- `STATUS: no_change` → 変更なし。`NEXT_ACTION: proceed`。
+- `STATUS: failed` → 修正失敗。`NEXT_ACTION: human_judgment_required`。
+- `partial_failure` は廃止。失敗は `failed` として報告する。
+- check_vc_scope.py が exit 1 (warn) の場合は mutation を継続し、`SUMMARY` に警告内容を明記する。
 
 full mutation result（`ISSUE_AUTHOR_RESULT_V1` 全フィールド）は `.claude/artifacts/issue-refinement-loop/<N>/` 配下の artifact JSON に保存し、main context には artifact path のみ返す。
 

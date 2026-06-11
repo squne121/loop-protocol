@@ -5,6 +5,10 @@ Verifies:
 - raw review fixture → compact stdout and full artifact JSON generation
 - verdict missing → exit 2
 - ISSUE_REVIEW_RESULT_COMPACT_V1 schema constants are defined
+- MUST_READ is always output even when empty (B7)
+- unknown/invalid status → ValueError fail-close (B8)
+- artifact containment is enforced via repo_root (B4)
+- artifact content is checked for secrets before writing (B5)
 """
 
 from __future__ import annotations
@@ -132,7 +136,7 @@ def test_compact_review_result_needs_fix(tmp_path):
 
 
 def test_compact_review_result_needs_fix_stdout_contains_all_fields(tmp_path):
-    """GIVEN needs-fix fixture WHEN stdout generated THEN all required compact fields present."""
+    """GIVEN needs-fix fixture WHEN stdout generated THEN all required compact fields present including MUST_READ."""
     fixture = FIXTURES_DIR / "review_result_needs_fix.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
@@ -141,8 +145,21 @@ def test_compact_review_result_needs_fix_stdout_contains_all_fields(tmp_path):
     )
     lines_text = "\n".join(stdout_lines)
 
-    for field in ["STATUS:", "VERDICT:", "SUMMARY:", "BLOCKERS:", "NEXT_ACTION:", "ARTIFACT:"]:
+    # B7: MUST_READ must always be present (even when empty)
+    for field in ["STATUS:", "VERDICT:", "SUMMARY:", "BLOCKERS:", "NEXT_ACTION:", "MUST_READ:", "ARTIFACT:"]:
         assert field in lines_text, f"Missing field in stdout: {field}"
+
+
+def test_compact_review_result_must_read_always_present_when_empty(tmp_path):
+    """GIVEN approve fixture (no must_read) WHEN stdout generated THEN MUST_READ: line is present (B7)."""
+    fixture = FIXTURES_DIR / "review_result_approve.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+
+    _, stdout_lines = compact_review_result(
+        raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
+    )
+    lines_text = "\n".join(stdout_lines)
+    assert "MUST_READ:" in lines_text, "MUST_READ: line must always be present even when empty"
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +228,87 @@ def test_compact_review_result_stdout_byte_limit(tmp_path):
 
     byte_count = len(lines_text.encode("utf-8"))
     assert byte_count <= 2048, f"stdout too large: {byte_count} bytes"
+
+
+# ---------------------------------------------------------------------------
+# B8: unknown/invalid status → ValueError fail-close
+# ---------------------------------------------------------------------------
+
+
+def test_compact_review_result_unknown_status_raises_valueerror(tmp_path):
+    """GIVEN review result with unknown status WHEN compact_review_result THEN ValueError (B8)."""
+    raw_result = {"verdict": "approve", "status": "mystery_status"}
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+    with pytest.raises(ValueError, match="Unknown/invalid status"):
+        compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+
+
+def test_compact_review_result_unknown_status_cli_exits_2(tmp_path):
+    """GIVEN CLI with unknown status WHEN run THEN exit code is 2 (B8)."""
+    import subprocess
+
+    bad_fixture = tmp_path / "bad_status.json"
+    bad_fixture.write_text('{"verdict": "approve", "status": "mystery"}', encoding="utf-8")
+    script = SCRIPTS_DIR / "compact_review_result.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--input-file", str(bad_fixture),
+         "--artifact-dir", str(tmp_path), "--issue-number", "42"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# B4: artifact containment
+# ---------------------------------------------------------------------------
+
+
+def test_compact_review_result_containment_check_passes(tmp_path):
+    """GIVEN valid repo_root WHEN compact_review_result THEN artifact is under base (B4)."""
+    fixture = FIXTURES_DIR / "review_result_approve.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    repo_root = tmp_path
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+
+    compact_data, _ = compact_review_result(
+        raw_result, artifact_dir=artifact_dir, issue_number=42, repo_root=repo_root
+    )
+    assert "compact_review_result_v1=" in compact_data["ARTIFACT"]
+
+
+def test_compact_review_result_containment_check_rejects_escape(tmp_path):
+    """GIVEN artifact_dir outside repo_root WHEN compact_review_result THEN ValueError (B4)."""
+    fixture = FIXTURES_DIR / "review_result_approve.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as other_root:
+        repo_root = Path(other_root) / "repo"
+        repo_root.mkdir()
+        artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+        with pytest.raises(ValueError, match="escapes base directory"):
+            compact_review_result(
+                raw_result, artifact_dir=artifact_dir, issue_number=42, repo_root=repo_root
+            )
+
+
+# ---------------------------------------------------------------------------
+# B5: artifact content secret check
+# ---------------------------------------------------------------------------
+
+
+def test_compact_review_result_artifact_secret_check_fails(tmp_path):
+    """GIVEN review result with secret-like content WHEN compact_review_result THEN ValueError (B5)."""
+    raw_result = {
+        "verdict": "approve",
+        "status": "ok",
+        "blocking_issues": [],
+        "diff_proposal": {"note": "token: ghp_" + "A" * 36},
+    }
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+    with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
+        compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
 
 
 # ---------------------------------------------------------------------------

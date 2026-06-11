@@ -74,6 +74,21 @@ def _validate_artifact_path(path: str | Path) -> Path:
     return p
 
 
+def _validate_artifact_containment(artifact_path: Path, repo_root: Path) -> None:
+    """
+    Validate that the resolved artifact path is contained within the expected base directory.
+
+    Uses Path.resolve() to follow symlinks and eliminate '..' before checking containment.
+    Raises ValueError if the resolved path escapes the base directory.
+    """
+    base = (repo_root / ".claude/artifacts/issue-refinement-loop").resolve()
+    resolved = artifact_path.resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(
+            f"Artifact path escapes base directory: resolved={resolved}, base={base}"
+        )
+
+
 def _validate_issue_slot(slot: str) -> None:
     """Validate that the issue slot component does not contain path traversal."""
     if ".." in slot or "/" in slot or "\\" in slot:
@@ -125,12 +140,16 @@ def compact_review_result(
     raw_result: dict[str, Any],
     artifact_dir: Path,
     issue_number: int | None = None,
+    repo_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """
     Convert raw REVIEW_ISSUE_RESULT_V1 to ISSUE_REVIEW_RESULT_COMPACT_V1.
 
     Returns (compact_data, stdout_lines).
-    Raises ValueError if verdict is missing or invalid.
+    Raises ValueError if:
+    - verdict is missing or invalid
+    - status is unknown/invalid (fail-close; B8)
+    - artifact path escapes containment base (B4)
     """
     # Validate required fields
     verdict = raw_result.get("verdict")
@@ -139,9 +158,12 @@ def compact_review_result(
     if verdict not in VALID_VERDICTS:
         raise ValueError(f"Invalid verdict: {verdict!r}. Expected one of {VALID_VERDICTS}")
 
+    # B8: fail-close on unknown/invalid status (do not round to ok)
     status = raw_result.get("status", "ok")
     if status not in VALID_STATUSES:
-        status = "ok"
+        raise ValueError(
+            f"Unknown/invalid status: {status!r}. Expected one of {VALID_STATUSES}"
+        )
 
     # Derive NEXT_ACTION from verdict
     if verdict == "approve":
@@ -188,6 +210,10 @@ def compact_review_result(
     artifact_filename = f"compact_review_result_{ts}.json"
     artifact_path = artifact_subdir / artifact_filename
 
+    # B4: containment check — resolve symlinks and verify artifact stays under base
+    if repo_root is not None:
+        _validate_artifact_containment(artifact_path, repo_root)
+
     # Build full artifact JSON (contains full structured data, never returned raw to main context)
     full_artifact: dict[str, Any] = {
         "schema": COMPACT_SCHEMA_NAME,
@@ -209,8 +235,16 @@ def compact_review_result(
         "failure_class": raw_result.get("failure_class"),
     }
 
+    # B5: secret check on artifact content before writing
+    artifact_content_str = json.dumps(full_artifact, ensure_ascii=False, indent=2)
+    artifact_violations = _no_secret_check(artifact_content_str)
+    if artifact_violations:
+        raise ValueError(
+            f"secret-like strings detected in artifact content: {artifact_violations}"
+        )
+
     # Write artifact atomically
-    artifact_content = json.dumps(full_artifact, ensure_ascii=False, indent=2).encode("utf-8")
+    artifact_content = artifact_content_str.encode("utf-8")
     _atomic_write(artifact_path, artifact_content)
 
     # Build compact dict (stdout representation)
@@ -226,15 +260,15 @@ def compact_review_result(
     }
 
     # Build stdout lines
+    # B7: MUST_READ is always output (even when empty)
     stdout_lines = [
         f"STATUS: {compact_data['STATUS']}",
         f"VERDICT: {compact_data['VERDICT']}",
         f"SUMMARY: {compact_data['SUMMARY']}",
         f"BLOCKERS: {compact_data['BLOCKERS']}",
         f"NEXT_ACTION: {compact_data['NEXT_ACTION']}",
+        f"MUST_READ: {compact_data['MUST_READ']}",
     ]
-    if compact_data["MUST_READ"]:
-        stdout_lines.append(f"MUST_READ: {compact_data['MUST_READ']}")
     if compact_data["EVIDENCE"]:
         stdout_lines.append(f"EVIDENCE: {compact_data['EVIDENCE']}")
     stdout_lines.append(f"ARTIFACT: {compact_data['ARTIFACT']}")
@@ -264,6 +298,12 @@ def main() -> int:
         default=None,
         help="Issue number for artifact sub-directory",
     )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Repository root for artifact containment check (B4)",
+    )
     args = parser.parse_args()
 
     # Read input
@@ -274,11 +314,11 @@ def main() -> int:
             raw_text = sys.stdin.read()
         raw_result = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        print(f"STATUS: failed", flush=True)
+        print("STATUS: failed", flush=True)
         print(f"ERROR: JSON parse error: {e}", flush=True, file=sys.stderr)
         return 2
     except Exception as e:
-        print(f"STATUS: failed", flush=True)
+        print("STATUS: failed", flush=True)
         print(f"ERROR: {e}", flush=True, file=sys.stderr)
         return 2
 
@@ -288,9 +328,10 @@ def main() -> int:
             raw_result,
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
+            repo_root=args.repo_root,
         )
     except ValueError as e:
-        print(f"STATUS: failed", flush=True)
+        print("STATUS: failed", flush=True)
         print(f"ERROR: {e}", flush=True, file=sys.stderr)
         return 2
 
@@ -301,6 +342,17 @@ def main() -> int:
         print("STATUS: failed", flush=True)
         print(
             f"ERROR: secret-like strings detected in stdout: {violations}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
+    # B3: enforce 2048 UTF-8 bytes limit on stdout output
+    byte_count = len(output_text.encode("utf-8"))
+    if byte_count > 2048:
+        print("STATUS: failed", flush=True)
+        print(
+            f"ERROR: stdout exceeds 2048 UTF-8 bytes limit: {byte_count} bytes",
             file=sys.stderr,
             flush=True,
         )

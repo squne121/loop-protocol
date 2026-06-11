@@ -6,6 +6,8 @@ Verifies:
 - .. and absolute paths are rejected
 - atomic write with 0600 permissions
 - stdout has no secret-like strings
+- artifact containment via repo_root (B4)
+- artifact content secret check (B5)
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from compact_review_result import (
     _atomic_write,
     _no_secret_check,
     _validate_artifact_path,
+    _validate_artifact_containment,
     compact_review_result,
 )
 
@@ -185,3 +188,50 @@ def test_artifact_json_schema_field_present(tmp_path):
 
     assert artifact_json["schema"] == "ISSUE_REVIEW_RESULT_COMPACT_V1"
     assert artifact_json["schema_version"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# B4: _validate_artifact_containment
+# ---------------------------------------------------------------------------
+
+
+def test_validate_artifact_containment_passes(tmp_path):
+    """GIVEN artifact path under repo_root WHEN _validate_artifact_containment THEN no error (B4)."""
+    repo_root = tmp_path
+    artifact_path = repo_root / ".claude/artifacts/issue-refinement-loop/42/result.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.touch()
+    _validate_artifact_containment(artifact_path, repo_root)  # should not raise
+
+
+def test_validate_artifact_containment_rejects_escape(tmp_path):
+    """GIVEN artifact path outside repo_root WHEN _validate_artifact_containment THEN ValueError (B4)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as other_dir:
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        # artifact_path is in other_dir which is outside repo_root
+        artifact_path = Path(other_dir) / ".claude/artifacts/issue-refinement-loop/42/result.json"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.touch()
+        with pytest.raises(ValueError, match="escapes base directory"):
+            _validate_artifact_containment(artifact_path, repo_root)
+
+
+# ---------------------------------------------------------------------------
+# B5: artifact content secret check
+# ---------------------------------------------------------------------------
+
+
+def test_no_secret_check_detects_token_in_artifact_content():
+    """GIVEN artifact JSON content with token WHEN _no_secret_check THEN violation detected (B5)."""
+    content = json.dumps({"note": "token: ghp_" + "A" * 36})
+    violations = _no_secret_check(content)
+    assert len(violations) > 0
+
+
+def test_no_secret_check_passes_clean_artifact():
+    """GIVEN clean artifact JSON WHEN _no_secret_check THEN no violations (B5)."""
+    content = json.dumps({"schema": "ISSUE_REVIEW_RESULT_COMPACT_V1", "verdict": "approve"})
+    violations = _no_secret_check(content)
+    assert violations == []

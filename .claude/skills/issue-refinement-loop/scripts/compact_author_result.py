@@ -6,13 +6,14 @@ Reads ISSUE_AUTHOR_RESULT_V1 JSON from stdin (or --input-file),
 writes compact stdout and full artifact JSON.
 
 stdout format (machine-readable compact lines):
-  STATUS: ok | partial_failure | failed | no_change
+  STATUS: ok | failed | no_change
+  SUMMARY: <one-line prose>
   BODY_HASH: <sha256 of updated body or empty>
   COMMENT_URL: <url or empty>
   ARTIFACT: compact_author_result_v1=<path>
   NEXT_ACTION: proceed | human_judgment_required
 
-exit codes: 0=ok, 1=no_change or partial_failure, 2=failed / body_hash_missing
+exit codes: 0=ok, 1=no_change, 2=failed / body_hash_missing
 """
 
 from __future__ import annotations
@@ -36,13 +37,14 @@ COMPACT_SCHEMA_VERSION = "1"
 
 REQUIRED_COMPACT_FIELDS = [
     "STATUS",
+    "SUMMARY",
     "BODY_HASH",
     "COMMENT_URL",
     "ARTIFACT",
     "NEXT_ACTION",
 ]
 
-VALID_STATUSES = {"ok", "partial_failure", "failed", "no_change"}
+VALID_STATUSES = {"ok", "failed", "no_change"}
 
 
 def _default_artifact_dir() -> Path:
@@ -62,6 +64,21 @@ def _validate_artifact_path(path: str | Path) -> Path:
     if ".." in parts:
         raise ValueError(f"Path traversal rejected: {path}")
     return p
+
+
+def _validate_artifact_containment(artifact_path: Path, repo_root: Path) -> None:
+    """
+    Validate that the resolved artifact path is contained within the expected base directory.
+
+    Uses Path.resolve() to follow symlinks and eliminate '..' before checking containment.
+    Raises ValueError if the resolved path escapes the base directory.
+    """
+    base = (repo_root / ".claude/artifacts/issue-refinement-loop").resolve()
+    resolved = artifact_path.resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(
+            f"Artifact path escapes base directory: resolved={resolved}, base={base}"
+        )
 
 
 def _validate_issue_slot(slot: str) -> None:
@@ -113,16 +130,22 @@ def compact_author_result(
     artifact_dir: Path,
     issue_number: int | None = None,
     updated_body: str | None = None,
+    repo_root: Path | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """
     Convert raw ISSUE_AUTHOR_RESULT_V1 to ISSUE_AUTHOR_RESULT_COMPACT_V1.
 
     Returns (compact_data, stdout_lines).
-    Raises ValueError if body_hash is missing for ok/partial_failure status.
+    Raises ValueError if:
+    - status is unknown/invalid (fail-close; B8)
+    - body_hash is missing for ok status (B1/B2)
+    - artifact path escapes containment base (B4)
     """
     status = raw_result.get("status", "ok")
     if status not in VALID_STATUSES:
-        status = "ok"
+        raise ValueError(
+            f"Unknown/invalid status: {status!r}. Expected one of {VALID_STATUSES}"
+        )
 
     # Derive body hash: from --updated-body or from raw_result.checked_body_sha256
     body_hash = ""
@@ -131,8 +154,8 @@ def compact_author_result(
     elif "checked_body_sha256" in raw_result:
         body_hash = raw_result["checked_body_sha256"]
 
-    # body_hash is required for ok and partial_failure statuses
-    if status in ("ok", "partial_failure") and not body_hash:
+    # body_hash is required for ok status
+    if status == "ok" and not body_hash:
         raise ValueError(
             f"body_hash is required for status={status!r} but was not provided. "
             "Pass --updated-body or include checked_body_sha256 in the input."
@@ -144,10 +167,26 @@ def compact_author_result(
     # Determine NEXT_ACTION
     if status in ("ok", "no_change"):
         next_action = "proceed"
-    elif status == "partial_failure":
-        next_action = "proceed"
     else:
         next_action = "human_judgment_required"
+
+    # Build one-line SUMMARY (B1: required field)
+    if status == "ok":
+        summary = "mutation applied"
+    elif status == "no_change":
+        summary = "no change applied"
+    else:
+        # failed
+        blockers = raw_result.get("validation_blockers", [])
+        if blockers:
+            first = blockers[0]
+            if isinstance(first, dict):
+                code = first.get("code", "")
+                summary = f"failed; {len(blockers)} blocker(s); first={code}" if code else f"failed; {len(blockers)} blocker(s)"
+            else:
+                summary = f"failed; {str(first)[:60]}"
+        else:
+            summary = "failed"
 
     # Determine artifact path
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -157,12 +196,17 @@ def compact_author_result(
     artifact_filename = f"compact_author_result_{ts}.json"
     artifact_path = artifact_subdir / artifact_filename
 
+    # B4: containment check — resolve symlinks and verify artifact stays under base
+    if repo_root is not None:
+        _validate_artifact_containment(artifact_path, repo_root)
+
     # Build full artifact JSON
     full_artifact: dict[str, Any] = {
         "schema": COMPACT_SCHEMA_NAME,
         "schema_version": COMPACT_SCHEMA_VERSION,
         "generated_at": ts,
         "status": status,
+        "summary": summary,
         "body_hash": body_hash,
         "comment_url": comment_url,
         "next_action": next_action,
@@ -177,13 +221,22 @@ def compact_author_result(
         ),
     }
 
+    # B5: secret check on artifact content before writing
+    artifact_content_str = json.dumps(full_artifact, ensure_ascii=False, indent=2)
+    artifact_violations = _no_secret_check(artifact_content_str)
+    if artifact_violations:
+        raise ValueError(
+            f"secret-like strings detected in artifact content: {artifact_violations}"
+        )
+
     # Write artifact atomically
-    artifact_content = json.dumps(full_artifact, ensure_ascii=False, indent=2).encode("utf-8")
+    artifact_content = artifact_content_str.encode("utf-8")
     _atomic_write(artifact_path, artifact_content)
 
     # Build compact dict
     compact_data = {
         "STATUS": status,
+        "SUMMARY": summary,
         "BODY_HASH": body_hash,
         "COMMENT_URL": comment_url,
         "ARTIFACT": f"compact_author_result_v1={artifact_path}",
@@ -193,6 +246,7 @@ def compact_author_result(
     # Build stdout lines
     stdout_lines = [
         f"STATUS: {compact_data['STATUS']}",
+        f"SUMMARY: {compact_data['SUMMARY']}",
         f"BODY_HASH: {compact_data['BODY_HASH']}",
     ]
     if compact_data["COMMENT_URL"]:
@@ -237,6 +291,12 @@ def main() -> int:
         default=None,
         help="Path to updated issue body file (for body_hash computation)",
     )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Repository root for artifact containment check (B4)",
+    )
     args = parser.parse_args()
 
     # Read input
@@ -272,6 +332,7 @@ def main() -> int:
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
             updated_body=updated_body,
+            repo_root=args.repo_root,
         )
     except ValueError as e:
         print("STATUS: failed", flush=True)
@@ -290,14 +351,23 @@ def main() -> int:
         )
         return 2
 
+    # B3: enforce 2048 UTF-8 bytes limit on stdout output
+    byte_count = len(output_text.encode("utf-8"))
+    if byte_count > 2048:
+        print("STATUS: failed", flush=True)
+        print(
+            f"ERROR: stdout exceeds 2048 UTF-8 bytes limit: {byte_count} bytes",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
     # Output
     for line in stdout_lines:
         print(line, flush=True)
 
     status = raw_result.get("status", "ok")
     if status == "no_change":
-        return 1
-    if status == "partial_failure":
         return 1
     if status == "failed":
         return 2
