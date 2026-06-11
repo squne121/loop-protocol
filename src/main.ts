@@ -21,6 +21,19 @@ import {
   startSortie,
 } from './systems'
 import { createHudController } from './ui'
+import {
+  createDebugPauseState,
+  toggleDebugPause,
+  resetInputOnPause,
+} from './ui/debugPause'
+
+// Re-export for testing convenience (tests import from src/ui/debugPause directly)
+export type { DebugPauseState } from './ui/debugPause'
+export { createDebugPauseState, toggleDebugPause, resetInputOnPause } from './ui/debugPause'
+
+// ---------------------------------------------------------------------------
+// App shell
+// ---------------------------------------------------------------------------
 
 const app = document.querySelector<HTMLDivElement>('#app')
 
@@ -59,6 +72,23 @@ const loadResult = storage.load()
 let hasLoadableSnapshot = loadResult.ok && loadResult.snapshot !== null
 let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefined : undefined)
 const renderer = createCanvasRenderer(canvas)
+
+// Debug pause state (runtime-local, not persisted)
+const debugPause = createDebugPauseState()
+const inputState = createInputState()
+
+/** Toggle pause and reset firing state to prevent held-fire bleed (AC7). */
+function handleTogglePause(): void {
+  toggleDebugPause(debugPause)
+  if (debugPause.isPaused) {
+    // AC7: clear firing/pointer active state on pause entry
+    resetInputOnPause(inputState)
+    setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
+  } else {
+    setHudFeedback('Resumed', 'Simulation resumed.')
+  }
+}
+
 const hud = createHudController(commandRail, {
   onStartSortie() {
     if (state.loopPhase !== 'preparation') {
@@ -167,17 +197,26 @@ const hud = createHudController(commandRail, {
   canQuickLoad() {
     return hasLoadableSnapshot
   },
+  onTogglePause() {
+    handleTogglePause()
+  },
 })
 
 if (!loadResult.ok) {
   reportStorageFailure('load', loadResult)
   setHudFeedback('Quick Load unavailable on startup.', 'A fresh preparation state was created.')
 }
-const inputState = createInputState()
 
 bindInput(canvas, inputState, () => state.arena)
 resizeArena(state)
 window.addEventListener('resize', () => resizeArena(state))
+
+// AC2: Escape key toggles pause/resume; event.repeat guard prevents multi-toggle on held key
+window.addEventListener('keydown', (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && !event.repeat) {
+    handleTogglePause()
+  }
+})
 
 maybeAutoStartRuntime()
 
@@ -208,15 +247,25 @@ function frame(now: number): void {
   const deltaMs = now - previousFrameTime
   previousFrameTime = now
 
-  const result = advanceSimulationLoop(
-    accumulatorMs,
-    deltaMs,
-    defaultSimulationConfig,
-    stepSimulation,
-  )
-  accumulatorMs = result.accumulatorMs
+  // AC3, AC5: while paused, do not advance the simulation accumulator.
+  // Pass deltaMs=0 so advanceSimulationLoop executes 0 steps.
+  // The accumulator is also reset on pause entry (below) to prevent catch-up.
+  if (!debugPause.isPaused) {
+    const result = advanceSimulationLoop(
+      accumulatorMs,
+      deltaMs,
+      defaultSimulationConfig,
+      stepSimulation,
+    )
+    accumulatorMs = result.accumulatorMs
+  } else {
+    // AC5: reset accumulator each frame while paused so wall-clock duration
+    // does not build up and trigger catch-up steps on resume.
+    accumulatorMs = 0
+  }
 
-  hud.render(state)
+  // AC4: render and HUD continue regardless of pause state
+  hud.render(state, debugPause.isPaused)
   renderer.render(state)
   window.requestAnimationFrame(frame)
 }

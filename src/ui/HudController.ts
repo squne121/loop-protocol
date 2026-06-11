@@ -9,10 +9,13 @@ export interface HudActions {
   onQuickLoad(): void
   onReset(): void
   canQuickLoad(): boolean
+  /** Called when the pause/resume button is clicked (AC1). */
+  onTogglePause(): void
 }
 
 export interface HudController {
-  render(state: GameState): void
+  /** Render the HUD. isPaused is the runtime-local debug pause flag (AC1, AC4). */
+  render(state: GameState, isPaused: boolean): void
 }
 
 export function createHudController(
@@ -62,6 +65,11 @@ export function createHudController(
       >
         Reset sortie
       </button>
+      <button
+        type="button"
+        data-action="toggle-pause"
+        title="Pause or resume simulation. Also toggled by Escape."
+      >Pause</button>
     </section>
   `
 
@@ -83,6 +91,9 @@ export function createHudController(
   container
     .querySelector<HTMLButtonElement>('[data-action="reset"]')
     ?.addEventListener('click', actions.onReset)
+  container
+    .querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
+    ?.addEventListener('click', actions.onTogglePause)
 
   const hp = queryField(container, 'hp')
   const resources = queryField(container, 'resources')
@@ -101,9 +112,10 @@ export function createHudController(
   const quickSaveButton = queryAction(container, 'quick-save')
   const quickLoadButton = queryAction(container, 'quick-load')
   const resetButton = queryAction(container, 'reset')
+  const togglePauseButton = queryAction(container, 'toggle-pause')
 
   return {
-    render(state) {
+    render(state, isPaused) {
       hp.textContent = `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`
       resources.textContent = `${state.progress.resources}`
       shots.textContent = `${state.player.shotsFired}`
@@ -132,6 +144,9 @@ export function createHudController(
       quickSaveButton.disabled = state.loopPhase !== 'preparation'
       quickLoadButton.disabled = state.loopPhase !== 'preparation' || !actions.canQuickLoad()
       resetButton.disabled = state.loopPhase !== 'preparation'
+
+      // AC1: pause button label reflects current pause state
+      togglePauseButton.textContent = isPaused ? 'Resume' : 'Pause'
 
       // Sortie status display (AC4, AC10)
       const s = state.sortie
