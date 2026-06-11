@@ -147,13 +147,27 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 ### Step 2: Review
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`REVIEW_ISSUE_RESULT_V1` を返す。orchestrator は `status` と `verdict` だけで routing し、domain judgment を再解釈しない。
+`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。orchestrator は `STATUS` と `VERDICT` だけで routing し、domain judgment を再解釈しない。
+
+consumer contract: `ISSUE_REVIEW_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
+
+- `VERDICT: approve` → Step 4.5 へ
+- `VERDICT: needs-fix` → Step 4 へ（または iteration 上限で Step 5 human_escalation）
+- full structured data は `EVIDENCE:` / `ARTIFACT:` パスから取得する（main context には返らない）
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
 ### Step 4: Rewrite
 
 `issue-author` SubAgent に opaque forwarding payload を渡して本文を更新する。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
+
+consumer contract: `ISSUE_AUTHOR_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_author_result.py`）
+
+- `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
+- `STATUS: no_change` → 変更なし、`NEXT_ACTION: proceed` で Step 2 に戻る
+- `STATUS: failed` → 修正失敗、`NEXT_ACTION: human_judgment_required`、Step 5 human_escalation へ
+- `partial_failure` は廃止。issue-author は `ok` / `no_change` / `failed` の 3 値のみを返す。
+- full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）
 
 rewrite ループの反復ごとに、checker 実行後に `scripts/decide_rewrite_route.py` を呼び出して `max_rewrite_attempts` 超過・body hash 変化なし・missing set 単調減少なしを runtime で強制し、`route`（`continue_rewrite` / `proceed_to_review` / `human_judgment_required`）に従って routing する。invocation 手順・state 永続化・`human_judgment_required` 連動は `references/termination-policy.md` の「Rewrite Loop Runtime Router（#664）」セクションを SSOT とする。orchestrator は attempt 数や no-progress を prose で再判定しない。
 

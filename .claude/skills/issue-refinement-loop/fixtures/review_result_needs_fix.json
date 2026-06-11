@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "generated_at": "2026-06-11T00:00:00Z",
+  "issue_url": "https://github.com/squne121/loop-protocol/issues/42",
+  "verdict": "needs-fix",
+  "needs_second_pass": false,
+  "failure_class": null,
+  "blocking_issues": [
+    {"code": "C5_AC_COUNT_MISMATCH", "message": "AC count mismatch"},
+    {"code": "C6_VC_MISSING", "message": "VC section missing"}
+  ],
+  "structured_blockers": [],
+  "non_blocking_improvements": [],
+  "diff_proposal": {"add": [], "remove": [], "rewrite": []},
+  "deterministic_checks": {
+    "C1": "pass",
+    "C2": "pass",
+    "C3": "pass",
+    "C4": "pass",
+    "C5": "fail",
+    "C6": "fail",
+    "C7": "pass",
+    "C8": "pass",
+    "C9": "pass",
+    "C10": "pass",
+    "C11": "pass",
+    "C12": "pass"
+  }
+}

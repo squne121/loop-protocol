@@ -1,0 +1,6 @@
+STATUS: ok
+VERDICT: approve
+SUMMARY: contract ready（日本語テキスト）
+BLOCKERS: 0
+NEXT_ACTION: proceed
+ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/42/compact_review_result_20260611T000000Z.json

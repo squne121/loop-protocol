@@ -1,0 +1,5 @@
+STATUS: failed
+Traceback (most recent call last):
+  File "foo.py", line 1, in <module>
+    raise ValueError("something went wrong")
+ValueError: something went wrong

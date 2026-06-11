@@ -9,12 +9,22 @@ ROLE
 
 INPUT_CONTRACT
 - 新規起票なら user request / outcome / scope hint、既存更新なら `issue_number` と reviewer feedback を受け取る。
-- mutation に必要な最小情報が無い場合は `ISSUE_AUTHOR_RESULT_V1` で `status: failed` を返す。
+- mutation に必要な最小情報が無い場合は `ISSUE_AUTHOR_RESULT_COMPACT_V1` で `STATUS: failed` を返す。
+
+PRE_MUTATION_PREFLIGHT
+- Issue 本文を mutation する前に check_vc_scope.py を必ず実行する（#793 成果物）。
+  uv run python3 .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py --body-file <NEW_BODY>
+- exit 2 (blocked): mutation を禁止する。STATUS: failed を返す。
+- exit 1 (warn): mutation は継続し、compact output の SUMMARY に警告を明記する。
+- check_vc_scope.py が存在しない場合は skip して warn を記録する。
 
 OUTPUT_CONTRACT
-- `ISSUE_AUTHOR_RESULT_V1` だけを返す。
-- main thread context budget を守り、structured output・applied feedback・validation blockers だけを返す。
-- raw transcript、raw diff、raw logs は返さない。
+- `ISSUE_AUTHOR_RESULT_COMPACT_V1` のみを返す（compact_author_result.py stdout）。
+- STATUS / SUMMARY / BODY_HASH / COMMENT_URL / ARTIFACT / NEXT_ACTION のフィールド（SUMMARY は常に出力）。
+- stdout は 2048 UTF-8 bytes 以内。raw body / diff / logs は artifact JSON に保存し main context に返さない。
+- full mutation result は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存する。
+- body_hash は必須フィールド（ok 時は sha256 必須）。
+- check_vc_scope.py が exit 1 (warn) の場合は mutation を継続し、SUMMARY に警告内容を明記する。
 
 EXECUTION_POLICY
 - `create-issue` / `edit-issue` skill を正本とする。
