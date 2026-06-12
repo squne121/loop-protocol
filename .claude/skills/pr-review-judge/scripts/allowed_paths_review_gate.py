@@ -41,7 +41,7 @@ class ExecutionContext:
 
     worktree_root: str
     generated_at: str
-    tool_version: str = "1.1.0"
+    tool_version: str = "1.2.0"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -135,6 +135,17 @@ class AllowedPathsMatcher:
 
     @staticmethod
     def normalize_allowed_pattern(pattern: str) -> Optional[str]:
+        # Trailing-slash patterns like "src/ui/" are treated as directory prefixes
+        # and normalized to "src/ui/**". Wildcard + trailing-slash is invalid.
+        if pattern.endswith("/"):
+            # Reject wildcard + trailing-slash (e.g. "src/*/")
+            bare = pattern.rstrip("/")
+            if "*" in bare:
+                return None
+            normalized_bare = AllowedPathsMatcher.normalize_path(bare)
+            if normalized_bare is None:
+                return None
+            return normalized_bare + "/**"
         normalized = AllowedPathsMatcher.normalize_path(pattern)
         if normalized is None:
             return None
