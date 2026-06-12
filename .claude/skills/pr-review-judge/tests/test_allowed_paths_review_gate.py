@@ -75,6 +75,62 @@ class TestAllowedPathsMatcher:
         assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") is None
         assert AllowedPathsMatcher.normalize_allowed_pattern(r"src\**") is None
 
+    # AC1: trailing-slash is normalized to /**
+    def test_trailing_slash_normalized_to_double_glob(self):
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/ui/") == "src/ui/**"
+
+    # AC2: file under trailing-slash directory is allowed
+    def test_is_file_allowed_trailing_slash_directory(self):
+        assert AllowedPathsMatcher.is_file_allowed("src/ui/HudController.ts", ["src/ui/"])
+
+    # AC3: another trailing-slash directory match
+    def test_is_file_allowed_tests_trailing_slash(self):
+        assert AllowedPathsMatcher.is_file_allowed("tests/foo.test.ts", ["tests/"])
+
+    # AC4: existing patterns unchanged
+    def test_existing_patterns_unchanged(self):
+        # exact file
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/main.ts") == "src/main.ts"
+        # recursive glob
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/ui/**") == "src/ui/**"
+        # single-level wildcard
+        assert AllowedPathsMatcher.normalize_allowed_pattern("docs/*") == "docs/*"
+        # invalid nested double glob
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") is None
+        # backslash
+        assert AllowedPathsMatcher.normalize_allowed_pattern(r"src\main.ts") is None
+        # absolute path
+        assert AllowedPathsMatcher.normalize_allowed_pattern("/src/main.ts") is None
+        # parent traversal
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/../main.ts") is None
+
+    # AC6: hash equivalence - trailing-slash and /** produce same hash
+    def test_compute_allowed_paths_hash_trailing_slash_equals_double_glob(self):
+        from allowed_paths_review_gate import AllowedPathsGateEvaluator
+        base = {
+            "pr_number": 1,
+            "base_ref": "main",
+            "base_sha": "abc",
+            "head_sha": "def",
+            "reviewed_head_sha": "def",
+            "contract_body_sha256": "sha",
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": "123",
+            "expected_contract_fingerprint": None,
+            "issue_number": 0,
+        }
+        ev1 = AllowedPathsGateEvaluator(**{**base, "allowed_paths": ["src/ui/"]})
+        ev2 = AllowedPathsGateEvaluator(**{**base, "allowed_paths": ["src/ui/**"]})
+        assert ev1.compute_allowed_paths_hash() == ev2.compute_allowed_paths_hash()
+
+    # AC7: wildcard + trailing-slash is invalid
+    def test_wildcard_trailing_slash_is_invalid(self):
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/*/") is None
+
+    def test_repeated_trailing_slash_is_rejected(self):
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src//") is None
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/ui//") is None
+
 
 class TestContractFingerprintAndExecutionContext:
     def test_fingerprint_contains_contract_info(self):
