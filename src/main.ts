@@ -79,14 +79,21 @@ const inputState = createInputState()
 
 /** Toggle pause and reset firing state to prevent held-fire bleed (AC7). */
 function handleTogglePause(): void {
-  toggleDebugPause(debugPause)
   if (debugPause.isPaused) {
-    // AC7: clear firing/pointer active state on pause entry
+    // AC7: clear firing/pointer active state accumulated during pause, then resume
     resetInputOnPause(inputState)
-    setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
-  } else {
+    toggleDebugPause(debugPause)
     setHudFeedback('Resumed', 'Simulation resumed.')
+    return
   }
+
+  // BLOCKER 1: pause entry is only allowed during running phase
+  if (state.loopPhase !== 'running') return
+
+  toggleDebugPause(debugPause)
+  // AC7: clear firing/pointer active state on pause entry
+  resetInputOnPause(inputState)
+  setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
 }
 
 const hud = createHudController(commandRail, {
@@ -180,6 +187,8 @@ const hud = createHudController(commandRail, {
     state = createInitialGameState(quickLoadResult.snapshot)
     resizeArena(state)
     hasLoadableSnapshot = true
+    // BLOCKER 1: reset debug pause on state transition to preparation
+    debugPause.isPaused = false
     setHudFeedback('Quick Load complete.', 'Progression snapshot restored for preparation.')
   },
   onReset() {
@@ -189,6 +198,8 @@ const hud = createHudController(commandRail, {
 
     state = createInitialGameState()
     resizeArena(state)
+    // BLOCKER 1: reset debug pause on state transition to preparation
+    debugPause.isPaused = false
     setHudFeedback(
       'Reset sortie complete.',
       'Reset sortie is a destructive boundary. Preparation only.',

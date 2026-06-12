@@ -7,7 +7,8 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { createHudController } from '../src/ui/HudController'
-import { createInitialGameState } from '../src/state'
+import { createInitialGameState, defaultSimulationConfig } from '../src/state'
+import { startSortie } from '../src/systems/SortieSystem'
 
 function makeContainer(): HTMLElement {
   const div = document.createElement('div')
@@ -56,12 +57,14 @@ describe('HUD pause/resume affordance — AC1', () => {
     expect(btn!.textContent).toBe('Resume')
   })
 
-  it('GIVEN HUD rendered WHEN pause button clicked THEN onTogglePause is called', () => {
+  it('GIVEN HUD rendered in running phase WHEN pause button clicked THEN onTogglePause is called', () => {
     const container = makeContainer()
     const onTogglePause = vi.fn()
     const actions = makeActions({ onTogglePause })
     const hud = createHudController(container, actions)
     const state = createInitialGameState()
+    // Pause button is only enabled during running phase (BLOCKER 1 fix)
+    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     hud.render(state, false)
 
     container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!.click()

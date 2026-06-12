@@ -147,6 +147,8 @@ export function createHudController(
 
       // AC1: pause button label reflects current pause state
       togglePauseButton.textContent = isPaused ? 'Resume' : 'Pause'
+      // BLOCKER 1: pause button is disabled when not in running phase and not already paused
+      togglePauseButton.disabled = state.loopPhase !== 'running' && !isPaused
 
       // Sortie status display (AC4, AC10)
       const s = state.sortie
