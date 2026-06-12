@@ -69,8 +69,8 @@ describe('formatCombatNumber', () => {
   it('GIVEN fractional value 7.9999 WHEN formatted THEN returns 8 (ceil, handles floating-point artifact)', () => {
     expect(formatCombatNumber(7.9999)).toBe('8')
   })
-  it('GIVEN fractional value 0.5 WHEN formatted THEN returns <1 (living unit, not 0)', () => {
-    expect(formatCombatNumber(0.5)).toBe('<1')
+  it('GIVEN fractional value 0.5 WHEN formatted THEN returns 1 (integer bucket, Issue #788)', () => {
+    expect(formatCombatNumber(0.5)).toBe('1')
   })
   it('GIVEN value 10000 WHEN formatted THEN returns 10k (compact after ceil)', () => {
     expect(formatCombatNumber(10000)).toBe('10k')
@@ -251,10 +251,10 @@ describe('drawEnemyHpLabel', () => {
     expect(ctx.fillText).toHaveBeenCalledWith('8', expect.any(Number), expect.any(Number))
   })
 
-  it('GIVEN fractional enemy HP 0.5 (living) WHEN drawEnemyHpLabel called THEN fillText receives "<1" not "0"', () => {
+  it('GIVEN fractional enemy HP 0.5 (living) WHEN drawEnemyHpLabel called THEN fillText receives "1" (integer bucket, Issue #788)', () => {
     const { ctx } = makeMockCtx()
     drawEnemyHpLabel({ ctx: ctx as unknown as CanvasRenderingContext2D, enemyX: 480, enemyY: 270, enemyRadius: 16, enemyHp: 0.5, arenaWidth: 960, arenaHeight: 540 })
-    expect(ctx.fillText).toHaveBeenCalledWith('<1', expect.any(Number), expect.any(Number))
+    expect(ctx.fillText).toHaveBeenCalledWith('1', expect.any(Number), expect.any(Number))
   })
 
   it('GIVEN draw call WHEN font set THEN matches HP_LABEL_FONT constant', () => {
