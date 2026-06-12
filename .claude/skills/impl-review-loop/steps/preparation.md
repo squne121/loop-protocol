@@ -36,9 +36,32 @@ gh issue view <issue_number> --json title,labels \
 `contract_snapshot_url` が提供されておらず、Issue コメントにも有効な `CONTRACT_REVIEW_RESULT_V1 status: go` が存在しない場合。
 
 - `contract_snapshot_url` 未提供 → Issue コメントを自動検出しても `status: go` の valid block が見つからない
-- この場合は **`issue-contract-review` を自動実行しない**（fail-only gate）。`intake_gate_failed: missing_contract_go` で停止し、人間に `issue-contract-review` の実行を依頼する
+- この場合は `ensure_contract_snapshot` を呼び出して contract snapshot の自動 materialize を試みる
 
-> **設計決定**: #149 実装の自動実行（`status: go` 不在時に `issue-contract-review` を自動呼び出し）は `impl-review-loop` preparation Step 1-b の旧設計。本 Issue（#564）以降は fail-only gate に変更する。自動実行パスは廃止。
+> **設計決定 (#817)**: `missing_contract_go` 判定時は `ensure_contract_snapshot.py` へ routing する。
+> `ensure_contract_snapshot` の結果に応じて以下の分岐をたどる:
+>
+> ```bash
+> uv run python3 .claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py \
+>   --issue-number <issue_number> \
+>   --repo <owner/repo> \
+>   --mode auto \
+>   --post
+> ```
+>
+> `termination_reason` 有効値（`null | approved | max_iterations | human_escalation | intake_gate_failed`）は routing 結果に基づいて LOOP_STATE へ記録する。
+>
+> | ensure_contract_snapshot 結果 | exit code | routing |
+> |---|---|---|
+> | `status: ok` (source: existing_go \| materialized_go) | 0 | contract_snapshot_url を LOOP_STATE に記録して Step 1 へ |
+> | `status: blocked_needs_refinement` | 10 | `intake_gate_failed: missing_contract_go` で停止。人間に refinement を依頼 |
+> | `status: human_judgment` | 20 | 即停止。`termination_reason: human_escalation` を記録して人間判断へ |
+> | `status: stale_or_conflicting_snapshot` (exit 50) | 50 | 即停止。Issue body が materialization 中に更新された。人間判断へ |
+> | `status: runtime_error` | 40 | 即停止。環境エラーを記録して人間判断へ |
+>
+> **旧設計との差分**: #564 以前の旧設計（fail-only gate）では `missing_contract_go` で無条件停止していた。
+> #817 以降は `ensure_contract_snapshot` への自動 routing を経由する。
+> `ensure_contract_snapshot` が ok を返した場合のみ、`LOOP_STATE.contract_snapshot_source: materialized_by_issue_contract_review` を記録してループを継続する。
 
 #### 3. `stale_contract_review`
 
@@ -158,12 +181,8 @@ gh api --paginate \
 
 **ステップ 3: 既存 `status: go` が存在しない場合**
 
-> **廃止（#564 以降）**: 旧設計では有効な `status: go` が検出されなかった場合に `issue-contract-review` を自動実行していた。  
-> #564 の intake gate（Step 0）導入後は、この自動実行パスは廃止される。  
-> `status: go` が存在しない場合は Step 0 の intake gate で `intake_gate_failed: missing_contract_go` として停止する。  
-> Step 1-b のステップ 3 は実行されない。
-
-（後方互換のためセクションを残すが、Step 0 で停止済みのためここには到達しない）
+Step 0 の intake gate で `missing_contract_go` が検出された場合は、`ensure_contract_snapshot` を呼び出す（Section 2 の `missing_contract_go` 分岐を参照）。
+Step 0 を通過して Step 1-b に到達するのは `contract_snapshot_url` が提供済みの場合のみのため、ここには通常到達しない。
 
 > **スコープ境界（#245 との関係）**: #245 のプリフライトで `contract_snapshot_url` 未提供問題が再現したため、本 Issue（#149）は contract snapshot materialization の canonical fix として扱う。一方で、#245 で観察された環境固有の ready tuple / 関連調整（#245 は session-recording docs Issue）は本 Issue の対象外であり、別 Issue または #245 側の refinement で扱う。本ステップは contract snapshot の取得（materialization）のみを担う。
 
