@@ -32,7 +32,7 @@ export const HP_LABEL_PADDING = 2
  * Policy (SSOT: docs/product/features/combat-core.md#combat-numeric-display-policy):
  *   NaN / Infinity / negative             -> "0"
  *   value === 0                           -> "0"
- *   0 < value < 1                         -> "<1" (avoid showing living unit as "0")
+ *   0 < value < 1                         -> Math.ceil(value) = "1" (integer bucket; Issue #788)
  *   value >= 1                            -> displayValue = Math.ceil(value), then:
  *       displayValue < 10000              -> String(displayValue)        ("9999", "8")
  *       displayValue < 1000000            -> floor(displayValue/1e3)+"k" ("10k", "999k")
@@ -55,11 +55,10 @@ export function formatCombatNumber(value: number): string {
   if (value === 0) {
     return '0'
   }
-  // 0 < value < 1: show as "<1" to avoid displaying living unit as "0"
-  if (value < 1) {
-    return '<1'
-  }
-  // value >= 1: ceil FIRST, then evaluate the compact boundary on the ceiled value.
+  // 0 < value: apply Math.ceil to produce an integer bucket (Issue #788 policy).
+  // For 0 < value < 1: Math.ceil returns 1, so living units with sub-1 HP appear as "1".
+  // This replaces the previous "<1" output. Player-facing normal UI must show integers only.
+  // For value >= 1: ceil FIRST, then evaluate the compact boundary on the ceiled value.
   // Branching on the raw value would render 9999.1 as the 5-digit "10000" because
   // 9999.1 < 10000 is true before rounding; ceiling first makes it 10000 -> "10k",
   // matching number_display_policy (#581: compact_from 10000).
