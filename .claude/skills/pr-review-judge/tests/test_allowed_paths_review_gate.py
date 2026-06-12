@@ -127,6 +127,10 @@ class TestAllowedPathsMatcher:
     def test_wildcard_trailing_slash_is_invalid(self):
         assert AllowedPathsMatcher.normalize_allowed_pattern("src/*/") is None
 
+    def test_repeated_trailing_slash_is_rejected(self):
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src//") is None
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/ui//") is None
+
 
 class TestContractFingerprintAndExecutionContext:
     def test_fingerprint_contains_contract_info(self):

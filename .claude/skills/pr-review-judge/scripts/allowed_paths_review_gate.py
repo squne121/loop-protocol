@@ -138,9 +138,9 @@ class AllowedPathsMatcher:
         # Trailing-slash patterns like "src/ui/" are treated as directory prefixes
         # and normalized to "src/ui/**". Wildcard + trailing-slash is invalid.
         if pattern.endswith("/"):
-            # Reject wildcard + trailing-slash (e.g. "src/*/")
-            bare = pattern.rstrip("/")
-            if "*" in bare:
+            bare = pattern[:-1]
+            # Reject repeated trailing slash (e.g. "src//") or wildcard + trailing-slash
+            if bare.endswith("/") or "*" in bare:
                 return None
             normalized_bare = AllowedPathsMatcher.normalize_path(bare)
             if normalized_bare is None:
