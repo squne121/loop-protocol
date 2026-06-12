@@ -408,3 +408,39 @@ class TestV2DoesNotRequireContractSnapshotUrlForRepairModes:
         ), (
             "V2 repair modes must explicitly state they do not require issue-contract-review preflight"
         )
+
+
+class TestUpdateBranchExpandedContract:
+    """Owner comment follow-up: expanded reason codes and rerun object stay documented."""
+
+    def test_result_v2_reason_code_enum_covers_all_expected_values(self):
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "IMPLEMENTATION_WORKER_RESULT_V2:")
+        for expected in [
+            "expected_head_sha_missing",
+            "expected_head_sha_mismatch",
+            "permission_denied",
+            "secondary_rate_limit",
+            "validation_failed",
+            "head_unchanged_after_accepted",
+            "transport_error",
+            "unknown_http_status",
+            "null",
+        ]:
+            assert expected in section, f"{expected} reason_code not documented"
+
+    def test_result_v2_rerun_required_is_object_contract(self):
+        content = AGENT_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "IMPLEMENTATION_WORKER_RESULT_V2:")
+        assert "rerun_required:" in section
+        assert "verification:" in section
+        assert "pr_review:" in section
+        assert "reason:" in section
+
+    def test_skill_update_branch_result_mentions_rate_limit_and_permission_diagnostics(self):
+        content = SKILL_FILE.read_text(encoding="utf-8")
+        section = _get_section(content, "UPDATE_BRANCH_RESULT_V1:")
+        assert "rate_limit_diagnostics" in section, "rate_limit_diagnostics missing from UPDATE_BRANCH_RESULT_V1"
+        assert "contents:write_on_head_repository_when_github_app" in content, (
+            "GitHub App contents:write diagnostic requirement not documented"
+        )
