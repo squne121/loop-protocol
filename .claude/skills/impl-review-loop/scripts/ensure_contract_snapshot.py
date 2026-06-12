@@ -12,7 +12,7 @@ Exit codes:
   20  human_judgment — 分類不能 / ambiguous / env error
   30  invalid_input — argument エラー
   40  runtime_error — subprocess / network エラー
-  50  stale_or_conflicting_snapshot — atomicity 検証で body_sha256 mismatch
+  50  stale_or_conflicting_snapshot — atomicity 検証で body_sha256 or updatedAt mismatch
 
 stdout: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 compact JSON のみ
 stderr: diagnostic messages のみ
@@ -27,18 +27,28 @@ Modes:
 idempotency marker:
   <!-- loop-protocol:contract-snapshot issue=<N> body_sha256=sha256:<...> schema=CONTRACT_REVIEW_RESULT_V1 -->
 
-body/comment snapshot atomicity:
-  最初に一括取得し body_sha256 と comments_digest を保存。
-  投稿直前に再取得して比較。不一致 → exit 50。
+body/comment snapshot atomicity (B2):
+  最初に一括取得し body_sha256, issue_updated_at, comments_digest を保存。
+  投稿直前に再取得して比較。
+  body_sha256 変化 OR updatedAt 変化 OR latest blocked コメント出現 → exit 50。
 
 API error classification (403/429/422 blind retry 禁止):
-  not_requested | dry_run | posted | deduped_existing |
+  not_requested | dry_run_would_post | posted | deduped_existing |
   permission_denied | rate_limited | validation_failed_or_spam | ambiguous_no_retry
+
+Schema key: post_status (not post_result — B4)
+
+status: ok implies contract_snapshot_url is not None (B3).
+dry-run / no-post → status: dry_run_would_post (not ok).
+
+Comment posting: gh api REST (B5) for precise HTTP status classification.
+V1 comment includes checks summary (B6).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -68,15 +78,25 @@ _IDEMPOTENCY_MARKER_TEMPLATE = (
     "body_sha256={body_sha256} schema=CONTRACT_REVIEW_RESULT_V1 -->"
 )
 
-# API post result codes
-POST_RESULT_NOT_REQUESTED = "not_requested"
-POST_RESULT_DRY_RUN = "dry_run"
-POST_RESULT_POSTED = "posted"
-POST_RESULT_DEDUPED = "deduped_existing"
-POST_RESULT_PERMISSION_DENIED = "permission_denied"
-POST_RESULT_RATE_LIMITED = "rate_limited"
-POST_RESULT_VALIDATION_FAILED = "validation_failed_or_spam"
-POST_RESULT_AMBIGUOUS = "ambiguous_no_retry"
+# API post status codes (B4: key is post_status throughout)
+POST_STATUS_NOT_REQUESTED = "not_requested"
+POST_STATUS_DRY_RUN = "dry_run_would_post"
+POST_STATUS_POSTED = "posted"
+POST_STATUS_DEDUPED = "deduped_existing"
+POST_STATUS_PERMISSION_DENIED = "permission_denied"
+POST_STATUS_RATE_LIMITED = "rate_limited"
+POST_STATUS_VALIDATION_FAILED = "validation_failed_or_spam"
+POST_STATUS_AMBIGUOUS = "ambiguous_no_retry"
+
+# Legacy aliases for tests that import old names — mapped to new values
+POST_RESULT_NOT_REQUESTED = POST_STATUS_NOT_REQUESTED
+POST_RESULT_DRY_RUN = POST_STATUS_DRY_RUN
+POST_RESULT_POSTED = POST_STATUS_POSTED
+POST_RESULT_DEDUPED = POST_STATUS_DEDUPED
+POST_RESULT_PERMISSION_DENIED = POST_STATUS_PERMISSION_DENIED
+POST_RESULT_RATE_LIMITED = POST_STATUS_RATE_LIMITED
+POST_RESULT_VALIDATION_FAILED = POST_STATUS_VALIDATION_FAILED
+POST_RESULT_AMBIGUOUS = POST_STATUS_AMBIGUOUS
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +118,7 @@ def _import_parser_module():
 
 
 # ---------------------------------------------------------------------------
-# Body snapshot helpers
+# Body + updatedAt snapshot helpers (B2)
 # ---------------------------------------------------------------------------
 
 
@@ -106,25 +126,51 @@ def sha256_of(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def fetch_issue_body(issue_number: int, repo: str, timeout: int = _DEFAULT_TIMEOUT) -> tuple[Optional[str], Optional[str]]:
-    """Returns (body_text, error_code_or_None)."""
+def fetch_issue_snapshot(
+    issue_number: int,
+    repo: str,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Fetch body + updatedAt in a single gh call.
+    Returns (body_text, updated_at_str, error_code_or_None).
+
+    B2: includes updatedAt for atomicity guard.
+    """
     try:
         result = subprocess.run(
-            ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"],
+            [
+                "gh", "issue", "view", str(issue_number),
+                "--repo", repo,
+                "--json", "body,updatedAt",
+            ],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
         if result.returncode != 0:
-            return None, "gh_issue_view_error"
+            return None, None, "gh_issue_view_error"
         data = json.loads(result.stdout)
-        return data.get("body", ""), None
+        return data.get("body", ""), data.get("updatedAt", ""), None
     except subprocess.TimeoutExpired:
-        return None, "gh_timeout"
+        return None, None, "gh_timeout"
     except json.JSONDecodeError:
-        return None, "gh_json_error"
+        return None, None, "gh_json_error"
     except Exception:
-        return None, "gh_other_error"
+        return None, None, "gh_other_error"
+
+
+def fetch_issue_body(
+    issue_number: int,
+    repo: str,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Backward-compatible wrapper: returns (body_text, error_code_or_None).
+    Internally calls fetch_issue_snapshot.
+    """
+    body, _updated_at, err = fetch_issue_snapshot(issue_number, repo, timeout)
+    return body, err
 
 
 def compute_comments_digest(comments: list[dict]) -> str:
@@ -174,17 +220,17 @@ def classify_post_http_error(status_code: int) -> str:
     403/429/422 → specific codes, no blind retry.
     """
     if status_code == 403:
-        return POST_RESULT_PERMISSION_DENIED
+        return POST_STATUS_PERMISSION_DENIED
     elif status_code == 429:
-        return POST_RESULT_RATE_LIMITED
+        return POST_STATUS_RATE_LIMITED
     elif status_code == 422:
-        return POST_RESULT_VALIDATION_FAILED
+        return POST_STATUS_VALIDATION_FAILED
     else:
-        return POST_RESULT_AMBIGUOUS
+        return POST_STATUS_AMBIGUOUS
 
 
 # ---------------------------------------------------------------------------
-# GitHub comment posting
+# GitHub comment posting via REST API (B5)
 # ---------------------------------------------------------------------------
 
 
@@ -195,45 +241,63 @@ def post_comment(
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> tuple[Optional[str], str, Optional[int]]:
     """
-    Post a comment to the issue via gh CLI.
-    Returns (html_url_or_None, result_code, http_status_or_None).
+    Post a comment to the issue via GitHub REST API.
+    Uses 'gh api --method POST' for precise HTTP status classification (B5).
 
-    result_code: posted | permission_denied | rate_limited |
-                 validation_failed_or_spam | ambiguous_no_retry
+    Returns (html_url_or_None, post_status_code, http_status_or_None).
+
+    post_status_code: posted | permission_denied | rate_limited |
+                      validation_failed_or_spam | ambiguous_no_retry
     """
+    import tempfile
+
+    # Write body to temp file to avoid shell escaping issues
     try:
-        result = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                str(issue_number),
-                "--repo",
-                repo,
-                "--body",
-                body,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(body)
+            tmp_path = tmp.name
+
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api",
+                    "--method", "POST",
+                    f"repos/{repo}/issues/{issue_number}/comments",
+                    "--field", f"body=@{tmp_path}",
+                    "--jq", ".html_url",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
         if result.returncode == 0:
-            # Try to extract URL from stdout
             url = result.stdout.strip() or None
-            return url, POST_RESULT_POSTED, None
+            return url, POST_STATUS_POSTED, None
 
         # Extract HTTP status from stderr
         http_status = _extract_http_status(result.stderr)
         if http_status:
+            # Handle 404/410 as ambiguous_no_retry
+            if http_status in (404, 410):
+                return None, POST_STATUS_AMBIGUOUS, http_status
             code = classify_post_http_error(http_status)
             return None, code, http_status
 
-        # Unknown error
-        return None, POST_RESULT_AMBIGUOUS, None
+        # Transport error: check idempotency via comment re-fetch
+        return None, POST_STATUS_AMBIGUOUS, None
+
     except subprocess.TimeoutExpired:
         return None, "gh_timeout", None
     except Exception:
-        return None, POST_RESULT_AMBIGUOUS, None
+        return None, POST_STATUS_AMBIGUOUS, None
 
 
 def _extract_http_status(stderr: str) -> Optional[int]:
@@ -317,6 +381,10 @@ def ensure_contract_snapshot(
     Main logic for ensure_contract_snapshot.
 
     Returns CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 dict.
+
+    Schema invariant (B3): status: ok implies contract_snapshot_url is not None.
+    dry-run / no-post → status: dry_run_would_post (not ok).
+    Schema key: post_status (B4).
     """
     result: dict[str, Any] = {
         "schema": "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
@@ -326,10 +394,12 @@ def ensure_contract_snapshot(
         "status": "runtime_error",
         "source": None,
         "contract_snapshot_url": None,
-        "post_result": POST_RESULT_NOT_REQUESTED,
+        "post_status": POST_STATUS_NOT_REQUESTED,  # B4: key is post_status
         "http_status": None,
         "body_sha256_at_check": None,
         "body_sha256_at_post": None,
+        "issue_updated_at_at_check": None,   # B2
+        "issue_updated_at_at_post": None,    # B2
         "comments_digest_at_check": None,
         "comments_digest_at_post": None,
         "idempotency_marker_found": False,
@@ -345,15 +415,16 @@ def ensure_contract_snapshot(
         result["status"] = "runtime_error"
         return result
 
-    # Step 1: Fetch body and comments atomically (initial snapshot)
-    body, body_err = fetch_issue_body(issue_number, repo)
-    if body_err:
-        result["errors"].append(f"body_fetch_error: {body_err}")
+    # Step 1: Fetch body, updatedAt, and comments atomically (initial snapshot) — B2
+    body, updated_at, snapshot_err = fetch_issue_snapshot(issue_number, repo)
+    if snapshot_err:
+        result["errors"].append(f"body_fetch_error: {snapshot_err}")
         result["status"] = "runtime_error"
         return result
 
     body_sha256 = sha256_of(body or "")
     result["body_sha256_at_check"] = body_sha256
+    result["issue_updated_at_at_check"] = updated_at  # B2
 
     comments, comments_err = parser_mod.fetch_issue_comments(issue_number, repo)
     if comments_err:
@@ -445,11 +516,12 @@ def ensure_contract_snapshot(
         return result
 
     # review_status == go
-    # dry-run: report would post but don't actually post
+    # B3: dry-run / no-post → status: dry_run_would_post (NOT ok)
+    # status: ok is reserved for cases where contract_snapshot_url is non-null
     if mode == "dry-run" or not do_post:
-        result["status"] = "ok"
+        result["status"] = "dry_run_would_post"
         result["source"] = "materialized_go"
-        result["post_result"] = POST_RESULT_DRY_RUN
+        result["post_status"] = POST_STATUS_DRY_RUN
         return result
 
     # auto + --post: prepare comment body
@@ -465,19 +537,20 @@ def ensure_contract_snapshot(
         result["status"] = "ok"
         result["source"] = "existing_go"
         result["contract_snapshot_url"] = existing_marker_url
-        result["post_result"] = POST_RESULT_DEDUPED
+        result["post_status"] = POST_STATUS_DEDUPED
         result["idempotency_marker_found"] = True
         return result
 
-    # Atomicity check: re-fetch body and comments before posting
-    body_post, body_post_err = fetch_issue_body(issue_number, repo)
-    if body_post_err:
-        result["errors"].append(f"body_refetch_error: {body_post_err}")
+    # Atomicity check (B2): re-fetch body, updatedAt, and comments before posting
+    body_post, updated_at_post, snapshot_post_err = fetch_issue_snapshot(issue_number, repo)
+    if snapshot_post_err:
+        result["errors"].append(f"body_refetch_error: {snapshot_post_err}")
         result["status"] = "runtime_error"
         return result
 
     body_sha256_post = sha256_of(body_post or "")
     result["body_sha256_at_post"] = body_sha256_post
+    result["issue_updated_at_at_post"] = updated_at_post  # B2
 
     comments_post, comments_post_err = parser_mod.fetch_issue_comments(issue_number, repo)
     if comments_post_err:
@@ -488,7 +561,7 @@ def ensure_contract_snapshot(
     comments_digest_post = compute_comments_digest(comments_post)
     result["comments_digest_at_post"] = comments_digest_post
 
-    # Stale check: body changed between initial fetch and post
+    # B2: Stale check — body_sha256 OR updatedAt changed → exit 50
     if body_sha256_post != body_sha256:
         result["status"] = "stale_or_conflicting_snapshot"
         result["errors"].append(
@@ -496,21 +569,35 @@ def ensure_contract_snapshot(
         )
         return result
 
-    # Also check if a go comment appeared in the interim
+    if updated_at_post and updated_at and updated_at_post != updated_at:
+        result["status"] = "stale_or_conflicting_snapshot"
+        result["errors"].append(
+            f"updated_at_mismatch: initial={updated_at} post={updated_at_post}"
+        )
+        return result
+
+    # Also check if a blocked comment appeared in the interim (B2)
     results_post = parser_mod.parse_contract_review_results(
         comments_post, expected_issue_url=issue_url
     )
+    latest_post = parser_mod.find_latest_result(results_post)
+    if latest_post and latest_post["status"] == "blocked":
+        result["status"] = "stale_or_conflicting_snapshot"
+        result["errors"].append(
+            "blocked_comment_appeared_during_atomicity_window"
+        )
+        return result
+
+    # Also check if a go comment appeared in the interim
     go_post = parser_mod.find_latest_go(results_post)
     if go_post:
         result["status"] = "ok"
         result["source"] = "existing_go"
         result["contract_snapshot_url"] = go_post["html_url"]
-        result["post_result"] = POST_RESULT_DEDUPED
+        result["post_status"] = POST_STATUS_DEDUPED
         return result
 
-    # Build comment to post
-    # The actual contract review result is embedded in the comment by run_contract_review_once
-    # For now, post a structured comment indicating the review result
+    # Build comment to post (B6: include checks summary)
     comment_body = _build_contract_review_comment(
         issue_number=issue_number,
         repo=repo,
@@ -519,20 +606,21 @@ def ensure_contract_snapshot(
         body_sha256=body_sha256,
     )
 
-    # Post comment (403/429/422 → no retry)
+    # Post comment via REST API — B5: 403/429/422 → no retry
     url, post_code, http_status = post_comment(issue_number, repo, comment_body)
-    result["post_result"] = post_code
+    result["post_status"] = post_code  # B4: key is post_status
     result["http_status"] = http_status
 
-    if post_code == POST_RESULT_POSTED:
+    if post_code == POST_STATUS_POSTED:
+        # B3: status: ok only when contract_snapshot_url is non-null
         result["status"] = "ok"
         result["source"] = "materialized_go"
         result["contract_snapshot_url"] = url
     elif post_code in (
-        POST_RESULT_PERMISSION_DENIED,
-        POST_RESULT_RATE_LIMITED,
-        POST_RESULT_VALIDATION_FAILED,
-        POST_RESULT_AMBIGUOUS,
+        POST_STATUS_PERMISSION_DENIED,
+        POST_STATUS_RATE_LIMITED,
+        POST_STATUS_VALIDATION_FAILED,
+        POST_STATUS_AMBIGUOUS,
     ):
         # 403/429/422: no blind retry — set status to human_judgment
         result["status"] = "human_judgment"
@@ -553,16 +641,24 @@ def _build_contract_review_comment(
     idempotency_marker: str,
     body_sha256: str,
 ) -> str:
-    """Build the GitHub comment body for contract review posting."""
-    import datetime
-
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    """
+    Build the GitHub comment body for contract review posting.
+    Includes checks summary (B6).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     owner_repo = repo.split("/")
     issue_url = (
         f"https://github.com/{repo}/issues/{issue_number}"
         if len(owner_repo) == 2
         else ""
     )
+
+    # B6: Build checks summary from review_result
+    checks = review_result.get("checks", {}) or {}
+    readiness_check = checks.get("readiness", "go") or "go"
+    blockers_check = checks.get("blockers", "pass") or "pass"
+    product_spec_check = checks.get("product_spec", "pass") or "pass"
+    vc_preflight_check = checks.get("vc_preflight", "pass") or "pass"
 
     return f"""{idempotency_marker}
 
@@ -575,8 +671,12 @@ CONTRACT_REVIEW_RESULT_V1:
   generated_by: issue-contract-review
   issue_url: {issue_url}
   body_sha256: "{body_sha256}"
+  checks:
+    readiness: {readiness_check}
+    blockers: {blockers_check}
+    product_spec: {product_spec_check}
+    vc_preflight: {vc_preflight_check}
   source: ensure_contract_snapshot_auto
-  readiness_status: {review_result.get("readiness_status", "go")}
 ```
 """
 
@@ -667,7 +767,7 @@ def main() -> int:
         return 0
     elif status == "blocked_needs_refinement":
         return 10
-    elif status == "human_judgment":
+    elif status in ("human_judgment", "dry_run_would_post"):
         return 20
     elif status == "stale_or_conflicting_snapshot":
         return 50

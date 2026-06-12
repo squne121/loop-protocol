@@ -21,6 +21,15 @@ Exit codes:
 
 stdout: CONTRACT_REVIEW_ONCE_RESULT_V1 compact JSON のみ
 stderr: debug/diagnostic messages のみ（stdout には混入しない）
+
+Check execution order (all modes):
+  1. contract_readiness_check.py  — readiness needs_fix → blocked
+  2. check_blockers.sh            — exit 1 / fallback ambiguous → blocked/human_judgment
+  3. check_product_spec_contract.py — applicable+fail → blocked; applicable+human_judgment → human_judgment
+  4. baseline_vc_preflight.py     — blocked → blocked; human_judgment → human_judgment
+     (vc_preflight is run in all modes, not only execute)
+
+All four checks pass → status: go with checks summary.
 """
 
 from __future__ import annotations
@@ -85,6 +94,30 @@ def _run_script(
         return None, -1, f"script_not_found: {cmd[0]}"
     except Exception as exc:
         return None, -1, f"subprocess_error: {exc}"
+
+
+def _run_shell_script(
+    cmd: list[str],
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> tuple[int, str, str]:
+    """
+    Run a shell script (non-JSON output).
+    Returns (exit_code, stdout, stderr).
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except FileNotFoundError:
+        return -1, "", f"script_not_found: {cmd[0]}"
+    except Exception as exc:
+        return -1, "", f"subprocess_error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +217,12 @@ def run_once(
     """
     Run issue-contract-review checks once for the given issue.
 
+    Execution order:
+      1. contract_readiness_check.py
+      2. check_blockers.sh
+      3. check_product_spec_contract.py
+      4. baseline_vc_preflight.py
+
     Returns CONTRACT_REVIEW_ONCE_RESULT_V1 dict.
     """
     result: dict[str, Any] = {
@@ -198,6 +237,12 @@ def run_once(
         "readiness_errors": [],
         "vc_preflight_status": None,
         "vc_preflight_classifications": [],
+        "checks": {
+            "readiness": None,
+            "blockers": None,
+            "product_spec": None,
+            "vc_preflight": None,
+        },
         "idempotency_check": {
             "performed": not skip_idempotency_check,
             "existing_go_url": None,
@@ -227,19 +272,6 @@ def run_once(
         str(_CONTRACT_READINESS_CHECK_PY),
         "--issue",
         str(issue_number),
-        "--issue-number",  # alias for compatibility
-        str(issue_number),
-        "--repo",
-        repo,
-        "--mode",
-        mode if mode in ("static", "preflight-static", "execute") else "static",
-    ]
-    # Use --issue (primary arg) only — avoids duplicate
-    readiness_cmd = [
-        sys.executable,
-        str(_CONTRACT_READINESS_CHECK_PY),
-        "--issue",
-        str(issue_number),
         "--repo",
         repo,
         "--mode",
@@ -264,10 +296,12 @@ def run_once(
 
     # Map readiness status
     if readiness_status == "human_judgment":
+        result["checks"]["readiness"] = "human_judgment"
         result["status"] = "human_judgment"
         result["source"] = "readiness_check"
         return result
     elif readiness_status == "needs_fix":
+        result["checks"]["readiness"] = "needs_fix"
         result["status"] = "blocked"
         result["source"] = "readiness_check"
         return result
@@ -276,56 +310,140 @@ def run_once(
         result["status"] = "runtime_error"
         result["errors"].append(f"unknown_readiness_status: {readiness_status}")
         return result
+    else:
+        result["checks"]["readiness"] = "go"
 
-    # Readiness is go — run VC preflight if mode is execute
-    if mode == "execute":
-        vc_result_json, vc_rc, vc_err = _run_script(
-            [
-                sys.executable,
-                str(_BASELINE_VC_PREFLIGHT_PY),
-                "--issue",
-                str(issue_number),
-                "--repo",
-                repo,
-            ],
-            timeout=_VC_PREFLIGHT_TIMEOUT,
+    # Step 3: check_blockers.sh
+    blockers_rc, blockers_stdout, blockers_stderr = _run_shell_script(
+        ["bash", str(_CHECK_BLOCKERS_SH), str(issue_number), repo],
+        timeout=_DEFAULT_TIMEOUT,
+    )
+
+    if blockers_rc == -1:
+        # Script not found or timeout
+        result["errors"].append(f"check_blockers_error: {blockers_stderr}")
+        result["status"] = "runtime_error"
+        return result
+    elif blockers_rc == 0:
+        result["checks"]["blockers"] = "pass"
+    else:
+        # exit 1 from check_blockers.sh:
+        #   "blocker が open" → deterministic blocked
+        #   "native dependency API unavailable" / "不一致" (mismatch) → human_judgment
+        stderr_lower = blockers_stderr.lower()
+        # Detect truly-ambiguous cases: API unavailable with no fallback, or mismatch
+        is_ambiguous = (
+            "unavailable" in stderr_lower
+            or "mismatch" in stderr_lower
+            or "不一致" in blockers_stderr
+            or "ambiguous" in stderr_lower
         )
-
-        if vc_err:
-            result["errors"].append(f"vc_preflight_error: {vc_err}")
-            result["status"] = "runtime_error"
-            return result
-
-        if vc_result_json is None:
-            result["errors"].append("vc_preflight_no_output")
-            result["status"] = "runtime_error"
-            return result
-
-        vc_status = vc_result_json.get("status", "")
-        result["vc_preflight_status"] = vc_status
-        result["vc_preflight_classifications"] = vc_result_json.get("results", [])
-
-        if vc_status == "human_judgment":
+        if is_ambiguous:
+            result["checks"]["blockers"] = "human_judgment"
             result["status"] = "human_judgment"
-            result["source"] = "vc_preflight"
-            return result
-        elif vc_status == "blocked":
-            result["status"] = "blocked"
-            result["source"] = "vc_preflight"
-            return result
-        elif vc_status == "pass":
-            result["status"] = "go"
-            result["source"] = "vc_preflight_pass"
+            result["source"] = "check_blockers"
+            result["errors"].append(f"check_blockers_human_judgment: {blockers_stderr.strip()}")
             return result
         else:
-            # Unknown vc status
-            result["status"] = "runtime_error"
-            result["errors"].append(f"unknown_vc_preflight_status: {vc_status}")
+            # blocker open OR fallback-based determination
+            result["checks"]["blockers"] = "blocked"
+            result["status"] = "blocked"
+            result["source"] = "check_blockers"
+            result["errors"].append(f"check_blockers_blocked: {blockers_stderr.strip()}")
             return result
+
+    # Step 4: check_product_spec_contract.py
+    product_spec_json, product_spec_rc, product_spec_err = _run_script(
+        [
+            sys.executable,
+            str(_CHECK_PRODUCT_SPEC_PY),
+            "--issue-number",
+            str(issue_number),
+            "--repo",
+            repo,
+        ],
+        timeout=_DEFAULT_TIMEOUT,
+    )
+
+    if product_spec_err:
+        result["errors"].append(f"product_spec_check_error: {product_spec_err}")
+        result["status"] = "runtime_error"
+        return result
+
+    if product_spec_json is None:
+        result["errors"].append("product_spec_check_no_output")
+        result["status"] = "runtime_error"
+        return result
+
+    ps_applicability = product_spec_json.get("applicability", "not_applicable")
+    ps_decision = product_spec_json.get("decision", "pass")
+
+    if ps_applicability == "applicable":
+        if ps_decision == "fail":
+            result["checks"]["product_spec"] = "fail"
+            result["status"] = "blocked"
+            result["source"] = "product_spec_check"
+            result["errors"].append(
+                f"product_spec_check_fail: {json.dumps(product_spec_json.get('blocked_reasons', []))}"
+            )
+            return result
+        elif ps_decision == "human_judgment":
+            result["checks"]["product_spec"] = "human_judgment"
+            result["status"] = "human_judgment"
+            result["source"] = "product_spec_check"
+            return result
+        else:
+            result["checks"]["product_spec"] = "pass"
     else:
-        # static/preflight-static mode: readiness go is sufficient
+        # not_applicable → treat as pass
+        result["checks"]["product_spec"] = "pass"
+
+    # Step 5: baseline_vc_preflight.py (run in all modes)
+    vc_result_json, vc_rc, vc_err = _run_script(
+        [
+            sys.executable,
+            str(_BASELINE_VC_PREFLIGHT_PY),
+            "--issue",
+            str(issue_number),
+            "--repo",
+            repo,
+        ],
+        timeout=_VC_PREFLIGHT_TIMEOUT,
+    )
+
+    if vc_err:
+        result["errors"].append(f"vc_preflight_error: {vc_err}")
+        result["status"] = "runtime_error"
+        return result
+
+    if vc_result_json is None:
+        result["errors"].append("vc_preflight_no_output")
+        result["status"] = "runtime_error"
+        return result
+
+    vc_status = vc_result_json.get("status", "")
+    result["vc_preflight_status"] = vc_status
+    result["vc_preflight_classifications"] = vc_result_json.get("results", [])
+
+    if vc_status == "human_judgment":
+        result["checks"]["vc_preflight"] = "human_judgment"
+        result["status"] = "human_judgment"
+        result["source"] = "vc_preflight"
+        return result
+    elif vc_status == "blocked":
+        result["checks"]["vc_preflight"] = "blocked"
+        result["status"] = "blocked"
+        result["source"] = "vc_preflight"
+        return result
+    elif vc_status == "pass":
+        result["checks"]["vc_preflight"] = "pass"
         result["status"] = "go"
-        result["source"] = "readiness_check_static"
+        result["source"] = "all_checks_pass"
+        return result
+    else:
+        # Unknown vc status
+        result["status"] = "runtime_error"
+        result["errors"].append(f"unknown_vc_preflight_status: {vc_status}")
         return result
 
 

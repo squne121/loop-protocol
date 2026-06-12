@@ -87,33 +87,41 @@ def _extract_yaml_blocks(body: str) -> list[str]:
 
 def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
     """
-    Minimal YAML key-value parser for flat + nested blocks.
-    Only handles string and bool scalar values at depth 1-2.
-    Does NOT import yaml to avoid external deps.
+    Parse a YAML block using yaml.safe_load when available, with a
+    minimal key-value fallback for environments where PyYAML is absent.
+
+    Preference: yaml.safe_load (PyYAML) — handles nested structures, quoted
+    strings, and all standard YAML scalar types correctly.
+    Fallback: custom line-by-line parser (flat + one level of nesting only).
     """
+    try:
+        import yaml  # noqa: F401 — available in project venv (PyYAML)
+        parsed = yaml.safe_load(block)
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
+    except Exception:
+        pass
+
+    # --- Minimal fallback parser (used only when yaml is unavailable) ---
     result: dict[str, Any] = {}
     lines = block.splitlines()
     current_key: Optional[str] = None
-    current_indent: Optional[int] = None
 
     for line in lines:
         stripped = line.rstrip()
         if not stripped or stripped.lstrip().startswith("#"):
             continue
 
-        # Detect indent level
         indent = len(line) - len(line.lstrip())
 
-        # Top-level key: value
         if indent == 0:
             current_key = None
-            current_indent = None
             m = re.match(r'^(\S[^:]*?):\s*(.*)', stripped)
             if m:
                 key = m.group(1).strip()
                 val = m.group(2).strip()
                 if val:
-                    # Remove surrounding quotes
                     if (val.startswith('"') and val.endswith('"')) or (
                         val.startswith("'") and val.endswith("'")
                     ):
@@ -122,9 +130,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                 else:
                     result[key] = None
                     current_key = key
-                    current_indent = 2  # expect children at indent >= 2
         elif current_key is not None:
-            # Nested key under current_key
             if isinstance(result.get(current_key), dict):
                 m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
                 if m:
@@ -136,7 +142,6 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                         sub_val = sub_val[1:-1]
                     result[current_key][sub_key] = sub_val or None
             else:
-                # First nested line — convert parent to dict
                 m = re.match(r'^\s+(\S[^:]*?):\s*(.*)', stripped)
                 if m:
                     sub_key = m.group(1).strip()
