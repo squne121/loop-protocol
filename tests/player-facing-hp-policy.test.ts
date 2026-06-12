@@ -156,15 +156,6 @@ describe('player-facing HP/HULL policy — AC8: HUD Hull display with fractional
 
   beforeEach(() => {
     container = document.createElement('div')
-    createHudController(container, {
-      onStartSortie: vi.fn(),
-      onClaimReward: vi.fn(),
-      onNextSortie: vi.fn(),
-      onQuickSave: vi.fn(),
-      onQuickLoad: vi.fn(),
-      onReset: vi.fn(),
-      canQuickLoad: vi.fn(() => true),
-    })
   })
 
   it('GIVEN player.hp = 0.5 maxHp = 8 WHEN HUD rendered THEN Hull shows "1/8" not "<1/8"', () => {
