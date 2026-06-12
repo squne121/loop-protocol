@@ -226,11 +226,40 @@ LOOP_HANDOFF_RESULT_V1:
 
 **Note**: 上記 4 フィールド（`checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys`）はスキーマの SSOT として本セクションが定義する。これら 4 フィールド + attempt counter に対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection）は #664 で `decide_rewrite_route.py` として実装済みであり、その orchestrator からの invocation 手順は直下の「Rewrite Loop Runtime Router」セクションが normative SSOT となる。
 
-### Rewrite Loop Runtime Router（#664）
+### Rewrite Loop Runtime Router（#664 / #814）
 
 Step 4（Rewrite）の rewrite ループにおいて、orchestrator は **checker を実行するたびに** `decide_rewrite_route.py` を呼び出し、その出力に従って routing する。これにより `max_rewrite_attempts` 超過・body hash 変化なし・missing set の単調減少なしを runtime で確定的に強制する（planner payload の値を宣言するだけでなく、実経路で enforcement する）。
 
-**invocation 手順**（rewrite loop の各反復で実行）:
+#### checker approve が全 stop guard より優先される（#814 AC1）
+
+`decide_rewrite_route` の判定優先順は以下の通り:
+
+1. `checker_exit_code == 0` → **即座に `proceed_to_review / checker_passed`**（`max_rewrite_attempts` 超過・`body_hash_unchanged`・`missing_contract_no_progress` よりも優先）
+2. `checker_exit_code != 0` かつ `rewrite_attempt_count >= max_rewrite_attempts` → `human_judgment_required / max_attempts_exceeded`
+3. `checker_exit_code != 0` かつ body hash 変化なし → `human_judgment_required / body_hash_unchanged`
+4. `checker_exit_code != 0` かつ missing set が strictly decrease しない → `human_judgment_required / missing_contract_no_progress`
+5. `checker_exit_code != 0` かつ budget 内 → `continue_rewrite / checker_failed_rewrite`
+
+checker が approve（exit 0）を返した場合、budget 超過中であっても・body hash が変化していなくても **`proceed_to_review`** を返す。
+
+#### wrapper スクリプト（`route_after_rewrite.py`）
+
+Step 4 の各反復で `route_after_rewrite.py` wrapper を呼び出すことで手順 1〜6 を一括実行できる。
+
+```bash
+uv run python3 .claude/skills/issue-refinement-loop/scripts/route_after_rewrite.py \
+  --issue <ISSUE_NUMBER> \
+  --repo <OWNER/REPO> \
+  --state-path <path/to/state.json> \
+  --max-rewrite-attempts <N>
+```
+
+wrapper は checker stdout JSON のみを parse し、stderr を JSON に混入しない（AC4）。
+checker exit 1（needs-fix）はインフラ障害でなく正常系として routing に渡す（AC4b）。
+`LOOP_REWRITE_ROUTER_STATE_V1` schema allowlist 外のキーを router state に混入しない（AC4c）。
+`load_rewrite_router_state()` / `save_rewrite_router_state()` を使い attempt counter を silent reset しない（AC4d）。
+
+**invocation 手順**（直接 `decide_rewrite_route.py` を呼ぶ場合）:
 
 1. **persisted state の復元（replay-safe）**: `load_rewrite_router_state(state_path, current_source_body_sha256)` で前回の attempt counter / `previous_*` を復元する。
    - file 不在 → `None`（attempt 0 で新規開始）

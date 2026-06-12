@@ -241,19 +241,22 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     Route the rewrite loop based on current router state.
 
     Priority order:
-    1. max_rewrite_attempts exceeded → human_judgment_required
-    2. body hash unchanged → human_judgment_required (body_hash_unchanged)
-    3. missing set not decreased → human_judgment_required (missing_contract_no_progress)
-    4. checker_exit_code != 0 → continue_rewrite (checker_failed_rewrite)
-    5. checker_exit_code == 0 → proceed_to_review
+    1. checker_exit_code == 0 → proceed_to_review (overrides all stop guards)
+    2. max_rewrite_attempts exceeded → human_judgment_required
+    3. body hash unchanged → human_judgment_required (body_hash_unchanged)
+    4. missing set not decreased → human_judgment_required (missing_contract_no_progress)
+    5. checker_exit_code != 0 → continue_rewrite (checker_failed_rewrite)
 
-    AC2: max_rewrite_attempts runtime enforcement.
+    AC1: checker_exit_code == 0 takes priority over ALL stop guards including
+        max_rewrite_attempts, body_hash_unchanged, and missing_contract_no_progress.
+        When checker approves, route directly to proceed_to_review regardless of
+        budget exhaustion or no-progress conditions.
+
+    AC2: max_rewrite_attempts runtime enforcement (only when checker_exit_code != 0).
         rewrite_attempt_count >= max_rewrite_attempts → human_judgment_required
         off-by-one: max=2, attempt 0/1 allowed, attempt 2 → stop.
 
-    AC3: checker_exit_code == 0 is required for review/handoff.
-
-    AC4: no-progress detection — body hash + missing set.
+    AC4: no-progress detection — body hash + missing set (only when checker_exit_code != 0).
 
     AC5: terminal result includes all required fields.
 
@@ -264,6 +267,24 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     """
 
     source_body_reset = state.source_body_reset
+
+    # --- AC1: checker_exit_code == 0 overrides all stop guards ---
+    # checker approve takes priority over max_rewrite_attempts, body_hash_unchanged,
+    # and missing_contract_no_progress. This is the highest-priority branch.
+    if state.checker_exit_code == 0:
+        return RouteResult(
+            route=ROUTE_PROCEED_TO_REVIEW,
+            reason_code=REASON_CODE_CHECKER_PASSED,
+            rewrite_attempt_count=state.rewrite_attempt_count,
+            max_rewrite_attempts=state.max_rewrite_attempts,
+            checked_body_sha256=state.checked_body_sha256,
+            checker_exit_code=state.checker_exit_code,
+            missing_sections=state.missing_sections,
+            missing_contract_keys=state.missing_contract_keys,
+            source_body_reset=source_body_reset,
+        )
+
+    # From here on: checker_exit_code != 0 (checker did not approve)
 
     # --- AC2: max_rewrite_attempts enforcement ---
     if state.rewrite_attempt_count >= state.max_rewrite_attempts:
@@ -328,25 +349,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
                     source_body_reset=source_body_reset,
                 )
 
-    # --- AC3: checker_exit_code gating ---
-    if state.checker_exit_code != 0:
-        # Checker still failing — continue rewrite loop
-        return RouteResult(
-            route=ROUTE_CONTINUE_REWRITE,
-            reason_code=REASON_CODE_CHECKER_FAILED,
-            rewrite_attempt_count=state.rewrite_attempt_count,
-            max_rewrite_attempts=state.max_rewrite_attempts,
-            checked_body_sha256=state.checked_body_sha256,
-            checker_exit_code=state.checker_exit_code,
-            missing_sections=state.missing_sections,
-            missing_contract_keys=state.missing_contract_keys,
-            source_body_reset=source_body_reset,
-        )
-
-    # checker_exit_code == 0: proceed to review/handoff
+    # checker_exit_code != 0 and within budget — continue rewrite loop
     return RouteResult(
-        route=ROUTE_PROCEED_TO_REVIEW,
-        reason_code=REASON_CODE_CHECKER_PASSED,
+        route=ROUTE_CONTINUE_REWRITE,
+        reason_code=REASON_CODE_CHECKER_FAILED,
         rewrite_attempt_count=state.rewrite_attempt_count,
         max_rewrite_attempts=state.max_rewrite_attempts,
         checked_body_sha256=state.checked_body_sha256,

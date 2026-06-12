@@ -717,8 +717,44 @@ def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
+def _extract_vc_ac_refs(vc_section: str) -> set[str]:
+    """
+    Extract all AC numbers referenced in VC comments.
+
+    Supports two forms:
+    - Single:  # AC1
+    - Grouped: # AC2, AC3, AC4  (comma-separated list on a single comment line)
+
+    Range notation (e.g. # AC2-AC4) is NOT supported by this function.
+    Each number in a comma-separated list is extracted individually.
+
+    Returns a set of digit strings (e.g. {"1", "2", "3", "4"}).
+    """
+    refs: set[str] = set()
+    # Match a comment line starting with # then one or more AC<N> references
+    # separated by optional commas/spaces.
+    # Pattern: # AC<N> optionally followed by , AC<N> repetitions
+    grouped_pattern = re.compile(
+        r'#\s*AC(\d+)'           # first AC reference after '#'
+        r'(?:\s*,\s*AC(\d+))*',  # zero or more comma-separated AC references
+    )
+    for m in grouped_pattern.finditer(vc_section):
+        # group(1) is the first number; scan the full match text for remaining numbers
+        full_match = m.group(0)
+        for num in re.findall(r'AC(\d+)', full_match):
+            refs.add(num)
+    return refs
+
+
 def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
-    """C5: AC と VC の番号一致チェック"""
+    """C5: AC と VC の番号一致チェック
+
+    VC 内の AC 参照として以下の形式を認識する:
+    - Single:  # AC1
+    - Grouped: # AC2, AC3, AC4  (カンマ区切りの grouped 表記)
+
+    Range 表記 (# AC2-AC4) は本 Issue のスコープ外であり、サポートしない (AC3b)。
+    """
     ac_section = extract_section(body, "Acceptance Criteria")
     vc_section = extract_section(body, "Verification Commands")
 
@@ -728,8 +764,8 @@ def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
     # AC 番号を収集
     ac_numbers = set(re.findall(r'AC(\d+)', ac_section))
 
-    # VC 内の AC 参照を収集（# AC1 形式のコメント）
-    vc_ac_refs = set(re.findall(r'#\s*AC(\d+)', vc_section))
+    # VC 内の AC 参照を収集（single および grouped コメント形式）
+    vc_ac_refs = _extract_vc_ac_refs(vc_section)
 
     # AC 番号と VC 参照が全て一致するか
     if not ac_numbers:

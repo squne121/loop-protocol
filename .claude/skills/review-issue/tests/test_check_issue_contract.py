@@ -822,3 +822,96 @@ class TestJsonStdoutPurity:
         assert generated_at.endswith("Z"), (
             f"generated_at must end with 'Z' (UTC), got: {generated_at}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AC3 / AC3b: C5 grouped AC comment support (Issue #814)
+# ---------------------------------------------------------------------------
+
+# Import the check function directly for unit-level testing
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from check_issue_contract import check_c5_ac_vc_alignment, _extract_vc_ac_refs  # noqa: E402
+
+
+class TestC5GroupedAcComment:
+    """AC3: C5 parser recognises grouped AC comments (# AC2, AC3, AC4).
+    AC3b: range notation (# AC2-AC4) is NOT supported.
+    """
+
+    def _body_with(self, ac_section: str, vc_section: str) -> str:
+        return (
+            "## Acceptance Criteria\n\n"
+            + ac_section
+            + "\n\n## Verification Commands\n\n"
+            + "```bash\n"
+            + vc_section
+            + "\n```\n"
+        )
+
+    def test_single_ac_reference_still_works(self):
+        """Single # AC1 reference is recognised (regression)."""
+        body = self._body_with(
+            "- [ ] AC1: foo\n",
+            "# AC1\n$ uv run pytest tests/ -q\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body)
+        assert result == "pass", f"Expected pass, got {result}. issues: {issues}"
+
+    def test_grouped_ac_comment_all_recognised(self):
+        """AC3: # AC2, AC3, AC4 grouped comment -> all three numbers extracted as referenced."""
+        body = self._body_with(
+            "- [ ] AC2: bar\n- [ ] AC3: baz\n- [ ] AC4: qux\n",
+            "# AC2, AC3, AC4\n$ uv run pytest tests/ -q\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body)
+        assert result == "pass", f"Expected pass, got {result}. issues: {issues}"
+
+    def test_grouped_ac_comment_partial_coverage(self):
+        """Grouped comment covering only some ACs -> fail for the uncovered ones."""
+        body = self._body_with(
+            "- [ ] AC1: first\n- [ ] AC2: second\n- [ ] AC3: third\n",
+            "# AC1, AC2\n$ uv run pytest tests/ -q\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body)
+        assert result == "fail", f"Expected fail (AC3 uncovered), got {result}"
+        assert any("AC3" in msg for msg in issues), f"Expected AC3 in issues: {issues}"
+
+    def test_extract_vc_ac_refs_single(self):
+        """_extract_vc_ac_refs returns single number correctly."""
+        refs = _extract_vc_ac_refs("# AC1\n$ foo")
+        assert refs == {"1"}
+
+    def test_extract_vc_ac_refs_grouped(self):
+        """_extract_vc_ac_refs returns all numbers from grouped comment."""
+        refs = _extract_vc_ac_refs("# AC2, AC3, AC4\n$ foo")
+        assert refs == {"2", "3", "4"}
+
+    def test_extract_vc_ac_refs_multiple_lines(self):
+        """_extract_vc_ac_refs handles multiple comment lines."""
+        vc = "# AC1\n$ cmd1\n# AC2, AC3\n$ cmd2\n"
+        refs = _extract_vc_ac_refs(vc)
+        assert refs == {"1", "2", "3"}
+
+    def test_range_notation_not_supported(self):
+        """AC3b: range notation # AC2-AC4 is NOT treated as grouped (not in scope).
+
+        Range '# AC2-AC4' only extracts AC2 (the first number matched),
+        because '-AC4' is not the comma pattern. The '-' is not a separator.
+        This is the expected non-support behaviour per AC3b.
+        """
+        # '# AC2-AC4' should NOT yield {"2","3","4"}
+        refs = _extract_vc_ac_refs("# AC2-AC4\n$ foo")
+        # Only AC2 is captured; AC3 and AC4 are NOT (range not supported)
+        assert "3" not in refs, (
+            "Range notation # AC2-AC4 should NOT yield AC3 (range not supported per AC3b)"
+        )
+        assert "4" not in refs, (
+            "Range notation # AC2-AC4 should NOT yield AC4 (range not supported per AC3b)"
+        )
+
+    def test_grouped_with_spaces_around_comma(self):
+        """Grouped AC refs with varying whitespace are parsed correctly."""
+        refs = _extract_vc_ac_refs("# AC1 , AC2 , AC3\n$ foo")
+        assert "1" in refs
+        assert "2" in refs
+        assert "3" in refs
