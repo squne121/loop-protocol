@@ -22,8 +22,9 @@ EXECUTION_POLICY
 - validator-first を優先し、required checks / AC coverage / SKIP or fallback verdict を deterministic に扱う。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: pr-review-judge
+- repo_local_skill_surface: .agents/skills/pr-review-judge/SKILL.md
 
 FAIL_CLOSED
 - deny-list 該当 PR を無理に処理しない。

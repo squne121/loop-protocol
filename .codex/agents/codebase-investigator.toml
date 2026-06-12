@@ -23,8 +23,9 @@ EXECUTION_POLICY
 - `rtk --help` に存在しない subcommand を作らない。read-only shell helper に `rtk` wrapper が無い場合は plain `sed` / `rg` / `find` などの direct read-only command を使う。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: gemini-cli-headless-delegation
+- repo_local_skill_surface: .agents/skills/gemini-cli-headless-delegation/SKILL.md
 
 FAIL_CLOSED
 - 委譲結果か一次 evidence が無い状態で「調査済み」と主張しない。

@@ -23,8 +23,9 @@ EXECUTION_POLICY
 - human approval が必要な body rewrite は confirm なしに実施しない。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: review-issue
+- repo_local_skill_surface: .agents/skills/review-issue/SKILL.md
 
 FAIL_CLOSED
 - AC / VC を弱める rewrite を行わない。

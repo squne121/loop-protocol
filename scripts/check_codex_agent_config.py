@@ -17,6 +17,17 @@ CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 HOOKS_PATH = REPO_ROOT / ".codex/hooks.json"
 
 
+def route_tokens_to_skill_surfaces(route: str) -> list[str]:
+    if route in {"", "none"}:
+        return []
+    return [f".agents/skills/{token}/SKILL.md" for token in route.split("|") if token]
+
+
+def extract_canonical_body_target(skill_surface: Path) -> str | None:
+    match = re.search(r"`([^`]*\.claude/skills/[^`]+/SKILL\.md)`", skill_surface.read_text(encoding="utf-8"))
+    return match.group(1) if match else None
+
+
 def load_expectations() -> dict:
     return json.loads(EXPECTATION_PATH.read_text(encoding="utf-8"))
 
@@ -27,8 +38,17 @@ def read_toml(path: Path) -> dict:
 
 
 def extract_runtime_field(instructions: str, field: str) -> str | None:
-    match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._-]+)", instructions)
+    match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._|-]+)", instructions)
     return match.group(1) if match else None
+
+
+def extract_skill_surface_paths(instructions: str) -> list[str]:
+    match = re.search(r"repo_local_skill_surface:\s*(.+)", instructions)
+    if not match:
+        return []
+    raw_value = match.group(1).strip()
+    parts = re.split(r"\s*,\s*|\s*\|\s*", raw_value)
+    return [part for part in parts if part]
 
 
 def load_agent(path: Path) -> dict:
@@ -72,6 +92,17 @@ def assert_required_fields(expectations: dict) -> list[str]:
                 failures.append(
                     f"{expected['path']}: developer_instructions missing {runtime_field}"
                 )
+        expected_skill_surfaces = expected.get("repo_local_skill_surfaces", [])
+        actual_skill_surfaces = extract_skill_surface_paths(instructions)
+        if expected_skill_surfaces and not actual_skill_surfaces:
+            failures.append(
+                f"{expected['path']}: developer_instructions missing repo_local_skill_surface"
+            )
+        expected_route_surfaces = route_tokens_to_skill_surfaces(expected.get("runtime_followup_route", ""))
+        if expected_skill_surfaces != expected_route_surfaces:
+            failures.append(
+                f"{expected['path']}: expected fixture route/surface mismatch {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
+            )
 
     return failures
 
@@ -99,6 +130,45 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
                 failures.append(
                     f"{expected['path']}: {runtime_field} expected {expected[runtime_field]!r} got {actual!r}"
                 )
+
+        expected_skill_surfaces = expected.get("repo_local_skill_surfaces", [])
+        actual_skill_surfaces = extract_skill_surface_paths(instructions)
+        if actual_skill_surfaces != expected_skill_surfaces:
+            failures.append(
+                f"{expected['path']}: repo_local_skill_surfaces expected {expected_skill_surfaces!r} got {actual_skill_surfaces!r}"
+            )
+        route_surface_paths = route_tokens_to_skill_surfaces(expected["runtime_followup_route"])
+        if actual_skill_surfaces != route_surface_paths:
+            failures.append(
+                f"{expected['path']}: runtime_followup_route {expected['runtime_followup_route']!r} must map to {route_surface_paths!r}, got {actual_skill_surfaces!r}"
+            )
+        for surface in actual_skill_surfaces:
+            if not surface.startswith(".agents/skills/"):
+                failures.append(
+                    f"{expected['path']}: repo_local_skill_surface must stay under .agents/skills/"
+                )
+            surface_path = REPO_ROOT / surface
+            if not surface_path.exists():
+                failures.append(
+                    f"{expected['path']}: missing repo-local skill surface {surface}"
+                )
+                continue
+            content = surface_path.read_text(encoding="utf-8")
+            if "name:" not in content or "description:" not in content:
+                failures.append(
+                    f"{expected['path']}: skill surface {surface} must declare name and description frontmatter"
+                )
+            canonical_target = extract_canonical_body_target(surface_path)
+            if canonical_target is None:
+                failures.append(
+                    f"{expected['path']}: skill surface {surface} must declare a canonical .claude/skills target"
+                )
+            else:
+                canonical_target_path = (surface_path.parent / canonical_target).resolve()
+                if not canonical_target_path.exists():
+                    failures.append(
+                        f"{expected['path']}: canonical skill body target missing for {surface}: {canonical_target}"
+                    )
 
         claude_agent_path = REPO_ROOT / expected["claude_agent_path"]
         if not claude_agent_path.exists():
@@ -138,8 +208,8 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
             failures.append(f".codex/hooks.json: missing PreToolUse matcher {matcher}")
             continue
         commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
-        if len(commands) != 1 or "--hook-pretool" not in commands[0]:
-            failures.append(f".codex/hooks.json: matcher {matcher} must route exactly one command with --hook-pretool")
+        if not commands or not any("--hook-pretool" in command for command in commands):
+            failures.append(f".codex/hooks.json: matcher {matcher} must route at least one command with --hook-pretool")
         hook_status = entry.get("hooks", [{}])[0].get("statusMessage") if entry.get("hooks") else None
         if hook_status != status_message:
             failures.append(f".codex/hooks.json: matcher {matcher} must use statusMessage {status_message!r}")
@@ -160,6 +230,10 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
     if not any("rtk pnpm exec node" in command for command in all_commands):
         failures.append(".codex/hooks.json: hooks must invoke the validator through rtk pnpm exec node")
+
+    codex_skills_path = REPO_ROOT / ".codex/skills"
+    if codex_skills_path.exists():
+        failures.append(".codex/skills: must not exist as a repo-shared skill surface")
 
     parity_script = REPO_ROOT / "scripts/check_claude_codex_agent_parity.py"
     namespace: dict[str, object] = {"__file__": str(parity_script), "__name__": "__parity__"}

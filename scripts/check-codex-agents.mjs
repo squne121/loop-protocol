@@ -35,7 +35,7 @@ const requiredAgentNames = [
 const builtInNames = new Set(['default', 'worker', 'explorer']);
 const allowedRuntimeStatuses = new Set([
   'codex_native',
-  'claude_skill_required',
+  'codex_skill_required',
   'followup_required',
 ]);
 
@@ -231,6 +231,35 @@ function getAgentFiles() {
 
 function extractRuntimeStatus(instructions) {
   const match = instructions.match(/runtime_dependency_status:\s*([a-z_]+)/);
+  return match?.[1] ?? null;
+}
+
+function extractSkillSurfacePaths(instructions) {
+  const match = instructions.match(/repo_local_skill_surface:\s*(.+)/);
+  if (!match) {
+    return [];
+  }
+  return match[1]
+    .split(/[|,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function routeTokensToSkillSurfaces(route) {
+  if (!route || route === 'none') {
+    return [];
+  }
+  return route.split('|').filter(Boolean).map((token) => `.agents/skills/${token}/SKILL.md`);
+}
+
+function extractRuntimeFollowupRoute(instructions) {
+  const match = instructions.match(/runtime_followup_route:\s*([a-zA-Z0-9._|-]+)/);
+  return match?.[1] ?? null;
+}
+
+function extractCanonicalBodyTarget(skillSurfacePath) {
+  const body = readText(skillSurfacePath);
+  const match = body.match(/`([^`]*\.claude\/skills\/[^`]+\/SKILL\.md)`/);
   return match?.[1] ?? null;
 }
 
@@ -439,6 +468,7 @@ function validateAgents() {
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
+  assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills must not exist as a repo-shared skill surface', failures);
 
   // hooks.json: JSON structural validation
   validateHooksJson(hooksPath, failures);
@@ -463,6 +493,8 @@ function validateAgents() {
     const name = parsed.name;
     const instructions = parsed.developer_instructions ?? '';
     const runtimeStatus = extractRuntimeStatus(instructions);
+    const runtimeFollowupRoute = extractRuntimeFollowupRoute(instructions);
+    const skillSurfacePaths = extractSkillSurfacePaths(instructions);
     const expected = reasoningMap.get(name);
 
     assert(Boolean(name), `${file}: missing name`, failures);
@@ -483,6 +515,32 @@ function validateAgents() {
     assert(!('sandbox_mode' in parsed), `${file}: sandbox_mode must not be mixed with permission profiles`, failures);
     assert(Boolean(runtimeStatus), `${file}: runtime_dependency_status is required`, failures);
     assert(allowedRuntimeStatuses.has(runtimeStatus), `${file}: runtime_dependency_status must be one of ${[...allowedRuntimeStatuses].join(', ')}`, failures);
+    if (runtimeStatus === 'codex_skill_required') {
+      assert(skillSurfacePaths.length > 0, `${file}: codex_skill_required agent must declare repo_local_skill_surface`, failures);
+      const expectedSkillSurfacePaths = routeTokensToSkillSurfaces(runtimeFollowupRoute);
+      assert(runtimeFollowupRoute !== null, `${file}: runtime_followup_route is required`, failures);
+      assert(
+        JSON.stringify(skillSurfacePaths) === JSON.stringify(expectedSkillSurfacePaths),
+        `${file}: runtime_followup_route ${runtimeFollowupRoute} must map exactly to ${expectedSkillSurfacePaths.join(', ') || '(none)'}`,
+        failures,
+      );
+      for (const skillSurfacePath of skillSurfacePaths) {
+        assert(skillSurfacePath.startsWith('.agents/skills/'), `${file}: repo_local_skill_surface must stay under .agents/skills/`, failures);
+        const fullSkillSurfacePath = path.join(repoRoot, skillSurfacePath);
+        assert(fs.existsSync(fullSkillSurfacePath), `${file}: missing repo-local skill surface ${skillSurfacePath}`, failures);
+        if (fs.existsSync(fullSkillSurfacePath)) {
+          const body = readText(fullSkillSurfacePath);
+          assert(body.includes('name:'), `${file}: ${skillSurfacePath} must declare name frontmatter`, failures);
+          assert(body.includes('description:'), `${file}: ${skillSurfacePath} must declare description frontmatter`, failures);
+          const canonicalTarget = extractCanonicalBodyTarget(fullSkillSurfacePath);
+          assert(Boolean(canonicalTarget), `${file}: ${skillSurfacePath} must declare a canonical .claude/skills target`, failures);
+          if (canonicalTarget) {
+            const canonicalTargetPath = path.resolve(path.dirname(fullSkillSurfacePath), canonicalTarget);
+            assert(fs.existsSync(canonicalTargetPath), `${file}: canonical skill body target missing for ${skillSurfacePath}: ${canonicalTarget}`, failures);
+          }
+        }
+      }
+    }
     assert(instructions.includes('structured output'), `${file}: developer_instructions must require structured output`, failures);
     assert(instructions.includes('context budget'), `${file}: developer_instructions must mention context budget`, failures);
     assert(instructions.includes('progressive disclosure'), `${file}: developer_instructions must mention progressive disclosure`, failures);

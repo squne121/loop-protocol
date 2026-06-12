@@ -33,8 +33,9 @@ EXECUTION_POLICY
 - direct gh bypass はせず、repo policy に沿う。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: create-issue|edit-issue
+- repo_local_skill_surface: .agents/skills/create-issue/SKILL.md, .agents/skills/edit-issue/SKILL.md
 
 FAIL_CLOSED
 - 承認が要る mutation を自動で断行しない。
