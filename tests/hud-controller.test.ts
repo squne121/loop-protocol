@@ -105,6 +105,7 @@ describe('HudController', () => {
     onQuickLoad: ReturnType<typeof vi.fn>
     onReset: ReturnType<typeof vi.fn>
     canQuickLoad: ReturnType<typeof vi.fn>
+    onTogglePause: ReturnType<typeof vi.fn>
   }
   let hudController: ReturnType<typeof createHudController>
 
@@ -118,12 +119,13 @@ describe('HudController', () => {
       onQuickLoad: vi.fn(),
       onReset: vi.fn(),
       canQuickLoad: vi.fn(() => true),
+      onTogglePause: vi.fn(),
     }
     hudController = createHudController(container, actions)
   })
 
   it('GIVEN preparation WHEN render called THEN phase copy and preparation actions are enabled', () => {
-    hudController.render(createState('preparation'))
+    hudController.render(createState('preparation'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Preparation')
     expect(queryButton(container, 'start-sortie').disabled).toBe(false)
@@ -138,13 +140,13 @@ describe('HudController', () => {
   it('GIVEN preparation without a loadable snapshot WHEN render called THEN Quick Load is disabled', () => {
     actions.canQuickLoad.mockReturnValue(false)
 
-    hudController.render(createState('preparation'))
+    hudController.render(createState('preparation'), false)
 
     expect(queryButton(container, 'quick-load').disabled).toBe(true)
   })
 
   it('GIVEN running WHEN render called THEN button.disabled marks the full action surface as disabled', () => {
-    hudController.render(createState('running'))
+    hudController.render(createState('running'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie running')
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
@@ -156,7 +158,7 @@ describe('HudController', () => {
   })
 
   it('GIVEN debrief_pending_reward WHEN render called THEN Debrief: reward pending enables Claim reward only', () => {
-    hudController.render(createState('debrief_pending_reward'))
+    hudController.render(createState('debrief_pending_reward'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward pending')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
@@ -170,7 +172,7 @@ describe('HudController', () => {
   })
 
   it('GIVEN debrief_reward_claimed WHEN render called THEN Debrief: reward claimed enables Next sortie only', () => {
-    hudController.render(createState('debrief_reward_claimed'))
+    hudController.render(createState('debrief_reward_claimed'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward claimed')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
@@ -188,7 +190,7 @@ describe('HudController', () => {
     state.telemetry.status = 'Reward claimed for this session.'
     state.telemetry.lastCommandSummary = 'Persistence will be handled by issue #739.'
 
-    hudController.render(state)
+    hudController.render(state, false)
 
     const status = container.querySelector('[data-field="status"]')
     expect(status?.textContent).toBe('Reward claimed for this session.')
@@ -200,7 +202,7 @@ describe('HudController', () => {
   })
 
   it('GIVEN running WHEN disabled buttons are clicked THEN callbacks are not invoked', () => {
-    hudController.render(createState('running'))
+    hudController.render(createState('running'), false)
 
     queryButton(container, 'start-sortie').click()
     queryButton(container, 'claim-reward').click()
@@ -218,7 +220,7 @@ describe('HudController', () => {
   })
 
   it('GIVEN debrief_reward_claimed WHEN disabled claim button is clicked THEN claim callback remains a no-op surface', () => {
-    hudController.render(createState('debrief_reward_claimed'))
+    hudController.render(createState('debrief_reward_claimed'), false)
 
     queryButton(container, 'claim-reward').click()
     queryButton(container, 'next-sortie').click()
