@@ -443,6 +443,29 @@ CONTRACT_REVIEW_RESULT_V1:
 - **branch / PR / worktree を本 skill では作らない**（`implement-issue` の責務）
 - 不適合検出時は自動修復せず、`issue-refinement-loop` の起動を人間に提案する
 
+## Programmatic Entry Points (scripts/)
+
+### run_contract_review_once.py（#817 追加）
+
+`impl-review-loop` の `missing_contract_go` 分岐から呼ばれる orchestration wrapper。
+既存 preflight scripts を薄くラップし `CONTRACT_REVIEW_ONCE_RESULT_V1` を返す。
+
+**呼び出し条件**: `ensure_contract_snapshot.py` が `--mode auto` で呼ばれた際に内部から起動される。
+直接呼び出しも可能（`--issue-number <N> --repo <owner/repo>`）。
+
+```bash
+uv run python3 .claude/skills/issue-contract-review/scripts/run_contract_review_once.py \
+  --issue-number <N> --repo <owner/repo> [--mode static|execute]
+```
+
+**wrapper status**: `go | blocked | human_judgment | runtime_error`  
+（`human_judgment` は native dependency 不可・ambiguous fallback 時のみ。JSON parse 失敗は `runtime_error`）
+
+### contract_review_result_parser.py（#817 追加）
+
+Issue コメントから valid `CONTRACT_REVIEW_RESULT_V1` を解析する共有 parser。
+`#66` との統合を見越した canonical entry point。
+
 ## Related
 
 - `docs/dev/dor.md` — Implementation Issue の Definition of Ready (DoR) 基準。本 skill の各チェック項目の正本定義先。

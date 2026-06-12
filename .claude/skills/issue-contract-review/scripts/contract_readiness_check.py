@@ -800,7 +800,9 @@ def main() -> int:
         description="Contract Readiness Check: returns ISSUE_CONTRACT_READINESS_RESULT_V1 JSON"
     )
     parser.add_argument("--body-file", help="Path to issue body file")
-    parser.add_argument("--issue", type=int, help="GitHub Issue number")
+    parser.add_argument(
+        "--issue", "--issue-number", dest="issue", type=int, help="GitHub Issue number"
+    )
     parser.add_argument(
         "--repo", default="squne121/loop-protocol", help="GitHub repo (owner/name)"
     )
