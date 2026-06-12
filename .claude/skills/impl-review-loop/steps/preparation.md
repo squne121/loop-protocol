@@ -49,6 +49,8 @@ gh issue view <issue_number> --json title,labels \
 >   --post
 > ```
 >
+> `termination_reason` 有効値（`null | approved | max_iterations | human_escalation | intake_gate_failed`）は routing 結果に基づいて LOOP_STATE へ記録する。
+>
 > | ensure_contract_snapshot 結果 | exit code | routing |
 > |---|---|---|
 > | `status: ok` (source: existing_go \| materialized_go) | 0 | contract_snapshot_url を LOOP_STATE に記録して Step 1 へ |
