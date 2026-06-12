@@ -23,8 +23,9 @@ EXECUTION_POLICY
 - follow-up issue の actual creation は main thread が承認・委譲したときだけ行う。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: post-merge-cleanup
+- repo_local_skill_surface: .agents/skills/post-merge-cleanup/SKILL.md
 
 FAIL_CLOSED
 - CONFLICT や dirty worktree を無視して cleanup を続行しない。

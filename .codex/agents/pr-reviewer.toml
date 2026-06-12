@@ -22,8 +22,9 @@ EXECUTION_POLICY
 - validator-first を優先し、required checks・runtime verification status・allowed paths compliance を deterministic に評価する。
 
 RUNTIME
-- runtime_dependency_status: claude_skill_required
+- runtime_dependency_status: codex_skill_required
 - runtime_followup_route: pr-review-judge
+- repo_local_skill_surface: .agents/skills/pr-review-judge/SKILL.md
 
 FAIL_CLOSED
 - 根拠の無い APPROVE を返さない。

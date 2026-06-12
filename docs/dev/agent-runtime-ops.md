@@ -193,6 +193,9 @@ GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/
 - `.codex/config.toml` の `default_permissions` が repo 既定 profile を選ぶ
 - `.codex/rules/default.rules` が command rules を持つ
 - `AGENTS.md` が Codex 向けの project-local instruction surface になる
+- `.agents/skills/` が Codex custom agent の repo-local discovery surface になる
+- `.claude/skills/` は Claude 側 prompt / skill surface であり、現時点では thin bridge が読む canonical body の保管場所でもある
+- したがってこの PR 系列で揃えるのは「discovery surface の整合」であり、`.claude/skills/` 実体の全面移設までは主張しない
 
 ### 旧 sandbox 設定との競合
 
