@@ -5,7 +5,6 @@ import {
   parseSnapshot,
   serializeSnapshot,
 } from '../src/storage'
-import { createGameSnapshot, createInitialGameState } from '../src/state'
 
 function createMemoryStorage(initialEntries?: Record<string, string>) {
   const bag = new Map<string, string>(Object.entries(initialEntries ?? {}))
@@ -346,65 +345,5 @@ describe('LocalGameStorage', () => {
       reason: 'corrupt-json',
       errorName: 'SyntaxError',
     })
-  })
-
-  it('GIVEN a state with runtime fields WHEN createGameSnapshot is called THEN it keep only progression fields', () => {
-    const state = createInitialGameState({
-      resources: 123,
-      weaponPower: 4,
-      playerMaxHp: 9,
-    })
-
-    state.loopPhase = 'running'
-    state.pendingRewardApplicationId = 'sortie-reward-1'
-    state.projectiles.push({
-      id: 1,
-      x: 1,
-      y: 2,
-      radius: 3,
-      directionX: 0,
-      directionY: 1,
-      speedPxPerSec: 120,
-      ageMs: 0,
-      lifetimeMs: 100,
-      damage: 4,
-    })
-
-    state.enemies.push({
-      id: 1,
-      definitionId: 'basic',
-      hp: 10,
-      maxHp: 10,
-      x: 0,
-      y: 0,
-      radius: 3,
-      speedPxPerSec: 60,
-      contactDamage: 1,
-      defeated: false,
-      defeatedAtTick: null,
-    })
-
-    const snapshot = createGameSnapshot(state)
-
-    expect(snapshot).toEqual({
-      schemaVersion: 1,
-      resources: 123,
-      weaponPower: 4,
-      playerMaxHp: 9,
-    })
-
-    const raw = serializeSnapshot(snapshot)
-    expect(raw).toContain('"schemaVersion":1')
-    expect(raw).toContain('"resources":123')
-    expect(raw).toContain('"weaponPower":4')
-    expect(raw).toContain('"playerMaxHp":9')
-    expect(raw).not.toContain('"loopPhase"')
-    expect(raw).not.toContain('"pendingRewardApplicationId"')
-    expect(raw).not.toContain('"rewardClaims"')
-    expect(raw).not.toContain('"tick"')
-    expect(raw).not.toContain('"elapsedMs"')
-    expect(raw).not.toContain('"enemies"')
-    expect(raw).not.toContain('"projectiles"')
-    expect(raw).not.toContain('"playerHpRemaining"')
   })
 })

@@ -113,7 +113,10 @@ const hud = createHudController(commandRail, {
     const claimResult = claimPendingReward(state)
 
     if (claimResult.ok) {
-      persistProgressionSnapshot('reward-claim')
+      setHudFeedback(
+        'Reward claimed for this session.',
+        'Persistence will be handled by issue #739.',
+      )
       return
     }
 
@@ -121,7 +124,7 @@ const hud = createHudController(commandRail, {
       case 'already-claimed':
         setHudFeedback(
           'Reward already claimed for this session.',
-          'Result already confirmed.',
+          'Persistence will be handled by issue #739.',
         )
         return
       case 'no-pending-reward':
@@ -148,7 +151,15 @@ const hud = createHudController(commandRail, {
       return
     }
 
-    persistProgressionSnapshot('quick-save')
+    const saveResult = storage.save(createGameSnapshot(state))
+    if (!saveResult.ok) {
+      reportStorageFailure('save', saveResult)
+      setHudFeedback('Quick Save failed.', 'Current state unchanged.')
+      return
+    }
+
+    hasLoadableSnapshot = true
+    setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
   },
   onQuickLoad() {
     if (state.loopPhase !== 'preparation') {
@@ -290,32 +301,6 @@ function maybeAutoStartRuntime(): void {
 function setHudFeedback(status: string, summary: string): void {
   state.telemetry.status = status
   state.telemetry.lastCommandSummary = summary
-}
-
-function persistProgressionSnapshot(
-  reason: 'reward-claim' | 'quick-save',
-): void {
-  const saveResult = storage.save(createGameSnapshot(state))
-
-  if (!saveResult.ok) {
-    reportStorageFailure('save', saveResult)
-    hasLoadableSnapshot = false
-
-    setHudFeedback(
-      'Progress not saved.',
-      'You can continue, but progress may be lost after reload.',
-    )
-    return
-  }
-
-  hasLoadableSnapshot = true
-
-  if (reason === 'reward-claim') {
-    setHudFeedback('Result confirmed.', 'Progress saved locally.')
-    return
-  }
-
-  setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
 }
 
 function resizeArena(currentState: typeof state): void {
