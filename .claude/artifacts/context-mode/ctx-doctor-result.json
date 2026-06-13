@@ -3,6 +3,7 @@
   "_issue": "#824",
   "_generated_at": "2026-06-13T04:25:52.135200+00:00",
   "tool": "context-mode doctor",
+  "ok": true,
   "exit_code": 0,
   "status": "pass",
   "errors": [],

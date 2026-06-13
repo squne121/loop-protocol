@@ -38,15 +38,30 @@
   "permission_policy": {
     "ctx_execute": "deny",
     "ctx_fetch_and_index": "deny",
-    "ctx_batch_execute": "allow",
-    "ctx_execute_file": "allow",
-    "ctx_index": "allow",
-    "ctx_search": "allow",
-    "ctx_stats": "allow",
-    "ctx_doctor": "allow",
-    "ctx_upgrade": "allow",
-    "ctx_purge": "allow",
-    "ctx_insight": "allow"
+    "ctx_index": "registered_pending_child_issue_825",
+    "ctx_search": "registered_pending_child_issue_825",
+    "ctx_batch_execute": "registered_not_approved_for_routine_use",
+    "ctx_execute_file": "registered_not_approved_for_routine_use",
+    "ctx_stats": "registered",
+    "ctx_doctor": "registered",
+    "ctx_upgrade": "registered",
+    "ctx_purge": "registered",
+    "ctx_insight": "registered"
   },
-  "deny_basis": "permissions.deny in .claude/settings.json: mcp__context-mode__ctx_execute, mcp__context-mode__ctx_fetch_and_index"
+  "deny_basis": "permissions.deny in .claude/settings.json: mcp__context-mode__ctx_execute, mcp__context-mode__ctx_fetch_and_index",
+  "actual_callable_tool_names": {
+    "ctx_execute": "mcp__context-mode__ctx_execute",
+    "ctx_fetch_and_index": "mcp__context-mode__ctx_fetch_and_index",
+    "ctx_index": "mcp__context-mode__ctx_index",
+    "ctx_search": "mcp__context-mode__ctx_search",
+    "ctx_batch_execute": "mcp__context-mode__ctx_batch_execute",
+    "ctx_execute_file": "mcp__context-mode__ctx_execute_file",
+    "ctx_stats": "mcp__context-mode__ctx_stats",
+    "ctx_doctor": "mcp__context-mode__ctx_doctor",
+    "ctx_upgrade": "mcp__context-mode__ctx_upgrade",
+    "ctx_purge": "mcp__context-mode__ctx_purge",
+    "ctx_insight": "mcp__context-mode__ctx_insight"
+  },
+  "deny_name_matches_callable": true,
+  "evidence_source": "claude settings.json permissions.deny entries verified against MCP tool registration (enabledPlugins: context-mode@context-mode; server-key: context-mode)"
 }

@@ -126,10 +126,18 @@ class TestCtxDoctorResultSchema:
     def test_required_fields_present(self) -> None:
         """必須フィールドが存在することを確認する。"""
         data = json.loads((ARTIFACT_DIR / "ctx-doctor-result.json").read_text())
+        assert "ok" in data, "ctx-doctor-result.json に ok フィールドがありません"
         assert "status" in data, "ctx-doctor-result.json に status フィールドがありません"
         assert "exit_code" in data, "ctx-doctor-result.json に exit_code フィールドがありません"
         assert "errors" in data, "ctx-doctor-result.json に errors フィールドがありません"
         assert "redaction" in data, "ctx-doctor-result.json に redaction フィールドがありません"
+
+    def test_ok_field_is_bool(self) -> None:
+        """ok フィールドが bool 型であることを確認する（Issue 契約必須フィールド）。"""
+        data = json.loads((ARTIFACT_DIR / "ctx-doctor-result.json").read_text())
+        assert isinstance(data.get("ok"), bool), (
+            f"ctx-doctor-result.json の ok フィールドが bool ではありません: {data.get('ok')}"
+        )
 
     @skip_if_runtime_not_available
     def test_ctx_doctor_ok(self) -> None:
@@ -215,6 +223,8 @@ def test_deny_policy() -> None:
     AC5: ctx_execute / ctx_fetch_and_index が permission_policy 上 deny で記録されていることを確認する。
 
     permission_policy フィールドで deny を確認する。
+    また、permission-policy.json の explicit_mcp_deny_entries が空でないこと、
+    ctx_index / ctx_search が allow でないことを検証する。
     """
     data = json.loads((ARTIFACT_DIR / "registered-tools.json").read_text())
     policy = data.get("permission_policy", {})
@@ -231,6 +241,33 @@ def test_deny_policy() -> None:
     )
     assert policy["ctx_fetch_and_index"] == "deny", (
         f"ctx_fetch_and_index の permission_policy が deny ではありません: {policy['ctx_fetch_and_index']}"
+    )
+
+    # ctx_index / ctx_search は #825 の negative test 完了前は allow であってはならない
+    assert policy.get("ctx_index") != "allow", (
+        f"ctx_index が allow に設定されています: {policy.get('ctx_index')}。"
+        "#825 の safety 検証が完了するまで allow 設定は禁止されています。"
+    )
+    assert policy.get("ctx_search") != "allow", (
+        f"ctx_search が allow に設定されています: {policy.get('ctx_search')}。"
+        "#825 の safety 検証が完了するまで allow 設定は禁止されています。"
+    )
+
+    # permission-policy.json の explicit_mcp_deny_entries が空でないことを検証
+    perm_policy_data = json.loads((ARTIFACT_DIR / "permission-policy.json").read_text())
+    explicit_deny = perm_policy_data.get("explicit_mcp_deny_entries", [])
+    assert len(explicit_deny) > 0, (
+        "permission-policy.json の explicit_mcp_deny_entries が空です。"
+        ".claude/settings.json の permissions.deny に MCP deny entries が設定されているはずです。"
+    )
+    assert "mcp__context-mode__ctx_execute" in explicit_deny, (
+        "explicit_mcp_deny_entries に mcp__context-mode__ctx_execute が含まれていません"
+    )
+    assert "mcp__context-mode__ctx_fetch_and_index" in explicit_deny, (
+        "explicit_mcp_deny_entries に mcp__context-mode__ctx_fetch_and_index が含まれていません"
+    )
+    assert perm_policy_data.get("explicit_deny_entry") is True, (
+        "permission-policy.json の explicit_deny_entry が true ではありません"
     )
 
 

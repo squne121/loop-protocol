@@ -1,14 +1,24 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "generated_at": "2026-06-13T04:22:08.987264+00:00",
+  "source_settings_file": ".claude/settings.json",
   "policy_scope": "project (LOOP_PROTOCOL .claude/settings.json)",
+  "explicit_mcp_deny_entries": [
+    "mcp__context-mode__ctx_execute",
+    "mcp__context-mode__ctx_fetch_and_index"
+  ],
+  "explicit_mcp_allow_entries": [],
+  "explicit_deny_entry": true,
+  "deny_policy_active": true,
+  "ctx_execute": "deny",
+  "ctx_fetch_and_index": "deny",
   "deny_policy": [
     {
       "tool": "ctx_execute",
       "mcp_tool_id": "mcp__context-mode__ctx_execute",
       "policy": "deny",
-      "reason": "Not in project allow list; sandbox code execution excluded from this project profile",
-      "explicit_deny_entry": false,
+      "reason": "Explicit deny entry in .claude/settings.json permissions.deny; sandbox code execution excluded from this project profile",
+      "explicit_deny_entry": true,
       "in_registered_tools": true,
       "execution_evidence": null
     },
@@ -16,8 +26,8 @@
       "tool": "ctx_fetch_and_index",
       "mcp_tool_id": "mcp__context-mode__ctx_fetch_and_index",
       "policy": "deny",
-      "reason": "Not in project allow list; external URL fetch excluded from this project profile",
-      "explicit_deny_entry": false,
+      "reason": "Explicit deny entry in .claude/settings.json permissions.deny; external URL fetch excluded from this project profile",
+      "explicit_deny_entry": true,
       "in_registered_tools": true,
       "execution_evidence": null
     }
@@ -52,10 +62,9 @@
     "Bash(env)",
     "Bash(env *)",
     "Bash(set)",
-    "Bash(set *)"
+    "Bash(set *)",
+    "mcp__context-mode__ctx_execute",
+    "mcp__context-mode__ctx_fetch_and_index"
   ],
-  "explicit_mcp_deny_entries": [],
-  "explicit_mcp_allow_entries": [],
-  "policy_basis": "No explicit allow entry for ctx_execute or ctx_fetch_and_index in project permissions.allow; Claude Code permission model: unlisted MCP tools require explicit allow or are denied at runtime",
   "local_settings_path": ".claude/settings.json (project scope)"
 }
