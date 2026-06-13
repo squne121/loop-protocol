@@ -1786,7 +1786,17 @@ def classify_result(
         _test_argv = shlex.split(command)
     except ValueError:
         _test_argv = []
-    if len(_test_argv) >= 3 and _test_argv[0] == "test":
+    # Handle test -s exit 2 (malformed) regardless of argument count (AC7)
+    # Must come before the len==3 guard so `test -s` (no operand, len=2) is also caught.
+    if (
+        len(_test_argv) >= 2
+        and _test_argv[0] == "test"
+        and _test_argv[1] == "-s"
+        and exit_code == 2
+    ):
+        return "blocked", "unknown", "blocked", "test -s returned exit 2 (malformed invocation)", "baseline_fail_expected"
+    # Exact 3-argument predicate: test <flag> <path> — no extra operands allowed (AC5)
+    if len(_test_argv) == 3 and _test_argv[0] == "test":
         _flag = _test_argv[1]
         if _flag in ("-f", "-d") and exit_code == 1:
             return "expected_fail", "file_not_found_expected", "go", None, "baseline_fail_expected"
@@ -1799,9 +1809,6 @@ def classify_result(
                 "test -s false means missing or zero-size file",
                 "baseline_fail_expected",
             )
-        if _flag == "-s" and exit_code == 2:
-            # exit 2: malformed invocation (operand missing / extra operand) — not go (AC7)
-            return "blocked", "unknown", "blocked", "test -s returned exit 2 (malformed invocation)", "baseline_fail_expected"
 
     # Generic exit_code != 0: try to infer expected_fail for common utilities
     # grep, sed, awk などが no-match で exit 1 を返すことは expected

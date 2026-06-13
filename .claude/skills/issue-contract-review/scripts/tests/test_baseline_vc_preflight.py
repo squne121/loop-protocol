@@ -1577,22 +1577,37 @@ def test_s_quoted_path_exit1_go():
 
 
 def test_s_malformed_exit2_not_go():
-    """AC7: test -s with malformed invocation exit 2 → not go (blocked)"""
+    """AC7: test -s with malformed invocation exit 2 → blocked (not go)"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     from baseline_vc_preflight import classify_result
 
-    # exit 2: operand missing
+    # exit 2: operand missing (test -s with no file argument)
     classification, category, decision, fix_hint, scope_class = classify_result(
         exit_code=2,
         stdout="",
         stderr="test: -s: binary operator expected",
         command="test -s",
     )
-    assert decision != "go", f"Expected non-go decision, got {decision}"
-    assert classification not in ("expected_fail", "expected_pass"), (
-        f"Expected non-pass classification, got {classification}"
+    assert decision == "blocked", f"Expected blocked decision, got {decision}"
+    assert classification == "blocked", f"Expected blocked classification, got {classification}"
+
+
+def test_s_extra_operand_exit2_blocked():
+    """AC7 extra: test -s with extra operand exit 2 → blocked (len>=3 but exit 2)"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    # exit 2: extra operand (`test -s a b` is an error per POSIX)
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="test: too many arguments",
+        command="test -s /some/file /extra",
     )
+    assert decision == "blocked", f"Expected blocked decision, got {decision}"
+    assert classification == "blocked", f"Expected blocked classification, got {classification}"
 
 
 def test_classify_result_uses_cwd_argument(tmp_path):
