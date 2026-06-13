@@ -229,7 +229,7 @@ fail / internal の場合、mutation は実行されず `ERROR=E_PR_BODY_VALIDAT
 
 ### preflight ステップ 2: 日本語比率チェック（`validate_japanese_content.py --threshold 0.1`）
 
-`validate_japanese_content.py` で PR body の日本語比率が 0.1 以上であることを検査する。
+`validate_japanese_content.py` で PR body から抽出した**各 prose block** の日本語文字比率が threshold（0.1）以上であることを検査する。`aggregate_ratio` は診断値であり、pass 条件ではない。いずれか 1 ブロックでも比率が threshold を下回ると fail となる。
 
 ```bash
 uv run python3 .claude/skills/create-issue/scripts/validate_japanese_content.py \

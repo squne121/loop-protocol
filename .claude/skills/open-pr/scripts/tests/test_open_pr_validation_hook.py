@@ -888,3 +888,16 @@ def test_ac8_japanese_internal_error_blocks_gh_pr_create(monkeypatch: pytest.Mon
     assert any(
         line == f"ERROR={open_pr.E_PR_BODY_JAPANESE_VALIDATION_FAILED}" for line in lines
     ), f"Expected ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED; got: {lines}"
+
+
+def test_japanese_validator_parity_with_update_pr():
+    """open_pr と update_pr の _run_japanese_content_validator が同じシグネチャ・挙動を持つことを確認。"""
+    import inspect
+    import open_pr
+    import update_pr
+    open_sig = inspect.signature(open_pr._run_japanese_content_validator)
+    update_sig = inspect.signature(update_pr._run_japanese_content_validator)
+    assert list(open_sig.parameters.keys()) == list(update_sig.parameters.keys()), (
+        f"シグネチャ不一致: open_pr={list(open_sig.parameters.keys())}, "
+        f"update_pr={list(update_sig.parameters.keys())}"
+    )

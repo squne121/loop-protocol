@@ -463,9 +463,10 @@ def main(argv: list[str] | None = None) -> int:
     # Japanese content preflight (AC4): validate PR body Japanese ratio before update
     japanese_result = _run_japanese_content_validator(body_text)
     if japanese_result.get("status") != "pass":
+        _jap_status = japanese_result.get("status")
         preflight = {
             "schema": "PR_BODY_PREFLIGHT_RESULT_V1",
-            "status": "fail",
+            "status": _jap_status if _jap_status in {"fail", "internal"} else "internal",
             "body_sha256": japanese_result.get("body_sha256", ""),
             "failed_blocks": japanese_result.get("failed_blocks", 0),
             "aggregate_ratio": japanese_result.get("aggregate_ratio", 0.0),
