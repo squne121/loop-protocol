@@ -212,6 +212,80 @@ function hasDuplicateArtifact(stableKeySegment) {
 }
 
 // ============================================================================
+// Issue Identity Resolution
+// ============================================================================
+
+/** Token-boundary regex for issue number extraction from branch/path strings. */
+const ISSUE_BRANCH_REGEX = /(?:^|[/_-])issue-([1-9][0-9]*)(?=$|[/_-])/
+
+/**
+ * Return true if value is a valid positive integer issue number (no leading zeros, > 0).
+ * Rejects: 0, negative, decimal, empty string, non-numeric.
+ */
+export function isValidIssueNumberValue(value) {
+  if (value === null || value === undefined || value === '') return false
+  const str = String(value)
+  if (!/^[1-9][0-9]*$/.test(str)) return false
+  const num = Number(str)
+  return Number.isInteger(num) && num > 0
+}
+
+/**
+ * Extract issue number from a string (branch name or path) using the token-boundary regex.
+ * Returns null if no valid issue number is found.
+ */
+export function extractIssueFromString(str) {
+  if (!str) return null
+  const match = ISSUE_BRANCH_REGEX.exec(str)
+  if (!match) return null
+  const num = parseInt(match[1], 10)
+  return num > 0 ? num : null
+}
+
+/**
+ * Extract issue number from trusted payload keys only.
+ * Forbidden: arbitrary key scanning, tool_input.command, transcript/message fields.
+ */
+function extractFromPayload(hookCtx) {
+  if (!hookCtx || typeof hookCtx !== 'object') return null
+  const candidates = [
+    hookCtx.issue_number,
+    hookCtx.issue?.number,
+    hookCtx.issueNumber,
+    hookCtx.loop?.issue_number,
+  ]
+  for (const value of candidates) {
+    if (isValidIssueNumberValue(value)) return parseInt(String(value), 10)
+  }
+  return null
+}
+
+/**
+ * Resolve issue number for phase_instance_id construction.
+ *
+ * Priority: trusted payload keys → git branch → cwd/worktree path → null (→ issue-0 sentinel)
+ *
+ * @param {object|null} hookCtx - Parsed hook stdin payload
+ * @param {{ branchName?: string|null, cwdPath?: string|null }} opts
+ * @returns {number|null} Resolved positive issue number, or null if unresolved
+ */
+export function resolveIssueNumber(hookCtx, { branchName = null, cwdPath = null } = {}) {
+  // 1. Trusted payload keys (highest priority)
+  const fromPayload = extractFromPayload(hookCtx)
+  if (fromPayload !== null) return fromPayload
+
+  // 2. Git branch name
+  const fromBranch = extractIssueFromString(branchName)
+  if (fromBranch !== null) return fromBranch
+
+  // 3. cwd / worktree path
+  const fromCwd = extractIssueFromString(cwdPath)
+  if (fromCwd !== null) return fromCwd
+
+  return null
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -271,10 +345,28 @@ async function main() {
     process.exit(0)
   }
 
+  // Resolve issue identity: payload → branch → cwd → issue-0 sentinel
+  let currentBranchName = null
+  try {
+    currentBranchName =
+      execFileSync('git', ['branch', '--show-current'], {
+        encoding: 'utf8',
+        cwd: REPO_ROOT,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim() || null
+  } catch {
+    // git unavailable or not a repo — fall through to cwd extraction
+  }
+  const resolvedIssueNumber = resolveIssueNumber(hookCtx, {
+    branchName: currentBranchName,
+    cwdPath: process.cwd(),
+  })
+
   // Build sequence ID: must be 3-digit zero-padded number (producer validates /^[0-9]{3}$/)
   // Use last 3 digits of epoch seconds to get a stable-ish 3-digit number
   const seqNum = String(Math.floor(Date.now() / 1000) % 1000).padStart(3, '0')
-  const phaseInstanceId = `issue-402:${phaseInfo.mainLoop}:${seqNum}`
+  const issuePrefix = resolvedIssueNumber !== null ? `issue-${resolvedIssueNumber}` : 'issue-0'
+  const phaseInstanceId = `${issuePrefix}:${phaseInfo.mainLoop}:${seqNum}`
 
   // Artifact filename: timestamp-based with stable key segment (no content hash — avoids circular ref)
   const timestamp = Date.now()
@@ -329,6 +421,11 @@ async function main() {
     producerArgs.push('--actor-session-id', sessionId)
   }
 
+  // Pass --issue <N> when issue identity is resolved (not sentinel)
+  if (resolvedIssueNumber !== null) {
+    producerArgs.push('--issue', String(resolvedIssueNumber))
+  }
+
   let manifestJson
   try {
     // Invoke producer and capture stdout (manifest JSON)
@@ -381,15 +478,18 @@ async function main() {
   process.exit(0)
 }
 
-main().catch((err) => {
-  // Best-effort: uncaught error does NOT block the session
-  process.stderr.write(
-    `[generate_session_manifest_from_hook] warn: fatal (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
-  )
-  // Release any lock we may be holding
-  if (_activeLockPath) {
-    releaseLock(_activeLockPath)
-    _activeLockPath = null
-  }
-  process.exit(0)
-})
+// Run main() only when executed directly (not imported for unit testing)
+if (fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((err) => {
+    // Best-effort: uncaught error does NOT block the session
+    process.stderr.write(
+      `[generate_session_manifest_from_hook] warn: fatal (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
+    )
+    // Release any lock we may be holding
+    if (_activeLockPath) {
+      releaseLock(_activeLockPath)
+      _activeLockPath = null
+    }
+    process.exit(0)
+  })
+}

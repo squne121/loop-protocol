@@ -15,6 +15,11 @@ import {
   validateManifestAgainstSchema,
   validateManifestSemantics,
 } from '../scripts/lib/agent-session-manifest-validation.mjs'
+import {
+  resolveIssueNumber,
+  isValidIssueNumberValue,
+  extractIssueFromString,
+} from '../.claude/hooks/generate_session_manifest_from_hook.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SCHEMA_PATH = resolve(__dirname, '../docs/schemas/agent-session-manifest.schema.json')
@@ -693,5 +698,113 @@ describe('agent-session-manifest generated manifest validation (subprocess)', ()
       }
       throw error
     }
+  })
+})
+
+// ============================================================================
+// Issue Identity Resolution (AC2 — #821)
+// ============================================================================
+
+describe('resolveIssueNumber — issue identity dynamic resolution (AC2)', () => {
+  // Case 1: payload issue_number wins at highest priority
+  it('GIVEN payload issue_number:821 WHEN resolving THEN returns 821 (payload wins)', () => {
+    const result = resolveIssueNumber(
+      { issue_number: 821 },
+      { branchName: 'worktree-issue-999-other', cwdPath: '/some/path' },
+    )
+    expect(result).toBe(821)
+  })
+
+  // Case 2: branch extraction when payload absent
+  it('GIVEN no payload and branch worktree-issue-821-session-manifest WHEN resolving THEN returns 821', () => {
+    const result = resolveIssueNumber(null, {
+      branchName: 'worktree-issue-821-session-manifest',
+      cwdPath: null,
+    })
+    expect(result).toBe(821)
+  })
+
+  // Case 3: cwd extraction when neither payload nor branch present
+  it('GIVEN no payload no branch and cwd .claude/worktrees/issue-821-foo WHEN resolving THEN returns 821', () => {
+    const result = resolveIssueNumber(null, {
+      branchName: null,
+      cwdPath: '/home/user/project/.claude/worktrees/issue-821-foo',
+    })
+    expect(result).toBe(821)
+  })
+
+  // Case 4: payload beats branch when both present and conflicting
+  it('GIVEN payload issue_number:821 and branch worktree-issue-999 WHEN resolving THEN payload wins returns 821', () => {
+    const result = resolveIssueNumber(
+      { issue_number: 821 },
+      { branchName: 'worktree-issue-999-other', cwdPath: null },
+    )
+    expect(result).toBe(821)
+  })
+
+  // Case 5: tool_input.command "gh issue view 402" is not a trusted key → not adopted
+  it('GIVEN payload tool_input.command containing issue 402 WHEN resolving THEN ignores it returns null', () => {
+    const result = resolveIssueNumber(
+      { tool_input: { command: 'gh issue view 402' } },
+      { branchName: null, cwdPath: null },
+    )
+    expect(result).toBeNull()
+  })
+
+  // Case 6: invalid issue_number values in payload → fallback
+  it('GIVEN issue_number:0 WHEN resolving THEN returns null (0 is invalid)', () => {
+    expect(resolveIssueNumber({ issue_number: 0 }, {})).toBeNull()
+  })
+
+  it('GIVEN issue_number:"000821" WHEN resolving THEN returns null (leading zeros invalid)', () => {
+    expect(resolveIssueNumber({ issue_number: '000821' }, {})).toBeNull()
+  })
+
+  it('GIVEN issue_number:-1 WHEN resolving THEN returns null (negative invalid)', () => {
+    expect(resolveIssueNumber({ issue_number: -1 }, {})).toBeNull()
+  })
+
+  it('GIVEN issue_number:1.5 WHEN resolving THEN returns null (decimal invalid)', () => {
+    expect(resolveIssueNumber({ issue_number: 1.5 }, {})).toBeNull()
+  })
+
+  it('GIVEN issue_number:"" WHEN resolving THEN returns null (empty string invalid)', () => {
+    expect(resolveIssueNumber({ issue_number: '' }, {})).toBeNull()
+  })
+
+  // Case 7: fully unresolvable → null (caller uses issue-0 sentinel)
+  it('GIVEN no payload no branch no cwd issue pattern WHEN resolving THEN returns null (issue-0 sentinel)', () => {
+    const result = resolveIssueNumber(null, {
+      branchName: 'main',
+      cwdPath: '/home/user/project',
+    })
+    expect(result).toBeNull()
+  })
+
+  // Additional: token-boundary regex — notissue-821 must NOT match
+  it('GIVEN branch notissue-821 WHEN extracting THEN returns null (boundary guard)', () => {
+    expect(extractIssueFromString('notissue-821')).toBeNull()
+  })
+
+  // Additional: issue-000 must NOT match (leading zeros guard)
+  it('GIVEN branch worktree-issue-000-foo WHEN extracting THEN returns null (issue-000 guard)', () => {
+    expect(extractIssueFromString('worktree-issue-000-foo')).toBeNull()
+  })
+
+  // isValidIssueNumberValue edge cases
+  it('GIVEN isValidIssueNumberValue WHEN checking valid number THEN returns true', () => {
+    expect(isValidIssueNumberValue(821)).toBe(true)
+    expect(isValidIssueNumberValue('1')).toBe(true)
+    expect(isValidIssueNumberValue(1)).toBe(true)
+  })
+
+  it('GIVEN isValidIssueNumberValue WHEN checking edge cases THEN returns false', () => {
+    expect(isValidIssueNumberValue(null)).toBe(false)
+    expect(isValidIssueNumberValue(undefined)).toBe(false)
+    expect(isValidIssueNumberValue('')).toBe(false)
+    expect(isValidIssueNumberValue(0)).toBe(false)
+    expect(isValidIssueNumberValue(-1)).toBe(false)
+    expect(isValidIssueNumberValue('00')).toBe(false)
+    expect(isValidIssueNumberValue('1.5')).toBe(false)
   })
 })
