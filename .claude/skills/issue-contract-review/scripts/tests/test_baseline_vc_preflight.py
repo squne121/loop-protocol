@@ -1720,6 +1720,75 @@ def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
     assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), f"Expected regression_gate + blocked error, got: {failures}"
 
 
+def test_preflight_scope_unknown_value_is_human_judgment():
+    """B4: unknown preflight-scope value is routed to human_judgment."""
+    fixture_content = """## Verification Commands
+
+```bash
+# preflight-scope: invalid
+$ test -f /etc/passwd
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_path = f.name
+
+    try:
+        data = run_preflight(fixture_path)
+        assert data["status"] == "human_judgment"
+        assert any(
+            r["decision"] == "human_judgment" and r["category"] == "unknown"
+            for r in data["results"]
+        )
+    finally:
+        import os
+        os.unlink(fixture_path)
+
+
+def test_preflight_scope_empty_value_is_human_judgment():
+    """B4: empty preflight-scope value is routed to human_judgment."""
+    fixture_content = """## Verification Commands
+
+```bash
+# preflight-scope:
+$ test -f /etc/passwd
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_path = f.name
+
+    try:
+        data = run_preflight(fixture_path)
+        assert data["status"] in ("human_judgment", "blocked")
+        assert any(r["category"] == "unknown" for r in data["results"])
+    finally:
+        import os
+        os.unlink(fixture_path)
+
+
+def test_invalid_ac_marker_is_ignored_for_ac_field():
+    """B4: invalid AC marker syntax is not treated as parsed AC label in baseline preflight."""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1: description
+true
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_path = f.name
+
+    try:
+        data = run_preflight(fixture_path)
+        assert data["results"], "Expected at least one result"
+        assert data["results"][0]["ac"] == "AC_UNKNOWN"
+    finally:
+        import os
+        os.unlink(fixture_path)
+
+
 if __name__ == "__main__":
     # Run tests
     test_ac1_file_exists()

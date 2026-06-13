@@ -29,6 +29,12 @@ from typing import Literal
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _ISSUE_TEMPLATE_DIR = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE"
 
+_SHARED_VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+if str(_SHARED_VC_SYNTAX_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_VC_SYNTAX_DIR))
+
+from vc_contract_syntax import parse_ac_marker_line, parse_preflight_scope_marker_line
+
 
 # =============================================================================
 # Type definitions
@@ -165,8 +171,11 @@ def _extract_ac_numbers(body: str) -> set[str]:
         return set()
 
     content, _, _ = section_info
-    # Match lines like: - [ ] AC1: ... or - [x] AC1: ...
-    pattern = r'- \[[^\]]*\]\s+AC(\d+):'
+    # Match lines like:
+    # - [ ] AC1: ...
+    # - [ ] AC1 ...
+    # - [x] AC1: ...
+    pattern = r'- \[[^\]]*\]\s+AC(\d+)\b'
     matches = re.findall(pattern, content)
     return {f"AC{m}" for m in matches}
 
@@ -178,10 +187,45 @@ def _extract_vc_ac_numbers(body: str) -> set[str]:
         return set()
 
     content, _, _ = section_info
-    # Match comment markers: # AC1, # AC2, etc. in executable command lines
-    pattern = r'#\s+AC(\d+)'
-    matches = re.findall(pattern, content)
-    return {f"AC{m}" for m in matches}
+    matches = set()
+    current_ac = None
+    in_bash_block = False
+
+    for raw_line in content.split("\n"):
+        line = raw_line.strip()
+
+        if line.startswith("```"):
+            fence = line.lower()
+            if not in_bash_block:
+                if fence.startswith("```bash"):
+                    in_bash_block = True
+                continue
+            in_bash_block = False
+            current_ac = None
+            continue
+
+        if not in_bash_block:
+            continue
+
+        if line.startswith("#"):
+            marker, is_valid = parse_ac_marker_line(line)
+            if marker is not None:
+                if is_valid:
+                    current_ac = marker
+                continue
+
+        # AC suffix on command line: `$ cmd  # AC1`
+        suffix_match = re.search(r"\s+#\s*(.+)\s*$", raw_line)
+        if suffix_match:
+            label, is_valid = parse_ac_marker_line(f"# {suffix_match.group(1)}")
+            if label is not None and is_valid:
+                matches.add(label)
+                continue
+
+        if current_ac is not None:
+            matches.add(current_ac)
+
+    return matches
 
 
 def _load_required_section_labels(kind: str) -> list[str]:
@@ -638,14 +682,11 @@ def _validate_lp020_runtime_verification_incomplete(body: str) -> list[Validatio
 
 
 def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationError]:
-    """LP016: Detect VC AC markers with inline description suffix.
+    """LP016: Detect VC AC marker suffix variants that are not bare markers.
 
-    Valid form:   # AC1
-    Invalid form: # AC1: some description text
-
-    The '# AC<N>: ...' form (with colon + text) is not a bare AC marker and
-    causes ambiguity in AC-to-VC traceability tooling. Only bare '# AC<N>'
-    standalone comment lines are permitted as AC markers in VC sections.
+    Canonical form: `# AC1` only.
+    Variants like `# AC1: desc`, `# AC1：desc`, `# AC1 - desc`,
+    `# AC1 — desc`, `# AC1 desc` are rejected.
     """
     section_info = _extract_section(body, "Verification Commands")
     if not section_info:
@@ -655,13 +696,11 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
     lines = body.split('\n')[start_line - 1:end_line]
 
     errors = []
-    # Match lines that are AC markers with a colon + non-whitespace description.
-    # Requires non-whitespace after ':' to avoid false positives on trailing colons.
-    pattern = re.compile(r'^\s*#\s+AC\d+\s*:\s*\S')
-
     current_line = start_line
     for line in lines:
-        if pattern.match(line):
+        label, is_valid = parse_ac_marker_line(line)
+        if label is not None and not is_valid:
+            # parse_ac_marker_line() reports any non-empty suffix as invalid.
             context, trunc = _get_context_lines(body, current_line, current_line)
             errors.append(ValidationError(
                 rule_id="LP016",
@@ -670,15 +709,119 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
                 line_start=current_line,
                 line_end=current_line,
                 message=(
-                    f"VC AC marker must be bare '# AC<N>' without description suffix. "
+                    "VC AC marker must be bare '# AC<N>' without suffix. "
                     f"Found: {line.strip()!r}"
                 ),
                 minimal_context=context,
                 context_truncated=trunc,
-                fix_hint="Change '# AC<N>: description' to bare '# AC<N>' on its own line.",
+                fix_hint="Use bare '# AC<N>' marker syntax on its own line.",
                 autofixable=False
             ))
         current_line += 1
+
+    return errors
+
+
+def _validate_lp018_vc_preflight_scope_value(body: str) -> list[ValidationError]:
+    """LP018: Validate preflight-scope markers and reject malformed values."""
+    section_info = _extract_section(body, "Verification Commands")
+    if not section_info:
+        return []
+
+    content, section_start, _ = section_info
+    errors: list[ValidationError] = []
+
+    in_bash = False
+
+    for idx, raw_line in enumerate(content.split("\n"), start=section_start):
+        line = raw_line.strip()
+
+        if line.startswith("```"):
+            fence = line.lstrip().lower()
+            if not in_bash:
+                if fence.startswith("```bash"):
+                    in_bash = True
+                continue
+            else:
+                in_bash = False
+            continue
+
+        if not in_bash:
+            continue
+
+        marker, _ = parse_preflight_scope_marker_line(raw_line)
+        if marker is None:
+            continue
+
+        if marker not in ("pr_review_only", "runtime_only"):
+            context, trunc = _get_context_lines(body, idx, idx)
+            errors.append(ValidationError(
+                rule_id="LP018",
+                severity="error",
+                section="Verification Commands",
+                line_start=idx,
+                line_end=idx,
+                message=(
+                    "Invalid # preflight-scope value. "
+                    f"Allowed values are: {', '.join(['pr_review_only', 'runtime_only'])}. "
+                    f"Found: {raw_line.strip()!r}"
+                ),
+                minimal_context=context,
+                context_truncated=trunc,
+                fix_hint=(
+                    "Use '# preflight-scope: pr_review_only' or "
+                    "'# preflight-scope: runtime_only' on its own line immediately "
+                    "before a command."
+                ),
+                autofixable=False,
+            ))
+
+    return errors
+
+
+def _validate_lp019_vc_preflight_scope_attached(body: str) -> list[ValidationError]:
+    """LP019: preflight-scope must be attached to a command line in bash block."""
+    section_info = _extract_section(body, "Verification Commands")
+    if not section_info:
+        return []
+
+    content, section_start, _ = section_info
+    errors: list[ValidationError] = []
+
+    for m in re.finditer(r"```bash[ \t]*\n(.*?)```", content, re.DOTALL):
+        block_start_offset = content[:m.start()].count("\n") + section_start + 1
+        block_lines = m.group(1).split("\n")
+
+        for i, raw_line in enumerate(block_lines, start=block_start_offset):
+            marker, _ = parse_preflight_scope_marker_line(raw_line)
+            if marker is None:
+                continue
+
+            # marker must be followed by a command line in the same block
+            next_index = i - block_start_offset + 1
+            attached = False
+            if 0 <= next_index < len(block_lines):
+                next_line = block_lines[next_index].strip()
+                if next_line and not next_line.startswith("#"):
+                    attached = True
+
+            if not attached:
+                context, trunc = _get_context_lines(body, i, i)
+                errors.append(ValidationError(
+                    rule_id="LP019",
+                    severity="error",
+                    section="Verification Commands",
+                    line_start=i,
+                    line_end=i,
+                    message=(
+                        "# preflight-scope marker must be immediately followed by "
+                        "a command inside a ```bash block."
+                    ),
+                    minimal_context=context,
+                    context_truncated=trunc,
+                    fix_hint="Move marker immediately above the target VC command.",
+                    autofixable=False,
+                ))
 
     return errors
 
@@ -921,6 +1064,8 @@ def validate_issue_body(
     all_errors.extend(_validate_lp014_markdown_backtick_grep(body))
     all_errors.extend(_validate_lp015_baseline_vc_heading_only(body))
     all_errors.extend(_validate_lp016_vc_ac_marker_with_description(body))
+    all_errors.extend(_validate_lp018_vc_preflight_scope_value(body))
+    all_errors.extend(_validate_lp019_vc_preflight_scope_attached(body))
     all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=effective_kind))
     all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))

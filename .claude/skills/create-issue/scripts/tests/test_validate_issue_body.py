@@ -508,6 +508,152 @@ grep '##' file  # AC1
         assert lp015_warnings[0].severity == "warning"
 
 
+class TestLP016AcMarkerStrictness:
+    """LP016: strict AC marker form enforcement in Verification Commands."""
+
+    @pytest.mark.parametrize("marker", [
+        "# AC1: description",
+        "# AC1：description",
+        "# AC1 - description",
+        "# AC1 — description",
+        "# AC1 description",
+    ])
+    def test_lp016_rejects_suffix_variants(self, marker):
+        body = f"""\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+{marker}
+test -f /etc/passwd
+```
+
+## Allowed Paths
+
+- /etc
+"""
+        result = validate_issue_body(body)
+        lp016_errors = [e for e in result.errors if e.rule_id == "LP016"]
+        assert len(lp016_errors) == 1
+        assert "bare" in lp016_errors[0].message
+
+    def test_lp016_accepts_bare_marker(self):
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# AC1
+test -f /etc/passwd
+```
+
+## Allowed Paths
+
+- /etc
+"""
+        result = validate_issue_body(body)
+        lp016_errors = [e for e in result.errors if e.rule_id == "LP016"]
+        assert len(lp016_errors) == 0
+
+
+class TestLP018LP019PreflightScope:
+    """LP018 / LP019: preflight-scope marker validation and attachment."""
+
+    def test_lp018_rejects_invalid_scope_value(self):
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# preflight-scope: foo
+# AC1
+true
+```
+
+## Allowed Paths
+
+- .
+"""
+        result = validate_issue_body(body)
+        errors = [e for e in result.errors if e.rule_id == "LP018"]
+        assert len(errors) == 1
+        assert "Allowed values" in errors[0].message
+
+    def test_lp018_rejects_empty_scope_value(self):
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# preflight-scope:
+# AC1
+true
+```
+
+## Allowed Paths
+
+- .
+"""
+        result = validate_issue_body(body)
+        errors = [e for e in result.errors if e.rule_id in ("LP018", "LP019")]
+        assert len(errors) >= 1
+
+    def test_lp019_requires_scope_attached(self):
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# preflight-scope: runtime_only
+# AC1
+test -f /etc/passwd
+```
+
+## Allowed Paths
+
+- /etc
+"""
+        result = validate_issue_body(body)
+        errors = [e for e in result.errors if e.rule_id == "LP019"]
+        assert len(errors) == 1
+
+    def test_lp019_accepts_attached_scope_marker(self):
+        body = """\
+## Acceptance Criteria
+
+- [ ] AC1 テスト
+
+## Verification Commands
+
+```bash
+# preflight-scope: runtime_only
+test -f /etc/passwd
+```
+
+## Allowed Paths
+
+- /etc
+"""
+        result = validate_issue_body(body)
+        lp019_errors = [e for e in result.errors if e.rule_id == "LP019"]
+        assert len(lp019_errors) == 0
+
+
 class TestLP020RuntimeVerificationIncomplete:
     """LP020: Runtime Verification Applicability incomplete."""
 
