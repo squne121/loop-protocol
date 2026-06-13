@@ -235,11 +235,9 @@ echo '{"termination_reason":"approved","issue_number":42}' | \
     --issue-number 42
 ```
 
-`human_escalation` の publish では、`termination_cause` omitted / `null` は `human_judgment_required` へ正規化され、`Cause: none` を出さない。caller が明示した valid cause は保持される。legacy alias `blocker_summary` is normalized to canonical `blockers_summary` だが、alias conflict や alias 側の型不正は fail-closed になる。
+`human_escalation` の publish では、`termination_cause` omitted / `null` は `human_judgment_required` へ正規化され、`Cause: none` を出さない。caller が明示した valid cause は保持される。canonical key は `blockers_summary`。`blocker_summary` は旧 alias として validation 前に `blockers_summary` へ正規化するが、alias conflict や alias 側の型不正は fail-closed になる。
 
-legacy alias blocker_summary is normalized to canonical blockers_summary.
-
-human_escalation example includes termination_cause and blockers_summary:
+human_escalation の入力例（termination_cause と blockers_summary を明示）:
 
 ```bash
 echo '{
@@ -248,8 +246,8 @@ echo '{
   "issue_number": 829,
   "iteration": 3,
   "blockers_summary": [
-    "owner decision is required",
-    "conflicting scope signals remain unresolved"
+    "オーナー判断が必要",
+    "スコープの矛盾が未解決"
   ]
 }' | uv run python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
   --issue-number 829
