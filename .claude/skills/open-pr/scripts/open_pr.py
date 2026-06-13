@@ -26,6 +26,7 @@ E_PR_BODY_VALIDATION_FAILED = "E_PR_BODY_VALIDATION_FAILED"
 E_LINKED_ISSUE_STATE_UNKNOWN = "E_LINKED_ISSUE_STATE_UNKNOWN"
 E_GH_FAILURE = "E_GH_FAILURE"
 E_SCHEMA_CONSUMER_INVENTORY_MISSING = "E_SCHEMA_CONSUMER_INVENTORY_MISSING"
+E_PR_BODY_JAPANESE_VALIDATION_FAILED = "E_PR_BODY_JAPANESE_VALIDATION_FAILED"
 
 
 def _classify_validator_errors(errors: list[object]) -> str:
@@ -306,6 +307,130 @@ def _run_pr_body_validator(
             Path(changed_paths_file.name).unlink(missing_ok=True)
 
 
+
+def _run_japanese_content_validator(
+    body_text: str,
+    threshold: float = 0.1,
+) -> dict[str, object]:
+    """Run validate_japanese_content.py against body_text.
+
+    Returns dict with keys:
+      - status: "pass" | "fail" | "internal"
+      - failed_blocks: int
+      - aggregate_ratio: float
+      - threshold: float
+      - body_sha256: str
+      - stderr: str (on fail/internal)
+    """
+    validator_script = (
+        Path(__file__).resolve().parent.parent.parent
+        / "create-issue" / "scripts" / "validate_japanese_content.py"
+    )
+
+    body_sha256 = f"sha256:{hashlib.sha256(body_text.encode('utf-8')).hexdigest()}"
+
+    body_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        encoding="utf-8",
+        delete=False,
+    )
+    try:
+        body_file.write(body_text)
+        body_file.flush()
+        body_file.close()
+
+        cmd = [
+            sys.executable,
+            str(validator_script),
+            "--file",
+            body_file.name,
+            "--threshold",
+            str(threshold),
+            "--verbose",
+        ]
+
+        try:
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "status": "internal",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.0,
+                "threshold": threshold,
+                "body_sha256": body_sha256,
+                "stderr": "Timeout expired",
+            }
+        except OSError as exc:
+            return {
+                "status": "internal",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.0,
+                "threshold": threshold,
+                "body_sha256": body_sha256,
+                "stderr": str(exc),
+            }
+
+        stderr_text = (cp.stderr or "").strip()
+
+        if cp.returncode == 0:
+            # Parse aggregate_ratio from stderr (verbose mode)
+            ratio = 0.0
+            for line in stderr_text.splitlines():
+                if line.startswith("aggregate_ratio:"):
+                    try:
+                        ratio = float(line.split(":", 1)[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+            return {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": ratio,
+                "threshold": threshold,
+                "body_sha256": body_sha256,
+                "stderr": stderr_text,
+            }
+        elif cp.returncode == 1:
+            # Parse aggregate_ratio and failed_blocks from stderr (verbose mode)
+            ratio = 0.0
+            failed_blocks = 0
+            for line in stderr_text.splitlines():
+                if line.startswith("aggregate_ratio:"):
+                    try:
+                        ratio = float(line.split(":", 1)[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("failed_blocks:"):
+                    try:
+                        failed_blocks = int(line.split(":", 1)[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+            return {
+                "status": "fail",
+                "failed_blocks": failed_blocks,
+                "aggregate_ratio": ratio,
+                "threshold": threshold,
+                "body_sha256": body_sha256,
+                "stderr": stderr_text,
+            }
+        else:
+            return {
+                "status": "internal",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.0,
+                "threshold": threshold,
+                "body_sha256": body_sha256,
+                "stderr": stderr_text,
+            }
+    finally:
+        Path(body_file.name).unlink(missing_ok=True)
+
 def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) -> str:
     args = [
         "pr",
@@ -371,6 +496,21 @@ def main(argv: list[str] | None = None) -> int:
             emit_kv("VALIDATOR_RULE_IDS", rule_ids)
         error_code = _classify_validator_errors(errors)
         emit_error(error_code, str(detail))
+        return 2
+
+    japanese_result = _run_japanese_content_validator(final_body)
+    if japanese_result.get("status") != "pass":
+        _jap_status = japanese_result.get("status")
+        preflight = {
+            "schema": "PR_BODY_PREFLIGHT_RESULT_V1",
+            "status": _jap_status if _jap_status in {"fail", "internal"} else "internal",
+            "body_sha256": japanese_result.get("body_sha256", ""),
+            "failed_blocks": japanese_result.get("failed_blocks", 0),
+            "aggregate_ratio": japanese_result.get("aggregate_ratio", 0.0),
+            "threshold": japanese_result.get("threshold", 0.1),
+        }
+        emit_kv("PR_BODY_PREFLIGHT_RESULT_V1", json.dumps(preflight, ensure_ascii=False))
+        emit_error(E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", ""))
         return 2
 
     existing = find_existing_pr(repo, branch)

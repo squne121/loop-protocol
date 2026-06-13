@@ -210,7 +210,54 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - `dry_run: true` でも publish ゲートと validator は実行する
 - 既存 PR が見つかった場合、本文 update は必ず update_pr.py wrapper 経由で行う（validator bypass 防止）
 
-## PR Body Japanese Check 失敗時の修復手順
+## PR 作成・PR 更新前の必須ローカル preflight
+
+`open_pr.py` および `update_pr.py` は `gh pr create` / `gh pr edit` の直前に以下の 2 段 preflight を実行する（fail-closed）。
+
+### preflight ステップ 1: PR body 構造バリデーション
+
+`validate_pr_body.py` で LP050〜LP058 を検査する。
+
+```bash
+uv run python3 .claude/skills/open-pr/scripts/validate_pr_body.py \
+  --body-file <final-pr-body-file> \
+  --changed-paths-file <changed-paths-file> \
+  --linked-issue <N>
+```
+
+fail / internal の場合、mutation は実行されず `ERROR=E_PR_BODY_VALIDATION_FAILED` 等が出力される。
+
+### preflight ステップ 2: 日本語比率チェック（`validate_japanese_content.py --threshold 0.1`）
+
+`validate_japanese_content.py` で PR body から抽出した**各 prose block** の日本語文字比率が threshold（0.1）以上であることを検査する。`aggregate_ratio` は診断値であり、pass 条件ではない。いずれか 1 ブロックでも比率が threshold を下回ると fail となる。
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/validate_japanese_content.py \
+  --file <final-pr-body-file> \
+  --threshold 0.1 \
+  --verbose
+```
+
+日本語チェック失敗時、`gh pr create` / `gh pr edit` は実行されず以下が出力される:
+
+```
+PR_BODY_PREFLIGHT_RESULT_V1={"schema": "PR_BODY_PREFLIGHT_RESULT_V1", "status": "fail", "body_sha256": "sha256:...", "failed_blocks": N, "aggregate_ratio": 0.0XX, "threshold": 0.1}
+ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED
+ERROR_DETAIL=<stderr from validate_japanese_content.py>
+```
+
+#### CI との SSOT 対応（AC7）
+
+ローカル preflight（`validate_japanese_content.py --threshold 0.1`）と CI ジョブは同一スクリプトを参照する。
+
+| 場所 | スクリプト | 閾値 | workflow/job |
+|---|---|---|---|
+| ローカル preflight（`open_pr.py` / `update_pr.py`） | `validate_japanese_content.py` | `0.1` | ローカル（`check-japanese.yml` 相当） |
+| CI | `validate_japanese_content.py` | `0.1` | `check-japanese.yml` |
+
+表記ゆれ解消: CI の workflow 名は `check-japanese.yml`（`validate-japanese.yml` ではない）。SSOT は `.github/workflows/check-japanese.yml` を参照すること。
+
+## PR Body Japanese Check 失敗時の修復手順（CI 失敗後）
 
 PR Body Japanese Check（`check-japanese.yml`）が失敗した場合は、`pr_body_japanese_repair_plan.py` を使って修復プランを生成し、`update_pr.py` 経由で適用する。
 
