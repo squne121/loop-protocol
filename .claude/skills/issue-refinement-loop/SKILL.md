@@ -192,6 +192,26 @@ echo '{"termination_reason":"approved","issue_number":42}' | \
     --issue-number 42
 ```
 
+`human_escalation` の publish では、`termination_cause` omitted / `null` は `human_judgment_required` へ正規化され、`Cause: none` を出さない。caller が明示した valid cause は保持される。legacy alias `blocker_summary` is normalized to canonical `blockers_summary` だが、alias conflict や alias 側の型不正は fail-closed になる。
+
+legacy alias blocker_summary is normalized to canonical blockers_summary.
+
+human_escalation example includes termination_cause and blockers_summary:
+
+```bash
+echo '{
+  "termination_reason": "human_escalation",
+  "termination_cause": "human_judgment_required",
+  "issue_number": 829,
+  "iteration": 3,
+  "blockers_summary": [
+    "owner decision is required",
+    "conflicting scope signals remain unresolved"
+  ]
+}' | uv run python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+  --issue-number 829
+```
+
 `publish_termination_report.py` は以下の責務を持つ:
 
 1. `render_termination_report.py` を `subprocess.run([sys.executable, ...], shell=False, ...)` で呼び出す

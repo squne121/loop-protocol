@@ -330,6 +330,41 @@ class TestTerminationReasonCauseSeparation:
         assert err != ""
         assert data is None
 
+    def test_human_escalation_missing_cause_defaults_to_human_judgment_required(self):
+        result = rtr.render(_make_input("human_escalation"))
+        assert result["termination_cause"] == "human_judgment_required"
+        assert "Cause: none" not in result["body"]
+        assert "Cause: human judgment required" in result["body"]
+
+    def test_legacy_blocker_summary_alias_renders_blockers(self):
+        result = rtr.render({
+            "termination_reason": "human_escalation",
+            "issue_number": 42,
+            "iteration": 3,
+            "blocker_summary": ["legacy blocker entry"],
+        })
+        assert result["publishable"] is True
+        assert result["termination_cause"] == "human_judgment_required"
+        assert "## Blockers" in result["body"]
+        assert '"legacy blocker entry"' in result["body"]
+
+    def test_blocker_summary_alias_conflict_is_rejected(self):
+        data, err = rtr._validate_input({
+            "termination_reason": "human_escalation",
+            "blocker_summary": ["legacy blocker"],
+            "blockers_summary": ["canonical blocker"],
+        })
+        assert data is None
+        assert err == "blocker_summary and blockers_summary conflict"
+
+    def test_blocker_summary_alias_type_is_rejected(self):
+        data, err = rtr._validate_input({
+            "termination_reason": "human_escalation",
+            "blocker_summary": "not-a-list",
+        })
+        assert data is None
+        assert err == "blocker_summary must be a list of strings"
+
 
 # ---------------------------------------------------------------------------
 # AC8: GFM fence / HTML marker / adversarial input robustness

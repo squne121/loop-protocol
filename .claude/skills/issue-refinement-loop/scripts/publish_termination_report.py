@@ -35,6 +35,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from render_termination_report import InputValidationError, normalize_input
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -265,8 +267,20 @@ def publish(
     To override the renderer path in tests, set publish_termination_report.RENDERER_SCRIPT
     directly before calling publish().
     """
+    try:
+        normalized_input = normalize_input(input_data)
+    except InputValidationError as exc:
+        _record_artifact(
+            issue_number=issue_number,
+            reason_code="invalid_input",
+            renderer_stderr=str(exc),
+            renderer_returncode=None,
+            extra={"validation_error": str(exc)},
+        )
+        return 1
+
     # Invoke renderer
-    result, renderer_stderr, returncode = _invoke_renderer(input_data)
+    result, renderer_stderr, returncode = _invoke_renderer(normalized_input)
 
     # Renderer non-zero exit — fail-closed
     if result is None:

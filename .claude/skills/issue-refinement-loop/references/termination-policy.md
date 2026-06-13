@@ -80,6 +80,42 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 
 `iteration + 1 >= max_iterations` かつ approve なしの場合は `human_escalation` で停止し、全 iteration 分の blocker summary を終了コメントに添付する。`max_iterations=3` 既定では、3 回目の `needs-fix` で停止する。
 
+### TERMINATION_REPORT_INPUT_V1 normalization
+
+- `termination_reason: human_escalation` かつ `termination_cause` omitted / `null` の場合、renderer / publisher は `Cause: none` を出さず `human_judgment_required` を fallback cause として扱う
+- caller が `max_iterations_exceeded` などの valid `termination_cause` を明示した場合は上書きしない
+- legacy alias `blocker_summary` is normalized to canonical `blockers_summary`
+- legacy alias blocker_summary is normalized to canonical blockers_summary
+- `blocker_summary` と `blockers_summary` が両方あり値が異なる場合は fail-closed とする
+- `blocker_summary` が `list[str]` でない場合も fail-closed とする
+
+human_escalation example includes termination_cause and blockers_summary:
+
+```json
+{
+  "termination_reason": "human_escalation",
+  "termination_cause": "human_judgment_required",
+  "issue_number": 829,
+  "iteration": 3,
+  "blockers_summary": [
+    "owner decision is required",
+    "conflicting scope signals remain unresolved"
+  ]
+}
+```
+
+legacy alias example:
+
+```json
+{
+  "termination_reason": "human_escalation",
+  "issue_number": 829,
+  "blocker_summary": [
+    "legacy caller payload still uses singular key"
+  ]
+}
+```
+
 ## Additional stop rules
 
 - anchor comment fact-check が未完了のまま stale approval を使おうとした場合
