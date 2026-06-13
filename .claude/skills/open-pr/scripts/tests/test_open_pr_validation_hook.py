@@ -157,6 +157,7 @@ def test_validator_receives_final_body_with_closes_reference(monkeypatch: pytest
             return {"status": "pass", "errors": []}
 
         monkeypatch.setattr(open_pr, "_run_pr_body_validator", fake_validator)
+        monkeypatch.setattr(open_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: {"number": 999, "url": "https://example.com/pr/999"})
         rc = open_pr.main(
             [
@@ -556,6 +557,7 @@ def test_ac4_not_schema_change_na_pass_path(
             "_run_pr_body_validator",
             lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
         )
+        monkeypatch.setattr(open_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
         # Return existing PR so create_pr is not called
         monkeypatch.setattr(
             open_pr,
@@ -696,3 +698,193 @@ def test_integration_missing_schema_consumer_inventory_uses_real_validator(
         )
     finally:
         Path(body_path).unlink(missing_ok=True)
+
+
+# --- AC8: Japanese content validation blocks gh pr create ---
+
+
+def _run_main_with_japanese_result(
+    monkeypatch: pytest.MonkeyPatch,
+    body_fixture: str,
+    japanese_result: dict,
+    extra_args: list[str] | None = None,
+) -> tuple[int, list[str]]:
+    """Helper: run open_pr.main with a fixed japanese validator result, capture stdout."""
+    body_path = write_temp_body(load_fixture(body_fixture))
+    output_lines: list[str] = []
+
+    def capture_print(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        line = sep.join(str(a) for a in args)
+        output_lines.append(line)
+
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-842-test")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        # PR body validator always passes
+        monkeypatch.setattr(
+            open_pr,
+            "_run_pr_body_validator",
+            lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
+        )
+        # Japanese validator returns the provided result
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text, threshold=0.1: japanese_result,
+        )
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        create_called = {"value": False}
+
+        def fake_create_pr(*args, **kwargs):
+            create_called["value"] = True
+            raise AssertionError("create_pr must not be called when Japanese check fails")
+
+        monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
+        monkeypatch.setattr("builtins.print", capture_print)
+
+        base_args = [
+            "--pr-title", "feat: test",
+            "--linked-issue", "842",
+            "--publish", "yes",
+            "--pr-body-file", body_path,
+        ]
+        if extra_args:
+            base_args.extend(extra_args)
+
+        rc = open_pr.main(base_args)
+        return rc, output_lines, create_called["value"]
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_ac8_japanese_fail_blocks_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
+    """AC8: English prose block -> Japanese check fail -> gh pr create NOT called."""
+    rc, lines, create_called = _run_main_with_japanese_result(
+        monkeypatch,
+        "valid_not_schema_change.md",
+        {
+            "status": "fail",
+            "failed_blocks": 2,
+            "aggregate_ratio": 0.02,
+            "threshold": 0.1,
+            "body_sha256": "sha256:abc123",
+            "stderr": "FAIL: 日本語比率不足 (aggregate=0.020, threshold=0.1, failed_blocks=2)",
+        },
+    )
+    assert rc == 2
+    assert not create_called, "gh pr create must NOT be called when Japanese check fails"
+    assert any(
+        line == f"ERROR={open_pr.E_PR_BODY_JAPANESE_VALIDATION_FAILED}" for line in lines
+    ), f"Expected ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED; got: {lines}"
+
+
+def test_ac8_japanese_fail_emits_preflight_result_v1(monkeypatch: pytest.MonkeyPatch):
+    """AC8: Japanese check fail emits PR_BODY_PREFLIGHT_RESULT_V1 with required fields."""
+    import json as _json
+    rc, lines, _ = _run_main_with_japanese_result(
+        monkeypatch,
+        "valid_not_schema_change.md",
+        {
+            "status": "fail",
+            "failed_blocks": 1,
+            "aggregate_ratio": 0.05,
+            "threshold": 0.1,
+            "body_sha256": "sha256:def456",
+            "stderr": "FAIL: 日本語比率不足",
+        },
+    )
+    assert rc == 2
+    preflight_lines = [l for l in lines if l.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
+    assert len(preflight_lines) == 1, f"Expected exactly one PR_BODY_PREFLIGHT_RESULT_V1 line; got: {lines}"
+    json_str = preflight_lines[0][len("PR_BODY_PREFLIGHT_RESULT_V1="):]
+    payload = _json.loads(json_str)
+    assert payload.get("schema") == "PR_BODY_PREFLIGHT_RESULT_V1"
+    assert payload.get("status") == "fail"
+    assert "body_sha256" in payload
+    assert "failed_blocks" in payload
+    assert "aggregate_ratio" in payload
+    assert "threshold" in payload
+
+
+def test_ac8_japanese_pass_allows_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
+    """AC8: Japanese check pass -> gh pr create is NOT blocked (normal flow continues)."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    create_called = {"value": False}
+    output_lines = []
+
+    def capture_print(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        line = sep.join(str(a) for a in args)
+        output_lines.append(line)
+
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-842-test")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        monkeypatch.setattr(
+            open_pr,
+            "_run_pr_body_validator",
+            lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
+        )
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text, threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.45,
+                "threshold": 0.1,
+                "body_sha256": "sha256:abc",
+                "stderr": "",
+            },
+        )
+        monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
+
+        def fake_create_pr(repo, title, body_file, branch, draft):
+            create_called["value"] = True
+            return "https://github.com/squne121/loop-protocol/pull/999"
+
+        monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
+        monkeypatch.setattr("builtins.print", capture_print)
+
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "842",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+            ]
+        )
+        assert rc == 0
+        assert create_called["value"] is True, "gh pr create SHOULD be called when Japanese check passes"
+        assert not any(
+            line.startswith("ERROR=") for line in output_lines
+        ), f"No ERROR expected; got: {output_lines}"
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_ac8_japanese_internal_error_blocks_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
+    """AC8: Japanese validator internal error -> fail-closed, gh pr create NOT called."""
+    rc, lines, create_called = _run_main_with_japanese_result(
+        monkeypatch,
+        "valid_not_schema_change.md",
+        {
+            "status": "internal",
+            "failed_blocks": 0,
+            "aggregate_ratio": 0.0,
+            "threshold": 0.1,
+            "body_sha256": "sha256:abc",
+            "stderr": "Timeout expired",
+        },
+    )
+    assert rc == 2
+    assert not create_called, "gh pr create must NOT be called on internal error"
+    assert any(
+        line == f"ERROR={open_pr.E_PR_BODY_JAPANESE_VALIDATION_FAILED}" for line in lines
+    ), f"Expected ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED; got: {lines}"

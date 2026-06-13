@@ -132,6 +132,7 @@ class TestUpdatePrValidatorPass:
                     "body_sha256": "sha256:abc123",
                 },
             )
+            monkeypatch.setattr(update_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
 
             def fake_update_pr(repo, pr_number, body_file):
                 update_called["value"] = True
@@ -298,6 +299,7 @@ class TestUpdatePrFixture:
                 }
 
             monkeypatch.setattr(update_pr, "_run_pr_body_validator", fake_validator)
+            monkeypatch.setattr(update_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
             monkeypatch.setattr(update_pr, "update_pr", lambda *args, **kwargs: True)
 
             rc = update_pr.main(
@@ -507,3 +509,185 @@ class TestTOCTOUSafety:
                         )
         finally:
             Path(original_body).unlink(missing_ok=True)
+
+
+# --- AC8: Japanese content validation blocks gh pr edit (update_pr.py) ---
+
+
+class TestJapaneseContentValidationHook:
+    """AC8: Japanese content validation blocks gh pr edit when prose fails threshold."""
+
+    def _run_main_with_japanese_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        body_text: str,
+        japanese_result: dict,
+    ) -> tuple[int, list[str]]:
+        """Helper: run update_pr.main with fixed japanese validator result, capture stdout."""
+        body_path = write_temp_body(body_text)
+        output_lines: list[str] = []
+
+        def capture_print(*args, **kwargs):
+            sep = kwargs.get("sep", " ")
+            line = sep.join(str(a) for a in args)
+            output_lines.append(line)
+
+        try:
+            monkeypatch.setattr(update_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+            # PR body validator always passes
+            monkeypatch.setattr(
+                update_pr,
+                "_run_pr_body_validator",
+                lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
+            )
+            # Japanese validator returns provided result
+            monkeypatch.setattr(
+                update_pr,
+                "_run_japanese_content_validator",
+                lambda body_text, threshold=0.1: japanese_result,
+            )
+
+            update_called = {"value": False}
+
+            def fake_update_pr(repo, pr_number, body_text):
+                update_called["value"] = True
+                raise AssertionError("update_pr must not be called when Japanese check fails")
+
+            monkeypatch.setattr(update_pr, "update_pr", fake_update_pr)
+            monkeypatch.setattr("builtins.print", capture_print)
+
+            rc = update_pr.main(
+                [
+                    "--pr-number", "842",
+                    "--body-file", body_path,
+                ]
+            )
+            return rc, output_lines, update_called["value"]
+        finally:
+            Path(body_path).unlink(missing_ok=True)
+
+    def test_japanese_fail_blocks_gh_pr_edit(self, monkeypatch: pytest.MonkeyPatch):
+        """AC8: English prose block -> Japanese check fail -> gh pr edit NOT called."""
+        body_text = load_fixture("valid_not_schema_change.md")
+        rc, lines, update_called = self._run_main_with_japanese_result(
+            monkeypatch,
+            body_text,
+            {
+                "status": "fail",
+                "failed_blocks": 2,
+                "aggregate_ratio": 0.02,
+                "threshold": 0.1,
+                "body_sha256": "sha256:abc123",
+                "stderr": "FAIL: 日本語比率不足 (aggregate=0.020, threshold=0.1, failed_blocks=2)",
+            },
+        )
+        assert rc == 1
+        assert not update_called, "gh pr edit must NOT be called when Japanese check fails"
+        assert any(
+            line == f"ERROR={update_pr.E_PR_BODY_JAPANESE_VALIDATION_FAILED}" for line in lines
+        ), f"Expected ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED; got: {lines}"
+
+    def test_japanese_fail_emits_preflight_result_v1(self, monkeypatch: pytest.MonkeyPatch):
+        """AC8: Japanese check fail emits PR_BODY_PREFLIGHT_RESULT_V1 with required fields."""
+        import json as _json
+        body_text = load_fixture("valid_not_schema_change.md")
+        rc, lines, _ = self._run_main_with_japanese_result(
+            monkeypatch,
+            body_text,
+            {
+                "status": "fail",
+                "failed_blocks": 1,
+                "aggregate_ratio": 0.05,
+                "threshold": 0.1,
+                "body_sha256": "sha256:def456",
+                "stderr": "FAIL: 日本語比率不足",
+            },
+        )
+        assert rc == 1
+        preflight_lines = [l for l in lines if l.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
+        assert len(preflight_lines) == 1, (
+            f"Expected exactly one PR_BODY_PREFLIGHT_RESULT_V1 line; got: {lines}"
+        )
+        json_str = preflight_lines[0][len("PR_BODY_PREFLIGHT_RESULT_V1="):]
+        payload = _json.loads(json_str)
+        assert payload.get("schema") == "PR_BODY_PREFLIGHT_RESULT_V1"
+        assert payload.get("status") == "fail"
+        assert "body_sha256" in payload
+        assert "failed_blocks" in payload
+        assert "aggregate_ratio" in payload
+        assert "threshold" in payload
+
+    def test_japanese_pass_allows_gh_pr_edit(self, monkeypatch: pytest.MonkeyPatch):
+        """AC8: Japanese check pass -> gh pr edit is NOT blocked."""
+        body_text = load_fixture("valid_not_schema_change.md")
+        body_sha256 = f"sha256:{__import__('hashlib').sha256(body_text.encode()).hexdigest()}"
+        body_path = write_temp_body(body_text)
+        update_called = {"value": False}
+        output_lines = []
+
+        def capture_print(*args, **kwargs):
+            sep = kwargs.get("sep", " ")
+            line = sep.join(str(a) for a in args)
+            output_lines.append(line)
+
+        try:
+            monkeypatch.setattr(update_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+            monkeypatch.setattr(
+                update_pr,
+                "_run_pr_body_validator",
+                lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
+            )
+            monkeypatch.setattr(
+                update_pr,
+                "_run_japanese_content_validator",
+                lambda body_text, threshold=0.1: {
+                    "status": "pass",
+                    "failed_blocks": 0,
+                    "aggregate_ratio": 0.45,
+                    "threshold": 0.1,
+                    "body_sha256": body_sha256,
+                    "stderr": "",
+                },
+            )
+
+            def fake_update_pr(repo, pr_number, body_text):
+                update_called["value"] = True
+                return True
+
+            monkeypatch.setattr(update_pr, "update_pr", fake_update_pr)
+            monkeypatch.setattr("builtins.print", capture_print)
+
+            rc = update_pr.main(
+                [
+                    "--pr-number", "842",
+                    "--body-file", body_path,
+                ]
+            )
+            assert rc == 0
+            assert update_called["value"] is True, "gh pr edit SHOULD be called when Japanese check passes"
+            assert not any(
+                line.startswith("ERROR=") for line in output_lines
+            ), f"No ERROR expected on pass; got: {output_lines}"
+        finally:
+            Path(body_path).unlink(missing_ok=True)
+
+    def test_japanese_internal_error_blocks_gh_pr_edit(self, monkeypatch: pytest.MonkeyPatch):
+        """AC8: Japanese validator internal error -> fail-closed, gh pr edit NOT called."""
+        body_text = load_fixture("valid_not_schema_change.md")
+        rc, lines, update_called = self._run_main_with_japanese_result(
+            monkeypatch,
+            body_text,
+            {
+                "status": "internal",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.0,
+                "threshold": 0.1,
+                "body_sha256": "sha256:abc",
+                "stderr": "Timeout expired",
+            },
+        )
+        assert rc == 1
+        assert not update_called, "gh pr edit must NOT be called on internal error"
+        assert any(
+            line == f"ERROR={update_pr.E_PR_BODY_JAPANESE_VALIDATION_FAILED}" for line in lines
+        ), f"Expected ERROR=E_PR_BODY_JAPANESE_VALIDATION_FAILED; got: {lines}"
