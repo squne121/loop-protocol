@@ -84,12 +84,11 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 
 - `termination_reason: human_escalation` かつ `termination_cause` omitted / `null` の場合、renderer / publisher は `Cause: none` を出さず `human_judgment_required` を fallback cause として扱う
 - caller が `max_iterations_exceeded` などの valid `termination_cause` を明示した場合は上書きしない
-- legacy alias `blocker_summary` is normalized to canonical `blockers_summary`
-- legacy alias blocker_summary is normalized to canonical blockers_summary
+- canonical key は `blockers_summary`。`blocker_summary` は旧 alias として validation 前に `blockers_summary` へ正規化する
 - `blocker_summary` と `blockers_summary` が両方あり値が異なる場合は fail-closed とする
 - `blocker_summary` が `list[str]` でない場合も fail-closed とする
 
-human_escalation example includes termination_cause and blockers_summary:
+human_escalation の入力例（termination_cause と blockers_summary を明示）:
 
 ```json
 {
@@ -98,8 +97,8 @@ human_escalation example includes termination_cause and blockers_summary:
   "issue_number": 829,
   "iteration": 3,
   "blockers_summary": [
-    "owner decision is required",
-    "conflicting scope signals remain unresolved"
+    "オーナー判断が必要",
+    "スコープの矛盾が未解決"
   ]
 }
 ```
