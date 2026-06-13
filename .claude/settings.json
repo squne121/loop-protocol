@@ -61,31 +61,8 @@
       "Bash(env)",
       "Bash(env *)",
       "Bash(set)",
-      "Bash(set *)",
-      "mcp__context-mode-experiment__ctx_execute",
-      "mcp__context-mode-experiment__ctx_fetch_and_index"
+      "Bash(set *)"
     ]
-  },
-  "mcpServers": {
-    "context-mode-experiment": {
-      "_comment": "context-mode MCP server - 実験用 profile 限定。ctx_execute / ctx_fetch_and_index は deny policy で禁止。",
-      "_scope": "experiment",
-      "_profile": "experiment",
-      "_install_note": "npm install -g context-mode でインストール後に有効化する。現時点では未インストール（#824 実装段階）。",
-      "_permission_policy": {
-        "ctx_execute": "deny",
-        "ctx_fetch_and_index": "deny",
-        "ctx_batch_execute": "allow-with-review",
-        "ctx_execute_file": "allow-with-review",
-        "ctx_index": "allow",
-        "ctx_search": "allow",
-        "ctx_stats": "allow",
-        "ctx_doctor": "allow",
-        "ctx_upgrade": "allow-with-review",
-        "ctx_purge": "allow-with-review",
-        "ctx_insight": "allow"
-      }
-    }
   },
   "hooks": {
     "PreToolUse": [
