@@ -3,10 +3,8 @@
 ## Codex execution policy
 
 - After this file, read `CLAUDE.md` and follow its read order. This file only adds Codex-specific execution policy.
-- Run project work through `rtk`.
+- Run project work through `rtk` (preferred harness).
 - If the `rtk` interface is unclear, inspect it first with `rtk --help`.
-- Do not bypass `rtk` with direct `pnpm`, mutating `git`, or `gh` commands unless the human explicitly instructs otherwise.
-- Read-only git inspection is allowed: `git status`, `git diff`, `git branch --show-current`, `git log`.
 - Do not modify `assets/` or `LICENSES/` unless the human explicitly authorizes it.
 - Treat this as a stricter Codex profile than `.claude/settings.json`, not a byte-for-byte translation.
 - Validation tasks should map to the repository scripts:
@@ -14,7 +12,22 @@
   - `lint`: `pnpm lint`
   - `test`: `pnpm test`
   - `build`: `pnpm build`
-  These must be invoked through `rtk` when `rtk` provides wrappers (rules forbid direct `pnpm` execution).
+
+### Direct execution (bounded fallback)
+
+`rtk` is the preferred harness, but the following commands are also allowed as direct execution when `rtk` wrappers are unavailable or inconvenient:
+
+**pnpm (read/validation only):**
+- `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build` — direct execution allowed
+- Mutation operations (`pnpm add`, `pnpm install`, `pnpm update`, `pnpm remove`) remain forbidden without `rtk` or explicit human instruction
+
+**git (read-only inspection):**
+- Allowed direct: `git status`, `git diff`, `git log`, `git branch`, `git show`, `git rev-parse`, `git ls-files`
+- Mutation operations (`git push`, `git add`, `git commit`, `git checkout -b`, `git reset`, `git merge`) remain forbidden without `rtk` or explicit human instruction
+
+**gh (read-only):**
+- Allowed direct: `gh issue view`, `gh issue list`, `gh pr view`, `gh pr list`, `gh pr checks`, `gh pr diff`
+- Mutation operations (`gh issue create`, `gh issue edit`, `gh pr merge`, `gh pr create`, `gh pr edit`) remain forbidden without `rtk` or explicit human instruction
 
 ## rtk trust boundary
 

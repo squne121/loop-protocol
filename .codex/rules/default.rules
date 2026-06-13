@@ -168,6 +168,65 @@ prefix_rule(
     ],
 )
 
+# --- DIRECT_ALLOW: specific pnpm / git / gh operations (Issue #874) ---
+# DIRECT_ALLOW が成立するのは、競合する broad forbidden を mutation-only に狭めているため。
+# Codex rules は prefix-specificity 優先ではなく、複数 match 時は most restrictive decision が勝つ。
+# これらのルールは blanket-forbidden rule と競合しているが、allow 側に fallback できるのは
+# forbidden 対象が mutation コマンド (e.g. pnpm add/install) に限定されているからである。
+# 最終 decision は codex execpolicy check で検証すること。
+
+# DIRECT_ALLOW_PNPM: validation commands allowed directly (no rtk wrapper needed in hook context)
+prefix_rule(
+    pattern = ["pnpm", ["typecheck", "lint", "test", "build"]],
+    decision = "allow",
+    justification = "Validation commands pnpm typecheck/lint/test/build are always safe and required for CI.",
+    match = [
+        "pnpm typecheck",
+        "pnpm lint",
+        "pnpm test",
+        "pnpm build",
+    ],
+)
+
+# DIRECT_ALLOW_GIT: read-only git inspection allowed directly
+prefix_rule(
+    pattern = ["git", ["status", "diff", "log", "branch", "show", "rev-parse", "ls-files"]],
+    decision = "allow",
+    justification = "Read-only git inspection is safe; more specific than the mutation-forbidden rule below.",
+    match = [
+        "git status",
+        "git diff",
+        "git log --oneline -5",
+        "git branch --show-current",
+        "git show HEAD",
+        "git rev-parse HEAD",
+        "git ls-files",
+    ],
+)
+
+# DIRECT_ALLOW_GH: read-only GitHub operations allowed directly
+prefix_rule(
+    pattern = ["gh", "issue", ["view", "list"]],
+    decision = "allow",
+    justification = "gh issue view/list are read-only and safe.",
+    match = [
+        "gh issue view 1",
+        "gh issue list",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "pr", ["view", "list", "checks", "diff"]],
+    decision = "allow",
+    justification = "gh pr view/list/checks/diff are read-only and safe.",
+    match = [
+        "gh pr view 1",
+        "gh pr list",
+        "gh pr checks 1",
+        "gh pr diff 1",
+    ],
+)
+
 # --- direct git read-only (Claude Code environment) ---
 
 prefix_rule(
@@ -224,25 +283,56 @@ prefix_rule(
 )
 
 prefix_rule(
-    pattern = ["pnpm"],
+    pattern = ["pnpm", ["add", "remove", "install", "uninstall", "update", "upgrade", "exec", "run", "dlx", "publish", "pack"]],
     decision = "forbidden",
-    justification = "Use `rtk pnpm ...` so validation runs through the project harness.",
+    justification = "Dependency mutation and exec operations require rtk pnpm wrapper. Use rtk pnpm for these.",
     match = [
-        "pnpm test",
-        "pnpm lint",
-        "pnpm typecheck",
-        "pnpm build",
+        "pnpm add lodash",
+        "pnpm install",
+        "pnpm exec node ...",
+        "pnpm run custom-script",
     ],
 )
 
 prefix_rule(
-    pattern = ["gh"],
+    pattern = ["gh", "pr", ["merge", "create", "close", "edit", "ready", "reopen", "review"]],
     decision = "forbidden",
-    justification = "Use `rtk gh ...` so GitHub operations follow project policy.",
+    justification = "Mutating GitHub PR operations require rtk gh wrapper.",
     match = [
-        "gh issue view 1",
-        "gh issue create",
+        "gh pr merge 1",
         "gh pr create",
-        "gh api repos/squne121/loop-protocol",
+        "gh pr close 1",
+        "gh pr edit 1",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "issue", ["create", "edit", "close", "reopen", "delete", "comment"]],
+    decision = "forbidden",
+    justification = "Mutating GitHub issue operations require rtk gh wrapper.",
+    match = [
+        "gh issue create",
+        "gh issue edit 1",
+        "gh issue close 1",
+        "gh issue comment 1",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "release"],
+    decision = "forbidden",
+    justification = "GitHub release operations require rtk gh wrapper.",
+    match = [
+        "gh release create v1.0.0",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "secret"],
+    decision = "forbidden",
+    justification = "GitHub secret operations are forbidden.",
+    match = [
+        "gh secret list",
+        "gh secret set FOO bar",
     ],
 )
