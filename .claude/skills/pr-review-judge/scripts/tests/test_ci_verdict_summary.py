@@ -29,9 +29,11 @@ from ci_verdict_summary import (
     EXIT_PENDING,
     EXIT_STALE,
     classify_check,
+    classify_gh_error,
     compute_overall_status,
     determine_check_verdict,
     extract_run_id_from_link,
+    find_failed_job_id,
     main,
     next_action_for,
     sanitize_check_name,
@@ -208,7 +210,16 @@ class TestBucket:
     def test_all_checks_pass_status_is_all_pass(self):
         """GIVEN all checks have pass bucket WHEN run THEN status all_pass"""
         checks_data = load_fixture("checks_all_pass.json")
-        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        # run_data には HEAD_SHA を一致させる
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
         with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
             with patch("sys.argv", ["ci_verdict_summary.py",
                                     "--pr", "1",
@@ -292,7 +303,15 @@ class TestStdout:
     def test_stdout_schema_fields_present_on_all_pass(self):
         """GIVEN all pass checks WHEN run THEN stdout JSON has all required schema fields"""
         checks_data = load_fixture("checks_all_pass.json")
-        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
         with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
             with patch("sys.argv", ["ci_verdict_summary.py",
                                     "--pr", "10",
@@ -309,7 +328,15 @@ class TestStdout:
 
     def test_stdout_schema_field_schema_is_CI_VERDICT_SUMMARY_V1(self):
         checks_data = load_fixture("checks_all_pass.json")
-        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
         with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
             with patch("sys.argv", ["ci_verdict_summary.py",
                                     "--pr", "10",
@@ -332,7 +359,15 @@ class TestStdout:
 
     def test_failed_checks_populated_on_failure(self):
         checks_data = load_fixture("checks_failed.json")
-        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "failure",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1002, "name": "test", "conclusion": "failure"}],
+            "databaseId": 1002,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
         with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
             with patch("sys.argv", ["ci_verdict_summary.py",
                                     "--pr", "11",
@@ -394,27 +429,19 @@ class TestLogExcerpt:
             "conclusion": "failure",
             "status": "completed",
             "workflowName": "CI",
-            "jobs": [{"databaseId": 12345}],
+            "jobs": [{"databaseId": 12345, "name": "test", "conclusion": "failure"}],
             "databaseId": 9999,
         }
         mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
-                with patch("sys.argv", ["ci_verdict_summary.py",
-                                        "--pr", "5",
-                                        "--repo", "owner/repo",
-                                        "--expected-head-sha", HEAD_SHA,
-                                        "--include-log-excerpt"]):
-                    with patch("ci_verdict_summary.Path") as mock_path_cls:
-                        # Redirect artifact writes to tmpdir
-                        real_path = Path
-                        def path_side_effect(p=""):
-                            if p == "artifacts":
-                                return real_path(tmpdir) / "artifacts"
-                            return real_path(p)
-                        mock_path_cls.side_effect = path_side_effect
-
+                with patch("ci_verdict_summary.get_repo_root", return_value=Path(tmpdir)):
+                    with patch("sys.argv", ["ci_verdict_summary.py",
+                                            "--pr", "5",
+                                            "--repo", "owner/repo",
+                                            "--expected-head-sha", HEAD_SHA,
+                                            "--include-log-excerpt"]):
                         import io
                         from contextlib import redirect_stdout
                         buf = io.StringIO()
@@ -474,6 +501,58 @@ class TestLogExcerpt:
         assert f"head-{HEAD_SHA}" in artifact_entry["path"]
         assert artifact_entry["path"].endswith(".log")
 
+    def test_log_fetch_error_sets_gh_error_verdict(self):
+        """B4: ログ取得失敗時は gh_error verdict が追加され next_action が manual_review_gh_error になる"""
+        checks_data = [
+            {
+                "name": "test",
+                "bucket": "fail",
+                "state": "FAILURE",
+                "workflow": "CI",
+                "link": "https://github.com/owner/repo/actions/runs/9999",
+                "event": "push",
+                "startedAt": None,
+                "completedAt": None,
+            }
+        ]
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "failure",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 12345, "name": "test", "conclusion": "failure"}],
+            "databaseId": 9999,
+        }
+
+        def mock_fn_log_fail(args: list[str]):
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, json.dumps({"headRefOid": HEAD_SHA})
+            if "pr" in args and "checks" in args:
+                return True, checks_data, json.dumps(checks_data)
+            if "run" in args and "view" in args and "--log" not in args:
+                return True, run_data, json.dumps(run_data)
+            if "run" in args and "view" in args and "--log" in args:
+                return False, None, "403 permission denied"
+            return False, None, "unexpected"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn_log_fail):
+            with patch("sys.argv", ["ci_verdict_summary.py",
+                                    "--pr", "5",
+                                    "--repo", "owner/repo",
+                                    "--expected-head-sha", HEAD_SHA,
+                                    "--include-log-excerpt"]):
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        assert out["next_action"] == "manual_review_gh_error"
+        log_fetch_errors = [e for e in out["errors"] if e.get("kind") == "log_fetch_error"]
+        assert len(log_fetch_errors) > 0
+
 
 # ---------------------------------------------------------------------------
 # AC: sanitize_check_name
@@ -522,18 +601,26 @@ class TestSanitize:
 
 
 # ---------------------------------------------------------------------------
-# AC: check_name filter
+# AC: check_name filter (B1: 0件→gh_error, 複数件→gh_error)
 # ---------------------------------------------------------------------------
 
 class TestCheckName:
-    """AC11: --check-name exact match フィルタのテスト"""
+    """AC11: --check-name exact match フィルタのテスト（B1修正後）"""
 
     def test_check_name_filter_includes_only_matching(self):
         """GIVEN --check-name build WHEN checks include build and test
         THEN only build appears in output checks
         """
         checks_data = load_fixture("checks_all_pass.json")
-        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
         with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
             with patch("sys.argv", ["ci_verdict_summary.py",
                                     "--pr", "20",
@@ -550,9 +637,9 @@ class TestCheckName:
         assert "build" in check_names
         assert "test" not in check_names
 
-    def test_check_name_filter_no_match_returns_empty(self):
-        """GIVEN --check-name nonexistent WHEN checks don't match
-        THEN checks list is empty and status all_pass (no failing evidence)
+    def test_check_name_filter_no_match_returns_gh_error(self):
+        """B1: GIVEN --check-name nonexistent WHEN checks don't match
+        THEN status is gh_error with kind=check_not_found (fail-closed)
         """
         checks_data = load_fixture("checks_all_pass.json")
         mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
@@ -567,7 +654,35 @@ class TestCheckName:
                 buf = io.StringIO()
                 with redirect_stdout(buf):
                     exit_code = main()
-        assert exit_code == EXIT_ALL_PASS
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        # check_not_found error should be present
+        kinds = [e.get("kind") for e in out["errors"]]
+        assert "check_not_found" in kinds
+
+    def test_check_name_filter_multiple_match_returns_gh_error(self):
+        """B1: GIVEN --check-name that matches multiple checks
+        THEN status is gh_error with kind=ambiguous_check_name (fail-closed)
+        """
+        checks_data = load_fixture("checks_ambiguous.json")
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data)
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            with patch("sys.argv", ["ci_verdict_summary.py",
+                                    "--pr", "22",
+                                    "--repo", "owner/repo",
+                                    "--expected-head-sha", HEAD_SHA,
+                                    "--check-name", "build"]):
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        kinds = [e.get("kind") for e in out["errors"]]
+        assert "ambiguous_check_name" in kinds
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +781,222 @@ class TestGhError:
         for err in out["errors"]:
             assert "kind" in err
             assert "detail" in err
+
+
+# ---------------------------------------------------------------------------
+# B2: pass check の head_sha 補完テスト
+# ---------------------------------------------------------------------------
+
+class TestPassCheckHeadShaVerification:
+    """B2: all_pass に寄与する check は run details で head SHA 確認"""
+
+    def test_pass_check_with_matching_run_head_sha_is_all_pass(self):
+        """GIVEN pass check and run head_sha matches expected
+        WHEN run
+        THEN status is all_pass
+        """
+        checks_data = [
+            {
+                "name": "build",
+                "bucket": "pass",
+                "state": "SUCCESS",
+                "workflow": "CI",
+                "link": "https://github.com/owner/repo/actions/runs/1001",
+                "event": "push",
+                "startedAt": None,
+                "completedAt": None,
+            }
+        ]
+        run_data = {
+            "headSha": HEAD_SHA,
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            with patch("sys.argv", ["ci_verdict_summary.py",
+                                    "--pr", "50",
+                                    "--repo", "owner/repo",
+                                    "--expected-head-sha", HEAD_SHA]):
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        assert exit_code == EXIT_ALL_PASS
+        out = json.loads(buf.getvalue())
+        assert out["status"] == "all_pass"
+
+    def test_pass_check_with_stale_run_head_sha_is_stale(self):
+        """GIVEN pass check but run head_sha is different from expected
+        WHEN run
+        THEN status is stale_head_sha (not all_pass)
+        """
+        checks_data = [
+            {
+                "name": "build",
+                "bucket": "pass",
+                "state": "SUCCESS",
+                "workflow": "CI",
+                "link": "https://github.com/owner/repo/actions/runs/1001",
+                "event": "push",
+                "startedAt": None,
+                "completedAt": None,
+            }
+        ]
+        run_data = {
+            "headSha": STALE_SHA,  # Different from EXPECTED_SHA
+            "conclusion": "success",
+            "status": "completed",
+            "workflowName": "CI",
+            "jobs": [{"databaseId": 1001, "name": "build", "conclusion": "success"}],
+            "databaseId": 1001,
+        }
+        mock_fn = make_mock_run_gh(head_sha=HEAD_SHA, checks=checks_data, run_data=run_data)
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            with patch("sys.argv", ["ci_verdict_summary.py",
+                                    "--pr", "51",
+                                    "--repo", "owner/repo",
+                                    "--expected-head-sha", HEAD_SHA]):
+                import io
+                from contextlib import redirect_stdout
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    exit_code = main()
+        out = json.loads(buf.getvalue())
+        # head_sha in run is STALE_SHA != HEAD_SHA → stale_head_sha
+        assert out["status"] == "stale_head_sha"
+        assert exit_code == EXIT_STALE
+
+
+# ---------------------------------------------------------------------------
+# B3: find_failed_job_id テスト
+# ---------------------------------------------------------------------------
+
+class TestFindFailedJobId:
+    """B3: failed job を適切に特定する"""
+
+    def test_find_failed_job_id_prefers_check_name_match(self):
+        jobs = [
+            {"databaseId": 1, "name": "lint", "conclusion": "success"},
+            {"databaseId": 2, "name": "test", "conclusion": "failure"},
+            {"databaseId": 3, "name": "build", "conclusion": "success"},
+        ]
+        result = find_failed_job_id(jobs, "test")
+        assert result == 2
+
+    def test_find_failed_job_id_falls_back_to_failed_conclusion(self):
+        jobs = [
+            {"databaseId": 1, "name": "lint", "conclusion": "success"},
+            {"databaseId": 2, "name": "other-job", "conclusion": "failure"},
+        ]
+        result = find_failed_job_id(jobs, "nonexistent")
+        assert result == 2
+
+    def test_find_failed_job_id_falls_back_to_first_if_all_success(self):
+        jobs = [
+            {"databaseId": 1, "name": "lint", "conclusion": "success"},
+            {"databaseId": 2, "name": "build", "conclusion": "success"},
+        ]
+        result = find_failed_job_id(jobs, None)
+        assert result == 1
+
+    def test_find_failed_job_id_returns_none_for_empty_jobs(self):
+        result = find_failed_job_id([], "test")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# B5: artifact path が repo-root 相対である確認
+# ---------------------------------------------------------------------------
+
+class TestArtifactPath:
+    """B5: artifact path は repo-root 相対の文字列で返す"""
+
+    def test_artifact_path_is_repo_root_relative(self):
+        """save_log_artifact の path は artifacts/ で始まる相対パスを返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            artifacts_base = repo_root / "artifacts"
+            with patch("ci_verdict_summary.get_repo_root", return_value=repo_root):
+                artifact_entry = save_log_artifact(
+                    log_text="log content",
+                    pr_number=42,
+                    head_sha=HEAD_SHA,
+                    check_name="build",
+                    job_id=1,
+                    artifacts_base=artifacts_base,
+                )
+        # path should be relative to repo_root (artifacts/ci-verdict/...)
+        assert artifact_entry["path"].startswith("artifacts/")
+        assert not artifact_entry["path"].startswith("/")
+
+
+# ---------------------------------------------------------------------------
+# B6: classify_gh_error 共通分類テスト
+# ---------------------------------------------------------------------------
+
+class TestClassifyGhError:
+    """B6: 共通 gh エラー分類関数のテスト"""
+
+    @pytest.mark.parametrize("stderr,expected_kind", [
+        ("unauthorized: authentication credentials required", "auth_failed"),
+        ("authentication failed", "auth_failed"),
+        ("credentials not found", "auth_failed"),
+        ("403 Forbidden: permission denied", "permission_denied"),
+        ("error: permission denied", "permission_denied"),
+        ("rate limit exceeded", "rate_limited"),
+        ("429 too many requests", "rate_limited"),
+        ("404 not found", "not_found"),
+        ("resource not found", "not_found"),
+        ("json decode error", "json_parse_error"),
+        ("parse error in response", "json_parse_error"),
+        ("some unknown error xyz", "gh_other_error"),
+    ])
+    def test_classify_gh_error_classification(self, stderr: str, expected_kind: str):
+        assert classify_gh_error(stderr) == expected_kind
+
+    def test_fetch_head_sha_uses_classify_gh_error(self):
+        """B6: fetch_head_sha が共通分類を使うことを確認"""
+        def mock_fn(args):
+            if "pr" in args and "view" in args:
+                return False, None, "rate limit exceeded"
+            return False, None, "unexpected"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            from ci_verdict_summary import fetch_head_sha
+            _, err = fetch_head_sha(42, "owner/repo")
+        assert err is not None
+        assert err["kind"] == "rate_limited"
+
+    def test_fetch_checks_uses_classify_gh_error(self):
+        """B6: fetch_checks が共通分類を使うことを確認"""
+        def mock_fn(args):
+            if "pr" in args and "checks" in args:
+                return False, None, "403 permission denied"
+            return False, None, "unexpected"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            from ci_verdict_summary import fetch_checks
+            _, err = fetch_checks(42, "owner/repo")
+        assert err is not None
+        assert err["kind"] == "permission_denied"
+
+    def test_fetch_run_details_uses_classify_gh_error(self):
+        """B6: fetch_run_details が共通分類を使うことを確認"""
+        def mock_fn(args):
+            if "run" in args and "view" in args:
+                return False, None, "404 not found"
+            return False, None, "unexpected"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            from ci_verdict_summary import fetch_run_details
+            _, err = fetch_run_details(9999, "owner/repo")
+        assert err is not None
+        assert err["kind"] == "not_found"
 
 
 # ---------------------------------------------------------------------------

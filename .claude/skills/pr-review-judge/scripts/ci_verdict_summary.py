@@ -73,6 +73,25 @@ def sanitize_check_name(name: str) -> str:
     return safe
 
 
+def classify_gh_error(stderr: str) -> str:
+    """
+    B6: 共通 gh エラー分類関数。
+    fetch_head_sha, fetch_checks, fetch_run_details, fetch_job_log で統一使用する。
+    """
+    s = stderr.lower()
+    if "unauthorized" in s or "authentication" in s or "credentials" in s:
+        return "auth_failed"
+    if "403" in s or "permission" in s or "forbidden" in s:
+        return "permission_denied"
+    if "rate limit" in s or "429" in s:
+        return "rate_limited"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if "json" in s or "parse" in s or "decode" in s:
+        return "json_parse_error"
+    return "gh_other_error"
+
+
 def run_gh(args: list[str]) -> tuple[bool, Any, str]:
     """gh コマンドを実行し (success, parsed_json_or_None, raw_text) を返す。"""
     try:
@@ -98,6 +117,20 @@ def run_gh(args: list[str]) -> tuple[bool, Any, str]:
         return False, None, str(e)[:512]
 
 
+def get_repo_root() -> Path:
+    """B5: git rev-parse --show-toplevel で repo root を取得する。"""
+    try:
+        result = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return Path(result.strip())
+    except Exception:
+        # fallback to cwd if git is not available (e.g., in tests)
+        return Path.cwd()
+
+
 def fetch_head_sha(pr_number: int, repo: str) -> tuple[Optional[str], Optional[dict]]:
     """PR の headRefOid を取得する。失敗時は (None, error_entry)。"""
     ok, data, raw = run_gh([
@@ -106,7 +139,9 @@ def fetch_head_sha(pr_number: int, repo: str) -> tuple[Optional[str], Optional[d
         "--json", "headRefOid",
     ])
     if not ok or data is None:
-        return None, {"kind": "gh_other_error", "detail": f"gh pr view headRefOid failed: {raw}"}
+        # B6: 共通エラー分類を使用
+        kind = classify_gh_error(raw)
+        return None, {"kind": kind, "detail": f"gh pr view headRefOid failed: {raw}"}
     head = data.get("headRefOid")
     if not head:
         return None, {"kind": "gh_other_error", "detail": "headRefOid missing in gh pr view output"}
@@ -121,17 +156,9 @@ def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[di
         "--json", "bucket,name,state,workflow,link,event,startedAt,completedAt",
     ])
     if not ok:
-        # 認証・rate-limit 系のエラー分類
-        low = raw.lower()
-        if "rate limit" in low or "rate-limit" in low or "secondary rate" in low:
-            return None, {"kind": "rate_limited", "detail": raw[:512]}
-        if "auth" in low or "credential" in low or "token" in low or "401" in raw:
-            return None, {"kind": "auth_failed", "detail": raw[:512]}
-        if "403" in raw or "permission" in low:
-            return None, {"kind": "permission_denied", "detail": raw[:512]}
-        if "404" in raw or "not found" in low:
-            return None, {"kind": "not_found", "detail": raw[:512]}
-        return None, {"kind": "gh_other_error", "detail": raw[:512]}
+        # B6: 共通エラー分類を使用
+        kind = classify_gh_error(raw)
+        return None, {"kind": kind, "detail": raw[:512]}
     if data is None:
         # gh pr checks は JSON array ではなく table 形式を返す場合がある
         return None, {"kind": "json_parse_error", "detail": f"gh pr checks output: {raw[:256]}"}
@@ -148,7 +175,9 @@ def fetch_run_details(run_id: int, repo: str) -> tuple[Optional[dict], Optional[
         "--json", "headSha,conclusion,status,workflowName,jobs,databaseId",
     ])
     if not ok or data is None:
-        return None, {"kind": "gh_other_error", "detail": f"gh run view {run_id}: {raw}"}
+        # B6: 共通エラー分類を使用
+        kind = classify_gh_error(raw)
+        return None, {"kind": kind, "detail": f"gh run view {run_id}: {raw}"}
     return data, None
 
 
@@ -161,7 +190,9 @@ def fetch_job_log(job_id: int, repo: str) -> tuple[Optional[str], Optional[dict]
         "--log",
     ])
     if not ok:
-        return None, {"kind": "log_fetch_error", "detail": f"gh run view --log job {job_id}: {raw}"}
+        # B6: 共通エラー分類を使用
+        kind = classify_gh_error(raw)
+        return None, {"kind": "log_fetch_error", "detail": f"gh run view --log job {job_id}: {raw}", "gh_kind": kind}
     return raw, None
 
 
@@ -315,14 +346,49 @@ def save_log_artifact(
 
     sha256 = hashlib.sha256(content_bytes).hexdigest()
 
+    # B5: path は repo-root 相対の文字列で返す
+    try:
+        repo_root = get_repo_root()
+        relative_path = artifact_path.relative_to(repo_root)
+        path_str = str(relative_path)
+    except ValueError:
+        # artifact_path が repo_root 配下でない場合は絶対パスを使用
+        path_str = str(artifact_path)
+
     return {
         "check_name": check_name,
         "job_id": job_id,
-        "path": str(artifact_path),
+        "path": path_str,
         "sha256": f"sha256:{sha256}",
         "bytes": len(content_bytes),
         "truncated": truncated,
     }
+
+
+def find_failed_job_id(jobs: list[dict], check_name: Optional[str]) -> Optional[int]:
+    """
+    B3: jobs リストから適切な job_id を取得する。
+    jobs[0] を盲目的に使わず、failed job（conclusion != success）を優先する。
+    check_name との対応が取れる場合はそれを優先する。
+    """
+    if not jobs:
+        return None
+
+    # まず check_name と一致する job を探す
+    if check_name:
+        for job in jobs:
+            job_name = job.get("name") or ""
+            if job_name == check_name or check_name in job_name:
+                return job.get("databaseId")
+
+    # 次に failed job を探す
+    for job in jobs:
+        conclusion = job.get("conclusion") or ""
+        if conclusion and conclusion != "success":
+            return job.get("databaseId")
+
+    # fallback: first job
+    return jobs[0].get("databaseId") if jobs else None
 
 
 def main() -> int:
@@ -382,24 +448,40 @@ def main() -> int:
     if errors:
         verdicts.append("gh_error")
 
+    # B1: --check-name フィルタ: 0件 → gh_error、複数件 → gh_error
+    if check_name_filter and raw_checks is not None:
+        matched = [raw for raw in raw_checks if (raw.get("name") or "unknown") == check_name_filter]
+        if len(matched) == 0:
+            errors.append({"kind": "check_not_found", "detail": f"check-name not found: {check_name_filter}"})
+            verdicts.append("gh_error")
+            raw_checks = []
+        elif len(matched) > 1:
+            errors.append({"kind": "ambiguous_check_name", "detail": f"check-name matched multiple checks: {check_name_filter}"})
+            verdicts.append("gh_error")
+            raw_checks = []
+        else:
+            raw_checks = matched
+
     for raw in (raw_checks or []):
         entry = classify_check(raw, head_sha or expected_head_sha)
 
-        # check-name フィルタ
-        if check_name_filter and entry["name"] != check_name_filter:
-            continue
-
-        # 失敗・pending の場合、または check-name 指定時のみ run details を補完
+        # 失敗・pending の場合、または expected_head_sha 指定時の pass check は run details を補完
         bucket = entry.get("bucket")
+        # B2: pass check で expected_head_sha が指定されている場合も補完して head SHA 確認
         needs_details = (
             bucket in ("fail", "pending", None)
-            or check_name_filter is not None
+            or (bucket == "pass" and expected_head_sha is not None)
         )
         if needs_details and entry["run_id"] is not None:
             run_data, run_err = fetch_run_details(entry["run_id"], repo)
             if run_err:
                 errors.append(run_err)
                 verdicts.append("gh_error")
+                # B2: pass check で補完失敗 → all_pass の根拠にしない → pending_or_queued 扱い
+                if bucket == "pass":
+                    entry["bucket"] = None
+                    entry["conclusion"] = None
+                    entry["status"] = "unknown"
             else:
                 # Update head_sha from run
                 run_head = run_data.get("headSha")
@@ -415,11 +497,10 @@ def main() -> int:
                 run_status = run_data.get("status")
                 if run_status and entry["status"] is None:
                     entry["status"] = run_status
-                # Extract job_id from jobs list
+                # B3: Extract job_id — 失敗 job を特定する（jobs[0] を盲目的に使わない）
                 jobs = run_data.get("jobs") or []
                 if jobs:
-                    # Use first job for log extraction
-                    entry["job_id"] = jobs[0].get("databaseId")
+                    entry["job_id"] = find_failed_job_id(jobs, entry["name"])
 
         verdict = determine_check_verdict(entry, head_sha or expected_head_sha)
         verdicts.append(verdict)
@@ -430,10 +511,13 @@ def main() -> int:
         if include_log_excerpt and verdict == "failed" and entry.get("job_id"):
             log_text, log_err = fetch_job_log(entry["job_id"], repo)
             if log_err:
+                # B4: ログ取得失敗時は errors に記録し next_action を manual_review_gh_error にする
                 errors.append(log_err)
+                verdicts.append("gh_error")
             elif log_text:
-                # artifacts base: cwd/artifacts
-                artifacts_base = Path("artifacts")
+                # B5: repo root から絶対パスで artifacts ディレクトリを作成
+                repo_root = get_repo_root()
+                artifacts_base = repo_root / "artifacts"
                 artifacts_base.mkdir(exist_ok=True)
                 artifact_entry = save_log_artifact(
                     log_text,
@@ -447,7 +531,8 @@ def main() -> int:
 
     # Overall status
     if not verdicts:
-        # No checks found → treat as all_pass (no failing evidence)
+        # No checks found (check_name_filter が一致しない場合は B1 で gh_error 処理済み)
+        # verdicts が空 = フィルタなしで checks も 0 件 → 証跡なし → all_pass
         overall_status = "all_pass"
     else:
         overall_status = compute_overall_status(verdicts)
