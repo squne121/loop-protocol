@@ -253,11 +253,20 @@ M3 では以下を方針とする:
 
 **警告**: `docs/product/features/persistence.md` が明記する通り、GitHub Pages 本番と PR preview は同一 origin の localStorage を共有し得る。localStorage は origin 単位で分離され、path 単位では分離されない。
 
-**`loop-protocol.mvp.save` をテスト前に clear する運用は、本番セーブデータを消す危険がある。** E2E / PR preview では以下のいずれかを採用すること:
+`loop-protocol.mvp.save` を本番互換キーとして保持しつつ、E2E / PR preview / assist-suspend で衝突しない key を使う:
 
-- `loop-protocol.preview.<pr-number>.save` のような preview 専用 key suffix を使用する（推奨）
+- `loop-protocol.preview.pr-<pr-number>.mvp.save` のような preview 専用 key suffix を使用する（推奨）
 - テスト起動時に storage adapter を差し替え、production key に触らない
-- production key との互換性を検証するテストのみ、明示的に隔離されたブラウザプロファイルで実行する
+- production key との互換性検証は、明示的に隔離されたブラウザプロファイル / コンテキストで実施する
+
+## Storage key matrix（本 Issue 系）
+
+- Production: `loop-protocol.mvp.save`
+- PR preview: `loop-protocol.preview.pr-<pr-number>.mvp.save`
+- E2E: `loop-protocol.e2e.<run-id>.mvp.save`
+- Assist-suspend (future): `loop-protocol.mvp.assist-suspend.v1`
+
+本 matrix は `#885` による運用変更を明文化し、`#740` の Playwright 追試で参照する。
 
 > **follow-up**: preview / E2E storage key 分離の具体的実装は #885 でトラッキングする。
 

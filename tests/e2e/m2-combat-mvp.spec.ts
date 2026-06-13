@@ -401,6 +401,61 @@ test('GIVEN E2E short sortie fixture WHEN ~0.5s elapses THEN sortie.status is ti
   expect(finalState.sortie.result).toBe('timeout')
 })
 
+test('GIVEN runtime storage key override WHEN result is confirmed THEN production key sentinel is unchanged and e2e key receives snapshot', async ({
+  page,
+}) => {
+  test.setTimeout(30_000)
+
+  const productionKey = 'loop-protocol.mvp.save'
+  const workerScope = `worker-${test.info().workerIndex}`
+  const e2eKey = `loop-protocol.e2e.${workerScope}.mvp.save`
+  const productionSentinel = `production-key-sentinel-${workerScope}`
+
+  await page.addInitScript(
+    (payload: { productionKey: string; productionSentinel: string; e2eKey: string }) => {
+      window.localStorage.setItem(payload.productionKey, payload.productionSentinel)
+      ;(window as Window & { __LOOP_STORAGE_KEY__?: string }).__LOOP_STORAGE_KEY__ = payload.e2eKey
+      ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+    },
+    { productionKey, productionSentinel, e2eKey },
+  )
+  await page.goto('/')
+
+  await expect
+    .poll(
+      async () => {
+        const s = await getGameState(page)
+        return s.sortie.status
+      },
+      { timeout: 12_000, intervals: [100] },
+    )
+    .toBe('timeout')
+
+  const confirmButton = page.locator('[data-action="confirm-result"]')
+  await expect(confirmButton).toBeVisible()
+  await confirmButton.click()
+
+  await expect(page.locator('[data-field="status"]')).toHaveText('Result confirmed.', {
+    timeout: 5_000,
+  })
+
+  const storageState = await page.evaluate(
+    (keys: [string, string]) => {
+      const [prodKey, e2eStorageKey] = keys
+      return {
+        productionValue: window.localStorage.getItem(prodKey),
+        e2eValue: window.localStorage.getItem(e2eStorageKey),
+      }
+    },
+    [productionKey, e2eKey],
+  )
+
+  expect(storageState.productionValue).toBe(productionSentinel)
+  expect(storageState.e2eValue).not.toBeNull()
+  expect(storageState.e2eValue).toContain('"resources"')
+  expect(storageState.productionValue).not.toContain('"resources"')
+})
+
 test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat', async ({
   page,
 }) => {

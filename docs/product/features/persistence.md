@@ -118,6 +118,25 @@ canonical snapshot fields（`resources` / `weaponPower` / `playerMaxHp`）の検
   - E2E / preview 環境では test 実行前に `loop-protocol.mvp.save` を clear し、本番セーブデータへの干渉と test 間汚染を防ぐ。
   - PR preview は production save と同一 origin/key を共有し得るため、ユーザー向け永続データの互換性検証以外の用途では preview 専用の key suffix を検討する。
 
+### Storage key matrix（production / preview / e2e / assist-suspend）
+
+| 環境 | 利用 key |
+|---|---|
+| production（本番配信） | `loop-protocol.mvp.save` |
+| PR preview | `loop-protocol.preview.pr-<pr-number>.mvp.save` |
+| E2E（per-test / per-worker） | `loop-protocol.e2e.<run-id>.mvp.save` |
+| Assist Suspend（要件化なし・将来） | `loop-protocol.mvp.assist-suspend.v1` |
+
+PR preview と E2E は production key を clear せず、上記の分離 key を使用して互換性テスト・回帰検証を行う。
+
+```yaml
+storage_key_matrix:
+  production: loop-protocol.mvp.save
+  preview: loop-protocol.preview.pr-<number>.mvp.save
+  e2e: loop-protocol.e2e.<run-id>.mvp.save
+  assist_suspend: loop-protocol.mvp.assist-suspend.v1
+```
+
 ## Non-Goals
 
 - **クラウド同期・ネットワーク越しの永続化**は非ゴール（localStorage は MVP の最小保存手段である）。
