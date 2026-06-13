@@ -163,36 +163,138 @@ def _repair_escaped_code_fences(body: str) -> tuple[str, list[dict]]:
 
 def _repair_section_fences(section: str, body_offset: int) -> tuple[str, list[dict]]:
     """Apply fence repair inside a section.  body_offset is the character offset
-    of section start within the full body (used for line number computation)."""
+    of section start within the full body (used for line number computation).
+
+    MAJOR 1 fix: Only target ``yaml`` opening fences (not bash/json/sh).
+    Uses a state machine to track the current open fence so that closing fences
+    inside a non-yaml block are not erroneously repaired.
+    After repair, re-parse the MRC YAML to confirm structural validity.
+    If YAML re-parse fails, the repair is rejected (original section returned).
+    """
     repairs: list[dict] = []
     lines = section.split("\n")
     new_lines: list[str] = []
-    repaired = False
+
+    # State machine: track current open fence language
+    current_fence_lang: str | None = None  # None = outside fence
 
     for i, line in enumerate(lines):
-        # Match: line is entirely an escaped fence (\`\`\`bash or \`\`\`)
-        m = re.match(r"^\\(`{3,})(bash|yaml|json|sh|)\s*$", line)
-        if m:
-            # Unescape: remove the leading backslash
-            unescaped = m.group(1) + m.group(2)
-            if unescaped.strip() != line.strip():
-                # Calculate approximate body line number (rough)
-                body_lines_before = section[:section.find(line)].count("\n") if section.find(line) >= 0 else 0
-                line_start = body_lines_before + 1
-                repairs.append({
-                    "kind": "escaped_code_fence",
-                    "line_start": line_start,
-                    "line_end": line_start,
-                    "reason": "machine_readable_contract_fence_escaped",
-                    "original": line,
-                    "repaired": unescaped,
-                })
-                new_lines.append(unescaped)
-                repaired = True
-                continue
+        # Check for any escaped fence (with or without language label)
+        m_escaped = re.match(r"^\\(`{3,})(\w*)\s*$", line)
+        # Check for unescaped fence (to track state)
+        m_unescaped = re.match(r"^`{3,}(\w*)\s*$", line)
+
+        if m_escaped:
+            lang = m_escaped.group(2)  # "" for unlabeled (closing or unlabeled opening)
+            backticks = m_escaped.group(1)
+
+            if current_fence_lang is None:
+                # Opening escaped fence
+                if lang == "yaml" or (lang == "" and current_fence_lang is None):
+                    # Could be yaml opening or unlabeled opening.
+                    # We only repair yaml opening fences.
+                    # But unlabeled could be a closing fence (if we were inside a block)
+                    # or an unlabeled opening — treat as yaml target only if lang == "yaml"
+                    if lang == "yaml":
+                        # yaml opening fence: repair it
+                        unescaped = backticks + lang
+                        body_lines_before = section[:section.find(line)].count("\n") if section.find(line) >= 0 else 0
+                        line_start = body_lines_before + 1
+                        repairs.append({
+                            "kind": "escaped_code_fence",
+                            "line_start": line_start,
+                            "line_end": line_start,
+                            "reason": "machine_readable_contract_fence_escaped",
+                            "original": line,
+                            "repaired": unescaped,
+                        })
+                        new_lines.append(unescaped)
+                        current_fence_lang = "yaml"
+                        continue
+                    else:
+                        # Unlabeled (could be yaml closing when we're not inside) - skip
+                        # Or non-yaml opening - record as non_target_fence
+                        repairs.append({
+                            "kind": "non_target_fence",
+                            "line_start": i + 1,
+                            "line_end": i + 1,
+                            "reason": "unlabeled_escaped_fence_outside_block",
+                            "original": line,
+                            "repaired": line,
+                        })
+                else:
+                    # Non-yaml language opening fence: skip, record as non_target
+                    repairs.append({
+                        "kind": "non_target_fence",
+                        "line_start": i + 1,
+                        "line_end": i + 1,
+                        "reason": f"non_yaml_fence_skipped: {lang}",
+                        "original": line,
+                        "repaired": line,
+                    })
+                    current_fence_lang = lang if lang else "__non_yaml__"
+            else:
+                # Inside a fence block: this is a closing fence
+                if current_fence_lang == "yaml":
+                    # Closing fence of yaml block: repair it
+                    unescaped = backticks
+                    body_lines_before = section[:section.find(line)].count("\n") if section.find(line) >= 0 else 0
+                    line_start = body_lines_before + 1
+                    repairs.append({
+                        "kind": "escaped_code_fence",
+                        "line_start": line_start,
+                        "line_end": line_start,
+                        "reason": "machine_readable_contract_fence_escaped",
+                        "original": line,
+                        "repaired": unescaped,
+                    })
+                    new_lines.append(unescaped)
+                    current_fence_lang = None
+                    continue
+                else:
+                    # Closing fence of non-yaml block: do not repair
+                    repairs.append({
+                        "kind": "non_target_fence",
+                        "line_start": i + 1,
+                        "line_end": i + 1,
+                        "reason": f"non_yaml_closing_fence_skipped",
+                        "original": line,
+                        "repaired": line,
+                    })
+                    current_fence_lang = None
+        elif m_unescaped:
+            # Track unescaped fence state (already-correct fences)
+            lang = m_unescaped.group(1)
+            if current_fence_lang is None:
+                current_fence_lang = lang if lang else "__unlabeled__"
+            else:
+                current_fence_lang = None
+
         new_lines.append(line)
 
-    return "\n".join(new_lines), repairs
+    repaired_section = "\n".join(new_lines)
+
+    # MAJOR 1 fix: Re-parse MRC YAML after repair to confirm structural validity.
+    # If the repaired section cannot be parsed as valid YAML, reject all repairs
+    # (return the original section unchanged with empty repairs list).
+    yaml_repairs = [r for r in repairs if r["kind"] == "escaped_code_fence"]
+    if yaml_repairs:
+        try:
+            import yaml as _yaml
+            yaml_block_re = re.compile(r"```yaml\n(.*?)```", re.DOTALL)
+            for yaml_match in yaml_block_re.finditer(repaired_section):
+                yaml_content = yaml_match.group(1)
+                _yaml.safe_load(yaml_content)
+        except Exception:
+            # YAML parse failed after repair: reject repair, return original section unchanged
+            return section, []
+
+    # Return escaped_code_fence repairs first, then non_target_fence (informational)
+    return repaired_section, (
+        [r for r in repairs if r["kind"] == "escaped_code_fence"] +
+        [r for r in repairs if r["kind"] == "non_target_fence"]
+    )
+
 
 
 # ---------------------------------------------------------------------------

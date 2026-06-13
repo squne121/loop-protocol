@@ -168,7 +168,7 @@ $ test -f nonexistent_file.py
 | `deferred` | — | `skipped` | `go` |
 | 欠落 | 0 | `unexpected_pass` + `missing_annotation` warning | `blocked` |
 
-### ### pytest exit code semantics
+### pytest exit code semantics
 
 | exit code | 意味 | 注意事項 |
 |---|---|---|

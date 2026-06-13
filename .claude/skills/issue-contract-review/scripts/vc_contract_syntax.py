@@ -171,9 +171,17 @@ def extract_baseline_expect_annotation(
             break
 
         # baseline-expect annotation: record it and continue scanning
-        value, _ = parse_baseline_expect_annotation(line)
+        # BLOCKER 2 fix: check is_known_value; invalid values are treated as None
+        # so that typos (e.g. "pas") do not silently degrade to a missing annotation.
+        value, is_known_value = parse_baseline_expect_annotation(line)
         if value is not None:
-            found_value = value
+            if is_known_value:
+                found_value = value
+            else:
+                # Invalid annotation value: store as sentinel "__invalid__" so
+                # baseline_vc_preflight can emit human_judgment / invalid_baseline_expect_annotation.
+                # Using None here would silently treat as "no annotation".
+                found_value = f"__invalid__:{value}"
             found_line_no = line_idx + 1  # 1-based
             found_raw = line
             continue

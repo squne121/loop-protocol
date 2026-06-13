@@ -2223,11 +2223,31 @@ def main() -> int:
                 runtime_verification_required = None
 
         else:
+            # BLOCKER 2 fix: invalid baseline-expect annotation value → human_judgment
+            # Sentinel "__invalid__:<raw>" is set by extract_baseline_expect_annotation
+            # when the annotation line is present but value is not in VALID_BASELINE_EXPECT_VALUES.
+            if baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
+                raw_invalid_value = baseline_expect[len("__invalid__:"):]
+                classification = "human_judgment"
+                decision = "human_judgment"
+                category = "invalid_baseline_expect_annotation"
+                exit_code = None
+                stdout, stderr = "", ""
+                duration_ms = 0
+                scope_class = "baseline_fail_expected"
+                fix_hint = (
+                    f"# baseline-expect: {raw_invalid_value} is not a valid annotation. "
+                    "Use pass|fail|deferred."
+                )
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
+
             # Issue #889: baseline-expect: deferred → skip (priority after preflight-scope)
-            if baseline_expect == "deferred":
+            elif baseline_expect == "deferred":
                 classification = "skipped"
                 decision = "go"
-                category = "preflight_scope_pr_review_only"
+                category = "baseline_expect_deferred"  # MAJOR 3 fix: distinct category
                 exit_code = None
                 stdout, stderr = "", ""
                 duration_ms = 0
@@ -2346,7 +2366,12 @@ def main() -> int:
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
             "annotations": {
-                "baseline_expect": baseline_expect if preflight_scope is None else None,
+                "baseline_expect": (
+                    # Expose raw invalid value (without __invalid__: prefix) in annotations
+                    baseline_expect[len("__invalid__:"):] if (
+                        preflight_scope is None and baseline_expect is not None and baseline_expect.startswith("__invalid__:")
+                    ) else (baseline_expect if preflight_scope is None else None)
+                ),
                 "vc_role": vc_role if preflight_scope is None else None,
                 "missing_baseline_expect": (
                     preflight_scope is None

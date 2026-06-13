@@ -2062,6 +2062,194 @@ $ test -f /this_file_definitely_does_not_exist_12345abc
     # exit 1 on test -f nonexistent → expected_fail
     assert r2["classification"] == "expected_fail"
 
+
+# ---------------------------------------------------------------------------
+# Issue #889 BLOCKER 2 fix: invalid baseline-expect annotation
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_baseline_expect_value_is_human_judgment():
+    """BLOCKER 2: # baseline-expect: pas (typo) → human_judgment / invalid_baseline_expect_annotation."""
+    import tempfile, os
+    body = """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: pas
+$ test -f README.md
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
+        tf.write(body)
+        tmp_path = tf.name
+    try:
+        import subprocess, sys, json
+        script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
+            capture_output=True, text=True, timeout=90,
+        )
+        data = json.loads(result.stdout)
+    finally:
+        os.unlink(tmp_path)
+
+    results = data["results"]
+    assert len(results) > 0
+    r = results[0]
+    assert r["classification"] == "human_judgment", (
+        f"Expected human_judgment but got {r['classification']}"
+    )
+    assert r["category"] == "invalid_baseline_expect_annotation", (
+        f"Expected invalid_baseline_expect_annotation but got {r['category']}"
+    )
+    assert r["decision"] == "human_judgment"
+    fix_hint = r.get("fix_hint") or ""
+    assert "pas" in fix_hint and "pass|fail|deferred" in fix_hint
+
+
+def test_empty_baseline_expect_value_is_human_judgment():
+    """BLOCKER 2: # baseline-expect: (empty) → human_judgment."""
+    import tempfile, os
+    body = """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect:
+$ test -f README.md
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
+        tf.write(body)
+        tmp_path = tf.name
+    try:
+        import subprocess, sys, json
+        script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
+            capture_output=True, text=True, timeout=90,
+        )
+        data = json.loads(result.stdout)
+    finally:
+        os.unlink(tmp_path)
+
+    results = data["results"]
+    assert len(results) > 0
+    r = results[0]
+    # Empty value is invalid → human_judgment
+    assert r["classification"] == "human_judgment"
+    assert r["category"] == "invalid_baseline_expect_annotation"
+
+
+def test_uppercase_baseline_expect_is_human_judgment():
+    """BLOCKER 2: # baseline-expect: PASS (uppercase) → human_judgment."""
+    import tempfile, os
+    body = """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: PASS
+$ test -f README.md
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
+        tf.write(body)
+        tmp_path = tf.name
+    try:
+        import subprocess, sys, json
+        script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
+            capture_output=True, text=True, timeout=90,
+        )
+        data = json.loads(result.stdout)
+    finally:
+        os.unlink(tmp_path)
+
+    results = data["results"]
+    assert len(results) > 0
+    r = results[0]
+    assert r["classification"] == "human_judgment"
+    assert r["category"] == "invalid_baseline_expect_annotation"
+
+
+# ---------------------------------------------------------------------------
+# MAJOR 2: malicious body fixtures
+# ---------------------------------------------------------------------------
+
+
+def test_malicious_baseline_expect_does_not_bypass_static_blocker():
+    """MAJOR 2: baseline-expect: pass does NOT bypass unsafe/compound command blockers."""
+    import tempfile, os, subprocess, sys, json
+
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+
+    malicious_bodies = [
+        # bash -c is unsafe_command
+        """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: pass
+$ bash -c 'echo hacked'
+```
+""",
+        # && is compound_command_disallowed
+        """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: pass
+$ test -f README.md && touch /tmp/pwned
+```
+""",
+    ]
+
+    for body in malicious_bodies:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
+            tf.write(body)
+            tmp_path = tf.name
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
+                capture_output=True, text=True, timeout=90,
+            )
+            data = json.loads(result.stdout)
+        finally:
+            os.unlink(tmp_path)
+
+        results = data["results"]
+        assert len(results) > 0
+        r = results[0]
+        # Must NOT be expected_pass — static blockers take priority over baseline-expect
+        assert r["classification"] != "expected_pass", (
+            f"Malicious body was classified as expected_pass: {r}"
+        )
+        assert r["decision"] == "blocked", (
+            f"Malicious body decision was not blocked: {r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# MAJOR 3: baseline-expect: deferred category
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_expect_deferred_category():
+    """MAJOR 3: baseline-expect: deferred → category is baseline_expect_deferred."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_deferred.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "skipped"
+    assert r["decision"] == "go"
+    # MAJOR 3 fix: category must be baseline_expect_deferred (not preflight_scope_pr_review_only)
+    assert r["category"] == "baseline_expect_deferred", (
+        f"Expected baseline_expect_deferred but got {r['category']}"
+    )
+
+
 if __name__ == "__main__":
     # Run tests
     test_ac1_file_exists()

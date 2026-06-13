@@ -776,9 +776,10 @@ def _build_result(
     blockers: list[str],
     artifacts: dict[str, str],
     hashes: dict[str, str],
+    repair_diagnostics: Optional[dict] = None,
 ) -> dict:
     """Build a refinement_preflight_result/v1 compliant dict."""
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION_RESULT,
         "status": status,
         "issue_number": issue_number,
@@ -793,6 +794,10 @@ def _build_result(
         "artifacts": artifacts,
         "hashes": hashes,
     }
+    # BLOCKER 1 fix: expose repair diagnostics in preflight output (report-only)
+    if repair_diagnostics is not None:
+        result["repair_diagnostics"] = repair_diagnostics
+    return result
 
 
 def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
@@ -1017,7 +1022,7 @@ def run_preflight(
     # --- Run repair pass before planner (Issue #889) ---
     # repair_issue_contract runs dry-run to report defects; the repaired body is
     # NOT fed to the planner (the planner always receives the original Issue body).
-    # Repair artifacts are informational only at this stage.
+    # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
     # --- Invoke planner ---
@@ -1113,6 +1118,7 @@ def run_preflight(
     }
 
     # --- Build final result (once, before writing) ---
+    # BLOCKER 1 fix: include repair_diagnostics in result (report-only, planner input unchanged)
     result = _build_result(
         status=status,
         issue_number=issue_number,
@@ -1126,6 +1132,7 @@ def run_preflight(
         blockers=blockers,
         artifacts={},  # filled below
         hashes=hashes,
+        repair_diagnostics=_repair_result,
     )
 
     # --- Validate result against result schema before writing ---
