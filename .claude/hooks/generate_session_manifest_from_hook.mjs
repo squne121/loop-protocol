@@ -36,13 +36,15 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { Buffer } from 'node:buffer'
 import {
   existsSync,
   mkdirSync,
   readdirSync,
   renameSync,
   writeFileSync,
+  openSync,
+  closeSync,
+  unlinkSync,
 } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -120,14 +122,31 @@ function ensureArtifactsDir() {
 }
 
 /**
+ * Recursively sort all object keys to produce a canonical JSON string.
+ * Arrays are preserved in order; object keys are sorted at every depth.
+ */
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalJson).join(',') + ']'
+  }
+  const sorted = Object.keys(value)
+    .sort()
+    .map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k]))
+  return '{' + sorted.join(',') + '}'
+}
+
+/**
  * Compute SHA-256 payload digest for throttle deduplication.
- * Returns first 16 hex chars of sha256(serializedPayload).
- * Empty string if payload is null/undefined.
+ * Uses recursive canonical JSON serialization to preserve nested objects.
+ * Returns first 16 hex chars of sha256(canonicalJson(payload)).
  */
 function computePayloadDigest(payload) {
   if (payload == null) return 'nullpayload'
   try {
-    const serialized = JSON.stringify(payload, Object.keys(payload).sort())
+    const serialized = canonicalJson(payload)
     return sha256(serialized).slice(0, 16)
   } catch {
     return 'digestfail'
@@ -135,17 +154,52 @@ function computePayloadDigest(payload) {
 }
 
 /**
- * Build a URL-safe stable key segment from event info.
- * Key format: {hookEventName}:{sessionId}:{toolName}:{phase}:{payloadDigest}
- * Encoded as URL-safe base64 for use in filename.
+ * Build a stable key segment by hashing all key material together.
+ * Avoids base64 truncation that would drop payloadDigest from the tail.
+ * Returns first 32 hex chars of sha256(canonicalJson(keyMaterial)).
  */
-function buildStableKey(hookEventName, sessionId, toolName, ledgerPhase, payloadDigest) {
-  const rawKey = `${hookEventName}:${sessionId || 'nosession'}:${toolName || ''}:${ledgerPhase}:${payloadDigest || 'nodigest'}`
-  return Buffer.from(rawKey).toString('base64url').slice(0, 40)
+function buildStableKey(hookEventName, sessionId, toolName, ledgerPhase, payloadDigest, loopStateHash) {
+  const keyMaterial = {
+    hookEventName,
+    sessionId: sessionId || 'nosession',
+    triggerOrTool: toolName || '',
+    ledgerPhase,
+    payloadDigest: payloadDigest || 'nodigest',
+    loopStateHash: loopStateHash || '',
+  }
+  return sha256(canonicalJson(keyMaterial)).slice(0, 32)
+}
+
+/**
+ * Try to claim an exclusive lock for a given stable key.
+ * Uses O_EXCL (openSync with 'wx') to atomically create the lock file.
+ * Returns true if the lock was acquired, false if another process holds it.
+ */
+function tryAcquireLock(lockPath) {
+  try {
+    const fd = openSync(lockPath, 'wx')
+    closeSync(fd)
+    return true
+  } catch {
+    // EEXIST — lock already held
+    return false
+  }
+}
+
+/**
+ * Release a previously acquired lock file.
+ */
+function releaseLock(lockPath) {
+  try {
+    unlinkSync(lockPath)
+  } catch {
+    // ignore cleanup errors
+  }
 }
 
 /**
  * Check if a duplicate artifact exists by scanning for stable key segment in filenames.
+ * Must be called while holding the lock for the given key.
  */
 function hasDuplicateArtifact(stableKeySegment) {
   try {
@@ -160,6 +214,9 @@ function hasDuplicateArtifact(stableKeySegment) {
 // ============================================================================
 // Main
 // ============================================================================
+
+// Module-level variable so that the catch handler can release any held lock
+let _activeLockPath = null
 
 async function main() {
   // Read hook context from stdin
@@ -188,11 +245,26 @@ async function main() {
   // Compute payload digest for throttle (same payload → same digest → skip)
   const payloadDigest = computePayloadDigest(hookCtx)
 
-  // Build stable duplicate key (not timestamp-dependent, includes payload_digest)
-  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase, payloadDigest)
+  // Build stable duplicate key — hash of all key material (no truncation of payloadDigest)
+  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase, payloadDigest, null)
 
-  // Check for duplicate before doing any work
+  // Ensure artifacts dir exists before attempting lock
+  ensureArtifactsDir()
+
+  // Acquire exclusive lock for this stable key to prevent parallel duplicate generation (B3)
+  const lockPath = join(ARTIFACTS_DIR, `.lock-${stableKeySegment}`)
+  _activeLockPath = lockPath
+  const lockAcquired = tryAcquireLock(lockPath)
+  if (!lockAcquired) {
+    process.stderr.write(
+      `[generate_session_manifest_from_hook] info: lock held by another process — skipping (key=${stableKeySegment}, event=${hookEventName})\n`,
+    )
+    process.exit(0)
+  }
+
+  // Double-check for duplicate after acquiring the lock (lock-then-check pattern)
   if (hasDuplicateArtifact(stableKeySegment)) {
+    releaseLock(lockPath)
     process.stderr.write(
       `[generate_session_manifest_from_hook] info: duplicate skip (key=${stableKeySegment}, event=${hookEventName})\n`,
     )
@@ -270,6 +342,7 @@ async function main() {
     process.stderr.write(
       `[generate_session_manifest_from_hook] warn: producer failed (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
     )
+    releaseLock(lockPath)
     process.exit(0)
   }
 
@@ -281,7 +354,6 @@ async function main() {
   const tmpPath = join(ARTIFACTS_DIR, `.tmp-${randomUUID()}`)
 
   try {
-    ensureArtifactsDir()
     writeFileSync(tmpPath, manifestJson, { encoding: 'utf8', flag: 'wx' })
     renameSync(tmpPath, finalPath)
     process.stderr.write(
@@ -298,8 +370,12 @@ async function main() {
     } catch {
       // ignore cleanup error
     }
+    releaseLock(lockPath)
     process.exit(0)
   }
+
+  // Release lock after successful artifact write
+  releaseLock(lockPath)
 
   // stdout remains empty (no manifest content on stdout)
   process.exit(0)
@@ -310,5 +386,10 @@ main().catch((err) => {
   process.stderr.write(
     `[generate_session_manifest_from_hook] warn: fatal (best-effort, continuing): ${sanitizeForStderr(err.message)}\n`,
   )
+  // Release any lock we may be holding
+  if (_activeLockPath) {
+    releaseLock(_activeLockPath)
+    _activeLockPath = null
+  }
   process.exit(0)
 })

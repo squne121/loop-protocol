@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "codex-session-stop-security-fail-001",
+  "secrets_mode": "none",
+  "touched_paths": [],
+  "forbidden_path_touched": true
+}
