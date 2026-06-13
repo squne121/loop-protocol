@@ -48,6 +48,17 @@ bash .claude/skills/issue-contract-review/scripts/check_blockers.sh <issue_numbe
 
 `baseline_vc_preflight.py` で AC 別 VC を AC1..N に抽出・実行し、scope/カテゴリ/判定を記録。
 
+`## Verification Commands` では ` ```bash ... ``` ` の **fenced bash** を **canonical VC format** とし、各コマンドを
+`$ <command>` + `# ACn` 形式で記載する。
+
+VC 実行前に静的に弾くカテゴリ:
+
+- `unsupported_shell_syntax` : `$(...)` / backtick / `${...}` を含む場合
+- `unsafe_command` : `rm` / `git push` / `curl` など危険コマンド
+- `command_not_allowed` : allowlist 外コマンド
+
+`unsupported_shell_syntax` は `run_command()` を呼ばない前提の必須カテゴリ。
+
 - コマンドは「`$ <command>` + `# ACn`」形式（verbatim）
 - baseline fail が期待される項目は `go` 可
 - `preflight-scope` marker は `baseline_fail_expected / pr_review_only / runtime_only` を制御
@@ -160,4 +171,3 @@ bash .claude/skills/issue-contract-review/scripts/check_blockers.sh <issue_numbe
 ## Output Constraint (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約を遵守。
-
