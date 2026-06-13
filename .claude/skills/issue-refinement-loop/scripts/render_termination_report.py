@@ -253,6 +253,44 @@ class InputValidationError(ValueError):
     """Raised when input fails validation (used internally)."""
 
 
+def normalize_input(raw: Any) -> dict[str, Any]:
+    """
+    Normalize TERMINATION_REPORT_INPUT_V1 into canonical form.
+
+    - `blocker_summary` is treated as a legacy alias for `blockers_summary`
+    - alias conflicts fail closed
+    - `human_escalation` without an explicit cause falls back to
+      `human_judgment_required`
+    """
+    if not isinstance(raw, dict):
+        raise InputValidationError("Input must be a JSON object")
+
+    data = dict(raw)
+
+    if "blocker_summary" in data:
+        blocker_summary = data["blocker_summary"]
+        if not isinstance(blocker_summary, list) or not all(
+            isinstance(item, str) for item in blocker_summary
+        ):
+            raise InputValidationError("blocker_summary must be a list of strings")
+
+        canonical = data.get("blockers_summary")
+        if "blockers_summary" in data and canonical != blocker_summary:
+            raise InputValidationError(
+                "blocker_summary and blockers_summary conflict"
+            )
+        data["blockers_summary"] = blocker_summary
+        data.pop("blocker_summary", None)
+
+    if (
+        data.get("termination_reason") == "human_escalation"
+        and data.get("termination_cause") is None
+    ):
+        data["termination_cause"] = "human_judgment_required"
+
+    return data
+
+
 def render(data: dict[str, Any]) -> dict[str, Any]:
     """
     Attempt to render the termination report with guard validation.
@@ -265,12 +303,11 @@ def render(data: dict[str, Any]) -> dict[str, Any]:
     Returns TERMINATION_REPORT_RENDER_RESULT_V1 dict.
     """
     # N1: validate input at render() entry so library callers also get validation
-    _, err = _validate_input(data)
+    data, err = _validate_input(data)
     if err:
         raise InputValidationError(err)
 
     generated_at = _now_iso()
-    data = dict(data)
     data.setdefault("generated_at", generated_at)
 
     termination_reason: str = data["termination_reason"]
@@ -376,17 +413,19 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
     Returns (validated_data, error_message).
     error_message is empty string on success.
     """
-    if not isinstance(raw, dict):
-        return None, "Input must be a JSON object"
+    try:
+        data = normalize_input(raw)
+    except InputValidationError as exc:
+        return None, str(exc)
 
-    termination_reason = raw.get("termination_reason")
+    termination_reason = data.get("termination_reason")
     if termination_reason not in VALID_TERMINATION_REASONS:
         return None, (
             f"Invalid termination_reason: {termination_reason!r}. "
             f"Must be one of: {sorted(VALID_TERMINATION_REASONS)}"
         )
 
-    termination_cause = raw.get("termination_cause")
+    termination_cause = data.get("termination_cause")
     if termination_cause not in VALID_TERMINATION_CAUSES:
         return None, (
             f"Invalid termination_cause: {termination_cause!r}. "
@@ -394,7 +433,7 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
             f"{sorted(str(x) for x in VALID_TERMINATION_CAUSES if x is not None) + ['null']}"
         )
 
-    issue_number = raw.get("issue_number")
+    issue_number = data.get("issue_number")
     if issue_number is not None:
         # Use type() not isinstance() so bool (subclass of int) is rejected (B3)
         if type(issue_number) is not int:
@@ -402,7 +441,7 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
                 f"issue_number must be int or null, got {type(issue_number).__name__}"
             )
 
-    iteration = raw.get("iteration")
+    iteration = data.get("iteration")
     if iteration is not None:
         # Use type() not isinstance() so bool (subclass of int) is rejected (B3)
         if type(iteration) is not int:
@@ -410,7 +449,7 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
                 f"iteration must be int or null, got {type(iteration).__name__}"
             )
 
-    blockers_summary = raw.get("blockers_summary")
+    blockers_summary = data.get("blockers_summary")
     if blockers_summary is not None:
         if not isinstance(blockers_summary, list):
             return None, (
@@ -420,7 +459,7 @@ def _validate_input(raw: Any) -> tuple[dict[str, Any] | None, str]:
         if not all(isinstance(x, str) for x in blockers_summary):
             return None, "blockers_summary must be a list of strings"
 
-    return raw, ""
+    return data, ""
 
 
 # ---------------------------------------------------------------------------
