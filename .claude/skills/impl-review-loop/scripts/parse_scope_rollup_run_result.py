@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""parse_scope_rollup_run_result.py
+
+Parse scope-rollup runner output and validate ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1
+marker in fenced YAML only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+MARKER_NAME = "ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1"
+OUTPUT_MARKER = "SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"
+
+ALLOWED_MARKER_STATUS = {"ok", "failed", "runner_unavailable"}
+REQUIRED_FIELDS_BASE = {
+    "status",
+    "repo",
+    "current_issue",
+    "invocation_id",
+    "requested_at",
+    "generated_at",
+    "script_blob_sha256",
+}
+REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256"}
+
+FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return _sha256_bytes(path.read_bytes())
+
+
+def _parse_iso8601(value: str) -> datetime:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        raise ValueError("timestamp must include timezone offset")
+    return dt.astimezone(timezone.utc)
+
+
+def _load_issue_refinement_verifier():
+    """Load issue-refinement-loop/scripts/verify_scope_rollup_result.py dynamically."""
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "issue-refinement-loop"
+        / "scripts"
+        / "verify_scope_rollup_result.py"
+    )
+    if not script_path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location(
+        "issue_refinement_verify_scope_rollup_result",
+        script_path,
+    )
+    if spec is None or spec.loader is None:
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_yaml_no_duplicate_keys(text: str) -> Any:
+    """Load YAML and fail when duplicate keys exist."""
+
+    class _StrictLoader(yaml.SafeLoader):
+        pass
+
+    def _construct_mapping(
+        loader: Any,
+        node: yaml.nodes.MappingNode,
+    ) -> dict[str, Any]:
+        mapping: dict[str, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node)
+            if key in mapping:
+                raise ValueError(f"duplicate key: {key}")
+            mapping[key] = loader.construct_object(value_node)
+        return mapping
+
+    _StrictLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _construct_mapping,
+    )
+    return yaml.load(text, Loader=_StrictLoader)
+
+
+def _extract_marker_blocks(output: str) -> list[dict[str, Any]]:
+    """Return ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 payloads from fenced YAML blocks."""
+    blocks: list[dict[str, Any]] = []
+    for match in FENCED_YAML_RE.finditer(output):
+        block_text = match.group(1).strip()
+        if MARKER_NAME not in block_text:
+            continue
+
+        try:
+            parsed = _load_yaml_no_duplicate_keys(block_text)
+        except Exception:
+            blocks.append({"__parse_error__": True})
+            continue
+
+        if not isinstance(parsed, dict):
+            continue
+        candidate = parsed.get(MARKER_NAME)
+        if isinstance(candidate, dict):
+            blocks.append(candidate)
+        elif candidate is not None:
+            blocks.append({"__type_error__": True})
+
+    return blocks
+
+
+def _validate_tmp_raw_plan_path(
+    raw_plan_path: Path,
+    invocation_id: str,
+) -> tuple[bool, str]:
+    if not raw_plan_path.is_absolute():
+        return False, "raw_plan_location_invalid"
+
+    if any(part == ".." for part in raw_plan_path.parts):
+        return False, "raw_plan_location_invalid"
+
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    raw_plan_path_text = str(raw_plan_path)
+    if not raw_plan_path_text.startswith(str(temp_root) + os.sep):
+        return False, "raw_plan_location_invalid"
+
+    if invocation_id not in raw_plan_path.name and invocation_id not in raw_plan_path_text:
+        return False, "raw_plan_location_invalid"
+
+    try:
+        if raw_plan_path.is_symlink():
+            return False, "raw_plan_location_invalid"
+        for parent in raw_plan_path.parents:
+            if parent.is_symlink():
+                return False, "raw_plan_location_invalid"
+    except OSError:
+        return False, "raw_plan_location_invalid"
+
+    try:
+        resolved_path = raw_plan_path.resolve()
+    except OSError:
+        return False, "raw_plan_location_invalid"
+
+    if not resolved_path.exists() or not resolved_path.is_file():
+        return False, "result_missing"
+
+    if not str(resolved_path).startswith(str(temp_root) + os.sep):
+        return False, "raw_plan_location_invalid"
+
+    return True, ""
+
+
+def _validate_marker_payload(
+    marker_payload: dict[str, Any],
+    expected_repo: str,
+    expected_issue_number: int,
+    expected_invocation_id: str,
+    expected_script_sha: str,
+    requested_at: str,
+) -> tuple[str, str | None, str | None, bool]:
+    """Validate marker payload.
+
+    Returns (parse_status, termination_cause, reject_reason, raw_plan_location_allowed).
+    """
+    for field in REQUIRED_FIELDS_BASE:
+        if field not in marker_payload:
+            return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    status = str(marker_payload.get("status", "")).strip()
+    if status not in ALLOWED_MARKER_STATUS:
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    if marker_payload.get("repo") != expected_repo:
+        return "rejected", "scope_rollup_marker_malformed", "repo_mismatch", False
+
+    try:
+        current_issue = int(marker_payload.get("current_issue"))
+    except Exception:
+        return "marker_malformed", "scope_rollup_marker_malformed", "issue_mismatch", False
+    if current_issue != expected_issue_number:
+        return "rejected", "scope_rollup_marker_malformed", "issue_mismatch", False
+
+    if str(marker_payload.get("invocation_id", "")) != str(expected_invocation_id):
+        return "rejected", "scope_rollup_marker_malformed", "invocation_id_mismatch", False
+
+    if not isinstance(marker_payload.get("script_blob_sha256"), str):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+    if marker_payload.get("script_blob_sha256") != expected_script_sha:
+        return "rejected", "scope_rollup_marker_malformed", "script_sha_mismatch", False
+
+    try:
+        requested_at_dt = _parse_iso8601(requested_at)
+        marker_requested_at_dt = _parse_iso8601(str(marker_payload.get("requested_at")))
+        if marker_requested_at_dt != requested_at_dt:
+            return "rejected", "scope_rollup_marker_malformed", "requested_at_mismatch", False
+        generated_at_dt = _parse_iso8601(str(marker_payload.get("generated_at")))
+    except Exception:
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    if generated_at_dt <= requested_at_dt:
+        return "rejected", "scope_rollup_marker_malformed", "stale", False
+
+    if status in {"failed", "runner_unavailable"}:
+        return status, None, None, False
+
+    result_block = marker_payload.get("result")
+    if not isinstance(result_block, dict):
+        return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+    for field in REQUIRE_RESULT_FIELDS:
+        if field not in result_block:
+            return "marker_malformed", "scope_rollup_marker_malformed", "marker_malformed", False
+
+    if result_block.get("verify_status") != "verified":
+        return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
+
+    raw_plan_path = Path(str(result_block.get("raw_plan_location", "")))
+    valid_path, path_reject_reason = _validate_tmp_raw_plan_path(
+        raw_plan_path=raw_plan_path,
+        invocation_id=str(expected_invocation_id),
+    )
+    if not valid_path:
+        if path_reject_reason == "":
+            return "rejected", "scope_rollup_marker_malformed", "raw_plan_location_invalid", False
+        return "rejected", "scope_rollup_marker_malformed", path_reject_reason, False
+
+    if _sha256_file(raw_plan_path) != str(result_block.get("result_sha256", "")):
+        return "rejected", "scope_rollup_marker_malformed", "result_sha_mismatch", False
+
+    verifier = _load_issue_refinement_verifier()
+    if verifier is None:
+        return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
+
+    _verify_output, verify_code = verifier.verify(str(raw_plan_path))
+    if verify_code != 0:
+        return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
+
+    return "ok", None, None, True
+
+
+def _format_result(
+    status: str,
+    routing_action: str,
+    termination_cause: str | None,
+    reject_reason: str | None,
+    raw_plan_location_allowed: bool,
+) -> dict[str, Any]:
+    return {
+        OUTPUT_MARKER: {
+            "status": status,
+            "routing_action": routing_action,
+            "termination_cause": termination_cause,
+            "reject_reason": reject_reason,
+            "raw_plan_location_allowed": raw_plan_location_allowed,
+        },
+    }
+
+
+def parse_scope_rollup_output(
+    *,
+    assistant_output: str,
+    repo: str,
+    issue_number: int,
+    invocation_id: str,
+    expected_script_sha: str,
+    requested_at: str,
+) -> dict[str, Any]:
+    marker_blocks = _extract_marker_blocks(assistant_output)
+
+    if not marker_blocks:
+        return _format_result(
+            status="marker_missing",
+            routing_action="stop_human",
+            termination_cause="scope_rollup_marker_missing",
+            reject_reason="marker_missing",
+            raw_plan_location_allowed=False,
+        )
+
+    if len(marker_blocks) > 1:
+        return _format_result(
+            status="marker_ambiguous",
+            routing_action="stop_human",
+            termination_cause="scope_rollup_marker_malformed",
+            reject_reason="marker_ambiguous",
+            raw_plan_location_allowed=False,
+        )
+
+    marker_payload = marker_blocks[0]
+    if "__parse_error__" in marker_payload or "__type_error__" in marker_payload:
+        return _format_result(
+            status="marker_malformed",
+            routing_action="stop_human",
+            termination_cause="scope_rollup_marker_malformed",
+            reject_reason="marker_malformed",
+            raw_plan_location_allowed=False,
+        )
+
+    parse_status, termination_cause, reject_reason, raw_allowed = _validate_marker_payload(
+        marker_payload=marker_payload,
+        expected_repo=repo,
+        expected_issue_number=issue_number,
+        expected_invocation_id=invocation_id,
+        expected_script_sha=expected_script_sha,
+        requested_at=requested_at,
+    )
+
+    if parse_status == "ok":
+        return _format_result(
+            status="ok",
+            routing_action="continue",
+            termination_cause=None,
+            reject_reason=None,
+            raw_plan_location_allowed=raw_allowed,
+        )
+
+    if parse_status == "runner_unavailable":
+        return _format_result(
+            status="runner_unavailable",
+            routing_action="deferred",
+            termination_cause=None,
+            reject_reason=None,
+            raw_plan_location_allowed=raw_allowed,
+        )
+
+    if parse_status == "failed":
+        return _format_result(
+            status="failed",
+            routing_action="stop_human",
+            termination_cause=termination_cause,
+            reject_reason=reject_reason,
+            raw_plan_location_allowed=raw_allowed,
+        )
+
+    return _format_result(
+        status=parse_status,
+        routing_action="stop_human",
+        termination_cause=termination_cause,
+        reject_reason=reject_reason,
+        raw_plan_location_allowed=raw_allowed,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Parse ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 output from scope-rollup-runner "
+            "and validate deterministic marker requirements."
+        )
+    )
+    parser.add_argument("--assistant-output-file", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--issue-number", required=True, type=int)
+    parser.add_argument("--invocation-id", required=True)
+    parser.add_argument("--expected-script-sha", required=True)
+    parser.add_argument("--requested-at", required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    output_file = Path(args.assistant_output_file)
+    if not output_file.exists():
+        result = _format_result(
+            status="marker_missing",
+            routing_action="stop_human",
+            termination_cause="scope_rollup_marker_missing",
+            reject_reason="marker_missing",
+            raw_plan_location_allowed=False,
+        )
+        print(yaml.safe_dump(result, sort_keys=False, allow_unicode=True).rstrip(), end="")
+        return
+
+    assistant_output = output_file.read_text(encoding="utf-8")
+    try:
+        result = parse_scope_rollup_output(
+            assistant_output=assistant_output,
+            repo=args.repo,
+            issue_number=args.issue_number,
+            invocation_id=args.invocation_id,
+            expected_script_sha=args.expected_script_sha,
+            requested_at=args.requested_at,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        result = _format_result(
+            status="marker_malformed",
+            routing_action="stop_human",
+            termination_cause="scope_rollup_marker_malformed",
+            reject_reason=f"unexpected_error: {type(exc).__name__}: {exc}",
+            raw_plan_location_allowed=False,
+        )
+
+    print(yaml.safe_dump(result, sort_keys=False, allow_unicode=True).rstrip(), end="")
+
+
+if __name__ == "__main__":
+    main()
