@@ -88,7 +88,7 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 - `blocker_summary` と `blockers_summary` が両方あり値が異なる場合は fail-closed とする
 - `blocker_summary` が `list[str]` でない場合も fail-closed とする
 
-human_escalation example includes termination_cause and blockers_summary:
+human_escalation の入力例（termination_cause と blockers_summary を明示）:
 
 ```json
 {
@@ -97,8 +97,8 @@ human_escalation example includes termination_cause and blockers_summary:
   "issue_number": 829,
   "iteration": 3,
   "blockers_summary": [
-    "owner decision is required",
-    "conflicting scope signals remain unresolved"
+    "オーナー判断が必要",
+    "スコープの矛盾が未解決"
   ]
 }
 ```

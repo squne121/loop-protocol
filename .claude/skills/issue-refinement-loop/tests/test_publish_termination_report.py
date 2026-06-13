@@ -798,3 +798,26 @@ class TestRealRendererE2E:
         assert "Cause: human judgment required" in body
         assert "## Blockers" in body
         assert "legacy blocker entry" in body
+
+
+# ---------------------------------------------------------------------------
+# AC2 (Issue #838): Docs prose negative guard
+# ---------------------------------------------------------------------------
+
+class TestTerminationReportDocsProse:
+    def test_english_duplicate_prose_removed(self):
+        root = Path(__file__).resolve().parent.parent
+        text = "\n".join([
+            (root / "SKILL.md").read_text(),
+            (root / "references" / "termination-policy.md").read_text(),
+        ])
+
+        forbidden = [
+            "human_escalation example includes termination_cause and blockers_summary",
+            "legacy alias blocker_summary is normalized to canonical blockers_summary",
+            "owner decision is required",
+            "conflicting scope signals remain unresolved",
+        ]
+
+        for phrase in forbidden:
+            assert phrase not in text, f"英語重複 prose が残っています: {phrase!r}"
