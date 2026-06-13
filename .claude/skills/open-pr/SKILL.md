@@ -259,8 +259,6 @@ ERROR_DETAIL=<stderr from validate_japanese_content.py>
 
 ## PR Body Japanese Check 失敗時の修復手順（CI 失敗後）
 
-## PR Body Japanese Check 失敗時の修復手順（CI 失敗後の修復手順）
-
 PR Body Japanese Check（`check-japanese.yml`）が失敗した場合は、`pr_body_japanese_repair_plan.py` を使って修復プランを生成し、`update_pr.py` 経由で適用する。
 
 ### ステップ 1: 修復プランの生成
