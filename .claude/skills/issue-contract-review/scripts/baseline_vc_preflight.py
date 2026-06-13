@@ -19,6 +19,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# Shared AC / preflight-scope parser contract (同一の VC grammar 定義を利用)
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+if str(_VC_SYNTAX_DIR) not in sys.path:
+    sys.path.insert(0, str(_VC_SYNTAX_DIR))
+
+from vc_contract_syntax import (
+    VALID_PRE_FLIGHT_SCOPE_VALUES,
+    parse_ac_marker_line,
+    parse_preflight_scope_marker_line,
+)
+
+
 def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optional[str]]:
     """
     GitHub API から Issue body を取得
@@ -188,10 +201,8 @@ def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Op
     if target_line_idx <= 0:
         return None
     prev_line = lines[target_line_idx - 1].strip()
-    match = re.match(r"^\s*#\s*preflight-scope:\s*(\S+)\s*$", prev_line)
-    if match:
-        return match.group(1)
-    return None
+    marker, _ = parse_preflight_scope_marker_line(prev_line)
+    return marker
 
 
 def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -> Optional[str]:
@@ -234,11 +245,13 @@ def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -
             continue
 
         # preflight-scope marker: transparent (allowed in the same block)
-        if re.match(r"^#\s*preflight-scope:\s*\S+", line):
+        marker, _ = parse_preflight_scope_marker_line(line)
+        if marker is not None:
             continue
 
         # AC marker line (# AC1 etc): transparent (allowed in the same block)
-        if re.match(r"^#\s*AC\d+\s*:?\s*$", line):
+        ac_label, is_valid = parse_ac_marker_line(line)
+        if ac_label is not None and is_valid:
             continue
 
         # Any other line (regular comment or non-comment non-command): stop scanning
@@ -264,18 +277,26 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
     current_ac = None
 
     for i, line in enumerate(lines, start=1):
-        # AC マーカーの抽出: `# AC<N>` または `# AC<N>:` (単独コメント行)
-        ac_match = re.match(r"^\s*#\s*AC(\d+)\s*:?\s*$", line)
-        if ac_match:
-            current_ac = f"AC{ac_match.group(1)}"
-            continue
+        # AC マーカーの抽出: `# AC<N>`（strict）
+        ac_label, is_valid = parse_ac_marker_line(line)
+        if ac_label is not None:
+            if is_valid:
+                current_ac = ac_label
+            # strict marker lines are annotation, not commands
+            if line.strip().startswith("#"):
+                continue
 
         # preflight-scope marker はスキップ（コマンドではない）
-        if re.match(r"^\s*#\s*preflight-scope:\s*\S+\s*$", line):
+        preflight_scope_marker, _ = parse_preflight_scope_marker_line(line)
+        if preflight_scope_marker is not None:
             continue
 
         # vc-regex-intent annotation はスキップ（コマンドではない）
         if re.match(r"^\s*#\s*vc-regex-intent:\s*\S+", line):
+            continue
+
+        if line.strip().startswith("#"):
+            # その他のコメント行はコマンドではない
             continue
 
         # コマンド行の抽出（$ prefix 除去）
@@ -290,18 +311,20 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
             cmd = cmd_match.group(1).strip()
             if cmd and not cmd.startswith("#"):
                 # B4: inline suffix `# AC<N>` を検出して ac_label を上書き、suffix を除去
-                suffix_match = re.search(r"\s+#\s*AC(\d+)\s*:?\s*$", cmd)
+                suffix_match = re.search(r"\s+#\s*(.+)\s*$", cmd)
                 if suffix_match:
-                    current_ac = f"AC{suffix_match.group(1)}"
-                    cmd = re.sub(r"\s+#\s*AC\d+\s*:?\s*$", "", cmd).strip()
+                    suffix_label, suffix_is_valid = parse_ac_marker_line(f"# {suffix_match.group(1)}")
+                    if suffix_label is not None and suffix_is_valid:
+                        current_ac = suffix_label
+                        cmd = re.sub(r"\s+#\s*AC\d+\s*$", "", cmd).strip()
 
-                # 直前行から preflight-scope marker を抽出
-                preflight_scope = extract_preflight_scope_marker(lines, i - 1)
+            # 直前行から preflight-scope marker を抽出
+            preflight_scope = extract_preflight_scope_marker(lines, i - 1)
 
-                # 直前行から vc-regex-intent annotation を抽出 (AC3: Issue #589)
-                vc_regex_intent = extract_vc_regex_intent_annotation(lines, i - 1)
+            # 直前行から vc-regex-intent annotation を抽出 (AC3: Issue #589)
+            vc_regex_intent = extract_vc_regex_intent_annotation(lines, i - 1)
 
-                commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent))
+            commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent))
 
     return commands
 
@@ -2130,7 +2153,7 @@ def main() -> int:
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
         if preflight_scope is not None:
-            if preflight_scope in ("pr_review_only", "runtime_only"):
+            if preflight_scope in VALID_PRE_FLIGHT_SCOPE_VALUES:
                 classification = "skipped"
                 decision = "go"
                 category = f"preflight_scope_{preflight_scope}"
@@ -2160,6 +2183,7 @@ def main() -> int:
                 verification_owner = None
                 deferred_reason = None
                 runtime_verification_required = None
+
         else:
             # Static classification checks BEFORE run_command (CRITICAL)
             # Negated search commands are statically classified as expected_fail/go
