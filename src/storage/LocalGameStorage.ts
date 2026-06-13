@@ -2,6 +2,68 @@ import { gameSnapshotSchemaVersion, type GameSnapshot } from '../state'
 
 export const defaultSaveKey = 'loop-protocol.mvp.save'
 
+const PREVIEW_KEY_PREFIX = 'loop-protocol.preview.'
+const PREVIEW_SUFFIX = '.mvp.save'
+const DEFAULT_PREVIEW_NAMESPACE_FALLBACK = 'preview'
+
+type WindowWithLoopStorageRuntime = Window & {
+  __LOOP_STORAGE_KEY__?: string
+}
+
+function getRuntimeStorageKey(): string | null {
+  const loopWindow = globalThis as unknown as WindowWithLoopStorageRuntime
+  const override = loopWindow.__LOOP_STORAGE_KEY__
+
+  if (typeof override === 'string') {
+    return override.trim()
+  }
+
+  return null
+}
+
+function normalizePreviewNamespace(namespace: string): string {
+  const trimmed = namespace.trim()
+  if (!trimmed) {
+    return DEFAULT_PREVIEW_NAMESPACE_FALLBACK
+  }
+
+  const stripped = trimmed.replace(/^preview[-_.]*/i, '')
+
+  const explicitMatch = stripped.match(/pr-[a-zA-Z0-9_-]+/)
+  if (explicitMatch) {
+    return explicitMatch[0].toLowerCase()
+  }
+
+  const numericMatch = stripped.match(/^\d+$/)
+  if (numericMatch) {
+    return `pr-${numericMatch[0]}`
+  }
+
+  const sanitized = stripped
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return sanitized ? `pr-${sanitized}` : DEFAULT_PREVIEW_NAMESPACE_FALLBACK
+}
+
+export function resolveStorageKey(storageNamespace?: string): string {
+  const runtimeKey = getRuntimeStorageKey()
+  if (runtimeKey) {
+    return runtimeKey
+  }
+
+  const configuredNamespace =
+    storageNamespace ?? import.meta.env.VITE_LOOP_STORAGE_NAMESPACE?.trim() ?? ''
+
+  if (!configuredNamespace) {
+    return defaultSaveKey
+  }
+
+  return `${PREVIEW_KEY_PREFIX}${normalizePreviewNamespace(configuredNamespace)}${PREVIEW_SUFFIX}`
+}
+
 const RESOURCE_CAP = 9_999_999
 const DEFAULT_WEAPON_POWER = 1
 const DEFAULT_PLAYER_MAX_HP = 8
@@ -162,7 +224,7 @@ function getDefaultStorage(): { storage: StorageAdapter | null; error?: unknown 
 }
 
 export function createLocalGameStorage(
-  storageKey = defaultSaveKey,
+  storageKey = resolveStorageKey(),
   storage: StorageAdapter | null | undefined = undefined,
 ): GameStorage {
   const resolvedStorage = storage === undefined ? getDefaultStorage() : { storage }

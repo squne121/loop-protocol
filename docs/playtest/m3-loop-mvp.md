@@ -12,10 +12,10 @@ recorded_at: "2026-06-13T06:34:59Z"
 
 
 <!-- verification_marker_ac2: doc_id: playtest-m3-loop-mvp HTTP origin origin: command: browser: commit: -->
-<!-- verification_marker_ac3: doc_id: playtest-m3-loop-mvp localStorage.removeItem('loop-protocol.mvp.save') raw JSON schemaVersion resources weaponPower playerMaxHp -->
+<!-- verification_marker_ac3: doc_id: playtest-m3-loop-mvp production sentinel + raw JSON schemaVersion resources weaponPower playerMaxHp -->
 <!-- verification_marker_ac4: doc_id: playtest-m3-loop-mvp resources after claim resources after reload loopPhase = preparation enemies/projectiles current HP -->
 <!-- verification_marker_ac5: doc_id: playtest-m3-loop-mvp QuotaExceededError happy-path only 未証明 未解決 #740 -->
-<!-- verification_marker_ac6: doc_id: playtest-m3-loop-mvp PR preview production 同一 origin 同一 key clear -->
+<!-- verification_marker_ac6: doc_id: playtest-m3-loop-mvp PR preview production 同一 origin 同一 key 分離を前提とし、clear 前提を除去 -->
 
 
 ## Overview
@@ -36,7 +36,7 @@ It does not close #740 by itself because #740 still requires Playwright E2E cove
 
 ## Preconditions
 
-- clear step: `localStorage.removeItem('loop-protocol.mvp.save')`
+- production key sentinel: `loop-protocol.mvp.save` は既存値を上書きせず監視対象として扱う
 - initial resources: `0`
 - initial hull: `8/8`
 - initial loop phase: `Preparation`
@@ -54,7 +54,9 @@ It does not close #740 by itself because #740 still requires Playwright E2E cove
 
 ### Storage assertion
 
-- key: `loop-protocol.mvp.save`
+- key:
+  - production: `loop-protocol.mvp.save`（本実装は `#885` で PR preview / E2E 分離を担保）
+  - 試験キー: `loop-protocol.preview.pr-<pr-number>.mvp.save` または `loop-protocol.e2e.<run-id>.mvp.save`
 - resources after claim: `10`
 - status after claim: `Result confirmed.`
 - command after claim: `Progress saved locally.`
@@ -97,10 +99,9 @@ It does not close #740 by itself because #740 still requires Playwright E2E cove
 
 ## Origin and storage cautions
 
-- production と PR preview は同一 origin / 同一 key を共有し得る
-- same-origin caution: GitHub Pages の `production` と `PR preview` は path が違っても localStorage key `loop-protocol.mvp.save` を共有し得る
-- clear before preview/local verification: `localStorage.removeItem('loop-protocol.mvp.save')`
-- `clear` を実行せずに preview/local を切り替えると既存 save が混線する可能性がある
+- production と PR preview は同一 origin を共有し得る
+- same-origin caution: GitHub Pages の `production` と `PR preview` は path が違っても、`loop-protocol.mvp.save` を含む同一キーを共有し得る
+- そのため `#885` では `loop-protocol.preview.pr-<pr-number>.mvp.save` へ key を分離し、`loop-protocol.mvp.save` は clear 前提なしで扱う
 
 ## Follow-up routing
 
