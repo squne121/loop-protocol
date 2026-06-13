@@ -7,6 +7,8 @@ import {
   createGameSnapshot,
   createInitialGameState,
   defaultSimulationConfig,
+  type GameState,
+  type LoopPhase,
 } from './state'
 import {
   createLocalGameStorage,
@@ -135,9 +137,14 @@ if ((!canvas || !commandRail) && !isTestRuntime) {
 }
 
 const storage = createLocalGameStorage()
-const loadResult = storage.load()
-let hasLoadableSnapshot = loadResult.ok && loadResult.snapshot !== null
-let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefined : undefined)
+// B1: No auto-load on startup. Probe storage once to know if a snapshot exists,
+// but do NOT apply it to state. Load is only triggered via Load Game button.
+const startupProbe = storage.load()
+let hasLoadableSnapshot = startupProbe.ok && startupProbe.snapshot !== null
+let state: GameState = createInitialGameState()
+// B1: Start in title_menu phase (not preparation).
+// Explicit cast prevents TypeScript CFA from narrowing loopPhase to a literal type.
+;(state as { loopPhase: LoopPhase }).loopPhase = 'title_menu'
 const renderer = canvas ? createCanvasRenderer(canvas) : null
 
 // Debug pause state (runtime-local, not persisted)
@@ -165,6 +172,16 @@ function handleTogglePause(): void {
 
 const hud = commandRail ? createHudController(commandRail, {
   onStartSortie() {
+    // B1: New Game — title_menu → preparation
+    if (state.loopPhase === 'title_menu') {
+      state = createInitialGameState()
+      state.loopPhase = 'preparation'
+      resizeArena(state)
+      debugPause.isPaused = false
+      setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
+      return
+    }
+
     if (state.loopPhase !== 'preparation') {
       return
     }
@@ -173,7 +190,8 @@ const hud = commandRail ? createHudController(commandRail, {
     setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
   },
   onClaimReward() {
-    // Supports both legacy debrief_pending_reward and new result phase
+    // Supports legacy debrief_pending_reward phase only.
+    // In result phase, reward is auto-claimed by confirmResult() (B3).
     if (state.loopPhase !== 'debrief_pending_reward' && !(state.loopPhase === 'result' && state.resultRewardStatus === 'pending')) {
       return
     }
@@ -181,7 +199,9 @@ const hud = commandRail ? createHudController(commandRail, {
     const claimResult = claimPendingReward(state)
 
     if (claimResult.ok) {
-      persistProgressionSnapshot('reward-claim')
+      // B2: Do NOT call storage.save() here (result phase).
+      // For legacy debrief_pending_reward, save happens when transitioning to preparation.
+      setHudFeedback('Reward claimed.', 'Confirm result to save and return to preparation.')
       return
     }
 
@@ -201,7 +221,7 @@ const hud = commandRail ? createHudController(commandRail, {
     }
   },
   onConfirmResult() {
-    // AC5: confirm result → preparation transition
+    // B3: confirm result auto-claims pending reward, then transitions to preparation and saves.
     if (state.loopPhase !== 'result') {
       return
     }
@@ -209,18 +229,23 @@ const hud = commandRail ? createHudController(commandRail, {
     confirmResult(state)
     // Reset debug pause on state transition to preparation
     debugPause.isPaused = false
+    // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
+    persistProgressionSnapshot('save')
     setHudFeedback('Result confirmed.', 'Ready for next sortie.')
   },
   onNextSortie() {
-    // Legacy debrief_reward_claimed → startSortie (kept for backward compat)
+    // B5: legacy debrief_reward_claimed → preparation (not directly to running).
+    // startSortie() only accepts preparation phase, so transition to preparation first.
     if (state.loopPhase !== 'debrief_reward_claimed') {
       return
     }
 
-    startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    state.loopPhase = 'preparation'
+    resizeArena(state)
+    debugPause.isPaused = false
     setHudFeedback(
-      'Next sortie started.',
-      'Claimed reward remains available only in this in-memory session until saved.',
+      'Returned to preparation.',
+      'Use Start sortie to begin the next sortie.',
     )
   },
   onSave() {
@@ -232,37 +257,43 @@ const hud = commandRail ? createHudController(commandRail, {
     persistProgressionSnapshot('save')
   },
   onLoadGame() {
-    // AC3, AC9: Load Game only from title_menu or load_menu
-    if (state.loopPhase !== 'title_menu' && state.loopPhase !== 'load_menu') {
+    // B1: title_menu → load_menu (select save slot step)
+    if (state.loopPhase === 'title_menu') {
+      state.loopPhase = 'load_menu'
+      setHudFeedback('Load Menu.', 'Select a save slot to load.')
       return
     }
 
-    if (!hasLoadableSnapshot) {
-      setHudFeedback('Load Game failed.', 'No save data available.')
+    // B1: load_menu + Load slot-1 → storage.load() → preparation
+    if (state.loopPhase === 'load_menu') {
+      if (!hasLoadableSnapshot) {
+        setHudFeedback('Load Game failed.', 'No save data available.')
+        return
+      }
+
+      const loadResult = storage.load()
+      if (!loadResult.ok) {
+        reportStorageFailure('load', loadResult)
+        setHudFeedback('Load Game failed.', 'Current state unchanged.')
+        return
+      }
+
+      if (loadResult.snapshot === null) {
+        hasLoadableSnapshot = false
+        setHudFeedback('Load Game failed.', 'No save data found.')
+        return
+      }
+
+      // AC3: restore to preparation after load
+      state = createInitialGameState(loadResult.snapshot)
+      state.loopPhase = 'preparation'
+      resizeArena(state)
+      hasLoadableSnapshot = true
+      // Reset debug pause on state transition to preparation
+      debugPause.isPaused = false
+      setHudFeedback('Load Game complete.', 'Progression snapshot restored.')
       return
     }
-
-    const loadResult = storage.load()
-    if (!loadResult.ok) {
-      reportStorageFailure('load', loadResult)
-      setHudFeedback('Load Game failed.', 'Current state unchanged.')
-      return
-    }
-
-    if (loadResult.snapshot === null) {
-      hasLoadableSnapshot = false
-      setHudFeedback('Load Game failed.', 'No save data found.')
-      return
-    }
-
-    // AC3: restore to preparation after load
-    state = createInitialGameState(loadResult.snapshot)
-    state.loopPhase = 'preparation'
-    resizeArena(state)
-    hasLoadableSnapshot = true
-    // Reset debug pause on state transition to preparation
-    debugPause.isPaused = false
-    setHudFeedback('Load Game complete.', 'Progression snapshot restored.')
   },
   onReset() {
     if (state.loopPhase !== 'preparation') {
@@ -287,9 +318,9 @@ const hud = commandRail ? createHudController(commandRail, {
   },
 }) : null
 
-if (!loadResult.ok) {
-  reportStorageFailure('load', loadResult)
-  setHudFeedback('Load Game unavailable on startup.', 'A fresh title menu state was created.')
+// B1: startup probe failure is non-fatal — title_menu state is always the starting point.
+if (!startupProbe.ok) {
+  reportStorageFailure('load', startupProbe)
 }
 
 if (canvas) {

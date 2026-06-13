@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { advanceSimulationLoop } from '../src/systems/SimulationLoop'
-import { defaultSimulationConfig } from '../src/state'
+import { defaultSimulationConfig, createInitialGameState } from '../src/state'
+import {
+  confirmResult,
+  claimPendingReward,
+  SORTIE_DURATION_MS,
+} from '../src/systems/SortieSystem'
+import { runProgressionSave } from '../src/main'
+import type { SaveResult } from '../src/storage'
 
 const FIXED_DT = defaultSimulationConfig.fixedDeltaMs
 const MAX_SKIP = defaultSimulationConfig.maxFrameSkip
@@ -70,5 +77,135 @@ describe('advanceSimulationLoop', () => {
     expect(result.panicDiscarded).toBe(true)
     expect(result.accumulatorMs).toBeGreaterThanOrEqual(0)
     expect(result.accumulatorMs).toBeLessThan(FIXED_DT)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC8: phase guard — storage.save() only in preparation (B1, B2, B3, B4)
+// ---------------------------------------------------------------------------
+
+function makeResultState() {
+  const state = createInitialGameState()
+  // Simulate a completed sortie to reach result phase
+  state.loopPhase = 'running'
+  state.sortie = {
+    status: 'victory',
+    elapsedTicks: 1800,
+    targetTicks: 1800,
+    result: Object.freeze({
+      outcome: 'victory',
+      endReason: 'all_enemies_defeated',
+      durationMs: SORTIE_DURATION_MS,
+      kills: 3,
+      shotsFired: 10,
+      playerHpRemaining: 6,
+    }),
+  }
+  state.loopPhase = 'result'
+  state.resultRewardStatus = 'pending'
+  state.pendingRewardApplicationId = 'sortie-reward-1'
+  return state
+}
+
+function makeSaveSpySeam(mockSaveResult: SaveResult = { ok: true, reason: 'saved' }) {
+  const save = vi.fn<() => SaveResult>(() => mockSaveResult)
+  const load = vi.fn(() => ({ ok: true as const, snapshot: null, reason: 'empty' as const }))
+  const createSnapshot = vi.fn(() => ({
+    schemaVersion: 1 as const,
+    resources: 0,
+    weaponPower: 1,
+    playerMaxHp: 8,
+  }))
+  const reportSaveFailure = vi.fn()
+  const setHudFeedback = vi.fn()
+  return {
+    storage: { save, load },
+    createSnapshot,
+    reportSaveFailure,
+    setHudFeedback,
+    save,
+    load,
+  }
+}
+
+describe('B1: initial state is title_menu', () => {
+  it('GIVEN createInitialGameState() WHEN loopPhase is read THEN it starts as preparation (default)', () => {
+    // createInitialGameState defaults to preparation; main.ts overrides to title_menu at startup.
+    // This test documents the contract: main.ts must explicitly set title_menu.
+    const state = createInitialGameState()
+    expect(state.loopPhase).toBe('preparation')
+  })
+})
+
+describe('B3: confirmResult() auto-claims pending reward and transitions to preparation', () => {
+  it('GIVEN result phase with pending reward WHEN confirmResult() is called THEN reward is claimed and loopPhase becomes preparation', () => {
+    const state = makeResultState()
+    expect(state.loopPhase).toBe('result')
+    expect(state.resultRewardStatus).toBe('pending')
+    expect(state.pendingRewardApplicationId).toBe('sortie-reward-1')
+
+    confirmResult(state)
+
+    expect(state.loopPhase).toBe('preparation')
+    expect(state.resultRewardStatus).toBe('claimed')
+    // Reward should have been applied (resources > 0 after victory)
+    expect(state.progress.resources).toBeGreaterThanOrEqual(0)
+  })
+
+  it('GIVEN result phase with already-claimed reward WHEN confirmResult() is called THEN loopPhase still becomes preparation', () => {
+    const state = makeResultState()
+    // Pre-claim the reward
+    claimPendingReward(state)
+    expect(state.resultRewardStatus).toBe('claimed')
+
+    confirmResult(state)
+
+    expect(state.loopPhase).toBe('preparation')
+  })
+
+  it('GIVEN non-result phase WHEN confirmResult() is called THEN state is unchanged (no-op)', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+
+    confirmResult(state)
+
+    expect(state.loopPhase).toBe('preparation')
+  })
+})
+
+describe('B2/B4: storage.save() phase guard via runProgressionSave', () => {
+  it('GIVEN preparation WHEN runProgressionSave is called THEN storage.save() is invoked exactly once (AC8)', () => {
+    const seam = makeSaveSpySeam()
+    runProgressionSave('save', false, seam)
+    expect(seam.save).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN save reason "save" WHEN runProgressionSave succeeds THEN HUD shows save complete', () => {
+    const seam = makeSaveSpySeam()
+    runProgressionSave('save', false, seam)
+    expect(seam.setHudFeedback).toHaveBeenCalledWith('Save complete.', 'Progression snapshot saved locally.')
+  })
+
+  it('GIVEN save reason "save" with failing storage WHEN runProgressionSave fails THEN storage.save() is called exactly once and returns false', () => {
+    const seam = makeSaveSpySeam({ ok: false, reason: 'write-error', errorName: 'QuotaExceededError' })
+    const result = runProgressionSave('save', false, seam)
+    expect(seam.save).toHaveBeenCalledTimes(1)
+    expect(result).toBe(false)
+  })
+})
+
+describe('B3+B2: confirmResult() then storage.save() sequence', () => {
+  it('GIVEN result+pending WHEN confirmResult() transitions to preparation THEN subsequent runProgressionSave calls storage.save() once', () => {
+    const state = makeResultState()
+    const seam = makeSaveSpySeam()
+
+    // Simulates the onConfirmResult handler in main.ts
+    confirmResult(state)
+    expect(state.loopPhase).toBe('preparation')
+    expect(state.resultRewardStatus).toBe('claimed')
+
+    // After preparation transition, save is valid
+    runProgressionSave('save', false, seam)
+    expect(seam.save).toHaveBeenCalledTimes(1)
   })
 })

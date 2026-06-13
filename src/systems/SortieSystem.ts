@@ -92,13 +92,27 @@ export function claimPendingReward(
 }
 
 /**
- * Confirms the result screen and transitions from 'result' to 'preparation' (AC5).
- * Must be called from 'result' phase after reward has been claimed.
+ * Confirms the result screen. If reward is still pending, auto-claims it first (B3).
+ * Then transitions from 'result' to 'preparation' (AC5).
  * No-op if called from any other phase.
+ *
+ * Caller is responsible for calling storage.save() after this returns,
+ * since save must occur in preparation phase (AC2, AC8).
  */
 export function confirmResult(state: GameState): void {
   if (state.loopPhase !== 'result') {
     return
+  }
+
+  // B3: auto-claim pending reward before transitioning to preparation
+  if (state.resultRewardStatus === 'pending') {
+    const applicationId = state.pendingRewardApplicationId
+    if (applicationId !== null && state.sortie.result !== null) {
+      const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
+      if (claimResult.ok || claimResult.reason === 'already-claimed') {
+        state.resultRewardStatus = 'claimed'
+      }
+    }
   }
 
   state.loopPhase = 'preparation'

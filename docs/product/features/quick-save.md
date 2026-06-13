@@ -67,10 +67,13 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 
 プレイテスト証跡メタデータ（`PlaytestEvidence`）は Quick Save の対象外。証跡エクスポートは Issue #571 で実装済みの export panel が担う（game state / Quick Save との統合は禁止）。
 
-## 現行 Load 動作
+## 現行 Load 動作（#619 更新）
 
-- 起動時のみ `storage.load()` を呼び、`createInitialGameState(snapshot)` に渡す
-- 手動ロード UI/action は現行実装に存在しない
+- **起動時の auto-load は廃止**。起動直後の state は `title_menu` フェーズであり、`storage.load()` の snapshot を自動適用しない
+- 起動時に storage の probe（snapshot 有無の確認）は行う（Load Game ボタンの enabled/disabled 制御のため）
+- **Load Game は `title_menu` / `load_menu` フェーズからのみ実行可能**:
+  - `title_menu` で Load Game ボタンを押すと `load_menu` に遷移する
+  - `load_menu` で Load slot-1 ボタンを押すと `storage.load()` を呼び、成功時に `preparation` フェーズへ遷移する
 - 復元対象: `resources`, `weaponPower`, `playerMaxHp` のみ
 - `player.hp` は保存時 HP ではなく `playerMaxHp` で初期化される
 - sortie / enemies / projectiles / cooldown / result / runtime は復元されない
@@ -107,7 +110,9 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 
 Save 操作（`LocalGameStorage.save()` の実際の呼び出し）は `preparation` フェーズのみ許可する。
 
-`running` / `result` / `title_menu` / `load_menu` フェーズでは Save を実行しない。これによりゲームバランスへの悪影響（戦闘中の save-scum 等）を防ぐ。
+`running` / `result` / `title_menu` / `load_menu` フェーズでは `storage.save()` を実行しない。これによりゲームバランスへの悪影響（戦闘中の save-scum 等）を防ぐ。
+
+**`result` フェーズの autosave は廃止（#619 B2/B3 更新）**: 以前は `onClaimReward()` が `result` フェーズ中に `storage.save()` を呼んでいたが、この動作は廃止した。現在の実装では `confirmResult()` が pending reward を自動 claim したうえで `preparation` フェーズへ遷移し、遷移後に `storage.save()` を呼ぶ。これにより save タイミングが `preparation` フェーズ内に統一される。
 
 ### Load Game ポリシー
 
