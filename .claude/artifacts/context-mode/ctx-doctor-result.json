@@ -1,0 +1,26 @@
+{
+  "_schema": "context-mode-ctx-doctor-result-v1",
+  "_issue": "#824",
+  "_generated_at": null,
+  "_status": "pending-runtime-verification",
+  "_preflight_scope": "runtime_only",
+  "_note": "このファイルは context-mode の実験用 profile 起動後に ctx-doctor コマンドを実行して生成します。現時点では context-mode 未インストールのため空スケルトンです。",
+  "ok": null,
+  "doctor_output": null,
+  "errors": [],
+  "warnings": [],
+  "mcp_registration_status": null,
+  "hooks_status": null,
+  "redaction": {
+    "home_path_masked": true,
+    "token_like_values_excluded": true,
+    "env_dump_excluded": true
+  },
+  "runtime_verification_instructions": [
+    "context-mode をインストールして実験用 profile で起動後:",
+    "1. claude --profile experiment ctx_doctor を実行（または MCP tool ctx_doctor を呼び出す）",
+    "2. 結果の JSON を本ファイルに保存する",
+    "3. home パスをマスク（例: <HOME_MASKED>）してから保存する",
+    "4. ok: true であることを確認する"
+  ]
+}

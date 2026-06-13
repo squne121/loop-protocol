@@ -1,0 +1,30 @@
+{
+  "_schema": "context-mode-version-provenance-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T00:00:00Z",
+  "_status": "pending-runtime-verification",
+  "_note": "このファイルは #824 実装段階で作成されたスケルトンです。context-mode インストール後に実際の値で更新してください。",
+  "installed_version": null,
+  "package_name": "context-mode",
+  "package_location_basename": null,
+  "package_location_hash": null,
+  "release_tag": null,
+  "package_hash": null,
+  "manifest_version": null,
+  "install_method": "npm",
+  "install_scope": "experiment-profile-only",
+  "install_command": "npm install -g context-mode",
+  "verification_instructions": [
+    "context-mode をインストール後に以下を実行して値を更新する:",
+    "1. npm list -g context-mode --json で installed_version を取得",
+    "2. npm root -g で package_location_basename を取得し hash 化",
+    "3. github.com/context-mode/context-mode/releases から release_tag を取得",
+    "4. npm pack context-mode --dry-run --json で package_hash を取得",
+    "5. package.json の version で manifest_version を確認"
+  ],
+  "redaction": {
+    "home_path_masked": true,
+    "token_like_values_excluded": true,
+    "env_dump_excluded": true
+  }
+}
