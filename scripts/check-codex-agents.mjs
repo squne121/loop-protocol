@@ -843,11 +843,11 @@ function denyForBash(command) {
 // ---------------------------------------------------------------------------
 // Allowed Paths enforcement
 // CODEX_ALLOWED_PATHS_MODE controls the write-guard behavior:
+//   workspace — (default when not set) repo workspace edits are allowed; protected paths are
+//               always denied. CODEX_ALLOWED_PATHS, if set, narrows (intersects) rather than widens.
+//               CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode (backward compat).
 //   strict    — CODEX_ALLOWED_PATHS must be declared; writes outside it are denied (fail-closed).
 //               If CODEX_ALLOWED_PATHS is not set in strict mode: deny all writes.
-//   workspace — repo workspace edits are allowed; protected paths are always denied.
-//               CODEX_ALLOWED_PATHS, if set, narrows (intersects) rather than widens.
-//               CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode (backward compat).
 //   shadow    — same allow logic as workspace but logs would-block events to
 //               .guard_shadow_log.jsonl for observability.
 //   unknown   — fail-closed (all writes denied). Unknown mode is never silently trusted.
@@ -866,8 +866,11 @@ function parseAllowedPathsMode() {
     return 'workspace'; // backward compat: legacy allow = workspace mode
   }
   const raw = (process.env.CODEX_ALLOWED_PATHS_MODE ?? '').trim().toLowerCase();
-  if (raw === 'strict' || raw === '') {
-    return 'strict'; // default when not set: fail-closed strict
+  if (raw === '' || raw === 'workspace') {
+    return 'workspace'; // default when not set: workspace mode (allow repo workspace edits)
+  }
+  if (raw === 'strict') {
+    return 'strict';
   }
   if (raw === 'workspace') return 'workspace';
   if (raw === 'shadow') return 'shadow';
@@ -1116,12 +1119,21 @@ function runSelfTest() {
 
   process.stdout.write('\n=== self-test: Allowed Paths enforcement (Edit/Write) ===\n');
 
-  // Test: CODEX_ALLOWED_PATHS not set, no legacy opt-in — fail-closed: any write is denied
+  // Test: CODEX_ALLOWED_PATHS_MODE not set — default is workspace: normal path is allowed
   {
     delete process.env.CODEX_ALLOWED_PATHS;
     delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    delete process.env.CODEX_ALLOWED_PATHS_MODE;
     const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    selfAssert(result !== null, 'Fail-closed default: src/main.ts edit is denied when CODEX_ALLOWED_PATHS not set');
+    selfAssert(result === null, 'Workspace default: src/main.ts edit is allowed when CODEX_ALLOWED_PATHS_MODE not set (Issue #874 goal: workspace default)');
+  }
+
+  // Test: CODEX_ALLOWED_PATHS_MODE=strict — fail-closed: any write is denied
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
+    selfAssert(result !== null, 'Strict mode: src/main.ts edit is denied when CODEX_ALLOWED_PATHS not set');
   }
 
   // Test: CODEX_ALLOWED_PATHS not set, CODEX_LEGACY_ALLOW_WRITES=1 — assets/ is denied
@@ -1170,12 +1182,12 @@ function runSelfTest() {
     selfAssert(result !== null, 'Strict mode: path traversal escape scripts/../src/main.ts is denied');
   }
 
-  // Test: path traversal escape — denied in fail-closed default
+  // Test: path traversal escape — denied in strict mode (no CODEX_ALLOWED_PATHS)
   {
     delete process.env.CODEX_ALLOWED_PATHS;
     delete process.env.CODEX_LEGACY_ALLOW_WRITES;
-    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, null);
-    selfAssert(result !== null, 'Fail-closed default: path traversal escape is denied');
+    const result = denyForWriteTool('Write', { file_path: 'scripts/../src/main.ts' }, null, 'strict');
+    selfAssert(result !== null, 'Strict mode: path traversal escape is denied');
   }
 
   // Test: NUL byte in path — denied
@@ -1375,12 +1387,21 @@ function runSelfTest() {
     selfAssert(result !== null && result.includes('direct_bypass_requires_rtk'), 'Bash hook: direct gh denied with direct_bypass_requires_rtk reason');
   }
 
-  // Test: Edit denied with allowed_paths_missing when CODEX_ALLOWED_PATHS not set
+  // Test: Edit allowed by workspace default when CODEX_ALLOWED_PATHS not set
   {
     delete process.env.CODEX_ALLOWED_PATHS;
     delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    delete process.env.CODEX_ALLOWED_PATHS_MODE;
     const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
-    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Write tool: denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
+    selfAssert(result === null, 'Write tool: workspace default allows src/main.ts when no CODEX_ALLOWED_PATHS (workspace is default mode)');
+  }
+
+  // Test: Edit denied with allowed_paths_missing when CODEX_ALLOWED_PATHS_MODE=strict and no CODEX_ALLOWED_PATHS
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
+    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Write tool (strict): denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
   }
 
   // Test: Write denied with allowed_paths_violation when path is outside Allowed Paths

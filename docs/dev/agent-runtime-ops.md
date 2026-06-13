@@ -234,8 +234,8 @@ codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh iss
 
 | モード | 説明 | 既定 |
 |---|---|---|
-| `strict` | `CODEX_ALLOWED_PATHS` の明示宣言が必須。未宣言時は全書き込みを deny（fail-closed）。 | 既定（未設定時） |
-| `workspace` | repo workspace 内の通常編集を allow。保護 path は常に deny。`CODEX_ALLOWED_PATHS` が設定されている場合は intersect（narrowing）で絞り込む。 | `CODEX_LEGACY_ALLOW_WRITES=1` と同等 |
+| `workspace` | repo workspace 内の通常編集を allow。保護 path は常に deny。`CODEX_ALLOWED_PATHS` が設定されている場合は intersect（narrowing）で絞り込む。 | **既定（未設定時）** |
+| `strict` | `CODEX_ALLOWED_PATHS` の明示宣言が必須。未宣言時は全書き込みを deny（fail-closed）。 | — |
 | `shadow` | workspace と同じ allow ロジック + would-block イベントを `.guard_shadow_log.jsonl`（repo root, git 管理外）に記録。 | — |
 | `unknown`（上記以外） | fail-closed（全書き込みを deny）。 | — |
 
