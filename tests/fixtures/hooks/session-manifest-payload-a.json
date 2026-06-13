@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "test-throttle-session-001",
+  "tool_name": "Bash",
+  "tool_use_id": "tool-001-payload-a"
+}
