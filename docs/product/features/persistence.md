@@ -115,8 +115,8 @@ canonical snapshot fields（`resources` / `weaponPower` / `playerMaxHp`）の検
 - acceptance test は `file://` ではなく **HTTP origin** 上で実行する前提とする。`file://` では localStorage の挙動が origin 仕様上保証されない（`file://` は保証対象外）。
 - same-origin deployment は path 間で localStorage を共有するため、`loop-protocol.` の project prefix によって project 間の key collision を回避する。
 - ただし project prefix は **同一 project の本番 / PR preview / dev preview 間の衝突には効かない**。localStorage は origin 単位で分離され path 単位では分離されないため、GitHub Pages の `/<repo>/` 本番と `/<repo>/pr-<n>/` preview は同一 origin の保存領域（同一 key `loop-protocol.mvp.save`）を共有し得る。
-  - E2E / preview 環境では test 実行前に `loop-protocol.mvp.save` を clear し、本番セーブデータへの干渉と test 間汚染を防ぐ。
-  - PR preview は production save と同一 origin/key を共有し得るため、ユーザー向け永続データの互換性検証以外の用途では preview 専用の key suffix を検討する。
+  - 旧運用として `loop-protocol.mvp.save` を E2E / preview 前に clear する案があったが、GitHub Pages 同一 origin 衝突により本番セーブデータを消す危険があるため廃止する。
+  - E2E / preview は `loop-protocol.e2e.*` / `loop-protocol.preview.pr-*` の分離 key を使い、production key は clear しない。
 
 ### Storage key matrix（production / preview / e2e / assist-suspend）
 
