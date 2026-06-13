@@ -4,7 +4,9 @@ import { resolveProgressionSaveFailureFeedback, runProgressionSave } from '../sr
 // Note: ProgressionSaveReason is now 'reward-claim' | 'save' (Quick Save renamed to Save — #619)
 import {
   createLocalGameStorage,
+  defaultSaveKey,
   parseSnapshot,
+  resolveStorageKey,
   serializeSnapshot,
   type SaveResult,
 } from '../src/storage'
@@ -27,6 +29,60 @@ function createMemoryStorage(initialEntries?: Record<string, string>) {
 }
 
 describe('LocalGameStorage', () => {
+  it('GIVEN no override WHEN resolveStorageKey is called THEN returns production save key', () => {
+    expect(resolveStorageKey()).toBe(defaultSaveKey)
+  })
+
+  it('GIVEN storage namespace override WHEN resolveStorageKey is called THEN returns preview namespace key', () => {
+    expect(resolveStorageKey('preview-pr-885')).toBe('loop-protocol.preview.pr-885.mvp.save')
+  })
+
+  it('GIVEN numeric namespace override WHEN resolveStorageKey is called THEN returns preview namespace key', () => {
+    expect(resolveStorageKey('885')).toBe('loop-protocol.preview.pr-885.mvp.save')
+  })
+
+  it('GIVEN runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN uses runtime key', () => {
+    const targetKey = 'loop-protocol.e2e.storage-resolver.mvp.save'
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+
+    try {
+      storageWindow.__LOOP_STORAGE_KEY__ = targetKey
+      expect(resolveStorageKey()).toBe(targetKey)
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
+  it('GIVEN runtime override key WHEN default createLocalGameStorage is used THEN it uses override key', () => {
+    const targetKey = 'loop-protocol.e2e.storage-internal.mvp.save'
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+
+    try {
+      const storage = createMemoryStorage()
+      storageWindow.__LOOP_STORAGE_KEY__ = targetKey
+
+      const gameStorage = createLocalGameStorage(undefined, storage)
+      expect(gameStorage.save({ schemaVersion: 1, resources: 1, weaponPower: 2, playerMaxHp: 3 }))
+        .toEqual({ ok: true, reason: 'saved' })
+
+      expect(storage.getItem(targetKey)).toEqual(
+        '{"schemaVersion":1,"resources":1,"weaponPower":2,"playerMaxHp":3}',
+      )
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
   it('GIVEN a v1 snapshot WHEN it is serialized and parsed THEN schemaVersion 1 is preserved', () => {
     const snapshot = {
       schemaVersion: 1,
