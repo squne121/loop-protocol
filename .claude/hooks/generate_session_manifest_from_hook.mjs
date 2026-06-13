@@ -23,9 +23,11 @@
  *   No content hash in filename (avoids circular reference with evidenceSourceRef)
  *   content hash stored as artifact_sha256 field via producer-generated manifest
  *
- * Duplicate stable key: {hookEventName}:{toolName}:{phase}
+ * Duplicate stable key: {hookEventName}:{sessionId}:{toolName}:{phase}:{payloadDigest}
  *   Scanned from existing artifact filenames in artifacts/ dir.
  *   Filename encodes key via URL-safe base64 segment.
+ *   payload_digest: sha256 of serialized stdin payload (first 16 hex chars)
+ *   Same payload digest → skip (throttle identical events from duplicate triggers)
  *
  * stdin: Claude hook context JSON (varies by event type)
  * stdout: empty (silent)
@@ -118,13 +120,28 @@ function ensureArtifactsDir() {
 }
 
 /**
+ * Compute SHA-256 payload digest for throttle deduplication.
+ * Returns first 16 hex chars of sha256(serializedPayload).
+ * Empty string if payload is null/undefined.
+ */
+function computePayloadDigest(payload) {
+  if (payload == null) return 'nullpayload'
+  try {
+    const serialized = JSON.stringify(payload, Object.keys(payload).sort())
+    return sha256(serialized).slice(0, 16)
+  } catch {
+    return 'digestfail'
+  }
+}
+
+/**
  * Build a URL-safe stable key segment from event info.
- * Key format: {hookEventName}:{toolName}:{phase}
+ * Key format: {hookEventName}:{sessionId}:{toolName}:{phase}:{payloadDigest}
  * Encoded as URL-safe base64 for use in filename.
  */
-function buildStableKey(hookEventName, sessionId, toolName, ledgerPhase) {
-  const rawKey = `${hookEventName}:${sessionId || 'nosession'}:${toolName || ''}:${ledgerPhase}`
-  return Buffer.from(rawKey).toString('base64url').slice(0, 32)
+function buildStableKey(hookEventName, sessionId, toolName, ledgerPhase, payloadDigest) {
+  const rawKey = `${hookEventName}:${sessionId || 'nosession'}:${toolName || ''}:${ledgerPhase}:${payloadDigest || 'nodigest'}`
+  return Buffer.from(rawKey).toString('base64url').slice(0, 40)
 }
 
 /**
@@ -168,8 +185,11 @@ async function main() {
   // Map event to phase info
   const phaseInfo = EVENT_PHASE_MAP[hookEventName] ?? EVENT_PHASE_MAP['Stop']
 
-  // Build stable duplicate key (not timestamp-dependent)
-  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase)
+  // Compute payload digest for throttle (same payload → same digest → skip)
+  const payloadDigest = computePayloadDigest(hookCtx)
+
+  // Build stable duplicate key (not timestamp-dependent, includes payload_digest)
+  const stableKeySegment = buildStableKey(hookEventName, sessionId, toolName, phaseInfo.ledgerPhase, payloadDigest)
 
   // Check for duplicate before doing any work
   if (hasDuplicateArtifact(stableKeySegment)) {

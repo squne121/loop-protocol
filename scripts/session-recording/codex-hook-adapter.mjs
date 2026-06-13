@@ -315,7 +315,10 @@ async function main() {
       emitJson(denyPermissionRequest(`Malformed ${event} payload blocked by hook.`))
       return
     }
-    emitJson(stopEventOutput(`Malformed ${event} payload blocked by hook.`))
+    // Stop / SubagentStop: session recording failure → best-effort telemetry, continue:true
+    // Do NOT emit stopEventOutput (continue:false) for recording failures (AC3)
+    process.stderr.write(`[codex-hook-adapter] warn: malformed ${event} payload — session recording skipped (best-effort)\n`)
+    emitJson({ continue: true })
     return
   }
 
@@ -334,7 +337,15 @@ async function main() {
   }
 
   if (event === 'Stop' || event === 'SubagentStop') {
-    emitJson(runManifestFlow(event, payload))
+    // AC3: session recording failure → best-effort telemetry, always continue:true
+    let result
+    try {
+      result = runManifestFlow(event, payload)
+    } catch (manifestErr) {
+      process.stderr.write(`[codex-hook-adapter] warn: ${event} manifest flow failed (best-effort): ${String(manifestErr?.message ?? 'unknown')}\n`)
+      result = { continue: true }
+    }
+    emitJson(result)
     return
   }
 
@@ -345,11 +356,13 @@ async function main() {
   throw new Error(`Unsupported event: ${event}`)
 }
 
-main().catch(() => {
+main().catch((err) => {
   const eventIndex = process.argv.indexOf('--event')
   const eventName = eventIndex >= 0 ? process.argv[eventIndex + 1] : null
   if (eventName === 'Stop' || eventName === 'SubagentStop') {
-    emitJson(stopEventOutput(sanitizeStopReason(eventName)))
+    // AC3: session recording failure → best-effort telemetry, continue:true (never block session)
+    process.stderr.write(`[codex-hook-adapter] warn: ${eventName} hook failed (best-effort, continuing): ${String(err?.message ?? 'unknown')}\n`)
+    emitJson({ continue: true })
     process.exit(0)
   }
   if (eventName === 'PreToolUse') {

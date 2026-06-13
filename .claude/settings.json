@@ -125,6 +125,18 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/save_loop_state_before_compaction.sh",
+            "args": [],
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
