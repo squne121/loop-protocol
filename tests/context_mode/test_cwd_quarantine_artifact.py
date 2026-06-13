@@ -234,3 +234,22 @@ class TestAC883:
                     f"{tool_short}: {tool!r} is in settings.json deny but artifact says {artifact_val!r}"
                 )
         assert not mismatches, "project_policy mismatch with settings.json:\n" + "\n".join(mismatches)
+
+    def test_execution_like_tools_not_allowed_or_asked(self):
+        """AC1: execution-like context-mode tools must not appear in allow/ask."""
+        assert self.SETTINGS_PATH.exists(), f"Settings not found: {self.SETTINGS_PATH}"
+        with self.SETTINGS_PATH.open() as f:
+            settings = json.load(f)
+
+        permissions = settings.get("permissions", {})
+        allow = set(permissions.get("allow", []))
+        ask = set(permissions.get("ask", []))
+
+        violations = []
+        for tool in self.EXECUTION_LIKE_TOOLS:
+            if tool in allow:
+                violations.append(f"{tool}: unexpectedly present in permissions.allow")
+            if tool in ask:
+                violations.append(f"{tool}: unexpectedly present in permissions.ask")
+
+        assert not violations, "execution-like tools must not be allow/ask:\n" + "\n".join(violations)
