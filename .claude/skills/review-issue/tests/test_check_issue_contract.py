@@ -915,3 +915,23 @@ class TestC5GroupedAcComment:
         assert "1" in refs
         assert "2" in refs
         assert "3" in refs
+
+    def test_prose_hash_ac_not_counted(self):
+        """B1: prose comment '説明: # AC2 は未検証' must NOT be extracted as C5 ref."""
+        refs = _extract_vc_ac_refs("説明: # AC2 は未検証\n")
+        assert refs == set()
+
+    def test_echo_hash_ac_not_counted(self):
+        """B1: shell echo containing '# AC2' must NOT be extracted as C5 ref."""
+        refs = _extract_vc_ac_refs('$ echo "# AC2"\n')
+        assert refs == set()
+
+    def test_url_fragment_ac_not_counted(self):
+        """B1: URL fragment '#AC2' must NOT be extracted as C5 ref."""
+        refs = _extract_vc_ac_refs("$ curl https://example.test/#AC2\n")
+        assert refs == set()
+
+    def test_filename_hash_ac_not_counted(self):
+        """B1: filename containing '#AC2' must NOT be extracted as C5 ref."""
+        refs = _extract_vc_ac_refs("$ cat docs/#AC2.md\n")
+        assert refs == set()

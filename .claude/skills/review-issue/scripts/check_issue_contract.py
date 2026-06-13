@@ -717,32 +717,34 @@ def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
+_VC_AC_COMMENT_RE = re.compile(
+    r"^\s*#\s*(AC\d+(?:\s*,\s*AC\d+)*)\s*$",
+    re.MULTILINE,
+)
+
+
 def _extract_vc_ac_refs(vc_section: str) -> set[str]:
     """
-    Extract all AC numbers referenced in VC comments.
+    Extract all AC numbers referenced in VC comment lines.
+
+    Only pure comment lines are recognised — a line whose content (after
+    stripping leading whitespace) is exactly ``# AC<N>`` or a comma-separated
+    list ``# AC<N>, AC<M>, ...``.  Lines that merely contain ``#AC`` as part
+    of prose, a URL fragment, a filename, or a shell command are intentionally
+    excluded.
 
     Supports two forms:
     - Single:  # AC1
     - Grouped: # AC2, AC3, AC4  (comma-separated list on a single comment line)
 
-    Range notation (e.g. # AC2-AC4) is NOT supported by this function.
-    Each number in a comma-separated list is extracted individually.
+    Range notation (e.g. # AC2-AC4) is NOT a recognised form; the whole line
+    fails to match and is treated as unrecognised (no refs extracted).
 
     Returns a set of digit strings (e.g. {"1", "2", "3", "4"}).
     """
     refs: set[str] = set()
-    # Match a comment line starting with # then one or more AC<N> references
-    # separated by optional commas/spaces.
-    # Pattern: # AC<N> optionally followed by , AC<N> repetitions
-    grouped_pattern = re.compile(
-        r'#\s*AC(\d+)'           # first AC reference after '#'
-        r'(?:\s*,\s*AC(\d+))*',  # zero or more comma-separated AC references
-    )
-    for m in grouped_pattern.finditer(vc_section):
-        # group(1) is the first number; scan the full match text for remaining numbers
-        full_match = m.group(0)
-        for num in re.findall(r'AC(\d+)', full_match):
-            refs.add(num)
+    for m in _VC_AC_COMMENT_RE.finditer(vc_section):
+        refs.update(re.findall(r"AC(\d+)", m.group(1)))
     return refs
 
 
