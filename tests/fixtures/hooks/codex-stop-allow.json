@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "codex-session-stop-001",
+  "secrets_mode": "none",
+  "touched_paths": []
+}

@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "PreCompact",
+  "session_id": "test-session-allow-001",
+  "context_window_usage": 0.85
+}
