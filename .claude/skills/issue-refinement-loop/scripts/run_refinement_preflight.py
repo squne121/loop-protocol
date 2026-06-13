@@ -776,7 +776,6 @@ def _build_result(
     blockers: list[str],
     artifacts: dict[str, str],
     hashes: dict[str, str],
-    repair_diagnostics: Optional[dict] = None,
 ) -> dict:
     """Build a refinement_preflight_result/v1 compliant dict."""
     result = {
@@ -794,9 +793,6 @@ def _build_result(
         "artifacts": artifacts,
         "hashes": hashes,
     }
-    # BLOCKER 1 fix: expose repair diagnostics in preflight output (report-only)
-    if repair_diagnostics is not None:
-        result["repair_diagnostics"] = repair_diagnostics
     return result
 
 
@@ -1076,7 +1072,32 @@ def run_preflight(
         reason_codes = fail_closed.get("reason_codes", [])
         blockers.extend(reason_codes)
 
-    # --- Apply exit code mapping (with plan for warn detection) ---
+    # --- Write repair artifact and update blockers ---
+    # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,
+    # which would violate schema additionalProperties: false).
+    repair_artifact_path: Optional[str] = None
+    try:
+        artifact_dir_repair = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+        artifact_dir_repair.mkdir(parents=True, exist_ok=True)
+        repair_artifact_file = artifact_dir_repair / "repair_diagnostics.json"
+        repair_artifact_file.write_text(
+            json.dumps(_repair_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        repair_artifact_path = str(repair_artifact_file)
+    except Exception:
+        pass  # Non-fatal: repair artifact write failure does not block preflight
+
+    # If repair detected changes, add a blocker so orchestrator is informed
+    if _repair_result.get("changed") is True and repair_artifact_path is not None:
+        blockers.append(
+            json.dumps({
+                "kind": "repair_diagnostics",
+                "message": "repair_issue_contract detected changes: see repair artifact for details",
+                "artifact_path": repair_artifact_path,
+            })
+        )
+
+    # --- Apply exit code mapping (with plan for warn detection, after all blockers finalized) ---
     status, exit_code = _apply_exit_code_mapping(
         planner_exit_code, planner_fail_closed, blockers, plan=plan
     )
@@ -1091,7 +1112,7 @@ def run_preflight(
     else:
         next_action = "fix_environment"
 
-    # --- Compute hashes for byte-stability (before writing) ---
+    # --- Compute hashes for byte-stability (after all blockers finalized) ---
     snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
     planner_input_text = json.dumps(planner_input_dict, sort_keys=True, ensure_ascii=False)
 
@@ -1118,7 +1139,6 @@ def run_preflight(
     }
 
     # --- Build final result (once, before writing) ---
-    # BLOCKER 1 fix: include repair_diagnostics in result (report-only, planner input unchanged)
     result = _build_result(
         status=status,
         issue_number=issue_number,
@@ -1132,7 +1152,6 @@ def run_preflight(
         blockers=blockers,
         artifacts={},  # filled below
         hashes=hashes,
-        repair_diagnostics=_repair_result,
     )
 
     # --- Validate result against result schema before writing ---
