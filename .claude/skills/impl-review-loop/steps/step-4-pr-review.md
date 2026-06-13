@@ -15,53 +15,73 @@ inputs:
 
 SubAgent 側は `.claude/skills/pr-review-judge/SKILL.md` の手順を実行し、verdict コメントを PR に投稿する。
 
-## 期待する出力
+## PR レビュー前の CI 待機ルート
 
-pr-reviewer が `gh pr review --comment` で投稿する verdict コメントに含まれる `LOOP_VERDICT` YAML:
+Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required checks の head-scoped 完了を待つ。
 
-```yaml
-LOOP_VERDICT:
-  verdict: APPROVE | REQUEST_CHANGES
-  blockers: []
-  mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-  mergeStateStatus: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
-  reviewed_head_sha: <SHA>
+- `--required` は必須
+- expected head SHA は Step 4 入力の `reviewed_head_sha`
+- helper は全終了経路で `CI_WAIT_RESULT_V1_JSON=...` を 1 行だけ出力する
+- exit code は `0=passed` / `1=CI negative or incomplete` / `2=auth, gh, malformed, invalid args`
+
+```bash
+.claude/skills/impl-review-loop/scripts/wait_ci_checks.sh \
+  --repo "$(gh repo view --json nameWithOwner --jq .nameWithOwner)" \
+  --pr <pr_number> \
+  --head-sha <reviewed_head_sha> \
+  --required \
+  --interval 15 \
+  --timeout-seconds 1800
 ```
 
-## 判定
+### CI_WAIT_RESULT_V1 status routing
 
-orchestrator は LOOP_VERDICT YAML を読み取り、次ステップを決定する:
-
-| verdict | 次アクション |
+| status | routing |
 |---|---|
-| `APPROVE` | LOOP_STATE.termination_reason = "approved" を立て、Step 5 で終了処理 |
-| `REQUEST_CHANGES` | blockers を LOOP_STATE.blockers_history に追加、Step 5 で iteration 判定 |
+| `passed` | PR review を継続 |
+| `failed` | `get_ci_failed_log.sh` を呼び出して failed log summary を取得 |
+| `cancelled` | `get_ci_failed_log.sh` を呼び出して cancelled / interrupted context を取得 |
+| `pending_timeout` | fail-closed。`CI_PENDING_TIMEOUT` blocker で REQUEST_CHANGES |
+| `no_checks` | fail-closed。required checks 未解決として REQUEST_CHANGES |
+| `skipped_only` | fail-closed。required checks が skipped のみとして REQUEST_CHANGES |
+| `head_sha_changed` | stale review。最新 head に対して Step 4 を再実行 |
+| `auth_error` | fail-closed。認証/権限問題として REQUEST_CHANGES |
+| `gh_error` | fail-closed。CLI/runtime 問題として REQUEST_CHANGES |
+| `malformed_gh_response` | fail-closed。machine-readable parse 不能として REQUEST_CHANGES |
 
-LOOP_VERDICT の YAML 解析方法は `step-5-mergeability-handling.md` を参照（最新コメントの抽出ルール含む）。
+`bucket=skipping` は成功扱いにしてはならない。required-only 集合に skipped entry が残る場合は incomplete とみなし、少なくとも `skipped_only` は fail-closed とする。
+
+## 期待する出力
+
+pr-reviewer が `gh pr review --comment` で投稿する verdict コメントには `LOOP_VERDICT_V2` fenced YAML を含める。
+
+```yaml
+LOOP_VERDICT_V2:
+  verdict: APPROVE | REQUEST_CHANGES
+  reviewed_head_sha: <SHA>
+  merge_ready: true | false
+  mergeability:
+    mergeable: MERGEABLE | CONFLICTING | UNKNOWN
+    merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
+  blockers: []
+  required_auto_actions: []
+  auto_fix_applied: []
+  follow_up_issue_requests: []
+```
+
+LOOP_VERDICT_V2 の解析は `step-5-mergeability-handling.md` を canonical とする。
 
 ## reviewed_head_sha 整合チェック
-
-LOOP_VERDICT に含まれる `reviewed_head_sha` が現在の PR head SHA と一致しない場合、pr-reviewer は古い head をレビューしている可能性がある:
 
 ```bash
 CURRENT_HEAD=$(gh pr view <pr_number> --json headRefOid --jq .headRefOid)
 ```
 
-不一致 → orchestrator は `LOOP_STATE.blockers_history` に "stale review on $REVIEWED_SHA vs current $CURRENT_HEAD" を記録し、Step 4 を再委譲（最新 head での再レビュー）。
-
-## 出力
-
-LOOP_STATE.last_step = "pr_review" に更新、LOOP_STATE.last_loop_verdict に APPROVE / REQUEST_CHANGES を記録、Step 5 へ進む。
+`reviewed_head_sha != CURRENT_HEAD` の場合は stale review とみなし、Step 4 を現在 head で再実行する。
 
 ## CI 失敗ログの取得（get_ci_failed_log helper）
 
-### 呼び出し条件
-
-PR の CI checks が失敗（conclusion: failure / timed_out / cancelled）の場合のみ呼び出す。
-pending の場合は #844 wait helper に委譲し、ログ取得を行わない。
-CI が pass の場合は呼び出さない。
-
-### reviewed_head_sha の渡し方
+`wait_ci_checks.sh` が `failed` または `cancelled` を返した場合のみ呼び出す。pending 中は呼び出さない。
 
 ```bash
 REVIEWED_HEAD_SHA=$(gh pr view <pr_number> --repo <repo> --json headRefOid --jq .headRefOid)
@@ -73,21 +93,11 @@ REVIEWED_HEAD_SHA=$(gh pr view <pr_number> --repo <repo> --json headRefOid --jq 
   --max-bytes 60000
 ```
 
-`reviewed_head_sha` は必ず PR の現在の head SHA を使う。branch 名を渡してはならない。
+`reviewed_head_sha` には branch 名ではなく現在の PR head SHA を渡す。
 
-### #844 wait helper との関係
+### CI_FAILED_LOG_RESULT_V1_JSON の解釈
 
-- CI が `ci_pending` を返した場合は #844 の wait helper（`wait_ci_checks.sh`）に委譲し、完了後に再度 get_ci_failed_log を呼ぶ。
-- `ci_pending` のまま wait helper も利用不可の場合は、`LOOP_VERDICT_V2.blockers` に `CI_PENDING` を記録して REQUEST_CHANGES を返す。
-
-### LOOP_VERDICT_V2 への取り込み方
-
-helper が `status=log_unavailable` を返した場合は blocker type を `CI_LOG_UNAVAILABLE` にする。
-ログ全文は `blockers` に含めず、failed_jobs + log summary（先頭 / 末尾 500 行程度）のみを記録する。
-
-### CI_FAILED_LOG_RESULT_V1 の解釈
-
-`get_ci_failed_log` は出力末尾に以下の YAML marker を常に出力する:
+helper は出力末尾に `CI_FAILED_LOG_RESULT_V1_JSON: {...}` を出す。主要フィールドは以下。
 
 ```yaml
 CI_FAILED_LOG_RESULT_V1:
@@ -102,12 +112,10 @@ CI_FAILED_LOG_RESULT_V1:
   truncated: true | false
 ```
 
-orchestrator はこの marker を parse し、`status` に応じて routing する:
-
 | status | routing |
 |---|---|
-| `ci_failed` | ログを `LOOP_VERDICT_V2.blockers` に CI_FAILED_LOG として記録 |
-| `ci_passed` | CI は pass — ログ取得スキップ |
-| `ci_pending` | #844 wait helper へ委譲（またはCI_PENDING blocker） |
-| `no_matching_run` | CI_LOG_UNAVAILABLE blocker |
-| `log_unavailable` | CI_LOG_UNAVAILABLE blocker |
+| `ci_failed` | log summary を `LOOP_VERDICT_V2.blockers` に反映 |
+| `ci_passed` | CI pass とみなしログ取得をスキップ |
+| `ci_pending` | wait helper を再実行、または `CI_PENDING` blocker |
+| `no_matching_run` | `CI_LOG_UNAVAILABLE` blocker |
+| `log_unavailable` | `CI_LOG_UNAVAILABLE` blocker |
