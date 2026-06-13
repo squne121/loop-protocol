@@ -146,3 +146,14 @@ class TestForbiddenValues:
         text = self._dump(artifact)
         match = HOME_PATTERN.search(text)
         assert not match, f"Found unredacted home path: {match.group()}"
+
+    def test_no_stale_placeholder(self, artifact):
+        """Angle-bracket placeholders like <worktree_path> must not appear in values.
+
+        "<unset>" is a legitimate sentinel for env vars not set and is excluded.
+        """
+        text = self._dump(artifact)
+        # Find angle-bracket placeholders in string values; exclude "<unset>" sentinel
+        placeholder_pattern = re.compile(r'"<(?!unset>)[a-z][a-z0-9_]*>"')
+        matches = placeholder_pattern.findall(text)
+        assert not matches, f"Found stale placeholders: {matches}"

@@ -42,11 +42,9 @@
     "linked_worktree": {
       "description": "Linked worktree scenario (documented upstream #756 bug)",
       "bash_evidence": {
-        "pwd": "<worktree_path>",
-        "git_show_toplevel": "<worktree_path>",
-        "git_branch_current": "<worktree_branch>",
-        "git_rev_parse_head": "<worktree_head>",
-        "git_is_inside_work_tree": "true"
+        "status": "probe_blocked_by_policy",
+        "note": "ctx_execute is deny-listed; worktree cwd comparison not performed in normal profile",
+        "upstream_756_documented_divergence": "ctx_execute pwd shows main repo root instead of worktree path (from upstream bug report)"
       },
       "ctx_execute_evidence": {
         "status": "permission_denied_or_diverges",
@@ -58,11 +56,9 @@
     "nested_repo": {
       "description": "Nested repo scenario",
       "bash_evidence": {
-        "pwd": "<nested_path>",
-        "git_show_toplevel": "<nested_path>",
-        "git_branch_current": "<nested_branch>",
-        "git_rev_parse_head": "<nested_head>",
-        "git_is_inside_work_tree": "true"
+        "status": "probe_blocked_by_policy",
+        "note": "ctx_execute is deny-listed; worktree cwd comparison not performed in normal profile",
+        "upstream_756_documented_divergence": "ctx_execute pwd shows main repo root instead of worktree path (from upstream bug report)"
       },
       "ctx_execute_evidence": {
         "status": "permission_denied",
