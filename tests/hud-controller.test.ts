@@ -100,6 +100,7 @@ function queryButton(container: HTMLElement, action: string): HTMLButtonElement 
 describe('HudController', () => {
   let container: HTMLElement
   let actions: {
+    onNewGame: ReturnType<typeof vi.fn>
     onStartSortie: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
     onConfirmResult: ReturnType<typeof vi.fn>
@@ -115,6 +116,7 @@ describe('HudController', () => {
   beforeEach(() => {
     container = document.createElement('div')
     actions = {
+      onNewGame: vi.fn(),
       onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult: vi.fn(),
@@ -142,15 +144,25 @@ describe('HudController', () => {
     expect(queryButton(container, 'reset').getAttribute('title')).toContain('destructive boundary')
   })
 
-  it('GIVEN title_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
+  it('GIVEN title_menu WHEN render called THEN new-game enabled, load-game enabled, start-sortie disabled (AC1)', () => {
     hudController.render(createState('title_menu'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Title Menu')
+    expect(queryButton(container, 'new-game').disabled).toBe(false)
     expect(queryButton(container, 'load-game').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'save').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
+  })
+
+  it('GIVEN title_menu without loadable snapshot WHEN render called THEN new-game enabled, load-game disabled (AC1)', () => {
+    actions.canLoadGame.mockReturnValue(false)
+    hudController.render(createState('title_menu'), false)
+
+    expect(queryButton(container, 'new-game').disabled).toBe(false)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
   })
 
   it('GIVEN load_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
@@ -184,13 +196,14 @@ describe('HudController', () => {
     expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
-  it('GIVEN result phase with pending reward WHEN render called THEN claim-reward and confirm-result are enabled (AC4, AC10)', () => {
+  it('GIVEN result phase with pending reward WHEN render called THEN confirm-result enabled, claim-reward disabled (AC4, AC5)', () => {
     hudController.render(createState('result', 'pending'), false)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Result')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
-    expect(queryButton(container, 'claim-reward').disabled).toBe(false)
+    // AC5: confirmResult auto-claims; claim-reward is legacy debrief only
+    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
@@ -256,6 +269,7 @@ describe('HudController', () => {
   it('GIVEN running WHEN disabled buttons are clicked THEN callbacks are not invoked', () => {
     hudController.render(createState('running'), false)
 
+    queryButton(container, 'new-game').click()
     queryButton(container, 'start-sortie').click()
     queryButton(container, 'claim-reward').click()
     queryButton(container, 'confirm-result').click()
@@ -264,6 +278,7 @@ describe('HudController', () => {
     queryButton(container, 'load-game').click()
     queryButton(container, 'reset').click()
 
+    expect(actions.onNewGame).not.toHaveBeenCalled()
     expect(actions.onStartSortie).not.toHaveBeenCalled()
     expect(actions.onClaimReward).not.toHaveBeenCalled()
     expect(actions.onConfirmResult).not.toHaveBeenCalled()
@@ -299,6 +314,7 @@ describe('AC3: Load Game phase gate — onLoadGame only fires from title_menu / 
     onLoadGame = vi.fn()
     canLoadGame = vi.fn(() => true)
     hudController = createHudController(container, {
+      onNewGame: vi.fn(),
       onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult: vi.fn(),
