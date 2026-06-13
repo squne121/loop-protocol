@@ -163,9 +163,22 @@ jobs:
           fi
           printf 'VITE_LOOP_COMMIT_SHA=%s\n' "$sha" >> "$GITHUB_ENV"
           printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - name: Resolve PR preview storage namespace
+        id: storage-namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="pr-${{ github.event.number }}"
+          case "$namespace" in
+            pr-[0-9]*) ;;
+            *) echo "Invalid preview storage namespace: $namespace" >&2; exit 1 ;;
+          esac
+          echo "VITE_LOOP_STORAGE_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
       - name: Verify PR preview build asset base path
         shell: bash
         run: |
@@ -173,6 +186,26 @@ jobs:
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
           if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
+      - name: Verify preview storage namespace in dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_prefix='loop-protocol.preview.'
+          expected_namespace="pr-${{ github.event.number }}"
+          expected_suffix='.mvp.save'
+          if ! grep -rq "$expected_prefix" dist/; then
+            echo "ERROR: preview storage prefix $expected_prefix not found in dist/" >&2
+            exit 1
+          fi
+          if ! grep -rq "$expected_namespace" dist/; then
+            echo "ERROR: preview storage namespace $expected_namespace not found in dist/" >&2
+            exit 1
+          fi
+          if ! grep -rq "$expected_suffix" dist/; then
+            echo "ERROR: preview storage suffix $expected_suffix not found in dist/" >&2
+            exit 1
+          fi
+          echo "OK: preview storage namespace components found in dist/"
       - name: Verify commit SHA in dist
         shell: bash
         run: |
