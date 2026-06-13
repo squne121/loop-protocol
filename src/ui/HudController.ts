@@ -2,6 +2,7 @@ import type { GameState } from '../state'
 import { formatCombatNumber } from '../render/renderUtils'
 
 export interface HudActions {
+  onNewGame?(): void
   onStartSortie(): void
   onClaimReward(): void
   /** Confirm result and return to preparation (AC5). */
@@ -67,6 +68,7 @@ export function createHudController(
       <p class="status-copy status-copy--muted" data-field="command"></p>
     </section>
     <section class="panel panel--actions">
+      <button type="button" data-action="new-game">New Game</button>
       <button type="button" data-action="start-sortie">Start sortie</button>
       <button type="button" data-action="claim-reward">Claim reward</button>
       <button type="button" data-action="confirm-result">Confirm result</button>
@@ -88,6 +90,11 @@ export function createHudController(
     </section>
   `
 
+  if (actions.onNewGame) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="new-game"]')
+      ?.addEventListener('click', actions.onNewGame)
+  }
   container
     .querySelector<HTMLButtonElement>('[data-action="start-sortie"]')
     ?.addEventListener('click', actions.onStartSortie)
@@ -132,6 +139,7 @@ export function createHudController(
   const sortieKills = queryField(container, 'sortie-kills')
   const sortieDuration = queryField(container, 'sortie-duration')
   const sortieResult = queryField(container, 'sortie-result')
+  const newGameButton = queryAction(container, 'new-game')
   const startSortieButton = queryAction(container, 'start-sortie')
   const claimRewardButton = queryAction(container, 'claim-reward')
   const confirmResultButton = queryAction(container, 'confirm-result')
@@ -176,9 +184,11 @@ export function createHudController(
 
       // Button enable policy derived from phase state machine (AC2, AC3, AC7, AC8, AC9)
       const isMenuPhase = state.loopPhase === 'title_menu' || state.loopPhase === 'load_menu'
+      // new-game: only in title_menu (AC1)
+      newGameButton.disabled = state.loopPhase !== 'title_menu'
       startSortieButton.disabled = state.loopPhase !== 'preparation'
-      // claim-reward: only for legacy debrief_pending_reward phase
-      claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward' && !(state.loopPhase === 'result' && state.resultRewardStatus === 'pending')
+      // claim-reward: legacy debrief_pending_reward phase only (AC5: result uses confirm-result)
+      claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward'
       // confirm-result: only in result phase (AC5)
       confirmResultButton.disabled = state.loopPhase !== 'result'
       // next-sortie: only for legacy debrief_reward_claimed phase
