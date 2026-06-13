@@ -33,6 +33,8 @@
     "ask": [],
     "deny": [
       "mcp__context-mode__ctx_execute",
+      "mcp__context-mode__ctx_batch_execute",
+      "mcp__context-mode__ctx_execute_file",
       "mcp__context-mode__ctx_fetch_and_index",
       "Write(assets/**)",
       "Edit(assets/**)",

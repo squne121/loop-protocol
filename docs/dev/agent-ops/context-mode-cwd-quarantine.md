@@ -19,8 +19,8 @@ upstream [mksglu/context-mode#756](https://github.com/mksglu/context-mode/issues
 | tool | policy | cwd_probe_required | quarantine 理由 |
 |---|---|---|---|
 | `ctx_execute` | deny | yes | upstream #756 OPEN; MCP server process.cwd() ≠ session cwd; explicitly deny-listed |
-| `ctx_batch_execute` | deny | yes | 複数コマンド実行; ctx_execute と同一 cwd リスク; sibling tool 未評価 |
-| `ctx_execute_file` | deny | yes | repo-relative ファイル解決リスク; sibling tool 未評価 |
+| `ctx_batch_execute` | deny | yes | 複数コマンド実行; ctx_execute と同一 cwd リスク; sibling tool 未評価; explicitly deny-listed |
+| `ctx_execute_file` | deny | yes | repo-relative ファイル解決リスク; sibling tool 未評価; explicitly deny-listed |
 
 ## Quarantine 継続理由
 

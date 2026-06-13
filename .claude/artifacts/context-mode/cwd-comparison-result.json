@@ -3,7 +3,7 @@
   "issue": "#826",
   "generated_at": "2026-06-13T14:30:00Z",
   "fetched_at": "2026-06-13T14:30:00Z",
-  "context_mode_version": "1.0.161",
+  "context_mode_version": "1.0.162",
   "upstream_issue_756_state": "open",
   "upstream_issue_756_url": "https://github.com/mksglu/context-mode/issues/756",
   "upstream_issue_756_fetched_at": "2026-06-13T14:30:00Z",
@@ -13,7 +13,7 @@
     "ctx_execute_file": "deny",
     "ctx_fetch_and_index": "deny",
     "policy_source": ".claude/settings.json deny list",
-    "policy_source_note": "mcp__context-mode__ctx_execute および mcp__context-mode__ctx_fetch_and_index が settings.json で明示 deny。ctx_batch_execute / ctx_execute_file は settings 上の明示 deny に入っていないが、execution-like tools として quarantine 対象とする"
+    "policy_source_note": "mcp__context-mode__ctx_execute, mcp__context-mode__ctx_batch_execute, mcp__context-mode__ctx_execute_file, mcp__context-mode__ctx_fetch_and_index が settings.json permissions.deny で明示 deny 済み"
   },
   "probe": {
     "profile_committed": false,
@@ -29,7 +29,7 @@
         "pwd": "/home/squne/projects/LOOP_PROTOCOL",
         "git_show_toplevel": "/home/squne/projects/LOOP_PROTOCOL",
         "git_branch_current": "worktree-issue-826-context-mode-cwd-quarantine",
-        "git_rev_parse_head": "1b8f71b",
+        "git_rev_parse_head": "b3034253aa83b83014ab1b7c4a9f84b44b77c0f5",
         "git_is_inside_work_tree": "true"
       },
       "ctx_execute_evidence": {
@@ -103,5 +103,6 @@
     "local probe was blocked by project deny policy (no isolated profile committed)",
     "ctx_batch_execute and ctx_execute_file not yet individually evaluated",
     "ctx_execute is explicitly denied in project settings"
-  ]
+  ],
+  "upstream_756_reported_context_mode_version": "1.0.161"
 }
