@@ -34,6 +34,7 @@ guard_ac_vc_alignment = _mod.guard_ac_vc_alignment
 guard_template = _mod.guard_template
 guard_vc_compound_shell_disallowed = _mod.guard_vc_compound_shell_disallowed
 guard_ready_tuple = _mod.guard_ready_tuple
+guard_issue_body_validation = _mod.guard_issue_body_validation
 check_ready_tuple = _mod.check_ready_tuple
 load_required_labels = _mod.load_required_labels
 extract_issue_kind_from_body = _mod.extract_issue_kind_from_body
@@ -336,6 +337,11 @@ pnpm typecheck
 ## Stop Conditions
 
 - Allowed Paths 外の変更が必要と判明した場合
+- In Scope の固定契約（キー集合・スキーマ・型定義）の変更が必要になった場合
+- 新規 Issue の起票が必要と判断した場合（スコープ分割が発生する場合）
+- 後続 Phase / 別スコープへの波及が判明した場合
+- nested SubAgent delegation が必要になった場合
+- 外部サービス利用・権限昇格・既存テスト大規模改変が必要になった場合
 
 ## Required Skills
 
@@ -1490,3 +1496,46 @@ class TestReadbackJsonPathValidation:
         assert output["all_passed"] is False
         errors = output["guards"][0]["errors"]
         assert any("malformed readback JSON" in e for e in errors)
+
+
+def _make_invalid_lp016_body() -> str:
+    """LP016 で NG になる不正 marker を含む最小の本文。"""
+    return """\
+## Acceptance Criteria
+
+- [ ] AC1: テスト
+
+## Verification Commands
+
+```bash
+# AC1: description
+test -f /etc/passwd
+```
+
+## Allowed Paths
+
+- .
+"""
+
+
+class TestIssueBodyValidationGuard:
+    """Tests for edit-issue issue body pre-validator guard."""
+
+    def test_guard_issue_body_validation_passes(self, tmp_path):
+        body_file = tmp_path / "valid.md"
+        body_file.write_text(make_implementation_body(), encoding="utf-8")
+
+        result = guard_issue_body_validation(body_file, "implementation")
+        assert result["name"] == "issue_body_validation"
+        assert result["passed"] is True
+        assert result["status"] == "pass"
+
+    def test_guard_issue_body_validation_reports_lp016(self, tmp_path):
+        body_file = tmp_path / "invalid.md"
+        body_file.write_text(_make_invalid_lp016_body(), encoding="utf-8")
+
+        result = guard_issue_body_validation(body_file, "implementation")
+        assert result["name"] == "issue_body_validation"
+        assert result["passed"] is False
+        errors = result.get("errors", [])
+        assert any(err.get("rule_id") == "LP016" for err in errors)
