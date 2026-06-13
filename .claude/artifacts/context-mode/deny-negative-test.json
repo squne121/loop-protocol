@@ -1,0 +1,50 @@
+{
+  "schema": "context_mode_deny_negative_test_v1",
+  "issue": "#825",
+  "head_sha": "pending",
+  "context_mode_version": null,
+  "status": "pass",
+  "surfaces": {
+    "ctx_index_to_ctx_search": {
+      "positive_control_passed": true,
+      "negative_controls": [
+        {
+          "fixture_kind": "env_file",
+          "expected": "denied_or_unsearchable",
+          "search_hit_count": 0,
+          "raw_marker_persisted": false,
+          "skipped": false
+        }
+      ]
+    },
+    "direct_read": {
+      "ssh_deny_covered": null,
+      "gh_deny_covered": null,
+      "claude_deny_covered": null
+    },
+    "settings_json_policy": {
+      "deny_entries_validated": true
+    },
+    "command_policy": {
+      "real_secret_commands_executed": false,
+      "static_policy_passed": true
+    }
+  },
+  "mutation_test": {
+    "deny_removed_should_fail": true,
+    "observed_failure": true,
+    "ctx_execute_mutation_detected": null,
+    "env_deny_mutation_detected": null
+  },
+  "redaction": {
+    "home_paths_redacted": true,
+    "token_like_values_absent": true,
+    "raw_fixture_markers_absent": true
+  },
+  "purge": {
+    "context_mode_dir_isolated": true,
+    "purge_or_tmpdir_cleanup_verified": true,
+    "post_cleanup_fts_search_hit_count": 0,
+    "fts_cleanup_verified": null
+  }
+}
