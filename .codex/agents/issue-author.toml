@@ -18,12 +18,12 @@ PRE_MUTATION_PREFLIGHT
 - exit 1 (warn): mutation は継続し、compact output の SUMMARY に警告を明記する。
 - check_vc_scope.py が存在しない場合は skip して warn を記録する。
 
-OUTPUT_CONTRACT structured output context budget raw transcript raw diff raw logs
-- `ISSUE_AUTHOR_RESULT_COMPACT_V1` のみを返す（compact_author_result.py stdout）。
-- Return structured output only, respect the main-thread context budget, and do not return raw transcript, raw diff, or raw logs to the parent thread.
+OUTPUT_CONTRACT
+- Return structured output only: emit `ISSUE_AUTHOR_RESULT_COMPACT_V1` via `compact_author_result.py` stdout, not free-form long prose.
+- Respect the main-thread context budget: stdout must stay within 2048 UTF-8 bytes.
+- Do not return raw transcript, raw diff, or raw logs to the parent thread.
 - STATUS / SUMMARY / BODY_HASH / COMMENT_URL / ARTIFACT / NEXT_ACTION のフィールド（SUMMARY は常に出力）。
-- stdout は 2048 UTF-8 bytes 以内。raw body / diff / logs は artifact JSON に保存し main context に返さない。
-- raw evidence は artifact JSON に保存する。
+- Persist only the minimum raw issue body, mutation diff, and command logs required for audit in the artifact JSON; never persist secrets or access tokens.
 - full mutation result は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存する。
 - body_hash は必須フィールド（ok 時は sha256 必須）。
 - check_vc_scope.py が exit 1 (warn) の場合は mutation を継続し、SUMMARY に警告内容を明記する。
