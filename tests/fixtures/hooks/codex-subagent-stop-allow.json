@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "SubagentStop",
+  "session_id": "codex-session-subagent-001",
+  "agent_id": "subagent-test-001",
+  "secrets_mode": "none",
+  "touched_paths": []
+}
