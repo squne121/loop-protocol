@@ -161,6 +161,49 @@ anchor comment により stale approval を無効化する場合も、raw snapsh
 
 `issue-author` SubAgent に opaque forwarding payload を渡して本文を更新する。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
 
+issue-author 起動前に、現在本文に対して pre-author static readiness check を実行する。
+
+```bash
+uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
+  --mode preflight-static \
+  --body-file <current_body_file>
+```
+
+inline form: `contract_readiness_check.py --mode preflight-static --body-file <current_body_file>`
+
+producer contract: `READINESS_FORWARDING_PAYLOAD_V1`
+
+```yaml
+READINESS_FORWARDING_PAYLOAD_V1:
+  readiness_result:
+    status: go | needs_fix | human_judgment | input_or_runtime_error
+    body_sha256: <sha256>
+    source_checks:
+      - contract_readiness_check.py --mode preflight-static
+    errors: []
+    readiness_result_ref: <artifact-or-path>
+```
+
+`preflight-static` は static body/readiness の事前確認専用であり、execute-mode の `unexpected_pass` 検出は扱わない。
+
+readiness routing:
+
+```yaml
+exit_code_0:
+  status: go
+  action: invoke_issue_author
+  readiness_errors: []
+exit_code_1:
+  status: needs_fix
+  action: invoke_issue_author_with_readiness_result
+exit_code_2:
+  status: human_judgment
+  action: skip_issue_author_and_go_step5
+exit_code_3:
+  status: input_or_runtime_error
+  action: human_escalation
+```
+
 consumer contract: `ISSUE_AUTHOR_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_author_result.py`）
 
 - `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
