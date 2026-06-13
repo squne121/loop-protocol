@@ -95,6 +95,49 @@ export function runProgressionSave(
   return true
 }
 
+export type LoadGameSeam = {
+  storage: { load(): LoadResult }
+  reportLoadFailure(result: Extract<LoadResult, { ok: false }>): void
+  setHudFeedback(status: string, summary: string): void
+  onTitleMenuTransition(): void
+  onLoadSuccess(snapshot: NonNullable<Extract<LoadResult, { ok: true }>['snapshot']>): void
+  onLoadFail(): void
+}
+
+/**
+ * AC3 testable seam: load game phase dispatch logic.
+ * Extracted from onLoadGame() closure to allow actual storage.load() spy tests.
+ */
+export function runLoadGame(
+  phase: LoopPhase,
+  hasLoadableSnap: boolean,
+  seam: LoadGameSeam,
+): void {
+  if (phase === 'title_menu') {
+    seam.onTitleMenuTransition()
+    return
+  }
+  if (phase === 'load_menu') {
+    if (!hasLoadableSnap) {
+      seam.setHudFeedback('Load Game failed.', 'No save data available.')
+      return
+    }
+    const result = seam.storage.load()
+    if (!result.ok) {
+      seam.reportLoadFailure(result)
+      seam.setHudFeedback('Load Game failed.', 'Current state unchanged.')
+      return
+    }
+    if (result.snapshot === null) {
+      seam.onLoadFail()
+      seam.setHudFeedback('Load Game failed.', 'No save data found.')
+      return
+    }
+    seam.onLoadSuccess(result.snapshot)
+    seam.setHudFeedback('Load Game complete.', 'Progression snapshot restored.')
+  }
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
@@ -171,17 +214,17 @@ function handleTogglePause(): void {
 }
 
 const hud = commandRail ? createHudController(commandRail, {
+  onNewGame() {
+    // AC1: title_menu → preparation (New Game). Separate from onStartSortie (AC2).
+    if (state.loopPhase !== 'title_menu') return
+    state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    resizeArena(state)
+    debugPause.isPaused = false
+    setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
+  },
   onStartSortie() {
-    // B1: New Game — title_menu → preparation
-    if (state.loopPhase === 'title_menu') {
-      state = createInitialGameState()
-      state.loopPhase = 'preparation'
-      resizeArena(state)
-      debugPause.isPaused = false
-      setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
-      return
-    }
-
+    // AC2: preparation only. title_menu New Game is handled by onNewGame().
     if (state.loopPhase !== 'preparation') {
       return
     }
@@ -192,7 +235,8 @@ const hud = commandRail ? createHudController(commandRail, {
   onClaimReward() {
     // Supports legacy debrief_pending_reward phase only.
     // In result phase, reward is auto-claimed by confirmResult() (B3).
-    if (state.loopPhase !== 'debrief_pending_reward' && !(state.loopPhase === 'result' && state.resultRewardStatus === 'pending')) {
+    // AC5: result phase uses confirmResult() which auto-claims. Claim reward is legacy debrief only.
+    if (state.loopPhase !== 'debrief_pending_reward') {
       return
     }
 
@@ -230,8 +274,11 @@ const hud = commandRail ? createHudController(commandRail, {
     // Reset debug pause on state transition to preparation
     debugPause.isPaused = false
     // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
-    persistProgressionSnapshot('save')
-    setHudFeedback('Result confirmed.', 'Ready for next sortie.')
+    // persistProgressionSnapshot sets HUD feedback internally (success or failure).
+    // Do NOT call setHudFeedback() unconditionally here — that would overwrite a
+    // save-failure message with a false success copy (AC6 fix).
+    // Use 'reward-claim' reason so feedback reads "Result confirmed." on success (AC5).
+    persistProgressionSnapshot('reward-claim')
   },
   onNextSortie() {
     // B5: legacy debrief_reward_claimed → preparation (not directly to running).
@@ -257,43 +304,26 @@ const hud = commandRail ? createHudController(commandRail, {
     persistProgressionSnapshot('save')
   },
   onLoadGame() {
-    // B1: title_menu → load_menu (select save slot step)
-    if (state.loopPhase === 'title_menu') {
-      state.loopPhase = 'load_menu'
-      setHudFeedback('Load Menu.', 'Select a save slot to load.')
-      return
-    }
-
-    // B1: load_menu + Load slot-1 → storage.load() → preparation
-    if (state.loopPhase === 'load_menu') {
-      if (!hasLoadableSnapshot) {
-        setHudFeedback('Load Game failed.', 'No save data available.')
-        return
-      }
-
-      const loadResult = storage.load()
-      if (!loadResult.ok) {
-        reportStorageFailure('load', loadResult)
-        setHudFeedback('Load Game failed.', 'Current state unchanged.')
-        return
-      }
-
-      if (loadResult.snapshot === null) {
+    // Delegated to runLoadGame() seam for testability (AC3).
+    runLoadGame(state.loopPhase, hasLoadableSnapshot, {
+      storage,
+      reportLoadFailure(result) { reportStorageFailure('load', result) },
+      setHudFeedback,
+      onTitleMenuTransition() {
+        state.loopPhase = 'load_menu'
+        setHudFeedback('Load Menu.', 'Select a save slot to load.')
+      },
+      onLoadSuccess(snapshot) {
+        state = createInitialGameState(snapshot)
+        state.loopPhase = 'preparation'
+        resizeArena(state)
+        hasLoadableSnapshot = true
+        debugPause.isPaused = false
+      },
+      onLoadFail() {
         hasLoadableSnapshot = false
-        setHudFeedback('Load Game failed.', 'No save data found.')
-        return
-      }
-
-      // AC3: restore to preparation after load
-      state = createInitialGameState(loadResult.snapshot)
-      state.loopPhase = 'preparation'
-      resizeArena(state)
-      hasLoadableSnapshot = true
-      // Reset debug pause on state transition to preparation
-      debugPause.isPaused = false
-      setHudFeedback('Load Game complete.', 'Progression snapshot restored.')
-      return
-    }
+      },
+    })
   },
   onReset() {
     if (state.loopPhase !== 'preparation') {

@@ -7,7 +7,7 @@ import {
   claimPendingReward,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
-import { runProgressionSave } from '../src/main'
+import { runProgressionSave, runLoadGame } from '../src/main'
 import type { SaveResult } from '../src/storage'
 
 const FIXED_DT = defaultSimulationConfig.fixedDeltaMs
@@ -207,5 +207,126 @@ describe('B3+B2: confirmResult() then storage.save() sequence', () => {
     // After preparation transition, save is valid
     runProgressionSave('save', false, seam)
     expect(seam.save).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC3: storage.load() spy — only called from title_menu / load_menu
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// AC3: runLoadGame seam — actual storage.load() spy matrix
+// ---------------------------------------------------------------------------
+
+describe('AC3: runLoadGame — storage.load() only called from load_menu', () => {
+  it('GIVEN title_menu WHEN runLoadGame called THEN storage.load is NOT called (transition only)', () => {
+    const loadSpy = vi.fn()
+    const transitionSpy = vi.fn()
+    runLoadGame('title_menu', true, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: vi.fn(),
+      onTitleMenuTransition: transitionSpy,
+      onLoadSuccess: vi.fn(),
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).not.toHaveBeenCalled()
+    expect(transitionSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN load_menu with snapshot WHEN runLoadGame called THEN storage.load is called exactly once', () => {
+    const loadSpy = vi.fn(() => ({
+      ok: true as const,
+      snapshot: { schemaVersion: 1 as const, resources: 5, weaponPower: 1, playerMaxHp: 8 },
+      reason: 'loaded' as const,
+    }))
+    const successSpy = vi.fn()
+    runLoadGame('load_menu', true, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: vi.fn(),
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: successSpy,
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).toHaveBeenCalledTimes(1)
+    expect(successSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN preparation phase WHEN runLoadGame called THEN storage.load is NOT called (no-op)', () => {
+    const loadSpy = vi.fn()
+    runLoadGame('preparation', false, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: vi.fn(),
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: vi.fn(),
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN running phase WHEN runLoadGame called THEN storage.load is NOT called (no-op)', () => {
+    const loadSpy = vi.fn()
+    runLoadGame('running', false, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: vi.fn(),
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: vi.fn(),
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN result phase WHEN runLoadGame called THEN storage.load is NOT called (no-op)', () => {
+    const loadSpy = vi.fn()
+    runLoadGame('result', false, {
+      storage: { load: loadSpy },
+      reportLoadFailure: vi.fn(),
+      setHudFeedback: vi.fn(),
+      onTitleMenuTransition: vi.fn(),
+      onLoadSuccess: vi.fn(),
+      onLoadFail: vi.fn(),
+    })
+    expect(loadSpy).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC5/AC6: reward-claim reason regression — confirm result feedback
+// ---------------------------------------------------------------------------
+
+describe('AC5/AC6: runProgressionSave with reward-claim reason', () => {
+  it('GIVEN reward-claim reason and save succeeds THEN feedback is "Result confirmed." / "Progress saved locally."', () => {
+    const setHudFeedback = vi.fn()
+    runProgressionSave('reward-claim', false, {
+      storage: { save: vi.fn(() => ({ ok: true as const, reason: 'saved' as const })) },
+      createSnapshot: () => ({ schemaVersion: 1 as const, resources: 0, weaponPower: 1, playerMaxHp: 8 }),
+      reportSaveFailure: vi.fn(),
+      setHudFeedback,
+    })
+    expect(setHudFeedback).toHaveBeenCalledWith('Result confirmed.', 'Progress saved locally.')
+  })
+
+  it('GIVEN reward-claim reason and save fails THEN feedback is progress-not-saved (no false success)', () => {
+    const setHudFeedback = vi.fn()
+    runProgressionSave('reward-claim', false, {
+      storage: {
+        save: vi.fn(() => ({
+          ok: false as const,
+          reason: 'write-error' as const,
+          errorName: 'QuotaExceededError',
+        })),
+      },
+      createSnapshot: () => ({ schemaVersion: 1 as const, resources: 0, weaponPower: 1, playerMaxHp: 8 }),
+      reportSaveFailure: vi.fn(),
+      setHudFeedback,
+    })
+    expect(setHudFeedback).toHaveBeenCalledWith(
+      'Result confirmed; progress not saved.',
+      expect.stringContaining('may be lost after reload'),
+    )
   })
 })

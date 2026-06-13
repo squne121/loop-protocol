@@ -191,20 +191,55 @@ function redactCommandPreview(command) {
   return truncated
 }
 
+/**
+ * evaluateGuard returns a structured object or null.
+ * Returns:
+ *   null                                        — no decision (allow pass-through)
+ *   { action: 'deny', reason_code, command_kind, message } — deny decision
+ *   { action: 'no_decision', reason_code, command_kind, message } — explicit no_decision
+ *
+ * reason_code values:
+ *   'public_checkpoint'             — public_checkpoint_enabled flag
+ *   'unknown_visibility_mapping'    — unknown_visibility_mapping flag
+ *   'secrets_mode'                  — secrets_mode != 'none'
+ *   'forbidden_path'                — forbidden path access
+ *   'secret_boundary_violation'     — secret-revealing command
+ *   'remote_write_requires_approval'— remote write (git push etc.)
+ */
 function evaluateGuard(payload, eventName) {
   const rawCommand = getCommand(payload)
 
   if (payload?.public_checkpoint_enabled === true) {
-    return `${eventName}: public checkpoint is forbidden`
+    return {
+      action: 'deny',
+      reason_code: 'public_checkpoint',
+      command_kind: 'public_checkpoint',
+      message: `${eventName}: public checkpoint is forbidden`,
+    }
   }
   if (payload?.unknown_visibility_mapping === true) {
-    return `${eventName}: unknown visibility mapping must fail closed`
+    return {
+      action: 'deny',
+      reason_code: 'unknown_visibility_mapping',
+      command_kind: 'unknown_visibility_mapping',
+      message: `${eventName}: unknown visibility mapping must fail closed`,
+    }
   }
   if (payload?.secrets_mode && payload.secrets_mode !== 'none') {
-    return `${eventName}: secrets_mode must remain none`
+    return {
+      action: 'deny',
+      reason_code: 'secrets_mode',
+      command_kind: 'secrets_mode',
+      message: `${eventName}: secrets_mode must remain none`,
+    }
   }
   if (payload?.forbidden_path_touched === true || matchesForbiddenPath(rawCommand)) {
-    return `${eventName}: forbidden path access blocked`
+    return {
+      action: 'deny',
+      reason_code: 'forbidden_path',
+      command_kind: 'forbidden_path',
+      message: `${eventName}: forbidden path access blocked`,
+    }
   }
 
   // Normalize env VAR=val prefix before classification.
@@ -212,21 +247,36 @@ function evaluateGuard(payload, eventName) {
   const { stripped: command, isEnvDump } = stripEnvPrefix(rawCommand)
   if (isEnvDump) {
     const preview = redactCommandPreview(rawCommand)
-    return `${eventName}: secret_boundary_violation [command_kind=env_dump] blocked_command_preview="${preview}"`
+    return {
+      action: 'deny',
+      reason_code: 'secret_boundary_violation',
+      command_kind: 'env_dump',
+      message: `${eventName}: secret_boundary_violation [command_kind=env_dump] blocked_command_preview="${preview}"`,
+    }
   }
 
   // AC3: secret boundary - highest priority deny among command classifiers
   const secretDenial = classifySecretBoundary(command)
   if (secretDenial) {
     const preview = redactCommandPreview(rawCommand)
-    return `${eventName}: secret_boundary_violation [command_kind=${secretDenial.command_kind}] blocked_command_preview="${preview}"`
+    return {
+      action: 'deny',
+      reason_code: 'secret_boundary_violation',
+      command_kind: secretDenial.command_kind,
+      message: `${eventName}: secret_boundary_violation [command_kind=${secretDenial.command_kind}] blocked_command_preview="${preview}"`,
+    }
   }
 
-  // AC4: remote write - deny with remote-write-specific reason (not secret)
+  // AC4: remote write - no_decision on PermissionRequest, deny on PreToolUse
   const remoteWriteDenial = classifyRemoteWrite(command)
   if (remoteWriteDenial) {
     const preview = redactCommandPreview(rawCommand)
-    return `${eventName}: remote_write_requires_approval [command_kind=${remoteWriteDenial.command_kind}] blocked_command_preview="${preview}"`
+    return {
+      action: 'no_decision',
+      reason_code: 'remote_write_requires_approval',
+      command_kind: remoteWriteDenial.command_kind,
+      message: `${eventName}: remote_write_requires_approval [command_kind=${remoteWriteDenial.command_kind}] blocked_command_preview="${preview}"`,
+    }
   }
 
   // AC2: read-only investigation passes through (no deny)
@@ -322,17 +372,26 @@ async function main() {
     return
   }
 
-  const reason = evaluateGuard(payload, event)
-  if (reason) {
+  const guardResult = evaluateGuard(payload, event)
+  if (guardResult !== null) {
     if (event === 'PreToolUse') {
-      emitJson(denyPreToolUse(reason))
+      // PreToolUse: deny for all deny/no_decision guard results (remote_write blocks PreToolUse)
+      emitJson(denyPreToolUse(guardResult.message))
       return
     }
     if (event === 'PermissionRequest') {
-      emitJson(denyPermissionRequest(reason))
+      // AC5 (#874): remote_write_requires_approval is no_decision on PermissionRequest
+      // (PreToolUse side still denies; permission-request side defers to Codex runtime).
+      // Other critical denials (secret_boundary_violation, forbidden_path, public_checkpoint,
+      // secrets_mode) remain as deny on PermissionRequest.
+      if (guardResult.reason_code === 'remote_write_requires_approval') {
+        // no_decision: emit nothing (exit 0, no stdout JSON)
+        return
+      }
+      emitJson(denyPermissionRequest(guardResult.message))
       return
     }
-    emitJson(stopEventOutput(reason))
+    emitJson(stopEventOutput(guardResult.message))
     return
   }
 
