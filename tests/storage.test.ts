@@ -67,13 +67,15 @@ describe('LocalGameStorage', () => {
     }
   })
 
-  it('GIVEN disallowed runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN it ignores override', () => {
+  it('GIVEN disallowed runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN it throws', () => {
     const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
     const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
 
     try {
       storageWindow.__LOOP_STORAGE_KEY__ = defaultSaveKey
-      expect(resolveStorageKey()).toBe(defaultSaveKey)
+      expect(() => resolveStorageKey()).toThrowError(
+        `Invalid __LOOP_STORAGE_KEY__: ${defaultSaveKey}`,
+      )
     } finally {
       if (previousOverride === undefined) {
         Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
@@ -108,22 +110,32 @@ describe('LocalGameStorage', () => {
     }
   })
 
-  it('GIVEN disallowed runtime override key WHEN default createLocalGameStorage is used THEN it keeps production key', () => {
+  it('GIVEN disallowed runtime override key WHEN default createLocalGameStorage is used THEN it throws', () => {
     const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
     const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
 
     try {
-      const storage = createMemoryStorage()
       storageWindow.__LOOP_STORAGE_KEY__ = 'loop-protocol.preview.pr-885.mvp.save'
 
-      const gameStorage = createLocalGameStorage(undefined, storage)
-      expect(gameStorage.save({ schemaVersion: 1, resources: 1, weaponPower: 2, playerMaxHp: 3 }))
-        .toEqual({ ok: true, reason: 'saved' })
-
-      expect(storage.getItem(defaultSaveKey)).toEqual(
-        '{"schemaVersion":1,"resources":1,"weaponPower":2,"playerMaxHp":3}',
+      expect(() => createLocalGameStorage()).toThrowError(
+        'Invalid __LOOP_STORAGE_KEY__: loop-protocol.preview.pr-885.mvp.save',
       )
-      expect(storage.getItem('loop-protocol.preview.pr-885.mvp.save')).toBeNull()
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
+  it('GIVEN non-string runtime override WHEN resolveStorageKey is called THEN it throws', () => {
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: unknown }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+
+    try {
+      storageWindow.__LOOP_STORAGE_KEY__ = 123
+      expect(() => resolveStorageKey()).toThrowError('__LOOP_STORAGE_KEY__ must be a string')
     } finally {
       if (previousOverride === undefined) {
         Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')

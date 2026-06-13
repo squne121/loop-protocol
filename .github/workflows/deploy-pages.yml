@@ -48,18 +48,6 @@ jobs:
           echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "base=$base" >> "$GITHUB_OUTPUT"
-      - name: Resolve PR preview storage namespace
-        id: storage-namespace
-        shell: bash
-        run: |
-          set -euo pipefail
-          namespace="pr-${{ github.event.number }}"
-          case "$namespace" in
-            pr-[0-9]*) ;;
-            *) echo "Invalid preview storage namespace: $namespace" >&2; exit 1 ;;
-          esac
-          echo "VITE_LOOP_STORAGE_NAMESPACE=$namespace" >> "$GITHUB_ENV"
-          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
       - name: Resolve and inject commit SHA
         id: commit-sha
         shell: bash
@@ -75,7 +63,6 @@ jobs:
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
-          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
       - name: Verify main build asset base path
         shell: bash
         run: |
@@ -176,9 +163,22 @@ jobs:
           fi
           printf 'VITE_LOOP_COMMIT_SHA=%s\n' "$sha" >> "$GITHUB_ENV"
           printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - name: Resolve PR preview storage namespace
+        id: storage-namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="pr-${{ github.event.number }}"
+          case "$namespace" in
+            pr-[0-9]*) ;;
+            *) echo "Invalid preview storage namespace: $namespace" >&2; exit 1 ;;
+          esac
+          echo "VITE_LOOP_STORAGE_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
       - name: Verify PR preview build asset base path
         shell: bash
         run: |
@@ -186,6 +186,16 @@ jobs:
           base="${{ steps.vite-base.outputs.base }}"
           grep -F "${base}assets/" dist/index.html
           if grep -qE 'src="/assets/|href="/assets/' dist/index.html; then exit 1; fi
+      - name: Verify preview storage namespace in dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_key="loop-protocol.preview.pr-${{ github.event.number }}.mvp.save"
+          if ! grep -rq "$expected_key" dist/; then
+            echo "ERROR: preview storage key $expected_key not found in dist/" >&2
+            exit 1
+          fi
+          echo "OK: preview storage key $expected_key found in dist/"
       - name: Verify commit SHA in dist
         shell: bash
         run: |

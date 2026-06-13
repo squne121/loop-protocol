@@ -18,12 +18,20 @@ function getRuntimeStorageKey(): string | null {
   const loopWindow = globalThis as unknown as WindowWithLoopStorageRuntime
   const override = loopWindow.__LOOP_STORAGE_KEY__
 
-  if (typeof override === 'string') {
-    const trimmed = override.trim()
-    return isAllowedRuntimeStorageKey(trimmed) ? trimmed : null
+  if (override === undefined) {
+    return null
   }
 
-  return null
+  if (typeof override !== 'string') {
+    throw new Error('__LOOP_STORAGE_KEY__ must be a string')
+  }
+
+  const trimmed = override.trim()
+  if (!isAllowedRuntimeStorageKey(trimmed)) {
+    throw new Error(`Invalid __LOOP_STORAGE_KEY__: ${override}`)
+  }
+
+  return trimmed
 }
 
 function normalizePreviewNamespace(namespace: string): string {

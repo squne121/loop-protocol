@@ -478,7 +478,7 @@ test('GIVEN runtime storage key override WHEN result is confirmed THEN productio
   })
   expect(parsedE2E).toEqual({
     schemaVersion: 1,
-    resources: 3,
+    resources: 30,
     weaponPower: 1,
     playerMaxHp: 8,
   })
