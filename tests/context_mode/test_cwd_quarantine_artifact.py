@@ -182,3 +182,55 @@ class TestForbiddenValues:
         placeholder_pattern = re.compile(r'"<(?!unset>)[a-z][a-z0-9_]*>"')
         matches = placeholder_pattern.findall(text)
         assert not matches, f"Found stale placeholders: {matches}"
+
+class TestAC883:
+    """AC4, AC5 (Issue #883): SHA length and project_policy match effective settings."""
+
+    SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+    SETTINGS_PATH = Path(".claude/settings.json")
+    EXECUTION_LIKE_TOOLS = [
+        "mcp__context-mode__ctx_execute",
+        "mcp__context-mode__ctx_batch_execute",
+        "mcp__context-mode__ctx_execute_file",
+        "mcp__context-mode__ctx_fetch_and_index",
+    ]
+
+    def test_head_sha_full_length(self, artifact):
+        """AC4: All cases without bash_evidence.status must have 40-char lowercase hex SHA."""
+        cases = artifact.get("cases", {})
+        failures = []
+        for case_name, case in cases.items():
+            bash = case.get("bash_evidence", {})
+            if "status" in bash:
+                # probe_blocked_by_policy — no SHA available; skip
+                continue
+            sha = bash.get("git_rev_parse_head", "")
+            if not self.SHA_PATTERN.match(sha):
+                failures.append(
+                    f"{case_name}.bash_evidence.git_rev_parse_head={sha!r} "
+                    f"(expected 40-char lowercase hex)"
+                )
+        assert not failures, "Short or invalid SHAs found:\n" + "\n".join(failures)
+
+    def test_project_policy_matches_effective_settings(self, artifact):
+        """AC5: artifact.project_policy deny entries must match .claude/settings.json deny list."""
+        assert self.SETTINGS_PATH.exists(), f"Settings not found: {self.SETTINGS_PATH}"
+        with self.SETTINGS_PATH.open() as f:
+            settings = json.load(f)
+        effective_deny: list[str] = settings.get("permissions", {}).get("deny", [])
+
+        policy = artifact.get("project_policy", {})
+        mismatches = []
+        for tool in self.EXECUTION_LIKE_TOOLS:
+            tool_short = tool.replace("mcp__context-mode__", "")
+            artifact_val = policy.get(tool_short)
+            in_settings_deny = tool in effective_deny
+            if artifact_val == "deny" and not in_settings_deny:
+                mismatches.append(
+                    f"{tool_short}: artifact says 'deny' but {tool!r} not in settings.json deny"
+                )
+            elif artifact_val != "deny" and in_settings_deny:
+                mismatches.append(
+                    f"{tool_short}: {tool!r} is in settings.json deny but artifact says {artifact_val!r}"
+                )
+        assert not mismatches, "project_policy mismatch with settings.json:\n" + "\n".join(mismatches)
