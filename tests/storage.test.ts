@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { resolveProgressionSaveFailureFeedback } from '../src/main'
 import {
   createLocalGameStorage,
   parseSnapshot,
@@ -406,5 +407,43 @@ describe('LocalGameStorage', () => {
     expect(raw).not.toContain('"enemies"')
     expect(raw).not.toContain('"projectiles"')
     expect(raw).not.toContain('"playerHpRemaining"')
+  })
+})
+
+describe('progression save failure feedback', () => {
+  it('GIVEN reward-claim save failure without a prior snapshot WHEN feedback is resolved THEN it keeps loadable snapshot false', () => {
+    const result = resolveProgressionSaveFailureFeedback('reward-claim', false)
+
+    expect(result).toEqual({
+      hasLoadableSnapshot: false,
+      status: 'Result confirmed; progress not saved.',
+      summary: 'No local save is currently available for Quick Load.',
+      readbackAttempted: false,
+    })
+  })
+
+  it('GIVEN reward-claim save failure with an existing loadable snapshot WHEN feedback is resolved THEN it keeps existing loadable snapshot', () => {
+    const result = resolveProgressionSaveFailureFeedback('reward-claim', true)
+
+    expect(result.hasLoadableSnapshot).toBe(true)
+    expect(result.status).toBe('Result confirmed; progress not saved.')
+    expect(result.summary).toContain('Previous local save is still available')
+    expect(result.readbackAttempted).toBe(false)
+  })
+
+  it('GIVEN quick-save save failure WHEN feedback is resolved THEN it does not read back after save failure', () => {
+    const withoutSnapshot = resolveProgressionSaveFailureFeedback('quick-save', false)
+    const withSnapshot = resolveProgressionSaveFailureFeedback('quick-save', true)
+
+    expect(withoutSnapshot).toEqual({
+      hasLoadableSnapshot: false,
+      status: 'Quick Save failed.',
+      summary: 'No local save is currently available for Quick Load.',
+      readbackAttempted: false,
+    })
+    expect(withSnapshot.hasLoadableSnapshot).toBe(true)
+    expect(withSnapshot.status).toBe('Quick Save failed.')
+    expect(withSnapshot.summary).toContain('Previous local save is still available')
+    expect(withSnapshot.readbackAttempted).toBe(false)
   })
 })

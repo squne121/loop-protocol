@@ -31,17 +31,53 @@ import {
 export type { DebugPauseState } from './ui/debugPause'
 export { createDebugPauseState, toggleDebugPause, resetInputOnPause } from './ui/debugPause'
 
+type ProgressionSaveReason = 'reward-claim' | 'quick-save'
+
+type ProgressionSaveFailureFeedback = {
+  hasLoadableSnapshot: boolean
+  status: string
+  summary: string
+  readbackAttempted: false
+}
+
+export function resolveProgressionSaveFailureFeedback(
+  reason: ProgressionSaveReason,
+  hadLoadableSnapshot: boolean,
+): ProgressionSaveFailureFeedback {
+  if (reason === 'reward-claim') {
+    return {
+      hasLoadableSnapshot: hadLoadableSnapshot,
+      status: 'Result confirmed; progress not saved.',
+      summary: hadLoadableSnapshot
+        ? 'Previous local save is still available for Quick Load.'
+        : 'No local save is currently available for Quick Load.',
+      readbackAttempted: false,
+    }
+  }
+
+  return {
+    hasLoadableSnapshot: hadLoadableSnapshot,
+    status: 'Quick Save failed.',
+    summary: hadLoadableSnapshot
+      ? 'Previous local save is still available for Quick Load.'
+      : 'No local save is currently available for Quick Load.',
+    readbackAttempted: false,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
 
-const app = document.querySelector<HTMLDivElement>('#app')
+const isTestRuntime = import.meta.env.MODE === 'test'
+const app = isTestRuntime ? null : document.querySelector<HTMLDivElement>('#app')
 
-if (!app) {
+if (!app && !isTestRuntime) {
   throw new Error('#app element is missing.')
 }
 
-app.innerHTML = `
+if (app) {
+  app.innerHTML = `
   <div class="app-shell">
     <section class="battle-stage">
       <div class="battle-stage__header">
@@ -56,14 +92,17 @@ app.innerHTML = `
     <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
 `
+}
 
 // AC2: opt-in evidence panel — visible only when ?playtest_evidence=1
-initPlaytestEvidencePanel(document.body, window.location.search)
+if (app) {
+  initPlaytestEvidencePanel(document.body, window.location.search)
+}
 
-const canvas = app.querySelector<HTMLCanvasElement>('.battle-stage__canvas')
-const commandRail = app.querySelector<HTMLElement>('.command-rail')
+const canvas = app?.querySelector<HTMLCanvasElement>('.battle-stage__canvas') ?? null
+const commandRail = app?.querySelector<HTMLElement>('.command-rail') ?? null
 
-if (!canvas || !commandRail) {
+if ((!canvas || !commandRail) && !isTestRuntime) {
   throw new Error('Application shell is incomplete.')
 }
 
@@ -71,7 +110,7 @@ const storage = createLocalGameStorage()
 const loadResult = storage.load()
 let hasLoadableSnapshot = loadResult.ok && loadResult.snapshot !== null
 let state = createInitialGameState(loadResult.ok ? loadResult.snapshot ?? undefined : undefined)
-const renderer = createCanvasRenderer(canvas)
+const renderer = canvas ? createCanvasRenderer(canvas) : null
 
 // Debug pause state (runtime-local, not persisted)
 const debugPause = createDebugPauseState()
@@ -96,7 +135,7 @@ function handleTogglePause(): void {
   setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
 }
 
-const hud = createHudController(commandRail, {
+const hud = commandRail ? createHudController(commandRail, {
   onStartSortie() {
     if (state.loopPhase !== 'preparation') {
       return
@@ -200,25 +239,29 @@ const hud = createHudController(commandRail, {
   onTogglePause() {
     handleTogglePause()
   },
-})
+}) : null
 
 if (!loadResult.ok) {
   reportStorageFailure('load', loadResult)
   setHudFeedback('Quick Load unavailable on startup.', 'A fresh preparation state was created.')
 }
 
-bindInput(canvas, inputState, () => state.arena)
-resizeArena(state)
-window.addEventListener('resize', () => resizeArena(state))
+if (canvas) {
+  bindInput(canvas, inputState, () => state.arena)
+  resizeArena(state)
+  window.addEventListener('resize', () => resizeArena(state))
+}
 
 // AC2: Escape key toggles pause/resume; event.repeat guard prevents multi-toggle on held key
-window.addEventListener('keydown', (event: KeyboardEvent) => {
-  if (event.key === 'Escape' && !event.repeat) {
-    handleTogglePause()
-  }
-})
+if (app) {
+  window.addEventListener('keydown', (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && !event.repeat) {
+      handleTogglePause()
+    }
+  })
 
-maybeAutoStartRuntime()
+  maybeAutoStartRuntime()
+}
 
 
 // E2E compile-time fixture overrides — only active in VITE_E2E_MODE builds.
@@ -244,6 +287,10 @@ let accumulatorMs = 0
 let previousFrameTime = performance.now()
 
 function frame(now: number): void {
+  if (!hud || !renderer) {
+    return
+  }
+
   const deltaMs = now - previousFrameTime
   previousFrameTime = now
 
@@ -270,7 +317,9 @@ function frame(now: number): void {
   window.requestAnimationFrame(frame)
 }
 
-window.requestAnimationFrame(frame)
+if (app) {
+  window.requestAnimationFrame(frame)
+}
 
 function stepSimulation(fixedDeltaMs: number): void {
   const commands = mapInputToCommands(inputState)
@@ -293,18 +342,16 @@ function setHudFeedback(status: string, summary: string): void {
 }
 
 function persistProgressionSnapshot(
-  reason: 'reward-claim' | 'quick-save',
+  reason: ProgressionSaveReason,
 ): void {
+  const hadLoadableSnapshot = hasLoadableSnapshot
   const saveResult = storage.save(createGameSnapshot(state))
 
   if (!saveResult.ok) {
     reportStorageFailure('save', saveResult)
-    hasLoadableSnapshot = false
-
-    setHudFeedback(
-      'Progress not saved.',
-      'You can continue, but progress may be lost after reload.',
-    )
+    const failureFeedback = resolveProgressionSaveFailureFeedback(reason, hadLoadableSnapshot)
+    hasLoadableSnapshot = failureFeedback.hasLoadableSnapshot
+    setHudFeedback(failureFeedback.status, failureFeedback.summary)
     return
   }
 
