@@ -4,13 +4,27 @@ import { formatCombatNumber } from '../render/renderUtils'
 export interface HudActions {
   onStartSortie(): void
   onClaimReward(): void
+  /** Confirm result and return to preparation (AC5). */
+  onConfirmResult?(): void
   onNextSortie(): void
-  onQuickSave(): void
-  onQuickLoad(): void
+  /** Save operation (AC2, AC8): caller must gate to preparation phase only. */
+  onSave?(): void
+  /** Load Game (AC3, AC9): only valid from title_menu / load_menu. */
+  onLoadGame?(): void
   onReset(): void
-  canQuickLoad(): boolean
+  /** Returns true if a loadable snapshot is available (AC3, AC9). */
+  canLoadGame?(): boolean
   /** Called when the pause/resume button is clicked (AC1). */
   onTogglePause(): void
+  // ---------------------------------------------------------------------------
+  // Backward-compat aliases (deprecated — use onSave / onLoadGame / canLoadGame)
+  // ---------------------------------------------------------------------------
+  /** @deprecated Use onSave() instead. */
+  onQuickSave?(): void
+  /** @deprecated Use onLoadGame() instead. */
+  onQuickLoad?(): void
+  /** @deprecated Use canLoadGame() instead. */
+  canQuickLoad?(): boolean
 }
 
 export interface HudController {
@@ -55,9 +69,10 @@ export function createHudController(
     <section class="panel panel--actions">
       <button type="button" data-action="start-sortie">Start sortie</button>
       <button type="button" data-action="claim-reward">Claim reward</button>
+      <button type="button" data-action="confirm-result">Confirm result</button>
       <button type="button" data-action="next-sortie">Next sortie</button>
-      <button type="button" data-action="quick-save">Quick Save</button>
-      <button type="button" data-action="quick-load">Quick Load</button>
+      <button type="button" data-action="save">Save</button>
+      <button type="button" data-action="load-game">Load Game</button>
       <button
         type="button"
         data-action="reset"
@@ -79,15 +94,26 @@ export function createHudController(
   container
     .querySelector<HTMLButtonElement>('[data-action="claim-reward"]')
     ?.addEventListener('click', actions.onClaimReward)
+  if (actions.onConfirmResult) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="confirm-result"]')
+      ?.addEventListener('click', actions.onConfirmResult)
+  }
   container
     .querySelector<HTMLButtonElement>('[data-action="next-sortie"]')
     ?.addEventListener('click', actions.onNextSortie)
-  container
-    .querySelector<HTMLButtonElement>('[data-action="quick-save"]')
-    ?.addEventListener('click', actions.onQuickSave)
-  container
-    .querySelector<HTMLButtonElement>('[data-action="quick-load"]')
-    ?.addEventListener('click', actions.onQuickLoad)
+  const saveHandler = actions.onSave ?? actions.onQuickSave
+  if (saveHandler) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="save"]')
+      ?.addEventListener('click', saveHandler)
+  }
+  const loadGameHandler = actions.onLoadGame ?? actions.onQuickLoad
+  if (loadGameHandler) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="load-game"]')
+      ?.addEventListener('click', loadGameHandler)
+  }
   container
     .querySelector<HTMLButtonElement>('[data-action="reset"]')
     ?.addEventListener('click', actions.onReset)
@@ -108,9 +134,10 @@ export function createHudController(
   const sortieResult = queryField(container, 'sortie-result')
   const startSortieButton = queryAction(container, 'start-sortie')
   const claimRewardButton = queryAction(container, 'claim-reward')
+  const confirmResultButton = queryAction(container, 'confirm-result')
   const nextSortieButton = queryAction(container, 'next-sortie')
-  const quickSaveButton = queryAction(container, 'quick-save')
-  const quickLoadButton = queryAction(container, 'quick-load')
+  const saveButton = queryAction(container, 'save')
+  const loadGameButton = queryAction(container, 'load-game')
   const resetButton = queryAction(container, 'reset')
   const togglePauseButton = queryAction(container, 'toggle-pause')
 
@@ -124,11 +151,20 @@ export function createHudController(
       command.textContent = state.telemetry.lastCommandSummary
 
       switch (state.loopPhase) {
+        case 'title_menu':
+          loopPhase.textContent = 'Title Menu'
+          break
+        case 'load_menu':
+          loopPhase.textContent = 'Load Menu'
+          break
         case 'preparation':
           loopPhase.textContent = 'Preparation'
           break
         case 'running':
           loopPhase.textContent = 'Sortie running'
+          break
+        case 'result':
+          loopPhase.textContent = 'Result'
           break
         case 'debrief_pending_reward':
           loopPhase.textContent = 'Debrief: reward pending'
@@ -138,11 +174,21 @@ export function createHudController(
           break
       }
 
+      // Button enable policy derived from phase state machine (AC2, AC3, AC7, AC8, AC9)
+      const isMenuPhase = state.loopPhase === 'title_menu' || state.loopPhase === 'load_menu'
       startSortieButton.disabled = state.loopPhase !== 'preparation'
-      claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward'
+      // claim-reward: only for legacy debrief_pending_reward phase
+      claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward' && !(state.loopPhase === 'result' && state.resultRewardStatus === 'pending')
+      // confirm-result: only in result phase (AC5)
+      confirmResultButton.disabled = state.loopPhase !== 'result'
+      // next-sortie: only for legacy debrief_reward_claimed phase
       nextSortieButton.disabled = state.loopPhase !== 'debrief_reward_claimed'
-      quickSaveButton.disabled = state.loopPhase !== 'preparation'
-      quickLoadButton.disabled = state.loopPhase !== 'preparation' || !actions.canQuickLoad()
+      // save: preparation only (AC2, AC8)
+      saveButton.disabled = state.loopPhase !== 'preparation'
+      // load-game: title_menu or load_menu only (AC3, AC9)
+      // canLoadGame is preferred; falls back to deprecated canQuickLoad for backward compat
+      const canLoad = (actions.canLoadGame ?? actions.canQuickLoad)?.() ?? false
+      loadGameButton.disabled = !isMenuPhase || !canLoad
       resetButton.disabled = state.loopPhase !== 'preparation'
 
       // AC1: pause button label reflects current pause state

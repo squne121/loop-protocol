@@ -93,7 +93,36 @@ export interface TelemetryState {
 // ---------------------------------------------------------------------------
 
 export type SortieStatus = 'idle' | 'running' | 'victory' | 'defeat' | 'timeout' | 'ended'
-export type LoopPhase = 'preparation' | 'running' | 'debrief_pending_reward' | 'debrief_reward_claimed'
+/**
+ * Game loop phase state machine (AC1).
+ *
+ * Transition policy:
+ * - [*] → title_menu (initial)
+ * - title_menu → preparation: New Game
+ * - title_menu → load_menu: Load Game
+ * - load_menu → preparation: Load slot-1 (storage.load())
+ * - load_menu → title_menu: Back
+ * - preparation → preparation: Save (storage.save())
+ * - preparation → running: Start Sortie
+ * - running → result: Victory / Defeat / Timeout
+ * - result → preparation: Confirm result
+ *
+ * Save policy: storage.save() ONLY in preparation (AC2, AC8).
+ * Load policy: storage.load() ONLY from title_menu / load_menu (AC3, AC9).
+ */
+export type LoopPhase =
+  | 'title_menu'
+  | 'load_menu'
+  | 'preparation'
+  | 'running'
+  | 'result'
+  | 'debrief_pending_reward'
+  | 'debrief_reward_claimed'
+
+/**
+ * Result reward claim status — separates result display from reward application (AC10).
+ */
+export type ResultRewardStatus = 'pending' | 'claimed'
 
 /**
  * Reason why a sortie ended. Discriminates the three terminal conditions.
@@ -171,6 +200,8 @@ export interface GameState {
   tick: number
   elapsedMs: number
   loopPhase: LoopPhase
+  /** Separates result display from reward application (AC10). Only meaningful in 'result' phase. */
+  resultRewardStatus: ResultRewardStatus
   pendingRewardApplicationId: RewardApplicationId | null
   nextRewardApplicationSequence: number
   arena: ArenaState
@@ -204,6 +235,7 @@ export function createInitialGameState(
     tick: 0,
     elapsedMs: 0,
     loopPhase: 'preparation',
+    resultRewardStatus: 'pending',
     pendingRewardApplicationId: null,
     nextRewardApplicationSequence: 1,
     arena: {

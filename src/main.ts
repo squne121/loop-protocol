@@ -17,6 +17,7 @@ import {
   advanceSimulationLoop,
   clampPlayerToArena,
   claimPendingReward,
+  confirmResult,
   runSortieSimulationStep,
   startSortie,
 } from './systems'
@@ -31,7 +32,7 @@ import {
 export type { DebugPauseState } from './ui/debugPause'
 export { createDebugPauseState, toggleDebugPause, resetInputOnPause } from './ui/debugPause'
 
-type ProgressionSaveReason = 'reward-claim' | 'quick-save'
+type ProgressionSaveReason = 'reward-claim' | 'save'
 
 type ProgressionSaveFailureFeedback = {
   hasLoadableSnapshot: boolean
@@ -55,7 +56,7 @@ export function resolveProgressionSaveFailureFeedback(
 
   return {
     hasLoadableSnapshot: hadLoadableSnapshot,
-    status: 'Quick Save failed.',
+    status: 'Save failed.',
     summary: hadLoadableSnapshot
       ? 'Previous local save is still available; this result may be lost after reload.'
       : 'No local save is available; this result may be lost after reload.',
@@ -88,7 +89,7 @@ export function runProgressionSave(
     return true
   }
 
-  seam.setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
+  seam.setHudFeedback('Save complete.', 'Progression snapshot saved locally.')
   return true
 }
 
@@ -169,10 +170,11 @@ const hud = commandRail ? createHudController(commandRail, {
     }
 
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
-    setHudFeedback('Sortie started.', 'Preparation controls are now locked until debrief.')
+    setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
   },
   onClaimReward() {
-    if (state.loopPhase !== 'debrief_pending_reward') {
+    // Supports both legacy debrief_pending_reward and new result phase
+    if (state.loopPhase !== 'debrief_pending_reward' && !(state.loopPhase === 'result' && state.resultRewardStatus === 'pending')) {
       return
     }
 
@@ -198,7 +200,19 @@ const hud = commandRail ? createHudController(commandRail, {
         return
     }
   },
+  onConfirmResult() {
+    // AC5: confirm result → preparation transition
+    if (state.loopPhase !== 'result') {
+      return
+    }
+
+    confirmResult(state)
+    // Reset debug pause on state transition to preparation
+    debugPause.isPaused = false
+    setHudFeedback('Result confirmed.', 'Ready for next sortie.')
+  },
   onNextSortie() {
+    // Legacy debrief_reward_claimed → startSortie (kept for backward compat)
     if (state.loopPhase !== 'debrief_reward_claimed') {
       return
     }
@@ -209,42 +223,46 @@ const hud = commandRail ? createHudController(commandRail, {
       'Claimed reward remains available only in this in-memory session until saved.',
     )
   },
-  onQuickSave() {
+  onSave() {
+    // AC2, AC8: Save only allowed in preparation phase
     if (state.loopPhase !== 'preparation') {
       return
     }
 
-    persistProgressionSnapshot('quick-save')
+    persistProgressionSnapshot('save')
   },
-  onQuickLoad() {
-    if (state.loopPhase !== 'preparation') {
+  onLoadGame() {
+    // AC3, AC9: Load Game only from title_menu or load_menu
+    if (state.loopPhase !== 'title_menu' && state.loopPhase !== 'load_menu') {
       return
     }
 
     if (!hasLoadableSnapshot) {
-      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+      setHudFeedback('Load Game failed.', 'No save data available.')
       return
     }
 
-    const quickLoadResult = storage.load()
-    if (!quickLoadResult.ok) {
-      reportStorageFailure('load', quickLoadResult)
-      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+    const loadResult = storage.load()
+    if (!loadResult.ok) {
+      reportStorageFailure('load', loadResult)
+      setHudFeedback('Load Game failed.', 'Current state unchanged.')
       return
     }
 
-    if (quickLoadResult.snapshot === null) {
+    if (loadResult.snapshot === null) {
       hasLoadableSnapshot = false
-      setHudFeedback('Quick Load failed.', 'Current state unchanged.')
+      setHudFeedback('Load Game failed.', 'No save data found.')
       return
     }
 
-    state = createInitialGameState(quickLoadResult.snapshot)
+    // AC3: restore to preparation after load
+    state = createInitialGameState(loadResult.snapshot)
+    state.loopPhase = 'preparation'
     resizeArena(state)
     hasLoadableSnapshot = true
-    // BLOCKER 1: reset debug pause on state transition to preparation
+    // Reset debug pause on state transition to preparation
     debugPause.isPaused = false
-    setHudFeedback('Quick Load complete.', 'Progression snapshot restored for preparation.')
+    setHudFeedback('Load Game complete.', 'Progression snapshot restored.')
   },
   onReset() {
     if (state.loopPhase !== 'preparation') {
@@ -252,15 +270,16 @@ const hud = commandRail ? createHudController(commandRail, {
     }
 
     state = createInitialGameState()
+    state.loopPhase = 'preparation'
     resizeArena(state)
-    // BLOCKER 1: reset debug pause on state transition to preparation
+    // Reset debug pause on state transition to preparation
     debugPause.isPaused = false
     setHudFeedback(
       'Reset sortie complete.',
       'Reset sortie is a destructive boundary. Preparation only.',
     )
   },
-  canQuickLoad() {
+  canLoadGame() {
     return hasLoadableSnapshot
   },
   onTogglePause() {
@@ -270,7 +289,7 @@ const hud = commandRail ? createHudController(commandRail, {
 
 if (!loadResult.ok) {
   reportStorageFailure('load', loadResult)
-  setHudFeedback('Quick Load unavailable on startup.', 'A fresh preparation state was created.')
+  setHudFeedback('Load Game unavailable on startup.', 'A fresh title menu state was created.')
 }
 
 if (canvas) {
@@ -358,6 +377,11 @@ function maybeAutoStartRuntime(): void {
     return
   }
 
+  // E2E: auto-transition from title_menu to preparation, then start sortie
+  if (state.loopPhase === 'title_menu') {
+    state.loopPhase = 'preparation'
+  }
+
   if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
   }
@@ -409,7 +433,7 @@ function reportStorageFailure(
 interface LoopE2ESnapshot {
   tick: number
   elapsedMs: number
-  loopPhase: 'preparation' | 'running' | 'debrief_pending_reward' | 'debrief_reward_claimed'
+  loopPhase: 'title_menu' | 'load_menu' | 'preparation' | 'running' | 'result' | 'debrief_pending_reward' | 'debrief_reward_claimed'
   player: {
     x: number
     y: number

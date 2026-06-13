@@ -3,29 +3,33 @@ doc_id: feature-quick-save
 status: draft
 related_issue: "#572"
 parent_issue: "#483"
+updated_by: "#619"
 trace_links:
   self_issue: "#572"
   parent_issue: "#483"
   background_pr: "#570"
+  implementation_issue: "#619"
   future_issues:
-    - "#619: Quick Save を準備フェーズ限定に制限し Quick Load を実装する"
-    - "#620: Quick Save ボタンの有効/無効表示と最小限のフィードバックを実装する"
+    - "#620: Save ボタンの有効/無効表示と最小限のフィードバックを実装する"
     - "#621: LocalGameStorage の例外処理を実装する（QuotaExceededError / parse 失敗）"
-    - "#622: Quick Save のアクセシビリティ互換代替案（中断セーブ・チェックポイント等）を調査する"
+    - "#622: Save のアクセシビリティ互換代替案（中断セーブ・チェックポイント等）を調査する"
+    - "#740: HTTP origin 上の runtime verification（M3 playtest 後）"
 acceptance:
   - AC1: docs/product/features/quick-save.md が存在する
   - AC2: progression-only スナップショットであると明記されている
   - AC3: 保存対象フィールド（resources / weaponPower / playerMaxHp）が明記されている
   - AC4: 非保存フィールド（current HP・enemies・projectiles 等）が明記されている
-  - AC5: ゲームデザイン方針（準備フェーズ制限・Quick Load 必要性）が明記されている
+  - AC5: ゲームデザイン方針（準備フェーズ制限・Load Game ポリシー）が明記されている
   - AC6: ストレージ仕様（loop-protocol.mvp.save・browser-local・origin-scoped）が明記されている
   - AC7: UI 自己説明・保存の意味方針が明記されている
   - AC8: 将来参照が少なくとも 3 件記載されている
 non-goals:
-  - Quick Save/Quick Load の UI 実装・コード変更（別 Issue）
-  - 準備フェーズの状態遷移実装（将来 Issue）
-  - ボタン UI 名の変更判定（Quick Save vs Progress Save）（スコープ外）
-related_tests: []
+  - Quick Save/Quick Load の UI 実装（#619 でポリシーを確定; UI は別 Issue）
+  - 準備フェーズの状態遷移実装（#619 で実装済み）
+  - ボタン UI 名の変更判定（Quick Save → Save に変更済み; #619）
+related_tests:
+  - tests/storage.test.ts
+  - tests/sortie-system.test.ts
 ---
 
 # Quick Save
@@ -97,21 +101,42 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 | same-origin sharing | path 単位で隔離されない | key namespace と schemaVersion を維持する |
 | ユーザー / XSS による改変 | save data は信頼できない | parse/validate/clamp してから state に反映する |
 
-## ゲームデザイン方針
+## ゲームデザイン方針（#619 更新）
 
-### 出撃中の Quick Save / Quick Load 禁止
+### Save 操作の準備フェーズ制限
 
-出撃中（sortie フェーズ中）の Quick Save および Quick Load は **禁止**する。
+Save 操作（`LocalGameStorage.save()` の実際の呼び出し）は `preparation` フェーズのみ許可する。
 
-セーブ・ロード操作は準備フェーズ（sortie 開始前の状態）にのみ許可する。これによりゲームバランスへの悪影響（戦闘中の save-scum 等）を防ぐ。
+`running` / `result` / `title_menu` / `load_menu` フェーズでは Save を実行しない。これによりゲームバランスへの悪影響（戦闘中の save-scum 等）を防ぐ。
 
-### 準備フェーズ制限
+### Load Game ポリシー（Quick Load 廃止）
 
-現行実装では `main.ts` が初期化後に直接 `startSortie(...)` を呼び出すため、明確な UI 準備フェーズが存在しない。Quick Save / Quick Load の有効化に伴い、具体的な状態遷移（準備フェーズ → 出撃フェーズ → 結果フェーズ）は将来の実装 Issue で定義する。
+**Quick Load** という名称は廃止する。ロード操作は **Load Game** として、ゲーム開始前メニュー（`title_menu` / `load_menu` フェーズ）からのみ実行可能とする。
 
-### Quick Load の必要性
+Load Game を実行すると、スナップショットを復元して `preparation` フェーズに入る。`running` / `result` フェーズ中は Load Game を実行しない（ゲームバランス保護）。
 
-Quick Save に対する対の操作として **Quick Load** が必要である。Quick Load の実装は別 Issue で扱う。
+この方針は 2026-06-13 の人間デザインコメント（Issue #619#issuecomment-4697787543）で確定した。
+
+### フェーズ状態機械（#619 実装）
+
+`LoopPhase` は以下の遷移を定義する（#619 で実装済み）:
+
+```
+[*] → title_menu
+title_menu → preparation: New Game
+title_menu → load_menu: Load Game (メニュー選択)
+load_menu → preparation: Load slot-1 (storage.load())
+load_menu → title_menu: Back
+preparation → preparation: Save (storage.save())
+preparation → running: Start Sortie
+running → result: Victory / Defeat / Timeout
+result → preparation: Confirm result
+```
+
+### Runtime Verification（deferred）
+
+HTTP origin 上の実動作確認（フェーズ遷移・ボタン状態・Save/Load 実挙動）は M3 playtest（全フェーズ遷移統合後）に deferred とする。
+参照: Issue #740 または後続 Issue で明示的に対応する。
 
 ## UI 方針
 
@@ -125,7 +150,8 @@ Quick Save の役割や保存の意味を説明するコピー（テキスト）
 
 以下の項目は現行スコープ外であり、それぞれ別 Issue で実装・定義する:
 
-1. **準備フェーズ制限の実装** (#619): Quick Save / Quick Load を出撃中に無効化する状態遷移定義（localStorage キー `loop-protocol.mvp.save` の読み書きタイミング制御を含む）
-2. **UI フィードバック** (#620): Quick Save ボタンの有効/無効表示（準備フェーズ外では無効化）および最小限の成功/失敗フィードバック
+1. **準備フェーズ制限の実装** (#619, 実装済み): Save / Load Game をフェーズ状態機械から導出し、`preparation` / `title_menu` / `load_menu` 制限を実装した。
+2. **UI フィードバック** (#620): Save ボタンの有効/無効表示（準備フェーズ外では無効化）および最小限の成功/失敗フィードバック
 3. **壊れたセーブデータの処理** (#621): 欠損・破損・ブロック・容量超過時のエラーハンドリングとフォールバック
 4. **アクセシビリティ互換の保存代替案** (#622): 中断セーブ・チェックポイント等、ブラウザ localStorage に依存しない保存方式の検討
+5. **HTTP origin 上の runtime verification** (#740, deferred): M3 playtest（全フェーズ遷移統合後）に実施予定。
