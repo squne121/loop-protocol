@@ -285,6 +285,63 @@ export function resolveIssueNumber(hookCtx, { branchName = null, cwdPath = null 
   return null
 }
 
+/**
+ * Build producer CLI arguments array from resolved context.
+ * Exported for unit testing so that --phase-instance-id and --issue presence
+ * can be verified without spawning a subprocess.
+ *
+ * @param {{ producerScript: string, repository: string, phaseInfo: {mainLoop:string,ledgerPhase:string},
+ *            phaseInstanceId: string, actorType: string, actorName: string,
+ *            evidenceSourceKind: string, evidenceSourceRef: string, evidenceVisibility: string,
+ *            sessionId: string|null, resolvedIssueNumber: number|null }} params
+ * @returns {string[]}
+ */
+export function buildProducerArgs({
+  producerScript,
+  repository,
+  phaseInfo,
+  phaseInstanceId,
+  actorType,
+  actorName,
+  evidenceSourceKind,
+  evidenceSourceRef,
+  evidenceVisibility,
+  sessionId,
+  resolvedIssueNumber,
+}) {
+  const args = [
+    producerScript,
+    '--repository',
+    repository,
+    '--phase-main-loop',
+    phaseInfo.mainLoop,
+    '--phase-ledger-phase',
+    phaseInfo.ledgerPhase,
+    '--phase-instance-id',
+    phaseInstanceId,
+    '--actor-type',
+    actorType,
+    '--actor-name',
+    actorName,
+    '--evidence-source-kind',
+    evidenceSourceKind,
+    '--evidence-source-ref',
+    evidenceSourceRef,
+    '--evidence-visibility',
+    evidenceVisibility,
+    '--format',
+    'json',
+    '--validate',
+  ]
+  if (sessionId) {
+    args.push('--actor-session-id', sessionId)
+  }
+  if (resolvedIssueNumber !== null) {
+    args.push('--issue', String(resolvedIssueNumber))
+  }
+  return args
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -346,12 +403,17 @@ async function main() {
   }
 
   // Resolve issue identity: payload → branch → cwd → issue-0 sentinel
+  // B1: use hookCtx.cwd (the active worktree cwd from hook stdin) rather than
+  // process.cwd() / REPO_ROOT so that worktrees are identified correctly.
+  const hookCwd = typeof hookCtx?.cwd === 'string' ? hookCtx.cwd : null
+  const gitCwd = hookCwd ?? REPO_ROOT
+
   let currentBranchName = null
   try {
     currentBranchName =
       execFileSync('git', ['branch', '--show-current'], {
         encoding: 'utf8',
-        cwd: REPO_ROOT,
+        cwd: gitCwd,
         stdio: ['pipe', 'pipe', 'pipe'],
       }).trim() || null
   } catch {
@@ -359,7 +421,7 @@ async function main() {
   }
   const resolvedIssueNumber = resolveIssueNumber(hookCtx, {
     branchName: currentBranchName,
-    cwdPath: process.cwd(),
+    cwdPath: hookCwd ?? process.cwd(),
   })
 
   // Build sequence ID: must be 3-digit zero-padded number (producer validates /^[0-9]{3}$/)
@@ -387,44 +449,20 @@ async function main() {
     actorName = `claude-code-hook-${safeToolName}`
   }
 
-  // Build producer CLI arguments
-  // Only pass arguments the producer CLI accepts (see --help output)
-  // PostToolUse tool_name / tool_use_id / SubagentStop agent_id are not
-  // producer CLI options — they are encoded in actor-name and phase-instance-id
-  const producerArgs = [
-    PRODUCER_SCRIPT,
-    '--repository',
-    REPOSITORY,
-    '--phase-main-loop',
-    phaseInfo.mainLoop,
-    '--phase-ledger-phase',
-    phaseInfo.ledgerPhase,
-    '--phase-instance-id',
+  // Build producer CLI arguments via exported helper (testable separately)
+  const producerArgs = buildProducerArgs({
+    producerScript: PRODUCER_SCRIPT,
+    repository: REPOSITORY,
+    phaseInfo,
     phaseInstanceId,
-    '--actor-type',
-    'ai_agent',
-    '--actor-name',
+    actorType: 'ai_agent',
     actorName,
-    '--evidence-source-kind',
-    'artifact',
-    '--evidence-source-ref',
+    evidenceSourceKind: 'artifact',
     evidenceSourceRef,
-    '--evidence-visibility',
-    'private_artifact',
-    '--format',
-    'json',
-    '--validate',
-  ]
-
-  // Add session ID as actor-session-id if available
-  if (sessionId) {
-    producerArgs.push('--actor-session-id', sessionId)
-  }
-
-  // Pass --issue <N> when issue identity is resolved (not sentinel)
-  if (resolvedIssueNumber !== null) {
-    producerArgs.push('--issue', String(resolvedIssueNumber))
-  }
+    evidenceVisibility: 'private_artifact',
+    sessionId,
+    resolvedIssueNumber,
+  })
 
   let manifestJson
   try {

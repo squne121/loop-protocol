@@ -19,6 +19,7 @@ import {
   resolveIssueNumber,
   isValidIssueNumberValue,
   extractIssueFromString,
+  buildProducerArgs,
 } from '../.claude/hooks/generate_session_manifest_from_hook.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -806,5 +807,83 @@ describe('resolveIssueNumber — issue identity dynamic resolution (AC2)', () =>
     expect(isValidIssueNumberValue(-1)).toBe(false)
     expect(isValidIssueNumberValue('00')).toBe(false)
     expect(isValidIssueNumberValue('1.5')).toBe(false)
+  })
+})
+
+describe('resolveIssueNumber — invalid payload fallback to branch/cwd (B3)', () => {
+  it('GIVEN invalid payload issue_number "000821" WHEN branchName has issue-821 THEN falls back to branch returns 821', () => {
+    expect(
+      resolveIssueNumber(
+        { issue_number: '000821' },
+        { branchName: 'worktree-issue-821-session-manifest', cwdPath: null },
+      ),
+    ).toBe(821)
+  })
+
+  it('GIVEN invalid payload issue_number 0 WHEN cwdPath has issue-821 THEN falls back to cwd returns 821', () => {
+    expect(
+      resolveIssueNumber(
+        { issue_number: 0 },
+        { branchName: null, cwdPath: '/home/user/.claude/worktrees/issue-821-foo' },
+      ),
+    ).toBe(821)
+  })
+
+  it('GIVEN all trusted alternate keys (issue.number, issueNumber, loop.issue_number) WHEN resolving THEN each is accepted', () => {
+    expect(resolveIssueNumber({ issue: { number: 821 } }, {})).toBe(821)
+    expect(resolveIssueNumber({ issueNumber: 821 }, {})).toBe(821)
+    expect(resolveIssueNumber({ loop: { issue_number: 821 } }, {})).toBe(821)
+  })
+})
+
+describe('buildProducerArgs — producer CLI args construction (B2)', () => {
+  const baseParams = {
+    producerScript: '/path/to/produce.mjs',
+    repository: 'owner/repo',
+    phaseInfo: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
+    actorType: 'ai_agent',
+    actorName: 'claude-code-hook',
+    evidenceSourceKind: 'artifact',
+    evidenceSourceRef: 'artifacts/test.json',
+    evidenceVisibility: 'private_artifact',
+    sessionId: null,
+  }
+
+  it('GIVEN resolved issue 821 WHEN built THEN --phase-instance-id is issue-821:impl:NNN and --issue 821 present', () => {
+    const args = buildProducerArgs({
+      ...baseParams,
+      phaseInstanceId: 'issue-821:impl:001',
+      resolvedIssueNumber: 821,
+    })
+    expect(args).toContain('--phase-instance-id')
+    const phaseIdx = args.indexOf('--phase-instance-id')
+    expect(args[phaseIdx + 1]).toMatch(/^issue-821:impl:[0-9]{3}$/)
+    expect(args).toContain('--issue')
+    const issueIdx = args.indexOf('--issue')
+    expect(args[issueIdx + 1]).toBe('821')
+  })
+
+  it('GIVEN unresolved issue (null) WHEN built THEN --phase-instance-id is issue-0:impl:NNN and --issue absent', () => {
+    const args = buildProducerArgs({
+      ...baseParams,
+      phaseInstanceId: 'issue-0:impl:001',
+      resolvedIssueNumber: null,
+    })
+    expect(args).toContain('--phase-instance-id')
+    const phaseIdx = args.indexOf('--phase-instance-id')
+    expect(args[phaseIdx + 1]).toMatch(/^issue-0:impl:[0-9]{3}$/)
+    expect(args).not.toContain('--issue')
+  })
+
+  it('GIVEN sessionId present WHEN built THEN --actor-session-id included', () => {
+    const args = buildProducerArgs({
+      ...baseParams,
+      phaseInstanceId: 'issue-821:impl:001',
+      resolvedIssueNumber: 821,
+      sessionId: 'sess-abc123',
+    })
+    expect(args).toContain('--actor-session-id')
+    const idx = args.indexOf('--actor-session-id')
+    expect(args[idx + 1]).toBe('sess-abc123')
   })
 })
