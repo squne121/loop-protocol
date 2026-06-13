@@ -21,7 +21,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const repoRoot = resolve(__dirname, '..')
+const repoRoot = resolve(__dirname, '..', '..')
 
 // ---------------------------------------------------------------------------
 // AC8/AC9: tests/fixtures/hooks/ directory exists
