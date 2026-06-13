@@ -122,12 +122,12 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rol
   > /tmp/scope_rollup_result_<invocation_id>.json 2>&1
 ```
 
-スクリプトが exit code 非 0 で失敗した場合:
+スクリプトが exit code 非 0 かつ 非 2 で失敗した場合（exit 2 は `partial` = current_issue 未発見の正常終了であり処理継続）:
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
-  error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0）"
+  error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0 かつ 非 2）"
   invocation_id: "<invocation_id>"
 ```
 
@@ -168,6 +168,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   generated_at: "<ISO8601（スクリプト実行完了時刻）>"
   git_head_sha: "<GIT_HEAD_SHA>"
   script_path: ".claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py"
+  script_blob_sha256: "<SCRIPT_SHA>"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
   inputs:
     current_issue_sha256: "<CURRENT_SHA>"
     issues_all_sha256: "<ISSUES_SHA>"
@@ -175,6 +176,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     issue_count: <ISSUE_COUNT>
     pr_count: <PR_COUNT>
   result:
+    plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
     plan_schema_name: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
     plan_schema_version: 2
     raw_plan_location: "/tmp/scope_rollup_result_<invocation_id>.json"

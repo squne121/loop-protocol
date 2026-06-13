@@ -30,6 +30,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import verify_scope_rollup_result as verifier  # noqa: E402
 import plan_issue_scope_rollup as rollup  # noqa: E402
 
+# Actual sha256 of plan_issue_scope_rollup.py (matches what verify script computes)
+_PLAN_SCRIPT_SHA256 = hashlib.sha256(
+    (SCRIPT_DIR / "plan_issue_scope_rollup.py").read_bytes()
+).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,8 +54,8 @@ def _make_valid_plan(tmp_path: Path, extra_candidates: list[dict[str, Any]] | No
         "candidates": candidates,
     }
     payload_sha256 = verifier._compute_payload_sha256(plan_without_sv)
-    # Use a dummy script_file_sha256 (no actual script to hash in test context)
-    script_file_sha256 = "deadbeef" * 8
+    # Use the actual sha256 of plan_issue_scope_rollup.py (matches what verify script recomputes)
+    script_file_sha256 = _PLAN_SCRIPT_SHA256
     self_validation = {
         "invocation_id": str(uuid.uuid4()),
         "payload_sha256": payload_sha256,
@@ -174,6 +179,20 @@ class TestShaMismatch:
         assert exit_code == verifier.EXIT_SHA_MISMATCH
         assert "PAYLOAD_SHA256:" in output
         assert "EXPECTED_PAYLOAD_SHA256:" in output
+
+    def test_tampered_script_file_sha256_causes_sha_mismatch(self, tmp_path: Path) -> None:
+        """GIVEN script_file_sha256 in self_validation is tampered, THEN sha_mismatch.
+
+        Verifies that verify_scope_rollup_result.py re-computes the actual sha256 of
+        plan_issue_scope_rollup.py rather than doing a pass-through.
+        """
+        plan = _make_valid_plan(tmp_path)
+        plan["self_validation"]["script_file_sha256"] = "deadbeef" * 8
+        path = _write_json(tmp_path, plan)
+        output, exit_code = verifier.verify(path)
+        assert exit_code == verifier.EXIT_SHA_MISMATCH, f"Expected exit 10, got {exit_code}"
+        assert "STATUS: sha_mismatch" in output
+        assert "script_file_sha256" in output
 
 
 # ---------------------------------------------------------------------------

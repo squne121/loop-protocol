@@ -193,17 +193,28 @@ def verify(result_json_path: str) -> tuple[str, int]:
     plan_without_self_validation = {k: v for k, v in plan.items() if k != "self_validation"}
     actual_payload_sha256 = _compute_payload_sha256(plan_without_self_validation)
 
-    # script_file_sha256: just pass through from self_validation (cannot re-run script here)
-    # The actual value is what was recorded; expected is the same field for display.
-    actual_script_file_sha256 = expected_script_file_sha256
+    # Recompute script_file_sha256 from the actual plan_issue_scope_rollup.py bytes
+    plan_script = Path(__file__).with_name("plan_issue_scope_rollup.py")
+    actual_script_file_sha256 = hashlib.sha256(plan_script.read_bytes()).hexdigest()
 
-    if actual_payload_sha256 != expected_payload_sha256:
-        output = _format_output(
-            status="sha_mismatch",
-            summary=(
+    payload_ok = actual_payload_sha256 == expected_payload_sha256
+    script_ok = actual_script_file_sha256 == expected_script_file_sha256
+
+    if not payload_ok or not script_ok:
+        mismatches: list[str] = []
+        if not payload_ok:
+            mismatches.append(
                 f"payload_sha256 mismatch: actual={actual_payload_sha256[:16]}... "
                 f"expected={expected_payload_sha256[:16]}..."
-            ),
+            )
+        if not script_ok:
+            mismatches.append(
+                f"script_file_sha256 mismatch: actual={actual_script_file_sha256[:16]}... "
+                f"expected={expected_script_file_sha256[:16]}..."
+            )
+        output = _format_output(
+            status="sha_mismatch",
+            summary="; ".join(mismatches),
             result_path=result_json_path,
             actual_payload_sha256=actual_payload_sha256,
             expected_payload_sha256=expected_payload_sha256,
