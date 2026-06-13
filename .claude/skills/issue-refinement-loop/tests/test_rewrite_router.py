@@ -58,22 +58,49 @@ class TestAC2MaxAttemptsBoundary:
         assert result.route != ROUTE_HUMAN_JUDGMENT_REQUIRED or result.reason_code != REASON_CODE_MAX_ATTEMPTS_EXCEEDED
         assert result.route in (ROUTE_CONTINUE_REWRITE, ROUTE_PROCEED_TO_REVIEW)
 
-    def test_max2_attempt2_exceeded(self):
-        """max=2, attempt=2 -> human_judgment_required with reason_code: max_attempts_exceeded."""
-        state = self._base_state(attempt=2, max_attempts=2)
+    def test_max2_attempt2_exceeded_checker_exit0_proceeds_to_review(self):
+        """max=2, attempt=2, checker_exit_code=0 -> proceed_to_review (AC1: checker approve overrides budget).
+
+        New spec (Issue #814): checker_exit_code==0 takes priority over all stop guards,
+        including max_rewrite_attempts. When checker approves, route to proceed_to_review
+        regardless of budget exhaustion.
+        """
+        state = self._base_state(attempt=2, max_attempts=2)  # checker_exit_code=0
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_PROCEED_TO_REVIEW
+        assert result.reason_code == REASON_CODE_CHECKER_PASSED
+
+    def test_max2_attempt2_exceeded_checker_exit1_human_judgment(self):
+        """max=2, attempt=2, checker_exit_code=1 -> human_judgment_required (AC2)."""
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=2,
+            max_rewrite_attempts=2,
+            checker_exit_code=1,
+            checked_body_sha256="abc123",
+            missing_sections=[],
+            missing_contract_keys=[],
+        )
         result = decide_rewrite_route(state)
         assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
         assert result.reason_code == REASON_CODE_MAX_ATTEMPTS_EXCEEDED
 
-    def test_max2_attempt3_exceeded(self):
-        """max=2, attempt=3 -> human_judgment_required with reason_code: max_attempts_exceeded."""
-        state = self._base_state(attempt=3, max_attempts=2)
+    def test_max2_attempt3_exceeded_checker_exit1_human_judgment(self):
+        """max=2, attempt=3, checker_exit_code=1 -> human_judgment_required (AC2)."""
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=3,
+            max_rewrite_attempts=2,
+            checker_exit_code=1,
+            checked_body_sha256="abc123",
+            missing_sections=[],
+            missing_contract_keys=[],
+        )
         result = decide_rewrite_route(state)
         assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
         assert result.reason_code == REASON_CODE_MAX_ATTEMPTS_EXCEEDED
 
     def test_result_echoes_attempt_count(self):
         """RouteResult echoes rewrite_attempt_count from state."""
+        # With checker_exit_code=0, proceed_to_review is returned (AC1)
         state = self._base_state(attempt=2, max_attempts=2)
         result = decide_rewrite_route(state)
         assert result.rewrite_attempt_count == 2
@@ -242,12 +269,16 @@ class TestAC6RegressionDirectCalls:
         assert result.checked_body_sha256 == "sha_abc"
 
     def test_max_boundary_off_by_one_strict(self):
-        """Strict off-by-one: attempt == max triggers stop, attempt == max-1 does not."""
-        # attempt 4, max 5 -> allowed
+        """Strict off-by-one: attempt == max triggers stop (when checker fails), attempt == max-1 does not.
+
+        Updated per Issue #814 (AC1): checker_exit_code==0 overrides max guard.
+        Tests use checker_exit_code=1 to isolate max boundary behavior.
+        """
+        # attempt 4, max 5, checker failing -> allowed (continue_rewrite)
         state_allowed = LOOP_REWRITE_ROUTER_STATE_V1(
             rewrite_attempt_count=4,
             max_rewrite_attempts=5,
-            checker_exit_code=0,
+            checker_exit_code=1,
             checked_body_sha256="h1",
             missing_sections=[],
             missing_contract_keys=[],
@@ -255,11 +286,11 @@ class TestAC6RegressionDirectCalls:
         result_allowed = decide_rewrite_route(state_allowed)
         assert result_allowed.reason_code != REASON_CODE_MAX_ATTEMPTS_EXCEEDED
 
-        # attempt 5, max 5 -> exceeded
+        # attempt 5, max 5, checker failing -> exceeded
         state_exceeded = LOOP_REWRITE_ROUTER_STATE_V1(
             rewrite_attempt_count=5,
             max_rewrite_attempts=5,
-            checker_exit_code=0,
+            checker_exit_code=1,
             checked_body_sha256="h1",
             missing_sections=[],
             missing_contract_keys=[],
@@ -267,6 +298,19 @@ class TestAC6RegressionDirectCalls:
         result_exceeded = decide_rewrite_route(state_exceeded)
         assert result_exceeded.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
         assert result_exceeded.reason_code == REASON_CODE_MAX_ATTEMPTS_EXCEEDED
+
+        # attempt 5, max 5, checker PASSING -> proceed_to_review (AC1 override)
+        state_exceeded_but_pass = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=5,
+            max_rewrite_attempts=5,
+            checker_exit_code=0,
+            checked_body_sha256="h1",
+            missing_sections=[],
+            missing_contract_keys=[],
+        )
+        result_pass = decide_rewrite_route(state_exceeded_but_pass)
+        assert result_pass.route == ROUTE_PROCEED_TO_REVIEW
+        assert result_pass.reason_code == REASON_CODE_CHECKER_PASSED
 
     def test_route_result_to_dict_contains_required_fields(self):
         """RouteResult.to_dict() contains all AC5 terminal result fields."""
@@ -803,3 +847,117 @@ class TestOrchestratorWiring:
             text=True,
         )
         assert proc.returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# AC1 / AC1b: checker_exit_code == 0 overrides ALL stop guards
+# ---------------------------------------------------------------------------
+
+
+class TestCheckerApproveOverridesBudget:
+    """AC1 / AC1b: checker approve (exit_code==0) overrides all stop guards.
+
+    These tests verify that checker_exit_code==0 takes priority over:
+    - max_rewrite_attempts exceeded
+    - body_hash_unchanged
+    - missing_contract_no_progress
+    """
+
+    def test_checker_approve_overrides_max_exceeded(self):
+        """AC1: checker_exit_code==0 + max exceeded -> proceed_to_review / checker_passed."""
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=5,
+            max_rewrite_attempts=2,
+            checker_exit_code=0,
+            checked_body_sha256="a" * 64,
+            missing_sections=[],
+            missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_PROCEED_TO_REVIEW
+        assert result.reason_code == REASON_CODE_CHECKER_PASSED
+
+    def test_checker_approve_overrides_body_hash_unchanged(self):
+        """AC1b: checker_exit_code==0 + same body hash as previous -> proceed_to_review."""
+        same_sha = "b" * 64
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=1,
+            max_rewrite_attempts=5,
+            checker_exit_code=0,
+            checked_body_sha256=same_sha,
+            missing_sections=[],
+            missing_contract_keys=[],
+            previous_checked_body_sha256=same_sha,
+            previous_missing_sections=[],
+            previous_missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_PROCEED_TO_REVIEW
+        assert result.reason_code == REASON_CODE_CHECKER_PASSED
+
+    def test_checker_approve_overrides_missing_contract_no_progress(self):
+        """AC1: checker_exit_code==0 + missing set not decreased -> proceed_to_review."""
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=1,
+            max_rewrite_attempts=5,
+            checker_exit_code=0,
+            checked_body_sha256="c" * 64,
+            missing_sections=["S1"],
+            missing_contract_keys=["K1"],
+            previous_checked_body_sha256="d" * 64,
+            previous_missing_sections=["S1"],
+            previous_missing_contract_keys=["K1"],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_PROCEED_TO_REVIEW
+        assert result.reason_code == REASON_CODE_CHECKER_PASSED
+
+    def test_checker_approve_overrides_max_and_body_hash_unchanged(self):
+        """AC1/AC1b combined: checker_exit_code==0 + max exceeded + same hash -> proceed_to_review."""
+        same_sha = "e" * 64
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=10,
+            max_rewrite_attempts=2,
+            checker_exit_code=0,
+            checked_body_sha256=same_sha,
+            missing_sections=[],
+            missing_contract_keys=[],
+            previous_checked_body_sha256=same_sha,
+            previous_missing_sections=[],
+            previous_missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_PROCEED_TO_REVIEW
+        assert result.reason_code == REASON_CODE_CHECKER_PASSED
+
+    def test_checker_fail_with_max_exceeded_still_human_judgment(self):
+        """AC2: checker_exit_code!=0 + max exceeded -> human_judgment_required (unchanged)."""
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=5,
+            max_rewrite_attempts=2,
+            checker_exit_code=1,
+            checked_body_sha256="f" * 64,
+            missing_sections=["S1"],
+            missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
+        assert result.reason_code == REASON_CODE_MAX_ATTEMPTS_EXCEEDED
+
+    def test_checker_fail_with_body_hash_unchanged_still_human_judgment(self):
+        """AC2b: checker_exit_code!=0 + body hash unchanged -> human_judgment_required."""
+        same_sha = "g" * 64
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=1,
+            max_rewrite_attempts=5,
+            checker_exit_code=1,
+            checked_body_sha256=same_sha,
+            missing_sections=["S1"],
+            missing_contract_keys=[],
+            previous_checked_body_sha256=same_sha,
+            previous_missing_sections=["S1"],
+            previous_missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
+        assert result.reason_code == REASON_CODE_BODY_HASH_UNCHANGED
