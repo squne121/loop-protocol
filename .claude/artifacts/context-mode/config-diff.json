@@ -1,0 +1,32 @@
+{
+  "_schema": "config-diff-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T04:26:17.341276+00:00",
+  "experiment_scope": {
+    "description": "context-mode を実験用 profile (local scope) で有効化",
+    "scope_type": "project-local",
+    "settings_file": ".claude/settings.json (worktree branch)",
+    "enabled_plugins": {
+      "context-mode@context-mode": true
+    },
+    "deny_policy_entries": [
+      "mcp__context-mode__ctx_execute",
+      "mcp__context-mode__ctx_fetch_and_index"
+    ]
+  },
+  "deny_policy_entries": [
+    "mcp__context-mode__ctx_execute",
+    "mcp__context-mode__ctx_fetch_and_index"
+  ],
+  "main_profile_affected": false,
+  "changes_applied": [
+    "enabledPlugins.context-mode@context-mode: true (実験用 profile で context-mode を有効化)",
+    "permissions.deny: mcp__context-mode__ctx_execute (deny policy)",
+    "permissions.deny: mcp__context-mode__ctx_fetch_and_index (deny policy)"
+  ],
+  "no_change_to": [
+    ".claude/hooks/** (hook スクリプト変更なし)",
+    "main ブランチの .claude/settings.json"
+  ],
+  "isolation_basis": "worktree ブランチ worktree-issue-824-claude-code-profile-context-mode-version に限定。main ブランチへの変更なし。"
+}

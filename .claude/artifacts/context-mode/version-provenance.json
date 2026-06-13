@@ -1,0 +1,25 @@
+{
+  "_schema": "version-provenance-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T04:25:26.890412+00:00",
+  "install_scope": "experiment-profile-only",
+  "package_name": "context-mode",
+  "installed_version": "1.0.162",
+  "package_location": "<MASKED_HOME_PATH>/nvm/versions/node/v24.14.0/lib/node_modules/context-mode",
+  "release_tag": "v1.0.162",
+  "npm_shasum": "9b467fbcee5196f90a06417a7b4569e55b8a22ab",
+  "npm_integrity": "sha512-LuAKNXmbLvtc3l3Ugnvv29zB1cpDLYrmlORnYCE5cpGrXbULEM/2JGwWjnJofUzrEmRhQHKZ0ADA2fYzV+MW5w==",
+  "tarball_url": "https://registry.npmjs.org/context-mode/-/context-mode-1.0.162.tgz",
+  "package_json_sha256": "95661d778a592b4acc31a56dc06e3aa5332dd95aa1ed0c953d184663b554af89",
+  "plugin_manifest_version": "1.0.162",
+  "plugin_manifest_id": "context-mode",
+  "node_version": "v24.14.0",
+  "install_method": "npm install -g context-mode",
+  "enabled_in": "project settings (enabledPlugins.context-mode@context-mode: true)",
+  "redaction": {
+    "home_path_masked": true,
+    "token_like_values_excluded": true,
+    "env_dump_excluded": true,
+    "note": "package_location の home path は <MASKED_HOME_PATH> に置換済み"
+  }
+}
