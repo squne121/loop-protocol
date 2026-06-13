@@ -1,0 +1,107 @@
+{
+  "schema": "context_mode_cwd_quarantine_v1",
+  "issue": "#826",
+  "generated_at": "2026-06-13T14:30:00Z",
+  "fetched_at": "2026-06-13T14:30:00Z",
+  "context_mode_version": "1.0.161",
+  "upstream_issue_756_state": "open",
+  "upstream_issue_756_url": "https://github.com/mksglu/context-mode/issues/756",
+  "upstream_issue_756_fetched_at": "2026-06-13T14:30:00Z",
+  "project_policy": {
+    "ctx_execute": "deny",
+    "ctx_batch_execute": "deny",
+    "ctx_execute_file": "deny",
+    "ctx_fetch_and_index": "deny",
+    "policy_source": ".claude/settings.json deny list",
+    "policy_source_note": "mcp__context-mode__ctx_execute および mcp__context-mode__ctx_fetch_and_index が settings.json で明示 deny。ctx_batch_execute / ctx_execute_file は settings 上の明示 deny に入っていないが、execution-like tools として quarantine 対象とする"
+  },
+  "probe": {
+    "profile_committed": false,
+    "probe_attempted": false,
+    "probe_blocked_reason": "ctx_execute is deny-listed in normal profile; executing it would violate project policy. Probe requires isolated local profile not committed to repo.",
+    "deny_restored": true,
+    "deny_restore_note": "No profile was modified; normal profile deny entries remain active"
+  },
+  "cases": {
+    "main_checkout": {
+      "description": "Main checkout (current branch)",
+      "bash_evidence": {
+        "pwd": "/home/squne/projects/LOOP_PROTOCOL",
+        "git_show_toplevel": "/home/squne/projects/LOOP_PROTOCOL",
+        "git_branch_current": "worktree-issue-826-context-mode-cwd-quarantine",
+        "git_rev_parse_head": "1b8f71b",
+        "git_is_inside_work_tree": "true"
+      },
+      "ctx_execute_evidence": {
+        "status": "permission_denied",
+        "note": "ctx_execute is deny-listed; cannot execute in normal profile",
+        "expected_divergence": "N/A - execution blocked by policy"
+      },
+      "comparison": "probe_blocked_by_policy"
+    },
+    "linked_worktree": {
+      "description": "Linked worktree scenario (documented upstream #756 bug)",
+      "bash_evidence": {
+        "pwd": "<worktree_path>",
+        "git_show_toplevel": "<worktree_path>",
+        "git_branch_current": "<worktree_branch>",
+        "git_rev_parse_head": "<worktree_head>",
+        "git_is_inside_work_tree": "true"
+      },
+      "ctx_execute_evidence": {
+        "status": "permission_denied_or_diverges",
+        "upstream_756_report": "ctx_execute reports main repo root and master branch instead of worktree",
+        "note": "Based on upstream #756 bug report: ctx_execute uses MCP server process.cwd() not session cwd"
+      },
+      "comparison": "divergence_documented_by_upstream_756"
+    },
+    "nested_repo": {
+      "description": "Nested repo scenario",
+      "bash_evidence": {
+        "pwd": "<nested_path>",
+        "git_show_toplevel": "<nested_path>",
+        "git_branch_current": "<nested_branch>",
+        "git_rev_parse_head": "<nested_head>",
+        "git_is_inside_work_tree": "true"
+      },
+      "ctx_execute_evidence": {
+        "status": "permission_denied",
+        "note": "ctx_execute is deny-listed; nested repo cwd comparison blocked by policy"
+      },
+      "comparison": "probe_blocked_by_policy"
+    }
+  },
+  "informational_only": {
+    "claude_project_dir": "<unset>",
+    "claude_project_dir_note": "CLAUDE_PROJECT_DIR is informational only per Claude Code docs; it is the stable project root passed to stdio MCP servers, not the session cwd. Must not be used for cwd correctness judgment."
+  },
+  "local_probe_result": {
+    "status": "blocked",
+    "reason": "ctx_execute deny-listed in normal profile; no isolated probe profile was committed",
+    "profile_committed": false
+  },
+  "execution_like_tools_quarantine_matrix": {
+    "ctx_execute": {
+      "policy": "deny",
+      "cwd_probe_required": true,
+      "reason": "upstream #756 confirms wrong-tree execution; deny-listed in project settings"
+    },
+    "ctx_batch_execute": {
+      "policy": "deny",
+      "cwd_probe_required": true,
+      "reason": "Multiple command execution; same cwd risk as ctx_execute; sibling tool not yet evaluated"
+    },
+    "ctx_execute_file": {
+      "policy": "deny",
+      "cwd_probe_required": true,
+      "reason": "Repo-relative file resolution risk; sibling tool not yet evaluated"
+    }
+  },
+  "verdict": "probe_blocked_quarantine_continue",
+  "verdict_reasons": [
+    "upstream #756 is OPEN as of 2026-06-13",
+    "local probe was blocked by project deny policy (no isolated profile committed)",
+    "ctx_batch_execute and ctx_execute_file not yet individually evaluated",
+    "ctx_execute is explicitly denied in project settings"
+  ]
+}
