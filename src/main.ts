@@ -230,8 +230,10 @@ const hud = commandRail ? createHudController(commandRail, {
     // Reset debug pause on state transition to preparation
     debugPause.isPaused = false
     // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
+    // persistProgressionSnapshot sets HUD feedback internally (success or failure).
+    // Do NOT call setHudFeedback() unconditionally here — that would overwrite a
+    // save-failure message with a false success copy (AC6 fix).
     persistProgressionSnapshot('save')
-    setHudFeedback('Result confirmed.', 'Ready for next sortie.')
   },
   onNextSortie() {
     // B5: legacy debrief_reward_claimed → preparation (not directly to running).

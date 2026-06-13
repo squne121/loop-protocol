@@ -283,3 +283,76 @@ describe('HudController', () => {
     expect(actions.onNextSortie).toHaveBeenCalledTimes(1)
   })
 })
+
+// ---------------------------------------------------------------------------
+// AC3: Load Game spy test — storage.load() only called from title_menu / load_menu
+// ---------------------------------------------------------------------------
+
+describe('AC3: Load Game phase gate — onLoadGame only fires from title_menu / load_menu', () => {
+  let container: HTMLElement
+  let onLoadGame: ReturnType<typeof vi.fn>
+  let canLoadGame: ReturnType<typeof vi.fn>
+  let hudController: ReturnType<typeof createHudController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    onLoadGame = vi.fn()
+    canLoadGame = vi.fn(() => true)
+    hudController = createHudController(container, {
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
+      onNextSortie: vi.fn(),
+      onSave: vi.fn(),
+      onLoadGame,
+      onReset: vi.fn(),
+      canLoadGame,
+      onTogglePause: vi.fn(),
+    })
+  })
+
+  it('GIVEN title_menu with loadable snapshot WHEN load-game button is clicked THEN onLoadGame is called once (AC3)', () => {
+    hudController.render(createState('title_menu'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(false)
+    queryButton(container, 'load-game').click()
+
+    expect(onLoadGame).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN load_menu with loadable snapshot WHEN load-game button is clicked THEN onLoadGame is called once (AC3)', () => {
+    hudController.render(createState('load_menu'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(false)
+    queryButton(container, 'load-game').click()
+
+    expect(onLoadGame).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN preparation phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
+    hudController.render(createState('preparation'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    queryButton(container, 'load-game').click()
+
+    expect(onLoadGame).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN running phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
+    hudController.render(createState('running'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    queryButton(container, 'load-game').click()
+
+    expect(onLoadGame).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN result phase WHEN load-game button is clicked THEN onLoadGame is NOT called (AC3)', () => {
+    hudController.render(createState('result', 'pending'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    queryButton(container, 'load-game').click()
+
+    expect(onLoadGame).not.toHaveBeenCalled()
+  })
+})
