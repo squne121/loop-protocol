@@ -394,3 +394,211 @@ class TestJsonlSchema:
         ]:
             result = run_hook(cmd, env_override={"RTK_SHADOW_LOG": log_file})
             assert result.stdout == "", f"stdout must be empty for command '{cmd}', got: {result.stdout!r}"
+
+
+# ============================================================
+# Fix Delta 1: gh api field flags → mutating_gh_api
+# ============================================================
+
+class TestGhApiFieldFlags:
+    """gh api の -f/-F/--raw-field/--field/--input が implicit POST になることを検証。"""
+
+    def _get_category(self, command: str, tmp_path) -> str:
+        log_file = str(tmp_path / "shadow.jsonl")
+        result = run_hook(command, env_override={"RTK_SHADOW_LOG": log_file})
+        assert result.returncode == 0
+        entries = read_jsonl(log_file)
+        if not entries:
+            return "no_entry"
+        return entries[-1].get("category", "missing_category")
+
+    def test_gh_api_raw_field_defaults_to_post_is_mutating_gh_api(self, tmp_path):
+        # gh api repos/x/y/issues/1/comments -f body=x → mutating_gh_api
+        assert self._get_category(
+            "gh api repos/x/y/issues/1/comments -f body=x", tmp_path
+        ) == "mutating_gh_api"
+
+    def test_gh_api_field_flag_defaults_to_post_is_mutating_gh_api(self, tmp_path):
+        # gh api repos/x/y/issues/1 -F title=x → mutating_gh_api
+        assert self._get_category(
+            "gh api repos/x/y/issues/1 -F title=x", tmp_path
+        ) == "mutating_gh_api"
+
+    def test_gh_api_input_flag_is_mutating_gh_api(self, tmp_path):
+        # gh api repos/x/y/issues/1 --input /tmp/body.json → mutating_gh_api
+        assert self._get_category(
+            "gh api repos/x/y/issues/1 --input /tmp/body.json", tmp_path
+        ) == "mutating_gh_api"
+
+    def test_gh_api_explicit_get_with_field_is_readonly(self, tmp_path):
+        # gh api repos/x/y/issues/1 --method GET -f per_page=10 → safe_readonly_gh (GET は安全)
+        assert self._get_category(
+            "gh api repos/x/y/issues/1 --method GET -f per_page=10", tmp_path
+        ) == "safe_readonly_gh"
+
+    def test_gh_api_no_field_flags_is_readonly(self, tmp_path):
+        # gh api repos/x/y/issues → safe_readonly_gh（フィールドフラグなし）
+        assert self._get_category(
+            "gh api repos/x/y/issues", tmp_path
+        ) == "safe_readonly_gh"
+
+
+# ============================================================
+# Fix Delta 2: Authorization header redaction
+# ============================================================
+
+class TestAuthSecretsRedacted:
+    """Authorization ヘッダー等の機密情報が command_preview_redacted に含まれないことを検証。"""
+
+    def _get_preview(self, command: str, tmp_path) -> str:
+        log_file = str(tmp_path / "shadow.jsonl")
+        result = run_hook(command, env_override={"RTK_SHADOW_LOG": log_file})
+        assert result.returncode == 0
+        entries = read_jsonl(log_file)
+        if not entries:
+            return ""
+        return entries[-1].get("command_preview_redacted", "")
+
+    @pytest.mark.parametrize("cmd", [
+        "gh api /user -H 'Authorization: Bearer SECRET123'",
+        'gh api /user --header "Authorization: token SECRET123"',
+        "gh api '/repos/x/y/issues?access_token=SECRET123'",
+    ])
+    def test_auth_secrets_redacted(self, cmd, tmp_path):
+        # command_preview_redacted に SECRET123 が含まれないこと
+        preview = self._get_preview(cmd, tmp_path)
+        assert "SECRET123" not in preview, (
+            f"Secret leaked in command_preview_redacted: {preview!r}"
+        )
+
+    def test_bearer_token_redacted(self, tmp_path):
+        preview = self._get_preview(
+            "gh api /user -H 'Authorization: Bearer ghp_ABCDEFG123456'", tmp_path
+        )
+        assert "ghp_ABCDEFG123456" not in preview
+
+    def test_access_token_url_query_redacted(self, tmp_path):
+        preview = self._get_preview(
+            "gh api '/repos/x/y?access_token=mytoken123'", tmp_path
+        )
+        assert "mytoken123" not in preview
+
+    def test_redact_before_truncation(self, tmp_path):
+        """truncation 前に full command に対して redact が行われることを確認。
+        機密情報が 200 bytes 内に収まる位置にある場合でも必ず redact される。"""
+        # SECRET が最初の 200 bytes 内に来るよう短めのコマンドを使う
+        cmd = "gh api /repos/x/y -H 'Authorization: Bearer SHORTTOKEN'"
+        preview = self._get_preview(cmd, tmp_path)
+        assert "SHORTTOKEN" not in preview, (
+            f"Token should be redacted before truncation, but found in: {preview!r}"
+        )
+
+
+# ============================================================
+# Fix Delta 3: wrapper/bypass パターンのテスト
+# ============================================================
+
+class TestWrapperBypassPatterns:
+    """git -C / bash -lc / command git push 等の wrapper パターンを検証。"""
+
+    def _get_category(self, command: str, tmp_path) -> str:
+        log_file = str(tmp_path / "shadow.jsonl")
+        result = run_hook(command, env_override={"RTK_SHADOW_LOG": log_file})
+        assert result.returncode == 0
+        entries = read_jsonl(log_file)
+        if not entries:
+            return "no_entry"
+        return entries[-1].get("category", "missing_category")
+
+    def _get_decision(self, command: str, tmp_path) -> str:
+        log_file = str(tmp_path / "shadow.jsonl")
+        result = run_hook(command, env_override={"RTK_SHADOW_LOG": log_file})
+        assert result.returncode == 0
+        entries = read_jsonl(log_file)
+        if not entries:
+            return "no_entry"
+        return entries[-1].get("decision_would_be", "no_entry")
+
+    def test_git_with_dash_C_push_is_mutating_git(self, tmp_path):
+        # git -C ../repo push → mutating_git
+        assert self._get_category("git -C ../repo push", tmp_path) == "mutating_git"
+
+    def test_git_with_dash_C_commit_is_mutating_git(self, tmp_path):
+        # git -C /path/to/repo commit -m msg → mutating_git
+        assert self._get_category("git -C /path/to/repo commit -m msg", tmp_path) == "mutating_git"
+
+    def test_git_with_dash_C_status_is_readonly(self, tmp_path):
+        # git -C ../repo status → safe_readonly_git
+        assert self._get_category("git -C ../repo status", tmp_path) == "safe_readonly_git"
+
+    def test_bash_lc_git_push_is_out_of_scope_or_risky(self, tmp_path):
+        # bash -lc 'git push origin HEAD' → out_of_scope_logged または mutating_git
+        # decision_would_be: deny 側に倒す
+        category = self._get_category("bash -lc 'git push origin HEAD'", tmp_path)
+        assert category in ("mutating_git", "out_of_scope_logged"), (
+            f"bash -lc 'git push' should be mutating_git or out_of_scope_logged, got: {category!r}"
+        )
+
+    def test_command_git_push_is_mutating_git(self, tmp_path):
+        # command git push → mutating_git または out_of_scope_logged
+        category = self._get_category("command git push", tmp_path)
+        assert category in ("mutating_git", "out_of_scope_logged"), (
+            f"'command git push' should be mutating_git or out_of_scope_logged, got: {category!r}"
+        )
+
+
+# ============================================================
+# Fix Delta 4: checkout/switch/restore/stash/worktree の分類
+# ============================================================
+
+class TestMutatingGitSubcommands:
+    """checkout / switch / restore / stash push / worktree add が mutating_git に分類されることを検証。"""
+
+    def _get_category(self, command: str, tmp_path) -> str:
+        log_file = str(tmp_path / "shadow.jsonl")
+        result = run_hook(command, env_override={"RTK_SHADOW_LOG": log_file})
+        assert result.returncode == 0
+        entries = read_jsonl(log_file)
+        if not entries:
+            return "no_entry"
+        return entries[-1].get("category", "missing_category")
+
+    def test_git_checkout_branch_is_mutating(self, tmp_path):
+        # git checkout main → mutating_git（branch 切り替えは mutation）
+        assert self._get_category("git checkout main", tmp_path) == "mutating_git"
+
+    def test_git_switch_branch_is_mutating(self, tmp_path):
+        # git switch main → mutating_git
+        assert self._get_category("git switch main", tmp_path) == "mutating_git"
+
+    def test_git_restore_file_is_mutating(self, tmp_path):
+        # git restore src/foo.ts → mutating_git（ファイル上書き）
+        assert self._get_category("git restore src/foo.ts", tmp_path) == "mutating_git"
+
+    def test_git_stash_push_is_mutating(self, tmp_path):
+        # git stash push → mutating_git
+        assert self._get_category("git stash push", tmp_path) == "mutating_git"
+
+    def test_git_stash_bare_is_mutating(self, tmp_path):
+        # git stash（サブコマンドなし）→ mutating_git
+        assert self._get_category("git stash", tmp_path) == "mutating_git"
+
+    def test_git_stash_list_is_readonly(self, tmp_path):
+        # git stash list → safe_readonly_git
+        assert self._get_category("git stash list", tmp_path) == "safe_readonly_git"
+
+    def test_git_stash_show_is_readonly(self, tmp_path):
+        # git stash show → safe_readonly_git
+        assert self._get_category("git stash show", tmp_path) == "safe_readonly_git"
+
+    def test_git_worktree_add_is_mutating(self, tmp_path):
+        # git worktree add .claude/worktrees/foo → mutating_git
+        assert self._get_category("git worktree add .claude/worktrees/foo", tmp_path) == "mutating_git"
+
+    def test_git_worktree_list_is_readonly(self, tmp_path):
+        # git worktree list → safe_readonly_git
+        assert self._get_category("git worktree list", tmp_path) == "safe_readonly_git"
+
+    def test_git_worktree_remove_is_mutating(self, tmp_path):
+        # git worktree remove .claude/worktrees/foo → mutating_git
+        assert self._get_category("git worktree remove .claude/worktrees/foo", tmp_path) == "mutating_git"

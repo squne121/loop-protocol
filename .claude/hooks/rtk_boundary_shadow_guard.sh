@@ -67,9 +67,21 @@ MATCHED_RULE=""
 DECISION_WOULD_BE="allow"
 
 # --- git 分類 ---
+# git -C <path> <subcmd> パターンのサポート: -C フラグ後のサブコマンドを取得
+_get_git_subcmd() {
+    local cmd="$1"
+    local subcmd
+    subcmd="$(echo "$cmd" | sed 's/^[[:space:]]*git[[:space:]]*//' | awk '{print $1}')"
+    # -C フラグがある場合は次のトークンをスキップしてサブコマンドを取得
+    if [ "$subcmd" = "-C" ]; then
+        subcmd="$(echo "$cmd" | sed 's/^[[:space:]]*git[[:space:]]*//' | awk '{print $3}')"
+    fi
+    echo "$subcmd"
+}
+
 if [ "$FIRST_TOKEN" = "git" ]; then
-    # git サブコマンドを取得
-    GIT_SUBCMD="$(echo "$COMMAND" | sed 's/^[[:space:]]*git[[:space:]]*//' | awk '{print $1}')"
+    # git サブコマンドを取得（-C フラグ対応）
+    GIT_SUBCMD="$(_get_git_subcmd "$COMMAND")"
 
     case "$GIT_SUBCMD" in
         commit|push|reset|rebase|tag|merge|cherry-pick|revert|am|apply|fetch|pull|rm|mv|add)
@@ -77,9 +89,47 @@ if [ "$FIRST_TOKEN" = "git" ]; then
             MATCHED_RULE="git_${GIT_SUBCMD}"
             DECISION_WOULD_BE="deny"
             ;;
-        status|log|diff|show|branch|describe|blame|shortlog|reflog|grep|ls-files|ls-tree|stash|worktree|checkout|switch|restore)
-            # stash / worktree / checkout / switch / restore は状況によって mutating だが
-            # 本 shadow guard では safe_readonly_git として記録（follow-up で精緻化）
+        checkout|switch|restore)
+            # branch 切り替え / ファイル上書き: mutating
+            CATEGORY="mutating_git"
+            MATCHED_RULE="git_${GIT_SUBCMD}"
+            DECISION_WOULD_BE="deny"
+            ;;
+        stash)
+            # stash サブコマンドを確認: list / show は readonly、その他は mutating
+            # git stash <action> の 3番目のトークンを取得（-C フラグなし前提）
+            STASH_ACTION="$(echo "$COMMAND" | awk '{print $3}')"
+            case "$STASH_ACTION" in
+                list|show)
+                    CATEGORY="safe_readonly_git"
+                    MATCHED_RULE="git_stash_${STASH_ACTION}"
+                    DECISION_WOULD_BE="allow"
+                    ;;
+                *)
+                    # stash push / stash pop / stash drop / bare stash は mutating
+                    CATEGORY="mutating_git"
+                    MATCHED_RULE="git_stash_mutating"
+                    DECISION_WOULD_BE="deny"
+                    ;;
+            esac
+            ;;
+        worktree)
+            # worktree サブコマンドを確認: list は readonly、add / remove / move は mutating
+            WORKTREE_ACTION="$(echo "$COMMAND" | sed 's/^.*worktree[[:space:]]*//' | awk '{print $1}')"
+            case "$WORKTREE_ACTION" in
+                list)
+                    CATEGORY="safe_readonly_git"
+                    MATCHED_RULE="git_worktree_list"
+                    DECISION_WOULD_BE="allow"
+                    ;;
+                *)
+                    CATEGORY="mutating_git"
+                    MATCHED_RULE="git_worktree_mutating"
+                    DECISION_WOULD_BE="deny"
+                    ;;
+            esac
+            ;;
+        status|log|diff|show|branch|describe|blame|shortlog|reflog|grep|ls-files|ls-tree)
             CATEGORY="safe_readonly_git"
             MATCHED_RULE="git_${GIT_SUBCMD}"
             DECISION_WOULD_BE="allow"
@@ -92,6 +142,20 @@ if [ "$FIRST_TOKEN" = "git" ]; then
             ;;
     esac
 
+# --- bash / command wrapper パターン（bypass 検出）---
+elif [ "$FIRST_TOKEN" = "bash" ] || [ "$FIRST_TOKEN" = "sh" ] || [ "$FIRST_TOKEN" = "command" ]; then
+    # bash -lc / bash -c / command git push 等の wrapper パターンを検出
+    # 内部コマンドを抽出して git/gh の mutating を判定する（保守的: deny 方向に倒す）
+    if echo "$COMMAND" | grep -qE '(git[[:space:]]+(push|commit|reset|rebase|merge|cherry-pick|revert|am|apply|tag|fetch|pull|rm|mv)|gh[[:space:]]+(issue|pr|api)[[:space:]])'; then
+        CATEGORY="mutating_git"
+        MATCHED_RULE="bash_wrapper_mutating_git_or_gh"
+        DECISION_WOULD_BE="deny"
+    else
+        CATEGORY="out_of_scope_logged"
+        MATCHED_RULE="bash_wrapper_unknown"
+        DECISION_WOULD_BE="allow"
+    fi
+
 # --- gh 分類 ---
 elif [ "$FIRST_TOKEN" = "gh" ]; then
     # gh サブコマンドを取得
@@ -100,10 +164,17 @@ elif [ "$FIRST_TOKEN" = "gh" ]; then
 
     case "$GH_SUBCMD" in
         api)
-            # -X PATCH / PUT / POST / DELETE は mutating
+            # -X PATCH / PUT / POST / DELETE は明示的に mutating
             if echo "$COMMAND" | grep -qE '(-X[[:space:]]*(PATCH|PUT|POST|DELETE)|--method[[:space:]]*(PATCH|PUT|POST|DELETE))'; then
                 CATEGORY="mutating_gh_api"
                 MATCHED_RULE="gh_api_mutating_method"
+                DECISION_WOULD_BE="deny"
+            # -f / --raw-field / -F / --field / --input が含まれる場合、デフォルト POST になる
+            # ただし明示的に --method GET がある場合は safe
+            elif echo "$COMMAND" | grep -qE '(-f[[:space:]]|--raw-field[[:space:]]|-F[[:space:]]|--field[[:space:]]|--input[[:space:]])' && \
+                 ! echo "$COMMAND" | grep -qE '(--method[[:space:]]*GET|-X[[:space:]]*GET)'; then
+                CATEGORY="mutating_gh_api"
+                MATCHED_RULE="gh_api_field_flags_implicit_post"
                 DECISION_WOULD_BE="deny"
             else
                 CATEGORY="safe_readonly_gh"
@@ -226,19 +297,25 @@ COMMAND_SHA256="sha256:$(echo -n "$COMMAND" | sha256sum 2>/dev/null | awk '{prin
 
 COMMAND_BYTES="${#COMMAND}"
 
-# command_preview_redacted: 200 bytes に切り、機密情報を redact
-# redact 対象: Authorization: / GH_TOKEN / GITHUB_TOKEN / --header / -H / HEREDOC / URL query token
-PREVIEW="$(echo "$COMMAND" | head -c 200)" || PREVIEW=""
-# Authorization ヘッダーを redact
-PREVIEW="$(echo "$PREVIEW" | sed 's/Authorization:[[:space:]]*[^[:space:]]*/Authorization: <redacted>/g' 2>/dev/null)" || true
+# command_preview_redacted: redact 後に 200 bytes に切る
+# redact 対象: Authorization: / GH_TOKEN / GITHUB_TOKEN / --header / -H の値 / HEREDOC / URL query token
+# 注意: truncation より先に full command に対して redact を行う（機密漏洩防止）
+PREVIEW="$COMMAND"
+# Authorization ヘッダー（Bearer / token 形式、quoted 含む）を redact
+PREVIEW="$(echo "$PREVIEW" | sed "s/Authorization:[[:space:]]*Bearer[[:space:]]*[^'\"[:space:]]*/Authorization: Bearer [REDACTED]/g;s/Authorization:[[:space:]]*token[[:space:]]*[^'\"[:space:]]*/Authorization: token [REDACTED]/g;s/Authorization:[[:space:]]*[^'\"[:space:]]*/Authorization: [REDACTED]/g" 2>/dev/null)" || true
 # GH_TOKEN / GITHUB_TOKEN を redact
 PREVIEW="$(echo "$PREVIEW" | sed 's/GH_TOKEN=[^[:space:]]*/GH_TOKEN=<redacted>/g;s/GITHUB_TOKEN=[^[:space:]]*/GITHUB_TOKEN=<redacted>/g' 2>/dev/null)" || true
-# --header / -H の値を redact
+# --header / -H の quoted 値全体を redact（Authorization を含む場合）
+PREVIEW="$(echo "$PREVIEW" | sed "s/-H[[:space:]]*'[^']*Authorization[^']*'/-H '<redacted>'/g;s/--header[[:space:]]*'[^']*Authorization[^']*'/--header '<redacted>'/g" 2>/dev/null)" || true
+PREVIEW="$(echo "$PREVIEW" | sed 's/-H[[:space:]]*"[^"]*Authorization[^"]*"/-H "<redacted>"/g;s/--header[[:space:]]*"[^"]*Authorization[^"]*"/--header "<redacted>"/g' 2>/dev/null)" || true
+# --header / -H の残りの値を redact
 PREVIEW="$(echo "$PREVIEW" | sed 's/\(--header\|-H\)[[:space:]]*[^[:space:]]*/\1 <redacted>/g' 2>/dev/null)" || true
 # HEREDOC (EOF) の内容を示唆するマーカーを redact
 PREVIEW="$(echo "$PREVIEW" | sed 's/<<[[:space:]]*['"'"'"]*/<<HEREDOC_REDACTED /g' 2>/dev/null)" || true
-# URL query string の token / key パラメータを redact
-PREVIEW="$(echo "$PREVIEW" | sed 's/[?&]\(token\|key\|access_token\|api_key\)=[^&[:space:]]*/\&\1=<redacted>/g' 2>/dev/null)" || true
+# URL query string の access_token / token / key / api_key パラメータを redact
+PREVIEW="$(echo "$PREVIEW" | sed 's/[?&]\(access_token\|token\|key\|api_key\)=[^&[:space:]]*/\&\1=<redacted>/g' 2>/dev/null)" || true
+# truncation: redact 後に 200 bytes に切る
+PREVIEW="$(echo "$PREVIEW" | head -c 200)" || PREVIEW=""
 
 # SESSION_ID 取得（環境変数 CLAUDE_SESSION_ID があれば使う）
 SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
@@ -252,7 +329,7 @@ _write_jsonl_direct() {
     # shadow_log.py が使えない場合の fallback（fail-open）
     local log_file="$1"
     local entry
-    entry="$(jq -n \
+    entry="$(jq -cn \
         --arg guard_name "rtk_boundary_shadow_guard" \
         --arg category "${CATEGORY:-unknown}" \
         --arg matched_rule "${MATCHED_RULE:-unknown}" \
