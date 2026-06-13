@@ -275,6 +275,8 @@ main conversation は raw `gh issue/pr list` output を直接展開せず、`sco
 ```bash
 INVOCATION_ID=$(date -u +%Y%m%dT%H%M%SZ)_$$
 REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+SCRIPT_SHA=$(sha256sum .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py | cut -d' ' -f1)
+REQUESTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 **2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う）:
@@ -314,68 +316,79 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   result:
     plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
     raw_plan_location: "/tmp/scope_rollup_<invocation_id>.json"
-    result_sha256: "<ファイルバイト列の sha256>"
+    result_sha256: "<sha256>"
+    verify_status: "verified|not_verified"
     suggested_actions_summary: "<1-3行の候補サマリ>"
     candidate_count: <int>
     high_confidence_count: <int>
 ```
 
-`plan:` フィールドは含まれない（ref-based 設計）。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+`result_sha256` は `raw_plan_location` のファイルバイト列の sha256。
 
-`result_sha256` は `raw_plan_location` のファイルバイト列の sha256 であり、`sha256sum` コマンドと同一の計算で算出する（RFC 8785 正規化は不要）。
+`raw_plan_location` は runner の最終応答保存後に `main conversation` でのみ採用し、実体は `/tmp/scope_rollup_<invocation_id>.json` 等の形式を想定する。`runner` が別経路でファイルを保存する運用はしない。
 
-### main conversation の marker 検証（採用判定）
+### main conversation の marker 検証
 
-runner から marker を受け取った後、main conversation は以下の検証を行う。
-いずれかの検証に失敗した場合は marker を **採用しない**（reject / mismatch）。
+runner から受け取った raw output を `parse_scope_rollup_run_result.py` へ渡し、parser の決定のみを採用する。marker の採点に失敗した場合は **raw `result.raw_plan_location` の直接読み取りは禁止**。
 
-| 検証項目 | 合格条件 |
-|---|---|
-| `status: ok` | `status` が `ok` であること |
-| repo mismatch | `repo` が現在の `REPO_FULL_NAME` と一致すること |
-| current_issue mismatch | `current_issue` が `issue_number` と一致すること |
-| invocation_id mismatch | `invocation_id` が step 1 で生成した `INVOCATION_ID` と一致すること |
-| stale（生成時刻が古い） | `generated_at` が `requested_at` より後であること |
-| script_blob_sha256 mismatch | `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha256 と一致すること |
-| result_sha256 mismatch | `result.result_sha256` が `result.raw_plan_location` のファイルバイト列の sha256 と一致すること |
+```bash
+uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_result.py \
+  --assistant-output-file /tmp/scope_rollup_<invocation_id>.txt \
+  --repo "${REPO_FULL_NAME}" \
+  --issue-number <issue_number> \
+  --invocation-id "${INVOCATION_ID}" \
+  --expected-script-sha "${SCRIPT_SHA}" \
+  --requested-at "${REQUESTED_AT}"
+```
+
+`parse_scope_rollup_run_result.py` は以下のどれかを返す:
+
+- `status: ok` → `routing_action: continue`
+- `status: runner_unavailable` → `routing_action: deferred`
+- `status: failed` → `routing_action: stop_human`
+- `status: marker_missing | marker_malformed | marker_ambiguous | rejected` → `routing_action: stop_human`
+- `routing_action: stop_human` は `human_escalation` として扱う（`LOOP_STATE.termination_reason: human_escalation`）
+- `routing_action: deferred` は `LOOP_STATE.scope_rollup_decision.decision: deferred` を許容する（必要に応じて追加で `human_escalation`）
+- `raw_plan_location_allowed: true` の場合のみ `result.raw_plan_location` を読み取る
 
 ### marker 検証・採用（ref-based フロー）
 
-検証通過後、main conversation は以下の手順で marker を採用する:
+`parse_scope_rollup_run_result.py` が `ok` を返した場合のみ marker を採用する:
 
-1. `repo` が現在のリポジトリと一致することを確認
-2. `current_issue` が対象 Issue 番号と一致することを確認
-3. `invocation_id` が重複していないことを確認（前回値と異なること）
-4. `script_blob_sha256` が `plan_issue_scope_rollup.py` の現在のバイト列 sha256 と一致することを確認
-5. `result.raw_plan_location` のファイルを読み取り、バイト列 sha256 を計算して `result.result_sha256` と照合する
-6. いずれかの不一致・欠損・stale の場合は marker を **採用しない**
+1. `repo` が現在の `REPO_FULL_NAME` と一致する
+2. `current_issue` が対象 Issue 番号と一致する
+3. `invocation_id` が step1 で生成した値と一致する
+4. `generated_at > requested_at`
+5. `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha と一致する
+6. `result.raw_plan_location` が存在し、`result.result_sha256` と一致し、`result.verify_status == verified`
+7. `verify_scope_rollup_result.py`（issue-refinement-loop 版）検証が pass
 
-検証通過後:
+これらが全て通過した場合:
 - `result.suggested_actions_summary` を `LOOP_STATE.scope_rollup_plan.summary` に採用する
 - `result.raw_plan_location` は debug 専用とし、default では main context に展開しない
 - `ISSUE_SCOPE_ROLLUP_DECISION_V2` を記録して次ステップへ進む
 
-### runner unavailable / permission denied 時の fallback
+### runner_unavailable / marker 違反の扱い
 
-runner が `status: runner_unavailable` を返した場合、または marker 検証に失敗した場合:
+- marker 検証で `marker_missing / marker_malformed / marker_ambiguous / rejected` が返る場合:
+  - `LOOP_STATE.termination_reason: human_escalation`（`termination_reason` 有効値: `null | approved | max_iterations | human_escalation | intake_gate_failed`）
+  - `LOOP_STATE.scope_rollup_decision.decision: human_review_required`
+  - `LOOP_STATE.scope_rollup_decision.runner_result.status` に `marker_missing | marker_malformed | marker_ambiguous` を記録し、`reject_reason` に `marker_missing | marker_malformed | marker_ambiguous | ...` を記録する
+  - `LOOP_STATE.scope_rollup_decision.termination_cause` を `scope_rollup_marker_missing` / `scope_rollup_marker_malformed` に保存する
+  - Step 3 へ進めず停止する
 
-- **silent fallback（main が raw `gh issue/pr list` output を直接展開すること）は禁止**
-- main は以下のいずれかを選択する:
-  1. `LOOP_STATE.scope_rollup_decision.decision: deferred` として scope rollup をスキップし、Step 3 へ進む（scope rollup は non-blocking）
-  2. 人間に `scope-rollup-runner` の環境整備または再実行を依頼する（`termination_reason: human_escalation`）
-- fallback の選択理由を `LOOP_STATE.scope_rollup_decision.skipped_reason` に記録する
+- runner が `status: runner_unavailable` を返し、marker 検証が構文上有効な場合は、従来どおり `decision: deferred` を許容する（必要に応じて `human_escalation`）
+- runner が `status: failed` を返す場合は、`decision: human_review_required` として停止する
 
 ### orchestrator の判断ルール（marker 採用後）
 
 marker 採用後、`result.suggested_actions_summary` および必要に応じて `result.raw_plan_location` のファイル内容（debug 時のみ）に基づいて以下の判断を行う:
 
-- `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認し、統合実施可否を判断してから次ステップに進む。自動実行しない。
-- `suggested_action: human_review_required`（`escalation_required: True` の genuine structural conflict）: 即時停止して人間が判断する（`termination_reason: human_escalation`）。
-- `suggested_action: proceed_with_coordination` の候補: 関連 Issue 番号を `LOOP_STATE.scope_rollup_decision.related_coordination[]` に構造化保存して次ステップへ継続する。PR body への `## Related coordination` 反映は PR 作成・更新フェーズの責務とし、preparation フェーズでは担わない。
-  - **`proceed_with_coordination` の意味**: 「安全に並行可能」ではなく「停止せず、coordination 証跡付きで進める」に限定する。同一ファイルの変更が独立していることは証明されていない（machine-readable anchors がなく CONFLICT_UNCERTAIN）。
-  - **PR 作成・更新フェーズ（open-pr skill）の責務**: `LOOP_STATE.scope_rollup_decision.related_coordination[]` を読み取り、PR body の `## Related coordination` セクションに関連 Issue 番号とメモを反映すること。`related_coordination` が空の場合はセクションを省略してよい。
-- `confidence: medium` の候補: LOOP_STATE に記録し、推奨アクションを提示するが自動実行しない。
-- `confidence: low` または候補なし: 記録してそのまま次ステップに進む。
+- `confidence: high` の候補が存在する場合: orchestrator は各候補の `suggested_action` を確認してから次ステップへ進む。
+- `suggested_action: human_review_required` の候補: 即時停止して human review（`termination_reason: human_escalation`）。
+- `suggested_action: proceed_with_coordination` の候補: 関連 Issue 番号を `LOOP_STATE.scope_rollup_decision.related_coordination[]` に構造化保存して次ステップへ継続する。
+- `confidence: medium` の候補: LOOP_STATE に記録し、推奨アクションを提示する。
+- `confidence: low` または候補なし: 記録して次ステップへ進む。
 
 **`ISSUE_SCOPE_ROLLUP_DECISION_V2` の記録**（統合実施・未実施にかかわらず常時記録）:
 
@@ -388,10 +401,10 @@ ISSUE_SCOPE_ROLLUP_DECISION_V2:
     generated_at: "<ISSUE_SCOPE_ROLLUP_PLAN_V2.generated_at>"
   runner_result:
     invocation_id: "<INVOCATION_ID>"
-    status: ok | runner_unavailable | rejected
-    reject_reason: null | repo_mismatch | issue_mismatch | invocation_id_mismatch | stale | script_sha_mismatch | result_sha_mismatch
+    status: ok | failed | runner_unavailable | rejected | marker_missing | marker_malformed | marker_ambiguous
+    reject_reason: null | failed | marker_missing | marker_ambiguous | marker_malformed | repo_mismatch | issue_mismatch | invocation_id_mismatch | requested_at_mismatch | stale | script_sha_mismatch | result_missing | raw_plan_location_invalid | verify_status_not_verified
   decision: executed | skipped | deferred | human_review_required
-  executed_actions: []
+  termination_cause: null | scope_rollup_marker_missing | scope_rollup_marker_malformed
   skipped_reason: null
   related_coordination: []
   candidates_reviewed:
@@ -419,6 +432,8 @@ git branch --list "$BRANCH" && echo "[WARN] branch 既存" || echo "[OK] branch 
 ```
 
 既存衝突あり → 過去のイテレーションの残骸の可能性。人間判断を仰ぐ。
+
+
 
 ## 4. Product Spec Gate 評価完了後の LOOP_STATE 初期化
 
