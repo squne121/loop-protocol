@@ -1,0 +1,16 @@
+{
+  "_schema": "profile-isolation-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T04:26:04.268231+00:00",
+  "main_profile_touched": false,
+  "main_settings_changed": false,
+  "main_hooks_changed": false,
+  "experiment_profile_only": true,
+  "rollback_ref": "docs/dev/agent-ops/context-mode-rollback.md",
+  "project_settings_sha256": "ebcfb7851205eb87f9794e01ddb47aba22ad44d51947b0c9a8fe25dc00a9540c",
+  "project_settings_path": ".claude/settings.json",
+  "main_branch_git_diff_files": [],
+  "isolation_method": "git worktree (branch: worktree-issue-824-claude-code-profile-context-mode-version)",
+  "worktree_path": ".claude/worktrees/issue-824-claude-code-profile-context-mode-version/",
+  "note": "context-mode は実験用 profile (local scope) のみで有効化。main branch の .claude/settings.json と .claude/hooks/** は変更なし。"
+}

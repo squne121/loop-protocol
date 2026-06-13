@@ -32,6 +32,8 @@
     ],
     "ask": [],
     "deny": [
+      "mcp__context-mode__ctx_execute",
+      "mcp__context-mode__ctx_fetch_and_index",
       "Write(assets/**)",
       "Edit(assets/**)",
       "Write(LICENSES/**)",
@@ -63,6 +65,9 @@
       "Bash(set)",
       "Bash(set *)"
     ]
+  },
+  "enabledPlugins": {
+    "context-mode@context-mode": true
   },
   "hooks": {
     "PreToolUse": [
