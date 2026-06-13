@@ -101,47 +101,61 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 # git head sha
 GIT_HEAD_SHA=$(git rev-parse HEAD)
 
-# script blob sha256
-SCRIPT_SHA=$(sha256sum .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py | awk '{print $1}')
+# inputs sha256（uv run python3 経由で計算 — 外部コマンド非依存）
+CURRENT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_current_issue_<invocation_id>.json)
+ISSUES_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_issues_all_<invocation_id>.json)
+PRS_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_prs_all_<invocation_id>.json)
 
-# inputs sha256
-CURRENT_SHA=$(sha256sum /tmp/scope_rollup_current_issue_<invocation_id>.json | awk '{print $1}')
-ISSUES_SHA=$(sha256sum /tmp/scope_rollup_issues_all_<invocation_id>.json | awk '{print $1}')
-PRS_SHA=$(sha256sum /tmp/scope_rollup_prs_all_<invocation_id>.json | awk '{print $1}')
-
-ISSUE_COUNT=$(python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_issues_all_<invocation_id>.json)
-PR_COUNT=$(python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_prs_all_<invocation_id>.json)
+ISSUE_COUNT=$(uv run python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_issues_all_<invocation_id>.json)
+PR_COUNT=$(uv run python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < /tmp/scope_rollup_prs_all_<invocation_id>.json)
 ```
 
 ### 5. plan_issue_scope_rollup.py 実行
 
 ```bash
-python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
+uv run python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py \
   --issues-json /tmp/scope_rollup_issues_all_<invocation_id>.json \
   --prs-json /tmp/scope_rollup_prs_all_<invocation_id>.json \
   --current-issue <issue_number> \
   --repo <repo> \
+  --invocation-id <invocation_id> \
   > /tmp/scope_rollup_result_<invocation_id>.json 2>&1
 ```
 
-スクリプトが exit code 非 0 で失敗した場合:
+スクリプトが exit code 非 0 かつ 非 2 で失敗した場合（exit 2 は `partial` = current_issue 未発見の正常終了であり処理継続）:
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
-  error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0）"
+  error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0 かつ 非 2）"
   invocation_id: "<invocation_id>"
 ```
 
-### 6. result sha256 計算
+### 6. verify_scope_rollup_result.py による結果検証
 
 ```bash
-RESULT_SHA=$(sha256sum /tmp/scope_rollup_result_<invocation_id>.json | awk '{print $1}')
+uv run python3 .claude/skills/issue-refinement-loop/scripts/verify_scope_rollup_result.py \
+  --result-json /tmp/scope_rollup_result_<invocation_id>.json
 ```
 
-### 7. ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に出力
+`verify_scope_rollup_result.py` が exit 0（STATUS: verified）以外を返した場合は即停止し、以下を返す:
 
-スクリプト実行成功時に以下の marker を stdout に出力する:
+```yaml
+ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
+  status: runner_unavailable
+  error: "verify_scope_rollup_result.py が verified 以外を返した"
+  invocation_id: "<invocation_id>"
+```
+
+### 7. result sha256 計算
+
+```bash
+RESULT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').read(); print(hashlib.sha256(d).hexdigest())" /tmp/scope_rollup_result_<invocation_id>.json)
+```
+
+### 8. ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に出力
+
+スクリプト実行および検証成功時に以下の marker を stdout に出力する:
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
@@ -154,7 +168,7 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   generated_at: "<ISO8601（スクリプト実行完了時刻）>"
   git_head_sha: "<GIT_HEAD_SHA>"
   script_path: ".claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py"
-  script_blob_sha256: "<SCRIPT_SHA>"
+  script_blob_sha256: "<SCRIPT_SHA>"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
   inputs:
     current_issue_sha256: "<CURRENT_SHA>"
     issues_all_sha256: "<ISSUES_SHA>"
@@ -162,24 +176,20 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
     issue_count: <ISSUE_COUNT>
     pr_count: <PR_COUNT>
   result:
-    plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
-    raw_plan_location: "/tmp/scope_rollup_<invocation_id>.json"
+    plan_schema: "ISSUE_SCOPE_ROLLUP_PLAN_V2"  # 後方互換 alias（ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 既存キー）
+    plan_schema_name: "ISSUE_SCOPE_ROLLUP_PLAN_V2"
+    plan_schema_version: 2
+    raw_plan_location: "/tmp/scope_rollup_result_<invocation_id>.json"
     result_sha256: "<ファイルバイト列の sha256>"
+    verify_status: "verified"
     suggested_actions_summary: "<1-3行の候補サマリ>"
     candidate_count: <候補数>
     high_confidence_count: <confidence:high の候補数>
 ```
 
-**result_sha256 の計算方法**（ファイルバイト列 sha256）:
-
-```bash
-# result_sha256 計算（ファイルバイト列 sha256）
-sha256sum /tmp/scope_rollup_<invocation_id>.json | awk '{print $1}'
-```
-
-`result_sha256` は `raw_plan_location` のファイルバイト列の sha256 であり、RFC 8785 正規化は不要。`sha256sum` コマンドと同一の計算で算出する。
-
 **`plan:` フィールドは含めない**。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+
+**`result_sha256` の計算方法**（ファイルバイト列 sha256）: uv run python3 の hashlib 経由で計算する（外部コマンド非依存）。
 
 ## 禁止操作（GitHub mutation / repo mutation の禁止）
 

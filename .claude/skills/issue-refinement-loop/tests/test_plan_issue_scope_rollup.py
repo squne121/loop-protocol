@@ -1311,3 +1311,83 @@ class TestProceedWithCoordination:
             f"CONFLICT_UNCERTAIN must take precedence over stale escalation_required=True; "
             f"got {action!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AC2: self_validation.payload_sha256 stability tests (Issue #820)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfValidation:
+    """AC2: self_validation block is present in run() output.
+    payload_sha256 covers the plan without self_validation (self-reference excluded).
+    """
+
+    def test_run_output_contains_self_validation_block(
+        self, empty_issues_json: str, empty_prs_json: str
+    ) -> None:
+        """AC1/AC2: GIVEN run() is called, THEN output contains self_validation block
+        with payload_sha256 field.
+        """
+        plan, _ = _run_with_code(empty_issues_json, empty_prs_json)
+        assert "self_validation" in plan, "plan must contain self_validation block"
+        sv = plan["self_validation"]
+        assert "payload_sha256" in sv, "self_validation must contain payload_sha256"
+        assert isinstance(sv["payload_sha256"], str)
+        assert len(sv["payload_sha256"]) == 64, "sha256 hex digest must be 64 chars"
+
+    def test_payload_sha256_is_stable_for_same_inputs(
+        self, empty_issues_json: str, empty_prs_json: str
+    ) -> None:
+        """AC2: GIVEN a plan dict (without self_validation), THEN payload_sha256 is
+        deterministic (byte-stable) when applied to the same dict twice.
+
+        Note: run() always produces a fresh generated_at timestamp, so two separate
+        run() calls will produce different payload_sha256 values even for the same
+        logical inputs. The stability guarantee applies to _compute_payload_sha256()
+        itself (same dict -> same hash), not to successive run() calls.
+        """
+        import plan_issue_scope_rollup as rollup_module
+        # Build a fixed payload and verify that hashing it twice gives the same result
+        fixed_payload = {
+            "schema_version": 2,
+            "repo": "test/repo",
+            "generated_at": "2026-06-13T00:00:00Z",  # fixed timestamp
+            "source": "plan_issue_scope_rollup",
+            "body_sha256": "abc123",
+            "input": {"completeness": "full", "warnings": []},
+            "candidates": [],
+        }
+        hash1 = rollup_module._compute_payload_sha256(fixed_payload)
+        hash2 = rollup_module._compute_payload_sha256(fixed_payload)
+        assert hash1 == hash2, (
+            "payload_sha256 must be deterministic (same dict -> same hash)"
+        )
+        assert len(hash1) == 64
+
+    def test_payload_sha256_changes_when_candidates_change(
+        self,
+        empty_issues_json: str,
+        empty_prs_json: str,
+        issues_shared_dedupe_key_json: str,
+    ) -> None:
+        """AC2: GIVEN different candidates, THEN payload_sha256 differs."""
+        plan_empty, _ = _run_with_code(empty_issues_json, empty_prs_json, invocation_id="id-1")
+        plan_with_candidates, _ = _run_with_code(
+            issues_shared_dedupe_key_json, empty_prs_json,
+            current_issue_number=200, invocation_id="id-2"
+        )
+        assert (
+            plan_empty["self_validation"]["payload_sha256"]
+            != plan_with_candidates["self_validation"]["payload_sha256"]
+        ), "payload_sha256 must differ when candidates differ"
+
+    def test_self_validation_contains_script_file_sha256(
+        self, empty_issues_json: str, empty_prs_json: str
+    ) -> None:
+        """AC3: GIVEN run() output, THEN self_validation.script_file_sha256 is present."""
+        plan, _ = _run_with_code(empty_issues_json, empty_prs_json)
+        sv = plan["self_validation"]
+        assert "script_file_sha256" in sv, "self_validation must contain script_file_sha256"
+        assert isinstance(sv["script_file_sha256"], str)
+        assert len(sv["script_file_sha256"]) == 64
