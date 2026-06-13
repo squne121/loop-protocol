@@ -509,6 +509,84 @@ class TestIntegration:
         assert exit_code == 1
         assert len(gh_calls) == 0
 
+    def test_publish_preserves_explicit_termination_cause(self):
+        renderer_inputs: list[dict[str, Any]] = []
+        fake_proc = _fake_renderer_proc(_make_render_result())
+        gh_proc = MagicMock()
+        gh_proc.returncode = 0
+        gh_proc.stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == sys.executable:
+                renderer_inputs.append(json.loads(kwargs["input"]))
+                return fake_proc
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                return gh_proc
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            exit_code = pub.publish(
+                issue_number=42,
+                input_data=_make_input(
+                    termination_reason="human_escalation",
+                    termination_cause="max_iterations_exceeded",
+                ),
+            )
+
+        assert exit_code == 0
+        assert renderer_inputs == [{
+            "termination_reason": "human_escalation",
+            "termination_cause": "max_iterations_exceeded",
+            "issue_number": 42,
+        }]
+
+    def test_publish_normalizes_legacy_blocker_summary_alias(self):
+        renderer_inputs: list[dict[str, Any]] = []
+        fake_proc = _fake_renderer_proc(_make_render_result())
+        gh_proc = MagicMock()
+        gh_proc.returncode = 0
+        gh_proc.stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == sys.executable:
+                renderer_inputs.append(json.loads(kwargs["input"]))
+                return fake_proc
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                return gh_proc
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            exit_code = pub.publish(
+                issue_number=42,
+                input_data={
+                    "termination_reason": "human_escalation",
+                    "issue_number": 42,
+                    "blocker_summary": ["legacy blocker entry"],
+                },
+            )
+
+        assert exit_code == 0
+        assert renderer_inputs == [{
+            "termination_reason": "human_escalation",
+            "termination_cause": "human_judgment_required",
+            "issue_number": 42,
+            "blockers_summary": ["legacy blocker entry"],
+        }]
+
+    def test_publish_rejects_blocker_summary_alias_conflict(self):
+        with patch("subprocess.run") as mock_run:
+            exit_code = pub.publish(
+                issue_number=42,
+                input_data={
+                    "termination_reason": "human_escalation",
+                    "blocker_summary": ["legacy blocker"],
+                    "blockers_summary": ["canonical blocker"],
+                },
+            )
+
+        assert exit_code == 1
+        mock_run.assert_not_called()
+
     def test_coexistence_with_loop_handoff_result_v1(self):
         """
         AC8: Coexistence test — LOOP_HANDOFF_RESULT_V1 and
