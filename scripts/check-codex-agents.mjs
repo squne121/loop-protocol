@@ -468,7 +468,7 @@ function validateAgents() {
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
-  assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills must not exist as a repo-shared skill surface', failures);
+  assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills: must not exist as a repo-shared skill surface', failures);
 
   // hooks.json: JSON structural validation
   validateHooksJson(hooksPath, failures);
