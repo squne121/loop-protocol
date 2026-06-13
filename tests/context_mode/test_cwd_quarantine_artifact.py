@@ -95,6 +95,31 @@ class TestCases:
                 f"main_checkout.bash_evidence.{field} is null/stale"
             )
 
+    def test_linked_worktree_bash_evidence(self, artifact):
+        case = artifact["cases"]["linked_worktree"]
+        bash = case.get("bash_evidence", {})
+        # Either real values OR probe_blocked_by_policy status
+        if "status" in bash:
+            assert bash["status"] == "probe_blocked_by_policy"
+        else:
+            for field in ["pwd", "git_show_toplevel", "git_branch_current",
+                          "git_rev_parse_head", "git_is_inside_work_tree"]:
+                assert bash.get(field) not in (None, "null", "pending", "unknown"), (
+                    f"linked_worktree.bash_evidence.{field} is null/stale"
+                )
+
+    def test_nested_repo_bash_evidence(self, artifact):
+        case = artifact["cases"]["nested_repo"]
+        bash = case.get("bash_evidence", {})
+        if "status" in bash:
+            assert bash["status"] == "probe_blocked_by_policy"
+        else:
+            for field in ["pwd", "git_show_toplevel", "git_branch_current",
+                          "git_rev_parse_head", "git_is_inside_work_tree"]:
+                assert bash.get(field) not in (None, "null", "pending", "unknown"), (
+                    f"nested_repo.bash_evidence.{field} is null/stale"
+                )
+
 
 class TestInformationalOnly:
     """AC5: CLAUDE_PROJECT_DIR must be informational_only, not used for cwd judgment."""

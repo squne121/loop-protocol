@@ -42,29 +42,33 @@
     "linked_worktree": {
       "description": "Linked worktree scenario (documented upstream #756 bug)",
       "bash_evidence": {
-        "status": "probe_blocked_by_policy",
-        "note": "ctx_execute is deny-listed; worktree cwd comparison not performed in normal profile",
-        "upstream_756_documented_divergence": "ctx_execute pwd shows main repo root instead of worktree path (from upstream bug report)"
+        "pwd": "/tmp/loop-protocol-wt-826-test",
+        "git_show_toplevel": "/tmp/loop-protocol-wt-826-test",
+        "git_branch_current": "test-826-tmp-wt-only",
+        "git_rev_parse_head": "346f624c8ca592a0ab2ebbdec4437007bf1b2ab9",
+        "git_is_inside_work_tree": "true"
       },
       "ctx_execute_evidence": {
         "status": "permission_denied_or_diverges",
         "upstream_756_report": "ctx_execute reports main repo root and master branch instead of worktree",
         "note": "Based on upstream #756 bug report: ctx_execute uses MCP server process.cwd() not session cwd"
       },
-      "comparison": "divergence_documented_by_upstream_756"
+      "comparison": "bash_measured_ctx_execute_blocked_upstream_756_documents_divergence"
     },
     "nested_repo": {
       "description": "Nested repo scenario",
       "bash_evidence": {
-        "status": "probe_blocked_by_policy",
-        "note": "ctx_execute is deny-listed; worktree cwd comparison not performed in normal profile",
-        "upstream_756_documented_divergence": "ctx_execute pwd shows main repo root instead of worktree path (from upstream bug report)"
+        "pwd": "/tmp/loop-protocol-nested-826-test",
+        "git_show_toplevel": "/tmp/loop-protocol-nested-826-test",
+        "git_branch_current": "master",
+        "git_rev_parse_head": "f041556c639df549a2a4f19c6009e8caaec31cf4",
+        "git_is_inside_work_tree": "true"
       },
       "ctx_execute_evidence": {
         "status": "permission_denied",
         "note": "ctx_execute is deny-listed; nested repo cwd comparison blocked by policy"
       },
-      "comparison": "probe_blocked_by_policy"
+      "comparison": "bash_measured_ctx_execute_blocked_by_policy"
     }
   },
   "informational_only": {
