@@ -93,11 +93,19 @@ agent_skill_surface_sharing:
       status: portability_not_confirmed_in_current_primary_sources
     thin_wrapper:
       default: preferred_when_portability_is_unproven
-  codex_bridge_requirements:
+  agents_skills_bridge_requirements:
+    canonical_target: ".claude/skills/<skill-name>/SKILL.md"
     all_of:
       - "explicitly_marked_as_derived_and_non_canonical"
+      - "contains_exact_imperative_to_read_the_canonical_body"
       - "contains_no_workflow_procedure_body_beyond_target_resolution_and_runtime_specific_caveats"
-      - "canonical_target_is_.agents/skills/<skill-name>/SKILL.md"
+      - "validator_proves_wrapper_is_thin"
+  codex_skills_bridge_requirements:
+    canonical_target: ".agents/skills/<skill-name>/SKILL.md"
+    all_of:
+      - "explicitly_marked_as_derived_and_non_canonical"
+      - "contains_exact_imperative_to_read_the_shared_agents_surface"
+      - "contains_no_workflow_procedure_body_beyond_target_resolution_and_runtime_specific_caveats"
       - "validator_proves_wrapper_is_thin"
   portable_shared_body_subset:
     required_frontmatter:

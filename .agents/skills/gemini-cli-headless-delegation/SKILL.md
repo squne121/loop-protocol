@@ -5,6 +5,6 @@ description: Gemini CLI を wrapper 経由で非対話 delegation する shared 
 
 # Gemini CLI Headless Delegation
 
-Codex custom agent 用の repo-shared skill entrypoint。
-この surface は discovery 用の thin bridge であり、runtime instruction body の正本は暫定的に `../../../.claude/skills/gemini-cli-headless-delegation/SKILL.md` に残る。
-`.agents/skills/` は Codex custom agent の repo-local discovery surface、`.claude/skills/` は Claude 側 prompt surface 兼 canonical body の保管場所として扱う。
+This file is a derived/non-canonical thin wrapper for the Codex repo-local discovery surface.
+Before executing this skill, read the canonical body at `../../../.claude/skills/gemini-cli-headless-delegation/SKILL.md`.
+Do not treat this wrapper as the workflow procedure body.

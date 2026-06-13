@@ -391,3 +391,7 @@ uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py
 - レビュー系: `pr-review-judge`, `pr-reviewer` (SubAgent)
 - オーケストレーション系: `impl-review-loop`, `open-pr`, `post-merge-cleanup`, `post-merge-cleanup-worker` (SubAgent)
 - 補助系: `ssot-discovery`, `gemini-cli-headless-delegation`, `nlm-skill`, `codebase-investigator` (SubAgent)
+
+- repo-local authoring/discovery surface は `.agents/skills/` を discovery、`.claude/skills/` を canonical body として分ける
+- Codex 公式の `symlinked skill folders` support は確認済みだが、この repo では symlink portability is unproven; thin bridge is the default
+- installable artifact として配布したい場合は direct repo surface を増やさず plugin packaging を別 concern として扱う
