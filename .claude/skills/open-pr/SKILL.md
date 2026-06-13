@@ -210,6 +210,82 @@ uv run python3 .claude/skills/open-pr/scripts/open_pr.py \
 - `dry_run: true` でも publish ゲートと validator は実行する
 - 既存 PR が見つかった場合、本文 update は必ず update_pr.py wrapper 経由で行う（validator bypass 防止）
 
+## PR Body Japanese Check 失敗時の修復手順
+
+PR Body Japanese Check（`check-japanese.yml`）が失敗した場合は、`pr_body_japanese_repair_plan.py` を使って修復プランを生成し、`update_pr.py` 経由で適用する。
+
+### ステップ 1: 修復プランの生成
+
+```bash
+# --body-file モード（PR body ファイルを直接指定）
+uv run python3 .claude/skills/open-pr/scripts/pr_body_japanese_repair_plan.py \
+  --body-file <path-to-pr-body.md> \
+  --threshold 0.1
+```
+
+または PR 番号から直接取得:
+
+```bash
+uv run python3 .claude/skills/open-pr/scripts/pr_body_japanese_repair_plan.py \
+  --pr <PR_NUMBER> \
+  --repo <owner>/<repo> \
+  --threshold 0.1
+```
+
+stdout は `PR_BODY_JAPANESE_REPAIR_PLAN_V1` の compact JSON:
+
+```json
+{
+  "schema": "PR_BODY_JAPANESE_REPAIR_PLAN_V1",
+  "status": "pass | repairable | human_review_required | invalid_body | gh_error",
+  "threshold": 0.1,
+  "failed_blocks": [...],
+  "safe_rewrite_plan": [...],
+  "body_file_out": null,
+  "preserved_tokens": ["Closes #N", "Refs #N", ...],
+  "next_action": "none | apply_safe_rewrite_plan | human_review_required"
+}
+```
+
+exit code: `0 pass / 10 repairable / 20 human_review_required / 30 invalid_body / 40 gh_error`
+
+日本語判定の SSOT:
+- `validate_japanese_content.py` の `validate_text()` / `split_markdown_blocks()`
+- `prose_boundary_policy.py` の `iter_markdown_blocks()` / `lookup_heading_policy()`
+
+### ステップ 2: status に応じた対処
+
+| status | 対処 |
+|---|---|
+| `pass` | Japanese Check は通過済み。再チェック不要 |
+| `repairable` | `safe_rewrite_plan` の `action: append_japanese_note` に従い、各ブロックに日本語注記を追記し、`update_pr.py` 経由で更新する |
+| `human_review_required` | 任意英語の意味変換が必要。人間が日本語翻訳を行い `update_pr.py` 経由で更新する |
+| `invalid_body` | PR body が空または読み込み不能。body を確認する |
+| `gh_error` | gh CLI エラー。認証 / PR 番号 / ネットワークを確認する |
+
+### ステップ 3: 修正後の PR body を update_pr.py 経由で適用
+
+修正した body ファイルを `update_pr.py` 経由で更新する（AC2 準拠: validator bypass 防止）:
+
+```bash
+uv run python3 .claude/skills/open-pr/scripts/update_pr.py \
+  --pr-number <N> \
+  --body-file <path-to-repaired-body.md> \
+  --linked-issue <linked-issue-num>
+```
+
+`update_pr.py` は内部で `validate_japanese_content.py` と `validate_pr_body.py` の両方を実行して
+整合性を確認してから `gh pr edit` を呼ぶ。
+
+### 保護トークン（preserved_tokens）
+
+以下のトークンは修復プラン生成時に `preserved_tokens` に記録され、書き換えから保護される:
+- GitHub closing keyword 全 variant: `close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved` + colon variant
+- cross-repo reference: `owner/repo#N`
+- 複数 issue 列挙: `Closes #1, #2, #3`
+- `Refs #N` / `Refs owner/repo#N`
+- HTML comment: `<!-- ... -->`
+
 ## PR Body Update（既存 PR への本文反映）
 
 PR の本文を更新する場合（既存 PR 発見時など）は、必ず以下の wrapper 経由で行う（validator pre-write hook を強制）:
