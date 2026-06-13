@@ -52,6 +52,9 @@ tmp/edit_issue_*.md
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す
 .claude/settings.local.json
 
+# Guard shadow log (write-guard observability, local only)
+.guard_shadow_log.jsonl
+
 # Python runtime artifacts
 .venv/
 __pycache__/

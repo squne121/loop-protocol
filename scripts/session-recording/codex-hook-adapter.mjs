@@ -329,6 +329,14 @@ async function main() {
       return
     }
     if (event === 'PermissionRequest') {
+      // AC5 (#874): remote_write_requires_approval is no_decision on PermissionRequest
+      // (PreToolUse side still denies; permission-request side defers to Codex runtime).
+      // Other critical denials (secret_boundary_violation, forbidden_path, public_checkpoint,
+      // secrets_mode) remain as deny on PermissionRequest.
+      if (reason.includes('remote_write_requires_approval')) {
+        // no_decision: emit nothing (exit 0, no stdout JSON)
+        return
+      }
       emitJson(denyPermissionRequest(reason))
       return
     }

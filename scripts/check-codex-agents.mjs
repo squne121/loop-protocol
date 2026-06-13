@@ -19,6 +19,9 @@ const ledgerPath = path.join(repoRoot, 'artifacts', 'codex', 'subagent-launch-le
 // CODEX_BIN env override for environments without codex on PATH
 const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
 
+// Shadow log path (repo root, git-untracked)
+const shadowLogPath = path.join(repoRoot, '.guard_shadow_log.jsonl');
+
 const requiredAgentNames = [
   'codebase-investigator',
   'implementation-worker',
@@ -452,16 +455,30 @@ function validateExecpolicy(failures) {
 
   // Representative command checks
   const checks = [
-    // read-only: must be allow
+    // read-only via rtk: must be allow
     { tokens: ['rtk', 'gh', 'issue', 'view', '1'], expectedDecision: 'allow' },
     { tokens: ['rtk', 'pnpm', 'test'], expectedDecision: 'allow' },
+    // DIRECT_ALLOW: validation commands are now allow without rtk wrapper (#874)
+    { tokens: ['pnpm', 'typecheck'], expectedDecision: 'allow' },
+    { tokens: ['pnpm', 'lint'], expectedDecision: 'allow' },
+    { tokens: ['pnpm', 'test'], expectedDecision: 'allow' },
+    { tokens: ['pnpm', 'build'], expectedDecision: 'allow' },
+    // DIRECT_ALLOW: git read-only is allow (#874)
+    { tokens: ['git', 'status'], expectedDecision: 'allow' },
+    { tokens: ['git', 'diff'], expectedDecision: 'allow' },
+    { tokens: ['git', 'log'], expectedDecision: 'allow' },
+    // DIRECT_ALLOW: gh read-only is allow (#874)
+    { tokens: ['gh', 'issue', 'view', '1'], expectedDecision: 'allow' },
+    { tokens: ['gh', 'pr', 'view', '1'], expectedDecision: 'allow' },
+    { tokens: ['gh', 'pr', 'checks', '1'], expectedDecision: 'allow' },
     // mutations: must NOT be allow (prompt or forbidden)
     { tokens: ['rtk', 'gh', 'pr', 'merge', '1'], expectedDecision: 'prompt', expectNotAllow: true },
     { tokens: ['rtk', 'git', 'push'], expectedDecision: 'prompt', expectNotAllow: true },
     { tokens: ['rtk', 'pnpm', 'add', 'lodash'], expectedDecision: 'prompt', expectNotAllow: true },
-    // direct bypass: must be forbidden
+    // direct bypass mutations: must be forbidden
     { tokens: ['git', 'push'], expectedDecision: 'forbidden' },
-    { tokens: ['pnpm', 'test'], expectedDecision: 'forbidden' },
+    { tokens: ['pnpm', 'add', 'lodash'], expectedDecision: 'forbidden' },
+    { tokens: ['gh', 'pr', 'merge', '1'], expectedDecision: 'forbidden' },
     { tokens: ['gh', 'issue', 'create'], expectedDecision: 'forbidden' },
   ];
 
@@ -824,25 +841,43 @@ function denyForBash(command) {
 }
 
 // ---------------------------------------------------------------------------
-// Allowed Paths enforcement (Fix B)
-// Behavior:
-//   - If CODEX_ALLOWED_PATHS is set: enforce strictly — writes outside the set
-//     are denied (fail-closed).
-//   - If CODEX_ALLOWED_PATHS is NOT set (default): deny all writes except
-//     assets/ and LICENSES/ protection (fail-closed by design).
-//     Set CODEX_LEGACY_ALLOW_WRITES=1 to restore the old allow-by-default
-//     behavior for callers that have not yet adopted CODEX_ALLOWED_PATHS.
-// Rationale: fail-closed is the correct default for a guardrail. Callers
-// must declare allowed paths per Issue contract; the legacy bypass is an
-// explicit opt-out, not the default.
+// Allowed Paths enforcement
+// CODEX_ALLOWED_PATHS_MODE controls the write-guard behavior:
+//   strict    — CODEX_ALLOWED_PATHS must be declared; writes outside it are denied (fail-closed).
+//               If CODEX_ALLOWED_PATHS is not set in strict mode: deny all writes.
+//   workspace — repo workspace edits are allowed; protected paths are always denied.
+//               CODEX_ALLOWED_PATHS, if set, narrows (intersects) rather than widens.
+//               CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode (backward compat).
+//   shadow    — same allow logic as workspace but logs would-block events to
+//               .guard_shadow_log.jsonl for observability.
+//   unknown   — fail-closed (all writes denied). Unknown mode is never silently trusted.
+//
+// Protected paths (always denied regardless of mode):
+//   assets/  LICENSES/  .env*  secrets/**
 //
 // KNOWN LIMITATION: path canonicalization uses path.resolve without realpath,
-// so symlinks that escape the repo root are not caught.
+// so symlinks that escape the repo root are not caught (WSL2 compatibility).
 // ---------------------------------------------------------------------------
+
+/** Parse CODEX_ALLOWED_PATHS_MODE; returns 'strict' | 'workspace' | 'shadow' | 'unknown' */
+function parseAllowedPathsMode() {
+  const legacyMode = process.env.CODEX_LEGACY_ALLOW_WRITES === '1';
+  if (legacyMode) {
+    return 'workspace'; // backward compat: legacy allow = workspace mode
+  }
+  const raw = (process.env.CODEX_ALLOWED_PATHS_MODE ?? '').trim().toLowerCase();
+  if (raw === 'strict' || raw === '') {
+    return 'strict'; // default when not set: fail-closed strict
+  }
+  if (raw === 'workspace') return 'workspace';
+  if (raw === 'shadow') return 'shadow';
+  return 'unknown'; // unknown mode → fail-closed
+}
+
 function parseAllowedPaths() {
   const raw = process.env.CODEX_ALLOWED_PATHS;
   if (!raw || !raw.trim()) {
-    return null; // not set: use fail-closed default (or legacy mode if opted in)
+    return null; // not set
   }
   // Accept newline-separated paths (colon is avoided: conflicts with Windows drive letters)
   return raw.split(/\n+/).map((p) => p.trim()).filter(Boolean);
@@ -865,46 +900,88 @@ function isPathAllowed(filePath, allowedPaths) {
   });
 }
 
-function isProtectedLegacy(filePath) {
+/** Returns true if filePath is a protected path (always denied in any mode). */
+function isProtectedPath(filePath) {
   const candidate = resolveInsideRepo(filePath);
   if (!candidate) return true; // null path (traversal/NUL) → deny
   const assetsDir = path.resolve(repoRoot, 'assets');
   const licensesDir = path.resolve(repoRoot, 'LICENSES');
+  // .env* files anywhere in the repo
+  const basename = path.basename(filePath);
+  const isEnvFile = /^\.env(\.|$)/.test(basename) || basename === '.env';
+  // secrets/** directory
+  const secretsDir = path.resolve(repoRoot, 'secrets');
+  const isInSecrets = candidate === secretsDir || candidate.startsWith(secretsDir + path.sep);
   return (
     candidate === assetsDir || candidate.startsWith(assetsDir + path.sep) ||
-    candidate === licensesDir || candidate.startsWith(licensesDir + path.sep)
+    candidate === licensesDir || candidate.startsWith(licensesDir + path.sep) ||
+    isEnvFile ||
+    isInSecrets
   );
+}
+
+/** Legacy alias: same as isProtectedPath for backward compat. */
+function isProtectedLegacy(filePath) {
+  return isProtectedPath(filePath);
+}
+
+function appendShadowLog(entry) {
+  try {
+    fs.appendFileSync(shadowLogPath, JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n', 'utf8');
+  } catch {
+    // shadow log write failure is non-fatal; log to stderr only
+    process.stderr.write('[guard-shadow] warn: failed to write to .guard_shadow_log.jsonl\n');
+  }
 }
 
 function extractPatchTouchedPaths(command) {
   return [...command.matchAll(/\*\*\* (?:Add|Delete|Update) File: (.+)$/gm)].map((match) => match[1].trim());
 }
 
-function denyForWriteTool(toolName, toolInput, allowedPaths) {
-  const legacyMode = process.env.CODEX_LEGACY_ALLOW_WRITES === '1';
+function denyForWriteTool(toolName, toolInput, allowedPaths, _modeOverride) {
+  const mode = _modeOverride ?? parseAllowedPathsMode();
+
+  // Unknown mode: fail-closed
+  if (mode === 'unknown') {
+    return 'codex_allowed_paths_mode_unknown: CODEX_ALLOWED_PATHS_MODE is not recognized. Fail-closed. Use strict, workspace, or shadow.';
+  }
 
   // apply_patch: extract touched paths from patch content
   if (toolName === 'apply_patch') {
     const command = normalizeCommand(toolInput?.command);
     const touchedPaths = extractPatchTouchedPaths(command);
-    if (allowedPaths !== null) {
-      // Strict mode: check against Allowed Paths
-      for (const filePath of touchedPaths) {
-        if (!isPathAllowed(filePath, allowedPaths)) {
-          // AC5: allowed_paths_violation — path is outside declared Allowed Paths
-          return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+
+    if (mode === 'strict') {
+      if (allowedPaths === null) {
+        // strict + no CODEX_ALLOWED_PATHS: deny any write
+        if (touchedPaths.length > 0) {
+          return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_ALLOWED_PATHS_MODE=workspace.';
+        }
+      } else {
+        for (const filePath of touchedPaths) {
+          if (!isPathAllowed(filePath, allowedPaths)) {
+            return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+          }
         }
       }
-    } else if (legacyMode) {
-      // Legacy opt-in: only block assets/LICENSES
-      if (touchedPaths.some((fp) => isProtectedLegacy(fp))) {
-        return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
-      }
     } else {
-      // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
-      if (touchedPaths.length > 0) {
-        // AC5: allowed_paths_missing — CODEX_ALLOWED_PATHS not declared
-        return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
+      // workspace or shadow: allow repo workspace edits; protected paths always denied
+      for (const filePath of touchedPaths) {
+        if (isProtectedPath(filePath)) {
+          const reason = 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
+          if (mode === 'shadow') {
+            appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
+          }
+          return reason;
+        }
+        // workspace/shadow: if CODEX_ALLOWED_PATHS is set, narrow (intersect)
+        if (allowedPaths !== null && !isPathAllowed(filePath, allowedPaths)) {
+          const reason = `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+          if (mode === 'shadow') {
+            appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
+          }
+          return reason;
+        }
       }
     }
     return null;
@@ -916,21 +993,32 @@ function denyForWriteTool(toolName, toolInput, allowedPaths) {
     if (!filePath) {
       return null; // no path to check
     }
-    if (allowedPaths !== null) {
-      // Strict mode
+
+    if (mode === 'strict') {
+      if (allowedPaths === null) {
+        // strict + no CODEX_ALLOWED_PATHS: deny all writes
+        return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_ALLOWED_PATHS_MODE=workspace.';
+      }
       if (!isPathAllowed(filePath, allowedPaths)) {
-        // AC5: allowed_paths_violation — path is outside declared Allowed Paths
         return `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
       }
-    } else if (legacyMode) {
-      // Legacy opt-in: only block assets/LICENSES
-      if (isProtectedLegacy(filePath)) {
-        return 'assets/ and LICENSES/ are human-managed and blocked by the local guardrail.';
-      }
     } else {
-      // Fail-closed default: CODEX_ALLOWED_PATHS must be declared
-      // AC5: allowed_paths_missing — CODEX_ALLOWED_PATHS not declared
-      return 'allowed_paths_missing: CODEX_ALLOWED_PATHS is not set. Declare allowed paths per Issue contract or set CODEX_LEGACY_ALLOW_WRITES=1 to opt out.';
+      // workspace or shadow: allow repo workspace edits; protected paths always denied
+      if (isProtectedPath(filePath)) {
+        const reason = 'protected_path_violation: path is in a protected area (assets/, LICENSES/, .env*, secrets/**).';
+        if (mode === 'shadow') {
+          appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
+        }
+        return reason;
+      }
+      // workspace/shadow: if CODEX_ALLOWED_PATHS is set, narrow (intersect)
+      if (allowedPaths !== null && !isPathAllowed(filePath, allowedPaths)) {
+        const reason = `allowed_paths_violation: "${filePath}" is outside the declared Allowed Paths set. (CODEX_ALLOWED_PATHS enforcement)`;
+        if (mode === 'shadow') {
+          appendShadowLog({ event: 'would_block', tool: toolName, path: filePath, reason });
+        }
+        return reason;
+      }
     }
     return null;
   }
@@ -1136,6 +1224,123 @@ function runSelfTest() {
     const patchCmd = '*** Update File: scripts/../src/main.ts\n--- a\n+++ b\n';
     const result = denyForWriteTool('apply_patch', { command: patchCmd }, ['scripts']);
     selfAssert(result !== null, 'Strict mode: apply_patch path traversal is denied');
+  }
+
+  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE workspace ===\n');
+
+  // workspace mode: normal path is allowed (no CODEX_ALLOWED_PATHS)
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    delete process.env.CODEX_ALLOWED_PATHS_MODE;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'workspace');
+    selfAssert(result === null, 'Workspace mode: src/main.ts edit is allowed (normal workspace path)');
+  }
+
+  // workspace mode: assets/ is denied
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null, 'workspace');
+    selfAssert(result !== null, 'Workspace mode: assets/ edit is denied (protected path)');
+  }
+
+  // workspace mode: .env is denied
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Write', { file_path: '.env' }, null, 'workspace');
+    selfAssert(result !== null, 'Workspace mode: .env write is denied (protected path)');
+  }
+
+  // workspace mode: .env.local is denied
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Write', { file_path: '.env.local' }, null, 'workspace');
+    selfAssert(result !== null, 'Workspace mode: .env.local write is denied (protected path)');
+  }
+
+  // workspace mode: secrets/ is denied
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Write', { file_path: 'secrets/api-key.txt' }, null, 'workspace');
+    selfAssert(result !== null, 'Workspace mode: secrets/ write is denied (protected path)');
+  }
+
+  // workspace mode + CODEX_ALLOWED_PATHS set: intersection — narrowing applies
+  {
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, ['scripts'], 'workspace');
+    selfAssert(result !== null, 'Workspace mode + CODEX_ALLOWED_PATHS set: src/main.ts denied (not in allowed set)');
+  }
+
+  // workspace mode + CODEX_ALLOWED_PATHS set: path in set is allowed
+  {
+    const result = denyForWriteTool('Edit', { file_path: 'scripts/check-codex-agents.mjs' }, ['scripts'], 'workspace');
+    selfAssert(result === null, 'Workspace mode + CODEX_ALLOWED_PATHS set: scripts/ is allowed');
+  }
+
+  // CODEX_LEGACY_ALLOW_WRITES=1 maps to workspace mode
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    process.env.CODEX_LEGACY_ALLOW_WRITES = '1';
+    delete process.env.CODEX_ALLOWED_PATHS_MODE;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null);
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    selfAssert(result === null, 'Legacy mode (CODEX_LEGACY_ALLOW_WRITES=1): maps to workspace — src/main.ts is allowed');
+  }
+
+  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE shadow ===\n');
+
+  // shadow mode: normal path is allowed (no CODEX_ALLOWED_PATHS)
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'shadow');
+    selfAssert(result === null, 'Shadow mode: src/main.ts edit is allowed (normal workspace path)');
+  }
+
+  // shadow mode: assets/ is denied
+  {
+    const result = denyForWriteTool('Edit', { file_path: 'assets/sprite.png' }, null, 'shadow');
+    selfAssert(result !== null, 'Shadow mode: assets/ edit is denied (protected path)');
+  }
+
+  // shadow mode: .env is denied
+  {
+    const result = denyForWriteTool('Write', { file_path: '.env' }, null, 'shadow');
+    selfAssert(result !== null, 'Shadow mode: .env write is denied (protected path)');
+  }
+
+  // shadow mode: secrets/ is denied
+  {
+    const result = denyForWriteTool('Write', { file_path: 'secrets/api-key.txt' }, null, 'shadow');
+    selfAssert(result !== null, 'Shadow mode: secrets/ write is denied (protected path)');
+  }
+
+  process.stdout.write('\n=== self-test: CODEX_ALLOWED_PATHS_MODE strict ===\n');
+
+  // strict mode + no CODEX_ALLOWED_PATHS: deny all writes
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    delete process.env.CODEX_LEGACY_ALLOW_WRITES;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'strict');
+    selfAssert(result !== null && result.includes('allowed_paths_missing'), 'Strict mode: src/main.ts denied with allowed_paths_missing when no CODEX_ALLOWED_PATHS');
+  }
+
+  // strict mode + CODEX_ALLOWED_PATHS set: path in set is allowed
+  {
+    const result = denyForWriteTool('Edit', { file_path: 'scripts/check-codex-agents.mjs' }, ['scripts'], 'strict');
+    selfAssert(result === null, 'Strict mode + CODEX_ALLOWED_PATHS: scripts/ is allowed');
+  }
+
+  // strict mode + CODEX_ALLOWED_PATHS set: path outside set is denied
+  {
+    const result = denyForWriteTool('Write', { file_path: 'src/main.ts' }, ['scripts'], 'strict');
+    selfAssert(result !== null && result.includes('allowed_paths_violation'), 'Strict mode + CODEX_ALLOWED_PATHS: src/main.ts denied (outside set)');
+  }
+
+  // unknown mode: fail-closed
+  {
+    delete process.env.CODEX_ALLOWED_PATHS;
+    const result = denyForWriteTool('Edit', { file_path: 'src/main.ts' }, null, 'unknown');
+    selfAssert(result !== null && result.includes('codex_allowed_paths_mode_unknown'), 'Unknown mode: fail-closed with codex_allowed_paths_mode_unknown reason');
   }
 
   process.stdout.write('\n=== self-test: Bash hook ===\n');

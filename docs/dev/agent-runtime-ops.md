@@ -226,6 +226,60 @@ codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh iss
 - `instruction surface` として `AGENTS.md` / `CLAUDE.md` が読み込まれているか
 - `codex status` 上で意図しない `sandbox_mode` や CLI override が残っていないか
 
+## CODEX_ALLOWED_PATHS_MODE
+
+`scripts/check-codex-agents.mjs` の write guard は `CODEX_ALLOWED_PATHS_MODE` 環境変数でモードを制御する。
+
+### モード一覧
+
+| モード | 説明 | 既定 |
+|---|---|---|
+| `strict` | `CODEX_ALLOWED_PATHS` の明示宣言が必須。未宣言時は全書き込みを deny（fail-closed）。 | 既定（未設定時） |
+| `workspace` | repo workspace 内の通常編集を allow。保護 path は常に deny。`CODEX_ALLOWED_PATHS` が設定されている場合は intersect（narrowing）で絞り込む。 | `CODEX_LEGACY_ALLOW_WRITES=1` と同等 |
+| `shadow` | workspace と同じ allow ロジック + would-block イベントを `.guard_shadow_log.jsonl`（repo root, git 管理外）に記録。 | — |
+| `unknown`（上記以外） | fail-closed（全書き込みを deny）。 | — |
+
+### 保護 path（全モード共通・常に deny）
+
+- `assets/`
+- `LICENSES/`
+- `.env` および `.env.*`（リポジトリ内の任意の場所）
+- `secrets/**`
+
+### 設定方法
+
+```bash
+# workspace モードを既定にする（Codex セッション起動時に設定）
+export CODEX_ALLOWED_PATHS_MODE=workspace
+
+# shadow モード（観測用）
+export CODEX_ALLOWED_PATHS_MODE=shadow
+
+# strict モード（明示 path のみ allow）
+export CODEX_ALLOWED_PATHS_MODE=strict
+export CODEX_ALLOWED_PATHS="scripts
+docs/dev"
+```
+
+### 推奨構成
+
+- **CI / 自動化**: `strict` モード（`CODEX_ALLOWED_PATHS` を Issue contract から設定する）
+- **インタラクティブ開発**: `workspace` モード
+- **新規 guard ルール検証**: `shadow` モード（`.guard_shadow_log.jsonl` を確認）
+
+### CODEX_LEGACY_ALLOW_WRITES との関係
+
+`CODEX_LEGACY_ALLOW_WRITES=1` は後方互換のために残すが、内部的に `workspace` モードと同等に統合される。
+新規設定では `CODEX_ALLOWED_PATHS_MODE=workspace` を明示的に使うことを推奨する。
+
+### PermissionRequest の remote_write 緩和
+
+`codex-hook-adapter.mjs` は `PermissionRequest` イベントで `remote_write_requires_approval`（git push 系）を
+`behavior: deny` ではなく no_decision（stdout なし・exit 0）として扱う。
+`PreToolUse` 側は引き続き `behavior: deny` を返す（方針 B）。
+`secret_boundary_violation`・`forbidden_path`・`public_checkpoint`・`secrets_mode` は
+`PermissionRequest` でも `deny` を維持する。
+
 ## Cross References
 
 - GitHub 操作の共通規約: [github-ops.md](github-ops.md)
