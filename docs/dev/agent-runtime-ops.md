@@ -195,6 +195,9 @@ GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/
 - `AGENTS.md` が Codex 向けの project-local instruction surface になる
 - `.agents/skills/` が Codex custom agent の repo-local discovery surface になる
 - `.claude/skills/` は Claude 側 prompt / skill surface であり、現時点では thin bridge が読む canonical body の保管場所でもある
+- repo-local authoring/discovery surface は `.agents/skills/` を discovery、`.claude/skills/` を canonical body として分ける
+- Codex 公式の `symlinked skill folders` support は確認済みだが、この repo では symlink portability is unproven; thin bridge is the default
+- installable artifact として配布したい場合は direct repo surface を増やさず plugin packaging を別 concern として扱う
 - したがってこの PR 系列で揃えるのは「discovery surface の整合」であり、`.claude/skills/` 実体の全面移設までは主張しない
 
 ### 旧 sandbox 設定との競合
