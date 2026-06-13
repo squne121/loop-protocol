@@ -24,7 +24,7 @@ acceptance:
   - AC7: UI 自己説明・保存の意味方針が明記されている
   - AC8: 将来参照が少なくとも 3 件記載されている
 non-goals:
-  - Quick Save/Quick Load の UI 実装（#619 でポリシーを確定; UI は別 Issue）
+  - Save UI 実装（#619 でポリシーを確定; UI は別 Issue）
   - 準備フェーズの状態遷移実装（#619 で実装済み）
   - ボタン UI 名の変更判定（Quick Save → Save に変更済み; #619）
 related_tests:
@@ -36,7 +36,7 @@ related_tests:
 
 ## Intent
 
-本文書は Quick Save の現行実装スコープ・ゲームデザイン上の役割・ストレージ仕様・将来方針の SSOT である。Quick Save/Quick Load の UI 実装・コード変更・準備フェーズ状態遷移の具体的定義は別 Issue で扱う。
+本文書は Quick Save の現行実装スコープ・ゲームデザイン上の役割・ストレージ仕様・将来方針の SSOT である。Save / Load Game の UI 実装・コード変更・準備フェーズ状態遷移の具体的定義は別 Issue で扱う。
 
 ## 現行実装の実態
 
@@ -70,7 +70,7 @@ UI ラベルとして "Quick Save" を使用しているが、実装上は `Loca
 ## 現行 Load 動作
 
 - 起動時のみ `storage.load()` を呼び、`createInitialGameState(snapshot)` に渡す
-- 手動 Quick Load UI/action は現行実装に存在しない
+- 手動ロード UI/action は現行実装に存在しない
 - 復元対象: `resources`, `weaponPower`, `playerMaxHp` のみ
 - `player.hp` は保存時 HP ではなく `playerMaxHp` で初期化される
 - sortie / enemies / projectiles / cooldown / result / runtime は復元されない
@@ -109,9 +109,9 @@ Save 操作（`LocalGameStorage.save()` の実際の呼び出し）は `preparat
 
 `running` / `result` / `title_menu` / `load_menu` フェーズでは Save を実行しない。これによりゲームバランスへの悪影響（戦闘中の save-scum 等）を防ぐ。
 
-### Load Game ポリシー（Quick Load 廃止）
+### Load Game ポリシー
 
-**Quick Load** という名称は廃止する。ロード操作は **Load Game** として、ゲーム開始前メニュー（`title_menu` / `load_menu` フェーズ）からのみ実行可能とする。
+ロード操作は **Load Game** として、ゲーム開始前メニュー（`title_menu` / `load_menu` フェーズ）からのみ実行可能とする（旧ロード名称は廃止）。
 
 Load Game を実行すると、スナップショットを復元して `preparation` フェーズに入る。`running` / `result` フェーズ中は Load Game を実行しない（ゲームバランス保護）。
 
