@@ -1,0 +1,8 @@
+{
+  "_comment": "FAKE settings.json for negative test — not a real Claude config",
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "fake_api_key": "FAKE_CLAUDE_SETTINGS_TOKEN_FOR_TESTING_ONLY"
+}
