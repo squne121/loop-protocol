@@ -158,5 +158,5 @@ Quick Save の役割や保存の意味を説明するコピー（テキスト）
 1. **準備フェーズ制限の実装** (#619, 実装済み): Save / Load Game をフェーズ状態機械から導出し、`preparation` / `title_menu` / `load_menu` 制限を実装した。
 2. **UI フィードバック** (#620): Save ボタンの有効/無効表示（準備フェーズ外では無効化）および最小限の成功/失敗フィードバック
 3. **壊れたセーブデータの処理** (#621): 欠損・破損・ブロック・容量超過時のエラーハンドリングとフォールバック
-4. **アクセシビリティ互換の保存代替案** (#622): 中断セーブ・チェックポイント等、ブラウザ localStorage に依存しない保存方式の検討
+4. **アクセシビリティ互換の保存代替案** (#622): 採否判断と設計方針を `docs/product/features/accessibility-save-policy.md` に記録済み。product Pause・フェーズ境界 Checkpoint を M3 採用、Assist Suspend を M4 以降研究候補とした。
 5. **HTTP origin 上の runtime verification** (#740, deferred): M3 playtest（全フェーズ遷移統合後）に実施予定。
