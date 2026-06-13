@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { resolveProgressionSaveFailureFeedback, runProgressionSave } from '../src/main'
+// Note: ProgressionSaveReason is now 'reward-claim' | 'save' (Quick Save renamed to Save — #619)
 import {
   createLocalGameStorage,
   parseSnapshot,
@@ -412,7 +413,7 @@ describe('LocalGameStorage', () => {
 })
 
 describe('progression save failure feedback', () => {
-  function runFailurePath(reason: 'reward-claim' | 'quick-save', hadLoadableSnapshot: boolean) {
+  function runFailurePath(reason: 'reward-claim' | 'save', hadLoadableSnapshot: boolean) {
     const createSnapshot = vi.fn(() => ({
       schemaVersion: 1 as const,
       resources: 11,
@@ -480,29 +481,29 @@ describe('progression save failure feedback', () => {
     expect(result.setHudFeedback).not.toHaveBeenCalledWith('Result confirmed.', 'Progress saved locally.')
   })
 
-  it('GIVEN quick-save save failure WHEN the production seam runs THEN it keeps the previous snapshot state and does not report save success', () => {
-    const withoutSnapshot = runFailurePath('quick-save', false)
-    const withSnapshot = runFailurePath('quick-save', true)
+  it('GIVEN save failure WHEN the production seam runs THEN it keeps the previous snapshot state and does not report save success', () => {
+    const withoutSnapshot = runFailurePath('save', false)
+    const withSnapshot = runFailurePath('save', true)
 
     expect(withoutSnapshot.nextHasLoadableSnapshot).toBe(false)
     expect(withSnapshot.nextHasLoadableSnapshot).toBe(true)
     expect(withoutSnapshot.load).not.toHaveBeenCalled()
     expect(withSnapshot.load).not.toHaveBeenCalled()
     expect(withoutSnapshot.setHudFeedback).toHaveBeenCalledWith(
-      'Quick Save failed.',
+      'Save failed.',
       'No local save is available; this result may be lost after reload.',
     )
     expect(withSnapshot.setHudFeedback).toHaveBeenCalledWith(
-      'Quick Save failed.',
+      'Save failed.',
       'Previous local save is still available; this result may be lost after reload.',
     )
     expect(withoutSnapshot.setHudFeedback).not.toHaveBeenCalledWith(
-      'Quick Save complete.',
-      'Progression snapshot is ready for Quick Load.',
+      'Save complete.',
+      'Progression snapshot saved locally.',
     )
     expect(withSnapshot.setHudFeedback).not.toHaveBeenCalledWith(
-      'Quick Save complete.',
-      'Progression snapshot is ready for Quick Load.',
+      'Save complete.',
+      'Progression snapshot saved locally.',
     )
   })
 
@@ -512,10 +513,46 @@ describe('progression save failure feedback', () => {
       status: 'Result confirmed; progress not saved.',
       summary: 'Previous local save is still available; this result may be lost after reload.',
     })
-    expect(resolveProgressionSaveFailureFeedback('quick-save', false)).toEqual({
+    expect(resolveProgressionSaveFailureFeedback('save', false)).toEqual({
       hasLoadableSnapshot: false,
-      status: 'Quick Save failed.',
+      status: 'Save failed.',
       summary: 'No local save is available; this result may be lost after reload.',
     })
+  })
+})
+
+describe('phase guard: storage.save() only in preparation (AC2, AC8)', () => {
+  function makeSaveSpySeam(mockSaveResult: SaveResult = { ok: true, reason: 'saved' }) {
+    const save = vi.fn<() => SaveResult>(() => mockSaveResult)
+    const load = vi.fn(() => ({ ok: true as const, snapshot: null, reason: 'empty' as const }))
+    const createSnapshot = vi.fn(() => ({
+      schemaVersion: 1 as const,
+      resources: 0,
+      weaponPower: 1,
+      playerMaxHp: 8,
+    }))
+    const reportSaveFailure = vi.fn()
+    const setHudFeedback = vi.fn()
+    return {
+      storage: { save, load },
+      createSnapshot,
+      reportSaveFailure,
+      setHudFeedback,
+      // direct references for assertion convenience
+      save,
+      load,
+    }
+  }
+
+  it('GIVEN preparation WHEN runProgressionSave called THEN storage.save() is invoked exactly once (AC8)', () => {
+    const seam = makeSaveSpySeam()
+    runProgressionSave('save', false, seam)
+    expect(seam.save).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN save success WHEN runProgressionSave called THEN setHudFeedback shows save complete (AC2)', () => {
+    const seam = makeSaveSpySeam()
+    runProgressionSave('save', false, seam)
+    expect(seam.setHudFeedback).toHaveBeenCalledWith('Save complete.', 'Progression snapshot saved locally.')
   })
 })

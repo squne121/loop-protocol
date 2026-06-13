@@ -50,12 +50,32 @@ export function claimPendingReward(
     return { ok: false, reason: 'no-pending-reward' }
   }
 
+  // Legacy debrief phases: support existing claimed state
   if (state.loopPhase === 'debrief_reward_claimed') {
     if (Object.prototype.hasOwnProperty.call(state.rewardClaims.claimedApplicationIds, applicationId)) {
       return { ok: false, reason: 'already-claimed' }
     }
 
     return { ok: false, reason: 'claimed-phase-ledger-miss' }
+  }
+
+  // New result phase: reward is pending or already claimed
+  if (state.loopPhase === 'result') {
+    if (state.resultRewardStatus === 'claimed') {
+      if (Object.prototype.hasOwnProperty.call(state.rewardClaims.claimedApplicationIds, applicationId)) {
+        return { ok: false, reason: 'already-claimed' }
+      }
+      return { ok: false, reason: 'claimed-phase-ledger-miss' }
+    }
+
+    const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
+    if (!claimResult.ok && claimResult.reason !== 'already-claimed') {
+      return claimResult
+    }
+
+    state.resultRewardStatus = 'claimed'
+    // Stay in result phase — transition to preparation happens via confirmResult()
+    return claimResult
   }
 
   if (state.loopPhase !== 'debrief_pending_reward') {
@@ -71,16 +91,43 @@ export function claimPendingReward(
   return claimResult
 }
 
+/**
+ * Confirms the result screen. If reward is still pending, auto-claims it first (B3).
+ * Then transitions from 'result' to 'preparation' (AC5).
+ * No-op if called from any other phase.
+ *
+ * Caller is responsible for calling storage.save() after this returns,
+ * since save must occur in preparation phase (AC2, AC8).
+ */
+export function confirmResult(state: GameState): void {
+  if (state.loopPhase !== 'result') {
+    return
+  }
+
+  // B3: auto-claim pending reward before transitioning to preparation
+  if (state.resultRewardStatus === 'pending') {
+    const applicationId = state.pendingRewardApplicationId
+    if (applicationId !== null && state.sortie.result !== null) {
+      const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
+      if (claimResult.ok || claimResult.reason === 'already-claimed') {
+        state.resultRewardStatus = 'claimed'
+      }
+    }
+  }
+
+  state.loopPhase = 'preparation'
+}
+
 
 /**
- * Initialises the sortie state machine from `preparation` or claimed debrief to `running`.
+ * Initialises the sortie state machine from `preparation` to `running` (AC7).
+ * No-op and state-mutation-free if called from any other phase.
  *
  * @param state        Mutable game state
  * @param fixedDeltaMs Fixed timestep in milliseconds (used to compute targetTicks)
  */
 export function startSortie(state: GameState, fixedDeltaMs: number): void {
-  const canStart =
-    state.loopPhase === 'preparation' || state.loopPhase === 'debrief_reward_claimed'
+  const canStart = state.loopPhase === 'preparation'
   if (!canStart) {
     return
   }
@@ -195,7 +242,9 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   }
 
   state.sortie = terminalState
-  state.loopPhase = 'debrief_pending_reward'
+  // AC4: transition to result phase, not directly to next sortie
+  state.loopPhase = 'result'
+  state.resultRewardStatus = 'pending'
   if (state.pendingRewardApplicationId === null) {
     state.pendingRewardApplicationId = buildRewardApplicationId(state)
   }
