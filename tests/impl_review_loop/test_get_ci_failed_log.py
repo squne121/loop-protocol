@@ -2,8 +2,8 @@
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -47,45 +47,76 @@ def make_run(
     }
 
 
-def parse_args_for(head_sha=HEAD_SHA, workflow=None, max_bytes=60000):
+def make_args(head_sha=HEAD_SHA, workflow=None, max_bytes=60000, run_id=None):
     import argparse
-
-    ns = argparse.Namespace(
-        repo="owner/repo",
-        pr=1,
-        head_sha=head_sha,
-        workflow=workflow,
-        job=None,
-        max_bytes=max_bytes,
+    return argparse.Namespace(
+        repo="owner/repo", pr=1, head_sha=head_sha,
+        workflow=workflow, max_bytes=max_bytes, run_id=run_id,
     )
-    return ns
+
+
+def parse_marker(capsys) -> dict:
+    captured = capsys.readouterr()
+    for line in captured.out.splitlines():
+        if line.startswith("CI_FAILED_LOG_RESULT_V1_JSON:"):
+            return json.loads(line[len("CI_FAILED_LOG_RESULT_V1_JSON:"):].strip())
+    raise AssertionError(f"CI_FAILED_LOG_RESULT_V1_JSON not found in stdout:\n{captured.out}")
 
 
 # ---------------------------------------------------------------------------
 # AC2: no matching run
 # ---------------------------------------------------------------------------
 class TestNoMatchingRun:
-    def test_empty_run_list(self, monkeypatch):
-        monkeypatch.setattr(mod, "run_gh", lambda *a, **k: (0, "[]", ""))
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+    def test_empty_run_list(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, "[]", ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "no_matching_run"
 
-    def test_sha_mismatch(self, monkeypatch):
+    def test_sha_mismatch(self, monkeypatch, capsys):
         runs = [make_run(head_sha="different_sha")]
-        monkeypatch.setattr(mod, "run_gh", lambda *a, **k: (0, json.dumps(runs), ""))
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, json.dumps(runs), ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "no_matching_run"
 
-    def test_gh_run_list_failure(self, monkeypatch):
-        monkeypatch.setattr(mod, "run_gh", lambda *a, **k: (1, "", "auth error"))
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+
+# ---------------------------------------------------------------------------
+# Error classification: auth_error / gh_error / malformed separate from no_matching_run
+# ---------------------------------------------------------------------------
+class TestErrorClassification:
+    def test_auth_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (1, "", "HTTP 401: Requires authentication"))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 2
+        m = parse_marker(capsys)
+        assert m["status"] == "auth_error"
+
+    def test_gh_error_generic(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (1, "", "network error"))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 2
+        m = parse_marker(capsys)
+        assert m["status"] == "gh_error"
+
+    def test_malformed_json(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, "not valid json", ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 2
+        m = parse_marker(capsys)
+        assert m["status"] == "malformed_gh_response"
 
 
 # ---------------------------------------------------------------------------
@@ -93,102 +124,153 @@ class TestNoMatchingRun:
 # ---------------------------------------------------------------------------
 class TestPending:
     @pytest.mark.parametrize("status", ["queued", "in_progress", "waiting"])
-    def test_pending_statuses(self, monkeypatch, status):
+    def test_pending_statuses(self, monkeypatch, capsys, status):
         run = make_run(status=status, conclusion=None)
-        monkeypatch.setattr(mod, "run_gh", lambda *a, **k: (0, json.dumps([run]), ""))
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, json.dumps([run]), ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 0
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_pending"
 
 
 # ---------------------------------------------------------------------------
 # AC4: success
 # ---------------------------------------------------------------------------
 class TestSuccess:
-    def test_ci_passed(self, monkeypatch):
+    def test_ci_passed_marker(self, monkeypatch, capsys):
         run = make_run(status="completed", conclusion="success")
-        monkeypatch.setattr(mod, "run_gh", lambda *a, **k: (0, json.dumps([run]), ""))
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, json.dumps([run]), ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 0
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_passed"
 
 
 # ---------------------------------------------------------------------------
-# AC5: failure primary
+# timed_out / cancelled / action_required are treated as failed
+# ---------------------------------------------------------------------------
+class TestFailedConclusions:
+    @pytest.mark.parametrize("conclusion", ["timed_out", "cancelled", "action_required"])
+    def test_failed_conclusions(self, monkeypatch, capsys, conclusion):
+        run = make_run(status="completed", conclusion=conclusion)
+        list_out = json.dumps([run])
+        jobs_out = json.dumps({"id": 9, "name": "build", "conclusion": conclusion})
+        log_out = "some log"
+
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
+            if "list" in joined:
+                return (0, list_out, "")
+            if "log-failed" in joined:
+                return (0, log_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_out, "")
+            return (1, "", "unexpected")
+
+        monkeypatch.setattr(mod, "run_gh", fake_run_gh)
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_failed"
+
+
+# ---------------------------------------------------------------------------
+# AC5: failure primary — failed_jobs populated in marker
 # ---------------------------------------------------------------------------
 class TestFailurePrimary:
-    def test_primary_log_retrieved(self, monkeypatch):
+    def test_primary_log_and_failed_jobs_in_marker(self, monkeypatch, capsys):
         run = make_run(conclusion="failure")
         list_out = json.dumps([run])
         log_out = "##[error] step failed\nsome log line"
+        jobs_json = json.dumps({"id": 9, "name": "build", "conclusion": "failure"})
 
-        def fake_run_gh(*args, **kwargs):
-            joined = " ".join(str(a) for a in args)
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
             if "list" in joined:
                 return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_json, "")
             if "log-failed" in joined:
                 return (0, log_out, "")
             return (1, "", "unexpected")
 
         monkeypatch.setattr(mod, "run_gh", fake_run_gh)
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_failed"
+        assert m["retrieval_method"] == "gh_log_failed"
+        assert len(m["failed_jobs"]) > 0
+        assert m["failed_jobs"][0]["name"] == "build"
 
 
 # ---------------------------------------------------------------------------
 # AC6: fallback
 # ---------------------------------------------------------------------------
 class TestFallback:
-    def test_fallback_success(self, monkeypatch):
+    def test_fallback_success_with_failed_jobs(self, monkeypatch, capsys):
         run = make_run(conclusion="failure")
         list_out = json.dumps([run])
-        jobs_out = json.dumps([{"id": 9, "name": "build", "conclusion": "failure"}])
+        jobs_out = json.dumps({"id": 9, "name": "build", "conclusion": "failure"})
         job_log = "Error in build step\nFailed"
 
-        def fake_run_gh(*args, **kwargs):
-            joined = " ".join(str(a) for a in args)
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
             if "list" in joined:
                 return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_out, "")
             if "log-failed" in joined:
                 return (0, "", "")
-            if "attempts" in joined and "jobs" in joined:
-                return (0, jobs_out, "")
-            if "jobs" in joined and "logs" in joined:
+            if "jobs/" in joined and "logs" in joined:
                 return (0, job_log, "")
             return (1, "", "unexpected")
 
         monkeypatch.setattr(mod, "run_gh", fake_run_gh)
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_failed"
+        assert m["retrieval_method"] == "rest_job_logs"
+        assert len(m["failed_jobs"]) > 0
 
-    def test_fallback_failure(self, monkeypatch):
+    def test_fallback_failure_returns_log_unavailable(self, monkeypatch, capsys):
         run = make_run(conclusion="failure")
         list_out = json.dumps([run])
+        jobs_out = json.dumps({"id": 9, "name": "build", "conclusion": "failure"})
 
-        def fake_run_gh(*args, **kwargs):
-            joined = " ".join(str(a) for a in args)
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
             if "list" in joined:
                 return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_out, "")
             return (1, "", "error")
 
         monkeypatch.setattr(mod, "run_gh", fake_run_gh)
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "log_unavailable"
 
 
 # ---------------------------------------------------------------------------
-# AC5/AC6: multiple attempts — latest attempt is selected
+# Multiple attempts — latest selected
 # ---------------------------------------------------------------------------
 class TestMultipleAttempts:
-    def test_latest_attempt_selected(self, monkeypatch):
+    def test_latest_attempt_selected(self, monkeypatch, capsys):
         runs = [
             make_run(conclusion="failure", attempt=1, run_id=1001),
             make_run(conclusion="failure", attempt=2, run_id=1001),
@@ -197,10 +279,12 @@ class TestMultipleAttempts:
         log_out = "latest attempt log"
         calls = []
 
-        def fake_run_gh(*args, **kwargs):
-            joined = " ".join(str(a) for a in args)
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
             if "list" in joined:
                 return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, "", "")
             if "log-failed" in joined:
                 calls.append(joined)
                 if "--attempt=2" in joined:
@@ -209,11 +293,58 @@ class TestMultipleAttempts:
             return (1, "", "unexpected")
 
         monkeypatch.setattr(mod, "run_gh", fake_run_gh)
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
         with pytest.raises(SystemExit) as exc:
             mod.main()
         assert exc.value.code == 1
-        assert any("--attempt=2" in c for c in calls), "latest attempt (2) must be used"
+        m = parse_marker(capsys)
+        assert m["attempt"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous run (multiple workflows, no filter)
+# ---------------------------------------------------------------------------
+class TestAmbiguousRun:
+    def test_ambiguous_returns_ambiguous_run(self, monkeypatch, capsys):
+        runs = [
+            make_run(conclusion="failure", workflow="CI"),
+            make_run(conclusion="failure", workflow="Deploy"),
+        ]
+        monkeypatch.setattr(mod, "run_gh", lambda *a: (0, json.dumps(runs), ""))
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "ambiguous_run"
+
+    def test_workflow_exact_match_resolves_ambiguity(self, monkeypatch, capsys):
+        runs = [
+            make_run(conclusion="failure", workflow="CI"),
+            make_run(conclusion="failure", workflow="Deploy"),
+        ]
+        list_out = json.dumps(runs)
+        jobs_out = json.dumps({"id": 9, "name": "typecheck", "conclusion": "failure"})
+
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
+            if "list" in joined:
+                return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_out, "")
+            if "log-failed" in joined:
+                return (0, "some log", "")
+            return (1, "", "unexpected")
+
+        monkeypatch.setattr(mod, "run_gh", fake_run_gh)
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args",
+                            lambda *a, **k: make_args(workflow="CI"))
+        with pytest.raises(SystemExit) as exc:
+            mod.main()
+        assert exc.value.code == 1
+        m = parse_marker(capsys)
+        assert m["status"] == "ci_failed"
+        assert m["workflow_name"] == "CI"
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +357,13 @@ class TestRedaction:
         assert "[REDACTED]" in redacted
         assert applied is True
 
+    def test_sha_not_redacted(self):
+        sha = "abc123def456abc123def456abc123def456abc1"
+        text = f"head sha: {sha}"
+        redacted, applied = mod.redact_tokens(text)
+        assert sha in redacted
+        assert applied is False
+
     def test_truncation(self):
         text = "x" * 200
         result, truncated = mod.truncate(text, 100)
@@ -236,16 +374,64 @@ class TestRedaction:
         text = "\x1b[31mred\x1b[0m"
         assert mod.strip_ansi(text) == "red"
 
+    def test_redact_tokens_return_type(self):
+        result = mod.redact_tokens("clean text")
+        assert isinstance(result, tuple) and len(result) == 2
+        text, flag = result
+        assert isinstance(text, str)
+        assert isinstance(flag, bool)
+
 
 # ---------------------------------------------------------------------------
-# Auth failure
+# marker JSON validity
 # ---------------------------------------------------------------------------
-class TestAuthFailure:
-    def test_auth_failure_returns_no_run(self, monkeypatch):
-        monkeypatch.setattr(
-            mod, "run_gh", lambda *a, **k: (1, "", "HTTP 401: Requires authentication")
-        )
-        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: parse_args_for())
-        with pytest.raises(SystemExit) as exc:
+class TestMarkerValidity:
+    def test_marker_has_required_fields(self, monkeypatch, capsys):
+        run = make_run(conclusion="failure", workflow="CI: build & test")
+        list_out = json.dumps([run])
+        jobs_out = json.dumps({"id": 9, "name": "build", "conclusion": "failure"})
+
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
+            if "list" in joined:
+                return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, jobs_out, "")
+            if "log-failed" in joined:
+                return (0, "log text", "")
+            return (1, "", "unexpected")
+
+        monkeypatch.setattr(mod, "run_gh", fake_run_gh)
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit):
             mod.main()
-        assert exc.value.code == 2
+        m = parse_marker(capsys)
+        required_fields = {
+            "schema", "status", "run_id", "attempt", "head_sha",
+            "workflow_name", "failed_jobs", "retrieval_method",
+            "redaction_applied", "truncated",
+        }
+        assert required_fields.issubset(m.keys())
+        assert m["schema"] == "CI_FAILED_LOG_RESULT_V1"
+
+    def test_workflow_name_with_special_chars_is_valid_json(self, monkeypatch, capsys):
+        run = make_run(conclusion="failure", workflow='CI: build "test" & deploy')
+        list_out = json.dumps([run])
+
+        def fake_run_gh(*a):
+            joined = " ".join(str(x) for x in a)
+            if "list" in joined:
+                return (0, list_out, "")
+            if "--paginate" in joined:
+                return (0, "", "")
+            if "log-failed" in joined:
+                return (0, "log", "")
+            return (1, "", "unexpected")
+
+        monkeypatch.setattr(mod, "run_gh", fake_run_gh)
+        monkeypatch.setattr("argparse.ArgumentParser.parse_args", lambda *a, **k: make_args())
+        with pytest.raises(SystemExit):
+            mod.main()
+        # parse_marker asserts JSON is valid; special chars must not break it
+        m = parse_marker(capsys)
+        assert 'CI: build "test"' in m["workflow_name"]
