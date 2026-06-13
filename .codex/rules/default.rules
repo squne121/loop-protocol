@@ -169,8 +169,11 @@ prefix_rule(
 )
 
 # --- DIRECT_ALLOW: specific pnpm / git / gh operations (Issue #874) ---
-# These more-specific prefix rules precede the blanket-forbidden rules below,
-# so they take priority via prefix-specificity.
+# DIRECT_ALLOW が成立するのは、競合する broad forbidden を mutation-only に狭めているため。
+# Codex rules は prefix-specificity 優先ではなく、複数 match 時は most restrictive decision が勝つ。
+# これらのルールは blanket-forbidden rule と競合しているが、allow 側に fallback できるのは
+# forbidden 対象が mutation コマンド (e.g. pnpm add/install) に限定されているからである。
+# 最終 decision は codex execpolicy check で検証すること。
 
 # DIRECT_ALLOW_PNPM: validation commands allowed directly (no rtk wrapper needed in hook context)
 prefix_rule(

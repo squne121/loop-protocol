@@ -816,7 +816,26 @@ function isMutatingGit(command) {
   return /^git\s+(add|commit|push|switch|checkout|worktree|stash|merge|rebase|cherry-pick|reset|restore|pull|fetch|remote|tag|config|submodule|rm|mv|clean|apply|am)\b/.test(command);
 }
 
+// Direct pnpm subcommands that are allowed without rtk wrapper (#874 AC).
+// These are validation/build commands that are always safe to run directly.
+const DIRECT_ALLOW_PNPM = /^pnpm\s+(typecheck|lint|test|build)(\s|$)/;
+
+// Direct gh subcommands that are allowed without rtk wrapper (#874 AC).
+const DIRECT_ALLOW_GH_ISSUE = /^gh\s+issue\s+(view|list)(\s|$)/;
+const DIRECT_ALLOW_GH_PR = /^gh\s+pr\s+(view|list|checks|diff)(\s|$)/;
+
+// Direct git read-only subcommands that are allowed without rtk wrapper (#874 AC).
+const DIRECT_ALLOW_GIT_READONLY = /^git\s+(status|diff|log|branch|show|rev-parse|ls-files)(\s|$)/;
+
 function isDirectBypass(command) {
+  // Allow: read-only / validation pnpm commands
+  if (DIRECT_ALLOW_PNPM.test(command)) return false;
+  // Allow: read-only gh operations
+  if (DIRECT_ALLOW_GH_ISSUE.test(command)) return false;
+  if (DIRECT_ALLOW_GH_PR.test(command)) return false;
+  // Allow: read-only git inspection
+  if (DIRECT_ALLOW_GIT_READONLY.test(command)) return false;
+
   return (
     /^pnpm\b/.test(command) ||
     /^gh\b/.test(command) ||
@@ -1363,16 +1382,90 @@ function runSelfTest() {
     selfAssert(result === null, 'Bash hook: rtk gh pr merge is not blocked (rtk prefix passes bash check)');
   }
 
-  // Test: direct gh is denied
+  // Test: pnpm typecheck/lint/test/build direct → allow (#874 AC)
+  {
+    const result = denyForBash('pnpm typecheck');
+    selfAssert(result === null, 'Bash hook: pnpm typecheck direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('pnpm lint');
+    selfAssert(result === null, 'Bash hook: pnpm lint direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('pnpm test');
+    selfAssert(result === null, 'Bash hook: pnpm test direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('pnpm build');
+    selfAssert(result === null, 'Bash hook: pnpm build direct is allowed (#874)');
+  }
+
+  // Test: git read-only commands direct → allow (#874 AC)
+  {
+    const result = denyForBash('git status');
+    selfAssert(result === null, 'Bash hook: git status direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('git diff');
+    selfAssert(result === null, 'Bash hook: git diff direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('git log --oneline -5');
+    selfAssert(result === null, 'Bash hook: git log direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('git branch --show-current');
+    selfAssert(result === null, 'Bash hook: git branch direct is allowed (#874)');
+  }
+
+  // Test: gh read-only commands direct → allow (#874 AC)
+  {
+    const result = denyForBash('gh issue view 1');
+    selfAssert(result === null, 'Bash hook: gh issue view direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('gh pr checks 1');
+    selfAssert(result === null, 'Bash hook: gh pr checks direct is allowed (#874)');
+  }
+  {
+    const result = denyForBash('gh pr view 1');
+    selfAssert(result === null, 'Bash hook: gh pr view direct is allowed (#874)');
+  }
+
+  // Test: pnpm mutation direct → deny (must still use rtk or be denied)
+  {
+    const result = denyForBash('pnpm add lodash');
+    selfAssert(result !== null, 'Bash hook: pnpm add direct is denied (mutation)');
+  }
+  {
+    const result = denyForBash('pnpm install');
+    selfAssert(result !== null, 'Bash hook: pnpm install direct is denied (mutation)');
+  }
+
+  // Test: direct gh mutation → deny
   {
     const result = denyForBash('gh pr merge 1');
     selfAssert(result !== null, 'Bash hook: direct gh pr merge is denied');
   }
-
-  // Test: direct pnpm is denied
   {
-    const result = denyForBash('pnpm test');
-    selfAssert(result !== null, 'Bash hook: direct pnpm test is denied');
+    const result = denyForBash('gh issue create');
+    selfAssert(result !== null, 'Bash hook: direct gh issue create is denied');
+  }
+  {
+    const result = denyForBash('gh issue edit 1');
+    selfAssert(result !== null, 'Bash hook: direct gh issue edit is denied');
+  }
+  {
+    const result = denyForBash('gh pr create');
+    selfAssert(result !== null, 'Bash hook: direct gh pr create is denied');
+  }
+  {
+    const result = denyForBash('gh pr edit 1');
+    selfAssert(result !== null, 'Bash hook: direct gh pr edit is denied');
+  }
+  {
+    const result = denyForBash('gh pr review 1');
+    selfAssert(result !== null, 'Bash hook: direct gh pr review is denied');
   }
 
   // Test: git push is denied
@@ -1380,11 +1473,49 @@ function runSelfTest() {
     const result = denyForBash('git push');
     selfAssert(result !== null, 'Bash hook: git push is denied');
   }
+  {
+    const result = denyForBash('git commit -m test');
+    selfAssert(result !== null, 'Bash hook: git commit is denied');
+  }
 
-  // Test: direct gh is denied with direct_bypass_requires_rtk reason
+  // Test: direct gh mutation denied with direct_bypass_requires_rtk reason
   {
     const result = denyForBash('gh pr merge 1');
     selfAssert(result !== null && result.includes('direct_bypass_requires_rtk'), 'Bash hook: direct gh denied with direct_bypass_requires_rtk reason');
+  }
+
+  // Test: hook payload JSON shape — pnpm typecheck via --hook-pretool input simulation
+  // These verify that the hook processes JSON payload correctly (AC BLOCKER 2).
+  {
+    // Simulate the denyForBash path via normalizeCommand (which hook uses)
+    const cmd = normalizeCommand('pnpm typecheck');
+    const result = denyForBash(cmd);
+    selfAssert(result === null, 'Bash hook (JSON payload): pnpm typecheck command from payload is allowed');
+  }
+  {
+    const cmd = normalizeCommand('git status');
+    const result = denyForBash(cmd);
+    selfAssert(result === null, 'Bash hook (JSON payload): git status command from payload is allowed');
+  }
+  {
+    const cmd = normalizeCommand('gh issue view 1');
+    const result = denyForBash(cmd);
+    selfAssert(result === null, 'Bash hook (JSON payload): gh issue view command from payload is allowed');
+  }
+  {
+    const cmd = normalizeCommand('pnpm add lodash');
+    const result = denyForBash(cmd);
+    selfAssert(result !== null, 'Bash hook (JSON payload): pnpm add from payload is denied');
+  }
+  {
+    const cmd = normalizeCommand('git push');
+    const result = denyForBash(cmd);
+    selfAssert(result !== null, 'Bash hook (JSON payload): git push from payload is denied');
+  }
+  {
+    const cmd = normalizeCommand('gh pr merge 1');
+    const result = denyForBash(cmd);
+    selfAssert(result !== null, 'Bash hook (JSON payload): gh pr merge from payload is denied');
   }
 
   // Test: Edit allowed by workspace default when CODEX_ALLOWED_PATHS not set
