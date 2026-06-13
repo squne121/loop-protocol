@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController } from '../src/ui/HudController'
-import type { GameState, LoopPhase, SortieResult } from '../src/state'
+import type { GameState, LoopPhase, ResultRewardStatus, SortieResult } from '../src/state'
 
 const TERMINAL_SORTIE_RESULT = {
   outcome: 'victory',
@@ -16,14 +16,16 @@ const TERMINAL_SORTIE_RESULT = {
   playerHpRemaining: 6,
 } satisfies SortieResult
 
-function createState(loopPhase: LoopPhase = 'preparation'): GameState {
+function createState(loopPhase: LoopPhase = 'preparation', resultRewardStatus: ResultRewardStatus = 'pending'): GameState {
   const isDebrief = loopPhase === 'debrief_pending_reward' || loopPhase === 'debrief_reward_claimed'
+  const isResult = loopPhase === 'result'
 
   return {
     tick: 0,
     elapsedMs: 0,
     loopPhase,
-    pendingRewardApplicationId: isDebrief ? 'sortie-reward-1' : null,
+    resultRewardStatus,
+    pendingRewardApplicationId: (isDebrief || isResult) ? 'sortie-reward-1' : null,
     nextRewardApplicationSequence: 2,
     arena: { width: 960, height: 540 },
     player: {
@@ -69,7 +71,7 @@ function createState(loopPhase: LoopPhase = 'preparation'): GameState {
             targetTicks: 1800,
             result: null,
           }
-        : isDebrief
+        : (isDebrief || isResult)
           ? {
               status: 'victory',
               elapsedTicks: 1800,
@@ -100,11 +102,12 @@ describe('HudController', () => {
   let actions: {
     onStartSortie: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
     onNextSortie: ReturnType<typeof vi.fn>
-    onQuickSave: ReturnType<typeof vi.fn>
-    onQuickLoad: ReturnType<typeof vi.fn>
+    onSave: ReturnType<typeof vi.fn>
+    onLoadGame: ReturnType<typeof vi.fn>
     onReset: ReturnType<typeof vi.fn>
-    canQuickLoad: ReturnType<typeof vi.fn>
+    canLoadGame: ReturnType<typeof vi.fn>
     onTogglePause: ReturnType<typeof vi.fn>
   }
   let hudController: ReturnType<typeof createHudController>
@@ -114,11 +117,12 @@ describe('HudController', () => {
     actions = {
       onStartSortie: vi.fn(),
       onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
       onNextSortie: vi.fn(),
-      onQuickSave: vi.fn(),
-      onQuickLoad: vi.fn(),
+      onSave: vi.fn(),
+      onLoadGame: vi.fn(),
       onReset: vi.fn(),
-      canQuickLoad: vi.fn(() => true),
+      canLoadGame: vi.fn(() => true),
       onTogglePause: vi.fn(),
     }
     hudController = createHudController(container, actions)
@@ -129,20 +133,42 @@ describe('HudController', () => {
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Preparation')
     expect(queryButton(container, 'start-sortie').disabled).toBe(false)
-    expect(queryButton(container, 'quick-save').disabled).toBe(false)
-    expect(queryButton(container, 'quick-load').disabled).toBe(false)
+    expect(queryButton(container, 'save').disabled).toBe(false)
     expect(queryButton(container, 'reset').disabled).toBe(false)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
     expect(queryButton(container, 'reset').getAttribute('title')).toContain('destructive boundary')
   })
 
-  it('GIVEN preparation without a loadable snapshot WHEN render called THEN Quick Load is disabled', () => {
-    actions.canQuickLoad.mockReturnValue(false)
+  it('GIVEN title_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
+    hudController.render(createState('title_menu'), false)
 
-    hudController.render(createState('preparation'), false)
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Title Menu')
+    expect(queryButton(container, 'load-game').disabled).toBe(false)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
+  })
 
-    expect(queryButton(container, 'quick-load').disabled).toBe(true)
+  it('GIVEN load_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
+    hudController.render(createState('load_menu'), false)
+
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Load Menu')
+    expect(queryButton(container, 'load-game').disabled).toBe(false)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+  })
+
+  it('GIVEN title_menu without a loadable snapshot WHEN render called THEN load-game is disabled (AC9)', () => {
+    actions.canLoadGame.mockReturnValue(false)
+
+    hudController.render(createState('title_menu'), false)
+
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
   })
 
   it('GIVEN running WHEN render called THEN button.disabled marks the full action surface as disabled', () => {
@@ -151,10 +177,36 @@ describe('HudController', () => {
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie running')
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'quick-save').disabled).toBe(true)
-    expect(queryButton(container, 'quick-load').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
     expect(queryButton(container, 'reset').disabled).toBe(true)
+  })
+
+  it('GIVEN result phase with pending reward WHEN render called THEN claim-reward and confirm-result are enabled (AC4, AC10)', () => {
+    hudController.render(createState('result', 'pending'), false)
+
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Result')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
+    expect(queryButton(container, 'claim-reward').disabled).toBe(false)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
+    expect(queryButton(container, 'reset').disabled).toBe(true)
+  })
+
+  it('GIVEN result phase with claimed reward WHEN render called THEN confirm-result is still enabled (AC5)', () => {
+    hudController.render(createState('result', 'claimed'), false)
+
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Result')
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'start-sortie').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
   })
 
   it('GIVEN debrief_pending_reward WHEN render called THEN Debrief: reward pending enables Claim reward only', () => {
@@ -166,8 +218,8 @@ describe('HudController', () => {
     expect(queryButton(container, 'claim-reward').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'quick-save').disabled).toBe(true)
-    expect(queryButton(container, 'quick-load').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
     expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
@@ -180,8 +232,8 @@ describe('HudController', () => {
     expect(queryButton(container, 'next-sortie').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'quick-save').disabled).toBe(true)
-    expect(queryButton(container, 'quick-load').disabled).toBe(true)
+    expect(queryButton(container, 'save').disabled).toBe(true)
+    expect(queryButton(container, 'load-game').disabled).toBe(true)
     expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
@@ -206,16 +258,18 @@ describe('HudController', () => {
 
     queryButton(container, 'start-sortie').click()
     queryButton(container, 'claim-reward').click()
+    queryButton(container, 'confirm-result').click()
     queryButton(container, 'next-sortie').click()
-    queryButton(container, 'quick-save').click()
-    queryButton(container, 'quick-load').click()
+    queryButton(container, 'save').click()
+    queryButton(container, 'load-game').click()
     queryButton(container, 'reset').click()
 
     expect(actions.onStartSortie).not.toHaveBeenCalled()
     expect(actions.onClaimReward).not.toHaveBeenCalled()
+    expect(actions.onConfirmResult).not.toHaveBeenCalled()
     expect(actions.onNextSortie).not.toHaveBeenCalled()
-    expect(actions.onQuickSave).not.toHaveBeenCalled()
-    expect(actions.onQuickLoad).not.toHaveBeenCalled()
+    expect(actions.onSave).not.toHaveBeenCalled()
+    expect(actions.onLoadGame).not.toHaveBeenCalled()
     expect(actions.onReset).toHaveBeenCalledTimes(0)
   })
 
