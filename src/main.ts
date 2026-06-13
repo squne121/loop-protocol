@@ -37,7 +37,6 @@ type ProgressionSaveFailureFeedback = {
   hasLoadableSnapshot: boolean
   status: string
   summary: string
-  readbackAttempted: false
 }
 
 export function resolveProgressionSaveFailureFeedback(
@@ -49,9 +48,8 @@ export function resolveProgressionSaveFailureFeedback(
       hasLoadableSnapshot: hadLoadableSnapshot,
       status: 'Result confirmed; progress not saved.',
       summary: hadLoadableSnapshot
-        ? 'Previous local save is still available for Quick Load.'
-        : 'No local save is currently available for Quick Load.',
-      readbackAttempted: false,
+        ? 'Previous local save is still available; this result may be lost after reload.'
+        : 'No local save is available; this result may be lost after reload.',
     }
   }
 
@@ -59,10 +57,39 @@ export function resolveProgressionSaveFailureFeedback(
     hasLoadableSnapshot: hadLoadableSnapshot,
     status: 'Quick Save failed.',
     summary: hadLoadableSnapshot
-      ? 'Previous local save is still available for Quick Load.'
-      : 'No local save is currently available for Quick Load.',
-    readbackAttempted: false,
+      ? 'Previous local save is still available; this result may be lost after reload.'
+      : 'No local save is available; this result may be lost after reload.',
   }
+}
+
+type ProgressionSaveSeam = {
+  storage: Pick<ReturnType<typeof createLocalGameStorage>, 'save' | 'load'>
+  createSnapshot: () => ReturnType<typeof createGameSnapshot>
+  reportSaveFailure: (result: Extract<SaveResult, { ok: false }>) => void
+  setHudFeedback: (status: string, summary: string) => void
+}
+
+export function runProgressionSave(
+  reason: ProgressionSaveReason,
+  hadLoadableSnapshot: boolean,
+  seam: ProgressionSaveSeam,
+): boolean {
+  const saveResult = seam.storage.save(seam.createSnapshot())
+
+  if (!saveResult.ok) {
+    seam.reportSaveFailure(saveResult)
+    const failureFeedback = resolveProgressionSaveFailureFeedback(reason, hadLoadableSnapshot)
+    seam.setHudFeedback(failureFeedback.status, failureFeedback.summary)
+    return failureFeedback.hasLoadableSnapshot
+  }
+
+  if (reason === 'reward-claim') {
+    seam.setHudFeedback('Result confirmed.', 'Progress saved locally.')
+    return true
+  }
+
+  seam.setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -344,25 +371,12 @@ function setHudFeedback(status: string, summary: string): void {
 function persistProgressionSnapshot(
   reason: ProgressionSaveReason,
 ): void {
-  const hadLoadableSnapshot = hasLoadableSnapshot
-  const saveResult = storage.save(createGameSnapshot(state))
-
-  if (!saveResult.ok) {
-    reportStorageFailure('save', saveResult)
-    const failureFeedback = resolveProgressionSaveFailureFeedback(reason, hadLoadableSnapshot)
-    hasLoadableSnapshot = failureFeedback.hasLoadableSnapshot
-    setHudFeedback(failureFeedback.status, failureFeedback.summary)
-    return
-  }
-
-  hasLoadableSnapshot = true
-
-  if (reason === 'reward-claim') {
-    setHudFeedback('Result confirmed.', 'Progress saved locally.')
-    return
-  }
-
-  setHudFeedback('Quick Save complete.', 'Progression snapshot is ready for Quick Load.')
+  hasLoadableSnapshot = runProgressionSave(reason, hasLoadableSnapshot, {
+    storage,
+    createSnapshot: () => createGameSnapshot(state),
+    reportSaveFailure: (result) => reportStorageFailure('save', result),
+    setHudFeedback,
+  })
 }
 
 function resizeArena(currentState: typeof state): void {

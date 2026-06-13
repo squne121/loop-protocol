@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { resolveProgressionSaveFailureFeedback } from '../src/main'
+import { resolveProgressionSaveFailureFeedback, runProgressionSave } from '../src/main'
 import {
   createLocalGameStorage,
   parseSnapshot,
   serializeSnapshot,
+  type SaveResult,
 } from '../src/storage'
 import { createGameSnapshot, createInitialGameState } from '../src/state'
 
@@ -411,39 +412,110 @@ describe('LocalGameStorage', () => {
 })
 
 describe('progression save failure feedback', () => {
-  it('GIVEN reward-claim save failure without a prior snapshot WHEN feedback is resolved THEN it keeps loadable snapshot false', () => {
-    const result = resolveProgressionSaveFailureFeedback('reward-claim', false)
+  function runFailurePath(reason: 'reward-claim' | 'quick-save', hadLoadableSnapshot: boolean) {
+    const createSnapshot = vi.fn(() => ({
+      schemaVersion: 1 as const,
+      resources: 11,
+      weaponPower: 3,
+      playerMaxHp: 9,
+    }))
+    const save = vi.fn<() => SaveResult>(() => ({
+      ok: false,
+      reason: 'write-error',
+      errorName: 'QuotaExceededError',
+    }))
+    const load = vi.fn(() => ({
+      ok: true as const,
+      snapshot: null,
+      reason: 'empty' as const,
+    }))
+    const reportSaveFailure = vi.fn()
+    const setHudFeedback = vi.fn<(status: string, summary: string) => void>()
 
-    expect(result).toEqual({
-      hasLoadableSnapshot: false,
-      status: 'Result confirmed; progress not saved.',
-      summary: 'No local save is currently available for Quick Load.',
-      readbackAttempted: false,
+    const nextHasLoadableSnapshot = runProgressionSave(reason, hadLoadableSnapshot, {
+      storage: { save, load },
+      createSnapshot,
+      reportSaveFailure,
+      setHudFeedback,
     })
+
+    return {
+      createSnapshot,
+      load,
+      nextHasLoadableSnapshot,
+      reportSaveFailure,
+      save,
+      setHudFeedback,
+    }
+  }
+
+  it('GIVEN reward-claim save failure without a prior snapshot WHEN the production seam runs THEN it keeps loadable snapshot false and explains reload loss risk', () => {
+    const result = runFailurePath('reward-claim', false)
+
+    expect(result.nextHasLoadableSnapshot).toBe(false)
+    expect(result.createSnapshot).toHaveBeenCalledTimes(1)
+    expect(result.save).toHaveBeenCalledTimes(1)
+    expect(result.load).not.toHaveBeenCalled()
+    expect(result.reportSaveFailure).toHaveBeenCalledWith({
+      ok: false,
+      reason: 'write-error',
+      errorName: 'QuotaExceededError',
+    })
+    expect(result.setHudFeedback).toHaveBeenCalledWith(
+      'Result confirmed; progress not saved.',
+      'No local save is available; this result may be lost after reload.',
+    )
+    expect(result.setHudFeedback).not.toHaveBeenCalledWith('Result confirmed.', 'Progress saved locally.')
   })
 
-  it('GIVEN reward-claim save failure with an existing loadable snapshot WHEN feedback is resolved THEN it keeps existing loadable snapshot', () => {
-    const result = resolveProgressionSaveFailureFeedback('reward-claim', true)
+  it('GIVEN reward-claim save failure with an existing loadable snapshot WHEN the production seam runs THEN it keeps the previous quick load available', () => {
+    const result = runFailurePath('reward-claim', true)
 
-    expect(result.hasLoadableSnapshot).toBe(true)
-    expect(result.status).toBe('Result confirmed; progress not saved.')
-    expect(result.summary).toContain('Previous local save is still available')
-    expect(result.readbackAttempted).toBe(false)
+    expect(result.nextHasLoadableSnapshot).toBe(true)
+    expect(result.load).not.toHaveBeenCalled()
+    expect(result.setHudFeedback).toHaveBeenCalledWith(
+      'Result confirmed; progress not saved.',
+      'Previous local save is still available; this result may be lost after reload.',
+    )
+    expect(result.setHudFeedback).not.toHaveBeenCalledWith('Result confirmed.', 'Progress saved locally.')
   })
 
-  it('GIVEN quick-save save failure WHEN feedback is resolved THEN it does not read back after save failure', () => {
-    const withoutSnapshot = resolveProgressionSaveFailureFeedback('quick-save', false)
-    const withSnapshot = resolveProgressionSaveFailureFeedback('quick-save', true)
+  it('GIVEN quick-save save failure WHEN the production seam runs THEN it keeps the previous snapshot state and does not report save success', () => {
+    const withoutSnapshot = runFailurePath('quick-save', false)
+    const withSnapshot = runFailurePath('quick-save', true)
 
-    expect(withoutSnapshot).toEqual({
+    expect(withoutSnapshot.nextHasLoadableSnapshot).toBe(false)
+    expect(withSnapshot.nextHasLoadableSnapshot).toBe(true)
+    expect(withoutSnapshot.load).not.toHaveBeenCalled()
+    expect(withSnapshot.load).not.toHaveBeenCalled()
+    expect(withoutSnapshot.setHudFeedback).toHaveBeenCalledWith(
+      'Quick Save failed.',
+      'No local save is available; this result may be lost after reload.',
+    )
+    expect(withSnapshot.setHudFeedback).toHaveBeenCalledWith(
+      'Quick Save failed.',
+      'Previous local save is still available; this result may be lost after reload.',
+    )
+    expect(withoutSnapshot.setHudFeedback).not.toHaveBeenCalledWith(
+      'Quick Save complete.',
+      'Progression snapshot is ready for Quick Load.',
+    )
+    expect(withSnapshot.setHudFeedback).not.toHaveBeenCalledWith(
+      'Quick Save complete.',
+      'Progression snapshot is ready for Quick Load.',
+    )
+  })
+
+  it('GIVEN save failure feedback is resolved directly WHEN the helper is called THEN the summary still states that this result may be lost after reload', () => {
+    expect(resolveProgressionSaveFailureFeedback('reward-claim', true)).toEqual({
+      hasLoadableSnapshot: true,
+      status: 'Result confirmed; progress not saved.',
+      summary: 'Previous local save is still available; this result may be lost after reload.',
+    })
+    expect(resolveProgressionSaveFailureFeedback('quick-save', false)).toEqual({
       hasLoadableSnapshot: false,
       status: 'Quick Save failed.',
-      summary: 'No local save is currently available for Quick Load.',
-      readbackAttempted: false,
+      summary: 'No local save is available; this result may be lost after reload.',
     })
-    expect(withSnapshot.hasLoadableSnapshot).toBe(true)
-    expect(withSnapshot.status).toBe('Quick Save failed.')
-    expect(withSnapshot.summary).toContain('Previous local save is still available')
-    expect(withSnapshot.readbackAttempted).toBe(false)
   })
 })
