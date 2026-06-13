@@ -1,0 +1,100 @@
+{
+  "_schema": "ctx-doctor-result-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T04:25:52.135200+00:00",
+  "tool": "context-mode doctor",
+  "exit_code": 0,
+  "status": "pass",
+  "errors": [],
+  "checks": [
+    {
+      "status": "INFO",
+      "message": "Platform: Claude Code (high confidence — CLAUDE_CODE_ENTRYPOINT or CLAUDE_PLUGIN_ROOT or CLAUDE_PROJECT_DIR or CLAUDE_SESSION_ID env var set)"
+    },
+    {
+      "status": "PASS",
+      "message": "Storage session: PASS — <HOME>/.claude/context-mode/sessions (adapter default)"
+    },
+    {
+      "status": "PASS",
+      "message": "Storage content: PASS — <HOME>/.claude/context-mode/content (adapter default)"
+    },
+    {
+      "status": "PASS",
+      "message": "Storage stats: PASS — <HOME>/.claude/context-mode/sessions (adapter default)"
+    },
+    {
+      "status": "WARN",
+      "message": "Performance: NORMAL — Using Node.js (install Bun for 3-5x speed boost)"
+    },
+    {
+      "status": "INFO",
+      "message": "Language coverage: 4/11 (36%) — javascript, shell, python, perl"
+    },
+    {
+      "status": "PASS",
+      "message": "Server test: PASS"
+    },
+    {
+      "status": "PASS",
+      "message": "PreToolUse hook: PASS — PreToolUse hook configured"
+    },
+    {
+      "status": "PASS",
+      "message": "SessionStart hook: PASS — SessionStart hook configured"
+    },
+    {
+      "status": "PASS",
+      "message": "Hook script: PreToolUse (pretooluse.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/pretooluse.mjs"
+    },
+    {
+      "status": "PASS",
+      "message": "Hook script: PostToolUse (posttooluse.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/posttooluse.mjs"
+    },
+    {
+      "status": "PASS",
+      "message": "Hook script: PreCompact (precompact.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/precompact.mjs"
+    },
+    {
+      "status": "PASS",
+      "message": "Hook script: SessionStart (sessionstart.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/sessionstart.mjs"
+    },
+    {
+      "status": "PASS",
+      "message": "Hook script: UserPromptSubmit (userpromptsubmit.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/userpromptsubmit.mjs"
+    },
+    {
+      "status": "PASS",
+      "message": "Plugin cache integrity: PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode (all required runtime siblings present)"
+    },
+    {
+      "status": "PASS",
+      "message": "Plugin enabled: PASS — Plugin enabled: context-mode@context-mode"
+    },
+    {
+      "status": "INFO",
+      "message": "Hook config: SKIP — no team-shared hook configs found in this workspace"
+    },
+    {
+      "status": "INFO",
+      "message": "Leftover .mcp.json check: SKIP — no plugin cache exists yet (Claude Code has not installed context-mode here)"
+    },
+    {
+      "status": "PASS",
+      "message": "FTS5 / SQLite: PASS — native module works"
+    },
+    {
+      "status": "PASS",
+      "message": "npm (MCP): PASS — v1.0.162"
+    },
+    {
+      "status": "INFO",
+      "message": "Claude Code: not installed — using standalone MCP mode"
+    }
+  ],
+  "raw_output_redacted": "┌   context-mode doctor \n│\n●  Platform: Claude Code (high confidence — CLAUDE_CODE_ENTRYPOINT or CLAUDE_PLUGIN_ROOT or CLAUDE_PROJECT_DIR or CLAUDE_SESSION_ID env var set)\n│\n◇  Storage paths ─────────────────────────────────────────────────────────╮\n│                                                                         │\n│  sessions: <HOME>/.claude/context-mode/sessions (adapter default)  │\n│  content:  <HOME>/.claude/context-mode/content (adapter default)   │\n│  stats:    <HOME>/.claude/context-mode/sessions (adapter default)  │\n│                                                                         │\n├─────────────────────────────────────────────────────────────────────────╯\n│\n◆  Storage session: PASS — <HOME>/.claude/context-mode/sessions (adapter default)\n│\n◆  Storage content: PASS — <HOME>/.claude/context-mode/content (adapter default)\n│\n◆  Storage stats: PASS — <HOME>/.claude/context-mode/sessions (adapter default)\n\u001b[?25l│\n◇  Diagnostics complete\n\u001b[?25h│\n◇  Runtimes ──────────────────────────────────────────────────────────────────╮\n│                                                                             │\n│    JavaScript: <HOME>/.nvm/versions/node/v24.14.0/bin/node (v24.14.0)  │\n│    TypeScript: not available (install bun, tsx, or ts-node)                 │\n│    Python:     python3 (Python 3.12.3)                                      │\n│    Shell:      /bin/bash (GNU bash, version 5.2.21(1)-release               │\n│  (x86_64-pc-linux-gnu))                                                     │\n│    Perl:       perl (This is perl 5, version 38, subversion 2 (v5.38.2)     │\n│  built for x86_64-linux-gnu-thread-multi)                                   │\n│                                                                             │\n│    Tip: Install Bun for 3-5x faster JS/TS execution → https://bun.sh        │\n│                                                                             │\n├─────────────────────────────────────────────────────────────────────────────╯\n│\n▲  Performance: NORMAL — Using Node.js (install Bun for 3-5x speed boost)\n│\n●  Language coverage: 4/11 (36%) — javascript, shell, python, perl\n│\n◇  Testing server initialization...\n│\n◆  Server test: PASS\n│\n◇  Checking Claude Code hooks configuration...\n│\n◆  PreToolUse hook: PASS — PreToolUse hook configured\n│\n◆  SessionStart hook: PASS — SessionStart hook configured\n│\n◇  Checking hook scripts...\n│\n◆  Hook script: PreToolUse (pretooluse.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/pretooluse.mjs\n│\n◆  Hook script: PostToolUse (posttooluse.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/posttooluse.mjs\n│\n◆  Hook script: PreCompact (precompact.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/precompact.mjs\n│\n◆  Hook script: SessionStart (sessionstart.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/sessionstart.mjs\n│\n◆  Hook script: UserPromptSubmit (userpromptsubmit.mjs): PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode/hooks/userpromptsubmit.mjs\n│\n◆  Plugin cache integrity: PASS — <HOME>/.nvm/versions/node/v24.14.0/lib/node_modules/context-mode (all required runtime siblings present)\n│\n◇  Checking Claude Code plugin registration...\n│\n◆  Plugin enabled: PASS — Plugin enabled: context-mode@context-mode\n│\n◇  Checking team-shared hook configs in your workspace...\n│\n●  Hook config: SKIP — no team-shared hook configs found in this workspace\n│\n◇  Checking for leftover .mcp.json files from older versions...\n│\n●  Leftover .mcp.json check: SKIP — no plugin cache exists yet (Claude Code has not installed context-mode here)\n│\n◇  Checking FTS5 / SQLite...\n│\n◆  FTS5 / SQLite: PASS — native module works\n│\n◇  Checking versions...\n│\n◆  npm (MCP): PASS — v1.0.162\n│\n●  Claude Code: not installed — using standalone MCP mode\n│\n└  Diagnostics complete!\n\n(node:3513480) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\n",
+  "redaction": {
+    "home_path_masked": true,
+    "note": "<HOME> が home directory path を置換済み"
+  }
+}

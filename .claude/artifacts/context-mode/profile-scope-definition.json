@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-06-13T04:22:37.277328+00:00",
+  "profile_name": "context-mode experimental (local project scope)",
+  "scope": "local",
+  "scope_description": "Project-level scope; settings apply only to LOOP_PROTOCOL workspace",
+  "context_mode_enabled": true,
+  "plugin_registration": {
+    "plugin_id": "context-mode@context-mode",
+    "enabled_in_global_settings": true,
+    "registration_type": "claude-plugin (npm-based MCP server)",
+    "plugin_manifest_id": "context-mode",
+    "plugin_manifest_version": "1.0.162"
+  },
+  "startup_evidence": {
+    "doctor_exit_code": 0,
+    "plugin_enabled_pass": true,
+    "server_test_pass": true,
+    "storage_pass": true,
+    "hook_scripts_pass": true
+  },
+  "active_tools": [
+    "ctx_batch_execute",
+    "ctx_doctor",
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_fetch_and_index",
+    "ctx_index",
+    "ctx_insight",
+    "ctx_purge",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_upgrade"
+  ],
+  "denied_tools": [
+    "ctx_execute",
+    "ctx_fetch_and_index"
+  ],
+  "allowed_tools": [
+    "ctx_batch_execute",
+    "ctx_execute_file",
+    "ctx_index",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_doctor",
+    "ctx_upgrade",
+    "ctx_purge",
+    "ctx_insight"
+  ],
+  "profile_isolation": "worktree-based (branch: worktree-issue-824-claude-code-profile-context-mode-version)",
+  "artifacts_dir": ".claude/artifacts/context-mode/"
+}

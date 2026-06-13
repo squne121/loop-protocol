@@ -1,0 +1,52 @@
+{
+  "_schema": "registered-tools-v1",
+  "_issue": "#824",
+  "_generated_at": "2026-06-13T04:25:36.758607+00:00",
+  "source": "openclaw.plugin.json contracts.tools",
+  "plugin_version": "1.0.162",
+  "registered_tools": [
+    "ctx_batch_execute",
+    "ctx_doctor",
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_fetch_and_index",
+    "ctx_index",
+    "ctx_insight",
+    "ctx_purge",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_upgrade"
+  ],
+  "expected_tools": [
+    "ctx_batch_execute",
+    "ctx_doctor",
+    "ctx_execute",
+    "ctx_execute_file",
+    "ctx_fetch_and_index",
+    "ctx_index",
+    "ctx_insight",
+    "ctx_purge",
+    "ctx_search",
+    "ctx_stats",
+    "ctx_upgrade"
+  ],
+  "tool_count": 11,
+  "expected_count": 11,
+  "match": true,
+  "missing_from_registered": [],
+  "extra_in_registered": [],
+  "permission_policy": {
+    "ctx_execute": "deny",
+    "ctx_fetch_and_index": "deny",
+    "ctx_batch_execute": "allow",
+    "ctx_execute_file": "allow",
+    "ctx_index": "allow",
+    "ctx_search": "allow",
+    "ctx_stats": "allow",
+    "ctx_doctor": "allow",
+    "ctx_upgrade": "allow",
+    "ctx_purge": "allow",
+    "ctx_insight": "allow"
+  },
+  "deny_basis": "permissions.deny in .claude/settings.json: mcp__context-mode__ctx_execute, mcp__context-mode__ctx_fetch_and_index"
+}

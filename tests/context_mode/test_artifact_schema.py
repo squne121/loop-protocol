@@ -39,8 +39,8 @@ def _is_context_mode_runtime_available() -> bool:
         return False
     try:
         data = json.loads(ctx_doctor_file.read_text())
-        # ok フィールドが非 null ならランタイム検証済みと判断する
-        return data.get("ok") is not None
+        # status: pass かつ exit_code: 0 ならランタイム検証済みと判断する
+        return data.get("status") == "pass" and data.get("exit_code") == 0
     except (json.JSONDecodeError, KeyError):
         return False
 
@@ -102,9 +102,8 @@ class TestVersionProvenanceSchema:
             f"install_scope が experiment-profile-only ではありません: {data.get('install_scope')}"
         )
 
-    @skip_if_runtime_not_available
     def test_installed_version_present(self) -> None:
-        """ランタイム検証: installed_version が null でないことを確認する。"""
+        """installed_version が null でないことを確認する。"""
         data = json.loads((ARTIFACT_DIR / "version-provenance.json").read_text())
         assert data.get("installed_version") is not None, (
             "installed_version が null です。"
@@ -127,15 +126,20 @@ class TestCtxDoctorResultSchema:
     def test_required_fields_present(self) -> None:
         """必須フィールドが存在することを確認する。"""
         data = json.loads((ARTIFACT_DIR / "ctx-doctor-result.json").read_text())
-        assert "ok" in data, "ctx-doctor-result.json に ok フィールドがありません"
+        assert "status" in data, "ctx-doctor-result.json に status フィールドがありません"
+        assert "exit_code" in data, "ctx-doctor-result.json に exit_code フィールドがありません"
+        assert "errors" in data, "ctx-doctor-result.json に errors フィールドがありません"
         assert "redaction" in data, "ctx-doctor-result.json に redaction フィールドがありません"
 
     @skip_if_runtime_not_available
     def test_ctx_doctor_ok(self) -> None:
         """ランタイム検証 (AC3): ctx-doctor が error なしで完了していることを確認する。"""
         data = json.loads((ARTIFACT_DIR / "ctx-doctor-result.json").read_text())
-        assert data.get("ok") is True, (
+        assert data.get("status") == "pass", (
             f"ctx-doctor が error を返しました: errors={data.get('errors', [])}"
+        )
+        assert data.get("exit_code") == 0, (
+            f"ctx-doctor の exit_code が 0 ではありません: {data.get('exit_code')}"
         )
         assert data.get("errors") == [] or data.get("errors") is None, (
             f"ctx-doctor に errors があります: {data.get('errors')}"
@@ -210,8 +214,7 @@ def test_deny_policy() -> None:
     """
     AC5: ctx_execute / ctx_fetch_and_index が permission_policy 上 deny で記録されていることを確認する。
 
-    runtime_only VC だが、permission_policy はスケルトン段階でも記録されているため
-    static に検証可能。
+    permission_policy フィールドで deny を確認する。
     """
     data = json.loads((ARTIFACT_DIR / "registered-tools.json").read_text())
     policy = data.get("permission_policy", {})
@@ -282,46 +285,10 @@ class TestAC1ExperimentProfileDefinition:
     """
     AC1: 実験用 profile/scope の定義が artifact に保存されていることを確認する。
 
-    settings.json の mcpServers に context-mode-experiment が定義されており、
-    _scope および _profile が experiment であることを確認する。
+    config-diff.json に実験用 scope の定義が保存されており、
+    deny_policy_entries に ctx_execute と ctx_fetch_and_index の deny が含まれ、
+    main_profile_affected が false であることを確認する。
     """
-
-    def test_settings_json_has_mcp_servers(self) -> None:
-        """settings.json に mcpServers が定義されていることを確認する。"""
-        settings_path = _REPO_ROOT / ".claude" / "settings.json"
-        assert settings_path.exists(), ".claude/settings.json が存在しません"
-        data = json.loads(settings_path.read_text())
-        assert "mcpServers" in data, ".claude/settings.json に mcpServers が定義されていません"
-
-    def test_context_mode_experiment_server_defined(self) -> None:
-        """context-mode-experiment MCP server が定義されていることを確認する。"""
-        settings_path = _REPO_ROOT / ".claude" / "settings.json"
-        data = json.loads(settings_path.read_text())
-        mcp_servers = data.get("mcpServers", {})
-        assert "context-mode-experiment" in mcp_servers, (
-            "mcpServers に context-mode-experiment が定義されていません"
-        )
-
-    def test_experiment_scope_defined(self) -> None:
-        """context-mode-experiment の _scope が experiment であることを確認する。"""
-        settings_path = _REPO_ROOT / ".claude" / "settings.json"
-        data = json.loads(settings_path.read_text())
-        server = data.get("mcpServers", {}).get("context-mode-experiment", {})
-        assert server.get("_scope") == "experiment", (
-            f"context-mode-experiment の _scope が experiment ではありません: {server.get('_scope')}"
-        )
-
-    def test_deny_policy_in_permissions(self) -> None:
-        """permissions.deny に ctx_execute と ctx_fetch_and_index が含まれることを確認する。"""
-        settings_path = _REPO_ROOT / ".claude" / "settings.json"
-        data = json.loads(settings_path.read_text())
-        deny_list = data.get("permissions", {}).get("deny", [])
-        assert "mcp__context-mode-experiment__ctx_execute" in deny_list, (
-            "permissions.deny に mcp__context-mode-experiment__ctx_execute が含まれていません"
-        )
-        assert "mcp__context-mode-experiment__ctx_fetch_and_index" in deny_list, (
-            "permissions.deny に mcp__context-mode-experiment__ctx_fetch_and_index が含まれていません"
-        )
 
     def test_config_diff_artifact_exists(self) -> None:
         """config-diff.json が存在することを確認する。"""
@@ -334,6 +301,49 @@ class TestAC1ExperimentProfileDefinition:
         data = json.loads((ARTIFACT_DIR / "config-diff.json").read_text())
         assert data.get("main_profile_affected") is False, (
             f"main_profile_affected が false ではありません: {data.get('main_profile_affected')}"
+        )
+
+    def test_config_diff_experiment_scope(self) -> None:
+        """config-diff.json に experiment scope が定義されていることを確認する。"""
+        data = json.loads((ARTIFACT_DIR / "config-diff.json").read_text())
+        assert data.get("experiment_scope") is not None, (
+            "config-diff.json に experiment_scope がありません"
+        )
+
+    def test_config_diff_deny_policy_entries(self) -> None:
+        """config-diff.json に ctx_execute と ctx_fetch_and_index の deny が含まれることを確認する。"""
+        data = json.loads((ARTIFACT_DIR / "config-diff.json").read_text())
+        deny_entries = data.get("deny_policy_entries", [])
+        assert "mcp__context-mode__ctx_execute" in deny_entries, (
+            "deny_policy_entries に mcp__context-mode__ctx_execute が含まれていません"
+        )
+        assert "mcp__context-mode__ctx_fetch_and_index" in deny_entries, (
+            "deny_policy_entries に mcp__context-mode__ctx_fetch_and_index が含まれていません"
+        )
+
+    def test_settings_json_deny_contains_mcp_tools(self) -> None:
+        """settings.json の permissions.deny に MCP tool deny が含まれることを確認する。"""
+        settings_path = _REPO_ROOT / ".claude" / "settings.json"
+        assert settings_path.exists(), ".claude/settings.json が存在しません"
+        data = json.loads(settings_path.read_text())
+        deny_list = data.get("permissions", {}).get("deny", [])
+        assert "mcp__context-mode__ctx_execute" in deny_list, (
+            "permissions.deny に mcp__context-mode__ctx_execute が含まれていません"
+        )
+        assert "mcp__context-mode__ctx_fetch_and_index" in deny_list, (
+            "permissions.deny に mcp__context-mode__ctx_fetch_and_index が含まれていません"
+        )
+
+    def test_settings_json_enables_context_mode_plugin(self) -> None:
+        """settings.json の enabledPlugins に context-mode が含まれることを確認する。"""
+        settings_path = _REPO_ROOT / ".claude" / "settings.json"
+        data = json.loads(settings_path.read_text())
+        enabled_plugins = data.get("enabledPlugins", {})
+        assert "context-mode@context-mode" in enabled_plugins, (
+            "enabledPlugins に context-mode@context-mode が含まれていません"
+        )
+        assert enabled_plugins["context-mode@context-mode"] is True, (
+            "context-mode@context-mode が true になっていません"
         )
 
 
