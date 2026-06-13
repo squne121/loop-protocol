@@ -407,17 +407,30 @@ test('GIVEN runtime storage key override WHEN result is confirmed THEN productio
   test.setTimeout(30_000)
 
   const productionKey = 'loop-protocol.mvp.save'
-  const workerScope = `worker-${test.info().workerIndex}`
+  const testInfo = test.info()
+  const workerScope = `worker-${testInfo.workerIndex}.retry-${testInfo.retry}.test-${testInfo.testId.replace(/[^a-zA-Z0-9._-]/g, '-')}`
   const e2eKey = `loop-protocol.e2e.${workerScope}.mvp.save`
-  const productionSentinel = `production-key-sentinel-${workerScope}`
+  const productionSentinel = JSON.stringify({
+    schemaVersion: 1,
+    resources: 777,
+    weaponPower: 3,
+    playerMaxHp: 11,
+  })
+  const e2eSentinel = JSON.stringify({
+    schemaVersion: 1,
+    resources: 1,
+    weaponPower: 1,
+    playerMaxHp: 8,
+  })
 
   await page.addInitScript(
-    (payload: { productionKey: string; productionSentinel: string; e2eKey: string }) => {
+    (payload: { productionKey: string; productionSentinel: string; e2eKey: string; e2eSentinel: string }) => {
       window.localStorage.setItem(payload.productionKey, payload.productionSentinel)
+      window.localStorage.setItem(payload.e2eKey, payload.e2eSentinel)
       ;(window as Window & { __LOOP_STORAGE_KEY__?: string }).__LOOP_STORAGE_KEY__ = payload.e2eKey
       ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
     },
-    { productionKey, productionSentinel, e2eKey },
+    { productionKey, productionSentinel, e2eKey, e2eSentinel },
   )
   await page.goto('/')
 
@@ -452,8 +465,23 @@ test('GIVEN runtime storage key override WHEN result is confirmed THEN productio
 
   expect(storageState.productionValue).toBe(productionSentinel)
   expect(storageState.e2eValue).not.toBeNull()
-  expect(storageState.e2eValue).toContain('"resources"')
-  expect(storageState.productionValue).not.toContain('"resources"')
+  expect(storageState.e2eValue).not.toBe(e2eSentinel)
+
+  const parsedProduction = JSON.parse(storageState.productionValue ?? 'null')
+  const parsedE2E = JSON.parse(storageState.e2eValue ?? 'null')
+
+  expect(parsedProduction).toEqual({
+    schemaVersion: 1,
+    resources: 777,
+    weaponPower: 3,
+    playerMaxHp: 11,
+  })
+  expect(parsedE2E).toEqual({
+    schemaVersion: 1,
+    resources: 3,
+    weaponPower: 1,
+    playerMaxHp: 8,
+  })
 })
 
 test('GIVEN E2E 1HP player fixture WHEN enemy contacts player THEN sortie.status is defeat', async ({

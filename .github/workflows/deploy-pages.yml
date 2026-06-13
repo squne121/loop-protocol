@@ -48,6 +48,18 @@ jobs:
           echo "VITE_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "PAGES_BASE_PATH=$base" >> "$GITHUB_ENV"
           echo "base=$base" >> "$GITHUB_OUTPUT"
+      - name: Resolve PR preview storage namespace
+        id: storage-namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="pr-${{ github.event.number }}"
+          case "$namespace" in
+            pr-[0-9]*) ;;
+            *) echo "Invalid preview storage namespace: $namespace" >&2; exit 1 ;;
+          esac
+          echo "VITE_LOOP_STORAGE_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
       - name: Resolve and inject commit SHA
         id: commit-sha
         shell: bash
@@ -63,6 +75,7 @@ jobs:
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
       - name: Verify main build asset base path
         shell: bash
         run: |

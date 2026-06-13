@@ -33,15 +33,24 @@ describe('LocalGameStorage', () => {
     expect(resolveStorageKey()).toBe(defaultSaveKey)
   })
 
-  it('GIVEN storage namespace override WHEN resolveStorageKey is called THEN returns preview namespace key', () => {
-    expect(resolveStorageKey('preview-pr-885')).toBe('loop-protocol.preview.pr-885.mvp.save')
-  })
-
   it('GIVEN numeric namespace override WHEN resolveStorageKey is called THEN returns preview namespace key', () => {
     expect(resolveStorageKey('885')).toBe('loop-protocol.preview.pr-885.mvp.save')
   })
 
-  it('GIVEN runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN uses runtime key', () => {
+  it('GIVEN pr-number namespace override WHEN resolveStorageKey is called THEN returns preview namespace key', () => {
+    expect(resolveStorageKey('pr-885')).toBe('loop-protocol.preview.pr-885.mvp.save')
+  })
+
+  it('GIVEN invalid preview namespace WHEN resolveStorageKey is called THEN it fails closed', () => {
+    expect(() => resolveStorageKey('preview-pr-885')).toThrowError(
+      'Invalid VITE_LOOP_STORAGE_NAMESPACE: preview-pr-885',
+    )
+    expect(() => resolveStorageKey('foobar')).toThrowError(
+      'Invalid VITE_LOOP_STORAGE_NAMESPACE: foobar',
+    )
+  })
+
+  it('GIVEN allowed runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN uses runtime key', () => {
     const targetKey = 'loop-protocol.e2e.storage-resolver.mvp.save'
     const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
     const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
@@ -58,7 +67,23 @@ describe('LocalGameStorage', () => {
     }
   })
 
-  it('GIVEN runtime override key WHEN default createLocalGameStorage is used THEN it uses override key', () => {
+  it('GIVEN disallowed runtime __LOOP_STORAGE_KEY__ override WHEN resolveStorageKey is called THEN it ignores override', () => {
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+
+    try {
+      storageWindow.__LOOP_STORAGE_KEY__ = defaultSaveKey
+      expect(resolveStorageKey()).toBe(defaultSaveKey)
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
+  it('GIVEN allowed runtime override key WHEN default createLocalGameStorage is used THEN it uses override key', () => {
     const targetKey = 'loop-protocol.e2e.storage-internal.mvp.save'
     const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
     const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
@@ -74,6 +99,31 @@ describe('LocalGameStorage', () => {
       expect(storage.getItem(targetKey)).toEqual(
         '{"schemaVersion":1,"resources":1,"weaponPower":2,"playerMaxHp":3}',
       )
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
+  it('GIVEN disallowed runtime override key WHEN default createLocalGameStorage is used THEN it keeps production key', () => {
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+
+    try {
+      const storage = createMemoryStorage()
+      storageWindow.__LOOP_STORAGE_KEY__ = 'loop-protocol.preview.pr-885.mvp.save'
+
+      const gameStorage = createLocalGameStorage(undefined, storage)
+      expect(gameStorage.save({ schemaVersion: 1, resources: 1, weaponPower: 2, playerMaxHp: 3 }))
+        .toEqual({ ok: true, reason: 'saved' })
+
+      expect(storage.getItem(defaultSaveKey)).toEqual(
+        '{"schemaVersion":1,"resources":1,"weaponPower":2,"playerMaxHp":3}',
+      )
+      expect(storage.getItem('loop-protocol.preview.pr-885.mvp.save')).toBeNull()
     } finally {
       if (previousOverride === undefined) {
         Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')

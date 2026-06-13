@@ -4,10 +4,14 @@ export const defaultSaveKey = 'loop-protocol.mvp.save'
 
 const PREVIEW_KEY_PREFIX = 'loop-protocol.preview.'
 const PREVIEW_SUFFIX = '.mvp.save'
-const DEFAULT_PREVIEW_NAMESPACE_FALLBACK = 'preview'
+const E2E_RUNTIME_KEY_PATTERN = /^loop-protocol\.e2e\.[a-z0-9._-]+\.mvp\.save$/i
 
 type WindowWithLoopStorageRuntime = Window & {
   __LOOP_STORAGE_KEY__?: string
+}
+
+function isAllowedRuntimeStorageKey(value: string): boolean {
+  return E2E_RUNTIME_KEY_PATTERN.test(value)
 }
 
 function getRuntimeStorageKey(): string | null {
@@ -15,7 +19,8 @@ function getRuntimeStorageKey(): string | null {
   const override = loopWindow.__LOOP_STORAGE_KEY__
 
   if (typeof override === 'string') {
-    return override.trim()
+    const trimmed = override.trim()
+    return isAllowedRuntimeStorageKey(trimmed) ? trimmed : null
   }
 
   return null
@@ -24,28 +29,21 @@ function getRuntimeStorageKey(): string | null {
 function normalizePreviewNamespace(namespace: string): string {
   const trimmed = namespace.trim()
   if (!trimmed) {
-    return DEFAULT_PREVIEW_NAMESPACE_FALLBACK
+    throw new Error('VITE_LOOP_STORAGE_NAMESPACE must not be empty')
   }
 
-  const stripped = trimmed.replace(/^preview[-_.]*/i, '')
-
-  const explicitMatch = stripped.match(/pr-[a-zA-Z0-9_-]+/)
+  const normalized = trimmed.toLowerCase()
+  const explicitMatch = normalized.match(/^pr-(\d+)$/)
   if (explicitMatch) {
-    return explicitMatch[0].toLowerCase()
+    return `pr-${explicitMatch[1]}`
   }
 
-  const numericMatch = stripped.match(/^\d+$/)
+  const numericMatch = normalized.match(/^(\d+)$/)
   if (numericMatch) {
     return `pr-${numericMatch[0]}`
   }
 
-  const sanitized = stripped
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
-
-  return sanitized ? `pr-${sanitized}` : DEFAULT_PREVIEW_NAMESPACE_FALLBACK
+  throw new Error(`Invalid VITE_LOOP_STORAGE_NAMESPACE: ${namespace}`)
 }
 
 export function resolveStorageKey(storageNamespace?: string): string {
