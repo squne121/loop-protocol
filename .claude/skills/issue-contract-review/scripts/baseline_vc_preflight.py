@@ -1780,9 +1780,28 @@ def classify_result(
     if "rg " in command and exit_code == 1:
         return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
-    # test -f / test -d with non-existent file
-    if ("test -f " in command or "test -d " in command) and exit_code == 1:
-        return "expected_fail", "file_not_found_expected", "go", None, "baseline_fail_expected"
+    # test -f / test -d / test -s with non-existent or zero-size file
+    # Use shlex.split for argv parse instead of substring matching (AC5)
+    try:
+        _test_argv = shlex.split(command)
+    except ValueError:
+        _test_argv = []
+    if len(_test_argv) >= 3 and _test_argv[0] == "test":
+        _flag = _test_argv[1]
+        if _flag in ("-f", "-d") and exit_code == 1:
+            return "expected_fail", "file_not_found_expected", "go", None, "baseline_fail_expected"
+        if _flag == "-s" and exit_code == 1:
+            # exit 1: file missing or zero-size — both are expected baseline fail (AC1, AC2)
+            return (
+                "expected_fail",
+                "file_not_found_expected",
+                "go",
+                "test -s false means missing or zero-size file",
+                "baseline_fail_expected",
+            )
+        if _flag == "-s" and exit_code == 2:
+            # exit 2: malformed invocation (operand missing / extra operand) — not go (AC7)
+            return "blocked", "unknown", "blocked", "test -s returned exit 2 (malformed invocation)", "baseline_fail_expected"
 
     # Generic exit_code != 0: try to infer expected_fail for common utilities
     # grep, sed, awk などが no-match で exit 1 を返すことは expected

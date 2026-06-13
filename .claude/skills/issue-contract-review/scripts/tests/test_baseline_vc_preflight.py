@@ -1504,6 +1504,97 @@ def test_has_command_substitution_mixed_quotes():
     assert has_command_substitution("echo '`date`'") is False
 
 
+def test_s_missing_file_exit1_go():
+    """AC1: test -s <missing-file> exit 1 → file_not_found_expected / go"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=1,
+        stdout="",
+        stderr="",
+        command="test -s /nonexistent/artifact.json",
+    )
+    assert category == "file_not_found_expected", f"Expected file_not_found_expected, got {category}"
+    assert decision == "go", f"Expected go, got {decision}"
+    assert classification == "expected_fail", f"Expected expected_fail, got {classification}"
+
+
+def test_s_empty_file_exit1_go(tmp_path):
+    """AC2: test -s <empty-file> exit 1 → file_not_found_expected / go with fix_hint"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    empty_file = tmp_path / "empty.json"
+    empty_file.write_text("")
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=1,
+        stdout="",
+        stderr="",
+        command=f"test -s {empty_file}",
+    )
+    assert category == "file_not_found_expected", f"Expected file_not_found_expected, got {category}"
+    assert decision == "go", f"Expected go, got {decision}"
+    assert fix_hint is not None and "test -s false means missing or zero-size file" in fix_hint, (
+        f"Expected fix_hint containing 'test -s false means missing or zero-size file', got {fix_hint!r}"
+    )
+
+
+def test_s_nonempty_file_exit0_blocked(tmp_path):
+    """AC3: test -s <nonempty-file> exit 0 → unexpected_pass / blocked"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    nonempty_file = tmp_path / "data.json"
+    nonempty_file.write_text('{"key": "value"}')
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        command=f"test -s {nonempty_file}",
+    )
+    assert decision == "blocked", f"Expected blocked, got {decision}"
+    assert classification == "unexpected_pass", f"Expected unexpected_pass, got {classification}"
+
+
+def test_s_quoted_path_exit1_go():
+    """AC6: test -s with quoted path containing spaces → file_not_found_expected / go"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=1,
+        stdout="",
+        stderr="",
+        command='test -s "/path/with spaces/artifact.json"',
+    )
+    assert category == "file_not_found_expected", f"Expected file_not_found_expected, got {category}"
+    assert decision == "go", f"Expected go, got {decision}"
+
+
+def test_s_malformed_exit2_not_go():
+    """AC7: test -s with malformed invocation exit 2 → not go (blocked)"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    # exit 2: operand missing
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        exit_code=2,
+        stdout="",
+        stderr="test: -s: binary operator expected",
+        command="test -s",
+    )
+    assert decision != "go", f"Expected non-go decision, got {decision}"
+    assert classification not in ("expected_fail", "expected_pass"), (
+        f"Expected non-pass classification, got {classification}"
+    )
+
+
 def test_classify_result_uses_cwd_argument(tmp_path):
     """B1: classify_result threads cwd to _is_regression_gate_command"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
@@ -1881,5 +1972,20 @@ if __name__ == "__main__":
 
     test_ac2_issue_repo_mocked()
     print("✓ Medium risk 2: AC2 mocked test")
+
+    test_s_missing_file_exit1_go()
+    print("✓ test -s: missing file exit1 → go")
+
+    test_s_empty_file_exit1_go()
+    print("✓ test -s: empty file exit1 → go (fix_hint)")
+
+    test_s_nonempty_file_exit0_blocked()
+    print("✓ test -s: nonempty file exit0 → blocked")
+
+    test_s_quoted_path_exit1_go()
+    print("✓ test -s: quoted path exit1 → go")
+
+    test_s_malformed_exit2_not_go()
+    print("✓ test -s: malformed exit2 → not go")
 
     print("\n✓ All tests passed!")
