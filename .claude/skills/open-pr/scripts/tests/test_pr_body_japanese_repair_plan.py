@@ -113,8 +113,8 @@ class TestPerBlockJapaneseRatio:
         """英語のみのブロックは threshold 未満で fail"""
         body = _make_valid_body("This summary is written entirely in English without any Japanese.")
         plan = analyze_pr_body(body, threshold=0.1)
-        assert plan["status"] in ("repairable", "human_review_required")
         assert len(plan["failed_blocks"]) > 0
+        assert plan["status"] in ("repairable", "human_review_required")
 
     def test_threshold_per_block_not_aggregate(self):
         """aggregate ではなく per-block で判定される"""
@@ -154,12 +154,12 @@ class TestRepairableRouting:
     """AC4: repairable = deterministic な意味保存修復のみ"""
 
     def test_short_english_boilerplate_is_repairable(self):
-        """短い英語のみの boilerplate は repairable"""
+        """短い英語 boilerplate は human_review_required（body_file_out が None のため downgrade）"""
         body = _make_valid_body("Test PR.")
         plan = analyze_pr_body(body, threshold=0.1)
-        # short boilerplate は repairable
-        if plan["failed_blocks"]:
-            assert plan["status"] == "repairable"
+        assert len(plan["failed_blocks"]) > 0
+        # _generate_body_file_out が None を返すため repairable → human_review_required へ downgrade
+        assert plan["status"] == "human_review_required"
 
     def test_long_english_prose_is_human_review_required(self):
         """長い英語 prose（任意の意味変換が必要）は human_review_required"""
@@ -171,9 +171,9 @@ class TestRepairableRouting:
         )
         body = _make_valid_body(long_english)
         plan = analyze_pr_body(body, threshold=0.1)
-        if plan["failed_blocks"]:
-            assert plan["status"] == "human_review_required"
-            assert plan["next_action"] == "human_review_required"
+        assert len(plan["failed_blocks"]) > 0
+        assert plan["status"] == "human_review_required"
+        assert plan["next_action"] == "human_review_required"
 
     def test_repairable_has_safe_rewrite_plan(self):
         """repairable case は safe_rewrite_plan を持つ"""
@@ -223,9 +223,9 @@ echo "hello world"
 ```
 """
         plan = analyze_pr_body(body_with_fence, threshold=0.1)
-        # code fence 内の英語は failed_blocks に出てこない
+        # code fence 内の英語は failed_blocks に出てこない（text_preview は --include-preview なしで None）
         for fb in plan["failed_blocks"]:
-            assert "hello world" not in fb.get("text_preview", "")
+            assert "hello world" not in (fb.get("text_preview") or "")
 
     def test_gfm_table_not_in_failed_blocks(self):
         """GFM テーブルは failed_blocks に含まれない"""
@@ -240,7 +240,7 @@ echo "hello world"
         # GFM テーブルは保護されるため failed_blocks に含まれない
         for fb in plan["failed_blocks"]:
             # text_preview に表のヘッダ行が含まれていないこと
-            preview = fb.get("text_preview", "")
+            preview = fb.get("text_preview") or ""
             # テーブルの delimiter 行や data 行は含まれない
             assert "|---|" not in preview
 
@@ -251,7 +251,7 @@ echo "hello world"
 """
         plan = analyze_pr_body(body_with_comment, threshold=0.1)
         for fb in plan["failed_blocks"]:
-            assert "HTML comment" not in fb.get("text_preview", "")
+            assert "HTML comment" not in (fb.get("text_preview") or "")
 
     def test_canonical_heading_not_in_failed_blocks(self):
         """canonical heading は failed_blocks に含まれない"""
@@ -272,25 +272,19 @@ contract_schema_version: v1
         plan = analyze_pr_body(body, threshold=0.1)
         # "Outcome" や "Machine-Readable Contract" は保護されるべき
         for fb in plan["failed_blocks"]:
-            preview = fb.get("text_preview", "")
+            preview = fb.get("text_preview") or ""
             assert not preview.startswith("## Outcome")
             assert not preview.startswith("## Machine-Readable Contract")
 
     def test_bilingual_heading_protected(self):
-        """日英混在見出しは保護される"""
+        """日英混在見出しは保護される（任意の ATX 見出しは protected）"""
         block = {
             "type": "prose",
             "text": "## 概要 (Summary)",
             "raw_text": "## 概要 (Summary)",
         }
-        # 直接 _is_protected_block でテスト
-        # bilingual_heading は heading_policy に存在しない場合は prose delta 対象
-        # だが heading パターン自体は保護判定対象
-        # ここでは直接 heading ブロックが protected かを確認
         result = _is_protected_block(block)
-        # 注: bilingual heading は heading_policy に存在しない場合 False になりうる
-        # テストは保護ロジックが呼ばれることを確認する
-        assert isinstance(result, bool)
+        assert result is True
 
     def test_fence_block_is_protected(self):
         """code_fence type のブロックは必ず保護される"""
@@ -385,6 +379,27 @@ class TestPreservedTokens:
         plan = analyze_pr_body(body, threshold=0.1)
         assert any("100" in t for t in plan["preserved_tokens"])
 
+    def test_repeated_keyword_multi_issue(self):
+        """GitHub docs 例: キーワード繰り返しによる複数 issue 列挙"""
+        body = "Resolves #10, resolves #123, resolves octo-org/octo-repo#100"
+        tokens = extract_preserved_tokens(body)
+        combined = " ".join(tokens)
+        assert "10" in combined
+        assert "123" in combined
+        assert "octo-org/octo-repo#100" in combined
+
+    def test_closes_uppercase_colon(self):
+        """GitHub docs 例: 大文字 CLOSES: のコロン variant"""
+        body = "CLOSES: #10"
+        tokens = extract_preserved_tokens(body)
+        assert any("10" in t for t in tokens)
+
+    def test_fixes_cross_repo(self):
+        """GitHub docs 例: Fixes owner/repo#N (cross-repo reference)"""
+        body = "Fixes owner/repo#42"
+        tokens = extract_preserved_tokens(body)
+        assert any("owner/repo#42" in t for t in tokens)
+
 
 # ---------------------------------------------------------------------------
 # AC7: body_file_out / validate_pr_body との連携
@@ -394,10 +409,13 @@ class TestBodyFileOut:
     """AC7: body_file_out を生成する repairable case のテスト"""
 
     def test_repairable_case_has_body_file_out_field(self):
-        """repairable case は body_file_out フィールドを持つ（None でも可）"""
+        """repairable status は body_file_out が non-None であることを保証する"""
         body = _make_valid_body("Short PR.")
         plan = analyze_pr_body(body, threshold=0.1)
         assert "body_file_out" in plan
+        # status: repairable になるのは body_file_out が non-None の場合のみ
+        if plan["status"] == "repairable":
+            assert plan["body_file_out"] is not None
 
     def test_pass_case_body_file_out_is_none(self):
         """pass case は body_file_out が None"""
@@ -407,17 +425,46 @@ class TestBodyFileOut:
             assert plan["body_file_out"] is None
 
     def test_validate_pr_body_passes_with_valid_fixture(self):
-        """validate_text() を通過する日本語テキストが pass を返す"""
-        # validate_text() は per-block で判定するため、
-        # 英語見出しのみの PR body は failed になる。
-        # ここでは純粋な日本語 prose のみを渡して pass することを確認する。
-        pure_japanese_body = (
-            "これはテスト用の日本語で書かれた PR の概要です。\n\n"
-            "修正内容を日本語で説明しています。\n\n"
-            "すべてのブロックが日本語で記述されています。"
+        """validate_pr_body.py と validate_japanese_content.py が有効 fixture で PASS する"""
+        _CREATE_ISSUE_SCRIPTS_DIR = _SCRIPT_DIR.parent.parent / "create-issue" / "scripts"
+        validate_pr_body_script = _SCRIPT_DIR / "validate_pr_body.py"
+        validate_japanese_script = _CREATE_ISSUE_SCRIPTS_DIR / "validate_japanese_content.py"
+        fixture_path = Path(__file__).parent / "fixtures" / "pr_body" / "valid_not_schema_change.md"
+
+        # validate_pr_body.py: 構造チェック → 既存 fixture を使用
+        non_safety_paths = Path(__file__).parent / "fixtures" / "pr_body" / "non_safety_paths.txt"
+        result = subprocess.run(
+            [sys.executable, str(validate_pr_body_script),
+             "--body-file", str(fixture_path),
+             "--linked-issue", "330",
+             "--changed-paths-file", str(non_safety_paths)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
         )
-        plan = analyze_pr_body(pure_japanese_body, threshold=0.1)
-        assert plan["status"] == "pass"
+        assert result.returncode == 0, (
+            f"validate_pr_body.py failed (exit {result.returncode}): {result.stdout}"
+        )
+
+        # validate_japanese_content.py: 日本語比率チェック → 純粋な日本語 prose で検証
+        japanese_body = "これはすべて日本語で書かれた概要です。\n\n修正内容を日本語で説明しています。"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False) as f:
+            f.write(japanese_body)
+            japanese_path = f.name
+        try:
+            result = subprocess.run(
+                [sys.executable, str(validate_japanese_script), "--file", japanese_path],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            assert result.returncode == 0, (
+                f"validate_japanese_content.py failed (exit {result.returncode}): {result.stderr}"
+            )
+        finally:
+            Path(japanese_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +520,14 @@ class TestCompactJsonAndExitCode:
         finally:
             Path(body_file).unlink(missing_ok=True)
 
-        # raw body marker が stdout に完全に露出していないこと
-        # (text_preview は 100 文字まで OK)
+        # raw body marker が stdout に露出していないこと（--include-preview なしはデフォルト非表示）
+        assert "UNIQUE_ENGLISH_MARKER_DO_NOT_REPEAT_XYZ123" not in result.stdout
         stdout_json = json.loads(result.stdout.strip())
-        # body_file_out フィールドは None または短い
-        assert stdout_json.get("body_file_out") is None or len(str(stdout_json.get("body_file_out", ""))) < 500
+        # body_file_out フィールドは None
+        assert stdout_json.get("body_file_out") is None
+        # text_preview は --include-preview なしなので None
+        for fb in stdout_json.get("failed_blocks", []):
+            assert fb.get("text_preview") is None
 
     def test_exit_code_0_for_pass(self):
         """pass case は exit code 0"""
@@ -509,8 +559,8 @@ class TestCompactJsonAndExitCode:
             timeout=30,
         )
         parsed = json.loads(result.stdout.strip())
-        # gh_error になるか、または gh が存在しない場合も gh_error
-        assert parsed["status"] == "gh_error" or result.returncode in (40, 20)
+        assert parsed["status"] == "gh_error"
+        assert result.returncode == 40
 
     def test_exit_code_30_for_missing_body_file(self):
         """存在しない body-file は exit code 30"""
@@ -631,7 +681,7 @@ def hello():
         body = _make_valid_body("日本語の説明です。") + body_text
         plan = analyze_pr_body(body, threshold=0.1)
         for fb in plan["failed_blocks"]:
-            assert "hello" not in fb.get("text_preview", "")
+            assert "hello" not in (fb.get("text_preview") or "")
 
     def test_lookup_heading_policy_ssot_used(self):
         """lookup_heading_policy SSOT が canonical heading を保護する"""

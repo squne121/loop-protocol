@@ -54,7 +54,6 @@ _vjc = _load_module("validate_japanese_content", _CREATE_ISSUE_SCRIPTS / "valida
 
 # SSOT 関数参照
 validate_text = _vjc.validate_text
-split_markdown_blocks = _vjc.split_markdown_blocks
 iter_markdown_blocks = _pbp.iter_markdown_blocks
 lookup_heading_policy = _pbp.lookup_heading_policy
 
@@ -150,16 +149,14 @@ def _is_protected_block(block: dict) -> bool:
                  "grep_pattern", "url_or_identifier_only"):
         return True
 
-    # prose ブロックでも canonical heading は保護
+    # prose ブロックでも ATX 見出し・HTML comment・closing keyword は保護
     if btype == "prose":
         text = block.get("text", "")
         raw_text = block.get("raw_text", text)
-        # heading_policy SSOT で判定
+        # 任意の ATX 見出し行は保護（canonical か否かを問わず）
         parsed = _pbp.parse_atx_heading_line(raw_text.rstrip("\r\n"))
         if parsed is not None:
-            heading_text = parsed["text"]
-            if lookup_heading_policy(heading_text) is not None:
-                return True
+            return True
         # HTML comment を含むブロックは保護
         if _HTML_COMMENT_RE.search(text):
             return True
@@ -197,7 +194,7 @@ def _is_repairable_block(block: dict, threshold: float = 0.1) -> bool:
 
     repairable 条件:
     1. 保護ブロックでない（prose ブロック）
-    2. 日本語比率が threshold 未満
+    2. 日本語比率が threshold 未満（SSOT の failed_blocks から来るため既知）
     3. テキストが短い（_REPAIRABLE_MAX_EFFECTIVE_CHARS 以下）かつ ASCII のみ
        → 既知 template / boilerplate として機械的な日本語補足が可能
 
@@ -212,13 +209,15 @@ def _is_repairable_block(block: dict, threshold: float = 0.1) -> bool:
 
     text = block.get("text", "")
 
-    # validate_text で日本語比率を確認
-    result = validate_text(text, threshold=threshold)
-    if result.passed:
-        return False  # already pass
+    # SSOT データから effective_chars を取得（未提供の場合は validate_text で計算）
+    effective_chars = block.get("effective_chars")
+    if effective_chars is None:
+        result = validate_text(text, threshold=threshold)
+        if result.passed:
+            return False
+        effective_chars = result.total_chars
 
     # 有効文字数が少なく ASCII のみ → boilerplate
-    effective_chars = result.total_chars
     if effective_chars == 0:
         return True  # empty prose = repairable (no-op)
     if effective_chars <= _REPAIRABLE_MAX_EFFECTIVE_CHARS and _SIMPLE_ENGLISH_RE.match(text.strip()):
@@ -231,13 +230,17 @@ def _is_repairable_block(block: dict, threshold: float = 0.1) -> bool:
 # safe_rewrite_plan 生成
 # ---------------------------------------------------------------------------
 
-def _build_safe_rewrite_plan(failed_blocks: list[dict], threshold: float) -> list[dict]:
+def _build_safe_rewrite_plan(
+    failed_blocks: list[dict],
+    threshold: float,
+    include_preview: bool = False,
+) -> list[dict]:
     """
     repairable な failed block の safe_rewrite_plan を構築する。
 
     safe_rewrite_plan の各エントリ:
     - block_index: 0-indexed の block 番号
-    - original_text: 元テキスト（先頭 100 文字）
+    - original_text: 元テキスト（--include-preview 指定時のみ先頭 100 文字。デフォルト: None）
     - action: "append_japanese_note" (唯一の deterministic action)
     - note: append すべき日本語注記（空文字列 = 呼び出し側が決定）
     """
@@ -246,7 +249,7 @@ def _build_safe_rewrite_plan(failed_blocks: list[dict], threshold: float) -> lis
         if _is_repairable_block(fb, threshold=threshold):
             plan.append({
                 "block_index": fb.get("_block_index", -1),
-                "original_text": fb.get("text", "")[:100],
+                "original_text": fb.get("text", "")[:100] if include_preview else None,
                 "action": "append_japanese_note",
                 "note": "",  # 機械的な確定翻訳は不可; 呼び出し側が補足する
             })
@@ -316,6 +319,7 @@ def _fetch_pr_body(pr_number: int, repo: str | None) -> tuple[str | None, str | 
 def analyze_pr_body(
     body: str,
     threshold: float = 0.1,
+    include_preview: bool = False,
 ) -> dict[str, Any]:
     """
     PR body を分析して PR_BODY_JAPANESE_REPAIR_PLAN_V1 を返す。
@@ -323,6 +327,7 @@ def analyze_pr_body(
     Args:
         body: PR body テキスト
         threshold: 日本語比率の閾値（デフォルト: 0.1）
+        include_preview: text_preview / original_text に実テキストを含めるか（デフォルト: False）
 
     Returns:
         PR_BODY_JAPANESE_REPAIR_PLAN_V1 dict
@@ -343,44 +348,43 @@ def analyze_pr_body(
     # 保護トークンを抽出（AC6）
     preserved_tokens = extract_preserved_tokens(body)
 
-    # split_markdown_blocks で block 分割（SSOT 再利用 AC2）
-    blocks = split_markdown_blocks(body)
-
-    # 各ブロックに index を付与
-    for i, block in enumerate(blocks):
-        block["_block_index"] = i
-
-    # validate_text を使って per-block 日本語判定（SSOT 再利用 AC2）
-    # validate_text は aggregate + per_block 両方の結果を返す
+    # SSOT: validate_text を全 body に対して一度だけ呼び出す（AC2 SSOT 再利用）
     full_result = validate_text(body, threshold=threshold)
 
-    # failed_blocks: validate_text の failed_blocks を参照
-    # ただし block の特定のため split_markdown_blocks と突合する
+    # 全ブロック pass の場合は早期リターン
+    if full_result.passed:
+        return {
+            "schema": "PR_BODY_JAPANESE_REPAIR_PLAN_V1",
+            "status": "pass",
+            "threshold": threshold,
+            "failed_blocks": [],
+            "safe_rewrite_plan": [],
+            "body_file_out": None,
+            "preserved_tokens": preserved_tokens,
+            "next_action": "none",
+        }
+
+    # SSOT の failed_blocks を出発点とし、追加の保護フィルタを適用する。
+    # validate_text は code fence / table / canonical heading を除外済み。
+    # ここでは ATX 見出し・HTML comment・closing keyword の追加保護を行う。
     failed_block_infos = []
-    for block in blocks:
-        btype = block.get("type", "prose")
-        if btype != "prose":
+    for i, sfb in enumerate(full_result.failed_blocks):
+        original = sfb.get("original", "")
+        synthetic_block = {"type": "prose", "text": original, "raw_text": original}
+        if _is_protected_block(synthetic_block):
             continue
-        if _is_protected_block(block):
-            continue
+        failed_block_infos.append({
+            "_block_index": i,
+            "text": original,
+            "type": "prose",
+            "ratio": sfb.get("ratio", 0.0),
+            "effective_chars": sfb.get("effective_chars", 0),
+            "japanese_chars": sfb.get("japanese_chars", 0),
+            "passed": False,
+        })
 
-        text = block.get("text", "")
-        block_result = validate_text(text, threshold=threshold)
-
-        if not block_result.passed and block_result.prose_blocks:
-            failed_block_infos.append({
-                "_block_index": block.get("_block_index", -1),
-                "text": text,
-                "type": btype,
-                "ratio": block_result.aggregate_ratio,
-                "effective_chars": block_result.total_chars,
-                "japanese_chars": block_result.japanese_chars,
-                "passed": False,
-            })
-
-    # status 判定
+    # 全 failed block が保護対象だった場合は pass
     if not failed_block_infos:
-        # 全ブロック pass
         return {
             "schema": "PR_BODY_JAPANESE_REPAIR_PLAN_V1",
             "status": "pass",
@@ -398,18 +402,19 @@ def analyze_pr_body(
         for fb in failed_block_infos
     )
 
-    safe_rewrite_plan = _build_safe_rewrite_plan(failed_block_infos, threshold)
+    safe_rewrite_plan = _build_safe_rewrite_plan(failed_block_infos, threshold, include_preview)
 
     # body_file_out 生成（repairable case のみ、現時点は None）
     body_file_out = None
     if all_repairable:
         body_file_out = _generate_body_file_out(body, failed_block_infos, threshold)
 
-    # failed_blocks の出力用整形（raw body は含めない）
+    # failed_blocks の出力用整形
+    # text_preview は --include-preview 指定時のみ実テキストを含める（デフォルト: None）
     output_failed_blocks = [
         {
             "block_index": fb.get("_block_index", -1),
-            "text_preview": fb.get("text", "")[:100],
+            "text_preview": fb.get("text", "")[:100] if include_preview else None,
             "ratio": round(fb.get("ratio", 0.0), 4),
             "effective_chars": fb.get("effective_chars", 0),
             "japanese_chars": fb.get("japanese_chars", 0),
@@ -417,7 +422,8 @@ def analyze_pr_body(
         for fb in failed_block_infos
     ]
 
-    if all_repairable:
+    # status: repairable は body_file_out が non-None の場合のみ（Blocker 1）
+    if all_repairable and body_file_out is not None:
         status = "repairable"
         next_action = "apply_safe_rewrite_plan"
     else:
@@ -485,6 +491,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0.1,
         help="日本語比率の閾値（デフォルト: 0.1）",
     )
+    parser.add_argument(
+        "--include-preview",
+        action="store_true",
+        default=False,
+        help="text_preview / original_text に実テキストを含める（デフォルト: 非表示）",
+    )
 
     args = parser.parse_args(argv)
 
@@ -543,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
             return 30
 
     # 分析実行
-    plan = analyze_pr_body(body, threshold=args.threshold)
+    plan = analyze_pr_body(body, threshold=args.threshold, include_preview=args.include_preview)
 
     # stdout に compact JSON のみ（AC8）
     print(json.dumps(plan, ensure_ascii=False, separators=(",", ":")))
