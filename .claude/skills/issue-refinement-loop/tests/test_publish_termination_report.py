@@ -761,3 +761,63 @@ class TestValidateRenderResult:
         err = pub._validate_render_result(result)
         assert err != ""
         assert "reason_code" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# AC1 (Issue #838): Real renderer E2E — _post_github_comment monkeypatch
+# ---------------------------------------------------------------------------
+
+class TestRealRendererE2E:
+    """AC1: E2E test using real render_termination_report.py subprocess with _post_github_comment monkeypatch."""
+
+    def test_publish_with_real_renderer_posts_normalized_human_escalation_body(self, monkeypatch):
+        posted: list[tuple[int, str]] = []
+
+        def fake_post_github_comment(*, issue_number: int, body: str) -> int:
+            posted.append((issue_number, body))
+            return 0
+
+        monkeypatch.setattr(pub, "_post_github_comment", fake_post_github_comment)
+
+        exit_code = pub.publish(
+            issue_number=42,
+            input_data={
+                "termination_reason": "human_escalation",
+                "issue_number": 42,
+                "iteration": 3,
+                "blocker_summary": ["legacy blocker entry"],
+            },
+        )
+
+        assert exit_code == 0
+        assert len(posted) == 1
+        assert posted[0][0] == 42
+
+        body = posted[0][1]
+        assert "Cause: none" not in body
+        assert "Cause: human judgment required" in body
+        assert "## Blockers" in body
+        assert "legacy blocker entry" in body
+
+
+# ---------------------------------------------------------------------------
+# AC2 (Issue #838): Docs prose negative guard
+# ---------------------------------------------------------------------------
+
+class TestTerminationReportDocsProse:
+    def test_english_duplicate_prose_removed(self):
+        root = Path(__file__).resolve().parent.parent
+        text = "\n".join([
+            (root / "SKILL.md").read_text(),
+            (root / "references" / "termination-policy.md").read_text(),
+        ])
+
+        forbidden = [
+            "human_escalation example includes termination_cause and blockers_summary",
+            "legacy alias blocker_summary is normalized to canonical blockers_summary",
+            "owner decision is required",
+            "conflicting scope signals remain unresolved",
+        ]
+
+        for phrase in forbidden:
+            assert phrase not in text, f"英語重複 prose が残っています: {phrase!r}"
