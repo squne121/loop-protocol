@@ -1895,6 +1895,173 @@ true
         os.unlink(fixture_path)
 
 
+
+# ---------------------------------------------------------------------------
+# Issue #889: baseline-expect annotation tests
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_expect_pass_exit0_is_expected_pass():
+    """Issue #889: baseline-expect: pass + exit 0 → expected_pass / go (NOT unexpected_pass)."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_pass.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "expected_pass", (
+        f"Expected expected_pass but got {r['classification']} "
+        f"(category={r.get('category')}, decision={r.get('decision')})"
+    )
+    assert r["decision"] == "go", f"Expected go but got {r['decision']}"
+    assert r.get("annotations", {}).get("baseline_expect") == "pass"
+
+
+def test_baseline_expect_pass_exit1_is_human_judgment():
+    """Issue #889: baseline-expect: pass + exit 1 → human_judgment / baseline_regression_failed."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_pass_fail.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    # Should be human_judgment (regression detected)
+    assert r["decision"] == "human_judgment", (
+        f"Expected human_judgment but got {r['decision']} "
+        f"(classification={r.get('classification')}, category={r.get('category')})"
+    )
+    assert r["classification"] == "human_judgment"
+    assert r.get("category") == "baseline_regression_failed"
+    assert r.get("annotations", {}).get("baseline_expect") == "pass"
+
+
+def test_baseline_expect_fail_exit1_is_expected_fail():
+    """Issue #889: baseline-expect: fail + exit 1 → expected_fail / go (backward compat)."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_fail.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "expected_fail", (
+        f"Expected expected_fail but got {r['classification']}"
+    )
+    assert r["decision"] == "go"
+    assert r.get("annotations", {}).get("baseline_expect") == "fail"
+
+
+def test_baseline_expect_deferred_is_skipped():
+    """Issue #889: baseline-expect: deferred → skipped / go."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_deferred.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "skipped", (
+        f"Expected skipped but got {r['classification']}"
+    )
+    assert r["decision"] == "go"
+
+
+def test_missing_annotation_unexpected_pass_has_hint():
+    """Issue #889: annotation absent + exit 0 → unexpected_pass / blocked with missing_annotation hint."""
+    fixture = Path(__file__).parent / "fixtures" / "missing_annotation_unexpected_pass.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "unexpected_pass"
+    assert r["decision"] == "blocked"
+    # missing_annotation_unexpected_pass is True in annotations
+    annotations = r.get("annotations", {})
+    assert annotations.get("missing_baseline_expect") is True
+    # fix_hint should mention missing_annotation
+    fix_hint = r.get("fix_hint") or ""
+    assert "missing_annotation" in fix_hint.lower() or "baseline-expect" in fix_hint.lower()
+
+
+def test_baseline_expect_pass_does_not_override_compound_command():
+    """Issue #889: baseline-expect: pass does NOT override compound command blocker."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_pass_compound.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    # Should still be blocked (compound command, not expected_pass)
+    assert r["classification"] == "blocked"
+    assert r["category"] == "compound_command_disallowed"
+    assert r["decision"] == "blocked"
+
+
+def test_annotation_source_fields_present():
+    """Issue #889: result JSON has annotations and annotation_source fields (AC11)."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_pass.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert "annotations" in r, "annotations field missing from result"
+    assert "annotation_source" in r, "annotation_source field missing from result"
+    ann = r["annotations"]
+    assert "baseline_expect" in ann, "annotations.baseline_expect missing"
+    assert "vc_role" in ann, "annotations.vc_role missing"
+    assert "missing_baseline_expect" in ann, "annotations.missing_baseline_expect missing"
+    src = r["annotation_source"]
+    assert "line" in src, "annotation_source.line missing"
+    assert "raw" in src, "annotation_source.raw missing"
+
+
+def test_annotation_scope_does_not_cross_empty_line():
+    """Issue #889: annotation scope stops at empty line (does not affect next command)."""
+    # Two commands; first has baseline-expect: pass but there's an empty line before the second
+    # The second command should NOT inherit the annotation
+    import tempfile, os
+    body = """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: pass
+$ test -d /home
+
+# AC2
+$ test -f /this_file_definitely_does_not_exist_12345abc
+```
+"""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(body)
+        tmp_path = tf.name
+
+    try:
+        script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+        import subprocess, sys, json
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
+            capture_output=True, text=True, timeout=90,
+        )
+        data = json.loads(result.stdout)
+    finally:
+        os.unlink(tmp_path)
+
+    results = data["results"]
+    assert len(results) == 2
+
+    # First command (AC1): baseline-expect: pass, exit 0 → expected_pass
+    r1 = results[0]
+    assert r1["annotations"]["baseline_expect"] == "pass"
+    assert r1["classification"] == "expected_pass"
+
+    # Second command (AC2): no annotation (empty line separates), exit 1 → expected_fail
+    r2 = results[1]
+    assert r2["annotations"]["baseline_expect"] is None
+    # exit 1 on test -f nonexistent → expected_fail
+    assert r2["classification"] == "expected_fail"
+
 if __name__ == "__main__":
     # Run tests
     test_ac1_file_exists()

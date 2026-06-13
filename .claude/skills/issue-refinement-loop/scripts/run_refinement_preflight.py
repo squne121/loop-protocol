@@ -86,6 +86,7 @@ except ImportError:
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
 PLANNER_SCRIPT = _SCRIPTS_DIR / "plan_refinement_loop.py"
+REPAIR_SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
 
 SCHEMA_VERSION_RESULT = "refinement_preflight_result/v1"
 SCHEMA_VERSION_PLANNER_INPUT = "refinement_loop_planner_input/v1"
@@ -499,6 +500,42 @@ def _build_planner_input(
         planner_input["now"] = now
 
     return planner_input
+
+
+def _invoke_repair(body: str) -> dict:
+    """
+    Invoke repair_issue_contract.py (dry-run) to pre-process the Issue body
+    before feeding it to the planner.
+
+    Returns the repair result dict (schema: repair_issue_contract/v1).
+    Never raises; on failure returns a minimal dict with error key.
+    """
+    import tempfile, os as _os, sys as _sys, subprocess as _sp
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(body)
+        tmp_path = tf.name
+
+    try:
+        proc = _sp.run(
+            [_sys.executable, str(REPAIR_SCRIPT), "--body-file", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        import json as _json
+        if proc.stdout:
+            return _json.loads(proc.stdout)
+        return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": proc.stderr or "no output"}
+    except Exception as exc:
+        return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": str(exc)}
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
@@ -976,6 +1013,12 @@ def run_preflight(
         "issue": issue,
         "comments": comments,
     }
+
+    # --- Run repair pass before planner (Issue #889) ---
+    # repair_issue_contract runs dry-run to report defects; the repaired body is
+    # NOT fed to the planner (the planner always receives the original Issue body).
+    # Repair artifacts are informational only at this stage.
+    _repair_result = _invoke_repair(issue.get("body", "") or "")
 
     # --- Invoke planner ---
     planner_input_dict = _build_planner_input(issue, comments, known_context, now=now)

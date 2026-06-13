@@ -105,7 +105,70 @@ $ pnpm test
 - block 先頭に 1 個書けば block 全体に効くという解釈は誤り
 - マーカーが複数コマンドに効くとみなすと、`baseline_fail_expected` チェックをすべきコマンドが `pr_review_only` と誤認される
 
-### pytest exit code semantics
+### baseline-expect と vc-role annotation の per-command 規約（Issue #889）
+
+`# baseline-expect: pass|fail|deferred` annotation は **各 `$` コマンド直前の連続 comment ブロック内**に記載する。
+
+```
+# baseline-expect: pass
+$ rg -n "baseline.expect" .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py
+```
+
+`vc-role:` annotation は VC の役割を明示するための任意アノテーション（現在は advisory のみ）。
+
+```
+# vc-role: existence_check
+# baseline-expect: pass
+$ test -f .claude/skills/issue-refinement-loop/scripts/repair_issue_contract.py
+```
+
+#### baseline-expect の意味と優先順位
+
+| annotation | 意味 | 適用ケース |
+|---|---|---|
+| `pass` | baseline（実装前）で exit 0 が期待される | promotion/refactor Issue（既存コードの検証） |
+| `fail` | baseline で exit 非0 が期待される | 従来の新規実装 Issue（デフォルト想定） |
+| `deferred` | baseline 実行を延期 | `pr_review_only` と同等 |
+
+**重要な制約**: `baseline-expect` は「実行結果分類 annotation」であり「安全ポリシー bypass annotation」ではない。
+
+以下の static blocker は `baseline-expect` で上書きできない（annotation があっても block が維持される）:
+- `unsafe_command`（curl / rm / bash -c 等）
+- `compound_command_disallowed`（&&, ||, | 等）
+- `trivially_pass`（discovery script + --keywords + --paths 同時使用）
+- `broad_search_path_unbounded`（rg の広すぎる search path）
+
+#### annotation の効く範囲（scope rule）
+
+- annotation は VC コマンド行の**直前の連続 comment ブロック内のみ**有効
+- 空行または別の `$` コマンド行を跨ぐと annotation が無効になる
+- `# preflight-scope:`、`# AC<N>`、`# vc-role:` は同一ブロック内として透過する
+
+```
+# AC1
+# vc-role: regression_gate
+# baseline-expect: pass
+$ rg -n "baseline.expect" scripts/baseline_vc_preflight.py
+                              ↑ この command に annotation が効く
+
+                   ← 空行があると annotation scope が切れる
+# AC2
+$ test -f nonexistent_file.py
+     ↑ この command には annotation が効かない
+```
+
+#### preflight 結果への mapping
+
+| annotation | exit code | classification | decision |
+|---|---|---|---|
+| `pass` | 0 | `expected_pass` | `go` |
+| `pass` | 非0 | `human_judgment` | `human_judgment`（baseline regression） |
+| `fail` | 非0 | `expected_fail` | `go` |
+| `fail` | 0 | `unexpected_pass` | `blocked` |
+| `deferred` | — | `skipped` | `go` |
+| 欠落 | 0 | `unexpected_pass` + `missing_annotation` warning | `blocked` |
+
+### ### pytest exit code semantics
 
 | exit code | 意味 | 注意事項 |
 |---|---|---|
