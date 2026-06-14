@@ -253,7 +253,7 @@ describe('HudController', () => {
   it('GIVEN feedback copy WHEN render called THEN status region exposes claim and persistence copy without innerHTML', () => {
     const state = createState('debrief_reward_claimed')
     state.telemetry.status = 'Reward claimed for this session.'
-    state.telemetry.lastCommandSummary = 'Persistence will be handled by issue #739.'
+    state.telemetry.lastCommandSummary = 'Confirm result to save and return to preparation.'
 
     hudController.render(state, false)
 
@@ -262,7 +262,7 @@ describe('HudController', () => {
     expect(status?.getAttribute('role')).toBe('status')
     expect(status?.getAttribute('aria-live')).toBe('polite')
     expect(container.querySelector('[data-field="command"]')?.textContent).toBe(
-      'Persistence will be handled by issue #739.',
+      'Confirm result to save and return to preparation.',
     )
   })
 
