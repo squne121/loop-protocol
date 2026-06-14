@@ -66,8 +66,8 @@ export function resolveProgressionSaveFailureFeedback(
     hasLoadableSnapshot: hadLoadableSnapshot,
     status: 'Save failed.',
     summary: hadLoadableSnapshot
-      ? 'Previous local save is still available; this result may be lost after reload.'
-      : 'No local save is available; this result may be lost after reload.',
+      ? 'Previous local save is still available; current progression was not written.'
+      : 'No local save is available; current progression was not written.',
   }
 }
 

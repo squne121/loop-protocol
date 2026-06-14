@@ -609,11 +609,11 @@ describe('progression save failure feedback', () => {
     expect(withSnapshot.load).not.toHaveBeenCalled()
     expect(withoutSnapshot.setHudFeedback).toHaveBeenCalledWith(
       'Save failed.',
-      'No local save is available; this result may be lost after reload.',
+      'No local save is available; current progression was not written.',
     )
     expect(withSnapshot.setHudFeedback).toHaveBeenCalledWith(
       'Save failed.',
-      'Previous local save is still available; this result may be lost after reload.',
+      'Previous local save is still available; current progression was not written.',
     )
     expect(withoutSnapshot.setHudFeedback).not.toHaveBeenCalledWith(
       'Save complete.',
@@ -634,7 +634,7 @@ describe('progression save failure feedback', () => {
     expect(resolveProgressionSaveFailureFeedback('save', false)).toEqual({
       hasLoadableSnapshot: false,
       status: 'Save failed.',
-      summary: 'No local save is available; this result may be lost after reload.',
+      summary: 'No local save is available; current progression was not written.',
     })
   })
 })
