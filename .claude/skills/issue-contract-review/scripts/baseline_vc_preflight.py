@@ -27,8 +27,11 @@ if str(_VC_SYNTAX_DIR) not in sys.path:
 
 from vc_contract_syntax import (
     VALID_PRE_FLIGHT_SCOPE_VALUES,
+    VALID_BASELINE_EXPECT_VALUES,
     parse_ac_marker_line,
     parse_preflight_scope_marker_line,
+    extract_baseline_expect_annotation,
+    extract_vc_role_annotation,
 )
 
 
@@ -260,17 +263,22 @@ def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -
     return found_annotation
 
 
-def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str], Optional[str]]]:
+def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str], Optional[str], Optional[str], Optional[str], Optional[int], Optional[str]]]:
     """
     bash ブロックからコマンドを抽出。
     AC マーカーとコマンドの行番号と preflight-scope marker と vc-regex-intent annotation を返す。
 
-    戻り値: [(ac_label, command, line_number, preflight_scope, vc_regex_intent), ...]
+    戻り値: [(ac_label, command, line_number, preflight_scope, vc_regex_intent,
+               baseline_expect, vc_role, annotation_line_no, annotation_raw), ...]
       - ac_label: "AC1", "AC2", ... または None
       - command: raw command ($ prefix 除去済み、suffix marker 除去済み)
       - line_number: block 内での行番号
       - preflight_scope: 'pr_review_only' / 'runtime_only' / None
       - vc_regex_intent: 'literal-pipe-ok' / None (AC3: Issue #589)
+      - baseline_expect: 'pass' / 'fail' / 'deferred' / None (Issue #889)
+      - vc_role: role string / None (Issue #889)
+      - annotation_line_no: 1-based line number of baseline-expect annotation / None
+      - annotation_raw: raw annotation line text / None
     """
     commands = []
     lines = block.split("\n")
@@ -324,7 +332,11 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
             # 直前行から vc-regex-intent annotation を抽出 (AC3: Issue #589)
             vc_regex_intent = extract_vc_regex_intent_annotation(lines, i - 1)
 
-            commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent))
+            # 直前の連続 annotation ブロックから baseline-expect / vc-role を抽出 (Issue #889)
+            baseline_expect, annotation_line_no, annotation_raw = extract_baseline_expect_annotation(lines, i - 1)
+            vc_role = extract_vc_role_annotation(lines, i - 1)
+
+            commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent, baseline_expect, vc_role, annotation_line_no, annotation_raw))
 
     return commands
 
@@ -2175,7 +2187,7 @@ def main() -> int:
         "extraction_errors": 0,
     }
 
-    for ac_label, command, line_no, preflight_scope, vc_regex_intent in commands:
+    for ac_label, command, line_no, preflight_scope, vc_regex_intent, baseline_expect, vc_role, annotation_line_no, annotation_raw in commands:
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
         if preflight_scope is not None:
@@ -2211,9 +2223,43 @@ def main() -> int:
                 runtime_verification_required = None
 
         else:
+            # BLOCKER 2 fix: invalid baseline-expect annotation value → human_judgment
+            # Sentinel "__invalid__:<raw>" is set by extract_baseline_expect_annotation
+            # when the annotation line is present but value is not in VALID_BASELINE_EXPECT_VALUES.
+            if baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
+                raw_invalid_value = baseline_expect[len("__invalid__:"):]
+                classification = "human_judgment"
+                decision = "human_judgment"
+                category = "invalid_baseline_expect_annotation"
+                exit_code = None
+                stdout, stderr = "", ""
+                duration_ms = 0
+                scope_class = "baseline_fail_expected"
+                fix_hint = (
+                    f"# baseline-expect: {raw_invalid_value} is not a valid annotation. "
+                    "Use pass|fail|deferred."
+                )
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
+
+            # Issue #889: baseline-expect: deferred → skip (priority after preflight-scope)
+            elif baseline_expect == "deferred":
+                classification = "skipped"
+                decision = "go"
+                category = "baseline_expect_deferred"  # MAJOR 3 fix: distinct category
+                exit_code = None
+                stdout, stderr = "", ""
+                duration_ms = 0
+                fix_hint = None
+                scope_class = "pr_review_only"
+                verification_owner = "pr-review-judge"
+                deferred_reason = "VC annotated baseline-expect: deferred; verification deferred"
+                runtime_verification_required = False
+
             # Static classification checks BEFORE run_command (CRITICAL)
             # Negated search commands are statically classified as expected_fail/go
-            if _is_negated_search_command(command):
+            elif _is_negated_search_command(command):
                 exit_code, stdout, stderr, duration_ms = None, "", "", 0
                 classification, category, decision, fix_hint, scope_class = (
                     "expected_fail",
@@ -2222,6 +2268,9 @@ def main() -> int:
                     None,
                     "baseline_fail_expected",
                 )
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
             else:
                 # AC1-AC3: classify_static_command checks unsafe/unsupported commands
                 # BEFORE any execution attempt
@@ -2237,6 +2286,7 @@ def main() -> int:
                 ):
                     static_result = None  # annotation exempts from blocked
                 if static_result is not None:
+                    # Static blocker: baseline-expect does NOT override static blocks
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result
                 else:
@@ -2249,9 +2299,47 @@ def main() -> int:
                         exit_code, stdout, stderr, command, cwd=args.cwd
                     )
 
-            verification_owner = None
-            deferred_reason = None
-            runtime_verification_required = None
+                    # Issue #889: Apply baseline-expect annotation post-execution re-mapping
+                    if baseline_expect == "pass":
+                        if exit_code == 0 and classification in ("unexpected_pass", "expected_pass"):
+                            # expected: exit 0 at baseline → expected_pass / go
+                            classification = "expected_pass"
+                            category = "baseline_expect_pass"
+                            decision = "go"
+                            scope_class = "regression_gate"
+                            fix_hint = None
+                        elif exit_code is not None and exit_code != 0:
+                            # exit non-0 despite baseline-expect: pass → regression detected
+                            classification = "human_judgment"
+                            category = "baseline_regression_failed"
+                            decision = "human_judgment"
+                            fix_hint = (
+                                "VC annotated baseline-expect: pass but exited non-0; "
+                                "the command that was passing at baseline is now failing. "
+                                "Investigate regression or update annotation."
+                            )
+                    elif baseline_expect == "fail":
+                        # baseline-expect: fail is the traditional expectation (backward compat)
+                        # unexpected_pass → needs_fix (existing behavior)
+                        # expected_fail → go (existing behavior)
+                        # No re-mapping needed; just preserve existing logic
+                        pass
+                    else:
+                        # annotation absent: add missing_annotation warning as fix_hint
+                        if classification == "unexpected_pass" and decision == "blocked":
+                            # Suggest adding baseline-expect annotation
+                            existing_hint = fix_hint or ""
+                            missing_hint = (
+                                " [missing_annotation] Consider adding "
+                                "# baseline-expect: pass on the preceding line "
+                                "if this VC is expected to pass at baseline "
+                                "(e.g., for a promotion/refactor Issue)."
+                            )
+                            fix_hint = existing_hint + missing_hint
+
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
 
         # C4: confidence を compute_confidence 経由で統一
         stdout_head, stdout_truncated, stdout_orig_count = truncate_output(stdout, args.max_head_lines)
@@ -2277,6 +2365,24 @@ def main() -> int:
             "stderr_original_line_count": stderr_orig_count,
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
+            "annotations": {
+                "baseline_expect": (
+                    # Expose raw invalid value (without __invalid__: prefix) in annotations
+                    baseline_expect[len("__invalid__:"):] if (
+                        preflight_scope is None and baseline_expect is not None and baseline_expect.startswith("__invalid__:")
+                    ) else (baseline_expect if preflight_scope is None else None)
+                ),
+                "vc_role": vc_role if preflight_scope is None else None,
+                "missing_baseline_expect": (
+                    preflight_scope is None
+                    and baseline_expect is None
+                    and classification == "unexpected_pass"
+                ),
+            },
+            "annotation_source": {
+                "line": annotation_line_no,
+                "raw": annotation_raw,
+            },
         }
         # AC5: Add routing metadata for skipped results
         if verification_owner:
