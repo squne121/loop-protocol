@@ -1,0 +1,118 @@
+{
+  "_schema": "context_mode_persistence_proof_v1",
+  "_issue": "#828",
+  "_generated_at": "2026-06-14T00:00:00.000000+00:00",
+  "storage_root_resolution_order": [
+    {
+      "priority": 1,
+      "env_var": "CONTEXT_MODE_DIR",
+      "description": "明示的に指定した storage root（最優先）",
+      "resolved": false,
+      "note": "本プロジェクトでは CONTEXT_MODE_DIR を設定していない（adapter default を使用）"
+    },
+    {
+      "priority": 2,
+      "env_var": "CLAUDE_PLUGIN_DATA",
+      "description": "Claude Code plugin data ディレクトリ",
+      "resolved": false,
+      "note": "本プロジェクトでは CLAUDE_PLUGIN_DATA を設定していない"
+    },
+    {
+      "priority": 3,
+      "source": "adapter default",
+      "description": "context-mode adapter が決定するデフォルト root",
+      "resolved": true,
+      "note": "ctx-doctor-result.json の Storage paths 出力で確認済み（adapter default）"
+    },
+    {
+      "priority": 4,
+      "path_suffix": "sessions",
+      "description": "<root>/sessions — セッションデータ（SQLite DB）",
+      "resolved": true,
+      "evidence_ref": "ctx-doctor-result.json checks[1].message"
+    },
+    {
+      "priority": 5,
+      "path_suffix": "content",
+      "description": "<root>/content — コンテンツ/インデックスデータ（SQLite FTS）",
+      "resolved": true,
+      "evidence_ref": "ctx-doctor-result.json checks[2].message"
+    }
+  ],
+  "effective_storage_root": {
+    "adapter": "adapter default",
+    "sessions_path_pattern": "<HOME>/.claude/context-mode/sessions",
+    "content_path_pattern": "<HOME>/.claude/context-mode/content",
+    "confirmed_by": "ctx-doctor-result.json (v1.0.162 実行結果)",
+    "home_path_masked": true,
+    "note": "実際のパスは HOME に依存する。ctx-doctor を実行して確認すること"
+  },
+  "storage_type": {
+    "sessions": "SQLite",
+    "content": "SQLite + FTS5（Full Text Search）",
+    "fts5_status": "native module works (ctx-doctor-result.json checks[18].message)"
+  },
+  "no_commit_policy": {
+    "db_files": "repo に commit 禁止",
+    "index_files": "repo に commit 禁止",
+    "cache_files": "repo に commit 禁止",
+    "raw_fetched_body": "repo に commit 禁止",
+    "policy_basis": "#828 AC8 / docs/dev/agent-ops/context-mode-ops.md"
+  },
+  "purge_methods_verified": [
+    {
+      "method": "ctx_purge MCP tool",
+      "tool_name": "mcp__context-mode__ctx_purge",
+      "scope": "indexed_content",
+      "verified_version": "1.0.162",
+      "evidence_ref": "registered-tools.json registered_tools[ctx_purge]",
+      "note": "v1.0.162 で registered_tools に存在確認済み"
+    },
+    {
+      "method": "slash command /context-mode:ctx-purge",
+      "command": "/context-mode:ctx-purge",
+      "scope": "indexed_content",
+      "verified_version": "1.0.162",
+      "note": "context-mode slash command として ctx_purge を実行する（MCP tool の 2a と同等）"
+    },
+    {
+      "method": "CLI: ctx purge",
+      "command": "ctx purge",
+      "scope": "indexed_content",
+      "verified_version": "1.0.162",
+      "note": "context-mode CLI から直接 purge を実行する"
+    },
+    {
+      "method": "fallback: manual DB deletion",
+      "path_pattern": "<HOME>/.claude/context-mode/sessions/",
+      "scope": "storage_root",
+      "note": "plugin 停止後に手動削除（fallback 手順）"
+    },
+    {
+      "method": "fallback: manual index deletion",
+      "path_pattern": "<HOME>/.claude/context-mode/content/",
+      "scope": "storage_root",
+      "note": "plugin 停止後に手動削除（fallback 手順）"
+    }
+  ],
+  "session_reset_not_storage_purge": {
+    "command": "/context reset",
+    "scope": "session",
+    "classification": "session_reset_not_storage_purge",
+    "note": "/context reset は Claude Code の会話コンテキストリセットであり、context-mode SQLite/FTS5 storage purge ではない。purge_methods_verified には含まない。"
+  },
+  "purge_verification": {
+    "method": "ctx_doctor stats check",
+    "verified_at": "2026-06-14",
+    "version": "1.0.162",
+    "description": "purge 後に mcp__context-mode__ctx_doctor の stats が空になっていることを確認する（runtime 実行が必要）。静的に zero hit を保証できないため、verify storage deletion という表現を使用する。"
+  },
+  "version": "1.0.162",
+  "redaction": {
+    "home_path_masked": true,
+    "raw_db_excluded": true,
+    "raw_secret_excluded": true,
+    "placeholder_excluded": true,
+    "note": "HOME path を <HOME> に置換済み。raw DB / secret / unredacted home path を含まない"
+  }
+}
