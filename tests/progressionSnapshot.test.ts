@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { SaveResult } from '../src/storage'
 import { createInitialGameState, createGameSnapshot } from '../src/state/GameState'
 import { runConfirmResultHandler } from '../src/main'
+import { claimPendingReward } from '../src/systems/SortieSystem'
 
 // ---------------------------------------------------------------------------
 // Test state factory
@@ -66,11 +67,12 @@ function makeHandlerSeam(mockSaveResult: SaveResult = { ok: true, reason: 'saved
 
 describe('AC1: result phase + pending reward → storage.save() exactly once', () => {
   it('GIVEN result phase with pending reward WHEN runConfirmResultHandler is called THEN storage.save() is called exactly once', () => {
-    const { state, seam, save } = makeHandlerSeam()
+    const { state, seam, save, resetDebugPause } = makeHandlerSeam()
 
     runConfirmResultHandler(state, false, seam)
 
     expect(save).toHaveBeenCalledTimes(1)
+    expect(resetDebugPause).toHaveBeenCalledTimes(1)
   })
 
   it('GIVEN result phase with pending reward WHEN runConfirmResultHandler is called THEN snapshot contains resources after reward claim', () => {
@@ -81,8 +83,12 @@ describe('AC1: result phase + pending reward → storage.save() exactly once', (
 
     expect(save).toHaveBeenCalledTimes(1)
     const savedSnapshot = save.mock.calls[0][0]
-    // resources must reflect the claimed reward (non-negative, >= initial 0)
-    expect(savedSnapshot.resources).toBeGreaterThanOrEqual(resourcesBefore)
+    // reward が実際に加算された（victory: base=100 + kills*bonus + hpBonus > 0）
+    expect(state.progress.resources).toBeGreaterThan(resourcesBefore)
+    // snapshot が post-claim state と一致する
+    expect(savedSnapshot.resources).toBe(state.progress.resources)
+    expect(savedSnapshot.weaponPower).toBe(state.progress.weaponPower)
+    expect(savedSnapshot.playerMaxHp).toBe(state.player.maxHp)
     expect(state.loopPhase).toBe('preparation')
     expect(state.resultRewardStatus).toBe('claimed')
   })
@@ -167,6 +173,27 @@ describe('AC3: double confirm does not call storage.save() twice and resources d
     const result = runConfirmResultHandler(state, true, seam)
     expect(result).toBeNull()
   })
+
+  it('GIVEN result phase already claimed via claimPendingReward WHEN runConfirmResultHandler is called THEN resources are not added again and saved snapshot matches claimed state', () => {
+    const { state, seam, save } = makeHandlerSeam()
+
+    // 事前に手動 claim（result phase のまま留まる）
+    const claim = claimPendingReward(state)
+    expect(claim.ok).toBe(true)
+    expect(state.loopPhase).toBe('result')
+    expect(state.resultRewardStatus).toBe('claimed')
+
+    const resourcesAfterPreClaim = state.progress.resources
+
+    // confirmResult handler は already-claimed でも save を 1 回だけ呼ぶ
+    runConfirmResultHandler(state, false, seam)
+
+    expect(save).toHaveBeenCalledTimes(1)
+    // resources は変化しない（二重加算なし）
+    expect(state.progress.resources).toBe(resourcesAfterPreClaim)
+    expect(save.mock.calls[0][0].resources).toBe(resourcesAfterPreClaim)
+    expect(state.loopPhase).toBe('preparation')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -202,5 +229,43 @@ describe('AC4: storage.save() failure does not show success messages', () => {
     runConfirmResultHandler(state, false, seam)
 
     expect(save).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN storage.save() fails with hadLoadableSnapshot=true THEN failure feedback preserves loadable snapshot state', () => {
+    const { state, seam, setHudFeedback, reportSaveFailure } = makeHandlerSeam({
+      ok: false,
+      reason: 'write-error',
+      errorName: 'QuotaExceededError',
+    })
+
+    const result = runConfirmResultHandler(state, true, seam)
+
+    // reportSaveFailure が呼ばれる
+    expect(reportSaveFailure).toHaveBeenCalledTimes(1)
+    // failure feedback の具体値を確認
+    expect(setHudFeedback).toHaveBeenCalledWith(
+      'Result confirmed; progress not saved.',
+      'Previous local save is still available; this result may be lost after reload.',
+    )
+    // hadLoadableSnapshot=true のとき戻り値は true
+    expect(result).toBe(true)
+  })
+
+  it('GIVEN storage.save() fails with hadLoadableSnapshot=false THEN failure feedback reports no available save', () => {
+    const { state, seam, setHudFeedback, reportSaveFailure } = makeHandlerSeam({
+      ok: false,
+      reason: 'write-error',
+      errorName: 'QuotaExceededError',
+    })
+
+    const result = runConfirmResultHandler(state, false, seam)
+
+    expect(reportSaveFailure).toHaveBeenCalledTimes(1)
+    expect(setHudFeedback).toHaveBeenCalledWith(
+      'Result confirmed; progress not saved.',
+      'No local save is available; this result may be lost after reload.',
+    )
+    // hadLoadableSnapshot=false のとき戻り値は false
+    expect(result).toBe(false)
   })
 })
