@@ -28,6 +28,7 @@ from ci_verdict_summary import (
     EXIT_GH_ERROR,
     EXIT_PENDING,
     EXIT_STALE,
+    HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES,
     classify_check,
     classify_gh_error,
     compute_overall_status,
@@ -1016,3 +1017,138 @@ class TestExtractRunId:
 
     def test_returns_none_for_none(self):
         assert extract_run_id_from_link(None) is None
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC3/AC4/AC5: head_sha=null skipped allowlist (Issue #863)
+# ---------------------------------------------------------------------------
+
+class TestHeadShaNullSkippedExclude:
+    """AC1/AC3/AC4/AC5: head_sha=None かつ conclusion=skipped の allowlist 除外テスト"""
+
+    def test_allowlist_contains_expected_entries(self):
+        """AC4: HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES に必須エントリが含まれる"""
+        assert "deploy-main" in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES
+        assert "cleanup-pr" in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES
+        assert "Issue Body Japanese Check (retrospective)" in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES
+        assert "Issue Comment Japanese Check (retrospective)" in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES
+        assert "PR Review Japanese Check (retrospective)" in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES
+
+    def test_head_sha_null_skipped_deploy_main_is_excluded(self):
+        """AC1: deploy-main の head_sha=None かつ conclusion=skipped は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "deploy-main",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_cleanup_pr_is_excluded(self):
+        """AC1/AC3: cleanup-pr の head_sha=None かつ conclusion=skipped は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "cleanup-pr",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_issue_body_japanese_is_excluded(self):
+        """AC1/AC3: Issue Body Japanese Check (retrospective) は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "Issue Body Japanese Check (retrospective)",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_issue_comment_japanese_is_excluded(self):
+        """AC1/AC3: Issue Comment Japanese Check (retrospective) は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "Issue Comment Japanese Check (retrospective)",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    def test_head_sha_null_skipped_pr_review_japanese_is_excluded(self):
+        """AC1/AC3: PR Review Japanese Check (retrospective) は excluded"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": "PR Review Japanese Check (retrospective)",
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    @pytest.mark.parametrize("required_job_name", [
+        "typecheck",
+        "lint",
+        "test",
+        "build",
+        "e2e",
+        "python-test",
+        "actionlint",
+        "PR Body Japanese Check",
+    ])
+    def test_required_job_null_skipped_stays_failed(self, required_job_name: str):
+        """AC5: required job の head_sha=None かつ conclusion=skipped は failed のまま"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "skipped",
+            "name": required_job_name,
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "failed"
+
+    def test_excluded_does_not_affect_overall_status(self):
+        """AC3: excluded verdict は overall status を failed にしない（all_pass を維持）"""
+        verdicts = ["all_pass", "excluded", "excluded"]
+        assert compute_overall_status(verdicts) == "all_pass"
+
+    def test_excluded_with_all_pass_checks_yields_all_pass(self):
+        """AC3: all_pass checks + excluded checks → overall all_pass"""
+        verdicts = ["all_pass", "all_pass", "excluded"]
+        assert compute_overall_status(verdicts) == "all_pass"
+
+    def test_excluded_only_yields_all_pass(self):
+        """excluded のみの場合も all_pass（evidence なしと同等）"""
+        verdicts = ["excluded", "excluded"]
+        assert compute_overall_status(verdicts) == "all_pass"
+
+    def test_excluded_does_not_mask_failed(self):
+        """excluded があっても failed は failed のまま"""
+        verdicts = ["failed", "excluded"]
+        assert compute_overall_status(verdicts) == "failed"
+
+    def test_non_null_head_sha_skipped_is_not_excluded(self):
+        """head_sha が non-None の skipped は allowlist に関わらず通常判定"""
+        entry = {
+            "head_sha": HEAD_SHA,  # non-None
+            "conclusion": "skipped",
+            "name": "deploy-main",  # allowlist に含まれるが head_sha が non-None
+            "bucket": "skipping",
+            "status": "completed",
+        }
+        # head_sha が PR head SHA と一致するので stale ではない → conclusion=skipped → failed
+        assert determine_check_verdict(entry, HEAD_SHA) == "failed"
+
+    def test_head_sha_null_non_skipped_conclusion_not_excluded(self):
+        """head_sha=None でも conclusion != skipped ならば excluded にならない"""
+        entry = {
+            "head_sha": None,
+            "conclusion": "failure",
+            "name": "deploy-main",
+            "bucket": "fail",
+            "status": "completed",
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "failed"

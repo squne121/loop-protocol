@@ -47,6 +47,18 @@ PENDING_STATUSES: set[str] = {
     "pending",
 }
 
+
+# head_sha=None かつ conclusion=skipped の場合に excluded として扱う
+# retrospective / conditional ジョブ名の allowlist。
+# これらのジョブは PR head SHA なしで skipped になることが正常動作であり、
+# failed として分類すると exit 10 の偽陽性を引き起こす。
+HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES: frozenset[str] = frozenset({
+    "deploy-main",
+    "cleanup-pr",
+    "Issue Body Japanese Check (retrospective)",
+    "Issue Comment Japanese Check (retrospective)",
+    "PR Review Japanese Check (retrospective)",
+})
 # Exit codes
 EXIT_ALL_PASS = 0
 EXIT_FAILED = 10
@@ -267,7 +279,7 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
 def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     """
     check entry から verdict bucket を決定する。
-    returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha"
+    returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
     head_sha = entry.get("head_sha")
@@ -277,6 +289,15 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     bucket = entry.get("bucket")
     conclusion = entry.get("conclusion")
     status = entry.get("status")
+
+    # head_sha=None かつ conclusion=skipped の場合: allowlist 照合して excluded を返す
+    # これは retrospective / conditional ジョブが PR head SHA なしで skipped になる正常動作を
+    # failed 偽陽性として扱わないための例外ルール。
+    # allowlist 外のジョブ（required job 等）は通常の verdict ロジックで処理する。
+    if head_sha is None and conclusion == "skipped":
+        name = entry.get("name") or ""
+        if name in HEAD_SHA_NULL_SKIPPED_EXCLUDE_NAMES:
+            return "excluded"
 
     # pending
     if bucket == "pending" or status in PENDING_STATUSES:
@@ -301,14 +322,18 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
 
 def compute_overall_status(verdicts: list[str]) -> str:
-    """優先順位: stale_head_sha > gh_error > pending_or_queued > failed > all_pass"""
-    if "stale_head_sha" in verdicts:
+    """優先順位: stale_head_sha > gh_error > pending_or_queued > failed > all_pass
+    "excluded" は集計対象外（overall status に影響しない）。
+    """
+    # excluded を除いた verdicts で判定する
+    effective = [v for v in verdicts if v != "excluded"]
+    if "stale_head_sha" in effective:
         return "stale_head_sha"
-    if "gh_error" in verdicts:
+    if "gh_error" in effective:
         return "gh_error"
-    if "pending_or_queued" in verdicts:
+    if "pending_or_queued" in effective:
         return "pending_or_queued"
-    if "failed" in verdicts:
+    if "failed" in effective:
         return "failed"
     return "all_pass"
 
@@ -537,7 +562,7 @@ def main() -> int:
     else:
         overall_status = compute_overall_status(verdicts)
 
-    # Build categorized lists
+    # Build categorized lists (excluded は各リストに含めない)
     failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "failed"]
     pending_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "pending_or_queued"]
     stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "stale_head_sha"]
