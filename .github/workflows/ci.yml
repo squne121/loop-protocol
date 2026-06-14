@@ -1013,6 +1013,16 @@ jobs:
           printf '{"step_id":"pytest_context_mode","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: pytest summarize-agent-transcript (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest tests/test_summarize_agent_transcript.py -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_summarize_agent_transcript","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Kill Switch smoke test
         run: python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
       - name: Secret exposure scan (production scripts)
@@ -1061,6 +1071,7 @@ jobs:
                   ".claude/skills/review-issue/tests/",
                   ".claude/skills/issue-refinement-loop/tests/",
                   "tests/context_mode/",
+                  "tests/test_summarize_agent_transcript.py",
               ],
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
               checked_out_sha=None,

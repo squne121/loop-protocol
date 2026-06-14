@@ -1,0 +1,15 @@
+{"type":"session_start","session_id":"sess-abc123","timestamp":"2026-06-14T10:00:00Z","tool":"claude","version":"claude-sonnet-4-6","model":"claude-sonnet-4-6","reasoning_effort":"high"}
+{"type":"tool_use","timestamp":"2026-06-14T10:00:01Z","tool_name":"Read","input":{"file_path":"/home/user/project/README.md"},"output":"# Project README"}
+{"type":"tool_use","timestamp":"2026-06-14T10:00:02Z","tool_name":"Bash","input":{"command":"pnpm test"},"output":"PASS","exit_code":0}
+{"type":"tool_use","timestamp":"2026-06-14T10:00:03Z","tool_name":"Bash","input":{"command":"pnpm build"},"output":"Error: build failed","exit_code":1}
+{"type":"tool_use","timestamp":"2026-06-14T10:00:04Z","tool_name":"Bash","input":{"command":"pnpm build"},"output":"Error: build failed","exit_code":1}
+{"type":"tool_use","timestamp":"2026-06-14T10:00:05Z","tool_name":"Read","input":{"file_path":"/home/user/project/README.md"},"output":"# Project README"}
+{"type":"subagent_spawn","timestamp":"2026-06-14T10:00:06Z","subagent_id":"sub-001","subagent_type":"test-runner"}
+{"type":"subagent_spawn","timestamp":"2026-06-14T10:00:07Z","subagent_id":"sub-002","subagent_type":"code-reviewer"}
+{"type":"hook_fired","timestamp":"2026-06-14T10:00:08Z","hook_name":"pre-commit","result":"allowed"}
+{"type":"hook_fired","timestamp":"2026-06-14T10:00:09Z","hook_name":"pre-push","result":"blocked"}
+{"type":"hook_fired","timestamp":"2026-06-14T10:00:10Z","hook_name":"post-commit","result":"skipped"}
+{"type":"compaction_marker","timestamp":"2026-06-14T10:00:11Z","reason":"context_limit"}
+{"type":"human_intervention","timestamp":"2026-06-14T10:00:12Z","reason":"manual_approval"}
+{"type":"token_usage","timestamp":"2026-06-14T10:00:13Z","prompt_tokens":15000,"completion_tokens":3000,"total_tokens":18000}
+{"type":"session_end","timestamp":"2026-06-14T10:01:00Z","session_id":"sess-abc123"}
