@@ -184,6 +184,23 @@ class TestAgentOpsReviewInventory:
                 f"Contract surface {surface!r} not found in inventory items"
             )
 
+    def test_inventory_includes_claude_hooks(self):
+        """GIVEN agent-ops-review WHEN inventory built THEN non-secret .claude/hooks/ items are in scope."""
+        tracked = get_tracked_paths_decoded(REPO_ROOT)
+        # Only check hook paths that pass the is_secret_like filter (others are intentionally excluded)
+        hook_tracked = [
+            p for p in tracked
+            if p.startswith(".claude/hooks/") and not is_secret_like(p)
+        ]
+        if not hook_tracked:
+            pytest.skip("No non-secret .claude/hooks/ tracked paths found")
+        inventory = build_agent_ops_inventory(REPO_ROOT, tracked)
+        inventory_paths = {it["path"] for it in inventory["items"]}
+        for hp in hook_tracked:
+            assert hp in inventory_paths, (
+                f".claude/hooks/ tracked path {hp!r} not found in inventory"
+            )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AC4: missing file => warn; missing critical route surface => blocked
@@ -191,51 +208,141 @@ class TestAgentOpsReviewInventory:
 
 
 class TestStatusLevels:
-    def test_missing_non_critical_tracked_gives_warn(self):
+    def _make_git_repo(self, tmp_path: Path) -> Path:
+        """Create a minimal git repo in tmp_path."""
+        subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(tmp_path), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(tmp_path), check=True, capture_output=True,
+        )
+        return tmp_path
+
+    def _make_fake_contract(self, repo_root: Path, surfaces: list[str]) -> None:
+        """Write a fake expected-runtime-contract.json with given surfaces."""
+        contract_dir = repo_root / "tests" / "fixtures" / "codex-agent-config"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        contract_path = contract_dir / "expected-runtime-contract.json"
+        contract_data = {
+            "required_agents": {
+                "test-agent": {
+                    "repo_local_skill_surfaces": surfaces,
+                }
+            }
+        }
+        contract_path.write_text(json.dumps(contract_data), encoding="utf-8")
+
+    def _get_tracked(self, repo_root: Path) -> list[str]:
+        """Get tracked paths from a git repo."""
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(repo_root), capture_output=True,
+        )
+        return [p.decode("utf-8") for p in result.stdout.split(b"\0") if p]
+
+    def test_missing_non_critical_tracked_gives_warn(self, tmp_path):
         """GIVEN tracked list with a non-critical missing file WHEN inventory built THEN STATUS: warn."""
-        # Simulate a tracked path that doesn't actually exist on disk
-        fake_tracked = list(get_tracked_paths_decoded(REPO_ROOT))
-        # Add a fake non-critical tracked path
-        fake_tracked.append("scripts/__nonexistent_script_for_test__.py")
-        inventory = build_agent_ops_inventory(REPO_ROOT, fake_tracked)
-        # The fake path is tracked but doesn't exist and is kind=script (not critical)
-        fake_items = [it for it in inventory["items"] if "__nonexistent_script_for_test__" in it["path"]]
-        if not fake_items:
-            pytest.skip("fake tracked path not included in inventory scope")
-        # STATUS depends on whether any critical is missing - just verify warn is possible
-        assert inventory["status"] in {"ok", "warn", "blocked"}
+        repo_root = self._make_git_repo(tmp_path)
 
-    def test_missing_critical_surface_gives_blocked(self):
-        """GIVEN critical surface not on disk WHEN inventory built THEN STATUS: blocked."""
-        # Build inventory with real tracked files but inject a fake critical surface
-        tracked = get_tracked_paths_decoded(REPO_ROOT)
-        # Temporarily mock to add a nonexistent critical surface
-        fake_tracked = tracked + [".agents/skills/__nonexistent_critical__/SKILL.md"]
+        # Create a critical surface so it passes the blocked check
+        critical_surface = ".agents/skills/test-skill/SKILL.md"
+        critical_abs = repo_root / critical_surface
+        critical_abs.parent.mkdir(parents=True, exist_ok=True)
+        critical_abs.write_text("# Test SKILL")
+        self._make_fake_contract(repo_root, [critical_surface])
 
-        import agent_ops_inventory as aoi_mod
-        original_load = aoi_mod.load_critical_surfaces_from_contract
+        # Create a non-critical tracked file, then delete it
+        non_critical = "scripts/some_script.py"
+        nc_abs = repo_root / non_critical
+        nc_abs.parent.mkdir(parents=True, exist_ok=True)
+        nc_abs.write_text("# script")
 
-        def fake_load(repo_root):
-            surfaces = original_load(repo_root)
-            surfaces.append(".agents/skills/__nonexistent_critical__/SKILL.md")
-            return surfaces
+        # Add both to git tracking
+        subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
 
-        aoi_mod.load_critical_surfaces_from_contract = fake_load
-        try:
-            inventory = build_agent_ops_inventory(REPO_ROOT, fake_tracked)
-        finally:
-            aoi_mod.load_critical_surfaces_from_contract = original_load
+        # Delete the non-critical file (now tracked but missing)
+        nc_abs.unlink()
 
-        assert inventory["status"] == "blocked", (
-            f"Expected STATUS: blocked when critical surface missing, got {inventory['status']!r}"
+        tracked = self._get_tracked(repo_root)
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "warn", (
+            f"Expected STATUS: warn when non-critical tracked file missing, got {inventory['status']!r}"
         )
 
-    def test_all_files_present_gives_ok(self):
-        """GIVEN all tracked files exist WHEN inventory built THEN STATUS: ok."""
-        tracked = get_tracked_paths_decoded(REPO_ROOT)
-        inventory = build_agent_ops_inventory(REPO_ROOT, tracked)
-        # All tracked files in this repo exist, so status should be ok
-        assert inventory["status"] in {"ok", "warn"}
+    def test_missing_critical_surface_gives_blocked(self, tmp_path):
+        """GIVEN critical surface in contract but not on disk WHEN inventory built THEN STATUS: blocked."""
+        repo_root = self._make_git_repo(tmp_path)
+
+        critical_surface = ".agents/skills/test-skill/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+
+        # DO NOT create the critical surface file - it's missing from disk
+        (repo_root / "README.md").write_text("test")
+        subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
+
+        tracked = self._get_tracked(repo_root)
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "blocked", (
+            f"Expected STATUS: blocked when critical surface missing from disk, got {inventory['status']!r}"
+        )
+
+    def test_critical_surface_not_tracked_gives_blocked(self, tmp_path):
+        """GIVEN critical surface exists on disk but not tracked WHEN inventory built THEN STATUS: blocked."""
+        repo_root = self._make_git_repo(tmp_path)
+
+        critical_surface = ".agents/skills/test-skill/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+
+        # Create the file but do NOT add it to git tracking
+        critical_abs = repo_root / critical_surface
+        critical_abs.parent.mkdir(parents=True, exist_ok=True)
+        critical_abs.write_text("# Test SKILL")
+
+        (repo_root / "README.md").write_text("test")
+        subprocess.run(["git", "add", "README.md"], cwd=str(repo_root), check=True, capture_output=True)
+        # intentionally do NOT add critical_surface to tracking
+
+        tracked = self._get_tracked(repo_root)
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "blocked", (
+            f"Expected STATUS: blocked when critical surface not tracked, got {inventory['status']!r}"
+        )
+
+    def test_all_files_present_and_tracked_gives_ok(self, tmp_path):
+        """GIVEN all critical surfaces present and tracked WHEN inventory built THEN STATUS: ok."""
+        repo_root = self._make_git_repo(tmp_path)
+
+        critical_surface = ".agents/skills/test-skill/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+
+        # Create and track the critical surface
+        critical_abs = repo_root / critical_surface
+        critical_abs.parent.mkdir(parents=True, exist_ok=True)
+        critical_abs.write_text("# Test SKILL")
+
+        # Also create expected paths (avoid secret-like filenames)
+        settings = repo_root / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("{}")
+
+        subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
+
+        tracked = self._get_tracked(repo_root)
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "ok", (
+            f"Expected STATUS: ok when all surfaces present and tracked, got {inventory['status']!r}"
+        )
+
+    def test_non_git_repo_gives_no_crash(self, tmp_path):
+        """GIVEN non-git directory WHEN build_agent_ops_inventory THEN no exception raised."""
+        try:
+            inventory = build_agent_ops_inventory(tmp_path, [])
+            assert inventory["status"] in {"ok", "warn", "blocked", "error"}
+        except Exception as e:
+            pytest.fail(f"build_agent_ops_inventory raised exception on non-git path: {e}")
 
     def test_fixture_missing_critical_surface_json(self):
         """GIVEN missing_critical_surface fixture WHEN loaded THEN expected_status is blocked."""
@@ -251,10 +358,9 @@ class TestStatusLevels:
 
     def test_critical_route_surface_mentioned_in_test(self):
         """GIVEN test file WHEN inspected THEN 'critical route surface' concept is tested."""
-        # This test verifies that the test suite covers the critical route surface concept
-        # (AC4 requirement: "critical route surface 欠落は STATUS: blocked に上がる")
-        # Verified by test_missing_critical_surface_gives_blocked above
-        assert True  # sentinel - the real test is test_missing_critical_surface_gives_blocked
+        # Verified by test_missing_critical_surface_gives_blocked and
+        # test_critical_surface_not_tracked_gives_blocked above
+        assert True  # sentinel
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -262,12 +368,19 @@ class TestStatusLevels:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _make_fresh_artifact_path() -> str:
+    """Create a temp file path that does NOT yet exist on disk (for O_EXCL compliance)."""
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.unlink(path)  # remove so write_artifact can create it with O_EXCL
+    return path
+
+
 class TestStdoutCompliance:
     def test_stdout_passes_check_agent_friendly_stdout(self):
         """GIVEN agent-ops-review CLI WHEN run THEN stdout passes check_agent_friendly_stdout."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-            artifact_path = tf.name
+        artifact_path = _make_fresh_artifact_path()
         try:
             result = subprocess.run(
                 [sys.executable, str(script), "--task-kind", "agent-ops-review",
@@ -288,8 +401,7 @@ class TestStdoutCompliance:
     def test_stdout_is_evidence_line_only(self):
         """GIVEN agent-ops-review CLI WHEN run THEN stdout contains EVIDENCE: key."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-            artifact_path = tf.name
+        artifact_path = _make_fresh_artifact_path()
         try:
             result = subprocess.run(
                 [sys.executable, str(script), "--task-kind", "agent-ops-review",
@@ -299,7 +411,7 @@ class TestStdoutCompliance:
                 cwd=str(REPO_ROOT),
             )
             assert "EVIDENCE:" in result.stdout, (
-                f"Expected EVIDENCE: in stdout, got: {result.stdout!r}"
+                f"Expected EVIDENCE: in stdout, got: {result.stdout!r}\nstderr: {result.stderr!r}"
             )
         finally:
             if os.path.exists(artifact_path):
@@ -385,8 +497,6 @@ class TestArtifactSecurity:
         tracked_set = set(tracked)
         inventory = build_agent_ops_inventory(REPO_ROOT, tracked)
         for item in inventory["items"]:
-            # Items derived from git ls-files or contract surfaces should be tracked or
-            # explicitly listed (contract fixture)
             if item["tracked"]:
                 assert item["path"] in tracked_set, (
                     f"Item marked tracked but not in git ls-files: {item['path']!r}"
@@ -400,6 +510,32 @@ class TestArtifactSecurity:
             mode = oct(os.stat(artifact_path).st_mode & 0o777)
             assert mode == oct(0o600), f"Expected 0600 permissions, got {mode}"
 
+    def test_write_artifact_rejects_existing_path(self):
+        """GIVEN existing file at artifact path WHEN write_artifact called THEN raises FileExistsError."""
+        import platform
+        if platform.system() == "Windows":
+            pytest.skip("O_EXCL semantics not guaranteed on Windows")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "existing.json"
+            artifact_path.write_text("{}")  # pre-create the file
+            with pytest.raises((FileExistsError, OSError)):
+                write_artifact(artifact_path, {"test": "data"})
+
+    def test_write_artifact_rejects_symlink(self):
+        """GIVEN symlink at artifact path WHEN write_artifact called THEN raises (O_NOFOLLOW)."""
+        import platform
+        if platform.system() == "Windows":
+            pytest.skip("O_NOFOLLOW not available on Windows")
+        if not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("O_NOFOLLOW not available on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "target.json"
+            target.write_text("{}")
+            symlink = Path(tmpdir) / "link.json"
+            symlink.symlink_to(target)
+            with pytest.raises(OSError):
+                write_artifact(symlink, {"test": "data"})
+
     def test_is_containment_safe_rejects_absolute(self):
         """GIVEN absolute path WHEN is_containment_safe THEN False."""
         assert not is_containment_safe(REPO_ROOT, "/etc/passwd")
@@ -411,6 +547,63 @@ class TestArtifactSecurity:
     def test_is_containment_safe_accepts_relative(self):
         """GIVEN valid relative path WHEN is_containment_safe THEN True."""
         assert is_containment_safe(REPO_ROOT, "scripts/agent_ops_inventory.py")
+
+    def test_is_containment_safe_rejects_symlink_escape(self, tmp_path):
+        """GIVEN symlink pointing outside repo WHEN is_containment_safe THEN False."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        # Create a symlink inside the repo that points outside
+        link = repo_root / "escape_link"
+        link.symlink_to("/etc/passwd")
+        assert not is_containment_safe(repo_root, "escape_link"), (
+            "is_containment_safe should return False for symlinks that escape repo"
+        )
+
+    def test_symlink_escape_excluded_from_inventory(self, tmp_path):
+        """GIVEN tracked symlink pointing outside repo WHEN inventory built THEN status=blocked."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        subprocess.run(["git", "init", str(repo_root)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(repo_root), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo_root), check=True, capture_output=True)
+
+        # Create an agent surface dir with a symlink that escapes
+        skill_dir = repo_root / ".agents" / "skills" / "evil-skill"
+        skill_dir.mkdir(parents=True)
+        evil_link = skill_dir / "SKILL.md"
+        evil_link.symlink_to("/etc/passwd")
+        subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
+
+        # Make a fake contract pointing to this surface
+        contract_dir = repo_root / "tests" / "fixtures" / "codex-agent-config"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        contract_path = contract_dir / "expected-runtime-contract.json"
+        contract_data = {
+            "required_agents": {
+                "evil-agent": {
+                    "repo_local_skill_surfaces": [".agents/skills/evil-skill/SKILL.md"]
+                }
+            }
+        }
+        contract_path.write_text(json.dumps(contract_data), encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
+
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(repo_root), capture_output=True,
+        )
+        tracked = [p.decode("utf-8") for p in result.stdout.split(b"\0") if p]
+
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+
+        # A symlink that escapes the repo on a critical surface must result in blocked.
+        # Either the item is excluded from inventory (containment rejected) and blocked
+        # because the critical surface is effectively missing/unsafe, OR it is included
+        # but status is blocked regardless.
+        assert inventory["status"] == "blocked", (
+            f"Expected blocked for symlink-escape critical surface, got {inventory['status']!r}\n"
+            f"items: {inventory['items']}\nmissing_critical: {inventory['missing_critical']}"
+        )
 
     def test_classify_path_kind_agent_skill(self):
         """GIVEN .agents/skills/ path WHEN classify_path_kind THEN agent_skill_surface."""
@@ -428,12 +621,17 @@ class TestArtifactSecurity:
         """GIVEN codex-agent-config fixture path WHEN classify_path_kind THEN codex_agent_fixture."""
         assert classify_path_kind("tests/fixtures/codex-agent-config/expected-runtime-contract.json") == "codex_agent_fixture"
 
+    def test_classify_path_kind_claude_hook(self):
+        """GIVEN .claude/hooks/ path WHEN classify_path_kind THEN claude_hook."""
+        assert classify_path_kind(".claude/hooks/pre-commit") == "claude_hook"
+
+    def test_classify_path_kind_claude_settings(self):
+        """GIVEN .claude/settings.json WHEN classify_path_kind THEN claude_settings."""
+        assert classify_path_kind(".claude/settings.json") == "claude_settings"
+
     def test_inventory_not_committed_to_repo(self):
         """GIVEN artifact output path WHEN using tmp path THEN not in repo tracked files."""
         tracked = get_tracked_paths_decoded(REPO_ROOT)
-        # Inventory should be written to tmp, not tracked
-        tmp_path = "/tmp/agent_ops_inventory.json"
-        # Verify no tracked file matches the default tmp path
         for p in tracked:
             assert not p.endswith("agent_ops_inventory.json"), (
                 f"artifact file should not be tracked: {p}"
@@ -471,8 +669,6 @@ class TestAgentSkilllContractSync:
 
     def test_no_hardcoded_skill_list(self):
         """GIVEN agent_ops_inventory WHEN source inspected THEN surfaces derived from contract."""
-        # This validates the design principle: no hand-written list
-        # The critical surfaces come from load_critical_surfaces_from_contract
         surfaces_from_code = load_critical_surfaces_from_contract(REPO_ROOT)
         expected_from_contract = []
         contract_data = json.loads(
@@ -486,6 +682,30 @@ class TestAgentSkilllContractSync:
         assert set(surfaces_from_code) == set(expected_from_contract), (
             "load_critical_surfaces_from_contract must derive from contract JSON, not a hard-coded list"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fix 5: decode failure does not silently drop paths
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestDecodeFailure:
+    def test_non_utf8_bytes_not_silently_dropped(self):
+        """GIVEN raw bytes with invalid UTF-8 WHEN get_tracked_paths_decoded processes THEN paths preserved."""
+        from agent_ops_inventory import get_tracked_paths_decoded
+        import unittest.mock as mock
+
+        # Simulate git ls-files -z returning a non-UTF-8 filename
+        bad_bytes = b"valid_file.py\x00\xff\xfebadf\xc3\x28ile.py\x00"
+        with mock.patch("agent_ops_inventory.get_tracked_files") as mock_get:
+            mock_get.return_value = [p for p in bad_bytes.split(b"\0") if p]
+            paths = get_tracked_paths_decoded(Path("/tmp"))
+            # Should have 2 entries (not 1 — the bad one should NOT be silently dropped)
+            assert len(paths) == 2, (
+                f"Expected 2 paths (no silent drop), got {len(paths)}: {paths}"
+            )
+            # The valid one should decode cleanly
+            assert "valid_file.py" in paths
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -506,10 +726,9 @@ class TestCLIIntegration:
         assert result.returncode == 0, f"Expected exit 0, got {result.returncode}\nstderr={result.stderr}"
 
     def test_cli_agent_ops_review_exits_0_with_artifact(self):
-        """GIVEN --task-kind agent-ops-review WHEN CLI run THEN exit 0 and artifact written."""
+        """GIVEN --task-kind agent-ops-review WHEN CLI run THEN exit 0 or 2 and artifact written."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-            artifact_path = tf.name
+        artifact_path = _make_fresh_artifact_path()
         try:
             result = subprocess.run(
                 [sys.executable, str(script), "--task-kind", "agent-ops-review",
@@ -553,3 +772,23 @@ class TestCLIIntegration:
             cwd=str(REPO_ROOT),
         )
         assert result.returncode != 0
+
+    def test_cli_default_artifact_in_tempdir(self):
+        """GIVEN agent-ops-review with no --artifact-out WHEN CLI run THEN artifact in agent-ops-* tempdir."""
+        script = SCRIPTS_DIR / "agent_ops_inventory.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--task-kind", "agent-ops-review"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        assert result.returncode in {0, 1, 2}, f"Unexpected exit: {result.returncode}\n{result.stderr}"
+        stdout = result.stdout
+        assert "EVIDENCE:" in stdout
+        evidence_line = [l for l in stdout.splitlines() if l.startswith("EVIDENCE:")]
+        assert evidence_line, f"No EVIDENCE: line in stdout: {stdout!r}"
+        artifact_path_str = evidence_line[0].split("EVIDENCE:", 1)[1].strip()
+        if artifact_path_str != "artifact_written":
+            assert "agent-ops-" in artifact_path_str, (
+                f"Default artifact path should be in agent-ops-* tempdir, got: {artifact_path_str!r}"
+            )
