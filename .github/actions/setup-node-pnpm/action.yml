@@ -1,0 +1,27 @@
+name: Setup Node.js and pnpm
+description: |
+  pnpm のバージョン設定と Node.js のセットアップ（pnpm キャッシュ付き）を行う
+  Composite Action。checkout 後に呼び出す。
+
+inputs:
+  node-version:
+    description: Node.js のバージョン
+    required: false
+    default: '22'
+  pnpm-version:
+    description: pnpm のバージョン
+    required: false
+    default: '11'
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v6
+      with:
+        version: ${{ inputs.pnpm-version }}
+        run_install: false
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: pnpm
+        cache-dependency-path: pnpm-lock.yaml

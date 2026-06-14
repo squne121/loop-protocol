@@ -19,13 +19,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+      - uses: ./.github/actions/setup-node-pnpm
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -142,13 +136,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+      - uses: ./.github/actions/setup-node-pnpm
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -265,13 +253,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+      - uses: ./.github/actions/setup-node-pnpm
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -407,13 +389,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+      - uses: ./.github/actions/setup-node-pnpm
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -530,13 +506,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
+      - uses: ./.github/actions/setup-node-pnpm
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -746,14 +716,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: ./.github/actions/setup-node-pnpm
+      - uses: ./.github/actions/setup-python-uv
       - name: uv python install (timed)
         id: timed-uv-python-install
         run: |
