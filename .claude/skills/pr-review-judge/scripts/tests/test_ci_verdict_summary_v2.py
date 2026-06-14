@@ -387,3 +387,179 @@ class TestAC12NeutralSkippedNotPass:
         entry = artifact["checks"][0]
         assert entry["blocking_merge_ready"] is True
         assert entry["failure_reason"] == "cancelled_current_head"
+
+
+# ---------------------------------------------------------------------------
+# B3: REQUIRED_CHECKS — empty input and partial input → no_required_evidence
+# ---------------------------------------------------------------------------
+
+class TestB3NoRequiredEvidence:
+    """B3: empty checks or missing required checks → no_required_evidence (not merge_ready)."""
+
+    def test_empty_checks_no_required_evidence(self, v2):
+        """Empty checks list must NOT yield merge_ready — no_required_evidence."""
+        artifact = build(v2, [])
+        assert artifact["overall_status"] == "no_required_evidence"
+        assert artifact["next_action"] == "manual_review_no_required_evidence"
+
+    def test_typecheck_only_no_required_evidence(self, v2):
+        """Only typecheck success is not sufficient — no_required_evidence."""
+        checks = [make_check("typecheck", conclusion="success")]
+        artifact = build(v2, checks)
+        assert artifact["overall_status"] == "no_required_evidence"
+        assert artifact["next_action"] == "manual_review_no_required_evidence"
+
+    def test_required_checks_constant_exists(self, v2):
+        """REQUIRED_CHECKS set must be defined and non-empty."""
+        assert hasattr(v2, "REQUIRED_CHECKS")
+        assert isinstance(v2.REQUIRED_CHECKS, set)
+        assert len(v2.REQUIRED_CHECKS) > 0
+
+    def test_required_checks_contains_all_ci_jobs(self, v2):
+        """REQUIRED_CHECKS must include all 7 ci.yml required/evidence jobs."""
+        expected = {
+            ("ci", "typecheck"),
+            ("ci", "lint"),
+            ("ci", "test"),
+            ("ci", "build"),
+            ("ci", "e2e"),
+            ("ci", "python-test"),
+            ("ci", "actionlint"),
+        }
+        assert expected.issubset(v2.REQUIRED_CHECKS)
+
+    def test_all_required_success_is_merge_ready(self, v2):
+        """All REQUIRED_CHECKS with success → merge_ready."""
+        checks = [
+            make_check("typecheck", conclusion="success"),
+            make_check("lint", conclusion="success"),
+            make_check("test", conclusion="success"),
+            make_check("build", conclusion="success"),
+            make_check("e2e", conclusion="success"),
+            make_check("python-test", conclusion="success"),
+            make_check("actionlint", conclusion="success"),
+        ]
+        artifact = build(v2, checks)
+        assert artifact["overall_status"] == "merge_ready"
+        assert artifact["next_action"] == "none"
+
+    def test_missing_one_required_check_no_required_evidence(self, v2):
+        """Six of seven required checks present — still no_required_evidence."""
+        checks = [
+            make_check("typecheck", conclusion="success"),
+            make_check("lint", conclusion="success"),
+            make_check("test", conclusion="success"),
+            make_check("build", conclusion="success"),
+            make_check("e2e", conclusion="success"),
+            make_check("python-test", conclusion="success"),
+            # actionlint missing
+        ]
+        artifact = build(v2, checks)
+        assert artifact["overall_status"] == "no_required_evidence"
+
+
+# ---------------------------------------------------------------------------
+# B5: unknown classification is conservatively blocking
+# ---------------------------------------------------------------------------
+
+class TestB5UnknownClassificationBlocking:
+    """B5: unknown classification must block merge-ready with failure_reason=gh_error."""
+
+    def test_unknown_check_is_blocking(self, v2):
+        """An unrecognised check (unknown classification) must block."""
+        check = {
+            "name": "some-new-unrecognised-check",
+            "workflow": "unknown-workflow",
+            "status": "completed",
+            "conclusion": "success",
+            "headSha": EXPECTED_SHA,
+        }
+        artifact = build(v2, [check])
+        entry = artifact["checks"][0]
+        assert entry["classification"] == "unknown"
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "gh_error"
+
+    def test_unknown_check_blocks_merge_ready(self, v2):
+        """All required checks pass but an unknown check is present → not merge_ready."""
+        all_required = [
+            make_check("typecheck", conclusion="success"),
+            make_check("lint", conclusion="success"),
+            make_check("test", conclusion="success"),
+            make_check("build", conclusion="success"),
+            make_check("e2e", conclusion="success"),
+            make_check("python-test", conclusion="success"),
+            make_check("actionlint", conclusion="success"),
+        ]
+        unknown_check = {
+            "name": "mystery-job",
+            "workflow": "ci",
+            "status": "completed",
+            "conclusion": "success",
+            "headSha": EXPECTED_SHA,
+        }
+        artifact = build(v2, all_required + [unknown_check])
+        # mystery-job is not in CLASSIFICATION_MAP → unknown → blocking
+        unknown_entry = next(c for c in artifact["checks"] if c["name"] == "mystery-job")
+        assert unknown_entry["classification"] == "unknown"
+        assert unknown_entry["blocking_merge_ready"] is True
+        assert artifact["overall_status"] != "merge_ready"
+
+    def test_unknown_check_head_sha_match_false(self, v2):
+        """B5: unknown classification → head_sha_match is irrelevant, always blocking."""
+        check = {
+            "name": "another-unknown",
+            "workflow": "ci",
+            "status": "completed",
+            "conclusion": "success",
+            "headSha": EXPECTED_SHA,
+        }
+        artifact = build(v2, [check])
+        entry = artifact["checks"][0]
+        assert entry["classification"] == "unknown"
+        assert entry["blocking_merge_ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# B1/B2: needs_result_synthetic provenance
+# ---------------------------------------------------------------------------
+
+class TestB1B2NeedsResultSynthetic:
+    """B1/B2: needs.result based checks use provenance=needs_result_synthetic, head_sha=None."""
+
+    def test_needs_json_to_raw_checks_produces_synthetic_provenance(self, v2):
+        """needs_json_to_raw_checks sets provenance=needs_result_synthetic."""
+        needs_map = {"typecheck": "success", "lint": "success"}
+        raw = v2.needs_json_to_raw_checks(needs_map)
+        for entry in raw:
+            assert entry.get("provenance") == "needs_result_synthetic"
+            assert entry.get("headSha") is None
+
+    def test_synthetic_provenance_sets_head_sha_none(self, v2):
+        """build_check_entry with provenance=needs_result_synthetic → head_sha=None, head_sha_match=False."""
+        raw = {
+            "name": "typecheck",
+            "workflow": "ci",
+            "status": "completed",
+            "conclusion": "success",
+            "headSha": None,
+            "provenance": "needs_result_synthetic",
+        }
+        entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
+        assert entry["head_sha"] is None
+        assert entry["head_sha_match"] is False
+        assert entry.get("provenance") == "needs_result_synthetic"
+
+    def test_synthetic_success_blocks_because_head_sha_none(self, v2):
+        """needs_result_synthetic success on required check → blocks (head_sha=None, stale_head_sha)."""
+        raw = {
+            "name": "typecheck",
+            "workflow": "ci",
+            "status": "completed",
+            "conclusion": "success",
+            "headSha": None,
+            "provenance": "needs_result_synthetic",
+        }
+        entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "stale_head_sha"
