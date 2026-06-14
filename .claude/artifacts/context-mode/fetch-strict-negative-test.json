@@ -2,12 +2,16 @@
   "schema": "context_mode_fetch_strict_negative_test_v1",
   "issue": "#827",
   "status": "pass",
-  "generated_at": "2026-06-13T23:08:01.987302+00:00",
-  "head_sha": "eaac4f9106977591defab4572cb8f6d4d1bb62b6",
+  "generated_at": "2026-06-14T00:14:23.756893+00:00",
+  "head_sha": "a9f810911f515f6b51bd6604ab0281bb7313d317",
   "context_mode_version": "1.0.162",
   "package_path_hash": "a8d76cb526ed44cd",
   "policy": {
     "ctx_fetch_and_index_committed_permission": "deny",
+    "fetch_tool_denied_by_project_policy": true,
+    "ctx_fetch_strict_env_configured": false,
+    "ctx_fetch_strict_runtime_observed": false,
+    "effective_fetch_block_reason": "project_permission_deny",
     "ctx_fetch_strict_configured": true,
     "ctx_fetch_strict_effective": true,
     "effective_reason": "deny_entry_blocks_mcp_tool_call",
@@ -28,7 +32,9 @@
       }
     },
     "all_required_tools_denied": true,
-    "deny_name_matches_callable": true
+    "deny_name_matches_callable": true,
+    "permission_policy_alignment_errors": [],
+    "permission_policy_checked": true
   },
   "network_safety": {
     "real_private_network_requests": 0,
@@ -36,7 +42,44 @@
     "redirect_mode": "fixture",
     "loopback_trap_server_hit_count": 0,
     "real_public_fetch_in_ci": false,
-    "trap_port_used": 42520
+    "cases": [
+      {
+        "name": "loopback_ipv4",
+        "input_url_redacted": "http://127.0.0.1:<PORT>/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "loopback",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "rfc1918_192_168",
+        "input_url_redacted": "http://192.168.1.1/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "rfc1918",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "link_local_169_254",
+        "input_url_redacted": "http://169.254.169.254/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "link_local_metadata",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "ipv6_loopback",
+        "input_url_redacted": "http://::1/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "loopback_ipv6",
+        "server_hit_count": 0,
+        "cache_hit": false
+      }
+    ]
   },
   "isolation": {
     "context_mode_dir_strategy": "isolated_tmpdir_per_test",
@@ -50,24 +93,24 @@
     "post_cleanup_hit_count": 0
   },
   "mutation_test": {
-    "scenarios": [
-      {
-        "name": "CTX_FETCH_STRICT_disabled",
-        "description": "CTX_FETCH_STRICT=0 または未設定でも deny により fetch はブロックされる",
-        "expected_detection": "deny_still_blocks",
-        "mutation_detected": true
-      },
+    "mutants": [
       {
         "name": "deny_entry_removed",
-        "description": "mcp__context-mode__ctx_fetch_and_index を deny から除去",
-        "expected_detection": "validation_fails",
-        "mutation_detected": true
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "ctx_fetch_and_index deny missing"
       },
       {
-        "name": "private_range_blocklist_relaxed",
-        "description": "URL classifier の private range を削除",
-        "expected_detection": "url_policy_matrix_fails",
-        "mutation_detected": true
+        "name": "ctx_fetch_strict_disabled",
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "ctx_fetch_strict_env_configured is false but claimed configured"
+      },
+      {
+        "name": "private_blocklist_relaxed",
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "private URL not blocked"
       }
     ],
     "all_mutations_detected": true

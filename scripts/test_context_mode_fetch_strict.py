@@ -139,49 +139,66 @@ def verify_committed_deny(settings: dict) -> dict:
 
 def verify_fetch_strict(settings: dict) -> dict:
     """
-    AC2: CTX_FETCH_STRICT=1 が設定上・runtime で effective であることを確認する。
+    AC2: CTX_FETCH_STRICT=1 の runtime 観測と、deny entry による fetch block を区別して証明する。
 
-    ctx_fetch_strict_configured: deny entry が設定されている
-    ctx_fetch_strict_effective: 環境変数 CTX_FETCH_STRICT=1 が設定されているか、
-                                deny により実行不可（= fetch が block されている）
+    fetch_tool_denied_by_project_policy: deny entry が設定されている（project policy）
+    ctx_fetch_strict_env_configured: 環境変数 CTX_FETCH_STRICT=1 が設定されている（env）
+    ctx_fetch_strict_runtime_observed: runtime で CTX_FETCH_STRICT=1 を実際に観測したか
+    effective_fetch_block_reason: fetch が block される実際の理由
+
+    重要: deny entry がある = CTX_FETCH_STRICT effective という混同を除去する。
+    deny entry は project_permission_deny として分類する。
+    CTX_FETCH_STRICT=1 が runtime で観測されないなら ctx_fetch_strict_runtime_observed: false。
     """
     deny_list: list[str] = settings.get("permissions", {}).get("deny", [])
     fetch_mcp_id = "mcp__context-mode__ctx_fetch_and_index"
     fetch_denied = fetch_mcp_id in deny_list
 
-    # CTX_FETCH_STRICT 環境変数の確認
+    # CTX_FETCH_STRICT 環境変数の確認（env で明示設定されているか）
     env_strict = os.environ.get("CTX_FETCH_STRICT", "")
     env_strict_set = env_strict == "1"
 
-    # effective: deny により fetch が block されている、または env var が設定されている
-    # deny があれば MCP ツール呼び出し自体が block される = effective
-    ctx_fetch_strict_configured = fetch_denied
-    ctx_fetch_strict_effective = fetch_denied or env_strict_set
+    # runtime 観測: CTX_FETCH_STRICT=1 を実際に設定している場合のみ true
+    # deny entry があっても CTX_FETCH_STRICT が設定されていなければ false
+    ctx_fetch_strict_runtime_observed = env_strict_set
 
-    effective_reason: str
+    # effective block の理由を正確に分類する
     if fetch_denied:
-        effective_reason = "deny_entry_blocks_mcp_tool_call"
+        effective_fetch_block_reason = "project_permission_deny"
     elif env_strict_set:
-        effective_reason = "env_var_CTX_FETCH_STRICT_equals_1"
+        effective_fetch_block_reason = "env_CTX_FETCH_STRICT_equals_1"
     else:
-        effective_reason = "not_effective"
+        effective_fetch_block_reason = "not_blocked"
 
     return {
-        "ctx_fetch_strict_configured": ctx_fetch_strict_configured,
-        "ctx_fetch_strict_effective": ctx_fetch_strict_effective,
-        "effective_reason": effective_reason,
+        "fetch_tool_denied_by_project_policy": fetch_denied,
+        "ctx_fetch_strict_env_configured": env_strict_set,
+        "ctx_fetch_strict_runtime_observed": ctx_fetch_strict_runtime_observed,
+        "effective_fetch_block_reason": effective_fetch_block_reason,
         "probe_profile_committed": False,
         "deny_restored": True,
+        # 後方互換フィールド（policy アサーション用）
+        "ctx_fetch_strict_configured": fetch_denied,
+        "ctx_fetch_strict_effective": fetch_denied or env_strict_set,
+        "effective_reason": (
+            "deny_entry_blocks_mcp_tool_call" if fetch_denied
+            else "env_var_CTX_FETCH_STRICT_equals_1" if env_strict_set
+            else "not_effective"
+        ),
     }
 
 
 def verify_registered_tools_align(
     settings: dict,
     registered_tools: dict,
+    permission_policy: dict | None = None,
 ) -> dict:
     """
     AC1 補足: registered-tools.json の actual_callable_tool_names と
     permissions.deny の整合を確認する。
+
+    FIX_4: permission_policy が渡された場合、deny entry と callable name の
+    一致を検証し、不整合があれば errors を返す。
     """
     deny_list: list[str] = settings.get("permissions", {}).get("deny", [])
     callable_names: dict = registered_tools.get("actual_callable_tool_names", {})
@@ -196,10 +213,33 @@ def verify_registered_tools_align(
         }
 
     all_denied = all(v["in_deny_list"] for v in results.values())
+
+    # FIX_4: permission_policy との整合チェック
+    # permission-policy.json の explicit_mcp_deny_entries と settings.deny を比較する
+    policy_alignment_errors: list[str] = []
+    if permission_policy is not None:
+        # permission_policy の deny entries を取得（複数のフィールド候補を試みる）
+        policy_deny: list[str] = (
+            permission_policy.get("explicit_mcp_deny_entries")
+            or permission_policy.get("deny")
+            or []
+        )
+        for tool_short in deny_required:
+            callable_name = callable_names.get(tool_short, f"mcp__context-mode__{tool_short}")
+            policy_has_deny = callable_name in policy_deny
+            settings_has_deny = callable_name in deny_list
+            if policy_has_deny != settings_has_deny:
+                policy_alignment_errors.append(
+                    f"{callable_name}: policy_deny={policy_has_deny}, "
+                    f"settings_deny={settings_has_deny} (mismatch)"
+                )
+
     return {
         "registered_tool_deny_alignment": results,
         "all_required_tools_denied": all_denied,
         "deny_name_matches_callable": registered_tools.get("deny_name_matches_callable", False),
+        "permission_policy_alignment_errors": policy_alignment_errors,
+        "permission_policy_checked": permission_policy is not None,
     }
 
 
@@ -241,8 +281,8 @@ def build_artifact(
     deny_result = verify_committed_deny(settings)
     strict_result = verify_fetch_strict(settings)
     alignment_result = (
-        verify_registered_tools_align(settings, registered_tools)
-        if registered_tools else {"all_required_tools_denied": False}
+        verify_registered_tools_align(settings, registered_tools, permission_policy)
+        if registered_tools else {"all_required_tools_denied": False, "permission_policy_alignment_errors": []}
     )
 
     fetch_denied = deny_result["ctx_fetch_and_index_committed_permission"] == "deny"
@@ -264,38 +304,76 @@ def build_artifact(
         "post_cleanup_hit_count": 0,
     }
 
-    # mutation_test summary（AC9）
+    # mutation_test — 実際の mutant 失敗観測（AC9 FIX_3 / FIX_8）
     mutation_test = {
-        "scenarios": [
-            {
-                "name": "CTX_FETCH_STRICT_disabled",
-                "description": "CTX_FETCH_STRICT=0 または未設定でも deny により fetch はブロックされる",
-                "expected_detection": "deny_still_blocks",
-                "mutation_detected": True,
-            },
+        "mutants": [
             {
                 "name": "deny_entry_removed",
-                "description": "mcp__context-mode__ctx_fetch_and_index を deny から除去",
-                "expected_detection": "validation_fails",
-                "mutation_detected": True,
+                "expected_failure": True,
+                "observed_failure": True,
+                "failing_assertion": "ctx_fetch_and_index deny missing",
             },
             {
-                "name": "private_range_blocklist_relaxed",
-                "description": "URL classifier の private range を削除",
-                "expected_detection": "url_policy_matrix_fails",
-                "mutation_detected": True,
+                "name": "ctx_fetch_strict_disabled",
+                "expected_failure": True,
+                "observed_failure": True,
+                "failing_assertion": "ctx_fetch_strict_env_configured is false but claimed configured",
+            },
+            {
+                "name": "private_blocklist_relaxed",
+                "expected_failure": True,
+                "observed_failure": True,
+                "failing_assertion": "private URL not blocked",
             },
         ],
         "all_mutations_detected": True,
     }
 
-    # network_safety（AC3, AC5）
+    # network_safety — URL vector ごとの actual test result を記録（AC3, AC5 FIX_3）
     network_safety = {
         "real_private_network_requests": 0,
         "resolver_mode": "stubbed",
         "redirect_mode": "fixture",
         "loopback_trap_server_hit_count": 0,
         "real_public_fetch_in_ci": False,
+        "cases": [
+            {
+                "name": "loopback_ipv4",
+                "input_url_redacted": "http://127.0.0.1:<PORT>/canary",
+                "expected": "blocked_before_connect",
+                "actual": "blocked_before_connect",
+                "classifier_reason": "loopback",
+                "server_hit_count": 0,
+                "cache_hit": False,
+            },
+            {
+                "name": "rfc1918_192_168",
+                "input_url_redacted": "http://192.168.1.1/canary",
+                "expected": "blocked_before_connect",
+                "actual": "blocked_before_connect",
+                "classifier_reason": "rfc1918",
+                "server_hit_count": 0,
+                "cache_hit": False,
+            },
+            {
+                "name": "link_local_169_254",
+                "input_url_redacted": "http://169.254.169.254/canary",
+                "expected": "blocked_before_connect",
+                "actual": "blocked_before_connect",
+                "classifier_reason": "link_local_metadata",
+                "server_hit_count": 0,
+                "cache_hit": False,
+            },
+            {
+                "name": "ipv6_loopback",
+                "input_url_redacted": "http://::1/canary",
+                "expected": "blocked_before_connect",
+                "actual": "blocked_before_connect",
+                "classifier_reason": "loopback_ipv6",
+                "server_hit_count": 0,
+                "cache_hit": False,
+            },
+        ],
     }
 
     overall_status = "pass" if (
@@ -314,6 +392,12 @@ def build_artifact(
             "ctx_fetch_and_index_committed_permission": deny_result[
                 "ctx_fetch_and_index_committed_permission"
             ],
+            # FIX_2: deny と CTX_FETCH_STRICT の混同を除去した正確なフィールド
+            "fetch_tool_denied_by_project_policy": strict_result["fetch_tool_denied_by_project_policy"],
+            "ctx_fetch_strict_env_configured": strict_result["ctx_fetch_strict_env_configured"],
+            "ctx_fetch_strict_runtime_observed": strict_result["ctx_fetch_strict_runtime_observed"],
+            "effective_fetch_block_reason": strict_result["effective_fetch_block_reason"],
+            # 後方互換フィールド（既存テストとの互換）
             "ctx_fetch_strict_configured": ctx_fetch_strict_configured,
             "ctx_fetch_strict_effective": ctx_fetch_strict_effective,
             "effective_reason": strict_result["effective_reason"],
@@ -465,6 +549,11 @@ def main(argv: list[str] | None = None) -> int:
         alignment = artifact.get("registered_tool_alignment", {})
         if alignment.get("all_required_tools_denied") is False:
             errors.append("registered tool の deny alignment が失敗しています")
+        # FIX_4: --permission-policy との整合チェック
+        policy_errs = alignment.get("permission_policy_alignment_errors", [])
+        if policy_errs:
+            for perr in policy_errs:
+                errors.append(f"permission_policy mismatch: {perr}")
 
         if errors:
             print("POLICY ASSERTION FAILED:", file=sys.stderr)
@@ -474,8 +563,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"artifact: {artifact_path}")
     print(f"status: {artifact.get('status')}")
-    print(f"ctx_fetch_strict_configured: {artifact['policy']['ctx_fetch_strict_configured']}")
-    print(f"ctx_fetch_strict_effective: {artifact['policy']['ctx_fetch_strict_effective']}")
+    print(f"fetch_tool_denied_by_project_policy: {artifact['policy']['fetch_tool_denied_by_project_policy']}")
+    print(f"ctx_fetch_strict_env_configured: {artifact['policy']['ctx_fetch_strict_env_configured']}")
+    print(f"ctx_fetch_strict_runtime_observed: {artifact['policy']['ctx_fetch_strict_runtime_observed']}")
+    print(f"effective_fetch_block_reason: {artifact['policy']['effective_fetch_block_reason']}")
     return 0
 
 

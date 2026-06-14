@@ -22,6 +22,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+# リポジトリルート（worktree / main どちらでも動作する）
+_REPO_ROOT_FOR_SHA = Path(__file__).parent.parent.parent
+
 import pytest
 
 # リポジトリルート（worktree / main どちらでも動作する）
@@ -47,7 +50,7 @@ def _ensure_artifact() -> None:
             try:
                 subprocess.run(
                     [
-                        "python3",
+                        "uv", "run", "python3",
                         str(script),
                         "--settings", str(_REPO_ROOT / ".claude" / "settings.json"),
                         "--registered-tools", str(ARTIFACT_DIR / "registered-tools.json"),
@@ -103,7 +106,7 @@ class Test_effective_strict:
         """
         GIVEN: fetch-strict-negative-test.json が存在する
         WHEN: policy.ctx_fetch_strict_configured を確認
-        THEN: true である
+        THEN: true である（deny entry = fetch tool が block されている）
         """
         data = _load_artifact()
         policy = data.get("policy", {})
@@ -115,7 +118,7 @@ class Test_effective_strict:
         """
         GIVEN: fetch-strict-negative-test.json が存在する
         WHEN: policy.ctx_fetch_strict_effective を確認
-        THEN: true である
+        THEN: true である（deny entry によるブロックを含む）
         """
         data = _load_artifact()
         policy = data.get("policy", {})
@@ -138,6 +141,44 @@ class Test_effective_strict:
         }
         assert reason in valid_reasons, (
             f"effective_reason が無効です: {reason!r}. 有効: {valid_reasons}"
+        )
+
+    def test_fetch_tool_denied_by_project_policy(self) -> None:
+        """
+        FIX_2: policy.fetch_tool_denied_by_project_policy が true であることを確認する。
+        deny entry がある = project_permission_deny による block。
+        """
+        data = _load_artifact()
+        policy = data.get("policy", {})
+        assert policy.get("fetch_tool_denied_by_project_policy") is True, (
+            f"fetch_tool_denied_by_project_policy が true ではありません: "
+            f"{policy.get('fetch_tool_denied_by_project_policy')}"
+        )
+
+    def test_ctx_fetch_strict_runtime_observed_is_false(self) -> None:
+        """
+        FIX_2: policy.ctx_fetch_strict_runtime_observed が false であることを確認する。
+        runtime で CTX_FETCH_STRICT=1 を観測しないなら過大主張しない。
+        """
+        data = _load_artifact()
+        policy = data.get("policy", {})
+        # CTX_FETCH_STRICT=1 が runtime で設定されていない場合は false が期待値
+        runtime_observed = policy.get("ctx_fetch_strict_runtime_observed")
+        assert runtime_observed is False, (
+            f"ctx_fetch_strict_runtime_observed が false ではありません: {runtime_observed}\n"
+            "runtime で CTX_FETCH_STRICT=1 が観測されていない場合は false にする（過大主張禁止）"
+        )
+
+    def test_effective_fetch_block_reason_is_project_policy(self) -> None:
+        """
+        FIX_2: policy.effective_fetch_block_reason が 'project_permission_deny' であることを確認する。
+        deny entry による block なら env var でなく project policy が理由。
+        """
+        data = _load_artifact()
+        policy = data.get("policy", {})
+        reason = policy.get("effective_fetch_block_reason", "")
+        assert reason == "project_permission_deny", (
+            f"effective_fetch_block_reason が 'project_permission_deny' ではありません: {reason!r}"
         )
 
     def test_committed_deny_in_policy(self) -> None:
@@ -220,7 +261,7 @@ class Test_artifact_schema:
             assert field in data, f"必須フィールド '{field}' が artifact に含まれていません"
 
     def test_artifact_policy_required_fields(self) -> None:
-        """artifact.policy に必須フィールドが含まれることを確認する。"""
+        """artifact.policy に必須フィールドが含まれることを確認する（FIX_2 新フィールド含む）。"""
         data = _load_artifact()
         policy = data.get("policy", {})
         required = [
@@ -229,6 +270,11 @@ class Test_artifact_schema:
             "ctx_fetch_strict_effective",
             "probe_profile_committed",
             "deny_restored",
+            # FIX_2 新フィールド
+            "fetch_tool_denied_by_project_policy",
+            "ctx_fetch_strict_env_configured",
+            "ctx_fetch_strict_runtime_observed",
+            "effective_fetch_block_reason",
         ]
         for field in required:
             assert field in policy, f"policy に必須フィールド '{field}' がありません"
@@ -434,4 +480,188 @@ class Test_fetch_policy_docs:
         content = _FETCH_POLICY_DOCS.read_text()
         assert len(content.strip()) > 100, (
             "context-mode-fetch-policy.md の内容が少なすぎます（空またはほぼ空）"
+        )
+
+
+# ---------------------------------------------------------------------------
+# FIX_1: artifact.head_sha == current git HEAD
+# ---------------------------------------------------------------------------
+
+
+class Test_artifact_head_sha_matches_current_head:
+    """
+    FIX_1: artifact の head_sha が current git HEAD と一致することを CI で検証する。
+    artifact が古い commit の HEAD を参照している場合はテストが fail する。
+    """
+
+    def _get_current_head_sha(self) -> str | None:
+        """現在の git HEAD SHA を取得する。取得できない場合は None。"""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(_REPO_ROOT_FOR_SHA),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+
+    def test_artifact_head_sha_matches_git_head(self) -> None:
+        """
+        FIX_1: artifact.head_sha が current git HEAD と一致することを確認する。
+
+        GIVEN: fetch-strict-negative-test.json artifact が存在する
+        WHEN: artifact.head_sha と git rev-parse HEAD を比較する
+        THEN: 両者が一致する（artifact が最新 commit で再生成されている）
+        """
+        current_head = self._get_current_head_sha()
+        if current_head is None:
+            pytest.skip("git rev-parse HEAD が取得できませんでした")
+
+        data = _load_artifact()
+        artifact_head_sha = data.get("head_sha", "")
+
+        assert artifact_head_sha == current_head, (
+            f"artifact.head_sha ({artifact_head_sha!r}) が "
+            f"current git HEAD ({current_head!r}) と一致しません。\n"
+            "scripts/test_context_mode_fetch_strict.py を再実行して artifact を再生成してください。"
+        )
+
+    def test_artifact_head_sha_format(self) -> None:
+        """artifact.head_sha が 40 文字の lowercase hex 文字列であることを確認する。"""
+        data = _load_artifact()
+        head_sha = data.get("head_sha", "")
+        assert re.match(r"^[0-9a-f]{40}$", head_sha), (
+            f"artifact.head_sha が git SHA 形式ではありません: {head_sha!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# FIX_3: artifact.network_safety.cases[] と mutation_test.mutants[] の検証
+# ---------------------------------------------------------------------------
+
+
+class Test_artifact_evidence_structure:
+    """
+    FIX_3: artifact の cases[] と mutation_test.mutants[] が実測 evidence を含むことを確認する。
+    """
+
+    def test_network_safety_has_cases(self) -> None:
+        """
+        FIX_3: artifact.network_safety.cases[] が存在し、1 件以上のエントリを含むことを確認する。
+        """
+        data = _load_artifact()
+        ns = data.get("network_safety", {})
+        cases = ns.get("cases", [])
+        assert isinstance(cases, list), (
+            f"network_safety.cases が list ではありません: {type(cases).__name__}"
+        )
+        assert len(cases) > 0, (
+            "network_safety.cases が空です。URL vector ごとの actual test result を記録してください。"
+        )
+
+    def test_network_safety_cases_structure(self) -> None:
+        """
+        FIX_3: artifact.network_safety.cases[] の各エントリが必須フィールドを含むことを確認する。
+        """
+        data = _load_artifact()
+        ns = data.get("network_safety", {})
+        cases = ns.get("cases", [])
+        required_case_fields = ["name", "expected", "actual", "server_hit_count"]
+        for i, case in enumerate(cases):
+            for field in required_case_fields:
+                assert field in case, (
+                    f"network_safety.cases[{i}] に必須フィールド '{field}' がありません: {case}"
+                )
+
+    def test_network_safety_cases_actual_matches_expected(self) -> None:
+        """
+        FIX_3: artifact.network_safety.cases[] の actual が expected と一致することを確認する。
+        """
+        data = _load_artifact()
+        ns = data.get("network_safety", {})
+        cases = ns.get("cases", [])
+        for case in cases:
+            name = case.get("name", "?")
+            expected = case.get("expected")
+            actual = case.get("actual")
+            assert expected == actual, (
+                f"network_safety.cases[{name!r}]: expected={expected!r}, actual={actual!r} が不一致"
+            )
+
+    def test_network_safety_cases_server_hit_count_zero(self) -> None:
+        """
+        FIX_3: 全 cases の server_hit_count が 0 であることを確認する（実接続なし）。
+        """
+        data = _load_artifact()
+        ns = data.get("network_safety", {})
+        cases = ns.get("cases", [])
+        for case in cases:
+            name = case.get("name", "?")
+            hit_count = case.get("server_hit_count", -1)
+            assert hit_count == 0, (
+                f"network_safety.cases[{name!r}].server_hit_count が 0 ではありません: {hit_count}"
+            )
+
+    def test_mutation_test_has_mutants(self) -> None:
+        """
+        FIX_3: artifact.mutation_test.mutants[] が存在し、3 件以上のエントリを含むことを確認する。
+        """
+        data = _load_artifact()
+        mutation = data.get("mutation_test", {})
+        mutants = mutation.get("mutants", [])
+        assert isinstance(mutants, list), (
+            f"mutation_test.mutants が list ではありません: {type(mutants).__name__}"
+        )
+        assert len(mutants) >= 3, (
+            f"mutation_test.mutants が 3 件未満です: {len(mutants)} 件"
+        )
+
+    def test_mutation_test_mutants_structure(self) -> None:
+        """
+        FIX_3: artifact.mutation_test.mutants[] の各エントリが必須フィールドを含むことを確認する。
+        """
+        data = _load_artifact()
+        mutation = data.get("mutation_test", {})
+        mutants = mutation.get("mutants", [])
+        required_mutant_fields = ["name", "expected_failure", "observed_failure", "failing_assertion"]
+        for i, mutant in enumerate(mutants):
+            for field in required_mutant_fields:
+                assert field in mutant, (
+                    f"mutation_test.mutants[{i}] に必須フィールド '{field}' がありません: {mutant}"
+                )
+
+    def test_mutation_test_all_mutants_observed_failure(self) -> None:
+        """
+        FIX_3: artifact.mutation_test.mutants[] の全エントリで observed_failure が true であることを確認する。
+        """
+        data = _load_artifact()
+        mutation = data.get("mutation_test", {})
+        mutants = mutation.get("mutants", [])
+        for mutant in mutants:
+            name = mutant.get("name", "?")
+            observed = mutant.get("observed_failure")
+            expected = mutant.get("expected_failure")
+            assert expected is True, (
+                f"mutation_test.mutants[{name!r}].expected_failure が true ではありません: {expected}"
+            )
+            assert observed is True, (
+                f"mutation_test.mutants[{name!r}].observed_failure が true ではありません: {observed}"
+            )
+
+    def test_mutation_test_mutant_names_cover_three_scenarios(self) -> None:
+        """
+        FIX_3: 3 種類の mutant（deny_entry_removed, ctx_fetch_strict_disabled, private_blocklist_relaxed）
+        が含まれることを確認する。
+        """
+        data = _load_artifact()
+        mutation = data.get("mutation_test", {})
+        mutants = mutation.get("mutants", [])
+        mutant_names = {m.get("name", "") for m in mutants}
+        required_names = {"deny_entry_removed", "ctx_fetch_strict_disabled", "private_blocklist_relaxed"}
+        missing = required_names - mutant_names
+        assert not missing, (
+            f"必須 mutant が含まれていません: {missing}. 現在の mutants: {mutant_names}"
         )
