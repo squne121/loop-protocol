@@ -1,36 +1,37 @@
 /**
  * src/ui/debugPause.ts
  *
- * Runtime-local debug pause/resume surface (Issue #786).
- * Not part of LoopPhase / GameState / snapshot schema.
+ * @deprecated Deprecated wrapper for backward compatibility (Issue #884).
+ * Use src/ui/productPause.ts instead.
+ * This module re-exports from productPause with legacy naming.
  */
 import type { InputState } from '../input/InputState'
+import {
+  type ProductPauseState,
+  createProductPauseState,
+  toggleProductPause,
+  resetInputOnPause as resetInputOnPauseImpl,
+} from './productPause'
 
-/** Opaque runtime-local debug pause state. */
-export interface DebugPauseState {
-  isPaused: boolean
-}
+/** @deprecated Use ProductPauseState from productPause.ts instead. */
+export type DebugPauseState = ProductPauseState
 
-/** Create a fresh (unpaused) debug pause state. */
+/** @deprecated Use createProductPauseState() instead. */
 export function createDebugPauseState(): DebugPauseState {
-  return { isPaused: false }
+  return createProductPauseState()
 }
 
-/**
- * Toggle pause/resume.
- * Called from Escape keydown (event.repeat=false guard) and the HUD button.
- */
+/** @deprecated Use toggleProductPause() instead. */
 export function toggleDebugPause(ps: DebugPauseState): void {
-  ps.isPaused = !ps.isPaused
+  toggleProductPause(ps)
 }
 
 /**
  * Clear firing / pointer active state when entering pause.
- * Prevents held fire from bleeding into resume (AC7).
+ * @deprecated Use resetInputOnPause() from productPause.ts instead.
  */
 export function resetInputOnPause(
   input: Pick<InputState, 'primaryPressed' | 'activePointerId'>,
 ): void {
-  input.primaryPressed = false
-  input.activePointerId = null
+  resetInputOnPauseImpl(input)
 }

@@ -25,14 +25,20 @@ import {
 } from './systems'
 import { createHudController } from './ui'
 import {
-  createDebugPauseState,
-  toggleDebugPause,
+  createProductPauseState,
+  toggleProductPause,
   resetInputOnPause,
-} from './ui/debugPause'
+} from './ui/productPause'
 
-// Re-export for testing convenience (tests import from src/ui/debugPause directly)
+// Re-export deprecated debugPause aliases for backward compatibility (AC11)
+// Tests and external code that import from src/ui/debugPause continue to work
+// via the deprecated wrapper in debugPause.ts
 export type { DebugPauseState } from './ui/debugPause'
 export { createDebugPauseState, toggleDebugPause, resetInputOnPause } from './ui/debugPause'
+
+// Re-export product pause API (AC11: product-facing naming)
+export type { ProductPauseState } from './ui/productPause'
+export { createProductPauseState, toggleProductPause } from './ui/productPause'
 
 type ProgressionSaveReason = 'reward-claim' | 'save'
 
@@ -182,7 +188,7 @@ if (app) {
         </div>
         <p class="battle-stage__copy">WASD to reposition. Hold pointer down to pressure the firing lane.</p>
       </div>
-      <canvas class="battle-stage__canvas" aria-label="Battle arena"></canvas>
+      <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
     </section>
     <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
@@ -212,16 +218,16 @@ let state: GameState = createInitialGameState()
 ;(state as { loopPhase: LoopPhase }).loopPhase = 'title_menu'
 const renderer = canvas ? createCanvasRenderer(canvas) : null
 
-// Debug pause state (runtime-local, not persisted)
-const debugPause = createDebugPauseState()
+// Product pause state (runtime-local, not persisted) — AC10, AC11
+const productPause = createProductPauseState()
 const inputState = createInputState()
 
-/** Toggle pause and reset firing state to prevent held-fire bleed (AC7). */
+/** Toggle pause and reset firing state to prevent held-fire bleed (AC5). */
 function handleTogglePause(): void {
-  if (debugPause.isPaused) {
-    // AC7: clear firing/pointer active state accumulated during pause, then resume
+  if (productPause.isPaused) {
+    // AC5: clear firing/pointer active state accumulated during pause, then resume
     resetInputOnPause(inputState)
-    toggleDebugPause(debugPause)
+    toggleProductPause(productPause)
     setHudFeedback('Resumed', 'Simulation resumed.')
     return
   }
@@ -229,8 +235,8 @@ function handleTogglePause(): void {
   // BLOCKER 1: pause entry is only allowed during running phase
   if (state.loopPhase !== 'running') return
 
-  toggleDebugPause(debugPause)
-  // AC7: clear firing/pointer active state on pause entry
+  toggleProductPause(productPause)
+  // AC5: clear firing/pointer active state on pause entry
   resetInputOnPause(inputState)
   setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
 }
@@ -242,7 +248,7 @@ const hud = commandRail ? createHudController(commandRail, {
     state = createInitialGameState()
     state.loopPhase = 'preparation'
     resizeArena(state)
-    debugPause.isPaused = false
+    productPause.isPaused = false
     setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
   },
   onStartSortie() {
@@ -293,8 +299,8 @@ const hud = commandRail ? createHudController(commandRail, {
     }
 
     confirmResult(state)
-    // Reset debug pause on state transition to preparation
-    debugPause.isPaused = false
+    // Reset product pause on state transition to preparation
+    productPause.isPaused = false
     // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
     // persistProgressionSnapshot sets HUD feedback internally (success or failure).
     // Do NOT call setHudFeedback() unconditionally here — that would overwrite a
@@ -311,7 +317,7 @@ const hud = commandRail ? createHudController(commandRail, {
 
     state.loopPhase = 'preparation'
     resizeArena(state)
-    debugPause.isPaused = false
+    productPause.isPaused = false
     setHudFeedback(
       'Returned to preparation.',
       'Use Start sortie to begin the next sortie.',
@@ -340,7 +346,7 @@ const hud = commandRail ? createHudController(commandRail, {
         state.loopPhase = 'preparation'
         resizeArena(state)
         hasLoadableSnapshot = true
-        debugPause.isPaused = false
+        productPause.isPaused = false
       },
       onLoadFail() {
         hasLoadableSnapshot = false
@@ -355,8 +361,8 @@ const hud = commandRail ? createHudController(commandRail, {
     state = createInitialGameState()
     state.loopPhase = 'preparation'
     resizeArena(state)
-    // Reset debug pause on state transition to preparation
-    debugPause.isPaused = false
+    // Reset product pause on state transition to preparation
+    productPause.isPaused = false
     setHudFeedback(
       'Reset sortie complete.',
       'Reset sortie is a destructive boundary. Preparation only.',
@@ -382,11 +388,34 @@ if (canvas) {
 }
 
 // AC2: Escape key toggles pause/resume; event.repeat guard prevents multi-toggle on held key
+// AC3: P key only when canvas has focus (document.activeElement === canvas) — WCAG 2.1.4
+// AC8: visibilitychange hidden → auto-pause during running phase only; visible → no auto-resume
+// AC12: visibilitychange hidden auto-pauses only during running phase; visible does NOT auto-resume
 if (app) {
   window.addEventListener('keydown', (event: KeyboardEvent) => {
+    // AC2: Escape toggles pause regardless of focus
     if (event.key === 'Escape' && !event.repeat) {
       handleTogglePause()
+      return
     }
+    // AC3, AC15: KeyP (P key) only when canvas is active element (WCAG 2.1.4 Character Key Shortcuts)
+    // event.code === 'KeyP' uses physical key position (layout-agnostic)
+    if (event.code === 'KeyP') {
+      if (!event.repeat && canvas && document.activeElement === canvas) {
+        handleTogglePause()
+      }
+    }
+  })
+
+  // AC8, AC12: auto-pause on tab/window hide during running phase only
+  // visible restore does NOT auto-resume (intentional: user must explicitly resume)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && state.loopPhase === 'running' && !productPause.isPaused) {
+      toggleProductPause(productPause)
+      resetInputOnPause(inputState)
+      setHudFeedback('Paused', 'Simulation paused: window hidden.')
+    }
+    // AC8: visible restoration does NOT auto-resume
   })
 
   maybeAutoStartRuntime()
@@ -423,10 +452,10 @@ function frame(now: number): void {
   const deltaMs = now - previousFrameTime
   previousFrameTime = now
 
-  // AC3, AC5: while paused, do not advance the simulation accumulator.
+  // AC4: while paused, do not advance the simulation accumulator.
   // Pass deltaMs=0 so advanceSimulationLoop executes 0 steps.
   // The accumulator is also reset on pause entry (below) to prevent catch-up.
-  if (!debugPause.isPaused) {
+  if (!productPause.isPaused) {
     const result = advanceSimulationLoop(
       accumulatorMs,
       deltaMs,
@@ -441,7 +470,7 @@ function frame(now: number): void {
   }
 
   // AC4: render and HUD continue regardless of pause state
-  hud.render(state, debugPause.isPaused)
+  hud.render(state, productPause.isPaused)
   renderer.render(state)
   window.requestAnimationFrame(frame)
 }
