@@ -101,6 +101,31 @@ export function runProgressionSave(
   return true
 }
 
+export type NextSortieHandlerSeam = {
+  setHudFeedback: (status: string, summary: string) => void
+}
+
+/**
+ * Testable seam for the onNextSortie handler (B5, Issue #859).
+ * If loopPhase !== 'debrief_reward_claimed', returns false without side effects.
+ * Otherwise transitions state to 'preparation' and calls setHudFeedback with
+ * 'Returned to preparation.' / 'Use Start sortie to begin the next sortie.'.
+ */
+export function runNextSortieHandler(
+  state: GameState,
+  seam: NextSortieHandlerSeam,
+): boolean {
+  if (state.loopPhase !== 'debrief_reward_claimed') {
+    return false
+  }
+  state.loopPhase = 'preparation'
+  seam.setHudFeedback(
+    'Returned to preparation.',
+    'Use Start sortie to begin the next sortie.',
+  )
+  return true
+}
+
 /**
  * Testable seam for the onConfirmResult handler (AC1–AC4, Issue #858).
  * Mirrors the production handler: if phase !== 'result', returns null without saving.
@@ -311,17 +336,12 @@ const hud = commandRail ? createHudController(commandRail, {
   onNextSortie() {
     // B5: legacy debrief_reward_claimed → preparation (not directly to running).
     // startSortie() only accepts preparation phase, so transition to preparation first.
-    if (state.loopPhase !== 'debrief_reward_claimed') {
+    // Delegates to runNextSortieHandler seam for testability (Issue #859).
+    if (!runNextSortieHandler(state, { setHudFeedback })) {
       return
     }
-
-    state.loopPhase = 'preparation'
     resizeArena(state)
     productPause.isPaused = false
-    setHudFeedback(
-      'Returned to preparation.',
-      'Use Start sortie to begin the next sortie.',
-    )
   },
   onSave() {
     // AC2, AC8: Save only allowed in preparation phase

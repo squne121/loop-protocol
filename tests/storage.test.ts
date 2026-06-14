@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { resolveProgressionSaveFailureFeedback, runProgressionSave } from '../src/main'
+import { resolveProgressionSaveFailureFeedback, runNextSortieHandler, runProgressionSave } from '../src/main'
 // Note: ProgressionSaveReason is now 'reward-claim' | 'save' (Quick Save renamed to Save — #619)
 import {
   createLocalGameStorage,
@@ -10,7 +10,7 @@ import {
   serializeSnapshot,
   type SaveResult,
 } from '../src/storage'
-import { createGameSnapshot, createInitialGameState } from '../src/state'
+import { createGameSnapshot, createInitialGameState, type LoopPhase } from '../src/state'
 
 function createMemoryStorage(initialEntries?: Record<string, string>) {
   const bag = new Map<string, string>(Object.entries(initialEntries ?? {}))
@@ -672,5 +672,64 @@ describe('phase guard: storage.save() only in preparation (AC2, AC8)', () => {
     const seam = makeSaveSpySeam()
     runProgressionSave('save', false, seam)
     expect(seam.setHudFeedback).toHaveBeenCalledWith('Save complete.', 'Progression snapshot saved locally.')
+  })
+})
+
+describe('runNextSortieHandler seam (B5, Issue #859)', () => {
+  function makeSeam() {
+    const setHudFeedback = vi.fn<(status: string, summary: string) => void>()
+    return { setHudFeedback }
+  }
+
+  it('GIVEN debrief_reward_claimed WHEN runNextSortieHandler called THEN returns true and transitions to preparation with correct feedback', () => {
+    const state = createInitialGameState()
+    ;(state as { loopPhase: LoopPhase }).loopPhase = 'debrief_reward_claimed'
+    const seam = makeSeam()
+
+    const result = runNextSortieHandler(state, seam)
+
+    expect(result).toBe(true)
+    expect(state.loopPhase).toBe('preparation')
+    expect(seam.setHudFeedback).toHaveBeenCalledWith(
+      'Returned to preparation.',
+      'Use Start sortie to begin the next sortie.',
+    )
+  })
+
+  it('GIVEN debrief_reward_claimed WHEN runNextSortieHandler called THEN does not produce forbidden legacy copy (AC5 regression, Issue #859)', () => {
+    const state = createInitialGameState()
+    ;(state as { loopPhase: LoopPhase }).loopPhase = 'debrief_reward_claimed'
+    const seam = makeSeam()
+
+    runNextSortieHandler(state, seam)
+
+    const calls = seam.setHudFeedback.mock.calls.flat()
+    for (const text of calls) {
+      expect(text).not.toMatch(/Progress saved locally\.|Result confirmed\.|Persistence will be handled|issue #739|in-memory until saved/)
+    }
+  })
+
+  it('GIVEN non-debrief_reward_claimed phase WHEN runNextSortieHandler called THEN returns false and does not change state or call setHudFeedback', () => {
+    const state = createInitialGameState()
+    ;(state as { loopPhase: LoopPhase }).loopPhase = 'preparation'
+    const seam = makeSeam()
+
+    const result = runNextSortieHandler(state, seam)
+
+    expect(result).toBe(false)
+    expect(state.loopPhase).toBe('preparation')
+    expect(seam.setHudFeedback).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN running phase WHEN runNextSortieHandler called THEN returns false without side effects', () => {
+    const state = createInitialGameState()
+    ;(state as { loopPhase: LoopPhase }).loopPhase = 'running'
+    const seam = makeSeam()
+
+    const result = runNextSortieHandler(state, seam)
+
+    expect(result).toBe(false)
+    expect(state.loopPhase).toBe('running')
+    expect(seam.setHudFeedback).not.toHaveBeenCalled()
   })
 })
