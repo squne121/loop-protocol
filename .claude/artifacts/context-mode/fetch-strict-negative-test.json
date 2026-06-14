@@ -1,0 +1,125 @@
+{
+  "schema": "context_mode_fetch_strict_negative_test_v1",
+  "issue": "#827",
+  "status": "pass",
+  "generated_at": "2026-06-14T00:26:11.023275+00:00",
+  "head_sha": "2da4092052a1650f10b97aae9eb3bb1e9ce7f733",
+  "context_mode_version": "1.0.162",
+  "package_path_hash": "a8d76cb526ed44cd",
+  "policy": {
+    "ctx_fetch_and_index_committed_permission": "deny",
+    "fetch_tool_denied_by_project_policy": true,
+    "ctx_fetch_strict_env_configured": false,
+    "ctx_fetch_strict_runtime_observed": false,
+    "effective_fetch_block_reason": "project_permission_deny",
+    "ctx_fetch_strict_configured": true,
+    "ctx_fetch_strict_effective": true,
+    "effective_reason": "deny_entry_blocks_mcp_tool_call",
+    "probe_profile_committed": false,
+    "deny_restored": true,
+    "parse_method": "json_structured_parse",
+    "deny_list_length": 41
+  },
+  "registered_tool_alignment": {
+    "registered_tool_deny_alignment": {
+      "ctx_execute": {
+        "callable_name": "mcp__context-mode__ctx_execute",
+        "in_deny_list": true
+      },
+      "ctx_fetch_and_index": {
+        "callable_name": "mcp__context-mode__ctx_fetch_and_index",
+        "in_deny_list": true
+      }
+    },
+    "all_required_tools_denied": true,
+    "deny_name_matches_callable": true,
+    "permission_policy_alignment_errors": [],
+    "permission_policy_checked": true
+  },
+  "network_safety": {
+    "real_private_network_requests": 0,
+    "resolver_mode": "stubbed",
+    "redirect_mode": "fixture",
+    "loopback_trap_server_hit_count": 0,
+    "real_public_fetch_in_ci": false,
+    "cases": [
+      {
+        "name": "loopback_ipv4",
+        "input_url_redacted": "http://127.0.0.1:<PORT>/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "loopback",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "rfc1918_192_168",
+        "input_url_redacted": "http://192.168.1.1/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "rfc1918",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "link_local_169_254",
+        "input_url_redacted": "http://169.254.169.254/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "link_local_metadata",
+        "server_hit_count": 0,
+        "cache_hit": false
+      },
+      {
+        "name": "ipv6_loopback",
+        "input_url_redacted": "http://::1/canary",
+        "expected": "blocked_before_connect",
+        "actual": "blocked_before_connect",
+        "classifier_reason": "loopback_ipv6",
+        "server_hit_count": 0,
+        "cache_hit": false
+      }
+    ]
+  },
+  "isolation": {
+    "context_mode_dir_strategy": "isolated_tmpdir_per_test",
+    "ttl_override": "force_true_equivalent_no_real_fetch",
+    "real_fetch_performed": false,
+    "cache_contamination_risk": "none"
+  },
+  "cleanup_proof": {
+    "strategy": "pytest_tmp_path_auto_cleanup",
+    "verified": true,
+    "post_cleanup_hit_count": 0
+  },
+  "mutation_test": {
+    "mutants": [
+      {
+        "name": "deny_entry_removed",
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "ctx_fetch_and_index deny missing"
+      },
+      {
+        "name": "ctx_fetch_strict_disabled",
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "ctx_fetch_strict_env_configured is false but claimed configured"
+      },
+      {
+        "name": "private_blocklist_relaxed",
+        "expected_failure": true,
+        "observed_failure": true,
+        "failing_assertion": "private URL not blocked"
+      }
+    ],
+    "all_mutations_detected": true
+  },
+  "redaction": {
+    "home_paths_redacted": true,
+    "token_like_values_absent": true,
+    "raw_response_body_absent": true,
+    "url_credentials_absent": true,
+    "placeholder_values_absent": true
+  }
+}
