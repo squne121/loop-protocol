@@ -1275,3 +1275,238 @@ jobs:
                       print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+  ci-verdict-summary:
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    needs: [typecheck, lint, test, build, e2e, python-test, actionlint]
+    env:
+      GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      GH_SHA: ${{ github.sha }}
+      GH_RUN_ID: ${{ github.run_id }}
+      GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+      GH_REPOSITORY: ${{ github.repository }}
+      GH_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Generate ci_verdict_summary_v2 artifact
+        env:
+          NEEDS_TYPECHECK_RESULT: ${{ needs.typecheck.result }}
+          NEEDS_LINT_RESULT: ${{ needs.lint.result }}
+          NEEDS_TEST_RESULT: ${{ needs.test.result }}
+          NEEDS_BUILD_RESULT: ${{ needs.build.result }}
+          NEEDS_E2E_RESULT: ${{ needs.e2e.result }}
+          NEEDS_PYTHON_TEST_RESULT: ${{ needs.python-test.result }}
+          NEEDS_ACTIONLINT_RESULT: ${{ needs.actionlint.result }}
+        run: |
+          mkdir -p ci_verdict_summary_v2_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib, datetime
+
+          expected_head_sha = os.environ["GH_HEAD_SHA"]
+          pr_head_sha = os.environ.get("GH_HEAD_SHA")
+          repository = os.environ.get("GH_REPOSITORY", "")
+          run_id = int(os.environ.get("GH_RUN_ID", "0"))
+          run_attempt = int(os.environ.get("GH_RUN_ATTEMPT", "1"))
+          event_name = os.environ.get("GH_EVENT_NAME", "unknown")
+
+          job_results = {
+              "typecheck": os.environ.get("NEEDS_TYPECHECK_RESULT", ""),
+              "lint": os.environ.get("NEEDS_LINT_RESULT", ""),
+              "test": os.environ.get("NEEDS_TEST_RESULT", ""),
+              "build": os.environ.get("NEEDS_BUILD_RESULT", ""),
+              "e2e": os.environ.get("NEEDS_E2E_RESULT", ""),
+              "python-test": os.environ.get("NEEDS_PYTHON_TEST_RESULT", ""),
+              "actionlint": os.environ.get("NEEDS_ACTIONLINT_RESULT", ""),
+          }
+
+          CLASSIFICATION_MAP = {
+              "typecheck": "required",
+              "lint": "required",
+              "test": "required",
+              "build": "required",
+              "e2e": "evidence",
+              "python-test": "evidence",
+              "actionlint": "required",
+          }
+
+          def result_to_conclusion(result):
+              mapping = {
+                  "success": "success",
+                  "failure": "failure",
+                  "cancelled": "cancelled",
+                  "skipped": "skipped",
+              }
+              return mapping.get(result, None)
+
+          def result_to_status(result):
+              if result in {"success", "failure", "cancelled", "skipped"}:
+                  return "completed"
+              return "unknown"
+
+          checks = []
+          for job_name, result in job_results.items():
+              classification = CLASSIFICATION_MAP.get(job_name, "unknown")
+              conclusion = result_to_conclusion(result)
+              status = result_to_status(result) if result else None
+              head_sha = expected_head_sha if result else None
+              head_sha_match = head_sha == expected_head_sha if head_sha else False
+
+              blocking = False
+              failure_reason = "none"
+
+              if classification in {"required", "evidence"}:
+                  if not result or status not in {"completed"}:
+                      blocking = True
+                      failure_reason = "pending"
+                  elif conclusion == "success" and head_sha_match:
+                      blocking = False
+                      failure_reason = "none"
+                  elif conclusion == "failure":
+                      blocking = True
+                      failure_reason = "failed"
+                  elif conclusion == "cancelled":
+                      blocking = True
+                      failure_reason = "cancelled_current_head"
+                  elif conclusion == "skipped":
+                      blocking = True
+                      failure_reason = "skipped_required"
+                  elif conclusion == "neutral":
+                      blocking = True
+                      failure_reason = "neutral_required"
+                  else:
+                      blocking = True
+                      failure_reason = "gh_error"
+
+              checks.append({
+                  "name": job_name,
+                  "workflow": "ci",
+                  "check_run_id": None,
+                  "status": status,
+                  "conclusion": conclusion,
+                  "classification": classification,
+                  "head_sha": head_sha,
+                  "expected_head_sha": expected_head_sha,
+                  "head_sha_match": head_sha_match,
+                  "blocking_merge_ready": blocking,
+                  "failure_reason": failure_reason,
+                  "artifact_refs": [],
+              })
+
+          blocking_checks = [c for c in checks if c["blocking_merge_ready"]]
+          if not blocking_checks:
+              overall_status = "merge_ready"
+              next_action = "none"
+          else:
+              reasons = {c["failure_reason"] for c in blocking_checks}
+              if "pending" in reasons:
+                  overall_status = "pending"
+                  next_action = "wait_for_ci"
+              elif "stale_head_sha" in reasons:
+                  overall_status = "stale_head_sha"
+                  next_action = "refresh_head_sha"
+              elif "gh_error" in reasons:
+                  overall_status = "gh_error"
+                  next_action = "manual_review_gh_error"
+              else:
+                  overall_status = "blocked"
+                  next_action = "inspect_failed_log_artifacts"
+
+          artifact = {
+              "schema": "ci_verdict_summary_v2",
+              "schema_version": 2,
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "repository": repository,
+              "workflow_run_id": run_id,
+              "workflow_run_attempt": run_attempt,
+              "event_name": event_name,
+              "expected_head_sha": expected_head_sha,
+              "head_sha": pr_head_sha,
+              "overall_status": overall_status,
+              "next_action": next_action,
+              "checks": checks,
+          }
+
+          out = pathlib.Path("ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-verdict-summary-v2 artifact
+        id: upload-ci-verdict-summary-v2
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-verdict-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Output ci_verdict_summary_v2 Step Summary
+        if: ${{ !cancelled() }}
+        env:
+          CI_VERDICT_V2_ARTIFACT_URL: ${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-url || 'N/A' }}
+          CI_VERDICT_V2_ARTIFACT_ID: ${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-id || 'N/A' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+
+          p = pathlib.Path("ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json")
+          if not p.exists():
+              print("ERROR: ci_verdict_summary_v2.json not found", file=sys.stderr)
+              sys.exit(1)
+
+          artifact = json.loads(p.read_text())
+          artifact_url = os.environ.get("CI_VERDICT_V2_ARTIFACT_URL", "N/A")
+          artifact_id = os.environ.get("CI_VERDICT_V2_ARTIFACT_ID", "N/A")
+
+          lines = []
+          lines.append("## CI Verdict Summary V2")
+          lines.append("")
+          lines.append(f"**schema:** `{artifact['schema']}` v{artifact['schema_version']}")
+          lines.append(f"**overall_status:** `{artifact['overall_status']}`")
+          lines.append(f"**next_action:** `{artifact['next_action']}`")
+          lines.append(f"**expected_head_sha:** `{artifact['expected_head_sha']}`")
+          lines.append(f"**head_sha:** `{artifact.get('head_sha')}`")
+          lines.append(f"**generated_at:** {artifact['generated_at']}")
+          lines.append(f"**artifact-id:** {artifact_id}")
+          lines.append(f"**artifact-url:** {artifact_url}")
+          lines.append("")
+
+          blockers = [c for c in artifact.get("checks", []) if c.get("blocking_merge_ready")]
+          if blockers:
+              lines.append("### Blockers")
+              lines.append("")
+              lines.append("| check | workflow | classification | status | conclusion | failure_reason |")
+              lines.append("|---|---|---|---|---|---|")
+              for c in blockers:
+                  lines.append(
+                      f"| {c['name']} | {c['workflow']} | {c['classification']} "
+                      f"| {c.get('status','')} | {c.get('conclusion','')} | {c.get('failure_reason','')} |"
+                  )
+              lines.append("")
+          else:
+              lines.append("No blockers — merge_ready.")
+              lines.append("")
+
+          lines.append("### All Checks")
+          lines.append("")
+          lines.append("| check | workflow | classification | status | conclusion | head_sha_match | blocking |")
+          lines.append("|---|---|---|---|---|---|---|")
+          for c in artifact.get("checks", []):
+              match_str = "yes" if c.get("head_sha_match") else "no"
+              blocking_str = "yes" if c.get("blocking_merge_ready") else "no"
+              lines.append(
+                  f"| {c['name']} | {c['workflow']} | {c['classification']} "
+                  f"| {c.get('status','')} | {c.get('conclusion','')} | {match_str} | {blocking_str} |"
+              )
+          lines.append("")
+
+          summary = "\n".join(lines)
+          step_summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary_path:
+              with open(step_summary_path, "a") as f:
+                  f.write(summary)
+          else:
+              print(summary)
+          PY
