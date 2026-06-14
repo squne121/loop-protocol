@@ -7,7 +7,7 @@ CI_VERDICT_SUMMARY_V1 schema の compact JSON として stdout に出力する�
 
 exit codes:
   0: all_pass
-  10: failed
+  10: failed / no_required_evidence
   20: pending_or_queued
   30: stale_head_sha
   40: gh_error
@@ -50,9 +50,22 @@ PENDING_STATUSES: set[str] = {
 # Exit codes
 EXIT_ALL_PASS = 0
 EXIT_FAILED = 10
+EXIT_NO_REQUIRED_EVIDENCE = 10  # same exit as failed — no required CI evidence
 EXIT_PENDING = 20
 EXIT_STALE = 30
 EXIT_GH_ERROR = 40
+
+# Allowlist: (workflow_name, check_name) tuples for head_sha=None + skipped exclusion.
+# These checks are conditional/retrospective and are excluded from verdict calculation
+# when they have head_sha=None and conclusion=skipped.
+# workflow names correspond to .github/workflows/ file `name:` fields.
+HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
+    ("deploy-pages", "deploy-main"),
+    ("deploy-pages", "cleanup-pr"),
+    ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"),
+    ("Check Japanese Content", "Issue Comment Japanese Check (retrospective)"),
+    ("Check Japanese Content", "PR Review Japanese Check (retrospective)"),
+})
 
 # Artifact truncation limit (bytes)
 LOG_TRUNCATE_BYTES = 64 * 1024  # 64KB
@@ -267,7 +280,7 @@ def classify_check(check: dict, pr_head_sha: str) -> dict:
 def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     """
     check entry から verdict bucket を決定する。
-    returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha"
+    returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
     # stale: head SHA mismatch
     head_sha = entry.get("head_sha")
@@ -277,6 +290,14 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     bucket = entry.get("bucket")
     conclusion = entry.get("conclusion")
     status = entry.get("status")
+    name = entry.get("name") or ""
+    workflow = entry.get("workflow") or ""
+
+    # Allowlist exclusion: head_sha=None + conclusion=skipped + (workflow, name) in rules
+    # These are conditional/retrospective checks that do not run on PR commits.
+    if head_sha is None and conclusion == "skipped":
+        if (workflow, name) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES:
+            return "excluded"
 
     # pending
     if bucket == "pending" or status in PENDING_STATUSES:
@@ -301,7 +322,7 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
 
 
 def compute_overall_status(verdicts: list[str]) -> str:
-    """優先順位: stale_head_sha > gh_error > pending_or_queued > failed > all_pass"""
+    """優先順位: stale_head_sha > gh_error > pending_or_queued > failed > all_pass > no_required_evidence"""
     if "stale_head_sha" in verdicts:
         return "stale_head_sha"
     if "gh_error" in verdicts:
@@ -310,6 +331,13 @@ def compute_overall_status(verdicts: list[str]) -> str:
         return "pending_or_queued"
     if "failed" in verdicts:
         return "failed"
+
+    # Filter out excluded verdicts to determine effective evidence
+    effective = [v for v in verdicts if v != "excluded"]
+    if not effective and verdicts:
+        # All checks are excluded — no required CI evidence to confirm pass
+        return "no_required_evidence"
+
     return "all_pass"
 
 
@@ -317,6 +345,7 @@ def next_action_for(status: str) -> str:
     mapping = {
         "all_pass": "none",
         "failed": "inspect_failed_log_artifacts",
+        "no_required_evidence": "inspect_failed_log_artifacts",
         "pending_or_queued": "wait_for_ci",
         "stale_head_sha": "refresh_head_sha",
         "gh_error": "manual_review_gh_error",
@@ -538,9 +567,11 @@ def main() -> int:
         overall_status = compute_overall_status(verdicts)
 
     # Build categorized lists
-    failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "failed"]
-    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "pending_or_queued"]
-    stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, head_sha or expected_head_sha) == "stale_head_sha"]
+    effective_sha = head_sha or expected_head_sha
+    failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "failed"]
+    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "pending_or_queued"]
+    stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "stale_head_sha"]
+    excluded_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "excluded"]
 
     summary: dict[str, Any] = {
         "schema": "CI_VERDICT_SUMMARY_V1",
@@ -554,6 +585,8 @@ def main() -> int:
         "failed_checks": failed_checks,
         "pending_checks": pending_checks,
         "stale_checks": stale_checks,
+        "excluded_checks": excluded_checks,
+        "excluded_count": len(excluded_checks),
         "log_artifacts": log_artifacts,
         "errors": errors,
         "next_action": next_action_for(overall_status),
@@ -565,6 +598,7 @@ def main() -> int:
     exit_map = {
         "all_pass": EXIT_ALL_PASS,
         "failed": EXIT_FAILED,
+        "no_required_evidence": EXIT_NO_REQUIRED_EVIDENCE,
         "pending_or_queued": EXIT_PENDING,
         "stale_head_sha": EXIT_STALE,
         "gh_error": EXIT_GH_ERROR,
