@@ -1,0 +1,4 @@
+{"type":"session_start","tool":"claude","model":"claude-opus","version":"1.0"}
+{"type":"tool_use","tool_name":"Bash","input":{"command":"ls"},"output":"file1.txt"}
+{"type":"subagent_spawn","subagent_id":"sub-001"}
+{"type":"session_end"}
