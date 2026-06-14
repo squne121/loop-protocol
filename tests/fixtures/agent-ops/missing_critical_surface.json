@@ -1,0 +1,6 @@
+{
+  "description": "Fixture for testing missing critical route surface detection",
+  "scenario": "missing_critical",
+  "expected_status": "blocked",
+  "expected_missing_critical": [".agents/skills/implement-issue/SKILL.md"]
+}
