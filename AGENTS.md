@@ -36,3 +36,10 @@
 - `rtk pnpm` enforces dependency mutation (install / add / remove / update) within project constraints.
 - `rtk curl` and `rtk env` require explicit review due to secret/exfiltration risk.
 - If `rtk` provides arbitrary shell passthrough without subcommand enforcement, this rules profile is not effective and must be renegotiated.
+
+## agent ops read plan 例外
+
+`agent-ops-review` タスクを実施する場合:
+- `scripts/agent_ops_inventory.py --task-kind agent-ops-review --artifact-out /tmp/inv.json` で inventory を生成する
+- stdout の `EVIDENCE:` 行が artifact path を示す
+- MUST_READ / DO_NOT_READ_INITIAL_ONLY の詳細は `scripts/agent_ops_inventory.py --help` を参照する
