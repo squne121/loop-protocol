@@ -82,7 +82,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -100,7 +110,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -195,7 +205,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -213,7 +233,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -327,7 +347,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -345,7 +375,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -440,7 +470,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -458,7 +498,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -579,7 +619,7 @@ jobs:
       - name: Upload Playwright report
         id: upload-playwright-report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: playwright-report/
@@ -588,7 +628,7 @@ jobs:
       - name: Upload test results
         id: upload-test-results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: test-results/
@@ -612,7 +652,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -630,7 +680,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -786,7 +836,7 @@ jobs:
             .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py
           _s=$?
           set -e
-          printf '{"step_id":"pytest_edit_issue_tests","phase_id":"pytest_edit_issue_tests","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_edit_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest create-issue tests (timed)
@@ -796,7 +846,7 @@ jobs:
           uv run --locked pytest .claude/skills/create-issue/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_create_issue_tests","phase_id":"pytest_create_issue_tests","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_create_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest create-issue scripts (timed)
@@ -806,7 +856,7 @@ jobs:
           uv run --locked pytest .claude/skills/create-issue/scripts/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_create_issue_scripts","phase_id":"pytest_create_issue_scripts","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_create_issue_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest ssot-discovery (timed)
@@ -816,7 +866,7 @@ jobs:
           uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_ssot_discovery","phase_id":"pytest_ssot_discovery","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_ssot_discovery","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest hook tests (timed)
@@ -826,7 +876,7 @@ jobs:
           uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
           _s=$?
           set -e
-          printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_hook_tests","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: Verify hook test discovery exclusions
@@ -880,7 +930,7 @@ jobs:
           uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_issue_contract_review_scripts","phase_id":"pytest_issue_contract_review_scripts","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_issue_contract_review_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest issue-contract-review tests (timed)
@@ -890,7 +940,7 @@ jobs:
           uv run --locked pytest .claude/skills/issue-contract-review/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_issue_contract_review_tests","phase_id":"pytest_issue_contract_review_tests","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_issue_contract_review_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest pr-review-judge (timed)
@@ -900,7 +950,7 @@ jobs:
           uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_pr_review_judge","phase_id":"pytest_pr_review_judge","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_pr_review_judge","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest open-pr (timed)
@@ -910,7 +960,7 @@ jobs:
           uv run --locked pytest .claude/skills/open-pr/scripts/tests/
           _s=$?
           set -e
-          printf '{"step_id":"pytest_open_pr","phase_id":"pytest_open_pr","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_open_pr","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest impl-review-loop (timed)
@@ -920,7 +970,7 @@ jobs:
           uv run --locked pytest .claude/skills/impl-review-loop/tests/ -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_impl_review_loop","phase_id":"pytest_impl_review_loop","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_impl_review_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest review-issue (timed)
@@ -930,7 +980,7 @@ jobs:
           uv run --locked pytest .claude/skills/review-issue/tests/ -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_review_issue","phase_id":"pytest_review_issue","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_review_issue","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest issue-refinement-loop (timed)
@@ -940,7 +990,7 @@ jobs:
           uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_issue_refinement_loop","phase_id":"pytest_issue_refinement_loop","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_issue_refinement_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest schemas (timed)
@@ -950,7 +1000,7 @@ jobs:
           uv run --locked pytest schemas/tests/ -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_schemas","phase_id":"pytest_schemas","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_schemas","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest context-mode (timed)
@@ -960,7 +1010,7 @@ jobs:
           uv run --locked pytest tests/context_mode/ -q
           _s=$?
           set -e
-          printf '{"step_id":"pytest_context_mode","phase_id":"pytest_context_mode","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_context_mode","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: Kill Switch smoke test
@@ -1021,7 +1071,7 @@ jobs:
           )
           sys.exit(module.generate_artifact(args))
           PY
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ci_test_selection
           path: ci_test_selection_artifacts/
@@ -1044,7 +1094,17 @@ jobs:
               for line in p.read_text().splitlines():
                   line = line.strip()
                   if line:
-                      measurements.append(json.loads(line))
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
           artifact = {
               "schema": "ci_runtime_baseline_v1",
               "run_id": os.environ["GH_RUN_ID"],
@@ -1062,7 +1122,7 @@ jobs:
           PY
       - name: Upload ci-runtime-baseline artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
@@ -1090,13 +1150,117 @@ jobs:
 
   actionlint:
     runs-on: ubuntu-latest
+    env:
+      GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - name: Install actionlint
+      - name: Install actionlint (timed)
+        id: timed-actionlint-install
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash | bash -s -- 1.7.12
-          sudo mv actionlint /usr/local/bin/actionlint
-      - name: Run actionlint
-        run: actionlint
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed actionlint_install bash -c 'curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash | bash -s -- 1.7.12 && sudo mv actionlint /usr/local/bin/actionlint'
+      - name: Run actionlint (timed)
+        id: timed-actionlint
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed actionlint actionlint
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ.get("GH_HEAD_SHA", os.environ["GH_SHA"]),
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ.get("GH_HEAD_SHA", os.environ["GH_SHA"]),
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"

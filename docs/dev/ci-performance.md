@@ -25,11 +25,20 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
       "step_id": "pnpm_install",
       "phase_id": "pnpm_install",
       "status": 0,
-      "elapsed_ms": 12345
+      "elapsed_ms": 12345,
+      "run_id": "<github.run_id>",
+      "run_attempt": "<github.run_attempt>",
+      "head_sha": "<pr head SHA または push SHA>",
+      "merge_sha": "<github.sha>",
+      "job": "<job name>",
+      "runner_image": "<ImageOS>/<ImageVersion>",
+      "measurement_method": "date_plus3N_ms"
     }
   ]
 }
 ```
+
+各 measurement record には top-level フィールド（`run_id`, `run_attempt`, `head_sha`, `merge_sha`, `job`, `runner_image`, `measurement_method`）が展開される。これにより artifact を job 単位でフラット化した場合でも各 record が単独で識別可能になる（AC3）。
 
 ### フィールド定義
 
@@ -43,10 +52,17 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test` / `actionlint`） |
 | `runner_image` | string | `${ImageOS}/${ImageVersion}` |
 | `measurement_method` | string | `"date_plus3N_ms"`（`date +%s%3N` による ms 計測） |
-| `measurements[].step_id` | string | ステップ識別子（stable phase id）|
-| `measurements[].phase_id` | string | `step_id` と同値（比較基軸） |
+| `measurements[].step_id` | string | ステップ識別子（granular; python-test では pytest_edit_issue_tests 等） |
+| `measurements[].phase_id` | string | 比較基軸（python-test の pytest 群では `pytest_skills` に統一; 他の job では `step_id` と同値） |
 | `measurements[].status` | int | コマンドの exit status |
 | `measurements[].elapsed_ms` | int | 経過時間（ミリ秒） |
+| `measurements[].run_id` | string | top-level `run_id` を展開（AC3: record 単独での識別を可能にする） |
+| `measurements[].run_attempt` | string | top-level `run_attempt` を展開 |
+| `measurements[].head_sha` | string | top-level `head_sha` を展開 |
+| `measurements[].merge_sha` | string | top-level `merge_sha` を展開 |
+| `measurements[].job` | string | top-level `job` を展開 |
+| `measurements[].runner_image` | string | top-level `runner_image` を展開 |
+| `measurements[].measurement_method` | string | top-level `measurement_method` を展開 |
 
 ### stable phase_id 一覧（#896 以降の比較基軸）
 
@@ -63,8 +79,31 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `test_e2e_ci` | `pnpm test:e2e:ci` | e2e |
 | `uv_python_install` | `uv python install` | python-test |
 | `uv_sync` | `uv sync --locked --group dev` | python-test |
-| `pytest_skills` | pytest（skills 群） | python-test |
+| `pytest_skills` | pytest（skills 群 14 ステップ合計の stable phase_id） | python-test |
+| `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |
 | `actionlint` | `actionlint` | actionlint |
+
+### python-test の step_id と phase_id の関係
+
+python-test job では pytest ステップが複数あり、各ステップの `step_id` は granular（例: `pytest_edit_issue_tests`, `pytest_create_issue_tests` 等）だが、
+`phase_id` は全て `pytest_skills` に統一されている。これにより #896 以降の比較で pytest 群全体の所要時間を単一 phase_id で集計できる。
+
+| step_id（granular） | phase_id（stable） |
+|---|---|
+| `pytest_edit_issue_tests` | `pytest_skills` |
+| `pytest_create_issue_tests` | `pytest_skills` |
+| `pytest_create_issue_scripts` | `pytest_skills` |
+| `pytest_ssot_discovery` | `pytest_skills` |
+| `pytest_hook_tests` | `pytest_skills` |
+| `pytest_issue_contract_review_scripts` | `pytest_skills` |
+| `pytest_issue_contract_review_tests` | `pytest_skills` |
+| `pytest_pr_review_judge` | `pytest_skills` |
+| `pytest_open_pr` | `pytest_skills` |
+| `pytest_impl_review_loop` | `pytest_skills` |
+| `pytest_review_issue` | `pytest_skills` |
+| `pytest_issue_refinement_loop` | `pytest_skills` |
+| `pytest_schemas` | `pytest_skills` |
+| `pytest_context_mode` | `pytest_skills` |
 
 ## run_timed wrapper 仕様
 
@@ -135,3 +174,21 @@ verdict 判定は #898 の `ci_verdict_summary_v2` に委譲する。
 - `actions/setup-node`
 - `astral-sh/setup-uv`
 - `actions/upload-artifact`（upload 自体の所要時間）
+
+### python-test job の未計測ガード群
+
+python-test job 内の以下のステップは計測対象外（`measurements.jsonl` に記録しない）:
+
+- `Install ripgrep`（`sudo apt-get install -y ripgrep`）
+- `Verify Python version`（Python バージョン確認）
+- `run: uv run --locked python .claude/scripts/check_secret_policy.py ...`
+- `run: uv run --locked python .claude/scripts/check_session_recording_policy.py ...`
+- `Check InputCommand docs schema`（`scripts/check_input_command_schema.py`）
+- `Check visual artifact pipeline wiring`（`scripts/check-visual-artifact-pipeline.py`）
+- `Verify hook test discovery exclusions`（hook テスト discovery 除外確認スクリプト）
+- `Kill Switch smoke test`（`kill_switch_runtime_smoke.py`）
+- `Secret exposure scan (production scripts)`（`secret_exposure_scanner.py`）
+- `Secret exposure scan (clean fixtures)`（`secret_exposure_scanner.py`）
+- `Generate ci_test_selection/v1 artifact`（`generate_ci_test_selection_artifact.py`）
+
+これらは CI ガード（整合性チェック・セキュリティスキャン）であり、runtime duration の比較基準とはしない。
