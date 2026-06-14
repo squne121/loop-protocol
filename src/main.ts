@@ -95,6 +95,28 @@ export function runProgressionSave(
   return true
 }
 
+/**
+ * Testable seam for the onConfirmResult handler (AC1–AC4, Issue #858).
+ * Mirrors the production handler: if phase !== 'result', returns null without saving.
+ * Otherwise calls confirmResult(state) then runProgressionSave('reward-claim', ...).
+ */
+export type ConfirmResultHandlerSeam = ProgressionSaveSeam & {
+  resetDebugPause: () => void
+}
+
+export function runConfirmResultHandler(
+  state: GameState,
+  hadLoadableSnapshot: boolean,
+  seam: ConfirmResultHandlerSeam,
+): boolean | null {
+  if (state.loopPhase !== 'result') {
+    return null
+  }
+  confirmResult(state)
+  seam.resetDebugPause()
+  return runProgressionSave('reward-claim', hadLoadableSnapshot, seam)
+}
+
 export type LoadGameSeam = {
   storage: { load(): LoadResult }
   reportLoadFailure(result: Extract<LoadResult, { ok: false }>): void
