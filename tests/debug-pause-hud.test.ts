@@ -44,7 +44,7 @@ describe('HUD pause/resume affordance — AC1', () => {
     expect(btn!.textContent).toBe('Pause')
   })
 
-  it('GIVEN HUD rendered WHEN paused THEN pause button text is "Resume"', () => {
+  it('GIVEN HUD rendered WHEN paused THEN aria-pressed is "true" and aria-label is "Resume simulation"', () => {
     const container = makeContainer()
     const actions = makeActions()
     const hud = createHudController(container, actions)
@@ -54,7 +54,10 @@ describe('HUD pause/resume affordance — AC1', () => {
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
     expect(btn).not.toBeNull()
-    expect(btn!.textContent).toBe('Resume')
+    // Button textContent is fixed to 'Pause'; state is conveyed via aria-pressed (AC16)
+    expect(btn!.textContent).toBe('Pause')
+    expect(btn!.getAttribute('aria-pressed')).toBe('true')
+    expect(btn!.getAttribute('aria-label')).toBe('Resume simulation')
   })
 
   it('GIVEN HUD rendered in running phase WHEN pause button clicked THEN onTogglePause is called', () => {
@@ -74,7 +77,7 @@ describe('HUD pause/resume affordance — AC1', () => {
 })
 
 describe('HUD pause feedback — AC6 (no debug metadata in normal UI)', () => {
-  it('GIVEN paused state WHEN render called THEN pause button shows "Resume" only (no telemetry/LoopPhase exposed as debug)', () => {
+  it('GIVEN paused state WHEN render called THEN pause button shows fixed label with no debug metadata', () => {
     const container = makeContainer()
     const actions = makeActions()
     const hud = createHudController(container, actions)
@@ -83,8 +86,10 @@ describe('HUD pause feedback — AC6 (no debug metadata in normal UI)', () => {
     hud.render(state, true)
 
     const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
-    // AC6: button text must be a player-facing minimal label, not debug metadata
-    expect(btn.textContent).toBe('Resume')
+    // AC6: button textContent is fixed 'Pause'; pause state conveyed via aria-pressed (AC16)
+    expect(btn.textContent).toBe('Pause')
+    // aria-label describes the current action for screen readers
+    expect(btn.getAttribute('aria-label')).toBe('Resume simulation')
     // No exact HP/HULL numbers in the pause button
     expect(btn.textContent).not.toMatch(/\d+\/\d+/)
     // No LoopPhase string exposed in button
@@ -104,5 +109,61 @@ describe('HUD render continues during pause — AC4', () => {
 
     const statusEl = container.querySelector<HTMLElement>('[data-field="status"]')
     expect(statusEl?.textContent).toBe('Paused')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// AC16: aria-pressed and pause live region
+// ---------------------------------------------------------------------------
+
+describe('HUD aria-pressed and pause live region — AC16', () => {
+  it('GIVEN not paused WHEN rendered THEN aria-pressed is "false"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, false)
+
+    const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
+    expect(btn.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('GIVEN paused WHEN rendered THEN aria-pressed is "true"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, true)
+
+    const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
+    expect(btn.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('GIVEN paused WHEN rendered THEN pause-status live region shows "Paused"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, true)
+
+    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
+    expect(pauseStatus).not.toBeNull()
+    expect(pauseStatus!.textContent).toBe('Paused')
+    expect(pauseStatus!.getAttribute('role')).toBe('status')
+  })
+
+  it('GIVEN not paused WHEN rendered THEN pause-status live region is empty', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, false)
+
+    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
+    expect(pauseStatus?.textContent).toBe('')
   })
 })
