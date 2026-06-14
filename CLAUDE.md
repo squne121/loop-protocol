@@ -13,6 +13,15 @@
 6. 関連する `docs/adr/*.md`、`docs/product/features/<feature>.md`、`docs/dev/directory-structure.md`
 7. プレイテスト関連作業を行う場合: `docs/product/playtest-protocol.md`, `docs/product/playtest-log.md`
 
+### agent ops task の read plan 例外
+
+`agent-ops-review` タスク（Codex agent 設定の検証・棚卸し等）を実施する場合は、
+通常の読み順序より先に以下を参照する:
+- `scripts/agent_ops_inventory.py --task-kind agent-ops-review` で inventory artifact を生成する
+- 詳細な MUST_READ / DO_NOT_READ_INITIAL_ONLY は同スクリプトの `--help` と artifact schema を参照する
+- `DO_NOT_READ_INITIAL_ONLY` は初期読込除外のみであり、追加読込は禁止ではない
+
+
 ## 不変のアーキテクチャ原則
 
 - `src/state` と `src/render` は完全に分離する。
