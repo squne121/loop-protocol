@@ -2,8 +2,8 @@
   "schema": "context_mode_fetch_strict_negative_test_v1",
   "issue": "#827",
   "status": "pass",
-  "generated_at": "2026-06-14T00:15:23.352991+00:00",
-  "head_sha": "7b3c04cf4979652b71274c9f60afd3ce1d414500",
+  "generated_at": "2026-06-14T00:25:49.161186+00:00",
+  "head_sha": "090b1bda1cbc4e20802de969df3b39752d455dfa",
   "context_mode_version": "1.0.162",
   "package_path_hash": "a8d76cb526ed44cd",
   "policy": {
