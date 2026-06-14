@@ -68,7 +68,7 @@ export function createHudController(
       <p class="status-copy status-copy--muted" data-field="command"></p>
     </section>
     <section class="panel panel--pause-status">
-      <p class="status-copy" data-field="pause-status" role="status" aria-live="assertive" aria-atomic="true"></p>
+      <p class="status-copy" data-field="pause-status" role="status" aria-live="polite" aria-atomic="true"></p>
     </section>
     <section class="panel panel--actions">
       <button type="button" data-action="new-game">New Game</button>
@@ -89,6 +89,7 @@ export function createHudController(
         type="button"
         data-action="toggle-pause"
         aria-pressed="false"
+        aria-label="Pause simulation"
         title="Pause or resume simulation. Also toggled by Escape."
       >Pause</button>
     </section>
@@ -206,10 +207,14 @@ export function createHudController(
       loadGameButton.disabled = !isMenuPhase || !canLoad
       resetButton.disabled = state.loopPhase !== 'preparation'
 
-      // AC1: pause button label reflects current pause state
-      togglePauseButton.textContent = isPaused ? 'Resume' : 'Pause'
-      // AC16: aria-pressed reflects current pause state
+      // AC1: aria-pressed reflects current pause state; label is fixed to avoid ARIA conflict
+      // aria-label updates to describe the current action (not current state)
       togglePauseButton.setAttribute('aria-pressed', isPaused ? 'true' : 'false')
+      togglePauseButton.setAttribute(
+        'aria-label',
+        isPaused ? 'Resume simulation' : 'Pause simulation',
+      )
+      // AC16: aria-pressed reflects current pause state
       // BLOCKER 1: pause button is disabled when not in running phase and not already paused
       togglePauseButton.disabled = state.loopPhase !== 'running' && !isPaused
 
