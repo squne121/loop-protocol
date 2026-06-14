@@ -5,4 +5,7 @@
 {"type":"hook_fired","timestamp":"2026-06-14T11:00:04Z","hook_name":"approval_gate","result":"allowed"}
 {"type":"hook_fired","timestamp":"2026-06-14T11:00:05Z","hook_name":"safety_check","result":"skipped"}
 {"type":"human_intervention","timestamp":"2026-06-14T11:00:06Z","reason":"user_feedback"}
+{"type":"tool_use","tool_name":"Read","input":{"file_path":"/tmp/codex-run/output.txt"},"output":"some output"}
+{"type":"hook_fired","hook_name":"multi_source_hook","result":"allowed","source":"agent_a"}
+{"type":"hook_fired","hook_name":"multi_source_hook","result":"allowed","source":"agent_b"}
 {"type":"session_end","timestamp":"2026-06-14T11:01:00Z","turn_id":"turn-001"}

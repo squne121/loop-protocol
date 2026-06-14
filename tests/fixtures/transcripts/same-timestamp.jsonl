@@ -1,0 +1,5 @@
+{"type":"session_start","tool":"claude","model":"claude-opus","version":"1.0","timestamp":"2026-06-14T10:00:00Z"}
+{"type":"tool_use","tool_name":"Bash","input":{"command":"ls"},"output":"file1.txt","timestamp":"2026-06-14T10:00:01Z"}
+{"type":"subagent_spawn","subagent_id":"sub-001","timestamp":"2026-06-14T10:00:01Z"}
+{"type":"subagent_spawn","subagent_id":"sub-002","timestamp":"2026-06-14T10:00:01Z"}
+{"type":"session_end","timestamp":"2026-06-14T10:01:00Z"}

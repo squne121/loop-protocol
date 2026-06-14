@@ -1,0 +1,4 @@
+{"type":"session_start","tool":"claude","model":"claude-opus","version":"1.0","timestamp":"2026-06-14T10:00:00Z"}
+{"type":"hook_fired","hook_name":"pre_commit","result":"allowed","source":"agent_a","timestamp":"2026-06-14T10:00:01Z"}
+{"type":"hook_fired","hook_name":"pre_commit","result":"allowed","source":"agent_b","timestamp":"2026-06-14T10:00:01Z"}
+{"type":"session_end","timestamp":"2026-06-14T10:01:00Z"}
