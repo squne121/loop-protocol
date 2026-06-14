@@ -26,8 +26,115 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Typecheck (timed)
+        id: timed-typecheck
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_typecheck pnpm typecheck
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     runs-on: ubuntu-latest
@@ -42,8 +149,115 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Lint (timed)
+        id: timed-lint
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_lint pnpm lint
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   test:
     runs-on: ubuntu-latest
@@ -58,9 +272,134 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm manifest:check
-      - run: pnpm test
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Manifest check (timed)
+        id: timed-manifest-check
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_manifest_check pnpm manifest:check
+      - name: Test (timed)
+        id: timed-test
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_test pnpm test
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     runs-on: ubuntu-latest
@@ -75,8 +414,115 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Build (timed)
+        id: timed-build
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_build pnpm build
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   e2e:
     runs-on: ubuntu-latest
@@ -91,13 +537,82 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Build for E2E
-        run: VITE_E2E_MODE=true pnpm build
-      - name: Install Playwright Chromium browser
-        run: pnpm playwright:install:ci
-      - name: Run E2E tests
-        run: pnpm test:e2e:ci
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Build for E2E (timed)
+        id: timed-build-e2e
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
+      - name: Install Playwright Chromium browser (timed)
+        id: timed-playwright-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed playwright_install pnpm playwright:install:ci
+      - name: Run E2E tests (timed)
+        id: timed-e2e
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed test_e2e_ci pnpm test:e2e:ci
       # Visual regression evidence pipeline — docs/dev/visual-baseline-registry.md §5
       # Upload on success AND failure (not just failure()) so baseline evidence is
       # always retained. Uses !cancelled() (not always()) — see registry §5 for rationale.
@@ -119,6 +634,58 @@ jobs:
           path: test-results/
           if-no-files-found: warn
           retention-days: 30
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
       # Summary step MUST be after upload steps: outputs.artifact-url is only
       # available once upload-artifact has run, and $GITHUB_STEP_SUMMARY is
       # per-step (a later step cannot edit an earlier step's summary).
@@ -130,6 +697,21 @@ jobs:
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
           {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+            echo ""
             echo "## Visual regression evidence"
             echo ""
             echo "Visual baseline 契約は docs/dev/visual-baseline-registry.md を参照。"
@@ -172,9 +754,63 @@ jobs:
           node-version: 22
           cache: pnpm
       - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv python install
-      - run: uv sync --locked --group dev
-      - run: pnpm install --frozen-lockfile
+      - name: uv python install (timed)
+        id: timed-uv-python-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed uv_python_install uv python install
+      - name: uv sync (timed)
+        id: timed-uv-sync
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed uv_sync uv sync --locked --group dev
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version
@@ -190,12 +826,59 @@ jobs:
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
-      - run: uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py .claude/skills/edit-issue/tests/test_guard_issue_body.py .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py
-      - run: uv run --locked pytest .claude/skills/create-issue/tests/
-      - run: uv run --locked pytest .claude/skills/create-issue/scripts/tests/
-      - run: uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
-      - name: Run Claude hook tests
-        run: uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
+      - name: pytest edit-issue tests (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest \
+            .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
+            .claude/skills/edit-issue/tests/test_guard_issue_body.py \
+            .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_edit_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest create-issue tests (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/create-issue/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_create_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest create-issue scripts (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/create-issue/scripts/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_create_issue_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest ssot-discovery (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_ssot_discovery","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest hook tests (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Verify hook test discovery exclusions
         run: |
           python3 - <<PY
@@ -240,15 +923,96 @@ jobs:
           if missing:
               raise SystemExit("Hook tests missing from pytest discovery:\n" + "\n".join(missing))
           PY
-      - run: uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
-      - run: uv run --locked pytest .claude/skills/issue-contract-review/tests/
-      - run: uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
-      - run: uv run --locked pytest .claude/skills/open-pr/scripts/tests/
-      - run: uv run --locked pytest .claude/skills/impl-review-loop/tests/ -q
-      - run: uv run --locked pytest .claude/skills/review-issue/tests/ -q
-      - run: uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q
-      - run: uv run --locked pytest schemas/tests/ -q
-      - run: uv run --locked pytest tests/context_mode/ -q
+      - name: pytest issue-contract-review scripts (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_issue_contract_review_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest issue-contract-review tests (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/issue-contract-review/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_issue_contract_review_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest pr-review-judge (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_pr_review_judge","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest open-pr (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/open-pr/scripts/tests/
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_open_pr","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest impl-review-loop (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/impl-review-loop/tests/ -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_impl_review_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest review-issue (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/review-issue/tests/ -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_review_issue","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest issue-refinement-loop (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_issue_refinement_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest schemas (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest schemas/tests/ -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_schemas","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: pytest context-mode (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest tests/context_mode/ -q
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_context_mode","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Kill Switch smoke test
         run: python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
       - name: Secret exposure scan (production scripts)
@@ -307,21 +1071,196 @@ jobs:
           )
           sys.exit(module.generate_artifact(args))
           PY
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ci_test_selection
           path: ci_test_selection_artifacts/
           if-no-files-found: ignore
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
   actionlint:
     runs-on: ubuntu-latest
+    env:
+      GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - name: Install actionlint
+      - name: Install actionlint (timed)
+        id: timed-actionlint-install
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash | bash -s -- 1.7.12
-          sudo mv actionlint /usr/local/bin/actionlint
-      - name: Run actionlint
-        run: actionlint
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed actionlint_install bash -c 'curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash | bash -s -- 1.7.12 && sudo mv actionlint /usr/local/bin/actionlint'
+      - name: Run actionlint (timed)
+        id: timed-actionlint
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed actionlint actionlint
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ.get("GH_HEAD_SHA", os.environ["GH_SHA"]),
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ.get("GH_HEAD_SHA", os.environ["GH_SHA"]),
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
