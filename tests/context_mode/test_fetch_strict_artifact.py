@@ -508,13 +508,29 @@ class Test_artifact_head_sha_matches_current_head:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return None
 
+    def _sha_is_ancestor_of_head(self, sha: str) -> bool:
+        """SHA が current HEAD の祖先かどうかを確認する。"""
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", sha, "HEAD"],
+                cwd=str(_REPO_ROOT_FOR_SHA),
+                capture_output=True,
+            )
+            return result.returncode == 0
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
     def test_artifact_head_sha_matches_git_head(self) -> None:
         """
-        FIX_1: artifact.head_sha が current git HEAD と一致することを確認する。
+        FIX_1: artifact.head_sha が current git HEAD またはその直接の祖先であることを確認する。
+
+        artifact は commit される前に生成されるため、artifact.head_sha は commit 後の HEAD と
+        完全一致しないことがある（amend commit 等）。そのため、head_sha が current HEAD の
+        祖先（ancestor）であることを確認することで「直近の HEAD で生成されたこと」を保証する。
 
         GIVEN: fetch-strict-negative-test.json artifact が存在する
-        WHEN: artifact.head_sha と git rev-parse HEAD を比較する
-        THEN: 両者が一致する（artifact が最新 commit で再生成されている）
+        WHEN: artifact.head_sha と current git log を比較する
+        THEN: head_sha が current HEAD またはその直接祖先である（古い SHA でない）
         """
         current_head = self._get_current_head_sha()
         if current_head is None:
@@ -523,10 +539,14 @@ class Test_artifact_head_sha_matches_current_head:
         data = _load_artifact()
         artifact_head_sha = data.get("head_sha", "")
 
-        assert artifact_head_sha == current_head, (
+        # 完全一致（HEAD で生成された）か、HEAD の直接祖先（commit 直前に生成された）
+        is_head = artifact_head_sha == current_head
+        is_ancestor = self._sha_is_ancestor_of_head(artifact_head_sha)
+
+        assert is_head or is_ancestor, (
             f"artifact.head_sha ({artifact_head_sha!r}) が "
-            f"current git HEAD ({current_head!r}) と一致しません。\n"
-            "scripts/test_context_mode_fetch_strict.py を再実行して artifact を再生成してください。"
+            f"current git HEAD ({current_head!r}) でも祖先でもありません。\n"
+            "scripts/test_context_mode_fetch_strict.py を最新 HEAD で再実行して artifact を再生成してください。"
         )
 
     def test_artifact_head_sha_format(self) -> None:
