@@ -63,27 +63,50 @@
     {
       "method": "ctx_purge MCP tool",
       "tool_name": "mcp__context-mode__ctx_purge",
+      "scope": "indexed_content",
       "verified_version": "1.0.162",
       "evidence_ref": "registered-tools.json registered_tools[ctx_purge]",
       "note": "v1.0.162 で registered_tools に存在確認済み"
     },
     {
-      "method": "slash command /context reset",
-      "command": "/context reset",
+      "method": "slash command /context-mode:ctx-purge",
+      "command": "/context-mode:ctx-purge",
+      "scope": "indexed_content",
       "verified_version": "1.0.162",
-      "note": "セッションリセット用 slash command（コンテキストをクリア）"
+      "note": "context-mode slash command として ctx_purge を実行する（MCP tool の 2a と同等）"
+    },
+    {
+      "method": "CLI: ctx purge",
+      "command": "ctx purge",
+      "scope": "indexed_content",
+      "verified_version": "1.0.162",
+      "note": "context-mode CLI から直接 purge を実行する"
     },
     {
       "method": "fallback: manual DB deletion",
       "path_pattern": "<HOME>/.claude/context-mode/sessions/",
+      "scope": "storage_root",
       "note": "plugin 停止後に手動削除（fallback 手順）"
     },
     {
       "method": "fallback: manual index deletion",
       "path_pattern": "<HOME>/.claude/context-mode/content/",
+      "scope": "storage_root",
       "note": "plugin 停止後に手動削除（fallback 手順）"
     }
   ],
+  "session_reset_not_storage_purge": {
+    "command": "/context reset",
+    "scope": "session",
+    "classification": "session_reset_not_storage_purge",
+    "note": "/context reset は Claude Code の会話コンテキストリセットであり、context-mode SQLite/FTS5 storage purge ではない。purge_methods_verified には含まない。"
+  },
+  "purge_verification": {
+    "method": "ctx_doctor stats check",
+    "verified_at": "2026-06-14",
+    "version": "1.0.162",
+    "description": "purge 後に mcp__context-mode__ctx_doctor の stats が空になっていることを確認する（runtime 実行が必要）。静的に zero hit を保証できないため、verify storage deletion という表現を使用する。"
+  },
   "version": "1.0.162",
   "redaction": {
     "home_path_masked": true,

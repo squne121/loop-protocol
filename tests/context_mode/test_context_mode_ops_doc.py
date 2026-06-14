@@ -116,6 +116,17 @@ class TestPersistenceProof:
         for field in required:
             assert field in data, f"persistence-proof.json に必須フィールド {field} がありません"
 
+    def test_purge_verification_structure(self) -> None:
+        """purge_verification フィールドが method / verified_at / version を含むことを確認する。"""
+        data = json.loads(_PERSISTENCE_PROOF.read_text())
+        assert "purge_verification" in data, (
+            "persistence-proof.json に purge_verification フィールドがありません"
+        )
+        pv = data["purge_verification"]
+        assert "method" in pv, "purge_verification に method がありません"
+        assert "verified_at" in pv, "purge_verification に verified_at がありません"
+        assert "version" in pv, "purge_verification に version がありません"
+
 
 # ─── AC3: purge コマンド検証 ─────────────────────────────────────────────────
 
@@ -160,9 +171,12 @@ class TestPurgeCommands:
         assert any("ctx_purge" in m for m in method_names), (
             "purge_methods_verified に ctx_purge が含まれていません"
         )
-        # slash command が含まれる
-        assert any("/context reset" in m or "slash" in m.lower() for m in method_names), (
-            "purge_methods_verified に slash command が含まれていません"
+        # storage purge の slash command または CLI が含まれる（/context-mode:ctx-purge または ctx purge）
+        assert any(
+            "/context-mode:ctx-purge" in m or "ctx purge" in m.lower() or "slash" in m.lower()
+            for m in method_names
+        ), (
+            "purge_methods_verified に storage purge 用の slash command / CLI が含まれていません"
         )
 
     def test_no_unverified_commands(self) -> None:
@@ -174,6 +188,38 @@ class TestPurgeCommands:
             assert "legacy" in content or "未確認" in content or "旧" in content, (
                 "context-mode purge --dry-run が legacy 注記なしに記録されています"
             )
+
+    def test_context_reset_not_in_purge_methods(self) -> None:
+        """/context reset が purge_methods_verified（または同等フィールド）に含まれていないことを確認する（negative assertion）。
+
+        /context reset は Claude Code の会話コンテキストリセットであり、
+        context-mode SQLite/FTS5 storage purge ではない。
+        purge_methods_verified に含まれていたら FAIL する。
+        """
+        data = json.loads(_PERSISTENCE_PROOF.read_text())
+        methods = data.get("purge_methods_verified", [])
+        for m in methods:
+            method_str = str(m.get("method", "")) + str(m.get("command", ""))
+            assert "/context reset" not in method_str, (
+                f"/context reset が purge_methods_verified に含まれています: {m}\n"
+                "/context reset は session reset であり storage purge ではありません。"
+                " session_reset_not_storage_purge フィールドに移動してください。"
+            )
+
+    def test_context_reset_classified_as_session_reset(self) -> None:
+        """/context reset が session_reset_not_storage_purge として分類されていることを確認する。"""
+        data = json.loads(_PERSISTENCE_PROOF.read_text())
+        assert "session_reset_not_storage_purge" in data, (
+            "persistence-proof.json に session_reset_not_storage_purge フィールドがありません。\n"
+            "/context reset の正しい分類として追加してください。"
+        )
+        srnsp = data["session_reset_not_storage_purge"]
+        assert "/context reset" in str(srnsp.get("command", "")), (
+            "session_reset_not_storage_purge に /context reset コマンドが記録されていません"
+        )
+        assert srnsp.get("scope") == "session", (
+            f"session_reset_not_storage_purge.scope が 'session' ではありません: {srnsp.get('scope')}"
+        )
 
 
 # ─── AC4: incident response ──────────────────────────────────────────────────
@@ -257,12 +303,33 @@ class TestIncidentResponse:
                     f"ステップ順序が正しくありません: '{a}' が '{b}' より後にあります"
                 )
 
-    def test_verify_zero_hit_documented(self) -> None:
-        """verify zero hit の概念が記録されている。"""
+    def test_verify_storage_deletion_documented(self) -> None:
+        """verify storage deletion または構造化された proof の存在が記録されている。
+
+        B3 fix_delta: 'verify zero hit' は runtime 実行が必要なため、
+        'verify storage deletion' という表現を使うか、
+        構造化された purge_verification の証跡手順を記録する。
+        """
         content = _OPS_DOC.read_text()
-        assert "zero" in content.lower() or "ゼロ" in content or "zero hit" in content.lower(), (
-            "context-mode-ops.md に verify zero hit が記録されていません"
+        # "verify storage deletion" または "verify zero hit" + 証跡手順のいずれかが存在すること
+        has_storage_deletion = "verify storage deletion" in content.lower() or "storage deletion" in content.lower()
+        has_zero_hit_with_proof = "zero hit" in content.lower() and (
+            "ctx_search" in content or "証跡" in content or "purge_verification" in content
         )
+        assert has_storage_deletion or has_zero_hit_with_proof, (
+            "context-mode-ops.md に 'verify storage deletion' または "
+            "'verify zero hit' + 証跡手順が記録されていません"
+        )
+
+    def test_purge_verification_proof_exists(self) -> None:
+        """persistence-proof.json に purge_verification 構造が存在することを確認する。"""
+        data = json.loads(_PERSISTENCE_PROOF.read_text())
+        assert "purge_verification" in data, (
+            "persistence-proof.json に purge_verification フィールドがありません"
+        )
+        pv = data["purge_verification"]
+        for key in ("method", "verified_at", "version"):
+            assert key in pv, f"purge_verification に {key} がありません"
 
     def test_rotate_step_documented(self) -> None:
         """rotate（credential ローテーション）が記録されている。"""
@@ -386,6 +453,69 @@ class TestElv2Policy:
             "context-mode-ops.md に ELv2 policy の matrix（Markdown table）がありません"
         )
 
+    def test_elv2_legal_and_project_policy_separated(self) -> None:
+        """ELv2 legal matrix と project local policy matrix が分離されていることを確認する（negative assertion）。
+
+        B4 fix_delta: 'no vendoring' を ELv2 legal 禁止として記載し、
+        project policy と混在している場合は FAIL する。
+        ELv2 section と project policy section が分離されているかを検証する。
+        """
+        content = _OPS_DOC.read_text()
+        # ELv2 legal matrix セクションと project policy セクションが別に存在することを確認
+        has_legal_matrix = (
+            "elv2 legal" in content.lower()
+            or "legal matrix" in content.lower()
+            or "ライセンス上の制約" in content
+            or "5a." in content.lower()
+        )
+        has_project_policy = (
+            "project local policy" in content.lower()
+            or "project policy" in content.lower()
+            or "本 repo 独自" in content
+            or "5b." in content.lower()
+        )
+        assert has_legal_matrix and has_project_policy, (
+            "context-mode-ops.md に ELv2 legal matrix と project local policy matrix の分離がありません。\n"
+            f"  ELv2 legal matrix: {has_legal_matrix}\n"
+            f"  project policy matrix: {has_project_policy}\n"
+            "5a（ELv2 legal）と 5b（project policy）を分離して記載してください。"
+        )
+
+    def test_no_vendoring_is_project_policy_not_elv2_legal(self) -> None:
+        """'no vendoring' が ELv2 legal 禁止ではなく project policy として記載されていることを確認する。
+
+        ELv2 自体は vendoring を一律禁止していない。
+        'no vendoring' を ELv2 禁止として混在させている場合は FAIL する。
+        """
+        content = _OPS_DOC.read_text()
+        # ELv2 legal matrix セクションを抽出する（5a セクション）
+        # "5a" または "ELv2 Legal" セクションを探す
+        legal_section_match = re.search(
+            r'(?:5a\.|ELv2 Legal Matrix|ライセンス上の制約).*?(?=\n###|\n##|\Z)',
+            content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if legal_section_match:
+            legal_section = legal_section_match.group(0)
+            # ELv2 legal section に "no vendoring" が「禁止」として記載されていないこと
+            # （ELv2 上は条件付きで可能なため）
+            if "no vendoring" in legal_section.lower() or "vendoring" in legal_section.lower():
+                # vendoring が ELv2 legal section にある場合、「条件付き」「条件次第」という注記があるはず
+                has_conditional_note = (
+                    "条件付き" in legal_section
+                    or "条件次第" in legal_section
+                    or "project policy" in legal_section.lower()
+                    or "本 repo" in legal_section
+                    or "elv2 自体は" in legal_section.lower()
+                    or "一律禁止していない" in legal_section
+                    or "ELv2 上は" in legal_section
+                )
+                assert has_conditional_note, (
+                    "ELv2 legal matrix セクションに 'no vendoring' が ELv2 禁止として記載されています。\n"
+                    "ELv2 自体は vendoring を一律禁止していません。\n"
+                    "project local policy として 5b セクションに分離し、ELv2 との区別を明示してください。"
+                )
+
 
 # ─── AC7: fetch_strict / permission deny 用語分離 ────────────────────────────
 
@@ -501,6 +631,7 @@ def test_persistence_proof_schema() -> None:
     t.test_no_unredacted_home_path()
     t.test_storage_root_resolution_order()
     t.test_required_fields()
+    t.test_purge_verification_structure()
 
 
 def test_purge_commands_documented() -> None:
@@ -512,6 +643,8 @@ def test_purge_commands_documented() -> None:
     t.test_fallback_deletion_documented()
     t.test_persistence_proof_purge_methods()
     t.test_no_unverified_commands()
+    t.test_context_reset_not_in_purge_methods()
+    t.test_context_reset_classified_as_session_reset()
 
 
 def test_incident_response_steps() -> None:
@@ -520,7 +653,8 @@ def test_incident_response_steps() -> None:
     t.test_incident_response_section_exists()
     t.test_all_steps_documented()
     t.test_step_order_correct()
-    t.test_verify_zero_hit_documented()
+    t.test_verify_storage_deletion_documented()
+    t.test_purge_verification_proof_exists()
     t.test_rotate_step_documented()
 
 
@@ -544,6 +678,8 @@ def test_elv2_policy_matrix() -> None:
     t.test_no_notice_removal_documented()
     t.test_modified_copy_notice_documented()
     t.test_matrix_format()
+    t.test_elv2_legal_and_project_policy_separated()
+    t.test_no_vendoring_is_project_policy_not_elv2_legal()
 
 
 def test_fetch_strict_separation() -> None:
