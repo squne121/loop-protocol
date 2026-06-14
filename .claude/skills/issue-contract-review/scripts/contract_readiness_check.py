@@ -300,6 +300,11 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     "unexpected_pass": "needs_fix",
     "unknown": "human_judgment",
     "no_commands_extracted": "needs_fix",
+    # Issue #889: baseline-expect annotation mappings
+    # baseline_expect_pass: VC annotated baseline-expect: pass and exited 0 → go
+    "baseline_expect_pass": "go",
+    # baseline_regression_failed: VC annotated baseline-expect: pass but exited non-0
+    "baseline_regression_failed": "human_judgment",
 }
 
 
@@ -421,9 +426,22 @@ def map_preflight_result_to_errors(
             else:
                 readiness_status = "human_judgment"
 
-        # unexpected_pass classification overrides: always needs_fix
+        # unexpected_pass classification overrides: normally needs_fix
+        # Issue #889: if preflight payload reports baseline_expect=pass for this result,
+        # then unexpected_pass was already re-mapped to expected_pass in baseline_vc_preflight.py
+        # and would not reach here. But guard defensively:
+        # - category == "baseline_expect_pass" → already handled above (mapped to go)
+        # - category == "baseline_regression_failed" → already mapped to human_judgment
+        # - annotation absent → backward compat: unexpected_pass → needs_fix
         if classification == "unexpected_pass":
-            readiness_status = "needs_fix"
+            annotations = r.get("annotations", {})
+            baseline_expect_val = annotations.get("baseline_expect") if isinstance(annotations, dict) else None
+            if baseline_expect_val == "pass":
+                # Should not normally occur (preflight re-maps to expected_pass),
+                # but if it does, treat as go (AC12: use annotations from payload)
+                readiness_status = "go"
+            else:
+                readiness_status = "needs_fix"
 
         if readiness_status in ("needs_fix", "human_judgment"):
             aggregate = _raise_status(aggregate, readiness_status)

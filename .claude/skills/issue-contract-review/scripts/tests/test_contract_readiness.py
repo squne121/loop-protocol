@@ -1261,3 +1261,130 @@ def test_kind_unsupported_vc_format_maps_to_needs_fix_with_category_preserved():
     assert aggregate == "needs_fix", (
         f"Blocker 3: unsupported_vc_format aggregate must be needs_fix, got: {aggregate}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #889: baseline-expect annotation-aware readiness mapping
+# ---------------------------------------------------------------------------
+
+
+def _build_preflight_result_with_annotation(
+    classification: str,
+    category: str,
+    decision: str,
+    baseline_expect: str | None,
+) -> dict:
+    """Build a mock baseline_vc_preflight/v1 result payload for testing."""
+    return {
+        "schema": "baseline_vc_preflight/v1",
+        "issue": 999,
+        "repo": "squne121/loop-protocol",
+        "status": "pass" if decision == "go" else "blocked",
+        "summary": {
+            "expected_fail": 0,
+            "unexpected_pass": 1 if classification == "unexpected_pass" else 0,
+            "blocked": 1 if decision == "blocked" else 0,
+            "human_judgment": 0,
+            "expected_pass": 1 if classification == "expected_pass" else 0,
+            "skipped": 0,
+            "extraction_errors": 0,
+        },
+        "results": [
+            {
+                "ac": "AC1",
+                "line": 1,
+                "raw_command": "test -d /home",
+                "command_hash": "sha256:abc",
+                "runner": "exec",
+                "exit_code": 0,
+                "classification": classification,
+                "category": category,
+                "decision": decision,
+                "scope_class": "baseline_fail_expected",
+                "confidence": "high",
+                "stdout_head": [],
+                "stdout_truncated": False,
+                "stdout_original_line_count": 0,
+                "stderr_head": [],
+                "stderr_truncated": False,
+                "stderr_original_line_count": 0,
+                "duration_ms": 10,
+                "fix_hint": None,
+                "annotations": {
+                    "baseline_expect": baseline_expect,
+                    "vc_role": None,
+                    "missing_baseline_expect": baseline_expect is None and classification == "unexpected_pass",
+                },
+                "annotation_source": {
+                    "line": None,
+                    "raw": None,
+                },
+            }
+        ],
+        "errors": [],
+    }
+
+
+def test_readiness_baseline_expect_pass_expected_pass_is_go():
+    """Issue #889 AC12: baseline-expect: pass + expected_pass in preflight → go readiness.
+
+    Uses map_preflight_result_to_errors directly (AC12: reads from preflight payload,
+    not from Issue body re-scan).
+    """
+    # Simulate: baseline_vc_preflight returns expected_pass (because baseline-expect: pass)
+    from contract_readiness_check import map_preflight_result_to_errors
+    preflight = _build_preflight_result_with_annotation(
+        classification="expected_pass",
+        category="baseline_expect_pass",
+        decision="go",
+        baseline_expect="pass",
+    )
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    # expected_pass → go (no error)
+    assert aggregate == "go", f"Expected go but got {aggregate}"
+    assert len(errors) == 0, f"Expected no errors but got {errors}"
+
+
+def test_readiness_baseline_expect_fail_unexpected_pass_is_needs_fix():
+    """Issue #889 AC12: baseline-expect: fail + unexpected_pass → needs_fix (backward compat)."""
+    from contract_readiness_check import map_preflight_result_to_errors
+    preflight = _build_preflight_result_with_annotation(
+        classification="unexpected_pass",
+        category="unexpected_pass",
+        decision="blocked",
+        baseline_expect="fail",
+    )
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert aggregate == "needs_fix", f"Expected needs_fix but got {aggregate}"
+
+
+def test_readiness_missing_annotation_unexpected_pass_is_needs_fix():
+    """Issue #889 AC12: annotation absent + unexpected_pass → needs_fix (backward compat)."""
+    from contract_readiness_check import map_preflight_result_to_errors
+    preflight = _build_preflight_result_with_annotation(
+        classification="unexpected_pass",
+        category="unexpected_pass",
+        decision="blocked",
+        baseline_expect=None,
+    )
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    assert aggregate == "needs_fix", f"Expected needs_fix but got {aggregate}"
+
+
+def test_readiness_baseline_expect_pass_unexpected_pass_is_go():
+    """Issue #889 AC12: baseline-expect: pass + unexpected_pass in payload → go.
+
+    This tests the defensive branch in map_preflight_result_to_errors:
+    even if preflight mistakenly returns unexpected_pass with annotations.baseline_expect=pass,
+    readiness maps it to go.
+    """
+    from contract_readiness_check import map_preflight_result_to_errors
+    preflight = _build_preflight_result_with_annotation(
+        classification="unexpected_pass",
+        category="unexpected_pass",
+        decision="blocked",
+        baseline_expect="pass",
+    )
+    errors, aggregate = map_preflight_result_to_errors(preflight)
+    # With baseline_expect=pass, unexpected_pass should map to go
+    assert aggregate == "go", f"Expected go but got {aggregate}"

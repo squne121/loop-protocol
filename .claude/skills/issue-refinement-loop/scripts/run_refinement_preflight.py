@@ -86,6 +86,7 @@ except ImportError:
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
 PLANNER_SCRIPT = _SCRIPTS_DIR / "plan_refinement_loop.py"
+REPAIR_SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
 
 SCHEMA_VERSION_RESULT = "refinement_preflight_result/v1"
 SCHEMA_VERSION_PLANNER_INPUT = "refinement_loop_planner_input/v1"
@@ -501,6 +502,42 @@ def _build_planner_input(
     return planner_input
 
 
+def _invoke_repair(body: str) -> dict:
+    """
+    Invoke repair_issue_contract.py (dry-run) to pre-process the Issue body
+    before feeding it to the planner.
+
+    Returns the repair result dict (schema: repair_issue_contract/v1).
+    Never raises; on failure returns a minimal dict with error key.
+    """
+    import tempfile, os as _os, sys as _sys, subprocess as _sp
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(body)
+        tmp_path = tf.name
+
+    try:
+        proc = _sp.run(
+            [_sys.executable, str(REPAIR_SCRIPT), "--body-file", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        import json as _json
+        if proc.stdout:
+            return _json.loads(proc.stdout)
+        return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": proc.stderr or "no output"}
+    except Exception as exc:
+        return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": str(exc)}
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
     """
     Invoke plan_refinement_loop.py via subprocess.run([sys.executable, ...], shell=False).
@@ -741,7 +778,7 @@ def _build_result(
     hashes: dict[str, str],
 ) -> dict:
     """Build a refinement_preflight_result/v1 compliant dict."""
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION_RESULT,
         "status": status,
         "issue_number": issue_number,
@@ -756,6 +793,7 @@ def _build_result(
         "artifacts": artifacts,
         "hashes": hashes,
     }
+    return result
 
 
 def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
@@ -977,6 +1015,12 @@ def run_preflight(
         "comments": comments,
     }
 
+    # --- Run repair pass before planner (Issue #889) ---
+    # repair_issue_contract runs dry-run to report defects; the repaired body is
+    # NOT fed to the planner (the planner always receives the original Issue body).
+    # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
+    _repair_result = _invoke_repair(issue.get("body", "") or "")
+
     # --- Invoke planner ---
     planner_input_dict = _build_planner_input(issue, comments, known_context, now=now)
     plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input_dict)
@@ -1028,7 +1072,32 @@ def run_preflight(
         reason_codes = fail_closed.get("reason_codes", [])
         blockers.extend(reason_codes)
 
-    # --- Apply exit code mapping (with plan for warn detection) ---
+    # --- Write repair artifact and update blockers ---
+    # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,
+    # which would violate schema additionalProperties: false).
+    repair_artifact_path: Optional[str] = None
+    try:
+        artifact_dir_repair = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+        artifact_dir_repair.mkdir(parents=True, exist_ok=True)
+        repair_artifact_file = artifact_dir_repair / "repair_diagnostics.json"
+        repair_artifact_file.write_text(
+            json.dumps(_repair_result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        repair_artifact_path = str(repair_artifact_file)
+    except Exception:
+        pass  # Non-fatal: repair artifact write failure does not block preflight
+
+    # If repair detected changes, add a blocker so orchestrator is informed
+    if _repair_result.get("changed") is True and repair_artifact_path is not None:
+        blockers.append(
+            json.dumps({
+                "kind": "repair_diagnostics",
+                "message": "repair_issue_contract detected changes: see repair artifact for details",
+                "artifact_path": repair_artifact_path,
+            })
+        )
+
+    # --- Apply exit code mapping (with plan for warn detection, after all blockers finalized) ---
     status, exit_code = _apply_exit_code_mapping(
         planner_exit_code, planner_fail_closed, blockers, plan=plan
     )
@@ -1043,7 +1112,7 @@ def run_preflight(
     else:
         next_action = "fix_environment"
 
-    # --- Compute hashes for byte-stability (before writing) ---
+    # --- Compute hashes for byte-stability (after all blockers finalized) ---
     snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
     planner_input_text = json.dumps(planner_input_dict, sort_keys=True, ensure_ascii=False)
 
