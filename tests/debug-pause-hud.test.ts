@@ -106,3 +106,59 @@ describe('HUD render continues during pause — AC4', () => {
     expect(statusEl?.textContent).toBe('Paused')
   })
 })
+
+// ---------------------------------------------------------------------------
+// AC16: aria-pressed and pause live region
+// ---------------------------------------------------------------------------
+
+describe('HUD aria-pressed and pause live region — AC16', () => {
+  it('GIVEN not paused WHEN rendered THEN aria-pressed is "false"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, false)
+
+    const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
+    expect(btn.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('GIVEN paused WHEN rendered THEN aria-pressed is "true"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, true)
+
+    const btn = container.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')!
+    expect(btn.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('GIVEN paused WHEN rendered THEN pause-status live region shows "Paused"', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, true)
+
+    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
+    expect(pauseStatus).not.toBeNull()
+    expect(pauseStatus!.textContent).toBe('Paused')
+    expect(pauseStatus!.getAttribute('role')).toBe('status')
+  })
+
+  it('GIVEN not paused WHEN rendered THEN pause-status live region is empty', () => {
+    const container = makeContainer()
+    const actions = makeActions()
+    const hud = createHudController(container, actions)
+    const state = createInitialGameState()
+
+    hud.render(state, false)
+
+    const pauseStatus = container.querySelector<HTMLElement>('[data-field="pause-status"]')
+    expect(pauseStatus?.textContent).toBe('')
+  })
+})

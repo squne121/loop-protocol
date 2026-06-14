@@ -29,7 +29,7 @@ export interface HudActions {
 }
 
 export interface HudController {
-  /** Render the HUD. isPaused is the runtime-local debug pause flag (AC1, AC4). */
+  /** Render the HUD. isPaused is the runtime-local product pause flag (AC1, AC4). */
   render(state: GameState, isPaused: boolean): void
 }
 
@@ -67,6 +67,9 @@ export function createHudController(
       <p class="status-copy" data-field="status" role="status" aria-live="polite"></p>
       <p class="status-copy status-copy--muted" data-field="command"></p>
     </section>
+    <section class="panel panel--pause-status">
+      <p class="status-copy" data-field="pause-status" role="status" aria-live="assertive" aria-atomic="true"></p>
+    </section>
     <section class="panel panel--actions">
       <button type="button" data-action="new-game">New Game</button>
       <button type="button" data-action="start-sortie">Start sortie</button>
@@ -85,6 +88,7 @@ export function createHudController(
       <button
         type="button"
         data-action="toggle-pause"
+        aria-pressed="false"
         title="Pause or resume simulation. Also toggled by Escape."
       >Pause</button>
     </section>
@@ -134,6 +138,7 @@ export function createHudController(
   const cooldown = queryField(container, 'cooldown')
   const status = queryField(container, 'status')
   const command = queryField(container, 'command')
+  const pauseStatus = queryField(container, 'pause-status')
   const loopPhase = queryField(container, 'loop-phase')
   const sortieStatus = queryField(container, 'sortie-status')
   const sortieKills = queryField(container, 'sortie-kills')
@@ -203,8 +208,13 @@ export function createHudController(
 
       // AC1: pause button label reflects current pause state
       togglePauseButton.textContent = isPaused ? 'Resume' : 'Pause'
+      // AC16: aria-pressed reflects current pause state
+      togglePauseButton.setAttribute('aria-pressed', isPaused ? 'true' : 'false')
       // BLOCKER 1: pause button is disabled when not in running phase and not already paused
       togglePauseButton.disabled = state.loopPhase !== 'running' && !isPaused
+
+      // AC6: live region shows "Paused" status for screen readers (AC16)
+      pauseStatus.textContent = isPaused ? 'Paused' : ''
 
       // Sortie status display (AC4, AC10)
       const s = state.sortie
