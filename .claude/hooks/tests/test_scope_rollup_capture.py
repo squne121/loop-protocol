@@ -92,6 +92,12 @@ def _read_capture_result(path: Path) -> dict[str, object]:
     return result
 
 
+def _single_capture_record(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    records = list(tmp_path.glob("scope_rollup_*.capture.yaml"))
+    assert len(records) == 1
+    return records[0], _read_capture_result(records[0])
+
+
 def test_deterministic_capture_writes_exact_final_response(tmp_path: Path) -> None:
     message = _render_marker()
     result = _run_coordinator(
@@ -152,8 +158,18 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected_status", "expected_record"),
+    ("payload", "expected_status", "expected_record_kind"),
     [
+        (
+            {
+                "hook_event_name": "Stop",
+                "agent_type": "scope-rollup-runner",
+                "last_assistant_message": _render_marker(),
+                "stop_hook_active": False,
+            },
+            "hook_unavailable",
+            "single_record",
+        ),
         (
             {
                 "hook_event_name": "SubagentStop",
@@ -161,8 +177,8 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "last_assistant_message": "",
                 "stop_hook_active": False,
             },
-            None,
-            None,
+            "missing_final_response",
+            "single_record",
         ),
         (
             {
@@ -171,8 +187,8 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "last_assistant_message": _render_marker(),
                 "stop_hook_active": False,
             },
-            None,
-            None,
+            "agent_type_mismatch",
+            "single_record",
         ),
         (
             {
@@ -184,7 +200,7 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "stop_hook_active": False,
             },
             "stale_capture",
-            "scope_rollup_inv-2026-06-15.capture.yaml",
+            "single_record",
         ),
         (
             {
@@ -193,8 +209,8 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "last_assistant_message": "```yaml\nISSUE_SCOPE_ROLLUP_RUN_RESULT_V1: [bad\n```",
                 "stop_hook_active": False,
             },
-            None,
-            None,
+            "parser_rejected",
+            "single_record",
         ),
     ],
 )
@@ -202,16 +218,22 @@ def test_fail_closed_capture_paths(
     tmp_path: Path,
     payload: dict[str, object],
     expected_status: str | None,
-    expected_record: str | None,
+    expected_record_kind: str,
 ) -> None:
     result = _run_coordinator(payload, tmp_path)
     assert result.returncode == 0
     assert not any(tmp_path.glob("scope_rollup_*.txt"))
 
-    if expected_record is None:
-        assert not any(tmp_path.glob("scope_rollup_*.capture.yaml"))
-        return
-
-    record = _read_capture_result(tmp_path / expected_record)
+    record_path, record = _single_capture_record(tmp_path)
+    assert record_path.name.startswith("scope_rollup_")
     assert record["capture_status"] == expected_status
     assert record["routing_action"] == "stop_human"
+    if expected_status == "hook_unavailable":
+        assert record["capture_mode"] == "unsupported"
+        assert record["parser_status"] == "not_applicable"
+    if expected_status == "missing_final_response":
+        assert record["parser_status"] == "marker_missing"
+    if expected_status == "agent_type_mismatch":
+        assert record["parser_status"] == "not_applicable"
+    if expected_status == "parser_rejected":
+        assert record["parser_status"] == "marker_malformed"

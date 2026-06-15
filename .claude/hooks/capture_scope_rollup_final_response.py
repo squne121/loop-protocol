@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -94,9 +95,12 @@ def _normalize_text(value: Any) -> str | None:
 
 
 def _sha256_bytes(raw: bytes) -> str:
-    import hashlib
-
     return hashlib.sha256(raw).hexdigest()
+
+
+def _payload_digest(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return _sha256_bytes(serialized.encode("utf-8"))
 
 
 def _load_yaml_no_duplicate_keys(text: str) -> Any:
@@ -207,6 +211,16 @@ def _build_record(decision: CaptureDecision) -> dict[str, Any]:
         "provenance": decision.provenance,
         "notes": decision.notes,
     }
+
+
+def _record_stem(decision: CaptureDecision, payload: dict[str, Any]) -> str:
+    if decision.invocation_id:
+        return f"scope_rollup_{decision.invocation_id}"
+
+    digest = _payload_digest(payload)[:12]
+    mode = re.sub(r"[^a-z0-9_-]+", "-", decision.capture_mode.lower()).strip("-") or "unknown"
+    status = re.sub(r"[^a-z0-9_-]+", "-", decision.capture_status.lower()).strip("-") or "unknown"
+    return f"scope_rollup_{mode}_{status}_{digest}"
 
 
 def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
@@ -451,11 +465,8 @@ def main() -> int:
     decision = _decision_from_payload(payload)
     decision = _capture(decision, last_assistant_message)
 
-    if decision.invocation_id is None:
-        return 0
-
     capture_dir = _resolve_capture_dir()
-    record_path = capture_dir / f"scope_rollup_{decision.invocation_id}.capture.yaml"
+    record_path = capture_dir / f"{_record_stem(decision, payload)}.capture.yaml"
     if not _validate_capture_path(record_path, capture_dir):
         return 0
     if record_path.exists():
