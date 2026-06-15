@@ -33,6 +33,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GUARD_SCRIPT="${SESSION_MANIFEST_GUARD:-${SCRIPT_DIR}/session_recording_policy_guard.sh}"
 PRODUCER_SCRIPT="${SESSION_MANIFEST_PRODUCER:-${SCRIPT_DIR}/generate_session_manifest_from_hook.mjs}"
+SCOPE_ROLLUP_CAPTURE_SCRIPT="${SCOPE_ROLLUP_CAPTURE_SCRIPT:-${SCRIPT_DIR}/capture_scope_rollup_final_response.py}"
+SCOPE_ROLLUP_CAPTURE_PYTHON="${SCOPE_ROLLUP_CAPTURE_PYTHON:-python3}"
 NODE_BIN="${SESSION_MANIFEST_NODE:-node}"
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,21 @@ _STDIN_FILE="${_TMPDIR}/stdin.json"
 
 # AC7: save stdin exactly once; both guard and producer receive the same payload
 cat > "$_STDIN_FILE"
+
+# ---------------------------------------------------------------------------
+# Scope rollup capture (best-effort, fail-closed in preparation)
+# Capture is independent from session-manifest guard/producers because
+# impl-review-loop relies on SubagentStop as a control-plane evidence route.
+# ---------------------------------------------------------------------------
+if [[ -f "$SCOPE_ROLLUP_CAPTURE_SCRIPT" ]]; then
+    _SCOPE_ROLLUP_CAPTURE_EXIT=0
+    "$SCOPE_ROLLUP_CAPTURE_PYTHON" "$SCOPE_ROLLUP_CAPTURE_SCRIPT" < "$_STDIN_FILE" \
+        >"$_TMPDIR/scope_rollup_capture.stdout" 2>"$_TMPDIR/scope_rollup_capture.stderr" || _SCOPE_ROLLUP_CAPTURE_EXIT=$?
+    cat "$_TMPDIR/scope_rollup_capture.stderr" >&2 2>/dev/null || true
+    if [[ "$_SCOPE_ROLLUP_CAPTURE_EXIT" -ne 0 ]]; then
+        echo "[session_manifest_coordinator] info: scope-rollup capture exited $_SCOPE_ROLLUP_CAPTURE_EXIT — preparation must fail closed if capture is required" >&2
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # AC6: stop_hook_active short-circuit

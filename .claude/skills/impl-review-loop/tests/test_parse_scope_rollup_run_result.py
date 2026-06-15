@@ -365,3 +365,33 @@ def test_ok_for_valid_ok_marker(tmp_path):
     assert result["status"] == "ok"
     assert result["routing_action"] == "continue"
     assert result["raw_plan_location_allowed"] is True
+
+
+def test_ok_when_capture_sidecar_block_is_present(tmp_path):
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
+    result_sha, _ = _build_plan_file(plan_path)
+
+    marker = _render_marker(
+        script_sha=script_sha,
+        raw_plan_location=str(plan_path),
+        result_sha=result_sha,
+    )
+    capture_block = """```yaml
+SCOPE_ROLLUP_CAPTURE_RESULT_V1:
+  capture_mode: subagent_stop_hook
+  capture_status: captured
+  parser_status: ok
+  routing_action: continue
+  invocation_id: inv-2026-06-13
+  capture_path: /tmp/scope_rollup_inv-2026-06-13.txt
+  capture_sha256: deadbeef
+```"""
+
+    result = _run_parser(
+        f"{capture_block}\n{marker}",
+        expected_script_sha=script_sha,
+        requested_at="2026-06-13T10:00:00+00:00",
+    )
+    assert result["status"] == "ok"
+    assert result["routing_action"] == "continue"

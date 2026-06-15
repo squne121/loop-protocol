@@ -20,6 +20,7 @@ permissionMode: auto
 ## 目的
 
 `impl-review-loop` preparation の Step 2.5 で呼び出され、`plan_issue_scope_rollup.py` を実行して `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に出力する。
+この最終応答は `SubagentStop` hook が `last_assistant_message` から deterministic capture する control-plane artifact でもある。
 
 GitHub への書き込み / repo への書き込みは一切行わない。read-only 実行のみ。
 
@@ -155,7 +156,8 @@ RESULT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').re
 
 ### 8. ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に出力
 
-スクリプト実行および検証成功時に以下の marker を stdout に出力する:
+スクリプト実行および検証成功時に以下の marker を **最終応答の唯一の fenced YAML block** として stdout に出力する。
+`SubagentStop` hook は `agent_type == scope-rollup-runner` かつ `last_assistant_message` のみを capture source とし、`agent_transcript_path` は provenance 用であって capture source ではない。
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
@@ -188,6 +190,27 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 ```
 
 **`plan:` フィールドは含めない**。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+
+### 8.5. Final Response Capture Contract
+
+`SubagentStop` hook 側の capture contract:
+
+```yaml
+SCOPE_ROLLUP_CAPTURE_RESULT_V1:
+  capture_mode: subagent_stop_hook
+  capture_status: captured | duplicate_invocation | stale_capture | parser_rejected | write_failed
+  parser_status: ok | failed | runner_unavailable | marker_missing | marker_malformed | marker_ambiguous | rejected
+  routing_action: continue | stop_human
+  agent_type: scope-rollup-runner
+  invocation_id: "<invocation_id>"
+  capture_source: last_assistant_message
+  capture_path: "/tmp/scope_rollup_<invocation_id>.txt"
+  capture_sha256: "<sha256 of exact captured bytes>"
+```
+
+- `capture_status: captured` のときだけ `/tmp/scope_rollup_<invocation_id>.txt` が作成される。
+- `agent_type != scope-rollup-runner`、empty final response、duplicate invocation、stale capture、marker parse 不能は fail-closed であり、capture file は作成されないか再利用されない。
+- no-hook route はこの agent ではサポートしない。`manual_main_capture` を前提にせず、capture 不在時は preparation が `unsupported` / `hook_unavailable` として `stop_human` に送る。
 
 **`result_sha256` の計算方法**（ファイルバイト列 sha256）: uv run python3 の hashlib 経由で計算する（外部コマンド非依存）。
 
