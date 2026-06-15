@@ -126,7 +126,7 @@ def decide_next_action(
     loop_state: dict[str, Any],
     review_verdict: Optional[str],
     max_iterations_override: Optional[int] = None,
-) -> tuple[str, str, list[str], list[str], "Optional[str]"]:
+) -> tuple[str, str, list[str], list[str], Optional[str]]:
     """
     Determine the next action for the refinement loop.
 
@@ -136,7 +136,7 @@ def decide_next_action(
         max_iterations_override: If provided, overrides loop_state["max_iterations"].
 
     Returns:
-        (status, next_action, commands, blockers)
+        (status, next_action, commands, blockers, termination_cause_hint)
 
     Priority order:
         1. inconsistent_state — corrupt/contradictory state fields
