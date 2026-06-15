@@ -384,36 +384,15 @@ describe('AC3: Load Game phase gate — onLoadGame only fires from title_menu / 
 
 describe('Issue #914: HUD action harness — next-sortie and confirm-result', () => {
   let container: HTMLElement
-  let hudController: ReturnType<typeof createHudController>
 
   beforeEach(() => {
     container = document.createElement('div')
-    hudController = createHudController(container, {
-      onNewGame: vi.fn(),
-      onStartSortie: vi.fn(),
-      onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
-      onNextSortie: vi.fn(),
-      onSave: vi.fn(),
-      onLoadGame: vi.fn(),
-      onReset: vi.fn(),
-      canLoadGame: vi.fn(() => true),
-      onTogglePause: vi.fn(),
-    })
   })
 
   it('AC1: GIVEN debrief_reward_claimed WHEN next-sortie click via runNextSortieHandler THEN HUD shows "Returned to preparation." / "Use Start sortie to begin the next sortie."', () => {
     const state = createState('debrief_reward_claimed')
-    hudController.render(state, false)
 
-    function renderHudAfterAction() {
-      hudController.render(state, false)
-    }
-
-    const button = queryButton(container, 'next-sortie')
-    expect(button.disabled).toBe(false)
-
-    button.addEventListener('click', () => {
+    const onNextSortie = vi.fn(() => {
       runNextSortieHandler(state, {
         setHudFeedback: (status, summary) => {
           state.telemetry.status = status
@@ -423,8 +402,29 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
       renderHudAfterAction()
     })
 
-    button.click()
+    const hudController = createHudController(container, {
+      onNewGame: vi.fn(),
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
+      onNextSortie,
+      onSave: vi.fn(),
+      onLoadGame: vi.fn(),
+      onReset: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onTogglePause: vi.fn(),
+    })
 
+    hudController.render(state, false)
+
+    function renderHudAfterAction() {
+      hudController.render(state, false)
+    }
+
+    expect(queryButton(container, 'next-sortie').disabled).toBe(false)
+    queryButton(container, 'next-sortie').click()
+
+    expect(onNextSortie).toHaveBeenCalledTimes(1)
     expect(state.loopPhase).toBe('preparation')
     expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Returned to preparation.')
     expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Use Start sortie to begin the next sortie.')
@@ -432,18 +432,9 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
 
   it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN HUD shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once', () => {
     const state = createState('result', 'pending')
-    hudController.render(state, false)
-
-    function renderHudAfterAction() {
-      hudController.render(state, false)
-    }
-
     const fakeProgressionStorageSave = vi.fn(() => ({ ok: true as const }))
 
-    const button = queryButton(container, 'confirm-result')
-    expect(button.disabled).toBe(false)
-
-    button.addEventListener('click', () => {
+    const onConfirmResult = vi.fn(() => {
       runConfirmResultHandler(state, true, {
         storage: {
           save: fakeProgressionStorageSave,
@@ -460,8 +451,29 @@ describe('Issue #914: HUD action harness — next-sortie and confirm-result', ()
       renderHudAfterAction()
     })
 
-    button.click()
+    const hudController = createHudController(container, {
+      onNewGame: vi.fn(),
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult,
+      onNextSortie: vi.fn(),
+      onSave: vi.fn(),
+      onLoadGame: vi.fn(),
+      onReset: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onTogglePause: vi.fn(),
+    })
 
+    hudController.render(state, false)
+
+    function renderHudAfterAction() {
+      hudController.render(state, false)
+    }
+
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+    queryButton(container, 'confirm-result').click()
+
+    expect(onConfirmResult).toHaveBeenCalledTimes(1)
     expect(state.loopPhase).toBe('preparation')
     expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Result confirmed.')
     expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Progress saved locally.')
