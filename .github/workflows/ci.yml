@@ -501,12 +501,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      options: --ipc=host
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          EXPECTED_PW="1.60.0"
+          if [ "$PW_VERSION" != "$EXPECTED_PW" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image is v$EXPECTED_PW. Update container.image in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$EXPECTED_PW"
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -545,25 +556,6 @@ jobs:
             return $status
           }
           run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
-      - name: Install Playwright Chromium browser (timed)
-        id: timed-playwright-install
-        run: |
-          run_timed() {
-            local step_id="$1"; shift
-            local start_ms end_ms elapsed_ms status
-            start_ms=$(date +%s%3N)
-            set +e
-            "$@"
-            status=$?
-            set -e
-            end_ms=$(date +%s%3N)
-            elapsed_ms=$((end_ms - start_ms))
-            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
-              "$step_id" "$step_id" "$status" "$elapsed_ms" \
-              >> measurements.jsonl
-            return $status
-          }
-          run_timed playwright_install pnpm playwright:install:ci
       - name: Run E2E tests (timed)
         id: timed-e2e
         run: |
