@@ -115,6 +115,49 @@ legacy alias example:
 }
 ```
 
+
+## scope_signal_guard 停止時の termination payload 正規化
+
+`scope_signal_guard.triggered=true` かつ `excluded_by_anchor_reframe=false` のとき、orchestrator は以下の規則に従って termination payload を組み立てる。
+
+### termination_cause 正規化ルール
+
+| フィールド | 使用する値 | 出所 |
+|---|---|---|
+| `termination_reason` | `human_escalation` | 固定 |
+| `termination_cause` | `human_judgment_required` | **常に `human_judgment_required` に正規化する** |
+| `blockers_summary` | `["scope_signal_guard_triggered", "scope_signal_guard_reason_code:<reason_code>"]` | `decide_next_loop_action.py` の BLOCKERS 出力 |
+
+**重要**: `scope_signal_guard.reason_code`（例: `new_allowed_path_layer`、`new_in_scope_area`）は `termination_cause` として使用しない。これらは `VALID_TERMINATION_CAUSES` に属さない diagnostic code であり、`render_termination_report.py` が reject する。
+
+`decide_next_loop_action.py` は `scope_signal_guard.triggered=true` のとき `TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator はこの値を `termination_cause` として使用する。
+
+### 正しい termination payload 例
+
+```json
+{
+  "termination_reason": "human_escalation",
+  "termination_cause": "human_judgment_required",
+  "issue_number": 907,
+  "iteration": 0,
+  "blockers_summary": [
+    "scope_signal_guard_triggered",
+    "scope_signal_guard_reason_code:new_allowed_path_layer"
+  ]
+}
+```
+
+### 誤った例（fail-closed）
+
+```json
+{
+  "termination_reason": "human_escalation",
+  "termination_cause": "scope_signal_guard_triggered"
+}
+```
+
+上記は `render_termination_report.py` の `_validate_input()` に `Invalid termination_cause` として reject される（#919 修正済み regression test: `test_scope_signal_guard_termination.py::TestAC3`）。
+
 ## Additional stop rules
 
 - anchor comment fact-check が未完了のまま stale approval を使おうとした場合
