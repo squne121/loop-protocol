@@ -1166,6 +1166,227 @@ def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# GitHub metadata assertion — Issue #942
+# ---------------------------------------------------------------------------
+
+def _is_github_metadata_assert_command(command: str) -> bool:
+    """
+    Detect if a command is a github_metadata_assert assertion.
+
+    Format: github_metadata_assert <contains|not_contains> <field> <literal> <endpoint> [flags...]
+
+    Returns True if the command starts with 'github_metadata_assert'.
+    """
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+
+    if not argv:
+        return False
+
+    return Path(argv[0]).name == "github_metadata_assert"
+
+
+def _is_allowed_github_metadata_assert(argv: List[str]) -> Optional[Tuple[bool, Optional[str]]]:
+    """
+    Validate github_metadata_assert command arguments and flags.
+
+    Format: github_metadata_assert <contains|not_contains> <field> <literal> <endpoint> [flags...]
+
+    Returns: (is_valid, error_message)
+      - (True, None): Command is valid
+      - (False, error_msg): Command is invalid with explanation
+
+    Validation rules (AC2, AC5, AC6):
+    - Method must be GET (no --method POST/PATCH/PUT/DELETE, no -X)
+    - Endpoint must match pattern repos/<owner>/<repo>/milestones/<number>
+      - Rejects absolute URLs (http://, https://, //)
+      - Rejects query strings (?)
+      - Rejects path traversal (..)
+      - Rejects placeholder endpoints (<...>)
+    - Dangerous flags are blocked: -f, -F, --field, --raw-field, --input, --header, -H, --include, -i,
+      --paginate, --slurp, --cache, --template, --preview, graphql
+    - Mutating methods blocked: --method POST/PATCH/PUT/DELETE, -X, --method=...
+    """
+    if len(argv) < 5:
+        return False, "github_metadata_assert requires at least 5 arguments: assertion_type field literal endpoint"
+
+    cmd_name = Path(argv[0]).name
+    if cmd_name != "github_metadata_assert":
+        return False, "Not a github_metadata_assert command"
+
+    assertion_type = argv[1].lower()
+    if assertion_type not in ("contains", "not_contains"):
+        return False, f"assertion_type must be 'contains' or 'not_contains', got '{argv[1]}'"
+
+    field = argv[2]
+    if not field or field.startswith('-'):
+        return False, "field argument is missing or invalid"
+
+    literal = argv[3]
+    if not literal or literal.startswith('-'):
+        return False, "literal argument is missing or invalid"
+
+    endpoint = argv[4]
+
+    # Validate endpoint (AC2)
+    # Reject absolute URLs
+    if endpoint.startswith('http://') or endpoint.startswith('https://') or endpoint.startswith('//'):
+        return False, "endpoint must not be an absolute URL; use relative path like 'repos/owner/repo/milestones/1'"
+
+    # Reject query strings
+    if '?' in endpoint:
+        return False, "endpoint must not contain query strings (?)"
+
+    # Reject path traversal
+    if '..' in endpoint:
+        return False, "endpoint must not contain path traversal (..)"
+
+    # Reject placeholder endpoints
+    if '<' in endpoint or '>' in endpoint:
+        return False, "endpoint must not contain placeholders (<...>); use actual values like 'repos/owner/repo/milestones/1'"
+
+    # Validate endpoint format: repos/<owner>/<repo>/milestones/<number>
+    # The number should be a positive integer, not a placeholder
+    if not re.match(r'^repos/[^/]+/[^/]+/milestones/\d+$', endpoint):
+        return False, f"endpoint must match 'repos/<owner>/<repo>/milestones/<number>', got '{endpoint}'"
+
+    # Check flags (AC5, AC6)
+    for i, arg in enumerate(argv[5:], start=5):
+        arg_lower = arg.lower()
+
+        # AC5: Dangerous flags (data modification / non-GET)
+        if arg in ('-f', '-F', '--field', '--raw-field', '--input', '--header', '-H', '--include', '-i',
+                   '--paginate', '--slurp', '--cache', '--template', '--preview'):
+            return False, f"flag '{arg}' is not allowed; github_metadata_assert is read-only"
+
+        if arg == 'graphql':
+            return False, "graphql keyword is not allowed; only REST API milestones endpoint is permitted"
+
+        # AC5: Flags with values using = syntax
+        if '=' in arg:
+            flag_part = arg.split('=')[0]
+            if flag_part in ('--field', '--raw-field', '--input', '--header', '-H', '--include', '-i',
+                             '--cache', '--template', '--preview', '--method'):
+                return False, f"flag '{flag_part}' (via '{arg}') is not allowed"
+
+        # AC6: Mutating methods
+        if arg == '--method' and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
+                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
+
+        if arg.startswith('--method='):
+            method = arg.split('=')[1].upper()
+            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
+                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
+
+        if arg == '-X' and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
+                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
+
+        if arg.startswith('-X') and len(arg) > 2:
+            method = arg[2:].upper()
+            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
+                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
+
+    return True, None
+
+
+def _check_github_metadata_assertion(
+    assertion_type: str,
+    field: str,
+    literal: str,
+    endpoint: str,
+    timeout_seconds: int = 10,
+) -> int:
+    """
+    Execute GitHub metadata assertion via gh api.
+
+    Internal implementation for github_metadata_assert.
+    Uses fixed argv to avoid shell injection: ["gh", "api", "--method", "GET", f"repos/..."]
+
+    Args:
+        assertion_type: "contains" or "not_contains"
+        field: field name to check (e.g., "description")
+        literal: literal string to search for
+        endpoint: full endpoint path (e.g., "repos/owner/repo/milestones/1")
+        timeout_seconds: timeout for gh command
+
+    Returns:
+        Exit code:
+          - 0: assertion passed
+          - 1: assertion failed (but gh API succeeded)
+          - 2: gh command not found
+          - 3: gh authentication failed
+          - 4: 404 not found (resource doesn't exist)
+          - 5: rate limited (429)
+          - 6: timeout
+          - 7: invalid JSON response
+          - 8: other HTTP error
+
+    Raises:
+        subprocess.TimeoutExpired: if gh command times out
+        json.JSONDecodeError: if gh response is not valid JSON
+    """
+    argv = ["gh", "api", "--method", "GET", endpoint]
+
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False,
+        )
+    except FileNotFoundError:
+        # gh command not found
+        return 2
+    except subprocess.TimeoutExpired:
+        return 6
+
+    # Check for HTTP errors via stderr/exit code
+    if result.returncode != 0:
+        stderr_lower = result.stderr.lower()
+        if "not authenticated" in stderr_lower or "authentication failed" in stderr_lower or "401" in result.stderr:
+            return 3
+        if "404" in result.stderr or "not found" in stderr_lower:
+            return 4
+        if "429" in result.stderr or "rate limit" in stderr_lower:
+            return 5
+        # Other HTTP errors
+        if result.returncode >= 400:
+            return 8
+        return result.returncode
+
+    # Parse JSON response
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return 7
+
+    # Check if field exists in response
+    if field not in data:
+        # Field missing: treat as absent
+        field_value = ""
+    else:
+        field_value = str(data.get(field, ""))
+
+    # Perform assertion
+    is_present = literal in field_value
+
+    # Return exit code based on assertion type
+    if assertion_type == "contains":
+        # contains: present → 0, absent → 1
+        return 0 if is_present else 1
+    else:  # not_contains
+        # not_contains: present → 1, absent → 0
+        return 1 if is_present else 0
+
+
 # Regex-bearing command detection for backslash-pipe (regex_literal_pipe_suspected) — Issue #589
 # ---------------------------------------------------------------------------
 
@@ -1580,6 +1801,19 @@ def classify_static_command(
                 "baseline_fail_expected",
             )
         return None  # allowed git read-only command
+
+    # 6.5. Check github_metadata_assert: first-class GitHub metadata assertion (Issue #942)
+    if _is_github_metadata_assert_command(raw_command):
+        is_valid, error_msg = _is_allowed_github_metadata_assert(argv)
+        if not is_valid:
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"github_metadata_assert validation failed: {error_msg}",
+                "baseline_fail_expected",
+            )
+        return None  # allowed github_metadata_assert command
 
     # 7. Check gh: exact read-only allowlist (B3)
     if cmd_basename == "gh":
@@ -2289,6 +2523,54 @@ def main() -> int:
                     # Static blocker: baseline-expect does NOT override static blocks
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result
+                elif _is_github_metadata_assert_command(command):
+                    # Issue #942: github_metadata_assert is allowed (static_result is None) but
+                    # is NOT a real executable binary. Instead of run_command (which would hit
+                    # "No such file or directory"), dispatch the assertion to
+                    # _check_github_metadata_assertion and classify by its exit code.
+                    # subprocess is invoked there with a fixed read-only argv (gh api --method GET).
+                    try:
+                        _assert_argv = shlex.split(command, posix=True)
+                    except ValueError:
+                        _assert_argv = []
+                    # static_result is None implies _is_allowed_github_metadata_assert validated argv,
+                    # so positions 1..4 are present and safe to read.
+                    _assertion_type = _assert_argv[1]
+                    _field = _assert_argv[2]
+                    _literal = _assert_argv[3]
+                    _endpoint = _assert_argv[4]
+                    assert_exit = _check_github_metadata_assertion(
+                        _assertion_type, _field, _literal, _endpoint,
+                        timeout_seconds=args.timeout_seconds,
+                    )
+                    exit_code, stdout, stderr, duration_ms = assert_exit, "", "", 0
+                    if assert_exit == 0:
+                        # assertion holds (present for contains / absent for not_contains)
+                        classification = "expected_pass"
+                        category = "github_metadata_assert_pass"
+                        decision = "go"
+                        scope_class = "regression_gate"
+                        fix_hint = None
+                    elif assert_exit == 1:
+                        # assertion does not hold; same go disposition as other expected_fail VCs
+                        classification = "expected_fail"
+                        category = "github_metadata_assert_fail"
+                        decision = "go"
+                        scope_class = "baseline_fail_expected"
+                        fix_hint = None
+                    else:
+                        # exit 2..8: environment error (gh missing / auth / 404 / rate limit /
+                        # timeout / invalid JSON / other HTTP). MUST NOT be a false pass (go).
+                        classification = "human_judgment"
+                        category = "github_metadata_assert_environment_error"
+                        decision = "human_judgment"
+                        scope_class = "baseline_fail_expected"
+                        fix_hint = (
+                            "github_metadata_assert hit an environment error "
+                            f"(exit {assert_exit}: gh missing / auth / 404 / rate limit / "
+                            "timeout / invalid JSON). This is distinct from assertion "
+                            "pass/fail and is not treated as a baseline pass."
+                        )
                 else:
                     # Safe to run: execute the command
                     exit_code, stdout, stderr, duration_ms = run_command(

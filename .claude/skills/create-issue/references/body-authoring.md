@@ -215,6 +215,28 @@ rg -c "削除対象の記述" <file>
 
 > `A && echo PASS || echo FAIL` 形式の compound shell は使用しない。`VC_SINGLE_COMMAND_GUARDRAIL` セクションを参照。
 
+### GitHub milestone metadata の readback assertion パターン
+
+GitHub milestone metadata（`description` 等）の forbidden phrase の有無を VC で検証する場合は、raw `gh api` を VC に書かず、first-class な `github_metadata_assert` を使う。raw `gh api` は preflight の allowlist で block され、`gh api ... --jq` は値を出力するだけで exit code による assertion にならない。
+
+許可される形（method GET 固定・endpoint は milestone のみ）:
+
+```bash
+# AC1: milestone description に forbidden phrase が含まれないことを exit code で確認する
+github_metadata_assert not_contains description "<literal>" repos/<owner>/<repo>/milestones/<number>
+```
+
+- assertion は `contains` / `not_contains` のみ。`contains` は present→exit 0、`not_contains` は absent→exit 0
+- endpoint は `repos/<owner>/<repo>/milestones/<number>` のみ（絶対 URL・query string・path traversal・placeholder は reject）
+- gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON は environment error として `human_judgment` 分類になり、false pass にならない
+
+禁止例:
+
+```bash
+# 不可: raw gh api は block される。jq は出力するだけで assertion にならない
+gh api repos/owner/repo/milestones/1 --jq '.description'
+```
+
 ### AC/VC 番号一致制約
 
 Verification Commands 内の `# AC<N>` コメント番号は、Acceptance Criteria の AC 番号と必ず一致させる。
