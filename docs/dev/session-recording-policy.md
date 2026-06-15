@@ -143,16 +143,50 @@ taxonomy_mapping:
 # 注意: 全 mode で public_full_transcript_allowed は false。
 # none 時でも public transcript は禁止。session 記録ツール未導入時も同様。
 public_surfaces:
-  github_issue_comment:
-    agent_session_manifest_allowed: true
-    raw_transcript_allowed: false
-    source_kind_prohibited:
-      - transcript
-      - local_file
-    rationale: >
-      agent_session_manifest/v1 は公開コメントへの添付を許可するが、
-      raw transcript / local_file の source_kind は禁止する。
-      公開 GitHub コメントには session metadata summary のみを置く。
+  github_issue_or_pr_comment:
+    agent_session_manifest:
+      body_allowed: false
+      opaque_ref_allowed: true
+      allowed_refs:
+        - artifact_id
+        - artifact_url
+        - artifact_digest
+        - schema_ref
+        - validation_verdict
+      forbidden_content:
+        - raw_transcript
+        - transcript_excerpt
+        - local_absolute_path
+        - secret_value
+        - full_command_output
+        - full_prompt
+      rationale: >
+        manifest body は Issue / PR comment に出さない。公開コメントでは
+        artifact_digest や validation_verdict などの opaque ref のみを許可する。
+    agent_run_report:
+      body_allowed: conditional
+      conditions:
+        - issue_935_schema_and_redaction_validator_merged
+        - issue_937_exact_marker_upsert_guard_merged
+        - exact_marker_upsert_guard_passed
+        - redaction_validator_clean
+        - max_body_bytes_passed
+      live_public_posting: forbidden_until_dependencies_merge
+      rationale: >
+        redacted report は conditional public comment の対象だが、#934 merge 時点では
+        dry-run 設計のみを許可し、live public posting は禁止する。
+    agent_retro_index:
+      body_allowed: conditional
+      conditions:
+        - issue_935_schema_and_redaction_validator_merged
+        - issue_937_exact_marker_upsert_guard_merged
+        - exact_marker_upsert_guard_passed
+        - redaction_validator_clean
+        - max_body_bytes_passed
+      live_public_posting: forbidden_until_dependencies_merge
+      rationale: >
+        retro index も conditional public comment の対象だが、#934 merge 時点では
+        dry-run のみで、live public posting は #935 / #937 完了後に限る。
 github_public_checkpoint_branch_allowed: false
 checkpoint_remote:
   allowed_visibility:
@@ -181,6 +215,15 @@ kill_switch:
     leaked_credentials_rotated_or_revoked: true
   verification_required: true
 ```
+
+## Public comment boundary
+
+- `agent_session_manifest/v1` の manifest 本文は Issue / PR comment に出さない。公開コメントでは `artifact_digest`、`artifact_url`、`schema_ref`、`validation_verdict` などの opaque ref のみ許可する。
+- `agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard を通過した後のみ conditional public comment 可とする。
+- #934 は docs-only boundary cleanup であり、#936 の lifecycle 導線も含めて live public posting はまだ禁止する。merge 時点で許可されるのは dry-run 設計と public-safe 境界の固定のみ。
+- public comment posting は trusted context のみで行う。`pull_request_target` では実行せず、top-level read-only baseline を維持したまま posting job に限って `issues: write` / `pull-requests: write` を付与する。
+- hook は diagnostic / prevention layer であり security boundary ではない。report/index の public-safe 判定正本は post-run validator と posting guard に置く。
+- 過去の manifest comment template や pilot wording は historical / non-current / not live public posting として扱い、current live public posting 許可の根拠にしない。
 
 ---
 
@@ -443,8 +486,10 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 
 > **注意（#412 境界）**: artifact に Secret が混入しない保証は `#412` 完了まで **保留**。
 > 現状は `secrets_mode: none` 前提で運用する。
-> "private artifact channel" とは「Issue / PR comment ではない非コメント面（retention-limited GitHub Actions artifact）」を指す。
-> **public repo では artifact は REST API 経由で公開アクセス可能**。manifest content は public-safe contract（絶対パスなし、token なし、transcript 本文なし）を満たすこと。
+> `private artifact` は legacy visibility enum 名であり、secret-safe を意味しない。ここでいう `private artifact` は
+> 「Issue / PR comment ではない retention-limited non-comment surface」を指す。
+> **public repo では artifact は REST API 経由で公開アクセス可能**。manifest / report / index の content は public-safe contract
+> （絶対パスなし、token なし、transcript 本文なし、full command output なし）を満たすこと。
 
 ### GitHub Actions CI lifecycle
 
@@ -470,9 +515,17 @@ manifest validation gate を main の merge blocker にする場合、required c
 | job name | `validate-generated-artifact` |
 | required check context | `agent-session-manifest / validate-generated-artifact` |
 
-`phase_instance_id` は現行 producer contract が `issue-<N>:<phase>:<seq>` を要求するため、
-CI では `run_id` と `run_attempt` から導出した 3 桁 seq を使って `issue-432:impl:<seq>` を生成する。
-raw の `ci:<workflow>:<run_id>:<run_attempt>` は current schema / validator では受け付けない。
+`phase_instance_id` は current schema で以下の 2 形式を受け付ける。
+
+1. `issue-<N>:<main_loop_phase>:<seq>`
+   - local / issue-bound / AI-driven run 用
+   - 例: `issue-934:impl:001`
+2. `ci:<producer_slug>:<run_id>:<run_attempt>`
+   - GitHub Actions CI run 用
+   - `producer_slug` は workflow name そのものではなく schema-safe fixed slug を使う
+   - 例: `ci:session-manifest:123456789:1`
+
+CI producer は `ci:session-manifest:<run_id>:<run_attempt>` を current schema reality として使う。`issue-432:impl:<seq>` への固定変換は current policy ではない。
 
 required check の SSOT は **branch protection** とする（ruleset PATCH API が 404 を返すため）。
 ruleset が利用可能になった場合は ruleset 側に required checks を移行し、branch protection fallback を削除する。

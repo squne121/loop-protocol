@@ -115,6 +115,12 @@ notes:
   - "token_usage.availability: unavailable を 0 と偽装しないこと（docs/schemas/agent-session-manifest.md 参照）"
 ```
 
+## #934 public-surface boundary cleanup note
+
+- #934 は public-surface boundary cleanup であり、`agent_session_manifest/v1` の live public posting を拡張する issue ではない。
+- #934 で固定する consumer-facing contract は「manifest 本文は Issue / PR comment に出さない」「公開コメントでは opaque ref のみ許可」「`agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が揃うまで dry-run only / not live public posting」という境界である。
+- `agent_run_report/v1` / `agent_retro_index/v1` の正式な Known Schema 登録、consumer inventory、validation command の追加は #935 で扱う。#934 では historical wording と current boundary の衝突解消のみを行う。
+
 ## schema_change_applicability 判定基準
 
 PR が schema を変更するか否かを判定する基準:
