@@ -5,7 +5,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController } from '../src/ui/HudController'
+import {
+  runNextSortieHandler,
+  runConfirmResultHandler,
+} from '../src/main'
 import type { GameState, LoopPhase, ResultRewardStatus, SortieResult } from '../src/state'
+import { createGameSnapshot } from '../src/state'
 
 const TERMINAL_SORTIE_RESULT = {
   outcome: 'victory',
@@ -370,5 +375,96 @@ describe('AC3: Load Game phase gate — onLoadGame only fires from title_menu / 
     queryButton(container, 'load-game').click()
 
     expect(onLoadGame).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Issue #914: HUD action harness — legacy Next sortie / Confirm result success feedback
+// ---------------------------------------------------------------------------
+
+describe('Issue #914: HUD action harness — next-sortie and confirm-result', () => {
+  let container: HTMLElement
+  let hudController: ReturnType<typeof createHudController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    hudController = createHudController(container, {
+      onNewGame: vi.fn(),
+      onStartSortie: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
+      onNextSortie: vi.fn(),
+      onSave: vi.fn(),
+      onLoadGame: vi.fn(),
+      onReset: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onTogglePause: vi.fn(),
+    })
+  })
+
+  it('AC1: GIVEN debrief_reward_claimed WHEN next-sortie click via runNextSortieHandler THEN HUD shows "Returned to preparation." / "Use Start sortie to begin the next sortie."', () => {
+    const state = createState('debrief_reward_claimed')
+    hudController.render(state, false)
+
+    function renderHudAfterAction() {
+      hudController.render(state, false)
+    }
+
+    const button = queryButton(container, 'next-sortie')
+    expect(button.disabled).toBe(false)
+
+    button.addEventListener('click', () => {
+      runNextSortieHandler(state, {
+        setHudFeedback: (status, summary) => {
+          state.telemetry.status = status
+          state.telemetry.lastCommandSummary = summary
+        },
+      })
+      renderHudAfterAction()
+    })
+
+    button.click()
+
+    expect(state.loopPhase).toBe('preparation')
+    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Returned to preparation.')
+    expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Use Start sortie to begin the next sortie.')
+  })
+
+  it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN HUD shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once', () => {
+    const state = createState('result', 'pending')
+    hudController.render(state, false)
+
+    function renderHudAfterAction() {
+      hudController.render(state, false)
+    }
+
+    const fakeProgressionStorageSave = vi.fn(() => ({ ok: true as const }))
+
+    const button = queryButton(container, 'confirm-result')
+    expect(button.disabled).toBe(false)
+
+    button.addEventListener('click', () => {
+      runConfirmResultHandler(state, true, {
+        storage: {
+          save: fakeProgressionStorageSave,
+          load: vi.fn(() => ({ ok: true as const, snapshot: null })),
+        },
+        createSnapshot: () => createGameSnapshot(state),
+        reportSaveFailure: vi.fn(),
+        setHudFeedback: (status, summary) => {
+          state.telemetry.status = status
+          state.telemetry.lastCommandSummary = summary
+        },
+        resetDebugPause: vi.fn(),
+      })
+      renderHudAfterAction()
+    })
+
+    button.click()
+
+    expect(state.loopPhase).toBe('preparation')
+    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Result confirmed.')
+    expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Progress saved locally.')
+    expect(fakeProgressionStorageSave).toHaveBeenCalledTimes(1)
   })
 })
