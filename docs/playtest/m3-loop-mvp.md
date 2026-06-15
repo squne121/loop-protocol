@@ -20,7 +20,7 @@ recorded_at: "2026-06-15T09:30:00Z"
 ## Overview
 
 #740 の Playwright E2E 自動化による Gate 証跡。
-`tests/e2e/m3-loop-mvp.spec.ts` を新規追加し、sortie→reward→localStorage 保存→page reload→snapshot 保持確認→Load Game 復元の全フローを検証した。
+`tests/e2e/m3-loop-mvp.spec.ts` を新規追加し、sortie→reward→localStorage 保存→page reload→snapshot 保持確認の全フロー（Load Game による snapshot 適用は実装契約として存在するが本E2Eでは未実行）を検証した。
 
 ## E2E 実行結果
 
@@ -40,7 +40,7 @@ recorded_at: "2026-06-15T09:30:00Z"
 | AC1 | tests/e2e/m3-loop-mvp.spec.ts の存在 | PASS（本ファイル自体が証明） |
 | AC2+AC3 | production sentinel 不変 / E2E key にスナップショット保存 | PASS |
 | AC4 | Confirm result の double invocation で resources 二重加算なし | PASS |
-| AC5 | reload 後 localStorage snapshot 保持（resources=30）、HUD は 0 表示（no auto-load）、Load Game で復元可能 | PASS |
+| AC5 | reload 後 localStorage snapshot 保持（resources=30）、HUD は 0 表示（no auto-load）、combat runtime は復元されない（Load Game による snapshot 適用は実装契約として存在するが本E2Eでは未実行） | PASS |
 | AC6 | 同一 result の再 confirm で resources 二重加算なし | PASS |
 | AC9 | origin が http://127.0.0.1:4173 | PASS |
 
@@ -142,6 +142,7 @@ Save failure / corrupt JSON / unsupported schema / QuotaExceededError / Security
 - older readable snapshot preservation: #621/#739 unit test でカバー
 - victory / defeat terminal での reward: m2-combat-mvp.spec.ts でカバー
 - 武器強化 (weaponPower): M4 スコープ（本 E2E は weaponPower=1 固定）
+- production sentinel reload 後不変性: `page.addInitScript()` は navigation ごとに再評価されるため、reload 後の sentinel 値は fixture により再注入され得る。production sentinel の invariant は reload 前の confirm flow（AC2+AC3）内の検証として扱う。reload 後 invariant の独立証明としては扱わない。
 
 ## Origin and storage cautions
 
