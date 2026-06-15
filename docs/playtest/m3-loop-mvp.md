@@ -20,7 +20,7 @@ recorded_at: "2026-06-15T09:30:00Z"
 ## Overview
 
 #740 の Playwright E2E 自動化による Gate 証跡。
-`tests/e2e/m3-loop-mvp.spec.ts` を新規追加し、sortie→reward→localStorage 保存→page reload→復元の全フローを検証した。
+`tests/e2e/m3-loop-mvp.spec.ts` を新規追加し、sortie→reward→localStorage 保存→page reload→snapshot 保持確認→Load Game 復元の全フローを検証した。
 
 ## E2E 実行結果
 
@@ -40,7 +40,7 @@ recorded_at: "2026-06-15T09:30:00Z"
 | AC1 | tests/e2e/m3-loop-mvp.spec.ts の存在 | PASS（本ファイル自体が証明） |
 | AC2+AC3 | production sentinel 不変 / E2E key にスナップショット保存 | PASS |
 | AC4 | Confirm result の double invocation で resources 二重加算なし | PASS |
-| AC5 | reload 後 localStorage から resources 復元、combat runtime は復元されない | PASS |
+| AC5 | reload 後 localStorage snapshot 保持（resources=30）、HUD は 0 表示（no auto-load）、Load Game で復元可能 | PASS |
 | AC6 | 同一 result の再 confirm で resources 二重加算なし | PASS |
 | AC9 | origin が http://127.0.0.1:4173 | PASS |
 
