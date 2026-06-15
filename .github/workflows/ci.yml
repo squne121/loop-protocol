@@ -1239,3 +1239,65 @@ jobs:
                       print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+  ci-verdict-summary:
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    needs: [typecheck, lint, test, build, e2e, python-test, actionlint]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Generate ci_verdict_summary_v2 artifact
+        # B1: inline Python verdict calculation removed — ci_verdict_summary_v2.py called directly.
+        # B2: --expected-head-sha uses github.event.pull_request.head.sha (not GITHUB_SHA).
+        #     needs.result does not carry real head SHA, so provenance=needs_result_synthetic is set.
+        env:
+          NEEDS_JSON: >-
+            {
+              "typecheck": "${{ needs.typecheck.result }}",
+              "lint": "${{ needs.lint.result }}",
+              "test": "${{ needs.test.result }}",
+              "build": "${{ needs.build.result }}",
+              "e2e": "${{ needs.e2e.result }}",
+              "python-test": "${{ needs.python-test.result }}",
+              "actionlint": "${{ needs.actionlint.result }}"
+            }
+        run: |
+          mkdir -p ci_verdict_summary_v2_artifacts
+          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+            --expected-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --repository "${{ github.repository }}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --workflow-run-attempt "${{ github.run_attempt }}" \
+            --event-name "${{ github.event_name }}" \
+            --needs-json "${NEEDS_JSON}" \
+            --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+      - name: Upload ci-verdict-summary-v2 artifact
+        id: upload-ci-verdict-summary-v2
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-verdict-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Output ci_verdict_summary_v2 Step Summary
+        # B4: artifact-id/url/digest passed to script so they appear in JSON and Step Summary.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+            --expected-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --repository "${{ github.repository }}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --workflow-run-attempt "${{ github.run_attempt }}" \
+            --event-name "${{ github.event_name }}" \
+            --needs-json "${NEEDS_JSON}" \
+            --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json \
+            --artifact-id "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-id }}" \
+            --artifact-url "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-url }}" \
+            --artifact-digest "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-digest }}"
