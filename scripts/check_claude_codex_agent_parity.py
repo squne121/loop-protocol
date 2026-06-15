@@ -39,6 +39,14 @@ CLAUDE_PERMISSION_LEVEL_MAP = {
     "default": "repo-write",
 }
 
+# Keywords in Codex developer_instructions that indicate nested delegation
+CODEX_DELEGATION_KEYWORDS = [
+    "spawn_agents_on_csv",
+    "recursive delegation",
+    "child agent spawn",
+    "spawn subagents",
+]
+
 
 class DriftEvidence:
     def __init__(
@@ -88,11 +96,16 @@ class AgentParityFacts:
         runtime_proof_note: str = (
             "Declaration is config-level; runtime proof requires launch-ledger validation."
         ),
-        nested_delegation_blocked: bool = False,
+        # B5: nested_delegation_blocked is now bool | None
+        # True = blocked, False = allowed, None = unknown (no tools key)
+        nested_delegation_blocked: bool | None = False,
         nested_delegation_evidence: str = "",
         model_declaration: str | None = None,
         reasoning_effort_declaration: str | None = None,
         evidence: list[DriftEvidence] | None = None,
+        # For permission report (B7)
+        claude_tools: list[str] | None = None,
+        claude_disallowed_tools: list[str] | None = None,
     ) -> None:
         self.agent_name = agent_name
         # Final output schema (compact schema returned to caller)
@@ -103,14 +116,17 @@ class AgentParityFacts:
         self.declared_permission = declared_permission  # claude.permissionMode or codex.default_permissions
         self.mutation_boundary = mutation_boundary      # derived readonly/issue-mutation/repo-write
         self.runtime_proof_note = runtime_proof_note
-        # Delegation
-        self.nested_delegation_blocked = nested_delegation_blocked
+        # Delegation (B5: bool | None)
+        self.nested_delegation_blocked: bool | None = nested_delegation_blocked
         self.nested_delegation_evidence = nested_delegation_evidence
         # Model config (advisory; not runtime proof)
         self.model_declaration = model_declaration
         self.reasoning_effort_declaration = reasoning_effort_declaration
         # Raw evidence list
         self.evidence: list[DriftEvidence] = evidence if evidence is not None else []
+        # B7: store raw tools lists for permission report
+        self.claude_tools: list[str] = claude_tools if claude_tools is not None else []
+        self.claude_disallowed_tools: list[str] = claude_disallowed_tools if claude_disallowed_tools is not None else []
 
     def __repr__(self) -> str:
         return (
@@ -162,8 +178,14 @@ def extract_runtime_field(instructions: str, field: str) -> str | None:
     return match.group(1) if match else None
 
 
-def find_line_number(text: str, search: str) -> int:
-    """Return 1-based line number of first occurrence of search in text, or 0 if not found."""
+def find_line_number(text: str, search: str | None) -> int:
+    """Return 1-based line number of first occurrence of search in text, or 0 if not found.
+
+    B8: Returns 0 if search is None or empty string to avoid false line 1 matches.
+    """
+    # B8: guard against empty/None search
+    if not search:
+        return 0
     for i, line in enumerate(text.splitlines(), start=1):
         if search in line:
             return i
@@ -192,12 +214,37 @@ def extract_artifact_only_schemas_from_claude(text: str, final_schema: str | Non
     """Extract artifact-only schemas from Claude agent markdown.
 
     These are schemas mentioned in 'artifact only:' or '（artifact のみ）' patterns,
-    as well as any ISSUE_*_V* schemas that are not the final output schema.
+    as well as heading patterns like '### 内部処理用 SCHEMA（artifact のみ）'.
+
+    B2: Added support for:
+    - '### 内部処理用 SCHEMA_NAME（artifact のみ）' (schema name first in heading)
+    - Lines/headings containing '内部処理用', 'artifact のみ', 'artifact-only'
     """
     artifact_only: list[str] = []
 
-    # Pattern: 'artifact only: `SCHEMA`' or 'artifact のみ: `SCHEMA`'
+    # Pattern: 'artifact only: `SCHEMA`' or 'artifact のみ: `SCHEMA`' (schema at end)
     for m in re.finditer(r"artifact\s+(?:only|のみ)[:\s]+[`']?([A-Z][A-Z0-9_]+_V\d+)[`']?", text, re.IGNORECASE):
+        name = m.group(1)
+        if name not in artifact_only:
+            artifact_only.append(name)
+
+    # B2: Pattern in heading: '### 内部処理用 SCHEMA_NAME（artifact のみ）' or similar
+    # Matches: heading lines where schema name appears before the artifact marker
+    for m in re.finditer(
+        r"(?:^|\n)#{1,6}\s+(?:内部処理用|artifact[- ]only)[^\n]*?([A-Z][A-Z0-9_]+_V\d+)[^\n]*?(?:artifact[- ]?(?:only|のみ)|内部処理用|のみ)",
+        text,
+        re.IGNORECASE,
+    ):
+        name = m.group(1)
+        if name not in artifact_only:
+            artifact_only.append(name)
+
+    # B2: Also match heading: '### 内部処理用 SCHEMA_NAME（artifact のみ）'
+    # where schema name comes after '内部処理用'
+    for m in re.finditer(
+        r"(?:^|\n)#{1,6}[^\n]*?内部処理用\s+([A-Z][A-Z0-9_]+_V\d+)",
+        text,
+    ):
         name = m.group(1)
         if name not in artifact_only:
             artifact_only.append(name)
@@ -249,28 +296,48 @@ def extract_claude_facts(
     facts.declared_permission = f"claude.permissionMode={permission_mode}"
     facts.mutation_boundary = CLAUDE_PERMISSION_LEVEL_MAP.get(permission_mode, "unknown")
 
-    # Nested delegation: check disallowedTools for 'Agent'
+    # B7: store raw tools lists
     disallowed = fm.get("disallowedTools", [])
     if not isinstance(disallowed, list):
         disallowed = []
     tools = fm.get("tools", [])
     if not isinstance(tools, list):
         tools = []
+    facts.claude_tools = list(tools)
+    facts.claude_disallowed_tools = list(disallowed)
 
-    agent_in_disallowed = "Agent" in disallowed
-    agent_in_tools = "Agent" in tools
-    facts.nested_delegation_blocked = agent_in_disallowed and not agent_in_tools
-    if agent_in_disallowed:
-        line = find_line_number(claude_text, "- Agent")
+    # B5: Nested delegation — 3-value logic
+    # True = blocked, False = allowed, None = unknown (no tools key and no disallowed)
+    has_tools_key = "tools" in fm
+    agent_denied = any(
+        t == "Agent" or t.startswith("Agent(") for t in disallowed
+    )
+    agent_in_tools = any(
+        t == "Agent" or t.startswith("Agent(") for t in tools
+    )
+
+    if agent_denied:
+        # disallowedTools takes priority
+        facts.nested_delegation_blocked = True
+        line = find_line_number(claude_text, "Agent")
         facts.nested_delegation_evidence = (
             f"Agent in disallowedTools at {claude_path.name}:{line}"
         )
-    elif not agent_in_tools:
-        facts.nested_delegation_evidence = (
-            f"Agent absent from tools list in {claude_path.name}"
-        )
+    elif has_tools_key:
+        # Explicit tools allowlist: blocked unless Agent is in it
+        facts.nested_delegation_blocked = not agent_in_tools
+        if agent_in_tools:
+            facts.nested_delegation_evidence = f"Agent present in tools at {claude_path.name}"
+        else:
+            facts.nested_delegation_evidence = (
+                f"Agent absent from explicit tools allowlist in {claude_path.name}"
+            )
     else:
-        facts.nested_delegation_evidence = f"Agent present in tools at {claude_path.name}"
+        # No tools key at all -> unknown
+        facts.nested_delegation_blocked = None
+        facts.nested_delegation_evidence = (
+            f"No tools key in frontmatter of {claude_path.name} (unknown)"
+        )
 
     # Model declaration (advisory)
     model = str(fm.get("model", ""))
@@ -313,6 +380,13 @@ def extract_codex_facts(
         facts.nested_delegation_blocked = False
         facts.nested_delegation_evidence = ".codex/config.toml not found or missing [agents].max_depth"
 
+    # B6: Check developer_instructions for delegation-enabling keywords
+    for keyword in CODEX_DELEGATION_KEYWORDS:
+        if keyword in instructions:
+            facts.nested_delegation_evidence += (
+                f"; WARNING: delegation keyword '{keyword}' found in developer_instructions"
+            )
+
     # Model declaration (advisory)
     model = str(codex_doc.get("model", ""))
     reasoning_effort = str(codex_doc.get("model_reasoning_effort", ""))
@@ -331,37 +405,40 @@ def compare_parity(
     claude_facts: AgentParityFacts,
     codex_facts: AgentParityFacts,
 ) -> list[DriftEvidence]:
-    """Compare Claude and Codex facts and return list of drift evidence."""
+    """Compare Claude and Codex facts and return list of drift evidence.
+
+    B1: Schema parity is always final-to-final comparison.
+    artifact_only_schema_names is supplementary info about Claude docs;
+    it does NOT suppress drift when Codex final schema matches a Claude artifact-only schema.
+
+    B3: schema / permission / delegation drifts are all fail-level (returned as evidence).
+    The caller promotes all drift to 'fail' status.
+    """
     drifts: list[DriftEvidence] = []
 
     # --- Schema parity (AC1, AC7) ---
+    # B1: Always compare final-to-final. Never suppress based on artifact_only_schema_names.
     c_schema = claude_facts.final_output_schema
     x_schema = codex_facts.final_output_schema
     if c_schema != x_schema:
-        # Check if codex schema is in claude's artifact-only list (AC7: not a fail)
-        if x_schema and x_schema in claude_facts.artifact_only_schema_names:
-            pass  # artifact-only schema: not a parity fail
-        else:
-            # Find line number of schema in claude file
-            claude_text = claude_path.read_text(encoding="utf-8")
-            line = find_line_number(claude_text, c_schema or "")
-            drifts.append(DriftEvidence(
-                rule_id="SCHEMA_PARITY_001",
-                file=str(claude_path),
-                line=line,
-                launcher="claude",
-                agent=agent_name,
-                expected=x_schema or "(none)",
-                actual=c_schema or "(none)",
-            ))
+        # B8: find_line_number handles None/empty gracefully
+        claude_text = claude_path.read_text(encoding="utf-8")
+        line = find_line_number(claude_text, c_schema)
+        drifts.append(DriftEvidence(
+            rule_id="SCHEMA_PARITY_001",
+            file=str(claude_path),
+            line=line,
+            launcher="claude",
+            agent=agent_name,
+            expected=x_schema or "(none)",
+            actual=c_schema or "(none)",
+        ))
 
     # --- Permission parity (AC2, AC8) ---
     c_boundary = claude_facts.mutation_boundary
     x_boundary = codex_facts.mutation_boundary
     if c_boundary != x_boundary:
         claude_text = claude_path.read_text(encoding="utf-8")
-        fm = extract_frontmatter(claude_text)
-        pm = str(fm.get("permissionMode", ""))
         line = find_line_number(claude_text, "permissionMode")
         drifts.append(DriftEvidence(
             rule_id="PERMISSION_BOUNDARY_001",
@@ -374,7 +451,10 @@ def compare_parity(
         ))
 
     # --- Nested delegation parity (AC4, AC9) ---
-    if claude_facts.nested_delegation_blocked != codex_facts.nested_delegation_blocked:
+    # B5: Handle None (unknown) — None vs True/False is considered drift
+    c_blocked = claude_facts.nested_delegation_blocked
+    x_blocked = codex_facts.nested_delegation_blocked
+    if c_blocked != x_blocked:
         claude_text = claude_path.read_text(encoding="utf-8")
         line = find_line_number(claude_text, "disallowedTools")
         drifts.append(DriftEvidence(
@@ -383,8 +463,20 @@ def compare_parity(
             line=line,
             launcher="claude",
             agent=agent_name,
-            expected=f"nested_delegation_blocked={codex_facts.nested_delegation_blocked}",
-            actual=f"nested_delegation_blocked={claude_facts.nested_delegation_blocked}",
+            expected=f"nested_delegation_blocked={x_blocked}",
+            actual=f"nested_delegation_blocked={c_blocked}",
+        ))
+
+    # B6: Check if Codex delegation keywords were found
+    if codex_facts.nested_delegation_evidence and "delegation keyword" in codex_facts.nested_delegation_evidence:
+        drifts.append(DriftEvidence(
+            rule_id="NESTED_DELEGATION_001",
+            file=str(codex_path),
+            line=0,
+            launcher="codex",
+            agent=agent_name,
+            expected="no delegation keywords in developer_instructions",
+            actual="delegation keyword found in developer_instructions",
         ))
 
     return drifts
@@ -395,11 +487,24 @@ def build_permission_report(
     claude_facts: AgentParityFacts,
     codex_facts: AgentParityFacts,
 ) -> dict:
-    """Build 3-layer permission report (AC8)."""
+    """Build 3-layer permission report (AC8).
+
+    B7: DECLARED_PERMISSION now includes claude.tools and claude.disallowedTools.
+    """
+    # B7: Build rich claude declared_permission
+    claude_permission_info: dict[str, object] = {
+        "permissionMode": claude_facts.declared_permission,
+    }
+    if claude_facts.claude_tools:
+        claude_permission_info["tools"] = claude_facts.claude_tools
+    if claude_facts.claude_disallowed_tools:
+        claude_permission_info["disallowedTools"] = claude_facts.claude_disallowed_tools
+
     return {
         "agent": agent_name,
         "DECLARED_PERMISSION": {
             "claude": claude_facts.declared_permission,
+            "claude_detail": claude_permission_info,
             "codex": codex_facts.declared_permission,
         },
         "MUTATION_BOUNDARY": {
@@ -631,10 +736,10 @@ def main(argv: list[str] | None = None) -> int:
         })
 
     # --- Determine overall status ---
-    if failures:
+    # B3: schema / permission / delegation drifts are fail-level.
+    # Model/reasoning_effort mismatch (advisory) remains warn-only.
+    if failures or all_drifts:
         status = "fail"
-    elif all_drifts:
-        status = "warn"
     else:
         status = "ok"
 

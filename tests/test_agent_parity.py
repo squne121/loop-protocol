@@ -11,6 +11,16 @@ Covers:
 - AC9: Claude nested delegation from disallowedTools; Codex from max_depth
 - AC10: drift evidence contains rule_id / file:line / launcher / agent / expected / actual
 - AC11: STATUS:warn exit code default 0, --strict exit 1
+
+fix_delta regression tests (B1-B8):
+- B1: Codex final schema that matches Claude artifact-only schema is still drift (fail)
+- B2: artifact-only schema extraction handles heading pattern 'SCHEMA（artifact のみ）'
+- B3: schema/permission/delegation drift produces STATUS:fail (not warn)
+- B4: real repo parity produces no unexpected blocker drift
+- B5: Claude nested delegation is blocked when Agent absent from explicit tools allowlist
+- B6: Codex delegation keywords in developer_instructions produce NESTED_DELEGATION_001
+- B7: DECLARED_PERMISSION includes claude.tools and claude.disallowedTools
+- B8: find_line_number returns 0 for empty/None search
 """
 
 from __future__ import annotations
@@ -24,6 +34,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+
+REPO_ROOT_FOR_INTEGRATION = Path(__file__).resolve().parents[1]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "check_claude_codex_agent_parity.py"
@@ -680,3 +692,295 @@ class TestFixtureFiles:
         )
         deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
         assert len(deleg_drifts) == 1
+
+
+# ---------------------------------------------------------------------------
+# B1: Codex final schema in Claude artifact-only is still drift (not suppressed)
+# ---------------------------------------------------------------------------
+
+class TestB1ArtifactOnlySuppressBug:
+    def test_codex_final_artifact_only_schema_is_drift(self, tmp_path: Path):
+        """B1: Codex emitting an artifact-only schema as final must produce SCHEMA_PARITY_001.
+
+        Claude final: ISSUE_REVIEW_RESULT_COMPACT_V1
+        Claude artifact-only: REVIEW_ISSUE_RESULT_V1
+        Codex final: REVIEW_ISSUE_RESULT_V1  <- this is drift, must NOT be suppressed.
+        """
+        claude_md = _claude_md(
+            output_schema="ISSUE_REVIEW_RESULT_COMPACT_V1",
+            artifact_only="REVIEW_ISSUE_RESULT_V1",
+        )
+        result = _run_cli(
+            tmp_path,
+            claude_md,
+            # Codex emits the artifact-only schema as its final output -> drift
+            output_schema_codex="REVIEW_ISSUE_RESULT_V1",
+        )
+        data = json.loads(result.stdout)
+        schema_drifts = [d for d in data["drift"] if d["rule_id"] == "SCHEMA_PARITY_001"]
+        assert len(schema_drifts) == 1, (
+            f"B1: Expected SCHEMA_PARITY_001 for Codex emitting artifact-only schema, "
+            f"but got: {schema_drifts}"
+        )
+        assert schema_drifts[0]["expected"] == "REVIEW_ISSUE_RESULT_V1"
+        assert schema_drifts[0]["actual"] == "ISSUE_REVIEW_RESULT_COMPACT_V1"
+
+
+# ---------------------------------------------------------------------------
+# B2: artifact-only schema extraction with heading pattern
+# ---------------------------------------------------------------------------
+
+class TestB2ArtifactOnlyExtraction:
+    def test_heading_pattern_schema_first(self):
+        """B2: Extract artifact-only schema from '### 内部処理用 SCHEMA（artifact のみ）' heading."""
+        text = (
+            "---\nname: issue-reviewer\n---\n"
+            "## 出力契約（ISSUE_REVIEW_RESULT_COMPACT_V1）\n\n"
+            "### 内部処理用 REVIEW_ISSUE_RESULT_V1（artifact のみ）\n"
+            "full schema stored in artifact.\n"
+        )
+        artifact_schemas = MOD.extract_artifact_only_schemas_from_claude(
+            text, "ISSUE_REVIEW_RESULT_COMPACT_V1"
+        )
+        assert "REVIEW_ISSUE_RESULT_V1" in artifact_schemas, (
+            f"B2: Expected REVIEW_ISSUE_RESULT_V1 in artifact_only, got: {artifact_schemas}"
+        )
+
+    def test_real_issue_reviewer_artifact_only_extracted(self):
+        """B2: Real issue-reviewer.md artifact-only schema is correctly extracted."""
+        claude_path = REPO_ROOT_FOR_INTEGRATION / ".claude" / "agents" / "issue-reviewer.md"
+        if not claude_path.exists():
+            pytest.skip("Real .claude/agents/issue-reviewer.md not accessible")
+        text = claude_path.read_text(encoding="utf-8")
+        final = MOD.extract_final_output_schema_from_claude(text)
+        artifact_only = MOD.extract_artifact_only_schemas_from_claude(text, final)
+        # issue-reviewer.md has '### 内部処理用 REVIEW_ISSUE_RESULT_V1（artifact のみ）'
+        assert "REVIEW_ISSUE_RESULT_V1" in artifact_only, (
+            f"B2: Real file should have REVIEW_ISSUE_RESULT_V1 as artifact-only, "
+            f"but got: {artifact_only} (final={final})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B3: drift produces STATUS:fail (not warn)
+# ---------------------------------------------------------------------------
+
+class TestB3DriftIsFail:
+    def test_schema_drift_produces_fail(self, tmp_path: Path):
+        """B3: schema drift -> STATUS: fail (not warn)."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(output_schema="ISSUE_REVIEW_COMPACT_V2"),
+            output_schema_codex="ISSUE_REVIEW_RESULT_COMPACT_V1",
+        )
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "fail", (
+            f"B3: Schema drift must produce STATUS:fail, got: {data['STATUS']}"
+        )
+        assert result.returncode == 1, (
+            f"B3: Schema drift must produce exit 1, got: {result.returncode}"
+        )
+
+    def test_permission_drift_produces_fail(self, tmp_path: Path):
+        """B3: permission drift -> STATUS: fail."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(permission_mode="acceptEdits"),
+            codex_permissions="loop-protocol-readonly",
+        )
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "fail", (
+            f"B3: Permission drift must produce STATUS:fail, got: {data['STATUS']}"
+        )
+
+    def test_delegation_drift_produces_fail(self, tmp_path: Path):
+        """B3: delegation drift -> STATUS: fail."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Edit"]),
+            max_depth=1,
+        )
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "fail", (
+            f"B3: Delegation drift must produce STATUS:fail, got: {data['STATUS']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B4: real repo integration test
+# ---------------------------------------------------------------------------
+
+class TestB4RealRepoParity:
+    def test_real_repo_parity(self):
+        """B4: Real repo parity check produces no schema/permission/delegation drift.
+
+        Runs the parity script against actual .claude/agents/ and .codex/agents/ files.
+        Schema/permission/delegation drift would indicate a real config mismatch that
+        must be fixed before merging.
+        """
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--format", "json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(REPO_ROOT_FOR_INTEGRATION),
+        )
+        assert result.stdout, f"B4: parity script produced no stdout. stderr={result.stderr!r}"
+        data = json.loads(result.stdout)
+
+        # No hard failures (missing files, name mismatches, etc.)
+        assert data["failures"] == [], (
+            f"B4: Unexpected hard failures in real repo parity: {data['failures']}"
+        )
+
+        # No schema/permission/delegation drift
+        schema_drifts = [d for d in data["drift"] if d["rule_id"] == "SCHEMA_PARITY_001"]
+        perm_drifts = [d for d in data["drift"] if d["rule_id"] == "PERMISSION_BOUNDARY_001"]
+        deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
+
+        assert schema_drifts == [], (
+            f"B4: Unexpected schema drift in real repo: {schema_drifts}"
+        )
+        assert perm_drifts == [], (
+            f"B4: Unexpected permission drift in real repo: {perm_drifts}"
+        )
+        assert deleg_drifts == [], (
+            f"B4: Unexpected delegation drift in real repo: {deleg_drifts}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B5: Claude nested delegation 3-value logic
+# ---------------------------------------------------------------------------
+
+class TestB5NestedDelegation3Value:
+    def test_tools_key_without_agent_is_blocked(self, tmp_path: Path):
+        """B5: Explicit tools allowlist without Agent -> nested_delegation_blocked=True."""
+        claude_text = _claude_md(tools=["Bash", "Read"], disallowed_tools=[])
+        claude_path = tmp_path / "issue-reviewer.md"
+        claude_path.write_text(claude_text, encoding="utf-8")
+        facts = MOD.extract_claude_facts("issue-reviewer", claude_path, claude_text)
+        assert facts.nested_delegation_blocked is True, (
+            f"B5: tools=[Bash,Read] without Agent should be blocked, got: "
+            f"{facts.nested_delegation_blocked}"
+        )
+
+    def test_no_tools_key_is_unknown(self, tmp_path: Path):
+        """B5: No tools key in frontmatter -> nested_delegation_blocked=None (unknown)."""
+        # Build a minimal claude md without a tools key
+        text = (
+            "---\n"
+            "name: issue-reviewer\n"
+            "model: haiku\n"
+            "permissionMode: dontAsk\n"
+            "disallowedTools: []\n"
+            "---\n\n"
+            "## 出力契約（ISSUE_REVIEW_RESULT_COMPACT_V1）\n"
+            "\nRUNTIME\n- runtime_dependency_status: codex_skill_required\n"
+            "- runtime_followup_route: review-issue\n"
+        )
+        claude_path = tmp_path / "issue-reviewer.md"
+        claude_path.write_text(text, encoding="utf-8")
+        facts = MOD.extract_claude_facts("issue-reviewer", claude_path, text)
+        assert facts.nested_delegation_blocked is None, (
+            f"B5: No tools key should yield blocked=None (unknown), got: "
+            f"{facts.nested_delegation_blocked}"
+        )
+
+    def test_tools_key_with_agent_is_allowed(self, tmp_path: Path):
+        """B5: Explicit tools allowlist that includes Agent -> nested_delegation_blocked=False."""
+        claude_text = _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=[])
+        claude_path = tmp_path / "issue-reviewer.md"
+        claude_path.write_text(claude_text, encoding="utf-8")
+        facts = MOD.extract_claude_facts("issue-reviewer", claude_path, claude_text)
+        assert facts.nested_delegation_blocked is False, (
+            f"B5: tools with Agent should be allowed, got: {facts.nested_delegation_blocked}"
+        )
+
+    def test_disallowed_takes_priority_over_tools(self, tmp_path: Path):
+        """B5: disallowedTools with Agent overrides tools allowlist (blocked takes priority)."""
+        claude_text = _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Agent"])
+        claude_path = tmp_path / "issue-reviewer.md"
+        claude_path.write_text(claude_text, encoding="utf-8")
+        facts = MOD.extract_claude_facts("issue-reviewer", claude_path, claude_text)
+        assert facts.nested_delegation_blocked is True, (
+            f"B5: disallowedTools Agent must override tools Agent, got: "
+            f"{facts.nested_delegation_blocked}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B7: DECLARED_PERMISSION includes tools and disallowedTools
+# ---------------------------------------------------------------------------
+
+class TestB7PermissionReportTools:
+    def test_declared_permission_includes_claude_detail(self, tmp_path: Path):
+        """B7: DECLARED_PERMISSION in permission report includes claude_detail with tools info."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(
+                permission_mode="dontAsk",
+                tools=["Bash", "Read"],
+                disallowed_tools=["Agent", "Edit"],
+            ),
+            codex_permissions="loop-protocol-readonly",
+        )
+        data = json.loads(result.stdout)
+        pr = data["permission_report"][0]
+        dp = pr["DECLARED_PERMISSION"]
+        assert "claude_detail" in dp, f"B7: claude_detail missing from DECLARED_PERMISSION: {dp}"
+        detail = dp["claude_detail"]
+        assert "permissionMode" in detail
+        assert "tools" in detail
+        assert "disallowedTools" in detail
+        assert "Bash" in detail["tools"]
+        assert "Agent" in detail["disallowedTools"]
+
+    def test_declared_permission_tools_omitted_when_empty(self, tmp_path: Path):
+        """B7: claude_detail omits tools/disallowedTools keys when lists are empty."""
+        # Build a claude md with empty tools and disallowed
+        text = (
+            "---\n"
+            "name: issue-reviewer\n"
+            "model: haiku\n"
+            "permissionMode: dontAsk\n"
+            "---\n\n"
+            "## 出力契約（ISSUE_REVIEW_RESULT_COMPACT_V1）\n"
+            "\nRUNTIME\n- runtime_dependency_status: codex_skill_required\n"
+            "- runtime_followup_route: review-issue\n"
+        )
+        tmp_claude_path = tmp_path / "issue-reviewer.md"
+        tmp_claude_path.write_text(text, encoding="utf-8")
+        facts = MOD.extract_claude_facts("issue-reviewer", tmp_claude_path, text)
+        assert facts.claude_tools == []
+        assert facts.claude_disallowed_tools == []
+
+
+# ---------------------------------------------------------------------------
+# B8: find_line_number guards against empty/None
+# ---------------------------------------------------------------------------
+
+class TestB8FindLineNumber:
+    def test_empty_search_returns_zero(self):
+        """B8: find_line_number with empty string returns 0, not 1."""
+        text = "line one\nline two\n"
+        result = MOD.find_line_number(text, "")
+        assert result == 0, f"B8: empty search should return 0, got: {result}"
+
+    def test_none_search_returns_zero(self):
+        """B8: find_line_number with None returns 0."""
+        text = "line one\nline two\n"
+        result = MOD.find_line_number(text, None)
+        assert result == 0, f"B8: None search should return 0, got: {result}"
+
+    def test_normal_search_still_works(self):
+        """B8: find_line_number with valid search still returns correct line."""
+        text = "alpha\nbeta\ngamma\n"
+        result = MOD.find_line_number(text, "beta")
+        assert result == 2, f"B8: 'beta' should be at line 2, got: {result}"
+
+    def test_not_found_returns_zero(self):
+        """B8: find_line_number returns 0 when search string not found."""
+        text = "alpha\nbeta\n"
+        result = MOD.find_line_number(text, "delta")
+        assert result == 0, f"B8: missing search should return 0, got: {result}"
