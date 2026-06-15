@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/agent-retro-index.schema.json",
+  "title": "agent_retro_index/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generation_verdict",
+    "entries",
+    "orphan_reports",
+    "ambiguous_links"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "agent_retro_index/v1"
+    },
+    "generation_verdict": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "blocked"
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    },
+    "orphan_reports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/orphanReport"
+      }
+    },
+    "ambiguous_links": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ambiguousLink"
+      }
+    }
+  },
+  "$defs": {
+    "ambiguousLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_digest",
+        "reason"
+      ],
+      "properties": {
+        "report_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_comment_url",
+        "report_digest",
+        "issue",
+        "pr",
+        "merge_sha",
+        "tags",
+        "friction_summary",
+        "quality_signals",
+        "follow_up_issues"
+      ],
+      "properties": {
+        "report_comment_url": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 240
+        },
+        "report_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pr": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "merge_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "friction_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "quality_signals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        },
+        "follow_up_issues": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "orphanReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_digest",
+        "reason"
+      ],
+      "properties": {
+        "report_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

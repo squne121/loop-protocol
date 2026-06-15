@@ -1,0 +1,423 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/squne121/loop-protocol/docs/schemas/agent-run-report.schema.json",
+  "title": "agent_run_report/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "public_surface_kind",
+    "public_safety",
+    "actor",
+    "authority",
+    "token_usage",
+    "manifest_refs",
+    "evidence_refs",
+    "commands_summary",
+    "docs_read_refs"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "agent_run_report/v1"
+    },
+    "public_surface_kind": {
+      "type": "string",
+      "enum": [
+        "github_issue_comment",
+        "github_pr_comment",
+        "none"
+      ]
+    },
+    "public_safety": {
+      "$ref": "#/$defs/publicSafety"
+    },
+    "actor": {
+      "$ref": "#/$defs/actor"
+    },
+    "authority": {
+      "$ref": "#/$defs/authority"
+    },
+    "token_usage": {
+      "$ref": "#/$defs/tokenUsage"
+    },
+    "manifest_refs": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/opaqueReference"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/opaqueReference"
+      }
+    },
+    "commands_summary": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/commandSummary"
+      }
+    },
+    "docs_read_refs": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/docReadRef"
+      }
+    }
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "name"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "ai_agent",
+            "github_action",
+            "human"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "basis",
+        "evidence_refs"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "authoritative",
+            "derived",
+            "non_authoritative"
+          ]
+        },
+        "basis": {
+          "type": "string",
+          "enum": [
+            "ai_self_report",
+            "validated_manifest_ref",
+            "github_action_check",
+            "human_attestation"
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        }
+      }
+    },
+    "commandSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_label",
+        "exit_code",
+        "verdict",
+        "summary",
+        "artifact_ref"
+      ],
+      "properties": {
+        "command_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "skip"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "artifact_ref": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "docReadRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_kind",
+        "ref",
+        "summary"
+      ],
+      "properties": {
+        "ref_kind": {
+          "type": "string",
+          "enum": [
+            "doc_path",
+            "issue",
+            "pull_request",
+            "url"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        }
+      }
+    },
+    "opaqueReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "validation_verdict"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "github_actions_artifact",
+            "workflow_run",
+            "schema_ref",
+            "github_comment",
+            "manifest_digest"
+          ]
+        },
+        "artifact_id": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,20}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow_run_url": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 240
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_ref": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ref": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "digest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "validation_verdict": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "publicSafety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "redaction_status",
+        "checked_by",
+        "validator_version",
+        "checked_at",
+        "verdict",
+        "blocked_reasons"
+      ],
+      "properties": {
+        "redaction_status": {
+          "type": "string",
+          "enum": [
+            "clean",
+            "blocked"
+          ]
+        },
+        "checked_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "validator_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "checked_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        }
+      }
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "tokenUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "source",
+        "prompt",
+        "completion",
+        "total"
+      ],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": [
+            "available",
+            "unavailable"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "none",
+            "openai_api",
+            "entire_cli",
+            "unknown"
+          ]
+        },
+        "prompt": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completion": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "total": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
