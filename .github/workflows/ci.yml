@@ -509,15 +509,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Verify Playwright Docker image version
-        run: |
-          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
-          EXPECTED_PW="1.60.0"
-          if [ "$PW_VERSION" != "$EXPECTED_PW" ]; then
-            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image is v$EXPECTED_PW. Update container.image in ci.yml."
-            exit 1
-          fi
-          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$EXPECTED_PW"
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -537,6 +528,15 @@ jobs:
             return $status
           }
           run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          EXPECTED_PW="1.60.0"
+          if [ "$PW_VERSION" != "$EXPECTED_PW" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image is v$EXPECTED_PW. Update container.image in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$EXPECTED_PW"
       - name: Build for E2E (timed)
         id: timed-build-e2e
         run: |
