@@ -501,12 +501,23 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_VERSION: "1.60.0"
+    container:
+      image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
+      options: --ipc=host
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-node-pnpm
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable pnpm
+          corepack prepare pnpm@11.7.0 --activate
       - name: Install dependencies (timed)
         id: timed-pnpm-install
         run: |
@@ -526,6 +537,14 @@ jobs:
             return $status
           }
           run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          if [ "$PW_VERSION" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image expects v$PLAYWRIGHT_VERSION. Update PLAYWRIGHT_VERSION and container.image digest in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$PLAYWRIGHT_VERSION"
       - name: Build for E2E (timed)
         id: timed-build-e2e
         run: |
@@ -545,25 +564,6 @@ jobs:
             return $status
           }
           run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
-      - name: Install Playwright Chromium browser (timed)
-        id: timed-playwright-install
-        run: |
-          run_timed() {
-            local step_id="$1"; shift
-            local start_ms end_ms elapsed_ms status
-            start_ms=$(date +%s%3N)
-            set +e
-            "$@"
-            status=$?
-            set -e
-            end_ms=$(date +%s%3N)
-            elapsed_ms=$((end_ms - start_ms))
-            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
-              "$step_id" "$step_id" "$status" "$elapsed_ms" \
-              >> measurements.jsonl
-            return $status
-          }
-          run_timed playwright_install pnpm playwright:install:ci
       - name: Run E2E tests (timed)
         id: timed-e2e
         run: |
