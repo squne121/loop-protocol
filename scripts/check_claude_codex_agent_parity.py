@@ -511,7 +511,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex-config", type=Path, default=None)
     parser.add_argument("--expectation-path", type=Path, default=None,
                         help="Override path to expected-runtime-contract.json (for testing)")
-    args = parser.parse_args(argv)
+    # parse_known_args を使用: exec() 経由で呼ばれた際に sys.argv に残る
+    # 親スクリプト (check_codex_agent_config.py 等) の引数を無視するため
+    args, _ = parser.parse_known_args(argv)
 
     claude_agent_dir = args.claude_agent_dir or (REPO_ROOT / ".claude/agents")
     codex_agent_dir = args.codex_agent_dir or (REPO_ROOT / ".codex/agents")
