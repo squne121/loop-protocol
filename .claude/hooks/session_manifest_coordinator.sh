@@ -33,6 +33,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GUARD_SCRIPT="${SESSION_MANIFEST_GUARD:-${SCRIPT_DIR}/session_recording_policy_guard.sh}"
 PRODUCER_SCRIPT="${SESSION_MANIFEST_PRODUCER:-${SCRIPT_DIR}/generate_session_manifest_from_hook.mjs}"
+SCOPE_ROLLUP_CAPTURE_SCRIPT="${SCOPE_ROLLUP_CAPTURE_SCRIPT:-${SCRIPT_DIR}/capture_scope_rollup_final_response.py}"
+SCOPE_ROLLUP_CAPTURE_PYTHON="${SCOPE_ROLLUP_CAPTURE_PYTHON:-python3}"
+SCOPE_ROLLUP_CAPTURE_DIR="${SCOPE_ROLLUP_CAPTURE_DIR:-/tmp}"
 NODE_BIN="${SESSION_MANIFEST_NODE:-node}"
 
 # ---------------------------------------------------------------------------
@@ -45,6 +48,65 @@ _STDIN_FILE="${_TMPDIR}/stdin.json"
 
 # AC7: save stdin exactly once; both guard and producer receive the same payload
 cat > "$_STDIN_FILE"
+
+# ---------------------------------------------------------------------------
+# Scope rollup capture (best-effort, fail-closed in preparation)
+# ---------------------------------------------------------------------------
+if [[ -f "$SCOPE_ROLLUP_CAPTURE_SCRIPT" ]]; then
+    if ! "$SCOPE_ROLLUP_CAPTURE_PYTHON" -c "import yaml" >/dev/null 2>&1; then
+        "$SCOPE_ROLLUP_CAPTURE_PYTHON" - "$_STDIN_FILE" "$SCOPE_ROLLUP_CAPTURE_DIR" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+stdin_file = Path(sys.argv[1])
+capture_dir = Path(sys.argv[2]).resolve()
+payload = json.loads(stdin_file.read_text(encoding="utf-8"))
+message = payload.get("last_assistant_message") or ""
+match = re.search(r"^\s*invocation_id:\s*['\"]?([A-Za-z0-9._:-]+)['\"]?\s*$", message, re.MULTILINE)
+invocation_id = match.group(1) if match else None
+safe_invocation_id = re.sub(r"[^A-Za-z0-9._-]+", "_", invocation_id) if invocation_id else None
+payload_digest = hashlib.sha256(
+    json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+).hexdigest()[:12]
+stem = f"scope_rollup_{safe_invocation_id}" if safe_invocation_id else f"scope_rollup_unsupported_hook_unavailable_{payload_digest}"
+record_path = capture_dir / f"{stem}.capture.yaml"
+if not record_path.exists():
+    record_path.write_text(
+        "\n".join(
+            [
+                "SCOPE_ROLLUP_CAPTURE_RESULT_V1:",
+                "  capture_mode: unsupported",
+                "  capture_status: hook_unavailable",
+                "  parser_status: not_applicable",
+                "  capture_routing_action: stop_human",
+                "  routing_action: stop_human",
+                f"  agent_type: {payload.get('agent_type')!s}",
+                f"  invocation_id: {invocation_id!s}",
+                "  capture_path: null",
+                "  capture_sha256: null",
+                "  capture_source: last_assistant_message",
+                "  notes:",
+                "    - hook runtime python is missing PyYAML",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+PY
+        echo "[session_manifest_coordinator] info: scope-rollup capture python lacks PyYAML; wrote hook_unavailable record" >&2
+    else
+        _SCOPE_ROLLUP_CAPTURE_EXIT=0
+        "$SCOPE_ROLLUP_CAPTURE_PYTHON" "$SCOPE_ROLLUP_CAPTURE_SCRIPT" < "$_STDIN_FILE" \
+            >"$_TMPDIR/scope_rollup_capture.stdout" 2>"$_TMPDIR/scope_rollup_capture.stderr" || _SCOPE_ROLLUP_CAPTURE_EXIT=$?
+        cat "$_TMPDIR/scope_rollup_capture.stderr" >&2 2>/dev/null || true
+        if [[ "$_SCOPE_ROLLUP_CAPTURE_EXIT" -ne 0 ]]; then
+            echo "[session_manifest_coordinator] info: scope-rollup capture exited $_SCOPE_ROLLUP_CAPTURE_EXIT — preparation must fail closed if capture is required" >&2
+        fi
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # AC6: stop_hook_active short-circuit

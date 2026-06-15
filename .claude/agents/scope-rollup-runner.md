@@ -20,6 +20,7 @@ permissionMode: auto
 ## 目的
 
 `impl-review-loop` preparation の Step 2.5 で呼び出され、`plan_issue_scope_rollup.py` を実行して `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に出力する。
+この最終応答は `SubagentStop` hook が `last_assistant_message` から deterministic capture する control-plane artifact でもある。
 
 GitHub への書き込み / repo への書き込みは一切行わない。read-only 実行のみ。
 
@@ -40,6 +41,13 @@ GitHub への書き込み / repo への書き込みは一切行わない。read-
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: failed
+  schema_version: 1
+  repo: "<repo or unknown>"
+  current_issue: <issue_number or -1>
+  invocation_id: "<invocation_id or missing>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA or unknown>"
   error: "INSUFFICIENT_INPUT: issue_number / repo / invocation_id のいずれかが欠落"
 ```
 
@@ -54,8 +62,14 @@ test -f .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "plan_issue_scope_rollup.py が見つからない"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<unknown>"
 ```
 
 ### 3. データ取得
@@ -91,8 +105,14 @@ gh pr list \
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "gh コマンド実行失敗（permission denied または network error）"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA or unknown>"
 ```
 
 ### 4. SHA256 計算
@@ -127,8 +147,14 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rol
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0 かつ 非 2）"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA>"
 ```
 
 ### 6. verify_scope_rollup_result.py による結果検証
@@ -143,8 +169,14 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/verify_scope_rollup_
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "verify_scope_rollup_result.py が verified 以外を返した"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA>"
 ```
 
 ### 7. result sha256 計算
@@ -155,7 +187,8 @@ RESULT_SHA=$(uv run python3 -c "import hashlib, sys; d=open(sys.argv[1],'rb').re
 
 ### 8. ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に出力
 
-スクリプト実行および検証成功時に以下の marker を stdout に出力する:
+スクリプト実行および検証成功時に以下の marker を **最終応答の唯一の fenced YAML block** として stdout に出力する。
+`SubagentStop` hook は `agent_type == scope-rollup-runner` かつ `last_assistant_message` のみを capture source とし、`agent_transcript_path` は provenance 用であって capture source ではない。
 
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
@@ -188,6 +221,27 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 ```
 
 **`plan:` フィールドは含めない**。raw plan JSON は `raw_plan_location` のファイルとして保持し、marker には inline 埋め込みしない。これにより main context への raw output 流入を防ぐ。
+
+### 8.5. Final Response Capture Contract
+
+`SubagentStop` hook 側の capture contract:
+
+```yaml
+SCOPE_ROLLUP_CAPTURE_RESULT_V1:
+  capture_mode: subagent_stop_hook
+  capture_status: captured | duplicate_invocation | stale_capture | parser_rejected | write_failed
+  parser_status: ok | failed | runner_unavailable | marker_missing | marker_malformed | marker_ambiguous | rejected
+  routing_action: continue | stop_human
+  agent_type: scope-rollup-runner
+  invocation_id: "<invocation_id>"
+  capture_source: last_assistant_message
+  capture_path: "/tmp/scope_rollup_<invocation_id>.txt"
+  capture_sha256: "<sha256 of exact captured bytes>"
+```
+
+- `capture_status: captured` のときだけ `/tmp/scope_rollup_<invocation_id>.txt` が作成される。
+- `agent_type != scope-rollup-runner`、empty final response、duplicate invocation、stale capture、marker parse 不能は fail-closed であり、capture file は作成されないか再利用されない。
+- no-hook route はこの agent ではサポートしない。`manual_main_capture` を前提にせず、capture 不在時は preparation が `unsupported` / `hook_unavailable` として `stop_human` に送る。
 
 **`result_sha256` の計算方法**（ファイルバイト列 sha256）: uv run python3 の hashlib 経由で計算する（外部コマンド非依存）。
 
