@@ -22,6 +22,7 @@ import yaml
 
 MARKER_NAME = "ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1"
 OUTPUT_MARKER = "SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"
+CAPTURE_MARKER = "SCOPE_ROLLUP_CAPTURE_RESULT_V1"
 
 ALLOWED_MARKER_STATUS = {"ok", "failed", "runner_unavailable"}
 REQUIRED_FIELDS_BASE = {
@@ -36,6 +37,10 @@ REQUIRED_FIELDS_BASE = {
 REQUIRE_RESULT_FIELDS = {"raw_plan_location", "result_sha256"}
 
 FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _safe_invocation_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value)
 
 
 def _sha256_bytes(raw: bytes) -> str:
@@ -129,6 +134,16 @@ def _extract_marker_blocks(output: str) -> list[dict[str, Any]]:
     return blocks
 
 
+def _load_capture_sidecar(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    parsed = _load_yaml_no_duplicate_keys(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        return None
+    capture = parsed.get(CAPTURE_MARKER)
+    return capture if isinstance(capture, dict) else None
+
+
 def _validate_tmp_raw_plan_path(
     raw_plan_path: Path,
     invocation_id: str,
@@ -172,6 +187,8 @@ def _validate_tmp_raw_plan_path(
 
 def _validate_marker_payload(
     marker_payload: dict[str, Any],
+    assistant_output_file: Path,
+    capture_sidecar_file: Path,
     expected_repo: str,
     expected_issue_number: int,
     expected_invocation_id: str,
@@ -246,6 +263,33 @@ def _validate_marker_payload(
     if _sha256_file(raw_plan_path) != str(result_block.get("result_sha256", "")):
         return "rejected", "scope_rollup_marker_malformed", "result_sha_mismatch", False
 
+    capture_sidecar = _load_capture_sidecar(capture_sidecar_file)
+    if capture_sidecar is None:
+        return "rejected", "scope_rollup_marker_malformed", "capture_sidecar_missing", False
+
+    expected_capture_path = str(assistant_output_file.resolve())
+    capture_path = str(capture_sidecar.get("capture_path", ""))
+    if capture_sidecar.get("capture_mode") != "subagent_stop_hook":
+        return "rejected", "scope_rollup_marker_malformed", "capture_mode_invalid", False
+    if capture_sidecar.get("capture_status") != "captured":
+        return "rejected", "scope_rollup_marker_malformed", "capture_status_invalid", False
+    if capture_sidecar.get("agent_type") != "scope-rollup-runner":
+        return "rejected", "scope_rollup_marker_malformed", "capture_agent_type_mismatch", False
+    if str(capture_sidecar.get("invocation_id", "")) != str(expected_invocation_id):
+        return "rejected", "scope_rollup_marker_malformed", "capture_invocation_id_mismatch", False
+    if capture_sidecar.get("capture_source") != "last_assistant_message":
+        return "rejected", "scope_rollup_marker_malformed", "capture_source_invalid", False
+    if capture_path != expected_capture_path:
+        return "rejected", "scope_rollup_marker_malformed", "capture_path_mismatch", False
+    if capture_sidecar.get("capture_routing_action", capture_sidecar.get("routing_action")) != "continue":
+        return "rejected", "scope_rollup_marker_malformed", "capture_routing_action_invalid", False
+    if not assistant_output_file.exists():
+        return "rejected", "scope_rollup_marker_malformed", "capture_file_missing", False
+    capture_sha = str(capture_sidecar.get("capture_sha256", ""))
+    actual_capture_sha = _sha256_file(assistant_output_file)
+    if capture_sha != actual_capture_sha:
+        return "rejected", "scope_rollup_marker_malformed", "capture_sha_mismatch", False
+
     verifier = _load_issue_refinement_verifier()
     if verifier is None:
         return "rejected", "scope_rollup_marker_malformed", "verify_status_not_verified", False
@@ -278,6 +322,8 @@ def _format_result(
 def parse_scope_rollup_output(
     *,
     assistant_output: str,
+    assistant_output_file: Path,
+    capture_sidecar_file: Path,
     repo: str,
     issue_number: int,
     invocation_id: str,
@@ -316,6 +362,8 @@ def parse_scope_rollup_output(
 
     parse_status, termination_cause, reject_reason, raw_allowed = _validate_marker_payload(
         marker_payload=marker_payload,
+        assistant_output_file=assistant_output_file,
+        capture_sidecar_file=capture_sidecar_file,
         expected_repo=repo,
         expected_issue_number=issue_number,
         expected_invocation_id=invocation_id,
@@ -367,6 +415,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--assistant-output-file", required=True)
+    parser.add_argument("--capture-sidecar-file", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--invocation-id", required=True)
@@ -379,6 +428,7 @@ def main() -> None:
     args = parse_args()
 
     output_file = Path(args.assistant_output_file)
+    capture_sidecar_file = Path(args.capture_sidecar_file)
     if not output_file.exists():
         result = _format_result(
             status="marker_missing",
@@ -394,6 +444,8 @@ def main() -> None:
     try:
         result = parse_scope_rollup_output(
             assistant_output=assistant_output,
+            assistant_output_file=output_file.resolve(),
+            capture_sidecar_file=capture_sidecar_file.resolve(),
             repo=args.repo,
             issue_number=args.issue_number,
             invocation_id=args.invocation_id,
