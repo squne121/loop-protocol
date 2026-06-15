@@ -1,0 +1,19 @@
+description: apply_pr_review_fix_delta is pr-review-judge schema, not accepted → fail-closed
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: true
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: CLEAN
+  required_auto_actions:
+  - kind: apply_pr_review_fix_delta
+    executor: implementation-worker
+    skill: implement-issue
+    blocking_merge_ready: true
+    expected_head_sha: abc123def456
+test_verdict: null
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: rejected_action_kind:apply_pr_review_fix_delta

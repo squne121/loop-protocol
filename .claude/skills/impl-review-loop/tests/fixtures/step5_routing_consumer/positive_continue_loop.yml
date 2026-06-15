@@ -1,0 +1,13 @@
+description: REQUEST_CHANGES → continue_loop
+loop_verdict:
+  verdict: REQUEST_CHANGES
+  merge_ready: false
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: CLEAN
+  required_auto_actions: []
+test_verdict: null
+expected:
+  route: continue_loop
+  fail_closed: false
