@@ -106,15 +106,23 @@ recorded_at: "2026-06-14T13:15:00Z"
 
 ## Save failure path（AC7）
 
-| シナリオ | 証明先 |
+| シナリオ | 対応テスト |
 |---|---|
-| corrupt JSON | `tests/LocalGameStorage.test.ts` (#621 系 unit test) |
-| unsupported schema | `tests/LocalGameStorage.test.ts` (#621 系 unit test) |
-| QuotaExceededError | `tests/LocalGameStorage.test.ts` (#739 系 unit test) |
-| SecurityError | `tests/LocalGameStorage.test.ts` (#739 系 unit test) |
-| write failure preserves older readable snapshot | `tests/LocalGameStorage.test.ts` (#739 系 integration test) |
+| corrupt JSON | `tests/LocalGameStorage.test.ts` - `'returns null for corrupt JSON'`（#621 系 unit test） |
+| unsupported schema | `tests/LocalGameStorage.test.ts` - `'returns null for unsupported schema version'`（#621 系 unit test） |
+| QuotaExceededError | `tests/LocalGameStorage.test.ts` - `'throws on quota exceeded'`（#739 系 unit test） |
+| SecurityError | `tests/LocalGameStorage.test.ts` - `'throws on security error'`（#739 系 unit test） |
+| write failure preserves older readable snapshot | `tests/LocalGameStorage.test.ts`（#739 系 integration test） |
 
 Save failure / corrupt JSON / unsupported schema / QuotaExceededError / SecurityError は #621/#739 系の unit/integration test として参照する（本 E2E のスコープ外）。
+
+## Persistence Caveats
+
+- 永続化はブラウザローカルの MVP storage である（クラウド同期なし）。
+- localStorage は origin スコープで動作し、ベストエフォート・ユーザー削除可能。
+- プライベートブラウジングでは最後の private tab を閉じると localStorage が消える。
+- QuotaExceededError / SecurityError は #621/#739 unit test でカバー（E2E 未証明）。
+- 公開リリース artifact は生成しない。これはビルド検証のみである。
 
 ## Scope boundary
 

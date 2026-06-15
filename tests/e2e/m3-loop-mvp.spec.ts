@@ -459,6 +459,16 @@ test(
       'resources in localStorage must persist across reload (AC5)',
     ).toBe(resourcesBeforeReload)
 
+    // AC5: B1 design — No auto-load on startup.
+    // After reload, createInitialGameState() initializes with resources=0 (not loaded from storage).
+    // HUD [data-field="resources"] reflects the runtime state (resources=0), not the stored snapshot.
+    // The persistence guarantee is that the stored snapshot is intact (verified above via localStorage).
+    // Load Game button would apply the snapshot, but that is a separate user action, not auto-load.
+    //
+    // AC5 DOM assertion: confirm-result button must be disabled after reload (phase is not 'result').
+    // This proves the result state was NOT restored, and combat runtime is fresh.
+    await expect(page.locator('[data-action="confirm-result"]')).toBeDisabled({ timeout: 5_000 })
+
     // AC5: combat runtime state must NOT be restored from save.
     // After reload + E2E auto-start, sortie.result is null (fresh state).
     // The app does NOT restore combat runtime from localStorage.
@@ -467,6 +477,10 @@ test(
       stateAfterReload.sortie.result,
       'sortie.result must be null after reload — combat runtime not restored (AC5)',
     ).toBeNull()
+    expect(
+      stateAfterReload.loopPhase,
+      'loopPhase must not be result after reload — result phase is not restored (AC5)',
+    ).not.toBe('result')
   },
 )
 
@@ -553,6 +567,19 @@ test(
 
     // --- Reload page ---
     await page.reload()
+
+    // AC6: reload 直後に confirm-result ボタンが disabled であることを確認。
+    // HudController: confirmResultButton.disabled = state.loopPhase !== 'result'
+    // After reload, loopPhase is NOT 'result' (E2E auto-start transitions to preparation/running).
+    // This proves the old result cannot be re-claimed via the UI.
+    await expect(confirmButton).toBeDisabled({ timeout: 5_000 })
+
+    // Additionally: verify loopPhase is not 'result' after reload (state-level proof)
+    const stateJustAfterReload = await getGameState(page)
+    expect(
+      stateJustAfterReload.loopPhase,
+      'loopPhase must not be result after reload — old result state is not restored (AC6)',
+    ).not.toBe('result')
 
     // After reload: short sortie fires again. Wait for second timeout.
     await expect
