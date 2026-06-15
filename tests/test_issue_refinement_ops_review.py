@@ -60,7 +60,7 @@ class TestIssueRefinementOpsReviewJsonCompactBudget:
         assert isinstance(spec, PlanSpec)
         assert spec.task_kind == "issue-refinement-ops-review"
 
-    def test_issue_refinement_ops_review_json_output_under_budget(self):
+    def test_issue_refinement_ops_review_json_compact_budget(self):
         """GIVEN issue-refinement-ops-review --json WHEN run THEN output <= 2048 UTF-8 bytes."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
         result = subprocess.run(
@@ -320,7 +320,7 @@ class TestIssueRefinementOpsReviewDoNotReadInitialOnly:
 
 
 class TestIssueRefinementOpsReviewArtifactOnly:
-    def test_inventory_artifact_output_to_file_only(self):
+    def test_inventory_artifact_only_output_to_file(self):
         """GIVEN issue-refinement-ops-review with inventory WHEN artifact written THEN stdout is EVIDENCE key only."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -427,7 +427,7 @@ class TestIssueRefinementOpsReviewSecurity:
 
 
 class TestSharedRegistrySpec:
-    def test_both_task_kinds_in_registry(self):
+    def test_shared_registry_both_task_kinds(self):
         """GIVEN PLAN_REGISTRY WHEN inspected THEN both agent-ops-review and issue-refinement-ops-review registered."""
         assert "agent-ops-review" in PLAN_REGISTRY
         assert "issue-refinement-ops-review" in PLAN_REGISTRY
@@ -454,7 +454,7 @@ class TestSharedRegistrySpec:
         keys2 = set(inv2.keys())
         assert keys1 == keys2, f"Schema keys differ: {keys1} vs {keys2}"
 
-    def test_status_logic_shared(self):
+    def test_shared_spec_status_logic(self):
         """GIVEN both task-kinds WHEN built with same repo state THEN same status logic."""
         # This is a trivial test since both use the same function, but it documents the expectation
         tracked = get_tracked_paths_decoded(REPO_ROOT)
