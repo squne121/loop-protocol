@@ -8,8 +8,9 @@ Validates:
 4.  All taxonomy_mapping modes have public_full_transcript_allowed: false
 5.  kill_switch.required_end_state has all required keys
 6.  kill_switch has trigger_conditions (non-empty)
-7.  public_surfaces.github_issue_comment.raw_transcript_allowed == false
-8.  checkpoint_remote.fail_closed_on_unknown_visibility == true
+7.  public_surfaces.github_issue_or_pr_comment subtree exact assertions
+8.  public_surfaces.github_issue_comment compatibility alias remains fail-closed
+9.  checkpoint_remote.fail_closed_on_unknown_visibility == true
 
 Usage:
     python3 .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
@@ -171,18 +172,67 @@ def check_kill_switch_trigger_conditions(data: dict) -> Tuple[bool, str]:
     return True, f"kill_switch.trigger_conditions has {len(tc)} conditions"
 
 
-def check_raw_transcript_false(data: dict) -> Tuple[bool, str]:
-    """Check 7: public_surfaces.github_issue_comment.raw_transcript_allowed == false."""
+def check_public_surface_exactness(data: dict) -> Tuple[bool, str]:
+    """Check 7: canonical Issue/PR comment subtree is exact and fail-closed."""
+    ps = data.get("public_surfaces")
+    if not isinstance(ps, dict):
+        return False, "public_surfaces key missing or not a mapping"
+    comment_surface = ps.get("github_issue_or_pr_comment")
+    if not isinstance(comment_surface, dict):
+        return False, "public_surfaces.github_issue_or_pr_comment missing or not a mapping"
+
+    manifest = comment_surface.get("agent_session_manifest")
+    if not isinstance(manifest, dict):
+        return False, "public_surfaces.github_issue_or_pr_comment.agent_session_manifest missing or not a mapping"
+    if manifest.get("body_allowed") is not False:
+        return False, f"agent_session_manifest.body_allowed={manifest.get('body_allowed')!r} (expected false)"
+    if manifest.get("opaque_ref_allowed") is not True:
+        return False, f"agent_session_manifest.opaque_ref_allowed={manifest.get('opaque_ref_allowed')!r} (expected true)"
+
+    allowed_refs = manifest.get("allowed_refs")
+    if not isinstance(allowed_refs, list) or "artifact_digest" not in allowed_refs:
+        return False, f"agent_session_manifest.allowed_refs missing artifact_digest: {allowed_refs!r}"
+
+    forbidden_content = manifest.get("forbidden_content")
+    required_forbidden = {"full_prompt", "full_command_output", "secret_value"}
+    if not isinstance(forbidden_content, list) or not required_forbidden.issubset(set(forbidden_content)):
+        return False, f"agent_session_manifest.forbidden_content missing required items: {forbidden_content!r}"
+
+    if manifest.get("agent_session_manifest_allowed") is True:
+        return False, "legacy agent_session_manifest_allowed=true resurfaced under canonical subtree"
+
+    for key in ["agent_run_report", "agent_retro_index"]:
+        item = comment_surface.get(key)
+        if not isinstance(item, dict):
+            return False, f"public_surfaces.github_issue_or_pr_comment.{key} missing or not a mapping"
+        if item.get("body_allowed") != "conditional":
+            return False, f"{key}.body_allowed={item.get('body_allowed')!r} (expected 'conditional')"
+        if item.get("live_public_posting") != "forbidden_until_dependencies_merge":
+            return False, (
+                f"{key}.live_public_posting={item.get('live_public_posting')!r} "
+                "(expected 'forbidden_until_dependencies_merge')"
+            )
+
+    return True, "canonical Issue/PR comment subtree is fail-closed and exact"
+
+
+def check_github_issue_comment_alias(data: dict) -> Tuple[bool, str]:
+    """Check 8: legacy alias remains compatibility-only and fail-closed."""
     ps = data.get("public_surfaces")
     if not isinstance(ps, dict):
         return False, "public_surfaces key missing or not a mapping"
     gic = ps.get("github_issue_comment")
     if not isinstance(gic, dict):
         return False, "public_surfaces.github_issue_comment missing or not a mapping"
+    if gic.get("compatibility_alias_of") != "github_issue_or_pr_comment":
+        return False, (
+            "public_surfaces.github_issue_comment.compatibility_alias_of missing or wrong: "
+            f"{gic.get('compatibility_alias_of')!r}"
+        )
     val = gic.get("raw_transcript_allowed")
     if val is not False:
         return False, f"public_surfaces.github_issue_comment.raw_transcript_allowed={val!r} (expected false)"
-    return True, "public_surfaces.github_issue_comment.raw_transcript_allowed: false"
+    return True, "legacy github_issue_comment alias remains compatibility-only and fail-closed"
 
 
 def check_fail_closed_on_unknown_visibility(data: dict) -> Tuple[bool, str]:
@@ -309,37 +359,44 @@ def main() -> int:
         ok6, msg6 = False, "Skipped (YAML parse failed)"
     results.append(("kill_switch.trigger_conditions non-empty", ok6, msg6))
 
-    # 7. raw_transcript_allowed: false
+    # 7. canonical Issue/PR comment subtree exactness
     if ok1:
-        ok7, msg7 = check_raw_transcript_false(yaml_data)
+        ok7, msg7 = check_public_surface_exactness(yaml_data)
     else:
         ok7, msg7 = False, "Skipped (YAML parse failed)"
-    results.append(("public_surfaces.github_issue_comment.raw_transcript_allowed=false", ok7, msg7))
+    results.append(("public_surfaces.github_issue_or_pr_comment exact assertions", ok7, msg7))
 
-    # 8. fail_closed_on_unknown_visibility: true
+    # 8. legacy alias stays fail-closed
     if ok1:
-        ok8, msg8 = check_fail_closed_on_unknown_visibility(yaml_data)
+        ok8, msg8 = check_github_issue_comment_alias(yaml_data)
     else:
         ok8, msg8 = False, "Skipped (YAML parse failed)"
-    results.append(("checkpoint_remote.fail_closed_on_unknown_visibility=true", ok8, msg8))
+    results.append(("public_surfaces.github_issue_comment compatibility alias", ok8, msg8))
 
-    # 9. global safety flags
+    # 9. fail_closed_on_unknown_visibility: true
     if ok1:
-        ok9, msg9 = check_global_safety_flags(yaml_data)
+        ok9, msg9 = check_fail_closed_on_unknown_visibility(yaml_data)
     else:
         ok9, msg9 = False, "Skipped (YAML parse failed)"
-    results.append(("global safety flags (checkpoint_branch/auto_push/manual_review)", ok9, msg9))
+    results.append(("checkpoint_remote.fail_closed_on_unknown_visibility=true", ok9, msg9))
 
-    # 10. source_of_truth path references
+    # 10. global safety flags
     if ok1:
-        ok10, msg10 = check_source_of_truth_paths(yaml_data)
+        ok10, msg10 = check_global_safety_flags(yaml_data)
     else:
         ok10, msg10 = False, "Skipped (YAML parse failed)"
-    results.append(("source_of_truth path references valid", ok10, msg10))
+    results.append(("global safety flags (checkpoint_branch/auto_push/manual_review)", ok10, msg10))
 
-    # 11. verification command patterns in Markdown body
-    ok11, msg11 = check_verification_commands_presence(content)
-    results.append(("verification command patterns present in document", ok11, msg11))
+    # 11. source_of_truth path references
+    if ok1:
+        ok11, msg11 = check_source_of_truth_paths(yaml_data)
+    else:
+        ok11, msg11 = False, "Skipped (YAML parse failed)"
+    results.append(("source_of_truth path references valid", ok11, msg11))
+
+    # 12. verification command patterns in Markdown body
+    ok12, msg12 = check_verification_commands_presence(content)
+    results.append(("verification command patterns present in document", ok12, msg12))
 
     # Print results
     all_pass = True
