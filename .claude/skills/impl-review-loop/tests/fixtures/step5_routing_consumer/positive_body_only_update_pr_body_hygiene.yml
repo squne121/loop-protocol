@@ -1,0 +1,18 @@
+description: APPROVE + CLEAN + update_pr_body_hygiene → route_to_body_only_action
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: true
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: CLEAN
+  required_auto_actions:
+  - kind: update_pr_body_hygiene
+    executor: implementation-worker
+    skill: implement-issue
+    blocking_merge_ready: false
+    expected_head_sha: null
+test_verdict: null
+expected:
+  route: route_to_body_only_action
+  fail_closed: false

@@ -1,0 +1,21 @@
+description: APPROVE + BEHIND + full update_branch matrix → route_to_update_branch
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: BEHIND
+  required_auto_actions:
+  - kind: update_branch
+    executor: implementation-worker
+    skill: implement-issue.update_branch
+    blocking_merge_ready: true
+    mechanical: true
+    expected_head_sha: abc123def456
+test_verdict:
+  branch_behind_main: true
+expected:
+  route: route_to_update_branch
+  fail_closed: false
+  reason_code: null

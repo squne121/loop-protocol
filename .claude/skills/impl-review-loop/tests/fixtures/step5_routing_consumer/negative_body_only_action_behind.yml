@@ -1,0 +1,20 @@
+description: body-only action (ensure_closing_keyword) while BEHIND → fail-closed
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: BEHIND
+  required_auto_actions:
+  - kind: ensure_closing_keyword
+    executor: implementation-worker
+    skill: implement-issue
+    blocking_merge_ready: false
+    expected_head_sha: null
+test_verdict:
+  branch_behind_main: true
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: body_only_action_while_behind
