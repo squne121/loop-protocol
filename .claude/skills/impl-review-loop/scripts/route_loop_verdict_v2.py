@@ -22,7 +22,8 @@ errors:           tuple of human-readable error strings (empty on success)
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
 
@@ -92,9 +93,16 @@ class RouteDecision:
     ]
     fail_closed: bool
     reason_code: str | None
-    selected_action: dict[str, Any] | None
-    rerun_required: dict[str, bool]
+    selected_action: Mapping[str, Any] | None
+    rerun_required: Mapping[str, bool]
     errors: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        # Wrap mutable dicts in MappingProxyType for immutability (Extra 6)
+        if isinstance(self.selected_action, dict):
+            object.__setattr__(self, "selected_action", MappingProxyType(self.selected_action))
+        if isinstance(self.rerun_required, dict):
+            object.__setattr__(self, "rerun_required", MappingProxyType(self.rerun_required))
 
 
 # ---------------------------------------------------------------------------
@@ -282,20 +290,23 @@ def _validate_update_branch_action(
     if blocking_merge_ready is not _CANONICAL_UPDATE_BRANCH_BLOCKING_MERGE_READY:
         return f"mismatched_blocking_merge_ready:{blocking_merge_ready}"
 
-    # mechanical (optional field — if present must be True, absence is also accepted)
+    # mechanical — required, must be True (Blocker 2)
     mechanical = action.get("mechanical")
-    if mechanical is not None:
-        if not isinstance(mechanical, bool):
-            return f"mechanical_not_bool:{mechanical!r}"
-        if mechanical is not _CANONICAL_UPDATE_BRANCH_MECHANICAL:
-            return f"mismatched_mechanical:{mechanical}"
+    if mechanical is None:
+        return "missing_mechanical"
+    if not isinstance(mechanical, bool):
+        return f"mechanical_not_bool:{mechanical!r}"
+    if mechanical is not True:
+        return f"mismatched_mechanical:{mechanical}"
 
-    # expected_head_sha (AC5)
+    # expected_head_sha (AC5) — must be non-null and match reviewed_head_sha (Blocker 1)
     expected_head_sha = action.get("expected_head_sha")
     if expected_head_sha is None:
         return "missing_expected_head_sha"
     if not isinstance(expected_head_sha, str) or not expected_head_sha:
         return "expected_head_sha_empty_or_not_str"
+    if expected_head_sha != reviewed_head_sha:
+        return "mismatched_expected_head_sha"
 
     return None
 
@@ -371,6 +382,22 @@ def route_loop_verdict_v2(
     # ------------------------------------------------------------------
     # Step 5: AC6 — branch_behind_main × merge_state_status invariant
     # ------------------------------------------------------------------
+
+    # Blocker 4: merge_state_status=BEHIND requires test_verdict with branch_behind_main key
+    if merge_state_status == "BEHIND":
+        if test_verdict is None:
+            return _fail(
+                "missing_branch_behind_main_for_BEHIND",
+                "merge_state_status is BEHIND but test_verdict is None. "
+                "branch_behind_main is required to validate the BEHIND state.",
+            )
+        if "branch_behind_main" not in test_verdict:
+            return _fail(
+                "missing_branch_behind_main_for_BEHIND",
+                "merge_state_status is BEHIND but test_verdict.branch_behind_main key is absent. "
+                "branch_behind_main is required to validate the BEHIND state.",
+            )
+
     branch_behind_main: Any = None
     if test_verdict is not None:
         branch_behind_main = test_verdict.get("branch_behind_main")

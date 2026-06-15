@@ -1,6 +1,7 @@
 """
 Regression fixtures for impl-review-loop V2 routing boundary.
 
+Issue #777: Migrated from shadow helper to production consumer import.
 Issue #454 fixes the consumer-side boundary registry for
 TEST_VERDICT_MACHINE/v1.branch_behind_main and
 LOOP_VERDICT_V2.required_auto_actions[].kind|executor|skill|expected_head_sha.
@@ -27,6 +28,7 @@ TEST_VERDICT_MACHINE:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import yaml
@@ -34,13 +36,17 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BOUNDARY_DOC = REPO_ROOT / "docs" / "dev" / "agent-skill-boundaries.md"
 FIXTURES_DIR = REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "tests" / "fixtures"
+STEP5_FIXTURES_DIR = FIXTURES_DIR / "step5_routing_consumer"
 
-ALLOWED_ACTION_KINDS = {
-    "ensure_closing_keyword",
-    "update_pr_body_hygiene",
-    "update_branch",
-    "apply_pr_review_fix_delta",
-}
+# ---------------------------------------------------------------------------
+# Production consumer import (replaces shadow helper)
+# ---------------------------------------------------------------------------
+
+SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
 
 
 def _read(path: Path) -> str:
@@ -51,26 +57,8 @@ def _load_yaml_fixture(name: str) -> dict:
     return yaml.safe_load((FIXTURES_DIR / name).read_text(encoding="utf-8"))
 
 
-def _route_required_auto_action(verdict: dict) -> str:
-    merge_state_status = verdict.get("mergeability", {}).get("merge_state_status")
-    required_auto_actions = verdict.get("required_auto_actions", [])
-    reviewed_head_sha = verdict.get("reviewed_head_sha")
-
-    if merge_state_status == "BEHIND" and not required_auto_actions:
-        return "fail_closed_missing_required_auto_actions"
-
-    for action in required_auto_actions:
-        kind = action.get("kind")
-        if kind not in ALLOWED_ACTION_KINDS:
-            return "fail_closed_unknown_required_auto_actions_kind"
-
-        if kind == "update_branch":
-            expected_head_sha = action.get("expected_head_sha")
-            if not expected_head_sha or expected_head_sha != reviewed_head_sha:
-                return "fail_closed_expected_head_sha_guard"
-            return "route_to_update_branch"
-
-    return "route_to_required_auto_action"
+def _load_step5_fixture(name: str) -> dict:
+    return yaml.safe_load((STEP5_FIXTURES_DIR / name).read_text(encoding="utf-8"))
 
 
 def test_given_boundary_doc_when_read_then_v2_routing_fields_are_registered() -> None:
@@ -89,30 +77,60 @@ def test_given_boundary_doc_when_read_then_stale_v1_wording_is_marked_noncanonic
 
 
 def test_given_v2_update_branch_fixture_when_routed_then_update_branch_path_is_selected() -> None:
-    fixture = _load_yaml_fixture("v2_update_branch_behind.yml")
-    verdict = fixture["verdict"]
-    action = verdict["required_auto_actions"][0]
+    """AC3: APPROVE + BEHIND + full update_branch matrix → route_to_update_branch.
 
+    Uses step5_routing_consumer/positive_update_branch.yml which has the canonical
+    skill=implement-issue.update_branch (not the legacy v2_update_branch_behind.yml
+    which has skill=implement-issue and is fail-closed per AC4).
+    """
+    fx = _load_step5_fixture("positive_update_branch.yml")
+    result = route_loop_verdict_v2(
+        fx["loop_verdict"],
+        test_verdict=fx.get("test_verdict"),
+    )
+    assert result.route == fx["expected"]["route"], (
+        f"Expected route '{fx['expected']['route']}', got '{result.route}'. errors: {result.errors}"
+    )
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+    assert result.selected_action is not None
+    action = dict(result.selected_action)
     assert action["kind"] == "update_branch"
     assert action["executor"] == "implementation-worker"
-    assert action["skill"] == "implement-issue"
-    assert action["expected_head_sha"] == verdict["reviewed_head_sha"]
-    assert _route_required_auto_action(verdict) == fixture["expected"]["route"]
+    assert action["skill"] == "implement-issue.update_branch"
+    assert action["expected_head_sha"] == fx["loop_verdict"]["reviewed_head_sha"]
 
 
 def test_given_unknown_kind_fixture_when_routed_then_it_fails_closed() -> None:
+    """AC4: unknown required_auto_actions kind → fail-closed."""
     fixture = _load_yaml_fixture("v2_unknown_required_auto_actions_kind.yml")
     verdict = fixture["verdict"]
 
     assert verdict["required_auto_actions"][0]["kind"] == "rotate_branch_magic"
-    assert _route_required_auto_action(verdict) == fixture["expected"]["route"]
+
+    result = route_loop_verdict_v2(verdict)
+    assert result.route == "fail_closed", (
+        f"Expected fail_closed, got '{result.route}'. reason_code: {result.reason_code}"
+    )
+    assert result.fail_closed is True
     assert fixture["expected"]["fail_closed"] is True
 
 
 def test_given_expected_head_sha_guard_fixture_when_routed_then_missing_or_mismatch_fails_closed() -> None:
+    """AC5: expected_head_sha guard — missing or mismatched SHA must fail closed.
+
+    Note: these fixtures also have skill=implement-issue (no subcommand), so the
+    production consumer fails closed at skill validation before reaching the SHA check.
+    Either way, the result must be fail_closed=True (the AC5 intent is preserved).
+    """
     fixture = _load_yaml_fixture("v2_update_branch_expected_head_sha_guard.yml")
 
     for case in fixture["cases"]:
-        route = _route_required_auto_action(case["verdict"])
-        assert route == case["expected"]["route"], case["name"]
+        result = route_loop_verdict_v2(case["verdict"])
+        assert result.route == "fail_closed", (
+            f"[{case['name']}] Expected fail_closed, got '{result.route}'. "
+            f"reason_code: {result.reason_code}"
+        )
+        assert result.fail_closed is True, (
+            f"[{case['name']}] Expected fail_closed=True"
+        )
         assert case["expected"]["fail_closed"] is True

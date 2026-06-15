@@ -14,6 +14,7 @@ Each fixture file defines:
 
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -132,6 +133,11 @@ def _assert_fail_closed(result: RouteDecision, expected: dict, fixture_name: str
             f"[{fixture_name}] Expected reason_code to start with '{prefix}', "
             f"got '{result.reason_code}'"
         )
+    if "reason_code" in expected and expected["reason_code"] is not None:
+        assert result.reason_code == expected["reason_code"], (
+            f"[{fixture_name}] Expected reason_code '{expected['reason_code']}', "
+            f"got '{result.reason_code}'"
+        )
 
 
 def test_negative_wrong_executor():
@@ -212,24 +218,126 @@ def test_negative_string_list_actions():
 
 
 # ---------------------------------------------------------------------------
+# Blocker 1: expected_head_sha mismatch must fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_negative_expected_head_sha_mismatch():
+    """negative_expected_head_sha_mismatch.yml: expected_head_sha != reviewed_head_sha → fail-closed."""
+    fx = _load_fixture("negative_expected_head_sha_mismatch.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    _assert_fail_closed(result, fx["expected"], "negative_expected_head_sha_mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: mechanical is required (must be True)
+# ---------------------------------------------------------------------------
+
+
+def test_negative_missing_mechanical():
+    """negative_missing_mechanical.yml: mechanical field absent → fail-closed."""
+    fx = _load_fixture("negative_missing_mechanical.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    _assert_fail_closed(result, fx["expected"], "negative_missing_mechanical")
+
+
+def test_negative_mechanical_false():
+    """negative_mechanical_false.yml: mechanical=false → fail-closed."""
+    fx = _load_fixture("negative_mechanical_false.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    _assert_fail_closed(result, fx["expected"], "negative_mechanical_false")
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: merge_state_status=BEHIND requires test_verdict with branch_behind_main
+# ---------------------------------------------------------------------------
+
+
+def test_negative_behind_missing_branch_behind_main():
+    """negative_behind_missing_branch_behind_main.yml: BEHIND + test_verdict=None → fail-closed."""
+    fx = _load_fixture("negative_behind_missing_branch_behind_main.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    _assert_fail_closed(result, fx["expected"], "negative_behind_missing_branch_behind_main")
+
+
+def test_negative_behind_branch_behind_main_key_absent():
+    """negative_behind_branch_behind_main_key_absent.yml: BEHIND + branch_behind_main key missing → fail-closed."""
+    fx = _load_fixture("negative_behind_branch_behind_main_key_absent.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    _assert_fail_closed(result, fx["expected"], "negative_behind_branch_behind_main_key_absent")
+
+
+# ---------------------------------------------------------------------------
+# Extra 5: REQUEST_CHANGES + malformed required_auto_actions design decision
+# ---------------------------------------------------------------------------
+
+
+def test_negative_request_changes_with_malformed_update_branch_action():
+    """Extra 5: REQUEST_CHANGES verdict skips action validation → continue_loop.
+
+    Design decision: REQUEST_CHANGES routes to continue_loop without inspecting
+    required_auto_actions. Action field validation only runs under APPROVE.
+    """
+    fx = _load_fixture("negative_request_changes_with_malformed_update_branch_action.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    assert result.route == fx["expected"]["route"], (
+        f"Expected route '{fx['expected']['route']}', got '{result.route}'. "
+        f"reason_code: {result.reason_code}"
+    )
+    assert result.fail_closed is fx["expected"]["fail_closed"]
+
+
+# ---------------------------------------------------------------------------
+# Extra 6: RouteDecision.selected_action and rerun_required are immutable
+# ---------------------------------------------------------------------------
+
+
+def test_route_decision_selected_action_is_immutable():
+    """Extra 6: selected_action must be MappingProxyType (immutable)."""
+    from types import MappingProxyType
+    fx = _load_fixture("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    assert result.selected_action is not None
+    assert isinstance(result.selected_action, MappingProxyType), (
+        f"Expected MappingProxyType, got {type(result.selected_action)}"
+    )
+    with pytest.raises(TypeError):
+        result.selected_action["kind"] = "hacked"  # type: ignore[index]
+
+
+def test_route_decision_rerun_required_is_immutable():
+    """Extra 6: rerun_required must be MappingProxyType (immutable)."""
+    from types import MappingProxyType
+    fx = _load_fixture("positive_update_branch.yml")
+    result = route_loop_verdict_v2(fx["loop_verdict"], test_verdict=fx.get("test_verdict"))
+    assert isinstance(result.rerun_required, MappingProxyType), (
+        f"Expected MappingProxyType, got {type(result.rerun_required)}"
+    )
+    with pytest.raises(TypeError):
+        result.rerun_required["verification"] = False  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
 # Pure unit tests for AC1 (no subprocess / import side effects)
 # ---------------------------------------------------------------------------
 
 
-def test_module_import_has_no_side_effects():
-    """AC1: importing route_loop_verdict_v2 must have no side effects.
-
-    We already imported it above. If subprocess/gh/git were called at import
-    time, this module would have failed to import or raised an error.
-    """
-    import route_loop_verdict_v2 as m
-    # The module must not expose any subprocess/network symbols at top level
-    forbidden = {"subprocess", "gh", "git", "requests", "urllib"}
-    public = {k for k in dir(m) if not k.startswith("_")}
-    overlap = public & forbidden
-    assert not overlap, (
-        f"route_loop_verdict_v2 must not expose these at module level: {overlap}"
-    )
+def test_module_no_forbidden_imports():
+    """Extra 7 (AST-based): route_loop_verdict_v2.py must not import forbidden modules."""
+    src = SCRIPTS_DIR / "route_loop_verdict_v2.py"
+    tree = ast.parse(src.read_text())
+    forbidden = {"subprocess", "socket", "urllib", "requests", "httpx", "os"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            else:
+                names = [node.module or ""]
+            for name in names:
+                root = name.split(".")[0]
+                assert root not in forbidden, (
+                    f"Forbidden import in route_loop_verdict_v2.py: {name!r}"
+                )
 
 
 def test_route_decision_is_frozen():
