@@ -1,0 +1,18 @@
+description: required_auto_actions[0].kind is unknown → fail-closed (unknown_kind)
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: true
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: CLEAN
+  required_auto_actions:
+  - kind: rotate_branch_magic
+    executor: implementation-worker
+    skill: implement-issue.update_branch
+    expected_head_sha: abc123def456
+test_verdict: null
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: 'unknown_kind:'

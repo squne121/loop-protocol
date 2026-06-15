@@ -1,0 +1,20 @@
+description: update_branch with missing skill field → fail-closed (missing_skill)
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: BEHIND
+  required_auto_actions:
+  - kind: update_branch
+    executor: implementation-worker
+    blocking_merge_ready: true
+    mechanical: true
+    expected_head_sha: abc123def456
+test_verdict:
+  branch_behind_main: true
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: update_branch_action_invalid:missing_skill

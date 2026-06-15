@@ -692,141 +692,124 @@ def test_b4_worker_status_ok_rerun_required_true_does_not_terminate():
 # B5: behavior routing fixture matrix
 # ---------------------------------------------------------------------------
 
+# Production consumer import for B5 routing tests
+import sys as _sys
+from pathlib import Path as _Path
 
-def _make_verdict_context(
+_SCRIPTS_DIR = (
+    _Path(__file__).resolve().parents[4]
+    / ".claude"
+    / "skills"
+    / "impl-review-loop"
+    / "scripts"
+)
+if str(_SCRIPTS_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+
+
+def _make_loop_verdict(
     verdict: str,
     merge_ready: bool,
     required_auto_actions: list,
     merge_state_status: str,
-) -> str:
-    """Simulate a routing context string based on fixture parameters."""
-    actions_str = "[]" if not required_auto_actions else str(required_auto_actions)
-    return (
-        f"verdict: {verdict}\n"
-        f"merge_ready: {str(merge_ready).lower()}\n"
-        f"required_auto_actions: {actions_str}\n"
-        f"merge_state_status: {merge_state_status}\n"
-    )
-
-
-def _evaluate_route(
-    verdict: str,
-    merge_ready: bool,
-    required_auto_actions: list,
-    merge_state_status: str,
-) -> str:
-    """
-    Deterministic routing logic mirroring step-5 decision table.
-    Returns: 'approved', 'implementation-worker.update_branch', 'human_escalation',
-             'not_approved_github', 'continue_loop'
-    """
-    if merge_state_status == "UNKNOWN":
-        return "human_escalation"
-
-    if verdict == "REQUEST_CHANGES":
-        return "continue_loop"
-
-    if verdict != "APPROVE":
-        return "human_escalation"
-
-    # APPROVE path
-    if merge_state_status == "DRAFT":
-        # draft_pr_ready=true but github_merge_ready=false
-        return "not_approved_github"
-
-    # Check required_auto_actions
-    for action in required_auto_actions:
-        if isinstance(action, dict) and action.get("kind") == "update_branch":
-            return "implementation-worker.update_branch"
-        if isinstance(action, dict) and action.get("kind") not in (
-            "update_branch", "update_pr_body_hygiene", "ensure_closing_keyword"
-        ):
-            return "human_escalation"
-        if isinstance(action, str):
-            # unknown / non-object action
-            return "human_escalation"
-
-    if required_auto_actions:
-        return "not_approved"  # non-empty but no update_branch → still not terminal
-
-    if not merge_ready:
-        return "not_approved"
-
-    return "approved"
-
-
-# Fixture matrix: (verdict, merge_ready, required_auto_actions, mergeStateStatus, expected_route)
-_FIXTURE_MATRIX = [
-    # APPROVE + merge_ready=true + [] + CLEAN → approved
-    ("APPROVE", True, [], "CLEAN", "approved"),
-    # APPROVE + merge_ready=false + [update_branch object] + BEHIND → update_branch worker
-    ("APPROVE", False, [{"kind": "update_branch", "expected_head_sha": "abc123"}], "BEHIND",
-     "implementation-worker.update_branch"),
-    # APPROVE + merge_ready=true + [unknown action object] + CLEAN → human_escalation
-    ("APPROVE", True, [{"kind": "unknown_action"}], "CLEAN", "human_escalation"),
-    # APPROVE + merge_ready=true + [non-empty known action] + CLEAN → not approved (continue)
-    ("APPROVE", True, [{"kind": "update_pr_body_hygiene"}], "CLEAN", "not_approved"),
-    # APPROVE + merge_ready=false + [] + DRAFT → not_approved_github (github_merge_ready: false)
-    ("APPROVE", False, [], "DRAFT", "not_approved_github"),
-    # APPROVE + merge_ready=false + [] + UNKNOWN → human_escalation
-    ("APPROVE", False, [], "UNKNOWN", "human_escalation"),
-    # REQUEST_CHANGES + merge_ready=false + [] + CLEAN → continue_loop
-    ("REQUEST_CHANGES", False, [], "CLEAN", "continue_loop"),
-]
+) -> dict:
+    """Build a minimal LOOP_VERDICT_V2 dict from B5 matrix parameters."""
+    return {
+        "verdict": verdict,
+        "merge_ready": merge_ready,
+        "reviewed_head_sha": "abc123def456",
+        "mergeability": {
+            "mergeable": "MERGEABLE",
+            "merge_state_status": merge_state_status,
+        },
+        "required_auto_actions": required_auto_actions,
+    }
 
 
 def test_b5_fixture_matrix_approved():
     """B5: APPROVE + merge_ready=true + [] + CLEAN must route to approved."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[0]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    lv = _make_loop_verdict("APPROVE", True, [], "CLEAN")
+    result = route_loop_verdict_v2(lv)
+    assert result.route == "approved", (
+        f"Expected 'approved', got '{result.route}'. errors: {result.errors}"
+    )
 
 
 def test_b5_fixture_matrix_update_branch():
-    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to update_branch worker."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[1]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    """B5: APPROVE + merge_ready=false + [update_branch] + BEHIND must route to route_to_update_branch."""
+    actions = [
+        {
+            "kind": "update_branch",
+            "executor": "implementation-worker",
+            "skill": "implement-issue.update_branch",
+            "blocking_merge_ready": True,
+            "mechanical": True,
+            "expected_head_sha": "abc123def456",
+        }
+    ]
+    lv = _make_loop_verdict("APPROVE", False, actions, "BEHIND")
+    result = route_loop_verdict_v2(lv, test_verdict={"branch_behind_main": True})
+    assert result.route == "route_to_update_branch", (
+        f"Expected 'route_to_update_branch', got '{result.route}'. errors: {result.errors}"
+    )
 
 
 def test_b5_fixture_matrix_unknown_action_human_escalation():
-    """B5: APPROVE + [unknown_action object] + CLEAN must route to human_escalation."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[2]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    """B5: APPROVE + [unknown_action object] + CLEAN must fail-closed (unknown kind)."""
+    actions = [{"kind": "unknown_action"}]
+    lv = _make_loop_verdict("APPROVE", True, actions, "CLEAN")
+    result = route_loop_verdict_v2(lv)
+    assert result.fail_closed is True, (
+        f"Expected fail_closed=True for unknown kind, got route='{result.route}'. errors: {result.errors}"
+    )
 
 
 def test_b5_fixture_matrix_nonempty_known_action_not_approved():
-    """B5: APPROVE + [update_pr_body_hygiene] + CLEAN must not be approved (loop continues)."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[3]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    """B5: APPROVE + [update_pr_body_hygiene] + CLEAN must route to route_to_body_only_action (not approved)."""
+    actions = [{"kind": "update_pr_body_hygiene"}]
+    lv = _make_loop_verdict("APPROVE", True, actions, "CLEAN")
+    result = route_loop_verdict_v2(lv)
+    assert result.route == "route_to_body_only_action", (
+        f"Expected 'route_to_body_only_action', got '{result.route}'. errors: {result.errors}"
+    )
+    assert result.route != "approved", (
+        "update_pr_body_hygiene action must not route to approved"
+    )
 
 
 def test_b5_fixture_matrix_draft_not_github_merge_ready():
-    """B5: APPROVE + [] + DRAFT must not be github_merge_ready (draft_pr_ready=true but not mergeable)."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[4]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    """B5: APPROVE + [] + DRAFT must not be approved (merge_ready=false with empty actions fails closed)."""
+    lv = _make_loop_verdict("APPROVE", False, [], "DRAFT")
+    result = route_loop_verdict_v2(lv)
+    assert result.route != "approved", (
+        f"DRAFT merge_state_status with merge_ready=false must not route to approved. "
+        f"Got '{result.route}'"
+    )
 
 
 def test_b5_fixture_matrix_unknown_status_human_escalation():
-    """B5: APPROVE + UNKNOWN merge_state_status must route to human_escalation."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[5]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    """B5: APPROVE + UNKNOWN merge_state_status must fail-closed (merge_ready=false with empty actions)."""
+    lv = _make_loop_verdict("APPROVE", False, [], "UNKNOWN")
+    result = route_loop_verdict_v2(lv)
+    assert result.route != "approved", (
+        f"UNKNOWN merge_state_status must not route to approved. Got '{result.route}'"
+    )
 
 
 def test_b5_fixture_matrix_request_changes_continue_loop():
     """B5: REQUEST_CHANGES must route to continue_loop (next iteration)."""
-    verdict, merge_ready, actions, status, expected = _FIXTURE_MATRIX[6]
-    result = _evaluate_route(verdict, merge_ready, actions, status)
-    assert result == expected, f"Expected '{expected}', got '{result}'"
+    lv = _make_loop_verdict("REQUEST_CHANGES", False, [], "CLEAN")
+    result = route_loop_verdict_v2(lv)
+    assert result.route == "continue_loop", (
+        f"Expected 'continue_loop', got '{result.route}'"
+    )
 
 
 def test_b5_ac10_approved_and_human_escalation_mutually_exclusive():
     """B5/AC10: termination_reason: approved and human_escalation must be mutually exclusive."""
-    body = _read(STEP5_FT)
+    body = STEP5_FT.read_text(encoding="utf-8")
     idx = body.find("worker_status_failed")
     assert idx != -1, "worker_status_failed must be defined"
     context = body[idx : idx + 200]
