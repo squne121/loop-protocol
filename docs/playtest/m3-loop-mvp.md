@@ -5,12 +5,12 @@ issue: "#740"
 parent_issue: "#733"
 source_pr: "#854"
 evidence_mode: browser-automation
-recorded_at: "2026-06-14T13:15:00Z"
+recorded_at: "2026-06-15T09:30:00Z"
 ---
 
 # M3 Loop MVP Playtest
 
-<!-- verification_marker_ac2: doc_id: playtest-m3-loop-mvp HTTP origin origin: http://127.0.0.1:4173 command: npx playwright test tests/e2e/m3-loop-mvp.spec.ts browser: Chromium commit: c96419988c86779527c547e67ed36306f9864fe3 -->
+<!-- verification_marker_ac2: doc_id: playtest-m3-loop-mvp HTTP origin origin: http://127.0.0.1:4173 command: npx playwright test tests/e2e/m3-loop-mvp.spec.ts browser: Chromium commit: fa7f5f5a5573b08444bf4ddbcd31dc6ccf0b36a7 -->
 <!-- verification_marker_ac3: doc_id: playtest-m3-loop-mvp production sentinel + raw JSON schemaVersion resources weaponPower playerMaxHp -->
 <!-- verification_marker_ac4: doc_id: playtest-m3-loop-mvp resources after claim resources after reload loopPhase = preparation enemies/projectiles current HP -->
 <!-- verification_marker_ac5: doc_id: playtest-m3-loop-mvp QuotaExceededError happy-path only 未証明 未解決 #740 -->
@@ -29,7 +29,7 @@ recorded_at: "2026-06-14T13:15:00Z"
 - command: `VITE_E2E_MODE=true vite build && npx playwright test tests/e2e/m3-loop-mvp.spec.ts`
 - origin: `http://127.0.0.1:4173`
 - browser: `Chromium (Playwright headless)`
-- commit: `c96419988c86779527c547e67ed36306f9864fe3`
+- commit: `fa7f5f5a5573b08444bf4ddbcd31dc6ccf0b36a7`
 - result: `5 passed (2.3m)`
 - classification: browser-automation（Playwright headless Chromium）
 
@@ -90,8 +90,10 @@ recorded_at: "2026-06-14T13:15:00Z"
 ### Reload assertion（AC5）
 
 - localStorage snapshot persists: `resources=30` — reload 前後で値が保持される
+- confirm-result ボタン: reload 後は disabled（loopPhase ≠ 'result' のため）
 - sortie.result after reload: `null`（combat runtime は復元されない）
 - loopPhase after reload: `running` or `preparation`（result/debrief フェーズは復元されない）
+- B1 note: HUD の resources は reload 後 0 表示（no auto-load 設計。Load Game ボタンで適用）
 
 ### Double-confirm prevention（AC4）
 
@@ -100,6 +102,8 @@ recorded_at: "2026-06-14T13:15:00Z"
 
 ### Re-claim prevention after reload（AC6）
 
+- reload 直後: confirm-result ボタンが disabled（loopPhase ≠ 'result'）→ 旧 result の UI 再クレーム不能
+- loopPhase after reload: `result` ではない（reload 直後に state assertion で確認）
 - reload 後の second confirm: resources=30（fresh sortie reward）
 - 旧 result の reward は再適用されない（pendingRewardApplicationId が変わる）
 - production key: reload 後も sentinel 値が不変
