@@ -294,6 +294,7 @@ def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str], task_ki
     """
     # Standard target prefixes included in all ops-review inventories
     target_prefixes = [
+        ".claude/agents/",
         ".agents/skills/",
         ".claude/skills/",
         ".claude/hooks/",
@@ -392,6 +393,25 @@ def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str], task_ki
             seen_warn.add(ep)
             missing_warn.append(ep)
 
+    # AC6 (MAJOR-2): per-prefix coverage so "prefix absent" vs "present but missing" is machine-decidable.
+    coverage_prefixes = [
+        ".claude/agents/",
+        ".claude/rules/",
+        ".claude/hooks/",
+        ".claude/skills/",
+        ".agents/skills/",
+        ".codex/agents/",
+        "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+    ]
+    coverage = []
+    for pref in coverage_prefixes:
+        matches = sum(1 for tp in tracked_paths if tp == pref or tp.startswith(pref))
+        coverage.append({
+            "prefix": pref,
+            "tracked_matches": matches,
+            "empty_ok": matches == 0,
+        })
+
     return {
         "schema_version": "agent_ops_inventory_v1",
         "task_kind": task_kind,
@@ -400,6 +420,7 @@ def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str], task_ki
         "items": items,
         "missing_critical": list(missing_critical),
         "missing_warn": missing_warn,
+        "coverage": coverage,
     }
 
 

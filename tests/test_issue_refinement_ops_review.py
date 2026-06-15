@@ -60,7 +60,7 @@ class TestIssueRefinementOpsReviewJsonCompactBudget:
         assert isinstance(spec, PlanSpec)
         assert spec.task_kind == "issue-refinement-ops-review"
 
-    def test_issue_refinement_ops_review_json_compact_budget(self):
+    def test_issue_refinement_ops_review_json_output_under_budget(self):
         """GIVEN issue-refinement-ops-review --json WHEN run THEN output <= 2048 UTF-8 bytes."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
         result = subprocess.run(
@@ -234,6 +234,47 @@ class TestIssueRefinementOpsReviewCoverage:
         ]
         assert len(fixture_items) >= 1, "expected-runtime-contract.json must appear in inventory"
 
+    def test_inventory_coverage_includes_claude_agents_and_codex_agents(self):
+        """GIVEN issue-refinement-ops-review inventory WHEN coverage inspected THEN includes all required prefixes."""
+        tracked = get_tracked_paths_decoded(REPO_ROOT)
+        artifact = build_agent_ops_inventory(REPO_ROOT, tracked, task_kind="issue-refinement-ops-review")
+
+        # AC6: coverage field exists and is a list
+        assert "coverage" in artifact, "coverage field missing from artifact"
+        assert isinstance(artifact["coverage"], list), "coverage should be a list"
+
+        # All required prefixes in coverage set
+        required_prefixes = {
+            ".claude/agents/",
+            ".claude/rules/",
+            ".claude/hooks/",
+            ".claude/skills/",
+            ".agents/skills/",
+            ".codex/agents/",
+            "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+        }
+        coverage_prefixes = {entry["prefix"] for entry in artifact["coverage"]}
+        assert required_prefixes == coverage_prefixes, (
+            f"Coverage prefixes mismatch. Expected {required_prefixes}, got {coverage_prefixes}"
+        )
+
+        # .claude/agents/ entry has tracked_matches >= 1 and empty_ok is False
+        claude_agents_entry = next(
+            (e for e in artifact["coverage"] if e["prefix"] == ".claude/agents/"),
+            None
+        )
+        assert claude_agents_entry is not None, ".claude/agents/ entry not found in coverage"
+        assert claude_agents_entry["tracked_matches"] >= 1, (
+            f".claude/agents/ should have tracked_matches >= 1, got {claude_agents_entry['tracked_matches']}"
+        )
+        assert claude_agents_entry["empty_ok"] is False, (
+            ".claude/agents/ should have empty_ok=False (real agent files exist)"
+        )
+
+        # There is at least 1 inventory item whose path starts with .claude/agents/
+        agent_items = [it for it in artifact["items"] if it["path"].startswith(".claude/agents/")]
+        assert len(agent_items) >= 1, "Expected at least 1 item starting with .claude/agents/ in inventory"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AC4: DO_NOT_READ_INITIAL_ONLY with read_policy clarification
@@ -279,7 +320,7 @@ class TestIssueRefinementOpsReviewDoNotReadInitialOnly:
 
 
 class TestIssueRefinementOpsReviewArtifactOnly:
-    def test_inventory_artifact_only_output_to_file(self):
+    def test_inventory_artifact_output_to_file_only(self):
         """GIVEN issue-refinement-ops-review with inventory WHEN artifact written THEN stdout is EVIDENCE key only."""
         script = SCRIPTS_DIR / "agent_ops_inventory.py"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -354,6 +395,31 @@ class TestIssueRefinementOpsReviewSecurity:
                 f"Secret-like path found: {item['path']!r}"
             )
 
+    def test_security_coverage_tracked_matches_and_empty_ok(self):
+        """GIVEN issue-refinement-ops-review artifact WHEN coverage inspected THEN tracked_matches and empty_ok machine-decidable."""
+        tracked = get_tracked_paths_decoded(REPO_ROOT)
+        artifact = build_agent_ops_inventory(REPO_ROOT, tracked, task_kind="issue-refinement-ops-review")
+
+        # AC6 (MAJOR-2): every entry in coverage has integer tracked_matches and boolean empty_ok
+        assert "coverage" in artifact, "coverage field missing"
+        for entry in artifact["coverage"]:
+            assert "prefix" in entry, f"Missing 'prefix' in coverage entry: {entry}"
+            assert "tracked_matches" in entry, f"Missing 'tracked_matches' in coverage entry: {entry}"
+            assert "empty_ok" in entry, f"Missing 'empty_ok' in coverage entry: {entry}"
+            assert isinstance(entry["tracked_matches"], int), (
+                f"tracked_matches should be int, got {type(entry['tracked_matches']).__name__} for {entry['prefix']}"
+            )
+            assert isinstance(entry["empty_ok"], bool), (
+                f"empty_ok should be bool, got {type(entry['empty_ok']).__name__} for {entry['prefix']}"
+            )
+            # Machine-decidable: empty_ok == (tracked_matches == 0)
+            expected_empty_ok = (entry["tracked_matches"] == 0)
+            assert entry["empty_ok"] == expected_empty_ok, (
+                f"empty_ok mismatch for {entry['prefix']}: "
+                f"tracked_matches={entry['tracked_matches']}, "
+                f"empty_ok={entry['empty_ok']}, expected={expected_empty_ok}"
+            )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AC7: shared registry/spec between agent-ops-review and issue-refinement-ops-review
@@ -361,7 +427,7 @@ class TestIssueRefinementOpsReviewSecurity:
 
 
 class TestSharedRegistrySpec:
-    def test_shared_registry_both_task_kinds(self):
+    def test_both_task_kinds_in_registry(self):
         """GIVEN PLAN_REGISTRY WHEN inspected THEN both agent-ops-review and issue-refinement-ops-review registered."""
         assert "agent-ops-review" in PLAN_REGISTRY
         assert "issue-refinement-ops-review" in PLAN_REGISTRY
@@ -388,7 +454,7 @@ class TestSharedRegistrySpec:
         keys2 = set(inv2.keys())
         assert keys1 == keys2, f"Schema keys differ: {keys1} vs {keys2}"
 
-    def test_shared_spec_status_logic(self):
+    def test_status_logic_shared(self):
         """GIVEN both task-kinds WHEN built with same repo state THEN same status logic."""
         # This is a trivial test since both use the same function, but it documents the expectation
         tracked = get_tracked_paths_decoded(REPO_ROOT)
