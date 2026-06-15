@@ -224,7 +224,20 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 
 `approved` 終了時は `LOOP_HANDOFF_RESULT_V1` marker を終了コメントに出力する（形式・routing rules は `references/termination-policy.md#LOOP_HANDOFF_RESULT_V1` 参照）。出力は `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment と fenced YAML block の 2 要素。
 
-#### Termination Report Publish Flow
+#### scope_signal_guard 停止時の termination_cause 正規化手順
+
+`scope_signal_guard.triggered=true` かつ `excluded_by_anchor_reframe=false` のとき、orchestrator は以下の手順で termination payload を組み立てる:
+
+1. `decide_next_loop_action.py` の出力から `TERMINATION_CAUSE:` 行を読み取る（`human_judgment_required` が出力される）
+2. `termination_cause: human_judgment_required` を termination payload に設定する
+3. `BLOCKERS:` 行の値（`scope_signal_guard_triggered`、`scope_signal_guard_reason_code:<code>` 等）を `blockers_summary` に転記する
+4. `publish_termination_report.py` に渡す
+
+`scope_signal_guard.reason_code` を `termination_cause` に直接渡してはならない。`VALID_TERMINATION_CAUSES` に含まれない diagnostic code は renderer が reject する（#919 回帰防止）。
+
+詳細は `references/termination-policy.md` の「scope_signal_guard 停止時の termination payload 正規化」セクションを参照する。
+
+## Termination Report Publish Flow
 
 終了レポートの GitHub 投稿は `publish_termination_report.py` を経由して行う。
 
