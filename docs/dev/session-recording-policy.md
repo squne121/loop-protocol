@@ -163,6 +163,15 @@ public_surfaces:
       rationale: >
         manifest body は Issue / PR comment に出さない。公開コメントでは
         artifact_digest や validation_verdict などの opaque ref のみを許可する。
+  github_issue_comment:
+    raw_transcript_allowed: false
+    source_kind_prohibited:
+      - transcript
+      - local_file
+    compatibility_note: >
+      legacy checker / policy consumer 互換のため `github_issue_comment` キーを残す。
+      current policy の正本は `github_issue_or_pr_comment.agent_session_manifest` であり、
+      manifest body は許可しない。
     agent_run_report:
       body_allowed: conditional
       conditions:
