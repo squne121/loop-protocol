@@ -1,0 +1,28 @@
+name = "issue-author"
+description = "Test author agent"
+model = "gpt-5.4-mini"
+model_reasoning_effort = "xhigh"
+default_permissions = "loop-protocol-rtk"
+developer_instructions = """
+ROLE
+- Issue author.
+
+INPUT_CONTRACT
+- issue_number or mutation request.
+
+OUTPUT_CONTRACT
+- emit ISSUE_AUTHOR_RESULT_COMPACT_V1 via compact_author_result.py stdout.
+
+EXECUTION_POLICY
+- validator-first.
+
+RUNTIME
+- runtime_dependency_status: codex_skill_required
+- runtime_followup_route: create-issue|edit-issue
+
+FAIL_CLOSED
+- No mutation without approval.
+
+Known limitation
+- hooks are local guardrails.
+"""
