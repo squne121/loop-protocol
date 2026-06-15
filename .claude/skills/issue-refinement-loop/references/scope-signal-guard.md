@@ -37,6 +37,15 @@ iteration 中に以下が新規追加されたら `termination_reason: human_esc
 - `## Allowed Paths` に別アーキテクチャ層が追加された
 - `## Acceptance Criteria` に低検証可能 AC が追加された
 
+
+## orchestrator への termination_cause 正規化注記
+
+`scope_signal_guard.triggered=true` で停止する場合、orchestrator は `decide_next_loop_action.py` の出力から `TERMINATION_CAUSE: human_judgment_required` を読み取り、termination payload の `termination_cause` に使用する。
+
+`scope_signal_guard.reason_code`（例: `new_allowed_path_layer`）は diagnostic code であり、`termination_cause` として render/publish に渡してはならない。`reason_code` は BLOCKERS から `blockers_summary` に転記し、終了コメントで確認可能な状態にする。
+
+詳細手順は `references/termination-policy.md` の「scope_signal_guard 停止時の termination payload 正規化」セクションを参照する。
+
 ## Must not
 
 - scope signal を見て自動で scope 拡大を承認しない

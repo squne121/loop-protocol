@@ -161,6 +161,7 @@ def decide_next_action(
             ACTION_HUMAN_ESCALATION,
             [],
             ["iteration_negative"],
+            None,
         )
     if max_iterations < 1:
         return (
@@ -168,6 +169,7 @@ def decide_next_action(
             ACTION_HUMAN_ESCALATION,
             [],
             ["max_iterations_below_1"],
+            None,
         )
 
     # --- Already terminated ---
@@ -177,17 +179,26 @@ def decide_next_action(
             ACTION_TERMINATE,
             [],
             [],
+            None,
         )
 
     # --- Priority 2: scope signal guard hard stop ---
     if scope_signal.get("triggered") and not scope_signal.get(
         "excluded_by_anchor_reframe", False
     ):
+        # Normalize: orchestrator must use human_judgment_required as termination_cause.
+        # scope_signal_guard.reason_code is NOT a valid termination_cause enum value.
+        # reason_code is preserved in blockers so orchestrator can surface it in blockers_summary.
+        reason_code = scope_signal.get("reason_code")
+        scope_blockers = ["scope_signal_guard_triggered"]
+        if reason_code:
+            scope_blockers.append(f"scope_signal_guard_reason_code:{reason_code}")
         return (
             STATUS_HUMAN_ESCALATION,
             ACTION_HUMAN_ESCALATION,
             [],
-            ["scope_signal_guard_triggered"],
+            scope_blockers,
+            "human_judgment_required",
         )
 
     # --- Priority 2: max_iterations exceeded (human escalation) ---
@@ -200,6 +211,7 @@ def decide_next_action(
             ACTION_HUMAN_ESCALATION,
             [],
             blockers,
+            "max_iterations_exceeded",
         )
 
     # --- Priority 3: verdict routing ---
@@ -209,6 +221,7 @@ def decide_next_action(
             ACTION_PROCEED_TO_STEP_4_5,
             [],
             [],
+            None,
         )
 
     if review_verdict == VERDICT_NEEDS_FIX:
@@ -218,6 +231,7 @@ def decide_next_action(
             ACTION_CONTINUE_TO_STEP_4,
             [],
             [],
+            None,
         )
 
     # verdict is null or unknown — warn but allow continuation
@@ -227,6 +241,7 @@ def decide_next_action(
         ACTION_HUMAN_ESCALATION,
         [],
         blockers,
+        None,
     )
 
 
@@ -240,12 +255,15 @@ def _format_output(
     next_action: str,
     commands: list[str],
     blockers: list[str],
+    termination_cause_hint: Optional[str] = None,
 ) -> str:
     """Format the stdout output (budget < 2000 bytes)."""
     lines = [
         f"STATUS: {status}",
         f"NEXT_ACTION: {next_action}",
     ]
+    if termination_cause_hint is not None:
+        lines.append(f"TERMINATION_CAUSE: {termination_cause_hint}")
     if commands:
         for cmd in commands:
             lines.append(f"COMMANDS: {cmd}")
@@ -368,14 +386,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Compute next action
-    status, next_action, commands, blockers = decide_next_action(
+    status, next_action, commands, blockers, termination_cause_hint = decide_next_action(
         loop_state=loop_state,
         review_verdict=verdict,
         max_iterations_override=args.max_iterations,
     )
 
     # Emit output
-    print(_format_output(status, next_action, commands, blockers))
+    print(_format_output(status, next_action, commands, blockers, termination_cause_hint))
 
     # Exit with appropriate code
     exit_map = {
