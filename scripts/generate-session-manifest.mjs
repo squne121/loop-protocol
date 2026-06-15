@@ -5,7 +5,9 @@
  *
  * Deterministic producer for agent_session_manifest/v1 JSON.
  * Generates manifest conforming to docs/schemas/agent-session-manifest.schema.json
- * via CLI arguments only. Supports JSON and GitHub comment (fenced markdown) output.
+ * via CLI arguments only. Supports canonical JSON output and a historical
+ * GitHub comment fixture format for legacy parser tests. The legacy comment
+ * fixture is non-current and not a live public posting contract.
  *
  * Usage:
  *   node scripts/generate-session-manifest.mjs \
@@ -106,12 +108,13 @@ OPTIONAL OPTIONS:
   --pr NUMBER                    PR number (must match ^[1-9][0-9]*$) [default: null]
   --phase-ledger-phase PHASE     Ledger phase (optional, defaults to null)
   --actor-session-id ID          Actor session ID [optional]
-  --format FORMAT                Output format: json, github-comment [default: json]
+  --format FORMAT                Output format: json, legacy-github-comment-fixture
+                                 Deprecated alias: github-comment (historical only, not live public posting)
   --manifest-id UUID             Override manifest_id (asm-<UUIDv4> format) [optional, auto-generated if omitted]
   --recorded-at ISO8601          Override recorded_at timestamp [optional, auto-generated if omitted]
-  --validate                     Run schema + semantic validation before output (default: false for json, true for github-comment)
+  --validate                     Run schema + semantic validation before output (default: true)
   --no-validate                  Skip all validation (escape hatch)
-  --allow-local-path             Allow local absolute paths in output (downgrades to warning, default: fail-closed)
+  --allow-local-path             Allow local absolute paths in JSON output only (legacy comment fixtureでは禁止)
   --strict-redaction             Force redaction scan on all formats [optional]
   --dry-run                      Output to stdout only, no side effects [no-op for script producer]
   --verification-overall STATUS  Overall verification result: pass|fail|partial|n_a [optional]
@@ -153,8 +156,11 @@ EXAMPLES:
     --evidence-source-kind ci_check \\
     --evidence-source-ref https://github.com/squne121/loop-protocol/runs/123456 \\
     --evidence-visibility public_github_comment \\
-    --format github-comment \\
+    --format legacy-github-comment-fixture \\
     --validate
+
+  # Historical fixture only: this format exists for legacy parser / marker tests.
+  # It is non-current and MUST NOT be used as a live public posting contract.
 `)
 }
 
@@ -440,6 +446,7 @@ function formatAsGithubComment(manifest) {
   const fenceLength = calculateFenceLength(manifest)
   const fence = '`'.repeat(fenceLength)
   return (
+    `<!-- historical-only: agent_session_manifest github-comment fixture; not live public posting -->\n` +
     `<!-- agent_session_manifest:v1 start -->\n` +
     `${fence}json\n` +
     `${jsonStr}\n` +
@@ -459,10 +466,10 @@ async function main() {
     // Generate manifest
     const manifest = generateManifest(opts)
 
-    const format = opts.format || 'json'
+    const requestedFormat = opts.format || 'json'
+    const format = requestedFormat === 'github-comment' ? 'legacy-github-comment-fixture' : requestedFormat
 
-    // M1 iter2: Run validation by default (unless --no-validate is set)
-    // Validation is mandatory for github-comment format
+    // Validation is on by default unless --no-validate is explicitly set.
     const skipValidation = opts['no-validate'] === true
     const shouldValidate = !skipValidation
 
@@ -490,6 +497,17 @@ async function main() {
 
     // B2 iter2: Secret detection - fail-closed by default (default behavior unless --allow-local-path)
     const allowLocalPath = opts['allow-local-path'] === true
+    if (allowLocalPath && format === 'legacy-github-comment-fixture') {
+      console.error('Error: --allow-local-path is forbidden for legacy GitHub comment fixtures.')
+      process.exit(1)
+    }
+
+    if (requestedFormat === 'github-comment') {
+      console.error(
+        "Warning: 'github-comment' is a deprecated historical alias. Use 'legacy-github-comment-fixture' only for non-current fixture generation.",
+      )
+    }
+
     const secretPattern = detectSecretPatterns(manifest)
     if (secretPattern) {
       const producerMetadataSafety = validateProducerMetadataSafety(manifest)
@@ -506,7 +524,7 @@ async function main() {
 
     // Format output
     let output
-    if (format === 'github-comment') {
+    if (format === 'legacy-github-comment-fixture') {
       output = formatAsGithubComment(manifest)
 
       // B2 iter2: Scan markdown output for secrets as well (fail-closed by default)
@@ -523,7 +541,9 @@ async function main() {
     } else if (format === 'json') {
       output = formatAsJson(manifest)
     } else {
-      throw new Error(`Unknown format: ${format}. Use 'json' or 'github-comment'`)
+      throw new Error(
+        `Unknown format: ${requestedFormat}. Use 'json' or 'legacy-github-comment-fixture'`,
+      )
     }
 
     // Output

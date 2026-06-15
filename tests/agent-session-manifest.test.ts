@@ -7,7 +7,7 @@
 import { existsSync, readFileSync } from 'fs'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import { execFileSync } from 'child_process'
+import { execFileSync, spawnSync } from 'child_process'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -639,8 +639,8 @@ describe('agent-session-manifest generated manifest validation (subprocess)', ()
     }
   })
 
-  it('generated github-comment artifact validates against schema', () => {
-    // AC6: Run generator with github-comment format and extract/validate JSON
+  it('generated legacy github-comment fixture validates against schema and stays historical', () => {
+    // AC6: Historical fixture remains schema-valid but is explicitly non-current.
     try {
       const output = execFileSync('node', [
         GENERATOR_SCRIPT,
@@ -655,8 +655,10 @@ describe('agent-session-manifest generated manifest validation (subprocess)', ()
         '--evidence-source-kind', 'artifact',
         '--evidence-source-ref', 'artifacts/manifest.json',
         '--evidence-visibility', 'private_artifact',
-        '--format', 'github-comment',
+        '--format', 'legacy-github-comment-fixture',
       ], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] })
+
+      expect(output).toContain('historical-only')
 
       // Extract JSON from fenced code block (HTML marker style)
       // Format: <!-- agent_session_manifest:v1 start -->
@@ -670,7 +672,7 @@ describe('agent-session-manifest generated manifest validation (subprocess)', ()
       const endIdx = output.indexOf(endMarker)
 
       if (startIdx === -1 || endIdx === -1) {
-        throw new Error('HTML markers not found in github-comment output')
+        throw new Error('HTML markers not found in legacy github-comment fixture output')
       }
 
       const fencedContent = output.substring(startIdx + startMarker.length, endIdx)
@@ -699,6 +701,38 @@ describe('agent-session-manifest generated manifest validation (subprocess)', ()
       }
       throw error
     }
+  })
+
+  it('legacy github-comment fixture rejects --allow-local-path escape hatch', () => {
+    const result = spawnSync('node', [
+      GENERATOR_SCRIPT,
+      '--repository', 'squne121/loop-protocol',
+      '--issue', '549',
+      '--phase-main-loop', 'impl',
+      '--phase-ledger-phase', 'implementation',
+      '--phase-instance-id', 'issue-549:impl:001',
+      '--actor-type', 'ai_agent',
+      '--actor-name', 'implementation-worker',
+      '--actor-session-id', 'session-001',
+      '--evidence-source-kind', 'artifact',
+      '--evidence-source-ref', 'artifacts/manifest.json',
+      '--evidence-visibility', 'private_artifact',
+      '--format', 'legacy-github-comment-fixture',
+      '--allow-local-path',
+    ], { encoding: 'utf-8' })
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('--allow-local-path is forbidden')
+  })
+
+  it('help marks github-comment as historical and non-current', () => {
+    const output = execFileSync('node', [GENERATOR_SCRIPT, '--help'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    expect(output).toContain('legacy-github-comment-fixture')
+    expect(output).toContain('historical only')
+    expect(output).toContain('not live public posting')
   })
 })
 

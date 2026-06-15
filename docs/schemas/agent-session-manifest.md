@@ -16,7 +16,7 @@ LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata
 
 ## 設計目的
 
-PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・test-runner 呼び出し有無・SKIP exit 0 黙認・PR 本文全面置換・token/context 圧迫）を事後検証するために、各 phase で **どの metadata を GitHub Issue/PR コメントに残すか** を明文化する。
+PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・test-runner 呼び出し有無・SKIP exit 0 黙認・PR 本文全面置換・token/context 圧迫）を事後検証するために、各 phase で **どの metadata を retention-limited artifact と opaque ref に残すか** を明文化する。
 
 ## 1 manifest = 1 ledger phase 原則
 
@@ -91,7 +91,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 |---|---|---|---|
 | `main_loop` | enum（7 値） | yes | Main Loop phase（後述 enum 値参照） |
 | `ledger_phase` | enum\|null | no | SubAgent Execution Ledger の対応 phase（scalar, optional）。1 manifest = 1 ledger phase |
-| `phase_instance_id` | string | yes | `"issue-<N>:<main_loop_phase>:<seq>"` 形式（例: `"issue-243:impl:001"`） |
+| `phase_instance_id` | string | yes | `issue-<N>:<main_loop_phase>:<seq>` または `ci:<producer_slug>:<run_id>:<run_attempt>` 形式（例: `"issue-243:impl:001"`, `"ci:session-manifest:123456789:1"`） |
 
 ### `token_usage` オブジェクト
 
@@ -143,7 +143,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `source_kind` | enum | yes | `github_comment \| ci_check \| hook_jsonl \| artifact \| transcript \| local_file` |
 | `source_ref` | string | yes | 証拠の URL またはパス |
 | `source_sha256` | string\|null | no | ファイルの SHA-256（optional） |
-| `visibility` | enum | no | `public_github_comment \| private_artifact \| local_only`（後述制約参照） |
+| `visibility` | enum | no | `public_github_comment \| private_artifact \| local_only`（`private_artifact` は legacy enum 名であり secret-safe を意味しない。後述制約参照） |
 
 **visibility 制約**: `visibility: public_github_comment` のとき、`source_kind: transcript` および `source_kind: local_file` は禁止。
 この制約は JSON Schema の `if/then` 条件で機械的に検証される。
@@ -233,6 +233,8 @@ phase:
   phase_instance_id: "issue-243:impl:002"
 ```
 
+CI artifact producer の場合は `phase_instance_id: "ci:session-manifest:<run_id>:<run_attempt>"` を使用する。
+
 ## Phase 別 必須 fields / 任意 fields 表
 
 以下の表は各フェーズで推奨される必須フィールドを示す。グローバル必須（`schema`, `manifest_id`, `recorded_at`, `repository`, `actor`, `phase`, `redaction`, `secret_policy`）はすべてのフェーズで必須であり、以下の表では省略する。
@@ -266,13 +268,19 @@ public repo への push 前に人間レビューを必須とする。
 `evidence.visibility: public_github_comment` のとき、`source_kind: transcript` / `source_kind: local_file` を使用することは
 JSON Schema によって機械的に禁止されている。
 
+- current live public posting では `agent_session_manifest/v1` の manifest 本文を Issue / PR comment に出さない。公開コメントで許可されるのは `artifact_digest`、`artifact_url`、`schema_ref`、`validation_verdict` などの opaque ref のみである。
+- `artifact_url` は retention-limited / auth-dependent / non-canonical locator であり、公開コメントで参照してよいが canonical な永続証跡ではない。永続 identity は `artifact_digest` と schema / marker 側へ寄せる。
+- `agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が揃った後にのみ conditional public comment 可であり、#934 merge 時点では dry-run のみで live public posting は禁止する。
+- `private_artifact` は legacy visibility enum 名であり secret-safe を意味しない。public repo では retention-limited non-comment surface 上の content も public-safe でなければならない。
+
 **EntireCLI や類似ツールを使用する場合の注意**:
 transcripts / prompts / checkpoint metadata が public repo に commit されると internet から参照可能になる。
-本 schema はこのリスクを防ぐために metadata のみを GitHub コメントに記録する設計を採用している。
+本 schema はこのリスクを防ぐために、manifest 本文ではなく metadata への opaque ref のみを GitHub コメントへ出せる public-safe boundary を採用している。
 
-## GitHub Comment テンプレート
+## Historical GitHub Comment Template（legacy / non-current）
 
-Issue/PR コメントに agent_session_manifest を記録する際は、以下の HTML marker 付き fenced code block を使用する:
+以下の template は historical 参照用であり、current live public posting の手順ではない。manifest 本文を Issue / PR comment に貼る運用は non-current であり、not live public posting として扱う。
+marker 文字列そのものは legacy parser / detection pattern の説明用に残すが、manifest body の公開許可を意味しない。
 
 ````markdown
 <!-- agent_session_manifest:v1 start -->
