@@ -95,6 +95,18 @@ VALIDATE_PR_BODY_PY = (
     / "validate_pr_body.py"
 )
 
+# ---------------------------------------------------------------------------
+# Production consumer import
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = (
+    REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "scripts"
+)
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -105,6 +117,7 @@ def _read(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 # LOOP_VERDICT_V2 fixture: BEHIND + required_auto_actions に update_branch を含む
+# skill は implement-issue.update_branch (サブコマンド付き) が正規値
 _LOOP_VERDICT_V2_BEHIND = {
     "verdict": "APPROVE",
     "merge_ready": False,
@@ -117,8 +130,9 @@ _LOOP_VERDICT_V2_BEHIND = {
         {
             "kind": "update_branch",
             "executor": "implementation-worker",
-            "skill": "implement-issue",
+            "skill": "implement-issue.update_branch",
             "blocking_merge_ready": True,
+            "mechanical": True,
             "expected_head_sha": "abc123def456",
         }
     ],
@@ -155,58 +169,6 @@ _LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION = {
         }
     ],
 }
-
-
-# ---------------------------------------------------------------------------
-# Routing logic (mirroring step-5-feedback-and-termination.md decision table)
-# ---------------------------------------------------------------------------
-
-def _evaluate_termination_route(verdict: dict) -> str:
-    """Deterministic routing based on LOOP_VERDICT_V2 fields.
-
-    Returns:
-      'approved': termination_reason: approved can be set
-      'route_to_update_branch': BEHIND → route to implementation-worker update_branch
-      'route_to_required_auto_action': non-empty required_auto_actions (non-update_branch)
-      'not_approved': merge_ready=false without BEHIND
-      'continue_loop': REQUEST_CHANGES
-
-    NOTE: この関数はテスト検証専用のローカル実装です。
-    実際の impl-review-loop orchestrator のロジックを反映しています。
-    Issue #634 のスコープ外のため、scripts/ への抽出は別 Issue で行います。
-    Ref: https://github.com/squne121/loop-protocol/issues/634 (Out of Scope)
-    """
-    v = verdict.get("verdict", "")
-    merge_ready = verdict.get("merge_ready", False)
-    required_auto_actions = verdict.get("required_auto_actions", [])
-    mergeability = verdict.get("mergeability", {})
-    merge_state_status = mergeability.get("merge_state_status", "")
-
-    if v == "REQUEST_CHANGES":
-        return "continue_loop"
-
-    if v != "APPROVE":
-        return "not_approved"
-
-    # BEHIND → update_branch route (termination_reason: approved は設定しない)
-    if merge_state_status == "BEHIND":
-        return "route_to_update_branch"
-
-    # required_auto_actions が残る → 終了しない
-    if required_auto_actions:
-        # update_branch が残る場合は update_branch route
-        for action in required_auto_actions:
-            if isinstance(action, dict) and action.get("kind") == "update_branch":
-                return "route_to_update_branch"
-        # それ以外（ensure_closing_keyword, update_pr_body_hygiene 等）
-        return "route_to_required_auto_action"
-
-    # merge_ready が false でかつ BEHIND でもない → 人間判断
-    if not merge_ready:
-        return "not_approved"
-
-    # APPROVE + merge_ready=true + required_auto_actions=[] → 終了可
-    return "approved"
 
 
 # ---------------------------------------------------------------------------
@@ -405,18 +367,28 @@ class TestAC5BehindMergeableRequiredAutoActionsUpdateBranch:
     """
 
     def test_behind_mergeable_routes_to_update_branch_after_pass(self):
-        """AC5 after-pass: BEHIND + MERGEABLE の LOOP_VERDICT_V2 で route が update_branch になること。"""
-        route = _evaluate_termination_route(_LOOP_VERDICT_V2_BEHIND)
-        assert route == "route_to_update_branch", (
-            f"BEHIND + MERGEABLE verdict must route to update_branch (not '{route}'). "
+        """AC5 after-pass: BEHIND + MERGEABLE の LOOP_VERDICT_V2 で route が update_branch になること。
+
+        production consumer に branch_behind_main=True を渡して route_to_update_branch を確認する。
+        """
+        result = route_loop_verdict_v2(
+            _LOOP_VERDICT_V2_BEHIND,
+            test_verdict={"branch_behind_main": True},
+        )
+        assert result.route == "route_to_update_branch", (
+            f"BEHIND + MERGEABLE verdict must route to update_branch (not '{result.route}'). "
+            f"errors: {result.errors}. "
             f"Fixture: {_LOOP_VERDICT_V2_BEHIND}"
         )
 
     def test_behind_not_approved_after_pass(self):
         """AC5 after-pass: BEHIND verdict で termination_reason: approved が立たないこと。"""
-        route = _evaluate_termination_route(_LOOP_VERDICT_V2_BEHIND)
-        assert route != "approved", (
-            f"BEHIND verdict must NOT route to 'approved'. Got: '{route}'. "
+        result = route_loop_verdict_v2(
+            _LOOP_VERDICT_V2_BEHIND,
+            test_verdict={"branch_behind_main": True},
+        )
+        assert result.route != "approved", (
+            f"BEHIND verdict must NOT route to 'approved'. Got: '{result.route}'. "
             f"APPROVE + BEHIND must not set termination_reason: approved."
         )
 
@@ -524,7 +496,7 @@ def test_update_branch_api_response_routing(
 def test_before_fail_loop_verdict_v1_behind_allows_premature_termination() -> None:
     """AC5 before-fail: V1 形式の verdict（required_auto_actions なし）で BEHIND が終了条件を bypass できた。
 
-    xfail: 現在の _evaluate_termination_route は BEHIND を正しく検出するため
+    xfail: 現在の production consumer は BEHIND を正しく検出するため
     このアサーションは XPASS になり strict=True で XPASS として成功扱いとなる。
     """
     v1_verdict = {
@@ -533,17 +505,14 @@ def test_before_fail_loop_verdict_v1_behind_allows_premature_termination() -> No
         "merge_state_status": "BEHIND",
         # V1: required_auto_actions フィールドなし、mergeability ネストなし
     }
-    route = _evaluate_termination_route(v1_verdict)
-    # V1 形式（mergeability ネストなし）では merge_state_status が取得できず
-    # BEHIND が検出されないため "not_approved" になる（merge_ready も未設定）
-    # 現在の実装は mergeability.merge_state_status を参照するため、
-    # フラット形式では BEHIND が検出されず "not_approved" になる
+    # production consumer で required_auto_actions が None → schema_invalid → fail_closed
+    # いずれにしても route != "approved" → xfail 発火
+    result = route_loop_verdict_v2(v1_verdict, test_verdict={"branch_behind_main": False})
+    # V1 形式は required_auto_actions が missing (None) → fail-closed
     # → route != "approved" なのでアサーション FAILS → xfail が発火
-    # Note: 現在の実装は V1 フラット形式を "not_approved" として扱うため
-    # このテストは XFAIL（期待通りの失敗）になる
-    assert route == "approved", (
+    assert result.route == "approved", (
         f"V1 verdict without required_auto_actions should have allowed 'approved' in old code. "
-        f"Got: '{route}' (current impl correctly rejects this)"
+        f"Got: '{result.route}' (current impl correctly rejects this)"
     )
 
 
@@ -584,17 +553,17 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
         before-fail: required_auto_actions を無視して APPROVE のみで終了していた。
         after-pass: required_auto_actions == [] が終了条件の一部として要求される。
         """
-        route = _evaluate_termination_route(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
-        assert route != "approved", (
-            f"required_auto_actions が残る場合は 'approved' route にならないこと。Got: '{route}'. "
+        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
+        assert result.route != "approved", (
+            f"required_auto_actions が残る場合は 'approved' route にならないこと。Got: '{result.route}'. "
             f"APPROVE + merge_ready=true + non-empty required_auto_actions must NOT terminate as approved."
         )
 
     def test_nonempty_required_auto_actions_routes_to_action_after_pass(self):
         """AC6 after-pass: required_auto_actions が残る場合は action routing になること。"""
-        route = _evaluate_termination_route(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
-        assert route in ("route_to_required_auto_action", "route_to_update_branch"), (
-            f"required_auto_actions が残る場合は action routing になること。Got: '{route}'."
+        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_WITH_KEYWORD_ACTION)
+        assert result.route in ("route_to_body_only_action", "route_to_update_branch"), (
+            f"required_auto_actions が残る場合は action routing になること。Got: '{result.route}'."
         )
 
     def test_clean_empty_actions_can_be_approved(self):
@@ -602,10 +571,10 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
 
         終了条件の正の検証: APPROVE + merge_ready=true + required_auto_actions=[] → approved。
         """
-        route = _evaluate_termination_route(_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS)
-        assert route == "approved", (
+        result = route_loop_verdict_v2(_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS)
+        assert result.route == "approved", (
             f"APPROVE + merge_ready=true + required_auto_actions=[] must route to 'approved'. "
-            f"Got: '{route}'. Fixture: {_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS}"
+            f"Got: '{result.route}'. errors: {result.errors}. Fixture: {_LOOP_VERDICT_V2_CLEAN_EMPTY_ACTIONS}"
         )
 
     def test_step5_feedback_required_auto_actions_gate_before_approved(self):
@@ -637,8 +606,7 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
         """AC6: before-fail シナリオの documentation。
 
         APPROVE + merge_ready=true + non-empty required_auto_actions が approved に routing
-        されないことを routing 関数で直接検証する（上記の test_nonempty_required_auto_actions_not_approved
-        と同等だが、fixture matrix として明示化）。
+        されないことを production consumer で直接検証する。
         """
         # before-fail シナリオを表す fixture
         before_fail_verdict = {
@@ -657,12 +625,12 @@ class TestAC6RequiredAutoActionsNonEmptyPreventApproval:
             ],
         }
 
-        route = _evaluate_termination_route(before_fail_verdict)
+        result = route_loop_verdict_v2(before_fail_verdict)
 
-        # before-fail シナリオでは approved になっていたが、after-pass では route_to_required_auto_action
-        assert route != "approved", (
+        # before-fail シナリオでは approved になっていたが、after-pass では route_to_body_only_action
+        assert result.route != "approved", (
             f"[before-fail regression] APPROVE + non-empty required_auto_actions must NOT be 'approved'. "
-            f"Got: '{route}'. This was the pre-#640 bug where APPROVE alone terminated the loop."
+            f"Got: '{result.route}'. This was the pre-#640 bug where APPROVE alone terminated the loop."
         )
 
 
@@ -719,9 +687,13 @@ def test_behind_mergeable_routes_to_update_branch():
       result: pass
       fixture: _LOOP_VERDICT_V2_BEHIND (inline)
     """
-    route = _evaluate_termination_route(_LOOP_VERDICT_V2_BEHIND)
-    assert route == "route_to_update_branch", (
-        f"BEHIND + MERGEABLE must route to update_branch (got '{route}')"
+    result = route_loop_verdict_v2(
+        _LOOP_VERDICT_V2_BEHIND,
+        test_verdict={"branch_behind_main": True},
+    )
+    assert result.route == "route_to_update_branch", (
+        f"BEHIND + MERGEABLE must route to update_branch (got '{result.route}'). "
+        f"errors: {result.errors}"
     )
 
 
@@ -732,8 +704,11 @@ def test_behind_mergeable_not_approved():
       version: 1
       result: pass
     """
-    route = _evaluate_termination_route(_LOOP_VERDICT_V2_BEHIND)
-    assert route != "approved", (
+    result = route_loop_verdict_v2(
+        _LOOP_VERDICT_V2_BEHIND,
+        test_verdict={"branch_behind_main": True},
+    )
+    assert result.route != "approved", (
         "BEHIND verdict must NOT route to 'approved'"
     )
 

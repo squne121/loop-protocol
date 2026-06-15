@@ -1,0 +1,18 @@
+scenario: negative_request_changes_with_malformed_update_branch_action
+loop_verdict:
+  verdict: REQUEST_CHANGES
+  merge_ready: false
+  reviewed_head_sha: "abc123"
+  mergeability:
+    merge_state_status: CLEAN
+  required_auto_actions:
+    - kind: update_branch
+      executor: pr-reviewer
+      skill: implement-issue
+      expected_head_sha: "zzz999"
+expected:
+  route: continue_loop
+  fail_closed: false
+  # REQUEST_CHANGES では action validation をスキップして continue_loop を返す設計。
+  # malformed action fields は REQUEST_CHANGES routing では検査されない。
+  # APPROVE verdict を経由した場合のみ action validation が走る。

@@ -1,0 +1,16 @@
+description: required_auto_actions as string-list ["update_branch"] → schema_invalid
+  (AC7)
+loop_verdict:
+  verdict: APPROVE
+  merge_ready: false
+  reviewed_head_sha: abc123def456
+  mergeability:
+    mergeable: MERGEABLE
+    merge_state_status: BEHIND
+  required_auto_actions:
+  - update_branch
+test_verdict: null
+expected:
+  route: fail_closed
+  fail_closed: true
+  reason_code_prefix: schema_invalid_required_auto_actions_string_list
