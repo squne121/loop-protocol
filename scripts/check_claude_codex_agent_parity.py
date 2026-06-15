@@ -15,7 +15,6 @@ import json
 import re
 import sys
 import tomllib
-from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -41,15 +40,31 @@ CLAUDE_PERMISSION_LEVEL_MAP = {
 }
 
 
-@dataclass
 class DriftEvidence:
-    rule_id: str
-    file: str
-    line: int
-    launcher: str  # "claude" or "codex"
-    agent: str
-    expected: str
-    actual: str
+    def __init__(
+        self,
+        rule_id: str,
+        file: str,
+        line: int,
+        launcher: str,  # "claude" or "codex"
+        agent: str,
+        expected: str,
+        actual: str,
+    ) -> None:
+        self.rule_id = rule_id
+        self.file = file
+        self.line = line
+        self.launcher = launcher
+        self.agent = agent
+        self.expected = expected
+        self.actual = actual
+
+    def __repr__(self) -> str:
+        return (
+            f"DriftEvidence(rule_id={self.rule_id!r}, file={self.file!r}, "
+            f"line={self.line!r}, launcher={self.launcher!r}, agent={self.agent!r}, "
+            f"expected={self.expected!r}, actual={self.actual!r})"
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -62,27 +77,47 @@ class DriftEvidence:
         }
 
 
-@dataclass
 class AgentParityFacts:
-    agent_name: str
-    # Final output schema (compact schema returned to caller)
-    final_output_schema: str | None = None
-    # Artifact-only schemas (never returned to caller, stored in artifacts only)
-    artifact_only_schema_names: list[str] = field(default_factory=list)
-    # Permission layers
-    declared_permission: str | None = None   # claude.permissionMode or codex.default_permissions
-    mutation_boundary: str | None = None     # derived readonly/issue-mutation/repo-write
-    runtime_proof_note: str = (
-        "Declaration is config-level; runtime proof requires launch-ledger validation."
-    )
-    # Delegation
-    nested_delegation_blocked: bool = False
-    nested_delegation_evidence: str = ""
-    # Model config (advisory; not runtime proof)
-    model_declaration: str | None = None
-    reasoning_effort_declaration: str | None = None
-    # Raw evidence list
-    evidence: list[DriftEvidence] = field(default_factory=list)
+    def __init__(
+        self,
+        agent_name: str,
+        final_output_schema: str | None = None,
+        artifact_only_schema_names: list[str] | None = None,
+        declared_permission: str | None = None,
+        mutation_boundary: str | None = None,
+        runtime_proof_note: str = (
+            "Declaration is config-level; runtime proof requires launch-ledger validation."
+        ),
+        nested_delegation_blocked: bool = False,
+        nested_delegation_evidence: str = "",
+        model_declaration: str | None = None,
+        reasoning_effort_declaration: str | None = None,
+        evidence: list[DriftEvidence] | None = None,
+    ) -> None:
+        self.agent_name = agent_name
+        # Final output schema (compact schema returned to caller)
+        self.final_output_schema = final_output_schema
+        # Artifact-only schemas (never returned to caller, stored in artifacts only)
+        self.artifact_only_schema_names: list[str] = artifact_only_schema_names if artifact_only_schema_names is not None else []
+        # Permission layers
+        self.declared_permission = declared_permission  # claude.permissionMode or codex.default_permissions
+        self.mutation_boundary = mutation_boundary      # derived readonly/issue-mutation/repo-write
+        self.runtime_proof_note = runtime_proof_note
+        # Delegation
+        self.nested_delegation_blocked = nested_delegation_blocked
+        self.nested_delegation_evidence = nested_delegation_evidence
+        # Model config (advisory; not runtime proof)
+        self.model_declaration = model_declaration
+        self.reasoning_effort_declaration = reasoning_effort_declaration
+        # Raw evidence list
+        self.evidence: list[DriftEvidence] = evidence if evidence is not None else []
+
+    def __repr__(self) -> str:
+        return (
+            f"AgentParityFacts(agent_name={self.agent_name!r}, "
+            f"final_output_schema={self.final_output_schema!r}, "
+            f"mutation_boundary={self.mutation_boundary!r})"
+        )
 
 
 def load_expectations() -> dict:
