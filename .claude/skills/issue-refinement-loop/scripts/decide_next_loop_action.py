@@ -126,7 +126,7 @@ def decide_next_action(
     loop_state: dict[str, Any],
     review_verdict: Optional[str],
     max_iterations_override: Optional[int] = None,
-) -> tuple[str, str, list[str], list[str]]:
+) -> tuple[str, str, list[str], list[str], "Optional[str]"]:
     """
     Determine the next action for the refinement loop.
 
