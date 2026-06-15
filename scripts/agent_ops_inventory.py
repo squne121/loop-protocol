@@ -33,6 +33,7 @@ EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runti
 
 VALID_TASK_KINDS = [
     "issue-refinement",
+    "issue-refinement-ops-review",
     "pr-review",
     "workflow-implementation",
     "product-implementation",
@@ -61,6 +62,27 @@ PLAN_REGISTRY: dict[str, PlanSpec] = {
             ".claude/agents/issue-author.md",
             ".claude/agents/issue-reviewer.md",
             ".claude/agents/review-issue.md",
+        ],
+        do_not_read_initial_only=[
+            "docs/product/",
+            "src/",
+        ],
+    ),
+    "issue-refinement-ops-review": PlanSpec(
+        task_kind="issue-refinement-ops-review",
+        must_read=[
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".claude/skills/issue-refinement-loop/SKILL.md",
+            ".claude/agents/issue-reviewer.md",
+            ".claude/agents/issue-author.md",
+            ".claude/skills/issue-contract-review/scripts/contract_readiness_check.py",
+            ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py",
+            ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
+            ".claude/skills/issue-refinement-loop/scripts/compact_review_result.py",
+            ".claude/skills/issue-refinement-loop/scripts/compact_author_result.py",
         ],
         do_not_read_initial_only=[
             "docs/product/",
@@ -256,9 +278,9 @@ def classify_path_kind(path: str) -> str:
     return "other"
 
 
-def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str]) -> dict:
+def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str], task_kind: str = "agent-ops-review") -> dict:
     """
-    Build inventory artifact for agent-ops-review.
+    Build inventory artifact for agent-ops or ops-review task-kinds.
     Only tracked files, metadata only (no file contents).
     Fields: path, exists, kind, tracked.
 
@@ -267,12 +289,15 @@ def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str]) -> dict
                OR is a symlink escaping the repo
     - warn:    any expected path is missing from disk OR not in tracked_set
     - ok:      all present, tracked, and no symlink escape
+
+    task_kind determines which target_prefixes and expected_paths to use.
     """
-    # Gather the target paths
+    # Standard target prefixes included in all ops-review inventories
     target_prefixes = [
         ".agents/skills/",
         ".claude/skills/",
         ".claude/hooks/",
+        ".claude/rules/",
         ".codex/",
         "tests/fixtures/codex-agent-config/",
     ]
@@ -369,7 +394,7 @@ def build_agent_ops_inventory(repo_root: Path, tracked_paths: list[str]) -> dict
 
     return {
         "schema_version": "agent_ops_inventory_v1",
-        "task_kind": "agent-ops-review",
+        "task_kind": task_kind,
         "status": status,
         "critical_surfaces": critical_surfaces,
         "items": items,
@@ -465,7 +490,12 @@ def main() -> int:
     args = parser.parse_args()
     repo_root: Path = args.repo_root.resolve()
 
-    if args.task_kind == "agent-ops-review":
+    # Task-kinds that require inventory artifact generation
+    inventory_task_kinds = {"agent-ops-review"}
+    # Task-kinds that can optionally generate inventory artifacts
+    optional_inventory_task_kinds = {"issue-refinement-ops-review"}
+
+    if args.task_kind in inventory_task_kinds or (args.task_kind in optional_inventory_task_kinds and args.artifact_out):
         # Determine artifact output path — use a safe tempdir by default
         if args.artifact_out:
             artifact_path = args.artifact_out
@@ -474,7 +504,7 @@ def main() -> int:
             artifact_path = Path(tmpdir) / "agent_ops_inventory.json"
 
         tracked_paths = get_tracked_paths_decoded(repo_root)
-        inventory = build_agent_ops_inventory(repo_root, tracked_paths)
+        inventory = build_agent_ops_inventory(repo_root, tracked_paths, task_kind=args.task_kind)
         write_artifact(artifact_path, inventory)
 
         stdout_line = f"EVIDENCE: {artifact_path}\n"
