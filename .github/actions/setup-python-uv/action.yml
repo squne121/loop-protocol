@@ -1,13 +1,9 @@
 name: Setup Python with uv
 description: |
   astral-sh/setup-uv を使って uv をセットアップする Composite Action。
-  checkout 後に呼び出す。
-
-inputs:
-  uv-version:
-    description: setup-uv action のバージョン（action tag）
-    required: false
-    default: 'v8.1.0'
+  checkout 後に呼び出す。uv バージョン pin は #375 で管理。
+  cache policy は setup-uv のデフォルト（enable-cache: auto）を採用。
+  uv python install / uv sync は workflow 側 timed step に残す。
 
 runs:
   using: composite
