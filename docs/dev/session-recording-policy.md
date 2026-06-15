@@ -163,15 +163,6 @@ public_surfaces:
       rationale: >
         manifest body は Issue / PR comment に出さない。公開コメントでは
         artifact_digest や validation_verdict などの opaque ref のみを許可する。
-  github_issue_comment:
-    raw_transcript_allowed: false
-    source_kind_prohibited:
-      - transcript
-      - local_file
-    compatibility_note: >
-      legacy checker / policy consumer 互換のため `github_issue_comment` キーを残す。
-      current policy の正本は `github_issue_or_pr_comment.agent_session_manifest` であり、
-      manifest body は許可しない。
     agent_run_report:
       body_allowed: conditional
       conditions:
@@ -196,6 +187,16 @@ public_surfaces:
       rationale: >
         retro index も conditional public comment の対象だが、#934 merge 時点では
         dry-run のみで、live public posting は #935 / #937 完了後に限る。
+  github_issue_comment:
+    compatibility_alias_of: github_issue_or_pr_comment
+    raw_transcript_allowed: false
+    source_kind_prohibited:
+      - transcript
+      - local_file
+    compatibility_note: >
+      legacy checker / policy consumer 互換のため `github_issue_comment` キーを残す。
+      current policy の正本は `github_issue_or_pr_comment` であり、
+      新規 contract は alias 側へ増設しない。
 github_public_checkpoint_branch_allowed: false
 checkpoint_remote:
   allowed_visibility:
@@ -232,6 +233,7 @@ kill_switch:
 - #934 は docs-only boundary cleanup であり、#936 の lifecycle 導線も含めて live public posting はまだ禁止する。merge 時点で許可されるのは dry-run 設計と public-safe 境界の固定のみ。
 - public comment posting は trusted context のみで行う。`pull_request_target` では実行せず、top-level read-only baseline を維持したまま posting job に限って `issues: write` / `pull-requests: write` を付与する。
 - hook は diagnostic / prevention layer であり security boundary ではない。report/index の public-safe 判定正本は post-run validator と posting guard に置く。
+- `artifact_url` は opaque ref ではあるが canonical evidence ではない。retention-limited / auth-dependent / non-canonical locator として扱い、永続的な識別は `artifact_digest`、`schema_ref`、`validation_verdict`、workflow run URL、comment marker に寄せる。
 - 過去の manifest comment template や pilot wording は historical / non-current / not live public posting として扱い、current live public posting 許可の根拠にしない。
 
 ---
@@ -509,7 +511,7 @@ hook wrapper（`generate_session_manifest_from_hook.mjs`）の動作:
 | trigger | `push` + `pull_request` + `merge_group`（`pull_request_target` は不使用） |
 | permissions | `contents: read`（read-only、write 権限なし） |
 | persist-credentials | `false` |
-| artifact upload | `actions/upload-artifact@v4`、`retention-days: 7`、`if-no-files-found: error` |
+| artifact upload | `actions/upload-artifact@v6`、`retention-days: 7`、`if-no-files-found: error` |
 | artifact name prefix | `agent-session-manifest` |
 
 ### required check operational contract (#432)
@@ -597,6 +599,8 @@ manifest の出力先は **retention-limited GitHub Actions artifact** とする
 `actions/artifacts` REST API 経由で誰でもダウンロード可能である。
 「private artifact」という語は "Secret が含まれない" ことを保証するものではなく、
 「公開コメント・git history ではない管理された配布面」であることを示す用語である。
+`artifact_url` は artifact / workflow run / repository retention に依存する auth-dependent な locator であり、
+canonical な永続証跡ではない。永続 identity は `artifact_digest` と comment marker / workflow run URL に寄せる。
 
 ### manifest content の public-safe contract
 

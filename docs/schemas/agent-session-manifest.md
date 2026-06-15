@@ -269,6 +269,7 @@ public repo への push 前に人間レビューを必須とする。
 JSON Schema によって機械的に禁止されている。
 
 - current live public posting では `agent_session_manifest/v1` の manifest 本文を Issue / PR comment に出さない。公開コメントで許可されるのは `artifact_digest`、`artifact_url`、`schema_ref`、`validation_verdict` などの opaque ref のみである。
+- `artifact_url` は retention-limited / auth-dependent / non-canonical locator であり、公開コメントで参照してよいが canonical な永続証跡ではない。永続 identity は `artifact_digest` と schema / marker 側へ寄せる。
 - `agent_run_report/v1` / `agent_retro_index/v1` は #935 schema/redaction validator と #937 exact marker upsert guard が揃った後にのみ conditional public comment 可であり、#934 merge 時点では dry-run のみで live public posting は禁止する。
 - `private_artifact` は legacy visibility enum 名であり secret-safe を意味しない。public repo では retention-limited non-comment surface 上の content も public-safe でなければならない。
 
