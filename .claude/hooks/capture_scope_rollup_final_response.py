@@ -53,7 +53,7 @@ class CaptureDecision:
     capture_mode: str
     capture_status: str
     parser_status: str
-    routing_action: str
+    capture_routing_action: str
     agent_type: str | None
     invocation_id: str | None
     requested_at: str | None
@@ -63,6 +63,10 @@ class CaptureDecision:
     capture_source: str
     provenance: dict[str, Any]
     notes: list[str]
+
+
+def _safe_invocation_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value)
 
 
 def _read_payload() -> dict[str, Any] | None:
@@ -200,7 +204,8 @@ def _build_record(decision: CaptureDecision) -> dict[str, Any]:
         "capture_mode": decision.capture_mode,
         "capture_status": decision.capture_status,
         "parser_status": decision.parser_status,
-        "routing_action": decision.routing_action,
+        "capture_routing_action": decision.capture_routing_action,
+        "routing_action": decision.capture_routing_action,
         "agent_type": decision.agent_type,
         "invocation_id": decision.invocation_id,
         "requested_at": decision.requested_at,
@@ -213,14 +218,24 @@ def _build_record(decision: CaptureDecision) -> dict[str, Any]:
     }
 
 
-def _record_stem(decision: CaptureDecision, payload: dict[str, Any]) -> str:
+def _canonical_stem(decision: CaptureDecision, payload: dict[str, Any]) -> str:
     if decision.invocation_id:
-        return f"scope_rollup_{decision.invocation_id}"
+        return f"scope_rollup_{_safe_invocation_id(decision.invocation_id)}"
 
     digest = _payload_digest(payload)[:12]
     mode = re.sub(r"[^a-z0-9_-]+", "-", decision.capture_mode.lower()).strip("-") or "unknown"
     status = re.sub(r"[^a-z0-9_-]+", "-", decision.capture_status.lower()).strip("-") or "unknown"
     return f"scope_rollup_{mode}_{status}_{digest}"
+
+
+def _record_stem(decision: CaptureDecision, payload: dict[str, Any]) -> str:
+    base = _canonical_stem(decision, payload)
+    if decision.capture_status == "captured":
+        return base
+
+    digest = _payload_digest(payload)[:12]
+    status = re.sub(r"[^a-z0-9_-]+", "-", decision.capture_status.lower()).strip("-") or "unknown"
+    return f"{base}.{status}.{digest}"
 
 
 def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
@@ -238,7 +253,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="unsupported",
             capture_status="hook_unavailable",
             parser_status="not_applicable",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=agent_type if isinstance(agent_type, str) else None,
             invocation_id=None,
             requested_at=None,
@@ -255,7 +270,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="agent_type_mismatch",
             parser_status="not_applicable",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=agent_type if isinstance(agent_type, str) else None,
             invocation_id=None,
             requested_at=None,
@@ -272,7 +287,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="missing_final_response",
             parser_status="marker_missing",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=None,
             requested_at=None,
@@ -297,7 +312,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="parser_rejected",
             parser_status=parser_status,
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=invocation_id,
             requested_at=requested_at,
@@ -315,7 +330,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="parser_rejected",
             parser_status="marker_malformed",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=invocation_id,
             requested_at=requested_at,
@@ -332,7 +347,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="parser_rejected",
             parser_status="marker_malformed",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=None,
             requested_at=requested_at,
@@ -352,7 +367,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="parser_rejected",
             parser_status="marker_malformed",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=invocation_id,
             requested_at=requested_at,
@@ -369,7 +384,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
             capture_mode="subagent_stop_hook",
             capture_status="stale_capture",
             parser_status="rejected",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=invocation_id,
             requested_at=requested_at,
@@ -382,13 +397,14 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
         )
 
     capture_dir = _resolve_capture_dir()
-    capture_path = capture_dir / f"scope_rollup_{invocation_id}.txt"
+    safe_invocation_id = _safe_invocation_id(invocation_id)
+    capture_path = capture_dir / f"scope_rollup_{safe_invocation_id}.txt"
     if not _validate_capture_path(capture_path, capture_dir):
         return CaptureDecision(
             capture_mode="subagent_stop_hook",
             capture_status="write_failed",
             parser_status="rejected",
-            routing_action="stop_human",
+            capture_routing_action="stop_human",
             agent_type=TARGET_AGENT_TYPE,
             invocation_id=invocation_id,
             requested_at=requested_at,
@@ -406,7 +422,7 @@ def _decision_from_payload(payload: dict[str, Any]) -> CaptureDecision:
         capture_mode="subagent_stop_hook",
         capture_status="captured",
         parser_status=str(marker_status),
-        routing_action="continue" if marker_status == "ok" else "stop_human",
+        capture_routing_action="continue" if marker_status == "ok" else "stop_human",
         agent_type=TARGET_AGENT_TYPE,
         invocation_id=invocation_id,
         requested_at=requested_at,
@@ -426,7 +442,7 @@ def _capture(decision: CaptureDecision, last_assistant_message: str | None) -> C
     capture_path = Path(decision.capture_path)
     if capture_path.exists():
         decision.capture_status = "duplicate_invocation"
-        decision.routing_action = "stop_human"
+        decision.capture_routing_action = "stop_human"
         decision.notes.append("capture file already exists")
         return decision
 
@@ -434,19 +450,19 @@ def _capture(decision: CaptureDecision, last_assistant_message: str | None) -> C
         _atomic_write(capture_path, (last_assistant_message or "").encode("utf-8"))
     except FileExistsError:
         decision.capture_status = "duplicate_invocation"
-        decision.routing_action = "stop_human"
+        decision.capture_routing_action = "stop_human"
         decision.notes.append("capture file already exists")
         return decision
     except OSError as exc:
         decision.capture_status = "write_failed"
-        decision.routing_action = "stop_human"
+        decision.capture_routing_action = "stop_human"
         decision.notes.append(f"capture write failed: {exc.__class__.__name__}")
         return decision
 
     mode = stat.S_IMODE(capture_path.stat().st_mode)
     if mode != 0o600:
         decision.capture_status = "write_failed"
-        decision.routing_action = "stop_human"
+        decision.capture_routing_action = "stop_human"
         decision.notes.append(f"capture mode mismatch: {oct(mode)}")
         return decision
 
@@ -469,7 +485,7 @@ def main() -> int:
     record_path = capture_dir / f"{_record_stem(decision, payload)}.capture.yaml"
     if not _validate_capture_path(record_path, capture_dir):
         return 0
-    if record_path.exists():
+    if decision.capture_status == "captured" and record_path.exists():
         return 0
 
     try:

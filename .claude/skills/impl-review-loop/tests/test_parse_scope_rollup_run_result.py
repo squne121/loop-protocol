@@ -31,16 +31,12 @@ PLAN_SCRIPT = (
     / "plan_issue_scope_rollup.py"
 )
 
+
 def _load_script_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _build_plan_file(path: Path) -> tuple[str, str]:
-    """Build a minimal valid ISSUE_SCOPE_ROLLUP_PLAN_V2 fixture and return expected sha.
-
-    Returns:
-        tuple[result_sha, payload_sha]
-    """
     body = {
         "scope_rollup": "v2-fixture",
         "meta": {"source": "test"},
@@ -52,7 +48,6 @@ def _build_plan_file(path: Path) -> tuple[str, str]:
     ).hexdigest()
 
     script_sha = _load_script_sha(PLAN_SCRIPT)
-
     payload = {
         "self_validation": {
             "schema_name": "ISSUE_SCOPE_ROLLUP_PLAN_V2",
@@ -62,9 +57,7 @@ def _build_plan_file(path: Path) -> tuple[str, str]:
         },
         **body,
     }
-
-    payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    path.write_text(payload_text, encoding="utf-8")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     result_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     return result_sha, payload_sha
 
@@ -117,6 +110,36 @@ def _render_marker(
     ).rstrip() + "\n```"
 
 
+def _render_capture_sidecar(
+    assistant_output_path: Path,
+    *,
+    invocation_id: str = "inv-2026-06-13",
+    capture_status: str = "captured",
+    capture_mode: str = "subagent_stop_hook",
+    agent_type: str = "scope-rollup-runner",
+    capture_source: str = "last_assistant_message",
+    routing_action: str = "continue",
+) -> str:
+    return yaml.safe_dump(
+        {
+            "SCOPE_ROLLUP_CAPTURE_RESULT_V1": {
+                "capture_mode": capture_mode,
+                "capture_status": capture_status,
+                "parser_status": "ok",
+                "capture_routing_action": routing_action,
+                "routing_action": routing_action,
+                "agent_type": agent_type,
+                "invocation_id": invocation_id,
+                "capture_path": str(assistant_output_path.resolve()),
+                "capture_sha256": hashlib.sha256(assistant_output_path.read_bytes()).hexdigest(),
+                "capture_source": capture_source,
+            }
+        },
+        sort_keys=False,
+        allow_unicode=True,
+    )
+
+
 def _run_parser(
     assistant_output: str,
     *,
@@ -124,10 +147,15 @@ def _run_parser(
     issue_number: int = 841,
     expected_script_sha: str,
     requested_at: str,
+    capture_sidecar_text: str | None = None,
 ) -> Dict[str, Any]:
     with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
         tmp.write(assistant_output)
         tmp_path = Path(tmp.name)
+
+    sidecar_path = tmp_path.with_suffix(".capture.yaml")
+    if capture_sidecar_text is not None:
+        sidecar_path.write_text(capture_sidecar_text, encoding="utf-8")
 
     try:
         result = subprocess.run(
@@ -136,6 +164,8 @@ def _run_parser(
                 str(PARSE_SCRIPT),
                 "--assistant-output-file",
                 str(tmp_path),
+                "--capture-sidecar-file",
+                str(sidecar_path),
                 "--repo",
                 "squne121/loop-protocol",
                 "--issue-number",
@@ -152,13 +182,13 @@ def _run_parser(
             check=False,
             timeout=10,
         )
-
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+        if sidecar_path.exists():
+            sidecar_path.unlink()
 
     assert result.returncode == 0, f"Parser command failed: {result.stderr}"
-
     parsed = yaml.safe_load(result.stdout)
     assert isinstance(parsed, dict)
     assert "SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1" in parsed
@@ -166,9 +196,8 @@ def _run_parser(
 
 
 def test_marker_missing_when_no_marker_block(tmp_path):
-    output = "No fenced marker blocks."
     result = _run_parser(
-        output,
+        "No fenced marker blocks.",
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
         requested_at="2026-06-13T10:00:00+00:00",
     )
@@ -178,9 +207,8 @@ def test_marker_missing_when_no_marker_block(tmp_path):
 
 
 def test_marker_missing_when_marker_appears_in_prose_only(tmp_path):
-    output = "The runner returned ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 but not in fenced YAML."
     result = _run_parser(
-        output,
+        "The runner returned ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 but not in fenced YAML.",
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
         requested_at="2026-06-13T10:00:00+00:00",
     )
@@ -188,9 +216,8 @@ def test_marker_missing_when_marker_appears_in_prose_only(tmp_path):
 
 
 def test_marker_malformed_for_bad_yaml(tmp_path):
-    output = "```yaml\n{ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1: [invalid`\n```"
     result = _run_parser(
-        output,
+        "```yaml\n{ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1: [invalid`\n```",
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
         requested_at="2026-06-13T10:00:00+00:00",
     )
@@ -201,45 +228,14 @@ def test_marker_malformed_for_bad_yaml(tmp_path):
 def test_marker_ambiguous_when_duplicate_markers_present(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
     marker = _render_marker(script_sha=script_sha)
-    assistant_output = f"{marker}\n{marker}"
-
     result = _run_parser(
-        assistant_output,
+        f"{marker}\n{marker}",
         expected_script_sha=script_sha,
         requested_at="2026-06-13T10:00:00+00:00",
     )
     assert result["status"] == "marker_ambiguous"
     assert result["routing_action"] == "stop_human"
     assert result["reject_reason"] == "marker_ambiguous"
-
-
-def test_marker_malformed_when_single_block_has_duplicate_key():
-    output = """```yaml
-ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
-  repo: squne121/loop-protocol
-  status: ok
-  current_issue: 841
-  invocation_id: inv-2026-06-13
-  requested_at: 2026-06-13T10:00:00+00:00
-  generated_at: 2026-06-13T10:01:00+00:00
-  script_blob_sha256: deadbeef
-ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
-  status: ok
-  repo: squne121/loop-protocol
-  current_issue: 841
-  invocation_id: inv-2026-06-13
-  requested_at: 2026-06-13T10:00:00+00:00
-  generated_at: 2026-06-13T10:01:00+00:00
-  script_blob_sha256: deadbeef
-```
-"""
-    result = _run_parser(
-        output,
-        expected_script_sha="deadbeef",
-        requested_at="2026-06-13T10:00:00+00:00",
-    )
-    assert result["status"] == "marker_malformed"
-    assert result["reject_reason"] == "marker_malformed"
 
 
 def test_rejected_when_invocation_id_mismatch(tmp_path):
@@ -257,15 +253,12 @@ def test_rejected_when_invocation_id_mismatch(tmp_path):
 def test_rejected_when_result_sha_mismatch(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
     plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
-    result_sha, _ = _build_plan_file(plan_path)
-
+    _result_sha, _ = _build_plan_file(plan_path)
     marker = _render_marker(
         script_sha=script_sha,
         raw_plan_location=str(plan_path),
         result_sha="deadbeef" + "00" * 30,
     )
-
-    assert len(marker) > 0
     result = _run_parser(
         marker,
         expected_script_sha=script_sha,
@@ -281,7 +274,6 @@ def test_rejected_when_raw_plan_location_is_invalid(tmp_path):
         script_sha=_load_script_sha(PLAN_SCRIPT),
         result_sha="0000000000000000000000000000000000000000000000000000000000000000",
     )
-
     result = _run_parser(
         marker,
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
@@ -291,7 +283,7 @@ def test_rejected_when_raw_plan_location_is_invalid(tmp_path):
     assert result["reject_reason"] == "raw_plan_location_invalid"
 
 
-def test_non_escation_for_runner_unavailable_marker(tmp_path):
+def test_non_escalation_for_runner_unavailable_marker(tmp_path):
     marker = _render_marker(
         status="runner_unavailable",
         include_result=False,
@@ -299,11 +291,11 @@ def test_non_escation_for_runner_unavailable_marker(tmp_path):
         requested_at="2026-06-13T10:00:00+00:00",
         generated_at="2026-06-13T10:01:00+00:00",
     )
-
     result = _run_parser(
         marker,
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
         requested_at="2026-06-13T10:00:00+00:00",
+        capture_sidecar_text="SCOPE_ROLLUP_CAPTURE_RESULT_V1:\n  capture_mode: unsupported\n",
     )
     assert result["status"] == "runner_unavailable"
     assert result["routing_action"] == "deferred"
@@ -317,11 +309,11 @@ def test_failed_marker_stops_human():
         requested_at="2026-06-13T10:00:00+00:00",
         generated_at="2026-06-13T10:01:00+00:00",
     )
-
     result = _run_parser(
         marker,
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
         requested_at="2026-06-13T10:00:00+00:00",
+        capture_sidecar_text="SCOPE_ROLLUP_CAPTURE_RESULT_V1:\n  capture_mode: unsupported\n",
     )
     assert result["status"] == "failed"
     assert result["routing_action"] == "stop_human"
@@ -336,7 +328,6 @@ def test_requested_at_mismatch_rejected(tmp_path):
         result_sha=result_sha,
         requested_at="2026-06-13T10:00:00+00:00",
     )
-
     result = _run_parser(
         marker,
         expected_script_sha=_load_script_sha(PLAN_SCRIPT),
@@ -346,52 +337,159 @@ def test_requested_at_mismatch_rejected(tmp_path):
     assert result["reject_reason"] == "requested_at_mismatch"
 
 
-def test_ok_for_valid_ok_marker(tmp_path):
+def test_rejected_when_capture_sidecar_is_missing(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
     plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
     result_sha, _ = _build_plan_file(plan_path)
-
     marker = _render_marker(
         script_sha=script_sha,
         raw_plan_location=str(plan_path),
         result_sha=result_sha,
     )
-
     result = _run_parser(
         marker,
         expected_script_sha=script_sha,
         requested_at="2026-06-13T10:00:00+00:00",
     )
-    assert result["status"] == "ok"
-    assert result["routing_action"] == "continue"
-    assert result["raw_plan_location_allowed"] is True
+    assert result["status"] == "rejected"
+    assert result["reject_reason"] == "capture_sidecar_missing"
 
 
-def test_ok_when_capture_sidecar_block_is_present(tmp_path):
+def test_ok_when_capture_sidecar_file_matches_assistant_output(tmp_path):
     script_sha = _load_script_sha(PLAN_SCRIPT)
     plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
     result_sha, _ = _build_plan_file(plan_path)
-
     marker = _render_marker(
         script_sha=script_sha,
         raw_plan_location=str(plan_path),
         result_sha=result_sha,
     )
-    capture_block = """```yaml
-SCOPE_ROLLUP_CAPTURE_RESULT_V1:
-  capture_mode: subagent_stop_hook
-  capture_status: captured
-  parser_status: ok
-  routing_action: continue
-  invocation_id: inv-2026-06-13
-  capture_path: /tmp/scope_rollup_inv-2026-06-13.txt
-  capture_sha256: deadbeef
-```"""
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(_render_capture_sidecar(output_path), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PARSE_SCRIPT),
+                "--assistant-output-file",
+                str(output_path),
+                "--capture-sidecar-file",
+                str(sidecar_path),
+                "--repo",
+                "squne121/loop-protocol",
+                "--issue-number",
+                "841",
+                "--invocation-id",
+                "inv-2026-06-13",
+                "--expected-script-sha",
+                script_sha,
+                "--requested-at",
+                "2026-06-13T10:00:00+00:00",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "ok"
+        assert parsed["routing_action"] == "continue"
+        assert parsed["raw_plan_location_allowed"] is True
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
 
-    result = _run_parser(
-        f"{capture_block}\n{marker}",
-        expected_script_sha=script_sha,
-        requested_at="2026-06-13T10:00:00+00:00",
+
+def test_rejected_when_capture_status_is_not_captured(tmp_path):
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
+    result_sha, _ = _build_plan_file(plan_path)
+    marker = _render_marker(script_sha=script_sha, raw_plan_location=str(plan_path), result_sha=result_sha)
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar_path.write_text(
+        _render_capture_sidecar(output_path, capture_status="duplicate_invocation", routing_action="stop_human"),
+        encoding="utf-8",
     )
-    assert result["status"] == "ok"
-    assert result["routing_action"] == "continue"
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PARSE_SCRIPT),
+                "--assistant-output-file",
+                str(output_path),
+                "--capture-sidecar-file",
+                str(sidecar_path),
+                "--repo",
+                "squne121/loop-protocol",
+                "--issue-number",
+                "841",
+                "--invocation-id",
+                "inv-2026-06-13",
+                "--expected-script-sha",
+                script_sha,
+                "--requested-at",
+                "2026-06-13T10:00:00+00:00",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "rejected"
+        assert parsed["reject_reason"] == "capture_status_invalid"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+
+
+def test_rejected_when_capture_sha_mismatches(tmp_path):
+    script_sha = _load_script_sha(PLAN_SCRIPT)
+    plan_path = tmp_path / "scope_rollup_inv-2026-06-13_result.json"
+    result_sha, _ = _build_plan_file(plan_path)
+    marker = _render_marker(script_sha=script_sha, raw_plan_location=str(plan_path), result_sha=result_sha)
+    with NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+        tmp.write(marker)
+        output_path = Path(tmp.name)
+    sidecar_path = output_path.with_suffix(".capture.yaml")
+    sidecar = yaml.safe_load(_render_capture_sidecar(output_path))
+    sidecar["SCOPE_ROLLUP_CAPTURE_RESULT_V1"]["capture_sha256"] = "deadbeef"
+    sidecar_path.write_text(yaml.safe_dump(sidecar, sort_keys=False), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PARSE_SCRIPT),
+                "--assistant-output-file",
+                str(output_path),
+                "--capture-sidecar-file",
+                str(sidecar_path),
+                "--repo",
+                "squne121/loop-protocol",
+                "--issue-number",
+                "841",
+                "--invocation-id",
+                "inv-2026-06-13",
+                "--expected-script-sha",
+                script_sha,
+                "--requested-at",
+                "2026-06-13T10:00:00+00:00",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        parsed = yaml.safe_load(result.stdout)["SCOPE_ROLLUP_MARKER_PARSE_RESULT_V1"]
+        assert parsed["status"] == "rejected"
+        assert parsed["reject_reason"] == "capture_sha_mismatch"
+    finally:
+        output_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)

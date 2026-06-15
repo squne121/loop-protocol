@@ -290,7 +290,6 @@ invocation_id: <INVOCATION_ID>
 ```
 
 runner は `ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1` marker を stdout に返す。
-`scope-rollup-runner` の final response capture は `SubagentStop` hook が既定経路であり、`last_assistant_message` を `/tmp/scope_rollup_<invocation_id>.txt` に atomic capture する。hook が成立しない場合は silent fallback せず fail-close する。
 
 ### ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 仕様
 
@@ -326,31 +325,16 @@ ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
 
 `result_sha256` は `raw_plan_location` のファイルバイト列の sha256。
 
-`raw_plan_location` は runner の最終応答 capture 後に `main conversation` でのみ採用し、実体は `/tmp/scope_rollup_<invocation_id>.json` 等の形式を想定する。`runner` が別経路で file を保存する運用はしない。
-
-`SubagentStop` hook は以下の sidecar も残す:
-
-```yaml
-SCOPE_ROLLUP_CAPTURE_RESULT_V1:
-  capture_mode: subagent_stop_hook | unsupported
-  capture_status: captured | hook_unavailable | duplicate_invocation | stale_capture | parser_rejected | write_failed
-  parser_status: ok | failed | runner_unavailable | marker_missing | marker_malformed | marker_ambiguous | rejected | not_applicable
-  routing_action: continue | stop_human
-  invocation_id: "<INVOCATION_ID>"
-  capture_path: "/tmp/scope_rollup_<invocation_id>.txt"
-  capture_sha256: "<sha256 or null>"
-```
-
-既定 route は `subagent_stop_hook` のみ。`manual_main_capture` は未採用とし、hook が使えない環境は `capture_mode: unsupported` / `capture_status: hook_unavailable` 相当として `routing_action: stop_human` に送る。
+`raw_plan_location` は runner の最終応答保存後に `main conversation` でのみ採用し、実体は `/tmp/scope_rollup_<invocation_id>.json` 等の形式を想定する。`runner` が別経路でファイルを保存する運用はしない。
 
 ### main conversation の marker 検証
 
 runner から受け取った raw output を `parse_scope_rollup_run_result.py` へ渡し、parser の決定のみを採用する。marker の採点に失敗した場合は **raw `result.raw_plan_location` の直接読み取りは禁止**。
-`/tmp/scope_rollup_<invocation_id>.txt` が存在しない、sidecar が `capture_status != captured`、または capture provenance を検証できない場合も同様に fail-close し、Step 3 へ進めない。
 
 ```bash
 uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_result.py \
   --assistant-output-file /tmp/scope_rollup_<invocation_id>.txt \
+  --capture-sidecar-file /tmp/scope_rollup_<invocation_id>.capture.yaml \
   --repo "${REPO_FULL_NAME}" \
   --issue-number <issue_number> \
   --invocation-id "${INVOCATION_ID}" \
@@ -364,7 +348,7 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 - `status: runner_unavailable` → `routing_action: deferred`
 - `status: failed` → `routing_action: stop_human`
 - `status: marker_missing | marker_malformed | marker_ambiguous | rejected` → `routing_action: stop_human`
-- `capture_mode: unsupported` / `capture_status: hook_unavailable` / `capture_status != captured` → `routing_action: stop_human`
+- sidecar missing / `capture_mode != subagent_stop_hook` / `capture_status != captured` / `capture_sha256` mismatch / `capture_path` mismatch / `agent_type` mismatch / `invocation_id` mismatch / `capture_source != last_assistant_message` → `routing_action: stop_human`
 - `routing_action: stop_human` は `human_escalation` として扱う（`LOOP_STATE.termination_reason: human_escalation`）
 - `routing_action: deferred` は `LOOP_STATE.scope_rollup_decision.decision: deferred` を許容する（必要に応じて追加で `human_escalation`）
 - `raw_plan_location_allowed: true` の場合のみ `result.raw_plan_location` を読み取る
@@ -377,9 +361,11 @@ uv run python3 .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_re
 2. `current_issue` が対象 Issue 番号と一致する
 3. `invocation_id` が step1 で生成した値と一致する
 4. `generated_at > requested_at`
-5. `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha と一致する
-6. `result.raw_plan_location` が存在し、`result.result_sha256` と一致し、`result.verify_status == verified`
-7. `verify_scope_rollup_result.py`（issue-refinement-loop 版）検証が pass
+5. capture sidecar が存在し、`capture_mode == subagent_stop_hook`、`capture_status == captured`、`capture_source == last_assistant_message`
+6. sidecar の `agent_type` / `invocation_id` / `capture_path` / `capture_sha256` が期待値と一致する
+7. `script_blob_sha256` が現在の `plan_issue_scope_rollup.py` の sha と一致する
+8. `result.raw_plan_location` が存在し、`result.result_sha256` と一致し、`result.verify_status == verified`
+9. `verify_scope_rollup_result.py`（issue-refinement-loop 版）検証が pass
 
 これらが全て通過した場合:
 - `result.suggested_actions_summary` を `LOOP_STATE.scope_rollup_plan.summary` に採用する

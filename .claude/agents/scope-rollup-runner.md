@@ -41,6 +41,13 @@ GitHub への書き込み / repo への書き込みは一切行わない。read-
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: failed
+  schema_version: 1
+  repo: "<repo or unknown>"
+  current_issue: <issue_number or -1>
+  invocation_id: "<invocation_id or missing>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA or unknown>"
   error: "INSUFFICIENT_INPUT: issue_number / repo / invocation_id のいずれかが欠落"
 ```
 
@@ -55,8 +62,14 @@ test -f .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rollup.py
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "plan_issue_scope_rollup.py が見つからない"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<unknown>"
 ```
 
 ### 3. データ取得
@@ -92,8 +105,14 @@ gh pr list \
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "gh コマンド実行失敗（permission denied または network error）"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA or unknown>"
 ```
 
 ### 4. SHA256 計算
@@ -128,8 +147,14 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/plan_issue_scope_rol
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "plan_issue_scope_rollup.py 実行失敗（exit code 非 0 かつ 非 2）"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA>"
 ```
 
 ### 6. verify_scope_rollup_result.py による結果検証
@@ -144,8 +169,14 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/verify_scope_rollup_
 ```yaml
 ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1:
   status: runner_unavailable
+  schema_version: 1
+  repo: "<repo>"
+  current_issue: <issue_number>
   error: "verify_scope_rollup_result.py が verified 以外を返した"
   invocation_id: "<invocation_id>"
+  requested_at: "<ISO8601>"
+  generated_at: "<ISO8601>"
+  script_blob_sha256: "<SCRIPT_SHA>"
 ```
 
 ### 7. result sha256 計算

@@ -122,11 +122,11 @@ def test_deterministic_capture_writes_exact_final_response(tmp_path: Path) -> No
     assert record["capture_mode"] == "subagent_stop_hook"
     assert record["capture_status"] == "captured"
     assert record["parser_status"] == "ok"
-    assert record["routing_action"] == "continue"
+    assert record["capture_routing_action"] == "continue"
     assert record["capture_source"] == "last_assistant_message"
 
 
-def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tmp_path: Path) -> None:
+def test_deterministic_capture_records_duplicate_sidecar_without_overwrite(tmp_path: Path) -> None:
     message = _render_marker()
     first = _run_coordinator(
         {
@@ -153,12 +153,32 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
     )
     assert second.returncode == 0
     assert capture_path.read_text(encoding="utf-8") == original
-    record = _read_capture_result(tmp_path / "scope_rollup_inv-2026-06-15.capture.yaml")
-    assert record["capture_status"] == "captured"
+
+    captured_record = _read_capture_result(tmp_path / "scope_rollup_inv-2026-06-15.capture.yaml")
+    assert captured_record["capture_status"] == "captured"
+
+    duplicate_records = list(tmp_path.glob("scope_rollup_inv-2026-06-15.duplicate_invocation.*.capture.yaml"))
+    assert len(duplicate_records) == 1
+    duplicate_record = _read_capture_result(duplicate_records[0])
+    assert duplicate_record["capture_status"] == "duplicate_invocation"
+    assert duplicate_record["capture_routing_action"] == "stop_human"
+
+
+def test_invocation_id_is_canonicalized_for_filename_safety(tmp_path: Path) -> None:
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": _render_marker(invocation_id="2026-06-15T12:00:00Z:abc"),
+        "stop_hook_active": False,
+    }
+
+    result = _run_coordinator(payload, tmp_path)
+    assert result.returncode == 0
+    assert (tmp_path / "scope_rollup_2026-06-15T12_00_00Z_abc.txt").exists()
 
 
 @pytest.mark.parametrize(
-    ("payload", "expected_status", "expected_record_kind"),
+    ("payload", "expected_status"),
     [
         (
             {
@@ -168,7 +188,6 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "stop_hook_active": False,
             },
             "hook_unavailable",
-            "single_record",
         ),
         (
             {
@@ -178,7 +197,6 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "stop_hook_active": False,
             },
             "missing_final_response",
-            "single_record",
         ),
         (
             {
@@ -188,19 +206,15 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "stop_hook_active": False,
             },
             "agent_type_mismatch",
-            "single_record",
         ),
         (
             {
                 "hook_event_name": "SubagentStop",
                 "agent_type": "scope-rollup-runner",
-                "last_assistant_message": _render_marker(
-                    generated_at="2026-06-15T12:00:00Z",
-                ),
+                "last_assistant_message": _render_marker(generated_at="2026-06-15T12:00:00Z"),
                 "stop_hook_active": False,
             },
             "stale_capture",
-            "single_record",
         ),
         (
             {
@@ -210,15 +224,13 @@ def test_deterministic_capture_rejects_duplicate_invocation_without_overwrite(tm
                 "stop_hook_active": False,
             },
             "parser_rejected",
-            "single_record",
         ),
     ],
 )
 def test_fail_closed_capture_paths(
     tmp_path: Path,
     payload: dict[str, object],
-    expected_status: str | None,
-    expected_record_kind: str,
+    expected_status: str,
 ) -> None:
     result = _run_coordinator(payload, tmp_path)
     assert result.returncode == 0
@@ -227,7 +239,7 @@ def test_fail_closed_capture_paths(
     record_path, record = _single_capture_record(tmp_path)
     assert record_path.name.startswith("scope_rollup_")
     assert record["capture_status"] == expected_status
-    assert record["routing_action"] == "stop_human"
+    assert record["capture_routing_action"] == "stop_human"
     if expected_status == "hook_unavailable":
         assert record["capture_mode"] == "unsupported"
         assert record["parser_status"] == "not_applicable"
