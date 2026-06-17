@@ -1605,8 +1605,30 @@ def test_fixed_env_applies_only_to_pnpm_build(monkeypatch):
     assert runner_env_delta == {}
 
 
+def test_fixed_env_does_not_apply_to_pnpm_build_with_extra_args(monkeypatch):
+    """AC2: pnpm build extra args は canonical gate ではなく CI 注入しない"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    import baseline_vc_preflight as module
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    _, _, _, _, runner_env_delta = module.run_command("pnpm build --filter foo", 30, ".")
+
+    assert captured["argv"] == ["pnpm", "build", "--filter", "foo"]
+    assert captured["env"] is None
+    assert runner_env_delta == {}
+
+
 def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, capsys):
-    """AC3: JSON evidence には full environment ではなく injected delta のみ残す"""
+    """AC3: JSON evidence と fragment は injected delta のみ残し full env を漏らさない"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     import baseline_vc_preflight as module
@@ -1617,11 +1639,14 @@ def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, c
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(
-        module,
-        "run_command",
-        lambda command, timeout_seconds, cwd: (0, "", "", 1, {"CI": "true"}),
-    )
+    monkeypatch.setenv("SHOULD_NOT_LEAK_SECRET", "sentinel-secret")
+
+    def fake_run(argv, **kwargs):
+        assert kwargs["env"]["CI"] == "true"
+        assert kwargs["env"]["SHOULD_NOT_LEAK_SECRET"] == "sentinel-secret"
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -1635,11 +1660,46 @@ def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, c
     )
 
     exit_code = module.main()
-    data = json.loads(capsys.readouterr().out)
+    raw_json = capsys.readouterr().out
+    data = json.loads(raw_json)
 
     assert exit_code == 0
+    assert "sentinel-secret" not in raw_json
+    assert "SHOULD_NOT_LEAK_SECRET" not in raw_json
     assert data["results"][0]["runner_env_delta"] == {"CI": "true"}
     assert set(data["results"][0]["runner_env_delta"].keys()) == {"CI"}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script_path),
+            "--body-file",
+            str(fixture),
+            "--issue",
+            "999",
+            "--format",
+            "contract-review-fragment",
+        ],
+    )
+    exit_code = module.main()
+    raw_fragment = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "sentinel-secret" not in raw_fragment
+    assert "SHOULD_NOT_LEAK_SECRET" not in raw_fragment
+
+    try:
+        import yaml
+    except ImportError:
+        pytest.skip("PyYAML not installed for fragment verification")
+        return
+
+    fragment = yaml.safe_load(raw_fragment)
+    assert (
+        fragment["vc_preflight"]["classifications"][0]["evidence"]["runner_env_delta"]
+        == {"CI": "true"}
+    )
 
 
 def test_env_wrapper_exact_env_ci_pnpm_gate_is_blocked():
@@ -1649,6 +1709,33 @@ def test_env_wrapper_exact_env_ci_pnpm_gate_is_blocked():
 ```bash
 # AC1
 $ env CI=true pnpm build
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        data = run_preflight(fixture_file)
+        results = data["results"]
+        found = any(
+            r["category"] == "command_not_allowed"
+            and r["decision"] == "blocked"
+            for r in results
+        )
+        assert found, f"Expected command_not_allowed/blocked. Got: {results}"
+    finally:
+        import os
+        os.unlink(fixture_file)
+
+
+def test_pnpm_build_with_extra_args_is_not_canonical_gate():
+    """AC5: pnpm build extra args は canonical pnpm gate として扱わない"""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm build --filter foo
 ```
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -1696,8 +1783,8 @@ $ CI=true pnpm build
         os.unlink(fixture_file)
 
 
-def test_package_manager_no_tty_prompt_classified_as_tooling_blocker():
-    """AC6: pnpm no-TTY failure は body-author-fixable ではなく tooling/env blocker として分類する"""
+def test_package_manager_no_tty_prompt_classified_as_tooling_blocker_after_runner_delta():
+    """AC6: runner delta 適用済み no-TTY は tooling/state blocker として分類する"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     from baseline_vc_preflight import classify_result
@@ -1708,13 +1795,36 @@ def test_package_manager_no_tty_prompt_classified_as_tooling_blocker():
         "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
         "pnpm build",
         cwd=".",
+        runner_env_delta={"CI": "true"},
     )
 
     assert classification == "blocked"
     assert category == "package_manager_no_tty_prompt"
     assert decision == "blocked"
     assert scope_class == "regression_gate"
-    assert fix_hint is not None and "tooling/env blocker" in fix_hint
+    assert fix_hint is not None and "already injected by the runner" in fix_hint
+
+
+def test_package_manager_no_tty_prompt_without_runner_delta_points_to_non_canonical_gate():
+    """AC6: fixed env delta 未適用 no-TTY は canonical gate mismatch を示す"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        1,
+        "",
+        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        "pnpm build",
+        cwd=".",
+        runner_env_delta={},
+    )
+
+    assert classification == "blocked"
+    assert category == "package_manager_no_tty_prompt"
+    assert decision == "blocked"
+    assert scope_class == "regression_gate"
+    assert fix_hint is not None and "did not match the canonical pnpm build gate" in fix_hint
 
 
 def test_s_quoted_path_exit1_go():

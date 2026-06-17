@@ -552,12 +552,7 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
         argv_check = shlex.split(command)
     except ValueError:
         argv_check = []
-    if (
-        argv_check
-        and Path(argv_check[0]).name == "pnpm"
-        and len(argv_check) >= 2
-        and ("pnpm", argv_check[1].lower()) in _ALLOWED_PNPM_SUBCOMMANDS
-    ):
+    if _canonical_pnpm_gate(argv_check) is not None:
         return True
 
     # Check for uv run pytest with existing test paths
@@ -1110,13 +1105,23 @@ _ALLOWED_COMMANDS: frozenset = frozenset([
     "basename",  # safe
     "which",     # safe
     "type",      # safe
-    "env",       # safe (read env)
+    "env",       # display-only; command wrapper/env injection denied by _is_allowed_env_invocation()
     "printenv",  # safe (read env)
     "pwd",       # safe
     "date",      # safe
     "stat",      # read-only
     # NOTE: mkdir removed from allowlist (B2) — mkdir -p .git/hooks and similar mutations possible
 ])
+
+
+def _canonical_pnpm_gate(argv: List[str]) -> Optional[Tuple[str, str]]:
+    """Return the canonical 2-token pnpm gate tuple, or None if not exact."""
+    if len(argv) != 2:
+        return None
+    key = (Path(argv[0]).name, argv[1].lower())
+    if key in _ALLOWED_PNPM_SUBCOMMANDS:
+        return key
+    return None
 
 
 def _is_allowed_python3_invocation(argv: List[str]) -> bool:
@@ -1174,12 +1179,7 @@ def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
     Only (pnpm, typecheck), (pnpm, lint), (pnpm, test), (pnpm, build) are allowed.
     pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are all blocked.
     """
-    if not argv or Path(argv[0]).name != "pnpm":
-        return False
-    if len(argv) < 2:
-        return False
-    key = ("pnpm", argv[1].lower())
-    return key in _ALLOWED_PNPM_SUBCOMMANDS
+    return _canonical_pnpm_gate(argv) is not None
 
 
 def _is_allowed_env_invocation(argv: List[str]) -> bool:
@@ -1193,9 +1193,9 @@ def _is_allowed_env_invocation(argv: List[str]) -> bool:
 
 def _fixed_env_delta_for_argv(argv: List[str]) -> Dict[str, str]:
     """Return a fixed runner-side env delta for exact safe commands only."""
-    if len(argv) < 2:
+    key = _canonical_pnpm_gate(argv)
+    if key is None:
         return {}
-    key = (Path(argv[0]).name, argv[1].lower())
     return dict(_FIXED_ENV_DELTA_BY_COMMAND.get(key, {}))
 
 
@@ -1206,7 +1206,7 @@ def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) ->
     except ValueError:
         return False
 
-    if len(argv) < 2 or Path(argv[0]).name != "pnpm" or argv[1].lower() != "build":
+    if _canonical_pnpm_gate(argv) != ("pnpm", "build"):
         return False
 
     combined = f"{stdout}\n{stderr}"
@@ -1725,6 +1725,7 @@ def classify_result(
     stderr: str,
     command: str,
     cwd: Optional[str] = None,
+    runner_env_delta: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
@@ -1773,13 +1774,22 @@ def classify_result(
             return "expected_pass", "regression_gate", "go", None, "regression_gate"
         else:
             if _is_package_manager_no_tty_prompt(command, stdout, stderr):
+                applied_runner_delta = runner_env_delta or {}
+                if applied_runner_delta == {"CI": "true"}:
+                    fix_hint = (
+                        "CI=true was already injected by the runner. This is still a pnpm/node_modules/tooling "
+                        "state blocker; do not rewrite the Issue body."
+                    )
+                else:
+                    fix_hint = (
+                        "This command did not match the canonical pnpm build gate, so the runner-side fixed env "
+                        "delta was not applied."
+                    )
                 return (
                     "blocked",
                     "package_manager_no_tty_prompt",
                     "blocked",
-                    "pnpm requested an interactive no-TTY prompt. Treat this as a tooling/env blocker, "
-                    "not an Issue body authoring problem. Keep shell=False and use the runner-side fixed "
-                    "env delta instead of shell env prefix workarounds.",
+                    fix_hint,
                     "regression_gate",
                 )
             # B5: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
@@ -2370,7 +2380,12 @@ def main() -> int:
                     )
 
                     classification, category, decision, fix_hint, scope_class = classify_result(
-                        exit_code, stdout, stderr, command, cwd=args.cwd
+                        exit_code,
+                        stdout,
+                        stderr,
+                        command,
+                        cwd=args.cwd,
+                        runner_env_delta=runner_env_delta,
                     )
 
                     # Issue #889: Apply baseline-expect annotation post-execution re-mapping

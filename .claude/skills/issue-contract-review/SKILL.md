@@ -58,7 +58,7 @@ VC 実行前に静的に弾くカテゴリ:
 - `unsupported_shell_syntax` : `$(...)` / backtick / `${...}` を含む場合
 - `unsafe_command` : `rm` / `git push` / `curl` など危険コマンド
 - `command_not_allowed` : allowlist 外コマンド
-- `package_manager_no_tty_prompt` : pnpm no-TTY prompt 由来の tooling/env blocker。body-author-fixable ではない
+- `package_manager_no_tty_prompt` : pnpm no-TTY prompt 由来の tooling/env blocker。`body_author_fixable=false` / downstream bucket `env_or_runtime`
 
 `unsupported_shell_syntax` は `run_command()` を呼ばない前提の必須カテゴリ。
 

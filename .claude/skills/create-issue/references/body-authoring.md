@@ -92,7 +92,7 @@ $ pnpm build
 1. まずコマンド自体の誤りか、tooling/env blocker かを切り分ける
 2. 正しい回帰ゲートコマンドに修正する（パス誤り・設定誤りの場合）
 3. 環境起因で baseline が壊れている場合は `human_judgment` として人間対応を依頼する
-4. `pnpm build` が `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` / `Aborted removal of modules directory due to no TTY` で失敗した場合は、Issue body を `# preflight-scope: runtime_only` に書き換えて回避しない。これは body-author-fixable ではなく tooling/env blocker であり、runner-side fixed env delta `{CI:"true"}` を使う実装側の課題として扱う
+4. `pnpm build` が `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` / `Aborted removal of modules directory due to no TTY` で失敗した場合は、Issue body を `# preflight-scope: runtime_only` に書き換えて回避しない。これは `body_author_fixable=false` の tooling/env blocker であり、downstream bucket は `env_or_runtime` として扱う
 5. `CI=true pnpm build` の shell env prefix や `env CI=true pnpm build` の wrapper で回避しない。`shell=False` 実行モデルと allowlist 境界を崩すため
 
 ### rva_immediate_field_missing
