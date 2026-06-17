@@ -1,0 +1,27 @@
+{
+  "schema": "agent_retro_index/v1",
+  "generation_verdict": "complete",
+  "entries": [
+    {
+      "report_comment_url": "https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122667",
+      "report_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "issue": 935,
+      "pr": 951,
+      "merge_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tags": [
+        "public-safe",
+        "validator"
+      ],
+      "friction_summary": "agent_run_report/v1 full payload copied",
+      "quality_signals": [
+        "allowlist_contract"
+      ],
+      "follow_up_issues": [
+        937
+      ],
+      "report_body": "should not exist"
+    }
+  ],
+  "orphan_reports": [],
+  "ambiguous_links": []
+}
