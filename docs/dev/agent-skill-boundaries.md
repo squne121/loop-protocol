@@ -544,6 +544,30 @@ CHILD_MATERIALIZATION_RESULT_V2:
 | `failed` | `human_escalation` |
 | `human_escalation` | `human_escalation`（escalation_items をコメントに記録） |
 
+### child materialization executor (`materialize_child_issues.py`)
+
+`CHILD_MATERIALIZATION_PLAN_V2` を入力に取り、起票・parent patch・結果集約までを決定論的に実行して `CHILD_MATERIALIZATION_RESULT_V2` を返す executor。`.claude/skills/create-issue/scripts/materialize_child_issues.py` が正本実装で、`create-issue` skill のステップ 4b から呼ばれる。
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
+  --plan-file <CHILD_MATERIALIZATION_PLAN_V2 互換 JSON> [--gh <gh binary>]
+```
+
+設計境界:
+
+| 項目 | 規約 |
+|---|---|
+| plan 検証 | closed schema。unknown key / duplicate `child_id` / `issue_lookup.complete: false` / 不正 `action` / 非整数 `depends_on` / 空 `allowed_paths` / AC↔VC set 不一致を fail-closed（非 JSON も拒否、YAML fallback なし） |
+| body render | `ISSUE_TEMPLATE/<kind>.yml` の required label order を **strict loader**（template 不在 / malformed / 空ラベルは `PlanValidationError`、validator の後方互換 fallback を継承しない）で取得して生成（spec-driven）。Machine-Readable Contract は `yaml.safe_dump` で生成し、`allowed_paths` / `verification_commands` / `title` の control-char・backtick・code-fence break-out を schema 段で拒否。`validate_issue_body.py --kind --title` 通過が起票の前提 |
+| 起票経路 | `create_issue_txn.py` のみ。`materialize_child_issues.py` は `gh issue create` を直接呼ばない。`--label-profile standard\|triage_only` も txn に転送 |
+| dependency | `depends_on` を `create_issue_txn.py --dependency` に写像し、txn の `_readback_dependencies` で GitHub read-back まで確認。自由記述 dependency は schema 段で fail-closed |
+| parent patch | `## Child Issues` section（exact heading regex、0 / 2 件以上は fail-closed）内で **必須** `parent.body_sha256` 一致 + exact `old_line` + `expected_match_count == 1` + section-scoped post-edit read-back を満たす場合のみ。`parent_body_updates` 非空時は `body_sha256` 必須。**`errors` または `escalation_items` が 1 件でもあれば parent patch を行わない**（mixed outcome は `partial_failure`） |
+| overlap gate | `overlap.status: clear` は preflight provenance（`source` / `verdict ∈ {safe_new_issue, no_overlap}` / `checked_at` / `input_sha256`）必須で、untrusted plan 入力だけの bare `clear` は fail-closed。`not_run` / `deferred_to_issue` は各 create child が #948 を `depends_on` に持つことを要求し、欠落で `human_escalation`。`undeterminable` は無条件 `human_escalation` |
+| result capture | `create_issue_txn` が `partial_failure` / `dedupe` で issue 番号を返した場合は `affected_issues` に記録し、silent loss を防ぐ（その run は `ok` にならず parent patch もしない） |
+| exit code | `ok`=0 / `human_escalation`=3 / その他=1 |
+
+`create_issue_txn.py` は AC3 として、internal validator 呼び出しに `--kind` / `--title` を転送する。`--issue-kind` が省略された場合は body の Machine-Readable Contract `issue_kind` を採用し、明示 `--issue-kind` と MRC kind が矛盾する場合は fail-closed する（両方空のときのみ後方互換で最小 static set を適用）。これにより caller が pre-validation を忘れても kind 固有の必須セクション / Stop Conditions / title prefix が fail-closed される。
+
 ## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け
