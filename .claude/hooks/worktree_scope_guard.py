@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+"""worktree_scope_guard.py — PreToolUse hook that blocks mutation outside the active issue worktree.
+
+Contract: WORKTREE_SCOPE_RESOLUTION_V1 / MUTATING_BASH_CLASSIFIER_V1 (Issue #960).
+
+When an active issue worktree exists, Write/Edit/MultiEdit targeting paths outside
+the expected worktree, and mutating Bash commands whose effective target is outside
+the expected worktree, are blocked (fail-closed). Read-only Bash and worktree-internal
+mutation are allowed.
+
+Exit codes:
+  0  — allow (no stdout/stderr)
+  2  — block (bounded stderr only: expected worktree + actual cwd)
+
+Design notes:
+- project_root is resolved via CLAUDE_PROJECT_DIR, else by walking up from __file__
+  (the settings.json parent). `git rev-parse --show-toplevel` is NOT used because
+  worktree isolation makes it return the main repo root.
+- path containment uses os.path.realpath + os.path.commonpath (NOT startswith), so
+  symlink-outside / `..` traversal / absolute-outside targets are blocked.
+- Unparseable Bash that may still mutate is blocked (fail-closed) when an active
+  issue worktree exists and the effective target cannot be proven inside it.
+- file-write mutations (redirection, tee, sed/perl -i, interpreter one-liners) have
+  their write-target path extracted and containment-checked; when a write mutation
+  is detected but no target can be extracted, it is fail-closed (block) while a
+  worktree exists.
+- `bash -c|-lc` / `sh -c` / `zsh -c` wrappers are unwrapped and their inner script
+  is recursively classified / target-extracted.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# ── Tool classes ──────────────────────────────────────────────────────────────
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
+BASH_TOOL = "Bash"
+
+# Matched mutation tools: a matched PreToolUse tool for which malformed payload is
+# fail-closed. The hook matcher is "Bash|Write|Edit|MultiEdit".
+MATCHED_TOOLS = WRITE_TOOLS | {BASH_TOOL}
+
+
+# =============================================================================
+# Block emission (bounded stderr — no command / path / worktree list / env leak)
+# =============================================================================
+
+def _block(expected_worktree: str, actual_cwd: str) -> None:
+    """Emit a bounded block message (<= 20 lines) and exit 2.
+
+    Only expected worktree and actual cwd are shown. No tool command, tool input
+    path, worktree list, or env values are emitted.
+    """
+    lines = [
+        "[worktree_scope_guard] blocked: mutation outside active issue worktree",
+        f"expected_worktree: {expected_worktree or '<unresolved>'}",
+        f"actual_cwd: {actual_cwd or '<unknown>'}",
+    ]
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.exit(2)
+
+
+def _allow() -> None:
+    """Allow the tool call (exit 0, no output)."""
+    sys.exit(0)
+
+
+# =============================================================================
+# project_root resolution (WORKTREE_SCOPE_RESOLUTION_V1.project_root_source_precedence)
+# =============================================================================
+
+def resolve_project_root() -> str:
+    """Resolve project root.
+
+    Precedence:
+      1. CLAUDE_PROJECT_DIR
+      2. settings_json_parent_resolution — walk up from this file
+         (<root>/.claude/hooks/worktree_scope_guard.py) so the `.claude` parent
+         is the project root. Anchored on __file__, never on
+         `git rev-parse --show-toplevel`.
+    """
+    env_root = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_root:
+        return os.path.realpath(env_root)
+    # __file__ = <root>/.claude/hooks/worktree_scope_guard.py
+    here = os.path.realpath(__file__)
+    hooks_dir = os.path.dirname(here)
+    claude_dir = os.path.dirname(hooks_dir)
+    root = os.path.dirname(claude_dir)
+    return os.path.realpath(root)
+
+
+# =============================================================================
+# current issue resolution (WORKTREE_SCOPE_RESOLUTION_V1.current_issue_source_precedence)
+# =============================================================================
+
+_ISSUE_RE = re.compile(r"^(?:worktree-)?issue-(\d+)-")
+_ISSUE_BASENAME_RE = re.compile(r"^issue-(\d+)-")
+_ISSUE_BRANCH_RE = re.compile(r"^(?:worktree-)?issue-(\d+)-")
+
+
+def resolve_current_issue(cwd: str, project_root: str) -> str | None:
+    """Resolve the active issue number as a string.
+
+    Precedence:
+      1. env LOOP_ISSUE_NUMBER
+      2. cwd basename matching /^issue-(\\d+)-/
+      3. current branch matching /^issue-(\\d+)-/
+    """
+    env_issue = os.environ.get("LOOP_ISSUE_NUMBER")
+    if env_issue and env_issue.strip().isdigit():
+        return env_issue.strip()
+
+    if cwd:
+        base = os.path.basename(os.path.normpath(cwd))
+        m = _ISSUE_BASENAME_RE.match(base)
+        if m:
+            return m.group(1)
+
+    branch = _current_branch(cwd or project_root)
+    if branch:
+        m = _ISSUE_BRANCH_RE.match(branch)
+        if m:
+            return m.group(1)
+
+    return None
+
+
+def _current_branch(path: str) -> str | None:
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        out = subprocess.run(
+            [git, "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+# =============================================================================
+# worktree catalog (WORKTREE_SCOPE_RESOLUTION_V1.worktree_catalog + parser)
+# =============================================================================
+
+def parse_worktree_porcelain_z(data: str) -> list[dict]:
+    """Parse `git worktree list --porcelain -z` output (NUL-separated records).
+
+    The -z form separates *attribute lines* by NUL. A worktree record starts with
+    a `worktree <path>` line and continues until the next `worktree ` line (or end).
+    Returns a list of dicts with at least 'worktree' and optionally 'branch'.
+    """
+    worktrees: list[dict] = []
+    current: dict | None = None
+    # -z separates each attribute by a single NUL byte.
+    for field in data.split("\0"):
+        if field == "":
+            continue
+        # Each field is like "worktree /path", "HEAD <sha>", "branch refs/heads/x",
+        # "bare", "detached", "locked", "prunable".
+        if field.startswith("worktree "):
+            if current is not None:
+                worktrees.append(current)
+            current = {"worktree": field[len("worktree "):]}
+        elif current is not None:
+            if field.startswith("branch "):
+                current["branch"] = field[len("branch "):]
+            elif " " in field:
+                key, _, value = field.partition(" ")
+                current[key] = value
+            else:
+                current[field] = True
+    if current is not None:
+        worktrees.append(current)
+    return worktrees
+
+
+def list_worktrees(project_root: str) -> list[dict] | None:
+    """Return parsed worktree catalog, or None if git is unavailable / fails."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        out = subprocess.run(
+            [git, "-C", project_root, "worktree", "list", "--porcelain", "-z"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return parse_worktree_porcelain_z(out.stdout)
+
+
+# =============================================================================
+# expected worktree selection (WORKTREE_SCOPE_RESOLUTION_V1.expected_worktree_selection)
+# =============================================================================
+
+class WorktreeResolution:
+    """Result of expected-worktree resolution."""
+
+    def __init__(self, expected: str | None, match_count: int, git_available: bool):
+        self.expected = expected  # realpath of expected worktree, or None
+        self.match_count = match_count  # number of catalog matches
+        self.git_available = git_available
+
+
+def resolve_expected_worktree(issue: str | None, project_root: str) -> WorktreeResolution:
+    """Select the expected worktree for the active issue.
+
+    Match requires BOTH:
+      - branch == refs/heads/issue-<issue>-* (worktree- prefix tolerated), AND
+      - path basename == issue-<issue>-*
+    """
+    if not issue:
+        return WorktreeResolution(None, 0, shutil.which("git") is not None)
+
+    catalog = list_worktrees(project_root)
+    if catalog is None:
+        # git unavailable / failed
+        return WorktreeResolution(None, 0, False)
+
+    branch_re = re.compile(r"^refs/heads/(?:worktree-)?issue-%s-" % re.escape(issue))
+    base_re = re.compile(r"^issue-%s-" % re.escape(issue))
+
+    matches: list[str] = []
+    for wt in catalog:
+        path = wt.get("worktree")
+        if not path:
+            continue
+        base = os.path.basename(os.path.normpath(path))
+        branch = wt.get("branch", "")
+        branch_ok = bool(branch) and bool(branch_re.match(branch))
+        base_ok = bool(base_re.match(base))
+        if branch_ok and base_ok:
+            matches.append(os.path.realpath(path))
+
+    if len(matches) == 1:
+        return WorktreeResolution(matches[0], 1, True)
+    return WorktreeResolution(None, len(matches), True)
+
+
+# =============================================================================
+# path containment (AC11)
+# =============================================================================
+
+def is_inside(expected_realpath: str, target_path: str, cwd: str) -> bool:
+    """True iff target_path resolves inside expected_realpath.
+
+    Uses realpath + commonpath (NOT startswith). Relative target paths are
+    resolved against cwd. Handles `..` traversal, symlink-outside, absolute-outside.
+    """
+    if not target_path:
+        return False
+    if not os.path.isabs(target_path):
+        base = cwd if cwd else os.getcwd()
+        target_path = os.path.join(base, target_path)
+    actual = os.path.realpath(target_path)
+    expected = os.path.realpath(expected_realpath)
+    try:
+        common = os.path.commonpath([expected, actual])
+    except ValueError:
+        # Different drives / mixed abs-rel — treat as outside.
+        return False
+    return common == expected
+
+
+# =============================================================================
+# Bash mutation classifier (MUTATING_BASH_CLASSIFIER_V1)
+# =============================================================================
+
+_GIT_MUTATING_SUBCMDS = {
+    "add", "commit", "push", "checkout", "switch", "restore", "reset",
+    "rebase", "merge", "cherry-pick", "revert", "am", "apply", "rm", "mv",
+    "tag",
+}
+# git stash mutates unless list/show; git worktree mutates unless list.
+_GH_PR_MUTATING = {
+    "create", "edit", "merge", "review", "comment", "close", "reopen",
+    "ready", "draft", "lock", "unlock",
+}
+_GH_ISSUE_MUTATING = {
+    "create", "edit", "comment", "close", "reopen", "delete", "lock", "unlock",
+}
+_PKG_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+_PKG_MUTATING = {
+    "add", "install", "remove", "update", "publish", "version", "link", "unlink",
+    "i", "rm", "un", "uninstall",
+}
+
+# read-only allowlist (worktree 解決不能でも allow)
+_GIT_READONLY = {"status", "diff", "log", "show", "rev-parse"}
+
+# General-purpose read-only programs that do NOT mutate the filesystem by their
+# own action. An external absolute-path *positional* argument to one of these is a
+# read source, not a write destination, so it must NOT trigger an over-block. Note:
+# redirection / `tee` write-target checks still apply (they are checked BEFORE this
+# allowlist via _is_file_write_mutation), so `cat x > ROOT/y` / `... | tee ROOT/y`
+# are still blocked via the write-target path.
+# `sed`/`perl` are intentionally EXCLUDED here: they are read-only only when no
+# `-i` in-place flag is present, which is handled separately (an `-i` form is
+# already classified as a file-write mutation upstream).
+_READONLY_PROGRAMS = {
+    "cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "wc", "find",
+    "awk", "cut", "sort", "uniq", "nl", "tr", "column", "diff", "cmp", "comm",
+    "file", "stat", "realpath", "readlink", "dirname", "basename", "pwd",
+    "echo", "printf", "test", "true", "false", "which", "type", "command-v",
+    "date", "env", "printenv", "id", "whoami", "uname", "hostname", "less",
+    "more", "tac", "od", "xxd", "md5sum", "sha1sum", "sha256sum", "jq", "yq",
+    "xargs",
+}
+# sed/perl are read-only only when NOT in-place (`-i`). An in-place form is
+# already classified as a file-write mutation upstream, so here (post-write-check)
+# any remaining sed/perl is read-only.
+_CONDITIONAL_READONLY_PROGRAMS = {"sed", "perl"}
+
+# Option flags that indicate a write destination for an otherwise-unknown program.
+# When one of these carries an external absolute path, the unknown program is
+# treated as a file-writer (Major formatter-write risk) and blocked. A bare
+# external *positional* arg (no write option) is treated as a read source → allow.
+_WRITE_OPTION_FLAGS = {
+    "-o", "--output", "--out", "-w", "--write", "--in-place", "--fix",
+    "--output-file", "--outfile",
+}
+
+# shell wrappers whose `-c` / `-lc` script argument carries an inner command.
+_SHELL_WRAPPERS = {"bash", "sh", "zsh"}
+
+
+def _tokenize(command: str) -> list[str]:
+    """Tokenize a shell command best-effort. On failure return a coarse split."""
+    import shlex
+    try:
+        return shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _has_redirection_or_inplace(command: str) -> bool:
+    """Detect shell file-write patterns: >, >>, tee, sed -i, perl -i."""
+    # redirection (avoid matching >&2 fd-dup and >( process subst loosely; any
+    # plain > / >> to a path is treated as a write — fail-closed bias).
+    if re.search(r"(^|\s)\d*>>?(?!&)", command):
+        return True
+    if re.search(r"(^|[|;&]|&&)\s*tee\b", command):
+        return True
+    if re.search(r"\bsed\b[^|;&]*\s-[a-zA-Z]*i\b", command):
+        return True
+    if re.search(r"\bsed\b[^|;&]*\s-i\b", command):
+        return True
+    if re.search(r"\bperl\b[^|;&]*\s-[a-zA-Z]*i\b", command):
+        return True
+    return False
+
+
+def _is_file_write_oneliner(command: str) -> bool:
+    """Detect python/node/ruby file-write one-liners."""
+    if re.search(r"\bpython3?\b[^|;&]*-c\b[^|;&]*\bopen\s*\([^)]*['\"][wax]", command):
+        return True
+    if re.search(r"\bnode\b[^|;&]*-e\b[^|;&]*(writeFile|createWriteStream|appendFile)", command):
+        return True
+    if re.search(r"\bruby\b[^|;&]*-e\b[^|;&]*(File\.(open|write)|\.write)", command):
+        return True
+    # generic: open(..., 'w') in any interpreter -c/-e
+    if re.search(r"-[ce]\b[^|;&]*open\s*\([^)]*['\"][wax]\+?['\"]", command):
+        return True
+    return False
+
+
+def _is_file_write_mutation(command: str) -> bool:
+    """True iff the command performs a file-write (redirection / tee / -i / one-liner)."""
+    return _has_redirection_or_inplace(command) or _is_file_write_oneliner(command)
+
+
+def classify_bash(command: str) -> str:
+    """Classify a Bash command.
+
+    Returns one of:
+      'read_only'  — known read-only allowlist; allow even if worktree unresolved.
+      'mutating'   — known mutation; block if effective target is outside worktree.
+      'unknown'    — cannot prove read-only; fail-closed (block) when worktree exists.
+    """
+    if not command or not command.strip():
+        return "unknown"
+
+    tokens = _tokenize(command)
+    if not tokens:
+        return "unknown"
+
+    # Filesystem write patterns first (these mutate regardless of program).
+    if _is_file_write_mutation(command):
+        return "mutating"
+
+    # Strip leading wrappers to find the effective program for classification.
+    prog_tokens = _strip_wrappers_for_classification(tokens)
+    if not prog_tokens:
+        return "unknown"
+
+    # `bash -c|-lc <script>` / `sh -c` / `zsh -c` wrapper → classify inner script.
+    inner = _extract_shell_wrapper_script(prog_tokens)
+    if inner is not None:
+        return classify_bash(inner)
+
+    prog = os.path.basename(prog_tokens[0])
+    args = prog_tokens[1:]
+
+    if prog == "git":
+        return _classify_git(args)
+    if prog == "gh":
+        return _classify_gh(args)
+    if prog in _PKG_MANAGERS:
+        return _classify_pkg(args)
+
+    # Pure read-only pipeline / single read-only program: every segment's
+    # effective program is in the read-only allowlist (no file-write mutation —
+    # already excluded above). `cat a | grep b`, `ls ROOT`, etc.
+    if _is_readonly_pipeline(command):
+        return "read_only"
+
+    # Unknown program: cannot prove read-only.
+    return "unknown"
+
+
+def _segment_program(segment: str) -> str | None:
+    """Return the effective program basename of a single pipeline segment, after
+    stripping `command` / `env VAR=...` wrappers. Returns None when empty."""
+    toks = _tokenize(segment)
+    if not toks:
+        return None
+    toks = _strip_wrappers_for_classification(toks)
+    if not toks:
+        return None
+    return os.path.basename(toks[0])
+
+
+def _is_readonly_program(prog: str, segment: str) -> bool:
+    """True iff `prog` is a known read-only program for this segment.
+
+    `sed`/`perl` are read-only only when no in-place (`-i`) flag is present; an
+    in-place form is classified as a file-write mutation upstream, so by the time
+    we reach here a sed/perl segment is read-only.
+    """
+    if prog in _READONLY_PROGRAMS:
+        return True
+    if prog in _CONDITIONAL_READONLY_PROGRAMS:
+        return not re.search(r"\s-[a-zA-Z]*i\b", segment)
+    return False
+
+
+def _is_readonly_pipeline(command: str) -> bool:
+    """True iff every pipeline segment of `command` is a read-only program.
+
+    Splits on `|` (pipe) only — `;`, `&&`, `||` chain heterogeneous commands and
+    are conservatively NOT treated as a single read-only pipeline here (each such
+    case falls through to 'unknown' for fail-closed bias). Redirection write
+    targets are handled before this function is reached.
+    """
+    # Reject shell-control chaining so a hidden mutation in a later clause cannot
+    # be masked by a read-only first clause.
+    if re.search(r"(;|&&|\|\|)", command):
+        return False
+    segments = command.split("|")
+    saw_one = False
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            return False
+        prog = _segment_program(seg)
+        if not prog:
+            return False
+        if not _is_readonly_program(prog, seg):
+            return False
+        saw_one = True
+    return saw_one
+
+
+def _strip_wrappers_for_classification(tokens: list[str]) -> list[str]:
+    """Strip leading `command` and `env VAR=...` to expose the underlying program.
+
+    Note: target-dir / write-target extraction (including `cd ... &&` and
+    `bash/sh -c` wrappers) is handled by effective_target_dirs() and
+    write_target_paths(); shell-wrapper unwrap for classification is handled by
+    _extract_shell_wrapper_script().
+    """
+    t = list(tokens)
+    # Strip `command`
+    if t and t[0] == "command":
+        t = t[1:]
+    # Strip `env VAR=val ...`
+    if t and t[0] == "env":
+        t = t[1:]
+        while t and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t[0]):
+            t = t[1:]
+    return t
+
+
+def _extract_shell_wrapper_script(prog_tokens: list[str]) -> str | None:
+    """If prog_tokens is `bash/sh/zsh [-l]* -c <script> ...` return <script>, else None.
+
+    Accepts combined flags like `-lc` and separate `-l -c`. The script argument is
+    the token immediately following the flag bundle that contains `c`.
+    """
+    if not prog_tokens:
+        return None
+    prog = os.path.basename(prog_tokens[0])
+    if prog not in _SHELL_WRAPPERS:
+        return None
+    i = 1
+    saw_c = False
+    while i < len(prog_tokens):
+        tok = prog_tokens[i]
+        if tok.startswith("-") and tok != "--":
+            # bundled flags, e.g. -lc / -c / -l
+            if "c" in tok[1:]:
+                saw_c = True
+                i += 1
+                break
+            i += 1
+            continue
+        if tok == "--":
+            i += 1
+            break
+        break
+    if not saw_c:
+        return None
+    if i < len(prog_tokens):
+        return prog_tokens[i]
+    return None
+
+
+def _classify_git(args: list[str]) -> str:
+    # Find first non-flag, non `-C <path>` token as the subcommand.
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-C":
+            i += 2
+            continue
+        if a.startswith("-C"):
+            i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(args):
+        return "unknown"
+    sub = args[i]
+    rest = args[i + 1:]
+    if sub in _GIT_READONLY:
+        return "read_only"
+    if sub == "worktree":
+        nxt = rest[0] if rest else ""
+        return "read_only" if nxt == "list" else "mutating"
+    if sub == "stash":
+        nxt = rest[0] if rest else ""
+        return "read_only" if nxt in ("list", "show") else "mutating"
+    if sub in _GIT_MUTATING_SUBCMDS:
+        return "mutating"
+    # Unknown git subcommand — fail-closed.
+    return "unknown"
+
+
+def _classify_gh(args: list[str]) -> str:
+    if not args:
+        return "unknown"
+    sub = args[0]
+    rest = args[1:]
+    if sub == "pr":
+        action = rest[0] if rest else ""
+        if action == "view":
+            return "read_only"
+        if action in _GH_PR_MUTATING:
+            return "mutating"
+        return "unknown"
+    if sub == "issue":
+        action = rest[0] if rest else ""
+        if action == "view":
+            return "read_only"
+        if action in _GH_ISSUE_MUTATING:
+            return "mutating"
+        return "unknown"
+    if sub == "api":
+        return _classify_gh_api(rest)
+    # other gh subcommands — fail-closed (cannot prove read-only).
+    return "unknown"
+
+
+def _classify_gh_api(args: list[str]) -> str:
+    """gh api is GET by default but becomes a write with method/field/input flags."""
+    method = None
+    has_field = False
+    explicit_get = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method"):
+            if i + 1 < len(args):
+                method = args[i + 1].upper()
+            i += 2
+            continue
+        m = re.match(r"^--method=(.+)$", a)
+        if m:
+            method = m.group(1).upper()
+            i += 1
+            continue
+        m = re.match(r"^-X(.+)$", a)
+        if m:
+            method = m.group(1).upper()
+            i += 1
+            continue
+        if a in ("-f", "-F", "--field", "--raw-field", "--input"):
+            has_field = True
+            i += 1
+            continue
+        if a.startswith("-f") or a.startswith("-F") or a.startswith("--field=") or a.startswith("--raw-field=") or a.startswith("--input="):
+            has_field = True
+            i += 1
+            continue
+        i += 1
+
+    if method == "GET":
+        explicit_get = True
+
+    write_methods = {"PATCH", "POST", "PUT", "DELETE"}
+    if method in write_methods:
+        return "mutating"
+    if has_field and not explicit_get:
+        return "mutating"
+    # default GET / explicit GET with no field flags → read-only
+    return "read_only"
+
+
+def _classify_pkg(args: list[str]) -> str:
+    if not args:
+        return "unknown"
+    sub = args[0]
+    if sub in _PKG_MUTATING:
+        return "mutating"
+    # readonly-ish: list, ls, run, test, view, why, outdated, audit, etc.
+    return "read_only"
+
+
+# =============================================================================
+# wrapper / explicit-target extraction (AC9)
+# =============================================================================
+
+def _abs_against(cwd: str, p: str) -> str:
+    if not os.path.isabs(p):
+        base = cwd if cwd else os.getcwd()
+        p = os.path.join(base, p)
+    return os.path.realpath(p)
+
+
+def _inner_scripts(command: str) -> list[str]:
+    """Return inner scripts from `bash/sh/zsh -c|-lc <script>` wrappers (recursive)."""
+    tokens = _tokenize(command)
+    prog_tokens = _strip_wrappers_for_classification(tokens)
+    inner = _extract_shell_wrapper_script(prog_tokens)
+    if inner is None:
+        return []
+    out = [inner]
+    out.extend(_inner_scripts(inner))
+    return out
+
+
+def effective_target_dirs(command: str, cwd: str) -> list[str]:
+    """Extract candidate effective working directories from wrappers/explicit targets.
+
+    Detects (including inside `bash/sh/zsh -c` wrapper scripts):
+      - `git -C <path>`
+      - leading `cd <path> &&`
+      - `command git -C <path>`
+      - `env VAR=... git -C <path>`
+    Returns absolute candidate dirs (resolved against cwd when relative). The
+    presence of any candidate outside the expected worktree triggers a block.
+    """
+    candidates: list[str] = []
+
+    def _scan(cmd: str) -> None:
+        # leading `cd <path> &&` / `cd <path> ;` (also when it appears after `&&`/`;`)
+        for m in re.finditer(r"(?:^|&&|;|\|\|)\s*cd\s+(['\"]?)([^&;|'\"]+)\1\s*(?=&&|;|\|\||$)", cmd):
+            candidates.append(_abs_against(cwd, m.group(2).strip()))
+        # `git -C <path>` (and `command git -C`, `env ... git -C`)
+        for gm in re.finditer(r"\bgit\s+(?:-c\s+\S+\s+)*-C\s+(['\"]?)([^\s'\"]+)\1", cmd):
+            candidates.append(_abs_against(cwd, gm.group(2)))
+        for gm in re.finditer(r"\bgit\s+-C(['\"]?)([^\s'\"]+)\1", cmd):
+            candidates.append(_abs_against(cwd, gm.group(2)))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+
+    return candidates
+
+
+# =============================================================================
+# write-target extraction (B2 / AC8) — file-write mutation destination paths
+# =============================================================================
+
+def write_target_paths(command: str, cwd: str) -> list[str]:
+    """Extract destination paths of file-write mutations from a command.
+
+    Covers (including inside `bash/sh/zsh -c` wrapper scripts):
+      - redirection `> path`, `>> path`
+      - `tee [opts] path...`
+      - `sed -i ... <file>`, `perl -i ... <file>`
+      - interpreter one-liners: open(PATH,'w'|'a'|'x'), writeFileSync(PATH,...),
+        appendFileSync(PATH,...), createWriteStream(PATH), File.write(PATH,...),
+        File.open(PATH,'w'|'a')
+    Returns absolute realpaths resolved against cwd.
+    """
+    targets: list[str] = []
+
+    def _add(p: str) -> None:
+        p = p.strip().strip("'\"")
+        if not p:
+            return
+        # Dynamic destinations (command substitution / globs / var expansion) are
+        # not statically resolvable → do NOT add (leaves targets empty so the
+        # caller fail-closes on a detected write mutation).
+        if re.search(r"[$`*?]|\$\(|\bsubprocess\b", p) or p.startswith("$("):
+            return
+        targets.append(_abs_against(cwd, p))
+
+    def _scan(cmd: str) -> None:
+        # redirection: > path / >> path (skip fd-dup >&)
+        for m in re.finditer(r"\d*>>?\s*(?!&)(['\"]?)([^\s'\";|&<>]+)\1", cmd):
+            _add(m.group(2))
+        # tee [opts] file...
+        for tm in re.finditer(r"\btee\b((?:\s+-[^\s]+)*)\s+([^|;&]+)", cmd):
+            rest = tm.group(2)
+            # stop at next shell operator
+            rest = re.split(r"[|;&]", rest)[0]
+            for tok in rest.split():
+                if tok.startswith("-"):
+                    continue
+                _add(tok)
+        # sed -i / perl -i: the target file(s) — take trailing non-flag tokens.
+        for sm in re.finditer(r"\b(?:sed|perl)\b([^|;&]*)", cmd):
+            seg = sm.group(1)
+            if not re.search(r"\s-[a-zA-Z]*i\b", seg):
+                continue
+            _extract_inplace_files(seg, _add)
+        # interpreter one-liners (open / writeFileSync / appendFileSync /
+        # createWriteStream / File.write / File.open)
+        for pm in re.finditer(r"open\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*(['\"])[wax]\+?\3", cmd):
+            _add(pm.group(2))
+        for pm in re.finditer(r"(?:writeFileSync|appendFileSync|createWriteStream)\s*\(\s*(['\"])([^'\"]+)\1", cmd):
+            _add(pm.group(2))
+        for pm in re.finditer(r"File\.(?:write|open)\s*\(\s*(['\"])([^'\"]+)\1", cmd):
+            _add(pm.group(2))
+        # python pathlib: Path('x').write_text / write_bytes
+        for pm in re.finditer(r"Path\s*\(\s*(['\"])([^'\"]+)\1\s*\)\s*\.write_", cmd):
+            _add(pm.group(2))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+
+    return targets
+
+
+def _extract_inplace_files(seg: str, add) -> None:
+    """Extract file arguments of a `sed -i ... files` / `perl -i ... files` segment.
+
+    Heuristic: trailing tokens that are not flags and not the sed/perl script
+    expression. We treat any non-flag token that is not the first quoted
+    s///-style script as a candidate file path. To stay fail-closed-friendly we
+    add every non-flag, non-option-value token except an obvious sed program.
+    """
+    toks = seg.split()
+    # drop a leading combined `-i*` / `-e` etc handled by skipping flags below
+    candidates = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-"):
+            # -e <expr> consumes the next token as the program
+            if t in ("-e", "-f"):
+                i += 2
+                continue
+            i += 1
+            continue
+        candidates.append(t)
+        i += 1
+    # The first non-flag token for sed without -e is the script (e.g. 's/a/b/').
+    # Treat tokens that look like a sed/perl program (contain / and start with a
+    # command letter, or are quoted s///) as the script, the rest as files.
+    for c in candidates:
+        if re.match(r"^s/.+/.+/[gpix]*$", c) or re.match(r"^['\"]?s/", c):
+            continue
+        if re.match(r"^[0-9,]+[a-z]", c):  # line-addr sed program
+            continue
+        add(c)
+
+
+# =============================================================================
+# absolute-path argument extraction (Major / AC15) — for unknown / mutating cmds
+# =============================================================================
+
+def absolute_path_args(command: str, cwd: str) -> list[str]:
+    """Extract ALL absolute-path-looking argument tokens (and inner-script tokens).
+
+    Returns realpaths of every `/abs` token and `--opt=/abs` value. Relative
+    tokens are ignored (cwd-containment already covers relative writes from inside
+    the worktree). NOTE: this returns positional reads too; callers that only care
+    about write destinations should use `write_option_abs_path_args()`.
+    """
+    found: list[str] = []
+
+    def _scan(cmd: str) -> None:
+        toks = _tokenize(cmd)
+        for tok in toks:
+            # `--output=/abs/path` style
+            if "=" in tok and not tok.startswith("/"):
+                _, _, val = tok.partition("=")
+                if val.startswith("/"):
+                    found.append(os.path.realpath(val))
+                continue
+            if tok.startswith("/") and len(tok) > 1:
+                found.append(os.path.realpath(tok))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+    return found
+
+
+def write_option_abs_path_args(command: str, cwd: str) -> list[str]:
+    """Extract external-write-destination absolute paths from write-indicating options.
+
+    Only absolute paths that are the *value of a known write option*
+    (`-o`/`--output`/`--out`/`-w`/`--write`/`--in-place`/`--fix`/...) are returned.
+    A bare positional absolute path (a read source for an unknown program) is NOT
+    returned — that is the over-block this narrows. Covers both
+    `--output /abs` (separate value) and `--output=/abs` (joined) forms, plus
+    inner `bash -c` wrapper scripts.
+    """
+    found: list[str] = []
+
+    def _scan(cmd: str) -> None:
+        toks = _tokenize(cmd)
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            # joined: --output=/abs  or  -o/abs
+            if "=" in tok and tok.startswith("-"):
+                flag, _, val = tok.partition("=")
+                if flag in _WRITE_OPTION_FLAGS and val.startswith("/"):
+                    found.append(os.path.realpath(val))
+                i += 1
+                continue
+            # joined short form: -o/abs
+            if tok.startswith("-o") and len(tok) > 2 and tok[2] == "/":
+                found.append(os.path.realpath(tok[2:]))
+                i += 1
+                continue
+            # separate value: --output /abs
+            if tok in _WRITE_OPTION_FLAGS:
+                if i + 1 < len(toks):
+                    nxt = toks[i + 1]
+                    if nxt.startswith("/") and len(nxt) > 1:
+                        found.append(os.path.realpath(nxt))
+                i += 2
+                continue
+            i += 1
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+    return found
+
+
+# =============================================================================
+# main decision
+# =============================================================================
+
+def decide(payload: dict) -> None:
+    """Make the allow/block decision and exit."""
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or os.environ.get("PWD") or os.getcwd()
+
+    # Malformed payload for a matched mutation tool → fail-closed.
+    if not tool_name:
+        _block("<unresolved>", cwd)
+    if tool_name not in MATCHED_TOOLS:
+        # Not a tool we guard (defensive; matcher should already scope this).
+        _allow()
+
+    project_root = resolve_project_root()
+    issue = resolve_current_issue(cwd, project_root)
+    resolution = resolve_expected_worktree(issue, project_root)
+
+    if tool_name in WRITE_TOOLS:
+        _decide_write(tool_input, cwd, issue, resolution)
+    elif tool_name == BASH_TOOL:
+        _decide_bash(tool_input, cwd, issue, resolution)
+
+    _allow()
+
+
+def _decide_write(tool_input: dict, cwd: str, issue: str | None,
+                  resolution: "WorktreeResolution") -> None:
+    target = (
+        tool_input.get("file_path")
+        or tool_input.get("path")
+        or ""
+    )
+
+    # No active issue resolvable → write tools are not scoped to a worktree; allow.
+    if not issue:
+        _allow()
+
+    # An issue is resolved but git is unavailable → fail-closed for mutation.
+    if not resolution.git_available:
+        _block("<git-unavailable>", cwd)
+
+    # B1: active issue resolved but NO matching worktree → fail-closed block
+    # (symmetric with _decide_bash zero_matches_for_mutation:block).
+    if resolution.match_count == 0:
+        _block("<no-matching-worktree>", cwd)
+
+    # multiple matches (match_count > 1) → fail-closed block.
+    if resolution.expected is None:
+        _block("<ambiguous>", cwd)
+
+    if is_inside(resolution.expected, target, cwd):
+        _allow()
+    _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
+
+
+def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
+                 resolution: "WorktreeResolution") -> None:
+    command = tool_input.get("command") or ""
+    klass = classify_bash(command)
+
+    # read-only allowlist: allow even if worktree unresolved / git unavailable.
+    if klass == "read_only":
+        _allow()
+
+    # From here, command is 'mutating' or 'unknown' (possible mutation).
+    if issue and not resolution.git_available:
+        # git binary unavailable for a possible mutation → fail-closed.
+        _block("<git-unavailable>", cwd)
+
+    if not issue or resolution.match_count == 0:
+        # No active issue worktree to scope against → allow non-read-only too
+        # (no worktree to escape). zero_matches_for_mutation:block applies only
+        # when an issue IS resolved but no matching worktree exists.
+        if issue and resolution.match_count == 0:
+            # Active issue resolved but no matching worktree → fail-closed block.
+            _block("<no-matching-worktree>", cwd)
+        _allow()
+
+    if resolution.expected is None:
+        # multiple matches → ambiguous → fail-closed.
+        _block("<ambiguous>", cwd)
+
+    expected = resolution.expected
+    rel_expected = _rel(expected, project_root=resolve_project_root())
+
+    # explicit target / wrapper dirs outside expected → block (B3: includes
+    # `cd`/`git -C` found inside bash -c wrapper scripts).
+    for d in effective_target_dirs(command, cwd):
+        if not _dir_inside(expected, d):
+            _block(rel_expected, cwd)
+
+    # B2: file-write mutation destination paths outside expected → block.
+    if _is_file_write_mutation_recursive(command):
+        wtargets = write_target_paths(command, cwd)
+        if not wtargets:
+            # write mutation detected but destination unextractable → fail-closed.
+            _block(rel_expected, cwd)
+        for t in wtargets:
+            if not _path_inside(expected, t):
+                _block(rel_expected, cwd)
+
+    # Major: a non-read-only command whose write destination is an external
+    # absolute path must be blocked. Read-only allowlist programs already returned
+    # above (so reads like `cat ROOT/f.txt`, `grep x ROOT/f`, `ls ROOT` are NOT
+    # affected). Any remaining 'unknown' program is unparsed: a bare external
+    # absolute path could be a write destination (cp/mv/dd/install/<formatter>),
+    # so we fail-closed on ANY external absolute path arg (positional OR option).
+    # For 'mutating' commands the precise write target is already handled by the
+    # B2 redirection/tee/-i write-target check and the cd/git -C check above
+    # (e.g. `cat ROOT/f > inside` writes inside → allowed); we additionally block
+    # external write-option destinations.
+    if klass == "unknown":
+        for p in absolute_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                _block(rel_expected, cwd)
+    if klass == "mutating":
+        for p in write_option_abs_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                _block(rel_expected, cwd)
+
+    # cwd outside expected → block (mutating or unknown-possible-mutation).
+    if not _dir_inside(expected, cwd):
+        _block(rel_expected, cwd)
+
+    # cwd inside expected and no outside explicit target / write-target.
+    if klass == "mutating":
+        _allow()
+    if klass == "unknown":
+        # Unknown command but cwd inside worktree and no outside target detected.
+        # Mutation possibility is contained to the worktree → allow.
+        _allow()
+
+    _allow()
+
+
+def _is_file_write_mutation_recursive(command: str) -> bool:
+    """True iff command (or an inner `bash -c` script) is a file-write mutation."""
+    if _is_file_write_mutation(command):
+        return True
+    for inner in _inner_scripts(command):
+        if _is_file_write_mutation(inner):
+            return True
+    return False
+
+
+def _path_inside(expected_realpath: str, candidate_path: str) -> bool:
+    """commonpath containment for an already-absolute realpath candidate."""
+    if not candidate_path:
+        return False
+    actual = os.path.realpath(candidate_path)
+    expected = os.path.realpath(expected_realpath)
+    try:
+        common = os.path.commonpath([expected, actual])
+    except ValueError:
+        return False
+    return common == expected
+
+
+def _dir_inside(expected_realpath: str, candidate_dir: str) -> bool:
+    if not candidate_dir:
+        return False
+    actual = os.path.realpath(candidate_dir)
+    expected = os.path.realpath(expected_realpath)
+    try:
+        common = os.path.commonpath([expected, actual])
+    except ValueError:
+        return False
+    return common == expected
+
+
+def _rel(path: str, project_root: str) -> str:
+    """Return project-relative path for bounded message; fall back to basename."""
+    try:
+        return os.path.relpath(path, project_root)
+    except ValueError:
+        return os.path.basename(os.path.normpath(path))
+
+
+# =============================================================================
+# entrypoint
+# =============================================================================
+
+def main() -> None:
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        # Malformed stdin. We cannot know the tool. Since the hook matcher only
+        # fires for Bash|Write|Edit|MultiEdit (matched mutation tools), a malformed
+        # payload for a matched tool is fail-closed.
+        cwd = os.environ.get("PWD") or os.getcwd()
+        _block("<unresolved>", cwd)
+        return
+    if not isinstance(payload, dict):
+        cwd = os.environ.get("PWD") or os.getcwd()
+        _block("<unresolved>", cwd)
+        return
+    decide(payload)
+
+
+if __name__ == "__main__":
+    main()
