@@ -31,13 +31,21 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from agent_ops_inventory import (
+    OPS_REVIEW_INVENTORY_PROFILE,
     PLAN_REGISTRY,
+    READ_POLICY_INITIAL_EXCLUSION,
+    CoverageTarget,
+    InventoryProfile,
     PlanSpec,
     VALID_TASK_KINDS,
     build_agent_ops_inventory,
     build_plan_output,
+    classify_path_kind,
+    emit_json_under_budget,
     get_tracked_paths_decoded,
     is_secret_like,
+    load_contract_surfaces_with_errors,
+    validate_artifact_destination,
     write_artifact,
 )
 from check_agent_friendly_stdout import check_stdout
@@ -107,6 +115,38 @@ class TestIssueRefinementOpsReviewJsonCompactBudget:
             assert isinstance(data, dict)
         except json.JSONDecodeError as e:
             pytest.fail(f"Output is not valid JSON (fallback to non-JSON), error: {e}\nstdout: {result.stdout!r}")
+
+    def test_json_compact_budget_overflow_stays_valid_json(self):
+        """GIVEN a payload that exceeds the budget WHEN emit_json_under_budget THEN
+        still valid JSON (degraded), never a non-JSON KEY: value string (BLOCKER 1)."""
+        bloated = {
+            "schema_version": "agent_ops_read_plan_v1",
+            "task_kind": "issue-refinement-ops-review",
+            "read_policy": READ_POLICY_INITIAL_EXCLUSION,
+            "MUST_READ": [f"path/to/file_{i}_with_a_fairly_long_name.py" for i in range(200)],
+            "DO_NOT_READ_INITIAL_ONLY": ["src/", "docs/product/"],
+        }
+        out = emit_json_under_budget(bloated, max_bytes=2048)
+        assert len(out.encode("utf-8")) <= 2048
+        data = json.loads(out)  # must parse — never a TASK_KIND: ... fallback string
+        assert data["status"] == "blocked"
+        assert data["error"] == "stdout_budget_exceeded"
+        assert data["task_kind"] == "issue-refinement-ops-review"
+
+    def test_json_compact_budget_overflow_via_bloated_registry_spec(self, monkeypatch):
+        """GIVEN PLAN_REGISTRY spec with a huge MUST_READ WHEN --json plan emitted THEN
+        output is still valid JSON within budget (forced overflow case)."""
+        base = PLAN_REGISTRY["issue-refinement-ops-review"]
+        huge = base._replace(
+            must_read=[f"a/very/long/path/segment/file_{i}.py" for i in range(500)]
+        )
+        monkeypatch.setitem(PLAN_REGISTRY, "issue-refinement-ops-review", huge)
+        plan = build_plan_output(PLAN_REGISTRY["issue-refinement-ops-review"], REPO_ROOT)
+        out = emit_json_under_budget(plan, max_bytes=2048)
+        assert len(out.encode("utf-8")) <= 2048
+        data = json.loads(out)
+        assert isinstance(data, dict)
+        assert data["task_kind"] == "issue-refinement-ops-review"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,6 +353,26 @@ class TestIssueRefinementOpsReviewDoNotReadInitialOnly:
             f"Expected note to clarify additional reads are not forbidden, got: {note!r}"
         )
 
+    def test_do_not_read_read_policy_exact_field(self):
+        """GIVEN issue-refinement-ops-review plan WHEN read_policy inspected THEN
+        machine-readable field equals the exact contract value (AC4 / BLOCKER 2)."""
+        spec = PLAN_REGISTRY["issue-refinement-ops-review"]
+        plan = build_plan_output(spec, REPO_ROOT)
+        assert plan["read_policy"] == "initial_exclusion_not_absolute_forbid"
+
+    def test_do_not_read_read_policy_present_in_json_cli(self):
+        """GIVEN issue-refinement-ops-review --json WHEN run THEN read_policy field present and exact."""
+        script = SCRIPTS_DIR / "agent_ops_inventory.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--task-kind", "issue-refinement-ops-review", "--json"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["read_policy"] == "initial_exclusion_not_absolute_forbid"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AC5: full inventory saved to artifact only; stdout minimal
@@ -356,6 +416,42 @@ class TestIssueRefinementOpsReviewArtifactOnly:
             artifact_data = json.loads(artifact_path.read_text(encoding="utf-8"))
             assert "items" in artifact_data
             assert len(artifact_data["items"]) > 0, "Artifact should contain inventory items"
+
+    def test_artifact_only_json_plus_artifact_out_returns_json_not_evidence(self):
+        """GIVEN --json --artifact-out WHEN run THEN stdout is JSON plan with
+        inventory_artifact, NOT an EVIDENCE: line (BLOCKER 4)."""
+        script = SCRIPTS_DIR / "agent_ops_inventory.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "inv.json"
+            result = subprocess.run(
+                [sys.executable, str(script), "--task-kind", "issue-refinement-ops-review",
+                 "--json", "--artifact-out", str(artifact_path)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+            assert result.returncode in {0, 1, 2}, f"stderr={result.stderr}"
+            assert not result.stdout.lstrip().startswith("EVIDENCE:"), (
+                f"--json must not emit EVIDENCE line, got: {result.stdout!r}"
+            )
+            data = json.loads(result.stdout)  # must be valid JSON
+            assert data["inventory_artifact"] == str(artifact_path)
+            assert artifact_path.exists()
+
+    def test_artifact_only_no_json_emits_evidence_line(self):
+        """GIVEN --artifact-out WITHOUT --json WHEN run THEN stdout is EVIDENCE: only."""
+        script = SCRIPTS_DIR / "agent_ops_inventory.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "inv.json"
+            result = subprocess.run(
+                [sys.executable, str(script), "--task-kind", "issue-refinement-ops-review",
+                 "--artifact-out", str(artifact_path)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+            assert result.returncode in {0, 1, 2}
+            assert result.stdout.startswith("EVIDENCE:")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -412,13 +508,64 @@ class TestIssueRefinementOpsReviewSecurity:
             assert isinstance(entry["empty_ok"], bool), (
                 f"empty_ok should be bool, got {type(entry['empty_ok']).__name__} for {entry['prefix']}"
             )
-            # Machine-decidable: empty_ok == (tracked_matches == 0)
-            expected_empty_ok = (entry["tracked_matches"] == 0)
-            assert entry["empty_ok"] == expected_empty_ok, (
-                f"empty_ok mismatch for {entry['prefix']}: "
-                f"tracked_matches={entry['tracked_matches']}, "
-                f"empty_ok={entry['empty_ok']}, expected={expected_empty_ok}"
-            )
+            # empty_ok is a configured policy on the target (here all required
+            # targets are empty_ok=False); coverage_ok is the computed result.
+            assert isinstance(entry["coverage_ok"], bool)
+            assert isinstance(entry["included_matches"], int)
+            assert isinstance(entry["filtered_matches"], int)
+            assert entry["filtered_matches"] == entry["tracked_matches"] - entry["included_matches"]
+
+    def test_security_coverage_ok_reflects_included_vs_tracked(self):
+        """GIVEN coverage WHEN inspected THEN coverage_ok is machine-decidable from
+        tracked/included/empty_ok (BLOCKER 5), distinguishing absent vs filtered."""
+        tracked = get_tracked_paths_decoded(REPO_ROOT)
+        artifact = build_agent_ops_inventory(REPO_ROOT, tracked, task_kind="issue-refinement-ops-review")
+        for e in artifact["coverage"]:
+            if e["tracked_matches"] == 0:
+                assert e["coverage_ok"] == bool(e["empty_ok"])
+            else:
+                assert e["coverage_ok"] == (e["filtered_matches"] == 0)
+
+    def test_security_file_coverage_target_uses_exact_match(self):
+        """GIVEN a file coverage target WHEN a sibling .bak path is tracked THEN it is
+        NOT falsely counted (file target = exact match, not prefix) (BLOCKER 5)."""
+        fixture = "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+        # Inject a decoy sibling that a startswith() match would wrongly count.
+        tracked = get_tracked_paths_decoded(REPO_ROOT) + [fixture + ".bak"]
+        artifact = build_agent_ops_inventory(REPO_ROOT, tracked, task_kind="issue-refinement-ops-review")
+        entry = next(e for e in artifact["coverage"] if e["prefix"] == fixture)
+        assert entry["target_type"] == "file"
+        assert entry["tracked_matches"] == 1, (
+            f"file target must match exactly, .bak must not inflate count: {entry}"
+        )
+
+    def test_security_codex_agents_toml_classified_as_codex_agent_definition(self):
+        """GIVEN a .codex/agents/*.toml path WHEN classified THEN codex_agent_definition,
+        not generic codex_config (MAJOR 1)."""
+        assert classify_path_kind(".codex/agents/issue-author.toml") == "codex_agent_definition"
+        assert classify_path_kind(".claude/agents/issue-reviewer.md") == "claude_agent_definition"
+        # Non-agent codex config still classifies as codex_config.
+        assert classify_path_kind(".codex/config.toml") == "codex_config"
+
+    def test_security_invalid_contract_json_is_blocked_not_traceback(self, tmp_path):
+        """GIVEN a corrupt expected-runtime-contract.json WHEN surfaces loaded THEN a
+        structured contract_error is returned, not a traceback (MAJOR 2)."""
+        contract = tmp_path / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+        contract.parent.mkdir(parents=True, exist_ok=True)
+        contract.write_text("{ this is not valid json", encoding="utf-8")
+        surfaces, errors = load_contract_surfaces_with_errors(tmp_path)
+        assert surfaces == []
+        assert errors and any("invalid_json" in e for e in errors)
+
+    def test_security_artifact_out_symlink_parent_rejected(self, tmp_path):
+        """GIVEN --artifact-out whose parent is a symlink WHEN validated THEN rejected
+        (parent-chain symlink trust boundary, BLOCKER 6)."""
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        link_dir = tmp_path / "linked"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+        with pytest.raises(ValueError):
+            validate_artifact_destination(link_dir / "inv.json", tmp_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,6 +626,40 @@ class TestSharedRegistrySpec:
         assert "agent-ops-review" not in source or "task_kind" in source, (
             "Builder should not have task-kind-specific logic; it should be parameterized"
         )
+
+    def test_shared_spec_inventory_profile_is_single_source(self):
+        """GIVEN both ops task-kinds WHEN inventory_profile inspected THEN both reference
+        the SAME profile object from the registry (AC7 / BLOCKER 3)."""
+        p1 = PLAN_REGISTRY["agent-ops-review"].inventory_profile
+        p2 = PLAN_REGISTRY["issue-refinement-ops-review"].inventory_profile
+        assert p1 is not None and p2 is not None
+        assert p1 is p2, "both ops task-kinds must share the same InventoryProfile object"
+        assert p1 is OPS_REVIEW_INVENTORY_PROFILE
+
+    def test_shared_registry_builder_reads_profile_not_hardcoded(self):
+        """GIVEN a custom PlanSpec whose profile lists ONLY one prefix WHEN inventory
+        built THEN items reflect that profile, proving the builder is spec-driven."""
+        custom_profile = InventoryProfile(
+            target_prefixes=(".claude/rules/",),
+            coverage_targets=(CoverageTarget(".claude/rules/", "dir", empty_ok=False),),
+            expected_paths=(),
+            critical_surface_source="none",
+        )
+        custom_spec = PlanSpec(
+            task_kind="issue-refinement-ops-review",
+            must_read=[],
+            do_not_read_initial_only=[],
+            inventory_profile=custom_profile,
+        )
+        tracked = get_tracked_paths_decoded(REPO_ROOT)
+        inv = build_agent_ops_inventory(REPO_ROOT, tracked, spec=custom_spec)
+        # Only .claude/rules/ items collected — profile drove the prefixes.
+        non_rules = [it for it in inv["items"] if not it["path"].startswith(".claude/rules/")]
+        assert non_rules == [], f"builder ignored spec profile, leaked items: {non_rules[:5]}"
+        cov_prefixes = {c["prefix"] for c in inv["coverage"]}
+        assert cov_prefixes == {".claude/rules/"}
+        # critical_surface_source=none -> no contract surfaces pulled in.
+        assert inv["critical_surfaces"] == []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
