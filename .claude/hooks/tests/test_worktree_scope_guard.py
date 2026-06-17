@@ -908,13 +908,13 @@ def test_major_readonly_allowlist_not_overblocked(tmp_path):
     "sed -n '1p' {root}/README.md",
     # read-only git against external dir → allow
     "git -C {root} status",
-    # bare positional external abs path to an unknown program (read source) → allow
-    "weirdtool {root}/target.bin",
 ])
 def test_readonly_external_abs_path_not_overblocked(tmp_path, command_tmpl):
-    """AC4/AC15 over-block regression: read-only commands (and a bare positional
-    external abs path to an unknown program) reading OUTSIDE the worktree from a
-    cwd inside the worktree are allowed — reads do not pollute main."""
+    """AC4 over-block regression: read-only ALLOWLIST commands reading OUTSIDE the
+    worktree from a cwd inside the worktree are allowed — reads do not pollute
+    main. A bare external abs path to an UNKNOWN (non-allowlist) program is instead
+    fail-closed blocked (cp/mv/dd write positionally and are indistinguishable from
+    a read at parse time); see test_block_mutating_bash_positional_writer_outside."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
     cmd = command_tmpl.format(root=str(repo["root"]))
     payload = {
@@ -983,3 +983,44 @@ def test_readonly_relative_internal_write_and_build_allowed(tmp_path):
         }
         r = _run_guard(payload, repo["root"], issue="942")
         assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
+
+
+@pytest.mark.parametrize("command_tmpl", [
+    "cp a.txt {root}/copied.txt",
+    "mv a.txt {root}/moved.txt",
+    "dd if=a.txt of={root}/dd.out",
+    "install a.txt {root}/inst.txt",
+    "cp -r . {root}/dircopy",
+    # unknown program with a bare external abs path: cannot prove read vs write
+    # at parse time → fail-closed (would otherwise re-open cp/mv/dd positional writes)
+    "weirdtool {root}/target.bin",
+])
+def test_block_mutating_bash_positional_writer_outside(tmp_path, command_tmpl):
+    """AC8/AC15: an unknown positional-writer (cp/mv/dd/install) whose external
+    absolute destination is a bare positional (or of=) arg must be fail-closed
+    blocked from inside the worktree. Read-only commands reading an external abs
+    path (cat/grep/ls) are still allowed via the read-only allowlist; only
+    non-read-only (unknown) programs are blocked on any external abs path arg."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, r.stderr
+
+
+def test_allow_read_only_external_read_with_relative_inside_write(tmp_path):
+    """Control: `cat ROOT/f > inside` reads an external abs path but writes the
+    redirection target INSIDE the worktree → allowed (not over-blocked)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = f"cat {repo['root']}/README.md > inside.txt"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, r.stderr

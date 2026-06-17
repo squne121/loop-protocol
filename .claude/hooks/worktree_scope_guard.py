@@ -987,16 +987,21 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
             if not _path_inside(expected, t):
                 _block(rel_expected, cwd)
 
-    # Major: unknown/mutating command whose *write-option* value is an external
-    # absolute path (formatter-write risk, e.g. `someformatter --output ROOT/x`).
-    # A bare positional external abs path is a READ source (e.g. `cat ROOT/f.txt`,
-    # `weirdtool ROOT/in.bin`, `cat ROOT/f.txt > inside.txt`) and is NOT blocked
-    # here — reading an external file does not pollute main. Actual write
-    # destinations are covered by: the B2 redirection/tee/-i write-target check
-    # above, the effective_target_dirs (cd / git -C) check above, and the
-    # write-option scan below. Scanning bare positional abs paths would
-    # false-positive on read inputs, so it is intentionally omitted.
-    if klass in ("unknown", "mutating"):
+    # Major: a non-read-only command whose write destination is an external
+    # absolute path must be blocked. Read-only allowlist programs already returned
+    # above (so reads like `cat ROOT/f.txt`, `grep x ROOT/f`, `ls ROOT` are NOT
+    # affected). Any remaining 'unknown' program is unparsed: a bare external
+    # absolute path could be a write destination (cp/mv/dd/install/<formatter>),
+    # so we fail-closed on ANY external absolute path arg (positional OR option).
+    # For 'mutating' commands the precise write target is already handled by the
+    # B2 redirection/tee/-i write-target check and the cd/git -C check above
+    # (e.g. `cat ROOT/f > inside` writes inside → allowed); we additionally block
+    # external write-option destinations.
+    if klass == "unknown":
+        for p in absolute_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                _block(rel_expected, cwd)
+    if klass == "mutating":
         for p in write_option_abs_path_args(command, cwd):
             if not _path_inside(expected, p):
                 _block(rel_expected, cwd)
