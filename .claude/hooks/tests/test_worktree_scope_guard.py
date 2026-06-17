@@ -833,11 +833,15 @@ def test_b3_shell_wrapper_internal_target_allowed(tmp_path):
 @pytest.mark.parametrize("command_tmpl", [
     "someformatter --output {root}/out.txt",
     "somegen --output={root}/out.txt",
-    "weirdtool {root}/target.bin",
+    "somelint --fix {root}/x.py",
+    "somefmt -o {root}/out.txt",
+    "rewrite --in-place {root}/x.txt",
 ])
 def test_major_unknown_external_abs_arg_blocks(tmp_path, command_tmpl):
-    """Major/AC15: an unknown command run from inside the worktree but carrying an
-    absolute-path argument pointing outside the worktree is fail-closed blocked."""
+    """Major/AC15: an unknown command run from inside the worktree carrying a
+    WRITE-OPTION absolute-path value pointing outside the worktree (formatter-write
+    risk) is fail-closed blocked. A bare positional external abs path is a read
+    source and is NOT blocked here (see over-block regression tests below)."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
     cmd = command_tmpl.format(root=str(repo["root"]))
     payload = {
@@ -869,6 +873,109 @@ def test_major_readonly_allowlist_not_overblocked(tmp_path):
     repo = _make_repo_with_worktree(tmp_path, issue="942")
     for cmd in ("git status", "git diff HEAD~1", "gh pr view 1",
                 "gh api -X GET repos/o/r"):
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(repo["worktree"]),
+        }
+        r = _run_guard(payload, repo["root"], issue="942")
+        assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
+
+
+# =============================================================================
+# Over-block regression [AC4/AC8/AC15]: read-only commands reading files OUTSIDE
+# the worktree must be ALLOWED. main pollution prevention targets mutation only;
+# reading an external file does not pollute main. The fix narrows the Major
+# unknown-external-abs-path block to write-option destinations only and adds a
+# general read-only program allowlist.
+# =============================================================================
+
+@pytest.mark.parametrize("command_tmpl", [
+    # bare read-only programs reading an external absolute path → allow
+    "cat {root}/README.md",
+    "grep x {root}/README.md",
+    "ls {root}",
+    "head {root}/README.md",
+    "tail {root}/README.md",
+    "wc -l {root}/README.md",
+    "find {root} -name x",
+    "stat {root}/README.md",
+    "realpath {root}/README.md",
+    # pipeline of read-only programs reading external → allow
+    "cat {root}/README.md | grep x",
+    "grep x {root}/README.md | wc -l",
+    # sed/perl WITHOUT in-place are read-only even reading external → allow
+    "sed -n '1p' {root}/README.md",
+    # read-only git against external dir → allow
+    "git -C {root} status",
+    # bare positional external abs path to an unknown program (read source) → allow
+    "weirdtool {root}/target.bin",
+])
+def test_readonly_external_abs_path_not_overblocked(tmp_path, command_tmpl):
+    """AC4/AC15 over-block regression: read-only commands (and a bare positional
+    external abs path to an unknown program) reading OUTSIDE the worktree from a
+    cwd inside the worktree are allowed — reads do not pollute main."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),  # cwd INSIDE the worktree
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
+
+
+@pytest.mark.parametrize("command_tmpl", [
+    # redirection to an external path from an otherwise read-only program → block
+    "cat {root}/README.md > {root}/evil.txt",
+    "echo x > {root}/evil.txt",
+    "echo x >> {root}/evil.txt",
+    "grep x in.txt > {root}/evil.txt",
+    # tee to an external path → block
+    "cat foo | tee {root}/evil.txt",
+    # sed/perl in-place on an external file → block
+    "sed -i 's/a/b/' {root}/README.md",
+    "perl -i -pe 's/a/b/' {root}/README.md",
+    # write-option destination to an external path → block
+    "someformatter --output {root}/out.txt",
+    "somefmt -o {root}/out.txt",
+])
+def test_readonly_program_external_redirection_still_blocks(tmp_path, command_tmpl):
+    """AC8 maintain: redirection / tee / in-place / write-option destinations to an
+    EXTERNAL absolute path are still blocked even when the leading program is
+    read-only. Redirection write-target checks take priority over the program
+    allowlist."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, f"{cmd!r} should block; stderr={r.stderr}"
+
+
+def test_readonly_program_internal_redirection_allowed(tmp_path):
+    """Control: a read-only program redirecting to a path INSIDE the worktree is
+    allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = f"cat {repo['root']}/README.md > {repo['worktree']}/copy.txt"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, r.stderr
+
+
+def test_readonly_relative_internal_write_and_build_allowed(tmp_path):
+    """Control: relative write inside the worktree and `npm run build` are allowed
+    (no over-block regression for ordinary in-worktree work)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    for cmd in ("echo x > inside.txt", "npm run build"):
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": cmd},

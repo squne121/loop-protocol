@@ -301,6 +301,38 @@ _PKG_MUTATING = {
 # read-only allowlist (worktree 解決不能でも allow)
 _GIT_READONLY = {"status", "diff", "log", "show", "rev-parse"}
 
+# General-purpose read-only programs that do NOT mutate the filesystem by their
+# own action. An external absolute-path *positional* argument to one of these is a
+# read source, not a write destination, so it must NOT trigger an over-block. Note:
+# redirection / `tee` write-target checks still apply (they are checked BEFORE this
+# allowlist via _is_file_write_mutation), so `cat x > ROOT/y` / `... | tee ROOT/y`
+# are still blocked via the write-target path.
+# `sed`/`perl` are intentionally EXCLUDED here: they are read-only only when no
+# `-i` in-place flag is present, which is handled separately (an `-i` form is
+# already classified as a file-write mutation upstream).
+_READONLY_PROGRAMS = {
+    "cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "wc", "find",
+    "awk", "cut", "sort", "uniq", "nl", "tr", "column", "diff", "cmp", "comm",
+    "file", "stat", "realpath", "readlink", "dirname", "basename", "pwd",
+    "echo", "printf", "test", "true", "false", "which", "type", "command-v",
+    "date", "env", "printenv", "id", "whoami", "uname", "hostname", "less",
+    "more", "tac", "od", "xxd", "md5sum", "sha1sum", "sha256sum", "jq", "yq",
+    "xargs",
+}
+# sed/perl are read-only only when NOT in-place (`-i`). An in-place form is
+# already classified as a file-write mutation upstream, so here (post-write-check)
+# any remaining sed/perl is read-only.
+_CONDITIONAL_READONLY_PROGRAMS = {"sed", "perl"}
+
+# Option flags that indicate a write destination for an otherwise-unknown program.
+# When one of these carries an external absolute path, the unknown program is
+# treated as a file-writer (Major formatter-write risk) and blocked. A bare
+# external *positional* arg (no write option) is treated as a read source → allow.
+_WRITE_OPTION_FLAGS = {
+    "-o", "--output", "--out", "-w", "--write", "--in-place", "--fix",
+    "--output-file", "--outfile",
+}
+
 # shell wrappers whose `-c` / `-lc` script argument carries an inner command.
 _SHELL_WRAPPERS = {"bash", "sh", "zsh"}
 
@@ -389,8 +421,67 @@ def classify_bash(command: str) -> str:
     if prog in _PKG_MANAGERS:
         return _classify_pkg(args)
 
+    # Pure read-only pipeline / single read-only program: every segment's
+    # effective program is in the read-only allowlist (no file-write mutation —
+    # already excluded above). `cat a | grep b`, `ls ROOT`, etc.
+    if _is_readonly_pipeline(command):
+        return "read_only"
+
     # Unknown program: cannot prove read-only.
     return "unknown"
+
+
+def _segment_program(segment: str) -> str | None:
+    """Return the effective program basename of a single pipeline segment, after
+    stripping `command` / `env VAR=...` wrappers. Returns None when empty."""
+    toks = _tokenize(segment)
+    if not toks:
+        return None
+    toks = _strip_wrappers_for_classification(toks)
+    if not toks:
+        return None
+    return os.path.basename(toks[0])
+
+
+def _is_readonly_program(prog: str, segment: str) -> bool:
+    """True iff `prog` is a known read-only program for this segment.
+
+    `sed`/`perl` are read-only only when no in-place (`-i`) flag is present; an
+    in-place form is classified as a file-write mutation upstream, so by the time
+    we reach here a sed/perl segment is read-only.
+    """
+    if prog in _READONLY_PROGRAMS:
+        return True
+    if prog in _CONDITIONAL_READONLY_PROGRAMS:
+        return not re.search(r"\s-[a-zA-Z]*i\b", segment)
+    return False
+
+
+def _is_readonly_pipeline(command: str) -> bool:
+    """True iff every pipeline segment of `command` is a read-only program.
+
+    Splits on `|` (pipe) only — `;`, `&&`, `||` chain heterogeneous commands and
+    are conservatively NOT treated as a single read-only pipeline here (each such
+    case falls through to 'unknown' for fail-closed bias). Redirection write
+    targets are handled before this function is reached.
+    """
+    # Reject shell-control chaining so a hidden mutation in a later clause cannot
+    # be masked by a read-only first clause.
+    if re.search(r"(;|&&|\|\|)", command):
+        return False
+    segments = command.split("|")
+    saw_one = False
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            return False
+        prog = _segment_program(seg)
+        if not prog:
+            return False
+        if not _is_readonly_program(prog, seg):
+            return False
+        saw_one = True
+    return saw_one
 
 
 def _strip_wrappers_for_classification(tokens: list[str]) -> list[str]:
@@ -719,12 +810,12 @@ def _extract_inplace_files(seg: str, add) -> None:
 # =============================================================================
 
 def absolute_path_args(command: str, cwd: str) -> list[str]:
-    """Extract absolute-path-looking argument tokens (and inner-script tokens).
+    """Extract ALL absolute-path-looking argument tokens (and inner-script tokens).
 
-    Used to catch unknown/mutating commands that write to an external absolute
-    path via an option like `--output /repo/x` or a positional `/repo/x`.
-    Returns realpaths. Relative tokens are ignored here (cwd-containment already
-    covers relative writes from inside the worktree).
+    Returns realpaths of every `/abs` token and `--opt=/abs` value. Relative
+    tokens are ignored (cwd-containment already covers relative writes from inside
+    the worktree). NOTE: this returns positional reads too; callers that only care
+    about write destinations should use `write_option_abs_path_args()`.
     """
     found: list[str] = []
 
@@ -739,6 +830,51 @@ def absolute_path_args(command: str, cwd: str) -> list[str]:
                 continue
             if tok.startswith("/") and len(tok) > 1:
                 found.append(os.path.realpath(tok))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+    return found
+
+
+def write_option_abs_path_args(command: str, cwd: str) -> list[str]:
+    """Extract external-write-destination absolute paths from write-indicating options.
+
+    Only absolute paths that are the *value of a known write option*
+    (`-o`/`--output`/`--out`/`-w`/`--write`/`--in-place`/`--fix`/...) are returned.
+    A bare positional absolute path (a read source for an unknown program) is NOT
+    returned — that is the over-block this narrows. Covers both
+    `--output /abs` (separate value) and `--output=/abs` (joined) forms, plus
+    inner `bash -c` wrapper scripts.
+    """
+    found: list[str] = []
+
+    def _scan(cmd: str) -> None:
+        toks = _tokenize(cmd)
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            # joined: --output=/abs  or  -o/abs
+            if "=" in tok and tok.startswith("-"):
+                flag, _, val = tok.partition("=")
+                if flag in _WRITE_OPTION_FLAGS and val.startswith("/"):
+                    found.append(os.path.realpath(val))
+                i += 1
+                continue
+            # joined short form: -o/abs
+            if tok.startswith("-o") and len(tok) > 2 and tok[2] == "/":
+                found.append(os.path.realpath(tok[2:]))
+                i += 1
+                continue
+            # separate value: --output /abs
+            if tok in _WRITE_OPTION_FLAGS:
+                if i + 1 < len(toks):
+                    nxt = toks[i + 1]
+                    if nxt.startswith("/") and len(nxt) > 1:
+                        found.append(os.path.realpath(nxt))
+                i += 2
+                continue
+            i += 1
 
     _scan(command)
     for inner in _inner_scripts(command):
@@ -851,9 +987,17 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
             if not _path_inside(expected, t):
                 _block(rel_expected, cwd)
 
-    # Major: unknown/mutating command with an absolute-path arg outside expected.
+    # Major: unknown/mutating command whose *write-option* value is an external
+    # absolute path (formatter-write risk, e.g. `someformatter --output ROOT/x`).
+    # A bare positional external abs path is a READ source (e.g. `cat ROOT/f.txt`,
+    # `weirdtool ROOT/in.bin`, `cat ROOT/f.txt > inside.txt`) and is NOT blocked
+    # here — reading an external file does not pollute main. Actual write
+    # destinations are covered by: the B2 redirection/tee/-i write-target check
+    # above, the effective_target_dirs (cd / git -C) check above, and the
+    # write-option scan below. Scanning bare positional abs paths would
+    # false-positive on read inputs, so it is intentionally omitted.
     if klass in ("unknown", "mutating"):
-        for p in absolute_path_args(command, cwd):
+        for p in write_option_abs_path_args(command, cwd):
             if not _path_inside(expected, p):
                 _block(rel_expected, cwd)
 
