@@ -94,6 +94,44 @@ def test_invalid_label_profile_fails(valid_plan):
         m.validate_plan(valid_plan)
 
 
+def test_parent_body_updates_require_body_sha256(valid_plan):
+    # Blocker 2: parent_body_updates without parent.body_sha256 is fail-closed.
+    valid_plan["parent_body_updates"] = [
+        {"section": "Child Issues", "old_line": "a", "new_line": "b", "expected_match_count": 1}
+    ]
+    valid_plan["parent"].pop("body_sha256", None)
+    with pytest.raises(m.PlanValidationError, match="body_sha256"):
+        m.validate_plan(valid_plan)
+
+
+def test_parent_body_updates_reject_bad_sha_format(valid_plan):
+    valid_plan["parent_body_updates"] = [
+        {"section": "Child Issues", "old_line": "a", "new_line": "b", "expected_match_count": 1}
+    ]
+    valid_plan["parent"]["body_sha256"] = "deadbeef"  # missing sha256: prefix / wrong length
+    with pytest.raises(m.PlanValidationError, match="body_sha256"):
+        m.validate_plan(valid_plan)
+
+
+def test_verification_command_code_fence_rejected(valid_plan):
+    # Medium 1: a VC containing a code fence could break out of the rendered ```bash block.
+    valid_plan["children"][0]["verification_commands"]["AC1"] = "echo ```injected"
+    with pytest.raises(m.PlanValidationError, match="code fence"):
+        m.validate_plan(valid_plan)
+
+
+def test_allowed_path_backtick_rejected(valid_plan):
+    valid_plan["children"][0]["allowed_paths"] = ["src/`evil`.ts"]
+    with pytest.raises(m.PlanValidationError, match="backtick"):
+        m.validate_plan(valid_plan)
+
+
+def test_title_control_char_rejected(valid_plan):
+    valid_plan["children"][0]["title"] = "実装: x\x00y"
+    with pytest.raises(m.PlanValidationError, match="control characters"):
+        m.validate_plan(valid_plan)
+
+
 def test_non_json_plan_file_fails(tmp_path):
     p = tmp_path / "plan.yaml"
     p.write_text("schema_version: 2\nrepo: x\n", encoding="utf-8")  # valid YAML, not JSON

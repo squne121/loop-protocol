@@ -31,8 +31,9 @@ NEW_LINE = "- [x] C254-2: validator parity #287"
 
 def _sha(body_with_nl: str) -> str:
     # apply_parent_checklist_patch strips one trailing newline from the gh --jq body.
+    # The canonical body_sha256 format is "sha256:<64 hex>".
     body = body_with_nl[:-1] if body_with_nl.endswith("\n") else body_with_nl
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 class FakeGh:
@@ -135,6 +136,18 @@ def test_readback_failure_reported():
     )
     assert res.updated is False
     assert "read-back" in res.error
+
+
+def test_missing_sha_aborts_without_edit():
+    # Blocker 2: body_sha256 is a hard precondition for patching.
+    gh = FakeGh(PARENT_BODY.rstrip("\n"))
+    res = m.apply_parent_checklist_patch(
+        repo="o/r", parent_issue=254, updates=_updates(),
+        expected_body_sha256=None, runners=m.Runners(gh=gh),
+    )
+    assert res.updated is False
+    assert "body_sha256 is required" in res.error
+    assert gh.calls == []
 
 
 def test_no_updates_is_noop():

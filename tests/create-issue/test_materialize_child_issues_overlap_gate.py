@@ -21,12 +21,19 @@ def _runners(create_calls):
     return m.Runners(validate=_ok_validate, create=create, gh=lambda a: m.RunResult(0, ""))
 
 
-def test_overlap_clear_proceeds(valid_plan):
-    valid_plan["overlap"] = {"status": "clear"}
+def test_overlap_clear_with_provenance_proceeds(valid_plan, clear_overlap):
+    valid_plan["overlap"] = clear_overlap
     calls = []
     res = m.materialize(valid_plan, _runners(calls))
     assert res["status"] == "ok"
     assert len(calls) == 1
+
+
+def test_bare_clear_without_provenance_fails(valid_plan):
+    # High 2: status=clear without preflight provenance is fail-closed at schema validation.
+    valid_plan["overlap"] = {"status": "clear"}
+    with pytest.raises(m.PlanValidationError, match="provenance|source|verdict|input_sha256|checked_at"):
+        m.validate_plan(valid_plan)
 
 
 def test_deferred_requires_948_dependency_escalates_when_missing(valid_plan):

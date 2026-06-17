@@ -38,6 +38,18 @@ def _valid_child() -> dict:
     }
 
 
+def _clear_overlap() -> dict:
+    # status=clear must carry preflight provenance (High 2 hardening).
+    return {
+        "status": "clear",
+        "source": "check_issue_overlap.py",
+        "helper_version": "1.0.0",
+        "input_sha256": "sha256:" + "a" * 64,
+        "checked_at": "2026-06-17T00:00:00Z",
+        "verdict": "safe_new_issue",
+    }
+
+
 def _valid_plan() -> dict:
     return {
         "schema_version": 2,
@@ -49,9 +61,14 @@ def _valid_plan() -> dict:
         },
         "issue_lookup": {"complete": True},
         "children": [_valid_child()],
-        "overlap": {"status": "clear"},
+        "overlap": _clear_overlap(),
         "parent_body_updates": [],
     }
+
+
+@pytest.fixture
+def clear_overlap():
+    return copy.deepcopy(_clear_overlap())
 
 
 @pytest.fixture

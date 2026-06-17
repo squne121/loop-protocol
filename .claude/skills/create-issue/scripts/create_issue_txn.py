@@ -1369,11 +1369,23 @@ def _run_issue_body_validator(
             "--body-file",
             temp_body_file,
         ]
-        # AC3: forward kind/title so create_issue_txn enforces kind-specific required
-        # sections / Stop Conditions / title prefix even when the caller forgot to
-        # pre-validate with --kind/--title.
-        if issue_kind:
-            validator_args += ["--kind", issue_kind]
+        # AC3 + High1 (#946): forward kind/title so the validator enforces kind-specific
+        # required sections / Stop Conditions / title prefix even when the caller forgot to
+        # pre-validate. When --issue-kind is omitted, adopt the body Machine-Readable
+        # Contract issue_kind; an explicit --issue-kind that contradicts the MRC kind is
+        # fail-closed.
+        mrc_kind = _extract_field_from_body(body, "issue_kind") or ""
+        if issue_kind and mrc_kind and issue_kind != mrc_kind:
+            raise TransactionError(
+                stage="issue-body-validate",
+                message=(
+                    f"issue_kind mismatch: --issue-kind={issue_kind!r} but body MRC "
+                    f"issue_kind={mrc_kind!r}"
+                ),
+            )
+        effective_kind = issue_kind or mrc_kind
+        if effective_kind:
+            validator_args += ["--kind", effective_kind]
         if title:
             validator_args += ["--title", title]
         cp = subprocess.run(

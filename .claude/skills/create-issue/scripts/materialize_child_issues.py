@@ -14,11 +14,13 @@ Design boundaries (see docs/dev/agent-skill-boundaries.md#child-materialization-
   spawns ``gh issue create`` directly (AC6). The label profile (``standard`` /
   ``triage_only``) is forwarded to the transaction helper, not to a raw ``gh`` call.
 * Parent checklist **patch** is the only direct ``gh`` mutation this module performs, and
-  it is gated by body_sha256 match + exact ``old_line`` + ``expected_match_count == 1`` +
-  post-edit read-back (AC5). It is applied only when the overall result is ``ok`` (AC7).
+  it is gated by a REQUIRED ``parent.body_sha256`` match + exact ``old_line`` +
+  ``expected_match_count == 1`` + post-edit read-back (AC5). It is applied only when the
+  overall result is ``ok`` with no errors and no escalation items (AC7).
 * The plan is validated against a closed schema. Any unknown key, duplicate ``child_id``,
   ``issue_lookup.complete: false``, invalid ``action``, non-integer ``depends_on``, empty
-  ``allowed_paths``, or AC/VC set mismatch is fail-closed (AC1).
+  ``allowed_paths``, AC/VC set mismatch, control-char injection, or missing
+  ``body_sha256`` (when patching) is fail-closed (AC1).
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,15 +36,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-# validate_issue_body lives next to this script; reuse its template loader so body
-# rendering and validation stay spec-driven (no hardcoded section order).
+import yaml
+
+# validate_issue_body lives next to this script; reuse its template loader as a cross-check
+# but the materializer uses a STRICT loader (fail-closed on missing/malformed template).
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-try:  # pragma: no cover - import wiring
-    from validate_issue_body import _load_required_section_labels  # type: ignore
-except Exception:  # pragma: no cover - defensive
-    _load_required_section_labels = None  # type: ignore
+# Repo root: .../.claude/skills/create-issue/scripts -> parents[3]
+_REPO_ROOT = _SCRIPT_DIR.parents[3]
+_ISSUE_TEMPLATE_DIR = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE"
 
 
 # --------------------------------------------------------------------------------------
@@ -49,6 +53,9 @@ except Exception:  # pragma: no cover - defensive
 # --------------------------------------------------------------------------------------
 
 SCHEMA_VERSION = 2
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Disallow control chars / fence break-out / backtick injection in rendered fields.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 _ALLOWED_TOP_KEYS = {
     "schema_version",
@@ -102,8 +109,20 @@ _ALLOWED_PARENT_UPDATE_KEYS = {
     "body_sha256",
 }
 
-_ALLOWED_OVERLAP_KEYS = {"status", "depends_on_issue", "reason"}
+# overlap gate (AC8). status=clear must carry preflight provenance so a plan producer
+# cannot assert "clear" from untrusted input alone (High 2).
+_ALLOWED_OVERLAP_KEYS = {
+    "status",
+    "depends_on_issue",
+    "reason",
+    "source",
+    "helper_version",
+    "input_sha256",
+    "checked_at",
+    "verdict",
+}
 _ALLOWED_OVERLAP_STATUS = {"clear", "deferred_to_issue", "not_run", "undeterminable"}
+_SAFE_OVERLAP_VERDICTS = {"safe_new_issue", "no_overlap"}
 
 # Default follow-up issue that owns the overlap preflight helper (#948). When the overlap
 # gate is deferred, every created child must declare this issue as a dependency (AC8).
@@ -117,6 +136,10 @@ class PlanValidationError(Exception):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PlanValidationError(message)
+
+
+def _require_clean_text(value: str, where: str) -> None:
+    _require(_CTRL_RE.search(value) is None, f"{where} contains control characters")
 
 
 def validate_plan(raw: Any) -> dict[str, Any]:
@@ -163,6 +186,15 @@ def validate_plan(raw: Any) -> dict[str, Any]:
     for u_idx, upd in enumerate(updates):
         _validate_parent_update(upd, u_idx)
 
+    # Blocker 2: a parent checklist patch requires the producer to pin the parent body
+    # hash, so a stale plan cannot mutate a drifted parent body.
+    if updates:
+        sha = parent.get("body_sha256")
+        _require(
+            isinstance(sha, str) and _SHA256_RE.match(sha) is not None,
+            "parent.body_sha256 (sha256:<64 hex>) is required when parent_body_updates is non-empty",
+        )
+
     return raw
 
 
@@ -198,10 +230,9 @@ def _validate_child(child: Any, idx: int, seen_ids: set[str]) -> None:
     if action == "create_issue":
         kind = child.get("kind")
         _require(kind in _ALLOWED_KINDS, f"children[{idx}] invalid kind: {kind!r}")
-        _require(
-            isinstance(child.get("title"), str) and child["title"].strip(),
-            f"children[{idx}].title must be a non-empty string",
-        )
+        title = child.get("title")
+        _require(isinstance(title, str) and title.strip(), f"children[{idx}].title must be a non-empty string")
+        _require_clean_text(title, f"children[{idx}].title")
 
         allowed_paths = child.get("allowed_paths")
         _require(
@@ -210,6 +241,8 @@ def _validate_child(child: Any, idx: int, seen_ids: set[str]) -> None:
         )
         for p in allowed_paths:
             _require(isinstance(p, str) and p.strip(), f"children[{idx}].allowed_paths entries must be non-empty strings")
+            _require_clean_text(p, f"children[{idx}].allowed_paths entry")
+            _require("`" not in p, f"children[{idx}].allowed_paths entry must not contain backticks")
 
         ac = child.get("acceptance_criteria")
         vc = child.get("verification_commands")
@@ -217,15 +250,17 @@ def _validate_child(child: Any, idx: int, seen_ids: set[str]) -> None:
         _require(isinstance(vc, dict) and len(vc) > 0, f"children[{idx}].verification_commands must be a non-empty object")
         ac_set = set(ac)
         vc_set = set(vc)
-        _require(
-            len(ac_set) == len(ac),
-            f"children[{idx}].acceptance_criteria contains duplicate AC ids",
-        )
+        _require(len(ac_set) == len(ac), f"children[{idx}].acceptance_criteria contains duplicate AC ids")
         _require(
             ac_set == vc_set,
             f"children[{idx}] AC/VC mismatch: acceptance_criteria={sorted(ac_set)} "
             f"verification_commands={sorted(vc_set)}",
         )
+        for ac_id, cmd in vc.items():
+            _require(isinstance(cmd, str) and cmd.strip(), f"children[{idx}].verification_commands[{ac_id}] must be non-empty")
+            # Reject code-fence break-out so the rendered ```bash block cannot be escaped.
+            _require("```" not in cmd, f"children[{idx}].verification_commands[{ac_id}] must not contain a code fence")
+            _require_clean_text(cmd, f"children[{idx}].verification_commands[{ac_id}]")
 
 
 def _validate_overlap(overlap: Any) -> None:
@@ -237,6 +272,27 @@ def _validate_overlap(overlap: Any) -> None:
     dep = overlap.get("depends_on_issue")
     if dep is not None:
         _require(isinstance(dep, int) and not isinstance(dep, bool), "overlap.depends_on_issue must be an integer")
+
+    # High 2: a "clear" verdict must be backed by preflight provenance — the materializer
+    # does not trust a bare {"status": "clear"} from an untrusted plan producer.
+    if status == "clear":
+        _require(
+            isinstance(overlap.get("source"), str) and overlap["source"].strip(),
+            "overlap.status=clear requires non-empty overlap.source (preflight provenance)",
+        )
+        _require(
+            overlap.get("verdict") in _SAFE_OVERLAP_VERDICTS,
+            f"overlap.status=clear requires overlap.verdict in {sorted(_SAFE_OVERLAP_VERDICTS)}",
+        )
+        _require(
+            isinstance(overlap.get("checked_at"), str) and overlap["checked_at"].strip(),
+            "overlap.status=clear requires overlap.checked_at",
+        )
+        ish = overlap.get("input_sha256")
+        _require(
+            isinstance(ish, str) and _SHA256_RE.match(ish) is not None,
+            "overlap.status=clear requires overlap.input_sha256 (sha256:<64 hex>)",
+        )
 
 
 def _validate_parent_update(upd: Any, idx: int) -> None:
@@ -263,19 +319,13 @@ class OverlapGateResult:
 
 
 def evaluate_overlap_gate(plan: dict[str, Any]) -> OverlapGateResult:
-    """Decide whether child creation may proceed under the overlap preflight policy (AC8).
-
-    * ``status: clear`` — overlap preflight ran and found no collision → proceed.
-    * ``status: deferred_to_issue`` / ``not_run`` (default) — overlap helper (#948) is not
-      yet available, so every created child MUST declare the overlap issue as a dependency.
-      Missing dependency → human_escalation.
-    * ``status: undeterminable`` — Allowed Paths overlap cannot be decided → human_escalation.
-    """
+    """Decide whether child creation may proceed under the overlap preflight policy (AC8)."""
     overlap = plan.get("overlap") or {"status": "not_run"}
     status = overlap.get("status", "not_run")
     dep_issue = overlap.get("depends_on_issue", DEFAULT_OVERLAP_ISSUE)
 
     if status == "clear":
+        # provenance already enforced by _validate_overlap
         return OverlapGateResult(ok=True)
 
     if status == "undeterminable":
@@ -313,8 +363,6 @@ def evaluate_overlap_gate(plan: dict[str, Any]) -> OverlapGateResult:
 # Canonical body rendering (AC2)
 # --------------------------------------------------------------------------------------
 
-# Default section content used when a child does not supply explicit prose. These keep the
-# rendered body template-compliant while remaining obviously machine-generated.
 _DEFAULT_SECTION_TEXT = {
     "Remaining Parent Gaps": "なし",
     "Out of Scope": "- 本 child のスコープ外の変更",
@@ -326,27 +374,44 @@ _DEFAULT_SECTION_TEXT = {
 def required_section_labels(kind: str) -> list[str]:
     """Return the required section labels for ``kind`` in template order (spec-driven).
 
-    Delegates to validate_issue_body._load_required_section_labels so the body render and
-    the validator agree on the exact ``ISSUE_TEMPLATE/<kind>.yml`` ordering (AC2).
+    Medium 2: the materializer uses a STRICT loader. Unlike the validator's
+    backward-compatible loader, a missing / malformed template or an empty required-label
+    set is fail-closed — the materializer must not silently downgrade the canonical body.
     """
-    if _load_required_section_labels is None:  # pragma: no cover - import failure
-        raise RuntimeError("validate_issue_body._load_required_section_labels unavailable")
-    return _load_required_section_labels(kind)
+    template_path = _ISSUE_TEMPLATE_DIR / f"{kind}.yml"
+    if not template_path.exists():
+        raise PlanValidationError(f"ISSUE_TEMPLATE/{kind}.yml not found; cannot render canonical body")
+    try:
+        form = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError) as exc:
+        raise PlanValidationError(f"ISSUE_TEMPLATE/{kind}.yml is malformed: {exc}") from exc
+
+    labels: list[str] = []
+    for item in (form or {}).get("body", []):
+        if item.get("type") == "markdown":
+            continue
+        if item.get("validations", {}).get("required") is True:
+            label = item.get("attributes", {}).get("label", "").removesuffix("*").strip()
+            if label:
+                labels.append(label)
+    _require(len(labels) > 0, f"ISSUE_TEMPLATE/{kind}.yml yields no required labels")
+    return labels
 
 
 def _render_machine_readable_contract(child: dict, parent_issue: int) -> str:
+    # Medium 1: build the MRC via yaml.safe_dump so embedded quotes/colons/newlines in
+    # goal_ref cannot break the YAML or inject extra keys.
     kind = child["kind"]
-    goal = child.get("sections", {}).get("goal_ref", "delivery-rollup child goal")
-    change_kind = child.get("sections", {}).get("change_kind", "code")
-    return (
-        "```yaml\n"
-        "contract_schema_version: v1\n"
-        f"issue_kind: {kind}\n"
-        f"parent_issue: \"#{parent_issue}\"\n"
-        f"goal_ref: \"{goal}\"\n"
-        f"change_kind: {change_kind}\n"
-        "```"
-    )
+    sections = child.get("sections", {})
+    mrc = {
+        "contract_schema_version": "v1",
+        "issue_kind": kind,
+        "parent_issue": f"#{parent_issue}",
+        "goal_ref": sections.get("goal_ref", "delivery-rollup child goal"),
+        "change_kind": sections.get("change_kind", "code"),
+    }
+    dumped = yaml.safe_dump(mrc, sort_keys=False, allow_unicode=True).rstrip("\n")
+    return "```yaml\n" + dumped + "\n```"
 
 
 def _render_acceptance_criteria(child: dict) -> str:
@@ -371,13 +436,7 @@ def _render_allowed_paths(child: dict) -> str:
 
 
 def render_canonical_body(child: dict, parent_issue: int) -> str:
-    """Render a template-compliant issue body from the child plan entry (AC2).
-
-    The section order is taken from ``ISSUE_TEMPLATE/<kind>.yml`` (spec-driven). Structured
-    fields (Machine-Readable Contract, Acceptance Criteria, Verification Commands, Allowed
-    Paths) are rendered from typed plan data; remaining required sections use supplied prose
-    or a conservative default so ``validate_issue_body.py`` passes.
-    """
+    """Render a template-compliant issue body from the child plan entry (AC2)."""
     kind = child["kind"]
     labels = required_section_labels(kind)
     sections = child.get("sections", {})
@@ -410,8 +469,6 @@ def render_canonical_body(child: dict, parent_issue: int) -> str:
         elif label in _DEFAULT_SECTION_TEXT:
             content = _DEFAULT_SECTION_TEXT[label]
         else:
-            # Required section with no structured renderer and no supplied prose: emit a
-            # minimal non-empty placeholder so the template guard passes.
             content = sections.get(label, "なし")
         body_parts.append(f"## {label}\n\n{content}")
 
@@ -493,8 +550,8 @@ def _default_create_runner(
         Path(body_file).unlink(missing_ok=True)
 
 
-def _default_gh_runner(args: list[str]) -> RunResult:
-    cp = subprocess.run(["gh", *args], capture_output=True, text=True)
+def _default_gh_runner(args: list[str], gh_bin: str = "gh") -> RunResult:
+    cp = subprocess.run([gh_bin, *args], capture_output=True, text=True)
     return RunResult(cp.returncode, cp.stdout, cp.stderr)
 
 
@@ -505,6 +562,15 @@ class Runners:
     gh: GhRunner = _default_gh_runner
 
 
+def _default_runners(gh_bin: str) -> Runners:
+    """Build runners whose default gh path is bound to ``gh_bin`` (Blocker 3: CLI --gh)."""
+    return Runners(
+        validate=_default_validate_runner,
+        create=_default_create_runner,
+        gh=lambda a: _default_gh_runner(a, gh_bin),
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Parent checklist patch (AC5)
 # --------------------------------------------------------------------------------------
@@ -513,20 +579,21 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_CHILD_ISSUES_HEADING_RE = re.compile(r"^##\s+Child Issues\s*$", re.IGNORECASE)
+_ANY_H2_RE = re.compile(r"^##\s+\S")
+
+
 def _extract_child_issues_section(body: str) -> tuple[int, int]:
-    """Return (start_line, end_line) indices (0-based, end exclusive) of the
-    ``## Child Issues`` section body, or raise if not found."""
+    """Return (start_line, end_line) of the ``## Child Issues`` section body (0-based, end
+    exclusive). High 3: the heading is matched with an exact regex (so ``## Child Issues
+    Archive`` does not match) and the section must appear exactly once."""
     lines = body.splitlines()
-    start = None
-    for i, ln in enumerate(lines):
-        if ln.strip().lower().startswith("## child issues"):
-            start = i + 1
-            break
-    if start is None:
-        raise PlanValidationError("parent body has no '## Child Issues' section")
+    starts = [i for i, ln in enumerate(lines) if _CHILD_ISSUES_HEADING_RE.match(ln)]
+    _require(len(starts) == 1, f"parent body must contain exactly one '## Child Issues' section (found {len(starts)})")
+    start = starts[0] + 1
     end = len(lines)
     for j in range(start, len(lines)):
-        if lines[j].startswith("## "):
+        if _ANY_H2_RE.match(lines[j]):
             end = j
             break
     return start, end
@@ -546,34 +613,33 @@ def apply_parent_checklist_patch(
     expected_body_sha256: Optional[str],
     runners: Runners,
 ) -> ParentPatchResult:
-    """Apply line-oriented patches to the parent ``## Child Issues`` section (AC5).
-
-    Guards (all must hold or the patch is aborted with no mutation):
-      * current parent body sha256 matches ``expected_body_sha256`` (when supplied)
-      * each ``old_line`` occurs exactly once **inside** the Child Issues section
-        (``expected_match_count == 1``)
-      * post-edit read-back confirms each ``new_line`` present and ``old_line`` absent
-    """
+    """Apply line-oriented patches to the parent ``## Child Issues`` section (AC5)."""
     if not updates:
         return ParentPatchResult(updated=False)
+
+    # body_sha256 is required at this point (validate_plan enforces it for non-empty
+    # updates); guard defensively so a direct caller cannot skip the precondition.
+    if not (isinstance(expected_body_sha256, str) and _SHA256_RE.match(expected_body_sha256)):
+        return ParentPatchResult(updated=False, error="parent.body_sha256 is required to patch the parent")
 
     view = runners.gh(["issue", "view", str(parent_issue), "--repo", repo, "--json", "body", "--jq", ".body"])
     if view.returncode != 0:
         return ParentPatchResult(updated=False, error=f"parent view failed: {view.stderr.strip()}")
     body = view.stdout
-    # gh --jq prints a trailing newline; normalize for sha comparison.
     body = body[:-1] if body.endswith("\n") else body
 
-    if expected_body_sha256:
-        normalized = expected_body_sha256.split("sha256:")[-1]
-        actual = _sha256(body)
-        if actual != normalized:
-            return ParentPatchResult(
-                updated=False,
-                error=f"parent body_sha256 mismatch: expected {normalized[:12]} got {actual[:12]}",
-            )
+    normalized = expected_body_sha256.split("sha256:")[-1]
+    actual = _sha256(body)
+    if actual != normalized:
+        return ParentPatchResult(
+            updated=False,
+            error=f"parent body_sha256 mismatch: expected {normalized[:12]} got {actual[:12]}",
+        )
 
-    start, end = _extract_child_issues_section(body)
+    try:
+        start, end = _extract_child_issues_section(body)
+    except PlanValidationError as exc:
+        return ParentPatchResult(updated=False, error=str(exc))
     lines = body.splitlines()
     new_lines = list(lines)
     for upd in updates:
@@ -598,14 +664,12 @@ def apply_parent_checklist_patch(
     finally:
         Path(body_file).unlink(missing_ok=True)
 
-    # Post-edit read-back.
+    # Post-edit read-back, section-scoped.
     rb = runners.gh(["issue", "view", str(parent_issue), "--repo", repo, "--json", "body", "--jq", ".body"])
     if rb.returncode != 0:
         return ParentPatchResult(updated=False, error="parent read-back view failed")
     rb_body = rb.stdout
     rb_body = rb_body[:-1] if rb_body.endswith("\n") else rb_body
-    # Read-back is section-scoped: the same line text may legitimately exist outside the
-    # ## Child Issues section, so we only require the patch to hold *within* the section.
     try:
         rb_start, rb_end = _extract_child_issues_section(rb_body)
     except PlanValidationError:
@@ -622,19 +686,20 @@ def apply_parent_checklist_patch(
 # --------------------------------------------------------------------------------------
 
 def _decide_status(created: list, errors: list, escalations: list) -> str:
-    if escalations and not errors and not created:
-        return "human_escalation"
-    if created and errors:
+    """Blocker 1: a mixed outcome (some created, but errors OR escalations present) is NOT
+    ``ok`` — it is ``partial_failure`` so the parent checklist is never marked complete
+    while work remains."""
+    if created and (errors or escalations):
         return "partial_failure"
-    if not created and errors:
+    if errors:
         return "failed"
-    if not created and escalations:
+    if escalations:
         return "human_escalation"
     return "ok"
 
 
 def _parse_created_issue(stdout: str) -> Optional[dict]:
-    """Extract the created issue number/url from create_issue_txn.py JSON stdout."""
+    """Extract issue number/url/status from create_issue_txn.py JSON stdout (last JSON line)."""
     for line in reversed(stdout.strip().splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -650,9 +715,9 @@ def _parse_created_issue(stdout: str) -> Optional[dict]:
     return None
 
 
-def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict[str, Any]:
+def materialize(plan: dict[str, Any], runners: Optional[Runners] = None, gh_bin: str = "gh") -> dict[str, Any]:
     """Execute the materialization plan and return a CHILD_MATERIALIZATION_RESULT_V2 dict."""
-    runners = runners or Runners()
+    runners = runners or _default_runners(gh_bin)
     plan = validate_plan(plan)
 
     repo = plan["repo"]
@@ -660,19 +725,20 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict
     parent_sha = plan["parent"].get("body_sha256")
 
     created_issues: list[dict] = []
+    affected_issues: list[dict] = []
     errors: list[dict] = []
     escalation_items: list[dict] = []
 
     # Overlap gate (AC8) — runs before any mutation.
     gate = evaluate_overlap_gate(plan)
     if not gate.ok:
-        escalation_items.extend(gate.escalations)
         return {
             "schema": "CHILD_MATERIALIZATION_RESULT_V2",
             "status": "human_escalation",
             "created_issues": [],
+            "affected_issues": [],
             "updated_parent": False,
-            "escalation_items": escalation_items,
+            "escalation_items": gate.escalations,
             "errors": [],
         }
 
@@ -680,7 +746,7 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict
         action = child["action"]
         child_id = child["child_id"]
 
-        if action in ("no_op",):
+        if action == "no_op":
             continue
         if action in ("human_escalation", "register_subissue_or_human_escalation", "reuse_and_update_parent"):
             escalation_items.append(
@@ -691,7 +757,7 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict
         # action == create_issue
         try:
             body = render_canonical_body(child, parent_issue)
-        except Exception as exc:  # render failure is fail-closed for this child
+        except Exception as exc:
             errors.append({"child_id": child_id, "error": f"render failed: {exc}"})
             continue
 
@@ -713,31 +779,48 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict
             label_profile=child.get("label_profile", "standard"),
             dependencies=list(child.get("depends_on", [])),
             parent_issue=parent_issue,
-            gh_bin="gh",
+            gh_bin=gh_bin,
         )
+        parsed = _parse_created_issue(c.stdout)
         if c.returncode != 0:
-            errors.append(
-                {"child_id": child_id, "error": f"create_issue_txn failed (exit {c.returncode}): {c.stderr[:300] or c.stdout[:300]}"}
-            )
+            # Medium 4: create_issue_txn may return partial_failure/dedupe with a real
+            # issue_number (the issue exists on GitHub). Record it so reconciliation is
+            # possible, but treat it as an error so the run is never "ok" / parent-patched.
+            if parsed and parsed.get("status") in ("partial_failure", "dedupe"):
+                affected_issues.append(
+                    {
+                        "child_id": child_id,
+                        "issue_number": parsed["issue_number"],
+                        "issue_url": parsed["issue_url"],
+                        "txn_status": parsed["status"],
+                    }
+                )
+                errors.append(
+                    {"child_id": child_id, "error": f"create_issue_txn {parsed['status']} but issue #{parsed['issue_number']} exists"}
+                )
+            else:
+                errors.append(
+                    {"child_id": child_id, "error": f"create_issue_txn failed (exit {c.returncode}): {c.stderr[:300] or c.stdout[:300]}"}
+                )
             continue
-        created = _parse_created_issue(c.stdout)
-        if not created:
+        if not parsed:
             errors.append({"child_id": child_id, "error": "could not parse created issue from txn output"})
             continue
         created_issues.append(
             {
                 "child_id": child_id,
-                "issue_number": created["issue_number"],
-                "issue_url": created["issue_url"],
+                "issue_number": parsed["issue_number"],
+                "issue_url": parsed["issue_url"],
                 "action_taken": "create_issue",
             }
         )
 
     status = _decide_status(created_issues, errors, escalation_items)
 
-    # Parent checklist patch ONLY on a clean ok result (AC7: partial_failure → no patch).
+    # Parent checklist patch ONLY on a fully clean result (AC7 / Blocker 1): no errors and
+    # no escalation items. A mixed run never marks the parent checklist complete.
     updated_parent = False
-    if status == "ok":
+    if status == "ok" and not errors and not escalation_items:
         patch = apply_parent_checklist_patch(
             repo=repo,
             parent_issue=parent_issue,
@@ -755,6 +838,7 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None) -> dict
         "schema": "CHILD_MATERIALIZATION_RESULT_V2",
         "status": status,
         "created_issues": created_issues,
+        "affected_issues": affected_issues,
         "updated_parent": updated_parent,
         "escalation_items": escalation_items,
         "errors": errors,
@@ -770,13 +854,13 @@ def _load_plan_file(path: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        # Non-JSON input is a hard schema violation (no YAML fallback). AC1.
         raise PlanValidationError(f"plan file is not valid JSON: {exc}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Materialize delivery-rollup child issues")
     parser.add_argument("--plan-file", required=True, help="Path to CHILD_MATERIALIZATION_PLAN_V2 JSON")
+    parser.add_argument("--gh", dest="gh_bin", default="gh", help="gh binary path (for fake-gh integration)")
     args = parser.parse_args(argv)
 
     try:
@@ -786,11 +870,11 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"PLAN_VALIDATION_ERROR: {exc}\n")
         return 2
 
-    result = materialize(plan)
+    result = materialize(plan, gh_bin=args.gh_bin)
     sys.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
-    if result["status"] in ("ok",):
+    if result["status"] == "ok":
         return 0
-    if result["status"] in ("human_escalation",):
+    if result["status"] == "human_escalation":
         return 3
     return 1
 

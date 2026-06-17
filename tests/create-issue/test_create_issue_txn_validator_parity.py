@@ -50,6 +50,27 @@ def test_validator_invocation_omits_kind_when_absent(monkeypatch):
     assert "--title" not in cap.argv
 
 
+def test_adopts_mrc_kind_when_issue_kind_omitted(monkeypatch):
+    # High 1 (#946): when --issue-kind is omitted, the body MRC issue_kind is adopted.
+    cap = _CapturedRun()
+    monkeypatch.setattr(txn.subprocess, "run", cap)
+    body = "```yaml\nissue_kind: implementation\n```\nbody"
+    txn._run_issue_body_validator(body, issue_kind="")
+    assert "--kind" in cap.argv
+    assert cap.argv[cap.argv.index("--kind") + 1] == "implementation"
+
+
+def test_issue_kind_mrc_mismatch_fails_closed(monkeypatch):
+    # High 1 (#946): an explicit --issue-kind that contradicts the MRC kind is fail-closed.
+    cap = _CapturedRun()
+    monkeypatch.setattr(txn.subprocess, "run", cap)
+    body = "```yaml\nissue_kind: research\n```\nbody"
+    with pytest.raises(txn.TransactionError, match="issue_kind mismatch"):
+        txn._run_issue_body_validator(body, issue_kind="implementation")
+    # No validator subprocess is spawned when the mismatch is detected.
+    assert cap.argv is None
+
+
 # Behavioral proof that parity matters: a body that omits a kind-specific required section
 # passes the validator WITHOUT --kind but FAILS with --kind=implementation.
 _BODY_MISSING_KIND_SECTION = """## Acceptance Criteria

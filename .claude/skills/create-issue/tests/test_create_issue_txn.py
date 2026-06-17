@@ -1622,6 +1622,11 @@ class TestDedupeIssueKindMismatch:
         -> failure_stage == "dedupe-kind-mismatch"."""
         existing_issue_body = "issue_kind: research\n" + _MINIMAL_VALID_BODY
 
+        # High1 (#946): create_issue_txn now adopts the body MRC issue_kind and runs the
+        # kind-strict validator. This test targets the dedupe identity gate, so the body
+        # validation is isolated (the minimal fixture body is not full-template-valid).
+        monkeypatch.setattr(txn, "_run_issue_body_validator", lambda *_a, **_k: {"status": "pass", "errors": []})
+
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
         def _fake_run_gh_json(args: list[str], *, stage: str) -> Any:

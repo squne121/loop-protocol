@@ -35,7 +35,7 @@ def test_render_order_tracks_template_not_hardcoded(valid_child, monkeypatch):
     # If the template loader returns a different order, the render must follow it.
     fake_order = ["Machine-Readable Contract", "Outcome", "Acceptance Criteria",
                   "Verification Commands", "Allowed Paths"]
-    monkeypatch.setattr(m, "_load_required_section_labels", lambda kind: list(fake_order))
+    monkeypatch.setattr(m, "required_section_labels", lambda kind: list(fake_order))
     body = m.render_canonical_body(valid_child, parent_issue=254)
     assert _sections_in_order(body) == fake_order
 
@@ -63,6 +63,31 @@ def test_rendered_body_passes_real_validator(valid_child):
     finally:
         Path(body_file).unlink(missing_ok=True)
     assert cp.returncode == 0, f"validator failed: {cp.stdout}\n{cp.stderr}"
+
+
+def test_mrc_yaml_safe_with_special_chars(valid_child):
+    # Medium 1: a goal_ref containing YAML-significant chars must not break the MRC YAML.
+    valid_child["sections"]["goal_ref"] = 'tricky: "value" with: colons # and hash'
+    body = m.render_canonical_body(valid_child, parent_issue=254)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
+        f.write(body)
+        bf = f.name
+    try:
+        cp = subprocess.run(
+            [sys.executable, str(VALIDATOR), "--body-file", bf,
+             "--kind", "implementation", "--title", valid_child["title"]],
+            capture_output=True, text=True,
+        )
+    finally:
+        Path(bf).unlink(missing_ok=True)
+    assert cp.returncode == 0, f"validator failed on special-char goal_ref: {cp.stdout}"
+
+
+def test_strict_template_loader_fails_closed_on_missing_kind():
+    # Medium 2: the materializer loader fail-closes (no silent downgrade) for a kind whose
+    # template file does not exist.
+    with pytest.raises(m.PlanValidationError, match="not found"):
+        m.required_section_labels("nonexistent_kind")
 
 
 def test_research_kind_renders_research_template_order(valid_child):

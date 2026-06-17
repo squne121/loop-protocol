@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -129,6 +131,56 @@ def test_fake_gh_integration_creation_only_via_txn(valid_child, tmp_path, monkey
     txn_out = _json.loads(res.stdout.strip().splitlines()[-1])
     assert "create" in txn_out["completed_steps"]
     assert txn_out["issue_number"] == 999
+
+
+def test_cli_fake_gh_integration_real_path(valid_child, clear_overlap, tmp_path, monkeypatch):
+    """Blocker 3: drive the actual CLI (`materialize_child_issues.py --plan-file ... --gh
+    fake-gh`) and assert that `gh issue create` reaches the fake gh ONLY through
+    create_issue_txn.py — never as a direct materializer call — and that the resulting
+    issue is captured in the RESULT_V2 (no silent loss)."""
+    import json as _json
+
+    fake_gh, log = _write_fake_gh(tmp_path)
+    monkeypatch.setenv("GH_LOG", str(log))
+
+    child = dict(valid_child)
+    child["depends_on"] = []  # overlap clear, so no #948 dependency needed; skip dep stage
+    plan = {
+        "schema_version": 2,
+        "repo": "o/r",
+        "parent": {"issue_number": 254, "parent_mode": "delivery-rollup"},
+        "issue_lookup": {"complete": True},
+        "children": [child],
+        "overlap": clear_overlap,
+        "parent_body_updates": [],
+    }
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(_json.dumps(plan), encoding="utf-8")
+
+    cp = subprocess.run(
+        [sys.executable, str(Path(m.__file__)), "--plan-file", str(plan_file), "--gh", str(fake_gh)],
+        capture_output=True, text=True,
+    )
+
+    log_lines = log.read_text(encoding="utf-8").splitlines()
+    create_lines = [ln for ln in log_lines if ln.startswith("issue create")]
+    # gh issue create reached the fake gh exactly once, via the txn path...
+    assert len(create_lines) == 1, log_lines
+    # ...and every `issue create` is immediately preceded by a dedupe `issue list`, the
+    # create_issue_txn signature (the materializer itself never shells `gh issue create`).
+    create_idx = next(i for i, ln in enumerate(log_lines) if ln.startswith("issue create"))
+    assert log_lines[create_idx - 1].startswith("issue list")
+    # txn applies labels via `issue edit --add-label`; the materializer's parent patch would
+    # be `issue edit ... --body-file`. The latter must be absent (run was not ok).
+    assert not any(ln.startswith("issue edit") and "--body-file" in ln for ln in log_lines)
+
+    # The created issue (#999) is captured in RESULT_V2 (created_issues or affected_issues),
+    # proving the materializer did not silently lose a created issue (Medium 4).
+    result = _json.loads(cp.stdout.strip().splitlines()[-1])
+    captured = {i["issue_number"] for i in result["created_issues"]} | {
+        i["issue_number"] for i in result["affected_issues"]
+    }
+    assert 999 in captured, result
 
 
 def test_materialize_full_run_never_raw_creates(valid_plan):
