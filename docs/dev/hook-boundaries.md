@@ -42,11 +42,21 @@ hook_boundaries_manifest_v1:
     timeout: 10
     classification: blocker
     fail_policy: fail_closed
-    exit_codes:
-      0: allow
-      2: block
+    script_exit_contract:
+      normal: 0
+      block: 2
+      internal_producer_failure: 2
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent_on_allow
     stderr_contract: minimal_structural_message_on_block
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_nonzero: stop_tool_call
       on_zero: proceed
@@ -63,11 +73,21 @@ hook_boundaries_manifest_v1:
     timeout: 10
     classification: blocker
     fail_policy: fail_closed
-    exit_codes:
-      0: allow
-      2: block
+    script_exit_contract:
+      normal: 0
+      block: 2
+      internal_producer_failure: 2
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent_on_allow
     stderr_contract: minimal_structural_message_on_block
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_nonzero: stop_tool_call
       on_zero: proceed
@@ -83,11 +103,20 @@ hook_boundaries_manifest_v1:
     timeout: 15
     classification: mode_dependent
     fail_policy: shadow_by_default
-    exit_codes:
-      0: allow
-      2: block_only_in_enforce_mode
+    script_exit_contract:
+      normal: 0
+      block_only_in_enforce_mode: 2
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
     stderr_contract: jsonl_shadow_log_or_block_reason
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_nonzero_shadow: proceed_and_log
       on_nonzero_enforce: stop_tool_call
@@ -110,10 +139,20 @@ hook_boundaries_manifest_v1:
     timeout: 10
     classification: telemetry
     fail_policy: fail_open
-    exit_codes:
-      0: always
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
     stderr_contract: jsonl_shadow_log_only
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_any: proceed
     notes: >
@@ -130,10 +169,20 @@ hook_boundaries_manifest_v1:
     timeout: 180
     classification: telemetry
     fail_policy: fail_open
-    exit_codes:
-      0: always
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: Stop
+      exit_2_effect: prevents_stop
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
     stderr_contract: diagnostic_on_failure_max_10_lines
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_any: proceed
     notes: >
@@ -152,10 +201,20 @@ hook_boundaries_manifest_v1:
     timeout: 180
     classification: telemetry
     fail_policy: fail_open
-    exit_codes:
-      0: always
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SubagentStop
+      exit_2_effect: prevents_subagent_stop
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
     stderr_contract: diagnostic_on_failure_max_10_lines
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_any: proceed
     notes: >
@@ -172,11 +231,20 @@ hook_boundaries_manifest_v1:
     timeout: 60
     classification: telemetry
     fail_policy: fail_open
-    exit_codes:
-      0: producer_success_or_skip
-      nonzero: producer_failure_ignored
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PostToolUse
+      exit_2_effect: cannot_block_completed_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
     stderr_contract: diagnostic_on_failure
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_any: proceed
     notes: >
@@ -194,10 +262,20 @@ hook_boundaries_manifest_v1:
     timeout: 30
     classification: telemetry
     fail_policy: fail_open
-    exit_codes:
-      0: always
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreCompact
+      exit_2_effect: blocks_compaction
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: always_empty
     stderr_contract: diagnostic_on_failure_max_10_lines
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
     agent_action:
       on_any: proceed
     notes: >
@@ -226,14 +304,13 @@ hook_boundaries_manifest_v1:
 
 ## 4. agent 判断表（Codex CLI）
 
-Codex CLI はこれらのフックを Claude Code フック機構と同一の形では実行しない。
-以下は **参考情報** であり、Claude Code の動作との parity を主張するものではない。
+この manifest は Claude Code の `.claude/settings.json` hook topology を対象とする。Codex CLI については、この manifest から Claude Code と同等の event / output / exit-code parity を主張しない。Codex 側の制御は sandbox、approval、network policy、telemetry、および Codex 固有 hook 実装の検証で別途扱う。
 
 | hook | Codex CLI での扱い |
 |---|---|
-| `secret_boundary_guard.sh` | Codex CLI は Claude Code hooks を直接実行しない。同等の制御は Codex の policy / allowed-tools 設定で実装する必要がある |
+| `secret_boundary_guard.sh` | この manifest の対象外。同等の制御は Codex 固有の policy / allowed-tools 設定で別途実装する必要がある |
 | `guard-japanese-prose.sh` | 同上 |
-| その他 telemetry hooks | Codex は Claude Code の hooks 機構を持たないため、これらの telemetry は Codex セッションでは生成されない |
+| その他 telemetry hooks | この manifest の対象外。Codex セッションでの telemetry 収集は Codex 固有実装に依存する |
 
 ---
 

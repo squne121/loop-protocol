@@ -37,6 +37,18 @@ MANIFEST_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# B2: classification の許可語彙
+VALID_CLASSIFICATIONS = {"blocker", "telemetry", "warning", "mode_dependent"}
+
+# B5: event ごとの期待 exit_2_effect
+EVENT_EXIT_2_EFFECT: dict[str, str] = {
+    "PreToolUse": "blocks_tool_call",
+    "Stop": "prevents_stop",
+    "SubagentStop": "prevents_subagent_stop",
+    "PreCompact": "blocks_compaction",
+    "PostToolUse": "cannot_block_completed_tool_call",
+}
+
 
 def extract_manifest(docs_text: str) -> list[dict[str, Any]]:
     """docs から hook_boundaries_manifest_v1 YAML block を抽出してパースする。"""
@@ -69,11 +81,13 @@ def resolve_handler_id(hook: dict[str, Any]) -> str:
     # node ラッパーパターン: command が "node" かつ args[0] がスクリプトパス
     # Path(command).name が "node" であることを確認（フルパスの場合も含む）
     if Path(command).name == "node":
-        if args:
-            script_path = args[0]
-            # パス展開変数を除去してファイル名を取得
-            stem = Path(script_path).stem
-            return stem
+        if not args:
+            # B1 guard: node wrapper without args はエラーとして扱う（caller で検出）
+            return "__node_no_args__"
+        script_path = args[0]
+        # パス展開変数を除去してファイル名を取得
+        stem = Path(script_path).stem
+        return stem
 
     # 通常パターン: command パスのファイル名（拡張子なし）を handler_id とする
     stem = Path(command).stem
@@ -85,7 +99,7 @@ def extract_settings_hooks(settings: dict[str, Any]) -> list[dict[str, Any]]:
     settings.json の hooks セクションを正規化されたリストに変換する。
 
     返却フォーマット（per hook）:
-      event, matcher, command, args, timeout, handler_id
+      event, matcher, command, args, timeout, handler_id, type
 
     照合キー: (handler_id, event) の複合キーを使用する。
     """
@@ -107,10 +121,181 @@ def extract_settings_hooks(settings: dict[str, Any]) -> list[dict[str, Any]]:
                         "command": hook.get("command", ""),
                         "args": hook.get("args", []),
                         "timeout": hook.get("timeout"),
+                        "type": hook.get("type"),
                         "handler_id": handler_id,
                     }
                 )
     return result
+
+
+# ─── duplicate 検出 (B1) ──────────────────────────────────────────────────────
+
+def detect_duplicates_in_manifest(
+    manifest_entries: list[dict[str, Any]],
+) -> list[str]:
+    """
+    B1: manifest 内の duplicate (handler_id, event) を検出する。
+
+    session_manifest_coordinator は Stop / SubagentStop に正当に複数配置されるが、
+    同一 (handler_id, event) は重複として fail-closed にする。
+    """
+    errors: list[str] = []
+    seen: dict[tuple[str, str], int] = {}
+    for idx, me in enumerate(manifest_entries):
+        hid = me.get("handler_id", "")
+        event = me.get("event", "")
+        key = (hid, event)
+        if key in seen:
+            errors.append(
+                f"[duplicate:manifest] (handler_id={hid!r}, event={event!r}) が "
+                f"index {seen[key]} と index {idx} の両方に存在します"
+            )
+        else:
+            seen[key] = idx
+    return errors
+
+
+def detect_duplicates_in_settings(
+    settings_entries: list[dict[str, Any]],
+) -> list[str]:
+    """
+    B1: settings 内の duplicate (handler_id, event) を検出する。
+
+    session_manifest_coordinator は Stop / SubagentStop に正当に複数配置されるが、
+    同一 (handler_id, event) は重複として fail-closed にする。
+    """
+    errors: list[str] = []
+    seen: dict[tuple[str, str], int] = {}
+    for idx, se in enumerate(settings_entries):
+        hid = se.get("handler_id", "")
+        event = se.get("event", "")
+        key = (hid, event)
+        if key in seen:
+            errors.append(
+                f"[duplicate:settings] (handler_id={hid!r}, event={event!r}) が "
+                f"index {seen[key]} と index {idx} の両方に存在します"
+            )
+        else:
+            seen[key] = idx
+    return errors
+
+
+# ─── manifest schema validation (B2, B5, B6) ─────────────────────────────────
+
+def validate_manifest_schema(
+    manifest_entries: list[dict[str, Any]],
+) -> list[str]:
+    """
+    B2/B5/B6: manifest の各 entry に対してスキーマ検証を行う。
+
+    - classification の vocabulary チェック（B2）
+    - blocker の必須フィールドチェック（B2）
+    - telemetry の必須フィールドチェック（B2）
+    - mode_dependent の必須フィールドチェック（B2）
+    - claude_event_semantics フィールドの存在チェック（B5）
+    - stdout_contract / stderr_contract 必須チェック（B6）
+    - redaction_contract の存在チェック（B6）
+    """
+    errors: list[str] = []
+
+    for me in manifest_entries:
+        hid = me.get("handler_id", "<unknown>")
+        event = me.get("event", "<unknown>")
+        label = f"{hid}@{event}"
+
+        # B2: classification vocabulary チェック
+        classification = me.get("classification")
+        if classification is None:
+            errors.append(f"[schema:{label}] classification フィールドがありません")
+        elif classification not in VALID_CLASSIFICATIONS:
+            errors.append(
+                f"[schema:{label}] classification の値 {classification!r} が不正です "
+                f"（許可値: {sorted(VALID_CLASSIFICATIONS)}）"
+            )
+        else:
+            # B2: blocker の必須フィールドチェック
+            if classification == "blocker":
+                fail_policy = me.get("fail_policy")
+                if fail_policy != "fail_closed":
+                    errors.append(
+                        f"[schema:{label}] blocker は fail_policy: fail_closed が必須ですが "
+                        f"{fail_policy!r} です"
+                    )
+                agent_action = me.get("agent_action", {})
+                if not isinstance(agent_action, dict):
+                    errors.append(
+                        f"[schema:{label}] blocker は agent_action が必須です（dict 形式）"
+                    )
+                elif agent_action.get("on_nonzero") != "stop_tool_call":
+                    errors.append(
+                        f"[schema:{label}] blocker は agent_action.on_nonzero: stop_tool_call が必須ですが "
+                        f"{agent_action.get('on_nonzero')!r} です"
+                    )
+
+            # B2: telemetry の必須フィールドチェック
+            elif classification == "telemetry":
+                fail_policy = me.get("fail_policy")
+                if fail_policy != "fail_open":
+                    errors.append(
+                        f"[schema:{label}] telemetry は fail_policy: fail_open が必須ですが "
+                        f"{fail_policy!r} です"
+                    )
+                agent_action = me.get("agent_action", {})
+                if not isinstance(agent_action, dict):
+                    errors.append(
+                        f"[schema:{label}] telemetry は agent_action が必須です（dict 形式）"
+                    )
+                elif agent_action.get("on_any") != "proceed":
+                    errors.append(
+                        f"[schema:{label}] telemetry は agent_action.on_any: proceed が必須ですが "
+                        f"{agent_action.get('on_any')!r} です"
+                    )
+
+            # B2: mode_dependent の必須フィールドチェック
+            elif classification == "mode_dependent":
+                if "mode_env" not in me:
+                    errors.append(
+                        f"[schema:{label}] mode_dependent は mode_env フィールドが必須です"
+                    )
+                if "mode_values" not in me:
+                    errors.append(
+                        f"[schema:{label}] mode_dependent は mode_values フィールドが必須です"
+                    )
+
+        # B5: claude_event_semantics フィールドの存在チェック
+        if "claude_event_semantics" not in me:
+            errors.append(
+                f"[schema:{label}] claude_event_semantics フィールドがありません"
+            )
+        else:
+            ces = me["claude_event_semantics"]
+            if not isinstance(ces, dict):
+                errors.append(
+                    f"[schema:{label}] claude_event_semantics は dict 形式が必須です"
+                )
+            else:
+                if "exit_2_effect" not in ces:
+                    errors.append(
+                        f"[schema:{label}] claude_event_semantics に exit_2_effect がありません"
+                    )
+
+        # B6: stdout_contract / stderr_contract 必須チェック
+        if "stdout_contract" not in me:
+            errors.append(
+                f"[schema:{label}] stdout_contract フィールドがありません"
+            )
+        if "stderr_contract" not in me:
+            errors.append(
+                f"[schema:{label}] stderr_contract フィールドがありません"
+            )
+
+        # B6: redaction_contract 存在チェック
+        if "redaction_contract" not in me:
+            errors.append(
+                f"[schema:{label}] redaction_contract フィールドがありません"
+            )
+
+    return errors
 
 
 # ─── 比較ロジック ─────────────────────────────────────────────────────────────
@@ -135,6 +320,20 @@ def check_drift(
     照合キーは (handler_id, event) の複合キー。
     """
     errors: list[str] = []
+
+    # B1: duplicate チェックを先に実施（dict 化前に実行）
+    dup_manifest = detect_duplicates_in_manifest(manifest_entries)
+    dup_settings = detect_duplicates_in_settings(settings_entries)
+    errors.extend(dup_manifest)
+    errors.extend(dup_settings)
+
+    # duplicate があった場合、その後の dict 化ロジックが不正確になるため早期リターン
+    if dup_manifest or dup_settings:
+        return errors
+
+    # B2/B5/B6: manifest schema validation
+    schema_errors = validate_manifest_schema(manifest_entries)
+    errors.extend(schema_errors)
 
     # settings の (handler_id, event) → entry マップを構築
     settings_by_key: dict[tuple[str, str], dict[str, Any]] = {}
