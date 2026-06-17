@@ -1170,6 +1170,13 @@ def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
 # GitHub metadata assertion — Issue #942
 # ---------------------------------------------------------------------------
 
+# Allowed milestone metadata fields for github_metadata_assert (Issue #942 review BLOCKER 1).
+# A field outside this allowlist (e.g. a 'description' typo like 'descripton') is rejected at
+# classify time rather than silently treated as an absent field, which would let not_contains
+# false-pass.
+_ALLOWED_GITHUB_METADATA_FIELDS = {"description"}
+
+
 def _is_github_metadata_assert_command(command: str) -> bool:
     """
     Detect if a command is a github_metadata_assert assertion.
@@ -1191,27 +1198,34 @@ def _is_github_metadata_assert_command(command: str) -> bool:
 
 def _is_allowed_github_metadata_assert(argv: List[str]) -> Optional[Tuple[bool, Optional[str]]]:
     """
-    Validate github_metadata_assert command arguments and flags.
+    Validate a github_metadata_assert command (Issue #942).
 
-    Format: github_metadata_assert <contains|not_contains> <field> <literal> <endpoint> [flags...]
+    Format (exactly 4 arguments after the command name; NO flags, NO extra positional):
+        github_metadata_assert <contains|not_contains> <field> <literal> <endpoint>
 
     Returns: (is_valid, error_message)
-      - (True, None): Command is valid
-      - (False, error_msg): Command is invalid with explanation
+      - (True, None): command is valid
+      - (False, error_msg): command is invalid with explanation
 
-    Validation rules (AC2, AC5, AC6):
-    - Method must be GET (no --method POST/PATCH/PUT/DELETE, no -X)
-    - Endpoint must match pattern repos/<owner>/<repo>/milestones/<number>
-      - Rejects absolute URLs (http://, https://, //)
-      - Rejects query strings (?)
-      - Rejects path traversal (..)
-      - Rejects placeholder endpoints (<...>)
-    - Dangerous flags are blocked: -f, -F, --field, --raw-field, --input, --header, -H, --include, -i,
-      --paginate, --slurp, --cache, --template, --preview, graphql
-    - Mutating methods blocked: --method POST/PATCH/PUT/DELETE, -X, --method=...
+    Validation rules:
+    - Exactly 5 argv tokens (command + assertion_type + field + literal + endpoint).
+      Any extra token is rejected. Because no flag surface is accepted at all, every
+      dangerous flag (-f/-F/--field/--raw-field/--input/--header/-H/--include/-i/
+      --paginate/--slurp/--cache/--template/--preview/graphql, in any case variant) and
+      every mutating method (--method POST/PATCH/PUT/DELETE, -X ..., --method=...) is
+      rejected here by construction (review BLOCKER 2 / MAJOR 1).
+    - assertion_type must be contains or not_contains.
+    - field must be in _ALLOWED_GITHUB_METADATA_FIELDS; a typo or unknown field is rejected
+      rather than silently treated as an absent field (review BLOCKER 1 / MAJOR 2).
+    - endpoint must match repos/<owner>/<repo>/milestones/<number>; absolute URLs, query
+      strings, path traversal and placeholders are rejected (AC2).
     """
-    if len(argv) < 5:
-        return False, "github_metadata_assert requires at least 5 arguments: assertion_type field literal endpoint"
+    if len(argv) != 5:
+        return False, (
+            "github_metadata_assert accepts exactly 4 arguments "
+            "(assertion_type field literal endpoint) and no flags; got "
+            f"{max(len(argv) - 1, 0)}"
+        )
 
     cmd_name = Path(argv[0]).name
     if cmd_name != "github_metadata_assert":
@@ -1222,76 +1236,33 @@ def _is_allowed_github_metadata_assert(argv: List[str]) -> Optional[Tuple[bool, 
         return False, f"assertion_type must be 'contains' or 'not_contains', got '{argv[1]}'"
 
     field = argv[2]
-    if not field or field.startswith('-'):
-        return False, "field argument is missing or invalid"
+    if field not in _ALLOWED_GITHUB_METADATA_FIELDS:
+        return False, (
+            f"field '{field}' is not allowed; allowed fields: "
+            f"{sorted(_ALLOWED_GITHUB_METADATA_FIELDS)}"
+        )
 
     literal = argv[3]
-    if not literal or literal.startswith('-'):
-        return False, "literal argument is missing or invalid"
+    if not literal:
+        return False, "literal argument is missing"
 
     endpoint = argv[4]
 
     # Validate endpoint (AC2)
-    # Reject absolute URLs
     if endpoint.startswith('http://') or endpoint.startswith('https://') or endpoint.startswith('//'):
         return False, "endpoint must not be an absolute URL; use relative path like 'repos/owner/repo/milestones/1'"
 
-    # Reject query strings
     if '?' in endpoint:
         return False, "endpoint must not contain query strings (?)"
 
-    # Reject path traversal
     if '..' in endpoint:
         return False, "endpoint must not contain path traversal (..)"
 
-    # Reject placeholder endpoints
     if '<' in endpoint or '>' in endpoint:
         return False, "endpoint must not contain placeholders (<...>); use actual values like 'repos/owner/repo/milestones/1'"
 
-    # Validate endpoint format: repos/<owner>/<repo>/milestones/<number>
-    # The number should be a positive integer, not a placeholder
     if not re.match(r'^repos/[^/]+/[^/]+/milestones/\d+$', endpoint):
         return False, f"endpoint must match 'repos/<owner>/<repo>/milestones/<number>', got '{endpoint}'"
-
-    # Check flags (AC5, AC6)
-    for i, arg in enumerate(argv[5:], start=5):
-        arg_lower = arg.lower()
-
-        # AC5: Dangerous flags (data modification / non-GET)
-        if arg in ('-f', '-F', '--field', '--raw-field', '--input', '--header', '-H', '--include', '-i',
-                   '--paginate', '--slurp', '--cache', '--template', '--preview'):
-            return False, f"flag '{arg}' is not allowed; github_metadata_assert is read-only"
-
-        if arg == 'graphql':
-            return False, "graphql keyword is not allowed; only REST API milestones endpoint is permitted"
-
-        # AC5: Flags with values using = syntax
-        if '=' in arg:
-            flag_part = arg.split('=')[0]
-            if flag_part in ('--field', '--raw-field', '--input', '--header', '-H', '--include', '-i',
-                             '--cache', '--template', '--preview', '--method'):
-                return False, f"flag '{flag_part}' (via '{arg}') is not allowed"
-
-        # AC6: Mutating methods
-        if arg == '--method' and i + 1 < len(argv):
-            method = argv[i + 1].upper()
-            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
-                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
-
-        if arg.startswith('--method='):
-            method = arg.split('=')[1].upper()
-            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
-                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
-
-        if arg == '-X' and i + 1 < len(argv):
-            method = argv[i + 1].upper()
-            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
-                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
-
-        if arg.startswith('-X') and len(arg) > 2:
-            method = arg[2:].upper()
-            if method in ('POST', 'PATCH', 'PUT', 'DELETE'):
-                return False, f"mutating HTTP method {method} is not allowed; only GET is permitted"
 
     return True, None
 
@@ -1326,7 +1297,8 @@ def _check_github_metadata_assertion(
           - 5: rate limited (429)
           - 6: timeout
           - 7: invalid JSON response
-          - 8: other HTTP error
+          - 8: other / unknown gh failure (network, 5xx, secondary rate limit, ...)
+          - 9: requested field absent from API response (schema error)
 
     Raises:
         subprocess.TimeoutExpired: if gh command times out
@@ -1357,10 +1329,10 @@ def _check_github_metadata_assertion(
             return 4
         if "429" in result.stderr or "rate limit" in stderr_lower:
             return 5
-        # Other HTTP errors
-        if result.returncode >= 400:
-            return 8
-        return result.returncode
+        # Any other nonzero gh exit is an environment / transport / API failure
+        # (network error, 5xx, 403 secondary rate limit, gh version drift, ...),
+        # NOT a semantic assertion failure. Never collapse it to exit 1 (review BLOCKER 3).
+        return 8
 
     # Parse JSON response
     try:
@@ -1368,12 +1340,14 @@ def _check_github_metadata_assertion(
     except json.JSONDecodeError:
         return 7
 
-    # Check if field exists in response
+    # The requested field must be present in the API response. A missing field
+    # (schema drift / renamed field) is NOT 'literal absent': collapsing it to an empty
+    # string would let not_contains false-pass (review BLOCKER 1). Treat it as a
+    # schema/environment error distinct from assertion pass/fail.
     if field not in data:
-        # Field missing: treat as absent
-        field_value = ""
-    else:
-        field_value = str(data.get(field, ""))
+        return 9
+    raw_value = data.get(field)
+    field_value = "" if raw_value is None else str(raw_value)
 
     # Perform assertion
     is_present = literal in field_value
@@ -2568,7 +2542,7 @@ def main() -> int:
                         fix_hint = (
                             "github_metadata_assert hit an environment error "
                             f"(exit {assert_exit}: gh missing / auth / 404 / rate limit / "
-                            "timeout / invalid JSON). This is distinct from assertion "
+                            "timeout / invalid JSON / missing field). This is distinct from assertion "
                             "pass/fail and is not treated as a baseline pass."
                         )
                 else:

@@ -155,7 +155,8 @@ VC 実行前に静的に弾くカテゴリ:
 
 GitHub milestone metadata（`description` 等）の forbidden phrase の有無を VC で検証する場合は、raw `gh api` を VC に書かず first-class な `github_metadata_assert` を使う。
 
-- 許可される形: `github_metadata_assert <contains|not_contains> <field> <literal> repos/<owner>/<repo>/milestones/<number>`
+- 許可される形: `github_metadata_assert <contains|not_contains> description <literal> repos/<owner>/<repo>/milestones/<number>`
+- コマンドは4引数ちょうど（assertion_type field literal endpoint）。field は `description` のみ（typo・未知 field は reject）。余分な positional / flags は一切受け付けない
 - 内部実行は固定 argv `gh api --method GET repos/<owner>/<repo>/milestones/<number>`（method GET 固定・非 mutating）
 - endpoint は milestone のみ（絶対 URL・query string・path traversal・placeholder は reject）
 - 危険な flags（`-f` / `-F` / `--field` / `--raw-field` / `--input` / `--header`(`-H`) / `--include`(`-i`) / `--paginate` / `--slurp` / `--cache` / `--template` / `--preview` / `graphql`）と mutating method（`--method POST/PATCH/PUT/DELETE`、`-X`）は block

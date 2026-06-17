@@ -57,10 +57,11 @@ $ github_metadata_assert not_contains description <literal> repos/<owner>/<repo>
 ```
 
 - assertion: `contains` / `not_contains` のみ
+- field は `description` のみ（allowlist 外・typo は reject）。コマンドは4引数ちょうどで flags / 余分な positional は reject
 - 内部実行は固定 argv `gh api --method GET repos/<owner>/<repo>/milestones/<number>`（method GET 固定・非 mutating）
 - endpoint は `repos/<owner>/<repo>/milestones/<number>` のみ（絶対 URL・query string `?`・path traversal `../`・placeholder `<...>` は reject）
 - `contains` は present→exit 0 / absent→non-zero、`not_contains` は absent→exit 0 / present→non-zero
-- gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON は `github_metadata_assert_environment_error` として `human_judgment` に分類され、assertion の pass/fail（false pass）と区別される
+- gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON / 未知の gh 失敗 / response に field 不在（schema drift）は `github_metadata_assert_environment_error` として `human_judgment` に分類され、assertion の pass/fail（false pass）と区別される
 
 禁止例（VC に raw `gh api` を書かない）:
 

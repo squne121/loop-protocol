@@ -289,11 +289,10 @@ class TestGitHubMetadataAssertDangerousFlags:
         assert is_valid is False
 
     def test_github_metadata_assert_dangerous_flags_blocked_graphql(self):
-        """AC5: graphql keyword is blocked."""
+        """AC5: graphql keyword is blocked (rejected as an extra token by the exact-arity rule)."""
         argv = 'github_metadata_assert contains description test repos/o/r/milestones/1 graphql'.split()
-        is_valid, msg = _is_allowed_github_metadata_assert(argv)
+        is_valid, _ = _is_allowed_github_metadata_assert(argv)
         assert is_valid is False
-        assert "graphql" in msg.lower()
 
     def test_github_metadata_assert_dangerous_flags_blocked_equals_form(self):
         """AC5: '--cache=off' (=value form) is blocked."""
@@ -412,3 +411,71 @@ class TestGitHubMetadataAssertEnvironmentError:
         assert r["decision"] == "human_judgment", r
         assert r["decision"] != "go", r
         assert r["exit_code"] == 4, r
+
+
+# ---------------------------------------------------------------------------
+# Review hardening: false-pass holes closed (BLOCKER 1/2/3, MAJOR 1/2)
+# ---------------------------------------------------------------------------
+
+class TestGitHubMetadataAssertNoFalsePass:
+    """Field allowlist, exact arity, and environment-vs-semantic failure split."""
+
+    def test_github_metadata_assert_field_typo_rejected(self):
+        """BLOCKER 1/MAJOR 2: a field outside the allowlist (e.g. a 'description' typo) is rejected."""
+        argv = 'github_metadata_assert not_contains descripton forbidden repos/o/r/milestones/1'.split()
+        is_valid, msg = _is_allowed_github_metadata_assert(argv)
+        assert is_valid is False
+        assert "field" in msg.lower()
+
+    @patch('subprocess.run')
+    def test_github_metadata_assert_missing_field_is_not_absent_pass(self, mock_run):
+        """
+        BLOCKER 1: when the API response lacks the requested field, not_contains must NOT
+        return exit 0 (absent). A field missing from the parsed JSON is a schema/environment
+        error, not 'literal absent' - otherwise a schema drift would silently false-pass.
+        """
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='{"title": "m", "state": "open"}', stderr=''
+        )
+        result = _check_github_metadata_assertion(
+            'not_contains', 'description', 'forbidden', 'repos/o/r/milestones/1'
+        )
+        assert result not in (0, 1), result
+        assert result == 9, result
+
+    def test_github_metadata_assert_exactly_five_argv_rejects_extra_positional(self):
+        """BLOCKER 2: an extra positional token beyond the 4 arguments is rejected."""
+        argv = 'github_metadata_assert contains description test repos/o/r/milestones/1 extra'.split()
+        is_valid, _ = _is_allowed_github_metadata_assert(argv)
+        assert is_valid is False
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "HTTP 500: internal server error",
+            "connection reset by peer",
+            "could not resolve host",
+            "x509: certificate has expired",
+        ],
+    )
+    @patch('subprocess.run')
+    def test_github_metadata_assert_unknown_gh_failure_is_environment_error(self, mock_run, stderr):
+        """
+        BLOCKER 3: an unknown nonzero gh failure (raw exit 1) must NOT be reported as a
+        semantic assertion failure (exit 1). It is an environment error (exit 8).
+        """
+        mock_run.return_value = MagicMock(returncode=1, stdout='', stderr=stderr)
+        result = _check_github_metadata_assertion(
+            'not_contains', 'description', 'forbidden', 'repos/o/r/milestones/1'
+        )
+        assert result not in (0, 1), (stderr, result)
+        assert result == 8, (stderr, result)
+
+    @patch('subprocess.run')
+    def test_github_metadata_assert_unknown_gh_failure_empty_stderr_is_environment_error(self, mock_run):
+        """BLOCKER 3: bare nonzero exit with no recognizable stderr is still an env error, not exit 1."""
+        mock_run.return_value = MagicMock(returncode=1, stdout='', stderr='')
+        result = _check_github_metadata_assertion(
+            'contains', 'description', 'required', 'repos/o/r/milestones/1'
+        )
+        assert result == 8, result

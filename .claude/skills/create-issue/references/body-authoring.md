@@ -227,6 +227,7 @@ github_metadata_assert not_contains description "<literal>" repos/<owner>/<repo>
 ```
 
 - assertion は `contains` / `not_contains` のみ。`contains` は present→exit 0、`not_contains` は absent→exit 0
+- field は `description` のみ（typo・未知 field は reject）。コマンドは4引数ちょうどで flags / 余分な positional は受け付けない
 - endpoint は `repos/<owner>/<repo>/milestones/<number>` のみ（絶対 URL・query string・path traversal・placeholder は reject）
 - gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON は environment error として `human_judgment` 分類になり、false pass にならない
 
