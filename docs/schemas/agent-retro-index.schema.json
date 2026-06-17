@@ -80,7 +80,8 @@
         "report_comment_url": {
           "type": "string",
           "format": "uri",
-          "maxLength": 240
+          "maxLength": 240,
+          "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$"
         },
         "report_digest": {
           "$ref": "#/$defs/sha256Digest"

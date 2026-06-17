@@ -22,4 +22,26 @@ describe('authority semantic validation', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.code === 'semantic.authority_evidence_refs_required')).toBe(true)
   })
+
+  it('GIVEN authority.level derived with non-deterministic evidence ref WHEN validated THEN report is rejected', () => {
+    const report = createValidReport()
+    report.actor.type = 'github_action'
+    report.authority.level = 'derived'
+    report.authority.basis = 'github_action_check'
+    report.authority.evidence_refs = [
+      {
+        kind: 'workflow_run',
+        artifact_id: null,
+        artifact_digest: null,
+        workflow_run_url: null,
+        schema_ref: null,
+        ref: 'trust me',
+        digest: null,
+        validation_verdict: 'unknown',
+      },
+    ]
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'semantic.opaque_ref_not_deterministic')).toBe(true)
+  })
 })

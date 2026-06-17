@@ -15,4 +15,20 @@ describe('agent_run_report public surface contract', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.code === 'semantic.public_surface_redaction_status')).toBe(true)
   })
+
+  it('GIVEN public report with verdict fail WHEN validated THEN report is rejected', () => {
+    const report = createValidReport()
+    report.public_safety.verdict = 'fail'
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'semantic.public_surface_verdict')).toBe(true)
+  })
+
+  it('GIVEN public report with blocked_reasons WHEN validated THEN report is rejected', () => {
+    const report = createValidReport()
+    report.public_safety.blocked_reasons = ['redaction pending']
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'semantic.public_surface_blocked_reasons')).toBe(true)
+  })
 })

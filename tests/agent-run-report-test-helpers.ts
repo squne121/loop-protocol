@@ -1,5 +1,7 @@
 import { execFileSync } from 'child_process'
+import { mkdtempSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
+import { tmpdir } from 'os'
 
 export const REPO_ROOT = resolve(__dirname, '..')
 export const SCRIPTS_DIR = resolve(REPO_ROOT, 'scripts')
@@ -97,6 +99,13 @@ export function createValidRetroIndex() {
     orphan_reports: [],
     ambiguous_links: [],
   }
+}
+
+export function createOutsideRepoReportFixture() {
+  const dir = mkdtempSync(resolve(tmpdir(), 'agent-run-report-'))
+  const filePath = resolve(dir, 'outside-report.json')
+  writeFileSync(filePath, JSON.stringify(createValidReport(), null, 2))
+  return filePath
 }
 
 export function runAgentRunReportCheck(args: string[], env: NodeJS.ProcessEnv = {}) {

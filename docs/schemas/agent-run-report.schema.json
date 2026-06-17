@@ -124,9 +124,7 @@
           "type": "array",
           "minItems": 0,
           "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 160
+            "$ref": "#/$defs/opaqueReference"
           }
         }
       }
@@ -301,7 +299,102 @@
             "unknown"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "manifest_digest"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "digest": {}
+            },
+            "required": [
+              "digest"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "github_actions_artifact"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "artifact_id": {},
+              "artifact_digest": {},
+              "workflow_run_url": {}
+            },
+            "required": [
+              "artifact_id",
+              "artifact_digest",
+              "workflow_run_url"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "workflow_run"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {},
+              "digest": {}
+            },
+            "required": [
+              "ref",
+              "digest"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "github_comment"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ref": {},
+              "digest": {}
+            },
+            "required": [
+              "ref",
+              "digest"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "schema_ref"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "schema_ref": {}
+            },
+            "required": [
+              "schema_ref"
+            ]
+          }
+        }
+      ]
     },
     "publicSafety": {
       "type": "object",

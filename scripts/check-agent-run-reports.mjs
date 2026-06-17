@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, realpathSync } from 'fs'
 import { glob as fsGlob, stat } from 'fs/promises'
-import { resolve, dirname, extname } from 'path'
+import { resolve, dirname, extname, sep } from 'path'
 import { fileURLToPath } from 'url'
 import {
   REPO_ROOT,
@@ -67,6 +67,16 @@ async function expandPatterns(patterns) {
   }
 
   return [...new Set(files)].sort()
+}
+
+function isWithinRepo(filePath) {
+  try {
+    const repoRootRealPath = realpathSync(REPO_ROOT)
+    const fileRealPath = realpathSync(filePath)
+    return fileRealPath === repoRootRealPath || fileRealPath.startsWith(`${repoRootRealPath}${sep}`)
+  } catch {
+    return false
+  }
 }
 
 function validateFile(filePath) {
@@ -134,6 +144,15 @@ async function main() {
     }
     console.log('agent-run-report:check: no files found (default targets) - skipped')
     process.exit(0)
+  }
+
+  const outsideRepoFile = files.find((file) => !isWithinRepo(file))
+  if (outsideRepoFile) {
+    console.error(`FAIL ${outsideRepoFile}`)
+    console.error('  - path: file')
+    console.error('    code: file.outside_repo')
+    console.error('    message: resolved target is outside the repository root')
+    process.exit(1)
   }
 
   let failures = 0

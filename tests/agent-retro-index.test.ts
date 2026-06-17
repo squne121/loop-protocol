@@ -15,4 +15,23 @@ describe('agent_retro_index validation', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.code === 'semantic.inline_report_copy')).toBe(true)
   })
+
+  it('GIVEN quality_signals containing raw transcript wording WHEN validated THEN semantic validation fails', () => {
+    const retro = createValidRetroIndex()
+    retro.entries[0].quality_signals = ['raw_transcript excerpt copied']
+    const result = validateAgentRetroIndex(retro)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'semantic.inline_report_copy')).toBe(true)
+  })
+
+  it('GIVEN complete retro index with orphan reports WHEN validated THEN semantic validation fails', () => {
+    const retro = createValidRetroIndex()
+    retro.orphan_reports = [{
+      report_digest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+      reason: 'orphan summary',
+    }]
+    const result = validateAgentRetroIndex(retro)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'semantic.complete_generation_disallows_orphans')).toBe(true)
+  })
 })

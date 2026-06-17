@@ -56,6 +56,13 @@ const MARKER_PATTERNS = [
   { code: 'markdown.marker_injection', regex: /<!--\s*agent_run_report:v1(?:\s+start|\s+end)?\s*-->/ },
   { code: 'markdown.marker_injection', regex: /<!--\s*agent_retro_index:v1(?:\s+start|\s+end)?\s*-->/ },
 ]
+const INLINE_REPORT_COPY_PATTERNS = [
+  { code: 'semantic.inline_report_copy', regex: /\bagent_run_report\/v1\b/i },
+  { code: 'semantic.inline_report_copy', regex: /\bagent_retro_index\/v1\b/i },
+  { code: 'semantic.inline_report_copy', regex: /\bagent_session_manifest\b/i },
+  { code: 'semantic.inline_report_copy', regex: /\b(raw_transcript|full_command_output|raw_manifest_json|transcript_excerpt|stdout|stderr|full_prompt)\b/i },
+  { code: 'semantic.inline_report_copy', regex: /"schema"\s*:\s*"agent_(?:run_report|retro_index|session_manifest)\/v1"/i },
+]
 
 function createAjv() {
   const ajv = new Ajv2020({
@@ -116,10 +123,16 @@ function normalizeScanValue(value) {
     return ''
   }
   let normalized = value.normalize('NFKC')
-  try {
-    normalized = decodeURIComponent(normalized)
-  } catch {
-    // best-effort only
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      const decoded = decodeURIComponent(normalized)
+      if (decoded === normalized) {
+        break
+      }
+      normalized = decoded
+    } catch {
+      break
+    }
   }
   return normalized.replace(/\\\\/g, '/').replace(/\\/g, '/')
 }
@@ -187,6 +200,96 @@ function scanStringValue(path, value) {
   return errors
 }
 
+function isDeterministicOpaqueRef(ref) {
+  if (!ref || typeof ref !== 'object') {
+    return false
+  }
+
+  switch (ref.kind) {
+    case 'manifest_digest':
+      return typeof ref.digest === 'string' && /^sha256:[0-9a-f]{64}$/i.test(ref.digest)
+    case 'github_actions_artifact':
+      return typeof ref.artifact_id === 'string'
+        && /^[0-9]{1,20}$/.test(ref.artifact_id)
+        && typeof ref.artifact_digest === 'string'
+        && /^sha256:[0-9a-f]{64}$/i.test(ref.artifact_digest)
+        && typeof ref.workflow_run_url === 'string'
+    case 'workflow_run':
+      return typeof ref.ref === 'string'
+        && /^https:\/\/github\.com\/squne121\/loop-protocol\/actions\/runs\/[0-9]+$/i.test(ref.ref)
+        && typeof ref.digest === 'string'
+        && /^sha256:[0-9a-f]{64}$/i.test(ref.digest)
+    case 'github_comment':
+      return typeof ref.ref === 'string'
+        && /^https:\/\/github\.com\/squne121\/loop-protocol\/(issues|pull)\/[0-9]+#issuecomment-[0-9]+$/i.test(ref.ref)
+        && typeof ref.digest === 'string'
+        && /^sha256:[0-9a-f]{64}$/i.test(ref.digest)
+    case 'schema_ref':
+      return typeof ref.schema_ref === 'string' && ref.schema_ref.length > 0
+    default:
+      return false
+  }
+}
+
+function validateOpaqueReference(ref, path, { requirePassVerdict = false } = {}) {
+  const errors = []
+
+  if (!isDeterministicOpaqueRef(ref)) {
+    errors.push({
+      path,
+      code: 'semantic.opaque_ref_not_deterministic',
+      message: `${path} must be a deterministic opaque reference for its kind`,
+    })
+  }
+
+  if (requirePassVerdict && ref?.validation_verdict !== 'pass') {
+    errors.push({
+      path: `${path}.validation_verdict`,
+      code: 'semantic.public_ref_validation_verdict',
+      message: 'public surface references must carry validation_verdict = "pass"',
+    })
+  }
+
+  return errors
+}
+
+function collectInlineReportCopyErrors(value, basePath = 'root') {
+  const errors = []
+
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => {
+      errors.push(...collectInlineReportCopyErrors(entry, `${basePath}[${index}]`))
+    })
+    return errors
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, entry] of Object.entries(value)) {
+      const nextPath = basePath === 'root' ? key : `${basePath}.${key}`
+      errors.push(...collectInlineReportCopyErrors(entry, nextPath))
+    }
+    return errors
+  }
+
+  if (typeof value !== 'string') {
+    return errors
+  }
+
+  const normalized = normalizeScanValue(value)
+  for (const pattern of INLINE_REPORT_COPY_PATTERNS) {
+    if (pattern.regex.test(normalized)) {
+      errors.push({
+        path: basePath,
+        code: pattern.code,
+        message: `${basePath} must not inline report/transcript payload-like text`,
+      })
+      break
+    }
+  }
+
+  return errors
+}
+
 function traversePublicSurface(value, parts = []) {
   const errors = []
   const currentPath = joinPath(parts)
@@ -240,12 +343,28 @@ export function validateRetroIndexAgainstSchema(json) {
 export function validateReportSemantics(report) {
   const errors = []
 
-  if (report.public_surface_kind !== 'none' && report.public_safety?.redaction_status !== 'clean') {
-    errors.push({
-      path: 'public_safety.redaction_status',
-      code: 'semantic.public_surface_redaction_status',
-      message: 'public surfaces must declare public_safety.redaction_status = "clean"',
-    })
+  if (report.public_surface_kind !== 'none') {
+    if (report.public_safety?.redaction_status !== 'clean') {
+      errors.push({
+        path: 'public_safety.redaction_status',
+        code: 'semantic.public_surface_redaction_status',
+        message: 'public surfaces must declare public_safety.redaction_status = "clean"',
+      })
+    }
+    if (report.public_safety?.verdict !== 'pass') {
+      errors.push({
+        path: 'public_safety.verdict',
+        code: 'semantic.public_surface_verdict',
+        message: 'public surfaces must declare public_safety.verdict = "pass"',
+      })
+    }
+    if ((report.public_safety?.blocked_reasons?.length ?? 0) !== 0) {
+      errors.push({
+        path: 'public_safety.blocked_reasons',
+        code: 'semantic.public_surface_blocked_reasons',
+        message: 'public surfaces must not carry blocked reasons',
+      })
+    }
   }
 
   if (report.actor?.type === 'ai_agent') {
@@ -271,6 +390,24 @@ export function validateReportSemantics(report) {
       code: 'semantic.authority_evidence_refs_required',
       message: 'authority levels above non_authoritative require deterministic evidence refs',
     })
+  }
+
+  for (const [index, ref] of (report.authority?.evidence_refs ?? []).entries()) {
+    errors.push(...validateOpaqueReference(ref, `authority.evidence_refs[${index}]`, {
+      requirePassVerdict: report.public_surface_kind !== 'none',
+    }))
+  }
+
+  for (const [index, ref] of (report.manifest_refs ?? []).entries()) {
+    errors.push(...validateOpaqueReference(ref, `manifest_refs[${index}]`, {
+      requirePassVerdict: report.public_surface_kind !== 'none',
+    }))
+  }
+
+  for (const [index, ref] of (report.evidence_refs ?? []).entries()) {
+    errors.push(...validateOpaqueReference(ref, `evidence_refs[${index}]`, {
+      requirePassVerdict: report.public_surface_kind !== 'none',
+    }))
   }
 
   if (report.token_usage?.availability === 'unavailable') {
@@ -303,11 +440,37 @@ export function validateRetroIndexSemantics(index) {
 
   for (let i = 0; i < (index.entries || []).length; i += 1) {
     const entry = index.entries[i]
-    if (typeof entry.friction_summary === 'string' && /agent_run_report\/v1/.test(entry.friction_summary)) {
+    errors.push(...collectInlineReportCopyErrors(entry, `entries[${i}]`))
+  }
+
+  for (let i = 0; i < (index.orphan_reports || []).length; i += 1) {
+    errors.push(...collectInlineReportCopyErrors(index.orphan_reports[i], `orphan_reports[${i}]`))
+  }
+
+  for (let i = 0; i < (index.ambiguous_links || []).length; i += 1) {
+    errors.push(...collectInlineReportCopyErrors(index.ambiguous_links[i], `ambiguous_links[${i}]`))
+  }
+
+  if (index.generation_verdict === 'complete') {
+    if ((index.entries?.length ?? 0) === 0) {
       errors.push({
-        path: `entries[${i}].friction_summary`,
-        code: 'semantic.inline_report_copy',
-        message: 'retro index friction_summary must not inline report payloads',
+        path: 'entries',
+        code: 'semantic.complete_generation_requires_entries',
+        message: 'generation_verdict complete requires at least one entry',
+      })
+    }
+    if ((index.orphan_reports?.length ?? 0) > 0) {
+      errors.push({
+        path: 'orphan_reports',
+        code: 'semantic.complete_generation_disallows_orphans',
+        message: 'generation_verdict complete cannot include orphan reports',
+      })
+    }
+    if ((index.ambiguous_links?.length ?? 0) > 0) {
+      errors.push({
+        path: 'ambiguous_links',
+        code: 'semantic.complete_generation_disallows_ambiguous_links',
+        message: 'generation_verdict complete cannot include ambiguous links',
       })
     }
   }
@@ -529,6 +692,22 @@ export function validateMarkdownCandidate(markdown, expectedSchemaName = null) {
   const validation = extraction.schemaName === 'agent_retro_index/v1'
     ? validateAgentRetroIndex(extraction.payload)
     : validateAgentRunReport(extraction.payload)
+
+  if (!validation.valid) {
+    return validation
+  }
+
+  const canonicalMarkdown = renderPublicMarkdown(extraction.payload)
+  if (markdown.trim() !== canonicalMarkdown.trim()) {
+    return {
+      valid: false,
+      errors: [{
+        path: 'markdown',
+        code: 'markdown.round_trip_mismatch',
+        message: 'markdown candidate must match canonical renderPublicMarkdown output',
+      }],
+    }
+  }
 
   return validation
 }

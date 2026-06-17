@@ -27,4 +27,11 @@ describe('markdown candidate validation', () => {
     expect(result.valid).toBe(false)
     expect(result.errors.some((error) => error.code === 'markdown.fence_mismatch')).toBe(true)
   })
+
+  it('GIVEN markdown with extra prose outside canonical template WHEN validated THEN candidate fails round-trip', () => {
+    const markdown = `Review note\n\n${renderPublicMarkdown(createValidReport())}`
+    const result = validateMarkdownCandidate(markdown)
+    expect(result.valid).toBe(false)
+    expect(result.errors.some((error) => error.code === 'markdown.round_trip_mismatch')).toBe(true)
+  })
 })

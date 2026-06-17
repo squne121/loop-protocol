@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { resolve } from 'path'
 import {
+  createOutsideRepoReportFixture,
   REPORT_FIXTURES_DIR,
   RETRO_FIXTURES_DIR,
   runAgentRunReportCheck,
@@ -33,5 +34,12 @@ describe('agent-run-report:check entrypoint', () => {
     const result = runAgentRunReportCheck(['--unknown-option'])
     expect(result.exitCode).toBe(2)
     expect(result.stderr).toContain('unknown option')
+  })
+
+  it('GIVEN repo-outside absolute target WHEN check command is run THEN exits 1 fail-closed', () => {
+    const outsidePath = createOutsideRepoReportFixture()
+    const result = runAgentRunReportCheck([outsidePath])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('file.outside_repo')
   })
 })
