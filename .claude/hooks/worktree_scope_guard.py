@@ -20,6 +20,12 @@ Design notes:
   symlink-outside / `..` traversal / absolute-outside targets are blocked.
 - Unparseable Bash that may still mutate is blocked (fail-closed) when an active
   issue worktree exists and the effective target cannot be proven inside it.
+- file-write mutations (redirection, tee, sed/perl -i, interpreter one-liners) have
+  their write-target path extracted and containment-checked; when a write mutation
+  is detected but no target can be extracted, it is fail-closed (block) while a
+  worktree exists.
+- `bash -c|-lc` / `sh -c` / `zsh -c` wrappers are unwrapped and their inner script
+  is recursively classified / target-extracted.
 """
 
 import json
@@ -295,6 +301,9 @@ _PKG_MUTATING = {
 # read-only allowlist (worktree 解決不能でも allow)
 _GIT_READONLY = {"status", "diff", "log", "show", "rev-parse"}
 
+# shell wrappers whose `-c` / `-lc` script argument carries an inner command.
+_SHELL_WRAPPERS = {"bash", "sh", "zsh"}
+
 
 def _tokenize(command: str) -> list[str]:
     """Tokenize a shell command best-effort. On failure return a coarse split."""
@@ -336,6 +345,11 @@ def _is_file_write_oneliner(command: str) -> bool:
     return False
 
 
+def _is_file_write_mutation(command: str) -> bool:
+    """True iff the command performs a file-write (redirection / tee / -i / one-liner)."""
+    return _has_redirection_or_inplace(command) or _is_file_write_oneliner(command)
+
+
 def classify_bash(command: str) -> str:
     """Classify a Bash command.
 
@@ -352,15 +366,18 @@ def classify_bash(command: str) -> str:
         return "unknown"
 
     # Filesystem write patterns first (these mutate regardless of program).
-    if _has_redirection_or_inplace(command):
-        return "mutating"
-    if _is_file_write_oneliner(command):
+    if _is_file_write_mutation(command):
         return "mutating"
 
     # Strip leading wrappers to find the effective program for classification.
     prog_tokens = _strip_wrappers_for_classification(tokens)
     if not prog_tokens:
         return "unknown"
+
+    # `bash -c|-lc <script>` / `sh -c` / `zsh -c` wrapper → classify inner script.
+    inner = _extract_shell_wrapper_script(prog_tokens)
+    if inner is not None:
+        return classify_bash(inner)
 
     prog = os.path.basename(prog_tokens[0])
     args = prog_tokens[1:]
@@ -377,10 +394,12 @@ def classify_bash(command: str) -> str:
 
 
 def _strip_wrappers_for_classification(tokens: list[str]) -> list[str]:
-    """Strip leading `command`, `env VAR=...`, `cd ... &&` and `bash/sh -c` to
-    expose the underlying program for classification.
+    """Strip leading `command` and `env VAR=...` to expose the underlying program.
 
-    Note: target-dir extraction is handled separately by effective_target_outside().
+    Note: target-dir / write-target extraction (including `cd ... &&` and
+    `bash/sh -c` wrappers) is handled by effective_target_dirs() and
+    write_target_paths(); shell-wrapper unwrap for classification is handled by
+    _extract_shell_wrapper_script().
     """
     t = list(tokens)
     # Strip `command`
@@ -392,6 +411,40 @@ def _strip_wrappers_for_classification(tokens: list[str]) -> list[str]:
         while t and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t[0]):
             t = t[1:]
     return t
+
+
+def _extract_shell_wrapper_script(prog_tokens: list[str]) -> str | None:
+    """If prog_tokens is `bash/sh/zsh [-l]* -c <script> ...` return <script>, else None.
+
+    Accepts combined flags like `-lc` and separate `-l -c`. The script argument is
+    the token immediately following the flag bundle that contains `c`.
+    """
+    if not prog_tokens:
+        return None
+    prog = os.path.basename(prog_tokens[0])
+    if prog not in _SHELL_WRAPPERS:
+        return None
+    i = 1
+    saw_c = False
+    while i < len(prog_tokens):
+        tok = prog_tokens[i]
+        if tok.startswith("-") and tok != "--":
+            # bundled flags, e.g. -lc / -c / -l
+            if "c" in tok[1:]:
+                saw_c = True
+                i += 1
+                break
+            i += 1
+            continue
+        if tok == "--":
+            i += 1
+            break
+        break
+    if not saw_c:
+        return None
+    if i < len(prog_tokens):
+        return prog_tokens[i]
+    return None
 
 
 def _classify_git(args: list[str]) -> str:
@@ -511,10 +564,29 @@ def _classify_pkg(args: list[str]) -> str:
 # wrapper / explicit-target extraction (AC9)
 # =============================================================================
 
+def _abs_against(cwd: str, p: str) -> str:
+    if not os.path.isabs(p):
+        base = cwd if cwd else os.getcwd()
+        p = os.path.join(base, p)
+    return os.path.realpath(p)
+
+
+def _inner_scripts(command: str) -> list[str]:
+    """Return inner scripts from `bash/sh/zsh -c|-lc <script>` wrappers (recursive)."""
+    tokens = _tokenize(command)
+    prog_tokens = _strip_wrappers_for_classification(tokens)
+    inner = _extract_shell_wrapper_script(prog_tokens)
+    if inner is None:
+        return []
+    out = [inner]
+    out.extend(_inner_scripts(inner))
+    return out
+
+
 def effective_target_dirs(command: str, cwd: str) -> list[str]:
     """Extract candidate effective working directories from wrappers/explicit targets.
 
-    Detects:
+    Detects (including inside `bash/sh/zsh -c` wrapper scripts):
       - `git -C <path>`
       - leading `cd <path> &&`
       - `command git -C <path>`
@@ -524,24 +596,154 @@ def effective_target_dirs(command: str, cwd: str) -> list[str]:
     """
     candidates: list[str] = []
 
-    def _abs(p: str) -> str:
-        if not os.path.isabs(p):
-            base = cwd if cwd else os.getcwd()
-            p = os.path.join(base, p)
-        return os.path.realpath(p)
+    def _scan(cmd: str) -> None:
+        # leading `cd <path> &&` / `cd <path> ;` (also when it appears after `&&`/`;`)
+        for m in re.finditer(r"(?:^|&&|;|\|\|)\s*cd\s+(['\"]?)([^&;|'\"]+)\1\s*(?=&&|;|\|\||$)", cmd):
+            candidates.append(_abs_against(cwd, m.group(2).strip()))
+        # `git -C <path>` (and `command git -C`, `env ... git -C`)
+        for gm in re.finditer(r"\bgit\s+(?:-c\s+\S+\s+)*-C\s+(['\"]?)([^\s'\"]+)\1", cmd):
+            candidates.append(_abs_against(cwd, gm.group(2)))
+        for gm in re.finditer(r"\bgit\s+-C(['\"]?)([^\s'\"]+)\1", cmd):
+            candidates.append(_abs_against(cwd, gm.group(2)))
 
-    # leading `cd <path> &&` / `cd <path> ;`
-    m = re.match(r"^\s*cd\s+(['\"]?)([^&;|'\"]+)\1\s*(?:&&|;)", command)
-    if m:
-        candidates.append(_abs(m.group(2).strip()))
-
-    # `git -C <path>` (and `command git -C`, `env ... git -C`)
-    for gm in re.finditer(r"\bgit\s+(?:-c\s+\S+\s+)*-C\s+(['\"]?)([^\s'\"]+)\1", command):
-        candidates.append(_abs(gm.group(2)))
-    for gm in re.finditer(r"\bgit\s+-C(['\"]?)([^\s'\"]+)\1", command):
-        candidates.append(_abs(gm.group(2)))
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
 
     return candidates
+
+
+# =============================================================================
+# write-target extraction (B2 / AC8) — file-write mutation destination paths
+# =============================================================================
+
+def write_target_paths(command: str, cwd: str) -> list[str]:
+    """Extract destination paths of file-write mutations from a command.
+
+    Covers (including inside `bash/sh/zsh -c` wrapper scripts):
+      - redirection `> path`, `>> path`
+      - `tee [opts] path...`
+      - `sed -i ... <file>`, `perl -i ... <file>`
+      - interpreter one-liners: open(PATH,'w'|'a'|'x'), writeFileSync(PATH,...),
+        appendFileSync(PATH,...), createWriteStream(PATH), File.write(PATH,...),
+        File.open(PATH,'w'|'a')
+    Returns absolute realpaths resolved against cwd.
+    """
+    targets: list[str] = []
+
+    def _add(p: str) -> None:
+        p = p.strip().strip("'\"")
+        if not p:
+            return
+        # Dynamic destinations (command substitution / globs / var expansion) are
+        # not statically resolvable → do NOT add (leaves targets empty so the
+        # caller fail-closes on a detected write mutation).
+        if re.search(r"[$`*?]|\$\(|\bsubprocess\b", p) or p.startswith("$("):
+            return
+        targets.append(_abs_against(cwd, p))
+
+    def _scan(cmd: str) -> None:
+        # redirection: > path / >> path (skip fd-dup >&)
+        for m in re.finditer(r"\d*>>?\s*(?!&)(['\"]?)([^\s'\";|&<>]+)\1", cmd):
+            _add(m.group(2))
+        # tee [opts] file...
+        for tm in re.finditer(r"\btee\b((?:\s+-[^\s]+)*)\s+([^|;&]+)", cmd):
+            rest = tm.group(2)
+            # stop at next shell operator
+            rest = re.split(r"[|;&]", rest)[0]
+            for tok in rest.split():
+                if tok.startswith("-"):
+                    continue
+                _add(tok)
+        # sed -i / perl -i: the target file(s) — take trailing non-flag tokens.
+        for sm in re.finditer(r"\b(?:sed|perl)\b([^|;&]*)", cmd):
+            seg = sm.group(1)
+            if not re.search(r"\s-[a-zA-Z]*i\b", seg):
+                continue
+            _extract_inplace_files(seg, _add)
+        # interpreter one-liners (open / writeFileSync / appendFileSync /
+        # createWriteStream / File.write / File.open)
+        for pm in re.finditer(r"open\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*(['\"])[wax]\+?\3", cmd):
+            _add(pm.group(2))
+        for pm in re.finditer(r"(?:writeFileSync|appendFileSync|createWriteStream)\s*\(\s*(['\"])([^'\"]+)\1", cmd):
+            _add(pm.group(2))
+        for pm in re.finditer(r"File\.(?:write|open)\s*\(\s*(['\"])([^'\"]+)\1", cmd):
+            _add(pm.group(2))
+        # python pathlib: Path('x').write_text / write_bytes
+        for pm in re.finditer(r"Path\s*\(\s*(['\"])([^'\"]+)\1\s*\)\s*\.write_", cmd):
+            _add(pm.group(2))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+
+    return targets
+
+
+def _extract_inplace_files(seg: str, add) -> None:
+    """Extract file arguments of a `sed -i ... files` / `perl -i ... files` segment.
+
+    Heuristic: trailing tokens that are not flags and not the sed/perl script
+    expression. We treat any non-flag token that is not the first quoted
+    s///-style script as a candidate file path. To stay fail-closed-friendly we
+    add every non-flag, non-option-value token except an obvious sed program.
+    """
+    toks = seg.split()
+    # drop a leading combined `-i*` / `-e` etc handled by skipping flags below
+    candidates = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-"):
+            # -e <expr> consumes the next token as the program
+            if t in ("-e", "-f"):
+                i += 2
+                continue
+            i += 1
+            continue
+        candidates.append(t)
+        i += 1
+    # The first non-flag token for sed without -e is the script (e.g. 's/a/b/').
+    # Treat tokens that look like a sed/perl program (contain / and start with a
+    # command letter, or are quoted s///) as the script, the rest as files.
+    for c in candidates:
+        if re.match(r"^s/.+/.+/[gpix]*$", c) or re.match(r"^['\"]?s/", c):
+            continue
+        if re.match(r"^[0-9,]+[a-z]", c):  # line-addr sed program
+            continue
+        add(c)
+
+
+# =============================================================================
+# absolute-path argument extraction (Major / AC15) — for unknown / mutating cmds
+# =============================================================================
+
+def absolute_path_args(command: str, cwd: str) -> list[str]:
+    """Extract absolute-path-looking argument tokens (and inner-script tokens).
+
+    Used to catch unknown/mutating commands that write to an external absolute
+    path via an option like `--output /repo/x` or a positional `/repo/x`.
+    Returns realpaths. Relative tokens are ignored here (cwd-containment already
+    covers relative writes from inside the worktree).
+    """
+    found: list[str] = []
+
+    def _scan(cmd: str) -> None:
+        toks = _tokenize(cmd)
+        for tok in toks:
+            # `--output=/abs/path` style
+            if "=" in tok and not tok.startswith("/"):
+                _, _, val = tok.partition("=")
+                if val.startswith("/"):
+                    found.append(os.path.realpath(val))
+                continue
+            if tok.startswith("/") and len(tok) > 1:
+                found.append(os.path.realpath(tok))
+
+    _scan(command)
+    for inner in _inner_scripts(command):
+        _scan(inner)
+    return found
 
 
 # =============================================================================
@@ -581,19 +783,20 @@ def _decide_write(tool_input: dict, cwd: str, issue: str | None,
         or ""
     )
 
-    # No active issue worktree resolvable → write tools are not scoped to a worktree;
-    # allow (no active worktree to protect). But if an issue is resolvable yet
-    # git is unavailable, that's fail-closed for mutation.
-    if issue and not resolution.git_available:
-        _block("<git-unavailable>", cwd)
-
-    if not issue or resolution.match_count == 0:
-        # No active issue worktree → nothing to scope against. Allow.
-        # (Mutation-without-worktree is out of scope per contract: read-only allow,
-        #  and write without an active worktree is not a worktree-escape.)
+    # No active issue resolvable → write tools are not scoped to a worktree; allow.
+    if not issue:
         _allow()
 
-    # 0 件は上で allow 済み。複数件 (match_count > 1) は fail-closed block。
+    # An issue is resolved but git is unavailable → fail-closed for mutation.
+    if not resolution.git_available:
+        _block("<git-unavailable>", cwd)
+
+    # B1: active issue resolved but NO matching worktree → fail-closed block
+    # (symmetric with _decide_bash zero_matches_for_mutation:block).
+    if resolution.match_count == 0:
+        _block("<no-matching-worktree>", cwd)
+
+    # multiple matches (match_count > 1) → fail-closed block.
     if resolution.expected is None:
         _block("<ambiguous>", cwd)
 
@@ -632,16 +835,33 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
     expected = resolution.expected
     rel_expected = _rel(expected, project_root=resolve_project_root())
 
-    # explicit target / wrapper dirs outside expected → block.
+    # explicit target / wrapper dirs outside expected → block (B3: includes
+    # `cd`/`git -C` found inside bash -c wrapper scripts).
     for d in effective_target_dirs(command, cwd):
         if not _dir_inside(expected, d):
             _block(rel_expected, cwd)
+
+    # B2: file-write mutation destination paths outside expected → block.
+    if _is_file_write_mutation_recursive(command):
+        wtargets = write_target_paths(command, cwd)
+        if not wtargets:
+            # write mutation detected but destination unextractable → fail-closed.
+            _block(rel_expected, cwd)
+        for t in wtargets:
+            if not _path_inside(expected, t):
+                _block(rel_expected, cwd)
+
+    # Major: unknown/mutating command with an absolute-path arg outside expected.
+    if klass in ("unknown", "mutating"):
+        for p in absolute_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                _block(rel_expected, cwd)
 
     # cwd outside expected → block (mutating or unknown-possible-mutation).
     if not _dir_inside(expected, cwd):
         _block(rel_expected, cwd)
 
-    # cwd inside expected and no outside explicit target.
+    # cwd inside expected and no outside explicit target / write-target.
     if klass == "mutating":
         _allow()
     if klass == "unknown":
@@ -650,6 +870,29 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
         _allow()
 
     _allow()
+
+
+def _is_file_write_mutation_recursive(command: str) -> bool:
+    """True iff command (or an inner `bash -c` script) is a file-write mutation."""
+    if _is_file_write_mutation(command):
+        return True
+    for inner in _inner_scripts(command):
+        if _is_file_write_mutation(inner):
+            return True
+    return False
+
+
+def _path_inside(expected_realpath: str, candidate_path: str) -> bool:
+    """commonpath containment for an already-absolute realpath candidate."""
+    if not candidate_path:
+        return False
+    actual = os.path.realpath(candidate_path)
+    expected = os.path.realpath(expected_realpath)
+    try:
+        common = os.path.commonpath([expected, actual])
+    except ValueError:
+        return False
+    return common == expected
 
 
 def _dir_inside(expected_realpath: str, candidate_dir: str) -> bool:

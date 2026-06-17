@@ -711,3 +711,168 @@ def test_settings_json_is_valid_and_wires_worktree_guard(tmp_path):
         for entry in pre for h in entry.get("hooks", [])
     )
     assert found, "worktree_scope_guard not wired in PreToolUse"
+
+
+# =============================================================================
+# Regression: fail-open closure (Issue #960 re-review) — B1 / B2 / B3 / Major
+# =============================================================================
+
+# ── B1 [AC12] Write/Edit/MultiEdit zero-match worktree → fail-closed block ────
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit"])
+def test_b1_write_zero_match_external_blocks(tmp_path, tool):
+    """B1/AC12: issue resolved (LOOP_ISSUE_NUMBER) but NO matching worktree →
+    Write/Edit/MultiEdit to an external path is fail-closed blocked (symmetric
+    with the mutating-Bash zero-match block)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    target = repo["root"] / "README.md"  # external, but worktree for 942 exists
+    payload = {
+        "tool_name": tool,
+        "tool_input": {"file_path": str(target)},
+        "cwd": str(repo["root"]),
+    }
+    # active issue 777 has no matching worktree → zero-match → block.
+    r = _run_guard(payload, repo["root"], issue="777")
+    assert r.returncode == 2, f"{tool} zero-match should block; stderr={r.stderr}"
+
+
+# ── B2 [AC8] shell file-write external target from inside worktree → block ────
+
+@pytest.mark.parametrize("command_tmpl", [
+    "echo x > {root}/evil.txt",
+    "echo x >> {root}/evil.txt",
+    "cat foo | tee {root}/evil.txt",
+    "sed -i 's/a/b/' {root}/README.md",
+    "perl -i -pe 's/a/b/' {root}/README.md",
+    "python3 -c \"open('{root}/evil.txt','w').write('x')\"",
+    "node -e \"require('fs').writeFileSync('{root}/evil.txt','x')\"",
+    "ruby -e \"File.write('{root}/evil.txt','x')\"",
+])
+def test_b2_shell_write_external_target_from_worktree_blocks(tmp_path, command_tmpl):
+    """B2/AC8/Outcome: cwd inside the worktree, but the file-write destination is an
+    external absolute path → block (write-target extracted + containment-checked)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),  # cwd INSIDE the worktree
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, f"{cmd!r} should block; stderr={r.stderr}"
+
+
+def test_b2_shell_write_internal_target_allowed(tmp_path):
+    """B2 control: file-write to a path inside the worktree is still allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = f"echo x > {repo['worktree']}/inside.txt"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, r.stderr
+
+
+def test_b2_shell_write_unextractable_target_fail_closed(tmp_path):
+    """B2: a file-write mutation whose destination cannot be extracted is
+    fail-closed (block) while a worktree exists."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    # `>` redirection with the destination produced by command substitution —
+    # the literal path is not statically extractable.
+    cmd = "echo x > $(some_helper --print-path)"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, r.stderr
+
+
+# ── B3 [AC9] bash -c / sh -c / env ... bash -lc wrapper unwrap → block ────────
+
+@pytest.mark.parametrize("command_tmpl", [
+    "bash -lc 'cd {root} && git add .'",
+    "sh -c 'echo x > {root}/y'",
+    "env FOO=bar bash -lc 'git -C {root} commit -m x'",
+    "bash -c 'cd {root} && git commit -m x'",
+    "zsh -c 'echo x > {root}/z'",
+])
+def test_b3_shell_wrapper_external_target_blocks(tmp_path, command_tmpl):
+    """B3/AC9: cwd inside the worktree, but a `bash/sh/zsh -c|-lc` wrapper script
+    targets an external dir (cd / git -C / redirection) → unwrap and block."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),  # cwd INSIDE the worktree
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, f"{cmd!r} should block; stderr={r.stderr}"
+
+
+def test_b3_shell_wrapper_internal_target_allowed(tmp_path):
+    """B3 control: a bash -lc wrapper whose cd/git -C stays inside the worktree
+    is allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = f"bash -lc 'cd {repo['worktree']} && git add .'"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, r.stderr
+
+
+# ── Major [AC15] unknown/mutating command with external absolute-path arg ─────
+
+@pytest.mark.parametrize("command_tmpl", [
+    "someformatter --output {root}/out.txt",
+    "somegen --output={root}/out.txt",
+    "weirdtool {root}/target.bin",
+])
+def test_major_unknown_external_abs_arg_blocks(tmp_path, command_tmpl):
+    """Major/AC15: an unknown command run from inside the worktree but carrying an
+    absolute-path argument pointing outside the worktree is fail-closed blocked."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = command_tmpl.format(root=str(repo["root"]))
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),  # cwd INSIDE the worktree
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 2, f"{cmd!r} should block; stderr={r.stderr}"
+
+
+def test_major_unknown_internal_abs_arg_allowed(tmp_path):
+    """Major control: unknown command with an absolute-path arg INSIDE the
+    worktree (cwd inside) is allowed (mutation contained)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    cmd = f"someformatter --output {repo['worktree']}/out.txt"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="942")
+    assert r.returncode == 0, r.stderr
+
+
+def test_major_readonly_allowlist_not_overblocked(tmp_path):
+    """Major control: read-only allowlist commands with no external abs path stay
+    allowed (no over-block from the stricter unknown-inside path)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="942")
+    for cmd in ("git status", "git diff HEAD~1", "gh pr view 1",
+                "gh api -X GET repos/o/r"):
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "cwd": str(repo["worktree"]),
+        }
+        r = _run_guard(payload, repo["root"], issue="942")
+        assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
