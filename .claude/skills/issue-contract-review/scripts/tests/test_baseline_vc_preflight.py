@@ -1560,6 +1560,163 @@ def test_s_nonempty_file_exit0_blocked(tmp_path):
     assert classification == "unexpected_pass", f"Expected unexpected_pass, got {classification}"
 
 
+def test_fixed_env_injects_ci_true_for_pnpm_build(monkeypatch):
+    """AC2: pnpm build は shell=False のまま CI=true を runner 側で注入する"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    import baseline_vc_preflight as module
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        captured["shell"] = kwargs.get("shell")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    exit_code, stdout, stderr, duration_ms, runner_env_delta = module.run_command("pnpm build", 30, ".")
+
+    assert captured["argv"] == ["pnpm", "build"]
+    assert captured["shell"] is False
+    assert captured["env"]["CI"] == "true"
+    assert runner_env_delta == {"CI": "true"}
+    assert exit_code == 0
+
+
+def test_fixed_env_applies_only_to_pnpm_build(monkeypatch):
+    """AC2: fixed_env は pnpm build のみに限定し、他の regression gate へ広げない"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    import baseline_vc_preflight as module
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    _, _, _, _, runner_env_delta = module.run_command("pnpm lint", 30, ".")
+
+    assert captured["env"] is None
+    assert runner_env_delta == {}
+
+
+def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, capsys):
+    """AC3: JSON evidence には full environment ではなく injected delta のみ残す"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    import baseline_vc_preflight as module
+
+    fixture = tmp_path / "pnpm_build.md"
+    fixture.write_text(
+        "## Verification Commands\n\n```bash\n# AC1\n$ pnpm build\n```\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "run_command",
+        lambda command, timeout_seconds, cwd: (0, "", "", 1, {"CI": "true"}),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script_path),
+            "--body-file",
+            str(fixture),
+            "--issue",
+            "999",
+        ],
+    )
+
+    exit_code = module.main()
+    data = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert data["results"][0]["runner_env_delta"] == {"CI": "true"}
+    assert set(data["results"][0]["runner_env_delta"].keys()) == {"CI"}
+
+
+def test_env_wrapper_exact_env_ci_pnpm_gate_is_blocked():
+    """AC5: env CI=true pnpm build は exact grammar を一般許可せず blocked のまま"""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+$ env CI=true pnpm build
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        data = run_preflight(fixture_file)
+        results = data["results"]
+        found = any(
+            r["category"] == "command_not_allowed"
+            and r["decision"] == "blocked"
+            for r in results
+        )
+        assert found, f"Expected command_not_allowed/blocked. Got: {results}"
+    finally:
+        import os
+        os.unlink(fixture_file)
+
+
+def test_shell_env_prefix_ci_true_pnpm_build_is_blocked():
+    """AC4: shell env prefix 形式の CI=true pnpm build は許可しない"""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+$ CI=true pnpm build
+```
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        data = run_preflight(fixture_file)
+        results = data["results"]
+        found = any(
+            r["category"] == "command_not_allowed"
+            and r["decision"] == "blocked"
+            for r in results
+        )
+        assert found, f"Expected command_not_allowed/blocked. Got: {results}"
+    finally:
+        import os
+        os.unlink(fixture_file)
+
+
+def test_package_manager_no_tty_prompt_classified_as_tooling_blocker():
+    """AC6: pnpm no-TTY failure は body-author-fixable ではなく tooling/env blocker として分類する"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import classify_result
+
+    classification, category, decision, fix_hint, scope_class = classify_result(
+        1,
+        "",
+        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        "pnpm build",
+        cwd=".",
+    )
+
+    assert classification == "blocked"
+    assert category == "package_manager_no_tty_prompt"
+    assert decision == "blocked"
+    assert scope_class == "regression_gate"
+    assert fix_hint is not None and "tooling/env blocker" in fix_hint
+
+
 def test_s_quoted_path_exit1_go():
     """AC6: test -s with quoted path containing spaces → file_not_found_expected / go"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
