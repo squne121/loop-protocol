@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+check_hook_boundaries.py
+
+docs/dev/hook-boundaries.md の hook_boundaries_manifest_v1 YAML block と
+.claude/settings.json の hooks topology を構造照合し drift を検出する。
+
+照合キーは (handler_id, event) の複合キー。
+同一スクリプトが複数 event（Stop / SubagentStop 等）に配置される場合は別エントリとして扱う。
+
+Exit codes:
+  0 — manifest と settings.json が一致（drift なし）
+  1 — drift 検出 または パース失敗
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+# ─── パス定数 ─────────────────────────────────────────────────────────────────
+
+REPO_ROOT = Path(__file__).parent.parent
+DOCS_PATH = REPO_ROOT / "docs" / "dev" / "hook-boundaries.md"
+SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
+
+# ─── manifest 抽出 ────────────────────────────────────────────────────────────
+
+MANIFEST_PATTERN = re.compile(
+    r"```yaml\s*\n(hook_boundaries_manifest_v1:.*?)```",
+    re.DOTALL,
+)
+
+
+def extract_manifest(docs_text: str) -> list[dict[str, Any]]:
+    """docs から hook_boundaries_manifest_v1 YAML block を抽出してパースする。"""
+    match = MANIFEST_PATTERN.search(docs_text)
+    if not match:
+        raise ValueError("hook_boundaries_manifest_v1 YAML block が docs に見つかりません")
+    raw_yaml = match.group(1)
+    parsed = yaml.safe_load(raw_yaml)
+    entries = parsed.get("hook_boundaries_manifest_v1")
+    if not isinstance(entries, list):
+        raise ValueError("hook_boundaries_manifest_v1 の値がリストではありません")
+    return entries
+
+
+# ─── settings.json 解析 ───────────────────────────────────────────────────────
+
+def resolve_handler_id(hook: dict[str, Any]) -> str:
+    """
+    hook dict から handler_id を解決する。
+
+    AC6: command が "node" の場合は args[0] のファイル名を使う
+    （PostToolUse の node ラッパーを取り逃がさない）。
+
+    handler_id はスクリプトのファイル名（拡張子なし）をそのまま使用する。
+    ハイフンを含む場合もファイル名通りに保持する（例: guard-japanese-prose）。
+    """
+    command: str = hook.get("command", "")
+    args: list[str] = hook.get("args", [])
+
+    # node ラッパーパターン: command が "node" かつ args[0] がスクリプトパス
+    # Path(command).name が "node" であることを確認（フルパスの場合も含む）
+    if Path(command).name == "node":
+        if args:
+            script_path = args[0]
+            # パス展開変数を除去してファイル名を取得
+            stem = Path(script_path).stem
+            return stem
+
+    # 通常パターン: command パスのファイル名（拡張子なし）を handler_id とする
+    stem = Path(command).stem
+    return stem
+
+
+def extract_settings_hooks(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    settings.json の hooks セクションを正規化されたリストに変換する。
+
+    返却フォーマット（per hook）:
+      event, matcher, command, args, timeout, handler_id
+
+    照合キー: (handler_id, event) の複合キーを使用する。
+    """
+    hooks_section: dict[str, Any] = settings.get("hooks", {})
+    result: list[dict[str, Any]] = []
+
+    for event, event_entries in hooks_section.items():
+        if not isinstance(event_entries, list):
+            continue
+        for entry in event_entries:
+            matcher = entry.get("matcher")  # Stop/PreCompact/SubagentStop では null
+            hooks_list: list[dict[str, Any]] = entry.get("hooks", [])
+            for hook in hooks_list:
+                handler_id = resolve_handler_id(hook)
+                result.append(
+                    {
+                        "event": event,
+                        "matcher": matcher,
+                        "command": hook.get("command", ""),
+                        "args": hook.get("args", []),
+                        "timeout": hook.get("timeout"),
+                        "handler_id": handler_id,
+                    }
+                )
+    return result
+
+
+# ─── 比較ロジック ─────────────────────────────────────────────────────────────
+
+# AC7: 照合対象フィールド
+COMPARE_FIELDS = ("event", "matcher", "handler_id", "timeout", "classification", "agent_action")
+
+# 複合照合キー
+def make_key(handler_id: str, event: str) -> tuple[str, str]:
+    return (handler_id, event)
+
+
+def check_drift(
+    manifest_entries: list[dict[str, Any]],
+    settings_entries: list[dict[str, Any]],
+) -> list[str]:
+    """
+    manifest と settings を構造照合し drift を返す。
+
+    AC7: event / matcher / handler_id / timeout / classification / agent_action を比較する。
+
+    照合キーは (handler_id, event) の複合キー。
+    """
+    errors: list[str] = []
+
+    # settings の (handler_id, event) → entry マップを構築
+    settings_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for se in settings_entries:
+        key = make_key(se["handler_id"], se["event"])
+        settings_by_key[key] = se
+
+    # manifest の (handler_id, event) → entry マップを構築
+    manifest_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for me in manifest_entries:
+        key = make_key(me["handler_id"], me["event"])
+        manifest_by_key[key] = me
+
+    settings_keys = set(settings_by_key.keys())
+    manifest_keys = set(manifest_by_key.keys())
+
+    # settings に存在するが manifest にない (handler_id, event)
+    missing_in_manifest = settings_keys - manifest_keys
+    missing_in_settings = manifest_keys - settings_keys
+
+    for key in sorted(missing_in_manifest):
+        errors.append(
+            f"[drift] settings.json に存在するが manifest にない "
+            f"(handler_id={key[0]!r}, event={key[1]!r})"
+        )
+
+    for key in sorted(missing_in_settings):
+        errors.append(
+            f"[drift] manifest に存在するが settings.json にない "
+            f"(handler_id={key[0]!r}, event={key[1]!r})"
+        )
+
+    # 両方に存在するキーについて各フィールドを照合
+    for key in sorted(settings_keys & manifest_keys):
+        se = settings_by_key[key]
+        me = manifest_by_key[key]
+        hid, event = key
+        label = f"{hid}@{event}"
+
+        # matcher 比較
+        if se["matcher"] != me.get("matcher"):
+            errors.append(
+                f"[drift:{label}] matcher mismatch: "
+                f"settings={se['matcher']!r} manifest={me.get('matcher')!r}"
+            )
+
+        # timeout 比較
+        if se["timeout"] != me.get("timeout"):
+            errors.append(
+                f"[drift:{label}] timeout mismatch: "
+                f"settings={se['timeout']!r} manifest={me.get('timeout')!r}"
+            )
+
+        # command 比較（${CLAUDE_PROJECT_DIR} 展開前で比較）
+        if se["command"] != me.get("command", ""):
+            errors.append(
+                f"[drift:{label}] command mismatch: "
+                f"settings={se['command']!r} manifest={me.get('command')!r}"
+            )
+
+        # args 比較
+        if se["args"] != (me.get("args") or []):
+            errors.append(
+                f"[drift:{label}] args mismatch: "
+                f"settings={se['args']!r} manifest={me.get('args')!r}"
+            )
+
+        # classification は manifest にのみ存在するが drift チェック対象に含める
+        if "classification" not in me:
+            errors.append(f"[drift:{label}] manifest に classification フィールドがありません")
+
+        # agent_action は manifest にのみ存在する（settings は構造持たない）
+        if "agent_action" not in me:
+            errors.append(f"[drift:{label}] manifest に agent_action フィールドがありません")
+
+    return errors
+
+
+# ─── メイン ───────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    errors: list[str] = []
+
+    # docs 読み込み
+    if not DOCS_PATH.exists():
+        print(f"[error] docs が見つかりません: {DOCS_PATH}", file=sys.stderr)
+        return 1
+    docs_text = DOCS_PATH.read_text(encoding="utf-8")
+
+    # settings.json 読み込み
+    if not SETTINGS_PATH.exists():
+        print(f"[error] settings.json が見つかりません: {SETTINGS_PATH}", file=sys.stderr)
+        return 1
+    settings_text = SETTINGS_PATH.read_text(encoding="utf-8")
+
+    # manifest パース
+    try:
+        manifest_entries = extract_manifest(docs_text)
+    except Exception as exc:
+        print(f"[error] manifest パース失敗: {exc}", file=sys.stderr)
+        return 1
+
+    # settings.json パース
+    try:
+        settings = json.loads(settings_text)
+    except json.JSONDecodeError as exc:
+        print(f"[error] settings.json パース失敗: {exc}", file=sys.stderr)
+        return 1
+
+    # hooks 抽出
+    settings_entries = extract_settings_hooks(settings)
+
+    # drift チェック
+    drift_errors = check_drift(manifest_entries, settings_entries)
+    errors.extend(drift_errors)
+
+    # 結果出力
+    if errors:
+        print("[check_hook_boundaries] FAIL: drift を検出しました", file=sys.stderr)
+        for err in errors:
+            print(f"  {err}", file=sys.stderr)
+        return 1
+
+    manifest_count = len(manifest_entries)
+    settings_count = len(settings_entries)
+    print(
+        f"[check_hook_boundaries] OK: manifest={manifest_count} entries, "
+        f"settings={settings_count} entries — drift なし"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
