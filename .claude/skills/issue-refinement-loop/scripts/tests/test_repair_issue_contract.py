@@ -469,3 +469,100 @@ $ test -f README.md
     # Clean body should not have changes
     assert result.get("changed") is False
 
+
+
+
+
+# ===== #899 genuine behavioral tests (subprocess the real scripts) =====
+def _run_ric_899(body):
+    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    script = str(Path(__file__).parent.parent / "repair_issue_contract.py")
+    with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(body); p = f.name
+    try:
+        r = _sp.run([_sys.executable, script, "--body-file", p], capture_output=True, text=True)
+        return _json.loads(r.stdout)
+    finally:
+        _os.unlink(p)
+
+
+def _run_bvp_899(body, strict=False):
+    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    root = Path(__file__).resolve()
+    while root != root.parent and not (root / ".claude").is_dir():
+        root = root.parent
+    script = str(root / ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
+    with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(body); p = f.name
+    try:
+        argv = [_sys.executable, script, "--body-file", p]
+        if strict:
+            argv.append("--strict")
+        r = _sp.run(argv, capture_output=True, text=True)
+        return _json.loads(r.stdout)
+    finally:
+        _os.unlink(p)
+
+
+def _result_for_899(data, needle):
+    for it in data.get("results", []):
+        if needle in (it.get("raw_command") or ""):
+            return it
+    return None
+
+
+def test_inline_baseline_expect_invalid():
+    """AC18: inline '# baseline-expect:' inside a bash fence is repaired (moved to the
+    preceding line) with a structured record; dry-run by default."""
+    body = "## Verification Commands\n\n```bash\n$ pnpm typecheck # baseline-expect: pass\n```\n"
+    res = _run_ric_899(body)
+    mv = [r for r in res["repairs"] if r.get("kind") == "move_inline_baseline_expect_to_preceding_line"]
+    assert len(mv) == 1, res
+    assert all(k in mv[0] for k in ("line_start", "line_end", "reason", "original", "repaired")), mv[0]
+    assert res["dry_run"] is True, res
+
+
+def test_quoted_literal_not_annotation():
+    """AC18: a quoted literal '# baseline-expect:' inside a bash fence is NOT repaired."""
+    body = "## Verification Commands\n\n```bash\n# baseline-expect: fail\n$ rg \"# baseline-expect: pass\" docs/dev/dor.md\n```\n"
+    res = _run_ric_899(body)
+    mv = [r for r in res["repairs"] if r.get("kind") == "move_inline_baseline_expect_to_preceding_line"]
+    assert len(mv) == 0, res
+
+
+def test_new_allowed_path_baseline_fail():
+    """AC18: a strict-mode VC targeting a NEW Allowed Path missing its annotation is
+    classified missing_baseline_expect_for_new_allowed_path with a declared
+    insert_baseline_expect_fail repair."""
+    body = ("## Verification Commands\n\n```bash\n$ test -f docs/dev/new-path-ac18-899.md\n```\n\n"
+            "## Allowed Paths\n\n- `docs/dev/new-path-ac18-899.md`\n")
+    data = _run_bvp_899(body, strict=True)
+    it = _result_for_899(data, "new-path-ac18-899.md")
+    assert it is not None, data
+    assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
+    assert (it.get("repair") or {}).get("kind") == "insert_baseline_expect_fail", it
+
+
+def test_rg_exit2_new_file():
+    """AC18: rg targeting a non-existent NEW Allowed Path file (rg would exit 2) is
+    classified missing_baseline_expect_for_new_allowed_path in strict mode, distinct
+    from a regex/permission error on an existing file."""
+    body = ("## Verification Commands\n\n```bash\n$ rg somepattern docs/dev/rg-exit2-ac18-899.md\n```\n\n"
+            "## Allowed Paths\n\n- `docs/dev/rg-exit2-ac18-899.md`\n")
+    data = _run_bvp_899(body, strict=True)
+    it = _result_for_899(data, "rg-exit2-ac18-899.md")
+    assert it is not None, data
+    assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
+
+
+def test_insert_baseline_expect_fail_for_new_allowed_path():
+    """AC4/AC18: repair inserts '# baseline-expect: fail' on the preceding line for a
+    VC targeting a NEW Allowed Path file (in Allowed Paths, not existing), with a
+    structured record; dry-run by default."""
+    body = ("## Verification Commands\n\n```bash\n$ test -f docs/dev/insert-newpath-899.md\n```\n\n"
+            "## Allowed Paths\n\n- `docs/dev/insert-newpath-899.md`\n")
+    res = _run_ric_899(body)
+    ins = [r for r in res["repairs"] if r.get("kind") == "insert_baseline_expect_fail"]
+    assert len(ins) == 1, res
+    assert all(k in ins[0] for k in ("line_start", "line_end", "reason", "original", "repaired", "safety", "confidence")), ins[0]
+    assert res["dry_run"] is True, res

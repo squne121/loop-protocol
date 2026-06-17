@@ -9,6 +9,7 @@ category / decision / confidence を含む JSON を返す。
 
 import argparse
 import hashlib
+import os
 import json
 import os
 import re
@@ -1642,6 +1643,69 @@ def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
     return False
 
 
+def has_unquoted_inline_baseline_expect(command: str) -> bool:
+    """AC2/AC12: detect an inline '# baseline-expect:' annotation embedded in a
+    command string OUTSIDE any quoted region. Quoted literals such as
+    `rg "# baseline-expect: pass" file` must NOT match."""
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif c == "#" and not in_single and not in_double:
+            rest = command[i + 1:].lstrip()
+            if rest.startswith("baseline-expect:"):
+                return True
+        i += 1
+    return False
+
+
+def _candidate_new_allowed_path_target(
+    command: str, allowed_paths: Optional[List[str]], cwd: Optional[str]
+) -> Optional[str]:
+    """AC4/AC14: if the command is `test -f|-e|-s PATH` or `rg ... PATH` whose PATH
+    is within Allowed Paths and does NOT exist at the baseline cwd, return that
+    PATH; otherwise None. Conservative shlex-based extraction; callers gate on
+    classify_static_command() returning None first (so unsafe/broad are excluded)."""
+    if not allowed_paths:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    prog = os.path.basename(argv[0])
+    norm_allowed = [p.strip().lstrip("./").rstrip("/") for p in allowed_paths if p.strip()]
+
+    def _in_allowed(p: str) -> bool:
+        pp = p.lstrip("./")
+        return any(pp == a or pp.startswith(a + "/") for a in norm_allowed)
+
+    candidates: List[str] = []
+    if prog == "test":
+        for a in argv[1:]:
+            if a.startswith("-"):
+                continue
+            candidates.append(a)
+    elif prog == "rg":
+        non_opt = [a for a in argv[1:] if not a.startswith("-")]
+        candidates.extend(non_opt[1:])
+    else:
+        return None
+
+    base = cwd or "."
+    for c in candidates:
+        if _in_allowed(c) and not os.path.exists(os.path.join(base, c)):
+            return c
+    return None
+
+
 def classify_static_command(
     raw_command: str, cwd: Path, allowed_paths: Optional[List[str]] = None
 ) -> Optional[Tuple[str, str, str, Optional[str], str]]:
@@ -2320,6 +2384,7 @@ def main() -> int:
         default="json",
         help="Output format (json or contract-review-fragment YAML)",
     )
+    parser.add_argument("--strict", action="store_true", default=False, help="Enable strict mode for annotation enforcement (detect missing annotations as needs_fix)")
 
     args = parser.parse_args()
 
@@ -2505,10 +2570,25 @@ def main() -> int:
                 runtime_verification_required = None
 
         else:
+            # AC2/AC12: inline '# baseline-expect:' is an invalid placement — detect
+            # BEFORE any execution so the malformed command is never run.
+            if has_unquoted_inline_baseline_expect(command):
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification = "blocked"
+                category = "inline_baseline_expect_invalid_placement"
+                decision = "blocked"
+                fix_hint = (
+                    "Inline '# baseline-expect:' alters command semantics and is not "
+                    "executed; move the annotation to the immediately preceding comment line."
+                )
+                scope_class = "baseline_fail_expected"
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
             # BLOCKER 2 fix: invalid baseline-expect annotation value → human_judgment
             # Sentinel "__invalid__:<raw>" is set by extract_baseline_expect_annotation
             # when the annotation line is present but value is not in VALID_BASELINE_EXPECT_VALUES.
-            if baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
+            elif baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
                 raw_invalid_value = baseline_expect[len("__invalid__:"):]
                 classification = "human_judgment"
                 decision = "human_judgment"
@@ -2553,6 +2633,29 @@ def main() -> int:
                 verification_owner = None
                 deferred_reason = None
                 runtime_verification_required = None
+            elif (
+                args.strict
+                and baseline_expect is None
+                and classify_static_command(command, Path(args.cwd), allowed_paths=allowed_paths_from_body) is None
+                and _candidate_new_allowed_path_target(command, allowed_paths_from_body, args.cwd) is not None
+            ):
+                # AC4/AC8/AC14: strict mode — VC targets a NEW Allowed Path file that
+                # does not exist at baseline and lacks a baseline-expect annotation.
+                _missing_target = _candidate_new_allowed_path_target(
+                    command, allowed_paths_from_body, args.cwd
+                )
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification = "blocked"
+                category = "missing_baseline_expect_for_new_allowed_path"
+                decision = "blocked"
+                fix_hint = (
+                    f"VC targets new Allowed Path '{_missing_target}' which does not exist at "
+                    "baseline; add '# baseline-expect: fail' on the preceding line."
+                )
+                scope_class = "baseline_fail_expected"
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
             else:
                 # AC1-AC3: classify_static_command checks unsafe/unsupported commands
                 # BEFORE any execution attempt
@@ -2568,7 +2671,7 @@ def main() -> int:
                 ):
                     static_result = None  # annotation exempts from blocked
                 if static_result is not None:
-                    # Static blocker: baseline-expect does NOT override static blocks
+                    # no_override_for_blocker: static_blocker takes precedence — baseline-expect does NOT override static blocks
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result
                 elif _is_github_metadata_assert_command(command):
@@ -2714,7 +2817,35 @@ def main() -> int:
                 "line": annotation_line_no,
                 "raw": annotation_raw,
             },
+            "strict": {
+                "enabled": args.strict,
+                "violation": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "body_author_fixable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "needs_fix": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "structured_feedback": {
+                    "category": category,
+                    "body_author_fixable": True,
+                    "category_wide_remediation": True,
+                } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+            } if args.strict or category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+            # strict + repair coordination for inline_baseline_expect and missing_baseline_expect
+            "repair": {
+                "repairable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "kind": (
+                    "move_inline_baseline_expect_to_preceding_line" if category == "inline_baseline_expect_invalid_placement"
+                    else "insert_baseline_expect_fail" if category == "missing_baseline_expect_for_new_allowed_path"
+                    else None
+                ),
+                "line_start": line_no,
+                "line_end": line_no,
+                "reason": (
+                    "baseline-expect annotation must be in contiguous preceding comment block" if category == "inline_baseline_expect_invalid_placement"
+                    else "new Allowed Path file requires baseline-expect: fail annotation" if category == "missing_baseline_expect_for_new_allowed_path"
+                    else None
+                ),
+            } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
         }
+        # "strict" + "repair" payload for inline_baseline_expect and missing_baseline_expect errors
         # AC5: Add routing metadata for skipped results
         if verification_owner:
             result_item["verification_owner"] = verification_owner

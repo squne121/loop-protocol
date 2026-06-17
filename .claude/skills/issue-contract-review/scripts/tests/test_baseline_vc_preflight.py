@@ -2407,112 +2407,94 @@ def test_baseline_expect_deferred_category():
     )
 
 
-if __name__ == "__main__":
-    # Run tests
-    test_ac1_file_exists()
-    print("✓ AC1: file exists and py_compile passes")
 
-    test_ac2_schema()
-    print("✓ AC2: schema correct")
 
-    test_ac3_body_file()
-    print("✓ AC3: body-file works")
 
-    test_ac4_unexpected_pass()
-    print("✓ AC4: unexpected_pass / blocked")
 
-    test_ac5_expected_fail()
-    print("✓ AC5: expected_fail / go")
+# ===== #899 genuine behavioral tests (subprocess the real script) =====
+def _run_bvp_899(body, strict=False):
+    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    script = str(Path(__file__).parent.parent / "baseline_vc_preflight.py")
+    with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(body); p = f.name
+    try:
+        argv = [_sys.executable, script, "--body-file", p]
+        if strict:
+            argv.append("--strict")
+        r = _sp.run(argv, capture_output=True, text=True)
+        return _json.loads(r.stdout)
+    finally:
+        _os.unlink(p)
 
-    test_ac6_env_missing_dep()
-    print("✓ AC6: env_missing_dep blocked")
 
-    test_ac7_output_truncation()
-    print("✓ AC7: output truncation")
+def _result_for_899(data, needle):
+    for it in data.get("results", []):
+        if needle in (it.get("raw_command") or ""):
+            return it
+    return None
 
-    test_ac8_command_hash_stable()
-    print("✓ AC8: command_hash stable")
 
-    test_ac9_compound_command()
-    print("✓ AC9: compound_command_disallowed")
+def test_ac7_actionlint_existing_pass_gate_expected_pass():
+    """AC7: an existing 'pass' gate VC (e.g. `Run actionlint`) annotated with a
+    preceding '# baseline-expect: pass' is classified expected_pass / go. Uses
+    `echo ok` as an environment-stable stand-in that reliably exits 0; the
+    motivating real gate is `Run actionlint`."""
+    body = "## Verification Commands\n\n```bash\n# baseline-expect: pass\n$ echo ok\n```\n"
+    data = _run_bvp_899(body, strict=False)
+    it = _result_for_899(data, "echo ok")
+    assert it is not None, data
+    assert it["classification"] == "expected_pass", it
+    assert it["decision"] == "go", it
 
-    test_no_commands_is_blocked()
-    print("✓ B3: no commands → blocked")
 
-    test_mixed_blocked_and_human_judgment_status_is_blocked()
-    print("✓ B2: mixed blocked/human_judgment → blocked")
+def test_ac8_strict_missing_annotation_needs_fix():
+    """AC8: in --strict a VC targeting a NEW Allowed Path file with no baseline-expect
+    annotation is missing_baseline_expect_for_new_allowed_path (body-author-fixable
+    needs_fix), not human_judgment. Non-strict keeps old behavior (AC9)."""
+    body = ("## Verification Commands\n\n```bash\n$ test -f docs/dev/ac8-new-path-899.md\n```\n\n"
+            "## Allowed Paths\n\n- `docs/dev/ac8-new-path-899.md`\n")
+    data = _run_bvp_899(body, strict=True)
+    it = _result_for_899(data, "test -f docs/dev/ac8-new-path-899.md")
+    assert it is not None, data
+    assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
+    assert it["decision"] == "blocked", it
+    assert it.get("strict") and it["strict"].get("needs_fix") is True, it
+    data2 = _run_bvp_899(body, strict=False)
+    it2 = _result_for_899(data2, "test -f docs/dev/ac8-new-path-899.md")
+    assert it2 is not None and it2["category"] != "missing_baseline_expect_for_new_allowed_path", it2
 
-    test_compound_command_not_executed()
-    print("✓ B1: compound command not executed")
 
-    test_inline_ac_suffix_is_parsed()
-    print("✓ B4: inline AC suffix parsed")
+def test_ac5_ci_performance_missing_baseline_needs_fix():
+    """AC5: #895-type — a strict-mode VC referencing a new docs/dev/ci-performance.md
+    that does not exist at baseline is missing_baseline_expect_for_new_allowed_path
+    (needs_fix), not human_judgment."""
+    body = ("## Verification Commands\n\n```bash\n$ rg ci_runtime_baseline_v1 docs/dev/ci-performance-nonexistent-899.md\n```\n\n"
+            "## Allowed Paths\n\n- `docs/dev/ci-performance-nonexistent-899.md`\n")
+    data = _run_bvp_899(body, strict=True)
+    it = _result_for_899(data, "ci-performance-nonexistent-899.md")
+    assert it is not None, data
+    assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
+    assert it["decision"] != "human_judgment", it
 
-    test_missing_script_is_file_not_found_unrunnable()
-    print("✓ B5: missing script → file_not_found_unrunnable")
 
-    test_truncate_output_is_byte_limited()
-    print("✓ B7: output byte-limited")
+def test_ac2_inline_baseline_expect_detection():
+    """AC2: inline '# baseline-expect:' is detected as invalid placement BEFORE
+    execution — exit_code is None proves the malformed command was never run."""
+    body = "## Verification Commands\n\n```bash\n$ rg nonexistentpattern899 README.md # baseline-expect: pass\n```\n"
+    data = _run_bvp_899(body, strict=False)
+    it = _result_for_899(data, "rg nonexistentpattern899")
+    assert it is not None, data
+    assert it["category"] == "inline_baseline_expect_invalid_placement", it
+    assert it["classification"] == "blocked", it
+    assert it["exit_code"] is None, it
 
-    test_contract_review_fragment_format()
-    print("✓ B8: contract-review-fragment format valid")
 
-    test_ac2_issue_repo_integration()
-    print("✓ B6: integration test skipped (requires pytest)")
-
-    # C1-C6 tests
-    test_yaml_lazy_import()
-    print("✓ C1: yaml lazy import")
-
-    test_exit_code_contract_pass()
-    print("✓ C2: exit code contract (pass)")
-
-    test_exit_code_contract_blocked()
-    print("✓ C2: exit code contract (blocked)")
-
-    test_exit_code_contract_human_judgment()
-    print("✓ C2: exit code contract (human_judgment)")
-
-    test_exit_code_contract_error()
-    print("✓ C2: exit code contract (error)")
-
-    test_fragment_preserves_human_judgment()
-    print("✓ C3: fragment preserves human_judgment")
-
-    test_confidence_json_fragment_parity()
-    print("✓ C4: confidence parity")
-
-    test_preparation_stops_on_human_judgment()
-    print("✓ C5: preparation stops on human_judgment")
-
-    test_shlex_compound_detection_no_space()
-    print("✓ C6: shlex compound detection (no space)")
-
-    test_shlex_compound_detection_quoted_pipe()
-    print("✓ C6: shlex compound detection (quoted pipe)")
-
-    test_shlex_compound_detection_redirect()
-    print("✓ C6: shlex compound detection (redirect)")
-
-    test_grep_invalid_regex_is_not_expected_fail()
-    print("✓ Medium risk 1: grep invalid regex")
-
-    test_ac2_issue_repo_mocked()
-    print("✓ Medium risk 2: AC2 mocked test")
-
-    test_s_missing_file_exit1_go()
-    print("✓ test -s: missing file exit1 → go")
-
-    test_s_empty_file_exit1_go()
-    print("✓ test -s: empty file exit1 → go (fix_hint)")
-
-    test_s_nonempty_file_exit0_blocked()
-    print("✓ test -s: nonempty file exit0 → blocked")
-
-    test_s_quoted_path_exit1_go()
-    print("✓ test -s: quoted path exit1 → go")
-
-    test_s_malformed_exit2_not_go()
-    print("✓ test -s: malformed exit2 → not go")
-
-    print("\n✓ All tests passed!")
+def test_ac12_inline_annotation_quoted_literal_safe():
+    """AC12: a quoted literal containing '# baseline-expect:' is NOT mistaken for an
+    inline annotation (no false positive)."""
+    body = ("## Verification Commands\n\n```bash\n# baseline-expect: fail\n"
+            "$ rg \"# baseline-expect: pass\" docs/dev/dor.md\n```\n")
+    data = _run_bvp_899(body, strict=False)
+    it = _result_for_899(data, "rg ")
+    assert it is not None, data
+    assert it["category"] != "inline_baseline_expect_invalid_placement", it
