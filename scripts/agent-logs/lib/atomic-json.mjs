@@ -1,59 +1,54 @@
-import { constants, open, rename, rm } from 'fs/promises'
-import { dirname, join, basename } from 'path'
+import { link, mkdir, open, rm } from 'fs/promises'
+import { basename, dirname, resolve } from 'path'
 import { randomUUID } from 'crypto'
+
+import { runtimeError } from './args.mjs'
 
 function stableStringify(value) {
   return `${JSON.stringify(value, null, 2)}\n`
 }
 
-async function fsyncDirectory(filePath) {
-  const dirHandle = await open(dirname(filePath), constants.O_RDONLY)
+async function fsyncDirectory(directoryPath) {
+  let directoryHandle
   try {
-    await dirHandle.sync()
+    directoryHandle = await open(directoryPath, 'r')
+    await directoryHandle.sync()
+  } catch {
+    // best effort only
   } finally {
-    await dirHandle.close()
+    await directoryHandle?.close()
   }
 }
 
-export async function writeJsonAtomic(filePath, value) {
-  const dir = dirname(filePath)
-  const tempPath = join(
-    dir,
-    `.${basename(filePath)}.${process.pid}.${randomUUID()}.tmp`,
+export async function writeJsonAtomic(outputPath, value, hooks = {}) {
+  const resolvedOutputPath = resolve(outputPath)
+  const outputDirectory = dirname(resolvedOutputPath)
+  const temporaryPath = resolve(
+    outputDirectory,
+    `.${basename(resolvedOutputPath)}.${process.pid}.${randomUUID()}.tmp`
   )
-  const payload = stableStringify(value)
-  const handle = await open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
 
+  await mkdir(outputDirectory, { recursive: true })
+
+  let temporaryHandle
   try {
-    await handle.writeFile(payload, { encoding: 'utf-8' })
-    await handle.sync()
+    temporaryHandle = await open(temporaryPath, 'wx', 0o600)
+    await temporaryHandle.writeFile(stableStringify(value), { encoding: 'utf-8' })
+    await temporaryHandle.sync()
+    await temporaryHandle.close()
+    temporaryHandle = null
+    await hooks.afterTempSync?.(temporaryPath, resolvedOutputPath)
+    await link(temporaryPath, resolvedOutputPath)
+    await hooks.afterPublishLink?.(temporaryPath, resolvedOutputPath)
+    await fsyncDirectory(outputDirectory)
+    await rm(temporaryPath, { force: true })
+    await fsyncDirectory(outputDirectory)
   } catch (error) {
-    await handle.close().catch(() => {})
-    await rm(tempPath, { force: true }).catch(() => {})
-    throw error
-  }
-
-  await handle.close()
-
-  try {
-    const destination = await open(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
-    await destination.close()
-    await rm(filePath, { force: true })
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {})
-    if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
-      const existsError = new Error('output_exists')
-      existsError.code = 'OUTPUT_EXISTS'
-      throw existsError
+    await temporaryHandle?.close().catch(() => {})
+    await rm(temporaryPath, { force: true }).catch(() => {})
+    if (error && typeof error === 'object' && error.code === 'EEXIST') {
+      throw runtimeError('output.exists', 'refusing to overwrite an existing output file')
     }
-    throw error
-  }
-
-  try {
-    await rename(tempPath, filePath)
-    await fsyncDirectory(filePath)
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {})
     throw error
   }
 }

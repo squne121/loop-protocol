@@ -1,6 +1,6 @@
-import { readFile } from 'fs/promises'
+import { assertNonEmptyString, runtimeError } from './args.mjs'
 
-const ALLOWED_KEYS = new Set([
+const ALLOWED_COMMAND_SUMMARY_KEYS = new Set([
   'command_label',
   'exit_code',
   'verdict',
@@ -8,74 +8,91 @@ const ALLOWED_KEYS = new Set([
   'artifact_ref',
 ])
 
-const FORBIDDEN_KEYS = new Set([
+const FORBIDDEN_COMMAND_INPUT_KEYS = new Set([
   'stdout',
   'stderr',
   'output',
   'log',
-  'full_command',
   'full_command_output',
-  'env',
+  'full_command',
   'raw_output',
+  'env',
+  'command',
 ])
 
-function normalizeEntries(payload) {
-  return Array.isArray(payload) ? payload : [payload]
+function parseJsonObject(raw, code) {
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw runtimeError(code, 'input must be valid JSON')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw runtimeError(code, 'input must be a JSON object')
+  }
+  return parsed
 }
 
-function validateEntry(entry) {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-    throw new Error('invalid_command_summary_entry')
-  }
-
-  for (const key of Object.keys(entry)) {
-    if (FORBIDDEN_KEYS.has(key) || !ALLOWED_KEYS.has(key)) {
-      throw new Error('invalid_command_summary_key')
+function assertAllowedKeys(record, allowedKeys, code) {
+  for (const key of Object.keys(record)) {
+    if (FORBIDDEN_COMMAND_INPUT_KEYS.has(key)) {
+      throw runtimeError(code, 'raw command output fields are not allowed')
+    }
+    if (!allowedKeys.has(key)) {
+      throw runtimeError(code, 'unexpected fields are not allowed')
     }
   }
+}
 
-  if (
-    typeof entry.command_label !== 'string'
-    || entry.command_label.length === 0
-    || entry.command_label.length > 80
-    || !Number.isInteger(entry.exit_code)
-    || entry.exit_code < 0
-    || !['pass', 'fail', 'skip'].includes(entry.verdict)
-    || typeof entry.summary !== 'string'
-    || entry.summary.length === 0
-    || entry.summary.length > 280
-    || !(
-      entry.artifact_ref === null
-      || (typeof entry.artifact_ref === 'string' && entry.artifact_ref.length > 0 && entry.artifact_ref.length <= 200)
+export function parseCommandSummaryJson(rawEntries) {
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
+    throw runtimeError('command_summary.required', 'at least one command summary is required')
+  }
+
+  return rawEntries.map((rawEntry, index) => {
+    const code = `command_summary[${index}]`
+    const record = parseJsonObject(rawEntry, code)
+    assertAllowedKeys(record, ALLOWED_COMMAND_SUMMARY_KEYS, code)
+
+    const commandLabel = assertNonEmptyString(
+      record.command_label,
+      `${code}.command_label`,
+      'command_label must be a non-empty string',
+      { maxLength: 80 }
     )
-  ) {
-    throw new Error('invalid_command_summary_shape')
-  }
+    if (!Number.isInteger(record.exit_code) || record.exit_code < 0) {
+      throw runtimeError(`${code}.exit_code`, 'exit_code must be a non-negative integer')
+    }
+    if (!['pass', 'fail', 'skip'].includes(record.verdict)) {
+      throw runtimeError(`${code}.verdict`, 'verdict must be pass, fail, or skip')
+    }
+    const summary = assertNonEmptyString(
+      record.summary,
+      `${code}.summary`,
+      'summary must be a non-empty string',
+      { maxLength: 280 }
+    )
 
-  return entry
+    if (!(record.artifact_ref === null || typeof record.artifact_ref === 'string')) {
+      throw runtimeError(`${code}.artifact_ref`, 'artifact_ref must be a string or null')
+    }
+    if (typeof record.artifact_ref === 'string' && record.artifact_ref.length > 200) {
+      throw runtimeError(`${code}.artifact_ref`, 'artifact_ref must be 200 characters or fewer')
+    }
+
+    return {
+      command_label: commandLabel,
+      exit_code: record.exit_code,
+      verdict: record.verdict,
+      summary,
+      artifact_ref: record.artifact_ref,
+    }
+  })
 }
 
-export async function loadCommandSummaries(filePaths) {
-  const summaries = []
-  for (const filePath of filePaths) {
-    let raw
-    try {
-      raw = await readFile(filePath, 'utf-8')
-    } catch {
-      throw new Error('command_summary_read_failed')
-    }
-    let payload
-    try {
-      payload = JSON.parse(raw)
-    } catch {
-      throw new Error('command_summary_parse_failed')
-    }
-    for (const entry of normalizeEntries(payload)) {
-      summaries.push(validateEntry(entry))
-    }
+export function parseJsonList(rawEntries, optionName) {
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
+    return []
   }
-  if (summaries.length === 0) {
-    throw new Error('missing_command_summaries')
-  }
-  return summaries
+  return rawEntries.map((rawEntry, index) => parseJsonObject(rawEntry, `${optionName}[${index}]`))
 }

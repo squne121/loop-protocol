@@ -1,46 +1,49 @@
-import { mkdtempSync, writeFileSync } from 'fs'
-import { spawnSync } from 'child_process'
+import { afterEach, describe, expect, it } from 'vitest'
 import { resolve } from 'path'
-import { tmpdir } from 'os'
-import { describe, expect, it } from 'vitest'
 
-const REPO_ROOT = resolve(__dirname, '..', '..')
+import {
+  cleanupTempDir,
+  createDraftArgs,
+  createFinalizeArgs,
+  createTempDir,
+  runNodeScript,
+  FINALIZE_SCRIPT,
+  START_SCRIPT,
+} from './helpers'
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    cleanupTempDir(tempDirs.pop() as string)
+  }
+})
 
 describe('command summary input guard', () => {
   it('GIVEN raw output fields WHEN finalize-agent-run parses command summaries THEN it fails closed', () => {
-    const dir = mkdtempSync(resolve(tmpdir(), 'agent-run-command-summary-'))
-    const draft = resolve(dir, 'draft.json')
-    const commandSummary = resolve(dir, 'commands.json')
-    const output = resolve(dir, 'report.json')
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
 
-    writeFileSync(draft, JSON.stringify({
-      schema: 'agent_run_draft/v1',
-      run_id: 'run-936',
-      target: 'issue#936',
-      phase: 'implementation',
-      actor: { type: 'ai_agent', name: 'Codex' },
-      started_at: '2026-06-17T11:40:00Z',
-    }))
-    writeFileSync(commandSummary, JSON.stringify([{
-      command_label: 'pnpm test agent-logs',
-      exit_code: 0,
-      verdict: 'pass',
-      summary: 'focused tests passed',
-      artifact_ref: null,
-      stdout: 'forbidden',
-    }]))
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
 
-    const result = spawnSync(process.execPath, [
-      resolve(REPO_ROOT, 'scripts/agent-logs/finalize-agent-run.mjs'),
-      '--draft', draft,
-      '--output', output,
-      '--command-summary-file', commandSummary,
-    ], {
-      cwd: REPO_ROOT,
-      encoding: 'utf-8',
-    })
+    const result = runNodeScript(
+      FINALIZE_SCRIPT,
+      createFinalizeArgs(draftPath, reportPath, [
+        '--command-summary-json',
+        JSON.stringify({
+          command_label: 'pnpm test -- tests/agent-logs',
+          exit_code: 0,
+          verdict: 'pass',
+          summary: 'focused tests passed',
+          artifact_ref: null,
+          stdout: 'forbidden',
+        }),
+      ])
+    )
 
-    expect(result.status).toBe(1)
-    expect(result.stderr).toContain('invalid_command_summary_key')
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('raw command output fields are not allowed')
   })
 })

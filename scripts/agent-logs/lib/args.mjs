@@ -1,76 +1,114 @@
-function fail(message, code = 2) {
-  const error = new Error(message)
-  error.exitCode = code
-  throw error
+export class CliError extends Error {
+  constructor(code, message, exitCode = 1) {
+    super(message)
+    this.name = 'CliError'
+    this.code = code
+    this.exitCode = exitCode
+  }
 }
 
-export function parseArgs(argv, spec) {
-  const result = {}
-  const multiValueKeys = new Set(
-    Object.entries(spec)
-      .filter(([, config]) => config.multiple)
-      .map(([key]) => key),
-  )
+export function usageError(code, message) {
+  return new CliError(code, message, 2)
+}
 
-  for (const key of multiValueKeys) {
-    result[key] = []
+export function runtimeError(code, message) {
+  return new CliError(code, message, 1)
+}
+
+export function parseArgs(argv, optionSpec) {
+  const options = {}
+
+  for (const spec of Object.values(optionSpec)) {
+    if (spec.multiple) {
+      options[spec.key] = []
+    } else if ('defaultValue' in spec) {
+      options[spec.key] = spec.defaultValue
+    }
   }
+
+  let positionalMode = false
 
   for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index]
-    if (!token.startsWith('--')) {
-      fail(`unknown_argument:${token}`)
-    }
-    const name = token.slice(2)
-    const config = spec[name]
-    if (!config) {
-      fail(`unknown_option:${token}`)
-    }
-    if (config.type === 'boolean') {
-      result[name] = true
+    const arg = argv[index]
+    if (arg === '--') {
+      positionalMode = true
       continue
     }
-    const value = argv[index + 1]
-    if (value === undefined || value.startsWith('--')) {
-      fail(`missing_value:${token}`)
+
+    const [flag, inlineValue] = positionalMode ? [arg, undefined] : arg.split(/=(.*)/s, 2)
+    const spec = optionSpec[flag]
+    if (!spec) {
+      throw usageError('cli.unknown_option', `unknown option: ${flag}`)
     }
-    index += 1
-    if (config.multiple) {
-      result[name].push(value)
+
+    const value = inlineValue !== undefined ? inlineValue : argv[index + 1]
+    if (typeof value !== 'string') {
+      throw usageError('cli.missing_value', `missing value for option: ${flag}`)
+    }
+    if (inlineValue === undefined) {
+      index += 1
+    }
+    if (spec.multiple) {
+      options[spec.key].push(value)
     } else {
-      result[name] = value
+      options[spec.key] = value
     }
   }
 
-  for (const [name, config] of Object.entries(spec)) {
-    if (config.required && (result[name] === undefined || result[name]?.length === 0)) {
-      fail(`missing_required:${name}`)
-    }
-    if (result[name] === undefined && 'defaultValue' in config) {
-      result[name] = config.defaultValue
+  for (const [flag, spec] of Object.entries(optionSpec)) {
+    const value = options[spec.key]
+    if (spec.required && (value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0))) {
+      throw usageError('cli.required_option', `missing required option: ${flag}`)
     }
   }
 
-  return result
+  return options
 }
 
-export function ensureIsoTimestamp(value, fieldName) {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) {
-    fail(`invalid_timestamp:${fieldName}`)
+export function assertEnum(value, allowedValues, code, message) {
+  if (!allowedValues.includes(value)) {
+    throw runtimeError(code, message)
   }
   return value
 }
 
-export function ensureEnum(value, allowed, fieldName) {
-  if (!allowed.includes(value)) {
-    fail(`invalid_enum:${fieldName}`)
+export function assertNonEmptyString(value, code, message, { maxLength = null } = {}) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw runtimeError(code, message)
+  }
+  if (maxLength !== null && value.length > maxLength) {
+    throw runtimeError(code, message)
   }
   return value
 }
 
-export function ensureLength(value, maxLength, fieldName) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
-    fail(`invalid_length:${fieldName}`)
+export function assertPositiveIntegerString(value, code, message) {
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw runtimeError(code, message)
+  }
+  return Number(value)
+}
+
+export function assertIsoTimestamp(value, code, message) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime()) || date.toISOString() !== value) {
+    throw runtimeError(code, message)
   }
   return value
+}
+
+export function assertIntegerString(value, code, message) {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw runtimeError(code, message)
+  }
+  return Number(value)
+}
+
+export function printCliError(prefix, error) {
+  if (error instanceof CliError) {
+    console.error(`${prefix}: ${error.code}: ${error.message}`)
+    return error.exitCode
+  }
+  console.error(`${prefix}: cli.unexpected_error: unexpected runtime failure`)
+  return 1
 }

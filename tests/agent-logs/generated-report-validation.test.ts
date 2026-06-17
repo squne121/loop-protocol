@@ -1,47 +1,97 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'fs'
-import { execFileSync } from 'child_process'
+import { afterEach, describe, expect, it } from 'vitest'
+import { readFileSync } from 'fs'
 import { resolve } from 'path'
-import { tmpdir } from 'os'
-import { validateAgentRunReport } from '../../scripts/lib/agent-run-report-validation.mjs'
-import { describe, expect, it } from 'vitest'
 
-const REPO_ROOT = resolve(__dirname, '..', '..')
+import { validateAgentRunReport } from '../../scripts/lib/agent-run-report-validation.mjs'
+import {
+  cleanupTempDir,
+  createDraftArgs,
+  createFinalizeArgs,
+  createTempDir,
+  PACKAGE_JSON,
+  readJson,
+  runNodeScript,
+  writeJson,
+  FINALIZE_SCRIPT,
+  START_SCRIPT,
+} from './helpers'
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    cleanupTempDir(tempDirs.pop() as string)
+  }
+})
 
 describe('generated agent run report', () => {
   it('GIVEN finalize-agent-run output WHEN validated THEN report passes current validator', () => {
-    const dir = mkdtempSync(resolve(tmpdir(), 'agent-run-validated-'))
-    const draft = resolve(dir, 'draft.json')
-    const commandSummary = resolve(dir, 'commands.json')
-    const output = resolve(dir, 'report.json')
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
 
-    writeFileSync(draft, JSON.stringify({
-      schema: 'agent_run_draft/v1',
-      run_id: 'run-936',
-      target: 'issue#936',
-      phase: 'implementation',
-      actor: { type: 'ai_agent', name: 'Codex' },
-      started_at: '2026-06-17T11:40:00Z',
-    }))
-    writeFileSync(commandSummary, JSON.stringify([{
-      command_label: 'pnpm test agent-logs',
-      exit_code: 0,
-      verdict: 'pass',
-      summary: 'focused tests passed',
-      artifact_ref: null,
-    }]))
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
+    const finalize = runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPath))
+    expect(finalize.exitCode).toBe(0)
 
-    execFileSync(process.execPath, [
-      resolve(REPO_ROOT, 'scripts/agent-logs/finalize-agent-run.mjs'),
-      '--draft', draft,
-      '--output', output,
-      '--command-summary-file', commandSummary,
-    ], {
-      cwd: REPO_ROOT,
-      encoding: 'utf-8',
-    })
+    const report = readJson(reportPath)
+    expect(Object.keys(report).sort()).toEqual([
+      'actor',
+      'authority',
+      'commands_summary',
+      'docs_read_refs',
+      'evidence_refs',
+      'manifest_refs',
+      'public_safety',
+      'public_surface_kind',
+      'schema',
+      'token_usage',
+    ])
 
-    const report = JSON.parse(readFileSync(output, 'utf-8'))
     const result = validateAgentRunReport(report)
     expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN package scripts WHEN inspected THEN agent-run lifecycle aliases are present without duplicating the validator command', () => {
+    const packageJson = JSON.parse(readFileSync(PACKAGE_JSON, 'utf-8'))
+    expect(packageJson.scripts['agent-run:start']).toBe('node scripts/agent-logs/start-agent-run.mjs')
+    expect(packageJson.scripts['agent-run:finalize']).toBe('node scripts/agent-logs/finalize-agent-run.mjs')
+    expect(packageJson.scripts['agent-run:check']).toBe(packageJson.scripts['agent-run-report:check'])
+  })
+
+  it('GIVEN the same draft and checked-at WHEN finalized twice THEN generated reports are deterministic', () => {
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPathA = resolve(tempDir, 'report-a.json')
+    const reportPathB = resolve(tempDir, 'report-b.json')
+
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
+    expect(runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPathA)).exitCode).toBe(0)
+    expect(runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPathB)).exitCode).toBe(0)
+
+    expect(readFileSync(reportPathA, 'utf-8')).toBe(readFileSync(reportPathB, 'utf-8'))
+  })
+
+  it('GIVEN a draft with extra keys WHEN finalized THEN draft validation fails closed', () => {
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
+
+    writeJson(draftPath, {
+      schema: 'agent_run_draft/v1',
+      run_id: 'run-936-001',
+      target: { kind: 'issue', id: 936 },
+      phase: 'implementation',
+      actor: { type: 'ai_agent', name: 'Codex worker' },
+      started_at: '2026-06-17T12:00:00.000Z',
+      extra_field: 'unexpected',
+    })
+
+    const result = runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPath))
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('draft.invalid')
   })
 })

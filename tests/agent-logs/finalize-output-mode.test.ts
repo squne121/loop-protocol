@@ -1,48 +1,81 @@
-import { spawnSync } from 'child_process'
-import { mkdtempSync, writeFileSync } from 'fs'
+import { afterEach, describe, expect, it } from 'vitest'
+import { readFileSync } from 'fs'
 import { resolve } from 'path'
-import { tmpdir } from 'os'
-import { describe, expect, it } from 'vitest'
 
-const REPO_ROOT = resolve(__dirname, '..', '..')
+import {
+  cleanupTempDir,
+  createCommandSummaryJson,
+  createDraftArgs,
+  createFinalizeArgs,
+  createTempDir,
+  runNodeScript,
+  FINALIZE_SCRIPT,
+  START_SCRIPT,
+} from './helpers'
+
+const tempDirs: string[] = []
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    cleanupTempDir(tempDirs.pop() as string)
+  }
+})
 
 describe('finalize-agent-run output contract', () => {
   it('GIVEN valid inputs WHEN finalized THEN stdout does not expose report json or paths', () => {
-    const dir = mkdtempSync(resolve(tmpdir(), 'agent-run-output-'))
-    const draft = resolve(dir, 'draft.json')
-    const commandSummary = resolve(dir, 'commands.json')
-    const output = resolve(dir, 'report.json')
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
 
-    writeFileSync(draft, JSON.stringify({
-      schema: 'agent_run_draft/v1',
-      run_id: 'run-936',
-      target: 'issue#936',
-      phase: 'implementation',
-      actor: { type: 'ai_agent', name: 'Codex' },
-      started_at: '2026-06-17T11:40:00Z',
-    }))
-    writeFileSync(commandSummary, JSON.stringify([{
-      command_label: 'pnpm test agent-logs',
-      exit_code: 0,
-      verdict: 'pass',
-      summary: 'focused tests passed',
-      artifact_ref: null,
-    }]))
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
 
-    const result = spawnSync(process.execPath, [
-      resolve(REPO_ROOT, 'scripts/agent-logs/finalize-agent-run.mjs'),
-      '--draft', draft,
-      '--output', output,
-      '--command-summary-file', commandSummary,
-    ], {
-      cwd: REPO_ROOT,
-      encoding: 'utf-8',
-    })
+    const result = runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPath))
 
-    expect(result.status).toBe(0)
-    expect(result.stdout).toBe('agent-run:finalize: ok\n')
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe('agent-run:finalize: report written')
     expect(result.stdout).not.toContain('{')
-    expect(result.stdout).not.toContain(output)
-    expect(result.stdout).not.toContain(draft)
+    expect(result.stdout).not.toContain('agent_run_report/v1')
+    expect(result.stdout).not.toContain(reportPath)
+  })
+
+  it('GIVEN a raw-output field in command summary input WHEN finalize-agent-run runs THEN it rejects the input without echoing payload values', () => {
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
+    const forbiddenPayload = 'super secret stdout dump'
+
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
+
+    const result = runNodeScript(
+      FINALIZE_SCRIPT,
+      createFinalizeArgs(draftPath, reportPath, [
+        '--command-summary-json',
+        createCommandSummaryJson({ stdout: forbiddenPayload }),
+      ])
+    )
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('raw command output fields are not allowed')
+    expect(result.stderr).not.toContain(forbiddenPayload)
+    expect(result.stderr).not.toContain(reportPath)
+  })
+
+  it('GIVEN an existing report path WHEN finalize-agent-run runs THEN it fails closed without changing the file', () => {
+    const tempDir = createTempDir()
+    tempDirs.push(tempDir)
+    const draftPath = resolve(tempDir, 'draft.json')
+    const reportPath = resolve(tempDir, 'report.json')
+
+    expect(runNodeScript(START_SCRIPT, createDraftArgs(draftPath)).exitCode).toBe(0)
+    expect(runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPath)).exitCode).toBe(0)
+
+    const before = readFileSync(reportPath, 'utf-8')
+    const second = runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPath))
+    expect(second.exitCode).toBe(1)
+    expect(second.stderr).toContain('output.exists')
+    expect(second.stderr).not.toContain(reportPath)
+    expect(readFileSync(reportPath, 'utf-8')).toBe(before)
   })
 })
