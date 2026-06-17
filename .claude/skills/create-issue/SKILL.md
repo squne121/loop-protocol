@@ -310,6 +310,27 @@ gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
 - plan が存在しない / 取得できない場合は通常の create-issue フロー（ステップ 1〜4）にフォールバック
 - `CHILD_MATERIALIZATION_PLAN_V2` は `docs/dev/agent-skill-boundaries.md` が schema 正本
 
+### 4b. `materialize_child_issues.py`（決定論的 executor / `CHILD_MATERIALIZATION_RESULT_V2` producer）
+
+ステップ 4a の手作業フローを **決定論的スクリプト**として正規化したのが `materialize_child_issues.py` である。LLM が child plan を逐次解釈して `create_issue_txn.py` を呼ぶ代わりに、closed-schema バリデーション・canonical body render・起票・parent patch・結果集約を 1 つの helper に集約する。
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
+  --plan-file <CHILD_MATERIALIZATION_PLAN_V2 互換 JSON>
+```
+
+**責務と保証**:
+
+1. **closed-schema 検証（fail-closed）**: unknown key / duplicate `child_id` / `issue_lookup.complete: false` / 不正 `action` / 非整数 `depends_on` / 空 `allowed_paths` / AC↔VC の AC set 不一致を exit 2 で拒否する。非 JSON 入力は YAML fallback せず拒否する。
+2. **canonical body render（spec-driven）**: `ISSUE_TEMPLATE/<kind>.yml` の required label order（`validate_issue_body._load_required_section_labels`）に従って body を生成し、`validate_issue_body.py --kind <kind> --title <title>` を通過した body だけを起票に回す。
+3. **起票は `create_issue_txn.py` 経由のみ**: `materialize_child_issues.py` は `gh issue create` を直接呼ばない。`--label-profile standard|triage_only` も `create_issue_txn.py` に転送する。
+4. **`depends_on` 写像 + read-back**: 各依存を `create_issue_txn.py --dependency <n>` に写像し、GitHub dependency read-back（`_readback_dependencies`）まで `create_issue_txn.py` が確認する。
+5. **parent checklist 安全 patch**: parent body の `## Child Issues` section 内で `body_sha256` 一致 / exact `old_line` / `expected_match_count == 1` / post-edit read-back を満たす場合のみ patch する。`partial_failure` では parent patch を一切行わない。
+6. **overlap gate**: overlap preflight（#948）が未導入（`overlap.status: not_run|deferred_to_issue`）の場合は各 child が #948 を `depends_on` に明記していることを要求し、満たさなければ `human_escalation`。`overlap.status: undeterminable` は無条件で `human_escalation`。
+7. **出力**: `CHILD_MATERIALIZATION_RESULT_V2`（schema 正本は `docs/dev/agent-skill-boundaries.md`）を stdout に JSON で返す。exit code は `ok`=0 / `human_escalation`=3 / それ以外=1。
+
+設計境界の詳細は `docs/dev/agent-skill-boundaries.md` の「child materialization executor」を参照。
+
 ## Output
 
 1. **Issue タイトル**: `<type>(<scope>): <description>` 形式で 1 案を決定（ユーザーへの選択肢提示は不要）
