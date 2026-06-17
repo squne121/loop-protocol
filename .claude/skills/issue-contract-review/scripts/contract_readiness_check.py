@@ -237,7 +237,7 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
 
     try:
         result = subprocess.run(
-            [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--body-file", tmp_path],
+            [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
             capture_output=True,
             text=True,
             timeout=120,
@@ -305,6 +305,9 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     "baseline_expect_pass": "go",
     # baseline_regression_failed: VC annotated baseline-expect: pass but exited non-0
     "baseline_regression_failed": "human_judgment",
+    # Issue #899: strict-mode annotation violations are body-author-fixable
+    "inline_baseline_expect_invalid_placement": "needs_fix",
+    "missing_baseline_expect_for_new_allowed_path": "needs_fix",
 }
 
 
@@ -458,7 +461,11 @@ def map_preflight_result_to_errors(
                     "line_end": r.get("line", 0),
                     "minimal_context": _build_vc_context(r),
                     "fix_hint": r.get("fix_hint") or _default_fix_hint(category),
-                    "autofixable": category in ("compound_command_disallowed",),
+                    "autofixable": category in (
+                        "compound_command_disallowed",
+                        "inline_baseline_expect_invalid_placement",
+                        "missing_baseline_expect_for_new_allowed_path",
+                    ),
                     "source_payload": {
                         "classification": classification,
                         "decision": decision,
@@ -466,6 +473,9 @@ def map_preflight_result_to_errors(
                         "exit_code": r.get("exit_code"),
                         "command_hash": r.get("command_hash", ""),
                         "duration_ms": r.get("duration_ms"),
+                        "strict": r.get("strict"),
+                        "repair": r.get("repair"),
+                        "annotations": r.get("annotations"),
                     },
                 }
             )
