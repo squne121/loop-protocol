@@ -406,6 +406,10 @@ class TestRunTransactionImplementationLabels:
     def test_implementation_kind_applies_standard_labels(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
         monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/100")
+        # AC3 (#946): create_issue_txn now forwards --kind/--title to the body
+        # validator, so this label-focused test isolates the validation gate (the
+        # minimal placeholder title/body are not full-template-valid by design).
+        monkeypatch.setattr(txn, "_run_issue_body_validator", lambda *_a, **_k: {"status": "pass", "errors": []})
         monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [100]))
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
 
@@ -444,6 +448,10 @@ class TestRunTransactionImplementationLabels:
     def test_non_implementation_kind_does_not_apply_standard_labels(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
         monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/101")
+        # AC3 (#946): create_issue_txn now forwards --kind/--title to the body
+        # validator, so this label-focused test isolates the validation gate (the
+        # minimal placeholder title/body are not full-template-valid by design).
+        monkeypatch.setattr(txn, "_run_issue_body_validator", lambda *_a, **_k: {"status": "pass", "errors": []})
         monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [101]))
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
 
