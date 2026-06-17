@@ -52,9 +52,9 @@ def test_helper_and_fixture_exist():
 def test_cli_dry_run_no_candidates_returns_safe_new_issue():
     out = _run_cli("--dry-run")
     assert out["mode"] == "issue_overlap"
-    assert out["verdict"] in VERDICTS
+    assert out["decision"] in VERDICTS
     # 候補なしの dry-run は safe_new_issue
-    assert out["verdict"] == "safe_new_issue"
+    assert out["decision"] == "safe_new_issue"
 
 
 def test_cli_dry_run_with_overlapping_candidate(tmp_path):
@@ -71,8 +71,8 @@ def test_cli_dry_run_with_overlapping_candidate(tmp_path):
     cand_file = tmp_path / "candidates.json"
     cand_file.write_text(json.dumps(candidates), encoding="utf-8")
     out = _run_cli("--dry-run", "--candidates-file", str(cand_file))
-    assert out["verdict"] in VERDICTS
-    assert out["verdict"] == "overlap_requires_comment"
+    assert out["decision"] in VERDICTS
+    assert out["decision"] == "overlap_requires_comment"
     assert 900 in out["matched_issues"]
 
 

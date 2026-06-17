@@ -83,4 +83,4 @@ def test_child_overlap_result_verdict_is_closed_enum():
     ]
     result = cio.classify_child_overlap(children)
     assert result.verdict in cio.VERDICTS
-    assert result.to_dict()["verdict"] in cio.VERDICTS
+    assert result.to_dict()["decision"] in cio.VERDICTS

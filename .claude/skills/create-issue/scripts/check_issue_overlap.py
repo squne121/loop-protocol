@@ -4,25 +4,36 @@ check_issue_overlap.py
 
 Issue 起票前の duplicate / overlap preflight helper。
 
-title keyword search だけに依存せず、title / goal / Allowed Paths / labels /
-parent issue refs を使って既存 OPEN Issue / 兄弟 child との overlap を機械判定する。
+title keyword search だけに依存せず、title / goal_ref / Allowed Paths / labels /
+parent issue refs / dependency refs を使って既存 OPEN Issue / 兄弟 child との
+overlap を機械判定し、`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1` を返す。
 
-Closed verdict enum（VERDICTS）:
-- duplicate:                既存 OPEN Issue とほぼ同一スコープ（Allowed Paths が同一集合）
-- overlap_requires_comment: Allowed Paths が部分的に重なる OPEN Issue が存在（coordination コメントが必要）
-- safe_new_issue:           overlap なし（新規起票で安全）
-- ambiguous_requires_human: 判定不能（title は重複だが Allowed Paths が disjoint 等）→ 人間判断
+## 設計境界（advisory / scope）
 
-GitHub full-text search の false positive は、候補 Issue body を read-back して
-実際の Allowed Paths overlap / title 類似を確認することで除外する
-（search hit という事実だけでは overlap と判定しない）。
+- 本 helper は **preflight advisory + structured evidence producer** であり、
+  `create_issue_txn.py` の mutation hard gate ではない（hard gate 配線は #948
+  follow-up と #946 の責務）。
+- verdict の closed enum（`duplicate` / `overlap_requires_comment` /
+  `safe_new_issue` / `ambiguous_requires_human`）は AC2 の正本。`policy_class`
+  は workflow.md（#384/#386）の Scope Collision Classification（C0/C1/C2a/C2b/C3）
+  への **mapping** であり、policy の再定義ではない。
+- path normalization は #387（scope_collision_check の evidence producer, OPEN）
+  と互換となる contract を目指す。#387 マージ後に共有正規化関数へ寄せる
+  （follow-up）。現時点では本 module 内の `normalize_path` が正本。
+- GitHub source（search / read-back / child plan）の失敗・partial・saturation は
+  **fail-closed**（`ambiguous_requires_human`）に倒す。`safe_new_issue` は
+  「source 成功かつ overlap 0」のときだけ返す。
+- child overlap（`classify_child_overlap`）は **fixture-only な sibling path
+  overlap checker** であり、#946 の `CHILD_MATERIALIZATION_PLAN_V2` を完全に
+  consume する gate ではない。lookup 不完全 / ambiguous child は fail-closed。
 
-delivery-rollup parent の child 起票では、まだ存在しない child 同士の
-Allowed Paths overlap も検査する（classify_child_overlap）。
-
-本 helper は決定論的 pure function を中核とし、GitHub 取得は CLI 層の薄い
-adapter に閉じる。tests は offline（--candidates-file / --children-file）で
-すべての verdict 経路を再現できる。
+policy_mapping:
+- exact_duplicate -> duplicate
+- C0  -> safe_new_issue
+- C1  -> overlap_requires_comment
+- C2a -> overlap_requires_comment
+- C2b -> ambiguous_requires_human
+- C3  -> ambiguous_requires_human
 """
 
 from __future__ import annotations
@@ -37,8 +48,11 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 
+SCHEMA_VERSION = "issue_overlap_preflight/v1"
+
+
 # ============================================================
-# Verdict enum（closed set）
+# decision enum（closed set, AC2 の正本）
 # ============================================================
 
 DUPLICATE = "duplicate"
@@ -47,34 +61,86 @@ SAFE_NEW_ISSUE = "safe_new_issue"
 AMBIGUOUS_REQUIRES_HUMAN = "ambiguous_requires_human"
 
 VERDICTS: frozenset = frozenset(
+    {DUPLICATE, OVERLAP_REQUIRES_COMMENT, SAFE_NEW_ISSUE, AMBIGUOUS_REQUIRES_HUMAN}
+)
+
+# ------------------------------------------------------------
+# reason_code enum
+# ------------------------------------------------------------
+
+REASON_CODES: frozenset = frozenset(
     {
-        DUPLICATE,
-        OVERLAP_REQUIRES_COMMENT,
-        SAFE_NEW_ISSUE,
-        AMBIGUOUS_REQUIRES_HUMAN,
+        "exact_title_duplicate",
+        "goal_ref_duplicate",
+        "allowed_paths_overlap",
+        "parent_child_collision",
+        "dependency_ambiguous",
+        "source_failed",
+        "readback_partial",
+        "malformed_candidate_contract",
+        "no_overlap",
     }
 )
+
+# ------------------------------------------------------------
+# policy_class enum（workflow.md #384/#386 への mapping）
+# ------------------------------------------------------------
+
+POLICY_CLASSES: frozenset = frozenset({"C0", "C1", "C2a", "C2b", "C3", "unknown"})
+
+POLICY_TO_DECISION = {
+    "exact_duplicate": DUPLICATE,
+    "C0": SAFE_NEW_ISSUE,
+    "C1": OVERLAP_REQUIRES_COMMENT,
+    "C2a": OVERLAP_REQUIRES_COMMENT,
+    "C2b": AMBIGUOUS_REQUIRES_HUMAN,
+    "C3": AMBIGUOUS_REQUIRES_HUMAN,
+}
+
+# ------------------------------------------------------------
+# matched_field enum
+# ------------------------------------------------------------
+
+MATCHED_FIELDS: frozenset = frozenset(
+    {"title", "goal_ref", "allowed_paths", "labels", "parent_refs"}
+)
+
+# ------------------------------------------------------------
+# source_status 値
+# ------------------------------------------------------------
+
+SOURCE_OK = "ok"
+SOURCE_FAILED = "failed"
+SOURCE_PARTIAL = "partial"
+SOURCE_SATURATED = "saturated"
+SOURCE_ABSENT = "absent"
 
 # title 類似のしきい値（Jaccard）
 _TITLE_DUP_THRESHOLD = 0.8       # ほぼ同一タイトル
 _TITLE_RELATED_THRESHOLD = 0.5   # 関連していると見なす下限
 
+# full-text search の saturation 既定 limit
+_DEFAULT_SEARCH_LIMIT = 30
+
 
 # ============================================================
-# Allowed Paths の正規化と overlap 判定
+# Allowed Paths の正規化と overlap 判定（#387 互換 contract を志向）
 # ============================================================
 
-_BULLET_RE = re.compile(r"^\s*[-+*]\s+")
+_BULLET_RE = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")  # - + * および 1. 1) 番号付き
 _CODE_RE = re.compile(r"^`([^`]+)`\s*(?:[（(].*)?$")
 _PAREN_ANNOTATION_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
+_MULTI_SLASH_RE = re.compile(r"/{2,}")
 
 
 def normalize_path(entry: str) -> str:
     """Allowed Paths の 1 エントリを bare path に正規化する。
 
-    - bullet marker（-, +, *）を除去
-    - backtick 包み（`path`）と末尾の全角/半角括弧注釈を除去
-    - 先頭の ``./`` と末尾スラッシュを除去
+    対応:
+    - bullet marker（- + *）と番号付きリスト（1. / 1)）の除去
+    - backtick 包み（`path`）と末尾の全角/半角括弧注釈の除去
+    - 先頭の ``./``、連続スラッシュの圧縮、末尾スラッシュの除去
+    - 末尾 glob ``/**`` / ``/*`` は basedir に畳む（prefix 比較で吸収するため）
     """
     s = entry.strip()
     s = _BULLET_RE.sub("", s).strip()
@@ -83,11 +149,14 @@ def normalize_path(entry: str) -> str:
         s = m.group(1).strip()
     else:
         s = _PAREN_ANNOTATION_RE.sub("", s).strip()
-    # 残った backtick / 末尾注釈を保守的に除去
     s = s.strip("`").strip()
     s = _PAREN_ANNOTATION_RE.sub("", s).strip()
     if s.startswith("./"):
         s = s[2:]
+    s = _MULTI_SLASH_RE.sub("/", s)
+    # 末尾 glob を basedir に畳む（tests/x/** -> tests/x, tests/x/* -> tests/x）
+    while s.endswith("/**") or s.endswith("/*"):
+        s = s.rsplit("/", 1)[0]
     s = s.rstrip("/")
     return s
 
@@ -110,8 +179,11 @@ def _segments(path: str) -> List[str]:
 def paths_conflict(a: str, b: str) -> bool:
     """2 つの正規化済みパスが同一スコープを指すか判定する。
 
-    完全一致、または一方が他方のディレクトリ接頭辞（segment prefix）である場合に
-    True を返す（例: ``tests/create-issue`` と ``tests/create-issue/test_x.py``）。
+    完全一致、または一方が他方の **segment 単位の** ディレクトリ接頭辞である
+    場合に True を返す（例: ``tests/create-issue`` と
+    ``tests/create-issue/test_x.py``）。
+    単なる文字列接頭辞（``tests/create`` と ``tests/create-issue``）は
+    segment 境界が異なるため overlap としない。
     """
     a = normalize_path(a)
     b = normalize_path(b)
@@ -134,7 +206,6 @@ def allowed_paths_overlap(
     for a in a_norm:
         for b in b_norm:
             if paths_conflict(a, b):
-                # より具体的（segment 数が多い）方を overlap 表現として残す
                 hits.add(a if len(_segments(a)) >= len(_segments(b)) else b)
     return tuple(sorted(hits))
 
@@ -146,21 +217,28 @@ def same_path_set(a_paths: Iterable[str], b_paths: Iterable[str]) -> bool:
 
 
 # ============================================================
-# title 類似（Jaccard token similarity）
+# title / goal_ref 類似
 # ============================================================
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-z]+|[぀-ヿ一-鿿]")
-# create-issue の title prefix（実装: / implement: 等）はノイズなので除外
-_TITLE_PREFIX_RE = re.compile(r"^\s*(実装|implement|impl|docs?|fix|chore|test)\s*[:：]\s*", re.IGNORECASE)
+_TITLE_PREFIX_RE = re.compile(
+    r"^\s*(実装|implement|impl|docs?|fix|chore|test)\s*[:：]\s*", re.IGNORECASE
+)
 
 
-def _title_tokens(title: str) -> frozenset:
+def _title_tokens(title: str) -> Tuple[str, ...]:
+    """title を正規化 token の **決定的（sorted）** tuple にする。
+
+    frozenset の反復順は非決定的なため、CLI query 生成にも使える sorted tuple
+    を返す（"deterministic" helper の契約を満たす）。
+    """
     body = _TITLE_PREFIX_RE.sub("", title or "")
-    return frozenset(t.lower() for t in _TOKEN_RE.findall(body))
+    toks = {t.lower() for t in _TOKEN_RE.findall(body)}
+    return tuple(sorted(toks))
 
 
 def title_similarity(a: str, b: str) -> float:
-    ta, tb = _title_tokens(a), _title_tokens(b)
+    ta, tb = set(_title_tokens(a)), set(_title_tokens(b))
     if not ta or not tb:
         return 0.0
     inter = len(ta & tb)
@@ -168,27 +246,59 @@ def title_similarity(a: str, b: str) -> float:
     return inter / union if union else 0.0
 
 
+def _norm_goal(goal: str) -> str:
+    return re.sub(r"\s+", " ", (goal or "").strip().lower())
+
+
 # ============================================================
-# 入力モデル
+# source_status / 入力モデル
 # ============================================================
 
 @dataclass(frozen=True)
-class IssueScope:
-    """Issue / child spec の overlap 判定に必要な最小スコープ。"""
+class SourceStatus:
+    issue_search: str = SOURCE_OK
+    issue_readback: str = SOURCE_OK
+    child_plan: str = SOURCE_ABSENT
 
+    @staticmethod
+    def ok() -> "SourceStatus":
+        return SourceStatus(SOURCE_OK, SOURCE_OK, SOURCE_ABSENT)
+
+    def is_degraded(self) -> bool:
+        return (
+            self.issue_search in {SOURCE_FAILED, SOURCE_SATURATED}
+            or self.issue_readback in {SOURCE_FAILED, SOURCE_PARTIAL}
+            or self.child_plan == SOURCE_FAILED
+        )
+
+    def degraded_reason(self) -> str:
+        if self.issue_readback in {SOURCE_FAILED, SOURCE_PARTIAL}:
+            return "readback_partial"
+        return "source_failed"
+
+    def to_dict(self) -> dict:
+        return {
+            "issue_search": self.issue_search,
+            "issue_readback": self.issue_readback,
+            "child_plan": self.child_plan,
+        }
+
+
+@dataclass(frozen=True)
+class IssueScope:
     title: str
     allowed_paths: Tuple[str, ...] = ()
     number: Optional[int] = None
-    goal: str = ""
+    url: str = ""
+    goal: str = ""                       # goal_ref
     labels: Tuple[str, ...] = ()
     parent_refs: Tuple[str, ...] = ()
+    depends_on: Tuple[str, ...] = ()     # `Depends on #N` / native dependency
     body: Optional[str] = None
     state: str = "OPEN"
-    # full-text search 由来の候補は read-back 検証が必要であることを示す
-    search_hit: bool = False
+    search_hit: bool = False             # full-text search 由来 → read-back 必須
 
     def effective_allowed_paths(self) -> Tuple[str, ...]:
-        """明示 allowed_paths があればそれを、無ければ body から read-back する。"""
         if self.allowed_paths:
             return normalize_paths(self.allowed_paths)
         if self.body:
@@ -201,9 +311,11 @@ class IssueScope:
             title=str(d.get("title", "")),
             allowed_paths=tuple(d.get("allowed_paths", []) or []),
             number=d.get("number"),
-            goal=str(d.get("goal", "") or ""),
+            url=str(d.get("url", "") or ""),
+            goal=str(d.get("goal", d.get("goal_ref", "")) or ""),
             labels=tuple(d.get("labels", []) or []),
             parent_refs=tuple(str(x) for x in (d.get("parent_refs", []) or [])),
+            depends_on=tuple(str(x) for x in (d.get("depends_on", []) or [])),
             body=d.get("body"),
             state=str(d.get("state", "OPEN") or "OPEN"),
             search_hit=bool(d.get("search_hit", False)),
@@ -211,12 +323,7 @@ class IssueScope:
 
 
 def extract_allowed_paths(body: str) -> List[str]:
-    """Issue body の ``## Allowed Paths`` セクションを read-back する。
-
-    GitHub full-text search が body のどこか（例: 引用や本文中の言及）に
-    キーワードを見つけても、実際の Allowed Paths セクションに当該パスが
-    無ければ overlap とは見なさない。この read-back が false positive 除外の核。
-    """
+    """Issue body の ``## Allowed Paths`` セクションを read-back する。"""
     if not body:
         return []
     match = re.search(
@@ -238,25 +345,105 @@ def extract_allowed_paths(body: str) -> List[str]:
     return paths
 
 
+def _ref_key(ref: str) -> str:
+    """`#948` / `948` / URL を `948` に正規化する。"""
+    s = str(ref).strip()
+    m = re.search(r"(\d+)\s*$", s)
+    return m.group(1) if m else s.lower()
+
+
 # ============================================================
 # 判定結果モデル
 # ============================================================
 
 @dataclass(frozen=True)
+class DependencyRelation:
+    relation: str = "none"   # predecessor | successor | none | ambiguous
+    evidence: str = "none"   # native_dependency | line_anchored_depends_on | parent_work_ordering | none
+
+    def to_dict(self) -> dict:
+        return {"relation": self.relation, "evidence": self.evidence}
+
+
+@dataclass(frozen=True)
+class CandidateEvidence:
+    issue_number: Optional[int]
+    url: str
+    title: str
+    matched_fields: Tuple[str, ...]
+    labels: Tuple[str, ...]
+    parent_refs: Tuple[str, ...]
+    allowed_paths: Tuple[str, ...]
+    overlapping_paths: Tuple[str, ...]
+    dependency_relation: DependencyRelation
+
+    def to_dict(self) -> dict:
+        return {
+            "issue_number": self.issue_number,
+            "url": self.url,
+            "title": self.title,
+            "matched_fields": list(self.matched_fields),
+            "labels": list(self.labels),
+            "parent_refs": list(self.parent_refs),
+            "allowed_paths": list(self.allowed_paths),
+            "overlapping_paths": list(self.overlapping_paths),
+            "dependency_relation": self.dependency_relation.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class OverlapResult:
     verdict: str
+    reason_code: str = "no_overlap"
+    policy_class: str = "C0"
     reason: str = ""
-    matched_issues: Tuple[int, ...] = ()
-    overlapping_paths: Tuple[str, ...] = ()
+    source_status: SourceStatus = field(default_factory=SourceStatus.ok)
+    target: Optional["IssueScope"] = None
+    candidates: Tuple[CandidateEvidence, ...] = ()
+    comment_template: Optional[str] = None
     excluded_false_positives: Tuple[int, ...] = ()
+
+    # --- 後方互換 derived プロパティ ---
+    @property
+    def decision(self) -> str:
+        return self.verdict
+
+    @property
+    def matched_issues(self) -> Tuple[int, ...]:
+        return tuple(
+            c.issue_number for c in self.candidates if c.issue_number is not None
+        )
+
+    @property
+    def overlapping_paths(self) -> Tuple[str, ...]:
+        hits: set = set()
+        for c in self.candidates:
+            hits.update(c.overlapping_paths)
+        return tuple(sorted(hits))
 
     def to_dict(self) -> dict:
         assert self.verdict in VERDICTS, f"invalid verdict: {self.verdict}"
+        assert self.reason_code in REASON_CODES, f"invalid reason_code: {self.reason_code}"
+        assert self.policy_class in POLICY_CLASSES, f"invalid policy_class: {self.policy_class}"
+        tgt = self.target
         return {
-            "verdict": self.verdict,
-            "reason": self.reason,
+            "schema_version": SCHEMA_VERSION,
+            "mode": "issue_overlap",
+            "decision": self.verdict,
+            "reason_code": self.reason_code,
+            "policy_class": self.policy_class,
+            "source_status": self.source_status.to_dict(),
+            "target": {
+                "title": tgt.title if tgt else "",
+                "goal_ref": tgt.goal if tgt else "",
+                "labels": list(tgt.labels) if tgt else [],
+                "parent_refs": list(tgt.parent_refs) if tgt else [],
+                "allowed_paths": list(tgt.effective_allowed_paths()) if tgt else [],
+            },
+            "candidates": [c.to_dict() for c in self.candidates],
             "matched_issues": list(self.matched_issues),
             "overlapping_paths": list(self.overlapping_paths),
+            "comment_template": self.comment_template,
             "excluded_false_positives": list(self.excluded_false_positives),
         }
 
@@ -269,28 +456,39 @@ class ChildOverlapPair:
     b_title: str
     overlapping_paths: Tuple[str, ...]
 
+    def to_dict(self) -> dict:
+        return {
+            "a_index": self.a_index,
+            "b_index": self.b_index,
+            "a_title": self.a_title,
+            "b_title": self.b_title,
+            "overlapping_paths": list(self.overlapping_paths),
+        }
+
 
 @dataclass(frozen=True)
 class ChildOverlapResult:
     verdict: str
+    reason_code: str = "no_overlap"
+    policy_class: str = "C0"
     reason: str = ""
     overlapping_pairs: Tuple[ChildOverlapPair, ...] = ()
+    comment_template: Optional[str] = None
+    child_plan_status: str = SOURCE_OK
 
     def to_dict(self) -> dict:
         assert self.verdict in VERDICTS, f"invalid verdict: {self.verdict}"
+        assert self.reason_code in REASON_CODES
+        assert self.policy_class in POLICY_CLASSES
         return {
-            "verdict": self.verdict,
-            "reason": self.reason,
-            "overlapping_pairs": [
-                {
-                    "a_index": p.a_index,
-                    "b_index": p.b_index,
-                    "a_title": p.a_title,
-                    "b_title": p.b_title,
-                    "overlapping_paths": list(p.overlapping_paths),
-                }
-                for p in self.overlapping_pairs
-            ],
+            "schema_version": SCHEMA_VERSION,
+            "mode": "child_overlap",
+            "decision": self.verdict,
+            "reason_code": self.reason_code,
+            "policy_class": self.policy_class,
+            "child_plan_status": self.child_plan_status,
+            "overlapping_pairs": [p.to_dict() for p in self.overlapping_pairs],
+            "comment_template": self.comment_template,
         }
 
 
@@ -298,84 +496,273 @@ class ChildOverlapResult:
 # 判定ロジック（pure function）
 # ============================================================
 
-def classify_overlap(
-    current: IssueScope, candidates: Sequence[IssueScope]
-) -> OverlapResult:
-    """現在の起票候補と既存 Issue 群の overlap を closed enum で判定する。
+def _dependency_relation(current: IssueScope, cand: IssueScope) -> DependencyRelation:
+    """current と candidate の dependency 関係を判定する。"""
+    cur_dep = {_ref_key(r) for r in current.depends_on}
+    cand_dep = {_ref_key(r) for r in cand.depends_on}
+    cand_key = _ref_key(cand.number) if cand.number is not None else None
+    cur_key = _ref_key(current.number) if current.number is not None else None
 
-    precedence: duplicate > overlap_requires_comment > ambiguous_requires_human
-    > safe_new_issue。
+    if cand_key and cand_key in cur_dep:
+        return DependencyRelation("predecessor", "line_anchored_depends_on")
+    if cur_key and cur_key in cand_dep:
+        return DependencyRelation("successor", "line_anchored_depends_on")
+    # 共有 parent による work ordering
+    cur_parents = {_ref_key(r) for r in current.parent_refs}
+    cand_parents = {_ref_key(r) for r in cand.parent_refs}
+    if cur_parents and cur_parents & cand_parents:
+        return DependencyRelation("none", "parent_work_ordering")
+    return DependencyRelation("none", "none")
+
+
+def _evaluate_candidate(
+    current: IssueScope, cand: IssueScope
+) -> Tuple[Optional[CandidateEvidence], List[str]]:
+    """1 candidate を評価し evidence を返す。matched_fields を構築する。"""
+    cur_paths = current.effective_allowed_paths()
+    cand_paths = cand.effective_allowed_paths()
+    overlap = allowed_paths_overlap(cur_paths, cand_paths)
+    tsim = title_similarity(current.title, cand.title)
+
+    matched: List[str] = []
+    if tsim >= _TITLE_DUP_THRESHOLD:
+        matched.append("title")
+    if current.goal and cand.goal and _norm_goal(current.goal) == _norm_goal(cand.goal):
+        matched.append("goal_ref")
+    if overlap:
+        matched.append("allowed_paths")
+    cur_labels = {l.lower() for l in current.labels}
+    cand_labels = {l.lower() for l in cand.labels}
+    # routing 用 generic label を除いた意味的 label の共有のみ matched 扱い
+    generic = {"enhancement", "bug", "workflow", "phase/implementation",
+               "agent/implementer", "documentation", "docs"}
+    shared_labels = (cur_labels & cand_labels) - generic
+    if shared_labels:
+        matched.append("labels")
+    dep = _dependency_relation(current, cand)
+    cur_parents = {_ref_key(r) for r in current.parent_refs}
+    cand_key = _ref_key(cand.number) if cand.number is not None else None
+    shared_parent = bool(cur_parents & {_ref_key(r) for r in cand.parent_refs})
+    parent_child = bool(
+        (cand_key and cand_key in cur_parents)
+        or (cur_parents and shared_parent)
+    )
+    if parent_child:
+        matched.append("parent_refs")
+
+    evidence = CandidateEvidence(
+        issue_number=cand.number,
+        url=cand.url,
+        title=cand.title,
+        matched_fields=tuple(matched),
+        labels=tuple(cand.labels),
+        parent_refs=tuple(cand.parent_refs),
+        allowed_paths=cand_paths,
+        overlapping_paths=overlap,
+        dependency_relation=dep,
+    )
+    return evidence, matched
+
+
+def classify_overlap(
+    current: IssueScope,
+    candidates: Sequence[IssueScope],
+    source_status: Optional[SourceStatus] = None,
+) -> OverlapResult:
+    """起票候補と既存 Issue 群の overlap を closed enum + structured evidence で判定する。
+
+    precedence: source degraded(fail-closed) > exact_duplicate > parent_child_collision
+    > dependency(C2a/C2b) > allowed_paths_overlap(C1) > title/goal disjoint(C3)
+    > safe_new_issue(C0)。
     """
+    source_status = source_status or SourceStatus.ok()
+
+    # --- fail-closed: GitHub source が degraded なら ambiguous へ倒す ---
+    if source_status.is_degraded():
+        return OverlapResult(
+            verdict=AMBIGUOUS_REQUIRES_HUMAN,
+            reason_code=source_status.degraded_reason(),
+            policy_class="unknown",
+            reason="GitHub source（search / read-back）が degraded。safe 判定不可。",
+            source_status=source_status,
+            target=current,
+        )
+
     cur_paths = current.effective_allowed_paths()
 
-    duplicate_hits: List[int] = []
-    overlap_hits: List[int] = []
-    overlap_paths: set = set()
-    title_dup_disjoint: List[int] = []
+    duplicate: List[CandidateEvidence] = []
+    parent_collision: List[CandidateEvidence] = []
+    dep_open: List[CandidateEvidence] = []     # predecessor open -> C2b
+    dep_closed: List[CandidateEvidence] = []   # predecessor closed -> C2a
+    overlap_partial: List[CandidateEvidence] = []
+    title_goal_disjoint: List[CandidateEvidence] = []
     excluded: List[int] = []
 
     for cand in candidates:
-        # OPEN 以外（CLOSED / MERGED 等）は overlap 対象外
         if str(cand.state).upper() != "OPEN":
             continue
-
-        cand_paths = cand.effective_allowed_paths()
-        path_overlap = allowed_paths_overlap(cur_paths, cand_paths)
-        tsim = title_similarity(current.title, cand.title)
+        ev, matched = _evaluate_candidate(current, cand)
+        has_path = "allowed_paths" in matched
+        has_title = "title" in matched
+        has_goal = "goal_ref" in matched
+        has_parent = "parent_refs" in matched
 
         # --- false positive 除外（read-back） ---
-        # full-text search hit だが、Allowed Paths が実際には重ならず、
-        # title 類似も低い候補は false positive として除外する。
-        if cand.search_hit and not path_overlap and tsim < _TITLE_RELATED_THRESHOLD:
+        if cand.search_hit and not has_path and not has_title and not has_goal:
             if cand.number is not None:
                 excluded.append(cand.number)
             continue
 
-        if path_overlap and cur_paths and same_path_set(cur_paths, cand_paths):
-            if cand.number is not None:
-                duplicate_hits.append(cand.number)
-            overlap_paths.update(path_overlap)
-        elif path_overlap:
-            if cand.number is not None:
-                overlap_hits.append(cand.number)
-            overlap_paths.update(path_overlap)
-        elif tsim >= _TITLE_DUP_THRESHOLD:
-            # title はほぼ同一だが Allowed Paths が disjoint → 判定不能
-            if cand.number is not None:
-                title_dup_disjoint.append(cand.number)
+        # precedence（candidate 単位）:
+        # title+goal 同時一致 > 明示 dependency > parent/child collision
+        # > 同一 path 集合(duplicate) > 部分 overlap(C1) > title/goal disjoint(C3)
+        if has_title and has_goal:
+            duplicate.append(ev)
+            continue
+        if has_path:
+            rel = ev.dependency_relation.relation
+            if rel == "predecessor":
+                # 明示依存がある = 意図的な直列化であり duplicate ではない
+                if str(cand.state).upper() == "OPEN":
+                    dep_open.append(ev)
+                else:
+                    dep_closed.append(ev)
+                continue
+            if has_parent:
+                parent_collision.append(ev)
+                continue
+            if same_path_set(cur_paths, ev.allowed_paths):
+                duplicate.append(ev)
+                continue
+            overlap_partial.append(ev)
+            continue
+        if has_title or has_goal:
+            title_goal_disjoint.append(ev)
 
-    if duplicate_hits:
+    # precedence に従って decision / policy_class / reason_code を決める
+    if duplicate:
         return OverlapResult(
             verdict=DUPLICATE,
-            reason="既存 OPEN Issue と Allowed Paths が同一集合",
-            matched_issues=tuple(sorted(duplicate_hits)),
-            overlapping_paths=tuple(sorted(overlap_paths)),
+            reason_code="exact_title_duplicate"
+            if any("title" in c.matched_fields for c in duplicate)
+            else "goal_ref_duplicate",
+            policy_class="unknown",
+            reason="既存 OPEN Issue と Allowed Paths 同一集合、または title+goal 同時一致",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(duplicate),
             excluded_false_positives=tuple(sorted(excluded)),
         )
-    if overlap_hits:
-        return OverlapResult(
-            verdict=OVERLAP_REQUIRES_COMMENT,
-            reason="既存 OPEN Issue と Allowed Paths が部分的に重複",
-            matched_issues=tuple(sorted(overlap_hits)),
-            overlapping_paths=tuple(sorted(overlap_paths)),
-            excluded_false_positives=tuple(sorted(excluded)),
-        )
-    if title_dup_disjoint:
+    if parent_collision:
         return OverlapResult(
             verdict=AMBIGUOUS_REQUIRES_HUMAN,
-            reason="title が既存 Issue とほぼ同一だが Allowed Paths が disjoint",
-            matched_issues=tuple(sorted(title_dup_disjoint)),
+            reason_code="parent_child_collision",
+            policy_class="C3",
+            reason="parent/child 関係で Allowed Paths が衝突",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(parent_collision),
+            comment_template=_build_comment_template(parent_collision, "C3"),
+            excluded_false_positives=tuple(sorted(excluded)),
+        )
+    if dep_open:
+        return OverlapResult(
+            verdict=AMBIGUOUS_REQUIRES_HUMAN,
+            reason_code="dependency_ambiguous",
+            policy_class="C2b",
+            reason="predecessor が open のまま依存順未解決（C2b）",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(dep_open),
+            comment_template=_build_comment_template(dep_open, "C2b"),
+            excluded_false_positives=tuple(sorted(excluded)),
+        )
+    if dep_closed:
+        return OverlapResult(
+            verdict=OVERLAP_REQUIRES_COMMENT,
+            reason_code="allowed_paths_overlap",
+            policy_class="C2a",
+            reason="predecessor が close 済みで直列化可能（C2a）",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(dep_closed),
+            comment_template=_build_comment_template(dep_closed, "C2a"),
+            excluded_false_positives=tuple(sorted(excluded)),
+        )
+    if overlap_partial:
+        return OverlapResult(
+            verdict=OVERLAP_REQUIRES_COMMENT,
+            reason_code="allowed_paths_overlap",
+            policy_class="C1",
+            reason="既存 OPEN Issue と Allowed Paths が部分的に重複（C1 benign overlap）",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(overlap_partial),
+            comment_template=_build_comment_template(overlap_partial, "C1"),
+            excluded_false_positives=tuple(sorted(excluded)),
+        )
+    if title_goal_disjoint:
+        return OverlapResult(
+            verdict=AMBIGUOUS_REQUIRES_HUMAN,
+            reason_code="exact_title_duplicate"
+            if any("title" in c.matched_fields for c in title_goal_disjoint)
+            else "goal_ref_duplicate",
+            policy_class="C3",
+            reason="title / goal が既存 Issue とほぼ一致するが Allowed Paths が disjoint（C3）",
+            source_status=source_status,
+            target=current,
+            candidates=tuple(title_goal_disjoint),
+            comment_template=_build_comment_template(title_goal_disjoint, "C3"),
             excluded_false_positives=tuple(sorted(excluded)),
         )
     return OverlapResult(
         verdict=SAFE_NEW_ISSUE,
-        reason="overlap なし（新規起票で安全）",
+        reason_code="no_overlap",
+        policy_class="C0",
+        reason="overlap なし（新規起票で安全, C0）",
+        source_status=source_status,
+        target=current,
         excluded_false_positives=tuple(sorted(excluded)),
     )
 
 
-def classify_child_overlap(children: Sequence[IssueScope]) -> ChildOverlapResult:
-    """delivery-rollup parent の兄弟 child 同士の Allowed Paths overlap を検査する。"""
+def _build_comment_template(
+    cands: Sequence[CandidateEvidence], policy_class: str
+) -> str:
+    refs = ", ".join(f"#{c.issue_number}" for c in cands if c.issue_number is not None)
+    paths: set = set()
+    for c in cands:
+        paths.update(c.overlapping_paths)
+    path_list = ", ".join(sorted(paths)) or "(none)"
+    return (
+        f"Scope Collision ({policy_class}): related_issue={refs or '(none)'}; "
+        f"overlapping_paths={path_list}. "
+        "non_conflict_reason / edit_intent / dependency ordering を記録すること。"
+    )
+
+
+def classify_child_overlap(
+    children: Sequence[IssueScope],
+    *,
+    lookup_complete: bool = True,
+    ambiguous_child: bool = False,
+    child_plan_status: str = SOURCE_OK,
+) -> ChildOverlapResult:
+    """delivery-rollup parent の兄弟 child 同士の Allowed Paths overlap を検査する。
+
+    **fixture-only な sibling path overlap checker** であり、#946 の child
+    materialization gate ではない。lookup 不完全 / ambiguous child /
+    child_plan source 失敗は fail-closed（ambiguous_requires_human）。
+    """
+    if (not lookup_complete) or ambiguous_child or child_plan_status == SOURCE_FAILED:
+        return ChildOverlapResult(
+            verdict=AMBIGUOUS_REQUIRES_HUMAN,
+            reason_code="readback_partial" if not lookup_complete else "dependency_ambiguous",
+            policy_class="unknown",
+            reason="child plan lookup 不完全 / ambiguous child / source 失敗 → fail-closed",
+            child_plan_status=child_plan_status if child_plan_status != SOURCE_OK else SOURCE_PARTIAL,
+        )
+
     pairs: List[ChildOverlapPair] = []
     has_identical = False
     for i in range(len(children)):
@@ -388,37 +775,50 @@ def classify_child_overlap(children: Sequence[IssueScope]) -> ChildOverlapResult
                 if same_path_set(a_paths, b_paths):
                     has_identical = True
                 pairs.append(
-                    ChildOverlapPair(
-                        a_index=i,
-                        b_index=j,
-                        a_title=a.title,
-                        b_title=b.title,
-                        overlapping_paths=overlap,
-                    )
+                    ChildOverlapPair(i, j, a.title, b.title, overlap)
                 )
 
     if not pairs:
         return ChildOverlapResult(
             verdict=SAFE_NEW_ISSUE,
+            reason_code="no_overlap",
+            policy_class="C0",
             reason="child 同士の Allowed Paths overlap なし",
+            child_plan_status=child_plan_status,
         )
     verdict = DUPLICATE if has_identical else OVERLAP_REQUIRES_COMMENT
     return ChildOverlapResult(
         verdict=verdict,
+        reason_code="allowed_paths_overlap",
+        policy_class="unknown" if has_identical else "C1",
         reason="child 同士で Allowed Paths が重複",
         overlapping_pairs=tuple(pairs),
+        comment_template=(
+            "Sibling child overlap: "
+            + "; ".join(
+                f"[{p.a_index}x{p.b_index}] {', '.join(p.overlapping_paths)}"
+                for p in pairs
+            )
+        ),
+        child_plan_status=child_plan_status,
     )
 
 
 # ============================================================
-# GitHub adapter（CLI 層、非 dry-run 時のみ使用）
+# GitHub adapter（CLI 層、非 dry-run 時のみ。fail-closed source_status を返す）
 # ============================================================
 
-def _gh_search_candidates(repo: str, query: str, limit: int = 30) -> List[IssueScope]:
+def gh_search_candidates(
+    repo: str, query_tokens: Sequence[str], limit: int = _DEFAULT_SEARCH_LIMIT
+) -> Tuple[List[IssueScope], SourceStatus]:
     """full-text search で候補 Issue を取得し body を read-back する。
 
-    network 依存のため tests からは呼ばれない（offline は --candidates-file）。
+    失敗 / partial / saturation を SourceStatus に正直に反映する
+    （fail-open して [] を返さない）。network 依存のため tests からは
+    monkeypatch / offline candidates で代替する。
     """
+    # in:title の決定的 query（sorted tokens）
+    query = " ".join(query_tokens)
     try:
         proc = subprocess.run(
             [
@@ -429,33 +829,38 @@ def _gh_search_candidates(repo: str, query: str, limit: int = 30) -> List[IssueS
             check=True, capture_output=True, text=True,
         )
         numbers = [item["number"] for item in json.loads(proc.stdout or "[]")]
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError):
-        return []
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError):
+        return [], SourceStatus(SOURCE_FAILED, SOURCE_OK, SOURCE_ABSENT)
+
+    search_status = SOURCE_SATURATED if len(numbers) >= limit else SOURCE_OK
 
     candidates: List[IssueScope] = []
+    readback_status = SOURCE_OK
     for num in numbers:
         try:
             view = subprocess.run(
                 [
                     "gh", "issue", "view", str(num), "--repo", repo,
-                    "--json", "number,title,body,labels,state",
+                    "--json", "number,title,body,labels,state,url",
                 ],
                 check=True, capture_output=True, text=True,
             )
             data = json.loads(view.stdout)
         except (subprocess.CalledProcessError, json.JSONDecodeError):
+            readback_status = SOURCE_PARTIAL
             continue
         candidates.append(
             IssueScope(
                 title=data.get("title", ""),
                 number=data.get("number"),
+                url=data.get("url", ""),
                 body=data.get("body"),
                 labels=tuple(l.get("name", "") for l in data.get("labels", []) or []),
                 state=data.get("state", "OPEN"),
                 search_hit=True,
             )
         )
-    return candidates
+    return candidates, SourceStatus(search_status, readback_status, SOURCE_ABSENT)
 
 
 # ============================================================
@@ -472,11 +877,37 @@ def _read_paths_file(path: str) -> List[str]:
     return out
 
 
-def _load_scope_list(path: str) -> List[IssueScope]:
+def _load_candidates(path: str) -> Tuple[List[IssueScope], SourceStatus]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    status = SourceStatus.ok()
     if isinstance(data, dict):
-        data = data.get("candidates") or data.get("children") or []
-    return [IssueScope.from_dict(d) for d in data]
+        ss = data.get("source_status")
+        if isinstance(ss, dict):
+            status = SourceStatus(
+                ss.get("issue_search", SOURCE_OK),
+                ss.get("issue_readback", SOURCE_OK),
+                ss.get("child_plan", SOURCE_ABSENT),
+            )
+        data = data.get("candidates") or []
+    return [IssueScope.from_dict(d) for d in data], status
+
+
+def _load_children(path: str) -> Tuple[List[IssueScope], bool, bool, str]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    lookup_complete = True
+    ambiguous = False
+    child_plan_status = SOURCE_OK
+    if isinstance(data, dict):
+        lookup_complete = bool(data.get("lookup_complete", True))
+        ambiguous = bool(data.get("ambiguous_child", False))
+        child_plan_status = str(data.get("child_plan_status", SOURCE_OK))
+        data = data.get("children") or []
+    return (
+        [IssueScope.from_dict(d) for d in data],
+        lookup_complete,
+        ambiguous,
+        child_plan_status,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -487,26 +918,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", help="owner/name（非 dry-run の full-text search に使用）")
     p.add_argument("--title", required=True, help="起票予定 Issue の title")
     p.add_argument("--goal", default="", help="goal_ref / Desired Destination")
-    p.add_argument(
-        "--allowed-paths-file",
-        help="起票予定 Issue の Allowed Paths（1 行 1 パス）",
-    )
+    p.add_argument("--allowed-paths-file", help="起票予定 Issue の Allowed Paths（1 行 1 パス）")
     p.add_argument("--label", action="append", default=[], help="label（複数可）")
+    p.add_argument("--parent-ref", action="append", default=[], help="parent issue ref（複数可）")
+    p.add_argument("--depends-on", action="append", default=[], help="Depends on ref（複数可）")
+    p.add_argument("--candidates-file", help="既存 Issue 候補の JSON（offline 判定 / read-back 用）")
+    p.add_argument("--children-file", help="兄弟 child spec の JSON（delivery-rollup child overlap 判定用）")
+    p.add_argument("--dry-run", action="store_true", help="GitHub へアクセスしない（候補は --candidates-file のみ）")
     p.add_argument(
-        "--parent-ref", action="append", default=[], help="parent issue ref（複数可）"
-    )
-    p.add_argument(
-        "--candidates-file",
-        help="既存 Issue 候補の JSON（offline 判定 / read-back 用）",
-    )
-    p.add_argument(
-        "--children-file",
-        help="兄弟 child spec の JSON（delivery-rollup child overlap 判定用）",
-    )
-    p.add_argument(
-        "--dry-run",
+        "--fail-on-unsafe",
         action="store_true",
-        help="GitHub へアクセスしない（候補は --candidates-file のみ）",
+        help="decision が safe_new_issue 以外なら exit code 3 を返す（shell gating 用）",
     )
     return p
 
@@ -520,10 +942,18 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- child overlap モード ---
     if args.children_file:
-        children = _load_scope_list(args.children_file)
-        child_result = classify_child_overlap(children)
-        out = {"mode": "child_overlap", **child_result.to_dict()}
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        children, lookup_complete, ambiguous, child_status = _load_children(
+            args.children_file
+        )
+        child_result = classify_child_overlap(
+            children,
+            lookup_complete=lookup_complete,
+            ambiguous_child=ambiguous,
+            child_plan_status=child_status,
+        )
+        print(json.dumps(child_result.to_dict(), ensure_ascii=False, indent=2))
+        if args.fail_on_unsafe and child_result.verdict != SAFE_NEW_ISSUE:
+            return 3
         return 0
 
     current = IssueScope(
@@ -532,27 +962,26 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         goal=args.goal,
         labels=tuple(args.label),
         parent_refs=tuple(args.parent_ref),
+        depends_on=tuple(args.depends_on),
     )
 
     candidates: List[IssueScope] = []
+    source_status = SourceStatus.ok()
     if args.candidates_file:
-        candidates = _load_scope_list(args.candidates_file)
+        candidates, source_status = _load_candidates(args.candidates_file)
     elif not args.dry_run:
         if not args.repo:
             print(
-                json.dumps(
-                    {"error": "--repo is required for online search"},
-                    ensure_ascii=False,
-                ),
+                json.dumps({"error": "--repo is required for online search"}, ensure_ascii=False),
                 file=sys.stderr,
             )
             return 2
-        query = " ".join(_title_tokens(args.title)) or args.title
-        candidates = _gh_search_candidates(args.repo, query)
+        candidates, source_status = gh_search_candidates(args.repo, _title_tokens(args.title))
 
-    result = classify_overlap(current, candidates)
-    out = {"mode": "issue_overlap", **result.to_dict()}
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    result = classify_overlap(current, candidates, source_status)
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    if args.fail_on_unsafe and result.verdict != SAFE_NEW_ISSUE:
+        return 3
     return 0
 
 
