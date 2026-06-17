@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import os
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -370,18 +371,24 @@ def detect_compound_command(command: str) -> bool:
     return any(t in operators for t in tokens)
 
 
-def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str, str, int]:
+def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str, str, int, Dict[str, str]]:
     """
     コマンドを単体実行。
 
-    戻り値: (exit_code, stdout, stderr, duration_ms)
+    戻り値: (exit_code, stdout, stderr, duration_ms, runner_env_delta)
     """
     try:
         # shlex.split で argv を構築（shell=False で安全に実行）
         argv = shlex.split(command)
     except ValueError:
         # shlex.split に失敗した場合は compound command の可能性
-        return -1, "", "shlex.split failed", 0
+        return -1, "", "shlex.split failed", 0, {}
+
+    env_delta = _fixed_env_delta_for_argv(argv)
+    run_env = None
+    if env_delta:
+        run_env = os.environ.copy()
+        run_env.update(env_delta)
 
     start = datetime.now()
     try:
@@ -392,15 +399,16 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
             timeout=timeout_seconds,
             cwd=cwd,
             shell=False,
+            env=run_env,
         )
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return result.returncode, result.stdout, result.stderr, duration_ms
+        return result.returncode, result.stdout, result.stderr, duration_ms, env_delta
     except subprocess.TimeoutExpired:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return -1, "", "timeout", duration_ms
+        return -1, "", "timeout", duration_ms, env_delta
     except Exception as e:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return -1, "", str(e), duration_ms
+        return -1, "", str(e), duration_ms, env_delta
 
 
 def truncate_line_bytes(line: str, max_bytes: int) -> str:
@@ -545,12 +553,7 @@ def _is_regression_gate_command(command: str, cwd: Optional[str] = None) -> bool
         argv_check = shlex.split(command)
     except ValueError:
         argv_check = []
-    if (
-        argv_check
-        and Path(argv_check[0]).name == "pnpm"
-        and len(argv_check) >= 2
-        and ("pnpm", argv_check[1].lower()) in _ALLOWED_PNPM_SUBCOMMANDS
-    ):
+    if _canonical_pnpm_gate(argv_check) is not None:
         return True
 
     # Check for uv run pytest with existing test paths
@@ -1061,6 +1064,15 @@ _ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
     ("pnpm", "build"),
 ])
 
+_FIXED_ENV_DELTA_BY_COMMAND: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("pnpm", "build"): {"CI": "true"},
+}
+
+_PNPM_NO_TTY_ERROR_PATTERNS: tuple[str, ...] = (
+    "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY",
+    "Aborted removal of modules directory due to no TTY",
+)
+
 # Explicitly allowed command basenames for baseline preflight
 # Anything NOT in this set is blocked by default (allowlist-closed policy, AC3)
 _ALLOWED_COMMANDS: frozenset = frozenset([
@@ -1094,13 +1106,23 @@ _ALLOWED_COMMANDS: frozenset = frozenset([
     "basename",  # safe
     "which",     # safe
     "type",      # safe
-    "env",       # safe (read env)
+    "env",       # display-only; command wrapper/env injection denied by _is_allowed_env_invocation()
     "printenv",  # safe (read env)
     "pwd",       # safe
     "date",      # safe
     "stat",      # read-only
     # NOTE: mkdir removed from allowlist (B2) — mkdir -p .git/hooks and similar mutations possible
 ])
+
+
+def _canonical_pnpm_gate(argv: List[str]) -> Optional[Tuple[str, str]]:
+    """Return the canonical 2-token pnpm gate tuple, or None if not exact."""
+    if len(argv) != 2:
+        return None
+    key = (Path(argv[0]).name, argv[1].lower())
+    if key in _ALLOWED_PNPM_SUBCOMMANDS:
+        return key
+    return None
 
 
 def _is_allowed_python3_invocation(argv: List[str]) -> bool:
@@ -1158,12 +1180,38 @@ def _is_allowed_pnpm_invocation(argv: List[str]) -> bool:
     Only (pnpm, typecheck), (pnpm, lint), (pnpm, test), (pnpm, build) are allowed.
     pnpm exec, pnpm dlx, pnpm run, pnpm add, etc. are all blocked.
     """
-    if not argv or Path(argv[0]).name != "pnpm":
+    return _canonical_pnpm_gate(argv) is not None
+
+
+def _is_allowed_env_invocation(argv: List[str]) -> bool:
+    """Allow `env` only for read-only display, never as a command wrapper."""
+    if not argv or Path(argv[0]).name != "env":
         return False
-    if len(argv) < 2:
+    if len(argv) == 1:
+        return True
+    return len(argv) == 2 and argv[1] in ("--help", "--version")
+
+
+def _fixed_env_delta_for_argv(argv: List[str]) -> Dict[str, str]:
+    """Return a fixed runner-side env delta for exact safe commands only."""
+    key = _canonical_pnpm_gate(argv)
+    if key is None:
+        return {}
+    return dict(_FIXED_ENV_DELTA_BY_COMMAND.get(key, {}))
+
+
+def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) -> bool:
+    """Detect package-manager no-TTY prompts that are tooling/env blockers."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
         return False
-    key = ("pnpm", argv[1].lower())
-    return key in _ALLOWED_PNPM_SUBCOMMANDS
+
+    if _canonical_pnpm_gate(argv) != ("pnpm", "build"):
+        return False
+
+    combined = f"{stdout}\n{stderr}"
+    return any(pattern in combined for pattern in _PNPM_NO_TTY_ERROR_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -1881,6 +1929,20 @@ def classify_static_command(
             )
         return None  # allowed pnpm subcommand
 
+    # 8.5. Check env: display-only allowlist
+    if cmd_basename == "env":
+        if not _is_allowed_env_invocation(argv):
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                "'env' is only allowed for read-only display (env, env --help, env --version). "
+                "Do not use env as a wrapper or to inject arbitrary variables into commands. "
+                "Shell env prefix forms like 'CI=true pnpm build' are also not allowed.",
+                "baseline_fail_expected",
+            )
+        return None
+
     # 9. Check uv: only allow uv run pytest / uv run python -m pytest / uv run python3 -m pytest
     if cmd_basename == "uv":
         if len(argv) >= 2 and argv[1] == "run":
@@ -1935,6 +1997,7 @@ def classify_result(
     stderr: str,
     command: str,
     cwd: Optional[str] = None,
+    runner_env_delta: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, str, Optional[str], str]:
     """
     VC 実行結果を分類。
@@ -1982,6 +2045,25 @@ def classify_result(
         if exit_code == 0:
             return "expected_pass", "regression_gate", "go", None, "regression_gate"
         else:
+            if _is_package_manager_no_tty_prompt(command, stdout, stderr):
+                applied_runner_delta = runner_env_delta or {}
+                if applied_runner_delta == {"CI": "true"}:
+                    fix_hint = (
+                        "CI=true was already injected by the runner. This is still a pnpm/node_modules/tooling "
+                        "state blocker; do not rewrite the Issue body."
+                    )
+                else:
+                    fix_hint = (
+                        "This command did not match the canonical pnpm build gate, so the runner-side fixed env "
+                        "delta was not applied."
+                    )
+                return (
+                    "blocked",
+                    "package_manager_no_tty_prompt",
+                    "blocked",
+                    fix_hint,
+                    "regression_gate",
+                )
             # B5: Check pytest exit codes 4/5 BEFORE regression_gate failure classification
             if _is_pytest_invocation(command):
                 combined_lower = f"{stdout}\n{stderr}".lower()
@@ -2265,6 +2347,7 @@ def generate_contract_review_fragment(status: str, results: List[Dict[str, Any]]
             "evidence": {
                 "stdout_excerpt": " ".join(stdout_lines[:5]) if stdout_lines else "",
                 "stderr_excerpt": " ".join(stderr_lines[:5]) if stderr_lines else "",
+                "runner_env_delta": r.get("runner_env_delta", {}),
             },
             "decision": decision,
         }
@@ -2461,6 +2544,7 @@ def main() -> int:
     }
 
     for ac_label, command, line_no, preflight_scope, vc_regex_intent, baseline_expect, vc_role, annotation_line_no, annotation_raw in commands:
+        runner_env_delta: Dict[str, str] = {}
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
         if preflight_scope is not None:
@@ -2650,12 +2734,17 @@ def main() -> int:
                         )
                 else:
                     # Safe to run: execute the command
-                    exit_code, stdout, stderr, duration_ms = run_command(
+                    exit_code, stdout, stderr, duration_ms, runner_env_delta = run_command(
                         command, args.timeout_seconds, args.cwd
                     )
 
                     classification, category, decision, fix_hint, scope_class = classify_result(
-                        exit_code, stdout, stderr, command, cwd=args.cwd
+                        exit_code,
+                        stdout,
+                        stderr,
+                        command,
+                        cwd=args.cwd,
+                        runner_env_delta=runner_env_delta,
                     )
 
                     # Issue #889: Apply baseline-expect annotation post-execution re-mapping
@@ -2722,6 +2811,7 @@ def main() -> int:
             "stderr_head": stderr_head,
             "stderr_truncated": stderr_truncated,
             "stderr_original_line_count": stderr_orig_count,
+            "runner_env_delta": runner_env_delta,
             "duration_ms": duration_ms,
             "fix_hint": fix_hint,
             "annotations": {
