@@ -52,3 +52,28 @@ $ <command>
 
 - `pr_review_only` / `runtime_only` のみ有効
 - 不正値は `classification: human_judgment`。
+
+## github_metadata_assert（GitHub milestone metadata の exit code assertion）
+
+GitHub milestone metadata（特に `description`）の forbidden phrase の有無を **exit code** で検証したい場合は、raw `gh api` を VC に書かず、first-class な `github_metadata_assert` を使う。
+
+許可される形:
+
+```bash
+# AC1
+$ github_metadata_assert not_contains description <literal> repos/<owner>/<repo>/milestones/<number>
+```
+
+- assertion: `contains` / `not_contains` のみ
+- field は `description` のみ（allowlist 外・typo は reject）。コマンドは4引数ちょうどで flags / 余分な positional は reject
+- 内部実行は固定 argv `gh api --method GET repos/<owner>/<repo>/milestones/<number>`（method GET 固定・非 mutating）
+- endpoint は `repos/<owner>/<repo>/milestones/<number>` のみ（絶対 URL・query string `?`・path traversal `../`・placeholder `<...>` は reject）
+- `contains` は present→exit 0 / absent→non-zero、`not_contains` は absent→exit 0 / present→non-zero
+- gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON / 未知の gh 失敗 / response に field 不在（schema drift）は `github_metadata_assert_environment_error` として `human_judgment` に分類され、assertion の pass/fail（false pass）と区別される
+
+禁止例（VC に raw `gh api` を書かない）:
+
+```bash
+# 不可: raw gh api は allowlist で block される。jq は出力するだけで assertion にならない
+$ gh api repos/owner/repo/milestones/1 --jq '.description'
+```

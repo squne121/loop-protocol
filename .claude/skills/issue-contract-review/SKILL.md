@@ -154,6 +154,19 @@ VC 実行前に静的に弾くカテゴリ:
 - `pnpm test` を含む回帰失敗は blocked
 - `.claude/skills/**` や `.codex` を触る場合は Stop 条件で一度停止
 
+## github_metadata_assert（GitHub metadata の安全な readback assertion）
+
+GitHub milestone metadata（`description` 等）の forbidden phrase の有無を VC で検証する場合は、raw `gh api` を VC に書かず first-class な `github_metadata_assert` を使う。
+
+- 許可される形: `github_metadata_assert <contains|not_contains> description <literal> repos/<owner>/<repo>/milestones/<number>`
+- コマンドは4引数ちょうど（assertion_type field literal endpoint）。field は `description` のみ（typo・未知 field は reject）。余分な positional / flags は一切受け付けない
+- 内部実行は固定 argv `gh api --method GET repos/<owner>/<repo>/milestones/<number>`（method GET 固定・非 mutating）
+- endpoint は milestone のみ（絶対 URL・query string・path traversal・placeholder は reject）
+- 危険な flags（`-f` / `-F` / `--field` / `--raw-field` / `--input` / `--header`(`-H`) / `--include`(`-i`) / `--paginate` / `--slurp` / `--cache` / `--template` / `--preview` / `graphql`）と mutating method（`--method POST/PATCH/PUT/DELETE`、`-X`）は block
+- gh 不在 / auth 失敗 / 404 / rate limit / timeout / invalid JSON は environment error として `human_judgment` 分類になり、assertion の pass/fail（false pass）と区別される
+- 禁止例: `gh api repos/owner/repo/milestones/1 --jq '.description'`（raw `gh api` は allowlist で block。jq は出力するだけで assertion にならない）
+- 詳細は `references/vc-preflight.md` を参照。
+
 ## Reference Loading Map（読取条件）
 
 - `references/contract-compliance.md`: テンプレ準拠 / state label / blocker / stop conditions の判定詳細。

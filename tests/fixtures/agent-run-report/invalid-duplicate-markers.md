@@ -1,0 +1,45 @@
+<!-- agent_run_report:v1 start -->
+````json
+{
+  "schema": "agent_run_report/v1",
+  "public_surface_kind": "github_issue_comment",
+  "public_safety": {
+    "redaction_status": "clean",
+    "checked_by": "pnpm agent-run-report:check",
+    "validator_version": "1.0.0",
+    "checked_at": "2026-06-15T22:57:00Z",
+    "verdict": "pass",
+    "blocked_reasons": []
+  },
+  "actor": {
+    "type": "ai_agent",
+    "name": "Codex"
+  },
+  "authority": {
+    "level": "non_authoritative",
+    "basis": "ai_self_report",
+    "evidence_refs": []
+  },
+  "token_usage": {
+    "availability": "unavailable",
+    "source": "none",
+    "prompt": null,
+    "completion": null,
+    "total": null
+  },
+  "manifest_refs": [],
+  "evidence_refs": [],
+  "commands_summary": [
+    {
+      "command_label": "pnpm test",
+      "exit_code": 0,
+      "verdict": "pass",
+      "summary": "clean summary",
+      "artifact_ref": null
+    }
+  ],
+  "docs_read_refs": []
+}
+````
+<!-- agent_run_report:v1 start -->
+<!-- agent_run_report:v1 end -->

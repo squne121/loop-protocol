@@ -9,6 +9,7 @@ category / decision / confidence を含む JSON を返す。
 
 import argparse
 import hashlib
+import os
 import json
 import os
 import re
@@ -1214,6 +1215,201 @@ def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) ->
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# GitHub metadata assertion — Issue #942
+# ---------------------------------------------------------------------------
+
+# Allowed milestone metadata fields for github_metadata_assert (Issue #942 review BLOCKER 1).
+# A field outside this allowlist (e.g. a 'description' typo like 'descripton') is rejected at
+# classify time rather than silently treated as an absent field, which would let not_contains
+# false-pass.
+_ALLOWED_GITHUB_METADATA_FIELDS = {"description"}
+
+
+def _is_github_metadata_assert_command(command: str) -> bool:
+    """
+    Detect if a command is a github_metadata_assert assertion.
+
+    Format: github_metadata_assert <contains|not_contains> <field> <literal> <endpoint> [flags...]
+
+    Returns True if the command starts with 'github_metadata_assert'.
+    """
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+
+    if not argv:
+        return False
+
+    return Path(argv[0]).name == "github_metadata_assert"
+
+
+def _is_allowed_github_metadata_assert(argv: List[str]) -> Optional[Tuple[bool, Optional[str]]]:
+    """
+    Validate a github_metadata_assert command (Issue #942).
+
+    Format (exactly 4 arguments after the command name; NO flags, NO extra positional):
+        github_metadata_assert <contains|not_contains> <field> <literal> <endpoint>
+
+    Returns: (is_valid, error_message)
+      - (True, None): command is valid
+      - (False, error_msg): command is invalid with explanation
+
+    Validation rules:
+    - Exactly 5 argv tokens (command + assertion_type + field + literal + endpoint).
+      Any extra token is rejected. Because no flag surface is accepted at all, every
+      dangerous flag (-f/-F/--field/--raw-field/--input/--header/-H/--include/-i/
+      --paginate/--slurp/--cache/--template/--preview/graphql, in any case variant) and
+      every mutating method (--method POST/PATCH/PUT/DELETE, -X ..., --method=...) is
+      rejected here by construction (review BLOCKER 2 / MAJOR 1).
+    - assertion_type must be contains or not_contains.
+    - field must be in _ALLOWED_GITHUB_METADATA_FIELDS; a typo or unknown field is rejected
+      rather than silently treated as an absent field (review BLOCKER 1 / MAJOR 2).
+    - endpoint must match repos/<owner>/<repo>/milestones/<number>; absolute URLs, query
+      strings, path traversal and placeholders are rejected (AC2).
+    """
+    if len(argv) != 5:
+        return False, (
+            "github_metadata_assert accepts exactly 4 arguments "
+            "(assertion_type field literal endpoint) and no flags; got "
+            f"{max(len(argv) - 1, 0)}"
+        )
+
+    cmd_name = Path(argv[0]).name
+    if cmd_name != "github_metadata_assert":
+        return False, "Not a github_metadata_assert command"
+
+    assertion_type = argv[1].lower()
+    if assertion_type not in ("contains", "not_contains"):
+        return False, f"assertion_type must be 'contains' or 'not_contains', got '{argv[1]}'"
+
+    field = argv[2]
+    if field not in _ALLOWED_GITHUB_METADATA_FIELDS:
+        return False, (
+            f"field '{field}' is not allowed; allowed fields: "
+            f"{sorted(_ALLOWED_GITHUB_METADATA_FIELDS)}"
+        )
+
+    literal = argv[3]
+    if not literal:
+        return False, "literal argument is missing"
+
+    endpoint = argv[4]
+
+    # Validate endpoint (AC2)
+    if endpoint.startswith('http://') or endpoint.startswith('https://') or endpoint.startswith('//'):
+        return False, "endpoint must not be an absolute URL; use relative path like 'repos/owner/repo/milestones/1'"
+
+    if '?' in endpoint:
+        return False, "endpoint must not contain query strings (?)"
+
+    if '..' in endpoint:
+        return False, "endpoint must not contain path traversal (..)"
+
+    if '<' in endpoint or '>' in endpoint:
+        return False, "endpoint must not contain placeholders (<...>); use actual values like 'repos/owner/repo/milestones/1'"
+
+    if not re.match(r'^repos/[^/]+/[^/]+/milestones/\d+$', endpoint):
+        return False, f"endpoint must match 'repos/<owner>/<repo>/milestones/<number>', got '{endpoint}'"
+
+    return True, None
+
+
+def _check_github_metadata_assertion(
+    assertion_type: str,
+    field: str,
+    literal: str,
+    endpoint: str,
+    timeout_seconds: int = 10,
+) -> int:
+    """
+    Execute GitHub metadata assertion via gh api.
+
+    Internal implementation for github_metadata_assert.
+    Uses fixed argv to avoid shell injection: ["gh", "api", "--method", "GET", f"repos/..."]
+
+    Args:
+        assertion_type: "contains" or "not_contains"
+        field: field name to check (e.g., "description")
+        literal: literal string to search for
+        endpoint: full endpoint path (e.g., "repos/owner/repo/milestones/1")
+        timeout_seconds: timeout for gh command
+
+    Returns:
+        Exit code:
+          - 0: assertion passed
+          - 1: assertion failed (but gh API succeeded)
+          - 2: gh command not found
+          - 3: gh authentication failed
+          - 4: 404 not found (resource doesn't exist)
+          - 5: rate limited (429)
+          - 6: timeout
+          - 7: invalid JSON response
+          - 8: other / unknown gh failure (network, 5xx, secondary rate limit, ...)
+          - 9: requested field absent from API response (schema error)
+
+    Raises:
+        subprocess.TimeoutExpired: if gh command times out
+        json.JSONDecodeError: if gh response is not valid JSON
+    """
+    argv = ["gh", "api", "--method", "GET", endpoint]
+
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False,
+        )
+    except FileNotFoundError:
+        # gh command not found
+        return 2
+    except subprocess.TimeoutExpired:
+        return 6
+
+    # Check for HTTP errors via stderr/exit code
+    if result.returncode != 0:
+        stderr_lower = result.stderr.lower()
+        if "not authenticated" in stderr_lower or "authentication failed" in stderr_lower or "401" in result.stderr:
+            return 3
+        if "404" in result.stderr or "not found" in stderr_lower:
+            return 4
+        if "429" in result.stderr or "rate limit" in stderr_lower:
+            return 5
+        # Any other nonzero gh exit is an environment / transport / API failure
+        # (network error, 5xx, 403 secondary rate limit, gh version drift, ...),
+        # NOT a semantic assertion failure. Never collapse it to exit 1 (review BLOCKER 3).
+        return 8
+
+    # Parse JSON response
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return 7
+
+    # The requested field must be present in the API response. A missing field
+    # (schema drift / renamed field) is NOT 'literal absent': collapsing it to an empty
+    # string would let not_contains false-pass (review BLOCKER 1). Treat it as a
+    # schema/environment error distinct from assertion pass/fail.
+    if field not in data:
+        return 9
+    raw_value = data.get(field)
+    field_value = "" if raw_value is None else str(raw_value)
+
+    # Perform assertion
+    is_present = literal in field_value
+
+    # Return exit code based on assertion type
+    if assertion_type == "contains":
+        # contains: present → 0, absent → 1
+        return 0 if is_present else 1
+    else:  # not_contains
+        # not_contains: present → 1, absent → 0
+        return 1 if is_present else 0
+
+
 # Regex-bearing command detection for backslash-pipe (regex_literal_pipe_suspected) — Issue #589
 # ---------------------------------------------------------------------------
 
@@ -1447,6 +1643,69 @@ def _command_pattern_contains_backslash_pipe(argv: List[str]) -> bool:
     return False
 
 
+def has_unquoted_inline_baseline_expect(command: str) -> bool:
+    """AC2/AC12: detect an inline '# baseline-expect:' annotation embedded in a
+    command string OUTSIDE any quoted region. Quoted literals such as
+    `rg "# baseline-expect: pass" file` must NOT match."""
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif c == "#" and not in_single and not in_double:
+            rest = command[i + 1:].lstrip()
+            if rest.startswith("baseline-expect:"):
+                return True
+        i += 1
+    return False
+
+
+def _candidate_new_allowed_path_target(
+    command: str, allowed_paths: Optional[List[str]], cwd: Optional[str]
+) -> Optional[str]:
+    """AC4/AC14: if the command is `test -f|-e|-s PATH` or `rg ... PATH` whose PATH
+    is within Allowed Paths and does NOT exist at the baseline cwd, return that
+    PATH; otherwise None. Conservative shlex-based extraction; callers gate on
+    classify_static_command() returning None first (so unsafe/broad are excluded)."""
+    if not allowed_paths:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    prog = os.path.basename(argv[0])
+    norm_allowed = [p.strip().lstrip("./").rstrip("/") for p in allowed_paths if p.strip()]
+
+    def _in_allowed(p: str) -> bool:
+        pp = p.lstrip("./")
+        return any(pp == a or pp.startswith(a + "/") for a in norm_allowed)
+
+    candidates: List[str] = []
+    if prog == "test":
+        for a in argv[1:]:
+            if a.startswith("-"):
+                continue
+            candidates.append(a)
+    elif prog == "rg":
+        non_opt = [a for a in argv[1:] if not a.startswith("-")]
+        candidates.extend(non_opt[1:])
+    else:
+        return None
+
+    base = cwd or "."
+    for c in candidates:
+        if _in_allowed(c) and not os.path.exists(os.path.join(base, c)):
+            return c
+    return None
+
+
 def classify_static_command(
     raw_command: str, cwd: Path, allowed_paths: Optional[List[str]] = None
 ) -> Optional[Tuple[str, str, str, Optional[str], str]]:
@@ -1628,6 +1887,19 @@ def classify_static_command(
                 "baseline_fail_expected",
             )
         return None  # allowed git read-only command
+
+    # 6.5. Check github_metadata_assert: first-class GitHub metadata assertion (Issue #942)
+    if _is_github_metadata_assert_command(raw_command):
+        is_valid, error_msg = _is_allowed_github_metadata_assert(argv)
+        if not is_valid:
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                f"github_metadata_assert validation failed: {error_msg}",
+                "baseline_fail_expected",
+            )
+        return None  # allowed github_metadata_assert command
 
     # 7. Check gh: exact read-only allowlist (B3)
     if cmd_basename == "gh":
@@ -2122,6 +2394,7 @@ def main() -> int:
         default="json",
         help="Output format (json or contract-review-fragment YAML)",
     )
+    parser.add_argument("--strict", action="store_true", default=False, help="Enable strict mode for annotation enforcement (detect missing annotations as needs_fix)")
 
     args = parser.parse_args()
 
@@ -2307,10 +2580,25 @@ def main() -> int:
                 runtime_verification_required = None
 
         else:
+            # AC2/AC12: inline '# baseline-expect:' is an invalid placement — detect
+            # BEFORE any execution so the malformed command is never run.
+            if has_unquoted_inline_baseline_expect(command):
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification = "blocked"
+                category = "inline_baseline_expect_invalid_placement"
+                decision = "blocked"
+                fix_hint = (
+                    "Inline '# baseline-expect:' alters command semantics and is not "
+                    "executed; move the annotation to the immediately preceding comment line."
+                )
+                scope_class = "baseline_fail_expected"
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
             # BLOCKER 2 fix: invalid baseline-expect annotation value → human_judgment
             # Sentinel "__invalid__:<raw>" is set by extract_baseline_expect_annotation
             # when the annotation line is present but value is not in VALID_BASELINE_EXPECT_VALUES.
-            if baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
+            elif baseline_expect is not None and baseline_expect.startswith("__invalid__:"):
                 raw_invalid_value = baseline_expect[len("__invalid__:"):]
                 classification = "human_judgment"
                 decision = "human_judgment"
@@ -2355,6 +2643,29 @@ def main() -> int:
                 verification_owner = None
                 deferred_reason = None
                 runtime_verification_required = None
+            elif (
+                args.strict
+                and baseline_expect is None
+                and classify_static_command(command, Path(args.cwd), allowed_paths=allowed_paths_from_body) is None
+                and _candidate_new_allowed_path_target(command, allowed_paths_from_body, args.cwd) is not None
+            ):
+                # AC4/AC8/AC14: strict mode — VC targets a NEW Allowed Path file that
+                # does not exist at baseline and lacks a baseline-expect annotation.
+                _missing_target = _candidate_new_allowed_path_target(
+                    command, allowed_paths_from_body, args.cwd
+                )
+                exit_code, stdout, stderr, duration_ms = None, "", "", 0
+                classification = "blocked"
+                category = "missing_baseline_expect_for_new_allowed_path"
+                decision = "blocked"
+                fix_hint = (
+                    f"VC targets new Allowed Path '{_missing_target}' which does not exist at "
+                    "baseline; add '# baseline-expect: fail' on the preceding line."
+                )
+                scope_class = "baseline_fail_expected"
+                verification_owner = None
+                deferred_reason = None
+                runtime_verification_required = None
             else:
                 # AC1-AC3: classify_static_command checks unsafe/unsupported commands
                 # BEFORE any execution attempt
@@ -2370,9 +2681,57 @@ def main() -> int:
                 ):
                     static_result = None  # annotation exempts from blocked
                 if static_result is not None:
-                    # Static blocker: baseline-expect does NOT override static blocks
+                    # no_override_for_blocker: static_blocker takes precedence — baseline-expect does NOT override static blocks
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result
+                elif _is_github_metadata_assert_command(command):
+                    # Issue #942: github_metadata_assert is allowed (static_result is None) but
+                    # is NOT a real executable binary. Instead of run_command (which would hit
+                    # "No such file or directory"), dispatch the assertion to
+                    # _check_github_metadata_assertion and classify by its exit code.
+                    # subprocess is invoked there with a fixed read-only argv (gh api --method GET).
+                    try:
+                        _assert_argv = shlex.split(command, posix=True)
+                    except ValueError:
+                        _assert_argv = []
+                    # static_result is None implies _is_allowed_github_metadata_assert validated argv,
+                    # so positions 1..4 are present and safe to read.
+                    _assertion_type = _assert_argv[1]
+                    _field = _assert_argv[2]
+                    _literal = _assert_argv[3]
+                    _endpoint = _assert_argv[4]
+                    assert_exit = _check_github_metadata_assertion(
+                        _assertion_type, _field, _literal, _endpoint,
+                        timeout_seconds=args.timeout_seconds,
+                    )
+                    exit_code, stdout, stderr, duration_ms = assert_exit, "", "", 0
+                    if assert_exit == 0:
+                        # assertion holds (present for contains / absent for not_contains)
+                        classification = "expected_pass"
+                        category = "github_metadata_assert_pass"
+                        decision = "go"
+                        scope_class = "regression_gate"
+                        fix_hint = None
+                    elif assert_exit == 1:
+                        # assertion does not hold; same go disposition as other expected_fail VCs
+                        classification = "expected_fail"
+                        category = "github_metadata_assert_fail"
+                        decision = "go"
+                        scope_class = "baseline_fail_expected"
+                        fix_hint = None
+                    else:
+                        # exit 2..8: environment error (gh missing / auth / 404 / rate limit /
+                        # timeout / invalid JSON / other HTTP). MUST NOT be a false pass (go).
+                        classification = "human_judgment"
+                        category = "github_metadata_assert_environment_error"
+                        decision = "human_judgment"
+                        scope_class = "baseline_fail_expected"
+                        fix_hint = (
+                            "github_metadata_assert hit an environment error "
+                            f"(exit {assert_exit}: gh missing / auth / 404 / rate limit / "
+                            "timeout / invalid JSON / missing field). This is distinct from assertion "
+                            "pass/fail and is not treated as a baseline pass."
+                        )
                 else:
                     # Safe to run: execute the command
                     exit_code, stdout, stderr, duration_ms, runner_env_delta = run_command(
@@ -2473,7 +2832,35 @@ def main() -> int:
                 "line": annotation_line_no,
                 "raw": annotation_raw,
             },
+            "strict": {
+                "enabled": args.strict,
+                "violation": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "body_author_fixable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "needs_fix": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "structured_feedback": {
+                    "category": category,
+                    "body_author_fixable": True,
+                    "category_wide_remediation": True,
+                } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+            } if args.strict or category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+            # strict + repair coordination for inline_baseline_expect and missing_baseline_expect
+            "repair": {
+                "repairable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "kind": (
+                    "move_inline_baseline_expect_to_preceding_line" if category == "inline_baseline_expect_invalid_placement"
+                    else "insert_baseline_expect_fail" if category == "missing_baseline_expect_for_new_allowed_path"
+                    else None
+                ),
+                "line_start": line_no,
+                "line_end": line_no,
+                "reason": (
+                    "baseline-expect annotation must be in contiguous preceding comment block" if category == "inline_baseline_expect_invalid_placement"
+                    else "new Allowed Path file requires baseline-expect: fail annotation" if category == "missing_baseline_expect_for_new_allowed_path"
+                    else None
+                ),
+            } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
         }
+        # "strict" + "repair" payload for inline_baseline_expect and missing_baseline_expect errors
         # AC5: Add routing metadata for skipped results
         if verification_owner:
             result_item["verification_owner"] = verification_owner
