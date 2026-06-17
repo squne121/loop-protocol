@@ -91,4 +91,47 @@ describe('github comment dry-run', () => {
     })
     expect('body' in result).toBe(false)
   })
+
+  it('GIVEN live mode without explicit confirmation WHEN posting is requested THEN it fails closed before any API writes', async () => {
+    const client = {
+      listIssueComments: async () => {
+        throw new Error('list should not run without live confirmation')
+      },
+      createIssueComment: async () => {
+        throw new Error('create should not run without live confirmation')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run without live confirmation')
+      },
+    }
+
+    await expect(postAgentRunReport({
+      draft: createDraft(),
+      report: createReport(),
+      repo: 'squne121/loop-protocol',
+      dryRun: false,
+      client,
+    })).rejects.toThrow(/confirm-live true/)
+  })
+
+  it('GIVEN a repo outside the allowlist WHEN posting is requested THEN it fails closed before comment scans', async () => {
+    const client = {
+      listIssueComments: async () => {
+        throw new Error('list should not run for a repo mismatch')
+      },
+      createIssueComment: async () => {
+        throw new Error('create should not run for a repo mismatch')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run for a repo mismatch')
+      },
+    }
+
+    await expect(postAgentRunReport({
+      draft: createDraft(),
+      report: createReport(),
+      repo: 'other/repo',
+      client,
+    })).rejects.toThrow(/allowlisted repository/)
+  })
 })

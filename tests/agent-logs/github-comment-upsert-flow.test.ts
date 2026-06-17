@@ -21,6 +21,23 @@ function createDraft() {
   }
 }
 
+function createPullRequestDraft() {
+  return {
+    schema: 'agent_run_draft/v1',
+    run_id: 'run-937-pr-001',
+    target: {
+      kind: 'pull_request',
+      id: 977,
+    },
+    phase: 'implementation',
+    actor: {
+      type: 'ai_agent',
+      name: 'Codex worker',
+    },
+    started_at: '2026-06-17T12:00:00.000Z',
+  }
+}
+
 function createReport(summary = 'focused tests passed') {
   return {
     schema: 'agent_run_report/v1',
@@ -99,6 +116,7 @@ describe('github comment upsert flow', () => {
       report,
       repo: 'squne121/loop-protocol',
       dryRun: false,
+      confirmLive: true,
       client,
     })
 
@@ -131,10 +149,75 @@ describe('github comment upsert flow', () => {
       report: createReport('new summary'),
       repo: 'squne121/loop-protocol',
       dryRun: false,
+      confirmLive: true,
       client,
     })
 
     expect(result.action).toBe('update')
     expect(result.comment_id).toBe(10)
+  })
+
+  it('GIVEN an issue-target draft with mismatched CLI overrides WHEN posting THEN it fails closed before scanning comments', async () => {
+    const client = {
+      listIssueComments: async () => {
+        throw new Error('list should not run for mismatched overrides')
+      },
+      createIssueComment: async () => {
+        throw new Error('create should not run for mismatched overrides')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run for mismatched overrides')
+      },
+    }
+
+    await expect(postAgentRunReport({
+      draft: createDraft(),
+      report: createReport(),
+      repo: 'squne121/loop-protocol',
+      issueNumber: 999,
+      client,
+    })).rejects.toThrow(/override must match draft.target.id/)
+
+    await expect(postAgentRunReport({
+      draft: createDraft(),
+      report: createReport(),
+      repo: 'squne121/loop-protocol',
+      prNumber: 977,
+      client,
+    })).rejects.toThrow(/does not allow --pr-number/)
+  })
+
+  it('GIVEN a pull-request draft WHEN posting with matching overrides THEN marker tuple and endpoint number both bind to the PR target', async () => {
+    const client = {
+      listIssueComments: async ({ issueNumber }) => {
+        expect(issueNumber).toBe(977)
+        return []
+      },
+      createIssueComment: async () => {
+        throw new Error('create should not run in dry-run')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run in dry-run')
+      },
+    }
+
+    const result = await postAgentRunReport({
+      draft: createPullRequestDraft(),
+      report: {
+        ...createReport(),
+        public_surface_kind: 'github_pr_comment',
+      },
+      repo: 'squne121/loop-protocol',
+      issueNumber: 977,
+      prNumber: 977,
+      dryRun: true,
+      client,
+    })
+
+    expect(result).toMatchObject({
+      action: 'create',
+      issue_number: 977,
+      pr_number: 977,
+    })
   })
 })

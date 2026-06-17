@@ -8,7 +8,7 @@ export const MAX_GITHUB_COMMENT_BYTES = 65536
 export const OWNERSHIP_MARKER_PATTERN = /^<!--\s*agent_run_report:v1 repo=(?<repo>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) issue=(?<issue>[0-9]+) pr=(?<pr>[0-9]+|null) run_id=(?<runId>[A-Za-z0-9._:-]+)\s*-->$/u
 export const DIGEST_MARKER_PATTERN = /^<!--\s*agent_run_report_digest:v1 sha256=(?<digest>[a-f0-9]{64})\s*-->$/iu
 
-const OWNERSHIP_MARKER_SCAN = /<!--\s*agent_run_report:v1\s+repo=[^>]*-->/giu
+const OWNERSHIP_MARKER_SCAN = /<!--\s*agent_run_report:v1\b(?!\s+(?:start|end)\b)[^>]*-->/giu
 const DIGEST_MARKER_SCAN = /<!--\s*agent_run_report_digest:v1\b[^>]*-->/giu
 
 function countRegexMatches(text, pattern) {
@@ -249,24 +249,48 @@ function classifyGithubError(httpStatus, errorBody) {
   }
 }
 
-function parseGhHttpResponse(rawText) {
+function sanitizeGithubErrorBody(errorBody) {
+  if (typeof errorBody !== 'string' || errorBody.trim().length === 0) {
+    return {
+      message: '',
+      documentation_url: null,
+    }
+  }
+  try {
+    const parsed = JSON.parse(errorBody)
+    return {
+      message: typeof parsed?.message === 'string' ? parsed.message : errorBody.trim(),
+      documentation_url: typeof parsed?.documentation_url === 'string' ? parsed.documentation_url : null,
+    }
+  } catch {
+    return {
+      message: errorBody.trim(),
+      documentation_url: null,
+    }
+  }
+}
+
+export function parseGhHttpResponse(rawText) {
   const normalized = rawText.replace(/\r\n/g, '\n')
   const lines = normalized.split('\n')
   const statusLine = lines.find((line) => /^HTTP\/\d(?:\.\d)?\s+\d{3}\b/u.test(line)) ?? ''
   const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(?<status>\d{3})\b/u)
   const httpStatus = statusMatch ? Number(statusMatch.groups.status) : null
-  const separatorIndex = normalized.indexOf('\n\n')
-  const responseBody = separatorIndex === -1 ? '' : normalized.slice(separatorIndex + 2).trim()
+  const statusIndex = lines.findIndex((line) => line === statusLine)
+  const bodyLines = statusIndex === -1 ? [] : lines.slice(statusIndex + 1)
+  const separatorIndex = bodyLines.findIndex((line) => line.trim() === '')
+  const responseBody = separatorIndex === -1 ? '' : bodyLines.slice(separatorIndex + 1).join('\n').trim()
   return {
     httpStatus,
     responseBody,
   }
 }
 
-function runGhApi(args) {
+function runGhApi(args, { stdinJson = null } = {}) {
   const result = spawnSync('gh', ['api', '-i', ...args], {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    input: stdinJson === null ? undefined : JSON.stringify(stdinJson),
   })
   const mergedOutput = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim()
   const { httpStatus, responseBody } = parseGhHttpResponse(mergedOutput)
@@ -306,8 +330,10 @@ export class GhCliIssueCommentsClient {
       '-H', 'Accept: application/vnd.github+json',
       '-H', 'X-GitHub-Api-Version: 2022-11-28',
       `repos/${repo}/issues/${issueNumber}/comments`,
-      '-f', `body=${body}`,
-    ])
+      '--input', '-',
+    ], {
+      stdinJson: { body },
+    })
     return response.body
   }
 
@@ -317,8 +343,10 @@ export class GhCliIssueCommentsClient {
       '-H', 'Accept: application/vnd.github+json',
       '-H', 'X-GitHub-Api-Version: 2022-11-28',
       `repos/${repo}/issues/comments/${commentId}`,
-      '-f', `body=${body}`,
-    ])
+      '--input', '-',
+    ], {
+      stdinJson: { body },
+    })
     return response.body
   }
 }
@@ -330,6 +358,9 @@ export async function listAllIssueComments(client, { repo, issueNumber, perPage 
     comments.push(...pageItems)
     if (pageItems.length < perPage) {
       break
+    }
+    if (page === 100) {
+      throw runtimeError('github_comments.pagination_exhausted', 'issue comment pagination exhausted before scan completion')
     }
   }
   return comments
@@ -450,10 +481,12 @@ export function summarizeGithubApiError(error) {
   if (!(error instanceof GithubApiError)) {
     return null
   }
+  const sanitized = sanitizeGithubErrorBody(error.errorBody)
   return {
     status: 'failed',
     reason_code: error.reasonCode,
     http_status: error.httpStatus,
-    error_body: error.errorBody,
+    message: sanitized.message,
+    documentation_url: sanitized.documentation_url,
   }
 }

@@ -93,4 +93,30 @@ describe('github comment ownership marker enforcement', () => {
     expect(validation.valid).toBe(false)
     expect(validation.errors.some((error) => error.code === 'github_comments.ownership_mismatch')).toBe(true)
   })
+
+  it('GIVEN a malformed ownership-like marker inside the payload WHEN final body is validated THEN the broad injection scan fails closed', () => {
+    const payloadMarkdown = renderValidatedPublicMarkdown(createReport('focused tests passed'))
+    const candidate = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 937,
+        prNumber: null,
+        runId: 'run-937-001',
+      },
+      payloadMarkdown,
+    })
+    const tampered = `${candidate.body}\n<!-- agent_run_report:v1 issue=937 run_id=run-937-001 -->`
+    const validation = validateFinalCommentBody(tampered, {
+      expectedOwnership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 937,
+        prNumber: null,
+        runId: 'run-937-001',
+      },
+      expectedDigest: candidate.digest,
+    })
+
+    expect(validation.valid).toBe(false)
+    expect(validation.errors.some((error) => error.code === 'github_comments.ownership_marker_count')).toBe(true)
+  })
 })

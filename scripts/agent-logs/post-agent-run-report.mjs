@@ -19,7 +19,8 @@ const OPTION_SPEC = {
   '--repo': { key: 'repo', required: true },
   '--issue-number': { key: 'issueNumber' },
   '--pr-number': { key: 'prNumber' },
-  '--dry-run': { key: 'dryRun', defaultValue: 'false' },
+  '--dry-run': { key: 'dryRun', defaultValue: 'true' },
+  '--confirm-live': { key: 'confirmLive', defaultValue: 'false' },
 }
 
 function parseBooleanFlag(value, optionName) {
@@ -40,11 +41,17 @@ function loadReport(reportPath) {
   }
 }
 
+function requireAllowedRepo(repo) {
+  if (repo !== 'squne121/loop-protocol') {
+    throw runtimeError('agent_run_post.repo_not_allowed', 'repo must match the allowlisted repository')
+  }
+}
+
 function resolvePostingTarget(draft, report, issueNumberInput, prNumberInput) {
   const targetKind = draft.target.kind
   const targetId = draft.target.id
-  const issueNumber = issueNumberInput ? Number(issueNumberInput) : targetKind === 'issue' ? targetId : null
-  const prNumber = prNumberInput ? Number(prNumberInput) : targetKind === 'pull_request' ? targetId : null
+  const issueNumberOverride = issueNumberInput === null ? null : Number(issueNumberInput)
+  const prNumberOverride = prNumberInput === null ? null : Number(prNumberInput)
 
   if (report.public_surface_kind === 'github_issue_comment' && targetKind !== 'issue') {
     throw runtimeError('agent_run_post.surface_mismatch', 'github_issue_comment requires an issue-target draft')
@@ -55,17 +62,34 @@ function resolvePostingTarget(draft, report, issueNumberInput, prNumberInput) {
   if (report.public_surface_kind === 'none') {
     throw runtimeError('agent_run_post.surface_mismatch', 'public_surface_kind none cannot be posted to GitHub comments')
   }
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-    throw runtimeError('agent_run_post.issue_number', 'issue_number must resolve to a positive integer')
+
+  if (targetKind === 'issue') {
+    if (issueNumberOverride !== null && issueNumberOverride !== targetId) {
+      throw runtimeError('agent_run_post.issue_number_mismatch', 'issue-target override must match draft.target.id')
+    }
+    if (prNumberOverride !== null) {
+      throw runtimeError('agent_run_post.pr_number_forbidden', 'issue-target draft does not allow --pr-number overrides')
+    }
+
+    return {
+      targetNumber: targetId,
+      issueNumber: targetId,
+      prNumber: null,
+    }
   }
-  if (targetKind === 'pull_request' && (!Number.isInteger(prNumber) || prNumber <= 0)) {
-    throw runtimeError('agent_run_post.pr_number', 'pr_number must resolve to a positive integer for pull request comments')
+
+  if (issueNumberOverride !== null && issueNumberOverride !== targetId) {
+    throw runtimeError('agent_run_post.issue_number_mismatch', 'pull_request-target issue number must match draft.target.id')
+  }
+  if (prNumberOverride !== null && prNumberOverride !== targetId) {
+    throw runtimeError('agent_run_post.pr_number_mismatch', 'pull_request-target pr number must match draft.target.id')
   }
 
   return {
-    targetNumber: targetKind === 'issue' ? issueNumber : prNumber,
-    issueNumber,
-    prNumber: prNumber ?? null,
+    // Pull request comments use the issue-comments endpoint with the PR number.
+    targetNumber: targetId,
+    issueNumber: targetId,
+    prNumber: targetId,
   }
 }
 
@@ -75,9 +99,14 @@ export async function postAgentRunReport({
   repo,
   issueNumber = null,
   prNumber = null,
-  dryRun = false,
+  dryRun = true,
+  confirmLive = false,
   client = new GhCliIssueCommentsClient(),
 }) {
+  requireAllowedRepo(repo)
+  if (!dryRun && !confirmLive) {
+    throw runtimeError('agent_run_post.live_confirmation_required', 'live posting requires --dry-run false and --confirm-live true')
+  }
   validateFinalReport(report)
   const payloadMarkdown = renderValidatedPublicMarkdown(report)
   const target = resolvePostingTarget(draft, report, issueNumber, prNumber)
@@ -95,6 +124,7 @@ export async function postAgentRunReport({
 async function main() {
   const options = parseArgs(process.argv.slice(2), OPTION_SPEC)
   const dryRun = parseBooleanFlag(options.dryRun, '--dry-run')
+  const confirmLive = parseBooleanFlag(options.confirmLive, '--confirm-live')
   const draft = await loadDraft(options.draftPath)
   const report = loadReport(options.reportPath)
 
@@ -106,6 +136,7 @@ async function main() {
       issueNumber: options.issueNumber ?? null,
       prNumber: options.prNumber ?? null,
       dryRun,
+      confirmLive,
     })
     console.log(JSON.stringify(result))
   } catch (error) {

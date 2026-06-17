@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 
+import { upsertGithubMarkerCommentFromFile } from '../../scripts/agent-logs/upsert-github-marker-comment.mjs'
 import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown, validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
 
@@ -93,5 +97,69 @@ describe('github comment post guard', () => {
     })
 
     expect(() => renderValidatedPublicMarkdown(report)).toThrow(/public_surface_redaction_status/)
+  })
+
+  it('GIVEN the helper CLI surface WHEN live posting is requested THEN it fails closed and keeps live writes on the validated-report path only', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'agent-run-post-guard-'))
+    const payloadPath = join(tempDir, 'payload.md')
+    try {
+      writeFileSync(payloadPath, renderValidatedPublicMarkdown(createReport()), 'utf-8')
+      const client = {
+        listIssueComments: async () => {
+          throw new Error('list should not run for helper live posting')
+        },
+        createIssueComment: async () => {
+          throw new Error('create should not run for helper live posting')
+        },
+        updateIssueComment: async () => {
+          throw new Error('update should not run for helper live posting')
+        },
+      }
+
+      await expect(upsertGithubMarkerCommentFromFile({
+        repo: 'squne121/loop-protocol',
+        targetNumber: 937,
+        issueNumber: 937,
+        prNumber: null,
+        runId: 'run-937-001',
+        payloadMarkdownFile: payloadPath,
+        dryRun: false,
+        client,
+      })).rejects.toThrow(/live posting is disabled/)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN non-canonical payload markdown WHEN the helper surface is used in dry-run THEN validation fails before any comment scan', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'agent-run-post-guard-'))
+    const payloadPath = join(tempDir, 'payload.md')
+    try {
+      writeFileSync(payloadPath, '```md\n/home/squne/leak\n```', 'utf-8')
+      const client = {
+        listIssueComments: async () => {
+          throw new Error('list should not run for invalid payload markdown')
+        },
+        createIssueComment: async () => {
+          throw new Error('create should not run for invalid payload markdown')
+        },
+        updateIssueComment: async () => {
+          throw new Error('update should not run for invalid payload markdown')
+        },
+      }
+
+      await expect(upsertGithubMarkerCommentFromFile({
+        repo: 'squne121/loop-protocol',
+        targetNumber: 937,
+        issueNumber: 937,
+        prNumber: null,
+        runId: 'run-937-001',
+        payloadMarkdownFile: payloadPath,
+        dryRun: true,
+        client,
+      })).rejects.toThrow(/duplicate_start_marker/)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   })
 })

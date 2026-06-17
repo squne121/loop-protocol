@@ -10,6 +10,7 @@ import {
   summarizeGithubApiError,
   upsertAgentRunReportComment,
 } from './lib/github-comments.mjs'
+import { validateMarkdownCandidate } from '../lib/agent-run-report-validation.mjs'
 
 const OPTION_SPEC = {
   '--repo': { key: 'repo', required: true },
@@ -18,7 +19,7 @@ const OPTION_SPEC = {
   '--pr-number': { key: 'prNumber' },
   '--run-id': { key: 'runId', required: true },
   '--payload-markdown-file': { key: 'payloadMarkdownFile', required: true },
-  '--dry-run': { key: 'dryRun', defaultValue: 'false' },
+  '--dry-run': { key: 'dryRun', defaultValue: 'true' },
 }
 
 function parseBooleanFlag(value) {
@@ -31,6 +32,19 @@ function parseBooleanFlag(value) {
   throw new Error('--dry-run must be true or false')
 }
 
+function loadValidatedPayloadMarkdown(payloadMarkdownFile) {
+  const payloadMarkdown = readFileSync(payloadMarkdownFile, 'utf-8')
+  const validation = validateMarkdownCandidate(payloadMarkdown, 'agent_run_report/v1')
+  if (!validation.valid) {
+    const summary = validation.errors
+      .slice(0, 3)
+      .map((error) => `${error.code} at ${error.path}`)
+      .join('; ')
+    throw new Error(summary || 'payload markdown failed canonical validation')
+  }
+  return payloadMarkdown
+}
+
 export async function upsertGithubMarkerCommentFromFile({
   repo,
   targetNumber,
@@ -38,10 +52,13 @@ export async function upsertGithubMarkerCommentFromFile({
   prNumber = null,
   runId,
   payloadMarkdownFile,
-  dryRun = false,
+  dryRun = true,
   client = new GhCliIssueCommentsClient(),
 }) {
-  const payloadMarkdown = readFileSync(payloadMarkdownFile, 'utf-8')
+  if (!dryRun) {
+    throw new Error('live posting is disabled for upsert-github-marker-comment; use post-agent-run-report.mjs')
+  }
+  const payloadMarkdown = loadValidatedPayloadMarkdown(payloadMarkdownFile)
   return upsertAgentRunReportComment(client, {
     repo,
     targetNumber: Number(targetNumber),
