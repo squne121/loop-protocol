@@ -182,6 +182,8 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
 - literal 含有ありで scope 重複あり → 即座に停止し 3 択を提示
 - scope 重複なし → 重複なし旨を人間確認事項に添えて次へ
 
+上記の gh ベース手動チェックに加え、title keyword search だけに依存しない決定論的判定として `.claude/skills/create-issue/scripts/check_issue_overlap.py`（overlap preflight helper）を使う。helper は title / goal / Allowed Paths / labels / parent issue refs から `duplicate` / `overlap_requires_comment` / `safe_new_issue` / `ambiguous_requires_human` の closed enum verdict を返し、GitHub full-text search の false positive は候補 Issue body の `## Allowed Paths` read-back で除外する。delivery-rollup parent の child 起票では、まだ存在しない child 同士の Allowed Paths overlap も同 helper の child overlap 判定で検査する。
+
 #### 同一 Allowed Paths への複数 Issue 集約ガイドライン（マージコンフリクト回避）
 
 scope 重複チェックの結果にかかわらず、以下を強く推奨する:
