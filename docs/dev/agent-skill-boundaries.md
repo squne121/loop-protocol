@@ -544,6 +544,29 @@ CHILD_MATERIALIZATION_RESULT_V2:
 | `failed` | `human_escalation` |
 | `human_escalation` | `human_escalation`（escalation_items をコメントに記録） |
 
+### child materialization executor (`materialize_child_issues.py`)
+
+`CHILD_MATERIALIZATION_PLAN_V2` を入力に取り、起票・parent patch・結果集約までを決定論的に実行して `CHILD_MATERIALIZATION_RESULT_V2` を返す executor。`.claude/skills/create-issue/scripts/materialize_child_issues.py` が正本実装で、`create-issue` skill のステップ 4b から呼ばれる。
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
+  --plan-file <CHILD_MATERIALIZATION_PLAN_V2 互換 JSON>
+```
+
+設計境界:
+
+| 項目 | 規約 |
+|---|---|
+| plan 検証 | closed schema。unknown key / duplicate `child_id` / `issue_lookup.complete: false` / 不正 `action` / 非整数 `depends_on` / 空 `allowed_paths` / AC↔VC set 不一致を fail-closed（非 JSON も拒否、YAML fallback なし） |
+| body render | `ISSUE_TEMPLATE/<kind>.yml` の required label order を `validate_issue_body._load_required_section_labels` から取得して生成（spec-driven、ハードコード順序を持たない）。`validate_issue_body.py --kind --title` 通過が起票の前提 |
+| 起票経路 | `create_issue_txn.py` のみ。`materialize_child_issues.py` は `gh issue create` を直接呼ばない。`--label-profile standard\|triage_only` も txn に転送 |
+| dependency | `depends_on` を `create_issue_txn.py --dependency` に写像し、txn の `_readback_dependencies` で GitHub read-back まで確認。自由記述 dependency は schema 段で fail-closed |
+| parent patch | `## Child Issues` section 内で `body_sha256` 一致 + exact `old_line` + `expected_match_count == 1` + post-edit read-back を満たす場合のみ。`partial_failure` では parent patch を行わない |
+| overlap gate | overlap preflight（#948）未導入時は各 create child が #948 を `depends_on` に持つことを要求し、欠落で `human_escalation`。`undeterminable` は無条件 `human_escalation` |
+| exit code | `ok`=0 / `human_escalation`=3 / その他=1 |
+
+`create_issue_txn.py` は AC3 として、internal validator 呼び出しに `--kind`（`--issue-kind` 由来）/ `--title` を転送する。これにより caller が pre-validation を忘れても kind 固有の必須セクション / Stop Conditions / title prefix が fail-closed される。
+
 ## 設計原則の補足
 
 ### review-issue と issue-contract-review の使い分け

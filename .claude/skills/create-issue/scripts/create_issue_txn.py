@@ -134,12 +134,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dependency", action="append", dest="dependency", type=int, default=[])
     parser.add_argument("--blocked-by", action="append", dest="dependency", type=int)
     parser.add_argument("--gh", default="gh")
+    parser.add_argument(
+        "--label-profile",
+        dest="label_profile",
+        default="standard",
+        choices=["standard", "triage_only"],
+        help="label profile: standard | triage_only",
+    )
     ns = parser.parse_args(argv)
     ns.subcommand = "create"
     return ns
 
 
-def _resolve_labels(labels: list[str], issue_kind: str) -> list[str]:
+def _resolve_labels(
+    labels: list[str], issue_kind: str, label_profile: str = "standard"
+) -> list[str]:
     """Return the effective label list, prepending standard labels for implementation kind.
 
     Standard labels (_IMPLEMENTATION_STANDARD_LABELS) are merged at the front of the
@@ -147,6 +156,14 @@ def _resolve_labels(labels: list[str], issue_kind: str) -> list[str]:
     while preserving order (standard labels first, then caller-supplied extras).
     For any other issue_kind (or empty string), labels are returned unchanged.
     """
+    if label_profile == "triage_only":
+        # Triage-only profile: do not auto-assign the full implementation label set;
+        # only ensure the triage-required signal is present (delivery-rollup auto path).
+        triage_merged: list[str] = ["triage-required"]
+        for label in labels:
+            if label not in triage_merged:
+                triage_merged.append(label)
+        return triage_merged
     if issue_kind != "implementation":
         return list(labels)
     merged: list[str] = list(_IMPLEMENTATION_STANDARD_LABELS)
@@ -1321,7 +1338,9 @@ def _reconcile_issue_links(
     return completed, parent_verified, dependency_verified, failed_readbacks_reconcile
 
 
-def _run_issue_body_validator(body: str) -> dict[str, Any]:
+def _run_issue_body_validator(
+    body: str, issue_kind: str = "", title: str | None = None
+) -> dict[str, Any]:
     """Call validate_issue_body.py validator on issue body text.
 
     Returns the JSON output from the validator (parsed).
@@ -1344,8 +1363,21 @@ def _run_issue_body_validator(body: str) -> dict[str, Any]:
                 message=f"validate_issue_body.py not found at {validator_script}"
             )
 
+        validator_args = [
+            sys.executable,
+            str(validator_script),
+            "--body-file",
+            temp_body_file,
+        ]
+        # AC3: forward kind/title so create_issue_txn enforces kind-specific required
+        # sections / Stop Conditions / title prefix even when the caller forgot to
+        # pre-validate with --kind/--title.
+        if issue_kind:
+            validator_args += ["--kind", issue_kind]
+        if title:
+            validator_args += ["--title", title]
         cp = subprocess.run(
-            [sys.executable, str(validator_script), "--body-file", temp_body_file],
+            validator_args,
             capture_output=True,
             text=True
         )
@@ -1384,12 +1416,13 @@ def run_transaction(
     body_file: str,
     labels: list[str],
     issue_kind: str = "",
+    label_profile: str = "standard",
     parent_issue_number: int,
     dependency_issue_numbers: list[int | str],
     gh_bin: str,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> TransactionResult:
-    labels = _resolve_labels(labels, issue_kind)
+    labels = _resolve_labels(labels, issue_kind, label_profile)
     normalized_dependency_issue_numbers = _normalize_dependency_numbers(dependency_issue_numbers)
     completed: list[str] = []
 
@@ -1423,7 +1456,9 @@ def run_transaction(
     # --- Blocker 2.5: Issue body validation (fail-closed before any GitHub mutation) ---
     # Call validate_issue_body.py to check for LP rule violations
     try:
-        _validator_result = _run_issue_body_validator(_body_text_for_parent)
+        _validator_result = _run_issue_body_validator(
+            _body_text_for_parent, issue_kind=issue_kind, title=title
+        )
         if _validator_result.get("status") == "fail":
             # Extract error details for logging
             errors = _validator_result.get("errors", [])
@@ -2119,6 +2154,7 @@ def main(argv: list[str] | None = None) -> int:
             body_file=args.body_file,
             labels=args.label,
             issue_kind=args.issue_kind,
+            label_profile=args.label_profile,
             parent_issue_number=args.parent_issue,
             dependency_issue_numbers=args.dependency,
             gh_bin=args.gh,
