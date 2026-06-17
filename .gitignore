@@ -59,3 +59,11 @@ tmp/edit_issue_*.md
 .venv/
 __pycache__/
 .pytest_cache/
+
+# LOCAL_MAIN_SCRATCH_ALLOW_V1 safe scratch prefixes (Issue #974)
+# These paths are allowed for Write/Edit/MultiEdit from local main context.
+artifacts/
+playwright-report/
+test-results/
+coverage/
+.cache/

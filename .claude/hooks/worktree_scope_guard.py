@@ -2,11 +2,22 @@
 """worktree_scope_guard.py — PreToolUse hook that blocks mutation outside the active issue worktree.
 
 Contract: WORKTREE_SCOPE_RESOLUTION_V1 / MUTATING_BASH_CLASSIFIER_V1 (Issue #960).
+Extended: LOCAL_MAIN_SCRATCH_ALLOW_V1 (Issue #974).
 
 When an active issue worktree exists, Write/Edit/MultiEdit targeting paths outside
 the expected worktree, and mutating Bash commands whose effective target is outside
 the expected worktree, are blocked (fail-closed). Read-only Bash and worktree-internal
 mutation are allowed.
+
+LOCAL_MAIN_SCRATCH_ALLOW_V1: When cwd is the project root (local main checkout),
+the current branch is main/default branch, and cwd is not inside any linked issue
+worktree, Write/Edit/MultiEdit to safe_scratch_prefix paths that are:
+  - gitignored by repo-local .gitignore (not global / .git/info/exclude only)
+  - untracked (not in git index)
+  - under SAFE_SCRATCH_PREFIXES (component-boundary match)
+  - free of sensitive path patterns
+  - free of symlink components
+are allowed. Phase 1: Write/Edit/MultiEdit only. Bash write exception is Phase 2.
 
 Exit codes:
   0  — allow (no stdout/stderr)
@@ -42,6 +53,375 @@ BASH_TOOL = "Bash"
 # Matched mutation tools: a matched PreToolUse tool for which malformed payload is
 # fail-closed. The hook matcher is "Bash|Write|Edit|MultiEdit".
 MATCHED_TOOLS = WRITE_TOOLS | {BASH_TOOL}
+
+
+# =============================================================================
+# LOCAL_MAIN_SCRATCH_ALLOW_V1 — safe scratch paths on local main checkout
+# =============================================================================
+
+# Safe scratch prefixes (component-boundary match required, not string prefix).
+# These must also be present in repo-local .gitignore.
+SAFE_SCRATCH_PREFIXES = (
+    "artifacts",
+    "playwright-report",
+    "test-results",
+    "coverage",
+    ".cache",
+)
+
+# Sensitive path patterns — any target matching these is ALWAYS blocked
+# regardless of prefix / ignore status.
+_SENSITIVE_PATTERNS = re.compile(
+    r"""
+    (^|/) (
+        \.env[^/]*         |   # .env, .env.local, .env.production, etc.
+        [^/]*\.pem         |   # *.pem
+        [^/]*\.key         |   # *.key
+        [^/]*\.p12         |   # *.p12
+        [^/]*\.pfx         |   # *.pfx
+        [^/]*token[^/]*    |   # *token*
+        [^/]*secret[^/]*   |   # *secret*
+        [^/]*credential[^/]* | # *credential*
+        \.npmrc            |   # .npmrc
+        \.pypirc           |   # .pypirc
+        \.netrc            |   # .netrc
+        \.ssh(/|$)         |   # .ssh/**
+        \.config/gh(/|$)       # .config/gh/**
+    ) ($|/)
+    """,
+    re.VERBOSE,
+)
+
+# Regex for main/default branch names
+_MAIN_BRANCH_RE = re.compile(r"^(main|master|trunk|develop|development)$")
+
+
+def _is_sensitive_path(relpath: str) -> bool:
+    """True iff relpath matches a sensitive path pattern."""
+    # Normalize to forward slashes for matching
+    normalized = relpath.replace(os.sep, "/")
+    return bool(_SENSITIVE_PATTERNS.search("/" + normalized))
+
+
+def _is_under_safe_prefix(relpath: str) -> bool:
+    """True iff relpath is under one of the SAFE_SCRATCH_PREFIXES (component boundary).
+
+    Uses os.path.commonpath to ensure component-boundary matching.
+    'artifacts_evil/foo' is NOT under 'artifacts'.
+    'artifacts/../README.md' is NOT under 'artifacts'.
+    """
+    if not relpath:
+        return False
+    # Normalize to remove any .. components first via os.path.normpath
+    normalized = os.path.normpath(relpath)
+    # Reject if normpath escapes the root (e.g., ../../something)
+    if normalized.startswith(".."):
+        return False
+    parts = normalized.split(os.sep)
+    if not parts or not parts[0]:
+        return False
+    top_component = parts[0]
+    return top_component in SAFE_SCRATCH_PREFIXES
+
+
+def _repo_default_branch(project_root: str) -> str | None:
+    """Return the repository default branch name (e.g. 'main'), or None."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        out = subprocess.run(
+            [git, "-C", project_root, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            branch = out.stdout.strip()
+            if branch and _MAIN_BRANCH_RE.match(branch):
+                return branch
+    except Exception:
+        pass
+    return None
+
+
+def _is_local_main_context(cwd_realpath: str, project_root: str) -> bool:
+    """True iff all three local-main context conditions are met (AC1):
+
+    1. cwd_realpath == project_root_realpath
+    2. current branch is main/default branch
+    3. cwd is NOT inside any linked issue worktree
+    """
+    project_root_real = os.path.realpath(project_root)
+    cwd_real = os.path.realpath(cwd_realpath)
+
+    # Condition 1: cwd == project_root
+    if cwd_real != project_root_real:
+        return False
+
+    # Condition 2: current branch is main/default
+    branch = _current_branch(project_root)
+    if not branch or not _MAIN_BRANCH_RE.match(branch):
+        return False
+
+    # Condition 3: cwd is not inside any linked issue worktree
+    # The project_root itself is not inside a worktree (worktrees are subpaths),
+    # but we explicitly verify via the worktree catalog.
+    catalog = list_worktrees(project_root)
+    if catalog is None:
+        # git unavailable — fail-closed
+        return False
+
+    for wt in catalog:
+        wt_path = wt.get("worktree")
+        if not wt_path:
+            continue
+        wt_real = os.path.realpath(wt_path)
+        # Skip the main worktree itself
+        if wt_real == project_root_real:
+            continue
+        # If cwd is inside any non-main worktree, it's not local main context
+        try:
+            common = os.path.commonpath([wt_real, cwd_real])
+        except ValueError:
+            continue
+        if common == wt_real:
+            return False
+
+    return True
+
+
+def _has_symlink_component(target_path: str, safe_root_real: str) -> bool:
+    """True iff any existing path component in target_path (under safe_root) is a symlink.
+
+    Also checks: safe_root itself must exist and not be a symlink.
+    Checks every component from safe_root down to target_path (existing ones).
+    Non-existent intermediate directories are OK (as long as none of the
+    existing parent directories are symlinks).
+
+    Returns True (block) if:
+    - safe_root does not exist
+    - safe_root is a symlink
+    - any existing component under safe_root (up to target) is a symlink
+    - target itself exists and is a symlink
+    """
+    # safe_root must exist and be a real directory (not a symlink)
+    if not os.path.exists(safe_root_real):
+        return True  # block: safe_root doesn't exist
+    if os.path.islink(safe_root_real):
+        return True  # block: safe_root is a symlink
+
+    # Walk from safe_root down to target_path, checking existing components
+    # target_path is already absolute
+    # Compute relative path from safe_root to target
+    try:
+        rel = os.path.relpath(target_path, safe_root_real)
+    except ValueError:
+        return True  # different drives — block
+
+    if rel.startswith(".."):
+        return True  # target is outside safe_root — block
+
+    parts = rel.split(os.sep)
+    current = safe_root_real
+    for part in parts:
+        current = os.path.join(current, part)
+        if os.path.exists(current) or os.path.islink(current):
+            if os.path.islink(current):
+                return True  # symlink component found — block
+
+    return False
+
+
+def _is_git_tracked(relpath: str, project_root: str) -> bool:
+    """True iff relpath is tracked (in git index). AC7."""
+    git = shutil.which("git")
+    if not git:
+        return True  # fail-closed: can't check → assume tracked
+    try:
+        out = subprocess.run(
+            [git, "-C", project_root, "ls-files", "--error-unmatch", "--", relpath],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return out.returncode == 0
+    except Exception:
+        return True  # fail-closed
+
+
+def _is_repo_local_gitignore(relpath: str, project_root: str) -> bool:
+    """True iff relpath is gitignored by repo-local .gitignore (not global/exclude only). AC8.
+
+    Uses `git check-ignore -v -- <rel>` and parses the source line.
+    Returns False (block) when:
+    - returncode != 0 (not ignored at all)
+    - source is ~/.gitignore_global, ~/.config/git/ignore, .git/info/exclude, etc.
+    Returns True (allow) only when source is a repo-local .gitignore file.
+    """
+    git = shutil.which("git")
+    if not git:
+        return False  # fail-closed
+
+    try:
+        out = subprocess.run(
+            [git, "-C", project_root, "check-ignore", "-v", "--", relpath],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False  # fail-closed
+
+    if out.returncode != 0:
+        # Not ignored at all
+        return False
+
+    # Output format: <source>:<linenum>:<pattern>\t<pathname>
+    stdout = out.stdout.strip()
+    if not stdout:
+        return False
+
+    # Extract the source file (before the first colon)
+    source_part = stdout.split(":")[0] if ":" in stdout else ""
+    if not source_part:
+        return False
+
+    # Resolve source path. git check-ignore -v may return a relative path
+    # (e.g. ".gitignore"), which must be resolved relative to project_root,
+    # not relative to the current working directory of this Python process.
+    project_root_real = os.path.realpath(project_root)
+    if os.path.isabs(source_part):
+        source_real = os.path.realpath(source_part)
+    else:
+        source_real = os.path.realpath(os.path.join(project_root_real, source_part))
+
+    # Accept only sources inside project_root (repo-local .gitignore files)
+    # Reject: global excludes, ~/.gitignore_global, ~/.config/git/ignore,
+    # .git/info/exclude (which is inside .git/ directory)
+    try:
+        common = os.path.commonpath([project_root_real, source_real])
+    except ValueError:
+        return False
+
+    if common != project_root_real:
+        # Source is outside project root — global ignore or home-dir gitignore
+        return False
+
+    # Reject .git/info/exclude (inside .git directory)
+    git_dir = os.path.join(project_root_real, ".git")
+    try:
+        git_common = os.path.commonpath([git_dir, source_real])
+    except ValueError:
+        pass
+    else:
+        if git_common == os.path.realpath(git_dir):
+            return False
+
+    return True
+
+
+def local_main_scratch_allow_v1(target: str, cwd: str, project_root: str,
+                                  tool_name: str) -> bool:
+    """LOCAL_MAIN_SCRATCH_ALLOW_V1: Allow Write/Edit/MultiEdit to safe scratch paths.
+
+    Returns True iff the target should be allowed under the local main scratch exception.
+    Returns False (fall through to normal guard logic) if any condition is not met.
+
+    Conditions (all must pass):
+    - tool_name is Write, Edit, or MultiEdit (Phase 1 only — AC10)
+    - cwd is local main context (AC1)
+    - target is absolute or resolved relative to cwd
+    - target_realpath is inside project_root
+    - target_realpath is NOT inside .git/** or .claude/worktrees/**
+    - normalized relpath is under SAFE_SCRATCH_PREFIXES (component boundary — AC4)
+    - NOT a sensitive path (AC6)
+    - NOT git-tracked / in index (AC7)
+    - gitignored by repo-local .gitignore (AC8)
+    - no symlink component in path (AC5)
+    - NOT a git/gh/package-manager mutation context (AC9)
+    """
+    # AC10: Phase 1 — Write/Edit/MultiEdit only
+    if tool_name not in WRITE_TOOLS:
+        return False
+
+    # AC9: git/gh/package-manager mutation — scratch exception does not apply
+    # (Write/Edit/MultiEdit to git internals is blocked by other checks)
+    # No special check needed here as we check against .git/** below.
+
+    # Resolve target to absolute path
+    if not target:
+        return False
+    if not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    target_real = os.path.realpath(target)
+    project_root_real = os.path.realpath(project_root)
+
+    # AC1: local main context check
+    cwd_real = os.path.realpath(cwd)
+    if not _is_local_main_context(cwd_real, project_root):
+        return False
+
+    # target must be inside project_root
+    try:
+        common = os.path.commonpath([project_root_real, target_real])
+    except ValueError:
+        return False
+    if common != project_root_real:
+        return False
+
+    # target must NOT be inside .git/**
+    git_dir = os.path.join(project_root_real, ".git")
+    try:
+        git_common = os.path.commonpath([git_dir, target_real])
+    except ValueError:
+        pass
+    else:
+        if git_common == os.path.realpath(git_dir):
+            return False
+
+    # target must NOT be inside .claude/worktrees/**
+    worktrees_dir = os.path.join(project_root_real, ".claude", "worktrees")
+    try:
+        wt_common = os.path.commonpath([os.path.realpath(worktrees_dir), target_real])
+    except ValueError:
+        pass
+    else:
+        if wt_common == os.path.realpath(worktrees_dir):
+            return False
+
+    # Compute relpath from project_root
+    try:
+        relpath = os.path.relpath(target_real, project_root_real)
+    except ValueError:
+        return False
+
+    # AC4: component-boundary prefix check
+    if not _is_under_safe_prefix(relpath):
+        return False
+
+    # AC6: sensitive path denylist
+    if _is_sensitive_path(relpath):
+        return False
+
+    # AC7: must NOT be git-tracked
+    if _is_git_tracked(relpath, project_root):
+        return False
+
+    # AC8: must be gitignored by repo-local .gitignore
+    if not _is_repo_local_gitignore(relpath, project_root):
+        return False
+
+    # AC5: symlink policy
+    # Determine the safe_root (top-level prefix dir)
+    top_component = os.path.normpath(relpath).split(os.sep)[0]
+    safe_root = os.path.join(project_root_real, top_component)
+    safe_root_real = os.path.realpath(safe_root)
+
+    if _has_symlink_component(target_real, safe_root_real):
+        return False
+
+    return True
 
 
 # =============================================================================
@@ -904,7 +1284,7 @@ def decide(payload: dict) -> None:
     resolution = resolve_expected_worktree(issue, project_root)
 
     if tool_name in WRITE_TOOLS:
-        _decide_write(tool_input, cwd, issue, resolution)
+        _decide_write(tool_input, cwd, issue, resolution, tool_name, project_root)
     elif tool_name == BASH_TOOL:
         _decide_bash(tool_input, cwd, issue, resolution)
 
@@ -912,12 +1292,16 @@ def decide(payload: dict) -> None:
 
 
 def _decide_write(tool_input: dict, cwd: str, issue: str | None,
-                  resolution: "WorktreeResolution") -> None:
+                  resolution: "WorktreeResolution", tool_name: str = "Write",
+                  project_root: str | None = None) -> None:
     target = (
         tool_input.get("file_path")
         or tool_input.get("path")
         or ""
     )
+
+    if project_root is None:
+        project_root = resolve_project_root()
 
     # No active issue resolvable → write tools are not scoped to a worktree; allow.
     if not issue:
@@ -938,6 +1322,12 @@ def _decide_write(tool_input: dict, cwd: str, issue: str | None,
 
     if is_inside(resolution.expected, target, cwd):
         _allow()
+
+    # Target is outside the expected worktree.
+    # LOCAL_MAIN_SCRATCH_ALLOW_V1: allow writes to safe scratch paths from local main.
+    if local_main_scratch_allow_v1(target, cwd, project_root, tool_name):
+        _allow()
+
     _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
 
 
