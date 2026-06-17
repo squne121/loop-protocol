@@ -182,6 +182,29 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
 - literal 含有ありで scope 重複あり → 即座に停止し 3 択を提示
 - scope 重複なし → 重複なし旨を人間確認事項に添えて次へ
 
+上記の gh ベース手動チェックに加え、title keyword search だけに依存しない決定論的判定として overlap preflight helper `.claude/skills/create-issue/scripts/check_issue_overlap.py` を使う。
+
+実行例:
+
+```bash
+uv run python3 .claude/skills/create-issue/scripts/check_issue_overlap.py \
+  --repo <owner/repo> --title "<起票予定 title>" \
+  --goal "<goal_ref>" --allowed-paths-file <paths.txt> \
+  [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...] \
+  --fail-on-unsafe
+```
+
+helper は `ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`（`decision` / `reason_code` / `policy_class` / `source_status` / `candidates[].matched_fields` / `comment_template`）を返す。`decision` 別の停止条件:
+
+- `safe_new_issue` → 起票続行。
+- `overlap_requires_comment`（C1/C2a）→ `comment_template` を新規 Issue に記録して起票。
+- `ambiguous_requires_human`（C2b/C3 / source degraded）→ **停止して人間判断**（`--fail-on-unsafe` 時は exit 3）。
+- `duplicate` → 起票中止し既存 Issue へ統合。
+
+GitHub source（search / read-back）失敗・partial・saturation は `ambiguous_requires_human` に倒れる（fail-closed。`safe_new_issue` の false green を作らない）。証跡として helper の JSON 出力（`ISSUE_OVERLAP_PREFLIGHT_RESULT_V1`）を Issue comment または PR 本文に残す。
+
+本 helper は preflight advisory であり、現時点で `create_issue_txn.py` の mutation hard gate には未配線（hard gate 化は follow-up issue）。child overlap は fixture-only であり #946 の child materialization gate ではない。
+
 #### 同一 Allowed Paths への複数 Issue 集約ガイドライン（マージコンフリクト回避）
 
 scope 重複チェックの結果にかかわらず、以下を強く推奨する:
