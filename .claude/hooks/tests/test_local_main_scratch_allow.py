@@ -164,19 +164,51 @@ def test_block_safe_prefix_not_in_repo_gitignore(tmp_path):
 def test_block_global_gitignore_only_match(tmp_path):
     """AC8: If only global gitignore matches (not repo-local), Write is blocked.
 
-    We test this by ensuring .gitignore does NOT contain the entry,
-    so git check-ignore -v would not show a repo-local source.
+    Sets up a global gitignore via core.excludesFile and a .git/info/exclude entry,
+    but does NOT add the path to repo-local .gitignore. Guard must block because
+    git check-ignore -v would not show a repo-local source.
     """
     repo = _make_repo_with_worktree(tmp_path, issue="974")
-    # No repo-local .gitignore entry for artifacts/
 
-    target = repo["root"] / "artifacts" / "report.html"
+    # Set up global gitignore (via core.excludesFile) — matches artifacts/
+    global_ignore = tmp_path / "global-exclude"
+    global_ignore.write_text("artifacts/**\n")
+    _git("config", "core.excludesFile", str(global_ignore), cwd=repo["root"])
+
+    # Also set up .git/info/exclude
+    git_info_exclude = repo["root"] / ".git" / "info" / "exclude"
+    with open(str(git_info_exclude), "a") as f:
+        f.write("artifacts/**\n")
+
+    # No repo-local .gitignore entry for artifacts/ — only global/exclude sources
+    target = repo["root"] / "artifacts" / "global-only.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
 
     payload = _write_payload(str(target), str(repo["root"]))
     result = _run_guard(payload, repo["root"], issue="974")
     assert result.returncode == 2, (
-        f"Expected block (exit 2), got {result.returncode}. stderr={result.stderr}"
+        f"Expected block (exit 2) for global-only gitignore match, got {result.returncode}. "
+        f"stderr={result.stderr}"
+    )
+
+
+def test_block_git_info_exclude_only_match(tmp_path):
+    """AC8 variant: .git/info/exclude-only match is also blocked (not repo-local .gitignore)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="974")
+
+    # Only .git/info/exclude — no repo-local .gitignore entry
+    git_info_exclude = repo["root"] / ".git" / "info" / "exclude"
+    with open(str(git_info_exclude), "a") as f:
+        f.write("artifacts/**\n")
+
+    target = repo["root"] / "artifacts" / "exclude-only.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = _write_payload(str(target), str(repo["root"]))
+    result = _run_guard(payload, repo["root"], issue="974")
+    assert result.returncode == 2, (
+        f"Expected block (exit 2) for .git/info/exclude-only match, got {result.returncode}. "
+        f"stderr={result.stderr}"
     )
 
 
@@ -389,4 +421,74 @@ def test_block_write_when_branch_is_issue_branch_not_main(tmp_path):
     )
     assert result.returncode == 2, (
         f"Expected block (exit 2), got {result.returncode}. stderr={result.stderr}"
+    )
+
+def test_block_write_inside_dot_git_even_if_ignored(tmp_path):
+    """AC: .git/ subpath is always blocked even if somehow gitignored."""
+    repo = _make_repo_with_worktree(tmp_path, issue="974")
+    _add_gitignore(repo["root"], [".git/scratch/", ".git/scratch/**"])
+
+    # Even if we somehow make .git/scratch gitignored, it must be blocked
+    target = repo["root"] / ".git" / "scratch" / "output.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = _write_payload(str(target), str(repo["root"]))
+    result = _run_guard(payload, repo["root"], issue="974")
+    assert result.returncode == 2, (
+        f"Expected block (exit 2) for .git/ write, got {result.returncode}. "
+        f"stderr={result.stderr}"
+    )
+
+
+def test_block_write_inside_claude_worktrees_even_if_ignored(tmp_path):
+    """AC: .claude/worktrees/ subpath is always blocked even if gitignored."""
+    repo = _make_repo_with_worktree(tmp_path, issue="974")
+    _add_gitignore(repo["root"], [".claude/worktrees/scratch/", ".claude/worktrees/scratch/**"])
+
+    target = repo["root"] / ".claude" / "worktrees" / "scratch" / "output.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = _write_payload(str(target), str(repo["root"]))
+    result = _run_guard(payload, repo["root"], issue="974")
+    assert result.returncode == 2, (
+        f"Expected block (exit 2) for .claude/worktrees/ write, got {result.returncode}. "
+        f"stderr={result.stderr}"
+    )
+
+
+def test_block_git_add_force_ignored_scratch_file(tmp_path):
+    """AC9 regression: git add -f on a scratch file must be blocked (git mutation).
+
+    Even though the target is an ignored scratch file, the command is 'git add -f'
+    which is a git mutation. The scratch allow exception does NOT apply to git mutations.
+    This prevents the path: write scratch -> git add -f -> staged in index.
+    """
+    repo = _make_repo_with_worktree(tmp_path, issue="974")
+    _add_gitignore(repo["root"], ["artifacts/", "artifacts/**"])
+
+    # Simulate a 'git add -f' Bash invocation targeting a scratch file
+    # The guard payload for Bash is different from Write — this tests the Bash path
+    # (worktree_scope_guard blocks mutating git commands regardless of target)
+    target_file = repo["root"] / "artifacts" / "scratch.txt"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("scratch content\n")
+
+    # Build a Bash tool payload simulating: git add -f artifacts/scratch.txt
+    payload = {
+        "tool": "Bash",
+        "tool_input": {
+            "command": f"git -C {repo['root']} add -f artifacts/scratch.txt"
+        }
+    }
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "974"}
+    result = subprocess.run(
+        ["bash", str(GUARD_SH)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env={**os.environ, **env},
+    )
+    assert result.returncode == 2, (
+        f"Expected block (exit 2) for 'git add -f' mutation, got {result.returncode}. "
+        f"stderr={result.stderr}"
     )

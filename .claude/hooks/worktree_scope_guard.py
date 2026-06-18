@@ -93,7 +93,7 @@ _SENSITIVE_PATTERNS = re.compile(
 )
 
 # Regex for main/default branch names
-_MAIN_BRANCH_RE = re.compile(r"^(main|master|trunk|develop|development)$")
+_MAIN_BRANCH_RE = re.compile(r"^(main|master|trunk)$")
 
 
 def _is_sensitive_path(relpath: str) -> bool:
@@ -125,20 +125,29 @@ def _is_under_safe_prefix(relpath: str) -> bool:
 
 
 def _repo_default_branch(project_root: str) -> str | None:
-    """Return the repository default branch name (e.g. 'main'), or None."""
+    """Return the repository default branch name from remote HEAD, or None.
+
+    Uses 'git symbolic-ref refs/remotes/origin/HEAD' to get the true default
+    branch, not the current branch. Falls back to None if unavailable.
+    """
     git = shutil.which("git")
     if not git:
         return None
     try:
         out = subprocess.run(
-            [git, "-C", project_root, "rev-parse", "--abbrev-ref", "HEAD"],
+            [git, "-C", project_root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if out.returncode == 0:
-            branch = out.stdout.strip()
-            if branch and _MAIN_BRANCH_RE.match(branch):
+            ref = out.stdout.strip()
+            # ref is e.g. "origin/main" -> extract just "main"
+            if "/" in ref:
+                branch = ref.split("/", 1)[1]
+            else:
+                branch = ref
+            if branch:
                 return branch
     except Exception:
         pass
@@ -159,9 +168,16 @@ def _is_local_main_context(cwd_realpath: str, project_root: str) -> bool:
     if cwd_real != project_root_real:
         return False
 
-    # Condition 2: current branch is main/default
+    # Condition 2: current branch is main/default branch
+    # allowed_branches = {"main", "master", "trunk"} union repo default branch
     branch = _current_branch(project_root)
-    if not branch or not _MAIN_BRANCH_RE.match(branch):
+    if not branch:
+        return False
+    allowed_branches = set(_MAIN_BRANCH_RE.pattern.strip("^()$").split("|"))
+    default = _repo_default_branch(project_root)
+    if default:
+        allowed_branches.add(default)
+    if branch not in allowed_branches:
         return False
 
     # Condition 3: cwd is not inside any linked issue worktree
