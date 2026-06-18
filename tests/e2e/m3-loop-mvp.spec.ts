@@ -355,8 +355,8 @@ test(
 
 // ---------------------------------------------------------------------------
 // AC5: reload 後も localStorage snapshot は保持されるが、
-//      B1 no auto-load により runtime resources / combat runtime state は復元されない。
-//      Load Game による snapshot 適用は本 E2E では未実行。
+//      B1 no auto-load により runtime resources / combat runtime state / result phase は復元されない。
+//      Load Game による snapshot 適用は実装契約として存在するが、本 E2E では未実行。
 //
 // Implementation note:
 // - addInitScript persists across reload.
