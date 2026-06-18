@@ -1,0 +1,128 @@
+name: agent-retro-index
+
+on:
+  workflow_dispatch:
+    inputs:
+      parent_issue:
+        description: Parent issue number for the canonical retro index marker
+        required: true
+        default: "928"
+      dry_run:
+        description: Keep the workflow in dry-run mode
+        required: true
+        default: "true"
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/agent-logs/update-retro-index.mjs
+      - scripts/agent-logs/lib/retro-index*.mjs
+      - scripts/lib/agent-run-report-validation.mjs
+      - docs/schemas/agent-retro-index.schema.json
+      - tests/agent-logs/retro-index*.test.ts
+      - tests/fixtures/agent-retro-index/**
+      - package.json
+      - pnpm-lock.yaml
+      - .github/workflows/agent-retro-index.yml
+
+permissions: {}
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Determine dry-run mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            printf 'dry_run=%s\n' "${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          else
+            printf 'dry_run=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build retro index artifact
+        run: |
+          node scripts/agent-logs/update-retro-index.mjs \
+            --repo squne121/loop-protocol \
+            --parent-issue "${{ inputs.parent_issue || '928' }}" \
+            --dry-run true \
+            --artifact-json-out artifacts/agent-retro-index.json \
+            --summary-json-out artifacts/agent-retro-index-summary.json
+
+      - name: Validate retro index artifact
+        run: pnpm agent-retro-index:check artifacts/agent-retro-index.json
+
+      - name: Verify artifact digest metadata
+        run: pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --summary-json-in artifacts/agent-retro-index-summary.json
+
+      - name: Upload retro index artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-retro-index
+          path: |
+            artifacts/agent-retro-index.json
+            artifacts/agent-retro-index-summary.json
+
+  upsert-parent-comment:
+    runs-on: ubuntu-latest
+    needs: build-index
+    if: github.event_name == 'push' || needs.build-index.outputs.dry_run == 'false'
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download retro index artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: agent-retro-index
+          path: artifacts
+
+      - name: Revalidate artifact before write
+        run: |
+          pnpm agent-retro-index:check artifacts/agent-retro-index.json
+          pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --summary-json-in artifacts/agent-retro-index-summary.json
+
+      - name: Upsert canonical parent marker
+        run: |
+          node scripts/agent-logs/update-retro-index.mjs \
+            --repo squne121/loop-protocol \
+            --parent-issue "${{ inputs.parent_issue || '928' }}" \
+            --dry-run false \
+            --confirm-live true \
+            --summary-json-out artifacts/agent-retro-index-live-summary.json
