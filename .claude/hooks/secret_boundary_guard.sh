@@ -122,10 +122,17 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     fi
 fi
 
-# ── Sensitive path patterns for Read/Write/Edit/Grep/Glob ────────────────────
+# ── Sensitive path patterns for Read/Write/Edit/Grep/Glob/MultiEdit ──────────
 # Block access to .env files, secrets/, credential paths, local token stores.
 
-SENSITIVE_TOOLS="Read Write Edit Grep Glob"
+SENSITIVE_TOOLS="Read Write Edit Grep Glob MultiEdit"
+
+# MultiEdit pathless fail-closed: MultiEdit で file_path が欠落または空文字の場合は
+# 安全側に倒して exit 2 で遮断する（stderr に raw payload/path/secret-like value を出力しない）。
+if [ "$TOOL_NAME" = "MultiEdit" ] && [ -z "$PATH_INPUT" ]; then
+    echo "[secret_boundary_guard] blocked: MultiEdit with missing/empty file_path — fail closed" >&2
+    exit 2
+fi
 
 if echo "$SENSITIVE_TOOLS" | grep -qw "$TOOL_NAME" && [ -n "$PATH_INPUT" ]; then
     BLOCKED=0
