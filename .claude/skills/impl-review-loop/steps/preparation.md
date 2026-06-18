@@ -67,18 +67,38 @@ gh issue view <issue_number> --json title,labels \
 
 `ensure_contract_snapshot` が `status: blocked_needs_refinement` を返した場合、preparation は **preflight の再実行や GitHub mutation を行わず**、既存の blocked evidence を `triage_contract_blockers.py` へ渡して short summary に正規化してよい。
 
-- 本 normalizer は **new classifier ではなく `normalizer_router`** として扱う。`vc_preflight.classifications[]` / `vc_preflight_classifications[]` / `BASELINE_VC_PREFLIGHT_RESULT_V1.results[]` を消費するだけで、raw command result の再分類はしない。
+- 本 normalizer は **new classifier ではなく `normalizer_router`** として扱う。`vc_preflight.classifications[]` / `vc_preflight_classifications[]` / `baseline_vc_preflight/v1.results[]` を消費するだけで、raw command result の再分類はしない。
 - Section 6 の `vc_preflight.status: blocked` routing とは責務が異なる。本節は **Step 0 / `missing_contract_go`** で止まったとき専用、Section 6 は **`status: go` 受信後の Step 1-c** 専用。
 - accepted input:
   - `CONTRACT_SNAPSHOT_ENSURE_RESULT_V1.contract_review_once_result.vc_preflight_classifications[]`
   - `CONTRACT_REVIEW_ONCE_RESULT_V1.vc_preflight_classifications[]`
-  - `BASELINE_VC_PREFLIGHT_RESULT_V1.results[]`
+  - `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight.classifications[]`（scalar は unsupported）
+  - `baseline_vc_preflight/v1.results[]`
 - unsupported input:
   - `source: latest_blocked` で `contract_snapshot_url` しかない snapshot-only payload
   - scalar-only `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight`
 - preparation が LOOP_STATE に記録するのは `CONTRACT_BLOCKER_TRIAGE_V1` の route key と **短い triage summary のみ**。raw stdout/stderr は埋め込まない（raw stdout / stderr を埋め込まない）。
 - `CONTRACT_BLOCKER_TRIAGE_V1` の route key には `aggregate_reason`, `step1_allowed`, `termination_reason`, `intake_gate_subreason`, `issue_refinement_recommended`, `environment_retry_recommended`, `body_author_fixable`, `suggested_actions`, `per_ac`, `source_integrity`, `mutation_free` を含める。
 - `aggregate_reason: mixed` は `step1_allowed: false` のまま停止し、human review を required route とする。
+
+minimum CLI invocation:
+
+```bash
+python3 .claude/skills/impl-review-loop/scripts/triage_contract_blockers.py \
+  --input-file "$CONTRACT_SNAPSHOT_ENSURE_RESULT_FILE" \
+  > "$CONTRACT_BLOCKER_TRIAGE_FILE"
+```
+
+normalizer 実行後は次を機械的に検査する:
+
+```text
+schema == CONTRACT_BLOCKER_TRIAGE_V1
+status == ok
+source_integrity.evidence_complete == true
+step1_allowed == false
+```
+
+`unsupported_input` / `incomplete_evidence` / `invalid_input` / invalid JSON / non-zero exit はすべて fail-closed で `human_escalation` に route する。
 
 推奨する埋め込み形は次のとおり:
 

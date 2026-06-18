@@ -6,141 +6,154 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
-from pathlib import Path
 from typing import Any
 
 
 SCHEMA_NAME = "CONTRACT_BLOCKER_TRIAGE_V1"
-SCHEMA_GOVERNANCE_FOLLOW_UP = "docs/dev/schema-governance.md"
+SCHEMA_VERSION = 1
+BASELINE_SCHEMA = "baseline_vc_preflight/v1"
 CI_TRUE_DELTA = {"CI": "true"}
+VALID_INPUT_SCHEMAS = {
+    "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
+    "CONTRACT_REVIEW_ONCE_RESULT_V1",
+    "CONTRACT_REVIEW_RESULT_V1",
+    BASELINE_SCHEMA,
+}
+VALID_STATUS = {
+    "ok",
+    "incomplete_evidence",
+    "unsupported_input",
+    "invalid_input",
+}
 
 
-def load_payload(input_file: str | None) -> dict[str, Any]:
-    if input_file:
-        return json.loads(Path(input_file).read_text(encoding="utf-8"))
-    return json.loads(sys.stdin.read())
-
-
-def _unsupported_result(
+def _result(
     *,
+    status: str,
     input_schema: str | None,
-    unsupported_reason: str,
-    reason: str,
+    unsupported_reason: str | None,
+    vc_preflight_executed: bool,
+    evidence_complete: bool,
+    accepted_item_count: int,
+    rejected_item_count: int,
+    aggregate_reason: str = "unclassified",
+    summary: str = "",
+    per_ac: list[dict[str, Any]] | None = None,
+    suggested_actions: list[dict[str, Any]] | None = None,
+    issue_refinement_recommended: bool = False,
+    environment_retry_recommended: bool = False,
+    body_author_fixable: bool = False,
+    errors: list[str] | None = None,
 ) -> dict[str, Any]:
+    suggested_actions = suggested_actions or []
+    per_ac = per_ac or []
+    errors = errors or []
+    suggested_next_action = "human_review"
+    if status == "ok":
+        if aggregate_reason == "vc_design_requires_refinement":
+            suggested_next_action = "refine_issue_contract"
+        elif aggregate_reason == "environment_artifact":
+            suggested_next_action = (
+                "retry_with_runner_env_delta"
+                if environment_retry_recommended
+                else "inspect_package_manager_state"
+            )
     return {
         "schema": SCHEMA_NAME,
-        "status": "unsupported_input",
-        "aggregate_reason": "unclassified",
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "aggregate_reason": aggregate_reason,
         "step1_allowed": False,
         "termination_reason": "intake_gate_failed",
         "intake_gate_subreason": "missing_contract_go",
-        "issue_refinement_recommended": False,
-        "environment_retry_recommended": False,
-        "body_author_fixable": False,
-        "suggested_next_action": "human_review",
-        "summary": reason,
-        "suggested_actions": [
-            {
-                "kind": "human_review",
-                "command": None,
-                "preconditions": [],
-                "reason": reason,
-            }
-        ],
-        "per_ac": [],
+        "issue_refinement_recommended": issue_refinement_recommended,
+        "environment_retry_recommended": environment_retry_recommended,
+        "body_author_fixable": body_author_fixable,
+        "suggested_next_action": suggested_next_action,
+        "summary": summary,
+        "suggested_actions": suggested_actions,
+        "per_ac": per_ac,
         "source_integrity": {
             "input_schema": input_schema,
-            "evidence_complete": False,
+            "vc_preflight_executed": vc_preflight_executed,
+            "evidence_complete": evidence_complete,
+            "accepted_item_count": accepted_item_count,
+            "rejected_item_count": rejected_item_count,
             "unsupported_reason": unsupported_reason,
         },
-        "schema_change_applicability": {"decision": "schema_change"},
-        "schema_governance_update": {
-            "status": "out_of_scope_followup_required",
-            "followup_issue": SCHEMA_GOVERNANCE_FOLLOW_UP,
-        },
         "mutation_free": True,
-        "errors": [],
+        "errors": errors,
     }
 
 
-def extract_supported_items(payload: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]] | None, str | None]:
-    schema_field = payload.get("schema")
-    if schema_field == "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1":
-        root = payload
-        review_once = root.get("contract_review_once_result")
-        if isinstance(review_once, dict):
-            classifications = review_once.get("vc_preflight_classifications")
-            if isinstance(classifications, list):
-                return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", classifications, None
-        if root.get("source") == "latest_blocked" and root.get("contract_snapshot_url"):
-            return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", None, "latest_blocked_requires_contract_review_once_result"
-        return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", None, "missing_classifications"
+def _sha256_command(command: str) -> str:
+    return "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
 
-    if schema_field == "CONTRACT_REVIEW_ONCE_RESULT_V1":
+
+def _is_valid_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 71 and value.startswith("sha256:")
+
+
+def _load_payload(input_file: str | None) -> Any:
+    if input_file:
+        with open(input_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.load(sys.stdin)
+
+
+def _extract_vc_from_contract_review_result(payload: dict[str, Any]) -> tuple[list[Any] | None, str | None]:
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        return None, "missing_checks"
+    vc = checks.get("vc_preflight")
+    if isinstance(vc, str):
+        return None, "scalar_vc_preflight_only"
+    if not isinstance(vc, dict):
+        return None, "missing_classifications"
+    classifications = vc.get("classifications")
+    if not isinstance(classifications, list):
+        return None, "missing_classifications"
+    return classifications, None
+
+
+def extract_supported_items(payload: Any) -> tuple[str | None, list[Any] | None, bool, str | None]:
+    if not isinstance(payload, dict):
+        return None, None, False, "top_level_not_object"
+
+    schema = payload.get("schema")
+    if schema == "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1":
+        review_once = payload.get("contract_review_once_result")
+        if payload.get("source") == "latest_blocked" and payload.get("contract_snapshot_url"):
+            return schema, None, False, "latest_blocked_snapshot_only"
+        if not isinstance(review_once, dict):
+            return schema, None, False, "missing_contract_review_once_result"
+        classifications = review_once.get("vc_preflight_classifications")
+        if not isinstance(classifications, list):
+            return schema, None, False, "missing_classifications"
+        return schema, classifications, True, None
+
+    if schema == "CONTRACT_REVIEW_ONCE_RESULT_V1":
         classifications = payload.get("vc_preflight_classifications")
-        if isinstance(classifications, list):
-            return "CONTRACT_REVIEW_ONCE_RESULT_V1", classifications, None
-        return "CONTRACT_REVIEW_ONCE_RESULT_V1", None, "missing_classifications"
+        if not isinstance(classifications, list):
+            return schema, None, False, "missing_classifications"
+        return schema, classifications, True, None
 
-    if schema_field == "BASELINE_VC_PREFLIGHT_RESULT_V1":
+    if schema == "CONTRACT_REVIEW_RESULT_V1":
+        classifications, err = _extract_vc_from_contract_review_result(payload)
+        if err is not None:
+            return schema, None, False, err
+        return schema, classifications, True, None
+
+    if schema == BASELINE_SCHEMA:
         results = payload.get("results")
-        if isinstance(results, list):
-            return "BASELINE_VC_PREFLIGHT_RESULT_V1", results, None
-        return "BASELINE_VC_PREFLIGHT_RESULT_V1", None, "missing_classifications"
+        if not isinstance(results, list):
+            return schema, None, False, "missing_classifications"
+        return schema, results, True, None
 
-    if schema_field == "CONTRACT_REVIEW_RESULT_V1":
-        checks = payload.get("checks", {})
-        if "vc_preflight" in checks:
-            return "CONTRACT_REVIEW_RESULT_V1", None, "unsupported_input_schema"
-        return "CONTRACT_REVIEW_RESULT_V1", None, "missing_classifications"
-
-    if "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1" in payload:
-        root = payload["CONTRACT_SNAPSHOT_ENSURE_RESULT_V1"]
-        review_once = root.get("contract_review_once_result")
-        if isinstance(review_once, dict):
-            classifications = review_once.get("vc_preflight_classifications")
-            if isinstance(classifications, list):
-                return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", classifications, None
-        if root.get("source") == "latest_blocked" and root.get("contract_snapshot_url"):
-            return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", None, "latest_blocked_requires_contract_review_once_result"
-        return "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1", None, "missing_classifications"
-
-    if "CONTRACT_REVIEW_ONCE_RESULT_V1" in payload:
-        root = payload["CONTRACT_REVIEW_ONCE_RESULT_V1"]
-        classifications = root.get("vc_preflight_classifications")
-        if isinstance(classifications, list):
-            return "CONTRACT_REVIEW_ONCE_RESULT_V1", classifications, None
-        return "CONTRACT_REVIEW_ONCE_RESULT_V1", None, "missing_classifications"
-
-    if "BASELINE_VC_PREFLIGHT_RESULT_V1" in payload:
-        root = payload["BASELINE_VC_PREFLIGHT_RESULT_V1"]
-        results = root.get("results")
-        if isinstance(results, list):
-            return "BASELINE_VC_PREFLIGHT_RESULT_V1", results, None
-        return "BASELINE_VC_PREFLIGHT_RESULT_V1", None, "missing_classifications"
-
-    if "CONTRACT_REVIEW_RESULT_V1" in payload:
-        checks = payload["CONTRACT_REVIEW_RESULT_V1"].get("checks", {})
-        if "vc_preflight" in checks:
-            return "CONTRACT_REVIEW_RESULT_V1", None, "unsupported_input_schema"
-        return "CONTRACT_REVIEW_RESULT_V1", None, "missing_classifications"
-
-    return None, None, "unknown_input_schema"
-
-
-def infer_pytest_subreason(command: str, stdout_excerpt: str, stderr_excerpt: str) -> str:
-    combined = f"{stdout_excerpt}\n{stderr_excerpt}".lower()
-    if re.search(r"(^|\s)-k(\s|=)", command):
-        return "pytest_k_filter_matches_no_tests"
-    if "-k mismatch" in combined or "keyword expression" in combined:
-        return "pytest_k_filter_matches_no_tests"
-    if "file or directory not found" in combined:
-        return "test_path_missing_in_baseline"
-    if re.search(r"(^|\s)(tests?/|[^ ]+test[^ ]*\.py)", command):
-        return "test_path_exists_but_collects_zero"
-    return "ambiguous_no_collection_context"
+    if schema in VALID_INPUT_SCHEMAS:
+        return schema, None, False, "missing_classifications"
+    return schema, None, False, "unknown_input_schema"
 
 
 def _normalize_runner_env_delta(value: Any) -> dict[str, str]:
@@ -149,213 +162,244 @@ def _normalize_runner_env_delta(value: Any) -> dict[str, str]:
     return {str(k): str(v) for k, v in value.items()}
 
 
-def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
-    command = item.get("command") or item.get("raw_command") or ""
-    evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
-    runner_env_delta = _normalize_runner_env_delta(
-        evidence.get("runner_env_delta", item.get("runner_env_delta", {}))
-    )
-    stdout_head = item.get("stdout_head", [])
-    stderr_head = item.get("stderr_head", [])
-    stdout_excerpt = str(evidence.get("stdout_excerpt", ""))
-    stderr_excerpt = str(evidence.get("stderr_excerpt", ""))
-    if not stdout_excerpt and isinstance(stdout_head, list):
-        stdout_excerpt = "\n".join(str(line) for line in stdout_head)
-    if not stderr_excerpt and isinstance(stderr_head, list):
-        stderr_excerpt = "\n".join(str(line) for line in stderr_head)
-    category = str(item.get("category", "unknown"))
+def _normalize_action(item: dict[str, Any]) -> dict[str, Any]:
+    if item["category"] == "package_manager_no_tty_prompt":
+        if item["runner_env_delta_seen"] == CI_TRUE_DELTA:
+            return {
+                "kind": "inspect_package_manager_state",
+                "argv": None,
+                "env_delta": {},
+                "preconditions": ["runner_env_delta == {'CI': 'true'}"],
+                "reason": "CI=true was already injected; inspect package manager or node_modules state",
+            }
+        return {
+            "kind": "retry_with_runner_env_delta",
+            "argv": ["pnpm", "build"],
+            "env_delta": CI_TRUE_DELTA,
+            "preconditions": ["runner_env_delta was absent"],
+            "reason": "Retry the canonical pnpm build gate with the fixed runner environment delta",
+        }
+    if item["category"] == "vc_no_tests_collected":
+        return {
+            "kind": "refine_issue_contract",
+            "argv": None,
+            "env_delta": {},
+            "preconditions": ["vc_preflight category == vc_no_tests_collected"],
+            "reason": "pytest exit 5 requires VC design refinement before Step 1",
+        }
+    return {
+        "kind": "human_review",
+        "argv": None,
+        "env_delta": {},
+        "preconditions": [],
+        "reason": f"Unsupported blocked category requires human review: {item['category']}",
+    }
+
+
+def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(item, dict):
+        return None, "non_object_item"
+    ac = item.get("ac")
+    category = item.get("category")
+    decision = item.get("decision")
+    if not isinstance(ac, str) or not isinstance(category, str) or not isinstance(decision, str):
+        return None, "missing_required_keys"
+    if decision != "blocked":
+        return None, "not_blocked"
+
+    runner_env_delta = _normalize_runner_env_delta(item.get("runner_env_delta"))
+    command_hash = item.get("command_hash")
+    raw_command = item.get("raw_command")
+    if _is_valid_sha256(command_hash):
+        normalized_command_hash = command_hash
+    elif isinstance(raw_command, str) and raw_command:
+        normalized_command_hash = _sha256_command(raw_command)
+    else:
+        return None, "missing_command_hash"
 
     if category == "vc_no_tests_collected":
+        exit_code = item.get("exit_code")
+        subreason = item.get("subreason")
+        if isinstance(subreason, str) and subreason:
+            normalized_subreason = subreason
+        elif exit_code == 5 and isinstance(raw_command, str) and " -k " in raw_command:
+            normalized_subreason = "pytest_k_filter_matches_no_tests"
+        else:
+            return None, "missing_vc_no_tests_collected_subreason"
         triage_reason = "vc_design_requires_refinement"
-        subreason = infer_pytest_subreason(command, stdout_excerpt, stderr_excerpt)
-        suggested_actions = [
-            {
-                "kind": "refine_issue_contract",
-                "command": None,
-                "preconditions": ["vc_preflight classification category is vc_no_tests_collected"],
-                "reason": "pytest exit 5 requires VC design refinement before Step 1",
-            }
-        ]
         body_author_fixable = True
         environment_retry_recommended = False
         evidence_pattern = "pytest_exit_5"
     elif category == "package_manager_no_tty_prompt":
+        normalized_subreason = (
+            "ci_runner_delta_already_applied"
+            if runner_env_delta == CI_TRUE_DELTA
+            else "ci_runner_delta_missing"
+        )
         triage_reason = "environment_artifact"
-        if runner_env_delta == CI_TRUE_DELTA:
-            subreason = "ci_runner_delta_already_applied"
-            suggested_actions = [
-                {
-                    "kind": "inspect_package_manager_state",
-                    "command": None,
-                    "preconditions": ["runner_env_delta == {'CI': 'true'}"],
-                    "reason": "CI=true was already injected; inspect package manager or node_modules state",
-                }
-            ]
-            environment_retry_recommended = False
-        else:
-            subreason = "ci_runner_delta_missing"
-            suggested_actions = [
-                {
-                    "kind": "retry_with_ci_true",
-                    "command": "CI=true pnpm build",
-                    "preconditions": ["runner_env_delta != {'CI': 'true'}"],
-                    "reason": "Retry with the canonical runner env delta before editing the Issue contract",
-                }
-            ]
-            environment_retry_recommended = True
         body_author_fixable = False
+        environment_retry_recommended = runner_env_delta != CI_TRUE_DELTA
         evidence_pattern = "pnpm_no_tty"
     else:
+        normalized_subreason = "unsupported_blocker_category"
         triage_reason = "unclassified"
-        subreason = "unsupported_blocker_category"
-        suggested_actions = [
-            {
-                "kind": "human_review",
-                "command": None,
-                "preconditions": [],
-                "reason": f"Unsupported blocked category requires human review: {category}",
-            }
-        ]
         body_author_fixable = False
         environment_retry_recommended = False
         evidence_pattern = "unknown"
 
-    return {
-        "ac": item.get("ac"),
-        "command": command,
-        "command_hash": "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest(),
+    normalized = {
+        "ac": ac,
+        "command_hash": normalized_command_hash,
         "category": category,
-        "decision": item.get("decision", "blocked"),
+        "decision": "blocked",
         "triage_reason": triage_reason,
-        "subreason": subreason,
+        "subreason": normalized_subreason,
         "evidence_pattern": evidence_pattern,
         "runner_env_delta_seen": runner_env_delta,
         "body_author_fixable": body_author_fixable,
         "environment_retry_recommended": environment_retry_recommended,
-        "suggested_actions": suggested_actions,
     }
+    return normalized, None
 
 
 def summarize(per_ac: list[dict[str, Any]], aggregate_reason: str) -> str:
     if not per_ac:
-        return "Blocked classifications were not available for deterministic triage."
-    fragments = []
+        return "Blocked evidence is incomplete and cannot be triaged deterministically."
+    parts = []
     for entry in per_ac[:3]:
-        if entry["triage_reason"] == "vc_design_requires_refinement":
-            fragments.append(f"{entry['ac']} pytest exit 5 requires VC refinement")
-        elif entry["triage_reason"] == "environment_artifact":
-            fragments.append(f"{entry['ac']} pnpm no-TTY is an environment artifact")
+        if entry["category"] == "vc_no_tests_collected":
+            parts.append(f"{entry['ac']} pytest exit 5 requires VC refinement")
+        elif entry["category"] == "package_manager_no_tty_prompt":
+            parts.append(f"{entry['ac']} pnpm no-TTY is an environment artifact")
         else:
-            fragments.append(f"{entry['ac']} needs human review")
-    summary = "; ".join(fragments)
+            parts.append(f"{entry['ac']} requires human review")
     if aggregate_reason == "mixed":
-        summary += "; mixed routing keeps Step 1 blocked"
-    return summary + "."
+        parts.append("mixed routing keeps Step 1 blocked")
+    return "; ".join(parts) + "."
 
 
-def build_triage_result(payload: dict[str, Any]) -> dict[str, Any]:
-    input_schema, items, unsupported_reason = extract_supported_items(payload)
-    if items is None:
-        reason_map = {
-            "latest_blocked_requires_contract_review_once_result": "Snapshot-only blocked evidence cannot be triaged deterministically.",
-            "unsupported_input_schema": "Scalar vc_preflight status is unsupported; per-AC classifications are required.",
-            "missing_classifications": "Blocked evidence is incomplete because vc_preflight classifications are missing.",
-            "unknown_input_schema": "Input schema is unsupported for contract blocker triage.",
-        }
-        return _unsupported_result(
+def build_triage_result(payload: Any) -> dict[str, Any]:
+    input_schema, items, vc_preflight_executed, extraction_error = extract_supported_items(payload)
+    if extraction_error in {"top_level_not_object"}:
+        return _result(
+            status="invalid_input",
             input_schema=input_schema,
-            unsupported_reason=unsupported_reason or "unknown_input_schema",
-            reason=reason_map.get(unsupported_reason or "", "Unsupported input"),
+            unsupported_reason=extraction_error,
+            vc_preflight_executed=False,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=0,
+            summary="Input JSON must be an object.",
+            errors=["input JSON must be an object"],
+        )
+    if extraction_error in {
+        "unknown_input_schema",
+        "scalar_vc_preflight_only",
+        "latest_blocked_snapshot_only",
+    }:
+        return _result(
+            status="unsupported_input",
+            input_schema=input_schema,
+            unsupported_reason=extraction_error,
+            vc_preflight_executed=False,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=0,
+            summary="Unsupported input for deterministic contract blocker triage.",
+            errors=[extraction_error],
+        )
+    if items is None:
+        return _result(
+            status="incomplete_evidence",
+            input_schema=input_schema,
+            unsupported_reason=extraction_error,
+            vc_preflight_executed=vc_preflight_executed,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=0,
+            summary="Blocked evidence is incomplete because required classifications are missing.",
+            errors=[extraction_error or "missing_classifications"],
         )
 
-    blocked_items = [
-        normalize_item(item)
-        for item in items
-        if isinstance(item, dict) and item.get("decision") == "blocked"
-    ]
-    triage_reasons = {entry["triage_reason"] for entry in blocked_items}
+    accepted: list[dict[str, Any]] = []
+    rejected_reasons: list[str] = []
+    for item in items:
+        normalized, reason = normalize_item(item)
+        if normalized is None:
+            rejected_reasons.append(reason or "rejected_item")
+            continue
+        accepted.append(normalized)
 
-    if not blocked_items or triage_reasons == {"unclassified"}:
-        aggregate_reason = "unclassified"
+    if not accepted:
+        return _result(
+            status="incomplete_evidence",
+            input_schema=input_schema,
+            unsupported_reason="no_blocked_items",
+            vc_preflight_executed=vc_preflight_executed,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=len(rejected_reasons),
+            summary="Blocked evidence does not contain any valid blocked classifications.",
+            errors=rejected_reasons,
+        )
+
+    triage_reasons = {item["triage_reason"] for item in accepted}
+    if triage_reasons == {"vc_design_requires_refinement"}:
+        aggregate_reason = "vc_design_requires_refinement"
     elif triage_reasons == {"environment_artifact"}:
         aggregate_reason = "environment_artifact"
-    elif triage_reasons == {"vc_design_requires_refinement"}:
-        aggregate_reason = "vc_design_requires_refinement"
+    elif len(triage_reasons) == 1 and "unclassified" in triage_reasons:
+        aggregate_reason = "unclassified"
     else:
         aggregate_reason = "mixed"
 
-    suggested_actions: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
     seen = set()
-    for entry in blocked_items:
-        for action in entry["suggested_actions"]:
-            key = (action["kind"], action["command"], action["reason"])
-            if key in seen:
-                continue
-            seen.add(key)
-            suggested_actions.append(action)
-
-    if aggregate_reason in {"mixed", "unclassified"}:
-        action = {
-            "kind": "human_review",
-            "command": None,
-            "preconditions": [],
-            "reason": "Mixed or unclassified blocked evidence must be reviewed before Step 1",
-        }
-        key = (action["kind"], action["command"], action["reason"])
-        if key not in seen:
-            suggested_actions.append(action)
-
-    if aggregate_reason == "vc_design_requires_refinement":
-        suggested_next_action = "refine_issue_contract"
-    elif aggregate_reason == "environment_artifact":
-        suggested_next_action = (
-            "retry_with_ci_true"
-            if any(entry["environment_retry_recommended"] for entry in blocked_items)
-            else "inspect_package_manager_state"
+    for item in accepted:
+        action = _normalize_action(item)
+        key = (
+            action["kind"],
+            tuple(action["argv"] or []),
+            tuple(sorted(action["env_delta"].items())),
+            tuple(action["preconditions"]),
+            action["reason"],
         )
-    else:
-        suggested_next_action = "human_review"
-
-    return {
-        "schema": SCHEMA_NAME,
-        "status": "ok",
-        "aggregate_reason": aggregate_reason,
-        "step1_allowed": False,
-        "termination_reason": "intake_gate_failed",
-        "intake_gate_subreason": "missing_contract_go",
-        "issue_refinement_recommended": any(
-            entry["triage_reason"] == "vc_design_requires_refinement" for entry in blocked_items
-        ),
-        "environment_retry_recommended": any(
-            entry["environment_retry_recommended"] for entry in blocked_items
-        ),
-        "body_author_fixable": bool(blocked_items) and all(
-            entry["body_author_fixable"] for entry in blocked_items
-        ),
-        "suggested_next_action": suggested_next_action,
-        "summary": summarize(blocked_items, aggregate_reason),
-        "suggested_actions": suggested_actions,
-        "per_ac": [
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(action)
+    if aggregate_reason in {"mixed", "unclassified"}:
+        actions.append(
             {
-                key: value
-                for key, value in entry.items()
-                if key != "suggested_actions"
+                "kind": "human_review",
+                "argv": None,
+                "env_delta": {},
+                "preconditions": [],
+                "reason": "Mixed or unclassified blocked evidence must be reviewed before Step 1",
             }
-            for entry in blocked_items
-        ],
-        "source_integrity": {
-            "input_schema": input_schema,
-            "evidence_complete": True,
-            "unsupported_reason": None,
-        },
-        "schema_change_applicability": {"decision": "schema_change"},
-        "schema_governance_update": {
-            "status": "out_of_scope_followup_required",
-            "followup_issue": SCHEMA_GOVERNANCE_FOLLOW_UP,
-        },
-        "mutation_free": True,
-        "errors": [],
-    }
+        )
+
+    return _result(
+        status="ok",
+        input_schema=input_schema,
+        unsupported_reason=None,
+        vc_preflight_executed=vc_preflight_executed,
+        evidence_complete=True,
+        accepted_item_count=len(accepted),
+        rejected_item_count=len(rejected_reasons),
+        aggregate_reason=aggregate_reason,
+        summary=summarize(accepted, aggregate_reason),
+        per_ac=accepted,
+        suggested_actions=actions,
+        issue_refinement_recommended=any(
+            item["triage_reason"] == "vc_design_requires_refinement" for item in accepted
+        ),
+        environment_retry_recommended=any(
+            item["environment_retry_recommended"] for item in accepted
+        ),
+        body_author_fixable=all(item["body_author_fixable"] for item in accepted),
+        errors=rejected_reasons,
+    )
 
 
 triage_contract_blockers = build_triage_result
@@ -365,26 +409,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Normalize blocked contract evidence without mutating GitHub or rerunning preflight."
     )
-    parser.add_argument(
-        "--input-file",
-        help="Read input JSON from file. Omit to read from stdin.",
-    )
+    parser.add_argument("--input-file", help="Read input JSON from file. Omit to read from stdin.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        payload = load_payload(args.input_file)
+        payload = _load_payload(args.input_file)
     except json.JSONDecodeError as exc:
-        print(json.dumps({"status": "error", "error": f"Invalid JSON: {exc}"}), file=sys.stderr)
+        result = _result(
+            status="invalid_input",
+            input_schema=None,
+            unsupported_reason="json_decode_error",
+            vc_preflight_executed=False,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=0,
+            summary="Input JSON could not be decoded.",
+            errors=[str(exc)],
+        )
+        json.dump(result, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
         return 1
     except OSError as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
+        result = _result(
+            status="invalid_input",
+            input_schema=None,
+            unsupported_reason="input_io_error",
+            vc_preflight_executed=False,
+            evidence_complete=False,
+            accepted_item_count=0,
+            rejected_item_count=0,
+            summary="Input file could not be read.",
+            errors=[str(exc)],
+        )
+        json.dump(result, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
         return 1
 
-    print(json.dumps(build_triage_result(payload), ensure_ascii=False, indent=2))
-    return 0
+    result = build_triage_result(payload)
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0 if result["status"] == "ok" else 1
 
 
 if __name__ == "__main__":

@@ -17,143 +17,178 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
 
-def run_cli(payload: dict) -> dict:
+def run_cli(payload: object) -> tuple[int, dict]:
     result = subprocess.run(
         [sys.executable, str(SCRIPT_PATH)],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    return json.loads(result.stdout)
+    return result.returncode, json.loads(result.stdout)
 
 
-def make_item(ac: str, category: str, stderr_head: list[str] | None = None, runner_env_delta: dict | None = None) -> dict:
-    return {
+def make_item(
+    ac: str,
+    category: str,
+    *,
+    command_hash: str = "sha256:" + "a" * 64,
+    exit_code: int = 5,
+    raw_command: str | None = None,
+    runner_env_delta: dict | None = None,
+    subreason: str | None = None,
+) -> dict:
+    item = {
         "ac": ac,
-        "command_hash": f"sha256:{ac.lower()}",
+        "command_hash": command_hash,
         "category": category,
         "decision": "blocked",
-        "stderr_head": stderr_head or [],
-        "stdout_head": [],
+        "exit_code": exit_code,
         "runner_env_delta": runner_env_delta or {},
     }
+    if raw_command is not None:
+        item["raw_command"] = raw_command
+    if subreason is not None:
+        item["subreason"] = subreason
+    return item
 
 
-def test_accepted_inputs_scalar_only_unsupported():
+def test_accepts_actual_baseline_producer_schema():
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            make_item(
+                "AC1",
+                "vc_no_tests_collected",
+                subreason="pytest_k_filter_matches_no_tests",
+                raw_command="uv run pytest tests/foo.py -k mismatch -v",
+            )
+        ],
+    }
+    result = mod.triage_contract_blockers(payload)
+    assert result["status"] == "ok"
+    assert result["source_integrity"]["input_schema"] == "baseline_vc_preflight/v1"
+
+
+def test_structured_contract_review_result_input_is_accepted():
+    payload = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "checks": {
+            "vc_preflight": {
+                "classifications": [
+                    make_item(
+                        "AC2",
+                        "vc_no_tests_collected",
+                        subreason="pytest_k_filter_matches_no_tests",
+                    )
+                ]
+            }
+        },
+    }
+    result = mod.triage_contract_blockers(payload)
+    assert result["status"] == "ok"
+    assert result["per_ac"][0]["subreason"] == "pytest_k_filter_matches_no_tests"
+
+
+def test_scalar_only_contract_review_result_is_unsupported():
     payload = {"schema": "CONTRACT_REVIEW_RESULT_V1", "checks": {"vc_preflight": "blocked"}}
     result = mod.triage_contract_blockers(payload)
-    assert result["source_integrity"]["evidence_complete"] is False
-    assert result["source_integrity"]["unsupported_reason"] == "unsupported_input_schema"
+    assert result["status"] == "unsupported_input"
+    assert result["source_integrity"]["unsupported_reason"] == "scalar_vc_preflight_only"
 
 
-def test_latest_blocked_incomplete():
+def test_latest_blocked_snapshot_only_is_unsupported():
     payload = {
         "schema": "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
         "source": "latest_blocked",
         "contract_snapshot_url": "https://example.invalid/comment",
     }
     result = mod.triage_contract_blockers(payload)
-    assert result["source_integrity"]["evidence_complete"] is False
-    assert result["source_integrity"]["unsupported_reason"] == "latest_blocked_requires_contract_review_once_result"
+    assert result["status"] == "unsupported_input"
+    assert result["source_integrity"]["unsupported_reason"] == "latest_blocked_snapshot_only"
 
 
-def test_pnpm_no_tty_retry_without_ci():
-    payload = {"schema": "BASELINE_VC_PREFLIGHT_RESULT_V1", "results": [make_item("AC3", "package_manager_no_tty_prompt")]}
-    result = mod.triage_contract_blockers(payload)
-    assert result["aggregate_reason"] == "environment_artifact"
-    assert result["environment_retry_recommended"] is True
-    assert result["suggested_actions"][0]["command"] == "CI=true pnpm build"
-
-
-def test_pnpm_no_tty_inspect_with_ci():
+def test_empty_classifications_is_incomplete_evidence():
     payload = {
-        "schema": "BASELINE_VC_PREFLIGHT_RESULT_V1",
-        "results": [make_item("AC4", "package_manager_no_tty_prompt", runner_env_delta={"CI": "true"})],
+        "schema": "CONTRACT_REVIEW_ONCE_RESULT_V1",
+        "status": "blocked",
+        "vc_preflight_classifications": [],
+    }
+    result = mod.triage_contract_blockers(payload)
+    assert result["status"] == "incomplete_evidence"
+    assert result["source_integrity"]["evidence_complete"] is False
+
+
+def test_pnpm_retry_uses_argv_and_env_delta():
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [make_item("AC3", "package_manager_no_tty_prompt", exit_code=1)],
+    }
+    result = mod.triage_contract_blockers(payload)
+    action = result["suggested_actions"][0]
+    assert action["kind"] == "retry_with_runner_env_delta"
+    assert action["argv"] == ["pnpm", "build"]
+    assert action["env_delta"] == {"CI": "true"}
+
+
+def test_pnpm_with_ci_true_routes_to_inspection():
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            make_item(
+                "AC4",
+                "package_manager_no_tty_prompt",
+                exit_code=1,
+                runner_env_delta={"CI": "true"},
+            )
+        ],
     }
     result = mod.triage_contract_blockers(payload)
     assert result["environment_retry_recommended"] is False
     assert result["suggested_actions"][0]["kind"] == "inspect_package_manager_state"
 
 
-def test_schema_keys_and_governance():
+def test_command_hash_is_preserved_without_raw_command_echo():
     payload = {
-        "schema": "CONTRACT_REVIEW_ONCE_RESULT_V1",
-        "vc_preflight_classifications": [
-            make_item("AC5", "package_manager_no_tty_prompt", runner_env_delta={"CI": "true"})
-        ],
-    }
-    result = mod.triage_contract_blockers(payload)
-    assert result["schema"] == "CONTRACT_BLOCKER_TRIAGE_V1"
-    for key in (
-        "aggregate_reason",
-        "step1_allowed",
-        "termination_reason",
-        "intake_gate_subreason",
-        "issue_refinement_recommended",
-        "environment_retry_recommended",
-        "body_author_fixable",
-        "suggested_actions",
-        "per_ac",
-        "source_integrity",
-        "mutation_free",
-    ):
-        assert key in result
-
-
-def test_pytest_exit_5_subreason():
-    payload = {
-        "schema": "BASELINE_VC_PREFLIGHT_RESULT_V1",
-        "results": [make_item("AC6", "vc_no_tests_collected", stderr_head=["ERROR: file or directory not found: tests/missing.py"])],
-    }
-    result = mod.triage_contract_blockers(payload)
-    assert result["aggregate_reason"] == "vc_design_requires_refinement"
-    assert result["per_ac"][0]["subreason"] == "test_path_missing_in_baseline"
-
-
-def test_mixed_routing():
-    payload = {
-        "schema": "BASELINE_VC_PREFLIGHT_RESULT_V1",
+        "schema": "baseline_vc_preflight/v1",
         "results": [
-            make_item("AC7A", "vc_no_tests_collected", stderr_head=["collected 0 tests"]),
-            make_item("AC7B", "package_manager_no_tty_prompt", runner_env_delta={"CI": "true"}),
+            make_item(
+                "AC5",
+                "vc_no_tests_collected",
+                command_hash="sha256:" + "b" * 64,
+                subreason="pytest_k_filter_matches_no_tests",
+            )
         ],
     }
     result = mod.triage_contract_blockers(payload)
-    assert result["aggregate_reason"] == "mixed"
-    assert result["step1_allowed"] is False
-    assert any(action["kind"] == "human_review" for action in result["suggested_actions"])
+    assert result["per_ac"][0]["command_hash"] == "sha256:" + "b" * 64
+    assert "command" not in result["per_ac"][0]
 
 
-def test_mutation_free(monkeypatch):
-    def forbidden_run(*args, **kwargs):
-        raise AssertionError("subprocess must not be called")
-
-    monkeypatch.setattr(subprocess, "run", forbidden_run)
+def test_malformed_item_is_incomplete_not_silently_dropped():
     payload = {
-        "schema": "BASELINE_VC_PREFLIGHT_RESULT_V1",
-        "results": [make_item("AC8", "vc_no_tests_collected", stderr_head=["collected 0 tests"])],
+        "schema": "baseline_vc_preflight/v1",
+        "results": ["not-an-object"],
     }
     result = mod.triage_contract_blockers(payload)
-    assert result["mutation_free"] is True
+    assert result["status"] == "incomplete_evidence"
+    assert "non_object_item" in result["errors"]
+
+
+def test_top_level_null_returns_machine_json():
+    exit_code, result = run_cli(None)
+    assert exit_code == 1
+    assert result["status"] == "invalid_input"
+
+
+def test_top_level_list_returns_machine_json():
+    exit_code, result = run_cli([])
+    assert exit_code == 1
+    assert result["status"] == "invalid_input"
 
 
 def test_preparation_summary():
     body = PREPARATION_MD.read_text(encoding="utf-8")
-    assert "contract_blocker_triage" in body
+    assert "python3 .claude/skills/impl-review-loop/scripts/triage_contract_blockers.py" in body
+    assert "source_integrity.evidence_complete == true" in body
     assert "raw stdout / stderr を埋め込まない" in body
-    assert "summary:" in body
-
-
-def test_cli_round_trip():
-    payload = {
-        "schema": "BASELINE_VC_PREFLIGHT_RESULT_V1",
-        "results": [
-            {
-                **make_item("AC9", "vc_no_tests_collected", stderr_head=["-k mismatch"]),
-                "raw_command": "uv run pytest tests/foo.py -k mismatch -v",
-            }
-        ],
-    }
-    result = run_cli(payload)
-    assert result["per_ac"][0]["subreason"] == "pytest_k_filter_matches_no_tests"
