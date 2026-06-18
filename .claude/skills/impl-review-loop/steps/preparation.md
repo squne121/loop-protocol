@@ -54,7 +54,7 @@ gh issue view <issue_number> --json title,labels \
 > | ensure_contract_snapshot 結果 | exit code | routing |
 > |---|---|---|
 > | `status: ok` (source: existing_go \| materialized_go) | 0 | contract_snapshot_url を LOOP_STATE に記録して Step 1 へ |
-> | `status: blocked_needs_refinement` | 10 | `intake_gate_failed: missing_contract_go` で停止。人間に refinement を依頼 |
+> | `status: blocked_needs_refinement` | 10 | `intake_gate_failed: missing_contract_go` で停止。`contract_review_once_result.vc_preflight_classifications[]` がある場合のみ `triage_contract_blockers.py` で短い triage summary を生成し、人間に refinement を依頼 |
 > | `status: human_judgment` | 20 | 即停止。`termination_reason: human_escalation` を記録して人間判断へ |
 > | `status: stale_or_conflicting_snapshot` (exit 50) | 50 | 即停止。Issue body が materialization 中に更新された。人間判断へ |
 > | `status: runtime_error` | 40 | 即停止。環境エラーを記録して人間判断へ |
@@ -62,6 +62,57 @@ gh issue view <issue_number> --json title,labels \
 > **旧設計との差分**: #564 以前の旧設計（fail-only gate）では `missing_contract_go` で無条件停止していた。
 > #817 以降は `ensure_contract_snapshot` への自動 routing を経由する。
 > `ensure_contract_snapshot` が ok を返した場合のみ、`LOOP_STATE.contract_snapshot_source: materialized_by_issue_contract_review` を記録してループを継続する。
+
+#### `blocked_needs_refinement` の triage normalizer（#959）
+
+`ensure_contract_snapshot` が `status: blocked_needs_refinement` を返した場合、preparation は **preflight の再実行や GitHub mutation を行わず**、既存の blocked evidence を `triage_contract_blockers.py` へ渡して short summary に正規化してよい。
+
+- 本 normalizer は **new classifier ではなく `normalizer_router`** として扱う。`vc_preflight.classifications[]` / `vc_preflight_classifications[]` / `baseline_vc_preflight/v1.results[]` を消費するだけで、raw command result の再分類はしない。
+- Section 6 の `vc_preflight.status: blocked` routing とは責務が異なる。本節は **Step 0 / `missing_contract_go`** で止まったとき専用、Section 6 は **`status: go` 受信後の Step 1-c** 専用。
+- accepted input:
+  - `CONTRACT_SNAPSHOT_ENSURE_RESULT_V1.contract_review_once_result.vc_preflight_classifications[]`
+  - `CONTRACT_REVIEW_ONCE_RESULT_V1.vc_preflight_classifications[]`
+  - `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight.classifications[]`（scalar は unsupported）
+  - `baseline_vc_preflight/v1.results[]`
+- unsupported input:
+  - `source: latest_blocked` で `contract_snapshot_url` しかない snapshot-only payload
+  - scalar-only `CONTRACT_REVIEW_RESULT_V1.checks.vc_preflight`
+- preparation が LOOP_STATE に記録するのは `CONTRACT_BLOCKER_TRIAGE_V1` の route key と **短い triage summary のみ**。raw stdout/stderr は埋め込まない（raw stdout / stderr を埋め込まない）。
+- `CONTRACT_BLOCKER_TRIAGE_V1` の route key には `aggregate_reason`, `step1_allowed`, `termination_reason`, `intake_gate_subreason`, `issue_refinement_recommended`, `environment_retry_recommended`, `body_author_fixable`, `suggested_actions`, `per_ac`, `source_integrity`, `mutation_free` を含める。
+- `aggregate_reason: mixed` は `step1_allowed: false` のまま停止し、human review を required route とする。
+
+minimum CLI invocation:
+
+```bash
+python3 .claude/skills/impl-review-loop/scripts/triage_contract_blockers.py \
+  --input-file "$CONTRACT_SNAPSHOT_ENSURE_RESULT_FILE" \
+  > "$CONTRACT_BLOCKER_TRIAGE_FILE"
+```
+
+normalizer 実行後は次を機械的に検査する:
+
+```text
+schema == CONTRACT_BLOCKER_TRIAGE_V1
+status == ok
+source_integrity.evidence_complete == true
+step1_allowed == false
+```
+
+`unsupported_input` / `incomplete_evidence` / `invalid_input` / invalid JSON / non-zero exit はすべて fail-closed で `human_escalation` に route する。
+
+推奨する埋め込み形は次のとおり:
+
+```yaml
+intake_gate:
+  status: intake_gate_failed
+  subreason: missing_contract_go
+  contract_blocker_triage:
+    schema: CONTRACT_BLOCKER_TRIAGE_V1
+    aggregate_reason: mixed
+    step1_allowed: false
+    summary: "AC1 pytest exit 5 requires VC refinement; AC2 pnpm no-TTY is an environment artifact."
+    suggested_next_action: human_review
+```
 
 #### 3. `stale_contract_review`
 
