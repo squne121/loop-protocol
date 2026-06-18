@@ -46,13 +46,15 @@ tmp/edit_issue_*.md
 # `.codex/skills` は local-only compatibility / symlink 用であり、repo-shared surface としては使わない。
 # .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
 .claude/skills/nlm-skill/
+# .system/ は ESLint では eslint.config.mjs 側で ignore 済みだが、git status / dirty tree に残り続けるため除外
 .claude/skills/.system/
 .claude/skills/*-workspace/
 .claude/worktrees/
 .claude/plans/
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す
 .claude/settings.local.json
-.pnpm-store/
+# repo root の project-local pnpm store（root 限定）
+/.pnpm-store/
 
 # Guard shadow log (write-guard observability, local only)
 .guard_shadow_log.jsonl
