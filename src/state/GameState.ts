@@ -1,5 +1,41 @@
 import type { EntityId } from '../entities'
 
+// ---------------------------------------------------------------------------
+// Unit taxonomy types (§5, unit-operations-and-npc-behavior SSOT)
+// Type-level only. No runtime values, no enum objects.
+// ---------------------------------------------------------------------------
+
+export type Faction =
+  | 'player'
+  | 'ally'
+  | 'enemy'
+  | 'neutral'
+
+export type UnitRole =
+  | 'ace_player'
+  | 'ally_basic'
+  | 'enemy_chaser'
+  | 'objective'
+  | 'neutral_obstacle'
+
+export type CommandIntent =
+  | 'none'
+  | 'assist_player'
+
+export type NpcBehaviorState =
+  | 'inactive'
+  | 'acquire_target'
+  | 'move_to_engage'
+  | 'attack'
+  | 'retreat'
+  | 'destroyed'
+
+export type TargetingPolicy =
+  | 'focus_player'
+  | 'assist_player_threat'
+  | 'nearest_hostile'
+  | 'ignore'
+
 export interface ArenaState {
   width: number
   height: number
