@@ -788,7 +788,7 @@ def test_existing_tools_no_regression(tool_name, path, expected_exit):
     WHEN checking exit codes,
     THEN existing tool block/allow behavior must not regress (AC4)."""
     assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
-    if tool_name == "Glob":
+    if tool_name in ("Glob", "Grep"):
         payload = json.dumps({"tool_name": tool_name, "tool_input": {"pattern": path}})
     else:
         payload = json.dumps({"tool_name": tool_name, "tool_input": {"file_path": path}})

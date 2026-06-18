@@ -160,6 +160,50 @@ def test_multiedit_pathless_fail_closed_empty():
     _assert_no_raw_payload_in_stderr(result.stderr, payload)
 
 
+
+@pytest.mark.parametrize("tool_input", [
+    # file_path 欠落 + path あり — fallback で迂回を試みる payload
+    {"path": "/home/user/projects/src/main.py", "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path 欠落 + pattern あり
+    {"pattern": "/home/user/src/main.py", "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path 欠落 + glob あり
+    {"glob": "**/*.ts", "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path が null
+    {"file_path": None, "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path が array
+    {"file_path": [], "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path が object
+    {"file_path": {}, "edits": [{"old_string": "x", "new_string": "y"}]},
+    # file_path が number
+    {"file_path": 123, "edits": [{"old_string": "x", "new_string": "y"}]},
+])
+def test_multiedit_pathless_fail_closed_fallback_variants(tool_input):
+    """GIVEN a MultiEdit tool input where file_path is missing/non-string or replaced by fallback keys,
+    WHEN guard processes it,
+    THEN exit code must be 2 (fail-closed).
+
+    Covers the B1 fix: MultiEdit must NOT use path/pattern/glob fallback.
+    Any non-string or absent file_path must trigger fail-closed block.
+    """
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    payload = json.dumps({
+        "tool_name": "MultiEdit",
+        "tool_input": tool_input,
+    })
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit code 2 for MultiEdit with non-string/absent file_path, "
+        f"got {result.returncode}\n"
+        f"tool_input: {tool_input}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
+
+
 def _assert_no_raw_payload_in_stderr(stderr: str, payload: str) -> None:
     """stderr に raw payload の断片や secret-like value が含まれていないことを確認する。"""
     # payload そのものが漏れていないこと
