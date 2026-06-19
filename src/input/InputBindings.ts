@@ -78,8 +78,11 @@ export function bindInput(
     input.moveRight = false
     input.primaryPressed = false
     input.activePointerId = null
-    // AC6: blur and visibilitychange hidden clear physical pressed state
+    // AC6: blur and visibilitychange hidden clear physical pressed state and rising edge latch
     input.assistPlayerPressed = false
+    // Blocker 4 (Issue #982): clear risingEdge so stale sample_assist_player is not emitted
+    // after blur/visibilitychange in the next mapInputToCommands call.
+    input.assistPlayerRisingEdge = false
   }
 
   keyTarget.addEventListener('keydown', (event: KeyboardEvent) => {
