@@ -33,11 +33,7 @@ _SHARED_VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-revi
 if str(_SHARED_VC_SYNTAX_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_VC_SYNTAX_DIR))
 
-from vc_contract_syntax import (
-    parse_ac_marker_line,
-    parse_preflight_scope_marker_line,
-    parse_verification_commands_section as _parse_vc_section,
-)
+from vc_contract_syntax import parse_ac_marker_line, parse_preflight_scope_marker_line
 
 
 # =============================================================================
@@ -185,19 +181,51 @@ def _extract_ac_numbers(body: str) -> set[str]:
 
 
 def _extract_vc_ac_numbers(body: str) -> set[str]:
-    """Extract AC numbers referenced in Verification Commands section.
-
-    #993: Uses shared parse_verification_commands_section() parser.
-    Recognises: bare # ACN markers, grouped # AC2, AC3 markers (#814),
-    and inline suffix $ command # ACN.
-    """
+    """Extract AC numbers referenced in Verification Commands section."""
     section_info = _extract_section(body, "Verification Commands")
     if not section_info:
         return set()
 
     content, _, _ = section_info
-    parse_result = _parse_vc_section(content)
-    return set(parse_result.ac_refs)
+    matches = set()
+    current_ac = None
+    in_bash_block = False
+
+    for raw_line in content.split("\n"):
+        line = raw_line.strip()
+
+        if line.startswith("```"):
+            fence = line.lower()
+            if not in_bash_block:
+                if fence.startswith("```bash"):
+                    in_bash_block = True
+                continue
+            in_bash_block = False
+            current_ac = None
+            continue
+
+        if not in_bash_block:
+            continue
+
+        if line.startswith("#"):
+            marker, is_valid = parse_ac_marker_line(line)
+            if marker is not None:
+                if is_valid:
+                    current_ac = marker
+                continue
+
+        # AC suffix on command line: `$ cmd  # AC1`
+        suffix_match = re.search(r"\s+#\s*(.+)\s*$", raw_line)
+        if suffix_match:
+            label, is_valid = parse_ac_marker_line(f"# {suffix_match.group(1)}")
+            if label is not None and is_valid:
+                matches.add(label)
+                continue
+
+        if current_ac is not None:
+            matches.add(current_ac)
+
+    return matches
 
 
 def _load_required_section_labels(kind: str) -> list[str]:
@@ -422,19 +450,20 @@ def _validate_lp010_ac_vc_mismatch(body: str) -> list[ValidationError]:
 
 
 def _validate_lp011_verification_command_format(body: str) -> list[ValidationError]:
-    """LP011: Detect invalid Verification Commands format.
-
-    #993: Uses shared parse_verification_commands_section() to check for bash fences.
-    """
+    """LP011: Detect invalid Verification Commands format."""
     section_info = _extract_section(body, "Verification Commands")
     if not section_info:
         return []
 
     content, start_line, end_line = section_info
+    lines = body.split('\n')[start_line - 1:end_line]
 
-    # Use shared parser to detect bash fence presence
-    parse_result = _parse_vc_section(content)
-    if not parse_result.has_bash_fence:
+    # Each AC should have at least one command in a fenced bash block
+    # Look for ```bash blocks with # AC<N> markers
+    errors = []
+
+    bash_blocks = re.findall(r'```bash\n(.*?)\n```', content, re.DOTALL)
+    if not bash_blocks:
         context, trunc = _get_context_lines(body, start_line, end_line)
         return [ValidationError(
             rule_id="LP011",
@@ -449,7 +478,7 @@ def _validate_lp011_verification_command_format(body: str) -> list[ValidationErr
             autofixable=False
         )]
 
-    return []
+    return errors
 
 
 def _validate_lp012_rg_encoding_flag(body: str) -> list[ValidationError]:
@@ -658,34 +687,20 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
     Canonical form: `# AC1` only.
     Variants like `# AC1: desc`, `# AC1：desc`, `# AC1 - desc`,
     `# AC1 — desc`, `# AC1 desc` are rejected.
-
-    #993: Colon/fullwidth-colon variants get a colon-specific fix_hint via
-    shared VcParseResult (kind="colon_marker"). Other suffixes use the
-    generic fix_hint.
     """
     section_info = _extract_section(body, "Verification Commands")
     if not section_info:
         return []
 
     content, start_line, end_line = section_info
-
-    # Build a map from raw_line → colon-specific fix_hint using shared parser
-    # (only for errors inside bash fences)
-    colon_fix_hints: dict[str, str] = {}
-    parse_result = _parse_vc_section(content)
-    for pe in parse_result.errors:
-        if pe.rule_id == "LP016" and pe.kind == "colon_marker":
-            colon_fix_hints[pe.raw_line] = pe.fix_hint
+    lines = body.split('\n')[start_line - 1:end_line]
 
     errors = []
-    lines = body.split('\n')[start_line - 1:end_line]
     current_line = start_line
     for line in lines:
         label, is_valid = parse_ac_marker_line(line)
         if label is not None and not is_valid:
-            stripped = line.strip()
-            # Use colon-specific fix_hint if available, generic otherwise
-            fix_hint = colon_fix_hints.get(stripped) or "Use bare '# AC<N>' marker syntax on its own line."
+            # parse_ac_marker_line() reports any non-empty suffix as invalid.
             context, trunc = _get_context_lines(body, current_line, current_line)
             errors.append(ValidationError(
                 rule_id="LP016",
@@ -695,11 +710,11 @@ def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationE
                 line_end=current_line,
                 message=(
                     "VC AC marker must be bare '# AC<N>' without suffix. "
-                    f"Found: {stripped!r}"
+                    f"Found: {line.strip()!r}"
                 ),
                 minimal_context=context,
                 context_truncated=trunc,
-                fix_hint=fix_hint,
+                fix_hint="Use bare '# AC<N>' marker syntax on its own line.",
                 autofixable=False
             ))
         current_line += 1
