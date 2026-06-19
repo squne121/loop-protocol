@@ -346,7 +346,7 @@ def test_guard_ordering_secret_precedes_worktree(tmp_path):
 
 def test_guard_ordering_worktree_matcher_shape(tmp_path):
     """AC6: worktree_scope_guard matcher includes Bash|Write|Edit|MultiEdit and
-    secret guard is unchanged (still excludes MultiEdit)."""
+    secret guard also includes MultiEdit (#970 で追加済み)."""
     settings = json.loads(SETTINGS_JSON.read_text())
     pre = settings["hooks"]["PreToolUse"]
 
@@ -363,10 +363,10 @@ def test_guard_ordering_worktree_matcher_shape(tmp_path):
     assert worktree_matcher is not None
     for tool in ("Bash", "Write", "Edit", "MultiEdit"):
         assert tool in worktree_matcher, f"{tool} missing from worktree matcher"
-    # secret guard unchanged: still does NOT include MultiEdit (follow-up Issue).
+    # #970 にて secret_boundary_guard にも MultiEdit を追加済み。
     assert secret_matcher is not None
-    assert "MultiEdit" not in secret_matcher, (
-        "secret_boundary_guard matcher must remain unchanged (no MultiEdit)"
+    assert "MultiEdit" in secret_matcher, (
+        "secret_boundary_guard matcher must include MultiEdit (#970)"
     )
 
 

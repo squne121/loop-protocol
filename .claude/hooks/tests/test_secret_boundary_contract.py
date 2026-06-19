@@ -723,3 +723,83 @@ def test_workflow_no_secrets_reference():
     assert not matches, (
         f"session-manifest.yml must not reference secrets., found {len(matches)} occurrence(s)"
     )
+
+
+# =============================================================================
+# MultiEdit regression: 既存 tool の非回帰確認 (AC4)
+# =============================================================================
+
+
+def test_multiedit_in_sensitive_tools():
+    """GIVEN secret_boundary_guard.sh exists, WHEN checking SENSITIVE_TOOLS definition,
+    THEN MultiEdit must be included (AC1 structural check via script content)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    content = GUARD_PATH.read_text()
+    assert "MultiEdit" in content, (
+        "MultiEdit not found in secret_boundary_guard.sh — AC1 violated"
+    )
+    # SENSITIVE_TOOLS 行に MultiEdit が含まれることを確認
+    sensitive_tools_line = [
+        line for line in content.splitlines()
+        if "SENSITIVE_TOOLS" in line and "MultiEdit" in line
+    ]
+    assert sensitive_tools_line, (
+        "SENSITIVE_TOOLS variable definition does not include MultiEdit"
+    )
+
+
+def test_settings_multiedit_in_secret_guard_matcher():
+    """GIVEN settings.json exists, WHEN checking secret_boundary_guard matcher,
+    THEN MultiEdit must be included in the matcher (AC2)."""
+    assert SETTINGS_JSON_PATH.exists(), f"settings.json not found: {SETTINGS_JSON_PATH}"
+    with open(SETTINGS_JSON_PATH) as f:
+        settings = json.load(f)
+
+    pre_tool_use = settings.get("hooks", {}).get("PreToolUse", [])
+    assert pre_tool_use, "PreToolUse hooks section is missing or empty"
+
+    for entry in pre_tool_use:
+        for hook in entry.get("hooks", []):
+            command = hook.get("command", "")
+            if "secret_boundary_guard" in command:
+                matcher = entry.get("matcher", "")
+                assert "MultiEdit" in matcher.split("|"), (
+                    f"secret_boundary_guard matcher does not include MultiEdit: {matcher!r}"
+                )
+                return
+
+    pytest.fail("secret_boundary_guard not found in PreToolUse hooks")
+
+
+@pytest.mark.parametrize("tool_name,path,expected_exit", [
+    # 既存 tool の block 挙動が回帰しないことを確認
+    ("Read", "/home/user/.env", 2),
+    ("Write", "/home/user/.env", 2),
+    ("Edit", "/home/user/.env", 2),
+    ("Grep", "/home/user/.env", 2),
+    ("Glob", "/home/user/.env", 2),
+    # MultiEdit も同様に block されること
+    ("MultiEdit", "/home/user/.env", 2),
+    # MultiEdit で safe path は allow されること
+    ("MultiEdit", "/home/user/projects/src/main.py", 0),
+])
+def test_existing_tools_no_regression(tool_name, path, expected_exit):
+    """GIVEN guard processes various tool inputs,
+    WHEN checking exit codes,
+    THEN existing tool block/allow behavior must not regress (AC4)."""
+    assert GUARD_PATH.exists(), f"Guard script not found: {GUARD_PATH}"
+    if tool_name in ("Glob", "Grep"):
+        payload = json.dumps({"tool_name": tool_name, "tool_input": {"pattern": path}})
+    else:
+        payload = json.dumps({"tool_name": tool_name, "tool_input": {"file_path": path}})
+    result = subprocess.run(
+        [str(GUARD_PATH)],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == expected_exit, (
+        f"Expected exit code {expected_exit} for {tool_name}({path}), "
+        f"got {result.returncode}\n"
+        f"stderr: {result.stderr[:200]}"
+    )
