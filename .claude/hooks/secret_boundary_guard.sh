@@ -122,10 +122,23 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     fi
 fi
 
-# ── Sensitive path patterns for Read/Write/Edit/Grep/Glob ────────────────────
+# ── Sensitive path patterns for Read/Write/Edit/Grep/Glob/MultiEdit ──────────
 # Block access to .env files, secrets/, credential paths, local token stores.
 
-SENSITIVE_TOOLS="Read Write Edit Grep Glob"
+SENSITIVE_TOOLS="Read Write Edit Grep Glob MultiEdit"
+
+# MultiEdit 専用: file_path の型と値を明示検証（fallback 禁止）
+# file_path が存在し、型 string で、非空であることを確認する。
+# path / pattern / glob 等の fallback キーは MultiEdit では受け付けない。
+if [ "$TOOL_NAME" = "MultiEdit" ]; then
+    FILE_PATH_TYPE=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path | type' 2>/dev/null || echo "missing")
+    MULTIEDIT_FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)
+    if [ "$FILE_PATH_TYPE" != "string" ] || [ -z "$MULTIEDIT_FILE_PATH" ]; then
+        echo "[secret_boundary_guard] blocked: MultiEdit with missing/invalid file_path — fail closed" >&2
+        exit 2
+    fi
+    PATH_INPUT="$MULTIEDIT_FILE_PATH"
+fi
 
 if echo "$SENSITIVE_TOOLS" | grep -qw "$TOOL_NAME" && [ -n "$PATH_INPUT" ]; then
     BLOCKED=0

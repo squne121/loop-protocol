@@ -36,7 +36,7 @@ schema_version: hook_boundaries_manifest_v1
 hook_boundaries_manifest_v1:
   - handler_id: secret_boundary_guard
     event: PreToolUse
-    matcher: "Bash|Read|Write|Edit|Grep|Glob"
+    matcher: "Bash|Read|Write|Edit|Grep|Glob|MultiEdit"
     command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/secret_boundary_guard.sh"
     args: []
     timeout: 10
