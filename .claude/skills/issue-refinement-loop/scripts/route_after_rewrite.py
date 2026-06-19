@@ -83,6 +83,9 @@ _STATE_ALLOWLIST = frozenset({
     "max_rewrite_attempts",
     "checker_exit_code",
     "checked_body_sha256",
+    "fix_category",
+    "rewrite_history",
+    "occurrence_count",
     "missing_sections",
     "missing_contract_keys",
     "previous_checked_body_sha256",
@@ -223,6 +226,24 @@ def _run_checker(
 # ---------------------------------------------------------------------------
 
 
+def _derive_fix_category(
+    blocking_issues: list[str],
+    missing_sections: list[str],
+    missing_contract_keys: list[str],
+) -> str:
+    """Derive a deterministic fix category from checker blockers."""
+    if missing_sections:
+        return "missing_section"
+    if missing_contract_keys:
+        return "missing_contract_key"
+
+    for msg in blocking_issues:
+        normalized = msg.lower()
+        if "contract" in normalized and "fail" in normalized:
+            return "unknown_contract_failure"
+    return "unknown_contract_failure"
+
+
 def _build_state_dict(
     *,
     rewrite_attempt_count: int,
@@ -264,14 +285,29 @@ def _build_state_dict(
         if m:
             missing_contract_keys.append(m.group(1))
 
+    fix_category = _derive_fix_category(
+        blocking_issues,
+        missing_sections,
+        missing_contract_keys,
+    )
+
     # previous_* fields from loaded state
     previous_checked_body_sha256: Optional[str] = None
     previous_missing_sections: list[str] = []
     previous_missing_contract_keys: list[str] = []
+    previous_rewrite_history: list[str] = []
     if previous_state is not None:
+        if source_body_reset:
+            # source body changed by human — reset stale history.
+            previous_rewrite_history = []
+        else:
+            previous_rewrite_history = list(previous_state.rewrite_history)
         previous_checked_body_sha256 = previous_state.checked_body_sha256
         previous_missing_sections = list(previous_state.missing_sections)
         previous_missing_contract_keys = list(previous_state.missing_contract_keys)
+
+    rewrite_history = previous_rewrite_history + [fix_category]
+    occurrence_count = rewrite_history.count(fix_category)
 
     state_dict: dict = {
         "schema_version": SCHEMA_VERSION,
@@ -279,6 +315,9 @@ def _build_state_dict(
         "max_rewrite_attempts": max_rewrite_attempts,
         "checker_exit_code": checker_exit_code,
         "checked_body_sha256": checked_body_sha256,
+        "fix_category": fix_category,
+        "rewrite_history": rewrite_history,
+        "occurrence_count": occurrence_count,
         "missing_sections": missing_sections,
         "missing_contract_keys": missing_contract_keys,
         "previous_checked_body_sha256": previous_checked_body_sha256,
@@ -452,6 +491,9 @@ def main(argv: list[str] | None = None) -> None:
         max_rewrite_attempts=state_dict["max_rewrite_attempts"],
         checker_exit_code=state_dict["checker_exit_code"],
         checked_body_sha256=state_dict["checked_body_sha256"],
+        fix_category=state_dict["fix_category"],
+        rewrite_history=state_dict["rewrite_history"],
+        occurrence_count=state_dict["occurrence_count"],
         missing_sections=state_dict["missing_sections"],
         missing_contract_keys=state_dict["missing_contract_keys"],
         previous_checked_body_sha256=state_dict["previous_checked_body_sha256"],
