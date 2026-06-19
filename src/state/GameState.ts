@@ -22,6 +22,28 @@ export type CommandIntent =
   | 'none'
   | 'assist_player'
 
+// ---------------------------------------------------------------------------
+// CommandIntent buffer types (§stage-7 contract, Issue #982)
+// Wall-clock expiry (Date.now, performance.now) is intentionally absent.
+// Expiry is deterministic: currentTick < expiresAtTick (AC2, AC7).
+// ---------------------------------------------------------------------------
+
+export type BufferedCommandIntent = Readonly<{
+  intent: Extract<CommandIntent, 'assist_player'>
+  sampledAtTick: number
+  expiresAtTick: number
+}>
+
+export interface CommandIntentRuntimeState {
+  activeIntent: CommandIntent
+  bufferedIntent: BufferedCommandIntent | null
+  /**
+   * TTL in fixed ticks. Converted from ms at init time:
+   *   ceil(ttlMs / fixedDeltaMs), clamped to [1, 180] (AC1).
+   */
+  assistPlayerTtlTicks: number
+}
+
 export type NpcBehaviorState =
   | 'inactive'
   | 'acquire_target'
@@ -251,6 +273,8 @@ export interface GameState {
   telemetry: TelemetryState
   /** Sortie state machine (AC1). Managed by SortieSystem. */
   sortie: SortieState
+  /** Command intent buffer runtime state (AC4, Issue #982). */
+  commandIntentRuntime: CommandIntentRuntimeState
 }
 
 export const gameSnapshotSchemaVersion = 1 as const
@@ -261,6 +285,26 @@ export interface GameSnapshot {
   weaponPower: number
   playerMaxHp: number
 }
+
+// ---------------------------------------------------------------------------
+// computeAssistPlayerTtlTicks — must precede createInitialGameState (used at init time)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute assistPlayerTtlTicks from ms and fixedDeltaMs.
+ * Converts wall-clock TTL to fixed-tick count: ceil(ttlMs / fixedDeltaMs).
+ * Clamped to [1, 180] (AC1).
+ *
+ * @param ttlMs       TTL in milliseconds (e.g. 133)
+ * @param fixedDeltaMs Fixed timestep in milliseconds (e.g. 1000/60 ≈ 16.667)
+ */
+export function computeAssistPlayerTtlTicks(ttlMs: number, fixedDeltaMs: number): number {
+  return Math.min(180, Math.max(1, Math.ceil(ttlMs / fixedDeltaMs)))
+}
+
+// Default TTL parameters (AC1, Blocker 3)
+const DEFAULT_TTL_MS = 133
+const DEFAULT_FIXED_DELTA_MS = 1000 / 60
 
 export function createInitialGameState(
   snapshot: Partial<GameSnapshot> = {},
@@ -317,6 +361,13 @@ export function createInitialGameState(
       targetTicks: 0,
       result: null,
     },
+    commandIntentRuntime: {
+      activeIntent: 'none',
+      bufferedIntent: null,
+      // AC1: computed via computeAssistPlayerTtlTicks(133ms, 1000/60ms) = 8 ticks at 60Hz.
+      // Clamped to [1, 180] as per AC1.
+      assistPlayerTtlTicks: computeAssistPlayerTtlTicks(DEFAULT_TTL_MS, DEFAULT_FIXED_DELTA_MS),
+    },
   }
 }
 
@@ -327,4 +378,75 @@ export function createGameSnapshot(state: GameState): GameSnapshot {
     weaponPower: state.progress.weaponPower,
     playerMaxHp: state.player.maxHp,
   }
+}
+
+// ---------------------------------------------------------------------------
+// CommandIntent production helpers (Blockers 1–3, Issue #982)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true iff the buffered intent is still active at currentTick.
+ * AC2: deterministic tick comparison — no Date.now / performance.now.
+ *
+ * Active condition: currentTick < expiresAtTick
+ */
+export function isBufferedCommandIntentActive(
+  buffered: BufferedCommandIntent,
+  currentTick: number,
+): boolean {
+  return currentTick < buffered.expiresAtTick
+}
+
+/**
+ * Samples an assist_player intent at the given tick and updates the runtime state.
+ * Creates a BufferedCommandIntent with expiresAtTick = sampledAtTick + assistPlayerTtlTicks (AC7).
+ * Also updates activeIntent to 'assist_player' (AC5, Blocker 1).
+ *
+ * Call this from the tick step when a 'sample_assist_player' InputCommand is received.
+ *
+ * @param runtime      Mutable CommandIntentRuntimeState
+ * @param currentTick  The current simulation tick
+ */
+export function sampleAssistPlayerIntent(
+  runtime: CommandIntentRuntimeState,
+  currentTick: number,
+): void {
+  const buffered: BufferedCommandIntent = {
+    intent: 'assist_player',
+    sampledAtTick: currentTick,
+    expiresAtTick: currentTick + runtime.assistPlayerTtlTicks,
+  }
+  runtime.bufferedIntent = buffered
+  runtime.activeIntent = 'assist_player'
+}
+
+/**
+ * Advances the CommandIntentRuntimeState by one tick.
+ * If the bufferedIntent has expired (currentTick >= expiresAtTick), clears it
+ * and resets activeIntent to 'none'.
+ *
+ * Call this once per tick step, after consuming commands.
+ *
+ * @param runtime      Mutable CommandIntentRuntimeState
+ * @param currentTick  The current simulation tick (post-increment, i.e. the tick being evaluated)
+ */
+export function tickCommandIntentRuntime(
+  runtime: CommandIntentRuntimeState,
+  currentTick: number,
+): void {
+  if (runtime.bufferedIntent !== null && !isBufferedCommandIntentActive(runtime.bufferedIntent, currentTick)) {
+    runtime.bufferedIntent = null
+    runtime.activeIntent = 'none'
+  }
+}
+
+/**
+ * Resets CommandIntentRuntimeState to initial state (Blocker 5, Issue #982).
+ * Call this in resetCombatRuntime / startSortie to clear any stale intents from a previous sortie.
+ *
+ * @param runtime Mutable CommandIntentRuntimeState
+ */
+export function resetCommandIntentRuntime(runtime: CommandIntentRuntimeState): void {
+  runtime.activeIntent = 'none'
+  runtime.bufferedIntent = null
 }
