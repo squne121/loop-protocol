@@ -9,7 +9,9 @@
  * AC3: Confirm result 後、resources が expected reward 分だけ増え、
  *      localStorage に schemaVersion:1 / resources / weaponPower / playerMaxHp が保存される
  * AC4: Confirm result の double invocation で resources が二重加算されない
- * AC5: reload 後、resources が localStorage から復元され、combat runtime state は復元されない
+ * AC5: reload 後も localStorage snapshot は保持されるが、B1 no auto-load により
+ *      runtime resources / combat runtime state / result phase は復元されない。
+ *      Load Game による snapshot 適用は実装契約として存在するが、本 E2E では未実行。
  * AC6: reload 後、同一 result を再 confirm / re-claim できない（resources が二重加算されない）
  * AC9: evidence の origin は http://127.0.0.1:4173 を使い、混在させない
  *
@@ -352,7 +354,9 @@ test(
 )
 
 // ---------------------------------------------------------------------------
-// AC5: reload 後、resources が localStorage から復元され、combat runtime state は復元されない
+// AC5: reload 後も localStorage snapshot は保持されるが、
+//      B1 no auto-load により runtime resources / combat runtime state / result phase は復元されない。
+//      Load Game による snapshot 適用は実装契約として存在するが、本 E2E では未実行。
 //
 // Implementation note:
 // - addInitScript persists across reload.
