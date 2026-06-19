@@ -686,6 +686,7 @@ def _validate_lp_vc_parser_errors(body: str) -> list[ValidationError]:
         if severity is None:
             continue
         abs_line = start_line + (err.line_number or 1) - 1
+        context, trunc = _get_context_lines(body, abs_line, abs_line)
         errors.append(ValidationError(
             rule_id="LP_VC_PARSER",
             severity=severity,
@@ -693,8 +694,8 @@ def _validate_lp_vc_parser_errors(body: str) -> list[ValidationError]:
             line_start=abs_line,
             line_end=abs_line,
             message=f"VC parse error ({err.kind}): {err.raw_line!r}",
-            minimal_context=[err.raw_line or ""],
-            context_truncated=False,
+            minimal_context=context,
+            context_truncated=trunc,
             fix_hint=err.fix_hint or "",
         ))
     return errors
