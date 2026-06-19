@@ -618,6 +618,11 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 )
                 if suffix_label2 is not None and suffix_valid2:
                     result.ac_refs.add(suffix_label2)
+            elif current_ac_refs:
+                # Backward compat: if valid AC markers were set before this non-$ command,
+                # still add them to ac_refs so C5 does not co-fire with C4.
+                # (old parser did this; omitting it causes autofix tools to refuse C4-only repairs)
+                result.ac_refs.update(current_ac_refs)
 
             result.errors.append(VcParseError(
                 kind="non_dollar_command",
