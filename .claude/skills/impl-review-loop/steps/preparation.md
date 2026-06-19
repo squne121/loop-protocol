@@ -2,6 +2,63 @@
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
+## 0-a. Intake capsule-first
+
+着手直後は **`IMPL_REVIEW_INTAKE_CAPSULE_V1` を最優先で生成して利用**する。
+
+以下の順序を固定し、同一データの重複取得を禁止する。
+
+1. `gh issue view` / snapshot / `git status` などの直接取得は、まず実行しない。
+2. `build_intake_capsule.py` を実行して `IMPL_REVIEW_INTAKE_CAPSULE_V1` を取得。
+3. `issue_ready_tuple` / `contract_snapshot` / `repo_state` / `source_integrity` を capsule 内で先に消費。
+4. capsule が `fresh` かつ `valid`（`source_integrity.evidence_complete == true`）な場合、**同一 loop 内では `gh issue view` / comments fetch / main `git status` / snapshot 探索を再実行しない**。
+5. `next_action.route` が `proceed_to_step_1` の場合のみ、capsule に含まれる準備済み情報を用いて Step 1 へ進む。
+6. `next_action.route == ensure_contract_snapshot` の場合のみ `ensure_contract_snapshot` を実行する。
+7. `next_action.route == run_contract_blocker_triage` の場合は `contract_snapshot.contract_blocker_triage` を優先し、raw evidence の再分類や preflight 再実行を行わない。
+8. `next_action.route == refresh_contract_snapshot` の場合は stale 扱いとして停止し、fresh snapshot の再取得へ route する。
+
+```bash
+uv run python3 .claude/skills/impl-review-loop/scripts/build_intake_capsule.py \
+  --issue-number <issue_number> \
+  --repo <owner/repo> \
+  --max-stdout-bytes 4096
+```
+
+実行後、`stdout` の JSON 以外の `issue` 本文や `.claude/skills` 全文は展開しない。
+
+```yaml
+IMPL_REVIEW_INTAKE_CAPSULE_V1:
+  schema: IMPL_REVIEW_INTAKE_CAPSULE_V1
+  issue_ready_tuple: <ready判定結果>
+  contract_snapshot: <status/route 依存>
+  source_integrity: <command digest / parse warnings / evidence_complete>
+  repo_state: <dirty summary>
+  worktree:
+    path: .claude/worktrees/issue-<N>-<slug>
+    branch: worktree-issue-<N>-<slug>
+  agent_runtime:
+    runner: wsl2-ubuntu
+    collector: build_intake_capsule.py
+  next_action:
+    route: ensure_contract_snapshot | run_contract_blocker_triage | proceed_to_step_1 | request_readiness_check | refresh_contract_snapshot | human_review_required
+```
+
+### Capsule failure policy
+
+`build_intake_capsule.py` がエラーを返した場合:
+
+- `issue_ready_tuple` / `contract_snapshot` は trust-less のまま扱い、既存 Step 0 判定を継続して再実行しない。
+- まず `stdout` の `errors` を確認し、必要なら `intake_gate_failed` 相当として停止。
+- `artifact` の `issue_metadata` を参照し、原因を fix できる範囲だけ再収集。
+
+`contract_snapshot.source` は以下を想定し、上位 Step が raw の再取得で同一ロジックを再実行しない:
+
+- `ensure_contract_snapshot_result`
+- `live_parse`
+
+`contract_snapshot.normalized_status` は最低限 `go | missing_go | latest_blocked | stale | human_judgment | runtime_error` を区別し、`upstream_status` を潰して 1 つの missing/blocked にまとめない。
+
+
 ## 0. Intake Gate — `CONTRACT_REVIEW_RESULT_V1 status: go` 必須検査
 
 `impl-review-loop` preparation の最初のゲート。以下の 5 つのサブ理由を **優先順位の高い順**に評価し、いずれかに該当する場合は `intake_gate_failed` として停止する。後続ステップへは進まない。

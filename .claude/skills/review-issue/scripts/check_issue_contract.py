@@ -54,6 +54,24 @@ _CREATE_ISSUE_SCRIPTS = (
 if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
 
+# ---------------------------------------------------------------------------
+# vc_contract_syntax を import（#993: shared VC grammar parser）
+# ---------------------------------------------------------------------------
+_VC_SYNTAX_SCRIPTS = (
+    Path(__file__).resolve().parent.parent.parent / "issue-contract-review" / "scripts"
+)
+if str(_VC_SYNTAX_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_VC_SYNTAX_SCRIPTS))
+
+try:
+    from vc_contract_syntax import parse_verification_commands_section as _parse_vc_section
+    _VC_SECTION_PARSER_AVAILABLE = True
+except ImportError:
+    _VC_SECTION_PARSER_AVAILABLE = False
+
+    def _parse_vc_section(vc_section: str):  # type: ignore[misc]
+        return None
+
 try:
     from prose_boundary_policy import (
         lookup_heading_policy as _lookup_heading_policy,
@@ -689,32 +707,31 @@ def check_c3_ac_checkbox_format(body: str) -> tuple[str, list[str]]:
 
 
 def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
-    """C4: VC コマンド存在チェック"""
+    """C4: VC コマンド存在チェック（#993: shared parser ベースに統一）
+
+    canonical format: ```bash fenced block 内の $ コマンド行のみを認識。
+    inline backtick VC や list-style VC (- `cmd`) は pass にしない。
+    """
     section = extract_section(body, "Verification Commands")
     if not section:
         return CheckResult.FAIL, ["## Verification Commands セクションが存在しないか空"]
 
-    # コードブロック内のコマンド行を確認（$ または - で始まる行）
-    code_blocks = re.findall(r'```[^\n]*\n(.*?)```', section, re.DOTALL)
-    command_lines = []
-    for block in code_blocks:
+    if _VC_SECTION_PARSER_AVAILABLE:
+        parse_result = _parse_vc_section(section)
+        if parse_result.commands:
+            return CheckResult.PASS, []
+        # No canonical commands — check if bash fence exists with non-$ content
+        if not parse_result.has_bash_fence:
+            return CheckResult.FAIL, ["VC に ```bash fenced block が見当たらない（canonical format が必要）"]
+        return CheckResult.FAIL, ["VC に実行可能コマンドが見当たらない（$ <command> 形式が必要）"]
+
+    # Fallback (shared parser unavailable): $ lines in bash fences only
+    bash_blocks = re.findall(r'```bash[^\n]*\n(.*?)```', section, re.DOTALL)
+    for block in bash_blocks:
         for line in block.splitlines():
-            stripped = line.strip()
-            if stripped.startswith('$') or (stripped.startswith('-') and '`' in stripped):
-                command_lines.append(stripped)
-
-    if command_lines:
-        return CheckResult.PASS, []
-
-    # コードブロックが存在しない場合: コードブロック外のインライン backtick を確認
-    # コードブロックを除去してからインライン backtick を確認する
-    section_without_code_blocks = re.sub(r'```[^\n]*\n.*?```', '', section, flags=re.DOTALL)
-    inline = re.findall(r'`[^`]+`', section_without_code_blocks)
-
-    if not inline:
-        return CheckResult.FAIL, ["VC に実行可能コマンドが見当たらない（$ / - で始まる行、またはインライン backtick が必要）"]
-
-    return CheckResult.PASS, []
+            if line.strip().startswith('$'):
+                return CheckResult.PASS, []
+    return CheckResult.FAIL, ["VC に実行可能コマンドが見当たらない（$ で始まる行が必要）"]
 
 
 _VC_AC_COMMENT_RE = re.compile(
@@ -749,11 +766,12 @@ def _extract_vc_ac_refs(vc_section: str) -> set[str]:
 
 
 def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
-    """C5: AC と VC の番号一致チェック
+    """C5: AC と VC の番号一致チェック（#993: shared parser ベースに統一）
 
     VC 内の AC 参照として以下の形式を認識する:
     - Single:  # AC1
-    - Grouped: # AC2, AC3, AC4  (カンマ区切りの grouped 表記)
+    - Grouped: # AC2, AC3, AC4  (カンマ区切りの grouped 表記 — #814)
+    - Inline suffix: $ command  # AC1
 
     Range 表記 (# AC2-AC4) は本 Issue のスコープ外であり、サポートしない (AC3b)。
     """
@@ -766,8 +784,16 @@ def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
     # AC 番号を収集
     ac_numbers = set(re.findall(r'AC(\d+)', ac_section))
 
-    # VC 内の AC 参照を収集（single および grouped コメント形式）
-    vc_ac_refs = _extract_vc_ac_refs(vc_section)
+    # VC 内の AC 参照を収集
+    # #993: shared parser を優先使用（inline suffix + grouped 両対応）。
+    # fallback として _extract_vc_ac_refs() を使用（comment-only 形式）。
+    if _VC_SECTION_PARSER_AVAILABLE:
+        parse_result = _parse_vc_section(vc_section)
+        # VcParseResult.ac_refs uses "AC1" format; extract digit-only for comparison
+        # with ac_numbers (which are digit-only from re.findall(r'AC(\d+)', ac_section)).
+        vc_ac_refs = {re.sub(r"^AC", "", ref) for ref in parse_result.ac_refs}
+    else:
+        vc_ac_refs = _extract_vc_ac_refs(vc_section)
 
     # AC 番号と VC 参照が全て一致するか
     if not ac_numbers:
