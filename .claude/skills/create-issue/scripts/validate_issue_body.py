@@ -652,6 +652,54 @@ def _validate_lp020_runtime_verification_incomplete(body: str) -> list[Validatio
     return []
 
 
+def _validate_lp_vc_parser_errors(body: str) -> list[ValidationError]:
+    """Convert VcParseError entries from shared parser to ValidationError.
+
+    Severity mapping:
+      - non_dollar_command             -> warning (backward compat, edit-issue autofix handles)
+      - preceding_marker_with_inline_suffix -> warning
+      - inline_backtick               -> error
+      - compound_shell                -> error
+      - colon_marker / suffixed_marker -> skip (LP016 handles)
+      - unlabeled_fence               -> skip (LP011 handles via has_bash_fence)
+    """
+    section_info = _extract_section(body, "Verification Commands")
+    if not section_info:
+        return []
+    content, start_line, end_line = section_info
+
+    parse_result = _parse_vc_section(content)
+
+    SEVERITY_MAP = {
+        "non_dollar_command": "warning",
+        "preceding_marker_with_inline_suffix": "warning",
+        "inline_backtick": "error",
+        "compound_shell": "error",
+    }
+    SKIP_KINDS = {"colon_marker", "suffixed_marker", "unlabeled_fence"}
+
+    errors: list[ValidationError] = []
+    for err in parse_result.errors:
+        if err.kind in SKIP_KINDS:
+            continue
+        severity = SEVERITY_MAP.get(err.kind)
+        if severity is None:
+            continue
+        abs_line = start_line + (err.line_number or 1) - 1
+        errors.append(ValidationError(
+            rule_id="LP_VC_PARSER",
+            severity=severity,
+            section="Verification Commands",
+            line_start=abs_line,
+            line_end=abs_line,
+            message=f"VC parse error ({err.kind}): {err.raw_line!r}",
+            minimal_context=[err.raw_line or ""],
+            context_truncated=False,
+            fix_hint=err.fix_hint or "",
+        ))
+    return errors
+
+
 def _validate_lp016_vc_ac_marker_with_description(body: str) -> list[ValidationError]:
     """LP016: Detect VC AC marker suffix variants that are not bare markers.
 
@@ -1049,6 +1097,7 @@ def validate_issue_body(
     all_errors.extend(_validate_lp014_markdown_backtick_grep(body))
     all_errors.extend(_validate_lp015_baseline_vc_heading_only(body))
     all_errors.extend(_validate_lp016_vc_ac_marker_with_description(body))
+    all_errors.extend(_validate_lp_vc_parser_errors(body))
     all_errors.extend(_validate_lp018_vc_preflight_scope_value(body))
     all_errors.extend(_validate_lp019_vc_preflight_scope_attached(body))
     all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=effective_kind))

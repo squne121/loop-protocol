@@ -395,11 +395,19 @@ class TestAC6InlineBacktickFail:
         assert len(lp011) >= 1, f"LP011 should fire for inline backtick VC"
 
     def test_preflight_static_result(self):
-        """Preflight --static-only should return for inline backtick VC."""
+        """Preflight --static-only must be blocked for inline backtick VC."""
         output = _run_preflight_static(_INLINE_BACKTICK_BODY)
-        # inline backtick is outside bash fences; preflight may return ok (no bash fence errors)
-        # or blocked depending on implementation. We just verify it returns valid JSON.
-        assert "status" in output, "Preflight must return status field"
+        assert output.get("status") == "blocked", (
+            f"Preflight should be blocked for inline backtick VC, got status={output.get('status')!r}"
+        )
+        all_error_kinds = [
+            err.get("kind")
+            for r in output.get("results", [])
+            for err in r.get("errors", [])
+        ]
+        assert "inline_backtick" in all_error_kinds, (
+            f"Expected inline_backtick error in preflight results, got kinds={all_error_kinds!r}"
+        )
 
 
 class TestAC6UnlabeledFenceFail:

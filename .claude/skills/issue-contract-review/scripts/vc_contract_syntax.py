@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Shared VC grammar helpers for AC markers and preflight-scope parsing.
 
+LOOP_PROTOCOL canonical lint rules (not GFM).  Command lines inside
+```bash fences must start with $  (dollar-space).  Inline
+backticks, compound shell operators, and unlabeled fences are rejected.
+
 Also provides:
   - baseline-expect annotation parser (Issue #889)
   - vc-role annotation parser (Issue #889)
@@ -27,6 +31,9 @@ _AC_MARKER_PATTERN = re.compile(r"^\s*#\s*AC(\d+)\b(.*)$")
 _PRE_FLIGHT_SCOPE_PATTERN = re.compile(r"^\s*#\s*preflight-scope:\s*(.*?)\s*$")
 _BASELINE_EXPECT_PATTERN = re.compile(r"^\s*#\s*baseline-expect:\s*(.*?)\s*$")
 _VC_ROLE_PATTERN = re.compile(r"^\s*#\s*vc-role:\s*(.*?)\s*$")
+
+# Compound shell operators that make a VC command ambiguous / non-runnable as-is.
+_COMPOUND_SHELL_RE = re.compile(r"[;&|]|>+|<+")
 
 # Grouped AC marker: "# AC1, AC2" or "# AC2, AC3, AC4" (comma-separated, no suffix)
 _GROUPED_AC_MARKER_PATTERN = re.compile(
@@ -339,7 +346,13 @@ class VcParseResult:
     """
     commands: list = field(default_factory=list)   # list[VcCommandEntry]
     errors: list = field(default_factory=list)     # list[VcParseError]
-    ac_refs: set = field(default_factory=set)      # set[str]
+    canonical_ac_refs: set = field(default_factory=set)  # set[str] — $ command refs
+    compat_ac_refs: set = field(default_factory=set)     # set[str] — non-$ backward compat refs
+
+    @property
+    def ac_refs(self) -> set:
+        """Union of canonical and compat AC refs (backward compat)."""
+        return self.canonical_ac_refs | self.compat_ac_refs
     has_bash_fence: bool = False
     has_unlabeled_fence: bool = False
 
@@ -566,6 +579,16 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                         cmd_str = re.sub(r"\s+#\s*AC\d+\s*$", "", cmd_str).strip()
 
             # Resolve AC refs: inline suffix overrides current_ac_refs if present
+            if inline_ac_refs and current_ac_refs:
+                result.errors.append(VcParseError(
+                    kind="preceding_marker_with_inline_suffix",
+                    line_number=line_no,
+                    raw_line=stripped,
+                    fix_hint=(
+                        "Command has both a preceding '# ACN' marker and an inline '# ACN' suffix. "
+                        "Use one or the other, not both."
+                    ),
+                ))
             if inline_ac_refs:
                 resolved_ac = inline_ac_refs
             else:
@@ -601,7 +624,19 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 vc_role=vc_role_val,
             )
             result.commands.append(entry)
-            result.ac_refs.update(resolved_ac)
+            result.canonical_ac_refs.update(resolved_ac)
+
+            # Detect compound shell operators
+            if cmd_str and _COMPOUND_SHELL_RE.search(cmd_str):
+                result.errors.append(VcParseError(
+                    kind="compound_shell",
+                    line_number=line_no,
+                    raw_line=stripped,
+                    fix_hint=(
+                        "Compound shell operators (&&, ||, ;, >, |, etc.) are not allowed in VC commands. "
+                        f"Split into separate $ lines. Found: {stripped!r}"
+                    ),
+                ))
 
             # Reset current_ac_refs after a command consumes it
             # (each command "claims" the accumulated markers)
@@ -617,12 +652,12 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                     f"# {non_dollar_suffix_m.group(1)}"
                 )
                 if suffix_label2 is not None and suffix_valid2:
-                    result.ac_refs.add(suffix_label2)
+                    result.compat_ac_refs.add(suffix_label2)
             elif current_ac_refs:
                 # Backward compat: if valid AC markers were set before this non-$ command,
                 # still add them to ac_refs so C5 does not co-fire with C4.
                 # (old parser did this; omitting it causes autofix tools to refuse C4-only repairs)
-                result.ac_refs.update(current_ac_refs)
+                result.compat_ac_refs.update(current_ac_refs)
 
             result.errors.append(VcParseError(
                 kind="non_dollar_command",
@@ -633,5 +668,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                     f"Found non-$ line: {stripped!r}"
                 ),
             ))
+
+
 
     return result

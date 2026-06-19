@@ -2542,6 +2542,9 @@ def main() -> int:
     allowed_paths_from_body = extract_allowed_paths(body)
 
     # B4: bash ブロックからコマンドを抽出 (```bash のみ canonical format)
+    # Note: the normal execution path uses the legacy extract_fenced_bash_blocks() /
+    # parse_commands_from_block() parsers, NOT the unified parse_verification_commands_section().
+    # Only --static-only mode (above) uses the shared parser from vc_contract_syntax.py (#993).
     blocks = extract_fenced_bash_blocks(vc_section)
     commands = []
     for block in blocks:
