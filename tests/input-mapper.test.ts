@@ -361,3 +361,44 @@ describe('bindInput (PointerEvent lifecycle)', () => {
     expect(input.primaryPressed).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Issue #982 AC6: sample_assist_player in mapInputToCommands
+// ---------------------------------------------------------------------------
+
+describe('mapInputToCommands – sample_assist_player (AC6, Issue #982)', () => {
+  it('GIVEN assistPlayerRisingEdge=true WHEN mapInputToCommands THEN sample_assist_player is emitted', () => {
+    const input = createInputState()
+    input.assistPlayerRisingEdge = true
+
+    const commands = mapInputToCommands(input)
+    expect(commands.some((c) => c.type === 'sample_assist_player')).toBe(true)
+  })
+
+  it('GIVEN assistPlayerRisingEdge=false WHEN mapInputToCommands THEN sample_assist_player is NOT emitted', () => {
+    const input = createInputState()
+    // risingEdge is false by default
+
+    const commands = mapInputToCommands(input)
+    expect(commands.some((c) => c.type === 'sample_assist_player')).toBe(false)
+  })
+
+  it('GIVEN assistPlayerRisingEdge=true WHEN mapInputToCommands THEN latch is cleared (risingEdge=false after call)', () => {
+    const input = createInputState()
+    input.assistPlayerRisingEdge = true
+
+    mapInputToCommands(input)
+    expect(input.assistPlayerRisingEdge).toBe(false)
+  })
+
+  it('GIVEN assistPlayerRisingEdge=true WHEN mapInputToCommands called twice THEN sample_assist_player emitted once total', () => {
+    const input = createInputState()
+    input.assistPlayerRisingEdge = true
+
+    const c1 = mapInputToCommands(input)
+    const c2 = mapInputToCommands(input)
+
+    expect(c1.filter((c) => c.type === 'sample_assist_player')).toHaveLength(1)
+    expect(c2.filter((c) => c.type === 'sample_assist_player')).toHaveLength(0)
+  })
+})

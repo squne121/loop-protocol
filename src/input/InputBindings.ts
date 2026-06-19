@@ -13,6 +13,13 @@ export const KEY_CODE_MAP = new Map<string, MovementKey>([
   ['ArrowRight', 'moveRight'],
 ])
 
+/**
+ * Z-equivalent key for the assist_player CommandIntent (AC5).
+ * Product contract maps KeyZ → CommandIntent.assist_player.
+ * Raw 'assist_player' is not exposed in normal UI; this binding is the only entry point.
+ */
+export const ASSIST_PLAYER_KEY_CODE = 'KeyZ'
+
 export interface CanvasLike {
   getBoundingClientRect(): { left: number; top: number; width: number; height: number }
   setPointerCapture(pointerId: number): void
@@ -24,6 +31,14 @@ export interface KeyEventTarget {
     type: 'keydown' | 'keyup',
     handler: (event: KeyboardEvent) => void,
   ): void
+}
+
+/**
+ * Visibility change event target interface for testability (AC6).
+ */
+export interface VisibilityTarget {
+  addEventListener(type: 'visibilitychange', handler: () => void): void
+  readonly hidden: boolean
 }
 
 function updatePointerCoords(
@@ -45,12 +60,16 @@ function updatePointerCoords(
  * @param input - mutable input state to update
  * @param getArena - returns current arena dimensions for coordinate mapping
  * @param keyTarget - optional event target for keyboard events (defaults to window)
+ * @param blurTarget - optional event target for blur events (defaults to window)
+ * @param visibilityTarget - optional event target for visibilitychange events (defaults to document)
  */
 export function bindInput(
   canvasElement: CanvasLike,
   input: InputState,
   getArena: () => { width: number; height: number },
   keyTarget: KeyEventTarget = window as unknown as KeyEventTarget,
+  blurTarget?: { addEventListener(type: 'blur', handler: () => void): void },
+  visibilityTarget?: VisibilityTarget,
 ): void {
   function resetInput(): void {
     input.moveUp = false
@@ -59,12 +78,22 @@ export function bindInput(
     input.moveRight = false
     input.primaryPressed = false
     input.activePointerId = null
+    // AC6: blur and visibilitychange hidden clear physical pressed state
+    input.assistPlayerPressed = false
   }
 
   keyTarget.addEventListener('keydown', (event: KeyboardEvent) => {
+    // AC6: event.repeat === true does NOT refresh rising edge
     const key = KEY_CODE_MAP.get(event.code)
     if (key) {
       input[key] = true
+    }
+    if (event.code === ASSIST_PLAYER_KEY_CODE) {
+      if (!event.repeat && !input.assistPlayerPressed) {
+        // Rising edge: transition false → true (AC6)
+        input.assistPlayerRisingEdge = true
+      }
+      input.assistPlayerPressed = true
     }
   })
 
@@ -73,14 +102,21 @@ export function bindInput(
     if (key) {
       input[key] = false
     }
+    if (event.code === ASSIST_PLAYER_KEY_CODE) {
+      // AC6: keyup clears physical pressed state
+      input.assistPlayerPressed = false
+    }
   })
 
-  if (typeof window !== 'undefined') {
-    window.addEventListener('blur', resetInput)
+  const effectiveBlurTarget = blurTarget ?? (typeof window !== 'undefined' ? window as unknown as { addEventListener(type: 'blur', handler: () => void): void } : null)
+  if (effectiveBlurTarget) {
+    effectiveBlurTarget.addEventListener('blur', resetInput)
   }
-  if (typeof document !== 'undefined') {
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
+
+  const effectiveVisibilityTarget = visibilityTarget ?? (typeof document !== 'undefined' ? document as unknown as VisibilityTarget : null)
+  if (effectiveVisibilityTarget) {
+    effectiveVisibilityTarget.addEventListener('visibilitychange', () => {
+      if (effectiveVisibilityTarget.hidden) {
         resetInput()
       }
     })

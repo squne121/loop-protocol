@@ -22,6 +22,28 @@ export type CommandIntent =
   | 'none'
   | 'assist_player'
 
+// ---------------------------------------------------------------------------
+// CommandIntent buffer types (§stage-7 contract, Issue #982)
+// Wall-clock expiry (Date.now, performance.now) is intentionally absent.
+// Expiry is deterministic: currentTick < expiresAtTick (AC2, AC7).
+// ---------------------------------------------------------------------------
+
+export type BufferedCommandIntent = Readonly<{
+  intent: Extract<CommandIntent, 'assist_player'>
+  sampledAtTick: number
+  expiresAtTick: number
+}>
+
+export interface CommandIntentRuntimeState {
+  activeIntent: CommandIntent
+  bufferedIntent: BufferedCommandIntent | null
+  /**
+   * TTL in fixed ticks. Converted from ms at init time:
+   *   ceil(ttlMs / fixedDeltaMs), clamped to [1, 180] (AC1).
+   */
+  assistPlayerTtlTicks: number
+}
+
 export type NpcBehaviorState =
   | 'inactive'
   | 'acquire_target'
@@ -251,6 +273,8 @@ export interface GameState {
   telemetry: TelemetryState
   /** Sortie state machine (AC1). Managed by SortieSystem. */
   sortie: SortieState
+  /** Command intent buffer runtime state (AC4, Issue #982). */
+  commandIntentRuntime: CommandIntentRuntimeState
 }
 
 export const gameSnapshotSchemaVersion = 1 as const
@@ -316,6 +340,13 @@ export function createInitialGameState(
       // targetTicks will be set by startSortie(); placeholder 0 is overwritten before use
       targetTicks: 0,
       result: null,
+    },
+    commandIntentRuntime: {
+      activeIntent: 'none',
+      bufferedIntent: null,
+      // Default TTL: 8 ticks ≈ 133ms at 60Hz (ceil(133/16.667) = 8).
+      // Clamped to [1, 180] as per AC1.
+      assistPlayerTtlTicks: 8,
     },
   }
 }
