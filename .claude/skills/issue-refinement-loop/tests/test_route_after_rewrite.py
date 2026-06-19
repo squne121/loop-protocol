@@ -241,6 +241,101 @@ class TestBuildStateDictPreviousState:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests — category metadata in state dict (fix_category / history / count)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStateDictCategoryMetadata:
+    """fix_category and rewrite_history are built deterministically."""
+
+    def test_fix_category_derives_from_missing_sections(self):
+        checker_json = {
+            "verdict": "needs-fix",
+            "blocking_issues": [
+                "必須セクション '## Acceptance Criteria' が存在しない",
+            ],
+        }
+        state_dict = _build_state_dict(
+            rewrite_attempt_count=0,
+            max_rewrite_attempts=3,
+            checker_exit_code=1,
+            checked_body_sha256=VALID_SHA,
+            checker_json=checker_json,
+            previous_state=None,
+            source_issue_body_sha256=VALID_SHA,
+            source_body_reset=False,
+        )
+        assert state_dict["fix_category"] == "missing_section"
+        assert state_dict["rewrite_history"] == ["missing_section"]
+        assert state_dict["occurrence_count"] == 1
+
+    def test_rewrite_history_tracks_category_recurrence(self):
+        previous = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=1,
+            max_rewrite_attempts=3,
+            checker_exit_code=1,
+            checked_body_sha256=VALID_SHA,
+            fix_category="missing_section",
+            rewrite_history=["missing_section", "missing_contract_key"],
+            missing_sections=["S1"],
+            missing_contract_keys=["K1"],
+        )
+        checker_json = {
+            "verdict": "needs-fix",
+            "blocking_issues": [
+                "必須セクション '## Acceptance Criteria' が存在しない",
+            ],
+        }
+        state_dict = _build_state_dict(
+            rewrite_attempt_count=2,
+            max_rewrite_attempts=3,
+            checker_exit_code=1,
+            checked_body_sha256=VALID_SHA,
+            checker_json=checker_json,
+            previous_state=previous,
+            source_issue_body_sha256=VALID_SHA,
+            source_body_reset=False,
+        )
+        assert state_dict["rewrite_history"] == [
+            "missing_section",
+            "missing_contract_key",
+            "missing_section",
+        ]
+        assert state_dict["occurrence_count"] == 2
+
+    def test_source_body_reset_clears_stale_rewrite_history(self):
+        previous = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=2,
+            max_rewrite_attempts=3,
+            checker_exit_code=1,
+            checked_body_sha256=VALID_SHA,
+            fix_category="missing_section",
+            rewrite_history=["missing_section", "missing_contract_key"],
+            missing_sections=["S1"],
+            missing_contract_keys=["K1"],
+        )
+        checker_json = {
+            "verdict": "needs-fix",
+            "blocking_issues": [
+                "必須セクション '## Acceptance Criteria' が存在しない",
+            ],
+        }
+        state_dict = _build_state_dict(
+            rewrite_attempt_count=0,
+            max_rewrite_attempts=3,
+            checker_exit_code=1,
+            checked_body_sha256=VALID_SHA,
+            checker_json=checker_json,
+            previous_state=previous,
+            source_issue_body_sha256=VALID_SHA,
+            source_body_reset=True,
+        )
+        assert state_dict["rewrite_history"] == ["missing_section"]
+        assert state_dict["occurrence_count"] == 1
+        assert state_dict["fix_category"] == "missing_section"
+
+
+# ---------------------------------------------------------------------------
 # Integration tests — CLI invocation via subprocess (AC4, AC4b, AC4d)
 # ---------------------------------------------------------------------------
 

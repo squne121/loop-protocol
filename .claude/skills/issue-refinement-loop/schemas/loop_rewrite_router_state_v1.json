@@ -22,6 +22,9 @@
       "type": "string",
       "pattern": "^(sha256:)?[A-Fa-f0-9]{64}$"
     },
+    "fix_category": {"type": "string"},
+    "rewrite_history": {"type": "array", "items": {"type": "string"}},
+    "occurrence_count": {"type": "integer", "minimum": 0},
     "missing_sections": {"type": "array", "items": {"type": "string"}},
     "missing_contract_keys": {"type": "array", "items": {"type": "string"}},
     "previous_checked_body_sha256": {"type": ["string", "null"]},

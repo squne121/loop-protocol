@@ -17,9 +17,12 @@ from decide_rewrite_route import (
     ROUTE_HUMAN_JUDGMENT_REQUIRED,
     ROUTE_PROCEED_TO_REVIEW,
     ROUTE_CONTINUE_REWRITE,
+    ROUTE_CATEGORY_WIDE_REMEDIATION,
     REASON_CODE_MAX_ATTEMPTS_EXCEEDED,
     REASON_CODE_BODY_HASH_UNCHANGED,
     REASON_CODE_MISSING_CONTRACT_NO_PROGRESS,
+    REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION,
+    REASON_CODE_FIX_CATEGORY_UNDECIDABLE,
     REASON_CODE_CHECKER_PASSED,
     REASON_CODE_CHECKER_FAILED,
 )
@@ -158,6 +161,46 @@ class TestAC3CheckerExitCode:
             assert result.route != ROUTE_PROCEED_TO_REVIEW, (
                 f"exit_code={exit_code} should not produce proceed_to_review"
             )
+
+
+class TestAC3BRepeatedCategoryRemediation:
+    """Same fix_category recurrence should route by category-aware policy."""
+
+    def test_repairable_category_recurrence_routes_to_category_wide_remediation(self):
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=2,
+            max_rewrite_attempts=5,
+            checker_exit_code=1,
+            checked_body_sha256="abc123",
+            fix_category="missing_section",
+            rewrite_history=["missing_section", "missing_section"],
+            occurrence_count=2,
+            missing_sections=["S1", "S2"],
+            missing_contract_keys=[],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_CATEGORY_WIDE_REMEDIATION
+        assert result.reason_code == REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION
+        assert result.repeated_fix_category == "missing_section"
+        assert result.occurrence_count == 2
+        assert result.to_dict()["fix_category"] == "missing_section"
+
+    def test_nonrepairable_category_recurrence_routes_to_human_judgment(self):
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=2,
+            max_rewrite_attempts=5,
+            checker_exit_code=1,
+            checked_body_sha256="abc123",
+            fix_category="unknown_policy_signal",
+            rewrite_history=["unknown_policy_signal", "unknown_policy_signal"],
+            occurrence_count=2,
+            missing_sections=["S1"],
+            missing_contract_keys=["K1"],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
+        assert result.reason_code == REASON_CODE_FIX_CATEGORY_UNDECIDABLE
+        assert result.stop_reason_if_unrepairable
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +377,14 @@ class TestAC6RegressionDirectCalls:
             "checker_exit_code",
             "missing_sections",
             "missing_contract_keys",
+            "fix_category",
+            "rewrite_history",
+            "occurrence_count",
+            "repeated_fix_category",
+            "remaining_blockers",
+            "required_evidence",
+            "suggested_repair_strategy",
+            "stop_reason_if_unrepairable",
             "source_body_reset",
         ]
         for field in required_fields:

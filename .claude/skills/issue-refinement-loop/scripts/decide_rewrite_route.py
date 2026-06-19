@@ -42,6 +42,7 @@ SCHEMA_VERSION = "loop_rewrite_router_state/v1"
 ROUTE_CONTINUE_REWRITE = "continue_rewrite"
 ROUTE_PROCEED_TO_REVIEW = "proceed_to_review"
 ROUTE_HUMAN_JUDGMENT_REQUIRED = "human_judgment_required"
+ROUTE_CATEGORY_WIDE_REMEDIATION = "category_wide_remediation"
 
 # Reason codes
 REASON_CODE_MAX_ATTEMPTS_EXCEEDED = "max_attempts_exceeded"
@@ -50,6 +51,10 @@ REASON_CODE_MISSING_CONTRACT_NO_PROGRESS = "missing_contract_no_progress"
 REASON_CODE_CHECKER_PASSED = "checker_passed"
 REASON_CODE_CHECKER_FAILED = "checker_failed_rewrite"
 REASON_CODE_SOURCE_BODY_RESET = "source_body_reset"
+REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION = (
+    "repeated_fix_category_remediation"
+)
+REASON_CODE_FIX_CATEGORY_UNDECIDABLE = "fix_category_undecidable"
 REASON_CODE_NULL = None
 
 
@@ -83,6 +88,12 @@ class LOOP_REWRITE_ROUTER_STATE_V1:
         missing_contract_keys: List of missing required contract keys after most recent check.
             Used for no-progress detection (must monotonically decrease).
 
+        fix_category: Current checker failure category used for category-level routing.
+
+        rewrite_history: Ordered history of observed fix categories.
+
+        occurrence_count: Number of occurrences of fix_category in rewrite_history.
+
         previous_checked_body_sha256: SHA256 of the issue body from the PREVIOUS iteration.
             None if this is the first iteration.
 
@@ -110,6 +121,9 @@ class LOOP_REWRITE_ROUTER_STATE_V1:
     checked_body_sha256: str
     missing_sections: list[str]
     missing_contract_keys: list[str]
+    fix_category: str = "unknown_contract_failure"
+    rewrite_history: list[str] = field(default_factory=list)
+    occurrence_count: int = 0
     previous_checked_body_sha256: Optional[str] = None
     previous_missing_sections: list[str] = field(default_factory=list)
     previous_missing_contract_keys: list[str] = field(default_factory=list)
@@ -158,6 +172,14 @@ class RouteResult:
     checker_exit_code: int
     missing_sections: list[str]
     missing_contract_keys: list[str]
+    fix_category: str = "unknown_contract_failure"
+    rewrite_history: list[str] = field(default_factory=list)
+    occurrence_count: int = 0
+    repeated_fix_category: Optional[str] = None
+    remaining_blockers: list[str] = field(default_factory=list)
+    required_evidence: list[str] = field(default_factory=list)
+    suggested_repair_strategy: Optional[str] = None
+    stop_reason_if_unrepairable: Optional[str] = None
     source_body_reset: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -172,6 +194,14 @@ class RouteResult:
             "checker_exit_code": self.checker_exit_code,
             "missing_sections": self.missing_sections,
             "missing_contract_keys": self.missing_contract_keys,
+            "fix_category": self.fix_category,
+            "rewrite_history": self.rewrite_history,
+            "occurrence_count": self.occurrence_count,
+            "repeated_fix_category": self.repeated_fix_category,
+            "remaining_blockers": self.remaining_blockers,
+            "required_evidence": self.required_evidence,
+            "suggested_repair_strategy": self.suggested_repair_strategy,
+            "stop_reason_if_unrepairable": self.stop_reason_if_unrepairable,
             "source_body_reset": self.source_body_reset,
         }
 
@@ -231,6 +261,57 @@ def _strictly_decreased(
     return current < previous  # strict (proper) subset
 
 
+_REPAIRABLE_FIX_CATEGORIES = {
+    "missing_section",
+    "missing_contract_key",
+    "unknown_contract_failure",
+}
+
+
+def _remaining_blockers(
+    missing_sections: list[str],
+    missing_contract_keys: list[str],
+) -> list[str]:
+    """Build deterministic blocker list in stable order."""
+    return [*missing_sections, *missing_contract_keys]
+
+
+def _required_evidence_for_fix_category(category: str) -> list[str]:
+    if category == "missing_section":
+        return [
+            "カテゴリ内で不足しているセクションを一括で補完する",
+            "各セクションへの実装方針と根拠を追加する",
+        ]
+    if category == "missing_contract_key":
+        return [
+            "カテゴリ内で欠落した contract key を一括で補完する",
+            "machine-readable block の欠損キーを明示する",
+        ]
+    return [
+        "カテゴリ再発を示す blockers と直近の checker 結果を同梱する",
+        "カテゴリ横断の修正後に再検証可能な根拠を提示する",
+    ]
+
+
+def _suggested_repair_strategy(category: str) -> str:
+    if category == "missing_section":
+        return "missing_section 再発時は同カテゴリ全件を一括追加する"
+    if category == "missing_contract_key":
+        return "missing_contract_key 再発時は契約キー群を同時解消する"
+    return "カテゴリ再発を単一カテゴリ改善として一括再修正する"
+
+
+def _is_repairable_fix_category(category: str) -> bool:
+    return category in _REPAIRABLE_FIX_CATEGORIES
+
+
+def _human_stop_reason(category: str) -> str:
+    return (
+        f"カテゴリ {category} は現行ルール集合で structured remediation が未定義（"
+        "category-wide remediation strategy 未定義）"
+    )
+
+
 # ---------------------------------------------------------------------------
 # decide_rewrite_route — pure function (AC1)
 # ---------------------------------------------------------------------------
@@ -267,6 +348,16 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     """
 
     source_body_reset = state.source_body_reset
+    repeated_fix_category = state.fix_category
+    remaining_blockers = _remaining_blockers(
+        state.missing_sections,
+        state.missing_contract_keys,
+    )
+    required_evidence = _required_evidence_for_fix_category(state.fix_category)
+    suggested_repair_strategy = _suggested_repair_strategy(state.fix_category)
+    stop_reason_if_unrepairable = (
+        _human_stop_reason(state.fix_category) if state.occurrence_count >= 2 else None
+    )
 
     # --- AC1: checker_exit_code == 0 overrides all stop guards ---
     # checker approve takes priority over max_rewrite_attempts, body_hash_unchanged,
@@ -281,10 +372,61 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             checker_exit_code=state.checker_exit_code,
             missing_sections=state.missing_sections,
             missing_contract_keys=state.missing_contract_keys,
+            fix_category=state.fix_category,
+            rewrite_history=state.rewrite_history,
+            occurrence_count=state.occurrence_count,
+            repeated_fix_category=repeated_fix_category,
+            remaining_blockers=remaining_blockers,
+            required_evidence=required_evidence,
+            suggested_repair_strategy=suggested_repair_strategy,
+            stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
         )
 
     # From here on: checker_exit_code != 0 (checker did not approve)
+
+    # --- AC3: same-category recurrence should be handled before budget/no-progress gates ---
+    if state.occurrence_count >= 2:
+        if _is_repairable_fix_category(state.fix_category):
+            return RouteResult(
+                route=ROUTE_CATEGORY_WIDE_REMEDIATION,
+                reason_code=REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION,
+                rewrite_attempt_count=state.rewrite_attempt_count,
+                max_rewrite_attempts=state.max_rewrite_attempts,
+                checked_body_sha256=state.checked_body_sha256,
+                checker_exit_code=state.checker_exit_code,
+                missing_sections=state.missing_sections,
+                missing_contract_keys=state.missing_contract_keys,
+                fix_category=state.fix_category,
+                rewrite_history=state.rewrite_history,
+                occurrence_count=state.occurrence_count,
+                repeated_fix_category=repeated_fix_category,
+                remaining_blockers=remaining_blockers,
+                required_evidence=required_evidence,
+                suggested_repair_strategy=suggested_repair_strategy,
+                stop_reason_if_unrepairable=stop_reason_if_unrepairable,
+                source_body_reset=source_body_reset,
+            )
+
+        return RouteResult(
+            route=ROUTE_HUMAN_JUDGMENT_REQUIRED,
+            reason_code=REASON_CODE_FIX_CATEGORY_UNDECIDABLE,
+            rewrite_attempt_count=state.rewrite_attempt_count,
+            max_rewrite_attempts=state.max_rewrite_attempts,
+            checked_body_sha256=state.checked_body_sha256,
+            checker_exit_code=state.checker_exit_code,
+            missing_sections=state.missing_sections,
+            missing_contract_keys=state.missing_contract_keys,
+            fix_category=state.fix_category,
+            rewrite_history=state.rewrite_history,
+            occurrence_count=state.occurrence_count,
+            repeated_fix_category=repeated_fix_category,
+            remaining_blockers=remaining_blockers,
+            required_evidence=required_evidence,
+            suggested_repair_strategy=suggested_repair_strategy,
+            stop_reason_if_unrepairable=stop_reason_if_unrepairable,
+            source_body_reset=source_body_reset,
+        )
 
     # --- AC2: max_rewrite_attempts enforcement ---
     if state.rewrite_attempt_count >= state.max_rewrite_attempts:
@@ -297,6 +439,14 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             checker_exit_code=state.checker_exit_code,
             missing_sections=state.missing_sections,
             missing_contract_keys=state.missing_contract_keys,
+            fix_category=state.fix_category,
+            rewrite_history=state.rewrite_history,
+            occurrence_count=state.occurrence_count,
+            repeated_fix_category=repeated_fix_category,
+            remaining_blockers=remaining_blockers,
+            required_evidence=required_evidence,
+            suggested_repair_strategy=suggested_repair_strategy,
+            stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
         )
 
@@ -315,6 +465,14 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             checker_exit_code=state.checker_exit_code,
             missing_sections=state.missing_sections,
             missing_contract_keys=state.missing_contract_keys,
+            fix_category=state.fix_category,
+            rewrite_history=state.rewrite_history,
+            occurrence_count=state.occurrence_count,
+            repeated_fix_category=repeated_fix_category,
+            remaining_blockers=remaining_blockers,
+            required_evidence=required_evidence,
+            suggested_repair_strategy=suggested_repair_strategy,
+            stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
         )
 
@@ -346,6 +504,14 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
                     checker_exit_code=state.checker_exit_code,
                     missing_sections=state.missing_sections,
                     missing_contract_keys=state.missing_contract_keys,
+                    fix_category=state.fix_category,
+                    rewrite_history=state.rewrite_history,
+                    occurrence_count=state.occurrence_count,
+                    repeated_fix_category=repeated_fix_category,
+                    remaining_blockers=remaining_blockers,
+                    required_evidence=required_evidence,
+                    suggested_repair_strategy=suggested_repair_strategy,
+                    stop_reason_if_unrepairable=stop_reason_if_unrepairable,
                     source_body_reset=source_body_reset,
                 )
 
@@ -359,6 +525,14 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
         checker_exit_code=state.checker_exit_code,
         missing_sections=state.missing_sections,
         missing_contract_keys=state.missing_contract_keys,
+        fix_category=state.fix_category,
+        rewrite_history=state.rewrite_history,
+        occurrence_count=state.occurrence_count,
+        repeated_fix_category=repeated_fix_category,
+        remaining_blockers=remaining_blockers,
+        required_evidence=required_evidence,
+        suggested_repair_strategy=suggested_repair_strategy,
+        stop_reason_if_unrepairable=stop_reason_if_unrepairable,
         source_body_reset=source_body_reset,
     )
 
@@ -486,6 +660,9 @@ def load_rewrite_router_state(
             checked_body_sha256=data["checked_body_sha256"],
             missing_sections=data.get("missing_sections", []),
             missing_contract_keys=data.get("missing_contract_keys", []),
+            fix_category=data.get("fix_category", "unknown_contract_failure"),
+            rewrite_history=[],
+            occurrence_count=0,
             previous_checked_body_sha256=None,
             previous_missing_sections=[],
             previous_missing_contract_keys=[],
@@ -501,6 +678,9 @@ def load_rewrite_router_state(
         checked_body_sha256=data["checked_body_sha256"],
         missing_sections=data.get("missing_sections", []),
         missing_contract_keys=data.get("missing_contract_keys", []),
+        fix_category=data.get("fix_category", "unknown_contract_failure"),
+        rewrite_history=list(data.get("rewrite_history", [])),
+        occurrence_count=data.get("occurrence_count", 0),
         previous_checked_body_sha256=data.get("previous_checked_body_sha256"),
         previous_missing_sections=data.get("previous_missing_sections", []),
         previous_missing_contract_keys=data.get("previous_missing_contract_keys", []),
@@ -531,6 +711,9 @@ def save_rewrite_router_state(
         "checked_body_sha256": state.checked_body_sha256,
         "missing_sections": state.missing_sections,
         "missing_contract_keys": state.missing_contract_keys,
+        "fix_category": state.fix_category,
+        "rewrite_history": state.rewrite_history,
+        "occurrence_count": state.occurrence_count,
         "previous_checked_body_sha256": state.previous_checked_body_sha256,
         "previous_missing_sections": state.previous_missing_sections,
         "previous_missing_contract_keys": state.previous_missing_contract_keys,
@@ -589,6 +772,9 @@ def main(argv: list[str] | None = None) -> None:
             checked_body_sha256=input_data["checked_body_sha256"],
             missing_sections=input_data.get("missing_sections", []),
             missing_contract_keys=input_data.get("missing_contract_keys", []),
+            fix_category=input_data.get("fix_category", "unknown_contract_failure"),
+            rewrite_history=input_data.get("rewrite_history", []),
+            occurrence_count=input_data.get("occurrence_count", 0),
             previous_checked_body_sha256=input_data.get("previous_checked_body_sha256"),
             previous_missing_sections=input_data.get("previous_missing_sections", []),
             previous_missing_contract_keys=input_data.get("previous_missing_contract_keys", []),
