@@ -273,8 +273,6 @@ def check_non_c4_c9_blockers(body: str) -> tuple[bool, list[str]]:
             #   - "C4" in message (check code reference)
             #   - "VC に実行可能コマンドが見当たらない" (C4 check fires when $ is missing
             #     — this is exactly what this script fixes, so don't gate on it)
-            #   - "VC に $ で始まるコマンド行が見当たらない" (new-parser variant of the same
-            #     C4 gate: bash fence exists but no $ lines — autofix adds the $ prefix)
             # C9-related:
             #   - "C9" in message
             #   - "Runtime Verification" in message (RVA section messages)
@@ -295,7 +293,6 @@ def check_non_c4_c9_blockers(body: str) -> tuple[bool, list[str]]:
                 "C4",
                 "C9",
                 "VC に実行可能コマンドが見当たらない",
-                "VC に $ で始まるコマンド行が見当たらない",
                 "Runtime Verification",
                 "レガシー Issue",
                 "必須セクション",
