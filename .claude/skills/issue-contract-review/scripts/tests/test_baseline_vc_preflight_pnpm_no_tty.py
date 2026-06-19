@@ -336,3 +336,94 @@ $ CI=true pnpm typecheck
         )
     finally:
         os.unlink(fixture_file)
+
+
+# ---------------------------------------------------------------------------
+# AC7 full-pipeline: baseline-expect: pass + pnpm typecheck no-TTY via monkeypatched run_command
+# ---------------------------------------------------------------------------
+
+def test_ac7_full_pipeline_baseline_pass_no_tty_typecheck():
+    """AC7 full-pipeline: baseline-expect: pass + pnpm typecheck no-TTY stderr →
+    classification==blocked / category==package_manager_no_tty_prompt
+    (NOT unexpected_fail / NOT baseline_regression_failed).
+
+    Monkeypatches run_command in the imported baseline_vc_preflight module so that
+    'pnpm typecheck' returns exit 1 with no-TTY stderr, then calls main() capturing stdout
+    with a fixture file containing '# baseline-expect: pass' annotation.
+    """
+    import importlib.util
+    import io
+    import contextlib
+    from unittest.mock import patch
+
+    # Load the module fresh so we can patch it
+    spec = importlib.util.spec_from_file_location("baseline_vc_preflight_ac7", SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None
+    bvp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bvp)  # type: ignore[union-attr]
+
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+# baseline-expect: pass
+$ pnpm typecheck
+```
+"""
+
+    _NO_TTY_STDERR_LOCAL = (
+        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY "
+        "Aborted removal of modules directory due to no TTY. If running in CI, set CI=true"
+    )
+
+    def fake_run_command(command: str, timeout_seconds: int, cwd: str):
+        """Simulate pnpm typecheck failing with no-TTY stderr."""
+        if "pnpm" in command and "typecheck" in command:
+            return 1, "", _NO_TTY_STDERR_LOCAL, 500, {}
+        return 0, "", "", 0, {}
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        captured_output = io.StringIO()
+        original_argv = sys.argv[:]
+        sys.argv = [str(SCRIPT_PATH), "--body-file", fixture_file, "--issue", "994"]
+        try:
+            with patch.object(bvp, "run_command", side_effect=fake_run_command):
+                with contextlib.redirect_stdout(captured_output):
+                    try:
+                        bvp.main()
+                    except SystemExit:
+                        pass
+        finally:
+            sys.argv = original_argv
+
+        output = captured_output.getvalue().strip()
+        assert output, "main() must produce JSON output"
+        data = json.loads(output)
+        results = data.get("results", [])
+        assert len(results) > 0, f"Expected at least one result, got: {data}"
+
+        ac1_result = results[0]
+        assert ac1_result.get("classification") == "blocked", (
+            f"AC7 full-pipeline: expected classification==blocked, got {ac1_result.get('classification')!r}. "
+            f"Full result: {ac1_result}"
+        )
+        assert ac1_result.get("category") == "package_manager_no_tty_prompt", (
+            f"AC7 full-pipeline: expected category==package_manager_no_tty_prompt, "
+            f"got {ac1_result.get('category')!r}. Full result: {ac1_result}"
+        )
+        assert ac1_result.get("decision") == "blocked", (
+            f"AC7 full-pipeline: expected decision==blocked, got {ac1_result.get('decision')!r}"
+        )
+        assert ac1_result.get("classification") != "unexpected_fail", (
+            "AC7 full-pipeline: classification must not be unexpected_fail"
+        )
+        assert ac1_result.get("category") != "baseline_regression_failed", (
+            "AC7 full-pipeline: category must not be baseline_regression_failed "
+            "(baseline-expect: pass must not override package_manager_no_tty_prompt)"
+        )
+    finally:
+        os.unlink(fixture_file)

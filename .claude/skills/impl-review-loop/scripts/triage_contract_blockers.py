@@ -14,6 +14,14 @@ SCHEMA_NAME = "CONTRACT_BLOCKER_TRIAGE_V1"
 SCHEMA_VERSION = 1
 BASELINE_SCHEMA = "baseline_vc_preflight/v1"
 CI_TRUE_DELTA = {"CI": "true"}
+# Allowlist of canonical pnpm gates that may receive retry_with_runner_env_delta.
+# Any raw_command that resolves to a different argv is fail-closed (non_canonical_pnpm_gate).
+_CANONICAL_PNPM_GATES: list[list[str]] = [
+    ["pnpm", "typecheck"],
+    ["pnpm", "lint"],
+    ["pnpm", "test"],
+    ["pnpm", "build"],
+]
 VALID_INPUT_SCHEMAS = {
     "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
     "CONTRACT_REVIEW_ONCE_RESULT_V1",
@@ -244,20 +252,24 @@ def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         body_author_fixable = False
         environment_retry_recommended = runner_env_delta != CI_TRUE_DELTA
         evidence_pattern = "pnpm_no_tty"
-        # Extract the actual failing gate argv from raw_command so _normalize_action
-        # can return the correct gate rather than hardcoding pnpm build.
+        # Extract the actual failing gate argv from raw_command and validate against
+        # the canonical pnpm gate allowlist.  If raw_command is present but resolves
+        # to a non-canonical argv (e.g. "pnpm install", "pnpm lint --filter foo"),
+        # fail-closed rather than emitting a non-canonical retry suggestion.
+        # Only when raw_command is absent do we allow the legacy ["pnpm", "build"] fallback.
         if isinstance(raw_command, str) and raw_command.strip():
             import shlex as _shlex
             try:
                 _argv = _shlex.split(raw_command.strip())
-                # Canonical form is exactly 2 tokens: pnpm <subcommand>
-                if len(_argv) == 2 and _argv[0] == "pnpm":
-                    _gate_argv: list[str] | None = _argv
-                else:
-                    _gate_argv = None
             except ValueError:
-                _gate_argv = None
+                _argv = []
+            if _argv in _CANONICAL_PNPM_GATES:
+                _gate_argv: list[str] | None = _argv
+            else:
+                # raw_command present but not a canonical gate — fail-closed
+                return None, "non_canonical_pnpm_gate"
         else:
+            # raw_command absent — legacy fallback for backward compat
             _gate_argv = None
     else:
         normalized_subreason = "unsupported_blocker_category"

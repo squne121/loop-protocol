@@ -193,3 +193,81 @@ def test_pnpm_lint_gate_action_reason_string():
     assert "pnpm build" not in action["reason"], (
         f"reason must not reference 'pnpm build' for a pnpm lint gate, got: {action['reason']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Negative tests: non-canonical pnpm commands must NOT return retry_with_runner_env_delta
+# ---------------------------------------------------------------------------
+
+def test_pnpm_install_is_not_canonical_gate():
+    """Negative: raw_command='pnpm install' must not return retry_with_runner_env_delta."""
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            make_item(
+                "AC1",
+                "package_manager_no_tty_prompt",
+                exit_code=1,
+                raw_command="pnpm install",
+                runner_env_delta={},
+            )
+        ],
+    }
+    result = mod.triage_contract_blockers(payload)
+    # The non-canonical item must be rejected, causing no accepted items
+    actions = result.get("suggested_actions", [])
+    retry_actions = [a for a in actions if a.get("kind") == "retry_with_runner_env_delta"]
+    assert len(retry_actions) == 0, (
+        f"'pnpm install' must not produce retry_with_runner_env_delta; got actions: {actions}"
+    )
+
+
+def test_pnpm_lint_with_extra_args_is_not_canonical():
+    """Negative: raw_command='pnpm lint --filter foo' must not return retry_with_runner_env_delta."""
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            make_item(
+                "AC2",
+                "package_manager_no_tty_prompt",
+                exit_code=1,
+                raw_command="pnpm lint --filter foo",
+                runner_env_delta={},
+            )
+        ],
+    }
+    result = mod.triage_contract_blockers(payload)
+    actions = result.get("suggested_actions", [])
+    retry_actions = [a for a in actions if a.get("kind") == "retry_with_runner_env_delta"]
+    assert len(retry_actions) == 0, (
+        f"'pnpm lint --filter foo' (extra args) must not produce retry_with_runner_env_delta; "
+        f"got actions: {actions}"
+    )
+
+
+def test_pnpm_fallback_when_no_raw_command_returns_build_argv():
+    """Negative complement: raw_command absent uses legacy fallback ['pnpm', 'build'], not non-canonical rejection."""
+    payload = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [
+            make_item(
+                "AC3",
+                "package_manager_no_tty_prompt",
+                exit_code=1,
+                # raw_command intentionally absent — only the legacy fallback path
+                runner_env_delta={},
+            )
+        ],
+    }
+    result = mod.triage_contract_blockers(payload)
+    assert result["status"] == "ok", (
+        f"raw_command absent must use legacy fallback, not fail; got {result['status']}: {result.get('errors')}"
+    )
+    actions = result.get("suggested_actions", [])
+    retry_actions = [a for a in actions if a.get("kind") == "retry_with_runner_env_delta"]
+    assert len(retry_actions) == 1, (
+        f"raw_command absent must produce exactly one retry_with_runner_env_delta; got: {retry_actions}"
+    )
+    assert retry_actions[0]["argv"] == ["pnpm", "build"], (
+        f"Legacy fallback must use ['pnpm', 'build']; got {retry_actions[0]['argv']!r}"
+    )
