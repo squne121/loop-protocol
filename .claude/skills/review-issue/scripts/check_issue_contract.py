@@ -723,7 +723,7 @@ def check_c4_vc_commands_present(body: str) -> tuple[str, list[str]]:
         # No canonical commands — check if bash fence exists with non-$ content
         if not parse_result.has_bash_fence:
             return CheckResult.FAIL, ["VC に ```bash fenced block が見当たらない（canonical format が必要）"]
-        return CheckResult.FAIL, ["VC に $ で始まるコマンド行が見当たらない（$ <command> 形式が必要）"]
+        return CheckResult.FAIL, ["VC に実行可能コマンドが見当たらない（$ <command> 形式が必要）"]
 
     # Fallback (shared parser unavailable): $ lines in bash fences only
     bash_blocks = re.findall(r'```bash[^\n]*\n(.*?)```', section, re.DOTALL)
