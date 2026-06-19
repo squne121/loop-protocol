@@ -34,6 +34,7 @@ from vc_contract_syntax import (
     parse_preflight_scope_marker_line,
     extract_baseline_expect_annotation,
     extract_vc_role_annotation,
+    parse_verification_commands_section,
 )
 
 
@@ -2395,6 +2396,16 @@ def main() -> int:
         help="Output format (json or contract-review-fragment YAML)",
     )
     parser.add_argument("--strict", action="store_true", default=False, help="Enable strict mode for annotation enforcement (detect missing annotations as needs_fix)")
+    parser.add_argument(
+        "--static-only",
+        action="store_true",
+        default=False,
+        help=(
+            "#993: Static-only mode. Parse VC section for non-canonical inputs "
+            "(unlabeled fence, colon AC marker, non-$ command) and return "
+            "blocked results without executing any commands."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2474,6 +2485,53 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         # C2: exit code 2 for extraction errors
         return 2
+
+    # #993: --static-only mode: parse for non-canonical VC inputs without executing
+    if getattr(args, "static_only", False):
+        static_parse = parse_verification_commands_section(vc_section)
+        static_results = []
+        for se in static_parse.static_errors:
+            static_results.append({
+                "ac": None,
+                "command": se.raw_line,
+                "classification": "blocked",
+                "category": se.kind,
+                "decision": "blocked",
+                "exit_code": None,
+                "errors": [
+                    {
+                        "kind": se.kind,
+                        "rule": se.rule_id or f"VC_STATIC_{se.kind.upper()}",
+                        "message": se.fix_hint,
+                        "minimal_context": se.raw_line,
+                        "fix_hint": se.fix_hint,
+                    }
+                ],
+            })
+        static_status = "blocked" if static_parse.static_errors else "ok"
+        result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {
+                "kind": source_kind,
+                "body_sha256": f"sha256:{compute_source_hash(body)}",
+            },
+            "mode": "static_only",
+            "status": static_status,
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": len(static_results),
+                "human_judgment": 0,
+                "extraction_errors": 0,
+            },
+            "results": static_results,
+            "errors": [],
+        }
+        print(json.dumps(result, indent=2))
+        return 0 if static_status == "ok" else 1
 
     # AC2: parse Allowed Paths from Issue body for containment-based broad path detection
     allowed_paths_from_body = extract_allowed_paths(body)
