@@ -14,6 +14,14 @@ SCHEMA_NAME = "CONTRACT_BLOCKER_TRIAGE_V1"
 SCHEMA_VERSION = 1
 BASELINE_SCHEMA = "baseline_vc_preflight/v1"
 CI_TRUE_DELTA = {"CI": "true"}
+# Allowlist of canonical pnpm gates that may receive retry_with_runner_env_delta.
+# Any raw_command that resolves to a different argv is fail-closed (non_canonical_pnpm_gate).
+_CANONICAL_PNPM_GATES: list[list[str]] = [
+    ["pnpm", "typecheck"],
+    ["pnpm", "lint"],
+    ["pnpm", "test"],
+    ["pnpm", "build"],
+]
 VALID_INPUT_SCHEMAS = {
     "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
     "CONTRACT_REVIEW_ONCE_RESULT_V1",
@@ -172,12 +180,16 @@ def _normalize_action(item: dict[str, Any]) -> dict[str, Any]:
                 "preconditions": ["runner_env_delta == {'CI': 'true'}"],
                 "reason": "CI=true was already injected; inspect package manager or node_modules state",
             }
+        # Use the actual failing gate argv if available; fall back to pnpm build
+        # only when raw_command was not present in the input (legacy fallback).
+        gate_argv: list[str] | None = item.get("gate_argv") or ["pnpm", "build"]
+        gate_str = " ".join(gate_argv) if gate_argv else "pnpm build"
         return {
             "kind": "retry_with_runner_env_delta",
-            "argv": ["pnpm", "build"],
+            "argv": gate_argv,
             "env_delta": CI_TRUE_DELTA,
             "preconditions": ["runner_env_delta was absent"],
-            "reason": "Retry the canonical pnpm build gate with the fixed runner environment delta",
+            "reason": f"Retry the canonical {gate_str} gate with the fixed runner environment delta",
         }
     if item["category"] == "vc_no_tests_collected":
         return {
@@ -240,6 +252,25 @@ def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         body_author_fixable = False
         environment_retry_recommended = runner_env_delta != CI_TRUE_DELTA
         evidence_pattern = "pnpm_no_tty"
+        # Extract the actual failing gate argv from raw_command and validate against
+        # the canonical pnpm gate allowlist.  If raw_command is present but resolves
+        # to a non-canonical argv (e.g. "pnpm install", "pnpm lint --filter foo"),
+        # fail-closed rather than emitting a non-canonical retry suggestion.
+        # Only when raw_command is absent do we allow the legacy ["pnpm", "build"] fallback.
+        if isinstance(raw_command, str) and raw_command.strip():
+            import shlex as _shlex
+            try:
+                _argv = _shlex.split(raw_command.strip())
+            except ValueError:
+                _argv = []
+            if _argv in _CANONICAL_PNPM_GATES:
+                _gate_argv: list[str] | None = _argv
+            else:
+                # raw_command present but not a canonical gate — fail-closed
+                return None, "non_canonical_pnpm_gate"
+        else:
+            # raw_command absent — legacy fallback for backward compat
+            _gate_argv = None
     else:
         normalized_subreason = "unsupported_blocker_category"
         triage_reason = "unclassified"
@@ -247,7 +278,7 @@ def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         environment_retry_recommended = False
         evidence_pattern = "unknown"
 
-    normalized = {
+    normalized: dict[str, Any] = {
         "ac": ac,
         "command_hash": normalized_command_hash,
         "category": category,
@@ -259,6 +290,10 @@ def normalize_item(item: Any) -> tuple[dict[str, Any] | None, str | None]:
         "body_author_fixable": body_author_fixable,
         "environment_retry_recommended": environment_retry_recommended,
     }
+    # Attach gate_argv for package_manager_no_tty_prompt so _normalize_action can
+    # return the actual failing gate's argv instead of a hardcoded default.
+    if category == "package_manager_no_tty_prompt":
+        normalized["gate_argv"] = _gate_argv  # type: ignore[possibly-undefined]
     return normalized, None
 
 

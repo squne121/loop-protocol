@@ -1585,24 +1585,29 @@ def test_fixed_env_injects_ci_true_for_pnpm_build(monkeypatch):
     assert exit_code == 0
 
 
-def test_fixed_env_applies_only_to_pnpm_build(monkeypatch):
-    """AC2: fixed_env は pnpm build のみに限定し、他の regression gate へ広げない"""
+def test_fixed_env_applies_to_all_canonical_pnpm_gates(monkeypatch):
+    """AC2 (updated): fixed_env は全 canonical pnpm gate（typecheck/lint/test/build）に CI=true を注入する"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     import baseline_vc_preflight as module
 
-    captured = {}
+    for gate in ("pnpm typecheck", "pnpm lint", "pnpm test", "pnpm build"):
+        captured: dict = {}
 
-    def fake_run(argv, **kwargs):
-        captured["env"] = kwargs.get("env")
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        def fake_run(argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+        monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    _, _, _, _, runner_env_delta = module.run_command("pnpm lint", 30, ".")
+        _, _, _, _, runner_env_delta = module.run_command(gate, 30, ".")
 
-    assert captured["env"] is None
-    assert runner_env_delta == {}
+        assert captured["env"] is not None and captured["env"].get("CI") == "true", (
+            f"{gate}: expected CI=true injection, got env={captured.get('env')}"
+        )
+        assert runner_env_delta == {"CI": "true"}, (
+            f"{gate}: expected runner_env_delta=={{'CI': 'true'}}, got {runner_env_delta}"
+        )
 
 
 def test_fixed_env_does_not_apply_to_pnpm_build_with_extra_args(monkeypatch):
@@ -1805,8 +1810,8 @@ def test_package_manager_no_tty_prompt_classified_as_tooling_blocker_after_runne
     assert fix_hint is not None and "already injected by the runner" in fix_hint
 
 
-def test_package_manager_no_tty_prompt_without_runner_delta_points_to_non_canonical_gate():
-    """AC6: fixed env delta 未適用 no-TTY は canonical gate mismatch を示す"""
+def test_package_manager_no_tty_prompt_without_runner_delta_points_to_env_retry():
+    """AC6: fixed env delta 未適用 no-TTY は runner-side CI=true の注入を促す"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     sys.path.insert(0, str(script_path.parent))
     from baseline_vc_preflight import classify_result
@@ -1824,7 +1829,7 @@ def test_package_manager_no_tty_prompt_without_runner_delta_points_to_non_canoni
     assert category == "package_manager_no_tty_prompt"
     assert decision == "blocked"
     assert scope_class == "regression_gate"
-    assert fix_hint is not None and "did not match the canonical pnpm build gate" in fix_hint
+    assert fix_hint is not None and "runner-side CI=true" in fix_hint
 
 
 def test_s_quoted_path_exit1_go():
