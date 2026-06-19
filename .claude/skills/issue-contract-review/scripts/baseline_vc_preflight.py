@@ -1066,6 +1066,9 @@ _ALLOWED_PNPM_SUBCOMMANDS: frozenset = frozenset([
 ])
 
 _FIXED_ENV_DELTA_BY_COMMAND: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("pnpm", "typecheck"): {"CI": "true"},
+    ("pnpm", "lint"): {"CI": "true"},
+    ("pnpm", "test"): {"CI": "true"},
     ("pnpm", "build"): {"CI": "true"},
 }
 
@@ -1208,7 +1211,7 @@ def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) ->
     except ValueError:
         return False
 
-    if _canonical_pnpm_gate(argv) != ("pnpm", "build"):
+    if _canonical_pnpm_gate(argv) is None:
         return False
 
     combined = f"{stdout}\n{stderr}"
@@ -2055,8 +2058,10 @@ def classify_result(
                     )
                 else:
                     fix_hint = (
-                        "This command did not match the canonical pnpm build gate, so the runner-side fixed env "
-                        "delta was not applied."
+                        "This is a package manager / no-TTY runner environment blocker, not an Issue body defect. "
+                        "Do not weaken ACs or rewrite the pnpm gate to runtime_only. "
+                        "Inspect pnpm/node_modules/tooling state; if runner_env_delta is missing, "
+                        "retry the same canonical pnpm gate with runner-side CI=true."
                     )
                 return (
                     "blocked",
@@ -2815,15 +2820,21 @@ def main() -> int:
                             scope_class = "regression_gate"
                             fix_hint = None
                         elif exit_code is not None and exit_code != 0:
-                            # exit non-0 despite baseline-expect: pass → regression detected
-                            classification = "human_judgment"
-                            category = "baseline_regression_failed"
-                            decision = "human_judgment"
-                            fix_hint = (
-                                "VC annotated baseline-expect: pass but exited non-0; "
-                                "the command that was passing at baseline is now failing. "
-                                "Investigate regression or update annotation."
-                            )
+                            if category == "package_manager_no_tty_prompt":
+                                # AC7: no-TTY is a tooling/env blocker — do not re-map to
+                                # baseline_regression_failed. The blocked/package_manager_no_tty_prompt
+                                # classification is authoritative regardless of baseline-expect: pass.
+                                pass
+                            else:
+                                # exit non-0 despite baseline-expect: pass → regression detected
+                                classification = "human_judgment"
+                                category = "baseline_regression_failed"
+                                decision = "human_judgment"
+                                fix_hint = (
+                                    "VC annotated baseline-expect: pass but exited non-0; "
+                                    "the command that was passing at baseline is now failing. "
+                                    "Investigate regression or update annotation."
+                                )
                     elif baseline_expect == "fail":
                         # baseline-expect: fail is the traditional expectation (backward compat)
                         # unexpected_pass → needs_fix (existing behavior)
