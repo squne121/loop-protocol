@@ -40,6 +40,42 @@ function createIssueCommentReport() {
   }
 }
 
+function createMultiPrReport() {
+  const report = createValidReport()
+  report.docs_read_refs = [
+    {
+      ref_kind: 'pull_request',
+      ref: 'https://github.com/squne121/loop-protocol/pull/955',
+      summary: 'Linked PR #955 validated',
+    },
+    {
+      ref_kind: 'pull_request',
+      ref: 'https://github.com/squne121/loop-protocol/pull/956',
+      summary: 'Linked PR #956 fallback',
+    },
+    {
+      ref_kind: 'issue',
+      ref: 'https://github.com/squne121/loop-protocol/issues/935',
+      summary: 'Closes #935',
+    },
+  ]
+  return {
+    html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122668',
+    body: buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-002',
+      },
+      payloadMarkdown: renderValidatedPublicMarkdown(report),
+    }).body,
+    linkedPrHints: [955, 956],
+    linkedIssueHints: [935],
+    branchHint: 'worktree-issue-935-agent-run-report',
+  }
+}
+
 describe('retro index builder', () => {
   it('GIVEN one valid report WHEN buildRetroIndex runs THEN it resolves complete canonical output without schema expansion', () => {
     const result = buildRetroIndex({
@@ -115,6 +151,71 @@ describe('retro index builder', () => {
       {
         report_digest: 'sha256:malformed',
         reason: 'report_marker_malformed',
+      },
+    ])
+  })
+
+  it('GIVEN multiple PR refs WHEN one associated PR is authoritative by merge sha THEN buildRetroIndex prefers it over weaker machine refs', () => {
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [createMultiPrReport()],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map([
+        [955, {
+          number: 955,
+          body: 'Closes #935',
+          mergeSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          headRefName: 'worktree-issue-935-agent-run-report',
+        }],
+        [956, {
+          number: 956,
+          body: 'Refs #935',
+          mergeSha: '',
+          headRefName: 'worktree-issue-956-other',
+        }],
+      ]),
+      associatedPrByMergeSha: new Map([
+        ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 955],
+      ]),
+    })
+
+    expect(result.index.generation_verdict).toBe('complete')
+    expect(result.index.entries[0]).toMatchObject({
+      issue: 935,
+      pr: 955,
+    })
+  })
+
+  it('GIVEN multiple merge-sha associated PR candidates WHEN they disagree THEN buildRetroIndex records an ambiguous link', () => {
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [createMultiPrReport()],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map([
+        [955, {
+          number: 955,
+          body: 'Closes #935',
+          mergeSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          headRefName: 'worktree-issue-935-agent-run-report',
+        }],
+        [956, {
+          number: 956,
+          body: 'Refs #935',
+          mergeSha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          headRefName: 'worktree-issue-956-other',
+        }],
+      ]),
+      associatedPrByMergeSha: new Map([
+        ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 955],
+        ['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 956],
+      ]),
+    })
+
+    expect(result.index.generation_verdict).toBe('partial')
+    expect(result.index.ambiguous_links).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'multiple pull request candidates matched',
       },
     ])
   })

@@ -176,6 +176,18 @@ function buildSourceCommentRef(sourceComment) {
   }
 }
 
+function isSourceCommentRefCandidate(value) {
+  return Boolean(
+    value
+    && typeof value.comment_url === 'string'
+    && (value.source_kind === 'issues' || value.source_kind === 'pull')
+    && Number.isInteger(value.source_number)
+    && value.source_number > 0
+    && typeof value.body_digest === 'string'
+    && /^sha256:[a-f0-9]{64}$/iu.test(value.body_digest)
+  )
+}
+
 function canonicalizeSourceCommentSet(sourceCommentRefs) {
   return JSON.stringify(
     sourceCommentRefs
@@ -189,6 +201,27 @@ function canonicalizeSourceCommentSet(sourceCommentRefs) {
     null,
     2
   )
+}
+
+function normalizeSourceCommentSet(sourceCommentRefs) {
+  if (!Array.isArray(sourceCommentRefs)) {
+    throw new TypeError('source comment set must be an array')
+  }
+  return sourceCommentRefs.map((ref) => {
+    if (!isSourceCommentRefCandidate(ref)) {
+      throw new TypeError('source comment set entry must contain canonical comment_url/source_kind/source_number/body_digest fields')
+    }
+    return {
+      comment_url: ref.comment_url,
+      source_kind: ref.source_kind,
+      source_number: ref.source_number,
+      body_digest: ref.body_digest.toLowerCase(),
+    }
+  })
+}
+
+function buildSourceCommentSetDigest(sourceCommentRefs) {
+  return sha256Digest(canonicalizeSourceCommentSet(normalizeSourceCommentSet(sourceCommentRefs)))
 }
 
 function normalizeSourceComment(sourceComment) {
@@ -249,6 +282,31 @@ function resolvePrCandidate(normalized, machineRefs, prMetadataByNumber, associa
   candidates.push(...machineRefs.prRefs)
 
   const uniqueCandidates = [...new Set(candidates)]
+  const associatedCandidates = [...new Set(
+    uniqueCandidates
+      .map((prNumber) => prMetadataByNumber.get(prNumber)?.mergeSha ?? null)
+      .filter((mergeSha) => typeof mergeSha === 'string' && mergeSha.length > 0)
+      .map((mergeSha) => associatedPrByMergeSha.get(mergeSha))
+      .filter((prNumber) => typeof prNumber === 'number')
+  )]
+
+  if (associatedCandidates.length > 1) {
+    return {
+      status: 'ambiguous',
+      prNumber: null,
+      prMeta: null,
+    }
+  }
+
+  if (associatedCandidates.length === 1) {
+    const prNumber = associatedCandidates[0]
+    return {
+      status: 'resolved',
+      prNumber,
+      prMeta: prMetadataByNumber.get(prNumber) ?? null,
+    }
+  }
+
   if (uniqueCandidates.length !== 1) {
     return {
       status: uniqueCandidates.length > 1 ? 'ambiguous' : 'orphan',
@@ -257,13 +315,8 @@ function resolvePrCandidate(normalized, machineRefs, prMetadataByNumber, associa
     }
   }
 
-  let prNumber = uniqueCandidates[0]
-  let prMeta = prMetadataByNumber.get(prNumber) ?? null
-  const mergeSha = prMeta?.mergeSha ?? null
-  if (mergeSha && associatedPrByMergeSha.has(mergeSha)) {
-    prNumber = associatedPrByMergeSha.get(mergeSha)
-    prMeta = prMetadataByNumber.get(prNumber) ?? prMeta
-  }
+  const prNumber = uniqueCandidates[0]
+  const prMeta = prMetadataByNumber.get(prNumber) ?? null
 
   return {
     status: 'resolved',
@@ -404,7 +457,7 @@ export function buildRetroIndex({
 
   const canonicalIndexJson = JSON.stringify(retroPayload, null, 2)
   const canonicalIndexDigest = sha256Digest(canonicalIndexJson)
-  const sourceCommentSetDigest = sha256Digest(canonicalizeSourceCommentSet(sourceCommentRefs))
+  const sourceCommentSetDigest = buildSourceCommentSetDigest(sourceCommentRefs)
 
   return {
     parentIssue,
@@ -430,4 +483,4 @@ export function detectSchemaMigrationRequirement(indexCandidate) {
   }
 }
 
-export { canonicalizeSourceCommentSet, sha256Digest, sha256Hex }
+export { buildSourceCommentSetDigest, canonicalizeSourceCommentSet, normalizeSourceCommentSet, sha256Digest, sha256Hex }

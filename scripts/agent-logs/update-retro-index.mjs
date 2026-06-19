@@ -8,7 +8,9 @@ import { fileURLToPath } from 'url'
 import { parseArgs, printCliError, runtimeError } from './lib/args.mjs'
 import {
   buildRetroIndex,
+  buildSourceCommentSetDigest,
   detectSchemaMigrationRequirement,
+  normalizeSourceCommentSet,
   RETRO_INDEX_ALGORITHM,
   sha256Digest,
 } from './lib/retro-index-builder.mjs'
@@ -28,6 +30,9 @@ const OPTION_SPEC = {
   '--dry-run': { key: 'dryRun', defaultValue: 'true' },
   '--confirm-live': { key: 'confirmLive', defaultValue: 'false' },
   '--artifact-json-out': { key: 'artifactJsonOut' },
+  '--artifact-json-in': { key: 'artifactJsonIn' },
+  '--source-set-json-out': { key: 'sourceSetJsonOut' },
+  '--source-set-json-in': { key: 'sourceSetJsonIn' },
   '--summary-json-out': { key: 'summaryJsonOut' },
   '--verify-artifact-json': { key: 'verifyArtifactJson' },
   '--summary-json-in': { key: 'summaryJsonIn' },
@@ -82,10 +87,14 @@ function fetchAssociatedPullRequests(repo, commitSha) {
   ])
 }
 
-function parseChecklistIssueNumbers(body) {
+export function parseChecklistIssueNumbers(body) {
   const numbers = new Set()
-  for (const match of (body ?? '').matchAll(/^- \[[ xX]\] #([0-9]+)/gmu)) {
-    numbers.add(Number(match[1]))
+  for (const rawLine of (body ?? '').split('\n')) {
+    const line = rawLine.trim()
+    const match = line.match(/^(?:[-*])\s+(?:\[[ xX]\]\s*)?(?:#([0-9]+)|https:\/\/github\.com\/squne121\/loop-protocol\/issues\/([0-9]+))(?:\b|\/|#|$)/u)
+    if (match) {
+      numbers.add(Number(match[1] ?? match[2]))
+    }
   }
   return [...numbers]
 }
@@ -189,21 +198,24 @@ function assertDigest(value, code, label) {
   }
 }
 
-export function verifyRetroIndexArtifact({
-  artifactJsonPath,
-  summaryJsonPath = null,
+function verifyRetroIndexArtifactData({
+  artifactPayload,
+  summary = {},
+  sourceCommentSet = null,
   expectedCanonicalDigest = null,
   expectedSourceCommentSetDigest = null,
 }) {
-  const artifactPayload = readJsonFile(artifactJsonPath, 'retro_index.artifact_json_invalid')
-  const summary = summaryJsonPath
-    ? readJsonFile(summaryJsonPath, 'retro_index.summary_json_invalid')
-    : {}
   const computedCanonicalDigest = sha256Digest(JSON.stringify(artifactPayload, null, 2))
   const summaryCanonicalDigest = summary.canonical_index_digest ?? null
   const summarySourceCommentSetDigest = summary.source_comment_set_digest ?? null
   const canonicalDigest = expectedCanonicalDigest ?? summaryCanonicalDigest
   const sourceCommentSetDigest = expectedSourceCommentSetDigest ?? summarySourceCommentSetDigest
+  const normalizedSourceCommentSet = sourceCommentSet === null
+    ? null
+    : normalizeSourceCommentSet(sourceCommentSet)
+  const computedSourceCommentSetDigest = normalizedSourceCommentSet === null
+    ? null
+    : buildSourceCommentSetDigest(normalizedSourceCommentSet)
 
   if (summaryCanonicalDigest !== null) {
     assertDigest(summaryCanonicalDigest, 'retro_index.summary_canonical_digest_invalid', 'summary canonical digest')
@@ -217,6 +229,9 @@ export function verifyRetroIndexArtifact({
   assertDigest(canonicalDigest, 'retro_index.expected_canonical_digest_invalid', 'expected canonical digest')
   if (sourceCommentSetDigest !== null) {
     assertDigest(sourceCommentSetDigest, 'retro_index.expected_source_set_digest_invalid', 'expected source-comment-set digest')
+    if (normalizedSourceCommentSet === null) {
+      throw runtimeError('retro_index.source_set_artifact_missing', 'source-set artifact is required for source-comment-set digest verification')
+    }
   }
   if (summaryCanonicalDigest && expectedCanonicalDigest && summaryCanonicalDigest !== expectedCanonicalDigest) {
     throw runtimeError('retro_index.summary_canonical_digest_mismatch', 'summary canonical digest does not match the expected digest')
@@ -227,14 +242,75 @@ export function verifyRetroIndexArtifact({
   if (computedCanonicalDigest !== canonicalDigest) {
     throw runtimeError('retro_index.canonical_digest_mismatch', 'artifact JSON digest does not match the expected canonical digest')
   }
+  if (computedSourceCommentSetDigest !== null && sourceCommentSetDigest !== null && computedSourceCommentSetDigest !== sourceCommentSetDigest) {
+    throw runtimeError('retro_index.source_comment_set_digest_mismatch', 'source-set artifact digest does not match the expected source-comment-set digest')
+  }
+
   return {
     status: 'ok',
     entry_count: Array.isArray(artifactPayload.entries) ? artifactPayload.entries.length : null,
     orphan_count: Array.isArray(artifactPayload.orphan_reports) ? artifactPayload.orphan_reports.length : null,
     ambiguous_count: Array.isArray(artifactPayload.ambiguous_links) ? artifactPayload.ambiguous_links.length : null,
     computedCanonicalDigest,
+    computedSourceCommentSetDigest,
     canonical_index_digest: canonicalDigest,
     source_comment_set_digest: sourceCommentSetDigest,
+    index: artifactPayload,
+    sourceCommentRefs: normalizedSourceCommentSet,
+    canonicalIndexDigest: canonicalDigest,
+    sourceCommentSetDigest,
+    sourceCommentSet: normalizedSourceCommentSet,
+    summary,
+    artifactPayload,
+  }
+}
+
+function readVerifiedRetroIndexArtifact({
+  artifactJsonPath,
+  sourceSetJsonPath = null,
+  summaryJsonPath = null,
+  expectedCanonicalDigest = null,
+  expectedSourceCommentSetDigest = null,
+}) {
+  const artifactPayload = readJsonFile(artifactJsonPath, 'retro_index.artifact_json_invalid')
+  const summary = summaryJsonPath
+    ? readJsonFile(summaryJsonPath, 'retro_index.summary_json_invalid')
+    : {}
+  const sourceCommentSet = sourceSetJsonPath
+    ? readJsonFile(sourceSetJsonPath, 'retro_index.source_set_json_invalid')
+    : null
+  return verifyRetroIndexArtifactData({
+    artifactPayload,
+    summary,
+    sourceCommentSet,
+    expectedCanonicalDigest,
+    expectedSourceCommentSetDigest,
+  })
+}
+
+export function verifyRetroIndexArtifact({
+  artifactJsonPath,
+  sourceSetJsonPath = null,
+  summaryJsonPath = null,
+  expectedCanonicalDigest = null,
+  expectedSourceCommentSetDigest = null,
+}) {
+  const verification = readVerifiedRetroIndexArtifact({
+    artifactJsonPath,
+    sourceSetJsonPath,
+    summaryJsonPath,
+    expectedCanonicalDigest,
+    expectedSourceCommentSetDigest,
+  })
+  return {
+    status: verification.status,
+    entry_count: verification.entry_count,
+    orphan_count: verification.orphan_count,
+    ambiguous_count: verification.ambiguous_count,
+    computedCanonicalDigest: verification.computedCanonicalDigest,
+    computedSourceCommentSetDigest: verification.computedSourceCommentSetDigest,
+    canonical_index_digest: verification.canonical_index_digest,
+    source_comment_set_digest: verification.source_comment_set_digest,
   }
 }
 
@@ -245,58 +321,82 @@ export async function updateRetroIndex({
   confirmLive = false,
   issueCommentClient = new GhCliIssueCommentsClient(),
   sourceBundle = null,
+  artifactBundle = null,
 }) {
   ensureAllowedRepo(repo)
   if (!dryRun && !confirmLive) {
     throw runtimeError('retro_index.live_confirmation_required', 'live posting requires --dry-run false and --confirm-live true')
   }
 
-  const bundle = sourceBundle ?? await collectSourceComments({
-    repo,
-    parentIssue,
-    issueCommentClient,
-  })
+  const built = artifactBundle ?? (() => {
+    const bundle = sourceBundle ?? collectSourceComments({
+      repo,
+      parentIssue,
+      issueCommentClient,
+    })
+    return Promise.resolve(bundle).then((resolvedBundle) => buildRetroIndex({
+      sourceComments: resolvedBundle.sourceComments,
+      parentIssue,
+      prMetadataByNumber: resolvedBundle.prMetadataByNumber,
+      associatedPrByMergeSha: resolvedBundle.associatedPrByMergeSha,
+      parentChildIssueNumbers: resolvedBundle.childIssues,
+    }))
+  })()
+  const resolvedBuilt = await built
 
-  const built = buildRetroIndex({
-    sourceComments: bundle.sourceComments,
-    parentIssue,
-    prMetadataByNumber: bundle.prMetadataByNumber,
-    associatedPrByMergeSha: bundle.associatedPrByMergeSha,
-    parentChildIssueNumbers: bundle.childIssues,
-  })
-
-  const schemaMigration = detectSchemaMigrationRequirement(built.index)
+  const schemaMigration = detectSchemaMigrationRequirement(resolvedBuilt.index)
   if (schemaMigration) {
     return {
       status: 'blocked',
       reason_code: 'schema_migration_required',
       message: schemaMigration.reason,
-      summary: built.summary,
+      action: null,
+      comment_url: null,
+      comment_id: null,
+      sourceCommentRefs: resolvedBuilt.sourceCommentRefs ?? [],
+      summary: resolvedBuilt.summary,
+      index: resolvedBuilt.index,
+    }
+  }
+  if (resolvedBuilt.index.generation_verdict === 'blocked') {
+    return {
+      status: 'blocked',
+      reason_code: 'report_blocked',
+      action: null,
+      comment_url: null,
+      comment_id: null,
+      parent_issue: parentIssue,
+      canonical_index_digest: resolvedBuilt.canonicalIndexDigest,
+      source_comment_set_digest: resolvedBuilt.sourceCommentSetDigest,
+      sourceCommentRefs: resolvedBuilt.sourceCommentRefs ?? [],
+      summary: resolvedBuilt.summary,
+      index: resolvedBuilt.index,
     }
   }
 
-  const payloadMarkdown = renderPublicMarkdown(built.index)
+  const payloadMarkdown = renderPublicMarkdown(resolvedBuilt.index)
   const upsert = await upsertRetroIndexComment(issueCommentClient, {
     repo,
     parentIssue,
     algorithm: RETRO_INDEX_ALGORITHM,
     payloadMarkdown,
-    canonicalIndexDigest: built.canonicalIndexDigest,
-    sourceCommentSetDigest: built.sourceCommentSetDigest,
+    canonicalIndexDigest: resolvedBuilt.canonicalIndexDigest,
+    sourceCommentSetDigest: resolvedBuilt.sourceCommentSetDigest,
     dryRun,
   })
 
   return {
-    status: built.index.generation_verdict === 'blocked' ? 'blocked' : 'ok',
-    reason_code: built.index.generation_verdict === 'blocked' ? 'report_blocked' : null,
+    status: 'ok',
+    reason_code: null,
     action: upsert.action,
     comment_url: upsert.comment_url,
     comment_id: upsert.comment_id,
     parent_issue: parentIssue,
-    canonical_index_digest: built.canonicalIndexDigest,
-    source_comment_set_digest: built.sourceCommentSetDigest,
-    summary: built.summary,
-    index: built.index,
+    canonical_index_digest: resolvedBuilt.canonicalIndexDigest,
+    source_comment_set_digest: resolvedBuilt.sourceCommentSetDigest,
+    sourceCommentRefs: resolvedBuilt.sourceCommentRefs ?? [],
+    summary: resolvedBuilt.summary,
+    index: resolvedBuilt.index,
   }
 }
 
@@ -305,6 +405,7 @@ async function main() {
   if (options.verifyArtifactJson) {
     const verification = verifyRetroIndexArtifact({
       artifactJsonPath: options.verifyArtifactJson,
+      sourceSetJsonPath: options.sourceSetJsonIn ?? null,
       summaryJsonPath: options.summaryJsonIn ?? null,
       expectedCanonicalDigest: options.expectedCanonicalDigest ?? null,
       expectedSourceCommentSetDigest: options.expectedSourceCommentSetDigest ?? null,
@@ -318,15 +419,28 @@ async function main() {
   if (!options.parentIssue) {
     throw runtimeError('cli.required_option', 'missing required option: --parent-issue')
   }
+  const artifactBundle = options.artifactJsonIn
+    ? readVerifiedRetroIndexArtifact({
+      artifactJsonPath: options.artifactJsonIn,
+      sourceSetJsonPath: options.sourceSetJsonIn ?? null,
+      summaryJsonPath: options.summaryJsonIn ?? null,
+      expectedCanonicalDigest: options.expectedCanonicalDigest ?? null,
+      expectedSourceCommentSetDigest: options.expectedSourceCommentSetDigest ?? null,
+    })
+    : null
   const result = await updateRetroIndex({
     repo: options.repo,
     parentIssue: Number(options.parentIssue),
     dryRun: parseBooleanFlag(options.dryRun, '--dry-run'),
     confirmLive: parseBooleanFlag(options.confirmLive, '--confirm-live'),
+    artifactBundle,
   })
 
   if (options.artifactJsonOut) {
     writeJsonFile(options.artifactJsonOut, result.index ?? {})
+  }
+  if (options.sourceSetJsonOut && result.sourceCommentRefs) {
+    writeJsonFile(options.sourceSetJsonOut, result.sourceCommentRefs)
   }
   if (options.summaryJsonOut) {
     writeJsonFile(options.summaryJsonOut, result.summary)

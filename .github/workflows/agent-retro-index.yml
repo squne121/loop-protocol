@@ -5,12 +5,14 @@ on:
     inputs:
       parent_issue:
         description: Parent issue number for the canonical retro index marker
+        type: number
         required: true
-        default: "928"
+        default: 928
       dry_run:
         description: Keep the workflow in dry-run mode
+        type: boolean
         required: true
-        default: "true"
+        default: true
   push:
     branches:
       - main
@@ -68,13 +70,14 @@ jobs:
             --parent-issue "${{ inputs.parent_issue || '928' }}" \
             --dry-run true \
             --artifact-json-out artifacts/agent-retro-index.json \
+            --source-set-json-out artifacts/agent-retro-index-source-set.json \
             --summary-json-out artifacts/agent-retro-index-summary.json
 
       - name: Validate retro index artifact
         run: pnpm agent-retro-index:check artifacts/agent-retro-index.json
 
       - name: Verify artifact digest metadata
-        run: pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --summary-json-in artifacts/agent-retro-index-summary.json
+        run: pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --source-set-json-in artifacts/agent-retro-index-source-set.json --summary-json-in artifacts/agent-retro-index-summary.json
 
       - name: Upload retro index artifact
         uses: actions/upload-artifact@v4
@@ -82,6 +85,7 @@ jobs:
           name: agent-retro-index
           path: |
             artifacts/agent-retro-index.json
+            artifacts/agent-retro-index-source-set.json
             artifacts/agent-retro-index-summary.json
 
   upsert-parent-comment:
@@ -116,7 +120,7 @@ jobs:
       - name: Revalidate artifact before write
         run: |
           pnpm agent-retro-index:check artifacts/agent-retro-index.json
-          pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --summary-json-in artifacts/agent-retro-index-summary.json
+          pnpm agent-retro-index:verify-digest artifacts/agent-retro-index.json --source-set-json-in artifacts/agent-retro-index-source-set.json --summary-json-in artifacts/agent-retro-index-summary.json
 
       - name: Upsert canonical parent marker
         run: |
@@ -125,4 +129,7 @@ jobs:
             --parent-issue "${{ inputs.parent_issue || '928' }}" \
             --dry-run false \
             --confirm-live true \
+            --artifact-json-in artifacts/agent-retro-index.json \
+            --source-set-json-in artifacts/agent-retro-index-source-set.json \
+            --summary-json-in artifacts/agent-retro-index-summary.json \
             --summary-json-out artifacts/agent-retro-index-live-summary.json
