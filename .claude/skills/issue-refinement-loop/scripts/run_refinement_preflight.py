@@ -403,13 +403,14 @@ def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, st
     gh 2.88.1+ --slurp returns [[...page1...], [...page2...]] which must be
     flattened to a single list.  Single-page results are also wrapped as [[...]].
     """
-    data, err = _run_gh(
-        [
-            "gh", "api",
-            f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
-            "--paginate", "--slurp",
-        ]
-    )
+    try:
+        from command_registry import render_command as _render_command
+        _argv = _render_command("gh.issue.comments.list", {"repo": repo, "issue_number": issue_number})
+    except Exception as exc:
+        raise RuntimeError(
+            f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}"
+        ) from exc
+    data, err = _run_gh(_argv)
     if data is None:
         return None, err
     # --slurp wraps each page as an element: [[page1_comments...], [page2_comments...]]
@@ -924,10 +925,32 @@ def _build_compact_stdout(result: dict) -> str:
 
     commands = result.get("commands", [])
     if commands:
-        lines.append("COMMANDS:")
-        for cmd in commands:
-            argv_str = " ".join(cmd.get("argv", []))
-            lines.append(f"  - [{cmd.get('kind', '?')}] {argv_str}")
+        try:
+            from command_registry import REGISTRY as _REG
+            spec_objects = []
+            for cmd in commands:
+                cmd_id = cmd.get("id") or cmd.get("kind", "?")
+                entry = _REG.get(cmd_id, {})
+                spec_objects.append({
+                    "id": cmd_id,
+                    "argv": cmd.get("argv", []),
+                    "shell": cmd.get("shell", False),
+                    "cwd_policy": entry.get("cwd_policy", "repo_root"),
+                    "stdin_contract": entry.get("stdin_contract", "none"),
+                    "stdout_contract": entry.get("stdout_contract", "unknown"),
+                    "timeout_seconds": entry.get("timeout_seconds", 120),
+                    "mutation": entry.get("mutation", False),
+                })
+            lines.append("COMMANDS_JSON: " + json.dumps(spec_objects, ensure_ascii=False, separators=(",", ":")))
+            lines.append("COMMANDS_DISPLAY:")
+            for cmd in commands:
+                argv_str = " ".join(str(a) for a in cmd.get("argv", []))
+                lines.append(f"  display: [{cmd.get('id') or cmd.get('kind', '?')}] {argv_str}")
+        except ImportError:
+            lines.append("COMMANDS:")
+            for cmd in commands:
+                argv_str = " ".join(cmd.get("argv", []))
+                lines.append(f"  - [{cmd.get('kind', '?')}] {argv_str}")
 
     blockers = result.get("blockers", [])
     if blockers:
@@ -1016,21 +1039,21 @@ def _build_result(
 
 
 def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
-    """Build commands[] from planner output. Argv-only, shell=False, static template."""
-    commands = []
-    # Suggest re-running the wrapper as a standard command template
-    commands.append({
+    """Build commands[] from ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 preflight.run entry."""
+    try:
+        from command_registry import render_command as _render_command, REGISTRY as _REGISTRY
+        _entry = _REGISTRY.get("preflight.run", {})
+        _argv = _render_command("preflight.run", {"issue_number": issue_number, "repo": repo})
+    except Exception as exc:
+        raise RuntimeError(
+            f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: command_registry render failed: {exc}"
+        ) from exc
+    return [{
         "kind": "run_preflight",
-        "argv": [
-            "uv", "run", "python3",
-            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
-            "--issue-number", str(issue_number),
-            "--repo", repo,
-        ],
+        "argv": _argv,
         "shell": False,
-        "source": "static_wrapper_template",
-    })
-    return commands
+        "source": "registry",
+    }]
 
 
 def _emit_failure_result(

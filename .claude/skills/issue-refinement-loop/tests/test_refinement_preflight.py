@@ -221,7 +221,7 @@ class TestAC1BasicFixtureOutput:
 
         assert "STATUS:" in stdout, "stdout must contain STATUS field"
         assert "NEXT_ACTION:" in stdout, "stdout must contain NEXT_ACTION field"
-        assert "COMMANDS:" in stdout, "stdout must contain COMMANDS field"
+        assert "COMMANDS_JSON:" in stdout, "stdout must contain COMMANDS_JSON field"
         assert "ARTIFACT:" in stdout, "stdout must contain ARTIFACT field"
         assert result["schema_version"] == "refinement_preflight_result/v1"
 
@@ -1009,7 +1009,7 @@ class TestAC11ArgvOnlyCommands:
                    f"shell must be False (boolean), got {cmd.get('shell')}"
 
     def test_commands_source_static_wrapper_template(self, tmp_path, capsys):
-        """AC11: every command has source='static_wrapper_template'."""
+        """AC11: every command has source='registry' (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)."""
         fixture_path = tmp_path / "fixture.json"
         fixture_path.write_text(
             json.dumps(make_minimal_fixture(body=VALID_ISSUE_BODY, issue_number=702)),
@@ -1025,8 +1025,8 @@ class TestAC11ArgvOnlyCommands:
             )
 
         for cmd in result.get("commands", []):
-            assert cmd.get("source") == "static_wrapper_template", \
-                   f"source must be 'static_wrapper_template', got {cmd.get('source')}"
+            assert cmd.get("source") == "registry", \
+                   f"source must be 'registry', got {cmd.get('source')}"
 
     def test_argv_contains_no_shell_string(self, tmp_path, capsys):
         """AC11: argv elements do not contain shell metacharacters as concatenated commands."""

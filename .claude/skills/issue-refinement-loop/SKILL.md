@@ -100,6 +100,8 @@ orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
 `run_refinement_preflight.py` wrapper を実行して Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括で実行する。wrapper は `plan_refinement_loop.py` を SSOT として呼び出す薄い adapter であり、判断ロジックは planner に委譲する。
 
+コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry（`preflight.run` 等）を参照する。
+
 ```bash
 uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
   --issue-number <N> \
@@ -113,7 +115,8 @@ wrapper の出力フィールドを確認する:
 - `STATUS: pass | warn | blocked | environment_failure` — 常に出力される
 - `NEXT_ACTION: proceed | proceed_with_notes | human_judgment_required | fix_environment` — 常に出力される
 - `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
-- `COMMANDS:` — argv-only コマンドテンプレート（空の場合は省略）
+- `COMMANDS_JSON:` — full command spec objects（canonical machine-consumable、空の場合は省略）
+- `COMMANDS_DISPLAY:` — human-readable display（display_only=true、空の場合は省略）
 - `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
 - `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）
 
@@ -376,6 +379,7 @@ echo '{
 | termination policy | `references/termination-policy.md` |
 | planner output contract | `references/refinement-loop-plan-output.md` |
 | scope rollup preflight | `references/scope-rollup-policy.md` |
+| command registry | `scripts/command_registry.py` — `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1` |
 
 ## Guardrails
 
