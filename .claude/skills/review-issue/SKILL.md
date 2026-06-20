@@ -30,6 +30,7 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
    
    Note: `--mode execute` は `compound_command_disallowed`（静的検出）と `unexpected_pass`（VC 実行結果）の両方を検出する。`shell=True` は導入しない（既存の `shell=False` 前提を維持）。
 3. checker の JSON をそのまま `REVIEW_ISSUE_RESULT_V1` に整形する（`verdict` / `deterministic_checks` / `blocking_issues` / `non_blocking_improvements` / `diff_proposal` を保持）。
+   `findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version も lossless に保持し、compact consumer が provenance を失わないようにする。
 4. `verdict: needs-fix` の場合のみ `diff_proposal` を呼び出し元に提示する。本文書き戻しは Step 5 の条件分岐に従う。
 5. 本文書き戻し条件:
 
@@ -55,11 +56,15 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 
 ```yaml
 REVIEW_ISSUE_RESULT_V1:
+  schema: REVIEW_ISSUE_RESULT_V1
+  schema_version: review_issue_result/v1
   status: ok | failed
+  body_sha256: <sha256>
   generated_at: <ISO 8601>
   generated_by: review-issue
   issue_url: https://github.com/<owner>/<repo>/issues/<番号>
   verdict: approve | needs-fix
+  findings: []
   deterministic_checks: <checker JSON deterministic_checks をそのまま>
   blocking_issues: <checker JSON blocking_issues をそのまま>
   non_blocking_improvements: <checker JSON non_blocking_improvements をそのまま>

@@ -234,12 +234,18 @@ class PreflightScope(str, Enum):
 
 REVIEW_ISSUE_RESULT_SCHEMA_VERSION = "review_issue_result/v1"
 REVIEW_ISSUE_RESULT_SCHEMA = "REVIEW_ISSUE_RESULT_V1"
-REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMA = "CHECK_ISSUE_CONTRACT_V1"
-REVIEW_ISSUE_CHECKER_ARTIFACT_PATH = ".claude/skills/review-issue/scripts/check_issue_contract.py"
+REVIEW_ISSUE_RESULT_SCHEMA_FILE = (
+    Path(__file__).resolve().parent.parent / "schemas" / "review_issue_result_v1.json"
+)
+REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMAS = frozenset(
+    {
+        REVIEW_ISSUE_RESULT_SCHEMA,
+        "CHECK_ISSUE_CONTRACT_V1",
+    }
+)
 REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER = "deterministic_domain_blocker"
 REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP = "checker_gap"
 REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN = "heuristic_concern"
-REVIEW_ISSUE_FINDING_KIND_UNKNOWN = "unknown"
 VALID_REVIEW_FINDING_KINDS = {
     REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
     REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP,
@@ -262,17 +268,19 @@ def _append_findings(
     blocking: bool,
     checker_evidence: Optional[list[dict]] = None,
 ) -> None:
-    evidence_entries = checker_evidence if checker_evidence is not None else []
+    evidence_entries = list(checker_evidence) if checker_evidence is not None else []
 
     finding_kind = _validate_finding_kind(finding_kind)
     if finding_kind == REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER and blocking:
+        evidence_entries = [
+            entry
+            for entry in evidence_entries
+            if _is_valid_deterministic_evidence(result, entry)
+        ]
         if not evidence_entries:
-            # AC2: deterministic_domain_blocker は evidence が必須。欠落時は checker_gap に降格。
+            # Deterministic blocker は current body に結びつく実 evidence が無ければ fail-closed。
             finding_kind = REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP
             blocking = False
-
-        if blocking and not evidence_entries:
-            raise ValueError("Failed to append deterministic finding evidence")
 
     for issue in issues:
         result.findings.append(
@@ -289,7 +297,7 @@ def _append_findings(
 def _validate_finding_kind(kind: str) -> str:
     if kind in VALID_REVIEW_FINDING_KINDS:
         return kind
-    return REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN
+    raise ValueError(f"Unsupported finding_kind: {kind!r}")
 
 
 def _validate_status(status: str) -> str:
@@ -298,19 +306,35 @@ def _validate_status(status: str) -> str:
     raise ValueError(f"Unsupported REVIEW_ISSUE_RESULT status: {status!r}")
 
 
-def _default_checker_evidence(result: "CheckerResult", deterministic_domain_key: str) -> list[dict]:
-    return [
-        {
-            "source_check": "check_issue_contract",
-            "rule_id": deterministic_domain_key,
-            "category": "deterministic_check",
-            "artifact_path": REVIEW_ISSUE_CHECKER_ARTIFACT_PATH,
-            "artifact_schema": REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMA,
-            "body_sha256": result.body_sha256,
-            "line_start": None,
-            "line_end": None,
-        }
-    ]
+def _is_valid_deterministic_evidence(result: "CheckerResult", entry: dict) -> bool:
+    required_fields = (
+        "source_check",
+        "rule_id",
+        "category",
+        "artifact_path",
+        "artifact_schema",
+        "body_sha256",
+        "iteration_id",
+    )
+    for field_name in required_fields:
+        value = entry.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    if entry.get("artifact_schema") not in REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMAS:
+        return False
+    if entry.get("body_sha256") != result.body_sha256:
+        return False
+    return True
+
+
+def _load_review_issue_result_schema() -> dict:
+    return json.loads(REVIEW_ISSUE_RESULT_SCHEMA_FILE.read_text(encoding="utf-8"))
+
+
+def _validate_review_issue_result_payload(payload: dict) -> None:
+    import jsonschema
+
+    jsonschema.validate(instance=payload, schema=_load_review_issue_result_schema())
 
 
 @dataclass
@@ -609,7 +633,15 @@ REQUIREMENT_ID_PATTERN = re.compile(r"^REQ-\d{3,}$")
 SOURCE_TASK_ID_PATTERN = re.compile(r"^(T|TASK-)\d{3,}$")
 
 
-def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: list, suggested_action: str) -> None:
+def _add_warning(
+    result: "CheckerResult",
+    code: str,
+    severity: str,
+    evidence: list,
+    suggested_action: str,
+    *,
+    emit_finding: bool = True,
+) -> None:
     """Append a structured non_blocking_improvement entry."""
     result.non_blocking_improvements.append({
         "code": code,
@@ -617,15 +649,16 @@ def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: li
         "evidence": evidence,
         "suggested_action": suggested_action,
     })
-    result.findings.append(
-        {
-            "finding_kind": REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
-            "deterministic_domain_key": code,
-            "blocking": False,
-            "checker_evidence": [],
-            "message": suggested_action,
-        }
-    )
+    if emit_finding:
+        result.findings.append(
+            {
+                "finding_kind": REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+                "deterministic_domain_key": code,
+                "blocking": False,
+                "checker_evidence": [],
+                "message": suggested_action,
+            }
+        )
 
 
 def extract_section(body: str, section_name: str) -> str:
@@ -1427,7 +1460,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="required_sections",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C1_required_sections in (CheckResult.FAIL, CheckResult.LEGACY_MISSING),
-        checker_evidence=_default_checker_evidence(result, "required_sections"),
     )
     # C1 fail 時: missing section ごとの skeleton を diff_proposal.add に同梱する
     if checks.C1_required_sections == CheckResult.FAIL and issues:
@@ -1451,7 +1483,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="stop_conditions",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C2_stop_conditions_6 == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "stop_conditions"),
     )
 
     # C3
@@ -1463,7 +1494,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="ac_checkbox_format",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C3_ac_checkbox_format == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "ac_checkbox_format"),
     )
 
     # C4
@@ -1475,7 +1505,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="vc_command_format",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
         blocking=checks.C4_vc_commands_present == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "vc_command_format"),
     )
 
     # annotation-aware VC parse (Issue #599)
@@ -1492,7 +1521,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="vc_number_alignment",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
         blocking=checks.C5_ac_vc_number_alignment == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "vc_number_alignment"),
     )
 
     # C6
@@ -1504,7 +1532,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="subjective_phrasing",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C6_no_subjective_phrasing == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "subjective_phrasing"),
     )
 
     # C7
@@ -1516,7 +1543,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="required_skills_semantics",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C7_required_skills_semantics == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "required_skills_semantics"),
     )
 
     # C8
@@ -1528,7 +1554,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="outcome_concreteness",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C8_outcome_concreteness == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "outcome_concreteness"),
     )
 
     # C9
@@ -1542,7 +1567,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
             deterministic_domain_key="runtime_applicability",
             finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
             blocking=True,
-            checker_evidence=_default_checker_evidence(result, "runtime_applicability"),
         )
     elif checks.C9_runtime_applicability_present == CheckResult.WARN:
         for msg in issues:
@@ -1552,6 +1576,7 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
                 severity="warning",
                 evidence=[msg],
                 suggested_action="implementation 以外の Issue でも `## Runtime Verification Applicability` セクションの追加を推奨する",
+                emit_finding=False,
             )
         _append_findings(
             result,
@@ -1559,7 +1584,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
             deterministic_domain_key="runtime_applicability",
             finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
             blocking=False,
-            checker_evidence=_default_checker_evidence(result, "runtime_applicability"),
         )
 
     # C10
@@ -1571,7 +1595,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="deferred_destination",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C10_deferred_destination_present == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "deferred_destination"),
     )
 
     # C11
@@ -1583,7 +1606,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="decision_tag_consistency",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C11_decision_tag_consistency == CheckResult.FAIL,
-        checker_evidence=_default_checker_evidence(result, "decision_tag_consistency"),
     )
 
     # C12: Product trace fields structure
@@ -1595,7 +1617,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="product_trace_fields_structure",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C12_product_trace_fields_structure != CheckResult.PASS,
-        checker_evidence=_default_checker_evidence(result, "product_trace_fields_structure"),
     )
 
     # C13: VC preflight decision consistency (if JSON provided)
@@ -1607,7 +1628,6 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="vc_preflight_decision_consistency",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C13_vc_preflight_decision_consistency != CheckResult.PASS,
-        checker_evidence=_default_checker_evidence(result, "vc_preflight_decision_consistency"),
     )
 
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
@@ -1700,7 +1720,7 @@ def result_to_dict(result: CheckerResult) -> dict:
             "skip_reason_type": cmd.skip_reason_type,
         }
 
-    return {
+    payload = {
         "schema": result.schema,
         "schema_version": result.schema_version,
         "verdict": result.verdict,
@@ -1729,6 +1749,8 @@ def result_to_dict(result: CheckerResult) -> dict:
         "diff_proposal": result.diff_proposal,
         "parsed_vc_commands": [_serialize_parsed_vc_cmd(c) for c in result.parsed_vc_commands],
     }
+    _validate_review_issue_result_payload(payload)
+    return payload
 
 
 def main() -> None:

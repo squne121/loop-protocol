@@ -100,6 +100,9 @@ def test_compact_review_result_approve_artifact_written(tmp_path):
     artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert artifact_json["schema"] == "ISSUE_REVIEW_RESULT_COMPACT_V1"
     assert artifact_json["verdict"] == "approve"
+    assert artifact_json["producer_schema"] == "REVIEW_ISSUE_RESULT_V1"
+    assert artifact_json["producer_body_sha256"].startswith("sha256:")
+    assert artifact_json["findings"] == []
 
 
 def test_compact_review_result_artifact_permissions(tmp_path):
@@ -148,6 +151,21 @@ def test_compact_review_result_needs_fix_stdout_contains_all_fields(tmp_path):
     # B7: MUST_READ must always be present (even when empty)
     for field in ["STATUS:", "VERDICT:", "SUMMARY:", "BLOCKERS:", "NEXT_ACTION:", "MUST_READ:", "ARTIFACT:"]:
         assert field in lines_text, f"Missing field in stdout: {field}"
+
+
+def test_compact_review_result_preserves_findings_losslessly(tmp_path):
+    """GIVEN full review artifact WHEN compacted THEN findings/provenance remain in artifact JSON."""
+    fixture = FIXTURES_DIR / "review_result_needs_fix.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+
+    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
+    artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+    assert artifact_json["producer_schema_version"] == "review_issue_result/v1"
+    assert artifact_json["producer_body_sha256"] == raw_result["body_sha256"]
+    assert artifact_json["findings"] == raw_result["findings"]
 
 
 def test_compact_review_result_must_read_always_present_when_empty(tmp_path):
@@ -301,10 +319,20 @@ def test_compact_review_result_containment_check_rejects_escape(tmp_path):
 def test_compact_review_result_artifact_secret_check_fails(tmp_path):
     """GIVEN review result with secret-like content WHEN compact_review_result THEN ValueError (B5)."""
     raw_result = {
+        "schema": "REVIEW_ISSUE_RESULT_V1",
+        "schema_version": "review_issue_result/v1",
         "verdict": "approve",
         "status": "ok",
+        "body_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issue_kind": "implementation",
+        "generated_at": "2026-06-11T00:00:00Z",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/42",
         "blocking_issues": [],
+        "non_blocking_improvements": [],
+        "findings": [],
         "diff_proposal": {"note": "token: ghp_" + "A" * 36},
+        "deterministic_checks": {},
+        "parsed_vc_commands": [],
     }
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
     with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
