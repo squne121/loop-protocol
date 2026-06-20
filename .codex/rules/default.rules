@@ -7,6 +7,16 @@
 # Known limitation: `rtk` itself does not enforce policy; if `rtk` is absent or
 # untrusted, the blanket-allow rule is removed to prevent bypass via `rtk` wrapping.
 
+# ─── Session startup preflight gate (local_main_branch_guard) ─────────────────
+# Before executing any implementation task, run the following mandatory gate:
+#
+#   uv run python3 scripts/check_local_main_branch_state.py --json
+#
+# If this exits non-zero, the local root checkout is not on the default branch.
+# Do NOT proceed with implementation work until the local root is on the default branch.
+# This is a required startup gate — failure to run it is a protocol violation.
+# ─────────────────────────────────────────────────────────────────────────────
+
 prefix_rule(
     pattern = ["rtk", "--help"],
     decision = "allow",
