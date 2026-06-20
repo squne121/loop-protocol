@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import re
 import subprocess
@@ -229,6 +230,87 @@ class PreflightScope(str, Enum):
     PR_REVIEW_ONLY = "pr_review_only"
     RUNTIME_ONLY = "runtime_only"
     UNKNOWN = "unknown"  # fail-closed / human_judgment
+
+
+REVIEW_ISSUE_RESULT_SCHEMA_VERSION = "review_issue_result/v1"
+REVIEW_ISSUE_RESULT_SCHEMA = "REVIEW_ISSUE_RESULT_V1"
+REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMA = "CHECK_ISSUE_CONTRACT_V1"
+REVIEW_ISSUE_CHECKER_ARTIFACT_PATH = ".claude/skills/review-issue/scripts/check_issue_contract.py"
+REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER = "deterministic_domain_blocker"
+REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP = "checker_gap"
+REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN = "heuristic_concern"
+REVIEW_ISSUE_FINDING_KIND_UNKNOWN = "unknown"
+VALID_REVIEW_FINDING_KINDS = {
+    REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+    REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP,
+    REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+}
+VALID_REVIEW_ISSUE_STATUS = ("ok", "failed")
+
+
+def _sha256_prefixed(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _append_findings(
+    result: "CheckerResult",
+    issues: list[str],
+    deterministic_domain_key: str,
+    *,
+    finding_kind: str,
+    blocking: bool,
+    checker_evidence: Optional[list[dict]] = None,
+) -> None:
+    evidence_entries = checker_evidence if checker_evidence is not None else []
+
+    finding_kind = _validate_finding_kind(finding_kind)
+    if finding_kind == REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER and blocking:
+        if not evidence_entries:
+            # AC2: deterministic_domain_blocker は evidence が必須。欠落時は checker_gap に降格。
+            finding_kind = REVIEW_ISSUE_FINDING_KIND_CHECKER_GAP
+            blocking = False
+
+        if blocking and not evidence_entries:
+            raise ValueError("Failed to append deterministic finding evidence")
+
+    for issue in issues:
+        result.findings.append(
+            {
+                "finding_kind": finding_kind,
+                "deterministic_domain_key": deterministic_domain_key,
+                "blocking": bool(blocking),
+                "checker_evidence": evidence_entries,
+                "message": issue,
+            }
+        )
+
+
+def _validate_finding_kind(kind: str) -> str:
+    if kind in VALID_REVIEW_FINDING_KINDS:
+        return kind
+    return REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN
+
+
+def _validate_status(status: str) -> str:
+    if status in VALID_REVIEW_ISSUE_STATUS:
+        return status
+    raise ValueError(f"Unsupported REVIEW_ISSUE_RESULT status: {status!r}")
+
+
+def _default_checker_evidence(result: "CheckerResult", deterministic_domain_key: str) -> list[dict]:
+    return [
+        {
+            "source_check": "check_issue_contract",
+            "rule_id": deterministic_domain_key,
+            "category": "deterministic_check",
+            "artifact_path": REVIEW_ISSUE_CHECKER_ARTIFACT_PATH,
+            "artifact_schema": REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMA,
+            "body_sha256": result.body_sha256,
+            "line_start": None,
+            "line_end": None,
+        }
+    ]
 
 
 @dataclass
@@ -507,9 +589,14 @@ class DeterministicChecks:
 
 @dataclass
 class CheckerResult:
+    schema: str = REVIEW_ISSUE_RESULT_SCHEMA
+    schema_version: str = REVIEW_ISSUE_RESULT_SCHEMA_VERSION
+    status: str = "ok"
+    body_sha256: str = ""
     verdict: str = "approve"
     deterministic_checks: DeterministicChecks = field(default_factory=DeterministicChecks)
     blocking_issues: list[str] = field(default_factory=list)
+    findings: list[dict] = field(default_factory=list)
     non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
     diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
     issue_kind: str = "implementation"
@@ -530,6 +617,15 @@ def _add_warning(result: "CheckerResult", code: str, severity: str, evidence: li
         "evidence": evidence,
         "suggested_action": suggested_action,
     })
+    result.findings.append(
+        {
+            "finding_kind": REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+            "deterministic_domain_key": code,
+            "blocking": False,
+            "checker_evidence": [],
+            "message": suggested_action,
+        }
+    )
 
 
 def extract_section(body: str, section_name: str) -> str:
@@ -1318,11 +1414,21 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     """Run all C1-C13 checks and return structured result."""
     issue_kind = detect_issue_kind(body, labels, title)
     result = CheckerResult(issue_kind=issue_kind)
+    result.body_sha256 = _sha256_prefixed(body)
+
     checks = result.deterministic_checks
 
     # C1
     checks.C1_required_sections, issues = check_c1_required_sections(body, issue_kind)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="required_sections",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C1_required_sections in (CheckResult.FAIL, CheckResult.LEGACY_MISSING),
+        checker_evidence=_default_checker_evidence(result, "required_sections"),
+    )
     # C1 fail 時: missing section ごとの skeleton を diff_proposal.add に同梱する
     if checks.C1_required_sections == CheckResult.FAIL and issues:
         missing_sections = []
@@ -1339,14 +1445,38 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     # C2
     checks.C2_stop_conditions_6, issues = check_c2_stop_conditions(body, issue_kind)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="stop_conditions",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C2_stop_conditions_6 == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "stop_conditions"),
+    )
 
     # C3
     checks.C3_ac_checkbox_format, issues = check_c3_ac_checkbox_format(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="ac_checkbox_format",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C3_ac_checkbox_format == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "ac_checkbox_format"),
+    )
 
     # C4
     checks.C4_vc_commands_present, issues = check_c4_vc_commands_present(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="vc_command_format",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+        blocking=checks.C4_vc_commands_present == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "vc_command_format"),
+    )
 
     # annotation-aware VC parse (Issue #599)
     vc_section = extract_section(body, "Verification Commands")
@@ -1356,24 +1486,64 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     # C5
     checks.C5_ac_vc_number_alignment, issues = check_c5_ac_vc_alignment(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="vc_number_alignment",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+        blocking=checks.C5_ac_vc_number_alignment == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "vc_number_alignment"),
+    )
 
     # C6
     checks.C6_no_subjective_phrasing, issues = check_c6_no_subjective_phrasing(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="subjective_phrasing",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C6_no_subjective_phrasing == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "subjective_phrasing"),
+    )
 
     # C7
     checks.C7_required_skills_semantics, issues = check_c7_required_skills_semantics(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="required_skills_semantics",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C7_required_skills_semantics == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "required_skills_semantics"),
+    )
 
     # C8
     checks.C8_outcome_concreteness, issues = check_c8_outcome_concreteness(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="outcome_concreteness",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C8_outcome_concreteness == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "outcome_concreteness"),
+    )
 
     # C9
     checks.C9_runtime_applicability_present, issues = check_c9_runtime_applicability(body, issue_kind)
     # warn は blocking_issues に追加しない
     if checks.C9_runtime_applicability_present in (CheckResult.FAIL, CheckResult.LEGACY_MISSING):
         result.blocking_issues.extend(issues)
+        _append_findings(
+            result,
+            issues,
+            deterministic_domain_key="runtime_applicability",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+            blocking=True,
+            checker_evidence=_default_checker_evidence(result, "runtime_applicability"),
+        )
     elif checks.C9_runtime_applicability_present == CheckResult.WARN:
         for msg in issues:
             _add_warning(
@@ -1383,22 +1553,62 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
                 evidence=[msg],
                 suggested_action="implementation 以外の Issue でも `## Runtime Verification Applicability` セクションの追加を推奨する",
             )
+        _append_findings(
+            result,
+            issues,
+            deterministic_domain_key="runtime_applicability",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+            blocking=False,
+            checker_evidence=_default_checker_evidence(result, "runtime_applicability"),
+        )
 
     # C10
     checks.C10_deferred_destination_present, issues = check_c10_deferred_destination(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="deferred_destination",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C10_deferred_destination_present == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "deferred_destination"),
+    )
 
     # C11
     checks.C11_decision_tag_consistency, issues = check_c11_decision_tag_consistency(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="decision_tag_consistency",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C11_decision_tag_consistency == CheckResult.FAIL,
+        checker_evidence=_default_checker_evidence(result, "decision_tag_consistency"),
+    )
 
     # C12: Product trace fields structure
     checks.C12_product_trace_fields_structure, issues = check_c12_product_trace_fields_structure(body)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="product_trace_fields_structure",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C12_product_trace_fields_structure != CheckResult.PASS,
+        checker_evidence=_default_checker_evidence(result, "product_trace_fields_structure"),
+    )
 
     # C13: VC preflight decision consistency (if JSON provided)
     checks.C13_vc_preflight_decision_consistency, issues = check_c13_vc_preflight_decision_consistency(vc_preflight_json_path)
     result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="vc_preflight_decision_consistency",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C13_vc_preflight_decision_consistency != CheckResult.PASS,
+        checker_evidence=_default_checker_evidence(result, "vc_preflight_decision_consistency"),
+    )
 
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
     detect_warning_scope_cvs_in_scope_mismatch(body, result)
@@ -1422,6 +1632,7 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         checks.C13_vc_preflight_decision_consistency,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
+    result.status = _validate_status("failed" if has_fail else "ok")
     result.verdict = "needs-fix" if has_fail else "approve"
 
     return result
@@ -1490,7 +1701,11 @@ def result_to_dict(result: CheckerResult) -> dict:
         }
 
     return {
+        "schema": result.schema,
+        "schema_version": result.schema_version,
         "verdict": result.verdict,
+        "status": result.status,
+        "body_sha256": result.body_sha256,
         "issue_kind": result.issue_kind,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "deterministic_checks": {
@@ -1510,6 +1725,7 @@ def result_to_dict(result: CheckerResult) -> dict:
         },
         "blocking_issues": result.blocking_issues,
         "non_blocking_improvements": result.non_blocking_improvements,
+        "findings": result.findings,
         "diff_proposal": result.diff_proposal,
         "parsed_vc_commands": [_serialize_parsed_vc_cmd(c) for c in result.parsed_vc_commands],
     }
