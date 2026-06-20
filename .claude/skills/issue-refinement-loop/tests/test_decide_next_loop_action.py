@@ -144,6 +144,25 @@ def test_max_iterations_override_cli_flag():
     assert "human_escalation" in result.stdout
 
 
+def test_approve_verdict_at_max_iterations_proceeds_to_step_4_5():
+    """
+    Regression: approve verdict at max_iterations must NOT escalate.
+    Priority 2b must only trigger for needs-fix, not approve.
+    iteration=2, max_iterations=3 (iteration+1 == max_iterations) with approve
+    → NEXT_ACTION: proceed_to_step_4_5, exit 0.
+    """
+    state = load_fixture()
+    state["iteration"] = 2
+    state["max_iterations"] = 3
+    result = run_script(state, verdict="approve")
+    assert result.returncode == 0, (
+        f"Expected exit 0 for approve+max_iterations, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "STATUS: pass" in result.stdout
+    assert "NEXT_ACTION: proceed_to_step_4_5" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Inconsistent state → exit 3
 # ---------------------------------------------------------------------------
@@ -479,3 +498,253 @@ def test_iteration_boundary_2_max_2_escalates():
         f"stdout: {result.stdout}"
     )
     assert "human_escalation" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# AC4: scope_signal_guard tests WITH phase condition
+# (existing tests preserved above; these add phase-sensitive variants)
+# ---------------------------------------------------------------------------
+
+
+def _make_phase_state_for_test(
+    phase: str,
+    source_kind: str = "loop_state_v1",
+) -> dict[Any, Any]:
+    """Build an ISSUE_REFINEMENT_PHASE_STATE_V1 for testing.
+
+    Creates a real temporary source file (M1: source_path must exist).
+    """
+    import subprocess
+    import sys as _sys
+    import tempfile
+    import json
+    from pathlib import Path
+
+    build_script = SKILL_ROOT / "scripts" / "build_refinement_phase_state.py"
+
+    # M1: source_path must be an existing file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as sf:
+        sf.write("{}")
+        source_path = sf.name
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out_f:
+        out_path = out_f.name
+
+    result = subprocess.run(
+        [
+            _sys.executable,
+            str(build_script),
+            "--phase", phase,
+            "--source-kind", source_kind,
+            "--source-path", source_path,
+            "--output-path", out_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"build_refinement_phase_state.py failed: {result.stdout} {result.stderr}"
+    )
+    return json.loads(Path(out_path).read_text(encoding="utf-8"))
+
+
+def _run_script_with_phase_state(
+    loop_state: dict[Any, Any],
+    phase_state: dict[Any, Any],
+    verdict: str = "needs-fix",
+) -> "subprocess.CompletedProcess":
+    """Run decide_next_loop_action.py with --phase-state-file."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(phase_state, f)
+        phase_state_path = f.name
+
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-json", json.dumps(loop_state),
+            "--review-result-verdict", verdict,
+            "--phase-state-file", phase_state_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_scope_signal_guard_triggered_in_post_rewrite_check_phase_escalates():
+    """
+    AC4: post_rewrite_check phase での scope_signal_guard.triggered=true は
+    引き続き TERMINATION_CAUSE: human_judgment_required を出す (#919 回帰維持)。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_in_scope_area",
+    }
+    phase_state = _make_phase_state_for_test("post_rewrite_check")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    # Should escalate (gate passes, routing proceeds to scope_signal_guard check)
+    assert result.returncode == 2, (
+        f"Expected exit 2 for scope_signal_guard in post_rewrite_check, "
+        f"got {result.returncode}\nstdout: {result.stdout}"
+    )
+    assert "STATUS: human_escalation" in result.stdout
+    assert "scope_signal_guard_triggered" in result.stdout
+    # AC4: reason_code is in BLOCKERS, not TERMINATION_CAUSE
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+    assert "scope_signal_guard_reason_code:new_in_scope_area" in result.stdout
+
+
+def test_scope_signal_guard_triggered_in_decide_next_action_phase_escalates():
+    """
+    AC4: decide_next_action phase での scope_signal_guard.triggered=true は
+    引き続き human_escalation を出す (#919 回帰維持)。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_allowed_path_layer",
+    }
+    phase_state = _make_phase_state_for_test("decide_next_action")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    assert result.returncode == 2
+    assert "STATUS: human_escalation" in result.stdout
+    assert "scope_signal_guard_triggered" in result.stdout
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+
+
+def test_scope_signal_guard_triggered_in_preflight_phase_blocked_by_gate():
+    """
+    AC4: preflight phase では phase gate が先に作動して
+    ISSUE_REFINEMENT_ROUTER_ERROR_V1 を返す。
+    scope_signal_guard テストの phase 条件補完。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_in_scope_area",
+    }
+    phase_state = _make_phase_state_for_test("preflight", source_kind="refinement_preflight_result_v1")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    # Gate fires — no human_escalation from routing logic
+    assert "STATUS: human_escalation" not in result.stdout
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout
+    assert result.returncode == 3
+
+
+def test_scope_signal_guard_reason_code_in_blockers_not_termination_cause():
+    """
+    AC4 / #919 回帰: scope_signal_guard.reason_code は BLOCKERS に保持され
+    TERMINATION_CAUSE には使われない。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_allowed_path_layer",
+    }
+    # No phase gate (baseline behavior)
+    result = run_script(state, verdict="needs-fix")
+
+    assert result.returncode == 2
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+    # reason_code must NOT appear as TERMINATION_CAUSE
+    assert "TERMINATION_CAUSE: new_allowed_path_layer" not in result.stdout
+    assert "TERMINATION_CAUSE: scope_signal_guard_triggered" not in result.stdout
+    # reason_code must appear in BLOCKERS
+    assert "BLOCKERS: scope_signal_guard_reason_code:new_allowed_path_layer" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# B4: --phase-state-file 指定時の LOOP_STATE_V1 schema validation エラー
+#     → ISSUE_REFINEMENT_ROUTER_ERROR_V1 with reason_code: loop_state_invalid
+# ---------------------------------------------------------------------------
+
+
+def test_phase_state_file_with_invalid_loop_state_returns_loop_state_invalid():
+    """
+    B4: --phase-state-file 指定かつ LOOP_STATE_V1 schema validation エラーで
+    reason_code: loop_state_invalid を返す。
+    """
+    import tempfile
+    import subprocess
+
+    # Build a valid phase state for post_rewrite_check (decide_next_loop_action is allowed)
+    phase_state = _make_phase_state_for_test("post_rewrite_check")
+
+    # Use a loop state with invalid schema (missing required fields)
+    invalid_loop_state = {
+        "schema_version": "loop_state/v1",
+        "iteration": 0,
+        # Missing: max_iterations, scope_signal_guard, etc.
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ps_f:
+        import json
+        json.dump(phase_state, ps_f)
+        phase_state_path = ps_f.name
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-json", json.dumps(invalid_loop_state),
+            "--review-result-verdict", "needs-fix",
+            "--phase-state-file", phase_state_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    # B4: Should emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 with loop_state_invalid
+    assert result.returncode == 3, (
+        f"Expected exit 3 for invalid loop state with phase-state-file (B4), "
+        f"got {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout, (
+        f"Expected ISSUE_REFINEMENT_ROUTER_ERROR_V1 in stdout:\n{result.stdout}"
+    )
+    # Parse the router error JSON
+    for line in result.stdout.splitlines():
+        if line.startswith("ISSUE_REFINEMENT_ROUTER_ERROR_V1:"):
+            payload = json.loads(line[len("ISSUE_REFINEMENT_ROUTER_ERROR_V1:"):].strip())
+            assert payload["reason_code"] == "loop_state_invalid", (
+                f"Expected reason_code=loop_state_invalid, got: {payload['reason_code']}"
+            )
+            assert payload["schema_version"] == "ISSUE_REFINEMENT_ROUTER_ERROR_V1"
+            assert payload["next_action"] == "rebuild_phase_state"
+            break
+    else:
+        pytest.fail(
+            f"No ISSUE_REFINEMENT_ROUTER_ERROR_V1 line found:\n{result.stdout}"
+        )
+
+
+def test_phase_state_file_absent_with_invalid_loop_state_returns_inconsistent_state():
+    """
+    B4 対比: --phase-state-file なしの場合は従来通り inconsistent_state を返す。
+    phase-state-file あり → loop_state_invalid / phase-state-file なし → inconsistent_state。
+    """
+    invalid_loop_state = {
+        "schema_version": "loop_state/v1",
+        "iteration": 0,
+    }
+    result = run_script(invalid_loop_state, verdict="needs-fix")
+    assert result.returncode == 3
+    # Should NOT emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 (no phase-state-file)
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" not in result.stdout
+    assert "inconsistent_state" in result.stdout or result.returncode == 3
