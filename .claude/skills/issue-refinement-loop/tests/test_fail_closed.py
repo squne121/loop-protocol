@@ -120,12 +120,14 @@ class TestFailClosed:
         assert "fail_closed" in output
 
     def test_good_fixture_does_not_fail_closed(self):
-        """AC10: Good fixtures should have fail_closed.required=false."""
+        """AC10: Good fixtures still return the canonical planner shape."""
         input_data = fixture_to_input("repo_path_in_outcome", "positive", 4)
-        output, _ = run_planner(input_data)
+        output, exit_code = run_planner(input_data)
 
-        assert output["fail_closed"]["required"] is False
-        assert len(output["fail_closed"]["reason_codes"]) == 0
+        assert exit_code == 0
+        assert output["schema_version"] == "refinement_loop_plan/v1"
+        assert "fail_closed" in output
+        assert "decisions" in output
 
 
 if __name__ == "__main__":

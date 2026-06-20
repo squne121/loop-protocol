@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 15,
-    "issue_body_sha256": "d9c8cc150ce6c212245cdf320f16d062c2b737a0d3e31612ab2c082b961b4a73",
+    "issue_body_sha256": "034e0e42c2541dcefeee89afd2f96b46e6bdec8b657d96edf85fcff1c7f740db",
     "comments_sha256": null,
     "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
