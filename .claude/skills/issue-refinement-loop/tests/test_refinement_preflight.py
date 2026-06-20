@@ -588,7 +588,7 @@ class TestNonStringFailClosedPayload:
 
         with (
             mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
-            mock.patch.object(wrapper, "_invoke_planner", return_value=(invalid_plan, 0, "")),
+            mock.patch.object(wrapper, "_invoke_planner", return_value=(invalid_plan, 0, "", "")),
         ):
             result, exit_code = wrapper.run_preflight(
                 issue_number=3200,
@@ -1527,7 +1527,7 @@ class TestB3WarnReachable:
 
         with (
             mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
-            mock.patch.object(wrapper, "_invoke_planner", return_value=(mock_plan, 0, "")),
+            mock.patch.object(wrapper, "_invoke_planner", return_value=(mock_plan, 0, "", "")),
         ):
             result, exit_code = wrapper.run_preflight(
                 issue_number=850,

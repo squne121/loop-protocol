@@ -724,11 +724,11 @@ def _invoke_repair(body: str) -> dict:
             pass
 
 
-def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
+def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str, str]:
     """
     Invoke plan_refinement_loop.py via subprocess.run([sys.executable, ...], shell=False).
 
-    Returns (plan_dict, exit_code, stderr_text).
+    Returns (plan_dict, exit_code, stderr_text, raw_stdout).
     plan_dict is None on JSON parse failure.
     """
     input_json = json.dumps(planner_input, ensure_ascii=False)
@@ -743,24 +743,25 @@ def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
             text=True,
         )
     except subprocess.TimeoutExpired:
-        return None, 3, f"planner timeout after {PLANNER_TIMEOUT}s"
+        return None, 3, f"planner timeout after {PLANNER_TIMEOUT}s", ""
     except FileNotFoundError:
-        return None, 3, f"planner script not found: {PLANNER_SCRIPT}"
+        return None, 3, f"planner script not found: {PLANNER_SCRIPT}", ""
     except Exception as exc:
-        return None, 3, f"planner unexpected error: {exc}"
+        return None, 3, f"planner unexpected error: {exc}", ""
 
     stderr_text = proc.stderr or ""
     exit_code = proc.returncode
+    raw_stdout = proc.stdout or ""
 
     if exit_code not in (0, 2, 3):
-        return None, exit_code, stderr_text
+        return None, exit_code, stderr_text, raw_stdout
 
     try:
         plan = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        return None, exit_code, f"planner stdout JSON decode error: {exc}"
+        return None, exit_code, f"planner stdout JSON decode error: {exc}", raw_stdout
 
-    return plan, exit_code, stderr_text
+    return plan, exit_code, stderr_text, raw_stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1350,7 +1351,7 @@ def run_preflight(
         anchor_comment_ids=anchor_comment_ids,
         now=now,
     )
-    plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input_dict)
+    plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(planner_input_dict)
 
     if plan is None:
         # Planner invocation failed
@@ -1358,6 +1359,45 @@ def run_preflight(
             blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
         else:
             blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
+
+        # --- Blocker 3: failure classification sidecar ---
+        failure_cls = classify_planner_failure(
+            exit_code=planner_exit_code,
+            stdout=planner_stdout_raw,
+            stderr=planner_stderr,
+            script_path=PLANNER_SCRIPT,
+            python_executable=sys.executable,
+        )
+        try:
+            _cls_dir = (
+                repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+            )
+            _cls_dir.mkdir(parents=True, exist_ok=True)
+            (_cls_dir / "planner_failure_classification_v1.json").write_text(
+                json.dumps(failure_cls, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        # --- Blocker 1 (failure path): provenance sidecar ---
+        try:
+            _anchor_url = anchor_comment_urls[0] if anchor_comment_urls else ""
+            _status_str_prov, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+            _prov = build_provenance(
+                repo=repo,
+                issue_number=issue_number,
+                anchor_comment_url=_anchor_url,
+                planner_input=planner_input_dict,
+                raw_snapshot=raw_snapshot,
+                wrapper_exit_code=EXIT_ENVIRONMENT_FAILURE,
+                wrapper_status=_status_str_prov,
+                blockers=blockers,
+                stderr=planner_stderr or "",
+                repo_root=repo_root,
+            )
+            write_provenance_artifact(repo_root, issue_number, _prov)
+        except Exception:
+            pass
 
         status_str, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
         return _emit_failure_result(
@@ -1559,6 +1599,25 @@ def run_preflight(
     )
     result["artifacts"] = artifacts
 
+    # --- Blocker 1 (success path): provenance sidecar ---
+    try:
+        _anchor_url_prov = anchor_comment_urls[0] if anchor_comment_urls else ""
+        _provenance = build_provenance(
+            repo=repo,
+            issue_number=issue_number,
+            anchor_comment_url=_anchor_url_prov,
+            planner_input=planner_input_dict,
+            raw_snapshot=raw_snapshot,
+            wrapper_exit_code=exit_code,
+            wrapper_status=result.get("status", "unknown"),
+            blockers=blockers,
+            stderr=planner_stderr or "",
+            repo_root=repo_root,
+        )
+        write_provenance_artifact(repo_root, issue_number, _provenance)
+    except Exception:
+        pass
+
     # Update artifact file with final artifacts field included
     artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
@@ -1592,6 +1651,32 @@ def _git_blob_sha(file_path: Path, repo_root: Path) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "hash-object", str(file_path.resolve())],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _git_head_tree_blob_sha(file_path: Path, repo_root: Path) -> str:
+    """Return blob SHA from HEAD tree (git rev-parse HEAD:<relpath>) or 'unknown'."""
+    try:
+        relpath = file_path.resolve().relative_to(repo_root.resolve())
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{relpath}"],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
+    """Return 'git status --short' for a file or 'unknown' on failure."""
+    try:
+        relpath = file_path.resolve().relative_to(repo_root.resolve())
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--short", "--", str(relpath)],
             capture_output=True, text=True, timeout=5, shell=False,
         )
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
@@ -1743,6 +1828,7 @@ def build_provenance(
 
     planner_input_text = _canonical_json(planner_input)
     raw_snapshot_text = _canonical_json(raw_snapshot)
+    stderr_str = stderr or ""
 
     return {
         "schema_version": "REFINEMENT_PREFLIGHT_PROVENANCE_V1",
@@ -1750,9 +1836,12 @@ def build_provenance(
         "issue_number": issue_number,
         "anchor_comment_url": anchor_comment_url,
         "git_head_sha": _git_head_sha(repo_root),
+        "planner_invocation_command": [sys.executable, str(planner_script)],
         "planner_script_path": str(planner_script),
         "planner_script_realpath": str(planner_script.resolve()),
         "planner_script_blob_sha": _git_blob_sha(planner_script, repo_root),
+        "planner_head_tree_blob_sha": _git_head_tree_blob_sha(planner_script, repo_root),
+        "planner_worktree_status": _git_worktree_status(planner_script, repo_root),
         "wrapper_script_blob_sha": _git_blob_sha(wrapper_script, repo_root),
         "python_executable": sys.executable,
         "python_version": sys.version,
@@ -1763,7 +1852,8 @@ def build_provenance(
         "blockers": list(blockers),
         "planner_input_sha256": _sha256(planner_input_text),
         "raw_snapshot_sha256": _sha256(raw_snapshot_text),
-        "stderr_sha256": _sha256(stderr or ""),
+        "stderr_sha256": _sha256(stderr_str),
+        "stderr_excerpt": stderr_str[:500],
     }
 
 
