@@ -58,3 +58,16 @@ def test_normalized_anchor_comment_state_blocks_missing_required_metadata(tmp_pa
         result, exit_code = wrapper.run_preflight(100, "testowner/testrepo", [], path)
     assert exit_code == wrapper.EXIT_BLOCKED
     assert wrapper.BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID in result["blockers"]
+
+
+def test_normalized_anchor_comment_state_blocks_invalid_datetime_format(tmp_path):
+    fixture = _fixture()
+    fixture["anchor_comments"][0]["created_at"] = "not-a-date"
+    path = tmp_path / "fixture.json"
+    path.write_text(json.dumps(fixture), encoding="utf-8")
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path), mock.patch.object(
+        wrapper, "_load_schema", side_effect=_load_schema_without_input_validation
+    ):
+        result, exit_code = wrapper.run_preflight(100, "testowner/testrepo", [], path)
+    assert exit_code == wrapper.EXIT_BLOCKED
+    assert wrapper.BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID in result["blockers"]

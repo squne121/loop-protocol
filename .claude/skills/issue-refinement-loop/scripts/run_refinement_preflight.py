@@ -251,12 +251,52 @@ def _validate_with_schema(
     if not _JSONSCHEMA_AVAILABLE:
         return True, []
     try:
-        _jsonschema.validate(data, schema)
+        validator_cls = _jsonschema.validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+        validator = validator_cls(
+            schema,
+            format_checker=validator_cls.FORMAT_CHECKER,
+        )
+        errors = sorted(validator.iter_errors(data), key=lambda exc: list(exc.path))
+        if errors:
+            return False, [f"schema_validation_error: {errors[0].message}"]
+        format_errors = _validate_date_time_formats(data, schema)
+        if format_errors:
+            return False, format_errors
         return True, []
     except _jsonschema.ValidationError as exc:
         return False, [f"schema_validation_error: {exc.message}"]
     except Exception as exc:
         return False, [f"schema_validation_unexpected: {exc}"]
+
+
+def _validate_date_time_formats(data: Any, schema: dict, path: str = "$") -> list[str]:
+    schema_type = schema.get("type")
+    if schema.get("format") == "date-time" and isinstance(data, str):
+        candidate = data.replace("Z", "+00:00")
+        try:
+            datetime.fromisoformat(candidate)
+        except ValueError:
+            return [f"schema_validation_error: {path} must be a valid date-time"]
+        return []
+
+    if schema_type == "object" and isinstance(data, dict):
+        errors: list[str] = []
+        for key, value in data.items():
+            child_schema = schema.get("properties", {}).get(key)
+            if isinstance(child_schema, dict):
+                errors.extend(_validate_date_time_formats(value, child_schema, f"{path}.{key}"))
+        return errors
+
+    if schema_type == "array" and isinstance(data, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            errors: list[str] = []
+            for index, item in enumerate(data):
+                errors.extend(_validate_date_time_formats(item, item_schema, f"{path}[{index}]"))
+            return errors
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +472,7 @@ def _build_anchor_comment_state(
         "comment_updated_at": comment.get("updated_at"),
         "preliminary_classification": "feedback_update_required",
         "final_classification": None,
-        "classification_reason": None,
+        "classification_reason": "defaulted_by_preflight_schema_normalization; semantic classification deferred to #1008/#1011",
         "verified_claims": [],
         "unresolved_claims": [],
         "scope_impact": None,
@@ -500,7 +540,7 @@ def _validate_anchor_comment_url(
         # Fixture mode: look up comment from pre-fetched data
         comment_data = None
         for c in fixture_comments:
-            if isinstance(c, dict) and c.get("id") == comment_id:
+            if isinstance(c, dict) and str(c.get("id")) == str(comment_id):
                 comment_data = c
                 break
         if comment_data is None:
@@ -604,7 +644,7 @@ def _build_planner_input(
     comments: list[dict],
     known_context: Optional[dict],
     anchor_comment_feedback: Optional[dict] = None,
-    anchor_comment_ids: Optional[set[int]] = None,
+    anchor_comment_ids: Optional[set[str]] = None,
     now: Optional[str] = None,
 ) -> dict:
     """Build REFINEMENT_LOOP_PLANNER_INPUT_V1 from issue/comments data."""
@@ -621,7 +661,7 @@ def _build_planner_input(
         planner_comments = []
         for comment in comments:
             comment_id = comment.get("id")
-            if isinstance(comment_id, int) and comment_id in anchor_comment_ids:
+            if comment_id is not None and str(comment_id) in anchor_comment_ids:
                 sanitized = dict(comment)
                 sanitized["body"] = "[redacted: anchor comment snapshot stored in artifact]"
                 planner_comments.append(sanitized)
@@ -1198,7 +1238,7 @@ def run_preflight(
 
     anchor_comment_state: Optional[dict[str, Any]] = None
     anchor_comment_feedback: Optional[dict[str, Any]] = None
-    anchor_comment_ids: set[int] = set()
+    anchor_comment_ids: set[str] = set()
 
     # --- Anchor comment structural validation ---
     if active_anchor_urls:
@@ -1230,7 +1270,7 @@ def run_preflight(
             comment_payload = None
             if fixture_comment_lookup is not None:
                 for item in fixture_comment_lookup:
-                    if item.get("id") == comment_id:
+                    if str(item.get("id")) == str(comment_id):
                         comment_payload = item
                         break
             else:
@@ -1271,7 +1311,7 @@ def run_preflight(
                     rewrite_constraints=None,
                 )
 
-            anchor_comment_ids.add(comment_payload["id"])
+            anchor_comment_ids.add(str(comment_payload["id"]))
             anchor_comment_feedback = {
                 "url": anchor_comment_state["url"],
                 "preliminary_classification": anchor_comment_state["preliminary_classification"],

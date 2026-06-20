@@ -16,6 +16,17 @@ def _load_schema_without_input_validation(name: str):
 
 
 def _fixture() -> dict:
+    live_comment = {
+        "id": "5551001",
+        "body": "raw anchor body",
+        "html_url": "https://github.com/testowner/testrepo/issues/100#issuecomment-5551001",
+        "url": "https://api.github.com/repos/testowner/testrepo/issues/comments/5551001",
+        "user": {"login": "owner"},
+        "author_association": "OWNER",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "issue_url": "https://api.github.com/repos/testowner/testrepo/issues/100",
+    }
     return {
         "schema_version": "refinement_preflight_input/v1",
         "issue_number": 100,
@@ -27,21 +38,14 @@ def _fixture() -> dict:
             "body": "## Machine-Readable Contract\n\n```yaml\nissue_kind: implementation\ncontract_schema_version: v1\n```\n\n## Parent Issue\n\nnone\n\n## Parent Goal Ref\n\n- Goal: test\n\n## Current Validated Scope\n\n- x\n\n## Remaining Parent Gaps\n\n- [ ] none\n\n## Outcome\n\nx\n\n## In Scope\n\n- x\n\n## Out of Scope\n\n- y\n\n## Acceptance Criteria\n\n- [ ] AC1: x\n\n## Verification Commands\n\n```bash\n# baseline-expect: fail\n$ test -f missing\n```\n\n## Allowed Paths\n\n- x\n\n## Runtime Verification Applicability\n\ndecision: not_applicable\n\n## Stop Conditions\n\n- z\n\n## Required Skills\n\n- なし\n",
             "labels": [],
         },
-        "comments": [],
+        "comments": [live_comment],
         "anchor_comment_urls": [
             "https://github.com/testowner/testrepo/issues/100#issuecomment-5551001"
         ],
         "anchor_comments": [
             {
-                "id": 5551001,
-                "body": "raw anchor body",
-                "html_url": "https://github.com/testowner/testrepo/issues/100#issuecomment-5551001",
-                "url": "https://api.github.com/repos/testowner/testrepo/issues/comments/5551001",
-                "user": {"login": "owner"},
-                "author_association": "OWNER",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z",
-                "issue_url": "https://api.github.com/repos/testowner/testrepo/issues/100",
+                **live_comment,
+                "id": "5551001",
             }
         ],
     }
