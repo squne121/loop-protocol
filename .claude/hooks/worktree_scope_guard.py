@@ -1375,6 +1375,12 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
             _block_cleanup(cleanup_reason)
         return  # unreachable
 
+    # Deny force branch deletion even inside the active worktree (AC4c: -D / --force / -f)
+    # git branch -D/--force is mutating (not cleanup), but must be denied regardless of cwd.
+    if klass == "mutating" and _is_force_branch_delete(command):
+        _block_cleanup("branch_force_delete_denied")
+        return  # unreachable
+
     # From here, command is 'mutating' or 'unknown' (possible mutation).
     if issue and not resolution.git_available:
         # git binary unavailable for a possible mutation → fail-closed.
@@ -1504,14 +1510,29 @@ def _rel(path: str, project_root: str) -> str:
 #   require_clean: bool — if true, worktree must have empty porcelain=v1 status
 
 def _validate_cleanup_contract(contract: dict) -> bool:
-    """True iff contract has the required POST_MERGE_CLEANUP_REQUEST_V2 fields."""
-    return (
-        isinstance(contract, dict)
-        and contract.get("schema") == "POST_MERGE_CLEANUP_REQUEST_V2"
-        and isinstance(contract.get("worktree_path"), str)
-        and isinstance(contract.get("branch_name"), str)
-        and isinstance(contract.get("require_clean"), bool)
-    )
+    """True iff contract is a valid POST_MERGE_CLEANUP_REQUEST_V2.
+
+    require_clean must be exactly True (not just bool-typed or truthy) — AC4b/AC10.
+    worktree_path must be an absolute path string.
+    branch_name must be non-empty and free of shell control characters.
+    """
+    if not isinstance(contract, dict):
+        return False
+    if contract.get("schema") != "POST_MERGE_CLEANUP_REQUEST_V2":
+        return False
+    wt_path = contract.get("worktree_path")
+    if not isinstance(wt_path, str) or not os.path.isabs(wt_path):
+        return False
+    branch = contract.get("branch_name")
+    if not isinstance(branch, str) or not branch:
+        return False
+    # branch_name must not contain shell control / whitespace chars
+    if any(c in branch for c in " \t\n\r;|&<>$`(){}!"):
+        return False
+    # require_clean must be exactly True — not just truthy (AC4b/AC10)
+    if contract.get("require_clean") is not True:
+        return False
+    return True
 
 
 def load_cleanup_contract(project_root: str) -> dict | None:
@@ -1544,13 +1565,75 @@ def load_cleanup_contract(project_root: str) -> dict | None:
     return None
 
 
+def _parse_worktree_list_branch(output: str, target_path: str) -> str | None:
+    """Parse `git worktree list --porcelain` output; return branch name for target_path.
+
+    Returns branch name (without refs/heads/ prefix) if found, else None.
+    """
+    current_wt: str | None = None
+    current_branch: str | None = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            current_wt = os.path.realpath(line[9:].strip())
+            current_branch = None
+        elif line.startswith("branch "):
+            current_branch = line[7:].strip()
+            if current_branch.startswith("refs/heads/"):
+                current_branch = current_branch[len("refs/heads/"):]
+        elif line == "":
+            if current_wt == target_path:
+                return current_branch
+    if current_wt == target_path:
+        return current_branch
+    return None
+
+
+def _is_force_branch_delete(command: str) -> bool:
+    """True iff command is a git branch force-delete or multi-target variant (AC4c).
+
+    Denied forms: -D, --force, -f, --delete --force, -d with >1 target.
+    Only git branch -d <exactly-one-branch> is NOT force-delete.
+    """
+    toks = _tokenize(command)
+    if not toks or toks[0] != "git" or len(toks) < 3:
+        return False
+    # Skip -C <path> flags to find the subcommand
+    i = 1
+    while i < len(toks):
+        if toks[i] == "-C" and i + 1 < len(toks):
+            i += 2
+        elif toks[i].startswith("-C") and len(toks[i]) > 2:
+            i += 1
+        elif toks[i].startswith("-"):
+            i += 1
+        else:
+            break
+    if i >= len(toks) or toks[i] != "branch":
+        return False
+    opts = toks[i + 1:]
+    if not opts:
+        return False
+    _FORCE_OPTS = {"-D", "--force", "-f"}
+    if opts[0] in _FORCE_OPTS:
+        return True
+    if opts[0] == "--delete" and any(o in opts[1:] for o in _FORCE_OPTS):
+        return True
+    # -d with more than one target (e.g. git branch -d foo bar)
+    if opts[0] == "-d" and len(opts) > 2:
+        return True
+    return False
+
+
 def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple[str, str]:
     """Decide allow/deny for a cleanup-class command (AC4).
 
     Returns (decision, reason).
     Allow only for exact argv forms with a valid matching contract.
-    Deny conditions: AC4a (no contract), AC4b (path mismatch/extra args),
-                    AC4c (-D/force), AC4d (traversal/sibling/multiple).
+    Deny conditions:
+      AC4a: no contract
+      AC4b: path mismatch/extra args/require_clean not true/dirty worktree
+      AC4c: -D/--force/-f/multiple targets
+      AC4d: path traversal/sibling/outside .claude/worktrees/
     """
     if contract is None:
         return "deny", "no_cleanup_contract"  # AC4a
@@ -1560,9 +1643,15 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         return "deny", "not_a_git_cleanup_command"
 
     if toks[1] == "worktree" and toks[2] == "remove":
-        # Exact argv only: git worktree remove <path>  (AC4b: no wildcard/chain)
+        # Exact argv only: git worktree remove <path>  (AC4b: no wildcard/chain/extra)
         if len(toks) != 4:
             return "deny", "worktree_remove_wrong_argc"
+
+        # require_clean must be exactly True in contract — already validated by
+        # _validate_cleanup_contract, but double-check here for defence-in-depth (AC4b/AC10)
+        if contract.get("require_clean") is not True:
+            return "deny", "require_clean_not_true"
+
         path_arg = toks[3]
         actual_path = (
             os.path.realpath(path_arg)
@@ -1570,20 +1659,54 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
             else os.path.realpath(os.path.join(cwd, path_arg))
         )
         expected_path = os.path.realpath(contract["worktree_path"])
-        # AC4d: path traversal / sibling prefix protection
-        try:
-            common = os.path.commonpath([expected_path, actual_path])
-        except ValueError:
-            return "deny", "worktree_path_traversal"
+
+        # AC4d: exact-path match (covers path traversal / sibling prefix)
         if actual_path != expected_path:
             return "deny", "worktree_path_mismatch"
+
+        # Contract worktree_path must be strictly under <project_root>/.claude/worktrees/
+        # This prevents stale contracts from targeting arbitrary filesystem paths.
+        _pr = resolve_project_root()
+        worktrees_dir = os.path.realpath(os.path.join(_pr, ".claude", "worktrees"))
+        if not expected_path.startswith(worktrees_dir + os.sep):
+            return "deny", "worktree_path_outside_worktrees_dir"
+
+        # Verify worktree exists in `git worktree list` and branch matches contract
+        try:
+            wl = subprocess.run(
+                ["git", "-C", _pr, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "deny", "worktree_list_exception"
+        if wl.returncode != 0:
+            return "deny", "worktree_list_failed"
+        found_branch = _parse_worktree_list_branch(wl.stdout, expected_path)
+        if found_branch is None:
+            return "deny", "worktree_not_in_list"
+        if found_branch != contract.get("branch_name", ""):
+            return "deny", "worktree_branch_mismatch"
+
+        # Clean check: git -C <path> status --porcelain=v1 -z must be empty (AC4b/AC10)
+        try:
+            st = subprocess.run(
+                ["git", "-C", expected_path, "status", "--porcelain=v1", "-z"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "deny", "status_command_exception"
+        if st.returncode != 0:
+            return "deny", "status_command_failed"
+        if st.stdout:
+            return "deny", "worktree_dirty"
+
         return "allow", "cleanup_worktree_remove_ok"
 
     if toks[1] == "branch" and toks[2] == "-d":
         # Exact argv only: git branch -d <branch>  (AC4c: -D/--force/--delete denied)
         if len(toks) != 4:
             return "deny", "branch_delete_wrong_argc"
-        if toks[3] != contract["branch_name"]:
+        if toks[3] != contract.get("branch_name", ""):
             return "deny", "branch_name_mismatch"
         return "allow", "cleanup_branch_delete_ok"
 
@@ -1670,6 +1793,10 @@ def build_decision(payload: dict) -> dict:
         contract = load_cleanup_contract(project_root)
         decision, reason = _decide_cleanup_bash(command, cwd, contract)
         return _v2("cleanup", cwd_class, decision, reason)
+
+    # Deny force branch deletion even inside the active worktree (AC4c)
+    if klass == "mutating" and _is_force_branch_delete(command):
+        return _v2("mutating", cwd_class, "deny", "branch_force_delete_denied")
 
     # mutating or unknown
     if not issue:
