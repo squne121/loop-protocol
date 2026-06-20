@@ -398,6 +398,17 @@ function validateHooksJson(hooksPath, failures) {
     );
   }
 
+  // AC3: structural validation for PermissionRequest, Stop, SubagentStop
+  assert(Array.isArray(parsed?.hooks?.PermissionRequest), 'hooks.json: must have hooks.PermissionRequest array (AC3 #1020)', failures);
+  assert(Array.isArray(parsed?.hooks?.Stop), 'hooks.json: must have hooks.Stop array (AC3 #1020)', failures);
+  assert(Array.isArray(parsed?.hooks?.SubagentStop), 'hooks.json: must have hooks.SubagentStop array (AC3 #1020)', failures);
+  const permissionRequestEntries = parsed?.hooks?.PermissionRequest ?? [];
+  assert(permissionRequestEntries.length >= 1, 'hooks.json: PermissionRequest must have at least one entry (AC3 #1020)', failures);
+  const stopEntries = parsed?.hooks?.Stop ?? [];
+  assert(stopEntries.length >= 1, 'hooks.json: Stop must have at least one entry (AC3 #1020)', failures);
+  const subagentStopEntries = parsed?.hooks?.SubagentStop ?? [];
+  assert(subagentStopEntries.length >= 1, 'hooks.json: SubagentStop must have at least one entry (AC3 #1020)', failures);
+
   const allHookCommands = [];
   for (const eventKey of ['SubagentStart', 'PreToolUse']) {
     const entries = parsed?.hooks?.[eventKey] ?? [];
@@ -544,6 +555,8 @@ function validateAgents() {
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
+  // AC1: config.toml must not define a [hooks] section; hooks live in .codex/hooks.json
+  assert(!configParsed?.hooks, 'config.toml must not define a [hooks] section; use .codex/hooks.json instead (AC1 #1020)', failures);
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
   assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills: must not exist as a repo-shared skill surface', failures);
 
