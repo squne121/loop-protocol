@@ -23,6 +23,7 @@ const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
 const shadowLogPath = path.join(repoRoot, '.guard_shadow_log.jsonl');
 
 const requiredAgentNames = [
+  'agent-ops-auditor',
   'codebase-investigator',
   'implementation-worker',
   'issue-author',
@@ -48,6 +49,7 @@ const expectedProfiles = new Set(['loop-protocol-readonly', 'loop-protocol-rtk']
 //   gpt-5.4-mini extra-high  = Sonnet equivalent (medium complexity tasks)
 //   gpt-5.4 medium           = Opus equivalent   (heavy implementation / review tasks)
 const reasoningMap = new Map([
+  ['agent-ops-auditor', { model: 'gpt-5.4-mini', effort: 'medium' }],
   ['codebase-investigator', { model: 'gpt-5.4-mini', effort: 'medium' }],
   ['implementation-worker', { model: 'gpt-5.4', effort: 'medium' }],
   ['issue-author', { model: 'gpt-5.4-mini', effort: 'xhigh' }],
@@ -61,6 +63,7 @@ const reasoningMap = new Map([
 ]);
 
 const readOnlyAgents = new Set([
+  'agent-ops-auditor',
   'codebase-investigator',
   'issue-reviewer',
   'pr-reviewer-lite',

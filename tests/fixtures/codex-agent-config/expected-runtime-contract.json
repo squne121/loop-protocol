@@ -1,5 +1,17 @@
 {
   "required_agents": {
+    "agent-ops-auditor": {
+      "path": ".codex/agents/agent-ops-auditor.toml",
+      "claude_agent_path": ".claude/agents/agent-ops-auditor.md",
+      "claude_model": "haiku",
+      "claude_permission_mode": "dontAsk",
+      "model": "gpt-5.4-mini",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none",
+      "repo_local_skill_surfaces": []
+    },
     "implementation-worker": {
       "path": ".codex/agents/implementation-worker.toml",
       "claude_agent_path": ".claude/agents/implementation-worker.md",
