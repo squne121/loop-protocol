@@ -1,5 +1,7 @@
 # Test Issue: Broken machine-readable contract
 
+## Machine-Readable Contract
+
 ## Outcome
 
 This issue has a malformed machine-readable contract.
@@ -24,3 +26,7 @@ status: planning
 ```bash
 uv run pytest tests/ -v
 ```
+
+## Allowed Paths
+
+- なし
