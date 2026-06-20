@@ -267,15 +267,21 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
 
 
 
+CODEX_RULES_DEFAULT_PATH = REPO_ROOT / ".codex" / "rules" / "default.rules"
+# B5: The startup preflight command that must be documented in the rules file
+REQUIRED_PREFLIGHT_GATE_CMD = "uv run python3 scripts/check_local_main_branch_state.py --json"
+
+
 def assert_local_main_branch_guard_preflight(hooks: dict) -> list[str]:
     """
     AC17: Validate startup preflight for local_main_branch_guard.
 
     Checks:
     1. check_local_main_branch_state.py exists (startup preflight script)
-    2. .codex/hooks.json has local_main_branch_guard in PreToolUse and PermissionRequest
-    3. No double-definition of local_main_branch_guard per event/matcher
-    4. Handler form is nested under hooks[] (not at matcher group level)
+    2. .codex/rules/default.rules documents startup preflight gate (B5)
+    3. .codex/hooks.json has local_main_branch_guard in PreToolUse and PermissionRequest
+    4. No double-definition of local_main_branch_guard per event/matcher
+    5. Handler form is nested under hooks[] (not at matcher group level)
     """
     failures: list[str] = []
 
@@ -286,6 +292,20 @@ def assert_local_main_branch_guard_preflight(hooks: dict) -> list[str]:
             "scripts/check_local_main_branch_state.py: startup preflight script missing "
             "(required for local_main_branch_guard — Codex PreToolUse is not a complete interception boundary)"
         )
+
+    # B5: Check 2: .codex/rules/default.rules must document the startup preflight gate
+    if not CODEX_RULES_DEFAULT_PATH.exists():
+        failures.append(
+            f"{CODEX_RULES_DEFAULT_PATH.relative_to(REPO_ROOT)}: rules file missing — "
+            "startup preflight gate must be documented here"
+        )
+    else:
+        rules_text = CODEX_RULES_DEFAULT_PATH.read_text(encoding="utf-8")
+        if REQUIRED_PREFLIGHT_GATE_CMD not in rules_text:
+            failures.append(
+                f".codex/rules/default.rules: startup preflight gate not documented — "
+                f"must contain: {REQUIRED_PREFLIGHT_GATE_CMD!r}"
+            )
 
     hooks_root = hooks.get("hooks", {})
 

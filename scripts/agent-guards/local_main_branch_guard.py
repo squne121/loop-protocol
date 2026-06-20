@@ -6,7 +6,7 @@ Shared core logic for the local root checkout branch drift guard.
 Used by both Claude Code (.claude/hooks/local_main_branch_guard.sh)
 and Codex CLI (.codex/hooks/local_main_branch_guard.sh) wrappers.
 
-Guard judgment: When running in local root context (cwd == primary worktree root
+Guard judgment: When running in local root context (cwd is under primary worktree
 and NOT inside a linked issue worktree), block any Bash command that would change
 the local root checkout away from the default branch.
 
@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -116,6 +117,17 @@ def get_primary_worktree_path(cwd: str | None = None) -> str | None:
         return None
 
 
+def get_cwd_git_toplevel(cwd: str) -> str | None:
+    """
+    Get the git toplevel for the given cwd.
+    Used to determine which worktree cwd belongs to.
+    """
+    rc, out = run_git("rev-parse", "--show-toplevel", cwd=cwd)
+    if rc == 0 and out:
+        return out
+    return None
+
+
 def get_current_branch(cwd: str | None = None) -> str | None:
     """Get current branch name. Returns None if detached HEAD."""
     rc, out = run_git("branch", "--show-current", cwd=cwd)
@@ -155,7 +167,11 @@ def resolve_default_branch(cwd: str | None = None) -> str:
 
 def is_local_root_context(cwd: str) -> bool:
     """
-    Return True if cwd is the primary worktree root (NOT inside a linked worktree).
+    Return True if cwd is under the primary worktree root (NOT inside a linked worktree).
+
+    B1 fix: Compare cwd's git toplevel against the primary worktree catalog path.
+    This ensures subdirectories of the primary worktree (scripts/, docs/, etc.)
+    are also correctly detected as local root context.
 
     Uses git worktree list --porcelain -z catalog to identify primary root.
     Does NOT rely on git rev-parse --show-toplevel alone.
@@ -167,15 +183,25 @@ def is_local_root_context(cwd: str) -> bool:
     if project_root is None:
         return False
 
-    real_cwd = os.path.realpath(cwd)
     real_root = os.path.realpath(project_root)
 
-    # cwd must equal primary worktree root
-    if real_cwd != real_root:
-        return False
+    # B1: Use git toplevel of cwd to handle subdirectories correctly.
+    # If CLAUDE_PROJECT_DIR is set, also accept cwd being under that root.
+    cwd_toplevel = get_cwd_git_toplevel(cwd)
+    if cwd_toplevel is None:
+        # Can't determine git toplevel; fall back to checking if cwd starts with root
+        real_cwd = os.path.realpath(cwd)
+        if real_cwd != real_root and not real_cwd.startswith(real_root + os.sep):
+            return False
+    else:
+        real_cwd_toplevel = os.path.realpath(cwd_toplevel)
+        if real_cwd_toplevel != real_root:
+            # cwd's toplevel is a different worktree (linked worktree)
+            return False
 
-    # Also check cwd is NOT under .claude/worktrees/
-    # (defensive: if worktrees are inside the project root)
+    # Check cwd is NOT under .claude/worktrees/
+    # (linked worktrees inside the project root should not trigger this guard)
+    real_cwd = os.path.realpath(cwd)
     worktrees_subdir = os.path.join(real_root, ".claude", "worktrees")
     if real_cwd.startswith(worktrees_subdir + os.sep) or real_cwd == worktrees_subdir:
         return False
@@ -210,6 +236,27 @@ def _resolve_project_root(cwd: str) -> str | None:
 
 # ─── Command parsing ──────────────────────────────────────────────────────────
 
+# Git global options that affect working directory or config.
+# B2: These must be normalized away before subcommand detection.
+# Presence of -C, --git-dir, --work-tree, --config-env → fail-closed in local root.
+_GIT_GLOBAL_OPTS_WITH_ARG = {
+    "-C", "-c", "--git-dir", "--work-tree", "--config-env",
+    "--namespace", "--super-prefix", "--exec-path",
+}
+_GIT_GLOBAL_FLAGS = {
+    "--bare", "--no-pager", "--no-replace-objects", "--no-optional-locks",
+    "--version", "--help", "--html-path", "--man-path", "--info-path",
+    "--list-cmds",
+}
+# These git global options change execution context and must be fail-closed
+_GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "--git-dir", "--work-tree", "--config-env"}
+
+# Shell metacharacters that indicate compound/unparseable commands
+_SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(")
+
+# Leading env assignment pattern: NAME=value (possibly multiple)
+_LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
+
 # Patterns for allowed read-only / non-branch-mutating commands
 READONLY_PATTERNS = [
     r"^git\s+(status|fetch|log|show|diff|blame|annotate|shortlog|describe)(\s|$)",
@@ -231,45 +278,92 @@ CHECKOUT_PATH_RESTORE_PATTERNS = [
     r"^git\s+restore(\s|$)",                    # git restore <path>
 ]
 
-# git switch/checkout to default branch (recovery)
-# Will be matched after resolving default_branch
-BRANCH_MUTATION_PATTERNS = [
-    # git switch variants that mutate branch
+# Minimal allowlist when root is already drifted.
+# B4: All commands NOT in this list are blocked.
+# Keys are regex patterns; value is True = allow.
+_DRIFTED_ALLOWLIST_PATTERNS = [
+    # git read-only
+    r"^git\s+status(\s|$)",
+    r"^git\s+branch\s+--show-current(\s|$)",
+    r"^git\s+rev-parse(\s|$)",
+    r"^git\s+worktree\s+(list|prune)(\s|$)",
+    r"^git\s+fetch(\s|$)",
+    # git recovery (switch/checkout to default branch — verified separately)
     r"^git\s+switch\s+",
-    # git checkout <branch> forms (NOT path restore)
-    r"^git\s+checkout\s+(?!--)(?!HEAD\s+--)(?!HEAD~\d+\s+--)(?!--pathspec)(?!-p)(?!-q\s+--)(?!\S+\s+--\s+)",
-    # git branch -m/-M (rename)
-    r"^git\s+branch\s+-[mM]\s+",
-    # gh pr checkout
-    r"^gh\s+pr\s+checkout\s+",
-    # hub pr checkout
-    r"^hub\s+pr\s+checkout\s+",
-]
-
-# Compound / wrapped shell patterns that are fail-closed
-COMPOUND_SHELL_PATTERNS = [
-    r"^bash\s+",
-    r"^sh\s+",
-    r"^zsh\s+",
-    r"^env\s+",
-    r"^command\s+",
-    r"&&",
-    r"\|\|",
-    r";",
-    r"`",
-    r"\$\(",
-]
-
-# Allow-list when already drifted
-ALLOWED_WHEN_DRIFTED_PATTERNS = [
-    # git read-only + recovery
-    r"^git\s+(status|branch\s+--show-current|rev-parse(\s|$)|worktree\s+(list|prune)|fetch)(\s|$)",
-    r"^git\s+switch\s+",   # will be further checked against default branch
-    r"^git\s+checkout\s+", # will be further checked against default branch
+    r"^git\s+checkout\s+",
     # gh read-only
     r"^gh\s+issue\s+(view|list)(\s|$)",
     r"^gh\s+pr\s+(view|list|status)(\s|$)",
 ]
+
+
+def _has_leading_env_assignment(cmd: str) -> bool:
+    """
+    Return True if cmd starts with one or more NAME=value env assignments.
+    E.g.: FOO=bar git switch issue-*
+    B3: leading env assignments must be detected for fail-closed handling.
+    """
+    return bool(_LEADING_ENV_ASSIGN_RE.match(cmd))
+
+
+def _strip_leading_env_assignments(cmd: str) -> str:
+    """Strip leading NAME=value env assignments from cmd."""
+    return _LEADING_ENV_ASSIGN_RE.sub("", cmd).strip()
+
+
+def _has_shell_metachar(cmd: str) -> bool:
+    """Return True if cmd contains shell metacharacters indicating compound commands."""
+    return bool(_SHELL_METACHAR_RE.search(cmd))
+
+
+def _normalize_git_global_opts(tokens: list[str]) -> tuple[list[str], bool]:
+    """
+    Normalize git global options from a token list.
+    Returns (remaining_tokens_starting_from_subcommand, fail_closed).
+
+    B2: If any fail-closed global option (-C, --git-dir, --work-tree, --config-env)
+    is present, return fail_closed=True.
+
+    Handles both:
+      git -C . switch issue-*    (option + value as separate tokens)
+      git --git-dir=/path switch  (option=value form)
+    """
+    if not tokens or tokens[0] != "git":
+        return tokens, False
+
+    fail_closed = False
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        # Check for option=value form: --git-dir=/path
+        opt_key = tok.split("=", 1)[0] if "=" in tok else tok
+        if opt_key in _GIT_GLOBAL_OPTS_WITH_ARG:
+            if opt_key in _GIT_GLOBAL_OPTS_FAILCLOSED:
+                fail_closed = True
+            # Skip: the option and its value (if separate token)
+            if "=" not in tok:
+                i += 2  # skip option and value token
+            else:
+                i += 1  # value is embedded
+        elif tok in _GIT_GLOBAL_FLAGS:
+            i += 1
+        else:
+            # Reached the subcommand
+            break
+    # Remaining: ["git"] + tokens[i:]  (preserve "git" at front for downstream matching)
+    return ["git"] + tokens[i:], fail_closed
+
+
+def tokenize_command(cmd: str) -> list[str] | None:
+    """
+    Tokenize command using shlex.split().
+    Returns None if parsing fails (treat as unparseable → fail-closed).
+    B6: shlex.split() replaces cmd.split() for correct quoting handling.
+    """
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return None
 
 
 def is_readonly_command(cmd: str) -> bool:
@@ -291,18 +385,16 @@ def is_path_restore_command(cmd: str) -> bool:
 
 
 def is_compound_or_wrapped(cmd: str) -> bool:
-    """Return True if command appears to be a compound/wrapped shell command."""
+    """
+    Return True if command appears to be a compound/wrapped shell command.
+    B6: Uses shlex parsing and metachar detection.
+    """
+    # Check for shell metacharacters (;, &&, ||, |, `, $()
+    if _has_shell_metachar(cmd):
+        return True
     # Check for shell wrappers at the start
-    if re.match(r"^(bash|sh|zsh)\s+(-[a-z]+\s+)*[\"']", cmd):
+    if re.match(r"^(bash|sh|zsh)\s+", cmd):
         return True
-    if re.match(r"^(bash|sh|zsh)\s+(-[a-z]+\s+)*\"?\$\(", cmd):
-        return True
-    if re.match(r"^(bash|sh|zsh)\s+(-[a-z]+\s+)*-c\s+", cmd):
-        return True
-    # Check for shell-level compound operators
-    for pattern in ["&&", "||", ";", "`"]:
-        if pattern in cmd:
-            return True
     # env prefix
     if re.match(r"^env\s+", cmd):
         return True
@@ -312,36 +404,117 @@ def is_compound_or_wrapped(cmd: str) -> bool:
     return False
 
 
-def extract_target_branch_from_git_switch(cmd: str) -> str | None:
-    """Extract branch name from git switch command."""
-    cmd = cmd.strip()
-    # git switch [options] <branch>
-    # Options that create/change branches:
-    # -c/-C <new-branch>, --orphan <branch>, --detach [<start>], --guess <remote>
-    # We want the target branch for all these
+def _rebuild_normalized_cmd(tokens: list[str]) -> str:
+    """Rebuild a normalized command string from tokens (for regex matching)."""
+    return " ".join(tokens)
 
-    # git switch --detach [<commit>]
+
+def extract_target_branch_from_tokens(tokens: list[str], subcommand: str) -> str | None:
+    """
+    Extract target branch from tokenized git switch/checkout/branch command.
+    B6: argv-based extraction replaces regex-on-string.
+    """
+    if subcommand == "switch":
+        return _extract_switch_branch_from_tokens(tokens)
+    elif subcommand == "checkout":
+        return _extract_checkout_branch_from_tokens(tokens)
+    elif subcommand == "branch":
+        return _extract_branch_rename_from_tokens(tokens)
+    return None
+
+
+def _extract_switch_branch_from_tokens(tokens: list[str]) -> str | None:
+    """Extract target branch from git switch token list (tokens[0]='git', tokens[1]='switch')."""
+    # tokens: ["git", "switch", ...]
+    args = tokens[2:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--detach",):
+            # Next arg is start-point (optional)
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                return args[i + 1]
+            return "<detached>"
+        if a in ("--orphan", "--guess", "-c", "-C"):
+            if i + 1 < len(args):
+                return args[i + 1]
+            return None
+        if a.startswith("--orphan="):
+            return a.split("=", 1)[1]
+        if a.startswith("-c=") or a.startswith("-C="):
+            return a.split("=", 1)[1]
+        if a.startswith("-") and len(a) == 2:
+            # Short flag without value (e.g. -d), skip
+            i += 1
+            continue
+        if a.startswith("--"):
+            # Unknown long flag, skip
+            i += 1
+            continue
+        # Non-flag arg = branch name
+        return a
+        i += 1
+    return None
+
+
+def _extract_checkout_branch_from_tokens(tokens: list[str]) -> str | None:
+    """Extract target branch from git checkout token list."""
+    args = tokens[2:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--detach":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                return args[i + 1]
+            return "<detached>"
+        if a in ("--orphan", "--ignore-other-worktrees", "-b", "-B"):
+            if i + 1 < len(args):
+                return args[i + 1]
+            return None
+        if a == "--":
+            # Everything after -- is a path, not a branch
+            return None
+        if a.startswith("-") and not a.startswith("--"):
+            i += 1
+            continue
+        if a.startswith("--"):
+            i += 1
+            continue
+        # Non-flag = branch name
+        return a
+        i += 1
+    return None
+
+
+def _extract_branch_rename_from_tokens(tokens: list[str]) -> str | None:
+    """Extract new branch name from git branch -m/-M tokens."""
+    # tokens: ["git", "branch", "-m"/"M", old?, new]
+    args = tokens[2:]
+    # Find -m or -M flag
+    non_flags = [a for a in args if not a.startswith("-")]
+    # If two non-flags: first=old, second=new; if one: it's the new name
+    if len(non_flags) >= 2:
+        return non_flags[1]
+    elif len(non_flags) == 1:
+        return non_flags[0]
+    return None
+
+
+def extract_target_branch_from_git_switch(cmd: str) -> str | None:
+    """Extract branch name from git switch command (regex fallback)."""
+    cmd = cmd.strip()
     m = re.match(r"^git\s+switch\s+(?:.*\s+)?--detach(?:\s+(\S+))?", cmd)
     if m:
         return m.group(1) or "<detached>"
-
-    # git switch --orphan <branch>
     m = re.match(r"^git\s+switch\s+(?:.*\s+)?--orphan\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git switch -c/-C <new-branch> [<start-point>]
     m = re.match(r"^git\s+switch\s+(?:.*\s+)?-[cC]\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git switch --guess <remote-tracking-branch>
     m = re.match(r"^git\s+switch\s+(?:.*\s+)?--guess\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git switch <branch> (simple form, last non-flag arg)
-    # Strip options starting with - and get last arg
     parts = cmd.split()
     branches = [p for p in parts[2:] if not p.startswith("-")]
     if branches:
@@ -350,30 +523,20 @@ def extract_target_branch_from_git_switch(cmd: str) -> str | None:
 
 
 def extract_target_branch_from_git_checkout(cmd: str) -> str | None:
-    """Extract branch name from git checkout command (branch-switching forms only)."""
+    """Extract branch name from git checkout command (regex fallback)."""
     cmd = cmd.strip()
-    # git checkout --detach [<commit>]
     m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--detach(?:\s+(\S+))?", cmd)
     if m:
         return m.group(1) or "<detached>"
-
-    # git checkout --orphan <branch>
     m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--orphan\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git checkout --ignore-other-worktrees <branch>
     m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--ignore-other-worktrees\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git checkout -b/-B <branch> [<start>]
     m = re.match(r"^git\s+checkout\s+(?:.*\s+)?-[bB]\s+(\S+)", cmd)
     if m:
         return m.group(1)
-
-    # git checkout <branch> (simple form)
-    # Last arg that doesn't start with -
     parts = cmd.split()
     branches = [p for p in parts[2:] if not p.startswith("-")]
     if branches:
@@ -382,10 +545,9 @@ def extract_target_branch_from_git_checkout(cmd: str) -> str | None:
 
 
 def extract_target_branch_from_git_branch_rename(cmd: str) -> str | None:
-    """Extract new branch name from git branch -m/-M <old> <new> or -m/-M <new>."""
+    """Extract new branch name from git branch -m/-M."""
     m = re.match(r"^git\s+branch\s+-[mM]\s+(\S+)(?:\s+(\S+))?", cmd)
     if m:
-        # If two args: first is old, second is new; if one arg: it's the new name
         return m.group(2) if m.group(2) else m.group(1)
     return None
 
@@ -404,8 +566,6 @@ def has_inline_env_override(cmd: str) -> bool:
     an inline env assignment for LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE.
     Inline env overrides are NOT allowed; only hook process env is.
     """
-    # Match leading env assignments like: VAR=value command ...
-    # or inline: ... LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE=1 git switch ...
     pattern = r"(?:^|\s)LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE\s*=\s*\S+"
     return bool(re.search(pattern, cmd))
 
@@ -474,7 +634,6 @@ def evaluate(
     # Step 5: Compound/wrapped commands in local root context: fail-closed
     # (Must check BEFORE readonly: "git status || git switch issue-*" starts with "git status")
     if is_compound_or_wrapped(cmd):
-        # Could contain hidden branch mutation
         return _result(
             status="block",
             reason_code=REASON_UNPARSEABLE,
@@ -484,8 +643,51 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
+    # B3: Leading env assignments in local root context — fail-closed.
+    # LOOP_DEFAULT_BRANCH=... or FOO=bar git switch ... are blocked.
+    if _has_leading_env_assignment(cmd):
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # B6: Tokenize with shlex; shlex parse failure → fail-closed
+    tokens = tokenize_command(cmd)
+    if tokens is None:
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # B2: Normalize git global options.
+    # If fail-closed global options (-C, --git-dir, --work-tree, --config-env) present → block.
+    normalized_tokens = tokens
+    git_global_fail_closed = False
+    if tokens and tokens[0] == "git":
+        normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(tokens)
+        if git_global_fail_closed:
+            return _result(
+                status="block",
+                reason_code=REASON_UNPARSEABLE,
+                current_branch=current_branch,
+                target_branch=None,
+                target_branch_kind=None,
+                hook_flavor=hook_flavor,
+            )
+
+    # Rebuild normalized cmd string for pattern matching
+    normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
+
     # Step 6: Read-only commands are always allowed
-    if is_readonly_command(cmd):
+    if is_readonly_command(normalized_cmd):
         return _result(
             status="allow",
             reason_code=REASON_READONLY,
@@ -496,7 +698,7 @@ def evaluate(
         )
 
     # Step 7: Path restore commands are not branch mutations
-    if is_path_restore_command(cmd):
+    if is_path_restore_command(normalized_cmd):
         return _result(
             status="allow",
             reason_code=REASON_READONLY,
@@ -510,11 +712,11 @@ def evaluate(
     already_drifted = (current_branch is not None and current_branch != default_branch)
 
     # Step 9: Check if this is a branch mutation command
-    is_branch_mutation = _is_branch_mutation_command(cmd)
+    is_branch_mutation = _is_branch_mutation_command(normalized_cmd, normalized_tokens)
 
     if is_branch_mutation:
-        # Extract target branch
-        target_branch = _extract_target_branch(cmd)
+        # Extract target branch using argv-based extraction (B6)
+        target_branch = _extract_target_branch(normalized_cmd, normalized_tokens)
         target_kind = classify_branch(target_branch, default_branch) if target_branch else "unknown"
 
         # Allow recovery to default branch
@@ -538,9 +740,9 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 10: Already-drifted root: block mutating gh commands and uv/pnpm
+    # Step 10: Already-drifted root: use explicit allowlist (B4)
     if already_drifted:
-        if _is_blocked_when_drifted(cmd):
+        if not _is_allowed_when_drifted(normalized_cmd):
             return _result(
                 status="block",
                 reason_code=REASON_ALREADY_DRIFTED,
@@ -561,8 +763,10 @@ def evaluate(
     )
 
 
-def _is_branch_mutation_command(cmd: str) -> bool:
-    """Return True if cmd is a branch mutation command."""
+def _is_branch_mutation_command(cmd: str, tokens: list[str] | None = None) -> bool:
+    """Return True if cmd is a branch mutation command.
+    B2/B6: Works on normalized cmd (after git global option stripping).
+    """
     if re.match(r"^git\s+switch\s+", cmd):
         return True
     if re.match(r"^git\s+checkout\s+", cmd):
@@ -577,8 +781,17 @@ def _is_branch_mutation_command(cmd: str) -> bool:
     return False
 
 
-def _extract_target_branch(cmd: str) -> str | None:
-    """Extract target branch from a branch mutation command."""
+def _extract_target_branch(cmd: str, tokens: list[str] | None = None) -> str | None:
+    """Extract target branch from a branch mutation command.
+    B6: Uses argv-based extraction when tokens are available.
+    """
+    if tokens and len(tokens) >= 2 and tokens[0] == "git":
+        subcommand = tokens[1] if len(tokens) > 1 else ""
+        if subcommand in ("switch", "checkout", "branch"):
+            result = extract_target_branch_from_tokens(tokens, subcommand)
+            if result is not None:
+                return result
+    # Fallback to regex
     if re.match(r"^git\s+switch\s+", cmd):
         return extract_target_branch_from_git_switch(cmd)
     if re.match(r"^git\s+checkout\s+", cmd):
@@ -590,8 +803,22 @@ def _extract_target_branch(cmd: str) -> str | None:
     return None
 
 
+def _is_allowed_when_drifted(cmd: str) -> bool:
+    """
+    B4: Return True if command is in the explicit allowlist when root is already drifted.
+    All other commands are blocked (allowlist-closed, not blocklist-closed).
+    """
+    for pattern in _DRIFTED_ALLOWLIST_PATTERNS:
+        if re.match(pattern, cmd):
+            return True
+    return False
+
+
 def _is_blocked_when_drifted(cmd: str) -> bool:
-    """Return True if command is blocked when root is already drifted."""
+    """
+    Legacy blocklist check — kept for backward compatibility with existing tests.
+    In evaluate(), _is_allowed_when_drifted is used instead (B4 fix).
+    """
     # Block mutating gh commands
     if re.match(r"^gh\s+issue\s+(edit|comment|close|reopen|delete|lock|unlock)(\s|$)", cmd):
         return True

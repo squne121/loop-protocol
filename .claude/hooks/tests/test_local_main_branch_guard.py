@@ -39,6 +39,9 @@ from local_main_branch_guard import (
     _is_branch_mutation_command,
     _extract_target_branch,
     _is_blocked_when_drifted,
+    _has_leading_env_assignment,
+    _normalize_git_global_opts,
+    _is_allowed_when_drifted,
     REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
     REASON_RECOVERY,
@@ -604,3 +607,215 @@ class TestAC16UnparseableCompoundCommands:
         assert is_compound_or_wrapped("bash -c 'git switch issue-*'") is True
         assert is_compound_or_wrapped("git status") is False
         assert is_compound_or_wrapped("git switch main") is False
+
+
+# ─── B1: cwd subdirectory of primary worktree is local root context ──────────
+
+def eval_in_local_root_subdir(command: str, repo_root: str, cwd: str, env_override: dict | None = None) -> dict:
+    """
+    Like eval_in_local_root but sets CLAUDE_PROJECT_DIR to repo_root (not cwd).
+    Used for B1 tests where cwd is a subdirectory of the primary worktree.
+    """
+    import os
+    old_env = os.environ.copy()
+    try:
+        os.environ["CLAUDE_PROJECT_DIR"] = repo_root
+        if env_override:
+            for k, v in env_override.items():
+                os.environ[k] = v
+        result = evaluate(command=command, cwd=cwd, hook_flavor="claude")
+    finally:
+        for k in list(os.environ.keys()):
+            if k not in old_env:
+                del os.environ[k]
+            else:
+                os.environ[k] = old_env[k]
+    return result
+
+
+class TestB1SubdirIsLocalRootContext:
+    """B1: cwd in scripts/ or docs/ under primary worktree should be blocked."""
+
+    def test_subdir_scripts_is_blocked(self, tmp_git_repo: Path):
+        """cwd=<repo>/scripts + git switch issue-* => block."""
+        scripts_dir = tmp_git_repo / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        result = eval_in_local_root_subdir(
+            "git switch issue-981-test",
+            repo_root=str(tmp_git_repo),
+            cwd=str(scripts_dir),
+        )
+        assert result["status"] == "block", (
+            "Expected block from scripts/ subdirectory of primary worktree"
+        )
+
+    def test_subdir_docs_is_blocked(self, tmp_git_repo: Path):
+        """cwd=<repo>/docs + git checkout issue-* => block."""
+        docs_dir = tmp_git_repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        result = eval_in_local_root_subdir(
+            "git checkout issue-981-test",
+            repo_root=str(tmp_git_repo),
+            cwd=str(docs_dir),
+        )
+        assert result["status"] == "block", (
+            "Expected block from docs/ subdirectory of primary worktree"
+        )
+
+    def test_linked_worktree_subdir_is_not_blocked(self, tmp_linked_worktree: Path):
+        """cwd inside linked worktree => not local root context => allow."""
+        result = eval_in_local_root(
+            "git switch main",
+            str(tmp_linked_worktree),
+        )
+        # The guard should allow because linked worktree != primary root
+        assert result["status"] == "allow", (
+            "Linked worktree cwd must not be treated as local root context"
+        )
+
+
+# ─── B2: git -C <path> global option bypass ──────────────────────────────────
+
+class TestB2GitGlobalOptionBypass:
+    """B2: git -C . switch / git -C scripts checkout => block (fail-closed)."""
+
+    def test_git_dash_C_switch_is_blocked(self, tmp_git_repo: Path):
+        """git -C . switch issue-1014-x => block."""
+        result = eval_in_local_root(
+            "git -C . switch issue-981-test",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "git -C . switch must be blocked (git global option bypass)"
+        )
+
+    def test_git_dash_C_scripts_checkout_is_blocked(self, tmp_git_repo: Path):
+        """git -C scripts checkout issue-1014-x => block."""
+        result = eval_in_local_root(
+            "git -C scripts checkout issue-981-test",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "git -C scripts checkout must be blocked (git global option bypass)"
+        )
+
+    def test_git_c_advice_switch_detach_is_blocked(self, tmp_git_repo: Path):
+        """git -c advice.detachedHead=false switch --detach HEAD~1 => block."""
+        result = eval_in_local_root(
+            "git -c advice.detachedHead=false switch --detach HEAD~1",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "git -c <config> switch --detach must be blocked"
+        )
+
+    def test_normalize_git_global_opts_failclosed(self):
+        """_normalize_git_global_opts detects -C and sets fail_closed=True."""
+        tokens = ["git", "-C", ".", "switch", "issue-981"]
+        _, fail_closed = _normalize_git_global_opts(tokens)
+        assert fail_closed is True
+
+    def test_normalize_git_global_opts_regular(self):
+        """_normalize_git_global_opts: plain git switch has no fail-closed opts."""
+        tokens = ["git", "switch", "issue-981"]
+        remaining, fail_closed = _normalize_git_global_opts(tokens)
+        assert fail_closed is False
+        assert remaining == ["git", "switch", "issue-981"]
+
+
+# ─── B3: leading NAME=value env assignment bypass ────────────────────────────
+
+class TestB3LeadingEnvAssignmentBypass:
+    """B3: FOO=bar git switch / LOOP_DEFAULT_BRANCH=... git switch => block."""
+
+    def test_foo_bar_git_switch_is_blocked(self, tmp_git_repo: Path):
+        """FOO=bar git switch issue-1014-x => block."""
+        result = eval_in_local_root(
+            "FOO=bar git switch issue-981-test",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "Leading env assignment must be fail-closed in local root context"
+        )
+
+    def test_loop_default_branch_env_switch_is_blocked(self, tmp_git_repo: Path):
+        """LOOP_DEFAULT_BRANCH=issue-1014-x git switch issue-1014-x => block."""
+        result = eval_in_local_root(
+            "LOOP_DEFAULT_BRANCH=issue-981-test git switch issue-981-test",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "LOOP_DEFAULT_BRANCH= env assignment in command must be blocked"
+        )
+
+    def test_has_leading_env_assignment_detects(self):
+        """_has_leading_env_assignment correctly detects leading env."""
+        assert _has_leading_env_assignment("FOO=bar git switch issue-*") is True
+        assert _has_leading_env_assignment("LOOP_DEFAULT_BRANCH=main git switch x") is True
+        assert _has_leading_env_assignment("git switch main") is False
+        assert _has_leading_env_assignment("git switch FOO=bar") is False
+
+
+# ─── B4: already-drifted root uses explicit allowlist ────────────────────────
+
+class TestB4DriftedRootExplicitAllowlist:
+    """B4: already-drifted mode blocks rtk wrapper and uses explicit allowlist."""
+
+    def test_rtk_pnpm_test_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """current_branch=issue-* + rtk pnpm test => block."""
+        result = eval_in_local_root(
+            "rtk pnpm test",
+            str(tmp_git_repo_drifted),
+        )
+        assert result["status"] == "block", (
+            "rtk pnpm test must be blocked when root is drifted"
+        )
+
+    def test_rtk_gh_pr_review_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """current_branch=issue-* + rtk gh pr review 1041 => block."""
+        result = eval_in_local_root(
+            "rtk gh pr review 1041",
+            str(tmp_git_repo_drifted),
+        )
+        assert result["status"] == "block", (
+            "rtk gh pr review must be blocked when root is drifted"
+        )
+
+    def test_rtk_test_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """rtk test => block when drifted."""
+        result = eval_in_local_root("rtk test", str(tmp_git_repo_drifted))
+        assert result["status"] == "block"
+
+    def test_rtk_pytest_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """rtk pytest => block when drifted."""
+        result = eval_in_local_root("rtk pytest", str(tmp_git_repo_drifted))
+        assert result["status"] == "block"
+
+    def test_rtk_gh_issue_edit_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """rtk gh issue edit => block when drifted."""
+        result = eval_in_local_root("rtk gh issue edit 1014 --title x", str(tmp_git_repo_drifted))
+        assert result["status"] == "block"
+
+    def test_rtk_gh_pr_merge_is_blocked_when_drifted(self, tmp_git_repo_drifted: Path):
+        """rtk gh pr merge => block when drifted."""
+        result = eval_in_local_root("rtk gh pr merge 1041", str(tmp_git_repo_drifted))
+        assert result["status"] == "block"
+
+    def test_allowlist_is_closed(self):
+        """_is_allowed_when_drifted only permits known-safe commands."""
+        # These should be allowed
+        assert _is_allowed_when_drifted("git status") is True
+        assert _is_allowed_when_drifted("git branch --show-current") is True
+        assert _is_allowed_when_drifted("git rev-parse HEAD") is True
+        assert _is_allowed_when_drifted("git worktree list") is True
+        assert _is_allowed_when_drifted("gh issue view 123") is True
+        assert _is_allowed_when_drifted("gh pr view 1041") is True
+        assert _is_allowed_when_drifted("gh pr list") is True
+        assert _is_allowed_when_drifted("gh pr status") is True
+        # These should NOT be allowed
+        assert _is_allowed_when_drifted("rtk pnpm test") is False
+        assert _is_allowed_when_drifted("rtk gh pr review 1041") is False
+        assert _is_allowed_when_drifted("pnpm test") is False
+        assert _is_allowed_when_drifted("uv run pytest") is False
+        assert _is_allowed_when_drifted("gh issue edit 123") is False
+        assert _is_allowed_when_drifted("gh pr merge 1041") is False
