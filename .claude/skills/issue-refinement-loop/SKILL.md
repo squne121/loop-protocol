@@ -63,12 +63,15 @@ needs-fix を受け取ったとき:
 [Step 2: Review]             → issue-reviewer → REVIEW_ISSUE_RESULT_V1
         ↓
  approve → Step 4.5 → Step 5
- needs-fix
-   ├─ iteration + 1 < max_iterations:
-   │    iteration += 1 → Step 4 (自動継続)
-   │
-   └─ iteration + 1 >= max_iterations:
-        → Step 5 (human_escalation) + 全 iteration 分 blocker summary
+ needs-fix → [Step 2a: Replay Arbitration]
+   ├─ deterministic_fail_confirmed:
+   │    iteration += 1 → Step 4
+   ├─ reviewer_claim_unbacked_by_deterministic_checker:
+   │    iteration を消費せず Step 2 に戻る
+   ├─ reviewer_false_positive_suspected:
+   │    → Step 5 (human_escalation)
+   └─ input_or_runtime_error:
+        → Step 5 (human_judgment_required)
 ```
 
 Step 3（adversarial review）と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
@@ -161,12 +164,12 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 ### Step 2: Review
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。orchestrator は `STATUS` と `VERDICT` だけで routing し、domain judgment を再解釈しない。
+`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。orchestrator は reviewer の prose を再判定せず、artifact と deterministic checker を使う arbitration step を `needs-fix` と Step 4 の間に挟む。
 
 consumer contract: `ISSUE_REVIEW_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
 - `VERDICT: approve` → Step 4.5 へ
-- `VERDICT: needs-fix` → Step 4 へ（または iteration 上限で Step 5 human_escalation）
+- `VERDICT: needs-fix` → `reviewer_claim_replay.py` arbitration を実行し、その結果で Step 4 / Step 2 / human escalation を分岐する
 - full structured data は `EVIDENCE:` / `ARTIFACT:` パスから取得する（main context には返らない）
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
@@ -178,7 +181,7 @@ review 後、phase state を `review` フェーズに更新してから verdict 
 `review` phase での routing は VERDICT に基づいて直接行う:
 
 - `VERDICT: approve` → phase state を `decide_next_action` に更新してから Step 4.5 へ
-- `VERDICT: needs-fix` → phase state を `rewrite` に更新してから Step 4 へ（または iteration 上限で Step 5 human_escalation）
+- `VERDICT: needs-fix` → phase state を `rewrite` に更新し、直後に Step 2a replay arbitration を実行してから Step 4 / Step 5 を決める
 
 phase state の更新:
 
@@ -203,6 +206,43 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_act
 `review` phase では `hard_stop_eligible: false`（pre-rewrite phase）のため、
 `scope_signal_guard.triggered: true` があっても `decide_next_loop_action.py` を呼ばない。
 hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_stop_eligible: true`）で行う（AC4 / #919 回帰維持）。
+
+#### Step 2a: Reviewer Claim Replay Arbitration
+
+`VERDICT: needs-fix` の直後に、reviewer blocker が deterministic checker に裏付けられているかを `reviewer_claim_replay.py` で確認する。これにより、unbacked reviewer blocker だけで semantic iteration を消費しない。
+
+```bash
+uv run python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay.py \
+  --review-result-file <compact_review_result_v1_path> \
+  --readiness-result-file <contract_readiness_result_v1_path> \
+  [--vc-preflight-result-file <baseline_vc_preflight_v1_path>] \
+  [--vc-syntax-result-file <vc_syntax_result_path>] \
+  --state-file .claude/artifacts/issue-refinement-loop/<issue_number>/reviewer_claim_replay_state.json
+```
+
+入力契約:
+- `--review-result-file` は `compact_review_result.py` artifact を指す。`blocking_issues` / `structured_blockers` / `deterministic_checks` を読む
+- `--readiness-result-file` は `contract_readiness_check.py` の実 output を指す
+- optional artifact を渡したのに file missing / JSON decode error / schema mismatch の場合は `input_or_runtime_error` として fail-closed にする
+- `vc_contract_syntax.py` は shared parser なので、JSON result producer が別に存在する場合だけ `--vc-syntax-result-file` を渡す。producer が無い run では省略する
+
+exact mapping:
+- `vc_command_format` / reviewer `C4` は `VCS001` / `LP011` / `LP016` / `non_dollar_command` / `compound_shell` / `compound_command_disallowed`
+- `ac_vc_number_mismatch` は `LP010` のみ
+- `missing_section` は `LP001` のみ
+- `rva_immediate_field_missing` は `contract_readiness_check` の同名 category のみ
+- `startswith("LP")` / `startswith("LP0")` のような prefix 判定は禁止
+
+出力契約:
+- `verdict: deterministic_fail_confirmed` → Step 4 rewrite に進む。`should_consume_iteration: true`
+- `verdict: reviewer_claim_unbacked_by_deterministic_checker` → reviewer blocker を non-blocking downgrade し、semantic iteration を消費せず Step 2 reviewer に戻す
+- `verdict: reviewer_false_positive_suspected` → same `body_sha256` + same blocker lane で 2 回連続 unbacked。`routing: human_escalation` で停止する
+- `verdict: input_or_runtime_error` → `human_judgment_required` で停止する
+
+state persistence:
+- state file は `body_sha256`、`reviewer_blocker_code`、`normalized_kind`、`consecutive_unbacked_count`、`last_review_artifact` を保持する
+- `body_sha256` が変わったら consecutive count を reset する
+- 同じ body / 同じ blocker lane でのみ consecutive count を increment する
 
 ### Step 4: Rewrite
 

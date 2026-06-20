@@ -2,17 +2,8 @@
 """
 reviewer_claim_replay.py - REVIEWER_CLAIM_REPLAY_V1
 
-Verifies whether an issue-reviewer blocker claim is backed by deterministic
-tool results (contract_readiness_check, baseline_vc_preflight, vc_contract_syntax).
-
-Unbacked blockers are classified as `reviewer_claim_unbacked_by_deterministic_checker`
-and should NOT consume a refinement loop iteration.
-
-Exit codes:
-  0: analysis complete (check `deterministic_backed` field for verdict)
-  1: input/runtime error
-
-stdout: compact JSON only (≤ 2048 bytes)
+Arbitrates reviewer blockers against deterministic artifacts before a
+`needs-fix` verdict consumes another refinement-loop iteration.
 """
 
 from __future__ import annotations
@@ -21,273 +12,328 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
+from typing import Any
 
 SCHEMA = "REVIEWER_CLAIM_REPLAY_V1"
+STATE_SCHEMA = "REVIEWER_CLAIM_REPLAY_STATE_V1"
 
-# Blocker code classification sets (normalized to lowercase)
-_VC_SYNTAX_CODES = frozenset(
-    [
-        "c4",
-        "vc_command_format",
-        "vc command format",
-        "$ prefix",
-        "missing $ prefix",
-        "missing_$_prefix",
-        "lp010",
-    ]
+VC_COMMAND_RULE_IDS = frozenset({"VCS001", "LP011", "LP016"})
+VC_COMMAND_CATEGORIES = frozenset(
+    {"non_dollar_command", "compound_shell", "compound_command_disallowed", "no_commands_extracted"}
 )
+LP010_RULE_IDS = frozenset({"LP010"})
+MISSING_SECTION_RULE_IDS = frozenset({"LP001"})
+RVA_CATEGORIES = frozenset({"rva_immediate_field_missing"})
 
-_SECTION_CODES = frozenset(
-    [
-        "missing_required_section",
-        "missing_section",
-        "c5",
+KIND_ALIASES = {
+    "c4": "vc_command_format",
+    "vc_command_format": "vc_command_format",
+    "vc command format": "vc_command_format",
+    "missing $ prefix": "vc_command_format",
+    "missing_$_prefix": "vc_command_format",
+    "lp010": "ac_vc_number_mismatch",
+    "ac_vc_number_mismatch": "ac_vc_number_mismatch",
+    "missing_required_section": "missing_section",
+    "missing_section": "missing_section",
+    "c5": "missing_section",
+    "rva_immediate_field_missing": "rva_immediate_field_missing",
+}
+
+
+def _normalize_blocker_code(code: str) -> str:
+    return " ".join(code.strip().lower().split())
+
+
+def _classify_blocker(blocker: dict[str, Any]) -> str:
+    code = str(blocker.get("reviewer_blocker_code") or "")
+    return KIND_ALIASES.get(_normalize_blocker_code(code), "unknown_blocker_type")
+
+
+def _load_json_file(path: str, label: str) -> dict[str, Any]:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} json decode error: {exc}") from exc
+
+
+def _extract_review_blockers(review_result: dict[str, Any]) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    for source in ("structured_blockers", "blocking_issues"):
+        items = review_result.get(source)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                code = str(item.get("code") or item.get("reviewer_blocker_code") or "").strip()
+                if code:
+                    blockers.append(
+                        {
+                            "reviewer_blocker_code": code,
+                            "message": item.get("message"),
+                            "line_start": item.get("line_start"),
+                            "line_end": item.get("line_end"),
+                        }
+                    )
+            elif isinstance(item, str) and item.strip():
+                blockers.append({"reviewer_blocker_code": item.strip()})
+        if blockers:
+            return blockers
+    return blockers
+
+
+def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for err in readiness_result.get("errors", []):
+        if not isinstance(err, dict):
+            continue
+        rule_id = str(err.get("rule_id") or "")
+        category = str(err.get("category") or "")
+        source_check = str(err.get("source_check") or "")
+
+        if kind == "vc_command_format":
+            if rule_id in VC_COMMAND_RULE_IDS:
+                matches.append(err)
+            elif source_check == "contract_readiness_check" and category in VC_COMMAND_CATEGORIES:
+                matches.append(err)
+        elif kind == "ac_vc_number_mismatch" and rule_id in LP010_RULE_IDS:
+            matches.append(err)
+        elif kind == "missing_section" and source_check == "validate_issue_body" and rule_id in MISSING_SECTION_RULE_IDS:
+            matches.append(err)
+        elif kind == "rva_immediate_field_missing" and source_check == "contract_readiness_check" and category in RVA_CATEGORIES:
+            matches.append(err)
+    return matches
+
+
+def _validate_minimal_schema(payload: dict[str, Any], label: str, required_keys: tuple[str, ...]) -> None:
+    missing = [key for key in required_keys if key not in payload]
+    if missing:
+        raise ValueError(f"{label} missing required keys: {', '.join(missing)}")
+
+
+def _matching_vc_preflight(kind: str, vc_preflight_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if vc_preflight_result is None:
+        return []
+    results = vc_preflight_result.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("vc-preflight-result-file.results must be a list")
+    if kind != "vc_command_format":
+        return []
+    return [item for item in results if isinstance(item, dict) and item.get("category") in VC_COMMAND_CATEGORIES]
+
+
+def _matching_vc_syntax(kind: str, vc_syntax_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if vc_syntax_result is None:
+        return []
+    errors = vc_syntax_result.get("errors", [])
+    if not isinstance(errors, list):
+        raise ValueError("vc-syntax-result-file.errors must be a list")
+    if kind != "vc_command_format":
+        return []
+    return [
+        item
+        for item in errors
+        if isinstance(item, dict)
+        and (item.get("rule_id") in VC_COMMAND_RULE_IDS or item.get("category") in VC_COMMAND_CATEGORIES)
     ]
-)
 
 
-def _classify_blocker(blocker_code: str) -> str:
-    """Return 'vc_syntax', 'section', or 'unknown'."""
-    normalized = blocker_code.lower().strip()
-    if normalized in _VC_SYNTAX_CODES:
-        return "vc_syntax"
-    if normalized in _SECTION_CODES:
-        return "section"
-    return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Source result checkers
-# ---------------------------------------------------------------------------
-
-
-def _check_readiness_for_vc_syntax(readiness: dict) -> list[str]:
-    """Return matched source check descriptions for VC syntax blocker."""
-    matched: list[str] = []
-    for err in readiness.get("errors", []):
-        rule_id = err.get("rule_id", "")
-        category = err.get("category", "")
-        source_check = err.get("source_check", "")
-        # LP010 from validate_issue_body, or compound_command_disallowed / VCS001
-        if rule_id.startswith("LP0") and source_check == "validate_issue_body":
-            matched.append(f"validate_issue_body: {rule_id}")
-        elif rule_id == "VCS001" or category == "compound_command_disallowed":
-            matched.append(f"contract_readiness_check: {rule_id} ({category})")
-        elif category in ("no_commands_extracted", "compound_command_disallowed"):
-            matched.append(f"{source_check}: {category}")
-    return matched
-
-
-def _check_readiness_for_section(readiness: dict) -> list[str]:
-    """Return matched source check descriptions for missing section blocker."""
-    matched: list[str] = []
-    for err in readiness.get("errors", []):
-        rule_id = err.get("rule_id", "")
-        source_check = err.get("source_check", "")
-        category = err.get("category", "")
-        # LP* rules from validate_issue_body = section/structure lint
-        if rule_id.startswith("LP") and source_check == "validate_issue_body":
-            matched.append(f"validate_issue_body: {rule_id}")
-        elif category in ("missing_required_section", "rva_immediate_field_missing"):
-            matched.append(f"{source_check}: {category}")
-    return matched
-
-
-def _check_vc_syntax_result(vc_syntax: dict) -> list[str]:
-    """Return matched source check descriptions from vc_contract_syntax result."""
-    matched: list[str] = []
-    # vc_contract_syntax result may contain LP010 errors or similar
-    for err in vc_syntax.get("errors", []):
-        rule_id = err.get("rule_id", "")
-        if rule_id:
-            matched.append(f"vc_contract_syntax: {rule_id}")
-    # Also check top-level errors list (some schemas use flat list)
-    if isinstance(vc_syntax.get("lp010_errors"), list) and vc_syntax["lp010_errors"]:
-        for item in vc_syntax["lp010_errors"]:
-            matched.append(f"vc_contract_syntax: LP010 {item}")
-    return matched
-
-
-def _check_vc_preflight_for_syntax(vc_preflight: dict) -> list[str]:
-    """Return matched source check descriptions from vc_preflight result for syntax issues."""
-    matched: list[str] = []
-    for result in vc_preflight.get("results", []):
-        category = result.get("category", "")
-        if category in ("compound_command_disallowed", "no_commands_extracted"):
-            ac = result.get("ac", "")
-            matched.append(f"baseline_vc_preflight: {category} {ac}".strip())
-    for err in vc_preflight.get("errors", []):
-        if isinstance(err, dict):
-            kind = err.get("kind", "")
-            if kind in ("extraction_error", "unsupported_vc_format"):
-                matched.append(f"baseline_vc_preflight: {kind}")
-        elif isinstance(err, str) and "command" in err.lower():
-            matched.append(f"baseline_vc_preflight: {err[:80]}")
-    return matched
-
-
-# ---------------------------------------------------------------------------
-# Main analysis
-# ---------------------------------------------------------------------------
-
-
-def analyze(
-    blocker_code: str,
-    body_file: Optional[str],
-    readiness_result: dict,
-    vc_syntax_result: Optional[dict],
-    vc_preflight_result: Optional[dict],
-    consecutive_count: int = 1,
-) -> dict:
-    """Perform replay analysis and return REVIEWER_CLAIM_REPLAY_V1 dict."""
-    kind = _classify_blocker(blocker_code)
-
-    matched_source_checks: list[str] = []
-
-    if kind == "vc_syntax":
-        matched_source_checks.extend(_check_readiness_for_vc_syntax(readiness_result))
-        if vc_syntax_result:
-            matched_source_checks.extend(_check_vc_syntax_result(vc_syntax_result))
-        if vc_preflight_result:
-            matched_source_checks.extend(_check_vc_preflight_for_syntax(vc_preflight_result))
-    elif kind == "section":
-        matched_source_checks.extend(_check_readiness_for_section(readiness_result))
-    else:
-        # Unknown blocker type — prose-only or unclassifiable
-        return {
-            "schema": SCHEMA,
-            "blocker_code": blocker_code,
-            "blocker_kind": "unknown_blocker_type",
-            "deterministic_backed": False,
-            "verdict": "reviewer_claim_unbacked_by_deterministic_checker",
-            "matched_source_checks": [],
-            "routing": "downgrade_to_non_blocking",
-            "should_consume_iteration": False,
-        }
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for item in matched_source_checks:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-    matched_source_checks = deduped
-
-    deterministic_backed = len(matched_source_checks) > 0
-
-    if deterministic_backed:
-        verdict = "deterministic_fail_confirmed"
-        routing = "proceed_to_rewrite"
-        should_consume = True
-    else:
-        # Check for repeated false positive suspicion
-        if consecutive_count >= 2:
-            verdict = "reviewer_false_positive_suspected"
-        else:
-            verdict = "reviewer_claim_unbacked_by_deterministic_checker"
-        routing = "downgrade_to_non_blocking"
-        should_consume = False
-
+def _evidence(source_check: str, payload: dict[str, Any], body_sha256: str) -> dict[str, Any]:
     return {
-        "schema": SCHEMA,
-        "blocker_code": blocker_code,
-        "blocker_kind": kind,
-        "deterministic_backed": deterministic_backed,
-        "verdict": verdict,
-        "matched_source_checks": matched_source_checks,
-        "routing": routing,
-        "should_consume_iteration": should_consume,
+        "source_check": source_check,
+        "rule_id": payload.get("rule_id"),
+        "category": payload.get("category"),
+        "line_start": payload.get("line_start"),
+        "line_end": payload.get("line_end"),
+        "body_sha256": body_sha256,
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _load_state(state_file: str | None) -> dict[str, Any]:
+    if not state_file:
+        return {}
+    path = Path(state_file)
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema") != STATE_SCHEMA:
+        raise ValueError(f"unexpected state schema: {data.get('schema')!r}")
+    return data
+
+
+def _save_state(state_file: str | None, state: dict[str, Any]) -> None:
+    if not state_file:
+        return
+    path = Path(state_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def analyze(
+    *,
+    review_result: dict[str, Any],
+    readiness_result: dict[str, Any],
+    vc_syntax_result: dict[str, Any] | None,
+    vc_preflight_result: dict[str, Any] | None,
+    previous_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    blockers = _extract_review_blockers(review_result)
+    body_sha256 = str(readiness_result.get("body_sha256") or "")
+    issue_url = str(review_result.get("issue_url") or "")
+    previous_state = previous_state or {}
+
+    if not blockers:
+        return (
+            {
+                "schema": SCHEMA,
+                "verdict": "input_or_runtime_error",
+                "routing": "human_judgment_required",
+                "should_consume_iteration": False,
+                "blockers": [],
+                "error": "review-result has no blocker entries",
+            },
+            previous_state,
+        )
+
+    blocker_results: list[dict[str, Any]] = []
+    any_backed = False
+    for blocker in blockers:
+        kind = _classify_blocker(blocker)
+        evidence = [
+            _evidence("baseline_vc_preflight", item, body_sha256)
+            for item in _matching_vc_preflight(kind, vc_preflight_result)
+        ]
+        evidence.extend(
+            _evidence("vc_contract_syntax", item, body_sha256)
+            for item in _matching_vc_syntax(kind, vc_syntax_result)
+        )
+        evidence.extend(
+            _evidence(str(err.get("source_check") or ""), err, body_sha256)
+            for err in _matching_readiness_errors(kind, readiness_result)
+        )
+        deterministic_backed = bool(evidence)
+        any_backed = any_backed or deterministic_backed
+        blocker_results.append(
+            {
+                "reviewer_blocker_code": blocker["reviewer_blocker_code"],
+                "normalized_kind": kind,
+                "deterministic_backed": deterministic_backed,
+                "message": blocker.get("message"),
+                "line_start": blocker.get("line_start"),
+                "line_end": blocker.get("line_end"),
+                "evidence": evidence,
+            }
+        )
+
+    primary = blocker_results[0]
+    same_lane = (
+        primary["reviewer_blocker_code"] == previous_state.get("reviewer_blocker_code")
+        and primary["normalized_kind"] == previous_state.get("normalized_kind")
+        and body_sha256 == previous_state.get("body_sha256")
+    )
+    prior_count = int(previous_state.get("consecutive_unbacked_count", 0))
+
+    if any_backed:
+        verdict = "deterministic_fail_confirmed"
+        routing = "proceed_to_rewrite"
+        should_consume_iteration = True
+        next_count = 0
+    else:
+        next_count = prior_count + 1 if same_lane else 1
+        verdict = (
+            "reviewer_false_positive_suspected"
+            if next_count >= 2
+            else "reviewer_claim_unbacked_by_deterministic_checker"
+        )
+        routing = "human_escalation" if verdict == "reviewer_false_positive_suspected" else "downgrade_to_non_blocking"
+        should_consume_iteration = False
+
+    next_state = {
+        "schema": STATE_SCHEMA,
+        "issue_url": issue_url,
+        "body_sha256": body_sha256,
+        "reviewer_blocker_code": primary["reviewer_blocker_code"],
+        "normalized_kind": primary["normalized_kind"],
+        "consecutive_unbacked_count": next_count,
+        "last_review_artifact": str(review_result.get("_artifact_path") or ""),
+    }
+    return (
+        {
+            "schema": SCHEMA,
+            "verdict": verdict,
+            "routing": routing,
+            "should_consume_iteration": should_consume_iteration,
+            "body_sha256": body_sha256,
+            "issue_url": issue_url,
+            "blockers": blocker_results,
+        },
+        next_state,
+    )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="REVIEWER_CLAIM_REPLAY_V1 — verify reviewer blocker against deterministic tools"
-    )
-    parser.add_argument("--blocker-code", required=True, help="Blocker code from reviewer")
-    parser.add_argument("--body-file", help="Path to issue body file (optional, reserved)")
-    parser.add_argument(
-        "--readiness-result-file",
-        required=True,
-        help="Path to ISSUE_CONTRACT_READINESS_RESULT_V1 JSON file",
-    )
-    parser.add_argument(
-        "--vc-syntax-result-file",
-        help="Path to vc_contract_syntax result JSON file (optional)",
-    )
-    parser.add_argument(
-        "--vc-preflight-result-file",
-        help="Path to baseline_vc_preflight result JSON file (optional)",
-    )
-    parser.add_argument(
-        "--consecutive-count",
-        type=int,
-        default=1,
-        help="Number of consecutive times this blocker has been replayed (default: 1)",
-    )
-
+    parser = argparse.ArgumentParser(description="Replay reviewer blockers against deterministic artifacts")
+    parser.add_argument("--review-result-file", required=True)
+    parser.add_argument("--readiness-result-file", required=True)
+    parser.add_argument("--vc-syntax-result-file")
+    parser.add_argument("--vc-preflight-result-file")
+    parser.add_argument("--state-file")
     args = parser.parse_args()
 
-    # Load readiness result
     try:
-        readiness_result = json.loads(Path(args.readiness_result_file).read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        review_result = _load_json_file(args.review_result_file, "review-result-file")
+        review_result["_artifact_path"] = args.review_result_file
+        readiness_result = _load_json_file(args.readiness_result_file, "readiness-result-file")
+        _validate_minimal_schema(review_result, "review-result-file", ("issue_url",))
+        _validate_minimal_schema(readiness_result, "readiness-result-file", ("body_sha256", "errors"))
+        vc_syntax_result = (
+            _load_json_file(args.vc_syntax_result_file, "vc-syntax-result-file")
+            if args.vc_syntax_result_file
+            else None
+        )
+        vc_preflight_result = (
+            _load_json_file(args.vc_preflight_result_file, "vc-preflight-result-file")
+            if args.vc_preflight_result_file
+            else None
+        )
+        previous_state = _load_state(args.state_file)
+        result, next_state = analyze(
+            review_result=review_result,
+            readiness_result=readiness_result,
+            vc_syntax_result=vc_syntax_result,
+            vc_preflight_result=vc_preflight_result,
+            previous_state=previous_state,
+        )
+        _save_state(args.state_file, next_state)
+    except ValueError as exc:
         print(
-            json.dumps({"error": f"readiness-result-file not found: {args.readiness_result_file}"}),
+            json.dumps(
+                {
+                    "schema": SCHEMA,
+                    "verdict": "input_or_runtime_error",
+                    "routing": "human_judgment_required",
+                    "error": str(exc),
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
             flush=True,
         )
         return 1
-    except json.JSONDecodeError as exc:
-        print(json.dumps({"error": f"json decode error in readiness-result-file: {exc}"}), flush=True)
-        return 1
 
-    # Load optional vc-syntax result
-    vc_syntax_result: Optional[dict] = None
-    if args.vc_syntax_result_file:
-        try:
-            vc_syntax_result = json.loads(
-                Path(args.vc_syntax_result_file).read_text(encoding="utf-8")
-            )
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass  # Optional — absence is not an error
-
-    # Load optional vc-preflight result
-    vc_preflight_result: Optional[dict] = None
-    if args.vc_preflight_result_file:
-        try:
-            vc_preflight_result = json.loads(
-                Path(args.vc_preflight_result_file).read_text(encoding="utf-8")
-            )
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass  # Optional — absence is not an error
-
-    result = analyze(
-        blocker_code=args.blocker_code,
-        body_file=args.body_file,
-        readiness_result=readiness_result,
-        vc_syntax_result=vc_syntax_result,
-        vc_preflight_result=vc_preflight_result,
-        consecutive_count=args.consecutive_count,
-    )
-
-    output = json.dumps(result, separators=(",", ":"))
-    # Guard: stdout must be compact JSON only, ≤ 2048 bytes
+    output = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
     if len(output.encode("utf-8")) > 2048:
-        # Truncate matched_source_checks to fit
-        result["matched_source_checks"] = result["matched_source_checks"][:3]
-        output = json.dumps(result, separators=(",", ":"))
-
+        trimmed = dict(result)
+        trimmed["blockers"] = [
+            {
+                "reviewer_blocker_code": blocker["reviewer_blocker_code"],
+                "normalized_kind": blocker["normalized_kind"],
+                "deterministic_backed": blocker["deterministic_backed"],
+            }
+            for blocker in result["blockers"][:2]
+        ]
+        output = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
     print(output, flush=True)
     return 0
 

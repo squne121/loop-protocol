@@ -1,413 +1,311 @@
-"""
-test_reviewer_claim_replay.py - Tests for reviewer_claim_replay.py
-
-AC1: readiness result に C4 対応エラーがある場合 → deterministic_backed: true
-AC2: readiness result に C4 対応エラーがない場合 → reviewer_claim_unbacked_by_deterministic_checker, should_consume_iteration: false
-AC3: 同一 blocker_code を 2 回連続して replay したとき、2 回目は reviewer_false_positive_suspected を返す
-AC4: deterministic_backed: true のとき should_consume_iteration: true
-AC5: stdout が compact JSON のみで 2048 bytes 以内
-"""
-
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-
-import pytest
-
-# ---------------------------------------------------------------------------
-# Path setup
-# ---------------------------------------------------------------------------
 
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 SCRIPT_PATH = SCRIPTS_DIR / "reviewer_claim_replay.py"
-
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from reviewer_claim_replay import analyze, SCHEMA
+from reviewer_claim_replay import SCHEMA, analyze  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-READINESS_WITH_C4_ERROR = {
+READINESS_LP001 = {
     "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
-    "status": "needs_fix",
-    "body_sha256": "sha256:abc123",
-    "source_checks": [
-        {"name": "validate_issue_body", "schema": "loop_body_lint/v1", "status": "fail", "exit_code": 1}
-    ],
+    "body_sha256": "sha256:body-a",
     "errors": [
         {
-            "rule_id": "VCS001",
-            "severity": "error",
-            "source_check": "contract_readiness_check",
-            "category": "compound_command_disallowed",
-            "section": "Verification Commands",
-            "line_start": 10,
-            "line_end": 10,
-            "minimal_context": ["$ rg foo | head -5"],
-            "fix_hint": "Remove compound shell operators.",
-            "autofixable": False,
+            "rule_id": "LP001",
+            "source_check": "validate_issue_body",
+            "category": "body_lint",
+            "line_start": 1,
+            "line_end": 1,
         }
     ],
-    "minimal_context": [],
-    "fix_hint": None,
 }
 
-READINESS_WITHOUT_C4_ERROR = {
+READINESS_LP010 = {
     "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
-    "status": "go",
-    "body_sha256": "sha256:def456",
-    "source_checks": [
-        {"name": "validate_issue_body", "schema": "loop_body_lint/v1", "status": "pass", "exit_code": 0}
+    "body_sha256": "sha256:body-a",
+    "errors": [
+        {
+            "rule_id": "LP010",
+            "source_check": "validate_issue_body",
+            "category": "body_lint",
+            "line_start": 5,
+            "line_end": 5,
+        }
     ],
-    "errors": [],
-    "minimal_context": [],
-    "fix_hint": None,
 }
 
-READINESS_WITH_SECTION_ERROR = {
+READINESS_LP005 = {
     "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
-    "status": "needs_fix",
-    "body_sha256": "sha256:sec789",
-    "source_checks": [
-        {"name": "validate_issue_body", "schema": "loop_body_lint/v1", "status": "fail", "exit_code": 1}
-    ],
+    "body_sha256": "sha256:body-a",
     "errors": [
         {
             "rule_id": "LP005",
-            "severity": "error",
             "source_check": "validate_issue_body",
-            "category": "missing_required_section",
-            "section": "Acceptance Criteria",
-            "line_start": 0,
-            "line_end": 0,
-            "minimal_context": [],
-            "fix_hint": "Add required section.",
-            "autofixable": False,
+            "category": "body_lint",
+            "line_start": 3,
+            "line_end": 3,
         }
     ],
-    "minimal_context": [],
-    "fix_hint": None,
+}
+
+READINESS_VCS001 = {
+    "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+    "body_sha256": "sha256:body-a",
+    "errors": [
+        {
+            "rule_id": "VCS001",
+            "source_check": "contract_readiness_check",
+            "category": "compound_command_disallowed",
+            "line_start": 10,
+            "line_end": 10,
+        }
+    ],
+}
+
+READINESS_CLEAN = {
+    "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+    "body_sha256": "sha256:body-a",
+    "errors": [],
+}
+
+COMPACT_C4 = {
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
+    "structured_blockers": [],
+}
+
+COMPACT_MISSING_SECTION = {
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "blocking_issues": [{"code": "missing_section", "message": "missing section"}],
+    "structured_blockers": [],
 }
 
 
-# ---------------------------------------------------------------------------
-# AC1: readiness result に C4 対応エラーがある場合 → deterministic_backed: true
-# ---------------------------------------------------------------------------
-
-
-def test_ac1_c4_backed_by_readiness_error():
-    """AC1: VCS001/compound_command_disallowed in readiness → deterministic_backed: true."""
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITH_C4_ERROR,
+def test_c4_with_lp001_only_is_unbacked():
+    result, _ = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_LP001,
         vc_syntax_result=None,
         vc_preflight_result=None,
+        previous_state={},
     )
     assert result["schema"] == SCHEMA
-    assert result["deterministic_backed"] is True
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert result["should_consume_iteration"] is False
+
+
+def test_c4_with_lp010_only_is_unbacked():
+    result, _ = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_LP010,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert result["should_consume_iteration"] is False
+
+
+def test_missing_section_with_real_lp001_is_backed():
+    result, _ = analyze(
+        review_result=COMPACT_MISSING_SECTION,
+        readiness_result=READINESS_LP001,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
     assert result["verdict"] == "deterministic_fail_confirmed"
-    assert len(result["matched_source_checks"]) > 0
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "missing_section"
+    assert blocker["evidence"][0]["rule_id"] == "LP001"
 
 
-def test_ac1_vc_command_format_backed():
-    """AC1: blocker_code 'vc_command_format' is vc_syntax class → backed by VCS001 error."""
-    result = analyze(
-        blocker_code="vc_command_format",
-        body_file=None,
-        readiness_result=READINESS_WITH_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is True
-
-
-def test_ac1_lp010_backed_by_vc_syntax_result():
-    """AC1: LP010 blocker backed by vc_syntax_result errors."""
-    vc_syntax = {
-        "errors": [
-            {"rule_id": "LP010", "section": "Verification Commands", "message": "missing $ prefix"}
-        ]
+def test_lp010_requires_exact_lp010_match():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "blocking_issues": [{"code": "LP010", "message": "ac/vc mismatch"}],
+        "structured_blockers": [],
     }
-    result = analyze(
-        blocker_code="LP010",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
-        vc_syntax_result=vc_syntax,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is True
-    assert any("LP010" in s for s in result["matched_source_checks"])
-
-
-# ---------------------------------------------------------------------------
-# AC2: readiness result に C4 対応エラーがない場合 → unbacked, should_consume_iteration: false
-# ---------------------------------------------------------------------------
-
-
-def test_ac2_c4_unbacked_when_no_errors():
-    """AC2: clean readiness result + C4 blocker → reviewer_claim_unbacked_by_deterministic_checker."""
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_LP010,
         vc_syntax_result=None,
         vc_preflight_result=None,
+        previous_state={},
     )
-    assert result["deterministic_backed"] is False
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["blockers"][0]["evidence"][0]["rule_id"] == "LP010"
+
+
+def test_missing_section_with_lp005_only_is_unbacked():
+    result, _ = analyze(
+        review_result=COMPACT_MISSING_SECTION,
+        readiness_result=READINESS_LP005,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
     assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
     assert result["should_consume_iteration"] is False
-    assert result["routing"] == "downgrade_to_non_blocking"
 
 
-def test_ac2_missing_prefix_unbacked():
-    """AC2: 'missing $ prefix' blocker with no backing errors → unbacked."""
-    result = analyze(
-        blocker_code="missing $ prefix",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
+def test_second_unbacked_same_body_becomes_false_positive():
+    previous = {
+        "schema": "REVIEWER_CLAIM_REPLAY_STATE_V1",
+        "issue_url": COMPACT_C4["issue_url"],
+        "body_sha256": "sha256:body-a",
+        "reviewer_blocker_code": "C4",
+        "normalized_kind": "vc_command_format",
+        "consecutive_unbacked_count": 1,
+        "last_review_artifact": "/tmp/prior.json",
+    }
+    result, next_state = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_CLEAN,
         vc_syntax_result=None,
         vc_preflight_result=None,
+        previous_state=previous,
     )
-    assert result["should_consume_iteration"] is False
-    assert result["deterministic_backed"] is False
-
-
-def test_ac2_section_blocker_unbacked_when_no_section_errors():
-    """AC2: missing_section blocker but no section errors in readiness → unbacked."""
-    result = analyze(
-        blocker_code="missing_section",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is False
-    assert result["should_consume_iteration"] is False
-
-
-# ---------------------------------------------------------------------------
-# AC3: consecutive_count >= 2 → reviewer_false_positive_suspected
-# ---------------------------------------------------------------------------
-
-
-def test_ac3_consecutive_count_2_returns_false_positive_suspected():
-    """AC3: 2nd consecutive unbacked replay → reviewer_false_positive_suspected."""
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-        consecutive_count=2,
-    )
-    assert result["deterministic_backed"] is False
     assert result["verdict"] == "reviewer_false_positive_suspected"
-    assert result["should_consume_iteration"] is False
+    assert result["routing"] == "human_escalation"
+    assert next_state["consecutive_unbacked_count"] == 2
 
 
-def test_ac3_consecutive_count_1_returns_unbacked_not_suspected():
-    """AC3: 1st consecutive replay → reviewer_claim_unbacked (not false_positive_suspected)."""
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
+def test_body_hash_change_resets_consecutive_count():
+    previous = {
+        "schema": "REVIEWER_CLAIM_REPLAY_STATE_V1",
+        "issue_url": COMPACT_C4["issue_url"],
+        "body_sha256": "sha256:old",
+        "reviewer_blocker_code": "C4",
+        "normalized_kind": "vc_command_format",
+        "consecutive_unbacked_count": 3,
+        "last_review_artifact": "/tmp/prior.json",
+    }
+    result, next_state = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_CLEAN,
         vc_syntax_result=None,
         vc_preflight_result=None,
-        consecutive_count=1,
+        previous_state=previous,
     )
     assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert next_state["consecutive_unbacked_count"] == 1
 
 
-def test_ac3_consecutive_count_3_also_returns_false_positive_suspected():
-    """AC3: consecutive_count >= 2 is the threshold."""
-    result = analyze(
-        blocker_code="missing_required_section",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-        consecutive_count=3,
-    )
-    assert result["verdict"] == "reviewer_false_positive_suspected"
-
-
-# ---------------------------------------------------------------------------
-# AC4: deterministic_backed: true → should_consume_iteration: true
-# ---------------------------------------------------------------------------
-
-
-def test_ac4_backed_consumes_iteration():
-    """AC4: deterministic_backed: true → should_consume_iteration: true."""
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITH_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is True
-    assert result["should_consume_iteration"] is True
-
-
-def test_ac4_section_backed_consumes_iteration():
-    """AC4: missing_section backed by readiness error → should_consume_iteration: true."""
-    result = analyze(
-        blocker_code="missing_required_section",
-        body_file=None,
-        readiness_result=READINESS_WITH_SECTION_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is True
-    assert result["should_consume_iteration"] is True
-
-
-# ---------------------------------------------------------------------------
-# AC5: stdout is compact JSON only, ≤ 2048 bytes
-# ---------------------------------------------------------------------------
-
-
-def test_ac5_stdout_is_compact_json_within_2048_bytes():
-    """AC5: CLI stdout is compact JSON and ≤ 2048 bytes."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    ) as f:
-        json.dump(READINESS_WITHOUT_C4_ERROR, f)
-        readiness_path = f.name
-
-    try:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "--blocker-code", "C4",
-                "--readiness-result-file", readiness_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        assert proc.returncode == 0, f"Script failed: {proc.stderr}"
-        stdout = proc.stdout.strip()
-        # Must be valid JSON
-        parsed = json.loads(stdout)
-        assert parsed["schema"] == SCHEMA
-        # Must be compact (no extra whitespace beyond separators)
-        assert "\n" not in stdout, "stdout must not contain newlines (compact JSON)"
-        # Must be ≤ 2048 bytes
-        byte_count = len(stdout.encode("utf-8"))
-        assert byte_count <= 2048, f"stdout exceeds 2048 bytes: {byte_count}"
-    finally:
-        import os
-        try:
-            os.unlink(readiness_path)
-        except OSError:
-            pass
-
-
-def test_ac5_stdout_backed_case_also_compact():
-    """AC5: backed case CLI stdout is compact JSON ≤ 2048 bytes."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    ) as f:
-        json.dump(READINESS_WITH_C4_ERROR, f)
-        readiness_path = f.name
-
-    try:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "--blocker-code", "C4",
-                "--readiness-result-file", readiness_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        assert proc.returncode == 0, f"Script failed: {proc.stderr}"
-        stdout = proc.stdout.strip()
-        parsed = json.loads(stdout)
-        assert parsed["deterministic_backed"] is True
-        byte_count = len(stdout.encode("utf-8"))
-        assert byte_count <= 2048, f"stdout exceeds 2048 bytes: {byte_count}"
-    finally:
-        import os
-        try:
-            os.unlink(readiness_path)
-        except OSError:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Additional edge cases
-# ---------------------------------------------------------------------------
-
-
-def test_unknown_blocker_code_returns_unbacked():
-    """Unknown blocker codes → deterministic_backed: false, unknown_blocker_type."""
-    result = analyze(
-        blocker_code="PROSE_QUALITY_ISSUE",
-        body_file=None,
-        readiness_result=READINESS_WITH_C4_ERROR,
-        vc_syntax_result=None,
-        vc_preflight_result=None,
-    )
-    assert result["deterministic_backed"] is False
-    assert result["blocker_kind"] == "unknown_blocker_type"
-    assert result["should_consume_iteration"] is False
-
-
-def test_vc_preflight_compound_command_backs_c4():
-    """vc_preflight result with compound_command_disallowed backs C4 blocker."""
+def test_vc_preflight_category_backs_c4():
     preflight = {
         "schema": "baseline_vc_preflight/v1",
-        "status": "blocked",
-        "results": [
-            {
-                "ac": "AC1",
-                "category": "compound_command_disallowed",
-                "classification": "blocked",
-                "decision": "blocked",
-                "raw_command": "rg foo | head -5",
-            }
-        ],
-        "errors": [],
+        "results": [{"category": "compound_command_disallowed", "line_start": 10, "line_end": 10}],
     }
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITHOUT_C4_ERROR,
+    result, _ = analyze(
+        review_result=COMPACT_C4,
+        readiness_result=READINESS_CLEAN,
         vc_syntax_result=None,
         vc_preflight_result=preflight,
+        previous_state={},
     )
-    assert result["deterministic_backed"] is True
-    assert any("compound_command_disallowed" in s for s in result["matched_source_checks"])
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["blockers"][0]["evidence"][0]["source_check"] == "baseline_vc_preflight"
 
 
-def test_matched_source_checks_deduplicated():
-    """matched_source_checks should not contain duplicates."""
-    # Both readiness and vc_syntax have VCS001
-    vc_syntax = {
-        "errors": [
-            {"rule_id": "VCS001", "section": "Verification Commands", "message": "compound op"}
-        ]
-    }
-    result = analyze(
-        blocker_code="C4",
-        body_file=None,
-        readiness_result=READINESS_WITH_C4_ERROR,
-        vc_syntax_result=vc_syntax,
-        vc_preflight_result=None,
+def test_cli_bad_optional_json_fails_closed(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    vc_syntax_path = tmp_path / "vc_syntax.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+    vc_syntax_path.write_text("{bad", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--vc-syntax-result-file",
+            str(vc_syntax_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
-    # No duplicates
-    assert len(result["matched_source_checks"]) == len(set(result["matched_source_checks"]))
+    assert proc.returncode == 1
+    assert json.loads(proc.stdout)["verdict"] == "input_or_runtime_error"
+
+
+def test_cli_writes_and_reuses_state_file(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    state_path = tmp_path / "state.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+
+    first = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--state-file",
+            str(state_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    second = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--state-file",
+            str(state_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert first.returncode == 0
+    assert second.returncode == 0
+    assert json.loads(second.stdout)["verdict"] == "reviewer_false_positive_suspected"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["consecutive_unbacked_count"] == 2
+
+
+def test_cli_stdout_is_compact_json(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_VCS001), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0
+    assert "\n" not in proc.stdout.strip()
+    assert len(proc.stdout.encode("utf-8")) <= 2048
