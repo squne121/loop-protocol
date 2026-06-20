@@ -116,12 +116,10 @@ Use `decide_next_loop_action.py` to compute the next action from the current LOO
 **Phase gate**: always pass `--phase-state-file` in phases where routing is permitted.
 In `preflight` and `investigation` phases, do NOT call `decide_next_loop_action.py`.
 
-```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py \
-  --loop-state-file <path/to/loop_state.json> \
-  --review-result-verdict <approve|needs-fix> \
-  --max-iterations <N> \
-  --phase-state-file <path/to/phase_state.json>
+**Registry id**: `decide.run` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
+
+```json
+{"id":"decide.run","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py","--loop-state-file","<path>","--review-result-verdict","<verdict>","--max-iterations","<N>","--phase-state-file","<phase_path>"],"shell":false,"cwd_policy":"repo_root"}
 ```
 
 Exit codes:
@@ -136,12 +134,10 @@ Priority: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass
 
 Use `build_refinement_phase_state.py` to generate `ISSUE_REFINEMENT_PHASE_STATE_V1`:
 
-```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
-  --phase <phase_name> \
-  --source-kind <kind> \
-  --source-path <artifact_path> \
-  --output-path <output_path>
+**Registry id**: `phase_state.build` (ISSUE_REFINEMENT_COMMAND_REGISTRY_V1)
+
+```json
+{"id":"phase_state.build","argv":["uv","run","python3",".claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py","--phase","<phase_name>","--source-kind","<kind>","--source-path","<artifact_path>","--output-path","<output_path>"],"shell":false,"cwd_policy":"repo_root"}
 ```
 
 The generated `ISSUE_REFINEMENT_PHASE_STATE_V1` contains `scope_signal_semantics.hard_stop_eligible`
