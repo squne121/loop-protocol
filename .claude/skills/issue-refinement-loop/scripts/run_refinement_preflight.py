@@ -22,6 +22,9 @@ Canonical stdout fields:
     COMMANDS     - argv-only command templates (omitted if empty)
     BLOCKERS     - blocker reason codes (omitted if empty)
     ARTIFACT     - artifact key: absolute_path pairs (omitted if empty)
+    REQUIRED_SECTIONS - required sections from rewrite constraints (planner-derived)
+    REQUIRED_CONTRACT_KEYS - required contract keys from rewrite constraints (planner-derived)
+    REWRITE_CONSTRAINTS - planner rewrite constraints payload when fail_closed=true
 
 Non-canonical / suppressed fields:
     SUMMARY      - human-only prose, not consumed by orchestrators
@@ -748,6 +751,27 @@ def _build_compact_stdout(result: dict) -> str:
         for b in blockers:
             lines.append(f"  - {b}")
 
+    required_sections = result.get("required_sections", [])
+    if required_sections:
+        lines.append("REQUIRED_SECTIONS:")
+        for section in required_sections:
+            lines.append(f"  - {section}")
+
+    required_contract_keys = result.get("required_contract_keys", [])
+    if required_contract_keys:
+        lines.append("REQUIRED_CONTRACT_KEYS:")
+        for key in required_contract_keys:
+            lines.append(f"  - {key}")
+
+    rewrite_constraints = result.get("rewrite_constraints")
+    if rewrite_constraints:
+        lines.append("REWRITE_CONSTRAINTS:")
+        try:
+            rewritten = json.dumps(rewrite_constraints, ensure_ascii=False)
+        except Exception:
+            rewritten = str(rewrite_constraints)
+        lines.append(f"  {rewritten}")
+
     artifacts = result.get("artifacts", {})
     if artifacts:
         lines.append("ARTIFACT:")
@@ -774,6 +798,10 @@ def _build_result(
     do_not_read: list[str],
     commands: list[dict],
     blockers: list[str],
+    planner_fail_closed_reason_codes: list[str],
+    required_sections: list[str],
+    required_contract_keys: list[str],
+    rewrite_constraints: Optional[dict[str, Any]],
     artifacts: dict[str, str],
     hashes: dict[str, str],
 ) -> dict:
@@ -790,9 +818,14 @@ def _build_result(
         "do_not_read": do_not_read,
         "commands": commands,
         "blockers": blockers,
+        "planner_fail_closed_reason_codes": planner_fail_closed_reason_codes,
+        "required_sections": required_sections,
+        "required_contract_keys": required_contract_keys,
         "artifacts": artifacts,
         "hashes": hashes,
     }
+    if rewrite_constraints is not None:
+        result["rewrite_constraints"] = rewrite_constraints
     return result
 
 
@@ -826,6 +859,10 @@ def _emit_failure_result(
     planner_fail_closed: Optional[bool] = None,
     planner_input: Optional[dict] = None,
     raw_snapshot: Optional[dict] = None,
+    planner_fail_closed_reason_codes: Optional[list[str]] = None,
+    required_sections: Optional[list[str]] = None,
+    required_contract_keys: Optional[list[str]] = None,
+    rewrite_constraints: Optional[dict[str, Any]] = None,
 ) -> tuple[dict, int]:
     """
     Build a failure/blocked/environment_failure result, write artifacts if available,
@@ -857,6 +894,10 @@ def _emit_failure_result(
             do_not_read=[],
             commands=[],
             blockers=blockers,
+            planner_fail_closed_reason_codes=planner_fail_closed_reason_codes or [],
+            required_sections=required_sections or [],
+            required_contract_keys=required_contract_keys or [],
+            rewrite_constraints=rewrite_constraints,
             artifacts={},
             hashes=hashes,
         )
@@ -873,7 +914,11 @@ def _emit_failure_result(
         do_not_read=[],
         commands=[],
         blockers=blockers,
-        artifacts=artifacts,
+        planner_fail_closed_reason_codes=planner_fail_closed_reason_codes or [],
+            required_sections=required_sections or [],
+            required_contract_keys=required_contract_keys or [],
+            rewrite_constraints=rewrite_constraints,
+            artifacts=artifacts,
         hashes=hashes,
     )
 
@@ -905,6 +950,10 @@ def run_preflight(
     blockers: list[str] = []
     planner_exit_code: Optional[int] = None
     planner_fail_closed: Optional[bool] = None
+    planner_fail_closed_reason_codes: list[str] = []
+    required_sections: list[str] = []
+    required_contract_keys: list[str] = []
+    rewrite_constraints: Optional[dict[str, Any]] = None
     planner_input_dict: Optional[dict] = None
     raw_snapshot: Optional[dict] = None
 
@@ -926,6 +975,10 @@ def run_preflight(
                 do_not_read=[],
                 commands=[],
                 blockers=[f"FIXTURE_LOAD_ERROR: {exc}"],
+                planner_fail_closed_reason_codes=[],
+                required_sections=[],
+                required_contract_keys=[],
+                rewrite_constraints=None,
                 artifacts={},
                 hashes={},
             )
@@ -945,6 +998,10 @@ def run_preflight(
                     status="blocked",
                     next_action="human_judgment_required",
                     blockers=[BLOCKER_INPUT_SCHEMA_INVALID, f"input_schema_errors: {err_detail}"],
+                    planner_fail_closed_reason_codes=[],
+                    required_sections=[],
+                    required_contract_keys=[],
+                    rewrite_constraints=None,
                 )
 
         issue = fixture_data.get("issue", {})
@@ -969,6 +1026,10 @@ def run_preflight(
                 status="environment_failure",
                 next_action="fix_environment",
                 blockers=blockers,
+                planner_fail_closed_reason_codes=[],
+                required_sections=[],
+                required_contract_keys=[],
+                rewrite_constraints=None,
             )
 
         comments, err = _fetch_issue_comments(repo, issue_number)
@@ -981,6 +1042,10 @@ def run_preflight(
                 status="environment_failure",
                 next_action="fix_environment",
                 blockers=blockers,
+                planner_fail_closed_reason_codes=[],
+                required_sections=[],
+                required_contract_keys=[],
+                rewrite_constraints=None,
             )
 
         active_anchor_urls = anchor_comment_urls
@@ -1003,6 +1068,10 @@ def run_preflight(
                 status="blocked",
                 next_action="human_judgment_required",
                 blockers=blockers,
+                planner_fail_closed_reason_codes=[],
+                required_sections=[],
+                required_contract_keys=[],
+                rewrite_constraints=None,
             )
 
     # --- Build raw snapshot (for artifact) ---
@@ -1040,6 +1109,10 @@ def run_preflight(
             status=status_str,
             next_action="fix_environment" if status_str == "environment_failure" else "human_judgment_required",
             blockers=blockers,
+            planner_fail_closed_reason_codes=[],
+            required_sections=[],
+            required_contract_keys=[],
+            rewrite_constraints=None,
             planner_exit_code=planner_exit_code,
             planner_input=planner_input_dict,
             raw_snapshot=raw_snapshot,
@@ -1071,6 +1144,20 @@ def run_preflight(
         blockers.append(BLOCKER_FAIL_CLOSED)
         reason_codes = fail_closed.get("reason_codes", [])
         blockers.extend(reason_codes)
+        planner_fail_closed_reason_codes = [str(rc) for rc in reason_codes if isinstance(rc, str)]
+        rc = fail_closed.get("rewrite_constraints", {})
+        if isinstance(rc, dict):
+            rewrite_constraints = rc
+            required_sections = [
+                str(section)
+                for section in rc.get("required_sections", [])
+                if isinstance(section, str)
+            ]
+            required_contract_keys = [
+                str(key)
+                for key in rc.get("required_contract_keys", [])
+                if isinstance(key, str)
+            ]
 
     # --- Write repair artifact and update blockers ---
     # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,
@@ -1129,6 +1216,10 @@ def run_preflight(
         "do_not_read": do_not_read,
         "commands": commands,
         "blockers": blockers,
+        "planner_fail_closed_reason_codes": planner_fail_closed_reason_codes,
+        "required_sections": required_sections,
+        "required_contract_keys": required_contract_keys,
+        "rewrite_constraints": rewrite_constraints,
     }
     result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False)
 
@@ -1150,6 +1241,10 @@ def run_preflight(
         do_not_read=do_not_read,
         commands=commands,
         blockers=blockers,
+        planner_fail_closed_reason_codes=planner_fail_closed_reason_codes,
+        required_sections=required_sections,
+        required_contract_keys=required_contract_keys,
+        rewrite_constraints=rewrite_constraints,
         artifacts={},  # filled below
         hashes=hashes,
     )
@@ -1247,6 +1342,10 @@ def main(argv: list[str] | None = None) -> None:
             do_not_read=[],
             commands=[],
             blockers=[BLOCKER_INVALID_ARGS, f"arg_errors: {err_detail}"],
+            planner_fail_closed_reason_codes=[],
+            required_sections=[],
+            required_contract_keys=[],
+            rewrite_constraints=None,
             artifacts={},
             hashes={},
         )

@@ -979,9 +979,9 @@ def _extract_missing_contract_keys(issue_body: str) -> list[str]:
     Extract missing required contract keys from the Machine-Readable Contract.
 
     Returns a list of required keys that are absent from the parsed contract dict.
-    Returns an empty list if no Machine-Readable Contract section or YAML block exists
-    (absence of contract is handled separately by section checks, not here).
-    Only returns missing keys when a contract block IS present but keys are absent.
+    If no Machine-Readable Contract section is present, returns all required keys
+    so downstream rewrite constraints can distinguish "section absent" from
+    "contract malformed / missing required keys".
     """
     if not _YAML_AVAILABLE:
         return []
@@ -989,7 +989,7 @@ def _extract_missing_contract_keys(issue_body: str) -> list[str]:
     sections = _extract_sections(issue_body)
     # Only check for missing keys if a Machine-Readable Contract section exists
     if "Machine-Readable Contract" not in sections:
-        return []
+        return list(REQUIRED_CONTRACT_KEYS)
 
     machine_contract = _extract_machine_contract(issue_body)
     if machine_contract is None:
@@ -1123,7 +1123,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         # Check for missing required contract keys (AC2/AC11)
         missing_contract_keys = _extract_missing_contract_keys(issue_body)
         if missing_contract_keys:
-            accumulated_missing_contract_keys = missing_contract_keys
+            accumulated_missing_contract_keys.extend(missing_contract_keys)
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
 
         # Apply alias normalization (design→research, tracking→parent, etc.)
@@ -1152,12 +1152,12 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     else:
                         missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
                         if missing:
-                            accumulated_missing_sections = missing
+                            accumulated_missing_sections.extend(missing)
                             fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
                 else:
                     # Template not found: fall back to Outcome check
                     if _check_missing_outcome(issue_body):
-                        accumulated_missing_sections = ["Outcome"]
+                        accumulated_missing_sections.extend(["Outcome"])
                         fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
         elif is_parent_delivery_rollup:
             # AC1: parent delivery-rollup — check parent template sections (not Outcome)
@@ -1171,13 +1171,21 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 else:
                     missing = _check_missing_sections_from_template(issue_body, load_result.required_labels)
                     if missing:
-                        accumulated_missing_sections = missing
+                        accumulated_missing_sections.extend(missing)
                         fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_PARENT_SECTION)
         else:
             # No machine contract or unknown issue_kind: fall back to Outcome check
             if _check_missing_outcome(issue_body):
-                accumulated_missing_sections = ["Outcome"]
+                accumulated_missing_sections.extend(["Outcome"])
                 fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
+
+        # Normalize accumulated constraints once all checks complete.
+        accumulated_missing_sections = _stable_sort_dedupe(accumulated_missing_sections)
+        accumulated_missing_contract_keys = _stable_sort_dedupe(accumulated_missing_contract_keys)
+
+        # Deduplicate reason_codes while preserving stable order.
+        if fail_closed_reasons:
+            fail_closed_reasons = list(dict.fromkeys(fail_closed_reasons))
 
         if fail_closed_reasons:
             # Build FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 for AC1/AC2/AC8

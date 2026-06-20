@@ -436,6 +436,50 @@ class TestAC6SchemaAndProjectionConsistency:
         assert artifact_data["status"] == result["status"]
         assert artifact_data["next_action"] == result["next_action"]
 
+    def test_fail_closed_forwarding_fields_in_stdout_and_artifact(self, tmp_path, capsys):
+        """Fail-closed result exposes required sections / contract keys / rewrite constraints."""
+        malformed_body = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+```
+"""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(make_minimal_fixture(body=malformed_body, issue_number=3000)),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=3000,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        captured = capsys.readouterr()
+        stdout = captured.out
+
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert result["status"] == "blocked"
+        assert result["planner_fail_closed"] is True
+        assert "missing_required_contract_key" in result["planner_fail_closed_reason_codes"]
+        assert result["required_contract_keys"], "required_contract_keys must be forwarded"
+        assert "issue_kind" in result["required_contract_keys"]
+        assert result["required_sections"], "required_sections must be forwarded"
+        assert "REQUIRED_SECTIONS:" in stdout, "compact stdout should include REQUIRED_SECTIONS"
+        assert "REQUIRED_CONTRACT_KEYS:" in stdout, "compact stdout should include REQUIRED_CONTRACT_KEYS"
+        assert "REWRITE_CONSTRAINTS:" in stdout, "compact stdout should include REWRITE_CONSTRAINTS"
+
+        artifact_path = result.get("artifacts", {}).get("refinement_preflight_result_v1")
+        assert artifact_path, "artifact path must be present"
+        artifact_data = json.loads(Path(artifact_path).read_text())
+        assert artifact_data["required_sections"] == result["required_sections"]
+        assert artifact_data["required_contract_keys"] == result["required_contract_keys"]
+        assert artifact_data["rewrite_constraints"] == result["rewrite_constraints"]
+        assert artifact_data["planner_fail_closed_reason_codes"] == result["planner_fail_closed_reason_codes"]
+
 
 # ---------------------------------------------------------------------------
 # AC7: exit_code_mapping — all mapping table branches covered
