@@ -144,6 +144,25 @@ def test_max_iterations_override_cli_flag():
     assert "human_escalation" in result.stdout
 
 
+def test_approve_verdict_at_max_iterations_proceeds_to_step_4_5():
+    """
+    Regression: approve verdict at max_iterations must NOT escalate.
+    Priority 2b must only trigger for needs-fix, not approve.
+    iteration=2, max_iterations=3 (iteration+1 == max_iterations) with approve
+    → NEXT_ACTION: proceed_to_step_4_5, exit 0.
+    """
+    state = load_fixture()
+    state["iteration"] = 2
+    state["max_iterations"] = 3
+    result = run_script(state, verdict="approve")
+    assert result.returncode == 0, (
+        f"Expected exit 0 for approve+max_iterations, got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "STATUS: pass" in result.stdout
+    assert "NEXT_ACTION: proceed_to_step_4_5" in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Inconsistent state → exit 3
 # ---------------------------------------------------------------------------

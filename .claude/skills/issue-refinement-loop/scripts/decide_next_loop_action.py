@@ -292,7 +292,7 @@ def decide_next_action(
         )
 
     # --- Priority 2b: max_iterations exceeded ---
-    if iteration + 1 >= max_iterations:
+    if review_verdict == VERDICT_NEEDS_FIX and iteration + 1 >= max_iterations:
         blockers = ["max_iterations_exceeded"]
         return (
             STATUS_HUMAN_ESCALATION,
