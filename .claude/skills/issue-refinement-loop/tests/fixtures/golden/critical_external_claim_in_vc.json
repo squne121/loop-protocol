@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 2,
-    "issue_body_sha256": "8adcdfd785eade52c99ad96a5a9dba8f6467ded1ea8e256359d860614e7ee7c8",
+    "issue_body_sha256": "c8782259406b62defb29575768813c8d604ecd49c846e17432ecfe2397646cfd",
     "comments_sha256": null,
     "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
@@ -51,8 +51,8 @@
           "source": "issue_body",
           "source_ref": null,
           "start_line": 1,
-          "end_line": 25,
-          "text_sha256": "8adcdfd785eade52c99ad96a5a9dba8f6467ded1ea8e256359d860614e7ee7c8"
+          "end_line": 62,
+          "text_sha256": "c8782259406b62defb29575768813c8d604ecd49c846e17432ecfe2397646cfd"
         }
       ],
       "confidence": "deterministic"

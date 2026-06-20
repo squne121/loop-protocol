@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 12,
-    "issue_body_sha256": "fb321911702e1073d0646c67eb0ac712e82cbf97d61754dc8aec2c13cda522c9",
+    "issue_body_sha256": "a66eeb41304be2b02589e0e50dc7eae10d9d5c3d248df59b290bf7d4b339bb6b",
     "comments_sha256": null,
     "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
@@ -41,16 +41,23 @@
   "fail_closed": {
     "required": true,
     "reason_codes": [
-      "malformed_machine_readable_contract"
+      "malformed_machine_readable_contract",
+      "missing_required_contract_key"
     ],
-    "human_message": "Issue contract malformation detected: malformed_machine_readable_contract",
+    "human_message": "Issue contract malformation detected: malformed_machine_readable_contract, missing_required_contract_key",
     "rewrite_constraints": {
       "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
       "required_sections": [],
-      "required_contract_keys": [],
+      "required_contract_keys": [
+        "contract_schema_version",
+        "issue_kind"
+      ],
       "rewrite_constraints": {
         "must_add_sections": [],
-        "must_add_contract_keys": [],
+        "must_add_contract_keys": [
+          "contract_schema_version",
+          "issue_kind"
+        ],
         "freeform_rewrite_forbidden": true
       },
       "override_policy": {
@@ -65,7 +72,9 @@
           "template_resolution_error",
           "checker_internal_error"
         ],
-        "overridable_in_current_result": [],
+        "overridable_in_current_result": [
+          "missing_required_contract_key"
+        ],
         "non_overridable_in_current_result": []
       },
       "max_rewrite_attempts": 2,

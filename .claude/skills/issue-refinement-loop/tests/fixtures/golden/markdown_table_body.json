@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 16,
-    "issue_body_sha256": "356330f0e8b9801cb75490de729a57d07a9999ff232ab493bffd031ddfa04c2c",
+    "issue_body_sha256": "a8c6f943e1d82e13ea31a534c4f8069088b49f49ca8ef87a9841f03cd68a10fc",
     "comments_sha256": null,
     "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
@@ -26,8 +26,8 @@
           "source": "issue_body",
           "source_ref": null,
           "start_line": 1,
-          "end_line": 27,
-          "text_sha256": "356330f0e8b9801cb75490de729a57d07a9999ff232ab493bffd031ddfa04c2c"
+          "end_line": 64,
+          "text_sha256": "a8c6f943e1d82e13ea31a534c4f8069088b49f49ca8ef87a9841f03cd68a10fc"
         }
       ],
       "confidence": "deterministic"
@@ -51,7 +51,7 @@
         {
           "child_title_hint": "| Tests | `tests/unit/button.test.ts` |  |",
           "marker": "TBD",
-          "body_line": 11
+          "body_line": 21
         }
       ],
       "evidence_spans": []
