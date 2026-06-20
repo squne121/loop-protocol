@@ -119,6 +119,8 @@ BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
 BLOCKER_INPUT_SCHEMA_INVALID = "INPUT_SCHEMA_INVALID"
 BLOCKER_RESULT_SCHEMA_INVALID = "RESULT_SCHEMA_INVALID"
 BLOCKER_INVALID_ARGS = "INVALID_ARGS"
+BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD = "REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD"
+BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE"
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,77 @@ def _now_iso() -> str:
 
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _as_string_list(
+    value: Any,
+    field_name: str,
+    blockers: list[str],
+) -> tuple[list[str], bool]:
+    """Extract a list[str] payload or record a blocker and fail closed."""
+    if not isinstance(value, list):
+        blockers.append(
+            f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}:"
+            f" {field_name} must be a list"
+        )
+        return [], False
+
+    for item in value:
+        if not isinstance(item, str):
+            blockers.append(
+                f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}:"
+                f" {field_name} contains non-string item"
+            )
+            return [], False
+
+    return value, True
+
+
+def _build_safe_rewrite_constraints(
+    required_sections: list[str],
+    required_contract_keys: list[str],
+) -> dict[str, Any]:
+    """Build a schema-safe rewrite constraints payload for fail-closed payload violations."""
+    return {
+        "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+        "required_sections": required_sections,
+        "required_contract_keys": required_contract_keys,
+        "rewrite_constraints": {
+            "must_add_sections": required_sections,
+            "must_add_contract_keys": required_contract_keys,
+            "freeform_rewrite_forbidden": True,
+        },
+        "override_policy": {
+            "allowed_reason_codes": [
+                "missing_required_section",
+                "missing_required_contract_key",
+            ],
+            "never_override_reason_codes": [
+                "unknown_issue_kind",
+                "issue_kind_policy_load_error",
+                "contract_schema_parse_error",
+                "template_resolution_error",
+                "checker_internal_error",
+            ],
+            "overridable_in_current_result": [],
+            "non_overridable_in_current_result": [],
+        },
+        "max_rewrite_attempts": 2,
+        "no_progress_route": "human_judgment_required",
+    }
+
+
+def _ensure_json_serializable(value: Any, field_name: str, blockers: list[str]) -> bool:
+    """Validate JSON serializability for deterministic stdout/hashing artifacts."""
+    try:
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return True
+    except (TypeError, ValueError) as exc:
+        blockers.append(
+            f"{BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE}:"
+            f" {field_name} serialization error: {exc}"
+        )
+        return False
 
 
 def _find_repo_root() -> Path:
@@ -766,10 +839,12 @@ def _build_compact_stdout(result: dict) -> str:
     rewrite_constraints = result.get("rewrite_constraints")
     if rewrite_constraints:
         lines.append("REWRITE_CONSTRAINTS:")
-        try:
-            rewritten = json.dumps(rewrite_constraints, ensure_ascii=False)
-        except Exception:
-            rewritten = str(rewrite_constraints)
+        rewritten = json.dumps(
+            rewrite_constraints,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         lines.append(f"  {rewritten}")
 
     artifacts = result.get("artifacts", {})
@@ -915,10 +990,10 @@ def _emit_failure_result(
         commands=[],
         blockers=blockers,
         planner_fail_closed_reason_codes=planner_fail_closed_reason_codes or [],
-            required_sections=required_sections or [],
-            required_contract_keys=required_contract_keys or [],
-            rewrite_constraints=rewrite_constraints,
-            artifacts=artifacts,
+        required_sections=required_sections or [],
+        required_contract_keys=required_contract_keys or [],
+        rewrite_constraints=rewrite_constraints,
+        artifacts=artifacts,
         hashes=hashes,
     )
 
@@ -1142,22 +1217,55 @@ def run_preflight(
         blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
     elif planner_exit_code == 0 and planner_fail_closed:
         blockers.append(BLOCKER_FAIL_CLOSED)
-        reason_codes = fail_closed.get("reason_codes", [])
+        reason_codes, reason_codes_ok = _as_string_list(
+            fail_closed.get("reason_codes", []),
+            "planner.fail_closed.reason_codes",
+            blockers,
+        )
+        planner_fail_closed_reason_codes = reason_codes
         blockers.extend(reason_codes)
-        planner_fail_closed_reason_codes = [str(rc) for rc in reason_codes if isinstance(rc, str)]
+        if not reason_codes_ok:
+            rewrite_constraints = _build_safe_rewrite_constraints([], [])
+
         rc = fail_closed.get("rewrite_constraints", {})
-        if isinstance(rc, dict):
-            rewrite_constraints = rc
-            required_sections = [
-                str(section)
-                for section in rc.get("required_sections", [])
-                if isinstance(section, str)
-            ]
-            required_contract_keys = [
-                str(key)
-                for key in rc.get("required_contract_keys", [])
-                if isinstance(key, str)
-            ]
+        if not isinstance(rc, dict):
+            blockers.append(f"{BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD}: rewrite_constraints must be an object")
+            planner_fail_closed_reason_codes = []
+            required_sections = []
+            required_contract_keys = []
+            rewrite_constraints = _build_safe_rewrite_constraints([], [])
+            reason_codes_ok = False
+        elif reason_codes_ok:
+            if not _ensure_json_serializable(rc, "planner.fail_closed.rewrite_constraints", blockers):
+                planner_fail_closed_reason_codes = []
+                required_sections = []
+                required_contract_keys = []
+                rewrite_constraints = _build_safe_rewrite_constraints([], [])
+                reason_codes_ok = False
+            else:
+                required_sections, sections_ok = _as_string_list(
+                    rc.get("required_sections", []),
+                    "planner.fail_closed.rewrite_constraints.required_sections",
+                    blockers,
+                )
+                required_contract_keys, keys_ok = _as_string_list(
+                    rc.get("required_contract_keys", []),
+                    "planner.fail_closed.rewrite_constraints.required_contract_keys",
+                    blockers,
+                )
+                if sections_ok and keys_ok:
+                    rewrite_constraints = rc
+                else:
+                    planner_fail_closed_reason_codes = []
+                    required_sections = []
+                    required_contract_keys = []
+                    rewrite_constraints = _build_safe_rewrite_constraints([], [])
+                    reason_codes_ok = False
+
+        if not reason_codes_ok:
+            # Schema-safe deterministic forwarding requires aligned payloads.
+            # Non-string / non-list fields are treated as schema violation.
+            blockers.append("planner_fail_closed_payload_invalid")
 
     # --- Write repair artifact and update blockers ---
     # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,

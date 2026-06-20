@@ -246,5 +246,23 @@
         "result_core_sha256": {"type": "string", "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "planner_fail_closed": {"const": true}
+        },
+        "required": ["planner_fail_closed"]
+      },
+      "then": {
+        "required": [
+          "planner_fail_closed_reason_codes",
+          "required_sections",
+          "required_contract_keys",
+          "rewrite_constraints"
+        ]
+      }
+    }
+  ]
 }

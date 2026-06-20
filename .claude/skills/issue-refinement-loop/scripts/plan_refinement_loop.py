@@ -979,9 +979,10 @@ def _extract_missing_contract_keys(issue_body: str) -> list[str]:
     Extract missing required contract keys from the Machine-Readable Contract.
 
     Returns a list of required keys that are absent from the parsed contract dict.
-    If no Machine-Readable Contract section is present, returns all required keys
-    so downstream rewrite constraints can distinguish "section absent" from
-    "contract malformed / missing required keys".
+    If the Machine-Readable Contract section exists but cannot be parsed, returns
+    all required keys so downstream rewrite constraints can flag contract parse gaps.
+    If the section is absent, returns an empty list and leaves section detection
+    to a separate caller path.
     """
     if not _YAML_AVAILABLE:
         return []
@@ -989,7 +990,7 @@ def _extract_missing_contract_keys(issue_body: str) -> list[str]:
     sections = _extract_sections(issue_body)
     # Only check for missing keys if a Machine-Readable Contract section exists
     if "Machine-Readable Contract" not in sections:
-        return list(REQUIRED_CONTRACT_KEYS)
+        return []
 
     machine_contract = _extract_machine_contract(issue_body)
     if machine_contract is None:
@@ -1121,10 +1122,16 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         parent_mode = machine_contract.get("parent_mode") if machine_contract else None
 
         # Check for missing required contract keys (AC2/AC11)
-        missing_contract_keys = _extract_missing_contract_keys(issue_body)
-        if missing_contract_keys:
-            accumulated_missing_contract_keys.extend(missing_contract_keys)
+        section_headings = _extract_sections(issue_body)
+        has_contract_section = "Machine-Readable Contract" in section_headings
+        if not has_contract_section:
+            accumulated_missing_sections.extend(["Machine-Readable Contract"])
             fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
+        else:
+            missing_contract_keys = _extract_missing_contract_keys(issue_body)
+            if missing_contract_keys:
+                accumulated_missing_contract_keys.extend(missing_contract_keys)
+                fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
 
         # Apply alias normalization (design→research, tracking→parent, etc.)
         # _normalize_issue_kind returns None for unknown/unresolvable kinds.
