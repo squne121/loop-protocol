@@ -38,6 +38,16 @@ KIND_ALIASES = {
     "c5": "missing_section",
     "rva_immediate_field_missing": "rva_immediate_field_missing",
 }
+KIND_TO_DETERMINISTIC_DOMAIN_KEY = {
+    "vc_command_format": "vc_command_format",
+    "ac_vc_number_mismatch": "vc_number_alignment",
+    "missing_section": "required_sections",
+    "rva_immediate_field_missing": "runtime_applicability",
+}
+VALID_FINDING_KINDS = frozenset(
+    {"deterministic_domain_blocker", "checker_gap", "heuristic_concern"}
+)
+VALID_ARTIFACT_SCHEMAS = frozenset({"REVIEW_ISSUE_RESULT_V1", "CHECK_ISSUE_CONTRACT_V1"})
 
 
 def _normalize_blocker_code(code: str) -> str:
@@ -81,6 +91,13 @@ def _extract_review_blockers(review_result: dict[str, Any]) -> list[dict[str, An
         if blockers:
             return blockers
     return blockers
+
+
+def _extract_findings(review_result: dict[str, Any]) -> list[dict[str, Any]]:
+    findings = review_result.get("findings", [])
+    if not isinstance(findings, list):
+        raise ValueError("review-result-file.findings must be a list when present")
+    return [item for item in findings if isinstance(item, dict)]
 
 
 def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -144,10 +161,66 @@ def _evidence(source_check: str, payload: dict[str, Any], body_sha256: str) -> d
         "source_check": source_check,
         "rule_id": payload.get("rule_id"),
         "category": payload.get("category"),
+        "artifact_path": payload.get("artifact_path", source_check or "unknown_artifact"),
+        "artifact_schema": payload.get("artifact_schema", "CHECK_ISSUE_CONTRACT_V1"),
         "line_start": payload.get("line_start"),
         "line_end": payload.get("line_end"),
         "body_sha256": body_sha256,
+        "iteration_id": payload.get("iteration_id", "legacy_replay_evidence"),
     }
+
+
+def _is_valid_checker_evidence(entry: dict[str, Any], body_sha256: str) -> bool:
+    required_fields = (
+        "source_check",
+        "rule_id",
+        "category",
+        "artifact_path",
+        "artifact_schema",
+        "body_sha256",
+        "iteration_id",
+    )
+    for field_name in required_fields:
+        value = entry.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    if entry.get("artifact_schema") not in VALID_ARTIFACT_SCHEMAS:
+        return False
+    if entry.get("body_sha256") != body_sha256:
+        return False
+    return True
+
+
+def _matching_findings(kind: str, findings: list[dict[str, Any]], body_sha256: str) -> list[dict[str, Any]]:
+    deterministic_domain_key = KIND_TO_DETERMINISTIC_DOMAIN_KEY.get(kind)
+    if deterministic_domain_key is None:
+        return []
+
+    matches: list[dict[str, Any]] = []
+    for finding in findings:
+        finding_kind = finding.get("finding_kind")
+        if finding_kind not in VALID_FINDING_KINDS:
+            continue
+        if finding.get("deterministic_domain_key") != deterministic_domain_key:
+            continue
+        checker_evidence = finding.get("checker_evidence", [])
+        if not isinstance(checker_evidence, list):
+            continue
+        valid_evidence = [
+            entry
+            for entry in checker_evidence
+            if isinstance(entry, dict) and _is_valid_checker_evidence(entry, body_sha256)
+        ]
+        matches.append(
+            {
+                "finding_kind": finding_kind,
+                "blocking": bool(finding.get("blocking")),
+                "message": finding.get("message"),
+                "checker_evidence": valid_evidence,
+                "evidence_valid": bool(valid_evidence),
+            }
+        )
+    return matches
 
 
 def _load_state(state_file: str | None) -> dict[str, Any]:
@@ -179,6 +252,7 @@ def analyze(
     previous_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     blockers = _extract_review_blockers(review_result)
+    findings = _extract_findings(review_result)
     body_sha256 = str(readiness_result.get("body_sha256") or "")
     issue_url = str(review_result.get("issue_url") or "")
     previous_state = previous_state or {}
@@ -197,34 +271,48 @@ def analyze(
         )
 
     blocker_results: list[dict[str, Any]] = []
-    any_backed = False
+    rewrite_ready_blockers: list[dict[str, Any]] = []
     for blocker in blockers:
         kind = _classify_blocker(blocker)
-        evidence = [
-            _evidence("baseline_vc_preflight", item, body_sha256)
-            for item in _matching_vc_preflight(kind, vc_preflight_result)
-        ]
-        evidence.extend(
-            _evidence("vc_contract_syntax", item, body_sha256)
-            for item in _matching_vc_syntax(kind, vc_syntax_result)
-        )
-        evidence.extend(
-            _evidence(str(err.get("source_check") or ""), err, body_sha256)
-            for err in _matching_readiness_errors(kind, readiness_result)
-        )
-        deterministic_backed = bool(evidence)
-        any_backed = any_backed or deterministic_backed
-        blocker_results.append(
-            {
-                "reviewer_blocker_code": blocker["reviewer_blocker_code"],
-                "normalized_kind": kind,
-                "deterministic_backed": deterministic_backed,
-                "message": blocker.get("message"),
-                "line_start": blocker.get("line_start"),
-                "line_end": blocker.get("line_end"),
-                "evidence": evidence,
-            }
-        )
+        matched_findings = _matching_findings(kind, findings, body_sha256)
+        evidence: list[dict[str, Any]] = []
+        deterministic_backed = False
+        if matched_findings:
+            for finding in matched_findings:
+                if (
+                    finding["finding_kind"] == "deterministic_domain_blocker"
+                    and finding["blocking"]
+                    and finding["evidence_valid"]
+                ):
+                    deterministic_backed = True
+                    evidence.extend(finding["checker_evidence"])
+        else:
+            evidence = [
+                _evidence("baseline_vc_preflight", item, body_sha256)
+                for item in _matching_vc_preflight(kind, vc_preflight_result)
+            ]
+            evidence.extend(
+                _evidence("vc_contract_syntax", item, body_sha256)
+                for item in _matching_vc_syntax(kind, vc_syntax_result)
+            )
+            evidence.extend(
+                _evidence(str(err.get("source_check") or ""), err, body_sha256)
+                for err in _matching_readiness_errors(kind, readiness_result)
+            )
+            deterministic_backed = bool(evidence)
+        blocker_result = {
+            "reviewer_blocker_code": blocker["reviewer_blocker_code"],
+            "normalized_kind": kind,
+            "deterministic_backed": deterministic_backed,
+            "message": blocker.get("message"),
+            "line_start": blocker.get("line_start"),
+            "line_end": blocker.get("line_end"),
+            "evidence": evidence,
+            "matched_findings": matched_findings,
+        }
+        blocker_results.append(blocker_result)
+        if deterministic_backed:
+            rewrite_ready_blockers.append(blocker_result)
 
     primary = blocker_results[0]
     same_lane = (
@@ -234,7 +322,7 @@ def analyze(
     )
     prior_count = int(previous_state.get("consecutive_unbacked_count", 0))
 
-    if any_backed:
+    if rewrite_ready_blockers:
         verdict = "deterministic_fail_confirmed"
         routing = "proceed_to_rewrite"
         should_consume_iteration = True
@@ -267,6 +355,7 @@ def analyze(
             "body_sha256": body_sha256,
             "issue_url": issue_url,
             "blockers": blocker_results,
+            "rewrite_ready_blockers": rewrite_ready_blockers,
         },
         next_state,
     )

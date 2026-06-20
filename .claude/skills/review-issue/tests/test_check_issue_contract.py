@@ -16,6 +16,9 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).parent.parent / "scripts" / "check_issue_contract.py"
 )
+sys.path.insert(0, str(SCRIPT_PATH.parent))
+import check_issue_contract as checker  # noqa: E402
+
 # contract_readiness_check.py is located in issue-contract-review skill
 CONTRACT_READINESS_SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
@@ -292,6 +295,15 @@ class TestC5Fail:
             f"Expected needs-fix, got {output['verdict']}"
         )
 
+    def test_c5_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
+        """GIVEN c5_fail_issue.md WHEN checker runs THEN deterministic finding is checker_gap until real evidence exists."""
+        output = run_checker("c5_fail_issue.md")
+        findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_number_alignment"]
+        assert findings, "Expected vc_number_alignment finding"
+        assert findings[0]["finding_kind"] == "checker_gap"
+        assert findings[0]["blocking"] is False
+        assert findings[0]["checker_evidence"] == []
+
 
 class TestC6Fail:
     """GIVEN a fixture with subjective phrasing in AC WHEN checker runs THEN C6 fails."""
@@ -320,6 +332,48 @@ class TestC8Fail:
         assert output["deterministic_checks"]["C8_outcome_concreteness"] == "fail", (
             f"Expected C8 to fail, got {output['deterministic_checks']['C8_outcome_concreteness']}"
         )
+
+
+class TestFindingsContract:
+    def test_c4_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN unsupported deterministic blocker stays non-blocking."""
+        output = run_checker("c4_fail_issue.md")
+        findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_command_format"]
+        assert findings, "Expected vc_command_format finding"
+        assert findings[0]["finding_kind"] == "checker_gap"
+        assert findings[0]["blocking"] is False
+        assert findings[0]["checker_evidence"] == []
+
+    def test_c9_warn_does_not_duplicate_findings(self):
+        """GIVEN research issue missing RVA WHEN checker runs THEN warning finding is emitted once."""
+        body = """## Machine-Readable Contract
+```yaml
+contract_schema_version: v1
+issue_kind: research
+parent_issue: none
+goal_ref: "research"
+change_kind: docs
+```
+
+## Outcome
+調査結果が記録される。
+
+## Stop Conditions
+- [ ] stop 1
+- [ ] stop 2
+- [ ] stop 3
+- [ ] stop 4
+- [ ] stop 5
+- [ ] stop 6
+"""
+        result = checker.run_checks(body, labels="", title="research issue")
+        payload = checker.result_to_dict(result)
+        findings = [
+            f
+            for f in payload["findings"]
+            if f["deterministic_domain_key"] == "runtime_applicability"
+        ]
+        assert len(findings) == 1, f"Expected one runtime_applicability finding, got: {findings}"
 
     def test_verdict_is_needs_fix(self):
         """GIVEN c8_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""

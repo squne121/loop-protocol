@@ -17,7 +17,7 @@ OUTPUT_CONTRACT
 - Do not return raw transcript, raw diff, or raw logs to the parent thread.
 - STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT の 8 フィールド（MUST_READ は空でも常に出力）。
 - Persist only the minimum raw review, issue body, diff, and command logs required for audit in the artifact JSON; never persist secrets or access tokens.
-- full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存する。
+- full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存し、`findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version を lossless に保持する。
 
 EXECUTION_POLICY
 - `review-issue` skill を正本とし、progressive disclosure で必要な references だけを読む。

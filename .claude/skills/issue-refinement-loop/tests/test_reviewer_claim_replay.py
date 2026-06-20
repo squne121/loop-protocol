@@ -80,6 +80,7 @@ COMPACT_C4 = {
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
     "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
     "structured_blockers": [],
+    "findings": [],
 }
 
 COMPACT_MISSING_SECTION = {
@@ -87,7 +88,41 @@ COMPACT_MISSING_SECTION = {
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
     "blocking_issues": [{"code": "missing_section", "message": "missing section"}],
     "structured_blockers": [],
+    "findings": [],
 }
+
+
+def _finding(
+    *,
+    finding_kind: str,
+    deterministic_domain_key: str,
+    body_sha256: str = "sha256:body-a",
+    blocking: bool,
+    artifact_schema: str = "REVIEW_ISSUE_RESULT_V1",
+    artifact_path: str = ".claude/artifacts/review.json",
+) -> dict:
+    evidence = []
+    if finding_kind == "deterministic_domain_blocker":
+        evidence = [
+            {
+                "source_check": "check_issue_contract",
+                "rule_id": deterministic_domain_key,
+                "category": "deterministic_check",
+                "artifact_path": artifact_path,
+                "artifact_schema": artifact_schema,
+                "body_sha256": body_sha256,
+                "iteration_id": "iter-1",
+                "line_start": 10,
+                "line_end": 10,
+            }
+        ]
+    return {
+        "finding_kind": finding_kind,
+        "deterministic_domain_key": deterministic_domain_key,
+        "blocking": blocking,
+        "checker_evidence": evidence,
+        "message": deterministic_domain_key,
+    }
 
 
 def test_c4_with_lp001_only_is_unbacked():
@@ -216,6 +251,95 @@ def test_vc_preflight_category_backs_c4():
     )
     assert result["verdict"] == "deterministic_fail_confirmed"
     assert result["blockers"][0]["evidence"][0]["source_check"] == "baseline_vc_preflight"
+
+
+def test_supported_deterministic_finding_routes_only_matching_blocker():
+    review = {
+        **COMPACT_C4,
+        "findings": [
+            _finding(
+                finding_kind="deterministic_domain_blocker",
+                deterministic_domain_key="vc_command_format",
+                blocking=True,
+            ),
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key="required_sections",
+                blocking=False,
+            ),
+        ],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert len(result["rewrite_ready_blockers"]) == 1
+    assert result["rewrite_ready_blockers"][0]["normalized_kind"] == "vc_command_format"
+
+
+def test_mixed_supported_and_unsupported_findings_do_not_promote_all_blockers():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": COMPACT_C4["issue_url"],
+        "blocking_issues": [
+            {"code": "C4", "message": "missing $ prefix"},
+            {"code": "missing_section", "message": "missing section"},
+        ],
+        "structured_blockers": [],
+        "findings": [
+            _finding(
+                finding_kind="deterministic_domain_blocker",
+                deterministic_domain_key="vc_command_format",
+                blocking=True,
+            ),
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key="required_sections",
+                blocking=False,
+            ),
+        ],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    assert len(result["rewrite_ready_blockers"]) == 1
+    assert result["rewrite_ready_blockers"][0]["reviewer_blocker_code"] == "C4"
+    unbacked = [item for item in result["blockers"] if not item["deterministic_backed"]]
+    assert len(unbacked) == 1
+    assert unbacked[0]["reviewer_blocker_code"] == "missing_section"
+
+
+def test_stale_or_wrong_schema_evidence_fails_closed():
+    review = {
+        **COMPACT_C4,
+        "findings": [
+            _finding(
+                finding_kind="deterministic_domain_blocker",
+                deterministic_domain_key="vc_command_format",
+                blocking=True,
+                body_sha256="sha256:stale",
+                artifact_schema="WRONG_SCHEMA",
+            )
+        ],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "reviewer_claim_unbacked_by_deterministic_checker"
+    assert result["blockers"][0]["deterministic_backed"] is False
 
 
 def test_cli_bad_optional_json_fails_closed(tmp_path: Path):
