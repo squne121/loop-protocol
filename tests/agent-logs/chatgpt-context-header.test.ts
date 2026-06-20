@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { writeFileSync, mkdtempSync, rmSync, readFileSync } from 'fs'
 import { execFileSync } from 'child_process'
-import { resolve } from 'path'
+import { resolve, basename } from 'path'
 import { tmpdir } from 'os'
 
 import { renderSafetyHeader } from '../../scripts/agent-logs/lib/chatgpt-context-renderer.mjs'
@@ -43,6 +43,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('chatgpt_context_bundle/v1')
     })
@@ -52,6 +54,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('<!-- SECURITY_BOUNDARY')
     })
@@ -61,6 +65,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('generated_at: 2026-06-19T00:00:00.000Z')
     })
@@ -70,6 +76,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('issue: #939')
     })
@@ -79,6 +87,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('parent_issue: #928')
     })
@@ -88,6 +98,8 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('```yaml')
       expect(result).toContain('```')
@@ -98,8 +110,109 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
         generated_at: '2026-06-19T00:00:00.000Z',
         issue: '#939',
         parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
       })
       expect(result).toContain('schema_version: v1')
+    })
+
+    // Blocker 1: AC10 required fields
+    it('GIVEN header meta WHEN rendering THEN output contains safety.redaction_status', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      })
+      expect(result).toContain('redaction_status:')
+    })
+
+    it('GIVEN header meta WHEN rendering THEN output contains safety.rendered_markdown_scan', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      })
+      expect(result).toContain('rendered_markdown_scan:')
+    })
+
+    it('GIVEN header meta WHEN rendering THEN output contains safety.untrusted_content_mode', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      })
+      expect(result).toContain('untrusted_content_mode:')
+    })
+
+    it('GIVEN header meta WHEN rendering THEN output contains budget.max_chars', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      })
+      expect(result).toContain('max_chars: 100000')
+    })
+
+    it('GIVEN header meta WHEN rendering THEN output contains budget.max_sections', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      })
+      expect(result).toContain('max_sections: 20')
+    })
+
+    it('GIVEN header meta WHEN rendering THEN output contains budget.rendered_chars', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      }, { renderedChars: 42, sources: [], omittedSections: [] })
+      expect(result).toContain('rendered_chars: 42')
+    })
+
+    it('GIVEN sources renderStats WHEN rendering THEN output contains sources section', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      }, {
+        renderedChars: 100,
+        sources: [{ kind: 'run_report_json', digest: 'sha256:aabb' }],
+        omittedSections: ['lower_priority_narrative'],
+      })
+      expect(result).toContain('sources:')
+      expect(result).toContain('kind: run_report_json')
+    })
+
+    it('GIVEN omitted sections renderStats WHEN rendering THEN output contains omitted_sections', () => {
+      const result = renderSafetyHeader({
+        generated_at: '2026-06-19T00:00:00.000Z',
+        issue: '#939',
+        parent_issue: '#928',
+        max_chars: 100000,
+        max_sections: 20,
+      }, {
+        renderedChars: 100,
+        sources: [],
+        omittedSections: ['lower_priority_narrative'],
+      })
+      expect(result).toContain('omitted_sections:')
+      expect(result).toContain('lower_priority_narrative')
     })
   })
 
@@ -168,6 +281,90 @@ describe('chatgpt-context machine-readable bundle header (AC10)', () => {
 
         const content = readFileSync(outputPath, 'utf-8')
         expect(content).toContain('chatgpt_context_bundle/v1')
+      } finally {
+        cleanupTempDir(tempDir)
+      }
+    })
+
+    // Blocker 1: end-to-end — all AC10 required fields present in final bundle
+    it('GIVEN valid inputs WHEN exporting THEN bundle header contains all AC10 required fields', () => {
+      const tempDir = createTempDir()
+      try {
+        const parentJson = resolve(tempDir, 'parent.json')
+        const targetJson = resolve(tempDir, 'target.json')
+        const retroJson = resolve(tempDir, 'retro.json')
+        const sourceSetJson = resolve(tempDir, 'source-set.json')
+        const outputPath = resolve(tempDir, 'bundle.md')
+        const summaryPath = resolve(tempDir, 'summary.json')
+
+        writeFileSync(parentJson, JSON.stringify({ number: 928, title: 'Parent' }))
+        writeFileSync(targetJson, JSON.stringify({ number: 939, title: 'Target' }))
+        writeFileSync(retroJson, JSON.stringify({}))
+        writeFileSync(sourceSetJson, JSON.stringify({}))
+
+        const result = runExportScript([
+          '--parent-issue-json', parentJson,
+          '--target-issue-json', targetJson,
+          '--retro-index-json', retroJson,
+          '--source-set-json', sourceSetJson,
+          '--max-chars', '100000',
+          '--max-sections', '20',
+          '--generated-at', '2026-06-19T00:00:00.000Z',
+          '--output', outputPath,
+          '--summary-json-out', summaryPath,
+        ])
+
+        expect(result.exitCode).toBe(0)
+        const content = readFileSync(outputPath, 'utf-8')
+
+        // All AC10 required fields
+        expect(content).toContain('redaction_status:')
+        expect(content).toContain('rendered_markdown_scan:')
+        expect(content).toContain('untrusted_content_mode:')
+        expect(content).toContain('max_chars:')
+        expect(content).toContain('rendered_chars:')
+        expect(content).toContain('max_sections:')
+        expect(content).toContain('sources:')
+        expect(content).toContain('omitted_sections:')
+      } finally {
+        cleanupTempDir(tempDir)
+      }
+    })
+
+    // Blocker "High: summary no absolute path" — output_path must not be present
+    it('GIVEN valid inputs WHEN exporting THEN summary JSON does not contain output_path', () => {
+      const tempDir = createTempDir()
+      try {
+        const parentJson = resolve(tempDir, 'parent.json')
+        const targetJson = resolve(tempDir, 'target.json')
+        const retroJson = resolve(tempDir, 'retro.json')
+        const sourceSetJson = resolve(tempDir, 'source-set.json')
+        const outputPath = resolve(tempDir, 'bundle.md')
+        const summaryPath = resolve(tempDir, 'summary.json')
+
+        writeFileSync(parentJson, JSON.stringify({ number: 928, title: 'Parent' }))
+        writeFileSync(targetJson, JSON.stringify({ number: 939, title: 'Target' }))
+        writeFileSync(retroJson, JSON.stringify({}))
+        writeFileSync(sourceSetJson, JSON.stringify({}))
+
+        const result = runExportScript([
+          '--parent-issue-json', parentJson,
+          '--target-issue-json', targetJson,
+          '--retro-index-json', retroJson,
+          '--source-set-json', sourceSetJson,
+          '--max-chars', '100000',
+          '--max-sections', '20',
+          '--generated-at', '2026-06-19T00:00:00.000Z',
+          '--output', outputPath,
+          '--summary-json-out', summaryPath,
+        ])
+
+        expect(result.exitCode).toBe(0)
+        const summaryContent = JSON.parse(readFileSync(summaryPath, 'utf-8'))
+        // output_path must not be present — only logical output_basename
+        expect(summaryContent).not.toHaveProperty('output_path')
+        expect(summaryContent).toHaveProperty('output_basename')
+        expect(summaryContent.output_basename).toBe(basename(outputPath))
       } finally {
         cleanupTempDir(tempDir)
       }

@@ -74,8 +74,10 @@ export function applyBudget(sections, budget) {
 }
 
 /**
- * Validate that the budget is sufficient to hold safety header + priority signals.
- * These are the minimum required sections.
+ * Validate that the budget is sufficient to hold the minimum required sections:
+ * safety_header, source_manifest, and priority_signals.
+ *
+ * Blocker 2 fix: source_manifest is now part of the required minimum frame.
  *
  * @param {object[]} sections
  * @param {object} budget
@@ -83,7 +85,7 @@ export function applyBudget(sections, budget) {
  */
 export function assertBudgetSufficient(sections, budget) {
   const required = sections.filter(
-    (s) => s.id === 'safety_header' || s.id === 'priority_signals'
+    (s) => s.id === 'safety_header' || s.id === 'source_manifest' || s.id === 'priority_signals'
   )
 
   const requiredChars = required.reduce((sum, s) => sum + s.content.length, 0)
@@ -92,7 +94,7 @@ export function assertBudgetSufficient(sections, budget) {
   if (requiredSections > budget.maxSections || requiredChars > budget.maxChars) {
     throw runtimeError(
       'budget.too_small',
-      `budget too small to hold safety_header + priority_signals: ` +
+      `budget too small to hold safety_header + source_manifest + priority_signals: ` +
         `need ${requiredChars} chars / ${requiredSections} sections, ` +
         `budget is ${budget.maxChars} chars / ${budget.maxSections} sections`
     )

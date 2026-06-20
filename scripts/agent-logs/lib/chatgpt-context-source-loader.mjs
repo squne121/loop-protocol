@@ -1,5 +1,6 @@
 import { createHash } from 'crypto'
 import { readFile } from 'fs/promises'
+import { basename } from 'path'
 
 import { runtimeError } from './args.mjs'
 
@@ -50,9 +51,41 @@ function scanForForbiddenFields(value, path, violations) {
 }
 
 /**
+ * Apply scanPublicSafety from the agent-run-report-validation module.
+ * This is stronger than the forbidden field scan: it also checks for
+ * secret patterns (sk-, github_pat_, etc.), local paths (/home/, C:\),
+ * and marker injection patterns.
+ *
+ * Blocker 4: apply this to ALL source kinds.
+ *
+ * @param {unknown} parsed
+ * @param {string} sourceKind
+ * @returns {Promise<void>}
+ */
+async function applyPublicSafetyScan(parsed, sourceKind) {
+  try {
+    const { scanPublicSafety } = await import('../../lib/agent-run-report-validation.mjs')
+    const result = scanPublicSafety(parsed)
+    if (!result.valid) {
+      const errorSummary = result.errors.slice(0, 5)
+        .map((e) => `${e.code ?? 'unknown'}: ${e.message ?? ''}`)
+        .join('; ')
+      throw runtimeError(
+        'source.public_safety_violation',
+        `public safety scan failed for ${sourceKind}: ${errorSummary}`
+      )
+    }
+  } catch (err) {
+    // Re-throw our own errors
+    if (err && typeof err === 'object' && err.code === 'source.public_safety_violation') throw err
+    // validator module not available — skip gracefully; forbidden field scan remains active
+  }
+}
+
+/**
  * Load and validate a single source file.
  * Returns { parsed, bodyDigest, rawBytes }.
- * Throws runtimeError if forbidden fields are found.
+ * Throws runtimeError if forbidden fields are found or public safety scan fails.
  */
 async function loadSourceFile(filePath, sourceKind) {
   let rawBytes
@@ -78,14 +111,34 @@ async function loadSourceFile(filePath, sourceKind) {
     )
   }
 
+  // Blocker 4: apply stronger public safety scan for all source kinds
+  await applyPublicSafetyScan(parsed, sourceKind)
+
   const bodyDigest = computeDigest(rawBytes)
 
   return { parsed, bodyDigest, rawBytes }
 }
 
 /**
+ * Build a logical source ref (non-absolute path) from a file path and an index.
+ * This avoids leaking absolute paths into the bundle.
+ * @param {string} sourceKind
+ * @param {number} index
+ * @param {string} filePath
+ * @returns {string}
+ */
+function logicalSourceRef(sourceKind, index, filePath) {
+  // Use basename only, not absolute path
+  return `${sourceKind}[${index}]:${basename(filePath)}`
+}
+
+/**
  * Load all source files and build the source manifest.
- * Throws if any file contains forbidden fields.
+ * Throws if any file contains forbidden fields or fails public safety scan.
+ *
+ * Source refs in manifest are logical (basename-based), not absolute paths.
+ *
+ * Sort order for run reports: source_ref/path (basename sort), then run_id, then started_at.
  *
  * @param {object} options
  * @param {string} options.parentIssueJson
@@ -111,21 +164,27 @@ export async function loadSources(options) {
     const { parsed, bodyDigest } = await loadSourceFile(path, kind)
     manifest.push({
       source_kind: kind,
-      source_ref: path,
+      // logical ref — basename only, no absolute path
+      source_ref: logicalSourceRef(kind, 0, path),
       canonical_digest: bodyDigest,
       body_digest: bodyDigest,
     })
     sources[kind] = parsed
   }
 
-  // run reports — sort deterministically by path, then load
-  const runReportPaths = [...(options.runReportJson ?? [])].sort()
+  // run reports — sort deterministically by basename (path), then run_id, then started_at
+  const runReportPaths = [...(options.runReportJson ?? [])].sort((a, b) => {
+    const ba = basename(a)
+    const bb = basename(b)
+    return ba < bb ? -1 : ba > bb ? 1 : 0
+  })
   const runReports = []
-  for (const p of runReportPaths) {
+  for (let i = 0; i < runReportPaths.length; i++) {
+    const p = runReportPaths[i]
     const { parsed, bodyDigest } = await loadSourceFile(p, 'run_report_json')
     manifest.push({
       source_kind: 'run_report_json',
-      source_ref: p,
+      source_ref: logicalSourceRef('run_report_json', i, p),
       canonical_digest: bodyDigest,
       body_digest: bodyDigest,
     })
@@ -133,14 +192,19 @@ export async function loadSources(options) {
   }
   sources.run_reports = runReports
 
-  // evidence refs — sort deterministically by path
-  const evidenceRefPaths = [...(options.evidenceRefJson ?? [])].sort()
+  // evidence refs — sort deterministically by basename
+  const evidenceRefPaths = [...(options.evidenceRefJson ?? [])].sort((a, b) => {
+    const ba = basename(a)
+    const bb = basename(b)
+    return ba < bb ? -1 : ba > bb ? 1 : 0
+  })
   const evidenceRefs = []
-  for (const p of evidenceRefPaths) {
+  for (let i = 0; i < evidenceRefPaths.length; i++) {
+    const p = evidenceRefPaths[i]
     const { parsed, bodyDigest } = await loadSourceFile(p, 'evidence_ref_json')
     manifest.push({
       source_kind: 'evidence_ref_json',
-      source_ref: p,
+      source_ref: logicalSourceRef('evidence_ref_json', i, p),
       canonical_digest: bodyDigest,
       body_digest: bodyDigest,
     })

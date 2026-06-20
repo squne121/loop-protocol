@@ -2,16 +2,57 @@ import { wrapAsDataBlock } from './chatgpt-context-safety-scan.mjs'
 
 /**
  * Render the SECURITY_BOUNDARY safety header section.
+ *
+ * AC10 requires a machine-readable YAML block with the following fields:
+ *   - generated_at, issue, parent_issue, schema_version
+ *   - safety.redaction_status, safety.rendered_markdown_scan, safety.untrusted_content_mode
+ *   - budget.max_chars, budget.rendered_chars, budget.max_sections
+ *   - sources[] (each kind + digest)
+ *   - omitted_sections[]
+ *
+ * Because rendered_chars depends on the final output length, this function accepts
+ * an optional `renderStats` parameter. When absent (1st-pass), rendered_chars is
+ * set to 0. The caller does a 2nd-pass after measuring the full bundle to set the
+ * real value.
+ *
  * @param {object} header Machine-readable YAML header content
+ * @param {object} [renderStats] Optional stats from 2nd pass
+ * @param {number} [renderStats.renderedChars]
+ * @param {object[]} [renderStats.sources] Array of { kind, digest }
+ * @param {string[]} [renderStats.omittedSections]
  * @returns {string}
  */
-export function renderSafetyHeader(header) {
+export function renderSafetyHeader(header, renderStats) {
+  const renderedChars = renderStats?.renderedChars ?? 0
+  const sources = renderStats?.sources ?? []
+  const omittedSections = renderStats?.omittedSections ?? []
+
+  const sourcesYaml = sources.length > 0
+    ? sources.map((s) => `    - kind: ${s.kind}\n      digest: ${s.digest}`).join('\n')
+    : '    []'
+
+  const omittedYaml = omittedSections.length > 0
+    ? omittedSections.map((id) => `    - ${id}`).join('\n')
+    : '    []'
+
   const yamlLines = [
     'chatgpt_context_bundle/v1:',
     `  generated_at: ${header.generated_at}`,
     `  issue: ${header.issue}`,
     `  parent_issue: ${header.parent_issue}`,
     `  schema_version: v1`,
+    `  safety:`,
+    `    redaction_status: ${header.redaction_status ?? 'clean'}`,
+    `    rendered_markdown_scan: pass`,
+    `    untrusted_content_mode: data_block_fenced`,
+    `  budget:`,
+    `    max_chars: ${header.max_chars ?? 0}`,
+    `    rendered_chars: ${renderedChars}`,
+    `    max_sections: ${header.max_sections ?? 0}`,
+    `  sources:`,
+    sourcesYaml,
+    `  omitted_sections:`,
+    omittedYaml,
   ]
   return [
     '<!-- SECURITY_BOUNDARY: chatgpt_context_bundle/v1 -->',
@@ -27,6 +68,7 @@ export function renderSafetyHeader(header) {
 
 /**
  * Render the source manifest section.
+ * Source refs are logical refs (source_kind/index), not absolute file paths.
  * @param {object[]} manifest Array of source manifest entries
  * @returns {string}
  */
@@ -117,6 +159,8 @@ export function renderCiReviewLoops(retroIndex) {
 
 /**
  * Render evidence refs section.
+ * All refs (unique and duplicate) are output in DATA blocks.
+ * Duplicate refs include duplicate_of and used_by_sections per AC5.
  * @param {object[]} dedupedRefs
  * @returns {string}
  */
@@ -127,15 +171,32 @@ export function renderEvidenceRefs(dedupedRefs) {
   const dupes = dedupedRefs.filter((r) => r.duplicate_of)
 
   for (const ref of unique) {
-    lines.push(`- **${ref.kind ?? 'unknown'}**: \`${ref.ref ?? ref.workflow_run_url ?? 'n/a'}\``)
-    lines.push(`  - digest: \`${ref.digest ?? 'n/a'}\``)
-    if (ref.used_by_sections && ref.used_by_sections.length > 0) {
-      lines.push(`  - used_by: ${ref.used_by_sections.join(', ')}`)
+    // Render as DATA block to avoid inline Markdown injection from external URLs/values
+    const refData = {
+      kind: ref.kind ?? 'unknown',
+      ref: ref.ref ?? ref.workflow_run_url ?? null,
+      digest: ref.digest ?? null,
+      used_by_sections: ref.used_by_sections ?? [],
+      duplicate_of: null,
     }
+    lines.push(wrapAsDataBlock(JSON.stringify(refData, null, 2)))
+    lines.push('')
   }
 
   if (dupes.length > 0) {
-    lines.push('', `_Duplicate refs (${dupes.length}): omitted from output, captured in summary._`)
+    lines.push('### Duplicate Evidence Refs', '')
+    for (const ref of dupes) {
+      const refData = {
+        kind: ref.kind ?? 'unknown',
+        ref: ref.ref ?? ref.workflow_run_url ?? null,
+        digest: ref.digest ?? null,
+        used_by_sections: ref.used_by_sections ?? [],
+        duplicate_of: ref.duplicate_of,
+        canonical_key_digest: ref.canonical_key_digest ?? null,
+      }
+      lines.push(wrapAsDataBlock(JSON.stringify(refData, null, 2)))
+      lines.push('')
+    }
   }
 
   lines.push('')

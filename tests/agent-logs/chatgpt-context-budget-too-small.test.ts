@@ -12,6 +12,7 @@ describe('chatgpt-context budget too small (AC6)', () => {
     it('GIVEN adequate budget WHEN asserting THEN does not throw', () => {
       const sections = [
         makeSection('safety_header', 100),
+        makeSection('source_manifest', 100),
         makeSection('priority_signals', 100),
         makeSection('lower_priority_narrative', 100),
       ]
@@ -21,6 +22,7 @@ describe('chatgpt-context budget too small (AC6)', () => {
     it('GIVEN budget too small for safety_header WHEN asserting THEN throws budget.too_small', () => {
       const sections = [
         makeSection('safety_header', 5000),
+        makeSection('source_manifest', 5000),
         makeSection('priority_signals', 5000),
       ]
       expect(() => assertBudgetSufficient(sections, { maxChars: 100, maxSections: 10 }))
@@ -30,6 +32,7 @@ describe('chatgpt-context budget too small (AC6)', () => {
     it('GIVEN budget too small for safety_header WHEN asserting THEN error code is budget.too_small', () => {
       const sections = [
         makeSection('safety_header', 5000),
+        makeSection('source_manifest', 5000),
         makeSection('priority_signals', 5000),
       ]
       let caughtCode: string | undefined
@@ -44,6 +47,7 @@ describe('chatgpt-context budget too small (AC6)', () => {
     it('GIVEN maxSections=0 WHEN asserting THEN throws budget.too_small', () => {
       const sections = [
         makeSection('safety_header', 10),
+        makeSection('source_manifest', 10),
         makeSection('priority_signals', 10),
       ]
       let caughtCode: string | undefined
@@ -55,9 +59,10 @@ describe('chatgpt-context budget too small (AC6)', () => {
       expect(caughtCode).toBe('budget.too_small')
     })
 
-    it('GIVEN budget with room for only 1 section when 2 required WHEN asserting THEN throws', () => {
+    it('GIVEN budget with room for only 1 section when 3 required WHEN asserting THEN throws', () => {
       const sections = [
         makeSection('safety_header', 10),
+        makeSection('source_manifest', 10),
         makeSection('priority_signals', 10),
       ]
       let threw = false
@@ -67,6 +72,34 @@ describe('chatgpt-context budget too small (AC6)', () => {
         threw = true
       }
       expect(threw).toBe(true)
+    })
+
+    // Blocker 2: source_manifest is now part of required minimum frame
+    it('GIVEN sections without source_manifest WHEN budget fits safety_header+priority_signals only THEN does not throw', () => {
+      // If source_manifest is not in sections list, assertBudgetSufficient only counts what's present
+      const sections = [
+        makeSection('safety_header', 10),
+        makeSection('priority_signals', 10),
+        // no source_manifest
+      ]
+      // Should pass since we only have 2 required sections and budget is big enough
+      expect(() => assertBudgetSufficient(sections, { maxChars: 10000, maxSections: 10 })).not.toThrow()
+    })
+
+    it('GIVEN sections with source_manifest WHEN budget too small for 3 sections WHEN asserting THEN throws', () => {
+      const sections = [
+        makeSection('safety_header', 100),
+        makeSection('source_manifest', 100),
+        makeSection('priority_signals', 100),
+      ]
+      let caughtCode: string | undefined
+      try {
+        // maxSections=2 is too small for 3 required sections
+        assertBudgetSufficient(sections, { maxChars: 10000, maxSections: 2 })
+      } catch (err) {
+        caughtCode = (err as { code?: string }).code
+      }
+      expect(caughtCode).toBe('budget.too_small')
     })
   })
 

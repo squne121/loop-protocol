@@ -47,6 +47,25 @@ describe('chatgpt-context evidence ref dedupe (AC5)', () => {
       const ref2 = makeRef({ artifact_id: 'art-002' })
       expect(buildDedupeKey(ref1)).not.toBe(buildDedupeKey(ref2))
     })
+
+    // Blocker 6: GitHub fragment (#issuecomment-...) must be part of dedup key
+    it('GIVEN refs with same base URL but different GitHub fragments WHEN building keys THEN keys differ', () => {
+      const ref1 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
+      const ref2 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-200' })
+      expect(buildDedupeKey(ref1)).not.toBe(buildDedupeKey(ref2))
+    })
+
+    it('GIVEN refs with same URL and same GitHub fragment WHEN building keys THEN keys are equal', () => {
+      const ref1 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
+      const ref2 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
+      expect(buildDedupeKey(ref1)).toBe(buildDedupeKey(ref2))
+    })
+
+    it('GIVEN refs with tracking params AND same fragment WHEN building keys THEN keys are equal', () => {
+      const ref1 = makeRef({ ref: 'https://github.com/org/repo/issues/1?utm_source=email#issuecomment-100' })
+      const ref2 = makeRef({ ref: 'https://github.com/org/repo/issues/1?utm_medium=social#issuecomment-100' })
+      expect(buildDedupeKey(ref1)).toBe(buildDedupeKey(ref2))
+    })
   })
 
   describe('dedupeEvidenceRefs', () => {
@@ -91,6 +110,40 @@ describe('chatgpt-context evidence ref dedupe (AC5)', () => {
     it('GIVEN refs with tracking URLs WHEN deduping THEN refs are identified as duplicates', () => {
       const ref1 = makeRef({ ref: 'https://github.com/org/repo?utm_source=email' })
       const ref2 = makeRef({ ref: 'https://github.com/org/repo?utm_medium=social' })
+      const result = dedupeEvidenceRefs([ref1, ref2])
+      expect(result).toHaveLength(2)
+      const dup = result.find((r: { duplicate_of: unknown }) => r.duplicate_of !== null)
+      expect(dup).toBeDefined()
+    })
+
+    // Blocker 6: canonical_key_digest must be present on all refs
+    it('GIVEN all refs WHEN deduping THEN all refs have canonical_key_digest', () => {
+      const refs = [makeRef(), makeRef({ kind: 'pr_review' })]
+      const result = dedupeEvidenceRefs(refs)
+      expect(result.every((r: { canonical_key_digest: unknown }) => typeof r.canonical_key_digest === 'string')).toBe(true)
+    })
+
+    it('GIVEN duplicate ref WHEN deduping THEN duplicate has non-empty canonical_key_digest', () => {
+      const ref = makeRef()
+      const refs = [ref, { ...ref }]
+      const result = dedupeEvidenceRefs(refs)
+      const dup = result.find((r: { duplicate_of: unknown }) => r.duplicate_of !== null)
+      expect(typeof dup?.canonical_key_digest).toBe('string')
+      expect((dup?.canonical_key_digest as string).length).toBeGreaterThan(0)
+    })
+
+    // Blocker 6: GitHub fragment variant dedup — different fragments = different refs
+    it('GIVEN refs with different GitHub fragments WHEN deduping THEN they are NOT duplicates', () => {
+      const ref1 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
+      const ref2 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-200' })
+      const result = dedupeEvidenceRefs([ref1, ref2])
+      expect(result).toHaveLength(2)
+      expect(result.every((r: { duplicate_of: unknown }) => r.duplicate_of === null)).toBe(true)
+    })
+
+    it('GIVEN refs with same GitHub fragment WHEN deduping THEN second is identified as duplicate', () => {
+      const ref1 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
+      const ref2 = makeRef({ ref: 'https://github.com/org/repo/issues/1#issuecomment-100' })
       const result = dedupeEvidenceRefs([ref1, ref2])
       expect(result).toHaveLength(2)
       const dup = result.find((r: { duplicate_of: unknown }) => r.duplicate_of !== null)
