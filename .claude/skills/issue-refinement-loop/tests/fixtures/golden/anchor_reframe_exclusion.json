@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 4,
-    "issue_body_sha256": "298264a2be4fe9ccb3076a4059525ae4d83223d324332e254bfae9fd4d61d0ac",
+    "issue_body_sha256": "8e3a86e12b1fb23fe5222386d2d871ca11dfa30fc9b420bddc3feebfb910a4c2",
     "comments_sha256": null,
     "known_context_sha256": "8ce0e21497805d28f35c8f0d4032e8ab2ca0b2a1464678cd5879229065576b41",
     "generated_at": "2025-05-25T12:00:00+00:00"
@@ -24,8 +24,8 @@
           "source": "issue_body",
           "source_ref": null,
           "start_line": 1,
-          "end_line": 22,
-          "text_sha256": "298264a2be4fe9ccb3076a4059525ae4d83223d324332e254bfae9fd4d61d0ac"
+          "end_line": 59,
+          "text_sha256": "8e3a86e12b1fb23fe5222386d2d871ca11dfa30fc9b420bddc3feebfb910a4c2"
         }
       ],
       "confidence": "deterministic"
@@ -50,8 +50,8 @@
           "source": "issue_body",
           "source_ref": null,
           "start_line": 1,
-          "end_line": 22,
-          "text_sha256": "298264a2be4fe9ccb3076a4059525ae4d83223d324332e254bfae9fd4d61d0ac"
+          "end_line": 59,
+          "text_sha256": "8e3a86e12b1fb23fe5222386d2d871ca11dfa30fc9b420bddc3feebfb910a4c2"
         }
       ],
       "confidence": "deterministic"
