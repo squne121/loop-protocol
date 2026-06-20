@@ -957,7 +957,16 @@ def _classify_git(args: list[str]) -> str:
         return "read_only"
     if sub == "worktree":
         nxt = rest[0] if rest else ""
-        return "read_only" if nxt == "list" else "mutating"
+        if nxt == "list":
+            return "read_only"
+        if nxt == "remove":
+            return "cleanup"
+        return "mutating"
+    if sub == "branch":
+        # -d (safe delete) is cleanup class (AC4c); -D / --force / -f are mutating.
+        if rest and rest[0] == "-d" and len(rest) == 2:
+            return "cleanup"
+        return "mutating"
     if sub == "stash":
         nxt = rest[0] if rest else ""
         return "read_only" if nxt in ("list", "show") else "mutating"
@@ -1356,6 +1365,16 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
     if klass == "read_only":
         _allow()
 
+    # Cleanup class: git worktree remove / git branch -d — check contract (AC4).
+    if klass == "cleanup":
+        contract = load_cleanup_contract(resolve_project_root())
+        cleanup_decision, cleanup_reason = _decide_cleanup_bash(command, cwd, contract)
+        if cleanup_decision == "allow":
+            _allow()
+        else:
+            _block_cleanup(cleanup_reason)
+        return  # unreachable
+
     # From here, command is 'mutating' or 'unknown' (possible mutation).
     if issue and not resolution.git_available:
         # git binary unavailable for a possible mutation → fail-closed.
@@ -1468,6 +1487,229 @@ def _rel(path: str, project_root: str) -> str:
         return os.path.relpath(path, project_root)
     except ValueError:
         return os.path.basename(os.path.normpath(path))
+
+
+
+# =============================================================================
+# POST_MERGE_CLEANUP_REQUEST_V2 — cleanup contract (Issue #1050)
+# =============================================================================
+# Contract supply (AC4e):
+#   1. CLAUDE_WORKTREE_CLEANUP_CONTRACT env var (JSON string)
+#   2. .claude/artifacts/cleanup_contract.json (file fallback)
+#
+# Schema:
+#   schema: "POST_MERGE_CLEANUP_REQUEST_V2"
+#   worktree_path: str  — absolute path to the worktree to remove
+#   branch_name:   str  — branch to delete with git branch -d
+#   require_clean: bool — if true, worktree must have empty porcelain=v1 status
+
+def _validate_cleanup_contract(contract: dict) -> bool:
+    """True iff contract has the required POST_MERGE_CLEANUP_REQUEST_V2 fields."""
+    return (
+        isinstance(contract, dict)
+        and contract.get("schema") == "POST_MERGE_CLEANUP_REQUEST_V2"
+        and isinstance(contract.get("worktree_path"), str)
+        and isinstance(contract.get("branch_name"), str)
+        and isinstance(contract.get("require_clean"), bool)
+    )
+
+
+def load_cleanup_contract(project_root: str) -> dict | None:
+    """Load POST_MERGE_CLEANUP_REQUEST_V2 from env var or artifact file (AC4e).
+
+    Supply precedence:
+      1. CLAUDE_WORKTREE_CLEANUP_CONTRACT env var (JSON string)
+      2. <project_root>/.claude/artifacts/cleanup_contract.json
+    Returns None on missing, JSON error, or schema mismatch.
+    Env var present but invalid → fail-closed (None).
+    """
+    env_json = os.environ.get("CLAUDE_WORKTREE_CLEANUP_CONTRACT")
+    if env_json:
+        try:
+            contract = json.loads(env_json)
+            if _validate_cleanup_contract(contract):
+                return contract
+        except (json.JSONDecodeError, Exception):
+            pass
+        return None  # env var present but invalid — fail-closed
+
+    artifact_path = os.path.join(project_root, ".claude", "artifacts", "cleanup_contract.json")
+    try:
+        with open(artifact_path, encoding="utf-8") as f:
+            contract = json.load(f)
+        if _validate_cleanup_contract(contract):
+            return contract
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple[str, str]:
+    """Decide allow/deny for a cleanup-class command (AC4).
+
+    Returns (decision, reason).
+    Allow only for exact argv forms with a valid matching contract.
+    Deny conditions: AC4a (no contract), AC4b (path mismatch/extra args),
+                    AC4c (-D/force), AC4d (traversal/sibling/multiple).
+    """
+    if contract is None:
+        return "deny", "no_cleanup_contract"  # AC4a
+
+    toks = _tokenize(command)
+    if len(toks) < 3 or toks[0] != "git":
+        return "deny", "not_a_git_cleanup_command"
+
+    if toks[1] == "worktree" and toks[2] == "remove":
+        # Exact argv only: git worktree remove <path>  (AC4b: no wildcard/chain)
+        if len(toks) != 4:
+            return "deny", "worktree_remove_wrong_argc"
+        path_arg = toks[3]
+        actual_path = (
+            os.path.realpath(path_arg)
+            if os.path.isabs(path_arg)
+            else os.path.realpath(os.path.join(cwd, path_arg))
+        )
+        expected_path = os.path.realpath(contract["worktree_path"])
+        # AC4d: path traversal / sibling prefix protection
+        try:
+            common = os.path.commonpath([expected_path, actual_path])
+        except ValueError:
+            return "deny", "worktree_path_traversal"
+        if actual_path != expected_path:
+            return "deny", "worktree_path_mismatch"
+        return "allow", "cleanup_worktree_remove_ok"
+
+    if toks[1] == "branch" and toks[2] == "-d":
+        # Exact argv only: git branch -d <branch>  (AC4c: -D/--force/--delete denied)
+        if len(toks) != 4:
+            return "deny", "branch_delete_wrong_argc"
+        if toks[3] != contract["branch_name"]:
+            return "deny", "branch_name_mismatch"
+        return "allow", "cleanup_branch_delete_ok"
+
+    return "deny", "not_a_cleanup_command"
+
+
+def _block_cleanup(reason: str) -> None:
+    """Emit bounded block message for cleanup-class denials (AC6).
+
+    Outputs: ≤10 lines, no raw command/path/branch/env values.
+    """
+    lines = [
+        "[worktree_scope_guard] blocked: cleanup operation denied",
+        f"reason: {reason}",
+    ]
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.exit(2)
+
+
+# =============================================================================
+# WORKTREE_SCOPE_DECISION_V2 — public importable API (Issue #1050, AC9)
+# =============================================================================
+
+def _v2(command_class: str, cwd_class: str, decision: str, reason: str) -> dict:
+    """Construct a WORKTREE_SCOPE_DECISION_V2 dict."""
+    return {
+        "schema": "WORKTREE_SCOPE_DECISION_V2",
+        "command_class": command_class,
+        "cwd_class": cwd_class,
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+def build_decision(payload: dict) -> dict:
+    """Public importable function: make guard decision, return WORKTREE_SCOPE_DECISION_V2.
+
+    WORKTREE_SCOPE_DECISION_V2 is NOT written to stdout by the runtime hook (AC9).
+    Unit tests call this directly instead of using subprocess (AC9).
+
+    Returns dict: schema, command_class, cwd_class, decision, reason.
+    """
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input") or {}
+    cwd = payload.get("cwd") or os.environ.get("PWD") or os.getcwd()
+
+    project_root = resolve_project_root()
+    issue = resolve_current_issue(cwd, project_root)
+    resolution = resolve_expected_worktree(issue, project_root)
+
+    cwd_class: str
+    if resolution.expected:
+        cwd_class = "inside_worktree" if _dir_inside(resolution.expected, cwd) else "outside_worktree"
+    else:
+        cwd_class = "unknown"
+
+    if not tool_name or tool_name not in MATCHED_TOOLS:
+        return _v2("unknown", cwd_class, "allow", "unmatched_tool")
+
+    if tool_name in WRITE_TOOLS:
+        target = tool_input.get("file_path") or tool_input.get("path") or ""
+        if not issue:
+            return _v2("mutation", cwd_class, "allow", "no_issue_no_scope")
+        if not resolution.git_available:
+            return _v2("mutation", cwd_class, "deny", "git_unavailable")
+        if resolution.match_count == 0:
+            return _v2("mutation", cwd_class, "deny", "no_matching_worktree")
+        if resolution.expected is None:
+            return _v2("mutation", cwd_class, "deny", "ambiguous_worktree")
+        if is_inside(resolution.expected, target, cwd):
+            return _v2("mutation", "inside_worktree", "allow", "write_inside_worktree")
+        if local_main_scratch_allow_v1(target, cwd, project_root, tool_name):
+            return _v2("mutation", "outside_worktree", "allow", "local_main_scratch")
+        return _v2("mutation", cwd_class, "deny", "write_outside_worktree")
+
+    # Bash tool
+    command = tool_input.get("command") or ""
+    klass = classify_bash(command)
+
+    if klass == "read_only":
+        return _v2("read_only", cwd_class, "allow", "read_only_command")
+
+    if klass == "cleanup":
+        contract = load_cleanup_contract(project_root)
+        decision, reason = _decide_cleanup_bash(command, cwd, contract)
+        return _v2("cleanup", cwd_class, decision, reason)
+
+    # mutating or unknown
+    if not issue:
+        return _v2(klass, cwd_class, "allow", "no_issue_no_scope")
+    if not resolution.git_available:
+        return _v2(klass, cwd_class, "deny", "git_unavailable")
+    if resolution.match_count == 0:
+        if issue:
+            return _v2(klass, cwd_class, "deny", "no_matching_worktree")
+        return _v2(klass, cwd_class, "allow", "no_issue_no_scope")
+    if resolution.expected is None:
+        return _v2(klass, cwd_class, "deny", "ambiguous_worktree")
+
+    expected = resolution.expected
+
+    for d in effective_target_dirs(command, cwd):
+        if not _dir_inside(expected, d):
+            return _v2(klass, "outside_worktree", "deny", "target_dir_outside_worktree")
+
+    if _is_file_write_mutation_recursive(command):
+        wtargets = write_target_paths(command, cwd)
+        if not wtargets:
+            return _v2(klass, cwd_class, "deny", "write_mutation_unextractable")
+        for t in wtargets:
+            if not _path_inside(expected, t):
+                return _v2(klass, cwd_class, "deny", "write_target_outside_worktree")
+
+    if klass == "unknown":
+        for p in absolute_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                return _v2(klass, cwd_class, "deny", "unknown_cmd_external_abs_path")
+    if klass == "mutating":
+        for p in write_option_abs_path_args(command, cwd):
+            if not _path_inside(expected, p):
+                return _v2(klass, cwd_class, "deny", "mutating_write_option_external")
+
+    if not _dir_inside(expected, cwd):
+        return _v2(klass, "outside_worktree", "deny", "cwd_outside_worktree")
+
+    return _v2(klass, "inside_worktree", "allow", "mutation_inside_worktree")
 
 
 # =============================================================================

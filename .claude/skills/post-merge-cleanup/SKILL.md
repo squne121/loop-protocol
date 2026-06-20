@@ -277,3 +277,32 @@ POST_MERGE_CLEANUP_REPORT_V1:
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
 `POST_MERGE_CLEANUP_REPORT_V1` の全フィールドは必ず含める（routing 必須フィールド）。
+
+
+## POST_MERGE_CLEANUP_REQUEST_V2 スキーマ
+
+worktree_scope_guard の cleanup contract として使用する JSON スキーマ。
+供給元: main thread / post-merge-cleanup skill が `CLAUDE_WORKTREE_CLEANUP_CONTRACT`
+環境変数に JSON を渡す（優先）、または hook が `.claude/artifacts/cleanup_contract.json` を読む。
+
+```json
+{
+  "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+  "worktree_path": "/abs/path/to/.claude/worktrees/issue-N-slug",
+  "branch_name": "worktree-issue-N-slug",
+  "require_clean": true
+}
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `schema` | `"POST_MERGE_CLEANUP_REQUEST_V2"` | スキーマ識別子（固定） |
+| `worktree_path` | `string` | 削除対象の worktree の絶対パス |
+| `branch_name` | `string` | `git branch -d` で削除するブランチ名 |
+| `require_clean` | `bool` | `true` の場合、`git -C <path> status --porcelain=v1 -z` が空であることを確認してから削除 |
+
+### worktree 削除条件（require_clean チェック）
+
+`require_clean: true` の場合、`git -C <worktree_path> status --porcelain=v1 -z` の出力が
+空であること（unstaged modification を含む全変更がないこと）を確認してから worktree を削除する。
+出力が空でない場合は cleanup を中断し `unresolved_cleanup_items` に記録する。
