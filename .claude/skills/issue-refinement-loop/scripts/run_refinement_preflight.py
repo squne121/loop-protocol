@@ -725,11 +725,11 @@ def _invoke_repair(body: str) -> dict:
             pass
 
 
-def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
+def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str, str]:
     """
     Invoke plan_refinement_loop.py via subprocess.run([sys.executable, ...], shell=False).
 
-    Returns (plan_dict, exit_code, stderr_text).
+    Returns (plan_dict, exit_code, stderr_text, raw_stdout).
     plan_dict is None on JSON parse failure.
     """
     input_json = json.dumps(planner_input, ensure_ascii=False)
@@ -744,24 +744,25 @@ def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str]:
             text=True,
         )
     except subprocess.TimeoutExpired:
-        return None, 3, f"planner timeout after {PLANNER_TIMEOUT}s"
+        return None, 3, f"planner timeout after {PLANNER_TIMEOUT}s", ""
     except FileNotFoundError:
-        return None, 3, f"planner script not found: {PLANNER_SCRIPT}"
+        return None, 3, f"planner script not found: {PLANNER_SCRIPT}", ""
     except Exception as exc:
-        return None, 3, f"planner unexpected error: {exc}"
+        return None, 3, f"planner unexpected error: {exc}", ""
 
     stderr_text = proc.stderr or ""
     exit_code = proc.returncode
+    raw_stdout = proc.stdout or ""
 
     if exit_code not in (0, 2, 3):
-        return None, exit_code, stderr_text
+        return None, exit_code, stderr_text, raw_stdout
 
     try:
         plan = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        return None, exit_code, f"planner stdout JSON decode error: {exc}"
+        return None, exit_code, f"planner stdout JSON decode error: {exc}", raw_stdout
 
-    return plan, exit_code, stderr_text
+    return plan, exit_code, stderr_text, raw_stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1373,7 +1374,7 @@ def run_preflight(
         anchor_comment_ids=anchor_comment_ids,
         now=now,
     )
-    plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input_dict)
+    plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(planner_input_dict)
 
     if plan is None:
         # Planner invocation failed
@@ -1381,6 +1382,45 @@ def run_preflight(
             blockers.append(BLOCKER_PLANNER_INVALID_INPUT)
         else:
             blockers.append(BLOCKER_PLANNER_INTERNAL_ERROR)
+
+        # --- Blocker 3: failure classification sidecar ---
+        failure_cls = classify_planner_failure(
+            exit_code=planner_exit_code,
+            stdout=planner_stdout_raw,
+            stderr=planner_stderr,
+            script_path=PLANNER_SCRIPT,
+            python_executable=sys.executable,
+        )
+        try:
+            _cls_dir = (
+                repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+            )
+            _cls_dir.mkdir(parents=True, exist_ok=True)
+            (_cls_dir / "planner_failure_classification_v1.json").write_text(
+                json.dumps(failure_cls, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        # --- Blocker 1 (failure path): provenance sidecar ---
+        try:
+            _anchor_url = anchor_comment_urls[0] if anchor_comment_urls else ""
+            _status_str_prov, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
+            _prov = build_provenance(
+                repo=repo,
+                issue_number=issue_number,
+                anchor_comment_url=_anchor_url,
+                planner_input=planner_input_dict,
+                raw_snapshot=raw_snapshot,
+                wrapper_exit_code=EXIT_ENVIRONMENT_FAILURE,
+                wrapper_status=_status_str_prov,
+                blockers=blockers,
+                stderr=planner_stderr or "",
+                repo_root=repo_root,
+            )
+            write_provenance_artifact(repo_root, issue_number, _prov)
+        except Exception:
+            pass
 
         status_str, _ = _apply_exit_code_mapping(planner_exit_code, None, blockers)
         return _emit_failure_result(
@@ -1582,6 +1622,25 @@ def run_preflight(
     )
     result["artifacts"] = artifacts
 
+    # --- Blocker 1 (success path): provenance sidecar ---
+    try:
+        _anchor_url_prov = anchor_comment_urls[0] if anchor_comment_urls else ""
+        _provenance = build_provenance(
+            repo=repo,
+            issue_number=issue_number,
+            anchor_comment_url=_anchor_url_prov,
+            planner_input=planner_input_dict,
+            raw_snapshot=raw_snapshot,
+            wrapper_exit_code=exit_code,
+            wrapper_status=result.get("status", "unknown"),
+            blockers=blockers,
+            stderr=planner_stderr or "",
+            repo_root=repo_root,
+        )
+        write_provenance_artifact(repo_root, issue_number, _provenance)
+    except Exception:
+        pass
+
     # Update artifact file with final artifacts field included
     artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
@@ -1591,6 +1650,289 @@ def run_preflight(
     print(_build_compact_stdout(result))
 
     return result, exit_code
+
+
+# ---------------------------------------------------------------------------
+# Provenance and failure classification (Issue #1035)
+# ---------------------------------------------------------------------------
+
+
+def _git_head_sha(repo_root: Path) -> str:
+    """Return git HEAD SHA or 'unknown' on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _git_blob_sha(file_path: Path, repo_root: Path) -> str:
+    """Return git blob SHA of a file or 'unknown' on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "hash-object", str(file_path.resolve())],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _git_head_tree_blob_sha(file_path: Path, repo_root: Path) -> str:
+    """Return blob SHA from HEAD tree (git rev-parse HEAD:<relpath>) or 'unknown'."""
+    try:
+        relpath = file_path.resolve().relative_to(repo_root.resolve())
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{relpath}"],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _git_worktree_status(file_path: Path, repo_root: Path) -> str:
+    """Return 'git status --short' for a file or 'unknown' on failure."""
+    try:
+        relpath = file_path.resolve().relative_to(repo_root.resolve())
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--short", "--", str(relpath)],
+            capture_output=True, text=True, timeout=5, shell=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def build_py_compile_proof(script_path: Path, repo_root: Path) -> dict:
+    """Generate PY_COMPILE_PROOF_V1 artifact for a Python script.
+
+    Runs ``python3 -m py_compile`` and records the full execution context
+    so that the caller can prove which interpreter / commit / file blob was
+    checked, not just whether compilation succeeded.
+    """
+    script_realpath = str(script_path.resolve())
+    command = [sys.executable, "-m", "py_compile", script_realpath]
+
+    try:
+        proc = subprocess.run(
+            command,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        py_compile_status = "pass" if proc.returncode == 0 else "fail"
+        stderr_text = proc.stderr or ""
+    except Exception as exc:
+        py_compile_status = "fail"
+        stderr_text = str(exc)
+
+    stderr_excerpt = stderr_text[:500]
+
+    return {
+        "schema_version": "PY_COMPILE_PROOF_V1",
+        "command": command,
+        "py_compile_status": py_compile_status,
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "git_head_sha": _git_head_sha(repo_root),
+        "planner_script_path": str(script_path),
+        "planner_script_realpath": script_realpath,
+        "planner_script_blob_sha": _git_blob_sha(script_path, repo_root),
+        "cwd": str(Path.cwd()),
+        "stderr_sha256": _sha256(stderr_text),
+        "stderr_excerpt": stderr_excerpt,
+    }
+
+
+def classify_planner_failure(
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    script_path: Optional[Path] = None,
+    python_executable: Optional[str] = None,
+) -> dict:
+    """Classify a planner failure into PLANNER_FAILURE_CLASSIFICATION_V1 taxonomy.
+
+    Categories (mutually exclusive, evaluated in priority order):
+      syntax_compile_failure         - SyntaxError detected in stderr / exit != 0
+      anchor_or_input_blocked        - exit 2 (invalid input / schema error)
+      planner_stdout_non_json        - exit 0 but stdout is not valid JSON
+      wrapper_environment_failure    - gh not found / auth / timeout
+      planner_runtime_internal_error - exit 3 without SyntaxError
+    """
+    stderr_str = stderr or ""
+    stdout_str = stdout or ""
+    is_syntax_error = bool(re.search(r"SyntaxError|py_compile\b", stderr_str))
+
+    if is_syntax_error and exit_code != 0:
+        category = "syntax_compile_failure"
+    elif exit_code == 2:
+        category = "anchor_or_input_blocked"
+    elif exit_code == 0:
+        try:
+            json.loads(stdout_str)
+            category = "planner_runtime_internal_error"
+        except (json.JSONDecodeError, ValueError):
+            category = "planner_stdout_non_json"
+    elif exit_code == 3:
+        env_keywords = ("not found", "FileNotFoundError", "timeout", "gh_", "gh not")
+        if any(kw in stderr_str for kw in env_keywords):
+            category = "wrapper_environment_failure"
+        else:
+            category = "planner_runtime_internal_error"
+    else:
+        category = "wrapper_environment_failure"
+
+    # Traceback excerpt (SyntaxError only)
+    traceback_excerpt = ""
+    if category == "syntax_compile_failure":
+        lines = stderr_str.splitlines()
+        relevant = [
+            ln for ln in lines
+            if "SyntaxError" in ln or ln.strip().startswith("File ") or "line " in ln.lower()
+        ]
+        traceback_excerpt = "\n".join(relevant[:10])
+
+    # JSON decode error (non-JSON stdout only)
+    json_decode_error = ""
+    if category == "planner_stdout_non_json":
+        try:
+            json.loads(stdout_str)
+        except (json.JSONDecodeError, ValueError) as exc:
+            json_decode_error = str(exc)
+
+    script_realpath = str(script_path.resolve()) if script_path else ""
+
+    return {
+        "schema_version": "PLANNER_FAILURE_CLASSIFICATION_V1",
+        "category": category,
+        "exit_code": exit_code,
+        "stdout_sha256": _sha256(stdout_str),
+        "stderr_sha256": _sha256(stderr_str),
+        "stderr_excerpt": stderr_str[:500],
+        "json_decode_error": json_decode_error,
+        "traceback_excerpt": traceback_excerpt,
+        "script_path": str(script_path) if script_path else "",
+        "script_realpath": script_realpath,
+        "python_executable": python_executable or sys.executable,
+        "python_version": sys.version,
+    }
+
+
+def build_provenance(
+    repo: str,
+    issue_number: int,
+    anchor_comment_url: str,
+    planner_input: dict,
+    raw_snapshot: dict,
+    wrapper_exit_code: int,
+    wrapper_status: str,
+    blockers: list,
+    stderr: str,
+    repo_root: Path,
+) -> dict:
+    """Generate REFINEMENT_PREFLIGHT_PROVENANCE_V1 sidecar artifact.
+
+    Captures the full execution context of a preflight run so that a later
+    replay or audit can verify which file/interpreter/commit was used.
+    Written to the same artifact directory as the main result but as a
+    separate file (``refinement_preflight_provenance_v1.json``) to avoid
+    violating the strict ``additionalProperties: false`` result schema.
+    """
+    planner_script = PLANNER_SCRIPT
+    wrapper_script = Path(__file__).resolve()
+
+    py_compile_proof = build_py_compile_proof(planner_script, repo_root)
+
+    planner_input_text = _canonical_json(planner_input)
+    raw_snapshot_text = _canonical_json(raw_snapshot)
+    stderr_str = stderr or ""
+
+    return {
+        "schema_version": "REFINEMENT_PREFLIGHT_PROVENANCE_V1",
+        "repo": repo,
+        "issue_number": issue_number,
+        "anchor_comment_url": anchor_comment_url,
+        "git_head_sha": _git_head_sha(repo_root),
+        "planner_invocation_command": [sys.executable, str(planner_script)],
+        "planner_script_path": str(planner_script),
+        "planner_script_realpath": str(planner_script.resolve()),
+        "planner_script_blob_sha": _git_blob_sha(planner_script, repo_root),
+        "planner_head_tree_blob_sha": _git_head_tree_blob_sha(planner_script, repo_root),
+        "planner_worktree_status": _git_worktree_status(planner_script, repo_root),
+        "wrapper_script_blob_sha": _git_blob_sha(wrapper_script, repo_root),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "cwd": str(Path.cwd()),
+        "py_compile_status": py_compile_proof["py_compile_status"],
+        "wrapper_exit_code": wrapper_exit_code,
+        "wrapper_status": wrapper_status,
+        "blockers": list(blockers),
+        "planner_input_sha256": _sha256(planner_input_text),
+        "raw_snapshot_sha256": _sha256(raw_snapshot_text),
+        "stderr_sha256": _sha256(stderr_str),
+        "stderr_excerpt": stderr_str[:500],
+    }
+
+
+def build_replay_proof(
+    live_input: dict,
+    fixture_input: dict,
+    live_result_status: str,
+    fixture_result_status: str,
+) -> dict:
+    """Generate REFINEMENT_PREFLIGHT_REPLAY_PROOF_V1.
+
+    Compares the SHA256 of the canonical JSON of ``live_input`` (fetched
+    from GitHub) against ``fixture_input`` (a saved snapshot).  Identical
+    hashes guarantee the classification is deterministic; a mismatch is
+    classified as ``input_drift`` so that the caller cannot prematurely
+    declare the issue resolved.
+    """
+    live_sha = _sha256(_canonical_json(live_input))
+    fixture_sha = _sha256(_canonical_json(fixture_input))
+    input_drift_detected = live_sha != fixture_sha
+    results_consistent = live_result_status == fixture_result_status
+
+    if input_drift_detected:
+        classification = "input_drift"
+    elif results_consistent:
+        classification = "replay_consistent"
+    else:
+        classification = "classification_mismatch"
+
+    return {
+        "schema_version": "REFINEMENT_PREFLIGHT_REPLAY_PROOF_V1",
+        "live_input_sha256": live_sha,
+        "fixture_input_sha256": fixture_sha,
+        "input_drift_detected": input_drift_detected,
+        "live_result_status": live_result_status,
+        "fixture_result_status": fixture_result_status,
+        "results_consistent": results_consistent,
+        "classification": classification,
+    }
+
+
+def write_provenance_artifact(
+    repo_root: Path,
+    issue_number: int,
+    provenance: dict,
+) -> str:
+    """Write provenance dict to the artifacts directory and return the path."""
+    artifact_dir = (
+        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    prov_path = artifact_dir / "refinement_preflight_provenance_v1.json"
+    prov_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return str(prov_path)
 
 
 # ---------------------------------------------------------------------------
