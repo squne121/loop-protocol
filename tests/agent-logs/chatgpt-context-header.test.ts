@@ -9,7 +9,6 @@ import { renderSafetyHeader } from '../../scripts/agent-logs/lib/chatgpt-context
 // Resolve from this test file's location — works both in worktree and main tree
 const TESTS_DIR = resolve(__dirname)
 const SCRIPTS_ROOT = resolve(TESTS_DIR, '..', '..', 'scripts')
-const REPO_ROOT = resolve(TESTS_DIR, '..', '..')
 const EXPORT_SCRIPT = resolve(SCRIPTS_ROOT, 'agent-logs', 'export-chatgpt-context.mjs')
 
 function createTempDir() {

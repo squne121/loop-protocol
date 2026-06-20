@@ -1,18 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { mkdirSync, writeFileSync } from 'fs'
-import { resolve } from 'path'
-import { tmpdir } from 'os'
-import { mkdtempSync, rmSync } from 'fs'
 
 import { FORBIDDEN_FIELDS, scanForForbiddenFields } from '../../scripts/agent-logs/lib/chatgpt-context-source-loader.mjs'
-
-function createTempDir() {
-  return mkdtempSync(resolve(tmpdir(), 'chatgpt-redaction-'))
-}
-
-function cleanupTempDir(dir: string) {
-  rmSync(dir, { recursive: true, force: true })
-}
 
 describe('chatgpt-context redaction (AC1)', () => {
   describe('FORBIDDEN_FIELDS list', () => {

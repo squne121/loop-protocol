@@ -5,7 +5,6 @@ import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 
 import { loadSources, computeDigest } from '../../scripts/agent-logs/lib/chatgpt-context-source-loader.mjs'
-import { readFileSync } from 'fs'
 
 function createTempDir() {
   return mkdtempSync(resolve(tmpdir(), 'chatgpt-provenance-'))

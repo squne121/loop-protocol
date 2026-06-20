@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { URL } from 'node:url'
 
 /**
  * Normalize a URL by stripping common tracking parameters.

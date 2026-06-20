@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { writeFileSync } from 'fs'
+import { writeFileSync, readFileSync } from 'fs'
 import { resolve } from 'path'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -126,7 +126,6 @@ describe('chatgpt-context rendered markdown scan (AC9)', () => {
         '--output', paths.output,
         '--summary-json-out', paths.summary,
       ])
-      const { readFileSync } = require('fs')
       const content = readFileSync(paths.output, 'utf-8')
       expect(content).toContain('SECURITY_BOUNDARY')
     } finally {
