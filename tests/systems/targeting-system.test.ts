@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { selectTarget, type ScoredTarget, type TargetSelectionInput } from '../../src/systems/TargetingSystem'
+import {
+  selectTarget,
+  type ScoredTarget,
+  type TargetSelectionInput,
+} from '../../src/systems/TargetingSystem'
 
 function makeInput(overrides: Partial<TargetSelectionInput> = {}): TargetSelectionInput {
   return {
@@ -49,24 +53,24 @@ const baseCandidates = [
     y: 290,
     defeated: false,
     destroyed: false,
-    isPlayer: true,
+    isPlayer: false,
   },
   {
     targetEntityId: '3',
     faction: 'neutral' as const,
     x: 300,
     y: 260,
-    defeated: true,
+    defeated: false,
     destroyed: false,
     isPlayer: false,
   },
 ]
 
 describe('selectTarget', () => {
-  it('GIVEN AC1 candidate filters WHEN defeated / same-faction / outside-arena candidates exist THEN only valid targets remain', () => {
+  it('GIVEN AC1 candidate filters WHEN defeated / same-faction / same-policy / neutral / outside-arena candidates exist THEN only valid hostile targets remain', () => {
     const input = makeInput({
       actor: {
-        faction: 'neutral',
+        faction: 'ally',
       },
       candidates: [
         ...baseCandidates,
@@ -81,7 +85,7 @@ describe('selectTarget', () => {
         },
         {
           targetEntityId: 'same-faction-ally',
-          faction: 'neutral',
+          faction: 'ally',
           x: 200,
           y: 200,
           defeated: false,
@@ -94,17 +98,83 @@ describe('selectTarget', () => {
     const result = selectTarget(input)
 
     expect(result.selectedTargetId).toBe('2')
-    expect(result.scoredCandidates).toHaveLength(2)
-    expect(result.scoredCandidates.map((c) => c.targetEntityId)).toEqual(['2', '1'])
+    expect(result.scoredCandidates).toHaveLength(1)
+    expect(result.scoredCandidates.map((c) => c.targetEntityId)).toEqual(['2'])
   })
 
-  it('GIVEN AC1 stale previous target WHEN that id is not in valid targets THEN clearedStaleTargetId is returned', () => {
+  it('GIVEN ignore policy WHEN candidates exist THEN no selection is made', () => {
     const input = makeInput({
+      actor: {
+        targetingPolicy: 'ignore',
+      },
+      candidates: [
+        ...baseCandidates,
+        {
+          targetEntityId: 'extra-hostile',
+          faction: 'enemy',
+          x: 210,
+          y: 275,
+          defeated: false,
+          destroyed: false,
+          isPlayer: false,
+        },
+      ],
+    })
+
+    const result = selectTarget(input)
+
+    expect(result.selectedTargetId).toBeNull()
+    expect(result.scoredCandidates).toHaveLength(0)
+    expect(result.clearedStaleTargetId).toBeNull()
+  })
+
+  it('GIVEN nearest_hostile policy WHEN candidates vary in distanceToAlly THEN closest hostile to actor is selected', () => {
+    const input = makeInput({
+      actor: {
+        targetingPolicy: 'nearest_hostile',
+        faction: 'ally',
+      },
+      candidates: [
+        {
+          targetEntityId: 'far-hostile',
+          faction: 'enemy',
+          x: 280,
+          y: 275,
+          defeated: false,
+          destroyed: false,
+          isPlayer: false,
+        },
+        {
+          targetEntityId: 'near-hostile',
+          faction: 'enemy',
+          x: 210,
+          y: 180,
+          defeated: false,
+          destroyed: false,
+          isPlayer: false,
+        },
+      ],
+    })
+
+    const result = selectTarget(input)
+
+    expect(result.selectedTargetId).toBe('near-hostile')
+    expect(result.scoredCandidates.map((target) => target.targetEntityId)).toEqual([
+      'near-hostile',
+      'far-hostile',
+    ])
+  })
+
+  it('GIVEN AC2 stale previous target WHEN that id is not in valid targets THEN clearedStaleTargetId is returned', () => {
+    const input = makeInput({
+      actor: {
+        faction: 'ally',
+      },
       previousTargetId: 'missing-id',
       candidates: [
         {
           targetEntityId: '2',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 240,
           y: 300,
           defeated: false,
@@ -124,11 +194,12 @@ describe('selectTarget', () => {
     const input = makeInput({
       actor: {
         targetingPolicy: 'focus_player',
+        faction: 'ally',
       },
       candidates: [
         {
           targetEntityId: 'enemy-b',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 240,
           y: 280,
           defeated: false,
@@ -137,7 +208,7 @@ describe('selectTarget', () => {
         },
         {
           targetEntityId: 'enemy-a',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 240,
           y: 280,
           defeated: false,
@@ -168,7 +239,7 @@ describe('selectTarget', () => {
       candidates: [
         {
           targetEntityId: 'far',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 700,
           y: 500,
           defeated: false,
@@ -248,10 +319,13 @@ describe('selectTarget', () => {
         targetingPolicy: 'focus_player',
         faction: 'ally',
       },
+      player: {
+        targetEntityId: 'far-player',
+      },
       candidates: [
         {
           targetEntityId: 'near-enemy',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 250,
           y: 265,
           defeated: false,
@@ -260,7 +334,7 @@ describe('selectTarget', () => {
         },
         {
           targetEntityId: 'far-player',
-          faction: 'neutral',
+          faction: 'enemy',
           x: 900,
           y: 300,
           defeated: false,
@@ -274,6 +348,48 @@ describe('selectTarget', () => {
     const result = selectTarget(input)
 
     expect(result.selectedTargetId).toBe('far-player')
+  })
+
+  it('GIVEN focus_player policy WHEN candidate isPlayer is spoofed THEN player targetEntityId is still preferred', () => {
+    const input = makeInput({
+      actor: {
+        targetingPolicy: 'focus_player',
+        faction: 'ally',
+      },
+      player: {
+        targetEntityId: 'actual-player',
+        x: 250,
+        y: 250,
+      },
+      candidates: [
+        {
+          targetEntityId: 'actual-player',
+          faction: 'enemy',
+          x: 245,
+          y: 265,
+          defeated: false,
+          destroyed: false,
+          isPlayer: false,
+        },
+        {
+          targetEntityId: 'spoofed-player',
+          faction: 'enemy',
+          x: 100,
+          y: 100,
+          defeated: false,
+          destroyed: false,
+          isPlayer: true,
+        },
+      ],
+    })
+
+    const result = selectTarget(input)
+
+    expect(result.selectedTargetId).toBe('actual-player')
+    const spoofed = result.scoredCandidates.find((target) => target.targetEntityId === 'spoofed-player') as ScoredTarget
+    const actual = result.scoredCandidates.find((target) => target.targetEntityId === 'actual-player') as ScoredTarget
+    expect(actual.isPlayer).toBe(1)
+    expect(spoofed.isPlayer).toBe(0)
   })
 
   it('GIVEN AC4 threatToPlayer binary mode WHEN candidate is exactly on boundary THEN threat=1', () => {
@@ -314,6 +430,83 @@ describe('selectTarget', () => {
     expect(result.selectedTargetId).toBe('boundary')
   })
 
+  it('GIVEN threat radius validation WHEN nearPlayerRadiusPx is negative OR invalid THEN threatToPlayer remains 0', () => {
+    const negativeRadius = selectTarget(
+      makeInput({
+        actor: {
+          targetingPolicy: 'assist_player_threat',
+          faction: 'ally',
+        },
+        commandIntent: 'assist_player',
+        commandIntentActive: true,
+        candidates: [
+          {
+            targetEntityId: 'near',
+            faction: 'enemy',
+            x: 300,
+            y: 270,
+            defeated: false,
+            destroyed: false,
+            isPlayer: false,
+          },
+        ],
+        nearPlayerRadiusPx: -60,
+      }),
+    )
+    const invalidRadius = selectTarget(
+      makeInput({
+        actor: {
+          targetingPolicy: 'assist_player_threat',
+          faction: 'ally',
+        },
+        commandIntent: 'assist_player',
+        commandIntentActive: true,
+        candidates: [
+          {
+            targetEntityId: 'near',
+            faction: 'enemy',
+            x: 300,
+            y: 270,
+            defeated: false,
+            destroyed: false,
+            isPlayer: false,
+          },
+        ],
+        nearPlayerRadiusPx: Number.NaN,
+      }),
+    )
+
+    expect(negativeRadius.scoredCandidates[0].threatToPlayer).toBe(0)
+    expect(invalidRadius.scoredCandidates[0].threatToPlayer).toBe(0)
+  })
+
+  it('GIVEN duplicate candidate ids WHEN input includes repeated targetEntityId THEN selectTarget throws', () => {
+    const input = makeInput({
+      candidates: [
+        {
+          targetEntityId: 'dup-id',
+          faction: 'enemy',
+          x: 240,
+          y: 260,
+          defeated: false,
+          destroyed: false,
+          isPlayer: false,
+        },
+        {
+          targetEntityId: 'dup-id',
+          faction: 'enemy',
+          x: 241,
+          y: 261,
+          defeated: false,
+          destroyed: false,
+          isPlayer: true,
+        },
+      ],
+    })
+
+    expect(() => selectTarget(input)).toThrowError(/duplicate targetEntityId: dup-id/)
+  })
+
   it('GIVEN AC5 deterministic behavior WHEN candidates are reversed between calls THEN selectedTargetId remains stable', () => {
     const input = makeInput({
       actor: {
@@ -345,10 +538,11 @@ describe('selectTarget', () => {
   it('GIVEN AC5 immutability WHEN selectTarget executes THEN input candidates and input objects remain unchanged', () => {
     const input = makeInput({
       candidates: [
-        { targetEntityId: 'x', faction: 'ally', x: 10, y: 20, defeated: false, destroyed: false, isPlayer: false },
-        { targetEntityId: 'y', faction: 'neutral', x: 30, y: 40, defeated: false, destroyed: false, isPlayer: true },
+        { targetEntityId: 'x', faction: 'enemy', x: 10, y: 20, defeated: false, destroyed: false, isPlayer: false },
+        { targetEntityId: 'y', faction: 'enemy', x: 30, y: 40, defeated: false, destroyed: false, isPlayer: true },
       ],
-      actor: { x: 12, y: 21 },
+      actor: { x: 12, y: 21, faction: 'ally' },
+      player: { targetEntityId: 'y', x: 30, y: 40 },
       previousTargetId: 'missing',
       commandIntent: 'assist_player',
       commandIntentActive: true,

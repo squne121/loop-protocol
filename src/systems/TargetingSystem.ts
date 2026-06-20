@@ -54,8 +54,6 @@ export type TargetSelectionResult = Readonly<{
   scoredCandidates: readonly ScoredTarget[]
 }>
 
-type ScoredTargetWithIndex = ScoredTarget & { readonly _sourceIndex: number }
-
 const ZERO = 0
 const ONE = 1
 
@@ -85,10 +83,33 @@ function compareNumber(a: number, b: number, direction: 'asc' | 'desc'): number 
 }
 
 function compareTargetId(a: TargetEntityId, b: TargetEntityId): number {
-  const value = a.localeCompare(b)
-  if (value < 0) return -1
-  if (value > 0) return 1
+  if (a < b) return -1
+  if (a > b) return 1
   return 0
+}
+
+function isHostile(actorFaction: Faction, candidateFaction: Faction): boolean {
+  if (actorFaction === 'neutral' || candidateFaction === 'neutral') return false
+  if (actorFaction === 'player' || actorFaction === 'ally') {
+    return candidateFaction === 'enemy'
+  }
+  return candidateFaction === 'ally' || candidateFaction === 'player'
+}
+
+function validateCandidateIds(candidates: readonly TargetEntitySnapshot[]): void {
+  const seen = new Set<TargetEntityId>()
+  for (const candidate of candidates) {
+    if (seen.has(candidate.targetEntityId)) {
+      throw new Error(`duplicate targetEntityId: ${candidate.targetEntityId}`)
+    }
+    seen.add(candidate.targetEntityId)
+  }
+}
+
+function computeThreatSqRadius(input: TargetSelectionInput): number | null {
+  return Number.isFinite(input.nearPlayerRadiusPx) && input.nearPlayerRadiusPx >= ZERO
+    ? input.nearPlayerRadiusPx * input.nearPlayerRadiusPx
+    : null
 }
 
 function scoreCandidate(
@@ -106,15 +127,18 @@ function scoreCandidate(
   const dyToAlly = candidate.y - input.actor.y
   const distanceToAlly = Math.hypot(dxToAlly, dyToAlly)
 
-  const nearPlayerRadiusSq = input.nearPlayerRadiusPx * input.nearPlayerRadiusPx
+  const threatRadiusSq = computeThreatSqRadius(input)
   const distanceToPlayerSq = dxToPlayer * dxToPlayer + dyToPlayer * dyToPlayer
 
   const threatToPlayer =
-    input.threatMode === 'binary_hostile_near_player' && candidate.faction === 'enemy' && distanceToPlayerSq <= nearPlayerRadiusSq
+    threatRadiusSq !== null &&
+    input.threatMode === 'binary_hostile_near_player' &&
+    candidate.faction === 'enemy' &&
+    distanceToPlayerSq <= threatRadiusSq
       ? ONE
       : ZERO
 
-  const isPlayer: 0 | 1 = candidate.isPlayer === true ? ONE : ZERO
+  const isPlayer: 0 | 1 = candidate.targetEntityId === input.player.targetEntityId ? ONE : ZERO
 
   return {
     commandIntentMatch,
@@ -126,7 +150,7 @@ function scoreCandidate(
 }
 
 function compareScoredTargets(a: ScoredTargetWithIndex, b: ScoredTargetWithIndex, policy: TargetingPolicy): number {
-  if (policy === 'assist_player_threat' || policy === 'ignore') {
+  if (policy === 'assist_player_threat') {
     const cmpCommandIntent = compareNumber(a.commandIntentMatch, b.commandIntentMatch, 'desc')
     if (cmpCommandIntent !== 0) return cmpCommandIntent
 
@@ -140,7 +164,7 @@ function compareScoredTargets(a: ScoredTargetWithIndex, b: ScoredTargetWithIndex
     if (cmpDistanceToAlly !== 0) return cmpDistanceToAlly
   }
 
-  if (policy === 'focus_player' || policy === 'nearest_hostile' || policy === 'ignore' || policy === 'assist_player_threat') {
+  if (policy === 'focus_player') {
     const cmpIsPlayer = compareNumber(a.isPlayer, b.isPlayer, 'desc')
     if (cmpIsPlayer !== 0) return cmpIsPlayer
 
@@ -148,26 +172,37 @@ function compareScoredTargets(a: ScoredTargetWithIndex, b: ScoredTargetWithIndex
     if (cmpDistanceToPlayer !== 0) return cmpDistanceToPlayer
   }
 
+  if (policy === 'nearest_hostile') {
+    const cmpDistanceToAlly = compareNumber(a.distanceToAlly, b.distanceToAlly, 'asc')
+    if (cmpDistanceToAlly !== 0) return cmpDistanceToAlly
+  }
+
   const cmpTargetId = compareTargetId(a.targetEntityId, b.targetEntityId)
   if (cmpTargetId !== 0) return cmpTargetId
 
-  if (a._sourceIndex < b._sourceIndex) return -1
-  if (a._sourceIndex > b._sourceIndex) return 1
   return 0
 }
 
+type ScoredTargetWithIndex = ScoredTarget
+
+function isValidCandidate(
+  input: TargetSelectionInput,
+  candidate: TargetEntitySnapshot,
+): candidate is TargetEntitySnapshot {
+  if (candidate.defeated || candidate.destroyed) return false
+  if (!isHostile(input.actor.faction, candidate.faction)) return false
+  if (!isFiniteRectValue(input.arena.width, input.arena.height)) return false
+  if (!isFiniteCoord(input.actor.x) || !isFiniteCoord(input.actor.y)) return false
+  if (!isFiniteCoord(input.player.x) || !isFiniteCoord(input.player.y)) return false
+  return isInArena(candidate.x, candidate.y, input.arena.width, input.arena.height)
+}
+
 export function selectTarget(input: TargetSelectionInput): TargetSelectionResult {
+  validateCandidateIds(input.candidates)
+
   const validTargets = input.candidates
-    .map((candidate, index) => ({ candidate, index }))
-    .filter(({ candidate }) => {
-      if (candidate.defeated || candidate.destroyed) return false
-      if (candidate.faction === input.actor.faction) return false
-      if (!isFiniteRectValue(input.arena.width, input.arena.height)) return false
-      if (!isFiniteCoord(input.actor.x) || !isFiniteCoord(input.actor.y)) return false
-      if (!isFiniteCoord(input.player.x) || !isFiniteCoord(input.player.y)) return false
-      return isInArena(candidate.x, candidate.y, input.arena.width, input.arena.height)
-    })
-    .map(({ candidate, index }) => {
+    .filter((candidate) => isValidCandidate(input, candidate))
+    .map((candidate) => {
       const scored = scoreCandidate(input, candidate)
       return {
         targetEntityId: candidate.targetEntityId,
@@ -176,7 +211,6 @@ export function selectTarget(input: TargetSelectionInput): TargetSelectionResult
         distanceToPlayer: scored.distanceToPlayer,
         distanceToAlly: scored.distanceToAlly,
         isPlayer: scored.isPlayer,
-        _sourceIndex: index,
       } satisfies ScoredTargetWithIndex
     })
 
@@ -184,6 +218,14 @@ export function selectTarget(input: TargetSelectionInput): TargetSelectionResult
     input.previousTargetId !== null && validTargets.every((target) => target.targetEntityId !== input.previousTargetId)
       ? input.previousTargetId
       : null
+
+  if (input.actor.targetingPolicy === 'ignore') {
+    return {
+      selectedTargetId: null,
+      clearedStaleTargetId,
+      scoredCandidates: [],
+    }
+  }
 
   const sorted = validTargets
     .slice()
@@ -194,10 +236,6 @@ export function selectTarget(input: TargetSelectionInput): TargetSelectionResult
   return {
     selectedTargetId: selected ? selected.targetEntityId : null,
     clearedStaleTargetId,
-    scoredCandidates: sorted.map((target) => {
-      const { _sourceIndex, ...scored } = target
-      void _sourceIndex
-      return scored
-    }),
+    scoredCandidates: sorted,
   }
 }
