@@ -62,9 +62,15 @@ describe('chatgpt-context injection scanner (AC9)', () => {
       expect(result).toMatch(/\n```$/)
     })
 
-    it('GIVEN text with triple backticks WHEN wrapping THEN backticks are escaped', () => {
+    it('GIVEN text with triple backticks WHEN wrapping THEN inner backtick sequences are escaped to html entity', () => {
       const result = wrapAsDataBlock('before ```code``` after')
-      expect(result).not.toMatch(/(?<!&#96;)```(?!DATA)(?!&#96;)/)
+      // The inner content should have backticks escaped, not raw triple-backtick sequences in the content body
+      const lines = result.split('\n')
+      // line 0: ```DATA, last line: ``` (closing fence), middle: content
+      const contentLines = lines.slice(1, -1)
+      const contentBody = contentLines.join('\n')
+      // Content body should not have raw triple backticks (they are escaped to &#96;)
+      expect(contentBody).not.toContain('```')
     })
   })
 

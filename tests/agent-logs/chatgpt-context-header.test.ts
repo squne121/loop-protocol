@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { writeFileSync } from 'fs'
+import { writeFileSync, mkdtempSync, rmSync, readFileSync } from 'fs'
+import { execFileSync } from 'child_process'
 import { resolve } from 'path'
-import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
-import { execFileSync, readFileSync } from 'fs'
 
 import { renderSafetyHeader } from '../../scripts/agent-logs/lib/chatgpt-context-renderer.mjs'
 
-const REPO_ROOT = resolve(__dirname, '..', '..')
-const EXPORT_SCRIPT = resolve(REPO_ROOT, 'scripts', 'agent-logs', 'export-chatgpt-context.mjs')
+// Resolve from this test file's location — works both in worktree and main tree
+const TESTS_DIR = resolve(__dirname)
+const SCRIPTS_ROOT = resolve(TESTS_DIR, '..', '..', 'scripts')
+const REPO_ROOT = resolve(TESTS_DIR, '..', '..')
+const EXPORT_SCRIPT = resolve(SCRIPTS_ROOT, 'agent-logs', 'export-chatgpt-context.mjs')
 
 function createTempDir() {
   return mkdtempSync(resolve(tmpdir(), 'chatgpt-header-'))
@@ -21,7 +23,6 @@ function cleanupTempDir(dir: string) {
 function runExportScript(args: string[]) {
   try {
     const stdout = execFileSync(process.execPath, [EXPORT_SCRIPT, ...args], {
-      cwd: REPO_ROOT,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     })

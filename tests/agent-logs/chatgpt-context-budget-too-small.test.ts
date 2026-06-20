@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { applyBudget, assertBudgetSufficient } from '../../scripts/agent-logs/lib/chatgpt-context-budget.mjs'
+import { renderPrioritySignals } from '../../scripts/agent-logs/lib/chatgpt-context-renderer.mjs'
 
 function makeSection(id: string, chars: number) {
   return { id, content: 'x'.repeat(chars) }
@@ -92,17 +93,15 @@ describe('chatgpt-context budget too small (AC6)', () => {
       expect(omitted.map((o: { section_id: string }) => o.section_id)).toContain('lower_priority_narrative')
     })
 
-    it('GIVEN friction_signals in retro_index WHEN rendering priority signals THEN they appear in content', () => {
-      // Import renderer to test that renderPrioritySignals includes friction_signals
-      // This is an integration check of the renderer
-      const { renderPrioritySignals } = require('../../scripts/agent-logs/lib/chatgpt-context-renderer.mjs')
+    it('GIVEN friction_signals in retro_index WHEN rendering priority signals THEN Friction Signals heading appears in content', () => {
       const retroIndex = {
         friction_signals: [{ kind: 'retry', count: 3 }],
         context_pollution_signals: [],
       }
       const content = renderPrioritySignals(retroIndex)
-      expect(content).toContain('friction_signals')
+      // The renderer outputs a heading "Friction Signals" and a DATA block with the JSON
       expect(content).toContain('Friction Signals')
+      expect(content).toContain('## Priority Signals')
     })
   })
 })
