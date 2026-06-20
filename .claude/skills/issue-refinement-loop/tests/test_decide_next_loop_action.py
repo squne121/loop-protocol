@@ -510,14 +510,23 @@ def _make_phase_state_for_test(
     phase: str,
     source_kind: str = "loop_state_v1",
 ) -> dict[Any, Any]:
-    """Build an ISSUE_REFINEMENT_PHASE_STATE_V1 for testing."""
-    # Import the builder directly to avoid subprocess overhead in these tests
-    import importlib
+    """Build an ISSUE_REFINEMENT_PHASE_STATE_V1 for testing.
+
+    Creates a real temporary source file (M1: source_path must exist).
+    """
+    import subprocess
     import sys as _sys
+    import tempfile
+    import json
+    from pathlib import Path
+
     build_script = SKILL_ROOT / "scripts" / "build_refinement_phase_state.py"
 
-    import tempfile
-    import subprocess
+    # M1: source_path must be an existing file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as sf:
+        sf.write("{}")
+        source_path = sf.name
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out_f:
         out_path = out_f.name
 
@@ -527,7 +536,7 @@ def _make_phase_state_for_test(
             str(build_script),
             "--phase", phase,
             "--source-kind", source_kind,
-            "--source-path", "/tmp/fake_source.json",
+            "--source-path", source_path,
             "--output-path", out_path,
         ],
         capture_output=True,
@@ -536,8 +545,6 @@ def _make_phase_state_for_test(
     assert result.returncode == 0, (
         f"build_refinement_phase_state.py failed: {result.stdout} {result.stderr}"
     )
-    import json
-    from pathlib import Path
     return json.loads(Path(out_path).read_text(encoding="utf-8"))
 
 
@@ -660,3 +667,84 @@ def test_scope_signal_guard_reason_code_in_blockers_not_termination_cause():
     assert "TERMINATION_CAUSE: scope_signal_guard_triggered" not in result.stdout
     # reason_code must appear in BLOCKERS
     assert "BLOCKERS: scope_signal_guard_reason_code:new_allowed_path_layer" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# B4: --phase-state-file 指定時の LOOP_STATE_V1 schema validation エラー
+#     → ISSUE_REFINEMENT_ROUTER_ERROR_V1 with reason_code: loop_state_invalid
+# ---------------------------------------------------------------------------
+
+
+def test_phase_state_file_with_invalid_loop_state_returns_loop_state_invalid():
+    """
+    B4: --phase-state-file 指定かつ LOOP_STATE_V1 schema validation エラーで
+    reason_code: loop_state_invalid を返す。
+    """
+    import tempfile
+    import subprocess
+
+    # Build a valid phase state for post_rewrite_check (decide_next_loop_action is allowed)
+    phase_state = _make_phase_state_for_test("post_rewrite_check")
+
+    # Use a loop state with invalid schema (missing required fields)
+    invalid_loop_state = {
+        "schema_version": "loop_state/v1",
+        "iteration": 0,
+        # Missing: max_iterations, scope_signal_guard, etc.
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as ps_f:
+        import json
+        json.dump(phase_state, ps_f)
+        phase_state_path = ps_f.name
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-json", json.dumps(invalid_loop_state),
+            "--review-result-verdict", "needs-fix",
+            "--phase-state-file", phase_state_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    # B4: Should emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 with loop_state_invalid
+    assert result.returncode == 3, (
+        f"Expected exit 3 for invalid loop state with phase-state-file (B4), "
+        f"got {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout, (
+        f"Expected ISSUE_REFINEMENT_ROUTER_ERROR_V1 in stdout:\n{result.stdout}"
+    )
+    # Parse the router error JSON
+    for line in result.stdout.splitlines():
+        if line.startswith("ISSUE_REFINEMENT_ROUTER_ERROR_V1:"):
+            payload = json.loads(line[len("ISSUE_REFINEMENT_ROUTER_ERROR_V1:"):].strip())
+            assert payload["reason_code"] == "loop_state_invalid", (
+                f"Expected reason_code=loop_state_invalid, got: {payload['reason_code']}"
+            )
+            assert payload["schema_version"] == "ISSUE_REFINEMENT_ROUTER_ERROR_V1"
+            assert payload["next_action"] == "rebuild_phase_state"
+            break
+    else:
+        pytest.fail(
+            f"No ISSUE_REFINEMENT_ROUTER_ERROR_V1 line found:\n{result.stdout}"
+        )
+
+
+def test_phase_state_file_absent_with_invalid_loop_state_returns_inconsistent_state():
+    """
+    B4 対比: --phase-state-file なしの場合は従来通り inconsistent_state を返す。
+    phase-state-file あり → loop_state_invalid / phase-state-file なし → inconsistent_state。
+    """
+    invalid_loop_state = {
+        "schema_version": "loop_state/v1",
+        "iteration": 0,
+    }
+    result = run_script(invalid_loop_state, verdict="needs-fix")
+    assert result.returncode == 3
+    # Should NOT emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 (no phase-state-file)
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" not in result.stdout
+    assert "inconsistent_state" in result.stdout or result.returncode == 3

@@ -129,12 +129,12 @@ termination payload を組み立てる前に、現在の phase が `hard_stop_el
 |---|---|---|
 | `preflight` | **false** | `continue_investigation` — human_escalation にしない |
 | `investigation` | **false** | `continue_investigation` — human_escalation にしない |
-| `review` | **true** | `hard_stop_candidate` → termination payload を組み立てる |
+| `review` | **false** | `continue_investigation` — pre-rewrite phase。`decide_next_loop_action.py` を呼ばない |
 | `post_rewrite_check` | **true** | `hard_stop_candidate` → termination payload を組み立てる |
 | `decide_next_action` | **true** | `hard_stop_candidate` → termination payload を組み立てる |
 
 `hard_stop_eligible: false` の phase では termination payload を組み立てない。
-`decide_next_loop_action.py` はこれらの phase で `forbidden_routers` に含まれるため、phase gate が先に作動して `ISSUE_REFINEMENT_ROUTER_ERROR_V1` を返す（`human_escalation` にならない）。
+`decide_next_loop_action.py` はこれらの phase（`preflight`, `investigation`, `review`）で `forbidden_routers` に含まれるため（allowlist gate により allowed_routers 外として）、phase gate が先に作動して `ISSUE_REFINEMENT_ROUTER_ERROR_V1` を返す（`human_escalation` にならない）。
 
 ### termination_cause 正規化ルール
 

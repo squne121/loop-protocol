@@ -171,7 +171,16 @@ consumer contract: `ISSUE_REVIEW_RESULT_COMPACT_V1`（SSOT: `.claude/skills/issu
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
-review 後、`decide_next_loop_action.py` を呼ぶ前に phase state を `review` フェーズに更新する:
+review 後、phase state を `review` フェーズに更新してから verdict に応じて routing する。
+
+**重要**: `review` phase は pre-rewrite phase であるため `decide_next_loop_action.py` を呼んではならない。
+`review` phase の `allowed_routers` に `decide_next_loop_action.py` は含まれない（B2 Router Rule）。
+`review` phase での routing は VERDICT に基づいて直接行う:
+
+- `VERDICT: approve` → phase state を `decide_next_action` に更新してから Step 4.5 へ
+- `VERDICT: needs-fix` → phase state を `rewrite` に更新してから Step 4 へ（または iteration 上限で Step 5 human_escalation）
+
+phase state の更新:
 
 ```bash
 uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
@@ -179,15 +188,21 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_pha
   --source-kind issue_review_result_compact_v1 \
   --source-path <review_result_path> \
   --output-path <phase_state_output_path>
+```
 
+`decide_next_loop_action.py` は `post_rewrite_check` または `decide_next_action` phase でのみ呼ぶ:
+
+```bash
+# post_rewrite_check または decide_next_action phase のみ
 uv run python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py \
   --loop-state-file <loop_state_path> \
   --review-result-verdict <approve|needs-fix> \
   --phase-state-file <phase_state_output_path>
 ```
 
-`review` phase では `hard_stop_eligible: true` であるため、`scope_signal_guard.triggered: true` は
-`human_escalation` を引き起こす（AC4 / #919 回帰維持）。
+`review` phase では `hard_stop_eligible: false`（pre-rewrite phase）のため、
+`scope_signal_guard.triggered: true` があっても `decide_next_loop_action.py` を呼ばない。
+hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_stop_eligible: true`）で行う（AC4 / #919 回帰維持）。
 
 ### Step 4: Rewrite
 

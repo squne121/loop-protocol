@@ -61,6 +61,21 @@ VALID_SOURCE_KINDS = [
     "loop_state_v1",
 ]
 
+# source_kind → allowed phases mapping (for consistency checks)
+_SOURCE_KIND_ALLOWED_PHASES: dict[str, list[str]] = {
+    "refinement_preflight_result_v1": ["preflight", "investigation"],
+    "issue_review_result_compact_v1": ["review", "post_rewrite_check", "decide_next_action"],
+    "issue_author_result_compact_v1": ["rewrite", "post_rewrite_check"],
+    "loop_state_v1": [
+        "investigation", "review", "rewrite", "post_rewrite_check",
+        "decide_next_action", "publish", "terminate",
+    ],
+}
+
+# phases that require loop_state_path or review_result_path
+_PHASES_REQUIRING_LOOP_STATE = ["post_rewrite_check", "decide_next_action"]
+_PHASES_REQUIRING_REVIEW_RESULT = ["review", "post_rewrite_check", "decide_next_action"]
+
 # Router name constants
 ROUTER_DECIDE_NEXT_LOOP_ACTION = "decide_next_loop_action.py"
 ROUTER_RUN_REFINEMENT_PREFLIGHT = "run_refinement_preflight.py"
@@ -102,15 +117,16 @@ _PHASE_ROUTER_RULES: dict[str, dict[str, Any]] = {
     },
     "review": {
         "allowed_routers": [
-            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_PLAN_REFINEMENT_LOOP,
+            ROUTER_DECIDE_REWRITE_ROUTE,
         ],
         "forbidden_routers": [
-            ROUTER_DECIDE_REWRITE_ROUTE,
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
             ROUTER_PUBLISH_TERMINATION_REPORT,
         ],
         "scope_signal_semantics": {
-            "triggered_meaning": "hard_stop_candidate",
-            "hard_stop_eligible": True,
+            "triggered_meaning": "continue_investigation",
+            "hard_stop_eligible": False,
         },
     },
     "rewrite": {
@@ -191,12 +207,31 @@ def build_phase_state(
     """
     Build ISSUE_REFINEMENT_PHASE_STATE_V1.
 
-    Returns the phase state dict. Never raises for ordinary invalid inputs;
-    callers should check the returned schema_version.
+    Raises ValueError for invalid inputs (unknown phase, missing source_path,
+    source_kind/phase inconsistency, missing required paths).
+
+    NOTE: scope_signal_guard.hard_stop_eligible は現在 phase のみで決定される。
+    signal_origin（existing_issue_body / rewrite_delta / review_delta）による
+    細粒度判定は後続 Issue で対応予定。
     """
     rules = _PHASE_ROUTER_RULES.get(phase)
     if rules is None:
         raise ValueError(f"Unknown phase: {phase!r}. Valid phases: {VALID_PHASES}")
+
+    # M1: source_path existence check
+    if not Path(source_path).exists():
+        raise ValueError(
+            f"source_path does not exist: {source_path!r} "
+            f"(phase={phase!r}, source_kind={source_kind!r})"
+        )
+
+    # M1: source_kind / phase consistency check
+    allowed_phases_for_kind = _SOURCE_KIND_ALLOWED_PHASES.get(source_kind)
+    if allowed_phases_for_kind is not None and phase not in allowed_phases_for_kind:
+        raise ValueError(
+            f"source_kind {source_kind!r} is not compatible with phase {phase!r}. "
+            f"Allowed phases for this source_kind: {allowed_phases_for_kind}"
+        )
 
     return {
         "schema_version": "ISSUE_REFINEMENT_PHASE_STATE_V1",

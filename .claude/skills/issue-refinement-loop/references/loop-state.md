@@ -79,7 +79,7 @@ Set at Step 0 (before any iteration). If non-null, the orchestrator records the 
 |---|---|---|---|
 | `preflight` | `continue_investigation` | false | Signal seen during preflight → proceed to investigation/review; do NOT call `decide_next_loop_action.py` |
 | `investigation` | `continue_investigation` | false | Signal seen during investigation → continue; not a hard stop |
-| `review` | `hard_stop_candidate` | true | Signal confirmed in review → `human_escalation` |
+| `review` | `continue_investigation` | false | Pre-rewrite phase; do NOT call `decide_next_loop_action.py`; route directly based on VERDICT |
 | `post_rewrite_check` | `hard_stop_candidate` | true | Signal in post-rewrite → `human_escalation` |
 | `decide_next_action` | `hard_stop_candidate` | true | Signal in routing phase → `human_escalation` |
 | `rewrite` | `ignored` | false | Signal during rewrite → ignored |

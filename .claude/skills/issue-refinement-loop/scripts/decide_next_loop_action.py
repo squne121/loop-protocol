@@ -175,10 +175,11 @@ def _check_phase_gate(
         return False, error
 
     phase = phase_state.get("phase", "unknown")
-    forbidden_routers = phase_state.get("forbidden_routers", [])
     allowed_routers = phase_state.get("allowed_routers", [])
 
-    if ROUTER_SELF_NAME in forbidden_routers:
+    # B3: Allowlist gate — router must be explicitly in allowed_routers (fail-closed).
+    # If allowed_routers is empty or missing, all routers are blocked.
+    if ROUTER_SELF_NAME not in allowed_routers:
         error = {
             "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
             "status": "router_error",
@@ -187,9 +188,9 @@ def _check_phase_gate(
             "attempted_router": ROUTER_SELF_NAME,
             "allowed_routers": allowed_routers,
             "forbidden_reason": (
-                f"Router {ROUTER_SELF_NAME!r} is forbidden in phase {phase!r}. "
-                f"In this phase, scope_signal_guard.triggered means 'continue_investigation' "
-                f"(hard_stop_eligible=false). Use investigation or review phase routers instead."
+                f"Router {ROUTER_SELF_NAME!r} is not in allowed_routers for phase {phase!r}. "
+                f"Allowed routers: {allowed_routers}. "
+                f"Use the appropriate phase router for this phase instead."
             ),
             "missing_fields": [],
             "unexpected_fields": [],
@@ -444,6 +445,9 @@ def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]]
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
+    # current_phase_state is set when --phase-state-file is provided; used in B4.
+    current_phase_state: Optional[dict[str, Any]] = None
+
     # --- Phase gate (evaluated BEFORE schema validation) ---
     if args.phase_state_file:
         phase_state, phase_load_err = _load_phase_state(args.phase_state_file)
@@ -464,6 +468,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             _emit_router_error(error)
             sys.exit(EXIT_INCONSISTENT_STATE)
 
+        current_phase_state = phase_state
         allowed, router_error = _check_phase_gate(phase_state)
         if not allowed and router_error is not None:
             _emit_router_error(router_error)
@@ -481,9 +486,30 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Validate schema
     valid, error_msg = validate_loop_state(loop_state)
     if not valid:
-        print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
-        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
-        print(f"BLOCKERS: {error_msg}")
+        # B4: When --phase-state-file is provided, emit ISSUE_REFINEMENT_ROUTER_ERROR_V1
+        # with reason_code: loop_state_invalid instead of generic inconsistent_state.
+        if args.phase_state_file:
+            missing_fields: list[str] = []
+            # Extract missing field hints from jsonschema error messages
+            if "required property" in error_msg or "required" in error_msg.lower():
+                missing_fields = [error_msg]
+            error = {
+                "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
+                "status": "router_error",
+                "reason_code": "loop_state_invalid",
+                "phase": current_phase_state.get("phase", "unknown") if current_phase_state is not None else "unknown",
+                "attempted_router": ROUTER_SELF_NAME,
+                "allowed_routers": [],
+                "forbidden_reason": f"LOOP_STATE_V1 schema validation failed: {error_msg}",
+                "missing_fields": missing_fields,
+                "unexpected_fields": [],
+                "next_action": "rebuild_phase_state",
+            }
+            _emit_router_error(error)
+        else:
+            print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
+            print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+            print(f"BLOCKERS: {error_msg}")
         sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Parse verdict

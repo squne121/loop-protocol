@@ -40,9 +40,22 @@ def load_loop_state_fixture() -> dict[str, Any]:
 def make_phase_state(
     phase: str,
     source_kind: str = "refinement_preflight_result_v1",
-    source_path: str = "/tmp/fake_source.json",
+    source_path: str | None = None,
 ) -> dict[str, Any]:
-    """Build a minimal ISSUE_REFINEMENT_PHASE_STATE_V1 via build_refinement_phase_state.py."""
+    """Build a minimal ISSUE_REFINEMENT_PHASE_STATE_V1 via build_refinement_phase_state.py.
+
+    source_path defaults to a temporary file created automatically (M1: source_path must exist).
+    """
+    # Create a real temp file for source_path (M1 requires source_path to exist)
+    _source_file = None
+    if source_path is None:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as sf:
+            sf.write("{}")
+            source_path = sf.name
+        _source_file = source_path
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as out_f:
@@ -379,8 +392,11 @@ def test_ac5_without_phase_gate_scope_signal_triggers_human_escalation():
 # ---------------------------------------------------------------------------
 
 
-def test_phase_gate_allows_decide_in_review_phase():
-    """review phase では decide_next_loop_action.py が allowed_routers に含まれるため通過。"""
+def test_phase_gate_blocks_decide_in_review_phase():
+    """
+    B2: review phase は pre-rewrite phase であるため decide_next_loop_action.py は forbidden。
+    Router Rule に従い allowed_routers に含まれない。
+    """
     loop_state = load_loop_state_fixture()
     loop_state["scope_signal_guard"]["triggered"] = False
     phase_state = make_phase_state(
@@ -390,12 +406,15 @@ def test_phase_gate_allows_decide_in_review_phase():
 
     result = run_decide_with_phase_state(loop_state, phase_state, verdict="needs-fix")
 
-    # Gate should pass → normal routing
-    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" not in result.stdout, (
-        f"Phase gate should not fire in review phase:\n{result.stdout}"
+    # Gate must block → ISSUE_REFINEMENT_ROUTER_ERROR_V1
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout, (
+        f"Phase gate should fire in review phase (pre-rewrite, decide is forbidden):\n{result.stdout}"
     )
-    assert result.returncode in (0, 1, 2), (
-        f"Unexpected exit code {result.returncode}:\n{result.stdout}"
+    assert "phase_not_allowed" in result.stdout, (
+        f"Expected reason_code=phase_not_allowed:\n{result.stdout}"
+    )
+    assert result.returncode == 3, (
+        f"Expected exit 3 for review phase gate block, got {result.returncode}:\n{result.stdout}"
     )
 
 
@@ -445,3 +464,255 @@ def test_investigation_phase_also_blocks_decide():
     assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout
     assert "phase_not_allowed" in result.stdout
     assert result.returncode == 3
+
+
+# ---------------------------------------------------------------------------
+# B2: review phase での decide_next_loop_action.py は forbidden
+# ---------------------------------------------------------------------------
+
+
+def test_review_phase_forbids_decide_next_loop_action():
+    """B2: review phase では decide_next_loop_action.py が forbidden_routers に含まれる。"""
+    phase_state = make_phase_state("review", source_kind="issue_review_result_compact_v1")
+    assert "decide_next_loop_action.py" not in phase_state["allowed_routers"], (
+        "review phase must NOT have decide_next_loop_action.py in allowed_routers (B2)"
+    )
+    assert "decide_next_loop_action.py" in phase_state["forbidden_routers"], (
+        "review phase must have decide_next_loop_action.py in forbidden_routers (B2)"
+    )
+
+
+def test_review_phase_hard_stop_eligible_is_false():
+    """B2: review phase は pre-rewrite phase であるため hard_stop_eligible: false。"""
+    phase_state = make_phase_state("review", source_kind="issue_review_result_compact_v1")
+    assert phase_state["scope_signal_semantics"]["hard_stop_eligible"] is False, (
+        f"review phase hard_stop_eligible must be false (B2), got: "
+        f"{phase_state['scope_signal_semantics']}"
+    )
+    assert phase_state["scope_signal_semantics"]["triggered_meaning"] == "continue_investigation"
+
+
+# ---------------------------------------------------------------------------
+# B3: allowlist gate — empty allowed_routers blocks all routers
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_gate_empty_allowed_routers_blocks_all():
+    """B3: allowed_routers=[] → すべての router が blocked（fail-closed）。"""
+    loop_state = load_loop_state_fixture()
+    # Manually craft a phase_state with empty allowed_routers
+    phase_state_with_empty_allowed = {
+        "schema_version": "ISSUE_REFINEMENT_PHASE_STATE_V1",
+        "phase": "terminate",
+        "source_artifact": {"kind": "loop_state_v1", "path": "/tmp/x.json"},
+        "loop_state_path": None,
+        "planner_result_path": None,
+        "review_result_path": None,
+        "allowed_routers": [],
+        "forbidden_routers": ["decide_next_loop_action.py"],
+        "scope_signal_semantics": {
+            "triggered_meaning": "ignored",
+            "hard_stop_eligible": False,
+        },
+    }
+
+    result = run_decide_with_phase_state(loop_state, phase_state_with_empty_allowed)
+
+    assert result.returncode == 3, (
+        f"Expected exit 3 when allowed_routers=[] (B3 fail-closed), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout
+    assert "phase_not_allowed" in result.stdout
+
+
+def test_allowlist_gate_missing_from_forbidden_but_not_in_allowed_is_blocked():
+    """
+    B3: forbidden_routers に含まれなくても allowed_routers に含まれなければ blocked。
+    旧 denylist ベースでは through できたが allowlist ベースでは blocked になる。
+    """
+    loop_state = load_loop_state_fixture()
+    # decide_next_loop_action.py を forbidden_routers から除外し、
+    # かつ allowed_routers にも含めない → allowlist gate で blocked になるべき
+    phase_state_denylist_bypass = {
+        "schema_version": "ISSUE_REFINEMENT_PHASE_STATE_V1",
+        "phase": "rewrite",
+        "source_artifact": {"kind": "loop_state_v1", "path": "/tmp/x.json"},
+        "loop_state_path": None,
+        "planner_result_path": None,
+        "review_result_path": None,
+        "allowed_routers": ["decide_rewrite_route.py"],  # decide_next_loop_action not here
+        "forbidden_routers": [],  # also NOT in forbidden — denylist would pass this
+        "scope_signal_semantics": {
+            "triggered_meaning": "ignored",
+            "hard_stop_eligible": False,
+        },
+    }
+
+    result = run_decide_with_phase_state(loop_state, phase_state_denylist_bypass)
+
+    # Allowlist gate: decide_next_loop_action.py not in allowed_routers → blocked
+    assert result.returncode == 3, (
+        f"Expected exit 3 (allowlist gate blocks non-allowed router), got {result.returncode}\n"
+        f"stdout: {result.stdout}"
+    )
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# M1: build_refinement_phase_state.py の source_path 存在チェック
+# ---------------------------------------------------------------------------
+
+
+def test_build_phase_state_missing_source_path_returns_error():
+    """M1: source_path が存在しない場合は STATUS: error を返す。"""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out_f:
+        out_path = out_f.name
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "preflight",
+            "--source-kind", "refinement_preflight_result_v1",
+            "--source-path", "/tmp/nonexistent_source_path_12345.json",
+            "--output-path", out_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, (
+        f"Expected exit 1 for missing source_path (M1), got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "STATUS: error" in result.stdout or "error" in result.stdout.lower(), (
+        f"Expected error message:\n{result.stdout}"
+    )
+
+
+def test_build_phase_state_source_kind_phase_mismatch_returns_error(tmp_path):
+    """M1: source_kind と phase の不整合でエラーを返す。"""
+    # refinement_preflight_result_v1 は preflight / investigation でのみ有効
+    # post_rewrite_check phase で使うと不整合
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+    out_file = tmp_path / "out.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", "post_rewrite_check",
+            "--source-kind", "refinement_preflight_result_v1",
+            "--source-path", str(source_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, (
+        f"Expected exit 1 for source_kind/phase mismatch (M1), got {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "error" in result.stdout.lower() or "STATUS: error" in result.stdout, (
+        f"Expected error for kind/phase mismatch:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3: validate_refinement_phase_transition.py の phase table テスト (parametrize)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+VALIDATE_SCRIPT = SKILL_ROOT / "scripts" / "validate_refinement_phase_transition.py"
+
+
+@pytest.mark.parametrize("phase,router,expected_allowed", [
+    # preflight → decide_next_loop_action.py は forbidden
+    ("preflight", "decide_next_loop_action.py", False),
+    ("preflight", "run_refinement_preflight.py", True),
+    ("preflight", "plan_refinement_loop.py", True),
+    # investigation → decide_next_loop_action.py は forbidden
+    ("investigation", "decide_next_loop_action.py", False),
+    ("investigation", "run_refinement_preflight.py", True),
+    # review → decide_next_loop_action.py は forbidden (B2)
+    ("review", "decide_next_loop_action.py", False),
+    ("review", "decide_rewrite_route.py", True),
+    # post_rewrite_check → decide_next_loop_action.py は allowed
+    ("post_rewrite_check", "decide_next_loop_action.py", True),
+    ("post_rewrite_check", "decide_rewrite_route.py", True),
+    # decide_next_action → decide_next_loop_action.py は allowed
+    ("decide_next_action", "decide_next_loop_action.py", True),
+    # rewrite → decide_next_loop_action.py は forbidden
+    ("rewrite", "decide_next_loop_action.py", False),
+    ("rewrite", "decide_rewrite_route.py", True),
+    # publish → decide_next_loop_action.py は forbidden
+    ("publish", "decide_next_loop_action.py", False),
+    ("publish", "publish_termination_report.py", True),
+    # terminate → すべて forbidden
+    ("terminate", "decide_next_loop_action.py", False),
+])
+def test_validate_router_in_phase_parametrize(phase, router, expected_allowed, tmp_path):
+    """M3: 全 phase の allowed/forbidden router に対する parametrized 検証テーブル。"""
+    # Build source kind appropriate for the phase
+    source_kind_map = {
+        "preflight": "refinement_preflight_result_v1",
+        "investigation": "refinement_preflight_result_v1",
+        "review": "issue_review_result_compact_v1",
+        "rewrite": "issue_author_result_compact_v1",
+        "post_rewrite_check": "loop_state_v1",
+        "decide_next_action": "loop_state_v1",
+        "publish": "loop_state_v1",
+        "terminate": "loop_state_v1",
+    }
+    source_kind = source_kind_map.get(phase, "loop_state_v1")
+    source_file = tmp_path / "source.json"
+    source_file.write_text("{}", encoding="utf-8")
+
+    # Build phase state
+    out_file = tmp_path / f"phase_state_{phase}.json"
+    result_build = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_SCRIPT),
+            "--phase", phase,
+            "--source-kind", source_kind,
+            "--source-path", str(source_file),
+            "--output-path", str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result_build.returncode == 0, (
+        f"build failed for phase={phase!r}:\n{result_build.stdout}\n{result_build.stderr}"
+    )
+
+    # Validate router against phase state
+    result_validate = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATE_SCRIPT),
+            "--phase-state-file", str(out_file),
+            "--attempted-router", router,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if expected_allowed:
+        assert result_validate.returncode == 0, (
+            f"Expected router {router!r} to be ALLOWED in phase {phase!r}, "
+            f"but got exit {result_validate.returncode}:\n{result_validate.stdout}"
+        )
+        assert "STATUS: allowed" in result_validate.stdout
+    else:
+        assert result_validate.returncode == 1, (
+            f"Expected router {router!r} to be FORBIDDEN in phase {phase!r}, "
+            f"but got exit {result_validate.returncode}:\n{result_validate.stdout}"
+        )
+        assert "STATUS: forbidden" in result_validate.stdout

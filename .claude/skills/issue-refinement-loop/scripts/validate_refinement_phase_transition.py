@@ -69,16 +69,21 @@ def validate_router_in_phase(
     """
     Check whether `attempted_router` is allowed in the current phase.
 
+    Uses allowlist semantics (B3): a router must be explicitly in allowed_routers
+    to pass. If allowed_routers is empty or missing, ALL routers are blocked
+    (fail-closed). The forbidden_routers list is informational only.
+
     Returns (allowed: bool, reason: str).
     """
-    forbidden = phase_state.get("forbidden_routers", [])
     allowed = phase_state.get("allowed_routers", [])
     phase = phase_state.get("phase", "unknown")
 
-    if attempted_router in forbidden:
+    # Allowlist gate: router must be explicitly permitted
+    if attempted_router not in allowed:
+        forbidden = phase_state.get("forbidden_routers", [])
         return False, (
-            f"Router {attempted_router!r} is forbidden in phase {phase!r}. "
-            f"Allowed routers: {allowed}"
+            f"Router {attempted_router!r} is not in allowed_routers for phase {phase!r}. "
+            f"Allowed routers: {allowed}. Forbidden routers: {forbidden}"
         )
     return True, f"Router {attempted_router!r} is allowed in phase {phase!r}."
 
