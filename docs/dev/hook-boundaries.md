@@ -12,6 +12,11 @@ schema_version: hook_boundaries_manifest_v1
 
 `scripts/check_hook_boundaries.py` がこの YAML manifest と `settings.json` を構造照合し drift を検出する。
 
+> **重要**: Codex CLI および Claude Code の hook は **fail-closed ローカルガードレール** であり、セキュリティ境界ではない。  
+> hook failure は non-blocking の場合でも transcript にエラーとして露出し、後続の agent 判断を汚染しうる。  
+> セキュリティ上の保護は branch protection / GitHub Actions CI / repository permission で行う。  
+> Codex hooks は `.codex/hooks.json` に集約し、`.codex/config.toml` に inline hooks を混在させない。
+
 ---
 
 ## 1. 分類の定義

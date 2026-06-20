@@ -9,7 +9,10 @@ import { fileURLToPath } from 'node:url';
 // Derive repoRoot from script location so it is stable regardless of cwd.
 // Hooks invoke this script via `$(git rev-parse --show-toplevel)/scripts/...`
 // but shell cwd when the hook fires may be a subdirectory.
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// REPO_ROOT_OVERRIDE allows tests to point the validator at a temporary repo fixture.
+const repoRoot = process.env.REPO_ROOT_OVERRIDE
+  ? path.resolve(process.env.REPO_ROOT_OVERRIDE)
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agentsDir = path.join(repoRoot, '.codex', 'agents');
 const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
@@ -398,6 +401,43 @@ function validateHooksJson(hooksPath, failures) {
     );
   }
 
+  // AC3: structural validation for PermissionRequest, Stop, SubagentStop.
+  // Each event must be a non-empty array; each entry must have at least one handler;
+  // and each handler object must have a "command" field of type string.
+  assert(Array.isArray(parsed?.hooks?.PermissionRequest), 'hooks.json: must have hooks.PermissionRequest array (AC3 #1020)', failures);
+  assert(Array.isArray(parsed?.hooks?.Stop), 'hooks.json: must have hooks.Stop array (AC3 #1020)', failures);
+  assert(Array.isArray(parsed?.hooks?.SubagentStop), 'hooks.json: must have hooks.SubagentStop array (AC3 #1020)', failures);
+  const permissionRequestEntries = parsed?.hooks?.PermissionRequest ?? [];
+  assert(permissionRequestEntries.length >= 1, 'hooks.json: PermissionRequest must have at least one entry (AC3 #1020)', failures);
+  const stopEntries = parsed?.hooks?.Stop ?? [];
+  assert(stopEntries.length >= 1, 'hooks.json: Stop must have at least one entry (AC3 #1020)', failures);
+  const subagentStopEntries = parsed?.hooks?.SubagentStop ?? [];
+  assert(subagentStopEntries.length >= 1, 'hooks.json: SubagentStop must have at least one entry (AC3 #1020)', failures);
+  // Validate that each entry in PermissionRequest/Stop/SubagentStop has at least one handler
+  // with a "command" field (string). An empty object {} or missing command fails.
+  for (const [eventKey, entries] of [
+    ['PermissionRequest', permissionRequestEntries],
+    ['Stop', stopEntries],
+    ['SubagentStop', subagentStopEntries],
+  ]) {
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      const handlers = entry?.hooks ?? [];
+      assert(
+        handlers.length >= 1,
+        `hooks.json: ${eventKey}[${i}] must have at least one handler in hooks[] (AC3 #1020)`,
+        failures,
+      );
+      for (let j = 0; j < handlers.length; j += 1) {
+        assert(
+          typeof handlers[j]?.command === 'string' && handlers[j].command.length > 0,
+          `hooks.json: ${eventKey}[${i}].hooks[${j}] must have a non-empty "command" field (AC3 #1020)`,
+          failures,
+        );
+      }
+    }
+  }
+
   const allHookCommands = [];
   for (const eventKey of ['SubagentStart', 'PreToolUse']) {
     const entries = parsed?.hooks?.[eventKey] ?? [];
@@ -544,6 +584,20 @@ function validateAgents() {
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
+  // AC1: config.toml must not define a [hooks] section; hooks live in .codex/hooks.json.
+  // Also scan for TOML array-of-tables [[hooks.*]] which the parser skips to avoid false errors.
+  // All of the following table header patterns must cause a failure:
+  //   [hooks]  [hooks.PreToolUse]  [[hooks.PreToolUse]]  [[hooks.PreToolUse.hooks]]
+  //   [[hooks.PermissionRequest]]  [[hooks.Stop]]  [[hooks.SubagentStop]]
+  assert(!configParsed?.hooks, 'config.toml must not define a [hooks] section; use .codex/hooks.json instead (AC1 #1020)', failures);
+  for (const line of configText.split(/\r?\n/)) {
+    const stripped = line.trim();
+    if (stripped.startsWith('#')) continue;
+    // Match [hooks], [hooks.X], [[hooks.X]], [[hooks.X.Y]] etc.
+    if (/^\[{1,2}hooks(\]|\.|\.{1,2}\w)/.test(stripped)) {
+      failures.push(`config.toml must not define a hooks table/array-of-tables header "${stripped}"; use .codex/hooks.json instead (AC1 #1020)`);
+    }
+  }
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
   assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills: must not exist as a repo-shared skill surface', failures);
 
