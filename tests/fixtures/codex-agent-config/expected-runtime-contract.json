@@ -123,6 +123,17 @@
       "repo_local_skill_surfaces": [
         ".agents/skills/gemini-cli-headless-delegation/SKILL.md"
       ]
+    },
+    "web-researcher": {
+      "path": ".codex/agents/web-researcher.toml",
+      "claude_agent_path": ".claude/agents/web-researcher.md",
+      "claude_model": "haiku",
+      "claude_permission_mode": "dontAsk",
+      "model": "gpt-5.4-mini",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "followup_required",
+      "runtime_followup_route": "grounded_research_or_direct_web"
     }
   },
   "required_instruction_tokens": [
