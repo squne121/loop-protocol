@@ -138,6 +138,59 @@ uv run python3 scripts/example.py
 """
 
 
+VALID_ISSUE_BODY_NO_MACHINE_CONTRACT = """\
+## Parent Issue
+
+#1
+
+## Parent Goal Ref
+
+- Goal: Test goal
+
+## Current Validated Scope
+
+- scripts/example.py
+
+## Remaining Parent Gaps
+
+- [ ] Nothing remaining
+
+## Outcome
+
+Add `scripts/example.py`.
+
+## In Scope
+
+- scripts/example.py
+
+## Out of Scope
+
+- Unrelated changes
+
+## Acceptance Criteria
+
+- [ ] AC1: Script exists.
+
+## Verification Commands
+
+```bash
+uv run python3 scripts/example.py
+```
+
+## Allowed Paths
+
+- scripts/example.py
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合
+
+## Required Skills
+
+なし
+"""
+
+
 # ---------------------------------------------------------------------------
 # AC1: fixture input produces STATUS / NEXT_ACTION / MUST_READ / COMMANDS /
 #      BLOCKERS / ARTIFACT in stdout
@@ -435,6 +488,173 @@ class TestAC6SchemaAndProjectionConsistency:
         artifact_data = json.loads(Path(artifact_path).read_text())
         assert artifact_data["status"] == result["status"]
         assert artifact_data["next_action"] == result["next_action"]
+
+    def test_fail_closed_forwarding_fields_in_stdout_and_artifact(self, tmp_path, capsys):
+        """Fail-closed result exposes required sections / contract keys / rewrite constraints."""
+        malformed_body = """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+```
+"""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(make_minimal_fixture(body=malformed_body, issue_number=3000)),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=3000,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        captured = capsys.readouterr()
+        stdout = captured.out
+
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert result["status"] == "blocked"
+        assert result["planner_fail_closed"] is True
+        assert "missing_required_contract_key" in result["planner_fail_closed_reason_codes"]
+        assert result["required_contract_keys"], "required_contract_keys must be forwarded"
+        assert "issue_kind" in result["required_contract_keys"]
+        assert result["required_sections"], "required_sections must be forwarded"
+        assert "REQUIRED_SECTIONS:" in stdout, "compact stdout should include REQUIRED_SECTIONS"
+        assert "REQUIRED_CONTRACT_KEYS:" in stdout, "compact stdout should include REQUIRED_CONTRACT_KEYS"
+        assert "REWRITE_CONSTRAINTS:" in stdout, "compact stdout should include REWRITE_CONSTRAINTS"
+
+        artifact_path = result.get("artifacts", {}).get("refinement_preflight_result_v1")
+        assert artifact_path, "artifact path must be present"
+        artifact_data = json.loads(Path(artifact_path).read_text())
+        assert artifact_data["required_sections"] == result["required_sections"]
+        assert artifact_data["required_contract_keys"] == result["required_contract_keys"]
+        assert artifact_data["rewrite_constraints"] == result["rewrite_constraints"]
+        assert artifact_data["planner_fail_closed_reason_codes"] == result["planner_fail_closed_reason_codes"]
+
+    def test_machine_contract_section_absent_requires_section_not_contract_keys(self, tmp_path, capsys):
+        """Machine-Readable Contract absent -> required section list, not key list."""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(make_minimal_fixture(body=VALID_ISSUE_BODY_NO_MACHINE_CONTRACT, issue_number=3100)),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=3100,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        captured = capsys.readouterr()
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert result["planner_fail_closed"] is True
+        assert "Machine-Readable Contract" in result["required_sections"]
+        assert result["required_contract_keys"] == []
+        assert "REQUIRED_SECTIONS:" in captured.out
+        assert "REQUIRED_CONTRACT_KEYS:" not in captured.out
+
+
+class TestNonStringFailClosedPayload:
+    """Non-string payloads must be rejected instead of silently dropped."""
+
+    def test_non_string_fail_closed_payload_blocks(self, tmp_path):
+        """Planner payload with non-string fields must map to blocked and blockers include payload errors."""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(make_minimal_fixture(body=VALID_ISSUE_BODY, issue_number=3200)),
+            encoding="utf-8",
+        )
+
+        invalid_plan = {
+            "schema_version": "refinement_loop_plan/v1",
+            "fail_closed": {
+                "required": True,
+                "reason_codes": ["missing_required_section", 1234],
+                "rewrite_constraints": {
+                    "required_sections": ["Outcome", 56],
+                    "required_contract_keys": ["issue_kind", "contract_schema_version"],
+                    "rewrite_constraints": {},
+                    "override_policy": {},
+                    "max_rewrite_attempts": 2,
+                    "no_progress_route": "human_judgment_required",
+                },
+            },
+            "decisions": {},
+        }
+
+        with (
+            mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+            mock.patch.object(wrapper, "_invoke_planner", return_value=(invalid_plan, 0, "")),
+        ):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=3200,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert result["status"] == "blocked"
+        assert result["planner_fail_closed"] is True
+        assert any(
+            "REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD" in blocker
+            for blocker in result["blockers"]
+        ), f"expected non-string payload blocker, got {result['blockers']}"
+        assert result["required_sections"] == []
+        assert result["required_contract_keys"] == []
+
+
+class TestRewriteConstraintsStdout:
+    """REWRITE_CONSTRAINTS in compact stdout must be JSON parseable."""
+
+    def test_rewrite_constraints_stdout_is_json_parseable(self):
+        """REWRITE_CONSTRAINTS stdout line is valid JSON."""
+        payload = {
+            "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
+            "required_sections": ["Outcome"],
+            "required_contract_keys": ["issue_kind"],
+            "rewrite_constraints": {
+                "must_add_sections": ["Outcome"],
+                "must_add_contract_keys": ["issue_kind"],
+                "freeform_rewrite_forbidden": True,
+            },
+            "override_policy": {
+                "allowed_reason_codes": ["missing_required_section"],
+                "never_override_reason_codes": ["checker_internal_error"],
+                "overridable_in_current_result": ["missing_required_section"],
+                "non_overridable_in_current_result": ["checker_internal_error"],
+            },
+            "max_rewrite_attempts": 2,
+            "no_progress_route": "human_judgment_required",
+        }
+        result = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "blocked",
+            "issue_number": 1,
+            "repo": "o/r",
+            "planner_exit_code": 0,
+            "planner_fail_closed": True,
+            "next_action": "human_judgment_required",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": ["PLANNER_FAIL_CLOSED"],
+            "planner_fail_closed_reason_codes": ["missing_required_section"],
+            "required_sections": ["Outcome"],
+            "required_contract_keys": ["issue_kind"],
+            "rewrite_constraints": payload,
+            "artifacts": {},
+            "hashes": {},
+        }
+
+        output = wrapper._build_compact_stdout(result)
+        lines = output.splitlines()
+        idx = lines.index("REWRITE_CONSTRAINTS:")
+        json.loads(lines[idx + 1].strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1416,55 @@ class TestB2JsonSchemaRuntimeValidation:
 
         with pytest.raises(_js.ValidationError):
             _js.validate(bad_result, schema)
+
+    def test_fail_closed_true_requires_rewrite_payloads_by_schema(self):
+        """B2: planner_fail_closed=true requires schema-forwarding fields by JSON Schema if/then."""
+        import jsonschema as _js
+        schema_path = SCHEMAS_DIR / "refinement_preflight_result_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+
+        invalid = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "blocked",
+            "issue_number": 1,
+            "repo": "o/r",
+            "planner_exit_code": 0,
+            "planner_fail_closed": True,
+            "next_action": "human_judgment_required",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": ["PLANNER_FAIL_CLOSED"],
+            "artifacts": {},
+            "hashes": {},
+        }
+
+        with pytest.raises(_js.ValidationError):
+            _js.validate(invalid, schema)
+
+    def test_fail_closed_false_allows_optional_rewrite_fields_to_be_absent(self):
+        """B2: planner_fail_closed=false can omit rewrite payload fields."""
+        import jsonschema as _js
+        schema_path = SCHEMAS_DIR / "refinement_preflight_result_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+
+        valid = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "pass",
+            "issue_number": 2,
+            "repo": "o/r",
+            "planner_exit_code": 0,
+            "planner_fail_closed": False,
+            "next_action": "proceed",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": [],
+            "artifacts": {},
+            "hashes": {},
+        }
+
+        _js.validate(valid, schema)
 
 
 # ---------------------------------------------------------------------------
