@@ -19,8 +19,7 @@ Canonical stdout fields:
     STATUS       - pass | warn | blocked | environment_failure (always present)
     NEXT_ACTION  - routing instruction (always present)
     MUST_READ    - files/paths to read before proceeding (omitted if empty)
-    COMMANDS_JSON - argv arrays as JSON array (machine-consumable canonical form, omitted if empty)
-    COMMANDS_DISPLAY - human-readable display of commands (display_only: true, omitted if empty)
+    COMMANDS     - argv-only command templates (omitted if empty)
     BLOCKERS     - blocker reason codes (omitted if empty)
     ARTIFACT     - artifact key: absolute_path pairs (omitted if empty)
     REQUIRED_SECTIONS - required sections from rewrite constraints (planner-derived)
@@ -117,6 +116,8 @@ BLOCKER_ANCHOR_REPO_MISMATCH = "ANCHOR_REPO_MISMATCH"
 BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH = "ANCHOR_ISSUE_NUMBER_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_NOT_FOUND = "ANCHOR_COMMENT_NOT_FOUND"
 BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
+BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID = "ANCHOR_COMMENT_SCHEMA_INVALID"
+BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED = "ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED"
 BLOCKER_INPUT_SCHEMA_INVALID = "INPUT_SCHEMA_INVALID"
 BLOCKER_RESULT_SCHEMA_INVALID = "RESULT_SCHEMA_INVALID"
 BLOCKER_INVALID_ARGS = "INVALID_ARGS"
@@ -250,12 +251,52 @@ def _validate_with_schema(
     if not _JSONSCHEMA_AVAILABLE:
         return True, []
     try:
-        _jsonschema.validate(data, schema)
+        validator_cls = _jsonschema.validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+        validator = validator_cls(
+            schema,
+            format_checker=validator_cls.FORMAT_CHECKER,
+        )
+        errors = sorted(validator.iter_errors(data), key=lambda exc: list(exc.path))
+        if errors:
+            return False, [f"schema_validation_error: {errors[0].message}"]
+        format_errors = _validate_date_time_formats(data, schema)
+        if format_errors:
+            return False, format_errors
         return True, []
     except _jsonschema.ValidationError as exc:
         return False, [f"schema_validation_error: {exc.message}"]
     except Exception as exc:
         return False, [f"schema_validation_unexpected: {exc}"]
+
+
+def _validate_date_time_formats(data: Any, schema: dict, path: str = "$") -> list[str]:
+    schema_type = schema.get("type")
+    if schema.get("format") == "date-time" and isinstance(data, str):
+        candidate = data.replace("Z", "+00:00")
+        try:
+            datetime.fromisoformat(candidate)
+        except ValueError:
+            return [f"schema_validation_error: {path} must be a valid date-time"]
+        return []
+
+    if schema_type == "object" and isinstance(data, dict):
+        errors: list[str] = []
+        for key, value in data.items():
+            child_schema = schema.get("properties", {}).get(key)
+            if isinstance(child_schema, dict):
+                errors.extend(_validate_date_time_formats(value, child_schema, f"{path}.{key}"))
+        return errors
+
+    if schema_type == "array" and isinstance(data, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            errors: list[str] = []
+            for index, item in enumerate(data):
+                errors.extend(_validate_date_time_formats(item, item_schema, f"{path}[{index}]"))
+            return errors
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +404,8 @@ def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, st
     flattened to a single list.  Single-page results are also wrapped as [[...]].
     """
     try:
-        from command_registry import render_command
-        _argv = render_command(
-            "gh.issue.comments.list",
-            {"repo": repo, "issue_number": issue_number},
-        )
+        from command_registry import render_command as _render_command
+        _argv = _render_command("gh.issue.comments.list", {"repo": repo, "issue_number": issue_number})
     except Exception as exc:
         raise RuntimeError(
             f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}"
@@ -397,6 +435,56 @@ def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]
         ["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"]
     )
     return data, err
+
+
+def _load_loop_state_schema() -> dict[str, Any]:
+    schema_path = _SCHEMAS_DIR / "loop_state.schema.json"
+    return json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def _build_anchor_comment_state(
+    *,
+    anchor_url: str,
+    comment: dict[str, Any],
+    issue_number: int,
+    captured_at: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    issue_url = comment.get("issue_url")
+    if not isinstance(issue_url, str) or not issue_url:
+        return None, [BLOCKER_ANCHOR_NOT_IN_ISSUE]
+
+    parsed_url = urlparse(issue_url)
+    path_parts = [part for part in parsed_url.path.split("/") if part]
+    if len(path_parts) < 4 or path_parts[-2] != "issues" or path_parts[-1] != str(issue_number):
+        return None, [BLOCKER_ANCHOR_NOT_IN_ISSUE]
+
+    state = {
+        "url": anchor_url,
+        "id": comment.get("id"),
+        "issue_number": issue_number,
+        "html_url": comment.get("html_url"),
+        "api_url": comment.get("url"),
+        "user_login": ((comment.get("user") or {}).get("login")),
+        "author_association": comment.get("author_association"),
+        "snapshot": comment.get("body", ""),
+        "captured_at": captured_at,
+        "fetched_at": captured_at,
+        "comment_created_at": comment.get("created_at"),
+        "comment_updated_at": comment.get("updated_at"),
+        "preliminary_classification": "feedback_update_required",
+        "final_classification": None,
+        "classification_reason": "defaulted_by_preflight_schema_normalization; semantic classification deferred to #1008/#1011",
+        "verified_claims": [],
+        "unresolved_claims": [],
+        "scope_impact": None,
+        "requires_fact_check": False,
+    }
+
+    schema = _load_loop_state_schema().get("definitions", {}).get("anchor_comment", {})
+    valid, errors = _validate_with_schema(state, schema)
+    if not valid:
+        return None, [BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID, *errors]
+    return state, []
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +541,7 @@ def _validate_anchor_comment_url(
         # Fixture mode: look up comment from pre-fetched data
         comment_data = None
         for c in fixture_comments:
-            if isinstance(c, dict) and c.get("id") == comment_id:
+            if isinstance(c, dict) and str(c.get("id")) == str(comment_id):
                 comment_data = c
                 break
         if comment_data is None:
@@ -526,6 +614,8 @@ def _validate_anchor_comments_batch(
 
     # Stable sort
     sorted_urls = sorted(deduped_urls)
+    if len(sorted_urls) > 1:
+        return [], [BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED]
 
     for url in sorted_urls:
         valid, blockers = _validate_anchor_comment_url(
@@ -554,6 +644,8 @@ def _build_planner_input(
     issue: dict,
     comments: list[dict],
     known_context: Optional[dict],
+    anchor_comment_feedback: Optional[dict] = None,
+    anchor_comment_ids: Optional[set[str]] = None,
     now: Optional[str] = None,
 ) -> dict:
     """Build REFINEMENT_LOOP_PLANNER_INPUT_V1 from issue/comments data."""
@@ -565,6 +657,18 @@ def _build_planner_input(
         elif isinstance(lbl, str):
             labels.append(lbl)
 
+    planner_comments = comments
+    if anchor_comment_ids:
+        planner_comments = []
+        for comment in comments:
+            comment_id = comment.get("id")
+            if comment_id is not None and str(comment_id) in anchor_comment_ids:
+                sanitized = dict(comment)
+                sanitized["body"] = "[redacted: anchor comment snapshot stored in artifact]"
+                planner_comments.append(sanitized)
+            else:
+                planner_comments.append(comment)
+
     planner_input: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION_PLANNER_INPUT,
         "issue": {
@@ -573,10 +677,12 @@ def _build_planner_input(
             "body": issue.get("body", ""),
             "labels": labels,
         },
-        "comments": comments,
+        "comments": planner_comments,
     }
     if known_context is not None:
         planner_input["known_context"] = known_context
+    if anchor_comment_feedback is not None:
+        planner_input["anchor_comment_feedback"] = anchor_comment_feedback
     if now is not None:
         planner_input["now"] = now
 
@@ -818,28 +924,32 @@ def _build_compact_stdout(result: dict) -> str:
 
     commands = result.get("commands", [])
     if commands:
-        # COMMANDS_JSON: canonical machine-consumable command spec (full object array)
-        # Orchestrators and SubAgents MUST consume COMMANDS_JSON:, not COMMANDS_DISPLAY:.
-        import json as _json
-        spec_objects = [
-            {
-                "id": cmd.get("id", cmd.get("kind", "?")),
-                "argv": cmd.get("argv", []),
-                "shell": cmd.get("shell", False),
-                "cwd_policy": cmd.get("cwd_policy", "repo_root"),
-                "stdin_contract": cmd.get("stdin_contract", "none"),
-                "stdout_contract": cmd.get("stdout_contract", "unknown"),
-                "timeout_seconds": cmd.get("timeout_seconds", 120),
-                "mutation": cmd.get("mutation", False),
-            }
-            for cmd in commands
-        ]
-        lines.append("COMMANDS_JSON: " + _json.dumps(spec_objects, ensure_ascii=False, separators=(",", ":")))
-        # COMMANDS_DISPLAY: human-readable, display_only=true, NOT for machine consumption
-        lines.append("COMMANDS_DISPLAY:")
-        for cmd in commands:
-            argv_str = " ".join(str(a) for a in cmd.get("argv", []))
-            lines.append(f"  display: [{cmd.get('id', cmd.get('kind', '?'))}] {argv_str}")
+        try:
+            from command_registry import REGISTRY as _REG
+            spec_objects = []
+            for cmd in commands:
+                cmd_id = cmd.get("id") or cmd.get("kind", "?")
+                entry = _REG.get(cmd_id, {})
+                spec_objects.append({
+                    "id": cmd_id,
+                    "argv": cmd.get("argv", []),
+                    "shell": cmd.get("shell", False),
+                    "cwd_policy": entry.get("cwd_policy", "repo_root"),
+                    "stdin_contract": entry.get("stdin_contract", "none"),
+                    "stdout_contract": entry.get("stdout_contract", "unknown"),
+                    "timeout_seconds": entry.get("timeout_seconds", 120),
+                    "mutation": entry.get("mutation", False),
+                })
+            lines.append("COMMANDS_JSON: " + json.dumps(spec_objects, ensure_ascii=False, separators=(",", ":")))
+            lines.append("COMMANDS_DISPLAY:")
+            for cmd in commands:
+                argv_str = " ".join(str(a) for a in cmd.get("argv", []))
+                lines.append(f"  display: [{cmd.get('id') or cmd.get('kind', '?')}] {argv_str}")
+        except ImportError:
+            lines.append("COMMANDS:")
+            for cmd in commands:
+                argv_str = " ".join(cmd.get("argv", []))
+                lines.append(f"  - [{cmd.get('kind', '?')}] {argv_str}")
 
     blockers = result.get("blockers", [])
     if blockers:
@@ -928,30 +1038,19 @@ def _build_result(
 
 
 def _commands_from_plan(plan: dict, issue_number: int, repo: str) -> list[dict]:
-    """Build commands[] from ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 preflight.run entry.
-
-    AC5: argv and full command spec are derived from ISSUE_REFINEMENT_COMMAND_REGISTRY_V1
-    via command_registry.py (entry 'preflight.run'). Registry unavailability is fail-closed
-    — RuntimeError is raised to surface BLOCKER_COMMAND_REGISTRY_UNAVAILABLE upstream.
-    """
+    """Build commands[] from ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 preflight.run entry."""
     try:
-        from command_registry import render_command, REGISTRY
-        entry = REGISTRY.get("preflight.run", {})
-        argv = render_command("preflight.run", {"issue_number": issue_number, "repo": repo})
+        from command_registry import render_command as _render_command, REGISTRY as _REGISTRY
+        _entry = _REGISTRY.get("preflight.run", {})
+        _argv = _render_command("preflight.run", {"issue_number": issue_number, "repo": repo})
     except Exception as exc:
         raise RuntimeError(
             f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: command_registry render failed: {exc}"
         ) from exc
     return [{
-        "id": "preflight.run",
         "kind": "run_preflight",
-        "argv": argv,
+        "argv": _argv,
         "shell": False,
-        "cwd_policy": entry.get("cwd_policy", "repo_root"),
-        "stdin_contract": entry.get("stdin_contract", "none"),
-        "stdout_contract": entry.get("stdout_contract", "refinement_preflight_result/v1"),
-        "timeout_seconds": entry.get("timeout_seconds", 120),
-        "mutation": entry.get("mutation", False),
         "source": "registry",
     }]
 
@@ -1160,6 +1259,10 @@ def run_preflight(
         active_anchor_urls = anchor_comment_urls
         fixture_comment_lookup = None
 
+    anchor_comment_state: Optional[dict[str, Any]] = None
+    anchor_comment_feedback: Optional[dict[str, Any]] = None
+    anchor_comment_ids: set[str] = set()
+
     # --- Anchor comment structural validation ---
     if active_anchor_urls:
         sorted_urls, anchor_blockers = _validate_anchor_comments_batch(
@@ -1183,6 +1286,66 @@ def run_preflight(
                 rewrite_constraints=None,
             )
 
+        if sorted_urls:
+            anchor_url = sorted_urls[0]
+            parsed_anchor = _parse_anchor_comment_url(anchor_url)
+            comment_id = parsed_anchor.get("comment_id")
+            comment_payload = None
+            if fixture_comment_lookup is not None:
+                for item in fixture_comment_lookup:
+                    if str(item.get("id")) == str(comment_id):
+                        comment_payload = item
+                        break
+            else:
+                comment_payload, err = _fetch_single_comment(repo, comment_id)
+                if comment_payload is None:
+                    blockers.append(BLOCKER_GH_FAILURE)
+                    return _emit_failure_result(
+                        repo_root=repo_root,
+                        issue_number=issue_number,
+                        repo=repo,
+                        status="environment_failure",
+                        next_action="fix_environment",
+                        blockers=blockers,
+                        planner_fail_closed_reason_codes=[],
+                        required_sections=[],
+                        required_contract_keys=[],
+                        rewrite_constraints=None,
+                    )
+
+            anchor_comment_state, anchor_errors = _build_anchor_comment_state(
+                anchor_url=anchor_url,
+                comment=comment_payload,
+                issue_number=issue_number,
+                captured_at=now or _now_iso(),
+            )
+            if anchor_errors:
+                blockers.extend(anchor_errors)
+                return _emit_failure_result(
+                    repo_root=repo_root,
+                    issue_number=issue_number,
+                    repo=repo,
+                    status="blocked",
+                    next_action="human_judgment_required",
+                    blockers=blockers,
+                    planner_fail_closed_reason_codes=[],
+                    required_sections=[],
+                    required_contract_keys=[],
+                    rewrite_constraints=None,
+                )
+
+            anchor_comment_ids.add(str(comment_payload["id"]))
+            anchor_comment_feedback = {
+                "url": anchor_comment_state["url"],
+                "preliminary_classification": anchor_comment_state["preliminary_classification"],
+                "final_classification": anchor_comment_state["final_classification"],
+                "classification_reason": anchor_comment_state["classification_reason"],
+                "verified_claims": anchor_comment_state["verified_claims"],
+                "unresolved_claims": anchor_comment_state["unresolved_claims"],
+                "scope_impact": anchor_comment_state["scope_impact"],
+                "requires_fact_check": anchor_comment_state["requires_fact_check"],
+            }
+
     # --- Build raw snapshot (for artifact) ---
     raw_snapshot = {
         "schema_version": "raw_issue_snapshot/v1",
@@ -1192,6 +1355,8 @@ def run_preflight(
         "issue": issue,
         "comments": comments,
     }
+    if anchor_comment_state is not None:
+        raw_snapshot["anchor_comment"] = anchor_comment_state
 
     # --- Run repair pass before planner (Issue #889) ---
     # repair_issue_contract runs dry-run to report defects; the repaired body is
@@ -1200,7 +1365,14 @@ def run_preflight(
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
     # --- Invoke planner ---
-    planner_input_dict = _build_planner_input(issue, comments, known_context, now=now)
+    planner_input_dict = _build_planner_input(
+        issue,
+        comments,
+        known_context,
+        anchor_comment_feedback=anchor_comment_feedback,
+        anchor_comment_ids=anchor_comment_ids,
+        now=now,
+    )
     plan, planner_exit_code, planner_stderr = _invoke_planner(planner_input_dict)
 
     if plan is None:
