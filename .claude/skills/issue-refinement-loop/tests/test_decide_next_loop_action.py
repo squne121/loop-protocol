@@ -479,3 +479,165 @@ def test_iteration_boundary_2_max_2_escalates():
         f"stdout: {result.stdout}"
     )
     assert "human_escalation" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# AC4: scope_signal_guard tests WITH phase condition
+# (existing tests preserved above; these add phase-sensitive variants)
+# ---------------------------------------------------------------------------
+
+
+def _make_phase_state_for_test(
+    phase: str,
+    source_kind: str = "loop_state_v1",
+) -> dict[Any, Any]:
+    """Build an ISSUE_REFINEMENT_PHASE_STATE_V1 for testing."""
+    # Import the builder directly to avoid subprocess overhead in these tests
+    import importlib
+    import sys as _sys
+    build_script = SKILL_ROOT / "scripts" / "build_refinement_phase_state.py"
+
+    import tempfile
+    import subprocess
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out_f:
+        out_path = out_f.name
+
+    result = subprocess.run(
+        [
+            _sys.executable,
+            str(build_script),
+            "--phase", phase,
+            "--source-kind", source_kind,
+            "--source-path", "/tmp/fake_source.json",
+            "--output-path", out_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"build_refinement_phase_state.py failed: {result.stdout} {result.stderr}"
+    )
+    import json
+    from pathlib import Path
+    return json.loads(Path(out_path).read_text(encoding="utf-8"))
+
+
+def _run_script_with_phase_state(
+    loop_state: dict[Any, Any],
+    phase_state: dict[Any, Any],
+    verdict: str = "needs-fix",
+) -> "subprocess.CompletedProcess":
+    """Run decide_next_loop_action.py with --phase-state-file."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(phase_state, f)
+        phase_state_path = f.name
+
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--loop-state-json", json.dumps(loop_state),
+            "--review-result-verdict", verdict,
+            "--phase-state-file", phase_state_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_scope_signal_guard_triggered_in_post_rewrite_check_phase_escalates():
+    """
+    AC4: post_rewrite_check phase での scope_signal_guard.triggered=true は
+    引き続き TERMINATION_CAUSE: human_judgment_required を出す (#919 回帰維持)。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_in_scope_area",
+    }
+    phase_state = _make_phase_state_for_test("post_rewrite_check")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    # Should escalate (gate passes, routing proceeds to scope_signal_guard check)
+    assert result.returncode == 2, (
+        f"Expected exit 2 for scope_signal_guard in post_rewrite_check, "
+        f"got {result.returncode}\nstdout: {result.stdout}"
+    )
+    assert "STATUS: human_escalation" in result.stdout
+    assert "scope_signal_guard_triggered" in result.stdout
+    # AC4: reason_code is in BLOCKERS, not TERMINATION_CAUSE
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+    assert "scope_signal_guard_reason_code:new_in_scope_area" in result.stdout
+
+
+def test_scope_signal_guard_triggered_in_decide_next_action_phase_escalates():
+    """
+    AC4: decide_next_action phase での scope_signal_guard.triggered=true は
+    引き続き human_escalation を出す (#919 回帰維持)。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_allowed_path_layer",
+    }
+    phase_state = _make_phase_state_for_test("decide_next_action")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    assert result.returncode == 2
+    assert "STATUS: human_escalation" in result.stdout
+    assert "scope_signal_guard_triggered" in result.stdout
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+
+
+def test_scope_signal_guard_triggered_in_preflight_phase_blocked_by_gate():
+    """
+    AC4: preflight phase では phase gate が先に作動して
+    ISSUE_REFINEMENT_ROUTER_ERROR_V1 を返す。
+    scope_signal_guard テストの phase 条件補完。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_in_scope_area",
+    }
+    phase_state = _make_phase_state_for_test("preflight", source_kind="refinement_preflight_result_v1")
+
+    result = _run_script_with_phase_state(state, phase_state, verdict="needs-fix")
+
+    # Gate fires — no human_escalation from routing logic
+    assert "STATUS: human_escalation" not in result.stdout
+    assert "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in result.stdout
+    assert result.returncode == 3
+
+
+def test_scope_signal_guard_reason_code_in_blockers_not_termination_cause():
+    """
+    AC4 / #919 回帰: scope_signal_guard.reason_code は BLOCKERS に保持され
+    TERMINATION_CAUSE には使われない。
+    """
+    state = load_fixture()
+    state["scope_signal_guard"] = {
+        "triggered": True,
+        "excluded_by_anchor_reframe": False,
+        "reason_code": "new_allowed_path_layer",
+    }
+    # No phase gate (baseline behavior)
+    result = run_script(state, verdict="needs-fix")
+
+    assert result.returncode == 2
+    assert "TERMINATION_CAUSE: human_judgment_required" in result.stdout
+    # reason_code must NOT appear as TERMINATION_CAUSE
+    assert "TERMINATION_CAUSE: new_allowed_path_layer" not in result.stdout
+    assert "TERMINATION_CAUSE: scope_signal_guard_triggered" not in result.stdout
+    # reason_code must appear in BLOCKERS
+    assert "BLOCKERS: scope_signal_guard_reason_code:new_allowed_path_layer" in result.stdout

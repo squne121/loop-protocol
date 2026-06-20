@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+build_refinement_phase_state.py
+
+Generates ISSUE_REFINEMENT_PHASE_STATE_V1 from a source artifact (preflight result,
+review result, loop state, etc.) to indicate which phase the refinement loop is
+currently in and which routers are allowed/forbidden.
+
+Usage:
+  uv run python3 build_refinement_phase_state.py \\
+    --phase <phase_name> \\
+    --source-kind <kind> \\
+    --source-path <path> \\
+    [--loop-state-path <path>] \\
+    [--planner-result-path <path>] \\
+    [--review-result-path <path>] \\
+    --output-path <path>
+
+Phases:
+  preflight           After run_refinement_preflight.py, before investigation
+  investigation       During Step 1 investigation
+  review              During Step 2 review
+  rewrite             During Step 4 rewrite
+  post_rewrite_check  After rewrite, before final review verdict
+  decide_next_action  When decide_next_loop_action.py is the intended router
+  publish             During Step 5 publish / termination
+  terminate           Loop is terminated
+
+Output:
+  Writes ISSUE_REFINEMENT_PHASE_STATE_V1 JSON to --output-path.
+  Prints STATUS: ok | error to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+# ---------------------------------------------------------------------------
+# Phase definitions
+# ---------------------------------------------------------------------------
+
+VALID_PHASES = [
+    "preflight",
+    "investigation",
+    "review",
+    "rewrite",
+    "post_rewrite_check",
+    "decide_next_action",
+    "publish",
+    "terminate",
+]
+
+VALID_SOURCE_KINDS = [
+    "refinement_preflight_result_v1",
+    "issue_review_result_compact_v1",
+    "issue_author_result_compact_v1",
+    "loop_state_v1",
+]
+
+# Router name constants
+ROUTER_DECIDE_NEXT_LOOP_ACTION = "decide_next_loop_action.py"
+ROUTER_RUN_REFINEMENT_PREFLIGHT = "run_refinement_preflight.py"
+ROUTER_PLAN_REFINEMENT_LOOP = "plan_refinement_loop.py"
+ROUTER_DECIDE_REWRITE_ROUTE = "decide_rewrite_route.py"
+ROUTER_PUBLISH_TERMINATION_REPORT = "publish_termination_report.py"
+ROUTER_RENDER_TERMINATION_REPORT = "render_termination_report.py"
+
+# Phase -> (allowed_routers, forbidden_routers, scope_signal_semantics)
+_PHASE_ROUTER_RULES: dict[str, dict[str, Any]] = {
+    "preflight": {
+        "allowed_routers": [
+            ROUTER_RUN_REFINEMENT_PREFLIGHT,
+            ROUTER_PLAN_REFINEMENT_LOOP,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_DECIDE_REWRITE_ROUTE,
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "continue_investigation",
+            "hard_stop_eligible": False,
+        },
+    },
+    "investigation": {
+        "allowed_routers": [
+            ROUTER_RUN_REFINEMENT_PREFLIGHT,
+            ROUTER_PLAN_REFINEMENT_LOOP,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_DECIDE_REWRITE_ROUTE,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "continue_investigation",
+            "hard_stop_eligible": False,
+        },
+    },
+    "review": {
+        "allowed_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_REWRITE_ROUTE,
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "hard_stop_candidate",
+            "hard_stop_eligible": True,
+        },
+    },
+    "rewrite": {
+        "allowed_routers": [
+            ROUTER_DECIDE_REWRITE_ROUTE,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "ignored",
+            "hard_stop_eligible": False,
+        },
+    },
+    "post_rewrite_check": {
+        "allowed_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_DECIDE_REWRITE_ROUTE,
+        ],
+        "forbidden_routers": [
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "hard_stop_candidate",
+            "hard_stop_eligible": True,
+        },
+    },
+    "decide_next_action": {
+        "allowed_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_REWRITE_ROUTE,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "hard_stop_candidate",
+            "hard_stop_eligible": True,
+        },
+    },
+    "publish": {
+        "allowed_routers": [
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+            ROUTER_RENDER_TERMINATION_REPORT,
+        ],
+        "forbidden_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_DECIDE_REWRITE_ROUTE,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "ignored",
+            "hard_stop_eligible": False,
+        },
+    },
+    "terminate": {
+        "allowed_routers": [],
+        "forbidden_routers": [
+            ROUTER_DECIDE_NEXT_LOOP_ACTION,
+            ROUTER_DECIDE_REWRITE_ROUTE,
+            ROUTER_PUBLISH_TERMINATION_REPORT,
+        ],
+        "scope_signal_semantics": {
+            "triggered_meaning": "ignored",
+            "hard_stop_eligible": False,
+        },
+    },
+}
+
+
+def build_phase_state(
+    phase: str,
+    source_kind: str,
+    source_path: str,
+    loop_state_path: Optional[str] = None,
+    planner_result_path: Optional[str] = None,
+    review_result_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Build ISSUE_REFINEMENT_PHASE_STATE_V1.
+
+    Returns the phase state dict. Never raises for ordinary invalid inputs;
+    callers should check the returned schema_version.
+    """
+    rules = _PHASE_ROUTER_RULES.get(phase)
+    if rules is None:
+        raise ValueError(f"Unknown phase: {phase!r}. Valid phases: {VALID_PHASES}")
+
+    return {
+        "schema_version": "ISSUE_REFINEMENT_PHASE_STATE_V1",
+        "phase": phase,
+        "source_artifact": {
+            "kind": source_kind,
+            "path": source_path,
+        },
+        "loop_state_path": loop_state_path,
+        "planner_result_path": planner_result_path,
+        "review_result_path": review_result_path,
+        "allowed_routers": list(rules["allowed_routers"]),
+        "forbidden_routers": list(rules["forbidden_routers"]),
+        "scope_signal_semantics": dict(rules["scope_signal_semantics"]),
+    }
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build ISSUE_REFINEMENT_PHASE_STATE_V1 for issue-refinement-loop."
+    )
+    parser.add_argument(
+        "--phase",
+        required=True,
+        choices=VALID_PHASES,
+        help="Current phase of the refinement loop.",
+    )
+    parser.add_argument(
+        "--source-kind",
+        required=True,
+        choices=VALID_SOURCE_KINDS,
+        help="Kind of the source artifact.",
+    )
+    parser.add_argument(
+        "--source-path",
+        required=True,
+        help="Path to the source artifact.",
+    )
+    parser.add_argument(
+        "--loop-state-path",
+        default=None,
+        help="Path to the LOOP_STATE_V1 JSON file (optional).",
+    )
+    parser.add_argument(
+        "--planner-result-path",
+        default=None,
+        help="Path to the REFINEMENT_LOOP_PLAN_V1 artifact (optional).",
+    )
+    parser.add_argument(
+        "--review-result-path",
+        default=None,
+        help="Path to the ISSUE_REVIEW_RESULT_COMPACT_V1 artifact (optional).",
+    )
+    parser.add_argument(
+        "--output-path",
+        required=True,
+        help="Path to write the ISSUE_REFINEMENT_PHASE_STATE_V1 JSON.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    try:
+        phase_state = build_phase_state(
+            phase=args.phase,
+            source_kind=args.source_kind,
+            source_path=args.source_path,
+            loop_state_path=args.loop_state_path,
+            planner_result_path=args.planner_result_path,
+            review_result_path=args.review_result_path,
+        )
+    except ValueError as e:
+        print(f"STATUS: error")
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    output_path = Path(args.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(phase_state, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    print("STATUS: ok")
+    print(f"ARTIFACT: phase_state={output_path}")
+    print(f"PHASE: {args.phase}")
+    print(
+        f"HARD_STOP_ELIGIBLE: {phase_state['scope_signal_semantics']['hard_stop_eligible']}"
+    )
+
+
+if __name__ == "__main__":
+    main()
