@@ -14,10 +14,11 @@ Input:
   --loop-state-json <json>      Inline LOOP_STATE_V1 JSON (alternative to file)
   --review-result-verdict <v>   One of: approve | needs-fix | null
   --max-iterations <N>          Override max_iterations from state (optional)
+  --phase-state-file <path>     Path to ISSUE_REFINEMENT_PHASE_STATE_V1 JSON (optional)
 
 Output (stdout, budget < 2000 bytes):
-  STATUS: pass | warn | human_escalation | inconsistent_state
-  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation | terminate
+  STATUS: pass | warn | human_escalation | inconsistent_state | router_error
+  NEXT_ACTION: continue_to_step_4 | proceed_to_step_4_5 | human_escalation | terminate | rebuild_phase_state
   COMMANDS: (optional) argv-array invocation hints
   BLOCKERS: (optional) blocker codes
 
@@ -28,6 +29,10 @@ Exit codes:
   3  inconsistent_state — state is corrupt or contradictory
 
 Priority: inconsistent_state (3) > human_escalation (2) > warn (1) > pass (0).
+
+Phase gate (evaluated BEFORE schema validation):
+  If --phase-state-file is provided and this router is in forbidden_routers,
+  output ISSUE_REFINEMENT_ROUTER_ERROR_V1 and exit 3.
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION = "loop_state/v1"
+PHASE_STATE_SCHEMA_VERSION = "ISSUE_REFINEMENT_PHASE_STATE_V1"
+ROUTER_SELF_NAME = "decide_next_loop_action.py"
 
 # Verdict constants
 VERDICT_APPROVE = "approve"
@@ -54,12 +61,14 @@ ACTION_CONTINUE_TO_STEP_4 = "continue_to_step_4"
 ACTION_PROCEED_TO_STEP_4_5 = "proceed_to_step_4_5"
 ACTION_HUMAN_ESCALATION = "human_escalation"
 ACTION_TERMINATE = "terminate"
+ACTION_REBUILD_PHASE_STATE = "rebuild_phase_state"
 
 # Status constants
 STATUS_PASS = "pass"
 STATUS_WARN = "warn"
 STATUS_HUMAN_ESCALATION = "human_escalation"
 STATUS_INCONSISTENT_STATE = "inconsistent_state"
+STATUS_ROUTER_ERROR = "router_error"
 
 # Exit codes
 EXIT_PASS = 0
@@ -115,6 +124,88 @@ def validate_loop_state(data: Any) -> tuple[bool, str]:
         return False, f"Schema validation failed: {e.message}"
 
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Phase gate (evaluated BEFORE schema validation)
+# ---------------------------------------------------------------------------
+
+
+def _load_phase_state(path: str) -> tuple[Optional[dict[str, Any]], str]:
+    """Load ISSUE_REFINEMENT_PHASE_STATE_V1 from file. Returns (data, error_msg)."""
+    p = Path(path)
+    if not p.exists():
+        return None, f"Phase state file not found: {path}"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return None, f"Invalid JSON in phase state file: {e}"
+    if not isinstance(data, dict):
+        return None, "Phase state must be a JSON object"
+    return data, ""
+
+
+def _check_phase_gate(
+    phase_state: dict[str, Any],
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """
+    Check whether this router (decide_next_loop_action.py) is forbidden in the
+    current phase.
+
+    Returns (allowed: bool, router_error_payload: dict | None).
+    If not allowed, router_error_payload contains the ISSUE_REFINEMENT_ROUTER_ERROR_V1.
+    """
+    schema_version = phase_state.get("schema_version")
+    if schema_version != PHASE_STATE_SCHEMA_VERSION:
+        error = {
+            "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
+            "status": "router_error",
+            "reason_code": "missing_phase_state",
+            "phase": phase_state.get("phase", "unknown"),
+            "attempted_router": ROUTER_SELF_NAME,
+            "allowed_routers": phase_state.get("allowed_routers", []),
+            "forbidden_reason": (
+                f"Phase state schema_version mismatch: expected "
+                f"{PHASE_STATE_SCHEMA_VERSION!r}, got {schema_version!r}"
+            ),
+            "missing_fields": [],
+            "unexpected_fields": [],
+            "next_action": "rebuild_phase_state",
+        }
+        return False, error
+
+    phase = phase_state.get("phase", "unknown")
+    allowed_routers = phase_state.get("allowed_routers", [])
+
+    # B3: Allowlist gate — router must be explicitly in allowed_routers (fail-closed).
+    # If allowed_routers is empty or missing, all routers are blocked.
+    if ROUTER_SELF_NAME not in allowed_routers:
+        error = {
+            "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
+            "status": "router_error",
+            "reason_code": "phase_not_allowed",
+            "phase": phase,
+            "attempted_router": ROUTER_SELF_NAME,
+            "allowed_routers": allowed_routers,
+            "forbidden_reason": (
+                f"Router {ROUTER_SELF_NAME!r} is not in allowed_routers for phase {phase!r}. "
+                f"Allowed routers: {allowed_routers}. "
+                f"Use the appropriate phase router for this phase instead."
+            ),
+            "missing_fields": [],
+            "unexpected_fields": [],
+            "next_action": "rebuild_phase_state",
+        }
+        return False, error
+
+    return True, None
+
+
+def _emit_router_error(error: dict[str, Any]) -> None:
+    """Emit ISSUE_REFINEMENT_ROUTER_ERROR_V1 to stdout."""
+    print(f"STATUS: {STATUS_ROUTER_ERROR}")
+    print(f"NEXT_ACTION: {ACTION_REBUILD_PHASE_STATE}")
+    print(f"ISSUE_REFINEMENT_ROUTER_ERROR_V1: {json.dumps(error, ensure_ascii=False)}")
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +292,7 @@ def decide_next_action(
             "human_judgment_required",
         )
 
-    # --- Priority 2: max_iterations exceeded (human escalation) ---
-    # iteration is the current 0-indexed round number.
-    # escalate when there is no next round: iteration + 1 >= max_iterations.
+    # --- Priority 2b: max_iterations exceeded ---
     if review_verdict == VERDICT_NEEDS_FIX and iteration + 1 >= max_iterations:
         blockers = ["max_iterations_exceeded"]
         return (
@@ -306,6 +395,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="N",
         help="Override max_iterations from state.",
     )
+    parser.add_argument(
+        "--phase-state-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to ISSUE_REFINEMENT_PHASE_STATE_V1 JSON file. "
+            "When provided, phase gate is evaluated BEFORE schema validation. "
+            "If this router is forbidden in the current phase, "
+            "ISSUE_REFINEMENT_ROUTER_ERROR_V1 is emitted and exit 3 is returned."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -345,6 +445,35 @@ def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]]
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
+    # current_phase_state is set when --phase-state-file is provided; used in B4.
+    current_phase_state: Optional[dict[str, Any]] = None
+
+    # --- Phase gate (evaluated BEFORE schema validation) ---
+    if args.phase_state_file:
+        phase_state, phase_load_err = _load_phase_state(args.phase_state_file)
+        if phase_load_err or phase_state is None:
+            # Cannot read phase state — treat as missing_phase_state error
+            error = {
+                "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
+                "status": "router_error",
+                "reason_code": "missing_phase_state",
+                "phase": "unknown",
+                "attempted_router": ROUTER_SELF_NAME,
+                "allowed_routers": [],
+                "forbidden_reason": phase_load_err or "Phase state data unavailable",
+                "missing_fields": [],
+                "unexpected_fields": [],
+                "next_action": "rebuild_phase_state",
+            }
+            _emit_router_error(error)
+            sys.exit(EXIT_INCONSISTENT_STATE)
+
+        current_phase_state = phase_state
+        allowed, router_error = _check_phase_gate(phase_state)
+        if not allowed and router_error is not None:
+            _emit_router_error(router_error)
+            sys.exit(EXIT_INCONSISTENT_STATE)
+
     # Load loop state
     loop_state, load_error = _load_loop_state(args)
     if load_error or loop_state is None:
@@ -357,9 +486,30 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Validate schema
     valid, error_msg = validate_loop_state(loop_state)
     if not valid:
-        print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
-        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
-        print(f"BLOCKERS: {error_msg}")
+        # B4: When --phase-state-file is provided, emit ISSUE_REFINEMENT_ROUTER_ERROR_V1
+        # with reason_code: loop_state_invalid instead of generic inconsistent_state.
+        if args.phase_state_file:
+            missing_fields: list[str] = []
+            # Extract missing field hints from jsonschema error messages
+            if "required property" in error_msg or "required" in error_msg.lower():
+                missing_fields = [error_msg]
+            error = {
+                "schema_version": "ISSUE_REFINEMENT_ROUTER_ERROR_V1",
+                "status": "router_error",
+                "reason_code": "loop_state_invalid",
+                "phase": current_phase_state.get("phase", "unknown") if current_phase_state is not None else "unknown",
+                "attempted_router": ROUTER_SELF_NAME,
+                "allowed_routers": [],
+                "forbidden_reason": f"LOOP_STATE_V1 schema validation failed: {error_msg}",
+                "missing_fields": missing_fields,
+                "unexpected_fields": [],
+                "next_action": "rebuild_phase_state",
+            }
+            _emit_router_error(error)
+        else:
+            print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
+            print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+            print(f"BLOCKERS: {error_msg}")
         sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Parse verdict
