@@ -1008,12 +1008,16 @@ def _build_fail_closed_rewrite_constraints(
     fail_closed_reasons: list[str],
     missing_sections: list[str],
     missing_contract_keys: list[str],
+    prevent_duplicate_repair: bool = False,
 ) -> dict[str, Any]:
     """
     Build FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 payload.
 
     AC1/AC2/AC8: Returned when fail_closed is triggered, to guide issue-author
     rewrite toward deterministic repair instead of freeform editing.
+
+    AC4: prevent_duplicate_repair=True when the same reason_code has already
+    been used in a prior rewrite attempt (from known_context.prev_fail_closed_reasons).
     """
     # Determine which reasons are overridable (AC7)
     overridable_reasons = [
@@ -1042,6 +1046,7 @@ def _build_fail_closed_rewrite_constraints(
         },
         "max_rewrite_attempts": 2,
         "no_progress_route": "human_judgment_required",
+        "prevent_duplicate_repair": prevent_duplicate_repair,
     }
 
 
@@ -1180,11 +1185,22 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
 
         if fail_closed_reasons:
+            # AC4: Detect if same reason_code was already used in a prior rewrite attempt.
+            # Callers pass known_context.prev_fail_closed_reasons to signal a repeated fail.
+            prev_fail_closed_reasons: list[str] = []
+            if known_context and isinstance(known_context, dict):
+                prev_fail_closed_reasons = known_context.get("prev_fail_closed_reasons", []) or []
+            # prevent_duplicate_repair = True when any current reason was already seen before
+            prevent_duplicate_repair = bool(
+                set(fail_closed_reasons) & set(prev_fail_closed_reasons)
+            )
+
             # Build FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 for AC1/AC2/AC8
             rewrite_constraints = _build_fail_closed_rewrite_constraints(
                 fail_closed_reasons,
                 accumulated_missing_sections,
                 accumulated_missing_contract_keys,
+                prevent_duplicate_repair=prevent_duplicate_repair,
             )
             # B3: Return schema-valid decisions with unknown confidence even in fail_closed
             return (
@@ -1231,6 +1247,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     "fail_closed": {
                         "required": True,
                         "reason_codes": fail_closed_reasons,
+                        "missing_sections": accumulated_missing_sections,
                         "human_message": f"Issue contract malformation detected: {', '.join(fail_closed_reasons)}",
                         "rewrite_constraints": rewrite_constraints,
                     },

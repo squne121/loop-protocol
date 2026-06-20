@@ -1070,7 +1070,14 @@ def run_preflight(
     elif planner_exit_code == 0 and planner_fail_closed:
         blockers.append(BLOCKER_FAIL_CLOSED)
         reason_codes = fail_closed.get("reason_codes", [])
-        blockers.extend(reason_codes)
+        # AC5: For missing_required_section, include all missing sections in the blocker entry
+        # so the issue-author sees the full list in a single iteration.
+        missing_sections = fail_closed.get("missing_sections", [])
+        for rc in reason_codes:
+            if rc == "missing_required_section" and missing_sections:
+                blockers.append(f"missing_required_section: {missing_sections}")
+            else:
+                blockers.append(rc)
 
     # --- Write repair artifact and update blockers ---
     # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,
