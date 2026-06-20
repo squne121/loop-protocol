@@ -4,10 +4,8 @@ Verifies .codex/hooks.json is the single source for hooks and
 .codex/config.toml does not contain inline hooks.
 """
 import json
-import re
+import os
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -20,7 +18,6 @@ CHECK_SCRIPT = REPO_ROOT / "scripts" / "check-codex-agents.mjs"
 
 def _run_validator(env_override: dict | None = None) -> subprocess.CompletedProcess:
     """Run check-codex-agents.mjs and return CompletedProcess."""
-    import os
     env = os.environ.copy()
     env["CODEX_ALLOW_NO_CODEX"] = "1"
     if env_override:
@@ -32,6 +29,46 @@ def _run_validator(env_override: dict | None = None) -> subprocess.CompletedProc
         env=env,
         cwd=str(REPO_ROOT),
     )
+
+
+def _make_fixture_repo(tmp_path: Path) -> Path:
+    """
+    Create a minimal repo fixture under tmp_path that mirrors the real repo structure.
+    Directories that the validator reads but are not under test are symlinked to the
+    real repo so the fixture stays valid for those parts.  The caller is responsible
+    for writing the specific file(s) that should be incorrect.
+    """
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir(parents=True)
+
+    # Symlink sub-directories we are NOT testing so the validator can read them.
+    for sub in ("agents", "rules", "hooks"):
+        src = REPO_ROOT / ".codex" / sub
+        if src.exists():
+            (codex_dir / sub).symlink_to(src)
+
+    # Symlink .agents/skills (canonical skill surface validator checks)
+    agents_skills_src = REPO_ROOT / ".agents" / "skills"
+    if agents_skills_src.exists():
+        agents_dir = tmp_path / ".agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "skills").symlink_to(agents_skills_src)
+
+    # Symlink .claude (canonical skill body target for relative symlinks in .agents/skills)
+    claude_src = REPO_ROOT / ".claude"
+    if claude_src.exists():
+        (tmp_path / ".claude").symlink_to(claude_src)
+
+    # Symlink artifacts/ (ledger path)
+    artifacts_src = REPO_ROOT / "artifacts"
+    if artifacts_src.exists():
+        (tmp_path / "artifacts").symlink_to(artifacts_src)
+
+    # Copy the real hooks.json and config.toml as defaults; callers may overwrite.
+    (codex_dir / "config.toml").write_text(CONFIG_TOML.read_text())
+    (codex_dir / "hooks.json").write_text(HOOKS_JSON.read_text())
+
+    return tmp_path
 
 
 def load_hooks():
@@ -65,24 +102,18 @@ def test_config_toml_no_hooks_section():
 ])
 def test_config_toml_hooks_array_of_tables_rejected(header, tmp_path):
     """AC1 negative: config.toml with any [[hooks.*]] header must cause validator to fail."""
-    # Write a minimal config.toml with the offending header injected.
+    fixture_root = _make_fixture_repo(tmp_path)
+
+    # Overwrite config.toml with the offending header appended.
     base_text = CONFIG_TOML.read_text()
     patched = base_text + f"\n{header}\ncommand = \"echo bad\"\n"
-    fake_config = tmp_path / "config.toml"
-    fake_config.write_text(patched)
+    (fixture_root / ".codex" / "config.toml").write_text(patched)
 
-    # Run the validator against a temp repo structure that mirrors the real one.
-    # We use a subprocess and patch the config path via a symlink-based workaround:
-    # instead of patching the real file, verify the logic directly by scanning lines.
-    # The validator uses text scanning for [[hooks.*]] detection (per AC1 fix_delta).
-    import re as _re
-    for line in patched.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if _re.match(r"^\[{1,2}hooks(\]|\.|\.{1,2}\w)", stripped):
-            return  # Expected: this line would trigger a failure
-    pytest.fail(f"Header '{header}' was not detected as a hooks table header in the patched config")
+    result = _run_validator(env_override={"REPO_ROOT_OVERRIDE": str(fixture_root)})
+    assert result.returncode != 0, (
+        f"Validator must exit non-zero when config.toml contains '{header}' hooks header.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
 
 def test_config_toml_mentions_hooks_json():
@@ -143,21 +174,21 @@ def _make_hooks_json_with_empty_handler(event_key: str) -> dict:
 @pytest.mark.parametrize("event_key", ["PermissionRequest", "Stop", "SubagentStop"])
 def test_hooks_json_empty_handler_command_rejected(event_key, tmp_path):
     """AC3 negative: handler with no 'command' field (e.g. [{}]) must be detected as invalid."""
+    fixture_root = _make_fixture_repo(tmp_path)
+
+    # Overwrite hooks.json with the patched version that has an empty handler.
     patched = _make_hooks_json_with_empty_handler(event_key)
-    entries = patched["hooks"].get(event_key, [])
-    # Each entry must have at least one handler, and each handler must have a non-empty command.
-    # This test verifies that [{}] (empty handler) fails the command-field check.
-    violations = []
-    for i, entry in enumerate(entries):
-        handlers = entry.get("hooks", [])
-        if not handlers:
-            violations.append(f"{event_key}[{i}]: no handlers")
-        for j, handler in enumerate(handlers):
-            if not isinstance(handler.get("command"), str) or not handler.get("command"):
-                violations.append(f"{event_key}[{i}].hooks[{j}]: missing or empty 'command'")
-    assert violations, (
-        f"Expected validation violations for empty handler in {event_key}, but none found. "
-        f"Patched entries: {entries}"
+    (fixture_root / ".codex" / "hooks.json").write_text(json.dumps(patched))
+
+    result = _run_validator(env_override={"REPO_ROOT_OVERRIDE": str(fixture_root)})
+    assert result.returncode != 0, (
+        f"Validator must exit non-zero when hooks.json has empty handler command for {event_key}.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert event_key in combined, (
+        f"Validator error output must mention '{event_key}'.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
 
 

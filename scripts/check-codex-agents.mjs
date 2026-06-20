@@ -9,7 +9,10 @@ import { fileURLToPath } from 'node:url';
 // Derive repoRoot from script location so it is stable regardless of cwd.
 // Hooks invoke this script via `$(git rev-parse --show-toplevel)/scripts/...`
 // but shell cwd when the hook fires may be a subdirectory.
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// REPO_ROOT_OVERRIDE allows tests to point the validator at a temporary repo fixture.
+const repoRoot = process.env.REPO_ROOT_OVERRIDE
+  ? path.resolve(process.env.REPO_ROOT_OVERRIDE)
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agentsDir = path.join(repoRoot, '.codex', 'agents');
 const configPath = path.join(repoRoot, '.codex', 'config.toml');
 const hooksPath = path.join(repoRoot, '.codex', 'hooks.json');
