@@ -58,6 +58,8 @@ export type TargetingPolicy =
   | 'nearest_hostile'
   | 'ignore'
 
+export type TargetEntityId = string
+
 export interface ArenaState {
   width: number
   height: number
@@ -75,6 +77,19 @@ export interface EnemyState {
   contactDamage: number
   defeated: boolean
   defeatedAtTick: number | null
+}
+
+export interface AllyState {
+  id: number
+  role: 'ally_basic'
+  faction: 'ally'
+  behaviorState: NpcBehaviorState
+  targetingPolicy: Extract<TargetingPolicy, 'nearest_hostile' | 'assist_player_threat'>
+  targetEntityId: TargetEntityId | null
+  x: number
+  y: number
+  radius: number
+  speedPxPerSec: number
 }
 
 export interface PlayerState {
@@ -268,6 +283,8 @@ export interface GameState {
   nextProjectileId: number
   enemies: EnemyState[]
   nextEnemyId: number
+  allies: AllyState[]
+  nextAllyId: number
   progress: ProgressState
   rewardClaims: RewardClaimState
   telemetry: TelemetryState
@@ -305,6 +322,21 @@ export function computeAssistPlayerTtlTicks(ttlMs: number, fixedDeltaMs: number)
 // Default TTL parameters (AC1, Blocker 3)
 const DEFAULT_TTL_MS = 133
 const DEFAULT_FIXED_DELTA_MS = 1000 / 60
+
+export function createDefaultAllyState(id: number): AllyState {
+  return {
+    id,
+    role: 'ally_basic',
+    faction: 'ally',
+    behaviorState: 'inactive',
+    targetingPolicy: 'nearest_hostile',
+    targetEntityId: null,
+    x: 160,
+    y: 270,
+    radius: 12,
+    speedPxPerSec: 140,
+  }
+}
 
 export function createInitialGameState(
   snapshot: Partial<GameSnapshot> = {},
@@ -350,6 +382,8 @@ export function createInitialGameState(
     nextProjectileId: 1,
     enemies: [],
     nextEnemyId: 1,
+    allies: [],
+    nextAllyId: 1,
     telemetry: {
       status: 'Combat systems green',
       lastCommandSummary: 'Awaiting pilot input',

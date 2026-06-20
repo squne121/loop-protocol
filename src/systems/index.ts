@@ -5,6 +5,7 @@ export * from './ProjectileSystem'
 export * from './SimulationLoop'
 export * from './EnemySpawnSystem'
 export * from './EnemyAISystem'
+export * from './AllyBehaviorSystem'
 export * from './SortieSystem'
 
 export * from './RewardSystem'

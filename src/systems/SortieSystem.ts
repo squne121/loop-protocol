@@ -1,8 +1,16 @@
-import type { GameState, RewardApplicationId, SortieResult, SortieState } from '../state/GameState'
+import {
+  createDefaultAllyState,
+  resetCommandIntentRuntime,
+  type GameState,
+  type RewardApplicationId,
+  type SortieResult,
+  type SortieState,
+} from '../state/GameState'
 import { mapInputToCommands } from '../input'
 import { runMovementSystem } from './MovementSystem'
 import { runEnemySpawnSystem } from './EnemySpawnSystem'
 import { runEnemyAISystem } from './EnemyAISystem'
+import { runAllyBehaviorSystem } from './AllyBehaviorSystem'
 import { runCombatSystem } from './CombatSystem'
 import { runProjectileSystem } from './ProjectileSystem'
 import { runCollisionSystem } from './CollisionSystem'
@@ -40,6 +48,9 @@ function resetCombatRuntime(state: GameState): void {
   state.nextProjectileId = 1
   state.enemies = []
   state.nextEnemyId = 1
+  state.allies = [createDefaultAllyState(1)]
+  state.nextAllyId = 2
+  resetCommandIntentRuntime(state.commandIntentRuntime)
 }
 
 export function claimPendingReward(
@@ -267,6 +278,7 @@ export function runSortieSimulationStep(
   runMovementSystem(state, commands, fixedDeltaMs)
   runEnemySpawnSystem(state)
   runEnemyAISystem(state, fixedDeltaMs)
+  runAllyBehaviorSystem(state, fixedDeltaMs)
   runCombatSystem(state, commands, fixedDeltaMs)
   runProjectileSystem(state, commands, fixedDeltaMs)
   const pairs = runCollisionSystem(state)

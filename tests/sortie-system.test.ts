@@ -102,6 +102,12 @@ describe('GIVEN startSortie from preparation', () => {
   it('WHEN startSortie called from preparation THEN loopPhase=running and sortie enters running state (AC7)', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+    state.commandIntentRuntime.bufferedIntent = {
+      intent: 'assist_player',
+      sampledAtTick: 1,
+      expiresAtTick: 9,
+    }
 
     startSortie(state, FDT)
 
@@ -109,6 +115,35 @@ describe('GIVEN startSortie from preparation', () => {
     expect(state.pendingRewardApplicationId).toBeNull()
     expect(state.sortie.status).toBe('running')
     expect(state.sortie.elapsedTicks).toBe(0)
+    expect(state.commandIntentRuntime.activeIntent).toBe('none')
+    expect(state.commandIntentRuntime.bufferedIntent).toBeNull()
+    expect(state.allies).toHaveLength(1)
+    expect(state.allies[0].role).toBe('ally_basic')
+    expect(state.allies[0].faction).toBe('ally')
+    expect(state.nextAllyId).toBe(2)
+  })
+
+  it('GIVEN one enemy and one ally WHEN runSortieSimulationStep runs THEN ally behavior is integrated after runEnemyAISystem and before runCombatSystem', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    startSortie(state, FDT)
+    state.enemies = [makeLiveEnemy(1)]
+    state.enemies[0].x = 340
+    state.enemies[0].y = 270
+    state.enemies[0].speedPxPerSec = 60
+    state.allies[0].x = 140
+    state.allies[0].y = 270
+    state.allies[0].speedPxPerSec = 60
+
+    const commands = mapInputToCommands(createInputState())
+
+    runSortieSimulationStep(state, commands, 1000)
+
+    expect(state.enemies[0].x).toBeCloseTo(280)
+    expect(state.allies[0].targetEntityId).toBe('enemy:1')
+    expect(state.allies[0].x).toBeCloseTo(200)
+    expect(state.projectiles).toHaveLength(0)
+    expect(state.player.hp).toBe(state.player.maxHp)
   })
 })
 

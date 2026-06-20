@@ -1,6 +1,12 @@
-import type { CommandIntent, Faction, TargetingPolicy } from '../state'
-
-export type TargetEntityId = string
+import type {
+  AllyState,
+  CommandIntent,
+  EnemyState,
+  Faction,
+  PlayerState,
+  TargetEntityId,
+  TargetingPolicy,
+} from '../state'
 
 export type TargetEntitySnapshot = Readonly<{
   targetEntityId: TargetEntityId
@@ -53,6 +59,18 @@ export type TargetSelectionResult = Readonly<{
   clearedStaleTargetId: string | null
   scoredCandidates: readonly ScoredTarget[]
 }>
+
+export function enemyTargetEntityId(enemy: Pick<EnemyState, 'id'>): TargetEntityId {
+  return `enemy:${enemy.id}`
+}
+
+export function allyTargetEntityId(ally: Pick<AllyState, 'id'>): TargetEntityId {
+  return `ally:${ally.id}`
+}
+
+export function playerTargetEntityId(player: Pick<PlayerState, 'id'>): TargetEntityId {
+  return player.id
+}
 
 const ZERO = 0
 const ONE = 1
