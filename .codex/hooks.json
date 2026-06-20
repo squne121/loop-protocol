@@ -19,6 +19,12 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh\"",
+            "timeout": 10,
+            "statusMessage": "Checking local root branch policy"
+          },
+          {
+            "type": "command",
             "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
             "timeout": 30,
             "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail"
@@ -53,6 +59,12 @@
       {
         "matcher": "^Bash$",
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh\"",
+            "timeout": 10,
+            "statusMessage": "Checking local root branch policy"
+          },
           {
             "type": "command",
             "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/.codex/hooks/session-recording-composite.mjs\" --event PermissionRequest",
