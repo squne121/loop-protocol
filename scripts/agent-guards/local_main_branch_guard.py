@@ -42,8 +42,27 @@ REASON_READONLY = "readonly_command"
 REASON_RECOVERY = "recovery_to_default_branch"
 REASON_DRIFT = "local_root_branch_drift"
 REASON_ALREADY_DRIFTED = "already_drifted_root"
+REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
+
+
+# ─── Root state classification ────────────────────────────────────────────────
+
+def classify_root_state(current_branch: str | None, default_branch: str) -> str:
+    """
+    Classify local root state into one of three kinds:
+      default           — on default branch (normal state)
+      drifted           — on a non-default named branch
+      detached_or_unknown — detached HEAD (current_branch is None) or unknown state
+
+    B1 fix: detached HEAD must NOT be treated as default/allow state.
+    """
+    if current_branch is None:
+        return "detached_or_unknown"
+    if current_branch == default_branch:
+        return "default"
+    return "drifted"
 
 
 # ─── Branch name classification ───────────────────────────────────────────────
@@ -248,8 +267,9 @@ _GIT_GLOBAL_FLAGS = {
     "--version", "--help", "--html-path", "--man-path", "--info-path",
     "--list-cmds",
 }
-# These git global options change execution context and must be fail-closed
-_GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "--git-dir", "--work-tree", "--config-env"}
+# These git global options change execution context and must be fail-closed.
+# B2 fix: -c is added because `git -c alias.sw='switch issue-N' sw` can bypass branch guard.
+_GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "-c", "--git-dir", "--work-tree", "--config-env"}
 
 # Shell metacharacters that indicate compound/unparseable commands
 _SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(")
@@ -278,19 +298,20 @@ CHECKOUT_PATH_RESTORE_PATTERNS = [
     r"^git\s+restore(\s|$)",                    # git restore <path>
 ]
 
-# Minimal allowlist when root is already drifted.
-# B4: All commands NOT in this list are blocked.
-# Keys are regex patterns; value is True = allow.
+# Minimal allowlist when root is already drifted or in detached_or_unknown state.
+# B3/B4 fix: All commands NOT in this list are blocked.
+# Note: git switch/checkout recovery to default branch is handled by Step 9 (branch mutation
+# with target == default_branch => REASON_RECOVERY). They do NOT need to be listed here.
+# B3 fix: git restore and git checkout -- <path> are intentionally NOT listed here;
+# path restore is only allowed when root_state == "default" (handled in Step 8).
 _DRIFTED_ALLOWLIST_PATTERNS = [
     # git read-only
     r"^git\s+status(\s|$)",
-    r"^git\s+branch\s+--show-current(\s|$)",
+    r"^git\s+branch\s+(--show-current|-a|-r|-v|--list|--verbose)(\s|$)",
     r"^git\s+rev-parse(\s|$)",
     r"^git\s+worktree\s+(list|prune)(\s|$)",
     r"^git\s+fetch(\s|$)",
-    # git recovery (switch/checkout to default branch — verified separately)
-    r"^git\s+switch\s+",
-    r"^git\s+checkout\s+",
+    r"^git\s+(log|show|diff|blame|annotate|shortlog|describe)(\s|$)",
     # gh read-only
     r"^gh\s+issue\s+(view|list)(\s|$)",
     r"^gh\s+pr\s+(view|list|status)(\s|$)",
@@ -686,7 +707,7 @@ def evaluate(
     # Rebuild normalized cmd string for pattern matching
     normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
 
-    # Step 6: Read-only commands are always allowed
+    # Step 6: Read-only commands are always allowed (safe even in drifted/detached states)
     if is_readonly_command(normalized_cmd):
         return _result(
             status="allow",
@@ -697,8 +718,16 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 7: Path restore commands are not branch mutations
-    if is_path_restore_command(normalized_cmd):
+    # Step 7: Classify root state.
+    # B1 fix: detached HEAD (current_branch is None) is treated as detached_or_unknown,
+    # NOT as default/allow. This must be checked BEFORE path restore allow (B3 fix).
+    root_state = classify_root_state(current_branch, default_branch)
+    already_drifted = root_state in ("drifted", "detached_or_unknown")
+
+    # Step 8: Path restore commands — allowed only when on default branch.
+    # B3 fix: drifted/detached_or_unknown roots must NOT allow path restore.
+    # In drifted/detached state, only the explicit allowlist (_DRIFTED_ALLOWLIST_PATTERNS) applies.
+    if is_path_restore_command(normalized_cmd) and root_state == "default":
         return _result(
             status="allow",
             reason_code=REASON_READONLY,
@@ -708,9 +737,6 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 8: Already-drifted root has stricter rules
-    already_drifted = (current_branch is not None and current_branch != default_branch)
-
     # Step 9: Check if this is a branch mutation command
     is_branch_mutation = _is_branch_mutation_command(normalized_cmd, normalized_tokens)
 
@@ -719,7 +745,7 @@ def evaluate(
         target_branch = _extract_target_branch(normalized_cmd, normalized_tokens)
         target_kind = classify_branch(target_branch, default_branch) if target_branch else "unknown"
 
-        # Allow recovery to default branch
+        # Allow recovery to default branch (always permitted regardless of root state)
         if target_branch == default_branch:
             return _result(
                 status="allow",
@@ -731,21 +757,29 @@ def evaluate(
             )
 
         # Block drift to non-default branch
+        if root_state == "detached_or_unknown":
+            block_reason = REASON_DETACHED_OR_UNKNOWN
+        elif already_drifted:
+            block_reason = REASON_ALREADY_DRIFTED
+        else:
+            block_reason = REASON_DRIFT
         return _result(
             status="block",
-            reason_code=REASON_DRIFT if not already_drifted else REASON_ALREADY_DRIFTED,
+            reason_code=block_reason,
             current_branch=current_branch,
             target_branch=target_branch,
             target_branch_kind=target_kind,
             hook_flavor=hook_flavor,
         )
 
-    # Step 10: Already-drifted root: use explicit allowlist (B4)
+    # Step 10: Drifted or detached root: use explicit allowlist (B1/B4)
+    # Both "drifted" and "detached_or_unknown" share the same strict allowlist.
     if already_drifted:
         if not _is_allowed_when_drifted(normalized_cmd):
+            block_reason = REASON_DETACHED_OR_UNKNOWN if root_state == "detached_or_unknown" else REASON_ALREADY_DRIFTED
             return _result(
                 status="block",
-                reason_code=REASON_ALREADY_DRIFTED,
+                reason_code=block_reason,
                 current_branch=current_branch,
                 target_branch=None,
                 target_branch_kind=None,
@@ -755,7 +789,7 @@ def evaluate(
     # Default: allow
     return _result(
         status="allow",
-        reason_code=REASON_READONLY if not is_branch_mutation else REASON_RECOVERY,
+        reason_code=REASON_READONLY,
         current_branch=current_branch,
         target_branch=None,
         target_branch_kind=None,
@@ -852,6 +886,23 @@ def _result(
 
 # ─── Hook entry point ─────────────────────────────────────────────────────────
 
+def _classify_branch_kind(branch: str | None, default_branch: str) -> str:
+    """
+    Classify a branch name into a kind for safe stderr output.
+    B5 fix: raw branch names MUST NOT appear in hook stderr (may contain sensitive identifiers).
+    Returns one of: default | issue_like | pr_like | other | detached
+    """
+    if branch is None:
+        return "detached"
+    if branch == default_branch:
+        return "default"
+    if re.match(r"^(issue-|worktree-issue-)\d+", branch):
+        return "issue_like"
+    if re.match(r"^(pr/|pull/|pr-)\d+", branch):
+        return "pr_like"
+    return "other"
+
+
 def run_hook(hook_flavor: str = "claude") -> int:
     """
     Entry point for hook mode.
@@ -864,7 +915,8 @@ def run_hook(hook_flavor: str = "claude") -> int:
         # Cannot parse stdin: fail-closed
         _emit_block_stderr(
             reason_code=REASON_UNPARSEABLE,
-            current_branch=None,
+            current_branch_kind="unknown",
+            current_is_default=False,
             target_branch_kind=None,
             hook_flavor=hook_flavor,
         )
@@ -889,9 +941,13 @@ def run_hook(hook_flavor: str = "claude") -> int:
     result = evaluate(command=command, cwd=cwd, hook_flavor=hook_flavor)
 
     if result["status"] == "block":
+        # B5 fix: resolve default_branch for kind classification
+        default_branch = resolve_default_branch(cwd=cwd)
+        current_branch = result.get("current_branch")
         _emit_block_stderr(
             reason_code=result["reason_code"],
-            current_branch=result.get("current_branch"),
+            current_branch_kind=_classify_branch_kind(current_branch, default_branch),
+            current_is_default=(current_branch == default_branch),
             target_branch_kind=result.get("target_branch_kind"),
             hook_flavor=hook_flavor,
         )
@@ -902,23 +958,32 @@ def run_hook(hook_flavor: str = "claude") -> int:
 
 def _emit_block_stderr(
     reason_code: str,
-    current_branch: str | None,
+    current_branch_kind: str,
+    current_is_default: bool,
     target_branch_kind: str | None,
     hook_flavor: str,
 ) -> None:
-    """Emit bounded, non-leaking block message to stderr (max 10 lines)."""
+    """
+    Emit bounded, non-leaking block message to stderr (max 10 lines).
+
+    B5 fix: raw branch names are NOT emitted. Only abstracted kinds are safe to output.
+    - current_branch_kind: default | issue_like | pr_like | other | detached | unknown
+    - current_is_default: bool (true only when on the default branch)
+    - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
+    Raw branch names belong in --json / preflight diagnostic mode only.
+    """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
         f"reason_code: {reason_code}",
+        f"current_branch_kind: {current_branch_kind}",
+        f"current_is_default: {str(current_is_default).lower()}",
     ]
-    if current_branch:
-        lines.append(f"current_branch: {current_branch}")
     if target_branch_kind:
         lines.append(f"target_branch_kind: {target_branch_kind}")
 
     if reason_code == REASON_INLINE_OVERRIDE:
         lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
-    elif reason_code == REASON_ALREADY_DRIFTED:
+    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
         lines.append("recovery: switch root back to default branch first")
     elif reason_code == REASON_UNPARSEABLE:
         lines.append("recovery: use simple (non-compound) git commands from local root")

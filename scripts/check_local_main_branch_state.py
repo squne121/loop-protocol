@@ -139,14 +139,64 @@ def check_state(cwd: str | None = None) -> dict:
 
 def run_self_test() -> int:
     """
-    Self-test: create a temporary git repo and verify guard behavior.
+    Self-test: create temporary git repos and run integration matrix against guard runtime.
+
+    B4 fix: This self-test exercises evaluate() directly for each root state scenario.
+    Verifies actual guard behavior (block/allow) rather than just check_state() output.
+
+    Integration matrix:
+      main root:
+        evaluate("git switch issue-1014-test") => block
+        evaluate("git checkout -- README.md") => allow (main state)
+      drifted root:
+        evaluate("pnpm test") => block
+        evaluate("git restore README.md") => block
+        evaluate("git switch main") => allow
+      detached root:
+        evaluate("pnpm test") => block
+        check_state() => unknown / exit 2
+      linked worktree:
+        evaluate("git switch main") => allow / not_local_root_context
+
     Returns 0 if all assertions pass, 1 if any fail.
     """
     import tempfile
     import shutil
 
+    if not _GUARD_AVAILABLE:
+        print("[self-test] SKIP: local_main_branch_guard module not available", file=sys.stderr)
+        return 1
+
+    from local_main_branch_guard import evaluate, get_current_branch, classify_root_state
+
     failures: list[str] = []
     tmpdir = tempfile.mkdtemp(prefix="local_main_branch_guard_selftest_")
+    wt_path = os.path.join(tmpdir, ".claude", "worktrees", "issue-1014-test")
+
+    def _assert(label: str, got: str, want: str) -> None:
+        if got == want:
+            print(f"[self-test] PASS: {label} => {got!r}")
+        else:
+            msg = f"{label}: expected {want!r}, got {got!r}"
+            failures.append(msg)
+            print(f"[self-test] FAIL: {msg}", file=sys.stderr)
+
+    def _eval(command: str, cwd: str, env_extra: dict | None = None) -> dict:
+        """Evaluate with CLAUDE_PROJECT_DIR set to tmpdir (primary root)."""
+        old_env = os.environ.copy()
+        try:
+            os.environ["CLAUDE_PROJECT_DIR"] = tmpdir
+            if env_extra:
+                for k, v in env_extra.items():
+                    os.environ[k] = v
+            return evaluate(command=command, cwd=cwd, hook_flavor="cli")
+        finally:
+            for k in list(os.environ.keys()):
+                if k not in old_env:
+                    del os.environ[k]
+                else:
+                    os.environ[k] = old_env[k]
+
     try:
         # Initialize a bare-minimum git repo
         subprocess.run(["git", "init", "-b", "main", tmpdir], check=True, capture_output=True)
@@ -157,34 +207,76 @@ def run_self_test() -> int:
         (Path(tmpdir) / "README.md").write_text("test")
         subprocess.run(["git", "-C", tmpdir, "add", "README.md"], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "commit", "-m", "init"], check=True, capture_output=True)
+        # Create issue branch for switching tests (but stay on main)
+        subprocess.run(["git", "-C", tmpdir, "branch", "issue-1014-test"], check=True, capture_output=True)
 
-        if not _GUARD_AVAILABLE:
-            failures.append("local_main_branch_guard module not available for self-test")
+        # ── Scenario 1: main root ────────────────────────────────────────────────
+        branch = get_current_branch(cwd=tmpdir)
+        if branch != "main":
+            failures.append(f"self-test setup: expected branch 'main', got {branch!r}")
         else:
-            from local_main_branch_guard import evaluate, is_local_root_context, get_current_branch
+            print(f"[self-test] PASS: initial branch = {branch!r}")
 
-            # Test 1: root on main + git switch issue-* => should NOT block (not local root context per catalog)
-            # Since tmpdir has no linked worktrees, is_local_root_context should return True
-            is_root = is_local_root_context(tmpdir)
-            # Note: is_local_root_context requires CLAUDE_PROJECT_DIR or worktree catalog
-            # For self-test we just verify the branch is readable
-            branch = get_current_branch(cwd=tmpdir)
-            if branch != "main":
-                failures.append(f"self-test: expected branch 'main', got {branch!r}")
-            else:
-                print(f"[self-test] PASS: initial branch = {branch!r}")
+        r = _eval("git switch issue-1014-test", tmpdir)
+        _assert("main root: git switch issue-* => block", r["status"], "block")
 
-            # Test 2: check_state on tmpdir
-            result = check_state(cwd=tmpdir)
-            # Not a local root per catalog (no worktree list entry for tmpdir as primary)
-            # but the message should be informative
-            print(f"[self-test] check_state: status={result['status']!r}, branch={result['current_branch']!r}")
+        r = _eval("git checkout -- README.md", tmpdir)
+        _assert("main root: git checkout -- README.md => allow", r["status"], "allow")
+
+        # ── Scenario 2: drifted root ─────────────────────────────────────────────
+        subprocess.run(["git", "-C", tmpdir, "switch", "issue-1014-test"], check=True, capture_output=True)
+
+        r = _eval("pnpm test", tmpdir)
+        _assert("drifted root: pnpm test => block", r["status"], "block")
+
+        r = _eval("git restore README.md", tmpdir)
+        _assert("drifted root: git restore README.md => block", r["status"], "block")
+
+        r = _eval("git switch main", tmpdir)
+        _assert("drifted root: git switch main => allow", r["status"], "allow")
+
+        # ── Scenario 3: detached root ─────────────────────────────────────────────
+        subprocess.run(["git", "-C", tmpdir, "switch", "--detach", "HEAD"], check=True, capture_output=True)
+
+        r = _eval("pnpm test", tmpdir)
+        _assert("detached root: pnpm test => block", r["status"], "block")
+
+        # check_state() must return unknown for detached HEAD
+        state = check_state(cwd=tmpdir)
+        _assert("detached root: check_state() status => unknown", state["status"], "unknown")
+        if state["current_branch"] is not None:
+            failures.append(f"detached root: check_state() current_branch should be None, got {state['current_branch']!r}")
+        else:
+            print("[self-test] PASS: detached root: current_branch is None")
+
+        # ── Scenario 4: switch back to main, create linked worktree ──────────────
+        subprocess.run(["git", "-C", tmpdir, "switch", "main"], check=True, capture_output=True)
+
+        os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+        rc = subprocess.run(
+            ["git", "-C", tmpdir, "worktree", "add", wt_path, "issue-1014-test"],
+            capture_output=True,
+        )
+        if rc.returncode != 0:
+            print(f"[self-test] WARNING: could not create linked worktree: {rc.stderr.decode()}")
+        else:
+            # In the linked worktree, git switch main => allow (not local root context)
+            r = _eval("git switch main", wt_path)
+            _assert(
+                "linked worktree: git switch main => allow (not_local_root_context)",
+                r["status"], "allow",
+            )
+            # cleanup
+            subprocess.run(
+                ["git", "-C", tmpdir, "worktree", "remove", "--force", wt_path],
+                capture_output=True,
+            )
 
         if failures:
             for f in failures:
                 print(f"[self-test] FAIL: {f}", file=sys.stderr)
             return 1
-        print("[self-test] PASS: all assertions passed")
+        print(f"[self-test] PASS: all assertions passed")
         return 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

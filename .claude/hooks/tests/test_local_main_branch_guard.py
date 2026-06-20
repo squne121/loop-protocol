@@ -31,6 +31,7 @@ from local_main_branch_guard import (
     get_current_branch,
     resolve_default_branch,
     classify_branch,
+    classify_root_state,
     has_inline_env_override,
     is_manual_override_active,
     is_readonly_command,
@@ -47,6 +48,7 @@ from local_main_branch_guard import (
     REASON_RECOVERY,
     REASON_DRIFT,
     REASON_ALREADY_DRIFTED,
+    REASON_DETACHED_OR_UNKNOWN,
     REASON_UNPARSEABLE,
     REASON_INLINE_OVERRIDE,
 )
@@ -253,7 +255,8 @@ class TestAC5BoundedStderr:
         from local_main_branch_guard import _emit_block_stderr, REASON_DRIFT
         _emit_block_stderr(
             reason_code=REASON_DRIFT,
-            current_branch="main",
+            current_branch_kind="default",
+            current_is_default=True,
             target_branch_kind="issue",
             hook_flavor="claude",
         )
@@ -266,7 +269,8 @@ class TestAC5BoundedStderr:
         from local_main_branch_guard import _emit_block_stderr, REASON_DRIFT
         _emit_block_stderr(
             reason_code=REASON_DRIFT,
-            current_branch="main",
+            current_branch_kind="default",
+            current_is_default=True,
             target_branch_kind="issue",
             hook_flavor="claude",
         )
@@ -819,3 +823,179 @@ class TestB4DriftedRootExplicitAllowlist:
         assert _is_allowed_when_drifted("uv run pytest") is False
         assert _is_allowed_when_drifted("gh issue edit 123") is False
         assert _is_allowed_when_drifted("gh pr merge 1041") is False
+
+
+# ─── B1: detached HEAD is treated as detached_or_unknown (not default allow) ─
+
+@pytest.fixture
+def tmp_git_repo_detached(tmp_git_repo: Path) -> Path:
+    """A repo where local root is in detached HEAD state."""
+    subprocess.run(
+        ["git", "-C", str(tmp_git_repo), "switch", "--detach", "HEAD"],
+        check=True, capture_output=True
+    )
+    return tmp_git_repo
+
+
+class TestB1DetachedHeadIsNotDefaultAllow:
+    """B1: detached HEAD must be treated as detached_or_unknown, not as default/allow."""
+
+    def test_classify_root_state_detached(self, tmp_git_repo_detached: Path):
+        """classify_root_state with current_branch=None returns detached_or_unknown."""
+        state = classify_root_state(None, "main")
+        assert state == "detached_or_unknown"
+
+    def test_classify_root_state_drifted(self):
+        """classify_root_state with non-default branch returns drifted."""
+        assert classify_root_state("issue-1014-test", "main") == "drifted"
+
+    def test_classify_root_state_default(self):
+        """classify_root_state with default branch returns default."""
+        assert classify_root_state("main", "main") == "default"
+
+    def test_detached_head_pnpm_test_is_blocked(self, tmp_git_repo_detached: Path):
+        """detached HEAD + pnpm test => block."""
+        result = eval_in_local_root("pnpm test", str(tmp_git_repo_detached))
+        assert result["status"] == "block", "pnpm test must be blocked in detached HEAD state"
+        assert result["reason_code"] == REASON_DETACHED_OR_UNKNOWN
+
+    def test_detached_head_git_switch_main_is_allowed(self, tmp_git_repo_detached: Path):
+        """detached HEAD + git switch main => allow (recovery)."""
+        result = eval_in_local_root("git switch main", str(tmp_git_repo_detached))
+        assert result["status"] == "allow", "git switch main must be allowed from detached HEAD"
+        assert result["reason_code"] == REASON_RECOVERY
+
+    def test_detached_head_git_switch_issue_is_blocked(self, tmp_git_repo_detached: Path):
+        """detached HEAD + git switch issue-1014-test => block."""
+        result = eval_in_local_root("git switch issue-1014-test", str(tmp_git_repo_detached))
+        assert result["status"] == "block", "git switch non-default must be blocked in detached HEAD"
+
+    def test_detached_head_git_status_is_allowed(self, tmp_git_repo_detached: Path):
+        """detached HEAD + git status => allow (readonly is always safe)."""
+        result = eval_in_local_root("git status", str(tmp_git_repo_detached))
+        assert result["status"] == "allow"
+
+
+# ─── B2: git -c alias bypass ─────────────────────────────────────────────────
+
+class TestB2GitDashCAliasBypass:
+    """B2: git -c alias.* must be fail-closed (can alias subcommands to bypass guard)."""
+
+    def test_git_c_alias_switch_is_blocked(self, tmp_git_repo: Path):
+        """git -c alias.sw='switch issue-981-test' sw => block."""
+        result = eval_in_local_root(
+            "git -c alias.sw='switch issue-981-test' sw",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "git -c alias.* must be fail-closed to prevent subcommand aliasing bypass"
+        )
+
+    def test_git_c_advice_switch_is_blocked(self, tmp_git_repo: Path):
+        """git -c advice.detachedHead=false switch issue-981-test => block."""
+        result = eval_in_local_root(
+            "git -c advice.detachedHead=false switch issue-981-test",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", (
+            "git -c <config> switch must be blocked (B2 fix)"
+        )
+
+    def test_normalize_git_global_opts_c_is_failclosed(self):
+        """_normalize_git_global_opts: -c must be in fail-closed set."""
+        tokens = ["git", "-c", "alias.sw=switch issue-981", "sw"]
+        _, fail_closed = _normalize_git_global_opts(tokens)
+        assert fail_closed is True, "-c must trigger fail_closed=True"
+
+
+# ─── B3: drifted root blocks path restore ────────────────────────────────────
+
+class TestB3DriftedRootBlocksPathRestore:
+    """B3: already_drifted/detached_or_unknown roots must block path restore commands."""
+
+    def test_drifted_root_git_restore_is_blocked(self, tmp_git_repo_drifted: Path):
+        """drifted root + git restore README.md => block."""
+        result = eval_in_local_root("git restore README.md", str(tmp_git_repo_drifted))
+        assert result["status"] == "block", (
+            "git restore must be blocked in drifted root (B3 fix)"
+        )
+
+    def test_drifted_root_git_checkout_double_dash_is_blocked(self, tmp_git_repo_drifted: Path):
+        """drifted root + git checkout -- README.md => block."""
+        result = eval_in_local_root("git checkout -- README.md", str(tmp_git_repo_drifted))
+        assert result["status"] == "block", (
+            "git checkout -- <path> must be blocked in drifted root (B3 fix)"
+        )
+
+    def test_drifted_root_git_checkout_p_is_blocked(self, tmp_git_repo_drifted: Path):
+        """drifted root + git checkout -p => block."""
+        result = eval_in_local_root("git checkout -p", str(tmp_git_repo_drifted))
+        assert result["status"] == "block", (
+            "git checkout -p must be blocked in drifted root (B3 fix)"
+        )
+
+    def test_main_root_git_restore_is_allowed(self, tmp_git_repo: Path):
+        """main root + git restore README.md => allow (path restore on default branch is fine)."""
+        result = eval_in_local_root("git restore README.md", str(tmp_git_repo))
+        assert result["status"] == "allow", (
+            "git restore must be allowed on main (default) branch"
+        )
+
+    def test_main_root_git_checkout_double_dash_is_allowed(self, tmp_git_repo: Path):
+        """main root + git checkout -- README.md => allow."""
+        result = eval_in_local_root("git checkout -- README.md", str(tmp_git_repo))
+        assert result["status"] == "allow", (
+            "git checkout -- <path> must be allowed on default branch"
+        )
+
+
+# ─── B5: _emit_block_stderr does not output raw branch names ─────────────────
+
+class TestB5NoRawBranchInStderr:
+    """B5: hook stderr must not contain raw branch names."""
+
+    def test_emit_block_stderr_no_raw_branch(self, capsys):
+        """_emit_block_stderr must not emit raw branch names."""
+        from local_main_branch_guard import _emit_block_stderr, REASON_DRIFT
+        _emit_block_stderr(
+            reason_code=REASON_DRIFT,
+            current_branch_kind="issue_like",
+            current_is_default=False,
+            target_branch_kind="issue",
+            hook_flavor="claude",
+        )
+        captured = capsys.readouterr()
+        # Must not contain raw branch names — only abstracted kinds
+        assert "issue-1014" not in captured.err
+        assert "worktree-issue" not in captured.err
+        # Must contain abstracted kind fields
+        assert "current_branch_kind" in captured.err
+        assert "current_is_default" in captured.err
+
+    def test_emit_block_stderr_contains_kind_fields(self, capsys):
+        """_emit_block_stderr emits current_branch_kind and current_is_default."""
+        from local_main_branch_guard import _emit_block_stderr, REASON_ALREADY_DRIFTED
+        _emit_block_stderr(
+            reason_code=REASON_ALREADY_DRIFTED,
+            current_branch_kind="other",
+            current_is_default=False,
+            target_branch_kind=None,
+            hook_flavor="codex",
+        )
+        captured = capsys.readouterr()
+        assert "current_branch_kind: other" in captured.err
+        assert "current_is_default: false" in captured.err
+
+    def test_emit_block_stderr_max_10_lines(self, capsys):
+        """_emit_block_stderr output is bounded to max 10 lines."""
+        from local_main_branch_guard import _emit_block_stderr, REASON_DRIFT
+        _emit_block_stderr(
+            reason_code=REASON_DRIFT,
+            current_branch_kind="issue_like",
+            current_is_default=False,
+            target_branch_kind="issue",
+            hook_flavor="claude",
+        )
+        captured = capsys.readouterr()
+        lines = [l for l in captured.err.splitlines() if l.strip()]
+        assert len(lines) <= 10
