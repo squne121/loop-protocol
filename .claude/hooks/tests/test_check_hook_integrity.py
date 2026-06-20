@@ -18,7 +18,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -536,6 +538,161 @@ def test_hooks_checked_counts_command_type_only(tmp_path: Path):
     })
     result = fp.run_check()
     assert result["hooks_checked"] == 1
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# B2: interpreter_missing — shutil.which() が None を返す場合
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_b2_interpreter_missing_when_which_returns_none(tmp_path: Path, monkeypatch):
+    """B2: shutil.which() が None を返す interpreter → interpreter_missing failure。"""
+    import shutil as shutil_mod
+
+    fp = FakeProjectRoot(tmp_path)
+    sh = fp.make_non_executable_sh("target.sh")
+    fp.write_settings({
+        "PreToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash",
+                        "args": [str(sh)],
+                    }
+                ]
+            }
+        ]
+    })
+    # monkeypatch: bash が PATH に存在しない状況をシミュレート
+    monkeypatch.setattr(shutil_mod, "which", lambda _: None)
+    # checker モジュールも同じ shutil を参照しているため patch が有効
+    monkeypatch.setattr(checker.shutil, "which", lambda _: None)
+    result = fp.run_check()
+    failure_codes = [f["reason_code"] for f in result["failures"]]
+    assert "interpreter_missing" in failure_codes
+    assert result["decision"] == "fail"
+    # remediation に interpreter 名が含まれること
+    missing = [f for f in result["failures"] if f["reason_code"] == "interpreter_missing"]
+    assert len(missing) >= 1
+    assert "bash" in missing[0]["remediation"]
+
+
+def test_b2_interpreter_present_does_not_fail(tmp_path: Path):
+    """B2: bash が PATH に存在する場合は interpreter_missing failure が出ない。"""
+    fp = FakeProjectRoot(tmp_path)
+    sh = fp.make_non_executable_sh("target.sh")
+    fp.write_settings({
+        "PreToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash",
+                        "args": [str(sh)],
+                    }
+                ]
+            }
+        ]
+    })
+    result = fp.run_check()
+    failure_codes = [f["reason_code"] for f in result["failures"]]
+    # bash は通常 PATH にある。interpreter_missing は出ないはず
+    assert "interpreter_missing" not in failure_codes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# B3: AC2 CLI test — subprocess で実行し stdout のみ JSON
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_b3_cli_outputs_json_only(tmp_path: Path):
+    """B3: CLI を subprocess で実行 — stdout は HOOK_INTEGRITY_RESULT_V1 JSON のみ、stderr は空。"""
+    settings = {"hooks": {}}
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    checker_path = Path(__file__).resolve().parent.parent / "check_hook_integrity.py"
+    completed = subprocess.run(
+        [sys.executable, str(checker_path), "--format", "json", "--project-root", str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.stderr == "", f"stderr not empty: {completed.stderr!r}"
+    payload = json.loads(completed.stdout)
+    assert set(payload) == {"HOOK_INTEGRITY_RESULT_V1"}
+    assert completed.returncode == 0  # failures なし
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# B4: placeholder allowlist — CLAUDE_PLUGIN_ROOT / CLAUDE_PLUGIN_DATA は unresolved にならない
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_b4_claude_plugin_root_is_not_placeholder_unresolved(tmp_path: Path):
+    """B4: ${CLAUDE_PLUGIN_ROOT} は placeholder_unresolved failure を出さない。"""
+    fp = FakeProjectRoot(tmp_path)
+    # args に ${CLAUDE_PLUGIN_ROOT} を含む shell 形式 (shell form → args なし)
+    # exec form で command に ${CLAUDE_PLUGIN_ROOT} を使う場合、解決後にファイルが
+    # 存在しないため missing になるが、placeholder_unresolved にはならない
+    fp.write_settings({
+        "PreToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash",
+                        "args": ["${CLAUDE_PLUGIN_ROOT}/hook.sh"],
+                    }
+                ]
+            }
+        ]
+    })
+    result = fp.run_check()
+    failure_codes = [f["reason_code"] for f in result["failures"]]
+    # CLAUDE_PLUGIN_ROOT は known placeholder なので path_placeholder_unresolved には**ならない**
+    assert "path_placeholder_unresolved" not in failure_codes
+
+
+def test_b4_claude_plugin_data_is_not_placeholder_unresolved(tmp_path: Path):
+    """B4: ${CLAUDE_PLUGIN_DATA} は placeholder_unresolved failure を出さない。"""
+    fp = FakeProjectRoot(tmp_path)
+    fp.write_settings({
+        "PreToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash",
+                        "args": ["${CLAUDE_PLUGIN_DATA}/data.sh"],
+                    }
+                ]
+            }
+        ]
+    })
+    result = fp.run_check()
+    failure_codes = [f["reason_code"] for f in result["failures"]]
+    assert "path_placeholder_unresolved" not in failure_codes
+
+
+def test_b4_unknown_placeholder_still_fails(tmp_path: Path):
+    """B4: ${UNKNOWN_VAR} は依然として path_placeholder_unresolved failure を出す。"""
+    fp = FakeProjectRoot(tmp_path)
+    fp.write_settings({
+        "PreToolUse": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash",
+                        "args": ["${UNKNOWN_VAR}/hook.sh"],
+                    }
+                ]
+            }
+        ]
+    })
+    result = fp.run_check()
+    failure_codes = [f["reason_code"] for f in result["failures"]]
+    assert "path_placeholder_unresolved" in failure_codes
 
 
 # ──────────────────────────────────────────────────────────────────────────────

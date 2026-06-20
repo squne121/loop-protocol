@@ -30,8 +30,11 @@ from typing import Any
 # exec form として扱う interpreter（PATH 解決可能なコマンド名）
 _INTERPRETER_COMMANDS = {"bash", "sh", "zsh", "python", "python3", "node", "uv", "npx"}
 
-# 未解決 placeholder パターン（${CLAUDE_PROJECT_DIR} 以外の変数）
-_PLACEHOLDER_RE = re.compile(r"\$\{(?!CLAUDE_PROJECT_DIR\})[^}]+\}")
+# 未解決 placeholder パターン（既知 placeholder 以外の変数）
+_KNOWN_PLACEHOLDERS = frozenset({"CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"})
+_PLACEHOLDER_RE = re.compile(
+    r"\$\{(?!" + "|".join(re.escape(p) + r"\}" for p in sorted(_KNOWN_PLACEHOLDERS)) + r")[^}]+\}"
+)
 
 # shell form で unsafe な ${CLAUDE_PROJECT_DIR} のパターン（引用符なし）
 _UNQUOTED_CLAUDE_PROJECT_DIR_RE = re.compile(
@@ -206,6 +209,14 @@ def _check_hook(
             )
         elif cmd_is_interpreter:
             # interpreter form: command 自体は PATH 解決可能前提
+            # まず interpreter が PATH で見つかるか検査する
+            if shutil.which(command_resolved) is None:
+                e = _base_entry("interpreter_missing", command_resolved)
+                e["remediation"] = (
+                    f"Install interpreter or fix PATH: {command_resolved!r}"
+                )
+                failures.append(e)
+                return failures, warnings
             # args 内のパスが存在するかを検査（executable bit 不要）
             if args_resolved:
                 for arg_resolved, arg_raw in zip(args_resolved, args_raw or []):
