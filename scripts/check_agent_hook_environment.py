@@ -12,8 +12,8 @@ Exit codes:
 Usage:
   uv run python3 scripts/check_agent_hook_environment.py --repo-root .
 
-AC1: /bin/sh が存在しない → {"status": "blocked", "reason": "bin_sh_missing"}
-AC2: cwd が存在しない → {"status": "environment_failure", "reason": "cwd_missing"}
+AC1: /bin/sh が存在しない → {"status": "blocked", "reason": "bin_sh_missing", ...}
+AC2: cwd が存在しない → {"status": "environment_failure", "reason": "cwd_missing", ...}
 AC3: hook command が解決できない → handler_id と event を含む JSON
 AC4: blocker hook と telemetry hook の failure を分類
 AC5: stdout は compact JSON のみ。raw command body を含まない
@@ -34,15 +34,17 @@ from typing import Any
 
 # exit 2 = block effect がある event（AC4）
 BLOCKER_EVENTS = {"PreToolUse", "Stop", "SubagentStop", "PreCompact"}
-# exit 2 でも tool 完了後のため blocking 効果なし
+# exit 2 でも tool 完了後のため blocking 効果なし（PostToolUse は prevent-before-execution 不可）
 TELEMETRY_EVENTS = {"PostToolUse"}
 
 
 def classify_hook(event: str) -> str:
-    """event 名から hook_class を返す（AC4）。"""
+    """event 名から hook_class を返す（AC4）。unknown event は fail-closed で "unknown" 扱い。"""
     if event in BLOCKER_EVENTS:
         return "blocker"
-    return "telemetry"
+    if event in TELEMETRY_EVENTS:
+        return "telemetry"
+    return "unknown"
 
 
 # ─── handler_id 解決 ──────────────────────────────────────────────────────────
@@ -88,6 +90,12 @@ def resolve_command_path(hook: dict[str, Any], repo_root: Path) -> Path:
     return Path(resolved)
 
 
+def _is_node_hook(hook: dict[str, Any]) -> bool:
+    """hook が node ラッパーパターン（command: "node", args: [script]）かを判定する。"""
+    command: str = hook.get("command", "")
+    return Path(command).name == "node"
+
+
 # ─── チェック関数 ─────────────────────────────────────────────────────────────
 
 def check_bin_sh() -> dict[str, Any]:
@@ -118,6 +126,7 @@ def check_hooks(settings: dict[str, Any], repo_root: Path) -> list[dict[str, Any
 
     - ${CLAUDE_PROJECT_DIR} を repo_root の絶対パスに置換してスクリプトを解決
     - スクリプトの存在・実行可能性・symlink escape を確認
+    - node ラッパー（command: "node"）の場合は script が readable であれば ok（executable 不要）
     - AC5: command_ref は script path のみ（raw command body 非掲載）
     - AC6: manifest drift は manifest_drift_ref フィールドで参照のみ
     """
@@ -136,15 +145,15 @@ def check_hooks(settings: dict[str, Any], repo_root: Path) -> list[dict[str, Any
                 handler_id = resolve_handler_id(hook)
                 hook_class = classify_hook(event)
                 script_path = resolve_command_path(hook, repo_root)
+                is_node = _is_node_hook(hook)
 
-                # スクリプトの状態を確認
-                hook_status = _check_script_status(script_path, repo_root)
+                hook_status = _check_script_status(script_path, repo_root, is_node_script=is_node)
 
                 # AC5: command_ref はパスのみ、raw command body を含まない
-                command_ref = f"<redacted - script path only, no raw command body>"
                 if hook_status != "symlink_escape":
-                    # パス情報は含めてよい（raw コマンド文字列でなくパスのみ）
                     command_ref = str(script_path)
+                else:
+                    command_ref = "<redacted - symlink escape detected>"
 
                 result.append(
                     {
@@ -159,14 +168,23 @@ def check_hooks(settings: dict[str, Any], repo_root: Path) -> list[dict[str, Any
     return result
 
 
-def _check_script_status(script_path: Path, repo_root: Path) -> str:
-    """スクリプトの存在・実行可能性・symlink escape をチェック。"""
-    # symlink escape チェック: symlink が repo_root 外に脱出していないか
+def _check_script_status(
+    script_path: Path,
+    repo_root: Path,
+    *,
+    is_node_script: bool = False,
+) -> str:
+    """スクリプトの存在・実行可能性・symlink escape をチェック。
+
+    is_node_script=True の場合は executable チェックをスキップ（node が executable であれば足りる）。
+    symlink escape は resolve 後の path relation で判定し、startswith による sibling-prefix bypass を防ぐ。
+    """
+    # symlink escape チェック: resolve 後の path relation で判定
     if script_path.is_symlink():
         try:
             real = script_path.resolve()
             repo_real = repo_root.resolve()
-            if not str(real).startswith(str(repo_real)):
+            if real != repo_real and not real.is_relative_to(repo_real):
                 return "symlink_escape"
         except OSError:
             return "missing"
@@ -174,7 +192,11 @@ def _check_script_status(script_path: Path, repo_root: Path) -> str:
     if not script_path.exists():
         return "missing"
 
-    if not os.access(str(script_path), os.X_OK):
+    if not script_path.is_file():
+        return "not_executable"
+
+    # node ラッパーは node 自体が executable。script は readable であれば足りる。
+    if not is_node_script and not os.access(str(script_path), os.X_OK):
         return "not_executable"
 
     return "ok"
@@ -182,15 +204,17 @@ def _check_script_status(script_path: Path, repo_root: Path) -> str:
 
 # ─── メイン ──────────────────────────────────────────────────────────────────
 
-def run_checks(repo_root: Path) -> dict[str, Any]:
-    """全チェックを実行し、結果 dict を返す。"""
-    # AC1: /bin/sh チェック
+def run_checks(
+    repo_root: Path,
+    _cwd_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """全チェックを実行し、結果 dict を返す。
+
+    _cwd_result: main() が早期実行した check_cwd() の結果を渡すと再実行を省略する。
+    """
     bin_sh_result = check_bin_sh()
+    cwd_result = _cwd_result if _cwd_result is not None else check_cwd()
 
-    # AC2: cwd チェック
-    cwd_result = check_cwd()
-
-    # .claude/settings.json 読み込み
     settings_path = repo_root / ".claude" / "settings.json"
     hooks_results: list[dict[str, Any]] = []
     settings_error: str | None = None
@@ -204,7 +228,6 @@ def run_checks(repo_root: Path) -> dict[str, Any]:
     else:
         settings_error = f"{settings_path} not found"
 
-    # 総合 status 判定
     overall_status = _determine_status(bin_sh_result, cwd_result, hooks_results, settings_error)
 
     result: dict[str, Any] = {
@@ -217,6 +240,12 @@ def run_checks(repo_root: Path) -> dict[str, Any]:
         # AC6: manifest drift は check_hook_boundaries.py に委譲（path reference のみ）
         "manifest_drift_ref": "run scripts/check_hook_boundaries.py for manifest diff",
     }
+
+    # AC1/AC2: top-level reason を追加（downstream consumer が documented schema で分岐できるよう）
+    if overall_status == "blocked" and bin_sh_result.get("status") == "missing":
+        result["reason"] = "bin_sh_missing"
+    elif overall_status == "environment_failure" and cwd_result.get("status") == "missing":
+        result["reason"] = "cwd_missing"
 
     if settings_error:
         result["settings_error"] = settings_error
@@ -239,9 +268,10 @@ def _determine_status(
     if cwd.get("status") == "missing":
         return "environment_failure"
 
-    # AC3/4: blocker hook の failure → blocked
+    # AC3/4: blocker または unknown hook の failure → blocked（fail-closed）
     for hook in hooks:
-        if hook.get("hook_class") == "blocker" and hook.get("status") != "ok":
+        hook_class = hook.get("hook_class", "unknown")
+        if hook_class in ("blocker", "unknown") and hook.get("status") != "ok":
             return "blocked"
 
     # telemetry hook failure のみ → warn
@@ -266,8 +296,25 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # AC2: cwd チェックを Path.resolve() より前に実行
+    # deleted cwd では Path(".").resolve() が内部で getcwd() を呼び OSError になる
+    cwd_result = check_cwd()
+    if cwd_result["status"] == "missing":
+        out: dict[str, Any] = {
+            "status": "environment_failure",
+            "reason": "cwd_missing",
+            "checks": {
+                "bin_sh": check_bin_sh(),
+                "cwd": cwd_result,
+                "hooks": [],
+            },
+            "manifest_drift_ref": "run scripts/check_hook_boundaries.py for manifest diff",
+        }
+        print(json.dumps(out, separators=(",", ":")))
+        return 1
+
     repo_root = Path(args.repo_root).resolve()
-    result = run_checks(repo_root)
+    result = run_checks(repo_root, _cwd_result=cwd_result)
 
     # AC5: stdout は compact JSON のみ
     print(json.dumps(result, separators=(",", ":")))
