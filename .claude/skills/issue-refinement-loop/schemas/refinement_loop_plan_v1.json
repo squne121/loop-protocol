@@ -222,6 +222,13 @@
             ]
           }
         },
+        "missing_sections": {
+          "description": "All missing required sections collected at once (Issue #1023)",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "human_message": {
           "type": "string"
         },
@@ -437,6 +444,10 @@
         "no_progress_route": {
           "type": "string",
           "const": "human_judgment_required"
+        },
+        "prevent_duplicate_repair": {
+          "description": "True when the same fail_closed reason was already seen in a prior rewrite attempt (Issue #1023)",
+          "type": "boolean"
         }
       }
     }

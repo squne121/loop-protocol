@@ -43,6 +43,7 @@
     "reason_codes": [
       "malformed_machine_readable_contract"
     ],
+    "missing_sections": [],
     "human_message": "Issue contract malformation detected: malformed_machine_readable_contract",
     "rewrite_constraints": {
       "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
@@ -69,7 +70,8 @@
         "non_overridable_in_current_result": []
       },
       "max_rewrite_attempts": 2,
-      "no_progress_route": "human_judgment_required"
+      "no_progress_route": "human_judgment_required",
+      "prevent_duplicate_repair": false
     }
   }
 }
