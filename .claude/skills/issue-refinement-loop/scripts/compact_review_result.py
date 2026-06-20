@@ -51,6 +51,9 @@ REQUIRED_COMPACT_FIELDS = [
 VALID_VERDICTS = {"approve", "needs-fix"}
 VALID_STATUSES = {"ok", "failed"}
 VALID_NEXT_ACTIONS = {"proceed", "request_changes", "human_judgment_required"}
+REVIEW_RESULT_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "review-issue" / "schemas" / "review_issue_result_v1.json"
+)
 
 
 def _default_artifact_dir() -> Path:
@@ -136,6 +139,16 @@ def _no_secret_check(text: str) -> list[str]:
     return violations
 
 
+def _load_review_result_schema() -> dict[str, Any]:
+    return json.loads(REVIEW_RESULT_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _validate_review_result_schema(raw_result: dict[str, Any]) -> None:
+    import jsonschema
+
+    jsonschema.validate(instance=raw_result, schema=_load_review_result_schema())
+
+
 def compact_review_result(
     raw_result: dict[str, Any],
     artifact_dir: Path,
@@ -164,6 +177,7 @@ def compact_review_result(
         raise ValueError(
             f"Unknown/invalid status: {status!r}. Expected one of {VALID_STATUSES}"
         )
+    _validate_review_result_schema(raw_result)
 
     # Derive NEXT_ACTION from verdict
     if verdict == "approve":
@@ -221,11 +235,15 @@ def compact_review_result(
         "generated_at": ts,
         "status": status,
         "verdict": verdict,
+        "producer_schema": raw_result.get("schema"),
+        "producer_schema_version": raw_result.get("schema_version"),
+        "producer_body_sha256": raw_result.get("body_sha256"),
         "summary": summary,
         "next_action": next_action,
         "blockers_count": blockers_count,
         "blocking_issues": blocking_issues,
         "structured_blockers": raw_result.get("structured_blockers", []),
+        "findings": raw_result.get("findings", []),
         "non_blocking_improvements": raw_result.get("non_blocking_improvements", []),
         "diff_proposal": raw_result.get("diff_proposal", {}),
         "deterministic_checks": raw_result.get("deterministic_checks", {}),
