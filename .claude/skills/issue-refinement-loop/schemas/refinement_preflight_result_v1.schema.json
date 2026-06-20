@@ -27,7 +27,12 @@
     },
     "status": {
       "type": "string",
-      "enum": ["pass", "warn", "blocked", "environment_failure"],
+      "enum": [
+        "pass",
+        "warn",
+        "blocked",
+        "environment_failure"
+      ],
       "description": "Wrapper-level status after applying exit_code_mapping table."
     },
     "issue_number": {
@@ -39,11 +44,17 @@
       "description": "owner/repo string."
     },
     "planner_exit_code": {
-      "type": ["integer", "null"],
+      "type": [
+        "integer",
+        "null"
+      ],
       "description": "Exit code returned by plan_refinement_loop.py. Null if planner was not invoked."
     },
     "planner_fail_closed": {
-      "type": ["boolean", "null"],
+      "type": [
+        "boolean",
+        "null"
+      ],
       "description": "Value of plan.fail_closed.required from planner output. Null if planner was not invoked."
     },
     "next_action": {
@@ -53,12 +64,16 @@
     "must_read": {
       "type": "array",
       "description": "Files/paths the orchestrator must read before proceeding.",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "do_not_read": {
       "type": "array",
       "description": "Files/paths the orchestrator must not read to conserve context.",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "commands": {
       "type": "array",
@@ -66,7 +81,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["kind", "argv", "shell", "source"],
+        "required": [
+          "kind",
+          "argv",
+          "shell",
+          "source"
+        ],
         "properties": {
           "kind": {
             "type": "string",
@@ -75,7 +95,9 @@
           "argv": {
             "type": "array",
             "description": "Argument vector. Must not contain shell-interpolated strings.",
-            "items": {"type": "string"}
+            "items": {
+              "type": "string"
+            }
           },
           "shell": {
             "type": "boolean",
@@ -84,8 +106,11 @@
           },
           "source": {
             "type": "string",
-            "const": "static_wrapper_template",
-            "description": "Origin of this command template."
+            "description": "Origin of this command template.",
+            "enum": [
+              "static_wrapper_template",
+              "registry"
+            ]
           }
         }
       }
@@ -93,17 +118,23 @@
     "planner_fail_closed_reason_codes": {
       "type": "array",
       "description": "Planner fail_closed reason codes mirrored for schema-safe forwarding.",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "required_sections": {
       "type": "array",
       "description": "Sections required by FAIL_CLOSED_REWRITE_CONSTRAINTS_V1.required_sections (planner-derived).",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "required_contract_keys": {
       "type": "array",
       "description": "Contract keys required by FAIL_CLOSED_REWRITE_CONSTRAINTS_V1.required_contract_keys (planner-derived).",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "rewrite_constraints": {
       "type": "object",
@@ -125,24 +156,36 @@
         },
         "required_sections": {
           "type": "array",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
         },
         "required_contract_keys": {
           "type": "array",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
         },
         "rewrite_constraints": {
           "type": "object",
-          "required": ["must_add_sections", "must_add_contract_keys", "freeform_rewrite_forbidden"],
+          "required": [
+            "must_add_sections",
+            "must_add_contract_keys",
+            "freeform_rewrite_forbidden"
+          ],
           "additionalProperties": false,
           "properties": {
             "must_add_sections": {
               "type": "array",
-              "items": {"type": "string"}
+              "items": {
+                "type": "string"
+              }
             },
             "must_add_contract_keys": {
               "type": "array",
-              "items": {"type": "string"}
+              "items": {
+                "type": "string"
+              }
             },
             "freeform_rewrite_forbidden": {
               "type": "boolean",
@@ -224,16 +267,27 @@
     "blockers": {
       "type": "array",
       "description": "Blocker reason codes (e.g. 'ANCHOR_NOT_IN_ISSUE').",
-      "items": {"type": "string"}
+      "items": {
+        "type": "string"
+      }
     },
     "artifacts": {
       "type": "object",
       "description": "Paths to artifact files written by this wrapper.",
       "additionalProperties": false,
       "properties": {
-        "raw_issue_snapshot": {"type": "string", "description": "Path to raw_issue_snapshot.json"},
-        "planner_input": {"type": "string", "description": "Path to planner_input.json"},
-        "refinement_preflight_result_v1": {"type": "string", "description": "Path to refinement_preflight_result_v1.json"}
+        "raw_issue_snapshot": {
+          "type": "string",
+          "description": "Path to raw_issue_snapshot.json"
+        },
+        "planner_input": {
+          "type": "string",
+          "description": "Path to planner_input.json"
+        },
+        "refinement_preflight_result_v1": {
+          "type": "string",
+          "description": "Path to refinement_preflight_result_v1.json"
+        }
       }
     },
     "hashes": {
@@ -241,9 +295,18 @@
       "description": "SHA256 hashes of key artifacts for byte-stability verification.",
       "additionalProperties": false,
       "properties": {
-        "raw_issue_snapshot_sha256": {"type": "string", "description": "SHA256 of canonical JSON of raw_issue_snapshot."},
-        "planner_input_sha256": {"type": "string", "description": "SHA256 of canonical JSON of planner_input."},
-        "result_core_sha256": {"type": "string", "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."}
+        "raw_issue_snapshot_sha256": {
+          "type": "string",
+          "description": "SHA256 of canonical JSON of raw_issue_snapshot."
+        },
+        "planner_input_sha256": {
+          "type": "string",
+          "description": "SHA256 of canonical JSON of planner_input."
+        },
+        "result_core_sha256": {
+          "type": "string",
+          "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."
+        }
       }
     }
   },
@@ -251,9 +314,13 @@
     {
       "if": {
         "properties": {
-          "planner_fail_closed": {"const": true}
+          "planner_fail_closed": {
+            "const": true
+          }
         },
-        "required": ["planner_fail_closed"]
+        "required": [
+          "planner_fail_closed"
+        ]
       },
       "then": {
         "required": [
