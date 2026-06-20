@@ -2,7 +2,7 @@
   "schema_version": "refinement_loop_plan/v1",
   "source": {
     "issue_number": 3,
-    "issue_body_sha256": "df9a750daed1a630a7d65e5de67734bcea5e7ec2370f5254dd372cd857a97fd7",
+    "issue_body_sha256": "d0034240a7b45b4855e3188520c952c3169aaaa5d74549f79a804f63448cc9b7",
     "comments_sha256": null,
     "known_context_sha256": null,
     "generated_at": "2025-05-25T12:00:00+00:00"
@@ -38,24 +38,39 @@
           "body_line": 1
         },
         {
+          "child_title_hint": "goal_ref: \"delivery rollup identifies  child slots\"",
+          "marker": "unmaterialized",
+          "body_line": 8
+        },
+        {
+          "child_title_hint": "未起票・・ の child slot を正しく拾い、親トラッカーの残件として扱える状態にする。",
+          "marker": "未起票",
+          "body_line": 24
+        },
+        {
+          "child_title_hint": "-  child slot 抽出",
+          "marker": "unmaterialized",
+          "body_line": 33
+        },
+        {
           "child_title_hint": "- #100  - Initial planning document",
           "marker": "未起票",
-          "body_line": 9
+          "body_line": 57
         },
         {
           "child_title_hint": "- #101 () - Implementation phase",
           "marker": "unmaterialized",
-          "body_line": 10
+          "body_line": 58
         },
         {
           "child_title_hint": "- #102 () - Verification and testing",
           "marker": "TBD",
-          "body_line": 11
+          "body_line": 59
         },
         {
           "child_title_hint": "- Code change tracking with (#103)  first sub-issue",
           "marker": "未起票",
-          "body_line": 12
+          "body_line": 60
         }
       ],
       "evidence_spans": []
