@@ -38,10 +38,10 @@ ci_runtime_delta_v1:
     p95_improvement_pct: <float>
 
   lanes_affected:
-    - fast_static: true | false
-    - python_unit: true | false
-    - contract_artifact: true | false
-    - integration: true | false
+    fast_static: true | false
+    python_unit: true | false
+    contract_artifact: true | false
+    integration: true | false
 
   decision:
     verdict: improved | regression | no_change | insufficient_data

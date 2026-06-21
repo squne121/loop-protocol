@@ -27,7 +27,7 @@ RUNTIME
 - repo_local_skill_surface: .agents/skills/pr-review-judge/SKILL.md
 
 CI_SKILL_ROUTING
-- CI 関連 PR（.github/workflows/**、pyproject.toml、uv.lock 等を含む変更）のレビュー時に `.claude/skills/ci-test-performance/SKILL.md` を読む。
+- CI 関連 PR（.github/workflows/**、pyproject.toml、uv.lock、docs/dev/test-lane-policy.md、.claude/skills/ci-test-performance/**、.agents/skills/ci-test-performance/**、.codex/agents/** 等を含む変更）のレビュー時に `.claude/skills/ci-test-performance/SKILL.md` を読む。
 - CI_TEST_PERFORMANCE_DECISION_V1 の証跡が PR 本文または artifact に存在しない場合は REQUEST_CHANGES を返すことができる。
 - Codex 環境では .agents/skills/ci-test-performance/SKILL.md を薄い bridge として使い、canonical body はそこで参照される .claude/skills/ci-test-performance/SKILL.md を読む。
 

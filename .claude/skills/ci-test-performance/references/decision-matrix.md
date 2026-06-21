@@ -5,7 +5,7 @@
 
 ## 変更タイプ → レーン対応表
 
-| 変更パス | fast-static | python-unit | contract-artifact | integration |
+| 変更パス | fast_static | python_unit | contract_artifact | integration |
 |---|---|---|---|---|
 | `.github/workflows/**` | 必須 | 必須 | 必須 | 必須 |
 | `pyproject.toml` | 不要 | 必須 | 不要 | 不要 |
@@ -13,7 +13,9 @@
 | `src/**/*.ts` / `src/**/*.tsx` | 必須 | 不要 | 不要 | 必須 |
 | `scripts/**/*.py` | 不要 | 必須 | 条件付き | 不要 |
 | `schemas/**` | 不要 | 必須 | 必須 | 不要 |
-| `docs/dev/**` | 不要 | 不要 | 必須 | 不要 |
+| `docs/dev/test-lane-policy.md` | 不要 | 不要 | 必須 | 不要 |
+| `docs/dev/agent-skill-boundaries.md` | 不要 | 不要 | 必須 | 不要 |
+| `docs/dev/**`（その他） | 不要 | 不要 | 条件付き（CI/skill/schema/artifact contract 変更の場合のみ） | 不要 |
 | `.claude/skills/**/SKILL.md` | 不要 | 不要 | 必須 | 不要 |
 | `.codex/agents/*.toml` | 不要 | 不要 | 必須 | 不要 |
 | `.agents/skills/**/SKILL.md` | 不要 | 不要 | 必須 | 不要 |
@@ -93,6 +95,18 @@ CI_TEST_PERFORMANCE_DECISION_V1:
   follow_up_required:
     - null                             # 必要なし
     # または follow-up Issue タイトル候補を記載
+```
+
+## lanes_affected 形式（runtime-delta.md での使用）
+
+`templates/runtime-delta.md` での `lanes_affected` は mapping 形式を使う:
+
+```yaml
+lanes_affected:
+  fast_static: false
+  python_unit: false
+  contract_artifact: true
+  integration: false
 ```
 
 ## risk_flags の説明

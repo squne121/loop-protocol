@@ -23,7 +23,7 @@
 ```yaml
 ci_test_lane_policy_v1:
   lanes:
-    - id: fast-static
+    - id: fast_static
       name: "Fast Static Analysis"
       description: "型チェック・lint・静的解析。コード変更があれば常に実行。"
       tools:
@@ -38,7 +38,7 @@ ci_test_lane_policy_v1:
         - 任意のソースコード変更
         - CI 常設
 
-    - id: python-unit
+    - id: python_unit
       name: "Python Unit Tests"
       description: "Python ユニットテスト。pytest による単体・統合テスト。"
       tools:
@@ -53,7 +53,7 @@ ci_test_lane_policy_v1:
         - schema / contract 変更
         - CI 常設
 
-    - id: contract-artifact
+    - id: contract_artifact
       name: "Contract / Artifact Verification"
       description: "スキーマ・コントラクト・アーティファクトの整合性検証。"
       tools:
@@ -88,7 +88,7 @@ ci_test_lane_policy_v1:
 
 変更内容に応じたレーン選択の判断基準:
 
-| 変更タイプ | fast-static | python-unit | contract-artifact | integration |
+| 変更タイプ | fast_static | python_unit | contract_artifact | integration |
 |---|---|---|---|---|
 | TypeScript/JS 変更 | 必須 | 不要 | 不要 | 必須 |
 | Python スクリプト変更 | 不要 | 必須 | 条件付き | 不要 |
@@ -108,9 +108,9 @@ ci_test_lane_policy_v1:
 2. **レビュー時**: CI 関連 PR で `CI_TEST_PERFORMANCE_DECISION_V1` の証跡を確認する時
 3. **テスト設計時**: 新しいテストがどのレーンに属するかを判断する時
 
-### hook による advisory suggestion（follow-up Issue 対象）
+### hook による advisory suggestion（Out of Scope）（→ #1080）
 
-hook による CI skill suggestion の実装は本 Issue スコープ外とし、別 follow-up Issue で対応する。
+hook による CI skill suggestion の実装は本 Issue スコープ外とし、#1080 で対応する。
 将来的には `FileChanged` / `PreToolUse` hook から `additionalContext` を返して AI エージェントに通知する設計を予定している。
 
 ### consumer routing

@@ -24,7 +24,7 @@ EXECUTION_POLICY
 - `rtk --help` に存在しない subcommand を作らない。read-only shell helper に `rtk` wrapper が無い場合は plain `sed` / `rg` / `find` などの direct read-only command を使う。
 
 CI_SKILL_ROUTING
-- CI 関連 path（.github/workflows/**、pyproject.toml、uv.lock、pytest/Ruff/xdist 設定）を編集する前に `.claude/skills/ci-test-performance/SKILL.md` を読む。
+- CI 関連 path（.github/workflows/**、pyproject.toml、uv.lock、pytest/Ruff/xdist 設定、docs/dev/test-lane-policy.md、.claude/skills/ci-test-performance/**、.agents/skills/ci-test-performance/**、.codex/agents/**）を編集する前に `.claude/skills/ci-test-performance/SKILL.md` を読む。
 - PR 本文または artifact に CI_TEST_PERFORMANCE_DECISION_V1 を残す。
 - Codex 環境では .agents/skills/ci-test-performance/SKILL.md を薄い bridge として使い、canonical body はそこで参照される .claude/skills/ci-test-performance/SKILL.md を読む。
 

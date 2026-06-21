@@ -10,6 +10,9 @@ paths:
   - ".claude/skills/ci-test-performance/**"
   - ".codex/agents/**"
   - ".claude/agents/**"
+  - ".agents/skills/ci-test-performance/**"
+  - "schemas/**"
+  - "docs/dev/agent-skill-boundaries.md"
 ---
 
 # CI Test Performance Skill
@@ -38,9 +41,9 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 
 | レーン | 概要 | 典型的な実行時間 |
 |---|---|---|
-| `fast-static` | 型チェック・lint・Ruff | < 1分 |
-| `python-unit` | pytest（xdist 導入後は並列） | 2-5分 |
-| `contract-artifact` | schema・contract・VC スクリプト | 30秒-2分 |
+| `fast_static` | 型チェック・lint・Ruff | < 1分 |
+| `python_unit` | pytest（xdist 導入後は並列） | 2-5分 |
+| `contract_artifact` | schema・contract・VC スクリプト | 30秒-2分 |
 | `integration` | pnpm build・E2E | 5-15分 |
 
 ## Procedure
@@ -117,6 +120,18 @@ CI_TEST_PERFORMANCE_DECISION_V1:
   follow_up_required: []
 ```
 
+## 現行で実行可能なコマンド（#1060 時点）
+
+- pnpm typecheck
+- pnpm test
+- pnpm build
+- pnpm lint
+
+## Target Policy（#1063/#1064 以降）
+
+- ruff check . （#1063 で導入後）
+- pytest -n auto （#1064 で導入後）
+
 ### Ruff 使用に関する注意
 
 ```bash
@@ -154,9 +169,9 @@ uv run pytest -n auto --dist loadscope
 | `test-runner` | VC / runtime artifact を検証し、lane 分類の検証をする |
 | `pr-reviewer` | CI 関連 PR で skill output / runtime evidence を確認する |
 
-## hook による advisory suggestion（Out of Scope）
+## hook による advisory suggestion（Out of Scope）（→ #1080）
 
-hook 実装（`FileChanged` / `PreToolUse` による `ci-test-performance` の自動サジェスト）は本 Issue スコープ外とし、別 follow-up Issue で対応する。
+hook 実装（`FileChanged` / `PreToolUse` による `ci-test-performance` の自動サジェスト）は本 Issue スコープ外とし、#1080 で対応する。
 
 ## 関連ドキュメント
 
