@@ -14,6 +14,17 @@ const STATE_DIR = process.env.SESSION_MANIFEST_DEBOUNCE_DIR ?? join(REPO_ROOT, '
 const EVENTS_DIR = join(STATE_DIR, 'events')
 const WORKER_LOCK = join(STATE_DIR, 'worker.lock')
 const WINDOW_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_WINDOW_MS ?? '400', 10)
+const FLUSH_WAIT_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_FLUSH_WAIT_MS ?? '3000', 10)
+const LOCK_POLL_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_LOCK_POLL_MS ?? '100', 10)
+const PRODUCER_TIMEOUT_MS = Number.parseInt(process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_TIMEOUT_MS ?? '5000', 10)
+const WORKER_STALE_MS = Number.parseInt(
+  process.env.SESSION_MANIFEST_DEBOUNCE_WORKER_STALE_MS ?? String(Math.max(PRODUCER_TIMEOUT_MS * 2, WINDOW_MS + 3000)),
+  10,
+)
+const PRODUCER_MAX_BUFFER_BYTES = Number.parseInt(
+  process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_MAX_BUFFER_BYTES ?? '1048576',
+  10,
+)
 const PRODUCER_CMD = process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_CMD ?? process.execPath
 const PRODUCER_ARGS = process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON
   ? JSON.parse(process.env.SESSION_MANIFEST_DEBOUNCE_PRODUCER_ARGS_JSON)
@@ -45,10 +56,67 @@ function ensureStateDir() {
   mkdirSync(EVENTS_DIR, { recursive: true })
 }
 
-function tryAcquire(pathname) {
+function nowMs() {
+  return Date.now()
+}
+
+function buildLockMetadata(role, overrides = {}) {
+  const current = nowMs()
+  return {
+    owner_pid: process.pid,
+    role,
+    started_at_ms: current,
+    heartbeat_at_ms: current,
+    ...overrides,
+  }
+}
+
+function readJsonFile(pathname) {
+  try {
+    return JSON.parse(readFileSync(pathname, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function writeLockMetadata(pathname, metadata) {
+  writeFileSync(pathname, JSON.stringify(metadata), 'utf8')
+}
+
+function processExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function isStaleLock(metadata) {
+  if (!metadata || typeof metadata !== 'object') return true
+  const heartbeat = Number(metadata.heartbeat_at_ms ?? metadata.started_at_ms ?? 0)
+  if (!Number.isFinite(heartbeat) || heartbeat <= 0) return true
+  if (nowMs() - heartbeat > WORKER_STALE_MS) return true
+  if (metadata.owner_pid != null && !processExists(Number(metadata.owner_pid))) return true
+  return false
+}
+
+function recoverStaleLock(pathname) {
+  if (!existsSync(pathname)) return false
+  const metadata = readJsonFile(pathname)
+  if (!isStaleLock(metadata)) return false
+  release(pathname)
+  return true
+}
+
+function tryAcquire(pathname, role, overrides = {}) {
+  ensureStateDir()
+  recoverStaleLock(pathname)
   try {
     const fd = openSync(pathname, 'wx')
     closeSync(fd)
+    writeLockMetadata(pathname, buildLockMetadata(role, overrides))
     return true
   } catch {
     return false
@@ -61,6 +129,16 @@ function release(pathname) {
   } catch {
     // ignore
   }
+}
+
+function refreshLock(pathname, updates = {}) {
+  if (!existsSync(pathname)) return
+  const existing = readJsonFile(pathname) ?? {}
+  writeLockMetadata(pathname, {
+    ...existing,
+    ...updates,
+    heartbeat_at_ms: nowMs(),
+  })
 }
 
 function sanitizeForStderr(msg) {
@@ -97,25 +175,63 @@ function extractPathCandidates(input) {
   return candidates
 }
 
+function tokenizeShellCommand(command) {
+  return command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
+}
+
+function unquoteToken(token) {
+  return token.replace(/^['"]|['"]$/g, '')
+}
+
+function looksLikeInlineEnvAssignment(token) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token)
+}
+
+function optionStartsMutation(token, shortFlag) {
+  return token === shortFlag || token.startsWith(`${shortFlag}=`) || new RegExp(`^-[^-]*${shortFlag.slice(1)}`).test(token)
+}
+
 function classifyBash(command) {
   if (typeof command !== 'string' || !command.trim()) return { kind: 'mutation_bash', mutationType: 'bash_unknown' }
   if (/[;><`]|&&|\|\||\$\(|\{|\}/.test(command)) return { kind: 'mutation_bash', mutationType: 'bash_complex' }
   const trimmed = command.trim()
-  const readonlyPatterns = [
-    /^rg\b/,
-    /^sed\b/,
-    /^cat\b/,
-    /^ls\b/,
-    /^pwd\b/,
-    /^find\b/,
-    /^test\b/,
-    /^git (status|diff|log|show|branch|rev-parse|ls-files)\b/,
-    /^gh (issue|pr) (view|list|checks|diff)\b/,
-  ]
-  if (readonlyPatterns.some((pattern) => pattern.test(trimmed))) {
+  const tokens = tokenizeShellCommand(trimmed).map(unquoteToken)
+  if (tokens.length === 0) return { kind: 'mutation_bash', mutationType: 'bash_unknown' }
+  if (looksLikeInlineEnvAssignment(tokens[0])) return { kind: 'mutation_bash', mutationType: 'mutation_bash_unknown' }
+
+  const [tool, ...args] = tokens
+  if (tool === 'rg' || tool === 'cat' || tool === 'ls' || tool === 'pwd' || tool === 'test') {
     return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
   }
-  return { kind: 'mutation_bash', mutationType: 'bash_mutation' }
+  if (tool === 'sed') {
+    if (args.some((token) => optionStartsMutation(token, '-i') || token === '--in-place' || token.startsWith('--in-place='))) {
+      return { kind: 'mutation_bash', mutationType: 'bash_mutation' }
+    }
+    return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
+  }
+  if (tool === 'find') {
+    if (args.some((token) => ['-delete', '-exec', '-execdir', '-ok', '-okdir'].includes(token))) {
+      return { kind: 'mutation_bash', mutationType: 'bash_mutation' }
+    }
+    return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
+  }
+  if (tool === 'git') {
+    const subcommand = args[0] ?? ''
+    if (['status', 'log', 'branch', 'rev-parse', 'ls-files'].includes(subcommand)) {
+      return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
+    }
+    if (['diff', 'show'].includes(subcommand)) {
+      if (args.some((token) => token === '--output' || token.startsWith('--output='))) {
+        return { kind: 'mutation_bash', mutationType: 'bash_mutation' }
+      }
+      return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
+    }
+    return { kind: 'mutation_bash', mutationType: 'mutation_bash_unknown' }
+  }
+  if (tool === 'gh' && ['issue', 'pr'].includes(args[0] ?? '') && ['view', 'list', 'checks', 'diff'].includes(args[1] ?? '')) {
+    return { kind: 'readonly_bash', mutationType: 'readonly_bash' }
+  }
+  return { kind: 'mutation_bash', mutationType: 'mutation_bash_unknown' }
 }
 
 function buildDelta(hookCtx) {
@@ -124,10 +240,10 @@ function buildDelta(hookCtx) {
   if (toolName === 'Bash') {
     const command = hookCtx?.tool_input?.command ?? ''
     const classification = classifyBash(command)
-    const paths = command
-      .split(/\s+/)
+    const paths = tokenizeShellCommand(command)
+      .map(unquoteToken)
       .filter((token) => token && /[./\\]/.test(token))
-      .map((token) => sanitizeRelativePath(token.replace(/^['"]|['"]$/g, ''), cwd))
+      .map((token) => sanitizeRelativePath(token, cwd))
       .filter(Boolean)
     return { kind: classification.kind, delta: [{ mutation_type: classification.mutationType, relative_paths: [...new Set(paths)] }] }
   }
@@ -153,23 +269,13 @@ function queueEvent(hookCtx) {
     JSON.stringify({
       hook_event_name: hookCtx?.hook_event_name ?? 'PostToolUse',
       session_id: hookCtx?.session_id ?? null,
-      cwd: hookCtx?.cwd ?? null,
       issue_number: hookCtx?.issue_number ?? hookCtx?.issue?.number ?? null,
       tool_name: hookCtx?.tool_name ?? hookCtx?.tool ?? null,
-      delta,
+      session_manifest_delta: delta,
     }),
     'utf8',
   )
   return { queued: true, kind, delta }
-}
-
-function spawnWorker() {
-  const child = spawn(process.execPath, [SCRIPT_PATH, '--worker'], {
-    detached: true,
-    stdio: 'ignore',
-    env: process.env,
-  })
-  child.unref()
 }
 
 function listEventFiles() {
@@ -178,6 +284,10 @@ function listEventFiles() {
     .filter((name) => name.endsWith('.json'))
     .sort()
     .map((name) => join(EVENTS_DIR, name))
+}
+
+function pendingEventCount() {
+  return listEventFiles().length
 }
 
 function extractTimestampFromEventFile(file) {
@@ -201,29 +311,38 @@ function runProducer(payload) {
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
     env: process.env,
+    timeout: PRODUCER_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+    maxBuffer: PRODUCER_MAX_BUFFER_BYTES,
   })
   const lines = summarizeStderr(result.stderr ?? '')
   if (lines.length > 0) {
     process.stderr.write(`${lines.join('\n')}\n`)
   }
+  const timedOut = result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGKILL'
+  const reasonCode = timedOut ? 'producer_timeout' : result.status === 0 ? null : 'producer_failed'
   process.stderr.write(
     `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
-      status: result.status === 0 ? 'ok' : 'warn',
+      status: result.status === 0 && !timedOut ? 'ok' : 'warn',
       producer_status: result.status ?? 0,
-      reason_code: result.status === 0 ? null : 'producer_failed',
+      reason_code: reasonCode,
       stderr_lines: lines.length,
+      timed_out: timedOut,
     })}\n`,
   )
+  return { ...result, timedOut, reasonCode }
 }
 
 async function flushLoop({ force = false }) {
   while (true) {
+    refreshLock(WORKER_LOCK)
     const files = listEventFiles()
     if (files.length === 0) break
     if (!force) {
       const newestTimestamp = Math.max(...files.map((file) => extractTimestampFromEventFile(file)))
       const quietForMs = Date.now() - newestTimestamp
       if (quietForMs < WINDOW_MS) {
+        refreshLock(WORKER_LOCK)
         await new Promise((resolvePromise) => globalThis.setTimeout(resolvePromise, WINDOW_MS - quietForMs))
         continue
       }
@@ -231,7 +350,7 @@ async function flushLoop({ force = false }) {
     const events = files.map((file) => JSON.parse(readFileSync(file, 'utf8')))
     const aggregatedDelta = []
     for (const event of events) {
-      for (const item of event.delta ?? []) {
+      for (const item of event.session_manifest_delta ?? event.delta ?? []) {
         const signature = JSON.stringify(item)
         if (!aggregatedDelta.some((existing) => JSON.stringify(existing) === signature)) {
           aggregatedDelta.push(item)
@@ -255,9 +374,51 @@ async function flushLoop({ force = false }) {
   }
 }
 
+async function flushWithLockHandling() {
+  const deadline = nowMs() + FLUSH_WAIT_MS
+  while (true) {
+    if (tryAcquire(WORKER_LOCK, 'flush')) {
+      try {
+        await flushLoop({ force: true })
+      } finally {
+        release(WORKER_LOCK)
+      }
+      return 0
+    }
+
+    if (pendingEventCount() === 0) {
+      process.stderr.write(
+        `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
+          status: 'ok',
+          reason_code: 'flush_completed_by_worker',
+          stderr_lines: 0,
+        })}\n`,
+      )
+      return 0
+    }
+
+    if (recoverStaleLock(WORKER_LOCK)) continue
+
+    if (nowMs() >= deadline) {
+      process.stderr.write(
+        `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
+          status: 'warn',
+          reason_code: 'flush_pending_timeout_lock_held',
+          pending_event_count: pendingEventCount(),
+          stderr_lines: 0,
+        })}\n`,
+      )
+      return 124
+    }
+
+    await new Promise((resolvePromise) => globalThis.setTimeout(resolvePromise, LOCK_POLL_MS))
+  }
+}
+
 async function main() {
   if (process.argv[2] === '--worker') {
     try {
+      refreshLock(WORKER_LOCK, { role: 'worker', owner_pid: process.pid })
       await flushLoop({ force: false })
     } finally {
       release(WORKER_LOCK)
@@ -266,22 +427,7 @@ async function main() {
   }
 
   if (process.argv[2] === '--flush') {
-    const lockAcquired = tryAcquire(WORKER_LOCK)
-    if (!lockAcquired) {
-      process.stderr.write(
-        `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
-          status: 'ok',
-          reason_code: 'flush_skipped_lock_held',
-          stderr_lines: 0,
-        })}\n`,
-      )
-      return
-    }
-    try {
-      await flushLoop({ force: true })
-    } finally {
-      release(WORKER_LOCK)
-    }
+    process.exitCode = await flushWithLockHandling()
     return
   }
 
@@ -289,9 +435,20 @@ async function main() {
   if (!hookCtx || (hookCtx.hook_event_name ?? hookCtx.type) !== 'PostToolUse') return
   const result = queueEvent(hookCtx)
   if (!result.queued) return
-  if (tryAcquire(WORKER_LOCK)) {
+  if (tryAcquire(WORKER_LOCK, 'worker')) {
     try {
-      spawnWorker()
+      const child = spawn(process.execPath, [SCRIPT_PATH, '--worker'], {
+        detached: true,
+        stdio: 'ignore',
+        env: process.env,
+      })
+      writeLockMetadata(
+        WORKER_LOCK,
+        buildLockMetadata('worker', {
+          owner_pid: child.pid,
+        }),
+      )
+      child.unref()
     } catch (error) {
       release(WORKER_LOCK)
       process.stderr.write(

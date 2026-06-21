@@ -17,9 +17,67 @@ trap 'rm -rf "$_TMPDIR"' EXIT
 _STDIN_FILE="${_TMPDIR}/stdin.json"
 cat > "$_STDIN_FILE"
 
-if [[ -f "$SCOPE_ROLLUP_CAPTURE_SCRIPT" ]]; then
+sanitize_stderr() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore")
+text = re.sub(r"[A-Za-z]:\\[^\s\"']+", "<path>", text)
+text = re.sub(r"/mnt/[A-Za-z]/[^\s\"']+", "<path>", text)
+text = re.sub(r"/[^\s\"']+", "<path>", text)
+lines = [line.strip() for line in text.splitlines() if line.strip()]
+for line in lines[:2]:
+    print(line[:220])
+PY
+}
+
+collect_summary() {
+  local step="$1"
+  local status="$2"
+  local reason_code="$3"
+  local stderr_file="$4"
+  local line="step=${step} status=${status} reason_code=${reason_code}"
+  local details
+  details="$(sanitize_stderr "$stderr_file")"
+  if [[ -n "$details" ]]; then
+    line="${line} detail=$(echo "$details" | head -n1)"
+  fi
+  SUMMARY_LINES+=("$line")
+}
+
+run_step() {
+  local step="$1"; shift
+  local stderr_file="${_TMPDIR}/${step}.stderr"
+  local stdout_file="${_TMPDIR}/${step}.stdout"
+  : > "$stderr_file"
+  : > "$stdout_file"
+
+  local exit_code=0
+  timeout "${COORDINATOR_STEP_TIMEOUT_SECONDS}s" "$@" < "$_STDIN_FILE" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
+
+  if [[ "$exit_code" -eq 124 ]]; then
+    collect_summary "$step" "timeout" "${step}_timeout" "$stderr_file"
+    return 124
+  fi
+  if [[ "$exit_code" -ne 0 ]]; then
+    collect_summary "$step" "warn" "${step}_failed" "$stderr_file"
+    return "$exit_code"
+  fi
+
+  collect_summary "$step" "ok" "none" "$stderr_file"
+  return 0
+}
+
+run_scope_rollup_capture() {
+  if [[ ! -f "$SCOPE_ROLLUP_CAPTURE_SCRIPT" ]]; then
+    return 0
+  fi
+
   if ! "$SCOPE_ROLLUP_CAPTURE_PYTHON" -c "import yaml" >/dev/null 2>&1; then
-    "$SCOPE_ROLLUP_CAPTURE_PYTHON" - "$_STDIN_FILE" "$SCOPE_ROLLUP_CAPTURE_DIR" <<'PY'
+    local fallback_script="${_TMPDIR}/scope_rollup_capture_fallback.py"
+    cat > "$fallback_script" <<'PY'
 import hashlib
 import json
 import re
@@ -60,71 +118,14 @@ if not record_path.exists():
         ),
         encoding="utf-8",
     )
+print("scope-rollup capture fallback wrote hook_unavailable record", file=sys.stderr)
 PY
-    echo "[session_manifest_coordinator] info: scope-rollup capture python lacks PyYAML; wrote hook_unavailable record" >&2
-  else
-    _SCOPE_ROLLUP_CAPTURE_EXIT=0
-    "$SCOPE_ROLLUP_CAPTURE_PYTHON" "$SCOPE_ROLLUP_CAPTURE_SCRIPT" < "$_STDIN_FILE" \
-      >"$_TMPDIR/scope_rollup_capture.stdout" 2>"$_TMPDIR/scope_rollup_capture.stderr" || _SCOPE_ROLLUP_CAPTURE_EXIT=$?
-    cat "$_TMPDIR/scope_rollup_capture.stderr" >&2 2>/dev/null || true
-    if [[ "$_SCOPE_ROLLUP_CAPTURE_EXIT" -ne 0 ]]; then
-      echo "[session_manifest_coordinator] info: scope-rollup capture exited $_SCOPE_ROLLUP_CAPTURE_EXIT — preparation must fail closed if capture is required" >&2
-    fi
-  fi
-fi
-
-sanitize_stderr() {
-  python3 - "$1" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore")
-text = re.sub(r"[A-Za-z]:\\[^\s\"']+", "<path>", text)
-text = re.sub(r"/mnt/[A-Za-z]/[^\s\"']+", "<path>", text)
-text = re.sub(r"/[^\s\"']+", "<path>", text)
-lines = [line.strip() for line in text.splitlines() if line.strip()]
-for line in lines[:2]:
-    print(line[:220])
-PY
-}
-
-collect_summary() {
-  local step="$1"
-  local status="$2"
-  local reason_code="$3"
-  local stderr_file="$4"
-  local line="step=${step} status=${status} reason_code=${reason_code}"
-  local details
-  details="$(sanitize_stderr "$stderr_file")"
-  if [[ -n "$details" ]]; then
-    line="${line} detail=$(echo "$details" | head -n1)"
-  fi
-  SUMMARY_LINES+=("$line")
-}
-
-run_step() {
-  local step="$1"
-  local command="$2"
-  local stderr_file="${_TMPDIR}/${step}.stderr"
-  local stdout_file="${_TMPDIR}/${step}.stdout"
-  : > "$stderr_file"
-  : > "$stdout_file"
-
-  local exit_code=0
-  timeout "${COORDINATOR_STEP_TIMEOUT_SECONDS}s" bash -lc "$command" < "$_STDIN_FILE" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
-
-  if [[ "$exit_code" -eq 124 ]]; then
-    collect_summary "$step" "timeout" "${step}_timeout" "$stderr_file"
-    return 124
-  fi
-  if [[ "$exit_code" -ne 0 ]]; then
-    collect_summary "$step" "warn" "${step}_failed" "$stderr_file"
-    return "$exit_code"
+    run_step "scope_rollup_capture" "$SCOPE_ROLLUP_CAPTURE_PYTHON" "$fallback_script" "$_STDIN_FILE" "$SCOPE_ROLLUP_CAPTURE_DIR"
+    return $?
   fi
 
-  collect_summary "$step" "ok" "none" "$stderr_file"
-  return 0
+  run_step "scope_rollup_capture" "$SCOPE_ROLLUP_CAPTURE_PYTHON" "$SCOPE_ROLLUP_CAPTURE_SCRIPT"
+  return $?
 }
 
 STOP_HOOK_ACTIVE="$(python3 -c "
@@ -145,14 +146,20 @@ if [[ "$STOP_HOOK_ACTIVE" == "true" ]]; then
   exit 0
 fi
 
-DEBOUNCE_COMMAND="'${NODE_BIN}' '${DEBOUNCE_SCRIPT}' --flush"
-GUARD_COMMAND="'${GUARD_SCRIPT}'"
-PRODUCER_COMMAND="'${NODE_BIN}' '${PRODUCER_SCRIPT}'"
+capture_exit=0
+run_scope_rollup_capture || capture_exit=$?
+if [[ "$capture_exit" -eq 124 && -z "$TIMEOUT_REASON" ]]; then
+  TIMEOUT_REASON="scope_rollup_capture_timeout"
+fi
 
-run_step "debounce_flush" "$DEBOUNCE_COMMAND" || true
+debounce_exit=0
+run_step "debounce_flush" "$NODE_BIN" "$DEBOUNCE_SCRIPT" --flush || debounce_exit=$?
+if [[ "$debounce_exit" -eq 124 && -z "$TIMEOUT_REASON" ]]; then
+  TIMEOUT_REASON="debounce_flush_timeout"
+fi
 
 guard_exit=0
-run_step "guard" "$GUARD_COMMAND" || guard_exit=$?
+run_step "guard" "$GUARD_SCRIPT" || guard_exit=$?
 if [[ "$guard_exit" -eq 124 ]]; then
   TIMEOUT_REASON="guard_timeout"
 fi
@@ -168,7 +175,7 @@ if [[ "$guard_exit" -ne 0 ]]; then
 fi
 
 producer_exit=0
-run_step "producer" "$PRODUCER_COMMAND" || producer_exit=$?
+run_step "producer" "$NODE_BIN" "$PRODUCER_SCRIPT" || producer_exit=$?
 if [[ "$producer_exit" -eq 124 ]]; then
   TIMEOUT_REASON="producer_timeout"
 fi

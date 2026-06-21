@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,6 +18,12 @@ REPO_ROOT = Path(
 
 HOOK_WRAPPER_PATH = REPO_ROOT / ".claude" / "hooks" / "generate_session_manifest_from_hook.mjs"
 SETTINGS_JSON_PATH = REPO_ROOT / ".claude" / "settings.json"
+CHECK_HOOK_BOUNDARIES_PATH = REPO_ROOT / "scripts" / "check_hook_boundaries.py"
+
+spec = importlib.util.spec_from_file_location("check_hook_boundaries", CHECK_HOOK_BOUNDARIES_PATH)
+check_hook_boundaries = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(check_hook_boundaries)
 
 
 def test_hook_boundaries_sync():
@@ -95,3 +102,19 @@ def test_settings_posttooluse_points_to_native_async_debounce_entrypoint():
     assert post_tool_use["command"] == "node"
     assert post_tool_use["args"][0].endswith("session_manifest_debounce.mjs")
     assert post_tool_use["async"] is True
+
+
+def test_hook_boundaries_narrative_checker_detects_stale_posttooluse_text():
+    docs_text = (REPO_ROOT / "docs" / "dev" / "hook-boundaries.md").read_text(encoding="utf-8")
+    stale_text = docs_text.replace(
+        "`session_manifest_debounce.mjs` | telemetry | 継続 |",
+        "`generate_session_manifest_from_hook.mjs` | telemetry | 継続 |",
+        1,
+    ).replace(
+        "`session_manifest_debounce.mjs`（PostToolUse front gate）",
+        "`generate_session_manifest_from_hook.mjs`（PostToolUse）",
+        1,
+    )
+    errors = check_hook_boundaries.validate_narrative_consistency(stale_text)
+    assert errors
+    assert any("stale topology" in error for error in errors)
