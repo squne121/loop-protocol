@@ -39,7 +39,7 @@ def _build_summary(issue: int, is_agent_surface_change: bool) -> str:
 def _build_checks() -> str:
     return (
         "- [ ] テスト確認: `uv run pytest .claude/skills/open-pr/tests/test_pr_body_hygiene.py -q`\n"
-        "- [ ] hygiene 判定確認: `uv run python3 .claude/skills/open-pr/scripts/validate_pr_body_hygiene.py --body-file <generated-body-file> --changed-paths-file <changed-paths-file> --linked-issue <issue> --draft <true|false>`"
+        "- [ ] hygiene 判定確認: `uv run python3 .claude/skills/open-pr/scripts/validate_pr_body_hygiene.py --body-file <generated-body-file> --changed-paths-file <changed-paths-file> --linked-issue <issue> --draft <true|false> --require-merge-ready`"
     )
 
 
@@ -56,10 +56,16 @@ def _build_inventory_reason() -> str:
     )
 
 
-def _build_safety_matrix(issue: int, changed_files: list[str], is_agent_surface_change: bool) -> str:
+def _build_safety_matrix(
+    issue: int,
+    changed_files: list[str],
+    is_agent_surface_change: bool,
+    draft: bool,
+) -> str:
+    draft_arg = "true" if draft else "false"
     evidence = (
         "`generate_pr_body.py --issue "
-        f"{issue} --changed-files {' '.join(changed_files)} --draft true`"
+        f"{issue} --changed-files {' '.join(changed_files)} --draft {draft_arg}`"
     )
     if is_agent_surface_change:
         claim = "`.claude/**` 変更時でも Safety Claim Matrix の空欄や placeholder を残さない"
@@ -74,14 +80,12 @@ def _build_safety_matrix(issue: int, changed_files: list[str], is_agent_surface_
     )
 
 
-def _build_notes(issue: int, draft: bool) -> str:
+def _build_notes(issue: int) -> str:
     lines = [
         f"- 関連する Issue は #{issue} です。",
         f"- 本 PR は Issue #{issue} を close します（Closes #{issue}）。",
         "- レビュー時に参照しやすい日本語本文を維持し、本文 hygiene の再修正を減らします。",
     ]
-    if draft:
-        lines.append("- Draft PR として作成し、内容確認後に ready for review へ切り替えます。")
     return "\n".join(lines)
 
 
@@ -94,8 +98,8 @@ def generate_pr_body(issue: int, changed_files: list[str], draft: bool) -> str:
         checks=_build_checks(),
         schema_reason=_build_schema_reason(),
         inventory_reason=_build_inventory_reason(),
-        safety_claim_matrix=_build_safety_matrix(issue, changed_files, is_agent_surface_change),
-        notes=_build_notes(issue, draft),
+        safety_claim_matrix=_build_safety_matrix(issue, changed_files, is_agent_surface_change, draft),
+        notes=_build_notes(issue),
     )
 
 

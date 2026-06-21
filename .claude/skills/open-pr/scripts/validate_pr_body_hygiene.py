@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 def _load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"failed to load module spec for {name}: {path}")
     module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     sys.modules[name] = module
     spec.loader.exec_module(module)  # type: ignore[union-attr]
@@ -35,12 +37,37 @@ validate_pr_body = _vpb.validate_pr_body
 extract_sections = _vpb._extract_sections
 is_placeholder_text = _vpb._is_placeholder_text
 
+_CLOSING_KEYWORD = r"(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+_ISSUE_REF = r"(?:[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+#\d+|#\d+)"
 _CLOSING_BLOCK_RE = re.compile(
-    r"(?is)^\s*(?:[-*]\s*)?"
-    r"(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved):?\s+"
-    r"(?:[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+#\d+|#\d+)"
-    r"(?:\s*,\s*(?:[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+#\d+|#\d+))*\s*$"
+    rf"(?is)^\s*(?:[-*]\s*)?"
+    rf"{_CLOSING_KEYWORD}:?\s+{_ISSUE_REF}"
+    rf"(?:\s*,\s*{_CLOSING_KEYWORD}:?\s+{_ISSUE_REF})*\s*$"
 )
+_MATRIX_ALLOWED_IMPLEMENTED = {"yes", "partial", "no"}
+_MATRIX_EMPTY_NOT_CONTROLLED = {"n/a", "none", "-"}
+
+
+def _normalize_cell(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def _is_concrete_cell(value: str) -> bool:
+    normalized = _normalize_cell(value)
+    return bool(normalized) and not is_placeholder_text(normalized)
+
+
+def _parse_markdown_table_rows(content: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        if re.fullmatch(r"\|\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", stripped):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        rows.append(cells)
+    return rows
 
 
 def _parse_bool(value: str) -> bool:
@@ -77,11 +104,26 @@ def _has_concrete_safety_matrix(body: str) -> bool:
         return False
     if is_placeholder_text(content):
         return False
-    data_rows = [
-        line for line in content.splitlines()
-        if line.strip().startswith("|") and not re.match(r"^\|\s*-", line.strip())
-    ]
-    return len(data_rows) >= 2
+    rows = _parse_markdown_table_rows(content)
+    if len(rows) < 2:
+        return False
+
+    for row in rows[1:]:
+        if len(row) < 5:
+            continue
+        claim, implemented, not_controlled, evidence, follow_up = row[:5]
+        implemented_value = _normalize_cell(implemented).lower()
+        not_controlled_value = _normalize_cell(not_controlled).lower()
+        if not _is_concrete_cell(claim):
+            continue
+        if implemented_value not in _MATRIX_ALLOWED_IMPLEMENTED:
+            continue
+        if not _is_concrete_cell(evidence):
+            continue
+        if not_controlled_value not in _MATRIX_EMPTY_NOT_CONTROLLED and not re.search(r"#\d+", follow_up):
+            continue
+        return True
+    return False
 
 
 def _find_standalone_closing_blocks(body: str) -> list[dict[str, Any]]:
@@ -135,7 +177,7 @@ class HygieneResult:
     schema: str
     target: str
     body_sha256: str
-    status: Literal["pass", "fail"]
+    status: Literal["pass", "fail", "action_required"]
     merge_ready: bool
     required_auto_actions: list[dict[str, Any]]
     validator_results: dict[str, Any]
@@ -192,7 +234,13 @@ def validate_pr_body_hygiene(
 
     required_auto_actions = _build_required_auto_actions(draft)
     merge_ready = not errors and not required_auto_actions
-    status: Literal["pass", "fail"] = "fail" if errors else "pass"
+    status: Literal["pass", "fail", "action_required"]
+    if errors:
+        status = "fail"
+    elif required_auto_actions:
+        status = "action_required"
+    else:
+        status = "pass"
     validator_results = {
         "pr_body": {
             "schema": pr_result.schema,
@@ -225,6 +273,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--changed-paths-file", type=str, default="")
     parser.add_argument("--linked-issue", required=True, type=int)
     parser.add_argument("--draft", default="false", type=_parse_bool)
+    parser.add_argument(
+        "--require-merge-ready",
+        action="store_true",
+        help="Exit 1 when the PR body is valid but still requires blocking auto-actions.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -241,7 +294,11 @@ def main(argv: list[str] | None = None) -> int:
 
     result = validate_pr_body_hygiene(body, changed_paths, args.linked_issue, args.draft)
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-    return 1 if result.status == "fail" else 0
+    if result.status == "fail":
+        return 1
+    if args.require_merge_ready and not result.merge_ready:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
