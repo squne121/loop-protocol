@@ -25,6 +25,7 @@ from decide_rewrite_route import (
     REASON_CODE_FIX_CATEGORY_UNDECIDABLE,
     REASON_CODE_CHECKER_PASSED,
     REASON_CODE_CHECKER_FAILED,
+    REASON_CODE_FINGERPRINT_DUPLICATE,
 )
 
 
@@ -1014,17 +1015,24 @@ class TestCheckerApproveOverridesBudget:
         assert result.reason_code == REASON_CODE_BODY_HASH_UNCHANGED
 
 
-
 # ---------------------------------------------------------------------------
 # AC9: fingerprint-based convergence detection (issue #1067)
 # ---------------------------------------------------------------------------
 
 
 class TestAC9FingerprintConvergence:
-    """AC9: rewrite_request_fingerprint is computed and echoed in RouteResult."""
+    """AC9: duplicate rewrite_request_fingerprint triggers human_judgment_required."""
 
-    def _make_state(self, checker_exit: int = 1, attempt: int = 0, max_attempts: int = 2,
-                    fingerprint=None, mutation_kind="semantic_rewrite", budget_debit=1):
+    def _make_state(
+        self,
+        checker_exit: int = 1,
+        attempt: int = 0,
+        max_attempts: int = 5,
+        fingerprint: str | None = None,
+        previous_fingerprints: list | None = None,
+        mutation_kind: str = "semantic_rewrite",
+        budget_debit: int = 1,
+    ) -> LOOP_REWRITE_ROUTER_STATE_V1:
         return LOOP_REWRITE_ROUTER_STATE_V1(
             rewrite_attempt_count=attempt,
             max_rewrite_attempts=max_attempts,
@@ -1033,13 +1041,57 @@ class TestAC9FingerprintConvergence:
             missing_sections=["Outcome"],
             missing_contract_keys=[],
             rewrite_request_fingerprint=fingerprint,
+            previous_rewrite_request_fingerprints=previous_fingerprints or [],
             last_mutation_kind=mutation_kind,
             budget_debit=budget_debit,
         )
 
-    def test_route_result_contains_fingerprint(self):
+    def test_first_occurrence_fingerprint_continues_rewrite(self):
+        """AC9: First occurrence of fingerprint X -> normal routing (continue_rewrite)."""
+        state = self._make_state(
+            fingerprint="abc123def456",
+            previous_fingerprints=[],  # no prior history
+        )
+        result = decide_rewrite_route(state)
+        # First occurrence: normal routing applies (checker_exit=1, no max exceeded)
+        assert result.route == ROUTE_CONTINUE_REWRITE
+        assert result.reason_code == REASON_CODE_CHECKER_FAILED
+
+    def test_duplicate_fingerprint_triggers_human_judgment(self):
+        """AC9: Same fingerprint X seen again -> human_judgment_required."""
+        fingerprint = "abc123def456"
+        state = self._make_state(
+            fingerprint=fingerprint,
+            previous_fingerprints=[fingerprint],  # already seen
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
+        assert result.reason_code == REASON_CODE_FINGERPRINT_DUPLICATE
+
+    def test_different_fingerprint_continues_rewrite(self):
+        """AC9: Different fingerprint -> normal routing continues."""
+        state = self._make_state(
+            fingerprint="new_fingerprint_xyz",
+            previous_fingerprints=["old_fingerprint_abc"],
+        )
+        result = decide_rewrite_route(state)
+        # Different fingerprint: normal routing applies
+        assert result.route == ROUTE_CONTINUE_REWRITE
+        assert result.reason_code == REASON_CODE_CHECKER_FAILED
+
+    def test_no_fingerprint_does_not_trigger_duplicate_check(self):
+        """AC9: fingerprint=None -> duplicate check skipped, normal routing."""
+        state = self._make_state(
+            fingerprint=None,
+            previous_fingerprints=["some_prior_fingerprint"],
+        )
+        result = decide_rewrite_route(state)
+        # No fingerprint set: check is skipped
+        assert result.route != ROUTE_HUMAN_JUDGMENT_REQUIRED or result.reason_code != REASON_CODE_FINGERPRINT_DUPLICATE
+
+    def test_route_result_echoes_fingerprint(self):
         """AC9: RouteResult.to_dict() includes rewrite_request_fingerprint key."""
-        state = self._make_state(fingerprint="abc123def456")
+        state = self._make_state(fingerprint="abc123def456", previous_fingerprints=[])
         result = decide_rewrite_route(state)
         d = result.to_dict()
         assert "rewrite_request_fingerprint" in d, (
@@ -1053,6 +1105,24 @@ class TestAC9FingerprintConvergence:
         result = decide_rewrite_route(state)
         d = result.to_dict()
         assert d.get("rewrite_request_fingerprint") is None
+
+    def test_duplicate_check_takes_priority_after_max_attempts(self):
+        """AC9: max_attempts check fires before fingerprint duplicate check."""
+        # max_attempts exceeded AND fingerprint duplicate: max_attempts wins (higher priority)
+        fingerprint = "fp_xyz"
+        state = LOOP_REWRITE_ROUTER_STATE_V1(
+            rewrite_attempt_count=5,
+            max_rewrite_attempts=2,
+            checker_exit_code=1,
+            checked_body_sha256="a" * 64,
+            missing_sections=["S1"],
+            missing_contract_keys=[],
+            rewrite_request_fingerprint=fingerprint,
+            previous_rewrite_request_fingerprints=[fingerprint],
+        )
+        result = decide_rewrite_route(state)
+        assert result.route == ROUTE_HUMAN_JUDGMENT_REQUIRED
+        assert result.reason_code == REASON_CODE_MAX_ATTEMPTS_EXCEEDED
 
 
 # ---------------------------------------------------------------------------
