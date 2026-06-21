@@ -94,9 +94,11 @@ _STATE_ALLOWLIST = frozenset({
     "source_issue_body_sha256",
     "replay_safe",
     "source_body_reset",
-    # NOTE: AC9/AC10 fields (rewrite_request_fingerprint, last_mutation_kind,
-    # budget_debit) are NOT in this allowlist — the JSON schema has
-    # additionalProperties: false and these are in-memory only.
+    # B4: AC9/AC10 fields now persisted in JSON schema (loop_rewrite_router_state_v1.json updated)
+    "rewrite_request_fingerprint",
+    "previous_rewrite_request_fingerprints",
+    "last_mutation_kind",
+    "budget_debit",
 })
 
 
@@ -310,44 +312,36 @@ def _build_state_dict(
     source_body_reset: bool,
     preflight_artifact_path: "str | None" = None,
     last_mutation_kind: str = "semantic_rewrite",
-) -> dict:
+) -> "tuple[dict, str | None]":
     """
     Construct a LOOP_REWRITE_ROUTER_STATE_V1 dict from first principles.
+
+    Returns (state_dict, artifact_error). artifact_error is None on success;
+    a non-None string when artifact is missing/invalid (B2 fix: callers must
+    check and exit early — do not validate/persist on error).
 
     Only keys in _STATE_ALLOWLIST are set.  checker_json keys are NOT merged
     (AC4c: schema allowlist-outside keys must not enter router state).
 
-    missing_sections and missing_contract_keys are extracted from checker_json
-    by explicit key lookup — no update() / **-unpacking of the full result.
+    AC8/B3: missing_sections and missing_contract_keys come solely from the
+    preflight artifact; the regex fallback path is removed.
     """
     # Extract only the fields we need from checker_json (explicit key access)
     blocking_issues: list[str] = checker_json.get("blocking_issues") or []
 
-    # AC8: Prefer artifact source over regex extraction from checker prose.
-    artifact_error: "str | None" = None
+    # AC8/B3: artifact is the sole source of truth for missing_sections.
+    # Regex fallback removed; callers without artifact get artifact_error and exit 3.
     if preflight_artifact_path is not None:
         missing_sections, missing_contract_keys, artifact_error = (
             _extract_missing_from_artifact(preflight_artifact_path)
         )
     else:
-        # Fallback regex extraction for backward compatibility when no artifact provided.
-        # AC8: This path is deprecated; new callers must provide preflight_artifact_path.
-        import re as _re
-        missing_sections: list[str] = []
-        for msg in blocking_issues:
-            m = _re.search(r"必須セクション '## ([^']+)' が存在しない", msg)
-            if m:
-                missing_sections.append(m.group(1))
-        missing_contract_keys: list[str] = []
-        for msg in blocking_issues:
-            m = _re.search(
-                r"contract(?:_key|_keys)?\s+['\"]?([A-Za-z_]+)['\"]?\s+が欠けている",
-                msg,
-            )
-            if m:
-                missing_contract_keys.append(m.group(1))
+        missing_sections = []
+        missing_contract_keys = []
+        artifact_error = "ARTIFACT_PATH_NOT_PROVIDED"
 
-        fix_category = _derive_fix_category(
+    # B1: fix_category computed AFTER both branches (was inside else only — UnboundLocalError on artifact path)
+    fix_category = _derive_fix_category(
         blocking_issues,
         missing_sections,
         missing_contract_keys,
@@ -356,13 +350,15 @@ def _build_state_dict(
     # AC10: budget_debit — format_only_repair does not consume budget
     budget_debit = 0 if last_mutation_kind == "format_only_repair" else 1
 
-    # AC9: rewrite_request_fingerprint — sha256 of strict-JSON of reason context
+    # B5/AC9: fingerprint based on reason_codes + rewrite_constraints (not fix_category + missing sets)
     import hashlib as _hashlib
+    _fail_closed = checker_json.get("fail_closed") or {}
+    _reason_codes = _fail_closed.get("reason_codes") or []
+    _rewrite_constraints_obj = _fail_closed.get("rewrite_constraints") or {}
     _fingerprint_payload = json.dumps(
         {
-            "fix_category": fix_category,
-            "missing_sections": sorted(missing_sections),
-            "missing_contract_keys": sorted(missing_contract_keys),
+            "reason_codes": sorted(_reason_codes) if isinstance(_reason_codes, list) else [],
+            "rewrite_constraints": _rewrite_constraints_obj,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -378,12 +374,19 @@ def _build_state_dict(
     previous_missing_sections: list[str] = []
     previous_missing_contract_keys: list[str] = []
     previous_rewrite_history: list[str] = []
+    prev_fingerprints: list[str] = []
     if previous_state is not None:
         if source_body_reset:
             # source body changed by human — reset stale history.
             previous_rewrite_history = []
+            prev_fingerprints = []
         else:
             previous_rewrite_history = list(previous_state.rewrite_history)
+            # B4: accumulate fingerprint history from previous state
+            prev_fp_list = list(previous_state.previous_rewrite_request_fingerprints or [])
+            if previous_state.rewrite_request_fingerprint is not None:
+                prev_fp_list = prev_fp_list + [previous_state.rewrite_request_fingerprint]
+            prev_fingerprints = prev_fp_list
         previous_checked_body_sha256 = previous_state.checked_body_sha256
         previous_missing_sections = list(previous_state.missing_sections)
         previous_missing_contract_keys = list(previous_state.missing_contract_keys)
@@ -408,19 +411,20 @@ def _build_state_dict(
         "source_issue_body_sha256": source_issue_body_sha256,
         "replay_safe": previous_state is not None,
         "source_body_reset": source_body_reset,
-        # NOTE: AC9/AC10 fields (rewrite_request_fingerprint, last_mutation_kind,
-        # budget_debit) are intentionally excluded — not in JSON schema.
-        # They are computed above for internal use but not persisted to state.
+        # B4: AC9/AC10 fields now in JSON schema (loop_rewrite_router_state_v1.json updated)
+        "rewrite_request_fingerprint": rewrite_request_fingerprint,
+        "previous_rewrite_request_fingerprints": prev_fingerprints,
+        "last_mutation_kind": last_mutation_kind,
+        "budget_debit": budget_debit,
     }
-    if artifact_error is not None:
-        state_dict["_artifact_error"] = artifact_error
 
     # Enforce allowlist (defensive: remove any unexpected keys)
     unexpected = set(state_dict.keys()) - _STATE_ALLOWLIST
     for key in unexpected:
         del state_dict[key]
 
-    return state_dict
+    # B2: return artifact_error separately so main() can exit 3 BEFORE validate/persist
+    return state_dict, artifact_error
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +570,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # Step 6: Build schema-valid state dict (allowlist enforcement)
-    state_dict = _build_state_dict(
+    state_dict, artifact_error = _build_state_dict(
         rewrite_attempt_count=rewrite_attempt_count,
         max_rewrite_attempts=args.max_rewrite_attempts,
         checker_exit_code=checker_exit_code,
@@ -579,10 +583,11 @@ def main(argv: list[str] | None = None) -> None:
         last_mutation_kind=args.mutation_kind,
     )
 
-    # AC8: If artifact reading failed, route to environment_failure
-    if "_artifact_error" in state_dict and args.artifact_path is not None:
+    # AC8/B2/B3: artifact_error returned by _build_state_dict; includes
+    # ARTIFACT_PATH_NOT_PROVIDED when --artifact-path is omitted.
+    if artifact_error is not None:
         print(
-            f"ERROR: AC8 artifact read failure: {state_dict['_artifact_error']}",
+            f"ERROR: AC8 artifact failure: {artifact_error}",
             file=sys.stderr,
         )
         sys.exit(3)
@@ -613,6 +618,11 @@ def main(argv: list[str] | None = None) -> None:
         source_issue_body_sha256=state_dict["source_issue_body_sha256"],
         replay_safe=True,
         source_body_reset=state_dict["source_body_reset"],
+        # B4: AC9/AC10 fields now persisted
+        rewrite_request_fingerprint=state_dict.get("rewrite_request_fingerprint"),
+        previous_rewrite_request_fingerprints=state_dict.get("previous_rewrite_request_fingerprints", []),
+        last_mutation_kind=state_dict.get("last_mutation_kind", "semantic_rewrite"),
+        budget_debit=state_dict.get("budget_debit", 1),
     )
     save_rewrite_router_state(state_obj, args.state_path)
 

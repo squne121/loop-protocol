@@ -160,7 +160,7 @@ class TestBuildStateDictAllowlist:
     def test_no_extra_keys_in_state_dict(self):
         """All keys in built state dict are in _STATE_ALLOWLIST."""
         checker_json = self._checker_json_with_extra_keys()
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -176,7 +176,7 @@ class TestBuildStateDictAllowlist:
     def test_verdict_not_in_state_dict(self):
         """'verdict' from checker_json is never injected into router state."""
         checker_json = {"verdict": "needs-fix", "blocking_issues": []}
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -195,7 +195,7 @@ class TestBuildStateDictAllowlist:
             "blocking_issues": [],
             "deterministic_checks": {"C1": "pass"},
         }
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=0,
@@ -210,7 +210,7 @@ class TestBuildStateDictAllowlist:
     def test_state_dict_is_schema_valid(self):
         """Built state dict passes validate_state_dict."""
         checker_json = {"verdict": "approve", "blocking_issues": []}
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=0,
@@ -235,7 +235,7 @@ class TestBuildStateDictPreviousState:
     def test_no_previous_state_sets_none_and_empty(self):
         """With no previous state, previous_* fields are None / empty."""
         checker_json = {"verdict": "needs-fix", "blocking_issues": []}
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -261,7 +261,7 @@ class TestBuildStateDictPreviousState:
             missing_contract_keys=["K1"],
         )
         checker_json = {"verdict": "needs-fix", "blocking_issues": []}
-        state_dict = _build_state_dict(
+        state_dict, _ = _build_state_dict(
             rewrite_attempt_count=2,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -285,14 +285,22 @@ class TestBuildStateDictPreviousState:
 class TestBuildStateDictCategoryMetadata:
     """fix_category and rewrite_history are built deterministically."""
 
-    def test_fix_category_derives_from_missing_sections(self):
+    def test_fix_category_derives_from_missing_sections(self, tmp_path):
+        # B3: artifact は missing_sections の唯一のソース
+        artifact = {
+            "schema_version": "refinement_preflight_result/v1",
+            "required_sections": ["Acceptance Criteria"],
+            "required_contract_keys": [],
+        }
+        artifact_file = tmp_path / "preflight_artifact.json"
+        artifact_file.write_text(json.dumps(artifact), encoding="utf-8")
         checker_json = {
             "verdict": "needs-fix",
             "blocking_issues": [
                 "必須セクション '## Acceptance Criteria' が存在しない",
             ],
         }
-        state_dict = _build_state_dict(
+        state_dict, err = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -301,7 +309,9 @@ class TestBuildStateDictCategoryMetadata:
             previous_state=None,
             source_issue_body_sha256=VALID_SHA,
             source_body_reset=False,
+            preflight_artifact_path=str(artifact_file),
         )
+        assert err is None
         assert state_dict["fix_category"] == "missing_section"
         assert state_dict["rewrite_history"] == ["missing_section"]
         assert state_dict["occurrence_count"] == 1
@@ -323,7 +333,12 @@ class TestBuildStateDictCategoryMetadata:
                 "必須セクション '## Acceptance Criteria' が存在しない",
             ],
         }
-        state_dict = _build_state_dict(
+        import tempfile as _tf326, os as _os326
+        _td326 = _tf326.mkdtemp()
+        _af326 = _os326.path.join(_td326, "art.json")
+        with open(_af326, "w", encoding="utf-8") as _fp326:
+            json.dump({"schema_version": "refinement_preflight_result/v1", "required_sections": ["Acceptance Criteria"], "required_contract_keys": []}, _fp326)
+        state_dict, err = _build_state_dict(
             rewrite_attempt_count=2,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -332,7 +347,9 @@ class TestBuildStateDictCategoryMetadata:
             previous_state=previous,
             source_issue_body_sha256=VALID_SHA,
             source_body_reset=False,
+            preflight_artifact_path=_af326,
         )
+        assert err is None
         assert state_dict["rewrite_history"] == [
             "missing_section",
             "missing_contract_key",
@@ -357,7 +374,12 @@ class TestBuildStateDictCategoryMetadata:
                 "必須セクション '## Acceptance Criteria' が存在しない",
             ],
         }
-        state_dict = _build_state_dict(
+        import tempfile as _tf360, os as _os360
+        _td360 = _tf360.mkdtemp()
+        _af360 = _os360.path.join(_td360, "art2.json")
+        with open(_af360, "w", encoding="utf-8") as _fp360:
+            json.dump({"schema_version": "refinement_preflight_result/v1", "required_sections": ["Acceptance Criteria"], "required_contract_keys": []}, _fp360)
+        state_dict, err = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
             checker_exit_code=1,
@@ -366,7 +388,9 @@ class TestBuildStateDictCategoryMetadata:
             previous_state=previous,
             source_issue_body_sha256=VALID_SHA,
             source_body_reset=True,
+            preflight_artifact_path=_af360,
         )
+        assert err is None
         assert state_dict["rewrite_history"] == ["missing_section"]
         assert state_dict["occurrence_count"] == 1
         assert state_dict["fix_category"] == "missing_section"
@@ -380,20 +404,36 @@ class TestBuildStateDictCategoryMetadata:
 class TestRouteAfterRewrireCli:
     """Integration tests for route_after_rewrite.py via subprocess."""
 
+    def _make_artifact(self, tmp_path, required_sections=None):
+        """テスト用最小 artifact を作成."""
+        import json as _j
+        artifact = {
+            "schema_version": "refinement_preflight_result/v1",
+            "required_sections": required_sections or [],
+            "required_contract_keys": [],
+        }
+        p = tmp_path / "artifact.json"
+        p.write_text(_j.dumps(artifact), encoding="utf-8")
+        return str(p)
+
     def _run_wrapper(
         self,
         body_file: str,
         state_path: str,
         max_rewrite_attempts: int = 3,
+        artifact_path: str | None = None,
     ) -> tuple[int, dict]:
         """Run route_after_rewrite.py CLI and return (exit_code, route_result_dict)."""
+        cmd = [
+            sys.executable, str(_WRAPPER_SCRIPT),
+            "--file", body_file,
+            "--state-path", state_path,
+            "--max-rewrite-attempts", str(max_rewrite_attempts),
+        ]
+        if artifact_path is not None:
+            cmd += ["--artifact-path", artifact_path]
         proc = subprocess.run(
-            [
-                sys.executable, str(_WRAPPER_SCRIPT),
-                "--file", body_file,
-                "--state-path", state_path,
-                "--max-rewrite-attempts", str(max_rewrite_attempts),
-            ],
+            cmd,
             capture_output=True,
             text=True,
         )
@@ -419,6 +459,7 @@ class TestRouteAfterRewrireCli:
         exit_code, route_result = self._run_wrapper(
             body_file=str(pass_fixture),
             state_path=state_path,
+            artifact_path=self._make_artifact(tmp_path),
         )
         assert exit_code == 0
         assert route_result.get("route") == "proceed_to_review"
@@ -435,6 +476,7 @@ class TestRouteAfterRewrireCli:
             body_file=str(fail_fixture),
             state_path=state_path,
             max_rewrite_attempts=3,
+            artifact_path=self._make_artifact(tmp_path),
         )
         assert exit_code == 0, "Wrapper must exit 0 even when checker returns needs-fix"
         route = route_result.get("route")
@@ -451,7 +493,7 @@ class TestRouteAfterRewrireCli:
         state_path = str(tmp_path / "state.json")
         assert not os.path.exists(state_path), "State file should not exist before first run"
 
-        self._run_wrapper(body_file=str(pass_fixture), state_path=state_path)
+        self._run_wrapper(body_file=str(pass_fixture), state_path=state_path, artifact_path=self._make_artifact(tmp_path))
 
         assert os.path.exists(state_path), "State file must be created after wrapper run"
 
@@ -467,11 +509,13 @@ class TestRouteAfterRewrireCli:
 
         state_path = str(tmp_path / "state.json")
 
+        _artifact = self._make_artifact(tmp_path)
         # First run
         self._run_wrapper(
             body_file=str(fail_fixture),
             state_path=state_path,
             max_rewrite_attempts=5,
+            artifact_path=_artifact,
         )
         state_after_first = load_rewrite_router_state(state_path)
         assert state_after_first is not None
@@ -482,6 +526,7 @@ class TestRouteAfterRewrireCli:
             body_file=str(fail_fixture),
             state_path=state_path,
             max_rewrite_attempts=5,
+            artifact_path=_artifact,
         )
         state_after_second = load_rewrite_router_state(state_path)
         assert state_after_second is not None
@@ -535,12 +580,14 @@ class TestRouteAfterRewrireCli:
             pytest.skip("c1_fail_issue.md fixture not found")
 
         state_path = str(tmp_path / "state.json")
+        artifact_path = self._make_artifact(tmp_path)
         proc = subprocess.run(
             [
                 sys.executable, str(_WRAPPER_SCRIPT),
                 "--file", str(fail_fixture),
                 "--state-path", state_path,
                 "--max-rewrite-attempts", "3",
+                "--artifact-path", artifact_path,
             ],
             capture_output=True,
             text=True,
@@ -737,3 +784,156 @@ uv run python3 scripts/foo.py
             f"with blockers={result.get('blockers')}"
         )
         assert exit_code in (0, 1), f"Expected exit 0 or 1, got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# Major 3: CLI/subprocess 経由 AC9/AC10 回帰テスト
+# ---------------------------------------------------------------------------
+
+
+def _make_minimal_artifact(artifact_dir: Path, required_sections=None, required_contract_keys=None) -> Path:
+    """テスト用の最小 preflight artifact を作成し、パスを返す。"""
+    artifact = {
+        "schema_version": "refinement_preflight_result/v1",
+        "required_sections": required_sections or [],
+        "required_contract_keys": required_contract_keys or [],
+    }
+    artifact_path = artifact_dir / "preflight_artifact.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return artifact_path
+
+
+def _run_route_after_rewrite_cli(
+    body_file: str,
+    state_path: str,
+    max_rewrite_attempts: int = 3,
+    artifact_path: str | None = None,
+    mutation_kind: str | None = None,
+) -> tuple[int, dict]:
+    """route_after_rewrite.py を subprocess 実行し (exit_code, route_result) を返す。"""
+    cmd = [
+        sys.executable, str(_WRAPPER_SCRIPT),
+        "--file", body_file,
+        "--state-path", state_path,
+        "--max-rewrite-attempts", str(max_rewrite_attempts),
+    ]
+    if artifact_path is not None:
+        cmd += ["--artifact-path", artifact_path]
+    if mutation_kind is not None:
+        cmd += ["--mutation-kind", mutation_kind]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    result = {}
+    if proc.stdout.strip():
+        try:
+            result = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            pass
+    return proc.returncode, result
+
+
+class TestAc9Ac10CliRegression:
+    """Major 3: CLI subprocess 経由の AC9/AC10 回帰テスト。"""
+
+    def _fail_body(self) -> str:
+        return _minimal_fail_body() or "## Title\n\ncontent without required sections"
+
+    def test_artifact_path_builds_nonnull_fingerprint(self, tmp_path):
+        """AC9: --artifact-path を渡すと route_result.rewrite_request_fingerprint が非 None。"""
+        body_file = tmp_path / "body.md"
+        body_file.write_text(self._fail_body(), encoding="utf-8")
+        state_path = str(tmp_path / "state.json")
+        artifact_path = str(_make_minimal_artifact(tmp_path))
+
+        exit_code, result = _run_route_after_rewrite_cli(
+            str(body_file), state_path, artifact_path=artifact_path
+        )
+        assert exit_code == 0, f"Expected exit 0, got {exit_code}; result={result}"
+        assert result.get("rewrite_request_fingerprint") is not None, (
+            f"rewrite_request_fingerprint must not be None: {result}"
+        )
+
+    def test_missing_artifact_path_exits_3(self, tmp_path):
+        """AC8/B3: --artifact-path を省略すると exit 3 (environment_failure)。"""
+        body_file = tmp_path / "body.md"
+        body_file.write_text(self._fail_body(), encoding="utf-8")
+        state_path = str(tmp_path / "state.json")
+
+        exit_code, _ = _run_route_after_rewrite_cli(str(body_file), state_path)
+        assert exit_code == 3, (
+            f"Expected exit 3 when --artifact-path omitted, got {exit_code}"
+        )
+
+    def test_format_only_repair_budget_debit_zero(self, tmp_path):
+        """AC10: --mutation-kind format_only_repair のとき budget_debit=0。"""
+        body_file = tmp_path / "body.md"
+        body_file.write_text(self._fail_body(), encoding="utf-8")
+        state_path = str(tmp_path / "state.json")
+        artifact_path = str(_make_minimal_artifact(tmp_path))
+
+        exit_code, result = _run_route_after_rewrite_cli(
+            str(body_file), state_path,
+            artifact_path=artifact_path,
+            mutation_kind="format_only_repair",
+        )
+        assert exit_code == 0, f"Expected exit 0, got {exit_code}"
+        assert result.get("budget_debit") == 0, (
+            f"format_only_repair must produce budget_debit=0: {result}"
+        )
+
+    def test_duplicate_fingerprint_routes_human_judgment(self, tmp_path):
+        """AC9: 同一 fingerprint が 2 回目で human_judgment_required へルーティングされる。
+
+        fingerprint は checker_json.fail_closed の reason_codes + rewrite_constraints で決まる。
+        artifact を変えることで fix_category を 1 回目と別にして AC3 (occurrence_count>=2) を
+        回避しつつ、AC9 (fingerprint duplicate) が fire することを確認する。
+        """
+        body_file = tmp_path / "body.md"
+        body_file.write_text(self._fail_body(), encoding="utf-8")
+        state_path = str(tmp_path / "state.json")
+
+        # 1 回目: required_sections で missing_section カテゴリ
+        (tmp_path / "art1").mkdir(exist_ok=True)
+        artifact1 = str(_make_minimal_artifact(tmp_path / "art1", required_sections=["Outcome"]))
+        exit_code1, result1 = _run_route_after_rewrite_cli(
+            str(body_file), state_path, artifact_path=artifact1
+        )
+        assert exit_code1 == 0, f"First call failed: {exit_code1}"
+        fp1 = result1.get("rewrite_request_fingerprint")
+        assert fp1 is not None, f"First call must produce fingerprint; result={result1}"
+
+        # 2 回目: required_contract_keys で missing_contract_key カテゴリ（fix_category が変わる）。
+        # fingerprint は checker_json.fail_closed に基づくので同じ body なら同一 → AC9 が fire する。
+        (tmp_path / "art2").mkdir(exist_ok=True)
+        artifact2 = str(_make_minimal_artifact(tmp_path / "art2", required_sections=[], required_contract_keys=["Outcome"]))
+        exit_code2, result2 = _run_route_after_rewrite_cli(
+            str(body_file), state_path, artifact_path=artifact2
+        )
+        assert exit_code2 == 0, f"Second call failed: {exit_code2}"
+        fp2 = result2.get("rewrite_request_fingerprint")
+        assert fp1 == fp2, (
+            f"Fingerprints must match (based on checker_json.fail_closed, not artifact): {fp1!r} vs {fp2!r}"
+        )
+        assert result2.get("route") == "human_judgment_required", (
+            f"Duplicate fingerprint must route to human_judgment_required: {result2.get('route')!r}\n"
+            f"full result: {result2}"
+        )
+
+    def test_ac9_ac10_fields_persisted_in_state_file(self, tmp_path):
+        """B4: AC9/AC10 フィールドが state JSON ファイルに保存される。"""
+        body_file = tmp_path / "body.md"
+        body_file.write_text(self._fail_body(), encoding="utf-8")
+        state_path = tmp_path / "state.json"
+        artifact_path = str(_make_minimal_artifact(tmp_path))
+
+        exit_code, _ = _run_route_after_rewrite_cli(
+            str(body_file), str(state_path), artifact_path=artifact_path
+        )
+        assert exit_code == 0, f"Expected exit 0, got {exit_code}"
+
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+        for field in ("rewrite_request_fingerprint", "previous_rewrite_request_fingerprints",
+                      "last_mutation_kind", "budget_debit"):
+            assert field in state_data, (
+                f"AC9/AC10 field '{field}' must be persisted in state: {list(state_data.keys())}"
+            )

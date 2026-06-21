@@ -832,7 +832,7 @@ def _apply_exit_code_mapping(
             BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID,
         }
         if any(
-            any(b.startswith(rb) for rb in rewrite_env_blockers)
+            any(b.split(":", 1)[0] == rb for rb in rewrite_env_blockers)
             for b in blockers
         ):
             has_env = True
@@ -1415,7 +1415,7 @@ def run_preflight(
             )
             _cls_dir.mkdir(parents=True, exist_ok=True)
             (_cls_dir / "planner_failure_classification_v1.json").write_text(
-                json.dumps(failure_cls, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(failure_cls, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
             )
         except Exception:
             pass
@@ -1568,7 +1568,7 @@ def run_preflight(
         artifact_dir_repair.mkdir(parents=True, exist_ok=True)
         repair_artifact_file = artifact_dir_repair / "repair_diagnostics.json"
         repair_artifact_file.write_text(
-            json.dumps(_repair_result, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_repair_result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
         )
         repair_artifact_path = str(repair_artifact_file)
     except Exception:
@@ -1976,7 +1976,7 @@ def write_provenance_artifact(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     prov_path = artifact_dir / "refinement_preflight_provenance_v1.json"
     prov_path.write_text(
-        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
     return str(prov_path)
 

@@ -786,6 +786,11 @@ def load_rewrite_router_state(
             source_issue_body_sha256=current_source_body_sha256,
             replay_safe=True,
             source_body_reset=True,
+            # B4: AC9/AC10 reset to defaults on source body reset
+            rewrite_request_fingerprint=data.get("rewrite_request_fingerprint"),
+            previous_rewrite_request_fingerprints=list(data.get("previous_rewrite_request_fingerprints", [])),
+            last_mutation_kind=data.get("last_mutation_kind", "semantic_rewrite"),
+            budget_debit=data.get("budget_debit", 1),
         )
 
     return LOOP_REWRITE_ROUTER_STATE_V1(
@@ -804,11 +809,11 @@ def load_rewrite_router_state(
         source_issue_body_sha256=stored_source_sha,
         replay_safe=True,
         source_body_reset=False,
-        # AC9/AC10 fields are not persisted to JSON schema; initialize to defaults
-        rewrite_request_fingerprint=None,
-        previous_rewrite_request_fingerprints=[],
-        last_mutation_kind="semantic_rewrite",
-        budget_debit=1,
+        # B4: AC9/AC10 now in JSON schema; read from JSON with safe defaults
+        rewrite_request_fingerprint=data.get("rewrite_request_fingerprint"),
+        previous_rewrite_request_fingerprints=list(data.get("previous_rewrite_request_fingerprints", [])),
+        last_mutation_kind=data.get("last_mutation_kind", "semantic_rewrite"),
+        budget_debit=data.get("budget_debit", 1),
     )
 
 
@@ -846,8 +851,11 @@ def save_rewrite_router_state(
         "source_issue_body_sha256": state.source_issue_body_sha256,
         "replay_safe": True,
         "source_body_reset": state.source_body_reset,
-        # NOTE: rewrite_request_fingerprint, previous_rewrite_request_fingerprints,
-        # last_mutation_kind, budget_debit are intentionally omitted — not in JSON schema.
+        # B4: AC9/AC10 fields now in JSON schema
+        "rewrite_request_fingerprint": state.rewrite_request_fingerprint,
+        "previous_rewrite_request_fingerprints": list(state.previous_rewrite_request_fingerprints or []),
+        "last_mutation_kind": state.last_mutation_kind,
+        "budget_debit": state.budget_debit,
     }
 
     target_dir = os.path.dirname(os.path.abspath(state_path))
@@ -909,11 +917,11 @@ def main(argv: list[str] | None = None) -> None:
             source_issue_body_sha256=input_data.get("source_issue_body_sha256"),
             replay_safe=input_data.get("replay_safe", False),
             source_body_reset=input_data.get("source_body_reset", False),
-            # AC9/AC10: not in JSON schema, so not read from CLI input
-            rewrite_request_fingerprint=None,
-            previous_rewrite_request_fingerprints=[],
-            last_mutation_kind="semantic_rewrite",
-            budget_debit=1,
+            # B4: AC9/AC10 now in JSON schema; read from input with safe defaults
+            rewrite_request_fingerprint=input_data.get("rewrite_request_fingerprint"),
+            previous_rewrite_request_fingerprints=list(input_data.get("previous_rewrite_request_fingerprints", [])),
+            last_mutation_kind=input_data.get("last_mutation_kind", "semantic_rewrite"),
+            budget_debit=input_data.get("budget_debit", 1),
         )
 
         result = decide_rewrite_route(state)
