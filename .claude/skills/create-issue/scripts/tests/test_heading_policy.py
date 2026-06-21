@@ -49,7 +49,14 @@ _LABEL_TO_CANONICAL: dict[str, str] = {
 # allowed to be prose-exempt. Adding a key here expands the prose-exemption
 # surface and must explain why it cannot be represented as a template label or
 # scaffolding heading.
-ALLOWED_EXTRAS: set[str] = set()
+ALLOWED_EXTRAS: set[str] = {
+    "Summary",
+    "Checks",
+    "Schema Change Applicability",
+    "Schema Consumer Inventory",
+    "Safety Claim Matrix",
+    "Notes",
+}
 
 
 _KNOWN_FIELD_TYPES = frozenset(

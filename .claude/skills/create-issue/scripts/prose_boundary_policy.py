@@ -86,6 +86,72 @@ def _normalize_heading_text(text: str) -> str:
 # heading_policy inventory
 # key = canonical_en（正規化後の英語見出し名）
 HEADING_POLICY: dict[str, dict] = {
+    "Summary": {
+        "canonical_en": "Summary",
+        "canonical_ja": "要約",
+        "accepted_forms": [
+            "Summary",
+            "要約 (Summary)",
+            "要約（Summary）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Summary",
+    },
+    "Checks": {
+        "canonical_en": "Checks",
+        "canonical_ja": "確認事項",
+        "accepted_forms": [
+            "Checks",
+            "確認事項 (Checks)",
+            "確認事項（Checks）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Checks",
+    },
+    "Schema Change Applicability": {
+        "canonical_en": "Schema Change Applicability",
+        "canonical_ja": "スキーマ変更適用性",
+        "accepted_forms": [
+            "Schema Change Applicability",
+            "スキーマ変更適用性 (Schema Change Applicability)",
+            "スキーマ変更適用性（Schema Change Applicability）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Schema Change Applicability",
+    },
+    "Schema Consumer Inventory": {
+        "canonical_en": "Schema Consumer Inventory",
+        "canonical_ja": "スキーマ利用箇所一覧",
+        "accepted_forms": [
+            "Schema Consumer Inventory",
+            "スキーマ利用箇所一覧 (Schema Consumer Inventory)",
+            "スキーマ利用箇所一覧（Schema Consumer Inventory）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Schema Consumer Inventory",
+    },
+    "Safety Claim Matrix": {
+        "canonical_en": "Safety Claim Matrix",
+        "canonical_ja": "安全性主張マトリクス",
+        "accepted_forms": [
+            "Safety Claim Matrix",
+            "安全性主張マトリクス (Safety Claim Matrix)",
+            "安全性主張マトリクス（Safety Claim Matrix）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Safety Claim Matrix",
+    },
+    "Notes": {
+        "canonical_en": "Notes",
+        "canonical_ja": "補足",
+        "accepted_forms": [
+            "Notes",
+            "補足 (Notes)",
+            "補足（Notes）",
+        ],
+        "prose_guard_kind": BLOCK_KIND_CANONICAL_HEADING,
+        "contract_checker_kind": "Notes",
+    },
     "Machine-Readable Contract": {
         "canonical_en": "Machine-Readable Contract",
         "canonical_ja": "機械可読コントラクト",

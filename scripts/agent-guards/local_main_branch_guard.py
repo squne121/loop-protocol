@@ -272,17 +272,38 @@ _GIT_GLOBAL_FLAGS = {
 _GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "-c", "--git-dir", "--work-tree", "--config-env"}
 
 # Shell metacharacters that indicate compound/unparseable commands
-_SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(")
+_SHELL_METACHAR_RE = re.compile(r"[;&<>|`]|\$\(")
 
 # Leading env assignment pattern: NAME=value (possibly multiple)
 _LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
 
-# Patterns for allowed read-only / non-branch-mutating commands
-READONLY_PATTERNS = [
-    r"^git\s+(status|fetch|log|show|diff|blame|annotate|shortlog|describe)(\s|$)",
+# Patterns for display-oriented read-only commands.
+DISPLAY_READONLY_PATTERNS = [
+    r"^rg(\s|$)",
+    r"^grep(\s|$)",
+    r"^cat(\s|$)",
+    r"^head(\s|$)",
+    r"^tail(\s|$)",
+    r"^wc(\s|$)",
+    r"^git\s+(status|log|show|diff|blame|annotate|shortlog|describe)(\s|$)",
     r"^git\s+branch\s+(--show-current|-a|-r|-v|--list|--verbose)(\s|$)",
     r"^git\s+rev-parse(\s|$)",
-    r"^git\s+worktree\s+(list|prune)(\s|$)",
+    r"^git\s+ls-files(\s|$)",
+    r"^git\s+worktree\s+list(\s|$)",
+]
+
+# Operations that may touch local metadata but do not move the root checkout.
+NON_BRANCH_MUTATING_PATTERNS = [
+    r"^git\s+fetch(\s|$)",
+    r"^git\s+worktree\s+prune(\s|$)",
+]
+
+READONLY_PATTERNS = DISPLAY_READONLY_PATTERNS + NON_BRANCH_MUTATING_PATTERNS
+
+READONLY_PIPELINE_SEGMENT_PATTERNS = [
+    r"^head(?:\s+-n\s+\d+)?$",
+    r"^tail(?:\s+-n\s+\d+)?$",
+    r"^wc\s+-l$",
 ]
 
 # git checkout path-restore forms (NOT branch switch)
@@ -394,6 +415,72 @@ def is_readonly_command(cmd: str) -> bool:
         if re.match(pattern, cmd):
             return True
     return False
+
+
+def _tokenize_readonly_pipeline(cmd: str) -> list[str] | None:
+    """Tokenize a potential read-only pipeline with shell punctuation preserved."""
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars="|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _is_readonly_pipeline_segment(cmd: str) -> bool:
+    """Return True if a segment is an allowed post-processing reader."""
+    normalized = cmd.strip()
+    for pattern in READONLY_PIPELINE_SEGMENT_PATTERNS:
+        if re.match(pattern, normalized):
+            return True
+    return False
+
+
+def classify_readonly_pipeline(cmd: str) -> bool:
+    """
+    Allow only narrow readonly pipeline forms.
+
+    Examples:
+      rg -n "TODO" README.md | head -n 20
+      git status --short | head -n 20
+      git diff --stat | head -n 20
+    """
+    if "|" not in cmd:
+        return False
+    if any(token in cmd for token in ("&&", "||", ";", "`", "$(")):
+        return False
+
+    tokens = _tokenize_readonly_pipeline(cmd)
+    if not tokens:
+        return False
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token == "|":
+            if not current:
+                return False
+            segments.append(current)
+            current = []
+            continue
+        if token in {"<", "<<", "<<<", ">", ">>"}:
+            return False
+        current.append(token)
+
+    if not current or not segments:
+        return False
+    segments.append(current)
+
+    first_segment = " ".join(segments[0]).strip()
+    if not is_readonly_command(first_segment):
+        return False
+
+    for segment_tokens in segments[1:]:
+        if not _is_readonly_pipeline_segment(" ".join(segment_tokens)):
+            return False
+
+    return True
 
 
 def is_path_restore_command(cmd: str) -> bool:
@@ -652,7 +739,20 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 5: Compound/wrapped commands in local root context: fail-closed
+    # Step 5: readonly pipeline classifier.
+    # Must run before generic compound detection so `rg ... | head ...` can pass,
+    # while mixed command / wrapper / redirection forms still fail closed.
+    if classify_readonly_pipeline(cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_READONLY,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 6: Compound/wrapped commands in local root context: fail-closed.
     # (Must check BEFORE readonly: "git status || git switch issue-*" starts with "git status")
     if is_compound_or_wrapped(cmd):
         return _result(
@@ -676,7 +776,7 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # B6: Tokenize with shlex; shlex parse failure → fail-closed
+    # Step 7: shlex parse failure → fail-closed
     tokens = tokenize_command(cmd)
     if tokens is None:
         return _result(
@@ -688,7 +788,7 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # B2: Normalize git global options.
+    # Step 8: Normalize git global options.
     # If fail-closed global options (-C, --git-dir, --work-tree, --config-env) present → block.
     normalized_tokens = tokens
     git_global_fail_closed = False
@@ -707,7 +807,7 @@ def evaluate(
     # Rebuild normalized cmd string for pattern matching
     normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
 
-    # Step 6: Read-only commands are always allowed (safe even in drifted/detached states)
+    # Step 9: Read-only commands are always allowed (safe even in drifted/detached states)
     if is_readonly_command(normalized_cmd):
         return _result(
             status="allow",
@@ -718,13 +818,13 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 7: Classify root state.
+    # Step 10: Classify root state.
     # B1 fix: detached HEAD (current_branch is None) is treated as detached_or_unknown,
     # NOT as default/allow. This must be checked BEFORE path restore allow (B3 fix).
     root_state = classify_root_state(current_branch, default_branch)
     already_drifted = root_state in ("drifted", "detached_or_unknown")
 
-    # Step 8: Path restore commands — allowed only when on default branch.
+    # Step 11: Path restore commands — allowed only when on default branch.
     # B3 fix: drifted/detached_or_unknown roots must NOT allow path restore.
     # In drifted/detached state, only the explicit allowlist (_DRIFTED_ALLOWLIST_PATTERNS) applies.
     if is_path_restore_command(normalized_cmd) and root_state == "default":
@@ -737,7 +837,7 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 9: Check if this is a branch mutation command
+    # Step 12: Check if this is a branch mutation command
     is_branch_mutation = _is_branch_mutation_command(normalized_cmd, normalized_tokens)
 
     if is_branch_mutation:
@@ -772,7 +872,7 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 10: Drifted or detached root: use explicit allowlist (B1/B4)
+    # Step 13: Drifted or detached root: use explicit allowlist (B1/B4)
     # Both "drifted" and "detached_or_unknown" share the same strict allowlist.
     if already_drifted:
         if not _is_allowed_when_drifted(normalized_cmd):

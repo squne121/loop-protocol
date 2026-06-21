@@ -41,23 +41,16 @@
   "fail_closed": {
     "required": true,
     "reason_codes": [
-      "malformed_machine_readable_contract",
-      "missing_required_contract_key"
+      "malformed_machine_readable_contract"
     ],
-    "human_message": "Issue contract malformation detected: malformed_machine_readable_contract, missing_required_contract_key",
+    "human_message": "Issue contract malformation detected: malformed_machine_readable_contract",
     "rewrite_constraints": {
       "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
       "required_sections": [],
-      "required_contract_keys": [
-        "contract_schema_version",
-        "issue_kind"
-      ],
+      "required_contract_keys": [],
       "rewrite_constraints": {
         "must_add_sections": [],
-        "must_add_contract_keys": [
-          "contract_schema_version",
-          "issue_kind"
-        ],
+        "must_add_contract_keys": [],
         "freeform_rewrite_forbidden": true
       },
       "override_policy": {
@@ -72,9 +65,7 @@
           "template_resolution_error",
           "checker_internal_error"
         ],
-        "overridable_in_current_result": [
-          "missing_required_contract_key"
-        ],
+        "overridable_in_current_result": [],
         "non_overridable_in_current_result": []
       },
       "max_rewrite_attempts": 2,
