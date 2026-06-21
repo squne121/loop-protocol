@@ -54,6 +54,7 @@ from local_main_branch_guard import (
     REASON_UNPARSEABLE,
     REASON_INLINE_OVERRIDE,
     REASON_DETERMINISTIC_CHECKER,
+    REASON_GITHUB_REMOTE_OPS,
 )
 
 
@@ -554,12 +555,9 @@ class TestAC12AlreadyDriftedAllowlist:
     """AC12: mutating gh commands are blocked in already-drifted state."""
 
     @pytest.mark.parametrize("cmd", [
+        # gh issue edit は最小集合外なので drifted 状態でも block（B3）
         "gh issue edit 123 --title new",
-        "gh issue comment 123 --body text",
-        "gh issue close 123",
         "gh pr checkout 988",
-        "gh pr edit 988 --title new",
-        "gh pr comment 988 --body text",
         "gh pr merge 988",
         "gh pr update-branch 988",
         "hub pr checkout 988",
@@ -570,6 +568,19 @@ class TestAC12AlreadyDriftedAllowlist:
     def test_blocked_when_drifted(self, tmp_git_repo_drifted: Path, cmd: str):
         result = eval_in_local_root(cmd, str(tmp_git_repo_drifted))
         assert result["status"] == "block", f"Expected block for drifted root: {cmd!r}"
+
+    @pytest.mark.parametrize("cmd", [
+        # post-merge-cleanup 最小集合のコマンドは drifted 状態でも allow（Step 9.7a が Step 13 より先）
+        "gh issue close 123",
+        "gh issue comment 123 --body text",
+        "gh pr edit 988 --title new",
+        "gh pr comment 988 --body text",
+    ])
+    def test_gh_ops_minimal_set_allowed_even_when_drifted(self, tmp_git_repo_drifted: Path, cmd: str):
+        """post-merge-cleanup 最小集合は drifted 状態でも allow される（B3 design intent）。"""
+        result = eval_in_local_root(cmd, str(tmp_git_repo_drifted))
+        assert result["status"] == "allow", f"Expected allow for minimal set in drifted root: {cmd!r}"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
     @pytest.mark.parametrize("cmd", [
         "gh issue view 123",
@@ -1196,10 +1207,10 @@ class TestGhReadonlyAndDenyClaude:
         result = eval_in_local_root("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_issue_edit_is_allowed(self, tmp_git_repo: Path):
-        """gh issue edit is in GH_OPS_ALLOW_PATTERNS and must be allowed."""
+    def test_gh_issue_edit_is_blocked(self, tmp_git_repo: Path):
+        """gh issue edit is NOT in the minimal allowlist and must be blocked (B3)."""
         result = eval_in_local_root("gh issue edit 123 --body new", str(tmp_git_repo))
-        assert result["status"] == "allow"
+        assert result["status"] == "block"
 
     def test_gh_issue_close_is_allowed(self, tmp_git_repo: Path):
         """gh issue close is in GH_OPS_ALLOW_PATTERNS and must be allowed."""
@@ -1286,19 +1297,22 @@ class TestGhMutationFailClosedCompletenessClaude:
     """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness, Claude flavor)."""
 
     @pytest.mark.parametrize("cmd", [
-        # gh issue subcommands NOT in GH_OPS_ALLOW_PATTERNS
+        # gh issue subcommands NOT in the minimal allowlist
+        "gh issue create --title x --body y",    # B3: removed from allowlist
+        "gh issue edit 123 --title new",          # B3: removed from allowlist
         "gh issue develop 123 --base main",
         "gh issue develop 123 --checkout",
         "gh issue transfer 123 other/repo",
         "gh issue pin 123",
         "gh issue unpin 123",
-        # gh pr subcommands NOT in GH_OPS_ALLOW_PATTERNS
+        # gh pr subcommands NOT in the minimal allowlist
+        "gh pr create --title x --body y",        # B3: removed from allowlist
         "gh pr revert 123",
         "gh pr lock 123",
         "gh pr unlock 123",
     ])
     def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
-        """GIVEN gh mutation not in readonly allowlist or GH_OPS_ALLOW_PATTERNS WHEN evaluated THEN blocked (allowlist-closed)."""
+        """GIVEN gh mutation not in readonly allowlist or minimal gh ops allowlist WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_in_local_root(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
@@ -1318,3 +1332,40 @@ class TestProjectTmpPolicyClaude:
         result = eval_in_local_root("uv run python3 /tmp/check.py --dry-run", str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
+
+class TestGhOpsMinimalAllowlistClaude:
+    """AC1, B3: post-merge-cleanup 最小集合の token-based classifier テスト（Claude flavor）。"""
+
+    @pytest.mark.parametrize("cmd,expected", [
+        # must-allow: 最小集合
+        ("gh issue close 1089", "allow"),
+        ("gh issue comment 123 --body hello", "allow"),
+        ("gh issue comment 123 --body-file /some/file.txt", "allow"),
+        ("gh issue reopen 456", "allow"),
+        ("gh pr comment 789 --body text", "allow"),
+        ("gh pr edit 101 --title new", "allow"),
+    ])
+    def test_minimal_allowlist_allowed(self, tmp_git_repo: Path, cmd: str, expected: str):
+        """GIVEN minimal allowlist command WHEN evaluated THEN allowed with github_remote_ops_command reason."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == expected
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize("cmd", [
+        # must-block: 最小集合外
+        "gh issue create --title x --body y",   # B3: not in minimal set
+        "gh issue edit 123 --title new",          # B3: not in minimal set (interactive possible)
+        "gh pr create --title x --body y",        # B3: not in minimal set
+        "gh issue comment 123",                   # B2: --body なし → interactive
+        "gh pr comment 456",                      # B2: --body なし → interactive
+        "gh issue close",                         # B1: 番号なし
+        "gh issue reopen",                        # B1: 番号なし
+        "gh pr edit",                             # B1: 番号なし → branch 依存
+        "gh issue comment 123 --delete-last",     # B2: destructive flag
+        "gh issue comment 123 --editor",          # B2: interactive flag
+        "gh issue comment 123 --web",             # B2: interactive flag
+    ])
+    def test_minimal_allowlist_blocked(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN command outside minimal allowlist WHEN evaluated THEN blocked."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
