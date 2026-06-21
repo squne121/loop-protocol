@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 SCRIPT_PATH = (
@@ -364,6 +365,23 @@ class TestFindingsContract:
         assert "structured_blockers" in schema["required"]
         assert schema["properties"]["structured_blockers"]["items"]["$ref"] == "#/$defs/structured_blocker"
         assert "structured_blocker" in schema["$defs"]
+
+    def test_schema_rejects_non_blocking_structured_blockers(self):
+        """GIVEN structured_blockers entry using checker_gap WHEN schema validates THEN it is rejected."""
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        payload = run_checker("c4_fail_issue.md")
+        payload["structured_blockers"] = [
+            {
+                "code": "C4",
+                "message": "gap",
+                "finding_kind": "checker_gap",
+                "deterministic_domain_key": "vc_command_format",
+                "blocking": False,
+                "checker_evidence": [],
+            }
+        ]
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=payload, schema=schema)
 
     def test_c9_warn_does_not_duplicate_findings(self):
         """GIVEN research issue missing RVA WHEN checker runs THEN warning finding is emitted once."""

@@ -64,6 +64,12 @@ ARTIFACT: compact_review_result_v1=<path>
 
 full structured review（`REVIEW_ISSUE_RESULT_V1` 全フィールド）は `.claude/artifacts/issue-refinement-loop/<N>/` 配下の artifact JSON に保存し、`findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version も lossless に保持したまま、main context には artifact path のみ返す。
 
+schema / consumer semantics の追加制約:
+- `structured_blockers` は blocking entry のみを保持し、`finding_kind=deterministic_domain_blocker` + `blocking=true` + `checker_evidence` 必須のものだけを格納する。
+- `checker_gap` / `heuristic_concern` は `findings[]` に残し、blocker として compact / replay consumer に渡さない。
+- compact / replay consumer が `checker_artifact_inconsistency` を返した場合は `human_escalation` ではなく checker artifact fix lane へ送る。
+- artifact JSON は strict JSON とし、`NaN` / `Infinity` を encode/decode しない。
+
 ```bash
 # compact 変換の実行例
 uv run python3 .claude/skills/issue-refinement-loop/scripts/compact_review_result.py \

@@ -220,65 +220,23 @@
           "type": "string"
         },
         "finding_kind": {
-          "enum": [
-            "deterministic_domain_blocker",
-            "checker_gap",
-            "heuristic_concern"
-          ]
+          "const": "deterministic_domain_blocker"
         },
         "deterministic_domain_key": {
           "type": "string",
           "minLength": 1
         },
         "blocking": {
-          "type": "boolean"
+          "const": true
         },
         "checker_evidence": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/checker_evidence"
           }
         }
       },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "finding_kind": {
-                "const": "deterministic_domain_blocker"
-              }
-            },
-            "required": ["finding_kind"]
-          },
-          "then": {
-            "properties": {
-              "blocking": {
-                "const": true
-              },
-              "checker_evidence": {
-                "minItems": 1
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "finding_kind": {
-                "const": "checker_gap"
-              }
-            },
-            "required": ["finding_kind"]
-          },
-          "then": {
-            "properties": {
-              "blocking": {
-                "const": false
-              }
-            }
-          }
-        }
-      ],
       "additionalProperties": true
     }
   },

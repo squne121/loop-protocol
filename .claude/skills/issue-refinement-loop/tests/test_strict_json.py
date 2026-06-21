@@ -69,3 +69,61 @@ def test_build_refinement_phase_state_cli_writes_strict_json(tmp_path):
     assert proc.returncode == 0, proc.stderr
     data = json.loads(output_path.read_text(encoding="utf-8"))
     assert data["schema_version"] == "ISSUE_REFINEMENT_PHASE_STATE_V1"
+
+
+def test_build_refinement_phase_state_cli_rejects_nan_in_source_input(tmp_path):
+    """GIVEN source JSON containing NaN WHEN CLI runs THEN it fails closed."""
+    source_path = tmp_path / "source.json"
+    output_path = tmp_path / "phase_state.json"
+    source_path.write_text('{"bad": NaN}', encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "build_refinement_phase_state.py"),
+            "--phase",
+            "review",
+            "--source-kind",
+            "issue_review_result_compact_v1",
+            "--source-path",
+            str(source_path),
+            "--review-result-path",
+            str(source_path),
+            "--output-path",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 1
+    assert "strict json validation error" in proc.stdout
+
+
+def test_build_refinement_phase_state_cli_rejects_infinity_in_review_input(tmp_path):
+    """GIVEN review-result JSON containing Infinity WHEN CLI runs THEN it fails closed."""
+    source_path = tmp_path / "source.json"
+    review_path = tmp_path / "review.json"
+    output_path = tmp_path / "phase_state.json"
+    source_path.write_text("{}", encoding="utf-8")
+    review_path.write_text('{"bad": Infinity}', encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "build_refinement_phase_state.py"),
+            "--phase",
+            "review",
+            "--source-kind",
+            "issue_review_result_compact_v1",
+            "--source-path",
+            str(source_path),
+            "--review-result-path",
+            str(review_path),
+            "--output-path",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 1
+    assert "strict json validation error" in proc.stdout

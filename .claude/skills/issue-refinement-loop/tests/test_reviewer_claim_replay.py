@@ -71,6 +71,20 @@ READINESS_VCS001 = {
     ],
 }
 
+READINESS_C9 = {
+    "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+    "body_sha256": "sha256:body-a",
+    "errors": [
+        {
+            "rule_id": "C9_runtime_applicability_present",
+            "source_check": "contract_readiness_check",
+            "category": "rva_immediate_field_missing",
+            "line_start": 8,
+            "line_end": 8,
+        }
+    ],
+}
+
 READINESS_CLEAN = {
     "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
     "body_sha256": "sha256:body-a",
@@ -89,6 +103,14 @@ COMPACT_MISSING_SECTION = {
     "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
     "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
     "blocking_issues": [{"code": "missing_section", "message": "missing section"}],
+    "structured_blockers": [],
+    "findings": [],
+}
+
+COMPACT_C9 = {
+    "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+    "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+    "blocking_issues": [{"code": "rva_immediate_field_missing", "message": "missing runtime applicability"}],
     "structured_blockers": [],
     "findings": [],
 }
@@ -231,6 +253,81 @@ def test_c5_checker_gap_with_failed_deterministic_check_is_inconsistency():
     assert blocker["normalized_kind"] == "ac_vc_number_mismatch"
     assert blocker["checker_artifact_inconsistency"] is True
     assert blocker["evidence"][0]["rule_id"] == "LP010"
+
+
+@pytest.mark.parametrize(
+    ("review", "readiness_result", "deterministic_domain_key", "check_name", "expected_kind", "expected_rule_id"),
+    [
+        (
+            COMPACT_MISSING_SECTION,
+            READINESS_LP001,
+            "required_sections",
+            "C1_required_sections",
+            "missing_section",
+            "LP001",
+        ),
+        (
+            COMPACT_C4,
+            READINESS_VCS001,
+            "vc_command_format",
+            "C4_vc_commands_present",
+            "vc_command_format",
+            "VCS001",
+        ),
+        (
+            {
+                "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+                "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+                "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
+                "structured_blockers": [],
+            },
+            READINESS_LP010,
+            "vc_number_alignment",
+            "C5_ac_vc_number_alignment",
+            "ac_vc_number_mismatch",
+            "LP010",
+        ),
+        (
+            COMPACT_C9,
+            READINESS_C9,
+            "runtime_applicability",
+            "C9_runtime_applicability_present",
+            "rva_immediate_field_missing",
+            "C9_runtime_applicability_present",
+        ),
+    ],
+)
+def test_checker_gap_failed_deterministic_check_mapping_is_fixed(
+    review,
+    readiness_result,
+    deterministic_domain_key,
+    check_name,
+    expected_kind,
+    expected_rule_id,
+):
+    review_result = {
+        **review,
+        "deterministic_checks": {check_name: "fail"},
+        "findings": [
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key=deterministic_domain_key,
+                blocking=False,
+            )
+        ],
+    }
+    result, _ = analyze(
+        review_result=review_result,
+        readiness_result=readiness_result,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "checker_artifact_inconsistency"
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == expected_kind
+    assert blocker["checker_artifact_inconsistency"] is True
+    assert blocker["evidence"][0]["rule_id"] == expected_rule_id
 
 
 def test_missing_section_with_lp005_only_is_unbacked():
