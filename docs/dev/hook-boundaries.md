@@ -105,6 +105,12 @@ hook_boundaries_manifest_v1:
       linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
       guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
+      reason_code 一覧（#1089 で追加）: readonly_command / branch_safe_maintenance_command /
+      deterministic_checker_command / unparseable_branch_mutation（gh mutation・/tmp wrapper 含む）。
+      fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
+      gh issue view/list, gh pr view/list/status は readonly_command として許可。
+      gh mutation コマンド（edit/close/merge 等）と /tmp wrapper / python -c は fail-closed。
+      deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
 
   - handler_id: worktree_scope_guard
     event: PreToolUse
