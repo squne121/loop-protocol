@@ -117,6 +117,111 @@ describe('runAllyBehaviorSystem', () => {
     expect(state.allies[0].behaviorState).toBe('move_to_engage')
   })
 
+  it('GIVEN assist_player is active WHEN a player-near threat is farther from ally THEN ally_basic prioritizes that threat', () => {
+    const state = createInitialGameState()
+    state.allies = [createDefaultAllyState(1)]
+    state.allies[0].x = 80
+    state.allies[0].y = 270
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 130,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+      },
+      {
+        id: 2,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 250,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+      },
+    ]
+
+    runAllyBehaviorSystem(state, 16)
+
+    expect(state.allies[0].targetingPolicy).toBe('assist_player_threat')
+    expect(state.allies[0].targetEntityId).toBe('enemy:2')
+  })
+
+  it('GIVEN assist_player has ended WHEN nearest_hostile becomes active again THEN ally_basic returns to nearest-hostile selection', () => {
+    const state = createInitialGameState()
+    state.allies = [createDefaultAllyState(1)]
+    state.allies[0].x = 80
+    state.allies[0].y = 270
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 130,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+      },
+      {
+        id: 2,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 250,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+      },
+    ]
+
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+    runAllyBehaviorSystem(state, 16)
+    expect(state.allies[0].targetEntityId).toBe('enemy:2')
+
+    state.commandIntentRuntime.activeIntent = 'none'
+    state.allies[0].targetEntityId = null
+    state.allies[0].x = 80
+    state.allies[0].y = 270
+
+    runAllyBehaviorSystem(state, 16)
+
+    expect(state.allies[0].targetingPolicy).toBe('nearest_hostile')
+    expect(state.allies[0].targetEntityId).toBe('enemy:1')
+  })
+
+  it('GIVEN no enemies WHEN ally behavior runs THEN target is cleared, ally becomes inactive, and position stays unchanged', () => {
+    const state = createInitialGameState()
+    state.allies = [createDefaultAllyState(1)]
+    state.allies[0].x = 180
+    state.allies[0].y = 220
+    state.allies[0].targetEntityId = 'enemy:99'
+
+    runAllyBehaviorSystem(state, 16)
+
+    expect(state.allies[0].targetEntityId).toBeNull()
+    expect(state.allies[0].behaviorState).toBe('inactive')
+    expect(state.allies[0].x).toBe(180)
+    expect(state.allies[0].y).toBe(220)
+  })
+
   it('GIVEN ally emits no projectile and no damage WHEN ally behavior runs THEN projectile list and HP stay unchanged', () => {
     const state = createInitialGameState()
     state.allies = [createDefaultAllyState(1)]

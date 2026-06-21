@@ -1,6 +1,8 @@
 import {
   createDefaultAllyState,
   resetCommandIntentRuntime,
+  sampleAssistPlayerIntent,
+  tickCommandIntentRuntime,
   type GameState,
   type RewardApplicationId,
   type SortieResult,
@@ -275,6 +277,9 @@ export function runSortieSimulationStep(
   fixedDeltaMs: number,
 ): void {
   if (state.loopPhase !== 'running' || state.sortie.status !== 'running') return
+  if (commands.some((command) => command.type === 'sample_assist_player')) {
+    sampleAssistPlayerIntent(state.commandIntentRuntime, state.tick)
+  }
   runMovementSystem(state, commands, fixedDeltaMs)
   runEnemySpawnSystem(state)
   runEnemyAISystem(state, fixedDeltaMs)
@@ -286,4 +291,5 @@ export function runSortieSimulationStep(
   runSortieSystem(state, fixedDeltaMs)
   state.tick += 1
   state.elapsedMs += fixedDeltaMs
+  tickCommandIntentRuntime(state.commandIntentRuntime, state.tick)
 }

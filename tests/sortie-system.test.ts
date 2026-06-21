@@ -145,6 +145,42 @@ describe('GIVEN startSortie from preparation', () => {
     expect(state.projectiles).toHaveLength(0)
     expect(state.player.hp).toBe(state.player.maxHp)
   })
+
+  it('GIVEN sample_assist_player and two enemies WHEN runSortieSimulationStep runs THEN assist_player is wired before ally target selection and expires on fixed ticks', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'preparation'
+    startSortie(state, FDT)
+    state.allies[0].x = 80
+    state.allies[0].y = 270
+    state.enemies = [makeLiveEnemy(1), makeLiveEnemy(2)]
+    state.enemies[0].x = 130
+    state.enemies[0].y = 270
+    state.enemies[1].x = 250
+    state.enemies[1].y = 270
+
+    const input = createInputState()
+    input.assistPlayerRisingEdge = true
+    const commands = mapInputToCommands(input)
+
+    runSortieSimulationStep(state, commands, 16)
+
+    expect(state.allies[0].targetEntityId).toBe('enemy:2')
+    expect(state.commandIntentRuntime.activeIntent).toBe('assist_player')
+    expect(state.commandIntentRuntime.bufferedIntent?.sampledAtTick).toBe(0)
+    expect(state.commandIntentRuntime.bufferedIntent?.expiresAtTick).toBe(
+      state.commandIntentRuntime.assistPlayerTtlTicks,
+    )
+
+    const emptyCommands = mapInputToCommands(createInputState())
+    for (let step = 1; step < state.commandIntentRuntime.assistPlayerTtlTicks - 1; step += 1) {
+      runSortieSimulationStep(state, emptyCommands, 16)
+      expect(state.commandIntentRuntime.activeIntent).toBe('assist_player')
+    }
+
+    runSortieSimulationStep(state, emptyCommands, 16)
+    expect(state.commandIntentRuntime.activeIntent).toBe('none')
+    expect(state.commandIntentRuntime.bufferedIntent).toBeNull()
+  })
 })
 
 describe('GIVEN a terminal outcome', () => {
