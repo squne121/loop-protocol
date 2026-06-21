@@ -46,7 +46,7 @@ import {
   closeSync,
   unlinkSync,
 } from 'node:fs'
-import { join, resolve, dirname } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 
@@ -56,9 +56,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // Configuration
 // ============================================================================
 
-const REPO_ROOT = resolve(__dirname, '..', '..')
-const PRODUCER_SCRIPT = join(REPO_ROOT, 'scripts', 'generate-session-manifest.mjs')
-const ARTIFACTS_DIR = join(REPO_ROOT, 'artifacts')
+const REPO_ROOT = resolve(process.env.CLAUDE_PROJECT_DIR ?? resolve(__dirname, '..', '..'))
+const PRODUCER_SCRIPT = process.env.SESSION_MANIFEST_PRODUCER_SCRIPT ?? join(REPO_ROOT, 'scripts', 'generate-session-manifest.mjs')
+const ARTIFACTS_DIR = process.env.SESSION_MANIFEST_ARTIFACTS_DIR ?? join(REPO_ROOT, 'artifacts')
 const REPOSITORY = 'squne121/loop-protocol'
 
 // Event-type to phase mapping
@@ -109,7 +109,45 @@ function sha256(content) {
  * Strip absolute path patterns from a string for safe stderr output.
  */
 function sanitizeForStderr(msg) {
-  return String(msg).replace(/\/[^\s"']+/g, '<path>')
+  return String(msg)
+    .replace(/[A-Za-z]:\\[^\s"']+/g, '<path>')
+    .replace(/\/mnt\/[A-Za-z]\/[^\s"']+/g, '<path>')
+    .replace(/\/[^\s"']+/g, '<path>')
+}
+
+function sanitizeRelativePath(rawPath, cwd) {
+  if (typeof rawPath !== 'string' || !rawPath.trim()) return null
+  const trimmed = rawPath.trim()
+  const normalized = trimmed.replace(/\\/g, '/')
+  const cwdNormalized = typeof cwd === 'string' ? cwd.replace(/\\/g, '/') : null
+  if (cwdNormalized && isAbsolute(normalized)) {
+    const rel = relative(cwdNormalized, normalized).replace(/\\/g, '/')
+    if (rel && !rel.startsWith('..')) return rel
+  }
+  if (!isAbsolute(normalized) && !normalized.startsWith('..')) return normalized
+  return basename(normalized)
+}
+
+function normalizePayloadForDigest(payload) {
+  if (!payload || typeof payload !== 'object') return payload
+  const normalized = { ...payload }
+  delete normalized.tool_use_id
+  delete normalized.transcript_path
+  delete normalized.timestamp
+  delete normalized.invocation_id
+  if (typeof normalized.cwd === 'string') {
+    normalized.cwd = sanitizeRelativePath(normalized.cwd, normalized.cwd) ?? '<cwd>'
+  }
+  if (normalized.hook_event_name === 'PostToolUse' && normalized.tool_name === 'Bash') {
+    const command = normalized.tool_input?.command
+    if (typeof command === 'string') {
+      normalized.tool_input = {
+        ...normalized.tool_input,
+        command: command.replace(/[A-Za-z]:\\[^\s"']+/g, '<path>').replace(/\/[^\s"']+/g, '<path>'),
+      }
+    }
+  }
+  return normalized
 }
 
 /**
@@ -146,7 +184,7 @@ function canonicalJson(value) {
 function computePayloadDigest(payload) {
   if (payload == null) return 'nullpayload'
   try {
-    const serialized = canonicalJson(payload)
+    const serialized = canonicalJson(normalizePayloadForDigest(payload))
     return sha256(serialized).slice(0, 16)
   } catch {
     return 'digestfail'
