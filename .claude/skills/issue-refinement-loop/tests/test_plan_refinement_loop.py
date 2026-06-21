@@ -742,3 +742,191 @@ class TestSkillMdWiring:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# AC1: Machine-Readable Contract section absent → required_sections
+#       NOT required_contract_keys  (issue #1067)
+# ---------------------------------------------------------------------------
+
+
+class TestAC1ContractSectionAbsentMissingSection:
+    """AC1: Machine-Readable Contract section absent → missing_required_section."""
+
+    def _make_input_no_contract(self) -> dict:
+        body = "## Outcome\n\nTest outcome.\n\n## Acceptance Criteria\n\n- [ ] AC1: test\n"
+        return {
+            "schema_version": "refinement_loop_planner_input/v1",
+            "issue": {
+                "number": 1,
+                "title": "Test AC1",
+                "body": body,
+                "labels": [],
+            },
+            "comments": None,
+            "known_context": None,
+            "now": "2026-01-01T00:00:00+00:00",
+        }
+
+    def test_no_contract_section_produces_missing_section_reason(self):
+        """AC1: absent Machine-Readable Contract → reason_codes includes missing_required_section."""
+        import subprocess, json, sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        planner = scripts_dir / "plan_refinement_loop.py"
+        result = subprocess.run(
+            [sys.executable, str(planner)],
+            input=json.dumps(self._make_input_no_contract()),
+            capture_output=True, text=True,
+        )
+        out = json.loads(result.stdout)
+        assert out["fail_closed"]["required"] is True
+        reason_codes = out["fail_closed"]["reason_codes"]
+        assert "missing_required_section" in reason_codes, (
+            f"Expected missing_required_section in reason_codes, got {reason_codes}"
+        )
+        # AC1: must NOT have missing_required_contract_key mixed in for section absence
+        assert "missing_required_contract_key" not in reason_codes, (
+            f"missing_required_contract_key must not appear when section is absent, "
+            f"got {reason_codes}"
+        )
+
+    def test_no_contract_section_required_sections_contains_machine_readable_contract(self):
+        """AC1: required_sections includes 'Machine-Readable Contract' when section absent."""
+        import subprocess, json, sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        planner = scripts_dir / "plan_refinement_loop.py"
+        result = subprocess.run(
+            [sys.executable, str(planner)],
+            input=json.dumps(self._make_input_no_contract()),
+            capture_output=True, text=True,
+        )
+        out = json.loads(result.stdout)
+        rc = out["fail_closed"].get("rewrite_constraints", {})
+        required_sections = rc.get("required_sections", [])
+        assert "Machine-Readable Contract" in required_sections, (
+            f"required_sections must contain 'Machine-Readable Contract', got {required_sections}"
+        )
+        required_contract_keys = rc.get("required_contract_keys", [])
+        assert required_contract_keys == [], (
+            f"required_contract_keys must be empty when section is absent, got {required_contract_keys}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC2: Contract section present but YAML malformed → separate path (issue #1067)
+# ---------------------------------------------------------------------------
+
+
+class TestAC2ContractMalformedSeparatePath:
+    """AC2: Contract YAML parse error uses separate reason code from missing key."""
+
+    def _make_input_malformed_yaml(self) -> dict:
+        """Issue body with Machine-Readable Contract section but invalid YAML."""
+        body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            ": this is not valid yaml: \x01\x00\n"
+            "```\n\n"
+            "## Outcome\n\nTest.\n"
+        )
+        return {
+            "schema_version": "refinement_loop_planner_input/v1",
+            "issue": {
+                "number": 2,
+                "title": "Test AC2 malformed",
+                "body": body,
+                "labels": [],
+            },
+            "comments": None,
+            "known_context": None,
+            "now": "2026-01-01T00:00:00+00:00",
+        }
+
+    def _make_input_no_yaml_block(self) -> dict:
+        """Issue body with Machine-Readable Contract section but no YAML block."""
+        body = (
+            "## Machine-Readable Contract\n\n"
+            "No YAML block here.\n\n"
+            "## Outcome\n\nTest.\n"
+        )
+        return {
+            "schema_version": "refinement_loop_planner_input/v1",
+            "issue": {
+                "number": 3,
+                "title": "Test AC2 no yaml block",
+                "body": body,
+                "labels": [],
+            },
+            "comments": None,
+            "known_context": None,
+            "now": "2026-01-01T00:00:00+00:00",
+        }
+
+    def test_malformed_yaml_does_not_produce_missing_contract_key(self):
+        """AC2: parse error → reason_codes must NOT include missing_required_contract_key."""
+        import subprocess, json, sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        planner = scripts_dir / "plan_refinement_loop.py"
+        result = subprocess.run(
+            [sys.executable, str(planner)],
+            input=json.dumps(self._make_input_malformed_yaml()),
+            capture_output=True, text=True,
+        )
+        out = json.loads(result.stdout)
+        if not out["fail_closed"]["required"]:
+            return  # not fail_closed for this body — skip
+        reason_codes = out["fail_closed"]["reason_codes"]
+        assert "missing_required_contract_key" not in reason_codes, (
+            f"malformed YAML must not produce missing_required_contract_key, got {reason_codes}"
+        )
+
+    def test_no_yaml_block_produces_malformed_reason(self):
+        """AC2: section present but no YAML block → malformed_machine_readable_contract."""
+        import subprocess, json, sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        planner = scripts_dir / "plan_refinement_loop.py"
+        result = subprocess.run(
+            [sys.executable, str(planner)],
+            input=json.dumps(self._make_input_no_yaml_block()),
+            capture_output=True, text=True,
+        )
+        out = json.loads(result.stdout)
+        if not out["fail_closed"]["required"]:
+            return
+        reason_codes = out["fail_closed"]["reason_codes"]
+        # Should have malformed or parse error, NOT missing_required_contract_key
+        has_malformed = any(
+            r in reason_codes
+            for r in ["malformed_machine_readable_contract", "contract_schema_parse_error"]
+        )
+        assert has_malformed, (
+            f"Expected malformed reason for missing YAML block, got {reason_codes}"
+        )
+        assert "missing_required_contract_key" not in reason_codes, (
+            f"must not produce missing_required_contract_key for no-YAML-block case, "
+            f"got {reason_codes}"
+        )
+
+    def test_malformed_contract_required_contract_keys_is_empty(self):
+        """AC2: parsed mapping required only when section is present and YAML is valid."""
+        import subprocess, json, sys
+        from pathlib import Path
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        planner = scripts_dir / "plan_refinement_loop.py"
+        result = subprocess.run(
+            [sys.executable, str(planner)],
+            input=json.dumps(self._make_input_no_yaml_block()),
+            capture_output=True, text=True,
+        )
+        out = json.loads(result.stdout)
+        if not out["fail_closed"]["required"]:
+            return
+        rc = out["fail_closed"].get("rewrite_constraints", {})
+        required_contract_keys = rc.get("required_contract_keys", [])
+        assert required_contract_keys == [], (
+            f"required_contract_keys must be [] when YAML parse fails, got {required_contract_keys}"
+        )

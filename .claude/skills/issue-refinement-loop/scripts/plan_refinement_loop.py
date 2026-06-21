@@ -340,8 +340,8 @@ def _sha256(text: str) -> str:
 
 
 def _canonical_json(obj: Any) -> str:
-    """Produce canonical JSON (sorted keys, compact)."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Produce canonical JSON (sorted keys, compact, NaN-safe)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _extract_sections(text: str) -> dict[str, str]:
@@ -1005,6 +1005,81 @@ def _extract_missing_contract_keys(issue_body: str) -> list[str]:
     return missing
 
 
+
+def _check_contract_parse_error(issue_body: str) -> "str | None":
+    """
+    AC2: Check whether the Machine-Readable Contract section has a YAML parse error.
+
+    Precondition: the 'Machine-Readable Contract' section MUST exist in the body
+    (caller is responsible for checking this first).
+
+    Returns:
+      - FAIL_CLOSED_REASON_MALFORMED_CONTRACT if no YAML block found in section
+      - FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR if YAML is present but cannot
+        be parsed OR the parsed result is not a dict
+      - None if YAML is parseable and returns a dict (keys may still be missing)
+    """
+    if not _YAML_AVAILABLE:
+        return FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR
+
+    sections = _extract_sections(issue_body)
+    contract_section = sections.get("Machine-Readable Contract", "")
+
+    # No YAML block at all → malformed
+    yaml_match = re.search(r"```yaml\n([\s\S]*?)\n```", contract_section)
+    if not yaml_match:
+        return FAIL_CLOSED_REASON_MALFORMED_CONTRACT
+
+    yaml_content = yaml_match.group(1)
+    try:
+        parsed = _yaml_module.safe_load(yaml_content)
+    except Exception:
+        return FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR
+
+    if not isinstance(parsed, dict):
+        return FAIL_CLOSED_REASON_CONTRACT_SCHEMA_PARSE_ERROR
+
+    return None
+
+
+def _strict_json_loads(text: str) -> object:
+    """
+    AC5: Strict JSON loading that rejects NaN / Infinity / -Infinity.
+
+    Python's json.loads accepts NaN and Infinity by default (parse_constant).
+    This function uses a parse_constant hook to reject them explicitly.
+    """
+    import math
+
+    def _reject_nan(value: str) -> float:
+        raise ValueError(
+            f"Strict JSON reject: NaN/Infinity/−Infinity values are not allowed. "
+            f"Got: {value!r}"
+        )
+
+    # Python 3.8+ json.loads does NOT expose parse_constant in a portable way.
+    # The most portable approach: decode then verify no float nan/inf survived.
+    result = json.loads(text)
+    _check_no_nan(result)
+    return result
+
+
+def _check_no_nan(obj: object) -> None:
+    """AC5: Recursively reject NaN/Infinity in a decoded JSON structure."""
+    import math
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(
+                f"Strict JSON reject: NaN/Infinity value encountered: {obj!r}"
+            )
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _check_no_nan(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            _check_no_nan(item)
+
+
 def _build_fail_closed_rewrite_constraints(
     fail_closed_reasons: list[str],
     missing_sections: list[str],
@@ -1125,13 +1200,22 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         section_headings = _extract_sections(issue_body)
         has_contract_section = "Machine-Readable Contract" in section_headings
         if not has_contract_section:
+            # AC1: Machine-Readable Contract section is absent → missing_required_section,
+            # NOT missing_required_contract_key. The section itself is missing.
             accumulated_missing_sections.extend(["Machine-Readable Contract"])
-            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
+            fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_SECTION)
         else:
-            missing_contract_keys = _extract_missing_contract_keys(issue_body)
-            if missing_contract_keys:
-                accumulated_missing_contract_keys.extend(missing_contract_keys)
-                fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
+            # AC2: Section present — distinguish parse error from key absence.
+            _contract_parse_error = _check_contract_parse_error(issue_body)
+            if _contract_parse_error:
+                # YAML parse error or malformed block — separate path from missing key.
+                fail_closed_reasons.append(_contract_parse_error)
+                # required_contract_keys is empty when we can't parse the YAML at all
+            else:
+                missing_contract_keys = _extract_missing_contract_keys(issue_body)
+                if missing_contract_keys:
+                    accumulated_missing_contract_keys.extend(missing_contract_keys)
+                    fail_closed_reasons.append(FAIL_CLOSED_REASON_MISSING_CONTRACT_KEY)
 
         # Apply alias normalization (design→research, tracking→parent, etc.)
         # _normalize_issue_kind returns None for unknown/unresolvable kinds.
@@ -1420,8 +1504,8 @@ def main(argv: list[str] | None = None) -> None:
     """Main CLI entry point."""
     try:
         input_text = sys.stdin.read()
-        input_data = json.loads(input_text)
-    except json.JSONDecodeError as e:
+        input_data = _strict_json_loads(input_text)
+    except (json.JSONDecodeError, ValueError) as e:
         # B3: Return schema-valid decisions even for JSON decode errors
         fail_closed_plan = {
             "schema_version": SCHEMA_VERSION,
@@ -1469,13 +1553,13 @@ def main(argv: list[str] | None = None) -> None:
                 "human_message": f"Invalid JSON input: {str(e)}",
             },
         }
-        print(json.dumps(fail_closed_plan, ensure_ascii=False, indent=2))
+        print(json.dumps(fail_closed_plan, ensure_ascii=False, indent=2, allow_nan=False))
         sys.exit(2)
 
     plan, exit_code = plan_refinement_loop(input_data)
 
     # Output JSON to stdout (no prose/markdown)
-    output_text = json.dumps(plan, ensure_ascii=False, indent=2)
+    output_text = json.dumps(plan, ensure_ascii=False, indent=2, allow_nan=False)
     print(output_text)
 
     sys.exit(exit_code)
