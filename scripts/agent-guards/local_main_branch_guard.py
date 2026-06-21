@@ -39,6 +39,7 @@ from typing import Any
 
 REASON_NOT_LOCAL_ROOT = "not_local_root_context"
 REASON_READONLY = "readonly_command"
+REASON_BRANCH_SAFE_MAINTENANCE = "branch_safe_maintenance_command"
 REASON_RECOVERY = "recovery_to_default_branch"
 REASON_DRIFT = "local_root_branch_drift"
 REASON_ALREADY_DRIFTED = "already_drifted_root"
@@ -293,12 +294,10 @@ DISPLAY_READONLY_PATTERNS = [
 ]
 
 # Operations that may touch local metadata but do not move the root checkout.
-NON_BRANCH_MUTATING_PATTERNS = [
+BRANCH_SAFE_MAINTENANCE_PATTERNS = [
     r"^git\s+fetch(\s|$)",
     r"^git\s+worktree\s+prune(\s|$)",
 ]
-
-READONLY_PATTERNS = DISPLAY_READONLY_PATTERNS + NON_BRANCH_MUTATING_PATTERNS
 
 READONLY_PIPELINE_SEGMENT_PATTERNS = [
     r"^head(?:\s+-n\s+\d+)?$",
@@ -409,9 +408,18 @@ def tokenize_command(cmd: str) -> list[str] | None:
 
 
 def is_readonly_command(cmd: str) -> bool:
-    """Return True if the command is clearly read-only and safe."""
+    """Return True if the command is a display-oriented read-only command."""
     cmd = cmd.strip()
-    for pattern in READONLY_PATTERNS:
+    for pattern in DISPLAY_READONLY_PATTERNS:
+        if re.match(pattern, cmd):
+            return True
+    return False
+
+
+def is_branch_safe_maintenance_command(cmd: str) -> bool:
+    """Return True if the command mutates metadata but not the root checkout branch."""
+    cmd = cmd.strip()
+    for pattern in BRANCH_SAFE_MAINTENANCE_PATTERNS:
         if re.match(pattern, cmd):
             return True
     return False
@@ -812,6 +820,18 @@ def evaluate(
         return _result(
             status="allow",
             reason_code=REASON_READONLY,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 9.5: Branch-safe maintenance commands remain allowed, but must not
+    # reuse readonly telemetry or readonly pipeline classification.
+    if is_branch_safe_maintenance_command(normalized_cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_BRANCH_SAFE_MAINTENANCE,
             current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
