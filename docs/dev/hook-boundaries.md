@@ -207,7 +207,7 @@ hook_boundaries_manifest_v1:
     matcher: null
     command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh"
     args: []
-    timeout: 180
+    timeout: 55
     classification: telemetry
     fail_policy: fail_open
     script_exit_contract:
@@ -218,7 +218,7 @@ hook_boundaries_manifest_v1:
       exit_2_effect: prevents_stop
       other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
-    stderr_contract: diagnostic_on_failure_max_10_lines
+    stderr_contract: machine_readable_timeout_reason_max_10_lines
     redaction_contract:
       no_raw_command: true
       no_raw_secret_like_value: true
@@ -227,9 +227,11 @@ hook_boundaries_manifest_v1:
     agent_action:
       on_any: proceed
     notes: >
-      Stop イベントで session manifest を生成する。
+      Stop イベントで pending debounce state を flush したうえで session manifest を生成する。
       guard（session_recording_policy_guard.sh）と
       producer（generate_session_manifest_from_hook.mjs）を逐次実行する coordinator。
+      debounce flush / guard / producer は個別 timeout を持ち、
+      hang 時も 60 秒未満で exit 0 のまま machine-readable timeout reason を返す。
       guard failure / producer failure いずれも exit 0（fail-open）。
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
@@ -239,7 +241,7 @@ hook_boundaries_manifest_v1:
     matcher: null
     command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh"
     args: []
-    timeout: 180
+    timeout: 55
     classification: telemetry
     fail_policy: fail_open
     script_exit_contract:
@@ -250,7 +252,7 @@ hook_boundaries_manifest_v1:
       exit_2_effect: prevents_subagent_stop
       other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
-    stderr_contract: diagnostic_on_failure_max_10_lines
+    stderr_contract: machine_readable_timeout_reason_max_10_lines
     redaction_contract:
       no_raw_command: true
       no_raw_secret_like_value: true
@@ -260,16 +262,17 @@ hook_boundaries_manifest_v1:
       on_any: proceed
     notes: >
       SubagentStop イベントでも session_manifest_coordinator と同一スクリプトを使用。
+      pending debounce state を flush してから guard / producer を実行する。
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
-  - handler_id: generate_session_manifest_from_hook
+  - handler_id: session_manifest_debounce
     event: PostToolUse
     matcher: "Bash|Edit|Write"
     command: "node"
     args:
-      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/generate_session_manifest_from_hook.mjs"
-    timeout: 60
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_debounce.mjs"
+    timeout: 10
     classification: telemetry
     fail_policy: fail_open
     script_exit_contract:
@@ -280,7 +283,7 @@ hook_boundaries_manifest_v1:
       exit_2_effect: cannot_block_completed_tool_call
       other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
-    stderr_contract: diagnostic_on_failure
+    stderr_contract: silent_or_machine_readable_summary_max_10_lines
     redaction_contract:
       no_raw_command: true
       no_raw_secret_like_value: true
@@ -289,9 +292,11 @@ hook_boundaries_manifest_v1:
     agent_action:
       on_any: proceed
     notes: >
-      PostToolUse hook（Bash|Edit|Write）で session manifest を更新する。
-      command が "node" で、実際のスクリプトは args[0] に格納される（AC6）。
-      producer failure は exit 0 扱いで agent を block しない。
+      PostToolUse hook（Bash|Edit|Write）は Claude Code native async で
+      session_manifest_debounce.mjs を front gate として起動する。
+      read-only Bash は skip し、mutation Bash / Edit / Write のみ debounce queue へ入れる。
+      command が "node" で、実際のスクリプトは args[0] に格納される。
+      producer invocation は detached worker で集約され、PostToolUse path 自体は stdout を出さない。
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
