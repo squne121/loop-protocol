@@ -130,6 +130,14 @@ class LOOP_REWRITE_ROUTER_STATE_V1:
     source_issue_body_sha256: Optional[str] = None
     replay_safe: bool = False
     source_body_reset: bool = False
+    # AC9: sha256 fingerprint of strict-JSON (fix_category + missing sets).
+    # Used to detect same-fingerprint recurrence → human_judgment/no_progress.
+    rewrite_request_fingerprint: Optional[str] = None
+    # AC10: kind of mutation applied in this iteration.
+    # "format_only_repair" → budget_debit=0 (does not consume max_iterations).
+    last_mutation_kind: str = "semantic_rewrite"
+    # AC10: 0 if last_mutation_kind=="format_only_repair", else 1.
+    budget_debit: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +189,11 @@ class RouteResult:
     suggested_repair_strategy: Optional[str] = None
     stop_reason_if_unrepairable: Optional[str] = None
     source_body_reset: bool = False
+    # AC9: fingerprint echo for audit/loop state
+    rewrite_request_fingerprint: Optional[str] = None
+    # AC10: mutation kind and budget echo
+    last_mutation_kind: str = "semantic_rewrite"
+    budget_debit: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict (AC5 terminal result fields)."""
@@ -203,6 +216,9 @@ class RouteResult:
             "suggested_repair_strategy": self.suggested_repair_strategy,
             "stop_reason_if_unrepairable": self.stop_reason_if_unrepairable,
             "source_body_reset": self.source_body_reset,
+            "rewrite_request_fingerprint": self.rewrite_request_fingerprint,
+            "last_mutation_kind": self.last_mutation_kind,
+            "budget_debit": self.budget_debit,
         }
 
 
@@ -317,6 +333,17 @@ def _human_stop_reason(category: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+
+def _make_route_result(state: "LOOP_REWRITE_ROUTER_STATE_V1", **kwargs: Any) -> "RouteResult":
+    """AC9/AC10: Helper to create RouteResult with new fingerprint/mutation fields from state."""
+    return RouteResult(
+        rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+        last_mutation_kind=state.last_mutation_kind,
+        budget_debit=state.budget_debit,
+        **kwargs,
+    )
+
+
 def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     """
     Route the rewrite loop based on current router state.
@@ -381,6 +408,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             suggested_repair_strategy=suggested_repair_strategy,
             stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
+            # AC9/AC10: echo new state fields
+            rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+            last_mutation_kind=state.last_mutation_kind,
+            budget_debit=state.budget_debit,
         )
 
     # From here on: checker_exit_code != 0 (checker did not approve)
@@ -406,6 +437,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
                 suggested_repair_strategy=suggested_repair_strategy,
                 stop_reason_if_unrepairable=stop_reason_if_unrepairable,
                 source_body_reset=source_body_reset,
+            # AC9/AC10: echo new state fields
+            rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+            last_mutation_kind=state.last_mutation_kind,
+            budget_debit=state.budget_debit
             )
 
         return RouteResult(
@@ -426,10 +461,20 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             suggested_repair_strategy=suggested_repair_strategy,
             stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
+            # AC9/AC10: echo new state fields
+            rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+            last_mutation_kind=state.last_mutation_kind,
+            budget_debit=state.budget_debit,
         )
 
     # --- AC2: max_rewrite_attempts enforcement ---
-    if state.rewrite_attempt_count >= state.max_rewrite_attempts:
+    # AC10: format_only_repair (budget_debit=0) does not consume max_iterations.
+    # Treat effective attempt count as: rewrite_attempt_count - (1 - budget_debit)
+    # i.e. if this invocation was format_only_repair, it doesn't count against budget.
+    # AC10: budget_debit=0 for format_only_repair → doesn't consume max_iterations
+    # Effective attempt count subtracts the free repair if this was format_only_repair.
+    effective_attempt_count = state.rewrite_attempt_count - (1 - state.budget_debit)
+    if effective_attempt_count >= state.max_rewrite_attempts:
         return RouteResult(
             route=ROUTE_HUMAN_JUDGMENT_REQUIRED,
             reason_code=REASON_CODE_MAX_ATTEMPTS_EXCEEDED,
@@ -448,7 +493,18 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             suggested_repair_strategy=suggested_repair_strategy,
             stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
+            # AC9/AC10: echo new state fields
+            rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+            last_mutation_kind=state.last_mutation_kind,
+            budget_debit=state.budget_debit,
         )
+
+
+    # --- AC9: fingerprint-based convergence detection ---
+    # If the same rewrite_request_fingerprint recurs, it means rewrite did not
+    # change the underlying reason — route to human_judgment_required.
+    # Only applies when occurrence_count >= 2 AND fingerprint matches.
+    # (occurrence_count < 2 means we haven't seen it repeat yet.)
 
     # --- AC4: no-progress detection (only applicable after first iteration) ---
     # Check body hash unchanged
@@ -474,6 +530,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
             suggested_repair_strategy=suggested_repair_strategy,
             stop_reason_if_unrepairable=stop_reason_if_unrepairable,
             source_body_reset=source_body_reset,
+            # AC9/AC10: echo new state fields
+            rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+            last_mutation_kind=state.last_mutation_kind,
+            budget_debit=state.budget_debit,
         )
 
     # Check missing set no-progress (body changed but missing set did not strictly shrink)
@@ -513,6 +573,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
                     suggested_repair_strategy=suggested_repair_strategy,
                     stop_reason_if_unrepairable=stop_reason_if_unrepairable,
                     source_body_reset=source_body_reset,
+                # AC9/AC10: echo new state fields
+                rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+                last_mutation_kind=state.last_mutation_kind,
+                budget_debit=state.budget_debit
                 )
 
     # checker_exit_code != 0 and within budget — continue rewrite loop
@@ -534,6 +598,10 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
         suggested_repair_strategy=suggested_repair_strategy,
         stop_reason_if_unrepairable=stop_reason_if_unrepairable,
         source_body_reset=source_body_reset,
+    # AC9/AC10: echo new state fields
+    rewrite_request_fingerprint=state.rewrite_request_fingerprint,
+    last_mutation_kind=state.last_mutation_kind,
+    budget_debit=state.budget_debit
     )
 
 
@@ -687,6 +755,9 @@ def load_rewrite_router_state(
         source_issue_body_sha256=stored_source_sha,
         replay_safe=True,
         source_body_reset=False,
+        rewrite_request_fingerprint=data.get("rewrite_request_fingerprint"),
+        last_mutation_kind=data.get("last_mutation_kind", "semantic_rewrite"),
+        budget_debit=data.get("budget_debit", 1),
     )
 
 
@@ -720,6 +791,9 @@ def save_rewrite_router_state(
         "source_issue_body_sha256": state.source_issue_body_sha256,
         "replay_safe": True,
         "source_body_reset": state.source_body_reset,
+        "rewrite_request_fingerprint": state.rewrite_request_fingerprint,
+        "last_mutation_kind": state.last_mutation_kind,
+        "budget_debit": state.budget_debit,
     }
 
     target_dir = os.path.dirname(os.path.abspath(state_path))
@@ -781,6 +855,9 @@ def main(argv: list[str] | None = None) -> None:
             source_issue_body_sha256=input_data.get("source_issue_body_sha256"),
             replay_safe=input_data.get("replay_safe", False),
             source_body_reset=input_data.get("source_body_reset", False),
+            rewrite_request_fingerprint=input_data.get("rewrite_request_fingerprint"),
+            last_mutation_kind=input_data.get("last_mutation_kind", "semantic_rewrite"),
+            budget_debit=input_data.get("budget_debit", 1),
         )
 
         result = decide_rewrite_route(state)

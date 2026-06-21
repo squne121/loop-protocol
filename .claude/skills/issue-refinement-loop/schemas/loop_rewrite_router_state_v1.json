@@ -15,23 +15,99 @@
       "type": "string",
       "const": "loop_rewrite_router_state/v1"
     },
-    "rewrite_attempt_count": {"type": "integer", "minimum": 0},
-    "max_rewrite_attempts": {"type": "integer", "minimum": 1},
-    "checker_exit_code": {"type": "integer"},
+    "rewrite_attempt_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_rewrite_attempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "checker_exit_code": {
+      "type": "integer"
+    },
     "checked_body_sha256": {
       "type": "string",
       "pattern": "^(sha256:)?[A-Fa-f0-9]{64}$"
     },
-    "fix_category": {"type": "string"},
-    "rewrite_history": {"type": "array", "items": {"type": "string"}},
-    "occurrence_count": {"type": "integer", "minimum": 0},
-    "missing_sections": {"type": "array", "items": {"type": "string"}},
-    "missing_contract_keys": {"type": "array", "items": {"type": "string"}},
-    "previous_checked_body_sha256": {"type": ["string", "null"]},
-    "previous_missing_sections": {"type": "array", "items": {"type": "string"}},
-    "previous_missing_contract_keys": {"type": "array", "items": {"type": "string"}},
-    "source_issue_body_sha256": {"type": ["string", "null"]},
-    "replay_safe": {"type": "boolean"},
-    "source_body_reset": {"type": "boolean"}
+    "fix_category": {
+      "type": "string"
+    },
+    "rewrite_history": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "occurrence_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "missing_sections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "missing_contract_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "previous_checked_body_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "previous_missing_sections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "previous_missing_contract_keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_issue_body_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "replay_safe": {
+      "type": "boolean"
+    },
+    "source_body_reset": {
+      "type": "boolean"
+    },
+    "rewrite_request_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "AC9: SHA256 fingerprint of fix_category + missing sets for convergence detection."
+    },
+    "last_mutation_kind": {
+      "type": "string",
+      "enum": [
+        "semantic_rewrite",
+        "format_only_repair",
+        "no_change"
+      ],
+      "description": "AC10: Kind of mutation applied.",
+      "default": "semantic_rewrite"
+    },
+    "budget_debit": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "AC10: 0 for format_only_repair, 1 otherwise.",
+      "default": 1
+    }
   }
 }

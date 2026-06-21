@@ -575,3 +575,65 @@ class TestPlannerContainsConstraintsV1:
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
+
+
+
+# ---------------------------------------------------------------------------
+# AC4 / AC5: NaN / Infinity strict JSON (issue #1067)
+# ---------------------------------------------------------------------------
+
+
+class TestAC4AC5StrictJsonNanRejection:
+    """AC4/AC5: json.dumps uses allow_nan=False; json.loads rejects NaN/Infinity."""
+
+    def test_planner_output_does_not_contain_nan(self):
+        """AC4: planner output JSON is valid strict JSON (no NaN/Infinity)."""
+        import math
+        body = load_fixture("missing_outcome_section", "malformed") or "## Outcome\n\nTest.\n"
+        output, exit_code = run_planner(make_input(body))
+        # Re-serialize and parse to detect NaN
+        serialized = json.dumps(output)
+        reparsed = json.loads(serialized)
+
+        def check_no_nan(obj):
+            if isinstance(obj, float):
+                assert not math.isnan(obj) and not math.isinf(obj), (
+                    f"NaN/Infinity found in planner output: {obj}"
+                )
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    check_no_nan(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    check_no_nan(item)
+        check_no_nan(reparsed)
+
+    def test_canonical_json_rejects_nan(self):
+        """AC4: _canonical_json with allow_nan=False raises on NaN input."""
+        import sys
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import importlib
+        import plan_refinement_loop as planner_mod
+        import math
+        import pytest
+        with pytest.raises((ValueError, TypeError)):
+            planner_mod._canonical_json({"value": math.nan})
+
+    def test_strict_json_loads_rejects_nan_string(self):
+        """AC5: _strict_json_loads rejects bare NaN token (Python json quirk)."""
+        import sys
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import plan_refinement_loop as planner_mod
+        import pytest
+        # Python's json.loads accepts NaN as a float by default
+        # Our strict version must reject it
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            planner_mod._strict_json_loads('{"value": NaN}')
+
+    def test_strict_json_loads_accepts_valid_json(self):
+        """AC5: _strict_json_loads accepts normal JSON without error."""
+        import sys
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import plan_refinement_loop as planner_mod
+        result = planner_mod._strict_json_loads('{"key": "value", "n": 42}')
+        assert result == {"key": "value", "n": 42}

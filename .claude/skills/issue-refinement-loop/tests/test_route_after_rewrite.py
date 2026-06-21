@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from unittest import mock
 
 import pytest
 
@@ -27,6 +28,42 @@ _SCRIPTS_DIR = _SKILL_ROOT / "scripts"
 
 # Add scripts to path for direct import
 sys.path.insert(0, str(_SCRIPTS_DIR))
+
+
+import run_refinement_preflight as wrapper  # noqa: E402 — for AC11 tests
+
+
+# ---------------------------------------------------------------------------
+# Helpers for AC11 tests
+# ---------------------------------------------------------------------------
+
+def run_planner(input_data):
+    """Run plan_refinement_loop.py and return (output_dict, exit_code)."""
+    import subprocess, json as _json, sys as _sys
+    script = _SCRIPTS_DIR / "plan_refinement_loop.py"
+    result = _sys.modules[__name__]  # get module
+    proc = subprocess.run(
+        [_sys.executable, str(script)],
+        input=_json.dumps(input_data, ensure_ascii=False),
+        capture_output=True, text=True,
+    )
+    return _json.loads(proc.stdout), proc.returncode
+
+
+def make_input(body, issue_number=1):
+    """Build a minimal valid REFINEMENT_LOOP_PLANNER_INPUT_V1 from body text."""
+    return {
+        "schema_version": "refinement_loop_planner_input/v1",
+        "issue": {
+            "number": issue_number,
+            "title": f"Test Issue #{issue_number}",
+            "body": body,
+            "labels": [],
+        },
+        "comments": None,
+        "known_context": None,
+        "now": "2026-01-01T00:00:00+00:00",
+    }
 
 from route_after_rewrite import (  # noqa: E402
     _sha256_of_body,
@@ -516,3 +553,187 @@ class TestRouteAfterRewrireCli:
             f"Wrapper must exit 0 when routing succeeds. "
             f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         )
+
+
+
+# ---------------------------------------------------------------------------
+# AC8: artifact source-of-truth for missing_sections (issue #1067)
+# ---------------------------------------------------------------------------
+
+
+class TestAC8ArtifactSourceOfTruth:
+    """AC8: route_after_rewrite reads missing_sections from preflight artifact."""
+
+    def _make_preflight_artifact(self, tmp_path, required_sections=None, required_contract_keys=None):
+        """Create a minimal refinement_preflight_result_v1.json artifact."""
+        artifact = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "blocked",
+            "issue_number": 100,
+            "repo": "testowner/testrepo",
+            "planner_exit_code": 0,
+            "planner_fail_closed": True,
+            "next_action": "human_judgment_required",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": ["PLANNER_FAIL_CLOSED"],
+            "planner_fail_closed_reason_codes": ["missing_required_section"],
+            "required_sections": required_sections or ["Outcome"],
+            "required_contract_keys": required_contract_keys or [],
+            "artifacts": {},
+            "hashes": {},
+        }
+        p = tmp_path / "refinement_preflight_result_v1.json"
+        p.write_text(json.dumps(artifact), encoding="utf-8")
+        return str(p)
+
+    def test_extract_missing_from_artifact_success(self, tmp_path):
+        """AC8: _extract_missing_from_artifact reads required_sections correctly."""
+        from route_after_rewrite import _extract_missing_from_artifact
+        artifact_path = self._make_preflight_artifact(
+            tmp_path,
+            required_sections=["Outcome", "Acceptance Criteria"],
+            required_contract_keys=["contract_schema_version"],
+        )
+        sections, keys, err = _extract_missing_from_artifact(artifact_path)
+        assert err is None, f"Expected no error, got {err}"
+        assert sections == ["Outcome", "Acceptance Criteria"]
+        assert keys == ["contract_schema_version"]
+
+    def test_extract_missing_from_artifact_none_path(self):
+        """AC8: None artifact_path returns error reason code."""
+        from route_after_rewrite import _extract_missing_from_artifact
+        sections, keys, err = _extract_missing_from_artifact(None)
+        assert err is not None
+        assert sections == []
+        assert keys == []
+
+    def test_extract_missing_from_artifact_missing_file(self, tmp_path):
+        """AC8: non-existent artifact file returns error reason code."""
+        from route_after_rewrite import _extract_missing_from_artifact
+        sections, keys, err = _extract_missing_from_artifact(str(tmp_path / "nonexistent.json"))
+        assert err is not None
+
+    def test_extract_missing_from_artifact_invalid_schema(self, tmp_path):
+        """AC8: artifact with wrong schema_version returns error reason code."""
+        from route_after_rewrite import _load_preflight_artifact
+        p = tmp_path / "bad.json"
+        p.write_text(json.dumps({"schema_version": "wrong/v1", "data": "x"}), encoding="utf-8")
+        result = _load_preflight_artifact(str(p))
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# AC11: false-positive fail_closed regression (issue #1067)
+# ---------------------------------------------------------------------------
+
+
+class TestAC11FalsePositiveFailClosedRegression:
+    """AC11: valid canonical fixture does NOT trigger fail_closed."""
+
+    def _make_canonical_valid_fixture(self) -> str:
+        """Return a canonical valid implementation issue body."""
+        return """## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "#100"
+```
+
+## Parent Issue
+
+#100
+
+## Parent Goal Ref
+
+- Goal: test
+
+## Current Validated Scope
+
+- scripts/foo.py
+
+## Remaining Parent Gaps
+
+- [ ] None remaining
+
+## Outcome
+
+Add `scripts/foo.py`.
+
+## In Scope
+
+- scripts/foo.py
+
+## Out of Scope
+
+- Unrelated changes
+
+## Acceptance Criteria
+
+- [ ] AC1: Script exists.
+
+## Verification Commands
+
+```bash
+uv run python3 scripts/foo.py
+```
+
+## Allowed Paths
+
+- scripts/foo.py
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要な場合
+
+## Required Skills
+
+なし
+"""
+
+    def test_valid_canonical_body_does_not_trigger_fail_closed(self):
+        """AC11: canonical valid body must NOT produce fail_closed.required=True."""
+        body = self._make_canonical_valid_fixture()
+        output, exit_code = run_planner(make_input(body))
+        # May produce warn (unknown confidence) but must NOT be fail_closed
+        assert exit_code == 0, f"Expected exit 0 (may warn), got {exit_code}"
+        assert output["fail_closed"]["required"] is False, (
+            f"Valid canonical body must not trigger fail_closed, "
+            f"got reason_codes={output['fail_closed'].get('reason_codes')}"
+        )
+
+    def test_valid_body_produces_pass_or_warn_not_blocked(self, tmp_path, capsys):
+        """AC11: valid body through preflight → pass or warn, not blocked."""
+        body = self._make_canonical_valid_fixture()
+        fixture_data = {
+            "schema_version": "refinement_preflight_input/v1",
+            "issue_number": 999,
+            "repo": "testowner/testrepo",
+            "now": "2026-01-01T00:00:00+00:00",
+            "issue": {
+                "number": 999,
+                "title": "Canonical Valid Issue",
+                "body": body,
+                "labels": [],
+            },
+            "comments": [],
+            "anchor_comment_urls": [],
+        }
+        fixture_path = tmp_path / "canonical.json"
+        fixture_path.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=999,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        assert result["status"] in ("pass", "warn"), (
+            f"Valid canonical body must produce pass/warn, got {result['status']} "
+            f"with blockers={result.get('blockers')}"
+        )
+        assert exit_code in (0, 1), f"Expected exit 0 or 1, got {exit_code}"
