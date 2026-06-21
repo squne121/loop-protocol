@@ -485,3 +485,41 @@ class TestPythonpathStaleAndTmpWrapper:
             elif "PYTHONPATH" in os.environ:
                 del os.environ["PYTHONPATH"]
         assert result["status"] == "allow"
+
+
+class TestGhMutationFailClosedCompleteness:
+    """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness)."""
+
+    @pytest.mark.parametrize("cmd", [
+        "gh issue create --title x --body y",
+        "gh issue develop 123 --base main",
+        "gh issue develop 123 --checkout",
+        "gh issue transfer 123 other/repo",
+        "gh issue pin 123",
+        "gh issue unpin 123",
+        "gh pr create --title x --body y",
+        "gh pr revert 123",
+        "gh pr lock 123",
+        "gh pr unlock 123",
+    ])
+    def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh mutation not in original denylist WHEN evaluated THEN blocked (allowlist-closed)."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+
+class TestProjectTmpPolicy:
+    """AC14: OS absolute /tmp is blocked but project-relative tmp/ is not mis-identified."""
+
+    def test_repo_relative_tmp_script_is_not_blocked(self, tmp_git_repo: Path):
+        """GIVEN uv run python3 tmp/check.py (relative) WHEN evaluated THEN allow (not OS /tmp)."""
+        result = eval_codex("uv run python3 tmp/check.py --dry-run", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result.get("reason_code") != REASON_UNPARSEABLE
+
+    def test_absolute_tmp_script_is_blocked(self, tmp_git_repo: Path):
+        """GIVEN uv run python3 /tmp/check.py (OS absolute) WHEN evaluated THEN blocked."""
+        result = eval_codex("uv run python3 /tmp/check.py --dry-run", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE

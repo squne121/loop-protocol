@@ -291,11 +291,9 @@ DETERMINISTIC_CHECKER_ALLOWLIST = [
     ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
 ]
 
-# ─── Gh mutation deny patterns ────────────────────────────────────────────────
-GH_MUTATION_DENY_PATTERNS = [
-    r"^gh\s+issue\s+(edit|comment|close|reopen|delete|lock|unlock)(\s|$)",
-    r"^gh\s+pr\s+(checkout|edit|comment|merge|close|reopen|ready|review|update-branch)(\s|$)",
-]
+# ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
+# ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS is blocked.
+GH_ISSUE_PR_COMMAND_PATTERN = re.compile(r"^gh\s+(issue|pr)\s+")
 
 # Patterns for display-oriented read-only commands.
 DISPLAY_READONLY_PATTERNS = [
@@ -469,12 +467,20 @@ def is_deterministic_checker_command(cmd: str, project_root: str | None = None) 
 
 
 def is_gh_mutation_command(cmd: str) -> bool:
-    """Return True if command is a gh mutation command (fail-closed, AC11)."""
+    """gh issue/pr コマンドで readonly allowlist 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
+    DISPLAY_READONLY_PATTERNS に含まれる gh issue view/list, gh pr view/list/status のみ通過。
+    gh issue create/develop/transfer/pin/unpin, gh pr create/revert/lock/unlock 等はすべてブロック。
+    """
     cmd = cmd.strip()
-    for pattern in GH_MUTATION_DENY_PATTERNS:
+    # Only applies to gh issue/pr subcommands
+    if not GH_ISSUE_PR_COMMAND_PATTERN.match(cmd):
+        return False
+    # If in readonly allowlist, it is NOT a mutation
+    for pattern in DISPLAY_READONLY_PATTERNS:
         if re.match(pattern, cmd):
-            return True
-    return False
+            return False
+    # gh issue/pr not in readonly allowlist → treat as mutation → block
+    return True
 
 
 def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
@@ -1003,7 +1009,9 @@ def evaluate(
                 hook_flavor=hook_flavor,
             )
 
-    # Step 13.5: Deterministic checker commands — allowed with distinct reason_code (AC5/AC12).
+    # Step 13.5: Deterministic checker commands on default branch — allowed with distinct reason_code (AC5/AC12).
+    # NOTE: drifted/detached root is blocked by step 13 before reaching here.
+    # deterministic_checker is intentionally NOT in the drifted allowlist; checker scripts should run from worktrees.
     project_root = _resolve_project_root(cwd)
     if is_deterministic_checker_command(normalized_cmd, project_root):
         return _result(
