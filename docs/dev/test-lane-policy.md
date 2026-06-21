@@ -8,13 +8,13 @@
 
 現行 CI（`.github/workflows/ci.yml`）での実装状態:
 
-- `python-test` job はまだ `setup-node-pnpm` と `pnpm install --frozen-lockfile` を実行している
+- `python-test` job は `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` と `pnpm install --frozen-lockfile` は実行しない
 - `pytest` は複数の step に分割されて実行されている
 - `schemas/tests/` は実行されているが、`ci_test_selection/v1` の `pytest_args` からは欠落している
 - `ruff` は未導入（`pyproject.toml` に dev dependency として登録されていない）
 - `pytest-xdist` は未導入（`pyproject.toml` に dev dependency として登録されていない）
 
-後続の child Issue（#1063 Ruff 導入、#1064 pytest-xdist 導入、#1061 python-test 整理）にて実際の CI 変更が行われる。
+後続の child Issue（#1063 Ruff 導入、#1064 pytest-xdist 導入）にて追加の CI 変更が行われる。
 
 ## Target Policy（目標ポリシー）
 

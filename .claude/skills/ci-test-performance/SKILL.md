@@ -25,7 +25,7 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 
 この Skill が定義する Target Policy と現行 CI 実装の差分:
 
-- `python-test` job は現在 `setup-node-pnpm` / `pnpm install --frozen-lockfile` を実行している（後続 child Issue で削除予定）
+- `python-test` job は現在 `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` / `pnpm install --frozen-lockfile` は実行しない
 - `pytest` は複数の step に分割されて実行されている（後続 child Issue で統合予定）
 - `schemas/tests/` は実行されているが `ci_test_selection/v1` の `pytest_args` に未登録
 - `ruff` は未導入（#1063 で対応予定）

@@ -716,7 +716,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-node-pnpm
       - uses: ./.github/actions/setup-python-uv
       - name: uv python install (timed)
         id: timed-uv-python-install
@@ -756,25 +755,6 @@ jobs:
             return $status
           }
           run_timed uv_sync uv sync --locked --group dev
-      - name: Install dependencies (timed)
-        id: timed-pnpm-install
-        run: |
-          run_timed() {
-            local step_id="$1"; shift
-            local start_ms end_ms elapsed_ms status
-            start_ms=$(date +%s%3N)
-            set +e
-            "$@"
-            status=$?
-            set -e
-            end_ms=$(date +%s%3N)
-            elapsed_ms=$((end_ms - start_ms))
-            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
-              "$step_id" "$step_id" "$status" "$elapsed_ms" \
-              >> measurements.jsonl
-            return $status
-          }
-          run_timed pnpm_install pnpm install --frozen-lockfile
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version

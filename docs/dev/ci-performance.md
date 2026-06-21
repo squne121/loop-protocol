@@ -68,7 +68,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 
 | phase_id | 対象コマンド | 対象 job |
 |---|---|---|
-| `pnpm_install` | `pnpm install --frozen-lockfile` | typecheck / lint / test / build / e2e / python-test |
+| `pnpm_install` | `pnpm install --frozen-lockfile` | typecheck / lint / test / build / e2e |
 | `pnpm_typecheck` | `pnpm typecheck` | typecheck |
 | `pnpm_lint` | `pnpm lint` | lint |
 | `pnpm_manifest_check` | `pnpm manifest:check` | test |
