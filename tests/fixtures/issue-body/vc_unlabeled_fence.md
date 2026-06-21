@@ -12,6 +12,8 @@ unlabeled fence VC format のテスト用 fixture（非 canonical）。
 
 ## Verification Commands
 
+<!-- Intentional negative VC fixture: the following fence must remain unlabeled to exercise unlabeled_fence / non-canonical VC handling. -->
+<!-- markdownlint-disable-next-line MD040 -->
 ```
 # AC1
 $ uv run pytest tests/ -x -q
