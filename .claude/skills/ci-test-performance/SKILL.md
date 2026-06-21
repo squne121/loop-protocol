@@ -26,8 +26,9 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 この Skill が定義する Target Policy と現行 CI 実装の差分:
 
 - `python-test` job は現在 `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` / `pnpm install --frozen-lockfile` は実行しない
-- `python-test` の hook pytest は Python-only hook tests を継続実行し、Node-backed 2 nodeid は `-k not (...)` で除外している
+- `python-test` の hook pytest は Python-only hook tests を継続実行し、Node-backed 2 nodeid は `--deselect=<exact nodeid>` で除外している
 - `node-backed-hook-tests` job が Node.js / pnpm 依存の hook wrapper 検証を専用に実行している
+- `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
 - `pytest` は複数の step に分割されて実行されている（後続 child Issue で統合予定）
 - `schemas/tests/` は実行されているが `ci_test_selection/v1` の `pytest_args` に未登録
 - `ruff` は未導入（#1063 で対応予定）
@@ -78,6 +79,7 @@ rg "pytest_args" .claude/skills/ docs/ 2>/dev/null | head -20
 - `ci_test_selection/v1` と実際の pytest step の差分を検出する
 - `schemas/tests/` が `pytest_args` から欠落している場合は `risk_flags` に記録する
 - `python-test` と `node-backed-hook-tests` の collect-only / artifact が lane 分離後の実行対象と矛盾しないか確認する
+- reviewer gate に使う artifact は upload 前に `test -s` を通し、`if-no-files-found: error` で silent-fail を避ける
 
 ### Step 4: CI_TEST_PERFORMANCE_DECISION_V1 の出力
 

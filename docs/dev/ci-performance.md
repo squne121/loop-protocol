@@ -130,6 +130,7 @@ Node-backed hook test 専用 job では、Node.js / pnpm 依存の hook wrapper 
 - `if: ${{ !cancelled() }}` を使い、step failure でも upload する
 - `if-no-files-found: warn` でファイル未生成時も CI failure にしない
 - `retention-days: 30`
+- ただし reviewer gate に使う `ci_test_selection` / `ci_verdict_summary_v2` 系 artifact は fail-close とし、upload 前に `test -s` で中身を確認した上で `if-no-files-found: error` を使う
 
 ## $GITHUB_STEP_SUMMARY 出力仕様
 
@@ -206,4 +207,4 @@ python-test job 内の以下のステップは計測対象外（`measurements.js
 
 node-backed-hook-tests job 内の以下のステップは計測対象外（`measurements.jsonl` に記録しない）:
 
-- `Generate node-backed hook selection artifact`（Node-backed hook nodeid の collect-only / `ci_test_selection_v1.json` 生成）
+- `Generate node-backed hook selection artifact`（Node-backed hook nodeid 2 件と python-test 側 deselection の collect-only、`ci_test_selection_v1.json`、`ci_test_selection_summary_v1.json` の生成と機械検証）

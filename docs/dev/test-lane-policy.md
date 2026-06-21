@@ -9,8 +9,9 @@
 現行 CI（`.github/workflows/ci.yml`）での実装状態:
 
 - `python-test` job は `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` と `pnpm install --frozen-lockfile` は実行しない
-- `python-test` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `-k not (...)` で除外し、Python-only hook tests を継続実行している
+- `python-test` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `--deselect=<exact nodeid>` で除外し、Python-only hook tests を継続実行している
 - `node-backed-hook-tests` job は `setup-node-pnpm` / `setup-python-uv` / `pnpm install --frozen-lockfile` を行った上で、Node-backed hook test nodeid だけを実行している
+- `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
 - `pytest` は複数の step に分割されて実行されている
 - `schemas/tests/` は実行されているが、`ci_test_selection/v1` の `pytest_args` からは欠落している
 - `ruff` は未導入（`pyproject.toml` に dev dependency として登録されていない）

@@ -819,7 +819,8 @@ jobs:
           set +e
           uv run --locked pytest .claude/hooks/tests/ -q \
             --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
-            -k 'not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)'
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths
           _s=$?
           set -e
           printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
@@ -852,8 +853,8 @@ jobs:
                   "-q",
                   ".claude/hooks/tests/",
                   "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
-                  "-k",
-                  "not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)",
+                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
+                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
               ],
               capture_output=True,
               text=True,
@@ -983,7 +984,8 @@ jobs:
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
             --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
-            -k 'not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)' \
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
             > ci_test_selection_artifacts/hook_tests_collect_only.txt
           python3 - <<'PY'
           import argparse
@@ -1012,8 +1014,8 @@ jobs:
                   ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
                   ".claude/hooks/tests/",
                   "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
-                  "-k",
-                  "not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)",
+                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
+                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
                   ".claude/skills/issue-contract-review/scripts/tests/",
                   ".claude/skills/issue-contract-review/tests/",
                   ".claude/skills/pr-review-judge/scripts/tests/",
@@ -1033,11 +1035,15 @@ jobs:
           )
           sys.exit(module.generate_artifact(args))
           PY
+      - name: Verify ci_test_selection evidence files
+        run: |
+          test -s ci_test_selection_artifacts/hook_tests_collect_only.txt
+          test -s ci_test_selection_artifacts/ci_test_selection_v1.json
       - uses: actions/upload-artifact@v7
         with:
           name: ci_test_selection
           path: ci_test_selection_artifacts/
-          if-no-files-found: ignore
+          if-no-files-found: error
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:
@@ -1194,9 +1200,16 @@ jobs:
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
             > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
+          uv run --locked pytest --collect-only -q \
+            .claude/hooks/tests/ \
+            --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
+            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
+            > ci_test_selection_artifacts/python_hook_tests_collect_only.txt
           python3 - <<'PY'
           import argparse
           import importlib.util
+          import json
           import pathlib
           import sys
 
@@ -1223,13 +1236,73 @@ jobs:
               job="node-backed-hook-tests",
               ci_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
           )
-          sys.exit(module.generate_artifact(args))
+          exit_code = module.generate_artifact(args)
+          if exit_code != 0:
+              sys.exit(exit_code)
+
+          node_backed_nodeids = [
+              ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
+              ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
+          ]
+          artifact_dir = pathlib.Path("ci_test_selection_artifacts")
+          python_lines = [
+              line.strip()
+              for line in (artifact_dir / "python_hook_tests_collect_only.txt").read_text().splitlines()
+              if line.strip()
+          ]
+          node_lines = [
+              line.strip()
+              for line in (artifact_dir / "node_backed_hook_tests_collect_only.txt").read_text().splitlines()
+              if line.strip()
+          ]
+
+          python_absent = sorted(nodeid for nodeid in node_backed_nodeids if nodeid not in python_lines)
+          node_exact_match = sorted(node_lines) == sorted(node_backed_nodeids)
+          overlap = sorted(set(python_lines) & set(node_lines))
+          summary = {
+              "schema": "ci_test_selection_summary_v1",
+              "python_test": {
+                  "collect_only_path": "ci_test_selection_artifacts/python_hook_tests_collect_only.txt",
+                  "node_backed_nodeids_absent": len(python_absent) == len(node_backed_nodeids),
+                  "absent_nodeids": python_absent,
+                  "collected_count": len(python_lines),
+              },
+              "node_backed_hook_tests": {
+                  "collect_only_path": "ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt",
+                  "exact_nodeid_count": len(node_lines),
+                  "exactly_expected_two": len(node_lines) == 2,
+                  "matches_expected_nodeids": node_exact_match,
+                  "collected_nodeids": node_lines,
+              },
+              "union_disjointness": {
+                  "disjoint": not overlap,
+                  "overlap_nodeids": overlap,
+                  "union_count": len(set(python_lines) | set(node_lines)),
+              },
+          }
+          out = artifact_dir / "ci_test_selection_summary_v1.json"
+          out.write_text(json.dumps(summary, indent=2) + "\n")
+
+          if not summary["python_test"]["node_backed_nodeids_absent"]:
+              raise SystemExit("Node-backed nodeids still present in python-test collect-only output")
+          if not summary["node_backed_hook_tests"]["exactly_expected_two"]:
+              raise SystemExit("node-backed-hook-tests collect-only output did not contain exactly 2 nodeids")
+          if not summary["node_backed_hook_tests"]["matches_expected_nodeids"]:
+              raise SystemExit("node-backed-hook-tests collect-only output did not match expected nodeids")
+          if not summary["union_disjointness"]["disjoint"]:
+              raise SystemExit("python-test and node-backed-hook-tests collect-only outputs overlapped")
           PY
+      - name: Verify node-backed ci_test_selection evidence files
+        run: |
+          test -s ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
+          test -s ci_test_selection_artifacts/python_hook_tests_collect_only.txt
+          test -s ci_test_selection_artifacts/ci_test_selection_v1.json
+          test -s ci_test_selection_artifacts/ci_test_selection_summary_v1.json
       - uses: actions/upload-artifact@v7
         with:
           name: ci_test_selection_node_backed_hook_tests
           path: ci_test_selection_artifacts/
-          if-no-files-found: ignore
+          if-no-files-found: error
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:
