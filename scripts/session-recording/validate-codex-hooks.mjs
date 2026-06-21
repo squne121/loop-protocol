@@ -27,6 +27,10 @@ function collectHooks(entries) {
   )
 }
 
+function findEntryByMatcher(entries, matcher) {
+  return (entries ?? []).find((entry) => entry?.matcher === matcher) ?? null
+}
+
 function assertExactCompositeHandler(eventName, entries, expectedMatcher, expectedCommand, failures) {
   assert(Array.isArray(entries), `hooks.${eventName} must exist`, failures)
   if (!Array.isArray(entries)) {
@@ -67,7 +71,12 @@ function assertEntryHookShape(eventName, entry, expectedMatcher, expectedCommand
   for (const [index, expected] of expectedCommands.entries()) {
     const hook = hooks[index]
     assert(hook?.type === 'command', `${eventName} ${expectedMatcher} hook ${index} type must be command`, failures)
-    assert(hook?.timeout === 30, `${eventName} ${expectedMatcher} hook ${index} timeout must be 30`, failures)
+    const expectedTimeout = expected.timeout ?? 30
+    assert(
+      hook?.timeout === expectedTimeout,
+      `${eventName} ${expectedMatcher} hook ${index} timeout must be ${expectedTimeout}`,
+      failures,
+    )
     assert(
       hook?.command === expected.command,
       `${eventName} ${expectedMatcher} hook ${index} command must exactly match expected handler`,
@@ -125,11 +134,14 @@ function main() {
     failures,
   )
   if (Array.isArray(hooks.PreToolUse) && hooks.PreToolUse.length === 2) {
+    const bashEntry = findEntryByMatcher(hooks.PreToolUse, '^Bash$')
+    const patchEntry = findEntryByMatcher(hooks.PreToolUse, '^(apply_patch|Edit|Write)$')
     assertEntryHookShape(
       'PreToolUse',
-      hooks.PreToolUse[0],
+      bashEntry,
       '^Bash$',
       [
+        { command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"', timeout: 10 },
         { command: `${checkCodexAgentsBase} --hook-pretool` },
         { command: `${compositeBase} --event PreToolUse` },
       ],
@@ -137,7 +149,7 @@ function main() {
     )
     assertEntryHookShape(
       'PreToolUse',
-      hooks.PreToolUse[1],
+      patchEntry,
       '^(apply_patch|Edit|Write)$',
       [
         { command: `${checkCodexAgentsBase} --hook-pretool` },
@@ -153,16 +165,21 @@ function main() {
     failures,
   )
   if (Array.isArray(hooks.PermissionRequest) && hooks.PermissionRequest.length === 2) {
+    const bashEntry = findEntryByMatcher(hooks.PermissionRequest, '^Bash$')
+    const patchEntry = findEntryByMatcher(hooks.PermissionRequest, '^(apply_patch|Edit|Write)$')
     assertEntryHookShape(
       'PermissionRequest',
-      hooks.PermissionRequest[0],
+      bashEntry,
       '^Bash$',
-      [{ command: `${compositeBase} --event PermissionRequest` }],
+      [
+        { command: 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/local_main_branch_guard.sh"', timeout: 10 },
+        { command: `${compositeBase} --event PermissionRequest` },
+      ],
       failures,
     )
     assertEntryHookShape(
       'PermissionRequest',
-      hooks.PermissionRequest[1],
+      patchEntry,
       '^(apply_patch|Edit|Write)$',
       [{ command: `${compositeBase} --event PermissionRequest` }],
       failures,
