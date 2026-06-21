@@ -1,60 +1,61 @@
 {
-  "schema_version": "refinement_loop_plan/v1",
-  "source": {
-    "issue_number": 17,
-    "issue_body_sha256": "067bf30ae46de7f73698df0bacf09664b688ce4632dee874cb72d38151a77604",
-    "comments_sha256": null,
-    "known_context_sha256": null,
-    "generated_at": "2025-05-25T12:00:00+00:00"
-  },
   "decisions": {
+    "delivery_rollup": {
+      "applicable": false,
+      "evidence_spans": [],
+      "unmaterialized_slots": []
+    },
+    "follow_up_materialization": {
+      "candidates": []
+    },
     "investigation_policy": {
-      "required": true,
-      "reason_code": "target_paths_present",
-      "target_paths": [
-        "src/real/file.ts",
-        "src/utils/Real.ts"
+      "confidence": "deterministic",
+      "evidence_spans": [
+        {
+          "end_line": 71,
+          "source": "issue_body",
+          "source_ref": null,
+          "start_line": 1,
+          "text_sha256": "067bf30ae46de7f73698df0bacf09664b688ce4632dee874cb72d38151a77604"
+        }
       ],
+      "reason_code": "target_paths_present",
       "repo_claims": [
         "- `src/real/file.ts`",
         "- `src/utils/Real.ts`"
       ],
-      "evidence_spans": [
-        {
-          "source": "issue_body",
-          "source_ref": null,
-          "start_line": 1,
-          "end_line": 71,
-          "text_sha256": "067bf30ae46de7f73698df0bacf09664b688ce4632dee874cb72d38151a77604"
-        }
-      ],
-      "confidence": "deterministic"
+      "required": true,
+      "target_paths": [
+        "src/real/file.ts",
+        "src/utils/Real.ts"
+      ]
+    },
+    "scope_delta_decision": null,
+    "scope_signal_guard": {
+      "evidence_spans": [],
+      "excluded_by_anchor_reframe": false,
+      "reason_code": "no_scope_signal",
+      "triggered": false
     },
     "web_research_policy": {
-      "required": false,
-      "reason_code": "no_critical_external_claim",
+      "confidence": "unknown",
       "critical_external_claims": [],
       "evidence_spans": [],
-      "confidence": "unknown"
-    },
-    "scope_signal_guard": {
-      "triggered": false,
-      "reason_code": "no_scope_signal",
-      "excluded_by_anchor_reframe": false,
-      "evidence_spans": []
-    },
-    "delivery_rollup": {
-      "applicable": false,
-      "unmaterialized_slots": [],
-      "evidence_spans": []
-    },
-    "follow_up_materialization": {
-      "candidates": []
+      "reason_code": "no_critical_external_claim",
+      "required": false
     }
   },
   "fail_closed": {
-    "required": false,
+    "human_message": "",
     "reason_codes": [],
-    "human_message": ""
+    "required": false
+  },
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "comments_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00",
+    "issue_body_sha256": "067bf30ae46de7f73698df0bacf09664b688ce4632dee874cb72d38151a77604",
+    "issue_number": 17,
+    "known_context_sha256": null
   }
 }

@@ -3,31 +3,56 @@
   "title": "REFINEMENT_LOOP_PLAN_V1",
   "description": "Deterministic plan output from plan_refinement_loop.py containing policy decisions and evidence extraction",
   "type": "object",
-  "required": ["schema_version", "source", "decisions", "fail_closed"],
+  "required": [
+    "schema_version",
+    "source",
+    "decisions",
+    "fail_closed"
+  ],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
       "type": "string",
-      "enum": ["refinement_loop_plan/v1"]
+      "enum": [
+        "refinement_loop_plan/v1"
+      ]
     },
     "source": {
       "type": "object",
-      "required": ["issue_number", "issue_body_sha256", "comments_sha256", "known_context_sha256", "generated_at"],
+      "required": [
+        "issue_number",
+        "issue_body_sha256",
+        "comments_sha256",
+        "known_context_sha256",
+        "generated_at"
+      ],
       "additionalProperties": false,
       "properties": {
         "issue_number": {
-          "type": ["integer", "null"]
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "issue_body_sha256": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$|^null$"
         },
         "comments_sha256": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$"
         },
         "known_context_sha256": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$"
         },
         "generated_at": {
@@ -43,13 +68,21 @@
         "web_research_policy",
         "scope_signal_guard",
         "delivery_rollup",
-        "follow_up_materialization"
+        "follow_up_materialization",
+        "scope_delta_decision"
       ],
       "additionalProperties": false,
       "properties": {
         "investigation_policy": {
           "type": "object",
-          "required": ["required", "reason_code", "target_paths", "repo_claims", "evidence_spans", "confidence"],
+          "required": [
+            "required",
+            "reason_code",
+            "target_paths",
+            "repo_claims",
+            "evidence_spans",
+            "confidence"
+          ],
           "additionalProperties": false,
           "properties": {
             "required": {
@@ -87,13 +120,22 @@
             },
             "confidence": {
               "type": "string",
-              "enum": ["deterministic", "unknown"]
+              "enum": [
+                "deterministic",
+                "unknown"
+              ]
             }
           }
         },
         "web_research_policy": {
           "type": "object",
-          "required": ["required", "reason_code", "critical_external_claims", "evidence_spans", "confidence"],
+          "required": [
+            "required",
+            "reason_code",
+            "critical_external_claims",
+            "evidence_spans",
+            "confidence"
+          ],
           "additionalProperties": false,
           "properties": {
             "required": {
@@ -123,13 +165,21 @@
             },
             "confidence": {
               "type": "string",
-              "enum": ["deterministic", "unknown"]
+              "enum": [
+                "deterministic",
+                "unknown"
+              ]
             }
           }
         },
         "scope_signal_guard": {
           "type": "object",
-          "required": ["triggered", "reason_code", "excluded_by_anchor_reframe", "evidence_spans"],
+          "required": [
+            "triggered",
+            "reason_code",
+            "excluded_by_anchor_reframe",
+            "evidence_spans"
+          ],
           "additionalProperties": false,
           "properties": {
             "triggered": {
@@ -158,7 +208,11 @@
         },
         "delivery_rollup": {
           "type": "object",
-          "required": ["applicable", "unmaterialized_slots", "evidence_spans"],
+          "required": [
+            "applicable",
+            "unmaterialized_slots",
+            "evidence_spans"
+          ],
           "additionalProperties": false,
           "properties": {
             "applicable": {
@@ -180,7 +234,9 @@
         },
         "follow_up_materialization": {
           "type": "object",
-          "required": ["candidates"],
+          "required": [
+            "candidates"
+          ],
           "additionalProperties": false,
           "properties": {
             "candidates": {
@@ -190,12 +246,82 @@
               }
             }
           }
+        },
+        "scope_delta_decision": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "status",
+                "implementation_go",
+                "anchor_author_association",
+                "anchor_comment_url",
+                "anchor_comment_hash",
+                "allowed_path_deltas",
+                "required_rerun"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "approved_by_trusted_anchor",
+                    "fail_closed",
+                    "not_applicable"
+                  ]
+                },
+                "implementation_go": {
+                  "type": "boolean"
+                },
+                "anchor_author_association": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "anchor_comment_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "anchor_comment_hash": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "allowed_path_deltas": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "required_rerun": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
         }
       }
     },
     "fail_closed": {
       "type": "object",
-      "required": ["required", "reason_codes", "human_message"],
+      "required": [
+        "required",
+        "reason_codes",
+        "human_message"
+      ],
       "additionalProperties": false,
       "properties": {
         "required": {
@@ -234,15 +360,28 @@
   "definitions": {
     "EvidenceSpan": {
       "type": "object",
-      "required": ["source", "source_ref", "start_line", "end_line", "text_sha256"],
+      "required": [
+        "source",
+        "source_ref",
+        "start_line",
+        "end_line",
+        "text_sha256"
+      ],
       "additionalProperties": false,
       "properties": {
         "source": {
           "type": "string",
-          "enum": ["issue_body", "comment", "known_context"]
+          "enum": [
+            "issue_body",
+            "comment",
+            "known_context"
+          ]
         },
         "source_ref": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "comment_id or other reference, null for issue_body"
         },
         "start_line": {
@@ -261,7 +400,11 @@
     },
     "ExternalClaim": {
       "type": "object",
-      "required": ["claim", "affects", "source_hint"],
+      "required": [
+        "claim",
+        "affects",
+        "source_hint"
+      ],
       "additionalProperties": false,
       "properties": {
         "claim": {
@@ -269,16 +412,29 @@
         },
         "affects": {
           "type": "string",
-          "enum": ["Outcome", "InScope", "AC", "VC", "StopCondition"]
+          "enum": [
+            "Outcome",
+            "InScope",
+            "AC",
+            "VC",
+            "StopCondition"
+          ]
         },
         "source_hint": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
     "UnmaterializedSlot": {
       "type": "object",
-      "required": ["child_title_hint", "marker", "body_line"],
+      "required": [
+        "child_title_hint",
+        "marker",
+        "body_line"
+      ],
       "additionalProperties": false,
       "properties": {
         "child_title_hint": {
@@ -286,7 +442,11 @@
         },
         "marker": {
           "type": "string",
-          "enum": ["未起票", "unmaterialized", "TBD"]
+          "enum": [
+            "未起票",
+            "unmaterialized",
+            "TBD"
+          ]
         },
         "body_line": {
           "type": "integer",
@@ -296,7 +456,11 @@
     },
     "FollowUpCandidate": {
       "type": "object",
-      "required": ["dedupe_key", "summary", "source_evidence"],
+      "required": [
+        "dedupe_key",
+        "summary",
+        "source_evidence"
+      ],
       "additionalProperties": false,
       "properties": {
         "dedupe_key": {
@@ -342,7 +506,11 @@
         },
         "rewrite_constraints": {
           "type": "object",
-          "required": ["must_add_sections", "must_add_contract_keys", "freeform_rewrite_forbidden"],
+          "required": [
+            "must_add_sections",
+            "must_add_contract_keys",
+            "freeform_rewrite_forbidden"
+          ],
           "additionalProperties": false,
           "properties": {
             "must_add_sections": {

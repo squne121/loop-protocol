@@ -1312,6 +1312,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                             "evidence_spans": [],
                             "confidence": CONFIDENCE_UNKNOWN,
                         },
+                        "scope_delta_decision": None,
                         "scope_signal_guard": {
                             "triggered": False,
                             "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
@@ -1423,9 +1424,10 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "scope_signal_guard": {
                     "triggered": scope_signal_triggered,
                     "reason_code": scope_signal_reason,
-                    "excluded_by_anchor_reframe": scope_signal_triggered and scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME,
+                    "excluded_by_anchor_reframe": scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME,
                     "evidence_spans": scope_signal_evidence,
                 },
+                "scope_delta_decision": known_context.get("scope_delta_decision") if known_context else None,
                 "delivery_rollup": {
                     "applicable": bool(unmaterialized_slots),
                     "unmaterialized_slots": unmaterialized_slots,
@@ -1471,6 +1473,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     "evidence_spans": [],
                     "confidence": CONFIDENCE_UNKNOWN,
                 },
+                "scope_delta_decision": None,
                 "scope_signal_guard": {
                     "triggered": False,
                     "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
@@ -1532,6 +1535,7 @@ def main(argv: list[str] | None = None) -> None:
                     "evidence_spans": [],
                     "confidence": CONFIDENCE_UNKNOWN,
                 },
+                "scope_delta_decision": None,
                 "scope_signal_guard": {
                     "triggered": False,
                     "reason_code": SCOPE_SIGNAL_REASON_NO_SIGNAL,
