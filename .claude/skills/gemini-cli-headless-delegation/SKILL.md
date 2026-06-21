@@ -68,6 +68,34 @@ disable-model-invocation: true
 
 この policy は wrapper-level retry の governance のみを扱う。grounding quality の判定、critical claim ごとの direct fallback、`WEB_RESEARCH_RESULT_V1` の最終分類は `web-researcher` の責務とする。wrapper script の挙動変更が必要になった場合は、本ファイルではなく `references/usage-contract.md` / `scripts/run_gemini_headless.py` / tests を更新する別 Issue を起票する。
 
+
+## Gemini OAuth 終了・API key 暫定運用・agy 移行
+
+Google ログイン経由の Gemini CLI 認証が終了した場合、`setup_check.py` は `auth.status: oauth_sunset`
+または `auth.status: ineligible_tier` を返す。
+
+### 暫定回避: GEMINI_API_KEY
+
+API key が利用可能な場合は `GEMINI_API_KEY` 環境変数に設定することで暫定的に Gemini 経路を継続できる。
+
+- **API key は暫定回避であり、恒久対応ではない。**
+- key の値は stdout / stderr / JSON 出力に絶対に含めない（`setup_check.py` が existence のみ検出する）。
+- key を `.env` / コードベース / PR 本文に commit しない。
+
+```bash
+# 暫定運用例（セッション内のみ有効）
+export GEMINI_API_KEY=<your-key>
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+# → auth.status: "authenticated_api_key"
+```
+
+### 恒久対応: agy (Antigravity CLI) への移行
+
+**恒久対応は Antigravity CLI (agy) への移行**である。parent Issue #104 を参照。
+
+- API key 暫定運用は #104 が完了するまでのブリッジであり、agy 移行が完了したら不要になる。
+- agy 移行の進捗は `docs/dev/current-focus.md` および #104 を参照。
+
 ## Core Rules
 
 ### Delegation Boundary

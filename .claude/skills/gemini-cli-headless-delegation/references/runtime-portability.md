@@ -170,6 +170,38 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_g
 `python3 ...` の直接実行は環境によって依存ライブラリが不足している場合があるため、
 `uv run` 経由を標準とする。
 
+
+## Gemini OAuth 終了後の運用境界
+
+Google OAuth 経由の Gemini CLI 認証が終了した場合、以下の運用境界に従う。
+
+### API key 暫定回避（一時的）
+
+`GEMINI_API_KEY` 環境変数を設定することで Gemini 経路を継続できる。
+**API key は暫定回避であり、恒久対応ではない。**
+
+| 項目 | 境界 |
+|------|------|
+| 利用目的 | agy 移行完了までのブリッジ |
+| key の有効期限 | 無期限ではないため定期的に確認する |
+| key の保存 | セッション内環境変数のみ。コードベース / `.env` / PR 本文への commit 禁止 |
+| key の出力 | 値を stdout / stderr / JSON に絶対に含めない（existence のみ検出） |
+
+```bash
+# 暫定運用（セッション内のみ）
+export GEMINI_API_KEY=<your-key>
+uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+# auth.status が "authenticated_api_key" になれば暫定運用中
+```
+
+### 恒久対応: agy (Antigravity CLI) 移行
+
+**恒久対応は parent Issue #104 の agy 移行**である。
+API key 暫定運用は #104 の agy provider 実装が完了したら不要になる。
+
+- agy 移行の進捗は #104 を参照。
+- agy が利用可能になったら `gemini-cli-headless-delegation` skill の provider を切り替える。
+
 ## Out of Scope
 
 - CodexCLI 向け実行手順（Followup Issue 扱い）
