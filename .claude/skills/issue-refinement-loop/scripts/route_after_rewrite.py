@@ -94,11 +94,9 @@ _STATE_ALLOWLIST = frozenset({
     "source_issue_body_sha256",
     "replay_safe",
     "source_body_reset",
-    # AC9: fingerprint for loop convergence detection
-    "rewrite_request_fingerprint",
-    # AC10: mutation kind and budget tracking
-    "last_mutation_kind",
-    "budget_debit",
+    # NOTE: AC9/AC10 fields (rewrite_request_fingerprint, last_mutation_kind,
+    # budget_debit) are NOT in this allowlist — the JSON schema has
+    # additionalProperties: false and these are in-memory only.
 })
 
 
@@ -410,11 +408,9 @@ def _build_state_dict(
         "source_issue_body_sha256": source_issue_body_sha256,
         "replay_safe": previous_state is not None,
         "source_body_reset": source_body_reset,
-        # AC9: fingerprint for loop convergence detection
-        "rewrite_request_fingerprint": rewrite_request_fingerprint,
-        # AC10: mutation kind and budget tracking
-        "last_mutation_kind": last_mutation_kind,
-        "budget_debit": budget_debit,
+        # NOTE: AC9/AC10 fields (rewrite_request_fingerprint, last_mutation_kind,
+        # budget_debit) are intentionally excluded — not in JSON schema.
+        # They are computed above for internal use but not persisted to state.
     }
     if artifact_error is not None:
         state_dict["_artifact_error"] = artifact_error
