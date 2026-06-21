@@ -140,7 +140,19 @@ def _no_secret_check(text: str) -> list[str]:
 
 
 def _load_review_result_schema() -> dict[str, Any]:
-    return json.loads(REVIEW_RESULT_SCHEMA_PATH.read_text(encoding="utf-8"))
+    return _strict_json_loads(REVIEW_RESULT_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _strict_json_loads(text: str) -> dict[str, Any]:
+    return json.loads(text, parse_constant=_reject_nonfinite_json)
+
+
+def _strict_json_dumps(payload: Any, *, indent: int | None = None) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=indent, allow_nan=False)
 
 
 def _validate_review_result_schema(raw_result: dict[str, Any]) -> None:
@@ -254,7 +266,7 @@ def compact_review_result(
     }
 
     # B5: secret check on artifact content before writing
-    artifact_content_str = json.dumps(full_artifact, ensure_ascii=False, indent=2)
+    artifact_content_str = _strict_json_dumps(full_artifact, indent=2)
     artifact_violations = _no_secret_check(artifact_content_str)
     if artifact_violations:
         raise ValueError(
@@ -330,8 +342,8 @@ def main() -> int:
             raw_text = args.input_file.read_text(encoding="utf-8")
         else:
             raw_text = sys.stdin.read()
-        raw_result = json.loads(raw_text)
-    except json.JSONDecodeError as e:
+        raw_result = _strict_json_loads(raw_text)
+    except (json.JSONDecodeError, ValueError) as e:
         print("STATUS: failed", flush=True)
         print(f"ERROR: JSON parse error: {e}", flush=True, file=sys.stderr)
         return 2

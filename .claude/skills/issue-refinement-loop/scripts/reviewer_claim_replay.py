@@ -48,6 +48,24 @@ VALID_FINDING_KINDS = frozenset(
     {"deterministic_domain_blocker", "checker_gap", "heuristic_concern"}
 )
 VALID_ARTIFACT_SCHEMAS = frozenset({"REVIEW_ISSUE_RESULT_V1", "CHECK_ISSUE_CONTRACT_V1"})
+KIND_TO_DETERMINISTIC_CHECK = {
+    "vc_command_format": "C4_vc_commands_present",
+    "ac_vc_number_mismatch": "C5_ac_vc_number_alignment",
+    "missing_section": "C1_required_sections",
+    "rva_immediate_field_missing": "C9_runtime_applicability_present",
+}
+
+
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _strict_json_loads(text: str) -> dict[str, Any]:
+    return json.loads(text, parse_constant=_reject_nonfinite_json)
+
+
+def _strict_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _normalize_blocker_code(code: str) -> str:
@@ -61,7 +79,7 @@ def _classify_blocker(blocker: dict[str, Any]) -> str:
 
 def _load_json_file(path: str, label: str) -> dict[str, Any]:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return _strict_json_loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"{label} not found: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -229,7 +247,7 @@ def _load_state(state_file: str | None) -> dict[str, Any]:
     path = Path(state_file)
     if not path.exists():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = _strict_json_loads(path.read_text(encoding="utf-8"))
     if data.get("schema") != STATE_SCHEMA:
         raise ValueError(f"unexpected state schema: {data.get('schema')!r}")
     return data
@@ -240,7 +258,20 @@ def _save_state(state_file: str | None, state: dict[str, Any]) -> None:
         return
     path = Path(state_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+
+def _has_deterministic_check_failure(kind: str, review_result: dict[str, Any]) -> bool:
+    check_name = KIND_TO_DETERMINISTIC_CHECK.get(kind)
+    if not check_name:
+        return False
+    deterministic_checks = review_result.get("deterministic_checks", {})
+    if not isinstance(deterministic_checks, dict):
+        return False
+    return deterministic_checks.get(check_name) == "fail"
 
 
 def analyze(
@@ -272,6 +303,7 @@ def analyze(
 
     blocker_results: list[dict[str, Any]] = []
     rewrite_ready_blockers: list[dict[str, Any]] = []
+    inconsistency_blockers: list[dict[str, Any]] = []
     for blocker in blockers:
         kind = _classify_blocker(blocker)
         matched_findings = _matching_findings(kind, findings, body_sha256)
@@ -286,24 +318,45 @@ def analyze(
                 ):
                     deterministic_backed = True
                     evidence.extend(finding["checker_evidence"])
-        else:
-            evidence = [
+        fallback_evidence: list[dict[str, Any]] = []
+        if not deterministic_backed and (
+            not matched_findings
+            or all(
+                finding["finding_kind"] in {"checker_gap", "heuristic_concern"}
+                or not finding["evidence_valid"]
+                for finding in matched_findings
+            )
+        ):
+            fallback_evidence = [
                 _evidence("baseline_vc_preflight", item, body_sha256)
                 for item in _matching_vc_preflight(kind, vc_preflight_result)
             ]
-            evidence.extend(
+            fallback_evidence.extend(
                 _evidence("vc_contract_syntax", item, body_sha256)
                 for item in _matching_vc_syntax(kind, vc_syntax_result)
             )
-            evidence.extend(
+            fallback_evidence.extend(
                 _evidence(str(err.get("source_check") or ""), err, body_sha256)
                 for err in _matching_readiness_errors(kind, readiness_result)
             )
-            deterministic_backed = bool(evidence)
+        if not matched_findings and fallback_evidence:
+            evidence = list(fallback_evidence)
+            deterministic_backed = True
+        has_inconsistency = (
+            bool(matched_findings)
+            and not deterministic_backed
+            and (
+                _has_deterministic_check_failure(kind, review_result)
+                or bool(fallback_evidence)
+            )
+        )
+        if has_inconsistency:
+            evidence = list(fallback_evidence)
         blocker_result = {
             "reviewer_blocker_code": blocker["reviewer_blocker_code"],
             "normalized_kind": kind,
             "deterministic_backed": deterministic_backed,
+            "checker_artifact_inconsistency": has_inconsistency,
             "message": blocker.get("message"),
             "line_start": blocker.get("line_start"),
             "line_end": blocker.get("line_end"),
@@ -313,6 +366,8 @@ def analyze(
         blocker_results.append(blocker_result)
         if deterministic_backed:
             rewrite_ready_blockers.append(blocker_result)
+        elif has_inconsistency:
+            inconsistency_blockers.append(blocker_result)
 
     primary = blocker_results[0]
     same_lane = (
@@ -326,6 +381,11 @@ def analyze(
         verdict = "deterministic_fail_confirmed"
         routing = "proceed_to_rewrite"
         should_consume_iteration = True
+        next_count = 0
+    elif inconsistency_blockers:
+        verdict = "checker_artifact_inconsistency"
+        routing = "fix_checker_artifact"
+        should_consume_iteration = False
         next_count = 0
     else:
         next_count = prior_count + 1 if same_lane else 1
@@ -397,21 +457,19 @@ def main() -> int:
         _save_state(args.state_file, next_state)
     except ValueError as exc:
         print(
-            json.dumps(
+            _strict_json_dumps(
                 {
                     "schema": SCHEMA,
                     "verdict": "input_or_runtime_error",
                     "routing": "human_judgment_required",
                     "error": str(exc),
                 },
-                separators=(",", ":"),
-                ensure_ascii=False,
             ),
             flush=True,
         )
         return 1
 
-    output = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+    output = _strict_json_dumps(result)
     if len(output.encode("utf-8")) > 2048:
         trimmed = dict(result)
         trimmed["blockers"] = [
@@ -419,10 +477,11 @@ def main() -> int:
                 "reviewer_blocker_code": blocker["reviewer_blocker_code"],
                 "normalized_kind": blocker["normalized_kind"],
                 "deterministic_backed": blocker["deterministic_backed"],
+                "checker_artifact_inconsistency": blocker["checker_artifact_inconsistency"],
             }
             for blocker in result["blockers"][:2]
         ]
-        output = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
+        output = _strict_json_dumps(trimmed)
     print(output, flush=True)
     return 0
 

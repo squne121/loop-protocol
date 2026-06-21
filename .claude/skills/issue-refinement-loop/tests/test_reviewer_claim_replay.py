@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 SCRIPT_PATH = SCRIPTS_DIR / "reviewer_claim_replay.py"
@@ -216,6 +218,32 @@ def test_second_unbacked_same_body_becomes_false_positive():
     assert next_state["consecutive_unbacked_count"] == 2
 
 
+def test_checker_gap_with_deterministic_check_fail_becomes_checker_artifact_inconsistency():
+    review = {
+        **COMPACT_C4,
+        "deterministic_checks": {"C4_vc_commands_present": "fail"},
+        "findings": [
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key="vc_command_format",
+                blocking=False,
+            )
+        ],
+    }
+    result, next_state = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "checker_artifact_inconsistency"
+    assert result["routing"] == "fix_checker_artifact"
+    assert result["should_consume_iteration"] is False
+    assert result["blockers"][0]["checker_artifact_inconsistency"] is True
+    assert next_state["consecutive_unbacked_count"] == 0
+
+
 def test_body_hash_change_resets_consecutive_count():
     previous = {
         "schema": "REVIEWER_CLAIM_REPLAY_STATE_V1",
@@ -250,6 +278,33 @@ def test_vc_preflight_category_backs_c4():
         previous_state={},
     )
     assert result["verdict"] == "deterministic_fail_confirmed"
+    assert result["blockers"][0]["evidence"][0]["source_check"] == "baseline_vc_preflight"
+
+
+def test_checker_gap_does_not_suppress_fallback_evidence_search():
+    review = {
+        **COMPACT_C4,
+        "deterministic_checks": {"C4_vc_commands_present": "fail"},
+        "findings": [
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key="vc_command_format",
+                blocking=False,
+            )
+        ],
+    }
+    preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "results": [{"category": "compound_command_disallowed", "line_start": 10, "line_end": 10}],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_CLEAN,
+        vc_syntax_result=None,
+        vc_preflight_result=preflight,
+        previous_state={},
+    )
+    assert result["verdict"] == "checker_artifact_inconsistency"
     assert result["blockers"][0]["evidence"][0]["source_check"] == "baseline_vc_preflight"
 
 
@@ -410,6 +465,43 @@ def test_cli_writes_and_reuses_state_file(tmp_path: Path):
     assert second.returncode == 0
     assert json.loads(second.stdout)["verdict"] == "reviewer_false_positive_suspected"
     assert json.loads(state_path.read_text(encoding="utf-8"))["consecutive_unbacked_count"] == 2
+
+
+def test_state_file_with_nan_is_rejected(tmp_path: Path):
+    review_path = tmp_path / "review.json"
+    readiness_path = tmp_path / "readiness.json"
+    state_path = tmp_path / "state.json"
+    review_path.write_text(json.dumps(COMPACT_C4), encoding="utf-8")
+    readiness_path.write_text(json.dumps(READINESS_CLEAN), encoding="utf-8")
+    state_path.write_text('{"schema":"REVIEWER_CLAIM_REPLAY_STATE_V1","bad":NaN}', encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--review-result-file",
+            str(review_path),
+            "--readiness-result-file",
+            str(readiness_path),
+            "--state-file",
+            str(state_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 1
+    assert json.loads(proc.stdout)["verdict"] == "input_or_runtime_error"
+
+
+def test_save_state_rejects_nan(tmp_path: Path):
+    from reviewer_claim_replay import _save_state  # noqa: WPS433
+
+    with pytest.raises(ValueError):
+        _save_state(
+            str(tmp_path / "state.json"),
+            {"schema": "REVIEWER_CLAIM_REPLAY_STATE_V1", "bad": float("nan")},
+        )
 
 
 def test_cli_stdout_is_compact_json(tmp_path: Path):

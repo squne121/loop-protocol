@@ -295,14 +295,15 @@ class TestC5Fail:
             f"Expected needs-fix, got {output['verdict']}"
         )
 
-    def test_c5_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
-        """GIVEN c5_fail_issue.md WHEN checker runs THEN deterministic finding is checker_gap until real evidence exists."""
+    def test_c5_deterministic_failure_emits_blocking_finding_with_evidence(self):
+        """GIVEN c5_fail_issue.md WHEN checker runs THEN deterministic finding stays blocking with self-evidence."""
         output = run_checker("c5_fail_issue.md")
         findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_number_alignment"]
         assert findings, "Expected vc_number_alignment finding"
-        assert findings[0]["finding_kind"] == "checker_gap"
-        assert findings[0]["blocking"] is False
-        assert findings[0]["checker_evidence"] == []
+        assert findings[0]["finding_kind"] == "deterministic_domain_blocker"
+        assert findings[0]["blocking"] is True
+        assert findings[0]["checker_evidence"][0]["source_check"] == "check_issue_contract"
+        assert output["structured_blockers"][0]["code"] == "C5"
 
 
 class TestC6Fail:
@@ -335,14 +336,26 @@ class TestC8Fail:
 
 
 class TestFindingsContract:
-    def test_c4_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
-        """GIVEN c4_fail_issue.md WHEN checker runs THEN unsupported deterministic blocker stays non-blocking."""
+    def test_c4_deterministic_failure_emits_blocking_finding_with_evidence(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN deterministic blocker is preserved with self-evidence."""
         output = run_checker("c4_fail_issue.md")
         findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_command_format"]
         assert findings, "Expected vc_command_format finding"
-        assert findings[0]["finding_kind"] == "checker_gap"
-        assert findings[0]["blocking"] is False
-        assert findings[0]["checker_evidence"] == []
+        assert findings[0]["finding_kind"] == "deterministic_domain_blocker"
+        assert findings[0]["blocking"] is True
+        assert findings[0]["checker_evidence"][0]["rule_id"] == "C4_vc_commands_present"
+        assert output["structured_blockers"][0]["code"] == "C4"
+
+    def test_structured_blockers_are_required_and_consistent(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN structured_blockers mirror deterministic findings."""
+        output = run_checker("c4_fail_issue.md")
+        structured = output["structured_blockers"]
+        assert structured, "Expected structured_blockers to be populated"
+        blocker = structured[0]
+        assert blocker["finding_kind"] == "deterministic_domain_blocker"
+        assert blocker["deterministic_domain_key"] == "vc_command_format"
+        assert blocker["blocking"] is True
+        assert blocker["checker_evidence"][0]["body_sha256"] == output["body_sha256"]
 
     def test_c9_warn_does_not_duplicate_findings(self):
         """GIVEN research issue missing RVA WHEN checker runs THEN warning finding is emitted once."""

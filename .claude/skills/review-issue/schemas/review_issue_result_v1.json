@@ -13,6 +13,7 @@
     "generated_at",
     "deterministic_checks",
     "blocking_issues",
+    "structured_blockers",
     "non_blocking_improvements",
     "findings",
     "diff_proposal",
@@ -59,6 +60,12 @@
             "additionalProperties": true
           }
         ]
+      }
+    },
+    "structured_blockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/structured_blocker"
       }
     },
     "non_blocking_improvements": {
@@ -151,6 +158,86 @@
         },
         "message": {
           "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "finding_kind": {
+                "const": "deterministic_domain_blocker"
+              }
+            },
+            "required": ["finding_kind"]
+          },
+          "then": {
+            "properties": {
+              "blocking": {
+                "const": true
+              },
+              "checker_evidence": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "finding_kind": {
+                "const": "checker_gap"
+              }
+            },
+            "required": ["finding_kind"]
+          },
+          "then": {
+            "properties": {
+              "blocking": {
+                "const": false
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "structured_blocker": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "finding_kind",
+        "deterministic_domain_key",
+        "blocking",
+        "checker_evidence"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "finding_kind": {
+          "enum": [
+            "deterministic_domain_blocker",
+            "checker_gap",
+            "heuristic_concern"
+          ]
+        },
+        "deterministic_domain_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "checker_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/checker_evidence"
+          }
         }
       },
       "allOf": [

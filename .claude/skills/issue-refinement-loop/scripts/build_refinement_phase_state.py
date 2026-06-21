@@ -313,7 +313,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(phase_state, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(phase_state, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
 

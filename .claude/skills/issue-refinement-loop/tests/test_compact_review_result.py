@@ -328,6 +328,7 @@ def test_compact_review_result_artifact_secret_check_fails(tmp_path):
         "generated_at": "2026-06-11T00:00:00Z",
         "issue_url": "https://github.com/squne121/loop-protocol/issues/42",
         "blocking_issues": [],
+        "structured_blockers": [],
         "non_blocking_improvements": [],
         "findings": [],
         "diff_proposal": {"note": "token: ghp_" + "A" * 36},
@@ -337,6 +338,38 @@ def test_compact_review_result_artifact_secret_check_fails(tmp_path):
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
     with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
         compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+
+
+def test_compact_review_result_rejects_nan_on_write(tmp_path):
+    """GIVEN review result with NaN WHEN artifact rendered THEN ValueError (strict JSON)."""
+    fixture = FIXTURES_DIR / "review_result_approve.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_result["diff_proposal"] = {"nan": float("nan")}
+
+    with pytest.raises(ValueError):
+        compact_review_result(
+            raw_result,
+            artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+            issue_number=42,
+        )
+
+
+def test_compact_review_result_cli_rejects_nan_input(tmp_path):
+    """GIVEN CLI input containing NaN WHEN run THEN exit 2 (strict JSON parse)."""
+    import subprocess
+
+    bad_fixture = tmp_path / "bad_nan.json"
+    bad_fixture.write_text(
+        """{"schema":"REVIEW_ISSUE_RESULT_V1","schema_version":"review_issue_result/v1","verdict":"approve","status":"ok","body_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","issue_kind":"implementation","generated_at":"2026-06-21T00:00:00Z","deterministic_checks":{},"blocking_issues":[],"structured_blockers":[],"non_blocking_improvements":[],"findings":[],"diff_proposal":{"value":NaN},"parsed_vc_commands":[]}""",
+        encoding="utf-8",
+    )
+    script = SCRIPTS_DIR / "compact_review_result.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--input-file", str(bad_fixture), "--artifact-dir", str(tmp_path), "--issue-number", "42"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
 
 
 # ---------------------------------------------------------------------------
