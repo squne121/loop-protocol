@@ -1248,12 +1248,12 @@ jobs:
           python_lines = [
               line.strip()
               for line in (artifact_dir / "python_hook_tests_collect_only.txt").read_text().splitlines()
-              if line.strip()
+              if line.strip() and "::" in line
           ]
           node_lines = [
               line.strip()
               for line in (artifact_dir / "node_backed_hook_tests_collect_only.txt").read_text().splitlines()
-              if line.strip()
+              if line.strip() and "::" in line
           ]
 
           python_absent = sorted(nodeid for nodeid in node_backed_nodeids if nodeid not in python_lines)
