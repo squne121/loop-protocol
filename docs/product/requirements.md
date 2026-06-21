@@ -2,8 +2,8 @@
 doc_id: DOC-REQ-001
 title: LOOP_PROTOCOL Requirements Baseline
 status: active
-capability_gate: M3 Result Persistence (v0.3.x)
-last_updated_by_issue: 734
+capability_gate: M4 Upgrade Loop (v0.4.x)
+last_updated_by_issue: 1094
 ---
 
 # Requirements Baseline
@@ -31,7 +31,8 @@ last_updated_by_issue: 734
 ## Current Capability Gate
 
 - M1 Foundation Gate (v0.1.x) の基盤・guardrail・workflow・最小仕様正本は確立済み。
-- 現在は `M3: Result Persistence (v0.3.x)` を進行中。報酬から resource への変換と永続化スライスを成立させる。
+- M3 の実装と自動検証は完了済みである。
+- 現在の capability gate は `M4: Upgrade Loop (v0.4.x)` とする。formal close / milestone readback の最終判断は `#733` 側で扱う。
 
 ## Global Non-Goals
 
@@ -42,21 +43,20 @@ last_updated_by_issue: 734
 - 高品質アセット前提の演出
 - Issue や spec にない大規模機能の先行追加
 
-## Milestone Scope: M3 Result Persistence (v0.3.x)
+## Milestone Scope: M4 Upgrade Loop (v0.4.x)
 
-- 現行の実装対象スコープは `M3: Result Persistence (v0.3.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
-- sortie 結果から報酬を獲得し、resource として `src/storage` の snapshot 境界経由で localStorage へ永続化し、reload 後に進行を復元するまでを M3 のスコープとする（報酬 → resource → localStorage 永続化 → reload 復元）。
-- M3 は MVP-004（データ駆動と保存境界）を永続化方向に具体化し、戦闘結果が resource として残る MVP Loop の最小実装を成立させる。
-- resource / reward / persistence の詳細仕様（初期値・上限・負値禁止・reward 計算式など）は feature spec（`docs/product/features/<feature>.md`）で定義する。
-- localStorage の例外・容量超過（QuotaExceededError）・利用不可・private browsing 時の揮発性などの失敗モードは M3 feature spec / storage 実装 Issue（#735 以降）で扱う。
+- 現行の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
+- M4 では、M3 で永続化済みの resource を消費して最小 upgrade を適用し、次 sortie の挙動変化として観測できるまでをスコープとする。
+- M4 は MVP Loop の「resource が次の強化導線へ接続できること」を最小成立させるフェーズであり、M3 persistence 境界と `src/data` の data-driven 定義の両立を前提にする。
+- resource consumption / upgrade の詳細仕様（消費量、負値禁止、反映対象、次 sortie への適用境界など）は feature spec（`docs/product/features/<feature>.md`）で定義する。
+- GitHub Milestone object の title mismatch や close 判断は本 requirements 更新のスコープ外であり、`docs/product/playable-roadmap.md` の mapping readback と `docs/dev/milestone-ops.md` に従って別途扱う。
 
-### M3 Non-Goals
+### M4 Non-Goals
 
-- 武器強化（resource 消費による強化）は `M4: Upgrade Loop (v0.4.x)` のスコープであり M3 には含めない。
-- upgrade tree（アップグレードツリー）の構築。
+- 大規模な upgrade tree（アップグレードツリー）の構築。
 - 複数武器の追加・切替。
 - campaign / territory の管理。
-- M3 / M4 境界の詳細は `docs/product/playable-roadmap.md` を参照する。
+- M4 / M5 境界の詳細は `docs/product/playable-roadmap.md` を参照する。
 
 ## Current MVP Requirements
 

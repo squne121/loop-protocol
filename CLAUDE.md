@@ -46,8 +46,8 @@
 
 ## 現在の開発フェーズ
 
-- 現在は `M1: Foundation Gate (v0.1.x)` を進行中。
-- まずは開発基盤、運用ルール、最小仕様正本を固める。
+- 現在は `M4: Upgrade Loop (v0.4.x)` を進行中。
+- M3 の実装と自動検証は完了済みで、現在は resource consumption と最小 upgrade loop を優先する。
 - 詳細な優先順位は `docs/dev/current-focus.md` を参照する。
 
 ## 最低限の確認コマンド
