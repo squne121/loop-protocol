@@ -184,6 +184,55 @@ def test_lp010_requires_exact_lp010_match():
     assert result["blockers"][0]["evidence"][0]["rule_id"] == "LP010"
 
 
+def test_c5_maps_to_ac_vc_number_mismatch_and_reconstructs_lp010():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
+        "structured_blockers": [],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_LP010,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "deterministic_fail_confirmed"
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "ac_vc_number_mismatch"
+    assert blocker["evidence"][0]["rule_id"] == "LP010"
+
+
+def test_c5_checker_gap_with_failed_deterministic_check_is_inconsistency():
+    review = {
+        "schema": "ISSUE_REVIEW_RESULT_COMPACT_V1",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/1021",
+        "blocking_issues": [{"code": "C5", "message": "ac/vc mismatch"}],
+        "structured_blockers": [],
+        "deterministic_checks": {"C5_ac_vc_number_alignment": "fail"},
+        "findings": [
+            _finding(
+                finding_kind="checker_gap",
+                deterministic_domain_key="vc_number_alignment",
+                blocking=False,
+            )
+        ],
+    }
+    result, _ = analyze(
+        review_result=review,
+        readiness_result=READINESS_LP010,
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert result["verdict"] == "checker_artifact_inconsistency"
+    blocker = result["blockers"][0]
+    assert blocker["normalized_kind"] == "ac_vc_number_mismatch"
+    assert blocker["checker_artifact_inconsistency"] is True
+    assert blocker["evidence"][0]["rule_id"] == "LP010"
+
+
 def test_missing_section_with_lp005_only_is_unbacked():
     result, _ = analyze(
         review_result=COMPACT_MISSING_SECTION,

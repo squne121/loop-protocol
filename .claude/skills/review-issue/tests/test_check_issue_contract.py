@@ -24,6 +24,7 @@ CONTRACT_READINESS_SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
 )
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "review_issue_result_v1.json"
 
 
 def run_checker(fixture_name: str) -> dict:
@@ -356,6 +357,13 @@ class TestFindingsContract:
         assert blocker["deterministic_domain_key"] == "vc_command_format"
         assert blocker["blocking"] is True
         assert blocker["checker_evidence"][0]["body_sha256"] == output["body_sha256"]
+
+    def test_schema_requires_top_level_structured_blockers(self):
+        """GIVEN review_issue_result_v1 schema WHEN loaded THEN structured_blockers is top-level required and schema-bound."""
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        assert "structured_blockers" in schema["required"]
+        assert schema["properties"]["structured_blockers"]["items"]["$ref"] == "#/$defs/structured_blocker"
+        assert "structured_blocker" in schema["$defs"]
 
     def test_c9_warn_does_not_duplicate_findings(self):
         """GIVEN research issue missing RVA WHEN checker runs THEN warning finding is emitted once."""

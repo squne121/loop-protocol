@@ -35,7 +35,7 @@ KIND_ALIASES = {
     "ac_vc_number_mismatch": "ac_vc_number_mismatch",
     "missing_required_section": "missing_section",
     "missing_section": "missing_section",
-    "c5": "missing_section",
+    "c5": "ac_vc_number_mismatch",
     "rva_immediate_field_missing": "rva_immediate_field_missing",
 }
 KIND_TO_DETERMINISTIC_DOMAIN_KEY = {
