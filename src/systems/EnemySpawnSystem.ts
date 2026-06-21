@@ -32,6 +32,11 @@ export function spawnEnemy(
     contactDamage: definition.contactDamage,
     defeated: false,
     defeatedAtTick: null,
+    faction: 'enemy',
+    role: 'enemy_chaser',
+    behaviorState: 'move_to_engage',
+    targetingPolicy: 'focus_player',
+    targetEntityId: state.player.id,
   }
 
   state.enemies.push(enemy)
