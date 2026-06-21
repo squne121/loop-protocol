@@ -52,6 +52,14 @@ _DEFAULT_SCHEMA_PATH = (
 # Allowed verdicts in compact review result
 VALID_VERDICTS = {"approve", "needs-fix"}
 
+# Required top-level decision fields in REFINEMENT_LOOP_PLAN_V1
+REQUIRED_DECISION_FIELDS = [
+    "web_research_policy",
+    "scope_signal_guard",
+    "delivery_rollup",
+    "follow_up_materialization",
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,8 +80,12 @@ def _sha256_bytes(data: bytes) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
-def load_json(path: Path) -> tuple[Optional[dict[str, Any]], str]:
-    """Load JSON from path. Returns (data, error_msg). error_msg is '' on success."""
+def load_json_object(path: Path) -> tuple[Optional[dict[str, Any]], str]:
+    """Load a JSON object from path.
+
+    Returns (data, error_msg). error_msg is '' on success.
+    Fails with an error if the JSON value is not a dict.
+    """
     if not path.exists():
         return None, f"File not found: {path}"
     try:
@@ -86,6 +98,33 @@ def load_json(path: Path) -> tuple[Optional[dict[str, Any]], str]:
     if not isinstance(data, dict):
         return None, f"Expected JSON object in {path}, got {type(data).__name__}"
     return data, ""
+
+
+def load_json_array(path: Path) -> tuple[Optional[list[Any]], str]:
+    """Load a JSON array from path.
+
+    Returns (data, error_msg). error_msg is '' on success.
+    Fails with an error if the file does not exist or the JSON value is not a list.
+    """
+    if not path.exists():
+        return None, f"File not found: {path}"
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error in {path}: {e}"
+    except OSError as e:
+        return None, f"Cannot read {path}: {e}"
+    if not isinstance(data, list):
+        return None, f"Expected JSON array in {path}, got {type(data).__name__}"
+    return data, ""
+
+
+# Keep load_json as an alias for load_json_object for backward compatibility
+# with schema loading (schema files are always objects).
+def load_json(path: Path) -> tuple[Optional[dict[str, Any]], str]:
+    """Load JSON object from path (alias for load_json_object)."""
+    return load_json_object(path)
 
 
 def write_json_deterministic(path: Path, obj: Any) -> None:
@@ -113,11 +152,16 @@ def validate_loop_state(
     """
     try:
         import jsonschema
+        import jsonschema.validators
     except ImportError as exc:
         raise ImportError(f"jsonschema not available: {exc}") from exc
 
-    # Prefer Draft7Validator to handle additionalProperties/unevaluatedProperties
-    validator_cls = jsonschema.Draft7Validator
+    # Auto-select validator based on $schema in the schema document.
+    # Falls back to Draft7Validator if $schema is missing or unrecognised.
+    try:
+        validator_cls = jsonschema.validators.validator_for(schema)
+    except Exception:
+        validator_cls = jsonschema.Draft7Validator
     validator = validator_cls(schema)
 
     errors = []
@@ -169,22 +213,52 @@ def build_loop_state(
     plan_issue = plan_source.get("issue_number")
     review_issue = review.get("issue_number")  # may not always be present
 
-    if plan_issue is not None and int(plan_issue) != issue_number:
-        blocked.append(
-            f"issue_number_mismatch: planner has issue_number={plan_issue}, "
-            f"CLI --issue-number={issue_number}"
-        )
-    if review_issue is not None and int(review_issue) != issue_number:
-        blocked.append(
-            f"issue_number_mismatch: review result has issue_number={review_issue}, "
-            f"CLI --issue-number={issue_number}"
-        )
+    if plan_issue is not None:
+        try:
+            if int(plan_issue) != issue_number:
+                blocked.append(
+                    f"issue_number_mismatch: planner has issue_number={plan_issue}, "
+                    f"CLI --issue-number={issue_number}"
+                )
+        except (ValueError, TypeError):
+            blocked.append(
+                f"issue_number_invalid: planner issue_number={plan_issue!r} "
+                f"cannot be converted to int"
+            )
+
+    if review_issue is not None:
+        try:
+            if int(review_issue) != issue_number:
+                blocked.append(
+                    f"issue_number_mismatch: review result has issue_number={review_issue}, "
+                    f"CLI --issue-number={issue_number}"
+                )
+        except (ValueError, TypeError):
+            blocked.append(
+                f"issue_number_invalid: review issue_number={review_issue!r} "
+                f"cannot be converted to int"
+            )
 
     if blocked:
         return None, blocked
 
     # --- Extract from planner ---
-    decisions = plan.get("decisions", {})
+    decisions = plan.get("decisions")
+    if decisions is None:
+        blocked.append(
+            "missing_required_field: planner artifact is missing 'decisions' field"
+        )
+        return None, blocked
+
+    # Validate required decision sub-fields (fail-closed)
+    for field in REQUIRED_DECISION_FIELDS:
+        if field not in decisions:
+            blocked.append(
+                f"missing_required_field: planner decisions missing required field '{field}'"
+            )
+
+    if blocked:
+        return None, blocked
 
     web_research_policy_raw = decisions.get("web_research_policy", {})
     web_research_policy = {
@@ -223,9 +297,15 @@ def build_loop_state(
         "candidates": list(follow_up_raw.get("candidates", []))
     }
 
-    # --- Extract from review ---
+    # --- Extract from review (fail-closed on missing VERDICT) ---
     verdict = review.get("VERDICT") or review.get("verdict")
-    if verdict is not None and verdict not in VALID_VERDICTS:
+    if verdict is None:
+        blocked.append(
+            "missing_required_field: review artifact is missing 'VERDICT' (or 'verdict') field"
+        )
+        return None, blocked
+
+    if verdict not in VALID_VERDICTS:
         blocked.append(f"unknown_verdict: verdict={verdict!r} is not in {sorted(VALID_VERDICTS)}")
         return None, blocked
 
@@ -322,7 +402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_path = Path(args.out)
 
     # --- Load inputs ---
-    plan, plan_err = load_json(planner_path)
+    plan, plan_err = load_json_object(planner_path)
     if plan_err:
         result = _make_build_result(
             status="invalid",
@@ -343,7 +423,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
         return 2
 
-    review, review_err = load_json(review_path)
+    review, review_err = load_json_object(review_path)
     if review_err:
         result = _make_build_result(
             status="invalid",
@@ -364,15 +444,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
         return 2
 
-    # Load optional blockers history
+    # Load optional blockers history — must be a JSON array (fail-closed)
     blockers_history: list[Any] = []
+    warnings: list[str] = []
     if args.blockers_history_file:
         bh_path = Path(args.blockers_history_file)
-        bh_data, bh_err = load_json(bh_path)
+        bh_data, bh_err = load_json_array(bh_path)
         if bh_err:
-            # Non-fatal: warn
-            pass
-        elif isinstance(bh_data, list):
+            # Propagate error as a warning so callers notice the malformed file.
+            warnings.append(f"blockers_history_file error: {bh_err}")
+        else:
+            assert bh_data is not None
             blockers_history = bh_data
 
     # --- Load schema ---
@@ -380,7 +462,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     schema: Optional[dict[str, Any]] = None
     if schema_path.exists():
         schema_hash = _sha256_file(schema_path)
-        schema_data, schema_err = load_json(schema_path)
+        schema_data, schema_err = load_json_object(schema_path)
         if not schema_err:
             schema = schema_data
 
@@ -418,7 +500,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             status="invalid",
             loop_state_path=str(out_path),
             errors=errors,
-            warnings=[],
+            warnings=warnings,
             provenance=provenance,
         )
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
@@ -437,7 +519,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 status="invalid",
                 loop_state_path=str(out_path),
                 errors=errors,
-                warnings=[],
+                warnings=warnings,
                 provenance=provenance,
             )
             print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
@@ -456,7 +538,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             status="invalid",
             loop_state_path=str(out_path),
             errors=validation_errors,
-            warnings=[],
+            warnings=warnings,
             provenance=provenance,
         )
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))
@@ -471,7 +553,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         loop_state_path=str(out_path),
         loop_state_sha256=loop_state_hash,
         errors=[],
-        warnings=[],
+        warnings=warnings,
         provenance=provenance,
     )
     print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))

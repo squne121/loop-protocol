@@ -12,6 +12,11 @@ Tests:
 - unknown verdict → invalid
 - scope_signal triggered → captured in loop state
 - max_iterations boundary
+- blockers_history file: array preserved, object rejected/warned, missing is error
+- missing planner decisions field → invalid
+- missing planner decision sub-fields → invalid
+- missing review VERDICT → invalid
+- issue_number non-integer → returns build result JSON (no traceback)
 """
 
 from __future__ import annotations
@@ -133,7 +138,7 @@ def _minimal_review(verdict: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# AC9: negative fixtures
+# AC9: negative fixtures (original tests)
 # ---------------------------------------------------------------------------
 
 
@@ -312,3 +317,201 @@ def test_missing_review_file(tmp_path):
     if result.stdout.strip():
         build_result = json.loads(result.stdout)
         assert build_result["status"] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: blockers_history_file (array vs object vs missing)
+# ---------------------------------------------------------------------------
+
+
+def test_blockers_history_file_array_is_preserved(tmp_path):
+    """Blocker 1: --blockers-history-file with valid JSON array is preserved in loop_state."""
+    history = [
+        {"iteration": 0, "blockers": ["scope_signal_guard_triggered"]},
+        {"iteration": 1, "blockers": ["max_iterations_exceeded"]},
+    ]
+    bh_path = tmp_path / "blockers_history.json"
+    bh_path.write_text(json.dumps(history), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        extra_args=["--blockers-history-file", str(bh_path)],
+    )
+    assert result.returncode == 0, f"Unexpected failure:\n{result.stdout}\n{result.stderr}"
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "ok"
+
+    loop_state = json.loads(out.read_text(encoding="utf-8"))
+    assert loop_state["blockers_history"] == history
+
+
+def test_blockers_history_file_object_is_invalid_or_warned(tmp_path):
+    """Blocker 1: --blockers-history-file with JSON object (not array) is warned."""
+    obj_path = tmp_path / "blockers_history_obj.json"
+    obj_path.write_text(json.dumps({"not": "an array"}), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        extra_args=["--blockers-history-file", str(obj_path)],
+    )
+    # Should either fail (status=invalid) or succeed with a warning — not silently accept.
+    build_result = json.loads(result.stdout)
+    if build_result["status"] == "ok":
+        # If accepted, it must appear in warnings[], not silently swallowed.
+        assert len(build_result.get("warnings", [])) > 0, (
+            "Non-array blockers_history_file must produce a warning when status=ok"
+        )
+        # The loop_state must NOT contain the object as blockers_history.
+        loop_state = json.loads(out.read_text(encoding="utf-8"))
+        assert isinstance(loop_state["blockers_history"], list), (
+            "blockers_history in loop_state must always be a list"
+        )
+        # An empty list is acceptable (the bad file was ignored with warning).
+        assert loop_state["blockers_history"] == []
+    else:
+        # Explicit invalid is also acceptable.
+        assert build_result["status"] == "invalid"
+        assert len(build_result.get("errors", [])) > 0
+
+
+def test_blockers_history_file_missing_is_error(tmp_path):
+    """Blocker 1: --blockers-history-file pointing to nonexistent file is warned/invalid."""
+    missing_path = tmp_path / "does_not_exist.json"
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        extra_args=["--blockers-history-file", str(missing_path)],
+    )
+    build_result = json.loads(result.stdout)
+    # Missing file must not be silently swallowed.
+    if build_result["status"] == "ok":
+        assert len(build_result.get("warnings", [])) > 0, (
+            "Missing blockers_history_file must produce a warning when status=ok"
+        )
+    else:
+        assert build_result["status"] == "invalid"
+        assert len(build_result.get("errors", [])) > 0
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: missing planner artifact required fields
+# ---------------------------------------------------------------------------
+
+
+def test_missing_planner_decisions_is_invalid(tmp_path):
+    """Blocker 2: Planner artifact missing 'decisions' field → status=invalid."""
+    planner = _minimal_planner()
+    del planner["decisions"]  # remove decisions entirely
+    planner_path = tmp_path / "planner_no_decisions.json"
+    planner_path.write_text(json.dumps(planner), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        planner_path=planner_path,
+    )
+    assert result.returncode != 0
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "invalid"
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "decisions" in all_messages
+
+
+def test_missing_planner_web_research_policy_is_invalid(tmp_path):
+    """Blocker 2: Planner decisions missing 'web_research_policy' → status=invalid."""
+    planner = _minimal_planner()
+    del planner["decisions"]["web_research_policy"]
+    planner_path = tmp_path / "planner_no_wrp.json"
+    planner_path.write_text(json.dumps(planner), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        planner_path=planner_path,
+    )
+    assert result.returncode != 0
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "invalid"
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "web_research_policy" in all_messages
+
+
+def test_missing_planner_scope_signal_guard_is_invalid(tmp_path):
+    """Blocker 2: Planner decisions missing 'scope_signal_guard' → status=invalid."""
+    planner = _minimal_planner()
+    del planner["decisions"]["scope_signal_guard"]
+    planner_path = tmp_path / "planner_no_ssg.json"
+    planner_path.write_text(json.dumps(planner), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        planner_path=planner_path,
+    )
+    assert result.returncode != 0
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "invalid"
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "scope_signal_guard" in all_messages
+
+
+def test_missing_review_verdict_is_invalid(tmp_path):
+    """Blocker 2: Review artifact missing VERDICT field → status=invalid."""
+    review = _minimal_review("approve")
+    del review["VERDICT"]  # remove VERDICT field entirely
+    review_path = tmp_path / "review_no_verdict.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        review_path=review_path,
+    )
+    assert result.returncode != 0
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "invalid"
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "VERDICT" in all_messages or "verdict" in all_messages.lower()
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: issue_number type safety
+# ---------------------------------------------------------------------------
+
+
+def test_planner_issue_number_non_integer_returns_build_result_json(tmp_path):
+    """Blocker 4: Non-integer issue_number in planner artifact → status=invalid JSON (no traceback)."""
+    planner = _minimal_planner()
+    planner["source"]["issue_number"] = "abc"  # string that cannot convert to int
+    planner_path = tmp_path / "planner_bad_issue.json"
+    planner_path.write_text(json.dumps(planner), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        planner_path=planner_path,
+        issue_number=1024,
+    )
+    # Must not traceback — stdout must be valid JSON
+    assert result.stdout.strip(), "Expected JSON output on stdout"
+    build_result = json.loads(result.stdout)  # raises if not JSON
+    assert build_result["status"] == "invalid"
+    assert len(build_result.get("errors", [])) > 0
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "issue_number" in all_messages.lower()
+
+
+def test_review_issue_number_non_integer_returns_build_result_json(tmp_path):
+    """Blocker 4: Non-integer issue_number in review artifact → status=invalid JSON (no traceback)."""
+    review = _minimal_review("approve")
+    review["issue_number"] = {"nested": "object"}  # object instead of int
+    review_path = tmp_path / "review_bad_issue.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+
+    result, out = run_builder(
+        tmp_path=tmp_path,
+        review_path=review_path,
+        issue_number=1024,
+    )
+    # Must not traceback — stdout must be valid JSON
+    assert result.stdout.strip(), "Expected JSON output on stdout"
+    build_result = json.loads(result.stdout)  # raises if not JSON
+    assert build_result["status"] == "invalid"
+    assert len(build_result.get("errors", [])) > 0
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "issue_number" in all_messages.lower()

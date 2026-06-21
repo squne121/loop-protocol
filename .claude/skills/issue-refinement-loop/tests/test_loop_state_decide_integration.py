@@ -9,6 +9,8 @@ Tests:
 - needs-fix → continue_to_step_4
 - scope_signal → human_escalation
 - max_iterations → human_escalation
+- loop_state.last_verdict used when --review-result-verdict omitted (Blocker 3)
+- missing review verdict → builder status=invalid (Blocker 2+3)
 """
 
 from __future__ import annotations
@@ -126,12 +128,24 @@ def build_loop_state(
 
 
 def run_decide(loop_state_path: Path, verdict: str) -> subprocess.CompletedProcess:
-    """Run decide_next_loop_action.py with the given loop_state file."""
+    """Run decide_next_loop_action.py with the given loop_state file and explicit verdict."""
     return subprocess.run(
         [
             sys.executable, str(DECIDE_SCRIPT),
             "--loop-state-file", str(loop_state_path),
             "--review-result-verdict", verdict,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_decide_no_verdict(loop_state_path: Path) -> subprocess.CompletedProcess:
+    """Run decide_next_loop_action.py without --review-result-verdict (uses loop_state.last_verdict)."""
+    return subprocess.run(
+        [
+            sys.executable, str(DECIDE_SCRIPT),
+            "--loop-state-file", str(loop_state_path),
         ],
         capture_output=True,
         text=True,
@@ -291,3 +305,91 @@ def test_builder_integration_scope_signal_from_fixture(tmp_path):
     assert decide_result.returncode == 2
     assert "STATUS: human_escalation" in decide_result.stdout
     assert "scope_signal_guard_triggered" in decide_result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: router uses loop_state.last_verdict when --review-result-verdict omitted
+# ---------------------------------------------------------------------------
+
+
+def test_builder_router_uses_loop_state_last_verdict_approve(tmp_path):
+    """Blocker 3: Without --review-result-verdict, router uses loop_state.last_verdict=approve."""
+    loop_state_path, _ = build_loop_state(
+        planner_data=_minimal_planner(),
+        review_data=_minimal_review("approve"),
+        issue_number=1024,
+        iteration=0,
+        max_iterations=3,
+        tmp_path=tmp_path,
+    )
+    # Verify last_verdict is stored in loop_state
+    loop_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
+    assert loop_state["last_verdict"] == "approve"
+
+    # Run router WITHOUT --review-result-verdict
+    result = run_decide_no_verdict(loop_state_path)
+    assert result.returncode == 0, (
+        f"Expected exit 0 using last_verdict=approve from loop_state, "
+        f"got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    assert "NEXT_ACTION: proceed_to_step_4_5" in result.stdout
+    assert "STATUS: pass" in result.stdout
+
+
+def test_builder_router_uses_loop_state_last_verdict_needs_fix(tmp_path):
+    """Blocker 3: Without --review-result-verdict, router uses loop_state.last_verdict=needs-fix."""
+    loop_state_path, _ = build_loop_state(
+        planner_data=_minimal_planner(),
+        review_data=_minimal_review("needs-fix"),
+        issue_number=1024,
+        iteration=0,
+        max_iterations=3,
+        tmp_path=tmp_path,
+    )
+    loop_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
+    assert loop_state["last_verdict"] == "needs-fix"
+
+    result = run_decide_no_verdict(loop_state_path)
+    assert result.returncode == 0, (
+        f"Expected exit 0 using last_verdict=needs-fix, "
+        f"got {result.returncode}\nstdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    assert "NEXT_ACTION: continue_to_step_4" in result.stdout
+    assert "STATUS: pass" in result.stdout
+
+
+def test_review_verdict_missing_is_invalid(tmp_path):
+    """Blocker 3 / Blocker 2: Builder with verdict-less review → status=invalid."""
+    # Review has no VERDICT key at all — not just null
+    review = {
+        "STATUS": "ok",
+        "SUMMARY": "no verdict here",
+        "BLOCKERS": "0",
+        "NEXT_ACTION": "proceed",
+        "MUST_READ": "",
+        "EVIDENCE": "",
+        "ARTIFACT": "",
+    }
+    planner_path = tmp_path / "planner.json"
+    planner_path.write_text(json.dumps(_minimal_planner()), encoding="utf-8")
+    review_path = tmp_path / "review.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    out_path = tmp_path / "loop_state.json"
+
+    result = subprocess.run(
+        [
+            sys.executable, str(BUILD_SCRIPT),
+            "--planner-result-file", str(planner_path),
+            "--review-result-file", str(review_path),
+            "--issue-number", "1024",
+            "--iteration", "0",
+            "--out", str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    build_result = json.loads(result.stdout)
+    assert build_result["status"] == "invalid"
+    all_messages = " ".join(e["message"] for e in build_result["errors"])
+    assert "VERDICT" in all_messages or "verdict" in all_messages.lower()
