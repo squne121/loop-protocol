@@ -667,3 +667,133 @@ def test_auth_does_not_leak_api_key_value(monkeypatch):
     assert sentinel not in serialized, (
         f"GEMINI_API_KEY value '{sentinel}' must not appear in check_auth output"
     )
+
+
+# ---------------------------------------------------------------------------
+# Additional tests for B1-B5 fixes (human review blockers)
+# ---------------------------------------------------------------------------
+
+
+def test_auth_timeout_recovery_mentions_api_key_and_issue_104():
+    """GIVEN smoke prompt times out
+    WHEN check_auth is called
+    THEN status is 'timeout' and recovery mentions GEMINI_API_KEY and #104."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            raise __import__("subprocess").TimeoutExpired(cmd=command, timeout=timeout)
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["ok"] is False
+    assert result["status"] == "timeout"
+    combined = " ".join(result.get("recovery", []))
+    assert "GEMINI_API_KEY" in combined
+    assert "#104" in combined
+
+
+def test_auth_does_not_leak_api_key_value_from_unauthenticated_detail(monkeypatch):
+    """GIVEN GEMINI_API_KEY is set AND gemini stderr includes the key value
+    WHEN check_auth falls into the unauthenticated branch
+    THEN the key value does NOT appear anywhere in the returned dict."""
+    sc = load_setup_check()
+
+    sentinel = "sk-UNAUTHENTICATED-LEAK-CHECK-99999"
+    monkeypatch.setenv("GEMINI_API_KEY", sentinel)
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            # Simulate Gemini CLI accidentally printing the key in its error output.
+            return _make_completed(1, stderr=f"auth failed: key={sentinel} was rejected")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    serialized = json.dumps(result)
+    assert sentinel not in serialized, (
+        "GEMINI_API_KEY value must be redacted from check_auth output even if CLI prints it"
+    )
+
+
+def test_auth_unrelated_no_longer_supported_is_not_oauth_sunset():
+    """GIVEN gemini exits with 'model no longer supported' (not OAuth sunset)
+    WHEN check_auth is called
+    THEN status is NOT oauth_sunset (B3: avoid over-detection)."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(1, stderr="Error: model gemini-1.0-pro is no longer supported.")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["status"] != "oauth_sunset", (
+        "'model no longer supported' must not trigger oauth_sunset (B3)"
+    )
+
+
+def test_auth_unrelated_tier_text_is_not_ineligible_tier():
+    """GIVEN gemini exits with 'tier' in an unrelated context (e.g. 'frontier tier error')
+    WHEN check_auth is called
+    THEN status is NOT ineligible_tier (B3: avoid over-detection)."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(1, stderr="Error: frontier tier request limit exceeded.")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["status"] != "ineligible_tier", (
+        "'frontier tier request limit exceeded' must not trigger ineligible_tier (B3)"
+    )
+
+
+def test_auth_status_always_in_auth_status_values():
+    """GIVEN various gemini CLI responses
+    THEN all returned auth status values are in AUTH_STATUS_VALUES (fixed enum)."""
+    sc = load_setup_check()
+    AUTH_VALUES = sc.AUTH_STATUS_VALUES
+
+    scenarios = [
+        ("ok", "", ""),
+        ("1", "service has been discontinued", ""),
+        ("1", "", "not eligible for this tier"),
+        ("1", "", "auth failed: not logged in"),
+        ("1", "", "unexpected random error"),
+        ("gemini_not_found", "", ""),
+    ]
+
+    for returncode_or_exc, stdout, stderr in scenarios:
+        if returncode_or_exc == "gemini_not_found":
+            def make_exc_side_effect(command, timeout=None):
+                if "gemini" in command and "--prompt" in command:
+                    raise FileNotFoundError("gemini not found")
+                return _make_completed(0)
+            side_effect = make_exc_side_effect
+        else:
+            rc = int(returncode_or_exc) if returncode_or_exc != "ok" else 0
+            _stdout, _stderr = stdout, stderr
+            def make_side_effect(rc=rc, out=_stdout, err=_stderr):
+                def _f(command, timeout=None):
+                    if "gemini" in command and "--prompt" in command:
+                        return _make_completed(rc, stdout=out, stderr=err)
+                    return _make_completed(0)
+                return _f
+            side_effect = make_side_effect()
+
+        with patch.object(sc, "_run", side_effect=side_effect):
+            result = sc.check_auth()
+
+        assert result.get("status") in AUTH_VALUES, (
+            f"status '{result.get('status')}' not in AUTH_STATUS_VALUES for scenario: "
+            f"rc={returncode_or_exc!r} stderr={stderr!r}"
+        )

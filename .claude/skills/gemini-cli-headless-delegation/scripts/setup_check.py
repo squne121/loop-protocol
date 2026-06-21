@@ -49,7 +49,7 @@ SERENA_CHECK_TIMEOUT = 30
 # Timeout for smoke prompt (seconds).
 SMOKE_PROMPT_TIMEOUT = 20
 
-# Valid auth status values.
+# Valid auth status values (fixed enum — do not change without updating Issue #1081).
 AUTH_STATUS_VALUES = frozenset([
     "authenticated",
     "authenticated_api_key",
@@ -82,6 +82,19 @@ def _run(command: list[str], timeout: int | None = None) -> subprocess.Completed
         check=False,
         timeout=timeout,
     )
+
+
+def _redact_api_key(text: str) -> str:
+    """Remove GEMINI_API_KEY value from text before output.
+
+    Security: the key value is NEVER stored in variables or included in outputs.
+    This redaction is a last-resort safety net for cases where external processes
+    (e.g. the gemini CLI itself) include the key in their own error output.
+    """
+    secret = os.environ.get("GEMINI_API_KEY")
+    if secret and secret in text:
+        return text.replace(secret, "[REDACTED]")
+    return text
 
 
 def _trusted_folders_path() -> Path:
@@ -356,6 +369,48 @@ def check_gemini_settings(repo_root: Path | None = None, fix: bool = False) -> d
 # Check: account authentication (smoke prompt)
 # ---------------------------------------------------------------------------
 
+# Specific service-termination phrases for oauth_sunset.
+# Use only specific multi-word phrases to avoid false positives from unrelated errors.
+_SUNSET_PHRASES = (
+    "service has been discontinued",
+    "sunset",
+    "replaced by antigravity",
+    "gemini code assist for individuals",
+    "transitioning gemini cli to antigravity",
+)
+
+# Compound check for oauth_sunset: require a combination of context words when
+# using short keywords to avoid mis-classifying "model no longer supported" etc.
+def _is_oauth_sunset(text: str) -> bool:
+    """Return True only for specific Gemini OAuth termination indicators."""
+    if "service has been discontinued" in text:
+        return True
+    if "sunset" in text and ("google" in text or "gemini" in text or "oauth" in text):
+        return True
+    if "replaced by antigravity" in text:
+        return True
+    if "gemini code assist for individuals" in text:
+        return True
+    if "transitioning gemini cli to antigravity" in text:
+        return True
+    if "google login" in text and "no longer" in text:
+        return True
+    if "oauth" in text and ("terminated" in text or "sunset" in text):
+        return True
+    return False
+
+
+# Specific IneligibleTierError phrases.
+def _is_ineligible_tier(text: str) -> bool:
+    """Return True only for specific account-tier ineligibility indicators."""
+    if "ineligibletiererror" in text:
+        return True
+    if "not eligible for this tier" in text:
+        return True
+    if "account does not qualify for" in text:
+        return True
+    return False
+
 
 def check_auth() -> dict[str, Any]:
     """Run a short smoke prompt to verify Gemini CLI authentication.
@@ -363,11 +418,12 @@ def check_auth() -> dict[str, Any]:
     Authentication itself is a human responsibility (pre-requisite).
     This check only verifies that cached credentials are working.
 
-    auth.status values (fixed enum):
-        authenticated         — OAuth login active and working
-        authenticated_api_key — API key present and accepted (temporary workaround)
+    auth.status values (fixed enum — see AUTH_STATUS_VALUES):
+        authenticated         — OAuth login active and working; api_key_present field
+                                indicates whether GEMINI_API_KEY is also set in the env
+        authenticated_api_key — Reserved for future use when API key use can be confirmed
         oauth_sunset          — Google OAuth login via Gemini CLI has been discontinued
-        ineligible_tier       — Account does not qualify for this Gemini tier
+        ineligible_tier       — Account does not qualify for required Gemini tier
         unauthenticated       — Not logged in (gemini auth login required)
         auth_failed           — Unknown auth failure
         timeout               — Smoke prompt timed out
@@ -375,6 +431,7 @@ def check_auth() -> dict[str, Any]:
 
     Security: GEMINI_API_KEY existence is detected but its value is NEVER logged,
     printed, or included in any output field (detail / recovery / result JSON).
+    Raw CLI output is redacted via _redact_api_key() before being placed in detail.
 
     Model override: set GEMINI_SETUP_CHECK_MODEL env var to override smoke model
     (default: gemini-2.0-flash).
@@ -408,20 +465,19 @@ def check_auth() -> dict[str, Any]:
         }
 
     if result.returncode == 0:
-        if has_api_key:
-            return {
-                "ok": True,
-                "status": "authenticated_api_key",
-                "api_key_present": True,
-            }
-        return {"ok": True, "status": "authenticated"}
+        # Success: always return 'authenticated'. api_key_present is informational only.
+        # 'authenticated_api_key' is reserved for future use when CLI confirms the key
+        # was the active auth provider (presence alone is not sufficient evidence).
+        return {
+            "ok": True,
+            "status": "authenticated",
+            "api_key_present": has_api_key,
+        }
 
     combined = (result.stdout + result.stderr).lower()
 
     # Detect Google OAuth sunset / service termination for Gemini CLI.
-    _SUNSET_KEYWORDS = ("service has been discontinued", "sunset", "no longer supported",
-                        "google login.*no longer", "oauth.*terminated")
-    if any(kw in combined for kw in _SUNSET_KEYWORDS):
+    if _is_oauth_sunset(combined):
         return {
             "ok": False,
             "status": "oauth_sunset",
@@ -430,9 +486,7 @@ def check_auth() -> dict[str, Any]:
         }
 
     # IneligibleTierError — account does not qualify for required Gemini tier.
-    _INELIGIBLE_KEYWORDS = ("ineligible", "not eligible", "tier", "account does not qualify",
-                             "requires.*subscription", "upgrade.*plan")
-    if any(kw in combined for kw in _INELIGIBLE_KEYWORDS):
+    if _is_ineligible_tier(combined):
         return {
             "ok": False,
             "status": "ineligible_tier",
@@ -443,10 +497,12 @@ def check_auth() -> dict[str, Any]:
     # Generic auth / login required.
     _AUTH_KEYWORDS = ("auth", "login", "credential", "sign in", "not logged")
     if any(kw in combined for kw in _AUTH_KEYWORDS):
+        # Redact API key from raw CLI output before including in detail.
+        raw_detail = (result.stderr or result.stdout)[:300]
         return {
             "ok": False,
             "status": "unauthenticated",
-            "detail": (result.stderr or result.stdout)[:300],
+            "detail": _redact_api_key(raw_detail),
             "recovery": [
                 "Run: gemini auth login",
                 "Authentication is a human pre-requisite; setup_check cannot automate OAuth login.",
