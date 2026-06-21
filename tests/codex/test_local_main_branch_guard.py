@@ -34,6 +34,7 @@ from local_main_branch_guard import (
     REASON_UNPARSEABLE,
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
+    REASON_GH_MUTATION,
 )
 
 
@@ -424,6 +425,61 @@ class TestGhReadonlyAndDeny:
         assert result["status"] == "block"
 
 
+class TestGhMutationReasonCode:
+    """AC1-AC7 (#1109): gh_mutation_denied reason_code for gh issue/pr mutation block."""
+
+    # AC2: gh issue close/comment/edit/reopen/delete/lock/unlock
+    @pytest.mark.parametrize("cmd", [
+        # gh issue close/comment/reopen are now allow via is_github_remote_ops_command (#1120)
+        "gh issue edit 123 --title new",
+        "gh issue delete 123",
+        "gh issue lock 123",
+        "gh issue unlock 123",
+    ])
+    def test_gh_issue_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh issue mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION, (
+            f"Expected gh_mutation_denied for {cmd!r}, got {result['reason_code']!r}"
+        )
+
+    # AC3: gh pr checkout/edit/comment/merge/update-branch/review
+    @pytest.mark.parametrize("cmd", [
+        # gh pr comment --body and gh pr edit <N> are now allow via is_github_remote_ops_command (#1120)
+        "gh pr checkout 456",
+        "gh pr merge 456",
+        "gh pr update-branch 456",
+        "gh pr review 456",
+    ])
+    def test_gh_pr_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh pr mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION, (
+            f"Expected gh_mutation_denied for {cmd!r}, got {result['reason_code']!r}"
+        )
+
+    # AC4: readonly commands still allow
+    @pytest.mark.parametrize("cmd", [
+        "gh issue view 123",
+        "gh issue list",
+        "gh pr view 456",
+        "gh pr list",
+        "gh pr status",
+    ])
+    def test_gh_readonly_still_allowed(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh readonly command WHEN evaluated THEN status is allow."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", (
+            f"Expected allow for readonly {cmd!r}, got {result['status']!r}"
+        )
+
+    def test_gh_mutation_denied_constant_value(self):
+        """AC1: REASON_GH_MUTATION == 'gh_mutation_denied'."""
+        assert REASON_GH_MUTATION == "gh_mutation_denied"
+
+
 class TestExactAllowlist:
     """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker reason_code."""
 
@@ -513,7 +569,7 @@ class TestGhMutationFailClosedCompleteness:
         """GIVEN gh mutation not in readonly allowlist or minimal gh ops allowlist WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
-        assert result["reason_code"] == REASON_UNPARSEABLE
+        assert result["reason_code"] == REASON_GH_MUTATION
 
     @pytest.mark.parametrize("cmd", [
         "gh issue close 1089",
