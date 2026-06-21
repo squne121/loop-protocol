@@ -479,6 +479,25 @@ class TestGhMutationReasonCode:
         """AC1: REASON_GH_MUTATION == 'gh_mutation_denied'."""
         assert REASON_GH_MUTATION == "gh_mutation_denied"
 
+    def test_gh_mutation_recovery_hint_contains_approved(self, tmp_git_repo: Path, capsys):
+        """AC7: gh mutation block の recovery hint が GitHub mutation 文脈の文言を含む"""
+        from local_main_branch_guard import _emit_block_stderr, REASON_GH_MUTATION
+        _emit_block_stderr(
+            reason_code=REASON_GH_MUTATION,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="codex",
+        )
+        captured = capsys.readouterr()
+        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
+        assert hint_line, "Expected a recovery: line in stderr"
+        hint = hint_line[0].lower()
+        assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
+            f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
+        )
+
+
 
 class TestExactAllowlist:
     """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker reason_code."""
