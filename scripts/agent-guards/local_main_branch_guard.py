@@ -47,6 +47,7 @@ REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
+REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -292,7 +293,7 @@ DETERMINISTIC_CHECKER_ALLOWLIST = [
 ]
 
 # ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
-# ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS is blocked.
+# ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS or is_github_remote_ops_command is blocked.
 GH_ISSUE_PR_COMMAND_PATTERN = re.compile(r"^gh\s+(issue|pr)\s+")
 
 # Patterns for display-oriented read-only commands.
@@ -466,10 +467,81 @@ def is_deterministic_checker_command(cmd: str, project_root: str | None = None) 
     return False
 
 
+def is_github_remote_ops_command(cmd: str) -> bool:
+    """
+    post-merge-cleanup で必要な GitHub remote ops の最小集合のみを allow。
+    token ベース classifier でフラグ・引数まで検証する。
+
+    Return True: post-merge-cleanup 最小集合に合致 → allow（ブロックしない）
+    Return False: 合致しない → caller が is_gh_mutation_command のブロック判定に従う
+
+    許可対象（post-merge-cleanup 最小集合）:
+      - gh issue close <N>              N は数値 issue 番号必須
+      - gh issue comment <N> --body/-b  N は数値、--body or --body-file 必須
+      - gh issue reopen <N>             N は数値 issue 番号必須
+      - gh pr comment <N> --body/-b     N は数値、--body or --body-file 必須
+      - gh pr edit <N> ...              N は数値 PR 番号必須
+
+    除外（削除）:
+      - gh issue create    post-merge-cleanup では不要
+      - gh issue edit      body 指定なし interactive がありうる
+      - gh pr create       local push が必要になりうる
+
+    明示ブロック対象フラグ:
+      - --delete-last  destructive
+      - --editor       interactive
+      - --web          interactive
+    """
+    cmd = cmd.strip()
+    tokens = tokenize_command(cmd)
+    if tokens is None or len(tokens) < 3:
+        return False
+    if tokens[0] != "gh":
+        return False
+    resource = tokens[1]   # "issue" or "pr"
+    subcommand = tokens[2] # "close", "comment", "reopen", "edit"
+
+    # Destructive / interactive flags → block always
+    BLOCKED_FLAGS = {"--delete-last", "--editor", "--web"}
+    if any(t in BLOCKED_FLAGS for t in tokens[3:]):
+        return False
+
+    if resource == "issue":
+        # gh issue close <N>
+        if subcommand == "close":
+            return len(tokens) >= 4 and tokens[3].isdigit()
+
+        # gh issue comment <N> --body/-b <text> OR --body-file <path>
+        if subcommand == "comment":
+            if len(tokens) < 4 or not tokens[3].isdigit():
+                return False
+            has_body = any(t in ("--body", "-b", "--body-file") for t in tokens[4:])
+            return has_body
+
+        # gh issue reopen <N>
+        if subcommand == "reopen":
+            return len(tokens) >= 4 and tokens[3].isdigit()
+
+    elif resource == "pr":
+        # gh pr comment <N> --body/-b <text> OR --body-file <path>
+        if subcommand == "comment":
+            if len(tokens) < 4 or not tokens[3].isdigit():
+                return False
+            has_body = any(t in ("--body", "-b", "--body-file") for t in tokens[4:])
+            return has_body
+
+        # gh pr edit <N> ... (PR番号指定必須)
+        if subcommand == "edit":
+            return len(tokens) >= 4 and tokens[3].isdigit()
+
+    return False
+
+
 def is_gh_mutation_command(cmd: str) -> bool:
-    """gh issue/pr コマンドで readonly allowlist 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
+    """gh issue/pr コマンドで readonly allowlist および is_github_remote_ops_command 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
     DISPLAY_READONLY_PATTERNS に含まれる gh issue view/list, gh pr view/list/status のみ通過。
-    gh issue create/develop/transfer/pin/unpin, gh pr create/revert/lock/unlock 等はすべてブロック。
+    is_github_remote_ops_command に合致する post-merge-cleanup 最小集合は通過（GitHub ops として許可）。
+    gh issue develop/transfer/pin/unpin, gh pr merge/checkout/revert/lock/unlock 等はすべてブロック。
     """
     cmd = cmd.strip()
     # Only applies to gh issue/pr subcommands
@@ -479,7 +551,7 @@ def is_gh_mutation_command(cmd: str) -> bool:
     for pattern in DISPLAY_READONLY_PATTERNS:
         if re.match(pattern, cmd):
             return False
-    # gh issue/pr not in readonly allowlist → treat as mutation → block
+    # gh issue/pr not in any allowlist → treat as mutation → block
     return True
 
 
@@ -930,7 +1002,18 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
-    # Step 9.7: Gh mutation commands — fail-closed (AC11).
+    # Step 9.7a: GitHub remote ops (post-merge-cleanup minimum set) — allow with distinct reason_code.
+    if is_github_remote_ops_command(normalized_cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_GITHUB_REMOTE_OPS,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 9.7b: Gh mutation commands — fail-closed (AC11).
     if is_gh_mutation_command(normalized_cmd):
         return _result(
             status="block",
