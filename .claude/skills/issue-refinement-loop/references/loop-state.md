@@ -13,6 +13,36 @@ schema: schemas/loop_state.schema.json
 Full field definitions and routing semantics for the `LOOP_STATE_V1` schema.
 The canonical machine-readable schema is `schemas/loop_state.schema.json`.
 
+## Building LOOP_STATE_V1
+
+Use `build_loop_state.py` to construct `LOOP_STATE_V1` from planner and review results.
+**Do not write LOOP_STATE JSON by hand** — use the builder to ensure schema validation and provenance.
+
+```bash
+uv run python3 .claude/skills/issue-refinement-loop/scripts/build_loop_state.py \
+  --planner-result-file <REFINEMENT_LOOP_PLAN_V1 path> \
+  --review-result-file <ISSUE_REVIEW_RESULT_COMPACT_V1 path> \
+  --issue-number <N> \
+  --iteration <0-indexed> \
+  [--max-iterations <N>] \
+  [--blockers-history-file <path>] \
+  [--schema-file <path>] \
+  --out <output path>
+```
+
+The builder outputs `LOOP_STATE_BUILD_RESULT_V1` (stdout JSON) with:
+- `status`: `ok` | `invalid`
+- `loop_state_path`: where the validated LOOP_STATE_V1 was written
+- `loop_state_sha256`: content hash for integrity checking
+- `errors[]`: schema validation errors (path, message, schema_path)
+- `provenance`: planner/review input hashes and source metadata
+
+Builder constraints:
+- Does NOT determine `next_action` (that is `decide_next_loop_action.py`'s job)
+- Does NOT perform GitHub mutations (`gh` commands)
+- Validates output against `schemas/loop_state.schema.json` using `iter_errors()` (all errors collected)
+- Input is file paths only — raw JSON strings are rejected
+
 ## Field Index
 
 | field | type | routing_critical | description |
@@ -36,6 +66,21 @@ The canonical machine-readable schema is `schemas/loop_state.schema.json`.
 | `delivery_rollup` | object | yes | Parent delivery rollup applicability |
 | `follow_up_materialization` | object | yes | Follow-up issue candidates |
 | `superseded_decision` | object | yes | If this issue was superseded by a human decision |
+
+## LOOP_STATE_V1 Field Mapping from Builder Inputs
+
+| LOOP_STATE_V1 field | Source |
+|---|---|
+| `issue_number` | CLI `--issue-number` (validated against planner/review artifacts) |
+| `iteration` | CLI `--iteration` |
+| `max_iterations` | CLI `--max-iterations` (default 3) |
+| `web_research_policy` | `REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy` |
+| `scope_signal_guard` | `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard` |
+| `delivery_rollup` | `REFINEMENT_LOOP_PLAN_V1.decisions.delivery_rollup` |
+| `follow_up_materialization` | `REFINEMENT_LOOP_PLAN_V1.decisions.follow_up_materialization` |
+| `last_verdict` | `ISSUE_REVIEW_RESULT_COMPACT_V1.VERDICT` |
+| `blockers_history` | CLI `--blockers-history-file` or empty array |
+| `termination_reason` | Always `null` (builder does not terminate the loop) |
 
 ## Routing Semantics
 
