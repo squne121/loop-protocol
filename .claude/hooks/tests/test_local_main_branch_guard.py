@@ -53,6 +53,7 @@ from local_main_branch_guard import (
     REASON_DETACHED_OR_UNKNOWN,
     REASON_UNPARSEABLE,
     REASON_INLINE_OVERRIDE,
+    REASON_DETERMINISTIC_CHECKER,
 )
 
 
@@ -1123,3 +1124,195 @@ class TestB5NoRawBranchInStderr:
         captured = capsys.readouterr()
         lines = [l for l in captured.err.splitlines() if l.strip()]
         assert len(lines) <= 10
+
+
+class TestBranchSafeMaintenanceParity:
+    """AC2 parity: git fetch / git worktree prune -> branch_safe_maintenance_command (Claude)."""
+
+    def test_git_fetch_is_branch_safe_maintenance(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git fetch", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == "branch_safe_maintenance_command"
+
+    def test_git_worktree_prune_is_branch_safe_maintenance(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git worktree prune", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == "branch_safe_maintenance_command"
+
+    def test_git_fetch_is_not_readonly_command(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git fetch", str(tmp_git_repo))
+        assert result["reason_code"] != REASON_READONLY
+
+
+class TestFdDuplicationClaude:
+    """AC10: 2>&1 | head fd-duplication (Claude flavor)."""
+
+    def test_fd_duplication_git_diff_stat_allowed(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git diff --stat 2>&1 | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+
+    def test_file_write_redirect_still_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root("rg TODO . > out.txt", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_append_redirect_still_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git log >> history.txt", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_fd_dup_without_pipe_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root("git diff 2>&1", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_rg_fd_dup_head_allowed(self, tmp_git_repo: Path):
+        result = eval_in_local_root('rg -n "TODO" README.md 2>&1 | head -n 10', str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+
+class TestGhReadonlyAndDenyClaude:
+    """AC11: gh readonly / gh deny (Claude flavor)."""
+
+    def test_gh_readonly_issue_view(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh issue view 123", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_issue_list_is_readonly(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh issue list", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_view_is_readonly(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh pr view 456", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_list_is_readonly(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh pr list", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_status_is_readonly(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh pr status", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_issue_view_pipeline_head_allowed(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh issue view 123 | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh issue edit 123 --body new", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_issue_close_is_denied(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh issue close 123", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_pr_merge_is_denied(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh pr merge 456", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_pr_update_branch_is_denied(self, tmp_git_repo: Path):
+        result = eval_in_local_root("gh pr update-branch 456", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+
+class TestExactAllowlistClaude:
+    """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker (Claude flavor)."""
+
+    def test_exact_allowlist_run_refinement_preflight(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_wildcard_path_not_in_allowlist(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
+
+    def test_publisher_deny_not_in_allowlist(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "uv run python3 .claude/skills/post-merge-cleanup/scripts/cleanup_runner.py",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
+
+    def test_deterministic_checker_command_reason_code(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert result["reason_code"] != REASON_READONLY
+
+
+class TestPythonpathStaleAndTmpWrapperClaude:
+    """AC14: PYTHONPATH stale regression / /tmp wrapper fail-closed (Claude flavor)."""
+
+    def test_tmp_wrapper_script_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root(
+            "uv run python3 /tmp/run_refinement_preflight.py --issue-number 985",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block"
+
+    def test_python_c_inline_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root("python3 -c import_os", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_bash_lc_wrapper_blocked(self, tmp_git_repo: Path):
+        result = eval_in_local_root("bash -lc 'uv run python3 /tmp/script.py'", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_pythonpath_stale_guard_module_unaffected(self, tmp_git_repo: Path, tmp_path: Path):
+        import os
+        (tmp_path / "command_registry.py").write_text("raise ImportError('stale!')")
+        old = os.environ.get("PYTHONPATH", "")
+        try:
+            os.environ["PYTHONPATH"] = str(tmp_path)
+            result = eval_in_local_root("git status", str(tmp_git_repo))
+        finally:
+            if old:
+                os.environ["PYTHONPATH"] = old
+            elif "PYTHONPATH" in os.environ:
+                del os.environ["PYTHONPATH"]
+        assert result["status"] == "allow"
+
+
+class TestGhMutationFailClosedCompletenessClaude:
+    """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness, Claude flavor)."""
+
+    @pytest.mark.parametrize("cmd", [
+        "gh issue create --title x --body y",
+        "gh issue develop 123 --base main",
+        "gh issue develop 123 --checkout",
+        "gh issue transfer 123 other/repo",
+        "gh issue pin 123",
+        "gh issue unpin 123",
+        "gh pr create --title x --body y",
+        "gh pr revert 123",
+        "gh pr lock 123",
+        "gh pr unlock 123",
+    ])
+    def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh mutation not in original denylist WHEN evaluated THEN blocked (allowlist-closed)."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+
+class TestProjectTmpPolicyClaude:
+    """AC14: OS absolute /tmp is blocked but project-relative tmp/ is not mis-identified (Claude flavor)."""
+
+    def test_repo_relative_tmp_script_is_not_blocked(self, tmp_git_repo: Path):
+        """GIVEN uv run python3 tmp/check.py (relative) WHEN evaluated THEN allow (not OS /tmp)."""
+        result = eval_in_local_root("uv run python3 tmp/check.py --dry-run", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result.get("reason_code") != REASON_UNPARSEABLE
+
+    def test_absolute_tmp_script_is_blocked(self, tmp_git_repo: Path):
+        """GIVEN uv run python3 /tmp/check.py (OS absolute) WHEN evaluated THEN blocked."""
+        result = eval_in_local_root("uv run python3 /tmp/check.py --dry-run", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
