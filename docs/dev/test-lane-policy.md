@@ -9,6 +9,8 @@
 現行 CI（`.github/workflows/ci.yml`）での実装状態:
 
 - `python-test` job は `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` と `pnpm install --frozen-lockfile` は実行しない
+- `python-test` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `-k not (...)` で除外し、Python-only hook tests を継続実行している
+- `node-backed-hook-tests` job は `setup-node-pnpm` / `setup-python-uv` / `pnpm install --frozen-lockfile` を行った上で、Node-backed hook test nodeid だけを実行している
 - `pytest` は複数の step に分割されて実行されている
 - `schemas/tests/` は実行されているが、`ci_test_selection/v1` の `pytest_args` からは欠落している
 - `ruff` は未導入（`pyproject.toml` に dev dependency として登録されていない）
@@ -40,7 +42,7 @@ ci_test_lane_policy_v1:
 
     - id: python_unit
       name: "Python Unit Tests"
-      description: "Python ユニットテスト。pytest による単体・統合テスト。"
+      description: "Python ユニットテスト。pytest による単体・統合テスト。Node-backed hook tests は除く。"
       tools:
         - "uv run pytest <test-paths>"
         - "uv run pytest -n auto（pytest-xdist 導入後）"
@@ -55,18 +57,20 @@ ci_test_lane_policy_v1:
 
     - id: contract_artifact
       name: "Contract / Artifact Verification"
-      description: "スキーマ・コントラクト・アーティファクトの整合性検証。"
+      description: "スキーマ・コントラクト・アーティファクトの整合性検証。Node-backed hook tests を含む。"
       tools:
         - "uv run pytest schemas/tests/"
         - "VC スクリプト（Issue 別）"
+        - "uv run pytest <node-backed hook test nodeids>"
       characteristics:
         - 実行時間: 30秒-2分
-        - 外部依存: なし
+        - 外部依存: 原則なし。ただし Node-backed hook tests は Node.js / pnpm を要求する
         - 並列化: 可能
       trigger:
         - docs/ 変更
         - schema/ 変更
         - .claude/skills/ の SKILL.md 変更
+        - Node-backed hook wrapper / artifact contract の検証
 
     - id: integration
       name: "Integration Tests"
@@ -92,6 +96,7 @@ ci_test_lane_policy_v1:
 |---|---|---|---|---|
 | TypeScript/JS 変更 | 必須 | 不要 | 不要 | 必須 |
 | Python スクリプト変更 | 不要 | 必須 | 条件付き | 不要 |
+| Node-backed hook wrapper / artifact contract 変更 | 不要 | 不要 | 必須 | 不要 |
 | docs/ 変更 | 不要 | 不要 | 必須 | 不要 |
 | schema/ 変更 | 不要 | 必須 | 必須 | 不要 |
 | CI workflow 変更 | 必須 | 必須 | 必須 | 必須 |

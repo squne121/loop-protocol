@@ -817,7 +817,9 @@ jobs:
         run: |
           _t0=$(date +%s%3N)
           set +e
-          uv run --locked pytest .claude/hooks/tests/ -q --ignore=.claude/hooks/tests/test_secret_boundary_contract.py
+          uv run --locked pytest .claude/hooks/tests/ -q \
+            --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
+            -k 'not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)'
           _s=$?
           set -e
           printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
@@ -850,6 +852,8 @@ jobs:
                   "-q",
                   ".claude/hooks/tests/",
                   "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+                  "-k",
+                  "not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)",
               ],
               capture_output=True,
               text=True,
@@ -979,6 +983,7 @@ jobs:
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
             --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
+            -k 'not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)' \
             > ci_test_selection_artifacts/hook_tests_collect_only.txt
           python3 - <<'PY'
           import argparse
@@ -1007,6 +1012,8 @@ jobs:
                   ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
                   ".claude/hooks/tests/",
                   "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
+                  "-k",
+                  "not (test_wrapper_stdout_is_silent_and_artifact_path_is_overridable or test_wrapper_stderr_redacts_posix_windows_and_wsl_paths)",
                   ".claude/skills/issue-contract-review/scripts/tests/",
                   ".claude/skills/issue-contract-review/tests/",
                   ".claude/skills/pr-review-judge/scripts/tests/",
@@ -1029,6 +1036,198 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ci_test_selection
+          path: ci_test_selection_artifacts/
+          if-no-files-found: ignore
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Output CI runtime summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## CI Runtime Baseline: ${{ github.job }}"
+            echo ""
+            echo "| step_id | elapsed_ms | status |"
+            echo "|---|---|---|"
+            python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      m = json.loads(line)
+                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  node-backed-hook-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-pnpm
+      - uses: ./.github/actions/setup-python-uv
+      - name: uv python install (timed)
+        id: timed-uv-python-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed uv_python_install uv python install
+      - name: uv sync (timed)
+        id: timed-uv-sync
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed uv_sync uv sync --locked --group dev
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: pytest node-backed hook tests (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q \
+            .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
+            .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_node_backed_hook_tests","phase_id":"pytest_node_backed_hooks","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
+      - name: Generate node-backed hook selection artifact
+        run: |
+          mkdir -p ci_test_selection_artifacts
+          uv run --locked pytest --collect-only -q \
+            .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
+            .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
+            > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
+          python3 - <<'PY'
+          import argparse
+          import importlib.util
+          import pathlib
+          import sys
+
+          script_path = pathlib.Path(
+              ".claude/skills/pr-review-judge/scripts/generate_ci_test_selection_artifact.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "generate_ci_test_selection_artifact", script_path
+          )
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+
+          args = argparse.Namespace(
+              output="ci_test_selection_artifacts/ci_test_selection_v1.json",
+              pytest_args=[
+                  ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
+                  ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
+              ],
+              pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
+              checked_out_sha=None,
+              merge_sha="${{ github.sha }}",
+              workflow="ci",
+              job="node-backed-hook-tests",
+              ci_run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+          )
+          sys.exit(module.generate_artifact(args))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci_test_selection_node_backed_hook_tests
           path: ci_test_selection_artifacts/
           if-no-files-found: ignore
       - name: Collect ci_runtime_baseline_v1 artifact
@@ -1223,7 +1422,7 @@ jobs:
   ci-verdict-summary:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
-    needs: [typecheck, lint, test, build, e2e, python-test, actionlint]
+    needs: [typecheck, lint, test, build, e2e, python-test, node-backed-hook-tests, actionlint]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -1245,6 +1444,7 @@ jobs:
               "build": "${{ needs.build.result }}",
               "e2e": "${{ needs.e2e.result }}",
               "python-test": "${{ needs.python-test.result }}",
+              "node-backed-hook-tests": "${{ needs['node-backed-hook-tests'].result }}",
               "actionlint": "${{ needs.actionlint.result }}"
             }
         run: |

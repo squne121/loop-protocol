@@ -49,7 +49,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `run_attempt` | string | GitHub Actions の `run_attempt` |
 | `head_sha` | string | PR head SHA（push 時は `github.sha` と同値） |
 | `merge_sha` | string | `github.sha`（merge commit SHA） |
-| `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test` / `actionlint`） |
+| `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test` / `node-backed-hook-tests` / `actionlint`） |
 | `runner_image` | string | `${ImageOS}/${ImageVersion}` |
 | `measurement_method` | string | `"date_plus3N_ms"`（`date +%s%3N` による ms 計測） |
 | `measurements[].step_id` | string | ステップ識別子（granular; python-test では pytest_edit_issue_tests 等） |
@@ -68,7 +68,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 
 | phase_id | 対象コマンド | 対象 job |
 |---|---|---|
-| `pnpm_install` | `pnpm install --frozen-lockfile` | typecheck / lint / test / build / e2e |
+| `pnpm_install` | `pnpm install --frozen-lockfile` | typecheck / lint / test / build / e2e / node-backed-hook-tests |
 | `pnpm_typecheck` | `pnpm typecheck` | typecheck |
 | `pnpm_lint` | `pnpm lint` | lint |
 | `pnpm_manifest_check` | `pnpm manifest:check` | test |
@@ -77,9 +77,10 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `pnpm_build_e2e` | `VITE_E2E_MODE=true pnpm build` | e2e |
 | `playwright_install` | `pnpm playwright:install:ci` | e2e |
 | `test_e2e_ci` | `pnpm test:e2e:ci` | e2e |
-| `uv_python_install` | `uv python install` | python-test |
-| `uv_sync` | `uv sync --locked --group dev` | python-test |
+| `uv_python_install` | `uv python install` | python-test / node-backed-hook-tests |
+| `uv_sync` | `uv sync --locked --group dev` | python-test / node-backed-hook-tests |
 | `pytest_skills` | pytest（skills 群 14 ステップ合計の stable phase_id） | python-test |
+| `pytest_node_backed_hooks` | Node-backed hook test nodeid 2 件 | node-backed-hook-tests |
 | `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |
 | `actionlint` | `actionlint` | actionlint |
 
@@ -104,6 +105,14 @@ python-test job では pytest ステップが複数あり、各ステップの `
 | `pytest_issue_refinement_loop` | `pytest_skills` |
 | `pytest_schemas` | `pytest_skills` |
 | `pytest_context_mode` | `pytest_skills` |
+
+### node-backed-hook-tests job の step_id と phase_id の関係
+
+Node-backed hook test 専用 job では、Node.js / pnpm 依存の hook wrapper 検証を dedicated phase として記録する。
+
+| step_id（granular） | phase_id（stable） |
+|---|---|
+| `pytest_node_backed_hook_tests` | `pytest_node_backed_hooks` |
 
 ## run_timed wrapper 仕様
 
@@ -192,3 +201,9 @@ python-test job 内の以下のステップは計測対象外（`measurements.js
 - `Generate ci_test_selection/v1 artifact`（`generate_ci_test_selection_artifact.py`）
 
 これらは CI ガード（整合性チェック・セキュリティスキャン）であり、runtime duration の比較基準とはしない。
+
+### node-backed-hook-tests job の未計測ガード群
+
+node-backed-hook-tests job 内の以下のステップは計測対象外（`measurements.jsonl` に記録しない）:
+
+- `Generate node-backed hook selection artifact`（Node-backed hook nodeid の collect-only / `ci_test_selection_v1.json` 生成）
