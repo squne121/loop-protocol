@@ -32,6 +32,7 @@ from compact_review_result import (
     REQUIRED_COMPACT_FIELDS,
     compact_review_result,
 )
+from reviewer_claim_replay import analyze
 
 FIXTURES_DIR = SKILLS_ROOT / "fixtures"
 
@@ -166,6 +167,84 @@ def test_compact_review_result_preserves_findings_losslessly(tmp_path):
     assert artifact_json["producer_schema_version"] == "review_issue_result/v1"
     assert artifact_json["producer_body_sha256"] == raw_result["body_sha256"]
     assert artifact_json["findings"] == raw_result["findings"]
+
+
+def test_compact_review_result_preserves_structured_blockers_for_replay(tmp_path):
+    """GIVEN blocking structured_blockers WHEN compacted THEN replay can still reconstruct deterministic fail."""
+    raw_result = {
+        "schema": "REVIEW_ISSUE_RESULT_V1",
+        "schema_version": "review_issue_result/v1",
+        "verdict": "needs-fix",
+        "status": "ok",
+        "body_sha256": "sha256:" + "4" * 64,
+        "issue_kind": "implementation",
+        "generated_at": "2026-06-21T00:00:00Z",
+        "issue_url": "https://github.com/squne121/loop-protocol/issues/42",
+        "deterministic_checks": {"C4_vc_commands_present": "fail"},
+        "blocking_issues": [{"code": "C4", "message": "missing $ prefix"}],
+        "structured_blockers": [
+            {
+                "code": "C4",
+                "message": "missing $ prefix",
+                "finding_kind": "deterministic_domain_blocker",
+                "deterministic_domain_key": "vc_command_format",
+                "blocking": True,
+                "checker_evidence": [
+                    {
+                        "source_check": "check_issue_contract",
+                        "rule_id": "C4_vc_commands_present",
+                        "category": "vc_command_format",
+                        "artifact_path": ".claude/skills/review-issue/scripts/check_issue_contract.py",
+                        "artifact_schema": "REVIEW_ISSUE_RESULT_V1",
+                        "body_sha256": "sha256:" + "4" * 64,
+                        "iteration_id": "iter-1",
+                        "line_start": None,
+                        "line_end": None,
+                    }
+                ],
+            }
+        ],
+        "non_blocking_improvements": [],
+        "findings": [
+            {
+                "finding_kind": "deterministic_domain_blocker",
+                "deterministic_domain_key": "vc_command_format",
+                "blocking": True,
+                "checker_evidence": [
+                    {
+                        "source_check": "check_issue_contract",
+                        "rule_id": "C4_vc_commands_present",
+                        "category": "vc_command_format",
+                        "artifact_path": ".claude/skills/review-issue/scripts/check_issue_contract.py",
+                        "artifact_schema": "REVIEW_ISSUE_RESULT_V1",
+                        "body_sha256": "sha256:" + "4" * 64,
+                        "iteration_id": "iter-1",
+                        "line_start": None,
+                        "line_end": None,
+                    }
+                ],
+                "message": "vc_command_format",
+            }
+        ],
+        "diff_proposal": {},
+        "parsed_vc_commands": [],
+    }
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+
+    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
+    artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+    assert artifact_json["structured_blockers"][0]["code"] == "C4"
+    replay_result, _ = analyze(
+        review_result=artifact_json,
+        readiness_result={"schema": "ISSUE_CONTRACT_READINESS_RESULT_V1", "body_sha256": "sha256:" + "4" * 64, "errors": []},
+        vc_syntax_result=None,
+        vc_preflight_result=None,
+        previous_state={},
+    )
+    assert replay_result["verdict"] == "deterministic_fail_confirmed"
+    assert replay_result["routing"] == "proceed_to_rewrite"
 
 
 def test_compact_review_result_must_read_always_present_when_empty(tmp_path):
@@ -328,6 +407,7 @@ def test_compact_review_result_artifact_secret_check_fails(tmp_path):
         "generated_at": "2026-06-11T00:00:00Z",
         "issue_url": "https://github.com/squne121/loop-protocol/issues/42",
         "blocking_issues": [],
+        "structured_blockers": [],
         "non_blocking_improvements": [],
         "findings": [],
         "diff_proposal": {"note": "token: ghp_" + "A" * 36},
@@ -337,6 +417,38 @@ def test_compact_review_result_artifact_secret_check_fails(tmp_path):
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
     with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
         compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+
+
+def test_compact_review_result_rejects_nan_on_write(tmp_path):
+    """GIVEN review result with NaN WHEN artifact rendered THEN ValueError (strict JSON)."""
+    fixture = FIXTURES_DIR / "review_result_approve.json"
+    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_result["diff_proposal"] = {"nan": float("nan")}
+
+    with pytest.raises(ValueError):
+        compact_review_result(
+            raw_result,
+            artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop",
+            issue_number=42,
+        )
+
+
+def test_compact_review_result_cli_rejects_nan_input(tmp_path):
+    """GIVEN CLI input containing NaN WHEN run THEN exit 2 (strict JSON parse)."""
+    import subprocess
+
+    bad_fixture = tmp_path / "bad_nan.json"
+    bad_fixture.write_text(
+        """{"schema":"REVIEW_ISSUE_RESULT_V1","schema_version":"review_issue_result/v1","verdict":"approve","status":"ok","body_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","issue_kind":"implementation","generated_at":"2026-06-21T00:00:00Z","deterministic_checks":{},"blocking_issues":[],"structured_blockers":[],"non_blocking_improvements":[],"findings":[],"diff_proposal":{"value":NaN},"parsed_vc_commands":[]}""",
+        encoding="utf-8",
+    )
+    script = SCRIPTS_DIR / "compact_review_result.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--input-file", str(bad_fixture), "--artifact-dir", str(tmp_path), "--issue-number", "42"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
 
 
 # ---------------------------------------------------------------------------

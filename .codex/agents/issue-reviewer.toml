@@ -18,6 +18,10 @@ OUTPUT_CONTRACT
 - STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / EVIDENCE / ARTIFACT の 8 フィールド（MUST_READ は空でも常に出力）。
 - Persist only the minimum raw review, issue body, diff, and command logs required for audit in the artifact JSON; never persist secrets or access tokens.
 - full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存し、`findings[]` / `checker_evidence[]` / `body_sha256` / producer schema version を lossless に保持する。
+- `structured_blockers` には blocking entry のみを保持し、`finding_kind=deterministic_domain_blocker` + `blocking=true` + `checker_evidence` 必須のものだけを許可する。
+- `checker_gap` / `heuristic_concern` は `findings[]` にのみ保持し、blocker として扱わない。
+- compact / replay consumer が `checker_artifact_inconsistency` を返した場合は human escalation ではなく checker artifact fix lane へ送る。
+- JSON artifact は strict JSON とし、`NaN` / `Infinity` を encode/decode しない。
 
 EXECUTION_POLICY
 - `review-issue` skill を正本とし、progressive disclosure で必要な references だけを読む。

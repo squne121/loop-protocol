@@ -267,6 +267,7 @@ def _append_findings(
     finding_kind: str,
     blocking: bool,
     checker_evidence: Optional[list[dict]] = None,
+    reviewer_blocker_code: Optional[str] = None,
 ) -> None:
     evidence_entries = list(checker_evidence) if checker_evidence is not None else []
 
@@ -283,15 +284,25 @@ def _append_findings(
             blocking = False
 
     for issue in issues:
-        result.findings.append(
-            {
-                "finding_kind": finding_kind,
-                "deterministic_domain_key": deterministic_domain_key,
-                "blocking": bool(blocking),
-                "checker_evidence": evidence_entries,
-                "message": issue,
-            }
-        )
+        finding = {
+            "finding_kind": finding_kind,
+            "deterministic_domain_key": deterministic_domain_key,
+            "blocking": bool(blocking),
+            "checker_evidence": evidence_entries,
+            "message": issue,
+        }
+        result.findings.append(finding)
+        if reviewer_blocker_code and finding_kind == REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER and blocking:
+            result.structured_blockers.append(
+                {
+                    "code": reviewer_blocker_code,
+                    "message": issue,
+                    "finding_kind": finding_kind,
+                    "deterministic_domain_key": deterministic_domain_key,
+                    "blocking": True,
+                    "checker_evidence": evidence_entries,
+                }
+            )
 
 
 def _validate_finding_kind(kind: str) -> str:
@@ -620,6 +631,7 @@ class CheckerResult:
     verdict: str = "approve"
     deterministic_checks: DeterministicChecks = field(default_factory=DeterministicChecks)
     blocking_issues: list[str] = field(default_factory=list)
+    structured_blockers: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
     non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
     diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
@@ -1443,6 +1455,27 @@ def generate_c1_missing_section_skeleton(
     return entries
 
 
+def _make_self_checker_evidence(
+    result: "CheckerResult",
+    *,
+    rule_id: str,
+    category: str,
+) -> list[dict]:
+    return [
+        {
+            "source_check": "check_issue_contract",
+            "rule_id": rule_id,
+            "category": category,
+            "artifact_path": "check_issue_contract.py",
+            "artifact_schema": "CHECK_ISSUE_CONTRACT_V1",
+            "body_sha256": result.body_sha256,
+            "iteration_id": "check_issue_contract_current",
+            "line_start": None,
+            "line_end": None,
+        }
+    ]
+
+
 def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_path: Optional[str] = None) -> CheckerResult:
     """Run all C1-C13 checks and return structured result."""
     issue_kind = detect_issue_kind(body, labels, title)
@@ -1505,6 +1538,16 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="vc_command_format",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
         blocking=checks.C4_vc_commands_present == CheckResult.FAIL,
+        checker_evidence=(
+            _make_self_checker_evidence(
+                result,
+                rule_id="C4_vc_commands_present",
+                category="vc_command_format",
+            )
+            if checks.C4_vc_commands_present == CheckResult.FAIL and issues
+            else []
+        ),
+        reviewer_blocker_code="C4",
     )
 
     # annotation-aware VC parse (Issue #599)
@@ -1521,6 +1564,16 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         deterministic_domain_key="vc_number_alignment",
         finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
         blocking=checks.C5_ac_vc_number_alignment == CheckResult.FAIL,
+        checker_evidence=(
+            _make_self_checker_evidence(
+                result,
+                rule_id="C5_ac_vc_number_alignment",
+                category="vc_number_alignment",
+            )
+            if checks.C5_ac_vc_number_alignment == CheckResult.FAIL and issues
+            else []
+        ),
+        reviewer_blocker_code="C5",
     )
 
     # C6
@@ -1744,6 +1797,7 @@ def result_to_dict(result: CheckerResult) -> dict:
             "C13_vc_preflight_decision_consistency": result.deterministic_checks.C13_vc_preflight_decision_consistency,
         },
         "blocking_issues": result.blocking_issues,
+        "structured_blockers": result.structured_blockers,
         "non_blocking_improvements": result.non_blocking_improvements,
         "findings": result.findings,
         "diff_proposal": result.diff_proposal,
@@ -1787,7 +1841,7 @@ def main() -> None:
             result = run_checks(body, labels, title, args.vc_preflight_json)
             output = result_to_dict(result)
         # Emit JSON exclusively to stdout (after redirect is restored)
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        print(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
     else:
         if args.file:
             body, labels, title = load_fixture_file(args.file)

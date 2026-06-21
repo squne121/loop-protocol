@@ -13,6 +13,7 @@
     "generated_at",
     "deterministic_checks",
     "blocking_issues",
+    "structured_blockers",
     "non_blocking_improvements",
     "findings",
     "diff_proposal",
@@ -59,6 +60,12 @@
             "additionalProperties": true
           }
         ]
+      }
+    },
+    "structured_blockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/structured_blocker"
       }
     },
     "non_blocking_improvements": {
@@ -192,6 +199,44 @@
           }
         }
       ],
+      "additionalProperties": true
+    },
+    "structured_blocker": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "finding_kind",
+        "deterministic_domain_key",
+        "blocking",
+        "checker_evidence"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string"
+        },
+        "finding_kind": {
+          "const": "deterministic_domain_blocker"
+        },
+        "deterministic_domain_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocking": {
+          "const": true
+        },
+        "checker_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/checker_evidence"
+          }
+        }
+      },
       "additionalProperties": true
     }
   },
