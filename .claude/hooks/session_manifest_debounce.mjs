@@ -224,7 +224,7 @@ async function flushLoop({ force = false }) {
       const newestTimestamp = Math.max(...files.map((file) => extractTimestampFromEventFile(file)))
       const quietForMs = Date.now() - newestTimestamp
       if (quietForMs < WINDOW_MS) {
-        await new Promise((resolvePromise) => setTimeout(resolvePromise, WINDOW_MS - quietForMs))
+        await new Promise((resolvePromise) => globalThis.setTimeout(resolvePromise, WINDOW_MS - quietForMs))
         continue
       }
     }
@@ -266,6 +266,17 @@ async function main() {
   }
 
   if (process.argv[2] === '--flush') {
+    const lockAcquired = tryAcquire(WORKER_LOCK)
+    if (!lockAcquired) {
+      process.stderr.write(
+        `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
+          status: 'ok',
+          reason_code: 'flush_skipped_lock_held',
+          stderr_lines: 0,
+        })}\n`,
+      )
+      return
+    }
     try {
       await flushLoop({ force: true })
     } finally {

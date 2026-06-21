@@ -37,8 +37,9 @@ def test_timeout_reason(tmp_path: Path):
     guard_stub.write_text("#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8")
     guard_stub.chmod(0o755)
 
+    producer_marker = tmp_path / "producer_called.txt"
     producer_stub = tmp_path / "producer.sh"
-    producer_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    producer_stub.write_text(f"#!/usr/bin/env bash\ntouch {producer_marker}\nexit 0\n", encoding="utf-8")
     producer_stub.chmod(0o755)
 
     debounce_stub = tmp_path / "debounce.mjs"
@@ -58,6 +59,8 @@ def test_timeout_reason(tmp_path: Path):
     assert result.returncode == 0
     assert elapsed < 10
     assert '"timeout_reason":"guard_timeout"' in result.stderr
+    assert not producer_marker.exists()
+    assert "step=producer" not in result.stderr
 
 
 def test_coordinator_limits_stderr_to_ten_lines_and_redacts_paths(tmp_path: Path):

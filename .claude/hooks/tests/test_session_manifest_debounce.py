@@ -192,3 +192,29 @@ exit 1
     assert "/home/private" not in flush_result.stderr
     assert "C:\\Users\\Private" not in flush_result.stderr
     assert "/mnt/c/Users/Private" not in flush_result.stderr
+
+
+def test_flush_does_not_release_unowned_worker_lock(tmp_path: Path):
+    producer = tmp_path / "producer.sh"
+    producer.write_text("#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n", encoding="utf-8")
+    producer.chmod(0o755)
+    env = make_env(tmp_path, producer)
+
+    debounce_dir = Path(env["SESSION_MANIFEST_DEBOUNCE_DIR"])
+    debounce_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = debounce_dir / "worker.lock"
+    lock_path.write_text("", encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(DEBOUNCE_PATH), "--flush"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0
+    assert lock_path.exists()
+    assert "flush_skipped_lock_held" in result.stderr
