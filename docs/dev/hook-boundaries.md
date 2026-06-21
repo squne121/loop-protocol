@@ -315,7 +315,7 @@ hook_boundaries_manifest_v1:
       event: PreToolUse
       exit_2_effect: blocks_tool_call
       other_nonzero_effect: non_blocking_error_or_stderr_visible
-    stdout_contract: json_advisory_on_match_silent_otherwise
+    stdout_contract: hookSpecificOutput_additionalContext_on_match_silent_otherwise
     stderr_contract: silent_or_minimal_on_failure
     redaction_contract:
       no_raw_command: true
@@ -329,6 +329,9 @@ hook_boundaries_manifest_v1:
     notes: >
       CI/test-lane 関連 path（.github/workflows/、pyproject.toml、uv.lock 等）を
       検出した場合に CI_TEST_PERFORMANCE_ADVISORY_V1 を stdout へ出力する non-blocking advisory。
+      stdout 形式は hookSpecificOutput.additionalContext ラッパー（Claude Code / Codex CLI 公式 PreToolUse 出力契約）に準拠する:
+      { "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "CI_TEST_PERFORMANCE_ADVISORY_V1 {inner_json}" } }
+      inner payload スキーマ: schemas/ci_test_performance_advisory_v1.schema.json
       block: false であり、通常 tool call を一切 block しない。
       失敗時（jq 不在・JSON parse error 等）も exit 0（fail-open）で継続する。
       block してはならない（AC2）。fail_open を維持する。

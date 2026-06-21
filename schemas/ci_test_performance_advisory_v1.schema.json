@@ -2,13 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://loop-protocol.local/schemas/ci_test_performance_advisory_v1.schema.json",
   "title": "CI Test Performance Advisory V1",
-  "description": "Schema for CI_TEST_PERFORMANCE_ADVISORY_V1 — non-blocking advisory emitted by the ci_test_performance_advisory hook when a CI/test-lane related path is detected.",
+  "description": "Schema for CI_TEST_PERFORMANCE_ADVISORY_V1 — the inner payload embedded in hookSpecificOutput.additionalContext of the Claude Code / Codex CLI PreToolUse hook stdout envelope. The full stdout is: { \"hookSpecificOutput\": { \"hookEventName\": \"PreToolUse\", \"additionalContext\": \"CI_TEST_PERFORMANCE_ADVISORY_V1 {<this_schema>}\" } }. This schema describes the JSON object that follows the 'CI_TEST_PERFORMANCE_ADVISORY_V1 ' prefix in additionalContext.",
   "type": "object",
   "required": [
     "schema",
-    "runtime",
-    "event",
-    "triggered",
     "block",
     "reason_code",
     "matched_paths",
@@ -22,22 +19,10 @@
       "type": "string",
       "const": "CI_TEST_PERFORMANCE_ADVISORY_V1"
     },
-    "runtime": {
-      "type": "string",
-      "enum": ["claude_code", "codex_cli"]
-    },
-    "event": {
-      "type": "string",
-      "const": "PreToolUse"
-    },
-    "triggered": {
-      "type": "boolean",
-      "const": true
-    },
     "block": {
       "type": "boolean",
       "const": false,
-      "description": "Always false — this hook is non-blocking (fail_open)."
+      "description": "Always false — this hook is non-blocking (fail_open). Never set to true."
     },
     "reason_code": {
       "type": "string",
