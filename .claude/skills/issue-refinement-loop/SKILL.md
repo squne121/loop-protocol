@@ -82,6 +82,11 @@ Step 3（adversarial review）と Step 1.5（spec document review）は採用し
 フィールド定義・routing semantics・next action 決定手順は `references/loop-state.md` を参照する。
 next action の決定は `scripts/decide_next_loop_action.py` に委譲する（呼び出し手順は `references/loop-state.md` を参照）。
 
+LOOP_STATE_V1 の構築は `scripts/build_loop_state.py` を使用する。手書き JSON 渡しは禁止。
+`build_loop_state.py` は `REFINEMENT_LOOP_PLAN_V1` と `ISSUE_REVIEW_RESULT_COMPACT_V1` を
+入力として受け取り、スキーマ検証済みの LOOP_STATE_V1 を生成する。
+詳細な builder-first フローは `references/loop-state.md` の「Building LOOP_STATE_V1」セクションを参照する。
+
 routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard`、`delivery_rollup`、
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
 orchestrator はこれらのフィールドを直接 prose 再判定しない。
