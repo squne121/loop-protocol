@@ -30,6 +30,8 @@ from local_main_branch_guard import (
     REASON_DRIFT,
     REASON_RECOVERY,
     REASON_NOT_LOCAL_ROOT,
+    REASON_READONLY,
+    REASON_UNPARSEABLE,
 )
 
 
@@ -170,6 +172,64 @@ class TestAC8CodexParity:
         assert guard_path.exists(), (
             f"Guard script not found: {guard_path}"
         )
+
+
+class TestReadonlyPipelineClassifier:
+    """readonly pipeline classifier fixtures for AC1-AC4."""
+
+    def test_readonly_pipeline_rg_head(self, tmp_git_repo: Path):
+        """GIVEN readonly pipeline WHEN rg is piped to head THEN allow readonly_command."""
+        result = eval_codex('rg -n "TODO" README.md | head -n 20', str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+
+    def test_readonly_pipeline_git_status_head(self, tmp_git_repo: Path):
+        """GIVEN readonly pipeline WHEN git status is piped to head THEN allow readonly_command."""
+        result = eval_codex("git status --short | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+
+    def test_readonly_pipeline_git_diff_head(self, tmp_git_repo: Path):
+        """GIVEN readonly pipeline WHEN git diff is piped to head THEN allow readonly_command."""
+        result = eval_codex("git diff --stat | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+
+    def test_readonly_pipeline_rejects_git_status_git_switch(self, tmp_git_repo: Path):
+        """GIVEN mixed pipeline WHEN git status feeds git switch THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("git status | git switch issue-123", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    def test_readonly_pipeline_rejects_xargs_rm(self, tmp_git_repo: Path):
+        """GIVEN readonly-looking pipeline WHEN xargs rm appears THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("rg TODO . | xargs rm -f", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    def test_readonly_pipeline_rejects_and_and_git_switch(self, tmp_git_repo: Path):
+        """GIVEN compound readonly pipeline WHEN && is present THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("rg TODO . && git switch issue-123", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    def test_readonly_pipeline_rejects_redirection(self, tmp_git_repo: Path):
+        """GIVEN readonly pipeline WHEN stdout redirection is present THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("rg TODO . > out.txt", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    def test_readonly_pipeline_rejects_bash_wrapper(self, tmp_git_repo: Path):
+        """GIVEN wrapped command WHEN bash -lc is used THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("bash -lc 'git switch issue-123'", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    def test_readonly_pipeline_rejects_command_substitution(self, tmp_git_repo: Path):
+        """GIVEN wrapped command WHEN command substitution is used THEN unparseable_branch_mutation is denied."""
+        result = eval_codex("$(git switch issue-123)", str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
 
 
 # ─── AC17: Codex startup preflight mandatory ─────────────────────────────────

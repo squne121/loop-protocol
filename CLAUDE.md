@@ -69,3 +69,23 @@
 - 動作検証 AC の運用規約: `docs/dev/runtime-verification-policy.md`
 - Secret Inventory と no-secret 運用境界: `docs/dev/secret-policy.md`
 - `docs/product/**` を変更する場合: `docs/product/CLAUDE.md` の最小ルールを参照する
+
+## エージェントランレポートと振り返りインデックス
+
+エージェントランの完了後は以下の 3 つのアーティファクトで記録・分析を行う:
+
+| アーティファクト | 責務 |
+|---|---|
+| `agent_session_manifest` | セッション中の内部追跡（読み取りファイル・ツール呼び出し） |
+| `agent_run_report` (`agent_run_report/v1`) | 個別ランの公開可能要約・AC 達成状況・`evidence_refs`・`commands_summary` |
+| `agent_retro_index` | 複数ランの横断インデックス・friction パターン・`follow_up_issues` 集約 |
+
+詳細な責務差分・phase stop conditions・review correction 手順・follow-up Issue 記録方法は
+`docs/dev/agent-run-report.md` を参照する。
+レトロインデックスの schema と運用手順は `docs/dev/agent-retro-index.md` を参照する。
+
+## Hook Boundary と post-run verifier
+
+hook（PreToolUse / PreWrite 等）は **diagnostic/prevention レイヤー** であり、カノニカルゲートではない。
+**post-run verifier が canonical gate** である。hook の通過は AC 達成の証明にならない。
+詳細は `docs/dev/agent-run-report.md` の「Hook Boundary Policy」セクションおよび `docs/dev/hook-boundaries.md` を参照する。

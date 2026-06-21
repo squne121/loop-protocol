@@ -376,6 +376,7 @@ VALIDATOR_RULE_IDS=<rule_ids>  # validator fail 時
 - `docs/dev/schema-governance.md` — schema 定義・Initial Known Schemas・Consumer Inventory 義務の SSOT
 - `scripts/open_pr.py` — PR 작성手順を実装する Python wrapper
 - `scripts/update_pr.py` — PR body 更新 wrapper with validator pre-write hook
+- `docs/dev/agent-run-report.md` — PR open 後のレポート posting handoff 規約
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 

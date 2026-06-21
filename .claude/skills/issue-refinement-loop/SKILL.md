@@ -445,6 +445,7 @@ uv run pytest .claude/skills/issue-refinement-loop/tests/ -v
 - `.claude/skills/gemini-cli-headless-delegation/SKILL.md`
 - `docs/dev/agent-skill-boundaries.md`
 - `docs/dev/workflow.md`
+- `docs/dev/agent-run-report.md` — run report finalize / posting handoff 規約
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
