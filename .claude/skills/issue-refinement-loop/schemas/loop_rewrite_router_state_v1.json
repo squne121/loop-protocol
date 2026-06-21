@@ -32,6 +32,10 @@
     "previous_missing_contract_keys": {"type": "array", "items": {"type": "string"}},
     "source_issue_body_sha256": {"type": ["string", "null"]},
     "replay_safe": {"type": "boolean"},
-    "source_body_reset": {"type": "boolean"}
+    "source_body_reset": {"type": "boolean"},
+    "rewrite_request_fingerprint": {"type": ["string", "null"]},
+    "previous_rewrite_request_fingerprints": {"type": "array", "items": {"type": "string"}},
+    "last_mutation_kind": {"type": "string"},
+    "budget_debit": {"type": "integer", "minimum": 0, "maximum": 1}
   }
 }

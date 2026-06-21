@@ -123,6 +123,8 @@ BLOCKER_RESULT_SCHEMA_INVALID = "RESULT_SCHEMA_INVALID"
 BLOCKER_INVALID_ARGS = "INVALID_ARGS"
 BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD = "REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD"
 BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE"
+BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION = "REWRITE_CONSTRAINTS_INVARIANT_VIOLATION"
+BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +142,7 @@ def _now_iso() -> str:
 
 
 def _canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _as_string_list(
@@ -204,7 +206,7 @@ def _build_safe_rewrite_constraints(
 def _ensure_json_serializable(value: Any, field_name: str, blockers: list[str]) -> bool:
     """Validate JSON serializability for deterministic stdout/hashing artifacts."""
     try:
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return True
     except (TypeError, ValueError) as exc:
         blockers.append(
@@ -732,7 +734,7 @@ def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str, str]:
     Returns (plan_dict, exit_code, stderr_text, raw_stdout).
     plan_dict is None on JSON parse failure.
     """
-    input_json = json.dumps(planner_input, ensure_ascii=False)
+    input_json = json.dumps(planner_input, ensure_ascii=False, allow_nan=False)
 
     try:
         proc = subprocess.run(
@@ -815,10 +817,25 @@ def _apply_exit_code_mapping(
             BLOCKER_INPUT_SCHEMA_INVALID,
             BLOCKER_INVALID_ARGS,
         }
-        env_blockers = {BLOCKER_GH_FAILURE, BLOCKER_RESULT_SCHEMA_INVALID}
-
-        has_anchor = any(b in anchor_blockers for b in blockers)
+        env_blockers = {
+            BLOCKER_GH_FAILURE,
+            BLOCKER_RESULT_SCHEMA_INVALID,
+        }
         has_env = any(b in env_blockers for b in blockers)
+        has_anchor = any(b in anchor_blockers for b in blockers)
+        # AC6: REWRITE_CONSTRAINTS_* and planner_fail_closed_payload_invalid
+        # are environment failures (payload integrity), not issue blockers.
+        rewrite_env_blockers = {
+            BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD,
+            BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE,
+            BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION,
+            BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID,
+        }
+        if any(
+            any(b.split(":", 1)[0] == rb for rb in rewrite_env_blockers)
+            for b in blockers
+        ):
+            has_env = True
 
         if has_env:
             return "environment_failure", EXIT_ENVIRONMENT_FAILURE
@@ -876,17 +893,17 @@ def _write_artifacts(
 
     snapshot_path = artifact_dir / "raw_issue_snapshot.json"
     snapshot_path.write_text(
-        json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(raw_snapshot, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
 
     planner_input_path = artifact_dir / "planner_input.json"
     planner_input_path.write_text(
-        json.dumps(planner_input, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(planner_input, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
 
     result_path = artifact_dir / "refinement_preflight_result_v1.json"
     result_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
 
     return {
@@ -978,6 +995,7 @@ def _build_compact_stdout(result: dict) -> str:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         lines.append(f"  {rewritten}")
 
@@ -1083,10 +1101,10 @@ def _emit_failure_result(
     # Compute hashes if raw_snapshot available
     hashes: dict[str, str] = {}
     if raw_snapshot is not None:
-        snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
+        snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False, allow_nan=False)
         hashes["raw_issue_snapshot_sha256"] = _sha256(snapshot_text)
     if planner_input is not None:
-        planner_input_text = json.dumps(planner_input, sort_keys=True, ensure_ascii=False)
+        planner_input_text = json.dumps(planner_input, sort_keys=True, ensure_ascii=False, allow_nan=False)
         hashes["planner_input_sha256"] = _sha256(planner_input_text)
 
     artifacts: dict[str, str] = {}
@@ -1397,7 +1415,7 @@ def run_preflight(
             )
             _cls_dir.mkdir(parents=True, exist_ok=True)
             (_cls_dir / "planner_failure_classification_v1.json").write_text(
-                json.dumps(failure_cls, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(failure_cls, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
             )
         except Exception:
             pass
@@ -1508,10 +1526,38 @@ def run_preflight(
                     rewrite_constraints = _build_safe_rewrite_constraints([], [])
                     reason_codes_ok = False
 
+        # AC7: Invariant check — required_sections/required_contract_keys must match
+        # the nested must_add_sections/must_add_contract_keys in rewrite_constraints.
+        if rewrite_constraints is not None and reason_codes_ok:
+            rc_inner = rewrite_constraints.get("rewrite_constraints", {})
+            must_add_sections = rc_inner.get("must_add_sections", [])
+            must_add_keys = rc_inner.get("must_add_contract_keys", [])
+            if list(required_sections) != list(must_add_sections):
+                blockers.append(
+                    f"{BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION}: "
+                    f"required_sections {required_sections!r} != "
+                    f"must_add_sections {must_add_sections!r}"
+                )
+                rewrite_constraints = _build_safe_rewrite_constraints([], [])
+                required_sections = []
+                required_contract_keys = []
+                reason_codes_ok = False
+            elif list(required_contract_keys) != list(must_add_keys):
+                blockers.append(
+                    f"{BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION}: "
+                    f"required_contract_keys {required_contract_keys!r} != "
+                    f"must_add_contract_keys {must_add_keys!r}"
+                )
+                rewrite_constraints = _build_safe_rewrite_constraints([], [])
+                required_sections = []
+                required_contract_keys = []
+                reason_codes_ok = False
+
+
         if not reason_codes_ok:
             # Schema-safe deterministic forwarding requires aligned payloads.
             # Non-string / non-list fields are treated as schema violation.
-            blockers.append("planner_fail_closed_payload_invalid")
+            blockers.append(BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID)
 
     # --- Write repair artifact and update blockers ---
     # BLOCKER 1 fix: repair_diagnostics is exposed via artifact file (not as a top-level result key,
@@ -1522,7 +1568,7 @@ def run_preflight(
         artifact_dir_repair.mkdir(parents=True, exist_ok=True)
         repair_artifact_file = artifact_dir_repair / "repair_diagnostics.json"
         repair_artifact_file.write_text(
-            json.dumps(_repair_result, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_repair_result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
         )
         repair_artifact_path = str(repair_artifact_file)
     except Exception:
@@ -1554,8 +1600,8 @@ def run_preflight(
         next_action = "fix_environment"
 
     # --- Compute hashes for byte-stability (after all blockers finalized) ---
-    snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False)
-    planner_input_text = json.dumps(planner_input_dict, sort_keys=True, ensure_ascii=False)
+    snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    planner_input_text = json.dumps(planner_input_dict, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
     # Core result (without artifacts/hashes) for hash computation
     result_core_for_hash = {
@@ -1575,7 +1621,7 @@ def run_preflight(
         "required_contract_keys": required_contract_keys,
         "rewrite_constraints": rewrite_constraints,
     }
-    result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False)
+    result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
     hashes = {
         "raw_issue_snapshot_sha256": _sha256(snapshot_text),
@@ -1930,7 +1976,7 @@ def write_provenance_artifact(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     prov_path = artifact_dir / "refinement_preflight_provenance_v1.json"
     prov_path.write_text(
-        json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
     return str(prov_path)
 

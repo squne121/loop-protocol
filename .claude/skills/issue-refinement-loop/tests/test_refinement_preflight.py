@@ -597,8 +597,17 @@ class TestNonStringFailClosedPayload:
                 fixture_path=fixture_path,
             )
 
-        assert exit_code == wrapper.EXIT_BLOCKED
-        assert result["status"] == "blocked"
+        # AC6: REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD now routes to environment_failure,
+        # not blocked. Non-string payload is a schema violation (payload integrity),
+        # not an issue-content blocker.
+        assert exit_code == wrapper.EXIT_ENVIRONMENT_FAILURE, (
+            f"AC6: expected EXIT_ENVIRONMENT_FAILURE ({wrapper.EXIT_ENVIRONMENT_FAILURE}), "
+            f"got {exit_code!r}. REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD must route to "
+            f"environment_failure, not blocked."
+        )
+        assert result["status"] == "environment_failure", (
+            f"AC6: expected status='environment_failure', got {result['status']!r}"
+        )
         assert result["planner_fail_closed"] is True
         assert any(
             "REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD" in blocker
@@ -2078,3 +2087,101 @@ def _build_result_from_main(argv: list[str]) -> dict | None:
     except SystemExit:
         pass
     return {"stdout": out.getvalue()}
+
+
+
+# ---------------------------------------------------------------------------
+# AC3 / AC7: custom invariant — required_sections == must_add_sections
+# ---------------------------------------------------------------------------
+
+
+class TestAC3AC7RewriteConstraintsInvariant:
+    """AC3/AC7: wrapper verifies required_sections == must_add_sections invariant."""
+
+    def _make_fixture_with_missing_section(self, tmp_path) -> "Path":
+        """Fixture that triggers fail_closed with missing section."""
+        body = "## Outcome\n\nTest outcome.\n"  # No Machine-Readable Contract
+        fixture_data = {
+            "schema_version": "refinement_preflight_input/v1",
+            "issue_number": 300,
+            "repo": "testowner/testrepo",
+            "now": "2026-01-01T00:00:00+00:00",
+            "issue": {
+                "number": 300,
+                "title": "Invariant Test",
+                "body": body,
+                "labels": [],
+            },
+            "comments": [],
+            "anchor_comment_urls": [],
+        }
+        p = tmp_path / "fixture.json"
+        p.write_text(json.dumps(fixture_data), encoding="utf-8")
+        return p
+
+    def test_invariant_check_required_sections_matches_must_add(self, tmp_path):
+        """AC7: required_sections must equal must_add_sections in rewrite_constraints."""
+        fixture_path = self._make_fixture_with_missing_section(tmp_path)
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=300,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        if result.get("rewrite_constraints") is not None:
+            rc = result["rewrite_constraints"]
+            inner = rc.get("rewrite_constraints", {})
+            required_sections = result.get("required_sections", [])
+            must_add_sections = inner.get("must_add_sections", [])
+            assert required_sections == must_add_sections, (
+                f"AC7 invariant violated: required_sections={required_sections} "
+                f"!= must_add_sections={must_add_sections}"
+            )
+
+    def test_invariant_check_required_contract_keys_matches_must_add(self, tmp_path):
+        """AC7: required_contract_keys must equal must_add_contract_keys."""
+        # Use a body that has a contract section with missing keys
+        body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            "issue_kind: implementation\n"
+            "```\n\n"
+            "## Outcome\n\nTest.\n"
+        )
+        fixture_data = {
+            "schema_version": "refinement_preflight_input/v1",
+            "issue_number": 301,
+            "repo": "testowner/testrepo",
+            "now": "2026-01-01T00:00:00+00:00",
+            "issue": {
+                "number": 301,
+                "title": "Contract key test",
+                "body": body,
+                "labels": [],
+            },
+            "comments": [],
+            "anchor_comment_urls": [],
+        }
+        fixture_path = tmp_path / "fixture2.json"
+        fixture_path.write_text(json.dumps(fixture_data), encoding="utf-8")
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=301,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        if result.get("rewrite_constraints") is not None:
+            rc = result["rewrite_constraints"]
+            inner = rc.get("rewrite_constraints", {})
+            required_contract_keys = result.get("required_contract_keys", [])
+            must_add_contract_keys = inner.get("must_add_contract_keys", [])
+            assert required_contract_keys == must_add_contract_keys, (
+                f"AC7 invariant violated: required_contract_keys={required_contract_keys} "
+                f"!= must_add_contract_keys={must_add_contract_keys}"
+            )

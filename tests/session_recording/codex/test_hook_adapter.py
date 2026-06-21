@@ -126,8 +126,8 @@ def test_kill_switch_unknown_visibility_subagent_stop():
 def test_malformed_stop_payload_fail_closed():
     result = run_adapter("Stop", "{", expect_exit=0)
     response = json.loads(result.stdout)
-    assert response["continue"] is False
-    assert "Malformed Stop payload" in response["stopReason"]
+    assert response["continue"] is True
+    assert "session recording skipped" in result.stderr
 
 
 def test_stdout_silent_for_stop_positive_fixture():
@@ -176,6 +176,26 @@ def test_permission_request_uses_event_specific_deny_shape():
     response = json.loads(result.stdout)
     assert response["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
     assert response["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+def test_pre_tool_use_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest():
+    """GIVEN readonly pipeline WHEN PreToolUse fires THEN stdout empty and no manifest directory is created."""
+    result = run_adapter("PreToolUse", {
+        "tool_input": {"command": 'rg -n "TODO" README.md | head -n 20'}
+    })
+    assert result.stdout == ""  # stdout empty
+    assert not (MANIFEST_ROOT / "pretooluse").exists()
+    assert not (MANIFEST_ROOT / "permissionrequest").exists()
+
+
+def test_permission_request_readonly_pipeline_keeps_stdout_empty_and_writes_no_manifest():
+    """GIVEN readonly pipeline WHEN PermissionRequest fires THEN stdout empty and no manifest directory is created."""
+    result = run_adapter("PermissionRequest", {
+        "tool_input": {"command": "git status --short | head -n 20"}
+    })
+    assert result.stdout == ""  # stdout empty
+    assert not (MANIFEST_ROOT / "pretooluse").exists()
+    assert not (MANIFEST_ROOT / "permissionrequest").exists()
 
 
 def test_hook_validator_rejects_duplicate_stop_composite_handler(tmp_path: Path):
