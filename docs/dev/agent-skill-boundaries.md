@@ -131,6 +131,38 @@ SubAgent（役割）── Skill（作業手順）
 | `gemini-cli-headless-delegation` | Gemini CLI への headless 委譲手順。file evidence の structure (REPO_EVIDENCE_REF_V1) と verification contract が定義されている。 |
 | `nlm-skill` | NotebookLM CLI / MCP 操作（既存導入） |
 
+
+## ci-test-performance Consumer Routing
+
+`ci-test-performance` Skill は CI テストパフォーマンスのレーン分類・hotspot 分析・意思決定を担う。
+詳細な手順は `.claude/skills/ci-test-performance/SKILL.md` を正本とする。
+以下は設計上の consumer routing 定義であり、各 agent/skill ファイルの実更新は別 follow-up Issue で対応する。
+
+### Consumer 一覧
+
+| Consumer | 役割 | 読むタイミング | 実更新状況 |
+|---|---|---|---|
+| `issue-contract-review` | CI 関連 Issue で `ci-test-performance` が Required Skills に欠落、または CI runtime evidence plan が存在しない場合に `blocked` を返すことができる | CI 関連 Issue の contract review 時 | 実更新は follow-up Issue に分離（docs-only 定義） |
+| `implementation-worker` | `.github/workflows/**`・`pyproject.toml`・`uv.lock`・pytest/Ruff/xdist/CI artifact 関連を触る前に `ci-test-performance` を読む。PR 本文または artifact に `CI_TEST_PERFORMANCE_DECISION_V1` を残す | CI 関連 path 編集前 | Codex CLI 側は `.codex/agents/implementation-worker.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
+| `test-runner` | VC 実行・runtime artifact 確認の担当。lane 設計の意思決定者ではなく、PASS/FAIL/SKIP 分類と artifact 整合性チェックを行う | VC 実行時 | Codex CLI 側は `.codex/agents/test-runner.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
+| `pr-reviewer` | CI 関連 PR で `CI_TEST_PERFORMANCE_DECISION_V1`・lane 判断・`ci_runtime_baseline` 比較・self-report 以外の証跡が存在しない場合は `REQUEST_CHANGES` を返すことができる | CI 関連 PR review 時 | Codex CLI 側は `.codex/agents/pr-reviewer.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
+
+### Claude Code 側 consumer 更新の扱い
+
+以下の Claude Code 側ファイルは本 Issue (#1060) のスコープ外とし、別 follow-up Issue で対応する:
+
+- `.claude/agents/implementation-worker.md` — CI 関連 path 編集時に `ci-test-performance` を読む routing
+- `.claude/agents/pr-reviewer.md` — CI 関連 PR review で `CI_TEST_PERFORMANCE_DECISION_V1` 確認の routing
+- `.claude/agents/test-runner.md` — VC 実行時の artifact 整合性確認 routing
+- `.claude/skills/issue-contract-review/SKILL.md` — CI 関連 Issue の preflight gate への組み込み
+
+本 Issue では「どの consumer が、いつ、どのような判断をするか」の設計上の routing 定義のみを本セクションに記載する。
+
+### hook による advisory suggestion
+
+hook 実装（CI 関連 path を edit した際に `ci-test-performance` を読むよう `additionalContext` を出す）は本 Issue スコープ外。
+Claude Code の `FileChanged` / `PreToolUse` hook と Codex CLI の `PreToolUse` hook のどちらで実装するかも含めて別 follow-up Issue で決定する。
+
 ## Spec Kit (speckit-*) スキル責務境界
 
 specify-cli v0.8.13 upstream から取得した 9 本の speckit-* スキルを `.claude/skills/` に配置する（Issue #303）。
