@@ -49,6 +49,25 @@ SERENA_CHECK_TIMEOUT = 30
 # Timeout for smoke prompt (seconds).
 SMOKE_PROMPT_TIMEOUT = 20
 
+# Valid auth status values (fixed enum — do not change without updating Issue #1081).
+AUTH_STATUS_VALUES = frozenset([
+    "authenticated",
+    "authenticated_api_key",
+    "oauth_sunset",
+    "ineligible_tier",
+    "unauthenticated",
+    "auth_failed",
+    "timeout",
+    "gemini_not_found",
+])
+
+# Recovery message template for auth failures that warrant API key / agy migration info.
+_RECOVERY_APIKEY_AND_AGY = [
+    "Temporary workaround: set GEMINI_API_KEY environment variable "
+    "(existence is detected; value is never logged — do not share or commit the key).",
+    "Permanent solution: migrate to agy (Antigravity CLI) — see #104.",
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,6 +82,19 @@ def _run(command: list[str], timeout: int | None = None) -> subprocess.Completed
         check=False,
         timeout=timeout,
     )
+
+
+def _redact_api_key(text: str) -> str:
+    """Remove GEMINI_API_KEY value from text before output.
+
+    Security: the key value is NEVER stored in variables or included in outputs.
+    This redaction is a last-resort safety net for cases where external processes
+    (e.g. the gemini CLI itself) include the key in their own error output.
+    """
+    secret = os.environ.get("GEMINI_API_KEY")
+    if secret and secret in text:
+        return text.replace(secret, "[REDACTED]")
+    return text
 
 
 def _trusted_folders_path() -> Path:
@@ -337,26 +369,91 @@ def check_gemini_settings(repo_root: Path | None = None, fix: bool = False) -> d
 # Check: account authentication (smoke prompt)
 # ---------------------------------------------------------------------------
 
+# Specific service-termination phrases for oauth_sunset.
+# Use only specific multi-word phrases to avoid false positives from unrelated errors.
+_SUNSET_PHRASES = (
+    "service has been discontinued",
+    "sunset",
+    "replaced by antigravity",
+    "gemini code assist for individuals",
+    "transitioning gemini cli to antigravity",
+)
+
+# Compound check for oauth_sunset: require a combination of context words when
+# using short keywords to avoid mis-classifying "model no longer supported" etc.
+def _is_oauth_sunset(text: str) -> bool:
+    """Return True only for specific Gemini OAuth termination indicators."""
+    if "service has been discontinued" in text:
+        return True
+    if "sunset" in text and ("google" in text or "gemini" in text or "oauth" in text):
+        return True
+    if "replaced by antigravity" in text:
+        return True
+    if "gemini code assist for individuals" in text:
+        return True
+    if "transitioning gemini cli to antigravity" in text:
+        return True
+    if "google login" in text and "no longer" in text:
+        return True
+    if "oauth" in text and ("terminated" in text or "sunset" in text):
+        return True
+    return False
+
+
+# Specific IneligibleTierError phrases.
+def _is_ineligible_tier(text: str) -> bool:
+    """Return True only for specific account-tier ineligibility indicators."""
+    if "ineligibletiererror" in text:
+        return True
+    if "not eligible for this tier" in text:
+        return True
+    if "account does not qualify for" in text:
+        return True
+    return False
+
 
 def check_auth() -> dict[str, Any]:
     """Run a short smoke prompt to verify Gemini CLI authentication.
 
     Authentication itself is a human responsibility (pre-requisite).
     This check only verifies that cached credentials are working.
+
+    auth.status values (fixed enum — see AUTH_STATUS_VALUES):
+        authenticated         — OAuth login active and working; api_key_present field
+                                indicates whether GEMINI_API_KEY is also set in the env
+        authenticated_api_key — Reserved for future use when API key use can be confirmed
+        oauth_sunset          — Google OAuth login via Gemini CLI has been discontinued
+        ineligible_tier       — Account does not qualify for required Gemini tier
+        unauthenticated       — Not logged in (gemini auth login required)
+        auth_failed           — Unknown auth failure
+        timeout               — Smoke prompt timed out
+        gemini_not_found      — gemini CLI not installed
+
+    Security: GEMINI_API_KEY existence is detected but its value is NEVER logged,
+    printed, or included in any output field (detail / recovery / result JSON).
+    Raw CLI output is redacted via _redact_api_key() before being placed in detail.
+
+    Model override: set GEMINI_SETUP_CHECK_MODEL env var to override smoke model
+    (default: gemini-2.0-flash).
     """
+    # Detect GEMINI_API_KEY presence only — never expose the value.
+    has_api_key = bool(os.environ.get("GEMINI_API_KEY"))
+
+    # Allow model override for smoke prompt.
+    model = os.environ.get("GEMINI_SETUP_CHECK_MODEL", "gemini-2.0-flash")
+
     try:
         result = _run(
-            ["gemini", "--prompt", "ok", "--model", "gemini-2.0-flash"],
+            ["gemini", "--prompt", "ok", "--model", model],
             timeout=SMOKE_PROMPT_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         return {
             "ok": False,
             "status": "timeout",
-            "detail": f"gemini --prompt 'ok' timed out after {SMOKE_PROMPT_TIMEOUT}s.",
-            "recovery": [
-                "Run: gemini auth login",
-                "Ensure Google account credentials are cached.",
+            "detail": "gemini --prompt 'ok' timed out.",
+            "recovery": _RECOVERY_APIKEY_AND_AGY + [
+                "Check network connectivity and gemini CLI version.",
             ],
         }
     except FileNotFoundError:
@@ -368,27 +465,57 @@ def check_auth() -> dict[str, Any]:
         }
 
     if result.returncode == 0:
-        return {"ok": True, "status": "authenticated"}
+        # Success: always return 'authenticated'. api_key_present is informational only.
+        # 'authenticated_api_key' is reserved for future use when CLI confirms the key
+        # was the active auth provider (presence alone is not sufficient evidence).
+        return {
+            "ok": True,
+            "status": "authenticated",
+            "api_key_present": has_api_key,
+        }
 
     combined = (result.stdout + result.stderr).lower()
-    if any(kw in combined for kw in ("auth", "login", "credential", "sign in", "not logged")):
+
+    # Detect Google OAuth sunset / service termination for Gemini CLI.
+    if _is_oauth_sunset(combined):
+        return {
+            "ok": False,
+            "status": "oauth_sunset",
+            "detail": "Google OAuth login via Gemini CLI has been discontinued.",
+            "recovery": _RECOVERY_APIKEY_AND_AGY,
+        }
+
+    # IneligibleTierError — account does not qualify for required Gemini tier.
+    if _is_ineligible_tier(combined):
+        return {
+            "ok": False,
+            "status": "ineligible_tier",
+            "detail": "Account is not eligible for the required Gemini tier.",
+            "recovery": _RECOVERY_APIKEY_AND_AGY,
+        }
+
+    # Generic auth / login required.
+    _AUTH_KEYWORDS = ("auth", "login", "credential", "sign in", "not logged")
+    if any(kw in combined for kw in _AUTH_KEYWORDS):
+        # Redact API key from raw CLI output before including in detail.
+        raw_detail = (result.stderr or result.stdout)[:300]
         return {
             "ok": False,
             "status": "unauthenticated",
-            "detail": (result.stderr or result.stdout)[:300],
+            "detail": _redact_api_key(raw_detail),
             "recovery": [
                 "Run: gemini auth login",
                 "Authentication is a human pre-requisite; setup_check cannot automate OAuth login.",
             ],
         }
 
+    # Unknown auth failure.
     return {
         "ok": False,
-        "status": "failed",
+        "status": "auth_failed",
         "returncode": result.returncode,
-        "stderr": result.stderr[:300],
-        "recovery": [
-            "Run: gemini auth login",
+        "recovery": _RECOVERY_APIKEY_AND_AGY + [
+            "Or run: gemini auth login",
             "Check: gemini --version",
         ],
     }
