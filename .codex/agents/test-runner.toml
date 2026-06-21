@@ -25,6 +25,11 @@ RUNTIME
 - runtime_dependency_status: codex_native
 - runtime_followup_route: none
 
+CI_SKILL_ROUTING
+- CI 関連の Verification Commands 実行時（.github/workflows/**、pyproject.toml、uv.lock、docs/dev/test-lane-policy.md、.claude/skills/ci-test-performance/**、.agents/skills/ci-test-performance/**、.codex/agents/** 等を含む変更）に `.claude/skills/ci-test-performance/SKILL.md` を参照して lane 分類と artifact 整合性を確認する。
+- ci_runtime_baseline_v1 artifact が存在する場合はその整合性を確認する。
+- Codex 環境では .agents/skills/ci-test-performance/SKILL.md を薄い bridge として使い、canonical body はそこで参照される .claude/skills/ci-test-performance/SKILL.md を読む。
+
 FAIL_CLOSED
 - SKIP を PASS に変換しない。
 - baseline fail expectation を理由に新規 regressions を見逃さない。
