@@ -78,7 +78,7 @@ Gemini CLI と同様に wrapper 経由で呼び出すが、出力形式・cwd po
 |---|---|---|
 | `no_tools` | supported | isolated temp cwd から agy を呼び出す。ファイル編集・shell 実行なし。 |
 | `proposal_only` | supported | isolated temp cwd から agy を呼び出す。返却は draft text のみ。 |
-| `grounded_research` | **unsupported_provider_profile** | agy は Google Search grounding をサポートしない。fail-closed。 |
+| `grounded_research` | **unsupported_provider_profile** | `provider=agy` の初期実装では未対応。wrapper が Google Search grounding contract を agy に対してまだ検証・公開していない（wrapper サポート境界）。fail-closed。 |
 | `local_asset_research` | **unsupported_provider_profile** | agy は Serena MCP 構成を持たない。fail-closed。 |
 | `github_research` | **unsupported_provider_profile** | agy は GitHub アクセス機能を持たない。fail-closed。 |
 
@@ -119,7 +119,13 @@ agy の stdout text は wrapper 側で `delegation_result/v1` スキーマに正
 - `local_asset_research`
 - `github_research`
 
-これらは agy では機能的にサポートできないため、fallback 経路を提供せず `ok: false` で即時終了する。
+`grounded_research` は `provider=agy` の初期実装では unsupported である。
+これは、この wrapper が agy に対して Google Search grounding contract をまだ検証・公開していないためであり、
+wrapper サポート境界であって agy 製品の永続的な機能制限ではない。
+
+`local_asset_research` と `github_research` も同様に、agy に対する対応 contract が未定義のため fail-closed とする。
+
+fallback 経路は提供せず `ok: false` で即時終了する。
 unsupported_provider_profile エラーは caller に返却し、人間判断または別 provider への切り替えを促す。
 
 ### AC7: Safety Mode（provider=agy）
