@@ -8,8 +8,8 @@ export const ENEMY_AI_EPSILON_PX = 0.5
  *
  * Design constraints (AC7 / AC8):
  * - No DOM / Canvas API / window / document / Date.now / performance.now dependencies.
- * - Only mutates enemy x/y coordinates. Player, projectiles, sortie, result, and render
- *   state are left untouched.
+ * - Only mutates enemy runtime fields. Player, projectiles, sortie, result, and render state
+ *   are left untouched.
  *
  * @param state       Mutable game state
  * @param fixedDeltaMs Fixed timestep in milliseconds (e.g. 1000/60 approx 16.67)
@@ -28,8 +28,11 @@ export function runEnemyAISystem(state: GameState, fixedDeltaMs: number): void {
   }
 
   for (const enemy of state.enemies) {
+    enemy.targetEntityId = state.player.id
+
     // AC3: skip defeated enemies
     if (enemy.defeated) {
+      enemy.behaviorState = 'destroyed'
       continue
     }
 
@@ -48,6 +51,7 @@ export function runEnemyAISystem(state: GameState, fixedDeltaMs: number): void {
 
     // AC5: avoid NaN when enemy is already at (or extremely close to) player center
     if (!Number.isFinite(distance) || distance <= ENEMY_AI_EPSILON_PX) {
+      enemy.behaviorState = 'attack'
       continue
     }
 
@@ -58,6 +62,7 @@ export function runEnemyAISystem(state: GameState, fixedDeltaMs: number): void {
     // AC2 + AC6: compute movement with overshoot clamp
     const moveDist = Math.min(enemy.speedPxPerSec * deltaSec, distance)
 
+    enemy.behaviorState = 'move_to_engage'
     enemy.x += normX * moveDist
     enemy.y += normY * moveDist
   }
