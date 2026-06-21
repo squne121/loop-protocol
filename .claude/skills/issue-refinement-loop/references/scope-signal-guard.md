@@ -100,7 +100,9 @@ GitHub API の `author_association` フィールドで判定する。
 - `target.repo` が実行中 repo と不一致
 - anchor URL が複数（単一コメントのみ信頼）
 - schema が malformed（`additionalProperties: false` 違反 / enum 不一致等）
-- comment body が fenced-code または quoted markdown 内に埋め込まれている（マーカー形式）
+- comment body が quoted markdown（blockquote `>`）内に埋め込まれている
+- fenced-code block 内の marker がさらに別の fenced-code や blockquote に入れ子になっている
+  - **注意**: top-level の `\`\`\`yaml` ブロックが canonical format。blockquote の後の fence や、非 YAML fenced block は fail-closed。
 
 trusted anchor と判定された場合のみ `scope_delta_decision.status=approved_by_trusted_anchor` を生成する。scope 拡張の自動実装許可は禁止。
 

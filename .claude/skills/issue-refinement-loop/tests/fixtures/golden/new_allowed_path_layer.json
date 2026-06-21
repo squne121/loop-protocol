@@ -1,62 +1,45 @@
 {
-  "schema_version": "refinement_loop_plan/v1",
-  "source": {
-    "issue_number": 19,
-    "issue_body_sha256": "16ea48c0e0afae2472339035fdb415a38b5f2882b5c2066e1ea4d992f3361e74",
-    "comments_sha256": null,
-    "known_context_sha256": null,
-    "generated_at": "2025-05-25T12:00:00+00:00"
-  },
   "decisions": {
-    "investigation_policy": {
-      "required": false,
-      "reason_code": "unknown_input_schema",
-      "target_paths": [],
-      "repo_claims": [],
-      "evidence_spans": [],
-      "confidence": "unknown"
-    },
-    "web_research_policy": {
-      "required": false,
-      "reason_code": "unknown_input_schema",
-      "critical_external_claims": [],
-      "evidence_spans": [],
-      "confidence": "unknown"
-    },
-    "scope_signal_guard": {
-      "triggered": false,
-      "reason_code": "no_scope_signal",
-      "excluded_by_anchor_reframe": false,
-      "evidence_spans": []
-    },
     "delivery_rollup": {
       "applicable": false,
-      "unmaterialized_slots": [],
-      "evidence_spans": []
+      "evidence_spans": [],
+      "unmaterialized_slots": []
     },
     "follow_up_materialization": {
       "candidates": []
+    },
+    "investigation_policy": {
+      "confidence": "unknown",
+      "evidence_spans": [],
+      "reason_code": "unknown_input_schema",
+      "repo_claims": [],
+      "required": false,
+      "target_paths": []
+    },
+    "scope_delta_decision": null,
+    "scope_signal_guard": {
+      "evidence_spans": [],
+      "excluded_by_anchor_reframe": false,
+      "reason_code": "no_scope_signal",
+      "triggered": false
+    },
+    "web_research_policy": {
+      "confidence": "unknown",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "reason_code": "unknown_input_schema",
+      "required": false
     }
   },
   "fail_closed": {
-    "required": true,
+    "human_message": "Issue contract malformation detected: missing_required_section",
     "reason_codes": [
       "missing_required_section"
     ],
-    "human_message": "Issue contract malformation detected: missing_required_section",
+    "required": true,
     "rewrite_constraints": {
-      "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1",
-      "required_sections": [
-        "In Scope"
-      ],
-      "required_contract_keys": [],
-      "rewrite_constraints": {
-        "must_add_sections": [
-          "In Scope"
-        ],
-        "must_add_contract_keys": [],
-        "freeform_rewrite_forbidden": true
-      },
+      "max_rewrite_attempts": 2,
+      "no_progress_route": "human_judgment_required",
       "override_policy": {
         "allowed_reason_codes": [
           "missing_required_section",
@@ -69,13 +52,31 @@
           "template_resolution_error",
           "checker_internal_error"
         ],
+        "non_overridable_in_current_result": [],
         "overridable_in_current_result": [
           "missing_required_section"
-        ],
-        "non_overridable_in_current_result": []
+        ]
       },
-      "max_rewrite_attempts": 2,
-      "no_progress_route": "human_judgment_required"
+      "required_contract_keys": [],
+      "required_sections": [
+        "In Scope"
+      ],
+      "rewrite_constraints": {
+        "freeform_rewrite_forbidden": true,
+        "must_add_contract_keys": [],
+        "must_add_sections": [
+          "In Scope"
+        ]
+      },
+      "schema_version": "FAIL_CLOSED_REWRITE_CONSTRAINTS_V1"
     }
+  },
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "comments_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00",
+    "issue_body_sha256": "16ea48c0e0afae2472339035fdb415a38b5f2882b5c2066e1ea4d992f3361e74",
+    "issue_number": 19,
+    "known_context_sha256": null
   }
 }
