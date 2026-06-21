@@ -158,6 +158,37 @@ class TestIssue1075BranchSafeMaintenanceTelemetry:
         assert is_branch_safe_maintenance_command(command) is True
         assert is_readonly_command(command) is False
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git fetch origin +seen:seen",
+            "git fetch --prune-tags origin",
+            "git fetch --refmap= refs/heads/main",
+        ],
+    )
+    def test_branch_safe_maintenance_fetch_variants_are_intentional_not_readonly(
+        self,
+        command: str,
+    ):
+        assert is_branch_safe_maintenance_command(command) is True
+        assert is_readonly_command(command) is False
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    @pytest.mark.parametrize("command", ["git fetch", "git worktree prune"])
+    def test_branch_safe_maintenance_reason_code_when_root_already_drifted(
+        self,
+        tmp_git_repo_drifted: Path,
+        command: str,
+        hook_flavor: str,
+    ):
+        result = eval_in_local_root(
+            command,
+            str(tmp_git_repo_drifted),
+            hook_flavor=hook_flavor,
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_BRANCH_SAFE_MAINTENANCE
+
     @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
     @pytest.mark.parametrize(
         "command",
