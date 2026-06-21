@@ -33,6 +33,9 @@ function createNoAllySortieState(): GameState {
   const state = createInitialGameState()
   state.loopPhase = 'preparation'
   startSortie(state, FDT)
+  // Compatibility-only fixture for #985 / SSOT §14.1.
+  // startSortie() intentionally creates one default ally in production;
+  // this test clears allies to freeze the legacy no-ally enemy_chaser contract.
   state.allies = []
   state.nextAllyId = 1
   state.commandIntentRuntime.activeIntent = 'none'
@@ -137,9 +140,14 @@ describe('sortie enemy taxonomy compatibility gate', () => {
     const assistLane = runTerminalLane('sample_assist_player')
 
     expect(noneLane.sortie.status).toBe('defeat')
+    expect(noneLane.sortie.elapsedTicks).toBe(1)
+    expect(noneLane.tick).toBe(1)
+    expect(noneLane.sortie.result?.durationMs).toBe(FDT)
+    expect(noneLane.sortie.result?.endReason).toBe('player_hp_zero')
     expect(assistLane.sortie.status).toBe('defeat')
     expect(assistLane.sortie.elapsedTicks).toBe(noneLane.sortie.elapsedTicks)
     expect(assistLane.tick).toBe(noneLane.tick)
+    expect(assistLane.sortie.result?.durationMs).toBe(noneLane.sortie.result?.durationMs)
     expect(assistLane.sortie.result?.endReason).toBe(noneLane.sortie.result?.endReason)
   })
 })

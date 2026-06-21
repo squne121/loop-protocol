@@ -105,22 +105,39 @@ describe('enemy taxonomy compatibility gate', () => {
 
     expect(epsilonState.enemies[0].x).toBe(ENEMY_AI_EPSILON_PX)
     expect(epsilonState.enemies[0].y).toBe(0)
+    // Compatibility placeholder only: attack means epsilon co-location, not contact-range semantics.
     expect(epsilonState.enemies[0].behaviorState).toBe('attack')
   })
 
-  it('GIVEN invalid fixedDeltaMs WHEN AI runs THEN positions and taxonomy state do not regress', () => {
+  it('GIVEN invalid fixedDeltaMs WHEN AI runs THEN taxonomy and position updates remain explicit no-op policy', () => {
     const state = createInitialGameState()
     state.player.x = 0
     state.player.y = 0
     state.enemies = [
-      makeEnemy({ x: 120, y: 0, speedPxPerSec: 100 }),
+      makeEnemy({ x: 120, y: 0, speedPxPerSec: 100, targetEntityId: 'enemy:stale', behaviorState: 'attack' }),
     ]
 
     runEnemyAISystem(state, Number.NaN)
 
     expect(state.enemies[0].x).toBe(120)
     expect(state.enemies[0].y).toBe(0)
-    expect(state.enemies[0].behaviorState).toBe('move_to_engage')
-    expect(state.enemies[0].targetEntityId).toBe('player-alpha')
+    expect(state.enemies[0].behaviorState).toBe('attack')
+    expect(state.enemies[0].targetEntityId).toBe('enemy:stale')
+  })
+
+  it('GIVEN invalid player coordinates WHEN AI runs THEN taxonomy normalization also remains no-op', () => {
+    const state = createInitialGameState()
+    state.player.x = Number.NaN
+    state.player.y = 0
+    state.enemies = [
+      makeEnemy({ x: 120, y: 0, speedPxPerSec: 100, targetEntityId: 'enemy:stale', behaviorState: 'attack' }),
+    ]
+
+    runEnemyAISystem(state, 1000)
+
+    expect(state.enemies[0].x).toBe(120)
+    expect(state.enemies[0].y).toBe(0)
+    expect(state.enemies[0].behaviorState).toBe('attack')
+    expect(state.enemies[0].targetEntityId).toBe('enemy:stale')
   })
 })
