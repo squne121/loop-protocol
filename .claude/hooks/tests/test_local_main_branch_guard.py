@@ -1196,13 +1196,15 @@ class TestGhReadonlyAndDenyClaude:
         result = eval_in_local_root("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
+    def test_gh_issue_edit_is_allowed(self, tmp_git_repo: Path):
+        """gh issue edit is in GH_OPS_ALLOW_PATTERNS and must be allowed."""
         result = eval_in_local_root("gh issue edit 123 --body new", str(tmp_git_repo))
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
 
-    def test_gh_issue_close_is_denied(self, tmp_git_repo: Path):
+    def test_gh_issue_close_is_allowed(self, tmp_git_repo: Path):
+        """gh issue close is in GH_OPS_ALLOW_PATTERNS and must be allowed."""
         result = eval_in_local_root("gh issue close 123", str(tmp_git_repo))
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
 
     def test_gh_pr_merge_is_denied(self, tmp_git_repo: Path):
         result = eval_in_local_root("gh pr merge 456", str(tmp_git_repo))
@@ -1284,19 +1286,19 @@ class TestGhMutationFailClosedCompletenessClaude:
     """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness, Claude flavor)."""
 
     @pytest.mark.parametrize("cmd", [
-        "gh issue create --title x --body y",
+        # gh issue subcommands NOT in GH_OPS_ALLOW_PATTERNS
         "gh issue develop 123 --base main",
         "gh issue develop 123 --checkout",
         "gh issue transfer 123 other/repo",
         "gh issue pin 123",
         "gh issue unpin 123",
-        "gh pr create --title x --body y",
+        # gh pr subcommands NOT in GH_OPS_ALLOW_PATTERNS
         "gh pr revert 123",
         "gh pr lock 123",
         "gh pr unlock 123",
     ])
     def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
-        """GIVEN gh mutation not in original denylist WHEN evaluated THEN blocked (allowlist-closed)."""
+        """GIVEN gh mutation not in readonly allowlist or GH_OPS_ALLOW_PATTERNS WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_in_local_root(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
