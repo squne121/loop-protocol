@@ -35,6 +35,7 @@ from local_main_branch_guard import (
     has_inline_env_override,
     is_manual_override_active,
     is_readonly_command,
+    is_branch_safe_maintenance_command,
     is_path_restore_command,
     is_compound_or_wrapped,
     _is_branch_mutation_command,
@@ -45,6 +46,7 @@ from local_main_branch_guard import (
     _is_allowed_when_drifted,
     REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
+    REASON_BRANCH_SAFE_MAINTENANCE,
     REASON_RECOVERY,
     REASON_DRIFT,
     REASON_ALREADY_DRIFTED,
@@ -111,7 +113,12 @@ def make_pretool_input(command: str, cwd: str) -> str:
     })
 
 
-def eval_in_local_root(command: str, cwd: str, env_override: dict | None = None) -> dict:
+def eval_in_local_root(
+    command: str,
+    cwd: str,
+    env_override: dict | None = None,
+    hook_flavor: str = "claude",
+) -> dict:
     """
     Call evaluate() with CLAUDE_PROJECT_DIR set to cwd so that
     is_local_root_context() correctly identifies cwd as primary root.
@@ -123,7 +130,7 @@ def eval_in_local_root(command: str, cwd: str, env_override: dict | None = None)
         if env_override:
             for k, v in env_override.items():
                 os.environ[k] = v
-        result = evaluate(command=command, cwd=cwd, hook_flavor="claude")
+        result = evaluate(command=command, cwd=cwd, hook_flavor=hook_flavor)
     finally:
         # Restore env
         for k in list(os.environ.keys()):
@@ -132,6 +139,92 @@ def eval_in_local_root(command: str, cwd: str, env_override: dict | None = None)
             else:
                 os.environ[k] = old_env[k]
     return result
+
+
+class TestIssue1075BranchSafeMaintenanceTelemetry:
+    """Issue #1075 regression coverage for branch-safe maintenance telemetry."""
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    @pytest.mark.parametrize("command", ["git fetch", "git worktree prune"])
+    def test_branch_safe_maintenance_reason_code_parity(
+        self,
+        tmp_git_repo: Path,
+        command: str,
+        hook_flavor: str,
+    ):
+        result = eval_in_local_root(command, str(tmp_git_repo), hook_flavor=hook_flavor)
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_BRANCH_SAFE_MAINTENANCE
+        assert is_branch_safe_maintenance_command(command) is True
+        assert is_readonly_command(command) is False
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    @pytest.mark.parametrize(
+        "command",
+        ["git status", "git diff --stat", "git log --oneline", "git worktree list"],
+    )
+    def test_readonly_parity_display_commands_remain_readonly(
+        self,
+        tmp_git_repo: Path,
+        command: str,
+        hook_flavor: str,
+    ):
+        result = eval_in_local_root(command, str(tmp_git_repo), hook_flavor=hook_flavor)
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+        assert is_readonly_command(command) is True
+        assert is_branch_safe_maintenance_command(command) is False
+
+    @pytest.mark.parametrize("command", ["git fetch | head -n 1", "git worktree prune | head -n 1"])
+    def test_pipeline_fail_closed_branch_safe_maintenance_is_not_readonly_pipeline(
+        self,
+        tmp_git_repo: Path,
+        command: str,
+    ):
+        result = eval_in_local_root(command, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_UNPARSEABLE
+
+    @pytest.mark.parametrize("hook_flavor", ["claude", "codex"])
+    def test_hook_flavor_parity_branch_safe_maintenance_schema_unchanged(
+        self,
+        tmp_git_repo: Path,
+        hook_flavor: str,
+    ):
+        result = eval_in_local_root("git fetch", str(tmp_git_repo), hook_flavor=hook_flavor)
+        assert result == {
+            "status": "allow",
+            "reason_code": REASON_BRANCH_SAFE_MAINTENANCE,
+            "current_branch": "main",
+            "target_branch": None,
+            "target_branch_kind": None,
+            "hook_flavor": hook_flavor,
+        }
+
+    def test_result_schema_compatibility_reason_code_enum_extension_only(self, tmp_git_repo: Path):
+        readonly_result = eval_in_local_root("git status", str(tmp_git_repo))
+        branch_safe_result = eval_in_local_root("git fetch", str(tmp_git_repo))
+
+        expected_keys = {
+            "status",
+            "reason_code",
+            "current_branch",
+            "target_branch",
+            "target_branch_kind",
+            "hook_flavor",
+        }
+
+        for result in (readonly_result, branch_safe_result):
+            assert set(result.keys()) == expected_keys
+            assert isinstance(result["status"], str)
+            assert isinstance(result["reason_code"], str)
+            assert result["current_branch"] in ("main", None)
+            assert result["target_branch"] is None or isinstance(result["target_branch"], str)
+            assert result["target_branch_kind"] is None or isinstance(result["target_branch_kind"], str)
+            assert isinstance(result["hook_flavor"], str)
+
+        assert readonly_result["reason_code"] == REASON_READONLY
+        assert branch_safe_result["reason_code"] == REASON_BRANCH_SAFE_MAINTENANCE
 
 
 # ─── AC1: Claude Code blocks root branch drift ────────────────────────────────
