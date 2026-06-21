@@ -37,6 +37,28 @@
 - `rtk curl` and `rtk env` require explicit review due to secret/exfiltration risk.
 - If `rtk` provides arbitrary shell passthrough without subcommand enforcement, this rules profile is not effective and must be renegotiated.
 
+## エージェントランレポートと振り返りインデックス
+
+エージェントランの完了後は以下の 3 つのアーティファクトで記録・分析を行う:
+
+| アーティファクト | 責務 |
+|---|---|
+| `agent_session_manifest` | セッション中の内部追跡（読み取りファイル・ツール呼び出し） |
+| `agent_run_report` (`agent_run_report/v1`) | 個別ランの公開可能要約・AC 達成状況・`evidence_refs`・`commands_summary` |
+| `agent_retro_index` | 複数ランの横断インデックス・friction パターン・`follow_up_issues` 集約 |
+
+詳細は `docs/dev/agent-run-report.md` を参照する。
+レトロインデックスの schema は `docs/dev/agent-retro-index.md` を参照する。
+
+各フェーズの Stop Conditions（`report finalized`、`public-safe check pass`、`posting dry-run or upsert done`）は
+`docs/dev/agent-run-report.md` の「Phase Stop Conditions」セクションに定義されている。
+
+## Hook Boundary と post-run verifier
+
+hook は **diagnostic/prevention レイヤー** であり、カノニカルゲートではない。
+**post-run verifier が canonical gate** である。
+詳細は `docs/dev/agent-run-report.md` の「Hook Boundary Policy」セクションを参照する。
+
 ## agent ops read plan 例外
 
 `agent-ops-review` タスクを実施する場合:
