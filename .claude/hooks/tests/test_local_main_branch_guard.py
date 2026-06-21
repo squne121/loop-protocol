@@ -56,6 +56,14 @@ from local_main_branch_guard import (
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
+    is_github_issue_mutation_command,
+    is_readonly_artifact_export_command,
+    GITHUB_CMD_CLASS_DISPLAY_READONLY,
+    GITHUB_CMD_CLASS_READONLY_EXPORT,
+    GITHUB_CMD_CLASS_ISSUE_MUTATION,
+    GITHUB_CMD_CLASS_PR_METADATA,
+    GITHUB_CMD_CLASS_DESTRUCTIVE,
+    TRUSTED_REPO_SLUG,
 )
 
 
@@ -1444,3 +1452,148 @@ class TestGhOpsMinimalAllowlistClaude:
         """GIVEN command outside minimal allowlist WHEN evaluated THEN blocked."""
         result = eval_in_local_root(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
+
+
+# ─── AC8〜AC15: Issue #1124 GitHub remote ops 5 分類 ────────────────────────
+
+class TestGithubIssueMutationCommandClaude:
+    """
+    AC8: gh issue edit with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
+    AC9: gh issue create with --repo + --body-file tmp/ → allow (github_issue_mutation_command)
+    AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
+    AC13: gh issue create/edit/comment/close/reopen is NOT readonly_command
+    """
+
+    # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
+    @pytest.mark.parametrize("cmd", [
+        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+        "gh issue edit 456 --repo squne121/loop-protocol --body-file tmp/body.md --label bug",
+        "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
+    ])
+    def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
+        """AC8: GIVEN gh issue edit with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
+        assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
+    @pytest.mark.parametrize("cmd", [
+        "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
+        "gh issue create --repo squne121/loop-protocol --title タイトル --body-file tmp/foo.md --label enhancement",
+        "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
+    ])
+    def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
+        """AC9: GIVEN gh issue create with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
+        assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    # AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
+    @pytest.mark.parametrize("cmd", [
+        "gh issue create",                                          # bare create
+        "gh issue edit 123",                                        # bare edit, no --body-file
+        "gh issue create --repo squne121/loop-protocol",            # no --body-file
+        "gh issue edit 123 --repo squne121/loop-protocol",          # no --body-file
+        "gh issue create --body-file tmp/foo.md",                   # no --repo
+        "gh issue edit 123 --body-file tmp/foo.md",                 # no --repo
+        "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md --editor",  # interactive
+        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md --web",   # interactive
+        "gh issue create --repo squne121/loop-protocol --body-file -",  # stdin
+        "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/foo.md",  # /tmp not tmp/
+        "gh issue edit 123 --repo other-org/other-repo --body-file tmp/foo.md",    # wrong repo
+    ])
+    def test_ac10_bare_gh_issue_create_or_edit_blocked(self, tmp_git_repo: Path, cmd: str):
+        """AC10: GIVEN bare gh issue create/edit or without required flags WHEN evaluated THEN block."""
+        assert not is_github_issue_mutation_command(cmd), f"Expected False for: {cmd!r}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block", f"Expected block for: {cmd!r}"
+
+    # AC13: gh issue create/edit/comment/close/reopen are NOT readonly_command
+    @pytest.mark.parametrize("cmd", [
+        "gh issue create --repo squne121/loop-protocol --title t --body-file tmp/foo.md",
+        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+        "gh issue close 123",
+        "gh issue comment 123 --body hello",
+        "gh issue reopen 123",
+    ])
+    def test_ac13_gh_issue_mutations_not_readonly_command(self, tmp_git_repo: Path, cmd: str):
+        """AC13: GIVEN gh issue mutation WHEN evaluated THEN reason_code is NOT readonly_command."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["reason_code"] != REASON_READONLY, (
+            f"gh issue mutation {cmd!r} must not have readonly_command reason_code, "
+            f"got: {result['reason_code']!r}"
+        )
+
+
+class TestReadonlyArtifactExportCommandClaude:
+    """
+    AC11: gh issue view ... > tmp/issue_123.md → allow (readonly_artifact_export_command)
+    AC12: gh issue view 123 > src/foo.md / > docs/foo.md / > .env / >> tmp/foo.md → block
+    """
+
+    # AC11: gh issue view ... > tmp/issue_123.md → allow
+    @pytest.mark.parametrize("cmd", [
+        "gh issue view 123 --repo squne121/loop-protocol --json body --jq .body > tmp/issue_123.md",
+        "gh issue view 456 > tmp/issue_456.md",
+        "gh issue view 1 --json body > tmp/out.md",
+    ])
+    def test_ac11_gh_issue_view_to_tmp_allowed(self, tmp_git_repo: Path, cmd: str):
+        """AC11: GIVEN gh issue view ... > tmp/... WHEN evaluated THEN allow."""
+        assert is_readonly_artifact_export_command(cmd), f"Expected True for: {cmd!r}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", f"Expected allow for: {cmd!r}"
+        assert result["reason_code"] == REASON_READONLY
+
+    # AC12: blocked destinations
+    @pytest.mark.parametrize("cmd", [
+        "gh issue view 123 > src/foo.md",          # src/ destination
+        "gh issue view 123 > docs/foo.md",         # docs/ destination
+        "gh issue view 123 > .env",                # .env destination
+        "gh issue view 123 >> tmp/foo.md",         # append redirect
+        "gh issue view 123 > /tmp/foo.md",         # /tmp absolute (not tmp/ relative)
+        "gh issue view 123 > foo.md",              # no directory prefix
+    ])
+    def test_ac12_gh_issue_view_to_blocked_dest_blocked(self, tmp_git_repo: Path, cmd: str):
+        """AC12: GIVEN gh issue view with blocked destination WHEN evaluated THEN block."""
+        assert not is_readonly_artifact_export_command(cmd), f"Expected False for: {cmd!r}"
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block", f"Expected block for: {cmd!r}"
+
+
+class TestGhDestructiveCommandsBlockedClaude:
+    """AC14: gh pr merge / gh pr checkout / gh pr update-branch remain blocked."""
+
+    @pytest.mark.parametrize("cmd", [
+        "gh pr merge 123",
+        "gh pr checkout 123",
+        "gh pr update-branch 456",
+    ])
+    def test_ac14_gh_pr_destructive_blocked(self, tmp_git_repo: Path, cmd: str):
+        """AC14: GIVEN gh pr merge/checkout/update-branch WHEN evaluated THEN block."""
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "block", f"Expected block for: {cmd!r}"
+        assert result["reason_code"] == REASON_GH_MUTATION
+
+    def test_ac14_gh_pr_create_blocked(self, tmp_git_repo: Path):
+        """AC14: gh pr create is blocked (destructive / local push dependent)."""
+        result = eval_in_local_root("gh pr create --title x --body y", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+
+class TestGithub5ClassVocabularyConstantsClaude:
+    """AC15: 5-class vocabulary constants are defined and consistent."""
+
+    def test_github_cmd_class_constants_defined(self):
+        """AC15: All 5 vocabulary constants must be defined."""
+        assert GITHUB_CMD_CLASS_DISPLAY_READONLY == "display_readonly_command"
+        assert GITHUB_CMD_CLASS_READONLY_EXPORT == "readonly_artifact_export_command"
+        assert GITHUB_CMD_CLASS_ISSUE_MUTATION == "github_issue_mutation_command"
+        assert GITHUB_CMD_CLASS_PR_METADATA == "github_pr_metadata_command"
+        assert GITHUB_CMD_CLASS_DESTRUCTIVE == "github_destructive_command"
+
+    def test_trusted_repo_slug_is_defined(self):
+        """AC15: TRUSTED_REPO_SLUG constant is defined."""
+        assert TRUSTED_REPO_SLUG == "squne121/loop-protocol"
+

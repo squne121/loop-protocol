@@ -319,7 +319,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["gh", "issue", ["create", "edit", "close", "reopen", "delete", "comment"]],
     decision = "forbidden",
-    justification = "Mutating GitHub issue operations require rtk gh wrapper.",
+    justification = "Mutating GitHub issue operations require rtk gh wrapper or managed skill context. Exception: github_issue_mutation_command (gh issue create/edit with --repo squne121/loop-protocol and --body-file tmp/<path>) is allowed via managed skill (create-issue / edit-issue). Bare gh issue create/edit without required flags remain forbidden. See docs/dev/hook-boundaries.md for 5-class taxonomy.",
     match = [
         "gh issue create",
         "gh issue edit 1",
