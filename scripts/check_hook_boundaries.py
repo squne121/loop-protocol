@@ -49,6 +49,17 @@ EVENT_EXIT_2_EFFECT: dict[str, str] = {
     "PostToolUse": "cannot_block_completed_tool_call",
 }
 
+STALE_NARRATIVE_PATTERNS = (
+    "`generate_session_manifest_from_hook.mjs` | telemetry | 継続 |",
+    "`generate_session_manifest_from_hook.mjs`（PostToolUse）",
+)
+
+REQUIRED_NARRATIVE_SNIPPETS = (
+    "`session_manifest_debounce.mjs` | telemetry | 継続 |",
+    "`session_manifest_debounce.mjs`（PostToolUse front gate）",
+    "`generate_session_manifest_from_hook.mjs` は Stop/SubagentStop producer / debounce worker downstream",
+)
+
 
 def extract_manifest(docs_text: str) -> list[dict[str, Any]]:
     """docs から hook_boundaries_manifest_v1 YAML block を抽出してパースする。"""
@@ -412,6 +423,30 @@ def check_drift(
     return errors
 
 
+def validate_narrative_consistency(docs_text: str) -> list[str]:
+    """
+    本文の説明表・telemetry 説明が current topology と一致しているか検証する。
+
+    YAML manifest と settings.json の構造一致だけでは、本文表に残った stale な
+    「generate_session_manifest_from_hook.mjs が PostToolUse hook」という記述を検出できない。
+    """
+    errors: list[str] = []
+
+    for snippet in STALE_NARRATIVE_PATTERNS:
+        if snippet in docs_text:
+            errors.append(
+                f"[narrative] stale topology 記述を検出しました: {snippet}"
+            )
+
+    for snippet in REQUIRED_NARRATIVE_SNIPPETS:
+        if snippet not in docs_text:
+            errors.append(
+                f"[narrative] current topology を示す本文記述が不足しています: {snippet}"
+            )
+
+    return errors
+
+
 # ─── メイン ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -449,6 +484,7 @@ def main() -> int:
     # drift チェック
     drift_errors = check_drift(manifest_entries, settings_entries)
     errors.extend(drift_errors)
+    errors.extend(validate_narrative_consistency(docs_text))
 
     # 結果出力
     if errors:
