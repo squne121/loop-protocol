@@ -105,11 +105,15 @@ hook_boundaries_manifest_v1:
       linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
       guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
-      reason_code 一覧（#1089 で追加）: readonly_command / branch_safe_maintenance_command /
-      deterministic_checker_command / unparseable_branch_mutation（gh mutation・/tmp wrapper 含む）。
+      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離）:
+      readonly_command / branch_safe_maintenance_command / deterministic_checker_command /
+      gh_mutation_denied / unparseable_branch_mutation。
+      gh_mutation_denied: gh issue/pr のうち readonly allowlist 外の mutation 系コマンドを fail-closed した場合に使用（#1109）。
+      unparseable_branch_mutation: compound/wrapper/redirection・/tmp wrapper・python -c・parse failure 等に使用。
       fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
       gh issue view/list, gh pr view/list/status は readonly_command として許可。
-      gh mutation コマンド（edit/close/merge 等）と /tmp wrapper / python -c は fail-closed。
+      gh issue/pr mutation コマンド（edit/close/merge 等）は gh_mutation_denied で fail-closed（#1109）。
+      /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
 
   - handler_id: worktree_scope_guard

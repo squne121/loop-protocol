@@ -1,46 +1,47 @@
 {
-  "schema_version": "refinement_loop_plan/v1",
-  "source": {
-    "issue_number": 11,
-    "issue_body_sha256": "5f8ce69baf7a07f1356f1e4b4918ee7eff3d26049ccdf20f818ac70e137ed020",
-    "comments_sha256": null,
-    "known_context_sha256": null,
-    "generated_at": "2025-05-25T12:00:00+00:00"
-  },
   "decisions": {
-    "investigation_policy": {
-      "required": false,
-      "reason_code": "no_repo_fact_claim",
-      "target_paths": [],
-      "repo_claims": [],
-      "evidence_spans": [],
-      "confidence": "unknown"
-    },
-    "web_research_policy": {
-      "required": false,
-      "reason_code": "no_critical_external_claim",
-      "critical_external_claims": [],
-      "evidence_spans": [],
-      "confidence": "unknown"
-    },
-    "scope_signal_guard": {
-      "triggered": false,
-      "reason_code": "no_scope_signal",
-      "excluded_by_anchor_reframe": false,
-      "evidence_spans": []
-    },
     "delivery_rollup": {
       "applicable": false,
-      "unmaterialized_slots": [],
-      "evidence_spans": []
+      "evidence_spans": [],
+      "unmaterialized_slots": []
     },
     "follow_up_materialization": {
       "candidates": []
+    },
+    "investigation_policy": {
+      "confidence": "unknown",
+      "evidence_spans": [],
+      "reason_code": "no_repo_fact_claim",
+      "repo_claims": [],
+      "required": false,
+      "target_paths": []
+    },
+    "scope_delta_decision": null,
+    "scope_signal_guard": {
+      "evidence_spans": [],
+      "excluded_by_anchor_reframe": false,
+      "reason_code": "no_scope_signal",
+      "triggered": false
+    },
+    "web_research_policy": {
+      "confidence": "unknown",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "reason_code": "no_critical_external_claim",
+      "required": false
     }
   },
   "fail_closed": {
-    "required": false,
+    "human_message": "",
     "reason_codes": [],
-    "human_message": ""
+    "required": false
+  },
+  "schema_version": "refinement_loop_plan/v1",
+  "source": {
+    "comments_sha256": null,
+    "generated_at": "2025-05-25T12:00:00+00:00",
+    "issue_body_sha256": "5f8ce69baf7a07f1356f1e4b4918ee7eff3d26049ccdf20f818ac70e137ed020",
+    "issue_number": 11,
+    "known_context_sha256": null
   }
 }

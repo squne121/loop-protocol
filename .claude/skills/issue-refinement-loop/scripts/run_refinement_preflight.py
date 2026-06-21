@@ -126,6 +126,8 @@ BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSO
 BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION = "REWRITE_CONSTRAINTS_INVARIANT_VIOLATION"
 BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_invalid"
 
+# Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
+TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -443,6 +445,147 @@ def _load_loop_state_schema() -> dict[str, Any]:
     schema_path = _SCHEMAS_DIR / "loop_state.schema.json"
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
+
+
+# ---------------------------------------------------------------------------
+# ANCHOR_SCOPE_REFRAME_V1 parsing and classification (AC2-AC5)
+# ---------------------------------------------------------------------------
+
+
+def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
+    """
+    Parse ANCHOR_SCOPE_REFRAME_V1 payload from a comment body.
+
+    Only top-level fenced yaml blocks are canonical.
+    Fail-closed: blockquote-embedded fenced blocks and raw-text markers are rejected.
+    Returns None if not found or malformed.
+    """
+    import re
+    fenced_pattern = re.compile(r"^```yaml\s*\n(.*?)^```", re.MULTILINE | re.DOTALL)
+    for match in fenced_pattern.finditer(comment_body):
+        yaml_content = match.group(1)
+        # Fail-closed: reject if this fence is inside a blockquote
+        start = match.start()
+        before = comment_body[:start]
+        if before.rstrip().endswith(">"):
+            continue
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(yaml_content)
+        except Exception:
+            return None
+        if isinstance(data, dict) and data.get("schema_version") == "ANCHOR_SCOPE_REFRAME_V1":
+            return data
+    return None
+
+
+def _classify_anchor_scope_reframe(
+    *,
+    comment_payload: "dict",
+    anchor_body: str,
+    repo: str,
+    issue_number: int,
+    anchor_url: str,
+) -> dict:
+    """
+    Classify anchor comment for ANCHOR_SCOPE_REFRAME_V1 trust and generate scope_delta_decision.
+
+    Trusted if ALL of:
+    - author_association in TRUSTED_ANCHOR_ASSOCIATIONS
+    - Payload has ANCHOR_SCOPE_REFRAME_V1 schema_version
+    - target.repo == repo
+    - target.issue_number == issue_number
+    - Payload passes anchor_scope_reframe_v1.schema.json validation
+
+    Always returns a scope_delta_decision dict.
+    """
+    import hashlib as _hashlib
+
+    author_assoc = comment_payload.get("author_association", "")
+    anchor_hash = _hashlib.sha256(
+        anchor_body.encode("utf-8") if isinstance(anchor_body, str) else anchor_body
+    ).hexdigest()
+
+    # Check author trust
+    if author_assoc not in TRUSTED_ANCHOR_ASSOCIATIONS:
+        return {
+            "status": "fail_closed",
+            "reason": f"untrusted_author_association: {author_assoc!r}",
+            "implementation_go": False,
+            "anchor_author_association": author_assoc or None,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": anchor_hash,
+            "allowed_path_deltas": [],
+            "required_rerun": [],
+        }
+
+    # Parse ANCHOR_SCOPE_REFRAME_V1 payload from body
+    payload = _parse_anchor_scope_reframe_body(anchor_body)
+    if payload is None:
+        return {
+            "status": "fail_closed",
+            "reason": "no_anchor_scope_reframe_v1_payload",
+            "implementation_go": False,
+            "anchor_author_association": author_assoc,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": anchor_hash,
+            "allowed_path_deltas": [],
+            "required_rerun": [],
+        }
+
+    # Validate against schema (fail-closed on schema error)
+    schema = _load_schema("anchor_scope_reframe_v1.schema.json")
+    if schema is not None:
+        valid, errors = _validate_with_schema(payload, schema)
+        if not valid:
+            return {
+                "status": "fail_closed",
+                "reason": f"schema_invalid: {errors[:3]}",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
+
+    # Check target.repo
+    target = payload.get("target", {})
+    if target.get("repo") != repo:
+        return {
+            "status": "fail_closed",
+            "reason": f"wrong_repo: expected {repo!r}, got {target.get('repo')!r}",
+            "implementation_go": False,
+            "anchor_author_association": author_assoc,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": anchor_hash,
+            "allowed_path_deltas": [],
+            "required_rerun": [],
+        }
+
+    # Check target.issue_number
+    if target.get("issue_number") != issue_number:
+        return {
+            "status": "fail_closed",
+            "reason": f"wrong_issue_number: expected {issue_number}, got {target.get('issue_number')!r}",
+            "implementation_go": False,
+            "anchor_author_association": author_assoc,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": anchor_hash,
+            "allowed_path_deltas": [],
+            "required_rerun": [],
+        }
+
+    # All checks pass — trusted anchor
+    return {
+        "status": "approved_by_trusted_anchor",
+        "implementation_go": False,
+        "anchor_author_association": author_assoc,
+        "anchor_comment_url": anchor_url,
+        "anchor_comment_hash": anchor_hash,
+        "allowed_path_deltas": payload.get("allowed_path_deltas", []),
+        "required_rerun": payload.get("required_rerun", []),
+    }
 
 def _build_anchor_comment_state(
     *,
@@ -1364,6 +1507,22 @@ def run_preflight(
                 "scope_impact": anchor_comment_state["scope_impact"],
                 "requires_fact_check": anchor_comment_state["requires_fact_check"],
             }
+
+            # --- Classify ANCHOR_SCOPE_REFRAME_V1 and build scope_delta_decision ---
+            scope_delta_decision = _classify_anchor_scope_reframe(
+                comment_payload=comment_payload,
+                anchor_body=anchor_comment_state["snapshot"],
+                repo=repo,
+                issue_number=issue_number,
+                anchor_url=anchor_url,
+            )
+            # Propagate to known_context so planner sees anchor_reframe context
+            _kc = dict(known_context) if known_context else {}
+            _kc["anchor_reframe"] = scope_delta_decision["status"] == "approved_by_trusted_anchor"
+            _kc["anchor_comment_url"] = anchor_url
+            _kc["anchor_comment_hash"] = scope_delta_decision.get("anchor_comment_hash", "")
+            _kc["scope_delta_decision"] = scope_delta_decision
+            known_context = _kc
 
     # --- Build raw snapshot (for artifact) ---
     raw_snapshot = {

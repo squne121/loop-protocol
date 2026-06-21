@@ -33,6 +33,8 @@ from local_main_branch_guard import (
     REASON_READONLY,
     REASON_UNPARSEABLE,
     REASON_DETERMINISTIC_CHECKER,
+    REASON_GITHUB_REMOTE_OPS,
+    REASON_GH_MUTATION,
 )
 
 
@@ -403,21 +405,98 @@ class TestGhReadonlyAndDeny:
         result = eval_codex("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
+    def test_gh_issue_edit_is_blocked(self, tmp_git_repo: Path):
+        """gh issue edit is NOT in the minimal allowlist and must be blocked (B3)."""
         result = eval_codex("gh issue edit 123 --body new", str(tmp_git_repo))
         assert result["status"] == "block"
 
-    def test_gh_issue_close_is_denied(self, tmp_git_repo: Path):
+    def test_gh_issue_close_is_allowed(self, tmp_git_repo: Path):
+        """gh issue close is in GH_OPS_ALLOW_PATTERNS and must be allowed (AC1)."""
         result = eval_codex("gh issue close 123", str(tmp_git_repo))
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
 
     def test_gh_pr_merge_is_denied(self, tmp_git_repo: Path):
+        """gh pr merge affects local state and must remain blocked (AC3)."""
         result = eval_codex("gh pr merge 456", str(tmp_git_repo))
         assert result["status"] == "block"
 
     def test_gh_pr_update_branch_is_denied(self, tmp_git_repo: Path):
         result = eval_codex("gh pr update-branch 456", str(tmp_git_repo))
         assert result["status"] == "block"
+
+
+class TestGhMutationReasonCode:
+    """AC1-AC7 (#1109): gh_mutation_denied reason_code for gh issue/pr mutation block."""
+
+    # AC2: gh issue close/comment/edit/reopen/delete/lock/unlock
+    @pytest.mark.parametrize("cmd", [
+        # gh issue close/comment/reopen are now allow via is_github_remote_ops_command (#1120)
+        "gh issue edit 123 --title new",
+        "gh issue delete 123",
+        "gh issue lock 123",
+        "gh issue unlock 123",
+    ])
+    def test_gh_issue_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh issue mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION, (
+            f"Expected gh_mutation_denied for {cmd!r}, got {result['reason_code']!r}"
+        )
+
+    # AC3: gh pr checkout/edit/comment/merge/update-branch/review
+    @pytest.mark.parametrize("cmd", [
+        # gh pr comment --body and gh pr edit <N> are now allow via is_github_remote_ops_command (#1120)
+        "gh pr checkout 456",
+        "gh pr merge 456",
+        "gh pr update-branch 456",
+        "gh pr review 456",
+    ])
+    def test_gh_pr_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh pr mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION, (
+            f"Expected gh_mutation_denied for {cmd!r}, got {result['reason_code']!r}"
+        )
+
+    # AC4: readonly commands still allow
+    @pytest.mark.parametrize("cmd", [
+        "gh issue view 123",
+        "gh issue list",
+        "gh pr view 456",
+        "gh pr list",
+        "gh pr status",
+    ])
+    def test_gh_readonly_still_allowed(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh readonly command WHEN evaluated THEN status is allow."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", (
+            f"Expected allow for readonly {cmd!r}, got {result['status']!r}"
+        )
+
+    def test_gh_mutation_denied_constant_value(self):
+        """AC1: REASON_GH_MUTATION == 'gh_mutation_denied'."""
+        assert REASON_GH_MUTATION == "gh_mutation_denied"
+
+    def test_gh_mutation_recovery_hint_contains_approved(self, tmp_git_repo: Path, capsys):
+        """AC7: gh mutation block の recovery hint が GitHub mutation 文脈の文言を含む"""
+        from local_main_branch_guard import _emit_block_stderr, REASON_GH_MUTATION
+        _emit_block_stderr(
+            reason_code=REASON_GH_MUTATION,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="codex",
+        )
+        captured = capsys.readouterr()
+        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
+        assert hint_line, "Expected a recovery: line in stderr"
+        hint = hint_line[0].lower()
+        assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
+            f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
+        )
+
 
 
 class TestExactAllowlist:
@@ -488,25 +567,42 @@ class TestPythonpathStaleAndTmpWrapper:
 
 
 class TestGhMutationFailClosedCompleteness:
-    """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness)."""
+    """AC11: gh issue/pr mutation subcommands outside readonly allowlist and GH_OPS_ALLOW_PATTERNS are ALL blocked (allowlist-closed completeness)."""
 
     @pytest.mark.parametrize("cmd", [
-        "gh issue create --title x --body y",
+        # gh issue subcommands NOT in the minimal allowlist
+        "gh issue create --title x --body y",    # B3: removed from allowlist
+        "gh issue edit 123 --title new",          # B3: removed from allowlist
         "gh issue develop 123 --base main",
         "gh issue develop 123 --checkout",
         "gh issue transfer 123 other/repo",
         "gh issue pin 123",
         "gh issue unpin 123",
-        "gh pr create --title x --body y",
+        # gh pr subcommands NOT in the minimal allowlist
+        "gh pr create --title x --body y",        # B3: removed from allowlist
         "gh pr revert 123",
         "gh pr lock 123",
         "gh pr unlock 123",
     ])
     def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
-        """GIVEN gh mutation not in original denylist WHEN evaluated THEN blocked (allowlist-closed)."""
+        """GIVEN gh mutation not in readonly allowlist or minimal gh ops allowlist WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
-        assert result["reason_code"] == REASON_UNPARSEABLE
+        assert result["reason_code"] == REASON_GH_MUTATION
+
+    @pytest.mark.parametrize("cmd", [
+        "gh issue close 1089",
+        "gh issue comment 123 --body hello",
+        "gh issue comment 123 --body-file /tmp/body.txt",
+        "gh issue reopen 123",
+        "gh pr comment 456 --body hello",
+        "gh pr edit 456 --title new",
+    ])
+    def test_gh_ops_allowlist_commands_are_allowed(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh issue/pr ops in post-merge-cleanup minimal set WHEN evaluated THEN allowed (AC1)."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
 
 class TestProjectTmpPolicy:
@@ -523,3 +619,40 @@ class TestProjectTmpPolicy:
         result = eval_codex("uv run python3 /tmp/check.py --dry-run", str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
+
+class TestGhOpsMinimalAllowlist:
+    """AC1, B3: post-merge-cleanup 最小集合の token-based classifier テスト（Codex flavor）。"""
+
+    @pytest.mark.parametrize("cmd,expected", [
+        # must-allow: 最小集合
+        ("gh issue close 1089", "allow"),
+        ("gh issue comment 123 --body hello", "allow"),
+        ("gh issue comment 123 --body-file /some/file.txt", "allow"),
+        ("gh issue reopen 456", "allow"),
+        ("gh pr comment 789 --body text", "allow"),
+        ("gh pr edit 101 --title new", "allow"),
+    ])
+    def test_minimal_allowlist_allowed(self, tmp_git_repo: Path, cmd: str, expected: str):
+        """GIVEN minimal allowlist command WHEN evaluated THEN allowed with github_remote_ops_command reason."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == expected
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+    @pytest.mark.parametrize("cmd", [
+        # must-block: 最小集合外
+        "gh issue create --title x --body y",   # B3: not in minimal set
+        "gh issue edit 123 --title new",          # B3: not in minimal set (interactive possible)
+        "gh pr create --title x --body y",        # B3: not in minimal set
+        "gh issue comment 123",                   # B2: --body なし → interactive
+        "gh pr comment 456",                      # B2: --body なし → interactive
+        "gh issue close",                         # B1: 番号なし
+        "gh issue reopen",                        # B1: 番号なし
+        "gh pr edit",                             # B1: 番号なし → branch 依存
+        "gh issue comment 123 --delete-last",     # B2: destructive flag
+        "gh issue comment 123 --editor",          # B2: interactive flag
+        "gh issue comment 123 --web",             # B2: interactive flag
+    ])
+    def test_minimal_allowlist_blocked(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN command outside minimal allowlist WHEN evaluated THEN blocked."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
