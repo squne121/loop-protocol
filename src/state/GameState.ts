@@ -52,6 +52,11 @@ export type NpcBehaviorState =
   | 'retreat'
   | 'destroyed'
 
+export type EnemyTaxonomyBehaviorState = Extract<
+  NpcBehaviorState,
+  'move_to_engage' | 'attack' | 'destroyed'
+>
+
 export type TargetingPolicy =
   | 'focus_player'
   | 'assist_player_threat'
@@ -77,6 +82,11 @@ export interface EnemyState {
   contactDamage: number
   defeated: boolean
   defeatedAtTick: number | null
+  faction: 'enemy'
+  role: 'enemy_chaser'
+  behaviorState: EnemyTaxonomyBehaviorState
+  targetingPolicy: 'focus_player'
+  targetEntityId: TargetEntityId
 }
 
 export interface AllyState {
