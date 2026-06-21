@@ -217,3 +217,43 @@ def test_hooks_json_root_structure():
     assert isinstance(data, dict), "hooks.json root must be a JSON object"
     assert "hooks" in data, "hooks.json must have a 'hooks' key at root"
     assert isinstance(data["hooks"], dict), "hooks.json 'hooks' value must be an object"
+
+
+# ---------------------------------------------------------------------------
+# AC6 (ci_test_performance_advisory surface guard): advisory hook must be
+#     registered in .codex/hooks.json PreToolUse
+# ---------------------------------------------------------------------------
+
+CI_ADVISORY_HOOK_FRAGMENT = "ci_test_performance_advisory.sh"
+
+
+def test_ci_advisory_hook_registered_in_hooks_json():
+    """
+    AC6 surface guard: ci_test_performance_advisory.sh must be registered
+    as a PreToolUse hook in .codex/hooks.json.
+    """
+    data = load_hooks()
+    pre_tool_entries = data.get("hooks", {}).get("PreToolUse", [])
+    all_commands = [
+        h.get("command", "")
+        for entry in pre_tool_entries
+        for h in entry.get("hooks", [])
+    ]
+    assert any(CI_ADVISORY_HOOK_FRAGMENT in cmd for cmd in all_commands), (
+        f"ci_test_performance_advisory.sh must be registered in .codex/hooks.json PreToolUse.\n"
+        f"Found commands: {all_commands}"
+    )
+
+
+def test_ci_advisory_hook_not_in_config_toml():
+    """
+    AC6 surface guard (negative): ci_test_performance_advisory must NOT be in config.toml.
+    AC5 contract: hooks must only be in hooks.json.
+    """
+    text = CONFIG_TOML.read_text()
+    for line in text.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        assert "ci_test_performance_advisory" not in line, (
+            "ci_test_performance_advisory must be registered in .codex/hooks.json only, not config.toml"
+        )

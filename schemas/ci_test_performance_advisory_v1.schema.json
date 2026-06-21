@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_test_performance_advisory_v1.schema.json",
+  "title": "CI Test Performance Advisory V1",
+  "description": "Schema for CI_TEST_PERFORMANCE_ADVISORY_V1 — non-blocking advisory emitted by the ci_test_performance_advisory hook when a CI/test-lane related path is detected.",
+  "type": "object",
+  "required": [
+    "schema",
+    "runtime",
+    "event",
+    "triggered",
+    "block",
+    "reason_code",
+    "matched_paths",
+    "required_skill",
+    "expected_followup_contract",
+    "message"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "CI_TEST_PERFORMANCE_ADVISORY_V1"
+    },
+    "runtime": {
+      "type": "string",
+      "enum": ["claude_code", "codex_cli"]
+    },
+    "event": {
+      "type": "string",
+      "const": "PreToolUse"
+    },
+    "triggered": {
+      "type": "boolean",
+      "const": true
+    },
+    "block": {
+      "type": "boolean",
+      "const": false,
+      "description": "Always false — this hook is non-blocking (fail_open)."
+    },
+    "reason_code": {
+      "type": "string",
+      "const": "ci_related_path"
+    },
+    "matched_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of matched path patterns that triggered the advisory."
+    },
+    "required_skill": {
+      "type": "string",
+      "const": ".claude/skills/ci-test-performance/SKILL.md"
+    },
+    "expected_followup_contract": {
+      "type": "string",
+      "const": "CI_TEST_PERFORMANCE_DECISION_V1"
+    },
+    "message": {
+      "type": "string"
+    }
+  }
+}

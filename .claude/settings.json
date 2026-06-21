@@ -134,6 +134,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/ci_test_performance_advisory.sh",
+            "args": [],
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
