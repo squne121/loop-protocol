@@ -528,3 +528,142 @@ def test_trusted_folders_path_default_without_env(monkeypatch):
     monkeypatch.delenv("GEMINI_CLI_TRUSTED_FOLDERS_PATH", raising=False)
     result = sc._trusted_folders_path()
     assert result == Path.home() / ".gemini" / "trustedFolders.json"
+
+
+# ---------------------------------------------------------------------------
+# AC1: oauth_sunset is classified
+# ---------------------------------------------------------------------------
+
+
+def test_auth_oauth_sunset_is_classified():
+    """GIVEN gemini exits non-zero with sunset-related stderr
+    WHEN check_auth is called
+    THEN status is 'oauth_sunset' and recovery mentions GEMINI_API_KEY and #104."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(
+                1,
+                stderr="Error: This service has been discontinued. Google OAuth login is no longer supported.",
+            )
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["ok"] is False
+    assert result["status"] == "oauth_sunset"
+    recovery_text = " ".join(result.get("recovery", []))
+    assert "GEMINI_API_KEY" in recovery_text, "recovery must mention GEMINI_API_KEY"
+    assert "#104" in recovery_text, "recovery must reference parent issue #104"
+
+
+# ---------------------------------------------------------------------------
+# AC1b: ineligible_tier is classified
+# ---------------------------------------------------------------------------
+
+
+def test_auth_ineligible_tier_is_classified():
+    """GIVEN gemini exits non-zero with ineligible tier stderr
+    WHEN check_auth is called
+    THEN status is 'ineligible_tier' and recovery mentions GEMINI_API_KEY and #104."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(
+                1,
+                stderr="Error: Account is not eligible for this tier. Please upgrade your plan.",
+            )
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["ok"] is False
+    assert result["status"] == "ineligible_tier"
+    recovery_text = " ".join(result.get("recovery", []))
+    assert "GEMINI_API_KEY" in recovery_text, "recovery must mention GEMINI_API_KEY"
+    assert "#104" in recovery_text, "recovery must reference parent issue #104"
+
+
+# ---------------------------------------------------------------------------
+# AC2: recovery for oauth_sunset mentions GEMINI_API_KEY and #104
+# ---------------------------------------------------------------------------
+
+
+def test_auth_recovery_mentions_api_key_and_issue_104():
+    """GIVEN oauth_sunset scenario
+    WHEN check_auth is called
+    THEN recovery message contains both 'GEMINI_API_KEY' and '#104'."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(1, stderr="sunset: no longer supported")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    recovery = result.get("recovery", [])
+    combined = " ".join(recovery)
+    assert "GEMINI_API_KEY" in combined
+    assert "#104" in combined
+
+
+# ---------------------------------------------------------------------------
+# AC2b: recovery for other auth failures also mentions GEMINI_API_KEY and #104
+# ---------------------------------------------------------------------------
+
+
+def test_auth_recovery_on_other_failure_mentions_api_key_and_issue_104():
+    """GIVEN an unknown auth failure (auth_failed status)
+    WHEN check_auth is called
+    THEN recovery message contains both 'GEMINI_API_KEY' and '#104'."""
+    sc = load_setup_check()
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(1, stderr="unexpected error: connection reset")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    assert result["ok"] is False
+    assert result["status"] == "auth_failed"
+    recovery = result.get("recovery", [])
+    combined = " ".join(recovery)
+    assert "GEMINI_API_KEY" in combined
+    assert "#104" in combined
+
+
+# ---------------------------------------------------------------------------
+# AC5: GEMINI_API_KEY value is never leaked in output
+# ---------------------------------------------------------------------------
+
+
+def test_auth_does_not_leak_api_key_value(monkeypatch):
+    """GIVEN GEMINI_API_KEY is set to a sentinel value
+    WHEN check_auth is called
+    THEN the sentinel value does NOT appear in any output field."""
+    sc = load_setup_check()
+
+    sentinel = "sk-SUPER_SECRET_VALUE_THAT_MUST_NOT_APPEAR_12345"
+    monkeypatch.setenv("GEMINI_API_KEY", sentinel)
+
+    def _run_side_effect(command, timeout=None):
+        if "gemini" in command and "--prompt" in command:
+            return _make_completed(1, stderr="auth error: ineligible tier")
+        return _make_completed(0)
+
+    with patch.object(sc, "_run", side_effect=_run_side_effect):
+        result = sc.check_auth()
+
+    # Serialize entire result to JSON and verify sentinel is absent.
+    serialized = json.dumps(result)
+    assert sentinel not in serialized, (
+        f"GEMINI_API_KEY value '{sentinel}' must not appear in check_auth output"
+    )
