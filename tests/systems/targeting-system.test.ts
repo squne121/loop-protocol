@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  enemyTargetEntityId,
+  playerTargetEntityId,
   selectTarget,
   type ScoredTarget,
   type TargetSelectionInput,
@@ -67,6 +69,11 @@ const baseCandidates = [
 ]
 
 describe('selectTarget', () => {
+  it('GIVEN TargetEntityId bridge helpers WHEN runtime ids are converted THEN enemy and player ids stay deterministic', () => {
+    expect(enemyTargetEntityId({ id: 7 })).toBe('enemy:7')
+    expect(playerTargetEntityId({ id: 'player-alpha' })).toBe('player-alpha')
+  })
+
   it('GIVEN AC1 candidate filters WHEN defeated / same-faction / same-policy / neutral / outside-arena candidates exist THEN only valid hostile targets remain', () => {
     const input = makeInput({
       actor: {
