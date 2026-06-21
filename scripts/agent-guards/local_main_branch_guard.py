@@ -292,8 +292,22 @@ DETERMINISTIC_CHECKER_ALLOWLIST = [
 ]
 
 # ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
-# ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS is blocked.
+# ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS or GH_OPS_ALLOW_PATTERNS is blocked.
 GH_ISSUE_PR_COMMAND_PATTERN = re.compile(r"^gh\s+(issue|pr)\s+")
+
+# GitHub ops operations that are allowed in local root context.
+# These are issue/PR metadata mutations that do NOT affect the local checkout state.
+# gh pr merge / gh pr checkout are intentionally NOT here (they affect local branch).
+GH_OPS_ALLOW_PATTERNS = [
+    r"^gh\s+issue\s+close(\s|$)",
+    r"^gh\s+issue\s+create(\s|$)",
+    r"^gh\s+issue\s+edit(\s|$)",
+    r"^gh\s+issue\s+comment(\s|$)",
+    r"^gh\s+issue\s+reopen(\s|$)",
+    r"^gh\s+pr\s+create(\s|$)",
+    r"^gh\s+pr\s+comment(\s|$)",
+    r"^gh\s+pr\s+edit(\s|$)",
+]
 
 # Patterns for display-oriented read-only commands.
 DISPLAY_READONLY_PATTERNS = [
@@ -467,9 +481,11 @@ def is_deterministic_checker_command(cmd: str, project_root: str | None = None) 
 
 
 def is_gh_mutation_command(cmd: str) -> bool:
-    """gh issue/pr コマンドで readonly allowlist 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
+    """gh issue/pr コマンドで readonly allowlist および GH_OPS_ALLOW_PATTERNS 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
     DISPLAY_READONLY_PATTERNS に含まれる gh issue view/list, gh pr view/list/status のみ通過。
-    gh issue create/develop/transfer/pin/unpin, gh pr create/revert/lock/unlock 等はすべてブロック。
+    GH_OPS_ALLOW_PATTERNS に含まれる gh issue close/create/edit/comment/reopen,
+    gh pr create/comment/edit は通過（GitHub ops として許可）。
+    gh issue develop/transfer/pin/unpin, gh pr merge/checkout/revert/lock/unlock 等はすべてブロック。
     """
     cmd = cmd.strip()
     # Only applies to gh issue/pr subcommands
@@ -479,7 +495,11 @@ def is_gh_mutation_command(cmd: str) -> bool:
     for pattern in DISPLAY_READONLY_PATTERNS:
         if re.match(pattern, cmd):
             return False
-    # gh issue/pr not in readonly allowlist → treat as mutation → block
+    # If in GitHub ops allowlist, it is allowed (post-merge-cleanup etc.)
+    for pattern in GH_OPS_ALLOW_PATTERNS:
+        if re.match(pattern, cmd):
+            return False
+    # gh issue/pr not in any allowlist → treat as mutation → block
     return True
 
 

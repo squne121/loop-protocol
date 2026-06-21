@@ -403,15 +403,18 @@ class TestGhReadonlyAndDeny:
         result = eval_codex("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
+    def test_gh_issue_edit_is_allowed(self, tmp_git_repo: Path):
+        """gh issue edit is in GH_OPS_ALLOW_PATTERNS and must be allowed."""
         result = eval_codex("gh issue edit 123 --body new", str(tmp_git_repo))
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
 
-    def test_gh_issue_close_is_denied(self, tmp_git_repo: Path):
+    def test_gh_issue_close_is_allowed(self, tmp_git_repo: Path):
+        """gh issue close is in GH_OPS_ALLOW_PATTERNS and must be allowed (AC1)."""
         result = eval_codex("gh issue close 123", str(tmp_git_repo))
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
 
     def test_gh_pr_merge_is_denied(self, tmp_git_repo: Path):
+        """gh pr merge affects local state and must remain blocked (AC3)."""
         result = eval_codex("gh pr merge 456", str(tmp_git_repo))
         assert result["status"] == "block"
 
@@ -488,25 +491,40 @@ class TestPythonpathStaleAndTmpWrapper:
 
 
 class TestGhMutationFailClosedCompleteness:
-    """AC11: gh issue/pr mutation subcommands outside readonly allowlist are ALL blocked (allowlist-closed completeness)."""
+    """AC11: gh issue/pr mutation subcommands outside readonly allowlist and GH_OPS_ALLOW_PATTERNS are ALL blocked (allowlist-closed completeness)."""
 
     @pytest.mark.parametrize("cmd", [
-        "gh issue create --title x --body y",
+        # gh issue subcommands NOT in GH_OPS_ALLOW_PATTERNS
         "gh issue develop 123 --base main",
         "gh issue develop 123 --checkout",
         "gh issue transfer 123 other/repo",
         "gh issue pin 123",
         "gh issue unpin 123",
-        "gh pr create --title x --body y",
+        # gh pr subcommands NOT in GH_OPS_ALLOW_PATTERNS
         "gh pr revert 123",
         "gh pr lock 123",
         "gh pr unlock 123",
     ])
     def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
-        """GIVEN gh mutation not in original denylist WHEN evaluated THEN blocked (allowlist-closed)."""
+        """GIVEN gh mutation not in readonly allowlist or GH_OPS_ALLOW_PATTERNS WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
+
+    @pytest.mark.parametrize("cmd", [
+        "gh issue close 1089",
+        "gh issue create --title x --body y",
+        "gh issue edit 123 --title new",
+        "gh issue comment 123 --body hello",
+        "gh issue reopen 123",
+        "gh pr create --title x --body y",
+        "gh pr comment 456 --body hello",
+        "gh pr edit 456 --title new",
+    ])
+    def test_gh_ops_allowlist_commands_are_allowed(self, tmp_git_repo: Path, cmd: str):
+        """GIVEN gh issue/pr ops in GH_OPS_ALLOW_PATTERNS WHEN evaluated THEN allowed (AC1, AC2)."""
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow"
 
 
 class TestProjectTmpPolicy:
