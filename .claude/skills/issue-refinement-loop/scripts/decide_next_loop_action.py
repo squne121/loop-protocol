@@ -12,7 +12,8 @@ state file. All mutation is the orchestrator's responsibility.
 Input:
   --loop-state-file <path>      Path to LOOP_STATE_V1 JSON file
   --loop-state-json <json>      Inline LOOP_STATE_V1 JSON (alternative to file)
-  --review-result-verdict <v>   One of: approve | needs-fix | null
+  --review-result-verdict <v>   One of: approve | needs-fix | null  (optional;
+                                when omitted, loop_state.last_verdict is used)
   --max-iterations <N>          Override max_iterations from state (optional)
   --phase-state-file <path>     Path to ISSUE_REFINEMENT_PHASE_STATE_V1 JSON (optional)
 
@@ -33,6 +34,12 @@ Priority: inconsistent_state (3) > human_escalation (2) > warn (1) > pass (0).
 Phase gate (evaluated BEFORE schema validation):
   If --phase-state-file is provided and this router is in forbidden_routers,
   output ISSUE_REFINEMENT_ROUTER_ERROR_V1 and exit 3.
+
+Verdict resolution:
+  When --review-result-verdict is omitted (or passed as "null"/""),
+  the router uses loop_state.last_verdict as the single source of truth.
+  When both --review-result-verdict and loop_state.last_verdict are non-null
+  and differ, the router exits with inconsistent_state (exit 3).
 """
 
 from __future__ import annotations
@@ -386,7 +393,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--review-result-verdict",
         metavar="VERDICT",
         default=None,
-        help="Review result verdict: approve | needs-fix | null",
+        help=(
+            "Review result verdict: approve | needs-fix | null. "
+            "When omitted, loop_state.last_verdict is used as the single source of truth. "
+            "When both are provided and non-null, they must agree (else inconsistent_state)."
+        ),
     )
     parser.add_argument(
         "--max-iterations",
@@ -512,28 +523,33 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(f"BLOCKERS: {error_msg}")
         sys.exit(EXIT_INCONSISTENT_STATE)
 
-    # Parse verdict
+    # Parse CLI verdict (may be absent / "null" / "")
     raw_verdict = args.review_result_verdict
     if raw_verdict in (None, "null", ""):
-        verdict: Optional[str] = None
+        cli_verdict: Optional[str] = None
     else:
-        verdict = raw_verdict
+        cli_verdict = raw_verdict
 
-    # Detect conflict: last_verdict in state vs --review-result-verdict CLI flag.
-    # Both being non-null with different values is an inconsistent state.
+    # Resolve single source of truth for verdict:
+    # - If CLI verdict is absent, use loop_state.last_verdict.
+    # - If CLI verdict is present and loop_state.last_verdict is also present
+    #   and they differ → inconsistent_state.
     state_last_verdict = loop_state.get("last_verdict")
-    if (
-        verdict is not None
-        and state_last_verdict is not None
-        and verdict != state_last_verdict
-    ):
+
+    if cli_verdict is None:
+        # Use loop_state.last_verdict as the authoritative source.
+        verdict: Optional[str] = state_last_verdict
+    elif state_last_verdict is not None and cli_verdict != state_last_verdict:
+        # Both non-null and conflicting.
         print(f"STATUS: {STATUS_INCONSISTENT_STATE}")
         print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
         print(
             f"BLOCKERS: last_verdict_conflict:"
-            f" state={state_last_verdict!r} cli={verdict!r}"
+            f" state={state_last_verdict!r} cli={cli_verdict!r}"
         )
         sys.exit(EXIT_INCONSISTENT_STATE)
+    else:
+        verdict = cli_verdict
 
     # Compute next action
     status, next_action, commands, blockers, termination_cause_hint = decide_next_action(
