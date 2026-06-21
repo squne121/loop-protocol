@@ -196,6 +196,27 @@ _PHASE_ROUTER_RULES: dict[str, dict[str, Any]] = {
 }
 
 
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _strict_json_loads(text: str) -> dict[str, Any]:
+    return json.loads(text, parse_constant=_reject_nonfinite_json)
+
+
+def _validate_json_input(path: str | None, *, label: str) -> None:
+    if not path:
+        return
+    try:
+        _strict_json_loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} json decode error: {exc}") from exc
+    except ValueError as exc:
+        raise ValueError(f"{label} strict json validation error: {exc}") from exc
+
+
 def build_phase_state(
     phase: str,
     source_kind: str,
@@ -224,6 +245,10 @@ def build_phase_state(
             f"source_path does not exist: {source_path!r} "
             f"(phase={phase!r}, source_kind={source_kind!r})"
         )
+    _validate_json_input(source_path, label="source_path")
+    _validate_json_input(loop_state_path, label="loop_state_path")
+    _validate_json_input(planner_result_path, label="planner_result_path")
+    _validate_json_input(review_result_path, label="review_result_path")
 
     # M1: source_kind / phase consistency check
     allowed_phases_for_kind = _SOURCE_KIND_ALLOWED_PHASES.get(source_kind)
@@ -313,7 +338,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(phase_state, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(phase_state, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
 

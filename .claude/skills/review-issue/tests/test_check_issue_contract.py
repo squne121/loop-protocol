@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 SCRIPT_PATH = (
@@ -24,6 +25,7 @@ CONTRACT_READINESS_SCRIPT_PATH = (
     Path(__file__).parent.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
 )
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
+SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "review_issue_result_v1.json"
 
 
 def run_checker(fixture_name: str) -> dict:
@@ -295,14 +297,15 @@ class TestC5Fail:
             f"Expected needs-fix, got {output['verdict']}"
         )
 
-    def test_c5_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
-        """GIVEN c5_fail_issue.md WHEN checker runs THEN deterministic finding is checker_gap until real evidence exists."""
+    def test_c5_deterministic_failure_emits_blocking_finding_with_evidence(self):
+        """GIVEN c5_fail_issue.md WHEN checker runs THEN deterministic finding stays blocking with self-evidence."""
         output = run_checker("c5_fail_issue.md")
         findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_number_alignment"]
         assert findings, "Expected vc_number_alignment finding"
-        assert findings[0]["finding_kind"] == "checker_gap"
-        assert findings[0]["blocking"] is False
-        assert findings[0]["checker_evidence"] == []
+        assert findings[0]["finding_kind"] == "deterministic_domain_blocker"
+        assert findings[0]["blocking"] is True
+        assert findings[0]["checker_evidence"][0]["source_check"] == "check_issue_contract"
+        assert output["structured_blockers"][0]["code"] == "C5"
 
 
 class TestC6Fail:
@@ -335,14 +338,50 @@ class TestC8Fail:
 
 
 class TestFindingsContract:
-    def test_c4_deterministic_failure_downgrades_to_checker_gap_without_evidence(self):
-        """GIVEN c4_fail_issue.md WHEN checker runs THEN unsupported deterministic blocker stays non-blocking."""
+    def test_c4_deterministic_failure_emits_blocking_finding_with_evidence(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN deterministic blocker is preserved with self-evidence."""
         output = run_checker("c4_fail_issue.md")
         findings = [f for f in output["findings"] if f["deterministic_domain_key"] == "vc_command_format"]
         assert findings, "Expected vc_command_format finding"
-        assert findings[0]["finding_kind"] == "checker_gap"
-        assert findings[0]["blocking"] is False
-        assert findings[0]["checker_evidence"] == []
+        assert findings[0]["finding_kind"] == "deterministic_domain_blocker"
+        assert findings[0]["blocking"] is True
+        assert findings[0]["checker_evidence"][0]["rule_id"] == "C4_vc_commands_present"
+        assert output["structured_blockers"][0]["code"] == "C4"
+
+    def test_structured_blockers_are_required_and_consistent(self):
+        """GIVEN c4_fail_issue.md WHEN checker runs THEN structured_blockers mirror deterministic findings."""
+        output = run_checker("c4_fail_issue.md")
+        structured = output["structured_blockers"]
+        assert structured, "Expected structured_blockers to be populated"
+        blocker = structured[0]
+        assert blocker["finding_kind"] == "deterministic_domain_blocker"
+        assert blocker["deterministic_domain_key"] == "vc_command_format"
+        assert blocker["blocking"] is True
+        assert blocker["checker_evidence"][0]["body_sha256"] == output["body_sha256"]
+
+    def test_schema_requires_top_level_structured_blockers(self):
+        """GIVEN review_issue_result_v1 schema WHEN loaded THEN structured_blockers is top-level required and schema-bound."""
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        assert "structured_blockers" in schema["required"]
+        assert schema["properties"]["structured_blockers"]["items"]["$ref"] == "#/$defs/structured_blocker"
+        assert "structured_blocker" in schema["$defs"]
+
+    def test_schema_rejects_non_blocking_structured_blockers(self):
+        """GIVEN structured_blockers entry using checker_gap WHEN schema validates THEN it is rejected."""
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        payload = run_checker("c4_fail_issue.md")
+        payload["structured_blockers"] = [
+            {
+                "code": "C4",
+                "message": "gap",
+                "finding_kind": "checker_gap",
+                "deterministic_domain_key": "vc_command_format",
+                "blocking": False,
+                "checker_evidence": [],
+            }
+        ]
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=payload, schema=schema)
 
     def test_c9_warn_does_not_duplicate_findings(self):
         """GIVEN research issue missing RVA WHEN checker runs THEN warning finding is emitted once."""
