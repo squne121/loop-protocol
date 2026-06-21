@@ -62,3 +62,89 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 - Gemini CLI は OAuth / Google アカウント認証で使う。headless 実行前に cached credential、trusted workspace、`.env`、MCP 設定が repo-local contract と矛盾しないことを確認する。
 - 429 / `MODEL_CAPACITY_EXHAUSTED` は同一 model 内だけ限定回数リトライし、別 model へ自動切替しない。
 - `--output-format json` / `stream-json` は Codex 側の契約範囲外。必要なら wrapper 外の別 contract で検討し、現状は `result.json` による headless JSON 契約に限定する。
+
+---
+
+## Provider Matrix: agy (Antigravity CLI)
+
+`agy` は Gemini OAuth 認証終了後の恒久代替 provider である。
+Gemini CLI と同様に wrapper 経由で呼び出すが、出力形式・cwd policy・safety mode が異なる。
+
+### AC1: Supported Profiles（provider=agy）
+
+`provider=agy` でサポートするプロファイルは以下のみ。
+
+| Profile | サポート状態 | 説明 |
+|---|---|---|
+| `no_tools` | supported | isolated temp cwd から agy を呼び出す。ファイル編集・shell 実行なし。 |
+| `proposal_only` | supported | isolated temp cwd から agy を呼び出す。返却は draft text のみ。 |
+| `grounded_research` | **unsupported_provider_profile** | `provider=agy` の初期実装では未対応。wrapper が Google Search grounding contract を agy に対してまだ検証・公開していない（wrapper サポート境界）。fail-closed。 |
+| `local_asset_research` | **unsupported_provider_profile** | agy は Serena MCP 構成を持たない。fail-closed。 |
+| `github_research` | **unsupported_provider_profile** | agy は GitHub アクセス機能を持たない。fail-closed。 |
+
+unsupported_provider_profile を request で指定した場合、wrapper は `ok: false` で即時返却する（fail-closed）。
+fallback や自動 profile 変換は行わない。
+
+### AC2: cwd/env Policy（provider=agy）
+
+agy を呼び出す際の cwd および環境変数は以下のポリシーに従う。
+
+| 項目 | ポリシー |
+|---|---|
+| cwd | isolated temp cwd（初期対応では repo root を cwd にしない） |
+| repo root 使用 | 不使用。`local_asset_research` のような repo root 起動は agy では行わない |
+| env | minimal env（必要最小限の環境変数のみ渡す） |
+| env 継承 | `GEMINI_API_KEY` 等の secret を環境変数ごと継承しない |
+
+agy は isolated temp cwd から実行し、repo のファイルシステムに直接アクセスしない。
+
+### AC3 / AC8: Result Normalization と Gemini JSON envelope
+
+`agy` の stdout は Gemini JSON envelope（`_parse_envelope` が解析する `{"response": ...}` 形式）を返さない。
+
+| 項目 | Gemini CLI | agy |
+|---|---|---|
+| stdout 形式 | Gemini JSON envelope（`{"response": ...}` 等） | plain text |
+| normalization | `_parse_envelope` で JSON parse | wrapper が stdout text を直接 `delegation_result/v1` に正規化 |
+| `_parse_envelope` 使用 | あり | **なし**（agy では `_parse_envelope` を通さない） |
+| delegation_result/v1 | envelope parse 後に生成 | stdout text から直接生成 |
+
+agy の stdout text は wrapper 側で `delegation_result/v1` スキーマに正規化し、Gemini JSON envelope parse（`_parse_envelope`）は使用しない。
+
+### AC6: Unsupported Profile の fail-closed（provider=agy）
+
+以下のプロファイルは `provider=agy` で `unsupported_provider_profile` として fail-closed する。
+
+- `grounded_research`
+- `local_asset_research`
+- `github_research`
+
+`grounded_research` は `provider=agy` の初期実装では unsupported である。
+これは、この wrapper が agy に対して Google Search grounding contract をまだ検証・公開していないためであり、
+wrapper サポート境界であって agy 製品の永続的な機能制限ではない。
+
+`local_asset_research` と `github_research` も同様に、agy に対する対応 contract が未定義のため fail-closed とする。
+
+fallback 経路は提供せず `ok: false` で即時終了する。
+unsupported_provider_profile エラーは caller に返却し、人間判断または別 provider への切り替えを促す。
+
+### AC7: Safety Mode（provider=agy）
+
+agy の safety mode は `degraded_wrapper_only` として扱う。
+
+| 項目 | 詳細 |
+|---|---|
+| safety mode | `degraded_wrapper_only` |
+| read-only 保証 | guaranteed ではない（wrapper-constrained） |
+| --approval-mode plan 相当 | 前提にしない |
+| file 書き込み | wrapper が実行しない（agy 側の保証は前提にしない） |
+
+agy の read-only 性は `degraded_wrapper_only / wrapper-constrained` であり、
+Gemini CLI の `no_tools` profile のような guaranteed read-only とは異なる。
+wrapper 側で実行範囲を constrain することで安全性を担保する設計であり、
+agy 自体の --approval-mode plan 相当の動作は前提にしない。
+
+### setup_check.py --provider agy
+
+`setup_check.py --provider agy` は現時点では未実装（Followup Issue 対応）。
+agy の preflight チェックは別途実装予定。
