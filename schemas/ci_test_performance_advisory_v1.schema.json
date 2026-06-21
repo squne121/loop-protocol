@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_test_performance_advisory_v1.schema.json",
+  "title": "CI Test Performance Advisory V1",
+  "description": "Schema for CI_TEST_PERFORMANCE_ADVISORY_V1 — the inner payload embedded in hookSpecificOutput.additionalContext of the Claude Code / Codex CLI PreToolUse hook stdout envelope. The full stdout is: { \"hookSpecificOutput\": { \"hookEventName\": \"PreToolUse\", \"additionalContext\": \"CI_TEST_PERFORMANCE_ADVISORY_V1 {<this_schema>}\" } }. This schema describes the JSON object that follows the 'CI_TEST_PERFORMANCE_ADVISORY_V1 ' prefix in additionalContext.",
+  "type": "object",
+  "required": [
+    "schema",
+    "block",
+    "reason_code",
+    "matched_paths",
+    "required_skill",
+    "expected_followup_contract",
+    "message"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "CI_TEST_PERFORMANCE_ADVISORY_V1"
+    },
+    "block": {
+      "type": "boolean",
+      "const": false,
+      "description": "Always false — this hook is non-blocking (fail_open). Never set to true."
+    },
+    "reason_code": {
+      "type": "string",
+      "const": "ci_related_path"
+    },
+    "matched_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of matched path patterns that triggered the advisory."
+    },
+    "required_skill": {
+      "type": "string",
+      "const": ".claude/skills/ci-test-performance/SKILL.md"
+    },
+    "expected_followup_contract": {
+      "type": "string",
+      "const": "CI_TEST_PERFORMANCE_DECISION_V1"
+    },
+    "message": {
+      "type": "string"
+    }
+  }
+}
