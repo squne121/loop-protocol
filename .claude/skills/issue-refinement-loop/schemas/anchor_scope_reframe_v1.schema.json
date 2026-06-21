@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ANCHOR_SCOPE_REFRAME_V1",
+  "description": "Schema for trusted anchor comment that approves a scope delta in issue-refinement-loop",
+  "type": "object",
+  "required": ["schema_version", "target", "decision", "allowed_path_deltas", "rationale", "required_rerun"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ANCHOR_SCOPE_REFRAME_V1"
+    },
+    "target": {
+      "type": "object",
+      "required": ["repo", "issue_number"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "type": "string",
+          "const": "squne121/loop-protocol"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["approve_scope_delta"]
+    },
+    "allowed_path_deltas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "required_rerun": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["contract_review", "refinement_preflight", "allowed_paths_gate"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  }
+}
