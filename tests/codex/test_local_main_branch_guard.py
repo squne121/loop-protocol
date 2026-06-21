@@ -354,7 +354,7 @@ class TestBranchSafeMaintenance:
 class TestFdDuplication:
     """AC10: 2>&1 | head fd-duplication."""
 
-    def test_git_diff_stat_fd_dup_head_allowed(self, tmp_git_repo: Path):
+    def test_fd_duplication_git_diff_stat_allowed(self, tmp_git_repo: Path):
         result = eval_codex("git diff --stat 2>&1 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
         assert result["reason_code"] == REASON_READONLY
@@ -379,7 +379,7 @@ class TestFdDuplication:
 class TestGhReadonlyAndDeny:
     """AC11: gh readonly / gh deny."""
 
-    def test_gh_issue_view_is_readonly(self, tmp_git_repo: Path):
+    def test_gh_readonly_issue_view(self, tmp_git_repo: Path):
         result = eval_codex("gh issue view 123", str(tmp_git_repo))
         assert result["status"] == "allow"
 
@@ -403,7 +403,7 @@ class TestGhReadonlyAndDeny:
         result = eval_codex("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_issue_edit_is_denied(self, tmp_git_repo: Path):
+    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
         result = eval_codex("gh issue edit 123 --body new", str(tmp_git_repo))
         assert result["status"] == "block"
 
@@ -445,7 +445,7 @@ class TestExactAllowlist:
         )
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
 
-    def test_deterministic_checker_reason_code_not_readonly(self, tmp_git_repo: Path):
+    def test_deterministic_checker_command_reason_code(self, tmp_git_repo: Path):
         result = eval_codex(
             "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
             str(tmp_git_repo),

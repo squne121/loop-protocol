@@ -1147,7 +1147,7 @@ class TestBranchSafeMaintenanceParity:
 class TestFdDuplicationClaude:
     """AC10: 2>&1 | head fd-duplication (Claude flavor)."""
 
-    def test_git_diff_stat_fd_dup_head_allowed(self, tmp_git_repo: Path):
+    def test_fd_duplication_git_diff_stat_allowed(self, tmp_git_repo: Path):
         result = eval_in_local_root("git diff --stat 2>&1 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
         assert result["reason_code"] == REASON_READONLY
@@ -1172,7 +1172,7 @@ class TestFdDuplicationClaude:
 class TestGhReadonlyAndDenyClaude:
     """AC11: gh readonly / gh deny (Claude flavor)."""
 
-    def test_gh_issue_view_is_readonly(self, tmp_git_repo: Path):
+    def test_gh_readonly_issue_view(self, tmp_git_repo: Path):
         result = eval_in_local_root("gh issue view 123", str(tmp_git_repo))
         assert result["status"] == "allow"
 
@@ -1196,7 +1196,7 @@ class TestGhReadonlyAndDenyClaude:
         result = eval_in_local_root("gh issue view 123 | head -n 20", str(tmp_git_repo))
         assert result["status"] == "allow"
 
-    def test_gh_issue_edit_is_denied(self, tmp_git_repo: Path):
+    def test_gh_deny_issue_edit(self, tmp_git_repo: Path):
         result = eval_in_local_root("gh issue edit 123 --body new", str(tmp_git_repo))
         assert result["status"] == "block"
 
@@ -1238,7 +1238,7 @@ class TestExactAllowlistClaude:
         )
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
 
-    def test_deterministic_checker_reason_code_not_readonly(self, tmp_git_repo: Path):
+    def test_deterministic_checker_command_reason_code(self, tmp_git_repo: Path):
         result = eval_in_local_root(
             "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
             str(tmp_git_repo),
