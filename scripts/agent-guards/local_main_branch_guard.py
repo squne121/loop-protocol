@@ -48,6 +48,7 @@ REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
+REASON_GH_MUTATION = "gh_mutation_denied"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -1017,7 +1018,7 @@ def evaluate(
     if is_gh_mutation_command(normalized_cmd):
         return _result(
             status="block",
-            reason_code=REASON_UNPARSEABLE,
+            reason_code=REASON_GH_MUTATION,
             current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
@@ -1309,6 +1310,8 @@ def _emit_block_stderr(
         lines.append("recovery: use simple (non-compound) git commands from local root")
     elif reason_code == REASON_DRIFT:
         lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
+    elif reason_code == REASON_GH_MUTATION:
+        lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
 
     lines.append(f"hook_flavor: {hook_flavor}")
 
