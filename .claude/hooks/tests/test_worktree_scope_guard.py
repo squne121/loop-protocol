@@ -1024,3 +1024,421 @@ def test_allow_read_only_external_read_with_relative_inside_write(tmp_path):
     }
     r = _run_guard(payload, repo["root"], issue="942")
     assert r.returncode == 0, r.stderr
+
+
+# =============================================================================
+# Issue #1050: WORKTREE_SCOPE_DECISION_V2 / cleanup classification tests
+# =============================================================================
+
+# --- AC2: git show HEAD:path inside worktree → allow ---
+
+def test_allow_git_show_inside_worktree(tmp_path):
+    """AC2: git show HEAD:path inside active worktree is read_only → allow."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "git show HEAD:README.md"},
+        "cwd": str(repo["worktree"]),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050")
+    assert r.returncode == 0, f"git show should allow; stderr={r.stderr}"
+
+
+# --- AC3: unrelated mutation inside worktree → deny (command_class: mutation) ---
+
+def test_deny_unrelated_mutation_via_build_decision(tmp_path):
+    """AC3: build_decision returns command_class==mutation and deny for mutation outside worktree."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    # Write to a path OUTSIDE the worktree → should deny
+    target = str(repo["root"] / "outside.txt")
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": target},
+        "cwd": str(repo["worktree"]),
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+    }
+    import os
+    old_env = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = "1050"
+    try:
+        d = mod.build_decision(payload)
+        assert d["schema"] == "WORKTREE_SCOPE_DECISION_V2"
+        assert "mutation" in d["command_class"]
+        assert d["decision"] == "deny"
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+# --- AC4a: git worktree remove without contract → deny ---
+
+def test_cleanup_worktree_remove_no_contract(tmp_path):
+    """AC4a: git worktree remove without cleanup contract is denied."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"should deny without contract; stderr={r.stderr}"
+
+
+# --- AC4b: git worktree remove with valid contract + exact path → allow ---
+
+def test_cleanup_worktree_remove_with_contract(tmp_path):
+    """AC4b: git worktree remove with valid contract and exact path → allow."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 0, f"should allow with valid contract; stderr={r.stderr}"
+
+
+# --- AC4c: git branch -d with valid contract → allow ---
+
+def test_cleanup_branch_delete_with_contract(tmp_path):
+    """AC4c: git branch -d <branch> with valid contract → allow."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    branch = "issue-1050-scope-guard"
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": branch,
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git branch -d {branch}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 0, f"should allow branch -d with valid contract; stderr={r.stderr}"
+
+
+# --- AC4c: git branch -D (force delete) → deny at guard decision level ---
+
+def test_cleanup_branch_force_delete_denied(tmp_path):
+    """AC4c: git branch -D with contract present must deny at guard decision level.
+
+    The guard must deny -D even when cwd is inside the active worktree.
+    Classifier returns mutating (not cleanup); _is_force_branch_delete catches it.
+    """
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    branch = "issue-1050-scope-guard"
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": branch,
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git branch -D {branch}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    # Must deny via guard decision (AC4c: -D denied regardless of cwd)
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"git branch -D must deny; returncode={r.returncode} stderr={r.stderr}"
+
+
+def test_cleanup_branch_delete_force_long_form_denied(tmp_path):
+    """AC4c: git branch --delete --force <branch> must deny at guard decision level."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    branch = "issue-1050-scope-guard"
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": branch,
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git branch --delete --force {branch}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"branch --delete --force must deny; stderr={r.stderr}"
+
+
+# --- AC4d: path traversal in worktree remove → deny ---
+
+def test_cleanup_worktree_remove_path_traversal_denied(tmp_path):
+    """AC4d: path traversal in git worktree remove → deny."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": True,
+    }
+    # Provide a different path (sibling directory)
+    sibling = str(tmp_path / "other-dir")
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {sibling}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"sibling path should deny; stderr={r.stderr}"
+
+
+# --- AC5: compound shell command → command_class: unknown ---
+
+def test_unknown_compound_shell_command(tmp_path):
+    """AC5: cd /repo && git status is compound → classify_bash returns unknown."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cmd = "cd /repo && git status"
+    klass = mod.classify_bash(cmd)
+    assert klass == "unknown", f"compound shell command must be unknown; got {klass!r}"
+
+
+# --- AC6: deny stderr bounded, no raw data, exit 2 ---
+
+def test_deny_stderr_exit2_bounded(tmp_path):
+    """AC6: cleanup deny → stderr ≤10 lines, no raw path/branch, exit 2."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    # No contract → should deny
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, "cleanup deny must exit 2"
+    stderr_lines = [l for l in r.stderr.splitlines() if l.strip()]
+    assert len(stderr_lines) <= 10, f"stderr must be ≤10 lines; got {len(stderr_lines)}"
+    # No raw path/branch/command in stderr
+    assert wt_path not in r.stderr, "stderr must not contain raw worktree path"
+    assert f"git worktree remove" not in r.stderr, "stderr must not contain raw command"
+
+
+# --- AC9: build_decision importable pure function ---
+
+def test_build_decision_importable(tmp_path):
+    """AC9: build_decision is importable from worktree_scope_guard and returns V2 dict."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "build_decision"), "build_decision must be importable"
+    assert callable(mod.build_decision)
+
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    import os
+    old_env = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = "1050"
+    try:
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "git show HEAD:README.md"},
+            "cwd": str(repo["worktree"]),
+        }
+        d = mod.build_decision(payload)
+        assert d["schema"] == "WORKTREE_SCOPE_DECISION_V2"
+        assert d["command_class"] == "read_only"
+        assert d["decision"] == "allow"
+        assert "cwd_class" in d
+        assert "reason" in d
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+# --- AC4b/AC10: require_clean enforcement ---
+
+def test_cleanup_require_clean_false_contract_invalid(tmp_path):
+    """AC4b/AC10: contract with require_clean=false is invalid → deny."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": False,  # must be exactly True
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    # require_clean: False makes the contract invalid → no contract → deny
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"require_clean:false must deny; stderr={r.stderr}"
+
+
+def test_cleanup_worktree_remove_dirty_unstaged_denied(tmp_path):
+    """AC4b/AC10: git worktree remove denied when worktree has unstaged modification."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = repo["worktree"]
+    # Create a dirty file in the worktree
+    (wt_path / "dirty.txt").write_text("unstaged\n")
+    # Stage then unstage to create a tracked unstaged modification
+    _git("add", "dirty.txt", cwd=wt_path)
+    _git("commit", "-m", "add dirty", cwd=wt_path)
+    (wt_path / "dirty.txt").write_text("modified\n")
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": str(wt_path),
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(wt_path),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"dirty worktree must deny; stderr={r.stderr}"
+
+
+def test_cleanup_worktree_remove_dirty_untracked_denied(tmp_path):
+    """AC4b/AC10: git worktree remove denied when worktree has untracked file."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = repo["worktree"]
+    # Create an untracked file
+    (wt_path / "untracked.txt").write_text("untracked\n")
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": str(wt_path),
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(wt_path),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"untracked file must deny; stderr={r.stderr}"
+
+
+def test_cleanup_worktree_remove_outside_worktrees_dir_denied(tmp_path):
+    """AC4d (Blocker 3): worktree_path outside .claude/worktrees/ is denied."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    # Use a path that's NOT under .claude/worktrees/ (project root itself)
+    bad_path = str(repo["root"])
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": bad_path,
+        "branch_name": "main",
+        "require_clean": True,
+    }
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {bad_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    # bad_path is the project root, not under .claude/worktrees/
+    # → invalid contract (not absolute check for worktree_path outside worktrees dir)
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"path outside .claude/worktrees/ must deny; stderr={r.stderr}"
+
+
+def test_cleanup_git_dash_c_worktree_remove_denied(tmp_path):
+    """High: git -C <path> worktree remove is denied (grammar not allowed in cleanup)."""
+    import json
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    project_root = str(repo["root"])
+    contract = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_path,
+        "branch_name": "issue-1050-scope-guard",
+        "require_clean": True,
+    }
+    # git -C <root> worktree remove <path>: classify=cleanup but decider denies
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git -C {project_root} worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {
+        "CLAUDE_PROJECT_DIR": project_root,
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(contract),
+    }
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, f"git -C worktree remove must deny; stderr={r.stderr}"
