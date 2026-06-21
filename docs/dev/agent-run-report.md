@@ -1,6 +1,161 @@
 # Agent Run Report
 
-This document describes the `agent_run_report/v1` schema and the `export-chatgpt-context` export surface.
+This document describes the `agent_run_report/v1` schema, the `export-chatgpt-context` export surface,
+and the operational procedures for report finalization, review correction, follow-up issue tracking,
+and hook boundary policy.
+
+## アーティファクト責務差分
+
+`agent_session_manifest`、`agent_run_report`、`agent_retro_index` は互いに補完する 3 つのアーティファクトであり、
+同一のエージェントランに対してそれぞれ異なる責務を担う。
+
+| アーティファクト | 責務 | 生成タイミング | public-safe 要件 |
+|---|---|---|---|
+| `agent_session_manifest` | セッション中の読み取りファイル・ツール呼び出し・コンテキスト境界の記録。内部追跡用。 | セッション中（逐次） | 不要（内部専用） |
+| `agent_run_report` (`agent_run_report/v1`) | ランの公開可能な要約。AC 達成状況・コマンド結果・証跡 URL・public-safety 判定を含む。 | セッション終了後（`finalize-agent-run.mjs`） | 必須（`public_safety.verdict: pass` が posting 前提） |
+| `agent_retro_index` | 複数ランにまたがる振り返りインデックス。friction パターン・フォローアップ Issue・改善点の集約。 | ラン完了後またはレトロスペクティブ時 | 任意（内容による） |
+
+これら 3 つのアーティファクトの参照順は次のとおり:
+1. `agent_session_manifest` でセッション内の raw 追跡を確認する
+2. `agent_run_report` で公開可能な要約と AC 達成状況を確認する
+3. `agent_retro_index` で横断的なパターンとフォローアップを確認する
+
+詳細は `docs/dev/agent-retro-index.md` を参照。
+
+## Phase Stop Conditions
+
+エージェントランの各フェーズに対して、以下の Stop Conditions が適用される。
+Stop Condition に到達する前に次フェーズへ進まない。
+
+### 実装フェーズ
+
+- コード/ドキュメント変更が Allowed Paths 内に収まっている
+- 全 AC の VC コマンドが期待する終了コードを返している
+- `pnpm typecheck && pnpm lint && pnpm test && pnpm build` が全て pass している
+
+### レポート確定フェーズ
+
+- **`report finalized`**: `agent_run_report/v1` JSON が `finalize-agent-run.mjs` によって生成されており、
+  `schema` フィールドが `"agent_run_report/v1"` であることを確認している
+- **`public-safe check pass`**: `public_safety.verdict === "pass"` かつ `blocked_reasons` が空であることを確認している
+  （`public_safety.redaction_status === "clean"` が前提）
+- forbidden fields（`raw_transcript`、`full_command_output`、`stdout`、`stderr`、`local_path` 等）が
+  ソース JSON に含まれていないことをスキャンで確認している
+
+### 投稿フェーズ
+
+- **`posting dry-run or upsert done`**: `export-chatgpt-context` の dry-run が成功しているか、
+  または GitHub Issue/PR へのコメント upsert が完了している
+- 投稿先（`public_surface_kind`）が意図した対象（`github_issue_comment` / `github_pr_comment`）であることを確認している
+- 二重投稿防止のため、upsert は既存コメントを上書きする形式を使用している
+
+## Review Correction Loop
+
+CI failure、human correction、または reviewer comment が発生した場合、
+`agent_run_report/v1` の以下のフィールドに反映する手順を踏む。
+
+### evidence_refs への反映
+
+`authority.evidence_refs` には、修正を裏付ける証跡を `opaqueReference` 形式で追記する:
+
+```json
+"evidence_refs": [
+  {
+    "kind": "workflow_run",
+    "ref": "https://github.com/squne121/loop-protocol/actions/runs/<run-id>",
+    "digest": "sha256:<64hex>",
+    "validation_verdict": "pass"
+  },
+  {
+    "kind": "github_comment",
+    "ref": "https://github.com/squne121/loop-protocol/pull/<pr>#issuecomment-<id>",
+    "digest": "sha256:<64hex>",
+    "validation_verdict": "pass"
+  }
+]
+```
+
+- CI が fail した場合: 失敗した workflow run を `kind: "workflow_run"` で `evidence_refs` に追記する
+- human correction が適用された場合: 修正を指示したコメントを `kind: "github_comment"` で追記する
+- reviewer comment による変更の場合: レビューコメントを `kind: "github_comment"` で追記する
+
+`evidence_refs` は `opaqueReference[]` 型であり、URL 文字列を直接格納できない。
+スキーマの詳細は `docs/schemas/agent-run-report.schema.json` の `$defs.opaqueReference` を参照。
+
+### commands_summary.summary への反映
+
+`commands_summary` の各エントリの `summary` フィールドに修正内容を記録する:
+
+```json
+"commands_summary": [
+  {
+    "command_label": "pnpm test",
+    "exit_code": 0,
+    "verdict": "pass",
+    "summary": "iteration-1: CI failure (exit_code: 1) 後に <fix> を適用して再実行。pass。",
+    "artifact_ref": null
+  }
+]
+```
+
+修正を含むイテレーションでは `summary` に `iteration-N:` プレフィックスを付けて変更点を明示する。
+
+### レポートの再確定
+
+修正後は再度 `finalize-agent-run.mjs` を実行してレポートを再生成し、
+`public-safe check pass` Stop Condition を再度確認してから投稿する。
+
+## Follow-up Issue Creation
+
+エージェントランの完了後に follow-up Issue を起票するか否かを判断し、結果を記録する。
+
+### agent_retro_index.entries への記録
+
+起票した follow-up Issue は `agent_retro_index` の対応エントリに記録する。
+`entries[].follow_up_issues` は Issue 番号の integer array である:
+
+```json
+"follow_up_issues": [941, 942]
+```
+
+スキーマ詳細は `docs/schemas/agent-retro-index.schema.json` および `docs/dev/agent-retro-index.md` を参照。
+
+### 起票しない場合の記録
+
+follow-up Issue を起票しない場合は、その理由を termination report またはローカル handoff に留める:
+
+- termination report: `commands_summary` の最後のエントリの `summary` に理由を記載する
+- ローカル handoff: `agent_run_report/v1` JSON の `commands_summary` に
+  `"command_label": "follow_up_decision"` エントリとして記録する
+
+```json
+{
+  "command_label": "follow_up_decision",
+  "exit_code": 0,
+  "verdict": "skip",
+  "summary": "スコープ内で解消済み。別 Issue 不要。",
+  "artifact_ref": null
+}
+```
+
+## Hook Boundary Policy
+
+hooks（pre-commit hook、PreToolUse hook 等）は **diagnostic/prevention レイヤー** であり、
+セキュリティ境界またはカノニカルゲートではない。
+
+> **post-run verifier が canonical gate である。** hook の通過は AC 達成の証明にならない。
+> 最終的な AC 判定は post-run verifier（VC コマンドの実行結果と証跡）に基づく。
+
+具体的な責務分担:
+
+| レイヤー | 責務 | カノニカル判定 |
+|---|---|---|
+| hook（PreToolUse / PreWrite 等） | 早期警告・local write の防止・環境ガード | **不可**（バイパス可能・環境依存） |
+| post-run verifier（VC コマンド群） | AC 達成の検証・証跡生成 | **可（canonical）** |
+| `agent_run_report/v1` | 公開可能なランの要約と AC 結果の記録 | 参照可能（verifier 結果を記録） |
+
+hook が fail した場合は Stop Condition として扱い、fix 後に post-run verifier を再実行する。
+hook が pass しても post-run verifier を省略しない。詳細は `docs/dev/hook-boundaries.md` を参照。
 
 ## agent_run_report/v1
 
