@@ -105,6 +105,12 @@ hook_boundaries_manifest_v1:
       linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
       guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
+      reason_code 一覧（#1089 で追加）: readonly_command / branch_safe_maintenance_command /
+      deterministic_checker_command / unparseable_branch_mutation（gh mutation・/tmp wrapper 含む）。
+      fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
+      gh issue view/list, gh pr view/list/status は readonly_command として許可。
+      gh mutation コマンド（edit/close/merge 等）と /tmp wrapper / python -c は fail-closed。
+      deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
 
   - handler_id: worktree_scope_guard
     event: PreToolUse
@@ -300,6 +306,42 @@ hook_boundaries_manifest_v1:
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
+  - handler_id: ci_test_performance_advisory
+    event: PreToolUse
+    matcher: "Bash|Write|Edit|MultiEdit"
+    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/ci_test_performance_advisory.sh"
+    args: []
+    timeout: 10
+    classification: warning
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: hookSpecificOutput_additionalContext_on_match_silent_otherwise
+    stderr_contract: silent_or_minimal_on_failure
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_match: emit_advisory_and_proceed
+      on_no_match: proceed_silently
+      on_any_failure: proceed
+    notes: >
+      CI/test-lane 関連 path（.github/workflows/、pyproject.toml、uv.lock 等）を
+      検出した場合に CI_TEST_PERFORMANCE_ADVISORY_V1 を stdout へ出力する non-blocking advisory。
+      stdout 形式は hookSpecificOutput.additionalContext ラッパー（Claude Code / Codex CLI 公式 PreToolUse 出力契約）に準拠する:
+      { "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "CI_TEST_PERFORMANCE_ADVISORY_V1 {inner_json}" } }
+      inner payload スキーマ: schemas/ci_test_performance_advisory_v1.schema.json
+      block: false であり、通常 tool call を一切 block しない。
+      失敗時（jq 不在・JSON parse error 等）も exit 0（fail-open）で継続する。
+      block してはならない（AC2）。fail_open を維持する。
+
   - handler_id: save_loop_state_before_compaction
     event: PreCompact
     matcher: null
@@ -342,6 +384,7 @@ hook_boundaries_manifest_v1:
 | `worktree_scope_guard.sh` | blocker | **操作を停止（block）** |
 | `guard-japanese-prose.sh` | mode_dependent | shadow モード: 継続（log のみ）/ enforce モード: **停止** |
 | `rtk_boundary_shadow_guard.sh` | telemetry | 継続（log のみ） |
+| `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
