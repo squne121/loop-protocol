@@ -46,6 +46,7 @@ REASON_ALREADY_DRIFTED = "already_drifted_root"
 REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
+REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -275,8 +276,26 @@ _GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "-c", "--git-dir", "--work-tree", "--config
 # Shell metacharacters that indicate compound/unparseable commands
 _SHELL_METACHAR_RE = re.compile(r"[;&<>|`]|\$\(")
 
+# Fd-duplication pattern: 2>&1 immediately before pipe
+_FD_DUP_STDERR_STDOUT_RE = re.compile(r"\s+2>&1(\s*\|)")
+
 # Leading env assignment pattern: NAME=value (possibly multiple)
 _LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
+
+# ─── Deterministic checker allowlist ─────────────────────────────────────────
+# Exact-path allowlist for deterministic checker scripts.
+# Wildcard patterns are prohibited. Add entries only for:
+# - non-repo-state-mutating scripts
+# - trusted entrypoints (not /tmp/, not python -c, not bash -lc)
+DETERMINISTIC_CHECKER_ALLOWLIST = [
+    ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+]
+
+# ─── Gh mutation deny patterns ────────────────────────────────────────────────
+GH_MUTATION_DENY_PATTERNS = [
+    r"^gh\s+issue\s+(edit|comment|close|reopen|delete|lock|unlock)(\s|$)",
+    r"^gh\s+pr\s+(checkout|edit|comment|merge|close|reopen|ready|review|update-branch)(\s|$)",
+]
 
 # Patterns for display-oriented read-only commands.
 DISPLAY_READONLY_PATTERNS = [
@@ -291,6 +310,8 @@ DISPLAY_READONLY_PATTERNS = [
     r"^git\s+rev-parse(\s|$)",
     r"^git\s+ls-files(\s|$)",
     r"^git\s+worktree\s+list(\s|$)",
+    r"^gh\s+issue\s+(view|list)(\s|$)",
+    r"^gh\s+pr\s+(view|list|status)(\s|$)",
 ]
 
 # Operations that may touch local metadata but do not move the root checkout.
@@ -425,6 +446,56 @@ def is_branch_safe_maintenance_command(cmd: str) -> bool:
     return False
 
 
+def is_deterministic_checker_command(cmd: str, project_root: str | None = None) -> bool:
+    """
+    Return True if cmd is an exact-allowlisted deterministic checker script.
+    Wildcard patterns are prohibited (AC5/AC12).
+    """
+    cmd = cmd.strip()
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 4:
+        return False
+    if tokens[:3] != ["uv", "run", "python3"]:
+        return False
+    script_path = tokens[3]
+    for allowed in DETERMINISTIC_CHECKER_ALLOWLIST:
+        if script_path == allowed:
+            return True
+        if project_root:
+            abs_allowed = os.path.join(project_root, allowed)
+            if script_path == abs_allowed:
+                return True
+    return False
+
+
+def is_gh_mutation_command(cmd: str) -> bool:
+    """Return True if command is a gh mutation command (fail-closed, AC11)."""
+    cmd = cmd.strip()
+    for pattern in GH_MUTATION_DENY_PATTERNS:
+        if re.match(pattern, cmd):
+            return True
+    return False
+
+
+def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
+    """Return True if command is /tmp wrapper or python -c (fail-closed, AC14)."""
+    cmd = cmd.strip()
+    tokens = tokenize_command(cmd)
+    if not tokens:
+        return False
+    # Block: python -c / python3 -c (inline code)
+    if tokens[0] in ("python", "python3") and "-c" in tokens[1:]:
+        return True
+    # Block: uv run python3 /tmp/*.py
+    if (len(tokens) >= 4 and tokens[:3] == ["uv", "run", "python3"]
+            and tokens[3].startswith("/tmp/")):
+        return True
+    # Block: direct /tmp/*.py execution
+    if tokens[0].startswith("/tmp/") and tokens[0].endswith(".py"):
+        return True
+    return False
+
+
 def _tokenize_readonly_pipeline(cmd: str) -> list[str] | None:
     """Tokenize a potential read-only pipeline with shell punctuation preserved."""
     try:
@@ -453,13 +524,17 @@ def classify_readonly_pipeline(cmd: str) -> bool:
       rg -n "TODO" README.md | head -n 20
       git status --short | head -n 20
       git diff --stat | head -n 20
+      git diff --stat 2>&1 | head -n 20  (fd-duplication, AC10)
     """
-    if "|" not in cmd:
+    # Normalize fd-duplication: "2>&1 |" -> " |" (fd-dup before pipe only, AC10)
+    cmd_to_parse = _FD_DUP_STDERR_STDOUT_RE.sub(r" \1", cmd).strip()
+
+    if "|" not in cmd_to_parse:
         return False
-    if any(token in cmd for token in ("&&", "||", ";", "`", "$(")):
+    if any(token in cmd_to_parse for token in ("&&", "||", ";", "`", "$(")):
         return False
 
-    tokens = _tokenize_readonly_pipeline(cmd)
+    tokens = _tokenize_readonly_pipeline(cmd_to_parse)
     if not tokens:
         return False
 
@@ -838,6 +913,28 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
+    # Step 9.6: Tmp wrapper / python -c commands — fail-closed (AC14).
+    if is_tmp_wrapper_or_python_c_command(normalized_cmd):
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 9.7: Gh mutation commands — fail-closed (AC11).
+    if is_gh_mutation_command(normalized_cmd):
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
     # Step 10: Classify root state.
     # B1 fix: detached HEAD (current_branch is None) is treated as detached_or_unknown,
     # NOT as default/allow. This must be checked BEFORE path restore allow (B3 fix).
@@ -905,6 +1002,18 @@ def evaluate(
                 target_branch_kind=None,
                 hook_flavor=hook_flavor,
             )
+
+    # Step 13.5: Deterministic checker commands — allowed with distinct reason_code (AC5/AC12).
+    project_root = _resolve_project_root(cwd)
+    if is_deterministic_checker_command(normalized_cmd, project_root):
+        return _result(
+            status="allow",
+            reason_code=REASON_DETERMINISTIC_CHECKER,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
 
     # Default: allow
     return _result(

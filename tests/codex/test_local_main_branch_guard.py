@@ -32,6 +32,7 @@ from local_main_branch_guard import (
     REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
     REASON_UNPARSEABLE,
+    REASON_DETERMINISTIC_CHECKER,
 )
 
 
@@ -330,3 +331,157 @@ class TestAC17CodexStartupPreflightMandatory:
             assert state.get("status") in ("ok", "unknown"), (
                 f"Expected ok/unknown from isolated main-branch repo, got: {state}"
             )
+
+
+class TestBranchSafeMaintenance:
+    """AC2: git fetch / git worktree prune -> branch_safe_maintenance_command."""
+
+    def test_git_fetch_is_branch_safe_maintenance(self, tmp_git_repo: Path):
+        result = eval_codex("git fetch", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == "branch_safe_maintenance_command"
+
+    def test_git_worktree_prune_is_branch_safe_maintenance(self, tmp_git_repo: Path):
+        result = eval_codex("git worktree prune", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == "branch_safe_maintenance_command"
+
+    def test_git_fetch_is_not_readonly_command(self, tmp_git_repo: Path):
+        result = eval_codex("git fetch", str(tmp_git_repo))
+        assert result["reason_code"] != REASON_READONLY
+
+
+class TestFdDuplication:
+    """AC10: 2>&1 | head fd-duplication."""
+
+    def test_git_diff_stat_fd_dup_head_allowed(self, tmp_git_repo: Path):
+        result = eval_codex("git diff --stat 2>&1 | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_READONLY
+
+    def test_file_write_redirect_still_blocked(self, tmp_git_repo: Path):
+        result = eval_codex("rg TODO . > out.txt", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_append_redirect_still_blocked(self, tmp_git_repo: Path):
+        result = eval_codex("git log >> history.txt", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_fd_dup_without_pipe_blocked(self, tmp_git_repo: Path):
+        result = eval_codex("git diff 2>&1", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_rg_fd_dup_head_allowed(self, tmp_git_repo: Path):
+        result = eval_codex('rg -n "TODO" README.md 2>&1 | head -n 10', str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+
+class TestGhReadonlyAndDeny:
+    """AC11: gh readonly / gh deny."""
+
+    def test_gh_issue_view_is_readonly(self, tmp_git_repo: Path):
+        result = eval_codex("gh issue view 123", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_issue_list_is_readonly(self, tmp_git_repo: Path):
+        result = eval_codex("gh issue list", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_view_is_readonly(self, tmp_git_repo: Path):
+        result = eval_codex("gh pr view 456", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_list_is_readonly(self, tmp_git_repo: Path):
+        result = eval_codex("gh pr list", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_pr_status_is_readonly(self, tmp_git_repo: Path):
+        result = eval_codex("gh pr status", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_issue_view_pipeline_head_allowed(self, tmp_git_repo: Path):
+        result = eval_codex("gh issue view 123 | head -n 20", str(tmp_git_repo))
+        assert result["status"] == "allow"
+
+    def test_gh_issue_edit_is_denied(self, tmp_git_repo: Path):
+        result = eval_codex("gh issue edit 123 --body new", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_issue_close_is_denied(self, tmp_git_repo: Path):
+        result = eval_codex("gh issue close 123", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_pr_merge_is_denied(self, tmp_git_repo: Path):
+        result = eval_codex("gh pr merge 456", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_gh_pr_update_branch_is_denied(self, tmp_git_repo: Path):
+        result = eval_codex("gh pr update-branch 456", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+
+class TestExactAllowlist:
+    """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker reason_code."""
+
+    def test_exact_allowlist_run_refinement_preflight(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_wildcard_path_not_in_allowlist(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
+
+    def test_publisher_deny_not_in_allowlist(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 .claude/skills/post-merge-cleanup/scripts/cleanup_runner.py",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
+
+    def test_deterministic_checker_reason_code_not_readonly(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert result["reason_code"] != REASON_READONLY
+
+
+class TestPythonpathStaleAndTmpWrapper:
+    """AC14: PYTHONPATH stale regression / /tmp wrapper fail-closed."""
+
+    def test_tmp_wrapper_script_blocked(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 /tmp/run_refinement_preflight.py --issue-number 985",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block"
+
+    def test_python_c_inline_blocked(self, tmp_git_repo: Path):
+        result = eval_codex("python3 -c import_os", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_bash_lc_wrapper_blocked(self, tmp_git_repo: Path):
+        result = eval_codex("bash -lc 'uv run python3 /tmp/script.py'", str(tmp_git_repo))
+        assert result["status"] == "block"
+
+    def test_pythonpath_stale_guard_module_unaffected(self, tmp_git_repo: Path, tmp_path: Path):
+        import os
+        (tmp_path / "command_registry.py").write_text("raise ImportError('stale!')")
+        old = os.environ.get("PYTHONPATH", "")
+        try:
+            os.environ["PYTHONPATH"] = str(tmp_path)
+            result = eval_codex("git status", str(tmp_git_repo))
+        finally:
+            if old:
+                os.environ["PYTHONPATH"] = old
+            elif "PYTHONPATH" in os.environ:
+                del os.environ["PYTHONPATH"]
+        assert result["status"] == "allow"
