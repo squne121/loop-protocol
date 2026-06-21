@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "loop_state_build_result/v1",
+  "title": "LOOP_STATE_BUILD_RESULT_V1",
+  "description": "Output of build_loop_state.py. Reports build status, provenance, and validation errors.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "loop_state_path",
+    "loop_state_sha256",
+    "errors",
+    "warnings",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "LOOP_STATE_BUILD_RESULT_V1"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "invalid"]
+    },
+    "loop_state_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "loop_state_sha256": {
+      "type": ["string", "null"],
+      "description": "SHA256 of the written LOOP_STATE_V1 file. Null if status is not ok."
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "message", "schema_path"],
+        "properties": {
+          "path": { "type": "string" },
+          "message": { "type": "string" },
+          "schema_path": { "type": "string" }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planner_result_path",
+        "planner_result_hash",
+        "review_result_path",
+        "review_result_hash",
+        "issue_number",
+        "iteration",
+        "schema_path",
+        "schema_hash"
+      ],
+      "properties": {
+        "planner_result_path": { "type": "string" },
+        "planner_result_hash": { "type": ["string", "null"] },
+        "review_result_path": { "type": "string" },
+        "review_result_hash": { "type": ["string", "null"] },
+        "issue_number": { "type": "integer", "minimum": 1 },
+        "iteration": { "type": "integer", "minimum": 0 },
+        "schema_path": { "type": "string" },
+        "schema_hash": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
