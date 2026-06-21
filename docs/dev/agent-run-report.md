@@ -12,7 +12,7 @@ and hook boundary policy.
 | アーティファクト | 責務 | 生成タイミング | public-safe 要件 |
 |---|---|---|---|
 | `agent_session_manifest` | セッション中の読み取りファイル・ツール呼び出し・コンテキスト境界の記録。内部追跡用。 | セッション中（逐次） | 不要（内部専用） |
-| `agent_run_report` (`agent_run_report/v1`) | ランの公開可能な要約。AC 達成状況・コマンド結果・証跡 URL・public-safety 判定を含む。 | セッション終了後（`finalize-agent-run.mjs`） | 必須（`public_safety.verdict: ok` が posting 前提） |
+| `agent_run_report` (`agent_run_report/v1`) | ランの公開可能な要約。AC 達成状況・コマンド結果・証跡 URL・public-safety 判定を含む。 | セッション終了後（`finalize-agent-run.mjs`） | 必須（`public_safety.verdict: pass` が posting 前提） |
 | `agent_retro_index` | 複数ランにまたがる振り返りインデックス。friction パターン・フォローアップ Issue・改善点の集約。 | ラン完了後またはレトロスペクティブ時 | 任意（内容による） |
 
 これら 3 つのアーティファクトの参照順は次のとおり:
@@ -37,7 +37,7 @@ Stop Condition に到達する前に次フェーズへ進まない。
 
 - **`report finalized`**: `agent_run_report/v1` JSON が `finalize-agent-run.mjs` によって生成されており、
   `schema` フィールドが `"agent_run_report/v1"` であることを確認している
-- **`public-safe check pass`**: `public_safety.verdict === "ok"` かつ `blocked_reasons` が空であることを確認している
+- **`public-safe check pass`**: `public_safety.verdict === "pass"` かつ `blocked_reasons` が空であることを確認している
   （`public_safety.redaction_status === "clean"` が前提）
 - forbidden fields（`raw_transcript`、`full_command_output`、`stdout`、`stderr`、`local_path` 等）が
   ソース JSON に含まれていないことをスキャンで確認している
@@ -56,19 +56,31 @@ CI failure、human correction、または reviewer comment が発生した場合
 
 ### evidence_refs への反映
 
-`authority.evidence_refs` には、修正を裏付ける証跡 URL を追記する:
+`authority.evidence_refs` には、修正を裏付ける証跡を `opaqueReference` 形式で追記する:
 
 ```json
 "evidence_refs": [
-  "https://github.com/owner/repo/actions/runs/<run-id>",
-  "https://github.com/owner/repo/pull/<pr-number>#issuecomment-<id>",
-  "https://github.com/owner/repo/issues/<issue-number>#issuecomment-<id>"
+  {
+    "kind": "workflow_run",
+    "ref": "https://github.com/squne121/loop-protocol/actions/runs/<run-id>",
+    "digest": "sha256:<64hex>",
+    "validation_verdict": "pass"
+  },
+  {
+    "kind": "github_comment",
+    "ref": "https://github.com/squne121/loop-protocol/pull/<pr>#issuecomment-<id>",
+    "digest": "sha256:<64hex>",
+    "validation_verdict": "pass"
+  }
 ]
 ```
 
-- CI が fail した場合: 失敗した workflow run の URL を `evidence_refs` に追記する
-- human correction が適用された場合: 修正を指示したコメント URL を `evidence_refs` に追記する
-- reviewer comment による変更の場合: レビューコメント URL を `evidence_refs` に追記する
+- CI が fail した場合: 失敗した workflow run を `kind: "workflow_run"` で `evidence_refs` に追記する
+- human correction が適用された場合: 修正を指示したコメントを `kind: "github_comment"` で追記する
+- reviewer comment による変更の場合: レビューコメントを `kind: "github_comment"` で追記する
+
+`evidence_refs` は `opaqueReference[]` 型であり、URL 文字列を直接格納できない。
+スキーマの詳細は `docs/schemas/agent-run-report.schema.json` の `$defs.opaqueReference` を参照。
 
 ### commands_summary.summary への反映
 
@@ -99,16 +111,14 @@ CI failure、human correction、または reviewer comment が発生した場合
 
 ### agent_retro_index.entries への記録
 
-起票した follow-up Issue は `agent_retro_index` の対応エントリに記録する:
+起票した follow-up Issue は `agent_retro_index` の対応エントリに記録する。
+`entries[].follow_up_issues` は Issue 番号の integer array である:
 
 ```json
-"follow_up_issues": [
-  {
-    "issue_url": "https://github.com/owner/repo/issues/<N>",
-    "reason": "AC3 で発見した <問題> の根本対処"
-  }
-]
+"follow_up_issues": [941, 942]
 ```
+
+スキーマ詳細は `docs/schemas/agent-retro-index.schema.json` および `docs/dev/agent-retro-index.md` を参照。
 
 ### 起票しない場合の記録
 

@@ -19,31 +19,27 @@
 ```json
 {
   "schema": "agent_retro_index/v1",
-  "generated_at": "<ISO-8601>",
+  "generation_verdict": "complete",
   "entries": [
     {
-      "run_id": "<run-identifier>",
-      "issue_url": "https://github.com/owner/repo/issues/<N>",
-      "pr_url": "https://github.com/owner/repo/pull/<N>",
-      "report_ref": "artifacts/report-<N>.json",
-      "friction_signals": [
-        {
-          "kind": "ci_failure | human_correction | reviewer_comment | scope_expansion",
-          "description": "<何が起きたか>",
-          "iteration": 1
-        }
-      ],
-      "follow_up_issues": [
-        {
-          "issue_url": "https://github.com/owner/repo/issues/<N>",
-          "reason": "<なぜ起票したか>"
-        }
-      ],
-      "improvement_notes": "<このランから得られた改善点>"
+      "report_comment_url": "https://github.com/squne121/loop-protocol/issues/940#issuecomment-4760662331",
+      "report_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "issue": 940,
+      "pr": 1073,
+      "merge_sha": "0000000000000000000000000000000000000000",
+      "tags": ["docs", "agent-run-report", "handoff"],
+      "friction_summary": "PR Body Japanese Check が standalone Closes #940 block で失敗。段落統合で解消。",
+      "quality_signals": ["all-ac-pass", "ci-all-pass", "docs-only"],
+      "follow_up_issues": [941]
     }
-  ]
+  ],
+  "orphan_reports": [],
+  "ambiguous_links": []
 }
 ```
+
+スキーマの正本は `docs/schemas/agent-retro-index.schema.json` を参照。
+`entries[].follow_up_issues` は Issue 番号の integer array（URL/reason object ではない）。
 
 ## follow_up_issues の運用
 
@@ -52,9 +48,14 @@
 follow-up Issue を起票したら、対応する `entries[].follow_up_issues` に記録する:
 
 1. `gh issue create` で Issue を起票する
-2. 取得した Issue URL を `follow_up_issues[].issue_url` に追加する
-3. 起票理由を `follow_up_issues[].reason` に記載する
-4. `agent_retro_index` JSON を更新し、`finalize-agent-run.mjs` で再生成する
+2. 取得した Issue 番号（integer）を `follow_up_issues` array に追加する
+3. `agent_retro_index` JSON を更新し、以下のスクリプトで再生成する:
+
+```bash
+pnpm agent-retro-index:update        # update-retro-index.mjs
+pnpm agent-retro-index:verify-digest # update-retro-index.mjs --verify-artifact-json
+pnpm agent-retro-index:check         # check-agent-run-reports.mjs
+```
 
 ### 起票しない場合
 

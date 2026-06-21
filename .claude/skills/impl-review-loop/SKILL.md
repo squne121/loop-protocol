@@ -163,6 +163,8 @@ preparation step で取得した contract snapshot 内の以下の情報を Step
 - `.claude/agents/implementation-worker.md` / `test-runner.md` / `pr-reviewer.md` — Step 1-4 で委譲する SubAgent
 - `docs/dev/agent-skill-boundaries.md` — オーケストレーター設計原則（control-plane / LOOP_STATE / 人間承認原則）
 - `docs/dev/github-ops.md` — GitHub 運用ルール（body-file guard / コメントテンプレ）
+- `docs/dev/agent-run-report.md` — run report finalize / posting handoff 規約
+- `docs/dev/agent-retro-index.md` — retro index 更新規約
 
 ## Loop Policy 参照
 
