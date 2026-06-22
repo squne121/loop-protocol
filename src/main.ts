@@ -1,7 +1,12 @@
 import './style.css'
 
 import { initPlaytestEvidencePanel } from './ui/playtestEvidence'
-import { bindInput, createInputState, mapInputToCommands } from './input'
+import {
+  bindInput,
+  createInputState,
+  mapInputToCommands,
+  type InputState,
+} from './input'
 import { createCanvasRenderer } from './render'
 import {
   createGameSnapshot,
@@ -191,6 +196,17 @@ export function runLoadGame(
   }
 }
 
+export function queueAssistPlayerCommand(
+  phase: LoopPhase,
+  inputState: Pick<InputState, 'assistPlayerRisingEdge'>,
+): boolean {
+  if (phase !== 'running') {
+    return false
+  }
+  inputState.assistPlayerRisingEdge = true
+  return true
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
@@ -284,6 +300,9 @@ const hud = commandRail ? createHudController(commandRail, {
 
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
     setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
+  },
+  onAssistPlayerCommand() {
+    queueAssistPlayerCommand(state.loopPhase, inputState)
   },
   onClaimReward() {
     // Supports legacy debrief_pending_reward phase only.
@@ -584,6 +603,17 @@ interface LoopE2ESnapshot {
     primaryPressed: boolean
     activePointerId: number | null
   }
+  commandIntent: {
+    activeIntent: 'none' | 'assist_player'
+    bufferedIntentExpiresAtTick: number | null
+  }
+  allies: Array<{
+    id: number
+    x: number
+    y: number
+    targetEntityId: string | null
+    behaviorState: GameState['allies'][number]['behaviorState']
+  }>
   enemies: Array<{
     id: number
     x: number
@@ -637,6 +667,18 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
           primaryPressed: inputState.primaryPressed,
           activePointerId: inputState.activePointerId,
         },
+        commandIntent: {
+          activeIntent: state.commandIntentRuntime.activeIntent,
+          bufferedIntentExpiresAtTick:
+            state.commandIntentRuntime.bufferedIntent?.expiresAtTick ?? null,
+        },
+        allies: state.allies.map((ally) => ({
+          id: ally.id,
+          x: ally.x,
+          y: ally.y,
+          targetEntityId: ally.targetEntityId,
+          behaviorState: ally.behaviorState,
+        })),
         enemies: state.enemies.map((e) => ({
           id: e.id,
           x: e.x,
