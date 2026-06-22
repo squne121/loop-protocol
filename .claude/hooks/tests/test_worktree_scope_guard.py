@@ -1563,6 +1563,26 @@ def test_v3_root_drift_active_worktree_mismatch_denied(tmp_path):
     assert d["reason"] == "root_drift_active_worktree_mismatch"
 
 
+def test_v3_runtime_root_drift_cleanup_denied(tmp_path):
+    """AC6 (runtime path): the real hook denies cleanup from a drifted root, bounded stderr."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard")
+    _git("switch", "-c", "issue-1137-drifted", cwd=repo["root"])
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git worktree remove {wt_path}"},
+        "cwd": str(repo["worktree"]),
+    }
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, r.stderr
+    assert "root_drift_active_worktree_mismatch" in r.stderr
+    # AC6 stderr bound: cleanup block stays within 10 lines and leaks no raw path.
+    assert len(r.stderr.strip().splitlines()) <= 10
+    assert wt_path not in r.stderr
+
+
 def test_v3_cleanup_reasons_in_shared_vocabulary(tmp_path):
     """AC9 parity: every cleanup deny reason is drawn from SHARED_CLEANUP_REASON_CODES."""
     mod = _load_guard_module()

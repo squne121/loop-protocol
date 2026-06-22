@@ -1399,7 +1399,14 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
 
     # Cleanup class: git worktree remove / git branch -d — check contract (AC4).
     if klass == "cleanup":
-        contract = load_cleanup_contract(resolve_project_root())
+        _pr = resolve_project_root()
+        # Recovery deadlock (Issue #1137, policy B): never run cleanup from a
+        # drifted root with an active issue worktree — emit the shared reason code
+        # via the bounded cleanup block (no auto-recovery mutation).
+        if _root_drift_active_worktree_mismatch(_pr):
+            _block_cleanup(_RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH)
+            return  # unreachable
+        contract = load_cleanup_contract(_pr)
         cleanup_decision, cleanup_reason = _decide_cleanup_bash(command, cwd, contract)
         if cleanup_decision == "allow":
             _allow()
