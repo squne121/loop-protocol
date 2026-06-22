@@ -4,8 +4,16 @@
  * schema_version: entirecli_safety_result/v1
  *
  * Determines whether EntireCLI usage is safe for inclusion in a public run report.
- * Does NOT replicate the Python canonical safety engine logic; instead operates as
- * an independent adapter that uses the same verdict taxonomy (not_applicable/safe/blocked).
+ *
+ * DUAL-IMPLEMENTATION NOTE (Blocker 7):
+ * This JS module is an independent implementation of the EntireCLI safety logic.
+ * The existing Python verifier (.claude/scripts/check_session_recording_runtime_safety.py)
+ * performs overlapping checks (hook files, visibility, redaction, fail-closed). Rather than
+ * call the Python verifier as a subprocess (which would add a Python runtime dependency to the
+ * JS agent-logs pipeline and is outside the Allowed Paths of this PR), this JS module
+ * reimplements the required checks independently. The relationship and dual-implementation
+ * status are documented here for future maintainers. Any changes to safety logic must be
+ * applied to both implementations. See docs/dev/agent-run-report.md for the canonical policy.
  *
  * Verdict rules:
  *   not_applicable — no EntireCLI presence detected (binary, dirs, refs, env, config)
@@ -38,6 +46,8 @@ export const ReasonCode = /** @type {const} */ ({
   TELEMETRY_ENABLED: 'telemetry_enabled',
   TELEMETRY_UNKNOWN: 'telemetry_unknown',
   RAW_VALUE_REDACTION_VIOLATION: 'raw_value_redaction_violation',
+  SETTINGS_PARSE_ERROR: 'settings_parse_error',
+  CODE_REMOTE_UNKNOWN_VISIBILITY: 'code_remote_unknown_visibility',
 })
 
 /**
@@ -89,6 +99,12 @@ const RAW_VALUE_PATTERNS = [
 const GITHUB_URL_PATTERN = /github\.com[:/]/i
 
 /**
+ * Sentinel object to distinguish parse error from empty settings.
+ * @type {{ parse_error: true }}
+ */
+export const SETTINGS_PARSE_ERROR_SENTINEL = { parse_error: /** @type {true} */ (true) }
+
+/**
  * Redact a fingerprint value: keep first 4 chars and hash-length indicator.
  * @param {string} value
  * @returns {string}
@@ -109,28 +125,60 @@ export function containsRawValue(text) {
 }
 
 /**
- * Parse entirecli settings objects for push_sessions and telemetry.
- * Merges base settings then local override.
+ * Deep merge strategy_options from base and local settings.
+ * Local settings override base settings at the field level within strategy_options.
+ *
+ * Handles both top-level `telemetry` (official schema) and
+ * `strategy_options.telemetry` (legacy/alternate schema).
  *
  * @param {Record<string, unknown>} baseSettings
  * @param {Record<string, unknown>} localSettings
- * @returns {{ pushSessions: boolean | null, telemetry: boolean | null }}
+ * @returns {{ pushSessions: boolean | null, telemetry: boolean | null, checkpointRemoteObj: { provider?: string, repo?: string } | string | null }}
  */
 export function parseEntireSettings(baseSettings, localSettings) {
-  const merged = { ...baseSettings, ...localSettings }
-  const strategyOptions = /** @type {Record<string, unknown>} */ (merged.strategy_options ?? {})
+  // Deep merge strategy_options
+  const baseStrategyOptions = /** @type {Record<string, unknown>} */ (baseSettings.strategy_options ?? {})
+  const localStrategyOptions = /** @type {Record<string, unknown>} */ (localSettings.strategy_options ?? {})
+  const mergedStrategyOptions = { ...baseStrategyOptions, ...localStrategyOptions }
+
+  // Merge top-level fields (local overrides base)
+  const mergedTopLevel = { ...baseSettings, ...localSettings }
 
   const pushSessions =
-    typeof strategyOptions.push_sessions === 'boolean'
-      ? strategyOptions.push_sessions
+    typeof mergedStrategyOptions.push_sessions === 'boolean'
+      ? mergedStrategyOptions.push_sessions
       : null
 
-  const telemetry =
-    typeof strategyOptions.telemetry === 'boolean'
-      ? strategyOptions.telemetry
+  // telemetry: check top-level first (official schema), then strategy_options (alternate)
+  const rawTelemetry =
+    typeof mergedTopLevel.telemetry === 'boolean'
+      ? mergedTopLevel.telemetry
+      : typeof mergedStrategyOptions.telemetry === 'boolean'
+        ? mergedStrategyOptions.telemetry
+        : null
+
+  const telemetry = rawTelemetry
+
+  // checkpoint_remote: official schema is strategy_options.checkpoint_remote as { provider, repo } object or string
+  // Also check top-level (legacy)
+  const rawCheckpointRemote =
+    mergedStrategyOptions.checkpoint_remote !== undefined
+      ? mergedStrategyOptions.checkpoint_remote
+      : mergedTopLevel.checkpoint_remote !== undefined
+        ? mergedTopLevel.checkpoint_remote
+        : null
+
+  // Normalize to object or string or null
+  const checkpointRemoteObj =
+    rawCheckpointRemote !== null && rawCheckpointRemote !== undefined
+      ? (typeof rawCheckpointRemote === 'object'
+          ? /** @type {{ provider?: string, repo?: string }} */ (rawCheckpointRemote)
+          : typeof rawCheckpointRemote === 'string'
+            ? rawCheckpointRemote
+            : null)
       : null
 
-  return { pushSessions, telemetry }
+  return { pushSessions, telemetry, checkpointRemoteObj }
 }
 
 /**
@@ -158,17 +206,21 @@ export function isCheckpointBranch(branchName) {
  *
  * @param {object} opts
  * @param {boolean} opts.entireBinaryPresent - whether `entire` binary is on PATH
+ * @param {string | null} [opts.entireVersion] - `entire version` output or null
+ * @param {string | null} [opts.entireEnableHelp] - `entire enable --help` surface or null
+ * @param {string | null} [opts.entireConfigureHelp] - `entire configure --help` surface or null
  * @param {boolean} opts.entireDirPresent - whether `.entire/` directory exists
  * @param {boolean} opts.entireHooksPresent - whether Entire hooks are installed
  * @param {string[]} opts.localRefs - local git refs (to detect entire/checkpoints/v1)
  * @param {boolean} opts.checkpointTrailerPresent - whether commit trailers include entire checkpoints
  * @param {boolean} opts.tokenEnvPresent - whether ENTIRE_CHECKPOINT_TOKEN env var is set
- * @param {Record<string, unknown>} opts.baseSettings - parsed .entire/settings.json
- * @param {Record<string, unknown>} opts.localSettings - parsed .entire/settings.local.json (override)
- * @param {string | null} opts.checkpointRemote - checkpoint_remote config value
+ * @param {Record<string, unknown> | { parse_error: true }} opts.baseSettings - parsed .entire/settings.json or parse error sentinel
+ * @param {Record<string, unknown> | { parse_error: true }} opts.localSettings - parsed .entire/settings.local.json (override) or parse error sentinel
+ * @param {string | null} opts.checkpointRemote - checkpoint_remote config value (string name) or null
  * @param {'private' | 'public' | 'unknown' | 'not_github' | 'local_only'} opts.checkpointRemoteVisibility
+ * @param {'private' | 'public' | 'unknown' | 'not_github' | 'local_only'} [opts.codeRemoteVisibility] - visibility of code remote (e.g. origin) when checkpointRemote not set
  * @param {string[]} opts.remoteBranches - remote branch names to inspect
- * @param {Record<string, string>} opts.gitConfig - flat git config key→value
+ * @param {Record<string, string[]>} opts.gitConfig - multi-value git config key→values[]
  * @param {string[]} opts.gitConfigParseErrors - any parse error messages
  * @param {string[]} opts.diagnosticStrings - all strings that will appear in output (for redaction check)
  * @returns {EntireCLISafetyResult}
@@ -176,6 +228,9 @@ export function isCheckpointBranch(branchName) {
 export function checkEntireCLISafety(opts) {
   const {
     entireBinaryPresent,
+    entireVersion = null,
+    entireEnableHelp = null,
+    entireConfigureHelp = null,
     entireDirPresent,
     entireHooksPresent,
     localRefs,
@@ -185,6 +240,7 @@ export function checkEntireCLISafety(opts) {
     localSettings,
     checkpointRemote,
     checkpointRemoteVisibility,
+    codeRemoteVisibility = 'unknown',
     remoteBranches,
     gitConfig,
     gitConfigParseErrors,
@@ -201,11 +257,20 @@ export function checkEntireCLISafety(opts) {
       verdict: 'blocked',
       reason_codes: [ReasonCode.RAW_VALUE_REDACTION_VIOLATION],
       raw_values_emitted: true,
+      checked_surfaces: buildCheckedSurfaces(entireBinaryPresent, entireVersion, entireEnableHelp, entireConfigureHelp),
     }
   }
 
   // --- Detect EntireCLI presence ---
   const hasEntireRef = localRefs.some((ref) => isCheckpointBranch(ref))
+
+  // Settings parse error counts as presence detection
+  const baseHasParseError = 'parse_error' in baseSettings && baseSettings.parse_error === true
+  const localHasParseError = 'parse_error' in localSettings && localSettings.parse_error === true
+
+  const safeBase = baseHasParseError ? {} : /** @type {Record<string, unknown>} */ (baseSettings)
+  const safeLocal = localHasParseError ? {} : /** @type {Record<string, unknown>} */ (localSettings)
+
   const entirePresent =
     entireBinaryPresent ||
     entireDirPresent ||
@@ -213,8 +278,10 @@ export function checkEntireCLISafety(opts) {
     hasEntireRef ||
     checkpointTrailerPresent ||
     tokenEnvPresent ||
-    Object.keys(baseSettings).length > 0 ||
-    Object.keys(localSettings).length > 0 ||
+    Object.keys(safeBase).length > 0 ||
+    Object.keys(safeLocal).length > 0 ||
+    baseHasParseError ||
+    localHasParseError ||
     checkpointRemote !== null
 
   if (!entirePresent) {
@@ -223,25 +290,31 @@ export function checkEntireCLISafety(opts) {
       verdict: 'not_applicable',
       reason_codes: [ReasonCode.ENTIRE_ABSENT],
       raw_values_emitted: false,
+      checked_surfaces: buildCheckedSurfaces(entireBinaryPresent, entireVersion, entireEnableHelp, entireConfigureHelp),
     }
+  }
+
+  // --- Settings parse error → blocked ---
+  if (baseHasParseError || localHasParseError) {
+    reasonCodes.push(ReasonCode.SETTINGS_PARSE_ERROR)
   }
 
   // --- EntireCLI is present; evaluate safety conditions ---
 
-  // Parse settings (local overrides base)
-  const { pushSessions, telemetry } = parseEntireSettings(baseSettings, localSettings)
+  // Parse settings (local overrides base, deep merge strategy_options)
+  const { pushSessions, telemetry } = parseEntireSettings(safeBase, safeLocal)
 
   // Check push_sessions
   if (pushSessions === true) {
     reasonCodes.push(ReasonCode.PUSH_SESSIONS_ENABLED)
-  } else if (pushSessions === null) {
+  } else if (pushSessions === null && !baseHasParseError && !localHasParseError) {
     reasonCodes.push(ReasonCode.PUSH_SESSIONS_UNKNOWN)
   }
 
   // Check telemetry (undefined → blocked)
   if (telemetry === true) {
     reasonCodes.push(ReasonCode.TELEMETRY_ENABLED)
-  } else if (telemetry === null) {
+  } else if (telemetry === null && !baseHasParseError && !localHasParseError) {
     reasonCodes.push(ReasonCode.TELEMETRY_UNKNOWN)
   }
 
@@ -259,9 +332,23 @@ export function checkEntireCLISafety(opts) {
     if (tokenEnvPresent && visibilityClass !== 'private_verified') {
       reasonCodes.push(ReasonCode.CHECKPOINT_TOKEN_WITHOUT_PRIVATE_REMOTE)
     }
-  } else if (tokenEnvPresent) {
-    // Token present but no checkpoint_remote configured → blocked
-    reasonCodes.push(ReasonCode.CHECKPOINT_TOKEN_WITHOUT_PRIVATE_REMOTE)
+  } else {
+    // Blocker 1: checkpoint_remote not configured → Entire will use code remote (origin etc.)
+    // We must check the code remote visibility. If unknown/public → blocked.
+    if (tokenEnvPresent) {
+      // Token present but no checkpoint_remote configured → blocked
+      reasonCodes.push(ReasonCode.CHECKPOINT_TOKEN_WITHOUT_PRIVATE_REMOTE)
+    }
+    // Check code remote visibility: if public or unknown → Entire may push checkpoints there
+    const codeVisibilityClass = classifyRemoteVisibility(codeRemoteVisibility)
+    if (codeVisibilityClass === 'blocked') {
+      if (codeRemoteVisibility === 'public') {
+        reasonCodes.push(ReasonCode.CODE_REMOTE_UNKNOWN_VISIBILITY)
+      } else {
+        // unknown, not_github → fail-closed
+        reasonCodes.push(ReasonCode.CODE_REMOTE_UNKNOWN_VISIBILITY)
+      }
+    }
   }
 
   // Check remote branches for public checkpoint/session refs
@@ -277,8 +364,22 @@ export function checkEntireCLISafety(opts) {
     reasonCodes.push(ReasonCode.GIT_CONFIG_PARSE_ERROR)
   } else {
     // Inspect push-related config values for public remote indicators
+    // gitConfig is now Record<string, string[]> (multi-value)
     let foundPublicPush = false
-    for (const [key, value] of Object.entries(gitConfig)) {
+
+    /**
+     * @param {string} value
+     */
+    const checkPushUrl = (value) => {
+      if (!foundPublicPush && value) {
+        if (!GITHUB_URL_PATTERN.test(value) && value.startsWith('http')) {
+          reasonCodes.push(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
+          foundPublicPush = true
+        }
+      }
+    }
+
+    for (const [key, values] of Object.entries(gitConfig)) {
       if (foundPublicPush) break
       const isPushUrlKey =
         key.includes('pushurl') ||
@@ -286,22 +387,32 @@ export function checkEntireCLISafety(opts) {
         key.includes('pushremote') ||
         key.includes('pushdefault') ||
         (key.includes('remote.') && key.endsWith('.push'))
-      if (isPushUrlKey && value) {
-        if (!GITHUB_URL_PATTERN.test(value) && value.startsWith('http')) {
-          reasonCodes.push(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
-          foundPublicPush = true
+
+      if (isPushUrlKey) {
+        // values is string[] for multi-value support
+        const valArr = Array.isArray(values) ? values : [values]
+        for (const v of valArr) {
+          checkPushUrl(v)
         }
       }
+
       // For mirror=true, check the associated remote URL
-      if (key.includes('remote.') && key.endsWith('.mirror') && value === 'true') {
-        // Extract remote name: remote.<name>.mirror → look up remote.<name>.url
-        const parts = key.split('.')
-        if (parts.length >= 3) {
-          const remoteName = parts.slice(1, parts.length - 1).join('.')
-          const remoteUrl = gitConfig[`remote.${remoteName}.url`] ?? ''
-          if (remoteUrl && !GITHUB_URL_PATTERN.test(remoteUrl) && remoteUrl.startsWith('http')) {
-            reasonCodes.push(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
-            foundPublicPush = true
+      if (key.includes('remote.') && key.endsWith('.mirror')) {
+        const valArr = Array.isArray(values) ? values : [values]
+        if (valArr.includes('true')) {
+          // Extract remote name: remote.<name>.mirror → look up remote.<name>.url
+          const parts = key.split('.')
+          if (parts.length >= 3) {
+            const remoteName = parts.slice(1, parts.length - 1).join('.')
+            const remoteUrls = gitConfig[`remote.${remoteName}.url`] ?? []
+            const urlArr = Array.isArray(remoteUrls) ? remoteUrls : [remoteUrls]
+            for (const remoteUrl of urlArr) {
+              if (remoteUrl && !GITHUB_URL_PATTERN.test(remoteUrl) && remoteUrl.startsWith('http')) {
+                reasonCodes.push(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
+                foundPublicPush = true
+                break
+              }
+            }
           }
         }
       }
@@ -315,8 +426,36 @@ export function checkEntireCLISafety(opts) {
     verdict: isBlocked ? 'blocked' : 'safe',
     reason_codes: isBlocked ? [...new Set(reasonCodes)] : [],
     raw_values_emitted: false,
+    checked_surfaces: buildCheckedSurfaces(entireBinaryPresent, entireVersion, entireEnableHelp, entireConfigureHelp),
   }
 }
+
+/**
+ * Build checked_surfaces object for AC6.
+ * Records binary presence and surface availability without raw output.
+ *
+ * @param {boolean} entireBinaryPresent
+ * @param {string | null} entireVersion
+ * @param {string | null} entireEnableHelp
+ * @param {string | null} entireConfigureHelp
+ * @returns {CheckedSurfaces}
+ */
+function buildCheckedSurfaces(entireBinaryPresent, entireVersion, entireEnableHelp, entireConfigureHelp) {
+  return {
+    entire_binary: entireBinaryPresent,
+    entire_version: entireVersion !== null ? redactFingerprint(entireVersion) : null,
+    entire_enable_help: entireEnableHelp !== null,
+    entire_configure_help: entireConfigureHelp !== null,
+  }
+}
+
+/**
+ * @typedef {object} CheckedSurfaces
+ * @property {boolean} entire_binary - whether `entire` binary was found on PATH
+ * @property {string | null} entire_version - redacted version fingerprint or null if unavailable
+ * @property {boolean} entire_enable_help - whether `entire enable --help` surface is available
+ * @property {boolean} entire_configure_help - whether `entire configure --help` surface is available
+ */
 
 /**
  * @typedef {object} EntireCLISafetyResult
@@ -324,4 +463,5 @@ export function checkEntireCLISafety(opts) {
  * @property {'not_applicable' | 'safe' | 'blocked'} verdict
  * @property {string[]} reason_codes
  * @property {boolean} raw_values_emitted
+ * @property {CheckedSurfaces} checked_surfaces
  */

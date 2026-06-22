@@ -26,6 +26,7 @@ function makeSafeInput() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'local_only' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
     gitConfig: {},
     gitConfigParseErrors: [],
@@ -144,7 +145,7 @@ describe('entirecli-fail-closed', () => {
   it('GIVEN git config parse error WHEN checked THEN verdict is blocked', () => {
     const result = checkEntireCLISafety({
       ...makeSafeInput(),
-      gitConfigParseErrors: ['git config --list failed'],
+      gitConfigParseErrors: ['git config -z --list failed'],
     })
 
     expect(result.verdict).toBe('blocked')
@@ -162,11 +163,55 @@ describe('entirecli-fail-closed', () => {
     expect(result.raw_values_emitted).toBe(true)
   })
 
+  it('GIVEN settings parse error sentinel WHEN checked THEN verdict is blocked with settings_parse_error', () => {
+    const result = checkEntireCLISafety({
+      ...makeSafeInput(),
+      baseSettings: { parse_error: true },
+    })
+
+    expect(result.verdict).toBe('blocked')
+    expect(result.reason_codes).toContain(ReasonCode.SETTINGS_PARSE_ERROR)
+  })
+
   it('GIVEN all safe conditions met WHEN checked THEN verdict is safe with empty reason_codes', () => {
     const result = checkEntireCLISafety(makeSafeInput())
 
     expect(result.verdict).toBe('safe')
     expect(result.reason_codes).toHaveLength(0)
     expect(result.raw_values_emitted).toBe(false)
+  })
+
+  describe('Blocker 1: checkpoint_remote unset + code remote visibility', () => {
+    it('GIVEN checkpoint_remote null and code remote unknown WHEN checked THEN blocked with code_remote_unknown_visibility', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeInput(),
+        checkpointRemote: null,
+        codeRemoteVisibility: 'unknown',
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.CODE_REMOTE_UNKNOWN_VISIBILITY)
+    })
+
+    it('GIVEN checkpoint_remote null and code remote public WHEN checked THEN blocked', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeInput(),
+        checkpointRemote: null,
+        codeRemoteVisibility: 'public',
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.CODE_REMOTE_UNKNOWN_VISIBILITY)
+    })
+
+    it('GIVEN checkpoint_remote null and code remote local_only WHEN checked THEN NOT blocked for code remote', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeInput(),
+        checkpointRemote: null,
+        codeRemoteVisibility: 'local_only',
+      })
+
+      expect(result.reason_codes).not.toContain(ReasonCode.CODE_REMOTE_UNKNOWN_VISIBILITY)
+    })
   })
 })

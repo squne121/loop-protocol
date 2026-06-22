@@ -19,8 +19,9 @@ function makeSafeBase() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'local_only' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
-    gitConfig: {},
+    gitConfig: {} as Record<string, string[]>,
     gitConfigParseErrors: [],
     diagnosticStrings: [],
   }
@@ -53,7 +54,7 @@ describe('entirecli-blocked', () => {
       const result = checkEntireCLISafety({
         ...makeSafeBase(),
         gitConfig: {
-          'remote.origin.pushurl': 'http://public.example.com/checkpoints.git',
+          'remote.origin.pushurl': ['http://public.example.com/checkpoints.git'],
         },
       })
 

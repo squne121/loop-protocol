@@ -23,16 +23,17 @@ const FIXTURE_SAFE = {
     strategy_options: {
       push_sessions: false,
       telemetry: false,
+      checkpoint_remote: 'origin',
     },
-    checkpoint_remote: 'origin',
   },
   localSettings: {},
   checkpointRemote: 'origin',
   checkpointRemoteVisibility: 'private' as const,
+  codeRemoteVisibility: 'local_only' as const,
   remoteBranches: ['origin/main', 'origin/develop'],
   gitConfig: {
-    'remote.origin.url': 'https://github.com/user/private-repo.git',
-  },
+    'remote.origin.url': ['https://github.com/user/private-repo.git'],
+  } as Record<string, string[]>,
   gitConfigParseErrors: [],
   diagnosticStrings: [
     'checkpoint_remote: orig***[len=6]',
@@ -53,9 +54,9 @@ const FIXTURE_PUBLIC_BRANCH = {
 const FIXTURE_PUSHURL_REWRITE = {
   ...FIXTURE_SAFE,
   gitConfig: {
-    'remote.origin.url': 'https://github.com/user/private-repo.git',
-    'remote.origin.pushurl': 'http://internal.example.com/mirror/repo.git',  // non-GitHub HTTP
-  },
+    'remote.origin.url': ['https://github.com/user/private-repo.git'],
+    'remote.origin.pushurl': ['http://internal.example.com/mirror/repo.git'],  // non-GitHub HTTP
+  } as Record<string, string[]>,
 }
 
 // Fixture: unknown visibility (GitHub API 403/404)
@@ -99,9 +100,9 @@ const FIXTURE_INCLUDE_IF_PUBLIC_PUSH = {
   ...FIXTURE_SAFE,
   // Simulated: includeIf conditional block loaded, non-GitHub pushurl present
   gitConfig: {
-    'remote.origin.url': 'https://github.com/user/private-repo.git',
-    'remote.origin.pushurl': 'http://public-mirror.io/repo.git',  // non-GitHub HTTP pushurl
-  },
+    'remote.origin.url': ['https://github.com/user/private-repo.git'],
+    'remote.origin.pushurl': ['http://public-mirror.io/repo.git'],  // non-GitHub HTTP pushurl
+  } as Record<string, string[]>,
 }
 
 // Fixture: settings.local.json overrides settings.json (push enabled via local)
@@ -136,6 +137,13 @@ describe('entirecli-safety (AC9 fixtures)', () => {
       const resultStr = JSON.stringify(result)
 
       expect(containsRawValue(resultStr)).toBe(false)
+    })
+
+    it('GIVEN safe config WHEN checked THEN checked_surfaces is present', () => {
+      const result = checkEntireCLISafety(FIXTURE_SAFE)
+
+      expect(result.checked_surfaces).toBeDefined()
+      expect(typeof result.checked_surfaces.entire_binary).toBe('boolean')
     })
   })
 
@@ -214,12 +222,56 @@ describe('entirecli-safety (AC9 fixtures)', () => {
     })
 
     it('GIVEN local settings override is applied WHEN parseEntireSettings called THEN local wins', () => {
-      const settings = parseEntireSettings(
+      const { pushSessions } = parseEntireSettings(
         { strategy_options: { push_sessions: false, telemetry: false } },
         { strategy_options: { push_sessions: true, telemetry: false } }
       )
 
-      expect(settings.pushSessions).toBe(true)
+      expect(pushSessions).toBe(true)
+    })
+  })
+
+  describe('Blocker 2: strategy_options.checkpoint_remote as object schema', () => {
+    it('GIVEN checkpoint_remote as { provider, repo } object in strategy_options WHEN parseEntireSettings called THEN checkpointRemoteObj is object', () => {
+      const { checkpointRemoteObj } = parseEntireSettings(
+        {
+          strategy_options: {
+            push_sessions: false,
+            telemetry: false,
+            checkpoint_remote: { provider: 'github', repo: 'user/checkpoints' },
+          },
+        },
+        {}
+      )
+
+      expect(checkpointRemoteObj).toEqual({ provider: 'github', repo: 'user/checkpoints' })
+    })
+
+    it('GIVEN checkpoint_remote as string in strategy_options WHEN parseEntireSettings called THEN checkpointRemoteObj is string', () => {
+      const { checkpointRemoteObj } = parseEntireSettings(
+        {
+          strategy_options: {
+            push_sessions: false,
+            telemetry: false,
+            checkpoint_remote: 'origin',
+          },
+        },
+        {}
+      )
+
+      expect(checkpointRemoteObj).toBe('origin')
+    })
+
+    it('GIVEN top-level telemetry (official schema) WHEN parseEntireSettings called THEN telemetry read from top level', () => {
+      const { telemetry } = parseEntireSettings(
+        {
+          telemetry: false,
+          strategy_options: { push_sessions: false },
+        },
+        {}
+      )
+
+      expect(telemetry).toBe(false)
     })
   })
 

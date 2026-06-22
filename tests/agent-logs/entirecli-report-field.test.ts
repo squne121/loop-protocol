@@ -1,9 +1,14 @@
 /**
  * AC8: checker の verdict が agent_run_report.public_safety.entirecli_safety に取り込める
  *
+ * AC8: deferred_by_stop_condition (schema field not in agent-run-report.schema.json)
+ *
  * AC7 Stop Condition: docs/schemas/agent-run-report.schema.json に entirecli_safety フィールドが
- * 存在しないため、schema 追加は scope 外。本テストは verdict 計算の結果オブジェクトが
- * report フィールドとして保持できる構造を持つことを検証する（schema 統合は別 follow-up Issue）。
+ * 存在しないため、schema 追加は scope 外（別 Issue で対応予定）。
+ *
+ * 本テストは verdict 計算の結果オブジェクトが report フィールドとして保持できる構造を持つことを
+ * 検証する（schema 統合は別 follow-up Issue）。
+ * AC8 の「agent_run_report schema への統合」は deferred_by_stop_condition。
  */
 import { describe, expect, it } from 'vitest'
 import { checkEntireCLISafety, SCHEMA_VERSION } from '../../scripts/agent-logs/lib/entirecli-safety.mjs'
@@ -20,6 +25,7 @@ function makeNotApplicableInput() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'unknown' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
     gitConfig: {},
     gitConfigParseErrors: [],
@@ -41,6 +47,7 @@ function makeSafeInput() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'local_only' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
     gitConfig: {},
     gitConfigParseErrors: [],
@@ -140,14 +147,24 @@ describe('entirecli-report-field', () => {
       const result = checkEntireCLISafety(makeNotApplicableInput())
       expect(result.reason_codes).toContain('entire_absent')
     })
+
+    it('GIVEN any verdict WHEN checked THEN checked_surfaces field is present', () => {
+      for (const input of [makeNotApplicableInput(), makeSafeInput(), makeBlockedInput()]) {
+        const result = checkEntireCLISafety(input)
+        expect(result.checked_surfaces).toBeDefined()
+        expect(typeof result.checked_surfaces.entire_binary).toBe('boolean')
+        expect(typeof result.checked_surfaces.entire_enable_help).toBe('boolean')
+        expect(typeof result.checked_surfaces.entire_configure_help).toBe('boolean')
+      }
+    })
   })
 
   describe('AC7 scope boundary', () => {
+    // AC8: deferred_by_stop_condition (schema field not in agent-run-report.schema.json)
+    // The schema at docs/schemas/agent-run-report.schema.json does not have
+    // entirecli_safety field, so schema integration is a separate follow-up.
+    // This test verifies the result object is structurally compatible with a report field.
     it('GIVEN entirecli_safety result WHEN injected into public_safety field THEN no schema validation occurs (schema not in scope)', () => {
-      // This test documents the AC7 Stop Condition:
-      // The schema at docs/schemas/agent-run-report.schema.json does not have
-      // entirecli_safety field, so schema integration is a separate follow-up.
-      // This test verifies the result object is structurally compatible.
       const result = checkEntireCLISafety(makeSafeInput())
 
       expect(result).toMatchObject({
@@ -155,6 +172,9 @@ describe('entirecli-report-field', () => {
         verdict: expect.stringMatching(/^(not_applicable|safe|blocked)$/),
         reason_codes: expect.any(Array),
         raw_values_emitted: expect.any(Boolean),
+        checked_surfaces: expect.objectContaining({
+          entire_binary: expect.any(Boolean),
+        }),
       })
     })
   })

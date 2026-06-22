@@ -16,6 +16,7 @@ function makeAbsentInput() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'unknown' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
     gitConfig: {},
     gitConfigParseErrors: [],
@@ -31,6 +32,13 @@ describe('entirecli-not-applicable', () => {
     expect(result.verdict).toBe('not_applicable')
     expect(result.reason_codes).toContain(ReasonCode.ENTIRE_ABSENT)
     expect(result.raw_values_emitted).toBe(false)
+  })
+
+  it('GIVEN not_applicable result WHEN checked THEN checked_surfaces field is present', () => {
+    const result = checkEntireCLISafety(makeAbsentInput())
+
+    expect(result.checked_surfaces).toBeDefined()
+    expect(typeof result.checked_surfaces.entire_binary).toBe('boolean')
   })
 
   it('GIVEN empty localRefs array with no checkpoint refs WHEN checked THEN verdict is not_applicable', () => {
@@ -55,9 +63,9 @@ describe('entirecli-not-applicable', () => {
     const result = checkEntireCLISafety({
       ...makeAbsentInput(),
       gitConfig: {
-        'user.email': 'test@example.com',
-        'core.autocrlf': 'false',
-        'remote.origin.url': 'https://github.com/example/repo.git',
+        'user.email': ['test@example.com'],
+        'core.autocrlf': ['false'],
+        'remote.origin.url': ['https://github.com/example/repo.git'],
       },
     })
 
@@ -113,6 +121,15 @@ describe('entirecli-not-applicable', () => {
     const result = checkEntireCLISafety({
       ...makeAbsentInput(),
       checkpointTrailerPresent: true,
+    })
+
+    expect(result.verdict).not.toBe('not_applicable')
+  })
+
+  it('GIVEN settings parse error sentinel WHEN checked THEN verdict is NOT not_applicable (parse error = presence signal)', () => {
+    const result = checkEntireCLISafety({
+      ...makeAbsentInput(),
+      baseSettings: { parse_error: true },
     })
 
     expect(result.verdict).not.toBe('not_applicable')

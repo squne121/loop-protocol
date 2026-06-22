@@ -5,6 +5,8 @@
  * remote.*.mirror, remote.*.push
  * local refs, .entire/, commit trailers, ENTIRE_CHECKPOINT_TOKEN env も対象
  * 出力は raw URL / raw config path / token を出さず reason_code と redacted fingerprint のみ
+ *
+ * gitConfig は multi-value: Record<string, string[]>
  */
 import { describe, expect, it } from 'vitest'
 import {
@@ -28,8 +30,9 @@ function makeSafeBase() {
     localSettings: {},
     checkpointRemote: null,
     checkpointRemoteVisibility: 'local_only' as const,
+    codeRemoteVisibility: 'local_only' as const,
     remoteBranches: [],
-    gitConfig: {},
+    gitConfig: {} as Record<string, string[]>,
     gitConfigParseErrors: [],
     diagnosticStrings: [],
   }
@@ -40,7 +43,7 @@ describe('entirecli-config-scan', () => {
     it('GIVEN git config parse error WHEN checked THEN blocked with git_config_parse_error', () => {
       const result = checkEntireCLISafety({
         ...makeSafeBase(),
-        gitConfigParseErrors: ['git config --list failed'],
+        gitConfigParseErrors: ['git config -z --list failed'],
       })
 
       expect(result.verdict).toBe('blocked')
@@ -58,12 +61,27 @@ describe('entirecli-config-scan', () => {
     })
   })
 
-  describe('non-GitHub HTTP push remote detection', () => {
+  describe('non-GitHub HTTP push remote detection (multi-value gitConfig)', () => {
     it('GIVEN remote.origin.pushurl with non-GitHub HTTP URL WHEN checked THEN blocked', () => {
       const result = checkEntireCLISafety({
         ...makeSafeBase(),
         gitConfig: {
-          'remote.origin.pushurl': 'http://gitlab.example.com/user/repo.git',
+          'remote.origin.pushurl': ['http://gitlab.example.com/user/repo.git'],
+        },
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
+    })
+
+    it('GIVEN remote.origin.pushurl with multiple values including non-GitHub HTTP WHEN checked THEN blocked', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeBase(),
+        gitConfig: {
+          'remote.origin.pushurl': [
+            'https://github.com/user/repo.git',
+            'http://mirror.example.com/repo.git',
+          ],
         },
       })
 
@@ -75,7 +93,7 @@ describe('entirecli-config-scan', () => {
       const result = checkEntireCLISafety({
         ...makeSafeBase(),
         gitConfig: {
-          'remote.origin.pushurl': 'https://github.com/user/private-repo.git',
+          'remote.origin.pushurl': ['https://github.com/user/private-repo.git'],
         },
       })
 
@@ -96,6 +114,7 @@ describe('entirecli-config-scan', () => {
         localSettings: {},
         checkpointRemote: null,
         checkpointRemoteVisibility: 'unknown' as const,
+        codeRemoteVisibility: 'local_only' as const,
         remoteBranches: [],
         gitConfig: {},
         gitConfigParseErrors: [],
@@ -120,6 +139,7 @@ describe('entirecli-config-scan', () => {
         localSettings: {},
         checkpointRemote: null,
         checkpointRemoteVisibility: 'local_only' as const,
+        codeRemoteVisibility: 'local_only' as const,
         remoteBranches: [],
         gitConfig: {},
         gitConfigParseErrors: [],
@@ -197,14 +217,52 @@ describe('entirecli-config-scan', () => {
       const result = checkEntireCLISafety({
         ...makeSafeBase(),
         gitConfig: {
-          'remote.backup.mirror': 'true',
-          'remote.backup.url': 'http://backup.example.com/repo.git',
+          'remote.backup.mirror': ['true'],
+          'remote.backup.url': ['http://backup.example.com/repo.git'],
         },
       })
 
       // mirror with non-GitHub HTTP URL → public push remote detected
       expect(result.verdict).toBe('blocked')
       expect(result.reason_codes).toContain(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
+    })
+
+    it('GIVEN git config with multiple remote pushurls WHEN one is public THEN blocked', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeBase(),
+        gitConfig: {
+          'remote.origin.url': ['https://github.com/user/repo.git'],
+          'remote.origin.pushurl': [
+            'https://github.com/user/repo.git',
+            'http://public-mirror.org/repo.git',
+          ],
+        },
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.PUBLIC_PUSH_REMOTE_DETECTED)
+    })
+  })
+
+  describe('Blocker 5: settings parse error is fail-closed', () => {
+    it('GIVEN base settings parse error sentinel WHEN checked THEN blocked', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeBase(),
+        baseSettings: { parse_error: true },
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.SETTINGS_PARSE_ERROR)
+    })
+
+    it('GIVEN local settings parse error sentinel WHEN checked THEN blocked', () => {
+      const result = checkEntireCLISafety({
+        ...makeSafeBase(),
+        localSettings: { parse_error: true },
+      })
+
+      expect(result.verdict).toBe('blocked')
+      expect(result.reason_codes).toContain(ReasonCode.SETTINGS_PARSE_ERROR)
     })
   })
 })
