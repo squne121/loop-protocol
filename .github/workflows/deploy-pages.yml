@@ -63,6 +63,14 @@ jobs:
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          VITE_LOOP_RUN_ID: ${{ github.run_id }}
+          VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          VITE_LOOP_PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+          VITE_LOOP_ARTIFACT_URL: "unknown"
+          VITE_LOOP_ARTIFACT_NAMES: gh-pages-main
+          VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unavailable-in-deploy-pages"
+          VITE_LOOP_RETENTION_DAYS: "90"
+          VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
       - name: Verify main build asset base path
         shell: bash
         run: |
@@ -108,6 +116,56 @@ jobs:
             git commit -m "chore: deploy main to gh-pages"
             git push origin HEAD:gh-pages
           fi
+      # B2 (#987): build-after provenance (artifact url/digest/retention) is NOT
+      # knowable at bundle build time. Upload the dist as a named artifact so the
+      # artifact-url / artifact-digest outputs become available, then emit them
+      # into playtest-evidence-provenance.json (kept OUT of the bundle).
+      - name: Upload dist bundle artifact
+        id: upload-dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: gh-pages-main-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Generate playtest-evidence-provenance.json
+        env:
+          ARTIFACT_URL: ${{ steps.upload-dist.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload-dist.outputs.artifact-digest }}
+          PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+          COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fulfilled_or_unknown() {
+            if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf 'unknown'; fi
+          }
+          reason_for() {
+            if [ -n "${1:-}" ]; then printf 'available'; else printf 'unknown'; fi
+          }
+          mkdir -p provenance_artifacts
+          cat > provenance_artifacts/playtest-evidence-provenance.json <<JSON
+          {
+            "schema": "playtest_evidence_provenance/v1",
+            "commit_sha": { "value": "$(fulfilled_or_unknown "$COMMIT_SHA")", "availability_reason": "$(reason_for "$COMMIT_SHA")" },
+            "run_id": { "value": "$(fulfilled_or_unknown "$RUN_ID")", "availability_reason": "$(reason_for "$RUN_ID")" },
+            "run_attempt": { "value": "$(fulfilled_or_unknown "$RUN_ATTEMPT")", "availability_reason": "$(reason_for "$RUN_ATTEMPT")" },
+            "page_url": { "value": "$(fulfilled_or_unknown "$PAGE_URL")", "availability_reason": "$(reason_for "$PAGE_URL")" },
+            "artifact_url": { "value": "$(fulfilled_or_unknown "$ARTIFACT_URL")", "availability_reason": "$(reason_for "$ARTIFACT_URL")" },
+            "artifact_digest_or_attestation": { "value": "$(fulfilled_or_unknown "$ARTIFACT_DIGEST")", "availability_reason": "$(reason_for "$ARTIFACT_DIGEST")" },
+            "retention_days": { "value": "90", "availability_reason": "available" }
+          }
+          JSON
+          cat provenance_artifacts/playtest-evidence-provenance.json
+      - name: Upload playtest-evidence-provenance artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: playtest-evidence-provenance
+          path: provenance_artifacts/
+          if-no-files-found: error
+          retention-days: 90
 
   deploy-pr:
     if: >-
@@ -179,6 +237,14 @@ jobs:
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
           VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
+          VITE_LOOP_RUN_ID: ${{ github.run_id }}
+          VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          VITE_LOOP_PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+          VITE_LOOP_ARTIFACT_URL: "unknown"
+          VITE_LOOP_ARTIFACT_NAMES: gh-pages-pr-${{ github.event.number }}
+          VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unavailable-in-deploy-pages"
+          VITE_LOOP_RETENTION_DAYS: "90"
+          VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
       - name: Verify PR preview build asset base path
         shell: bash
         run: |

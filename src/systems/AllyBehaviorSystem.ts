@@ -1,4 +1,5 @@
 import type { AllyState, GameState, TargetEntityId } from '../state'
+import { recordTargetSwitch } from '../playtest/assistPlayerEventLog'
 import { selectTarget } from './TargetingSystem'
 import {
   allyTargetEntityId,
@@ -54,7 +55,11 @@ function moveAllyTowardEnemy(
   ally.behaviorState = 'move_to_engage'
 }
 
-export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): void {
+export function runAllyBehaviorSystem(
+  state: GameState,
+  fixedDeltaMs: number,
+  commandSeq: number | null = null,
+): void {
   const commandIntentActive = state.commandIntentRuntime.activeIntent !== 'none'
   const candidates = state.enemies.map((enemy) => ({
     targetEntityId: enemyTargetEntityId(enemy),
@@ -67,6 +72,7 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
   }))
 
   for (const ally of state.allies) {
+    const previousTargetId = ally.targetEntityId
     ally.targetingPolicy =
       commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player'
         ? 'assist_player_threat'
@@ -89,7 +95,7 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
       arena: state.arena,
       commandIntent: state.commandIntentRuntime.activeIntent,
       commandIntentActive,
-      previousTargetId: ally.targetEntityId,
+      previousTargetId,
       threatMode: 'binary_hostile_near_player',
       nearPlayerRadiusPx: NEAR_PLAYER_RADIUS_PX,
     })
@@ -105,6 +111,36 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
     }
 
     ally.targetEntityId = selection.selectedTargetId
+
+    // B4 (#987): correlate a target_switch to the originating assist command even
+    // when it lands on a later tick within the TTL window. `commandSeq` is set
+    // only on the input tick; `activeCommandSeq` carries the originating command
+    // forward while the assist intent remains active.
+    const assistIntentActive =
+      commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player'
+    const correlatedCommandSeq =
+      commandSeq ?? (assistIntentActive ? state.commandIntentRuntime.activeCommandSeq : null)
+
+    if (
+      correlatedCommandSeq !== null &&
+      previousTargetId !== selection.selectedTargetId &&
+      selection.selectedTargetId !== null
+    ) {
+      recordTargetSwitch(state.playtestEvidenceRuntime, {
+        tick: state.tick,
+        commandSeq: correlatedCommandSeq,
+        allyId: ally.id,
+        fromTargetId: previousTargetId,
+        toTargetId: selection.selectedTargetId,
+        causedByCommandIntent: assistIntentActive,
+      })
+    }
+
+    // B3 (expired): mark the assist intent as having reached a confirmed ally
+    // target so a later TTL lapse does not emit a spurious command_noop: expired.
+    if (assistIntentActive && selection.selectedTargetId !== null) {
+      state.commandIntentRuntime.activeIntentTargetConfirmed = true
+    }
 
     const targetEnemy = findLivingEnemyByTargetEntityId(state, selection.selectedTargetId)
     if (!targetEnemy) {
