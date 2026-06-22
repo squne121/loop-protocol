@@ -73,8 +73,8 @@
 
 ## スコープ管理
 
-- `M1: Foundation Gate (v0.1.x)` の間は、まず基盤整備 Issue を閉じる。
-- `movement + projectile` は `#2` の最小仕様と `#3` の docs 整備を前提に進める。
+- 現在は `M4: Upgrade Loop (v0.4.x)` の境界を優先し、resource consumption と最小 upgrade loop を M3 persistence の上に載せる。
+- current milestone boundary の正本は `docs/dev/current-focus.md` と `docs/product/playable-roadmap.md` を参照し、境界を越える拡張は follow-up Issue に分離する。
 - hooks、permission 詳細、skill 実装はそれぞれ専用 Issue で扱う。
 
 ## Secret 管理

@@ -3,7 +3,7 @@ doc_id: DOC-ROADMAP-001
 title: Post-M1 Playable Outcome Roadmap
 status: active
 note: conceptual roadmap; not GitHub Milestone object creation
-last_updated_by_issue: 148
+last_updated_by_issue: 1094
 ---
 
 # Post-M1 Playable Outcome Roadmap
@@ -20,7 +20,7 @@ last_updated_by_issue: 148
 - **体験概要（非正本）**: `docs/product/game-overview.md` — MVP Loop の参照元として使用するが、要件の正本としては扱わない
 - **Milestone 命名規則**: `docs/dev/milestone-ops.md`
 - 個別機能の stable な仕様は `docs/product/features/<feature>.md` へ昇格させる
-- **M3 / M4 boundary authority**: M3 / M4 の conceptual milestone boundary は本 roadmap の M3 / M4 セクションを参照元とする。ただし global scope / global non-goals の正本は `docs/product/requirements.md` であり、本 roadmap を global 要件の正本へ格上げしない。GitHub Milestone object はこの roadmap を反映する外部メタデータとして扱う。
+- **Milestone boundary authority**: M2 / M3 / M4 / M5 の conceptual milestone boundary は本 roadmap の各 milestone セクションと mapping table を参照元とする。ただし global scope / global non-goals の正本は `docs/product/requirements.md` であり、本 roadmap を global 要件の正本へ格上げしない。GitHub Milestone object はこの roadmap を反映する外部メタデータとして扱う。
 
 ---
 
@@ -37,6 +37,19 @@ last_updated_by_issue: 148
 
 ---
 
+## Conceptual Milestone to GitHub Milestone Mapping
+
+readback_date: 2026-06-21
+
+| conceptual_milestone_id | conceptual_title | github_milestone_number | github_milestone_title | mapping_status | decision_note |
+|---|---|---:|---|---|---|
+| M2 | M2: Gameplay Core (v0.2.x) | 4 | M2: Combat MVP Gate (v0.2.x) | mismatch_pending_rename | conceptual boundary は gameplay core、GitHub milestone object は旧 title のまま残っている。rename 判断は別スコープ。 |
+| M3 | M3: Result Persistence (v0.3.x) | 3 | M3: Result Persistence (v0.3.x) | aligned | conceptual title と GitHub milestone title は一致している。formal close / readback の最終判断は `#733` 側で扱う。 |
+| M4 | M4: Upgrade Loop (v0.4.x) | 2 | M4: UX MVP Gate (v0.4.x) | mismatch_pending_rename | conceptual boundary は upgrade loop だが、GitHub milestone object は旧 UX milestone title のまま残っている。rename は Out of Scope。 |
+| M5 | M5: Playable Slice Hardening (v0.5.x) | null | null | unmapped | 2026-06-21 readback 時点で対応する GitHub milestone object は未作成。conceptual milestone のみ存在する。 |
+
+---
+
 ## Conceptual Milestones
 
 ### M2: Gameplay Core (v0.2.x)
@@ -44,6 +57,10 @@ last_updated_by_issue: 148
 ```yaml
 milestone_id: M2
 title: "M2: Gameplay Core (v0.2.x)"
+github_milestone_number: 4
+github_milestone_title: "M2: Combat MVP Gate (v0.2.x)"
+mapping_status: mismatch_pending_rename
+decision_note: "conceptual boundary は Gameplay Core だが、GitHub milestone object は旧 title Combat MVP Gate のまま。rename は別 Issue で扱う。"
 source_mvp_loop:
   - sortie_playable
   - canvas_player_control
@@ -82,6 +99,10 @@ spec_destination:
 ```yaml
 milestone_id: M3
 title: "M3: Result Persistence (v0.3.x)"
+github_milestone_number: 3
+github_milestone_title: "M3: Result Persistence (v0.3.x)"
+mapping_status: aligned
+decision_note: "conceptual title と GitHub milestone title は一致している。formal close / readback の最終判断は #733 側。"
 source_mvp_loop:
   - result_resource_loop
 scope: |
@@ -113,6 +134,10 @@ spec_destination:
 ```yaml
 milestone_id: M4
 title: "M4: Upgrade Loop (v0.4.x)"
+github_milestone_number: 2
+github_milestone_title: "M4: UX MVP Gate (v0.4.x)"
+mapping_status: mismatch_pending_rename
+decision_note: "conceptual boundary は Upgrade Loop だが、GitHub milestone object は旧 UX milestone title のまま。rename は Out of Scope。"
 source_mvp_loop:
   - result_resource_loop
 scope: |
@@ -143,6 +168,10 @@ spec_destination:
 ```yaml
 milestone_id: M5
 title: "M5: Playable Slice Hardening (v0.5.x)"
+github_milestone_number: null
+github_milestone_title: null
+mapping_status: unmapped
+decision_note: "2026-06-21 readback 時点で対応する GitHub milestone object は未作成。conceptual milestone としてのみ管理する。"
 source_mvp_loop:
   - dom_canvas_separation
 scope: |
@@ -182,5 +211,5 @@ spec_destination:
 
 - この文書は conceptual roadmap の正本であり、個別機能仕様の正本ではない。
 - M2〜M5 の Parent Issue が materialize された時点で、対応する issue number を追記する。
-- GitHub Milestone object を作成した場合は `github_milestone_number` を追記し、作成証跡は Issue コメント readback を正本とする。
+- GitHub Milestone object の対応は `github_milestone_number` / `github_milestone_title` / `mapping_status` / `decision_note` を更新し、readback date を残す。
 - feature spec が作成された後は、詳細仕様は `docs/product/features/<feature>.md` を正本とし、本 roadmap は概要・依存関係・到達条件のみを保持する。
