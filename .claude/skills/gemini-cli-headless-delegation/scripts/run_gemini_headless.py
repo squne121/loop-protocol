@@ -1396,6 +1396,10 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
             "unsupported_provider_option: provider=agy does not support explicit model selection "
             "(requested_model will be recorded as provider_default)"
         )
+    # prompt is required and must be non-empty
+    prompt = request.get("prompt")
+    if not prompt or not str(prompt).strip():
+        errors.append("agy_empty_prompt: provider=agy requires a non-empty 'prompt' field")
     return errors
 
 
@@ -1473,9 +1477,93 @@ def run_delegation(
                 "model_downgrades": [],
             }
         prompt_text = request.get("prompt") or ""
-        timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
+        try:
+            timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
+        except (TypeError, ValueError):
+            timeout_sec_agy = DEFAULT_TIMEOUT_SEC
         try:
             agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+        except subprocess.TimeoutExpired:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                "warnings": [f"agy_timeout: process exceeded {timeout_sec_agy}s"],
+                "failure_reason": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                "failure_class": "agy_timeout",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        except FileNotFoundError:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": "agy_not_found: agy binary not found in PATH",
+                "warnings": ["agy_not_found: agy binary not found in PATH"],
+                "failure_reason": "agy_not_found: agy binary not found in PATH",
+                "failure_class": "agy_not_found",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        except PermissionError:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": "agy_permission_error: permission denied executing agy",
+                "warnings": ["agy_permission_error: permission denied executing agy"],
+                "failure_reason": "agy_permission_error: permission denied executing agy",
+                "failure_class": "agy_permission_error",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
         except Exception as exc:
             return {
                 "schema": "delegation_result/v1",
@@ -1498,6 +1586,7 @@ def run_delegation(
                 "stderr": str(exc),
                 "warnings": [str(exc)],
                 "failure_reason": str(exc),
+                "failure_class": "agy_unexpected_error",
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],

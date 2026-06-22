@@ -418,3 +418,69 @@ def test_agy_proposal_only_run_delegation_integration() -> None:
     mock_run.assert_called_once()
     assert result["ok"] is True
     assert result["response_text"] == "LOOP_AGY_SMOKE_OK"
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: additional edge case tests (empty prompt, invalid timeout, exception classes)
+# ---------------------------------------------------------------------------
+
+
+def test_agy_empty_prompt_fails_closed() -> None:
+    """Fix4/AC: provider=agy with empty prompt -> agy_empty_prompt fail-closed."""
+    req = _agy_request(prompt="")
+    result = rgh.run_delegation(req)
+    assert result["ok"] is False
+    failure = result.get("failure_reason") or ""
+    assert "agy_empty_prompt" in failure
+
+
+def test_agy_whitespace_only_prompt_fails_closed() -> None:
+    """Fix4/AC: provider=agy with whitespace-only prompt -> agy_empty_prompt fail-closed."""
+    req = _agy_request(prompt="   \n  ")
+    result = rgh.run_delegation(req)
+    assert result["ok"] is False
+    failure = result.get("failure_reason") or ""
+    assert "agy_empty_prompt" in failure
+
+
+def test_agy_none_prompt_fails_closed() -> None:
+    """Fix4/AC: provider=agy with prompt=None -> agy_empty_prompt fail-closed."""
+    req = _agy_request()
+    req["prompt"] = None  # type: ignore[assignment]
+    result = rgh.run_delegation(req)
+    assert result["ok"] is False
+    failure = result.get("failure_reason") or ""
+    assert "agy_empty_prompt" in failure
+
+
+def test_agy_invalid_timeout_falls_back_to_default() -> None:
+    """Fix4: timeout_sec='abc' -> falls back to DEFAULT_TIMEOUT_SEC, no uncaught ValueError."""
+    completed = _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+    with patch.object(rgh, "_run_agy", return_value=completed) as mock_run:
+        result = rgh.run_delegation(_agy_request(timeout_sec="abc"))
+    # Should not raise ValueError; result must be ok
+    assert result["ok"] is True
+    mock_run.assert_called_once()
+    # timeout passed to _run_agy must be the default integer value
+    call_args = mock_run.call_args
+    actual_timeout = call_args[0][1] if call_args[0] else call_args[1].get("timeout_sec")
+    assert isinstance(actual_timeout, int)
+    assert actual_timeout == rgh.DEFAULT_TIMEOUT_SEC
+
+
+def test_agy_timeout_expired_returns_failure_class() -> None:
+    """Fix4: subprocess.TimeoutExpired -> failure_class='agy_timeout'."""
+    with patch.object(rgh, "_run_agy", side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=30)):
+        result = rgh.run_delegation(_agy_request())
+    assert result["ok"] is False
+    assert result.get("failure_class") == "agy_timeout"
+    assert "agy_timeout" in (result.get("failure_reason") or "")
+
+
+def test_agy_file_not_found_returns_failure_class() -> None:
+    """Fix4: FileNotFoundError -> failure_class='agy_not_found'."""
+    with patch.object(rgh, "_run_agy", side_effect=FileNotFoundError("agy not found")):
+        result = rgh.run_delegation(_agy_request())
+    assert result["ok"] is False
+    assert result.get("failure_class") == "agy_not_found"
+    assert "agy_not_found" in (result.get("failure_reason") or "")
