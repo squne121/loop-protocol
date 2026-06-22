@@ -267,3 +267,51 @@ If the budget is too small to hold `safety_header` + `priority_signals`, the CLI
 | `lib/chatgpt-context-dedupe.mjs` | Evidence ref canonicalization and deduplication |
 | `lib/chatgpt-context-budget.mjs` | Priority-aware budget allocation |
 | `lib/chatgpt-context-renderer.mjs` | Markdown section renderers |
+
+## EntireCLI Safety Checker
+
+`scripts/agent-logs/check-entirecli-safety.mjs` は EntireCLI の使用状況を検査し、
+`agent_run_report` の `public_safety` フィールドへ取り込むための verdict を計算する adapter である。
+
+### Verdict 種別
+
+| verdict | 意味 |
+|---|---|
+| `not_applicable` | EntireCLI 未使用（binary / `.entire/` / hooks / refs / env / config がすべて不在） |
+| `safe` | EntireCLI 使用検出 + 全安全条件を満たす |
+| `blocked` | public/unknown push 経路、telemetry 有効、parse error、raw 値漏洩のいずれかを検出 |
+
+### schema_version
+
+`entirecli_safety_result/v1`
+
+### safe 条件（すべて満たす必要あり）
+
+- `strategy_options.push_sessions` が `false`（未設定は `blocked`）
+- `strategy_options.telemetry` が `false`（未設定は `blocked`）
+- `checkpoint_remote` が `private_verified` または local-only
+- `ENTIRE_CHECKPOINT_TOKEN` 存在時は `checkpoint_remote` が `private_verified`
+- public / unknown / non-GitHub / parse error はすべて `blocked`
+
+### 検査対象 git config キー
+
+`remote.*.url`、`remote.*.pushurl`、`remote.pushDefault`、`branch.*.pushRemote`、
+`url.*.insteadOf`、`url.*.pushInsteadOf`、`include.path`、`includeIf.*.path`、
+`remote.*.mirror`、`remote.*.push`
+
+### Redaction ポリシー
+
+診断出力に raw URL / raw config path / token を含めてはならない。
+`reason_code` と redacted fingerprint（`redactFingerprint()` 使用）のみ許可する。
+
+### schema フィールド統合
+
+`agent-run-report.schema.json` への `entirecli_safety` フィールド追加は別 Issue（AC7 Stop Condition）。
+現時点では verdict 計算のみ提供し、report への埋め込みは呼び出し元が担う。
+
+### Library Module
+
+| Module | Responsibility |
+|---|---|
+| `lib/entirecli-safety.mjs` | verdict 計算ロジック・redaction helper・設定パーサー |
+| `scripts/agent-logs/check-entirecli-safety.mjs` | CLI entry point（live git/fs 検査） |
