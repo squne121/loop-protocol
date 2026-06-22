@@ -601,7 +601,7 @@ class TestGhMutationFailClosedCompleteness:
     @pytest.mark.parametrize("cmd", [
         "gh issue close 1089",
         "gh issue comment 123 --body hello",
-        "gh issue comment 123 --body-file /tmp/body.txt",
+        "gh issue comment 123 --body-file tmp/body.txt",  # B4: canonical tmp/ path (not /tmp/)
         "gh issue reopen 123",
         "gh pr comment 456 --body hello",
         "gh pr edit 456 --title new",
@@ -635,7 +635,7 @@ class TestGhOpsMinimalAllowlist:
         # must-allow: 最小集合
         ("gh issue close 1089", "allow"),
         ("gh issue comment 123 --body hello", "allow"),
-        ("gh issue comment 123 --body-file /some/file.txt", "allow"),
+        ("gh issue comment 123 --body-file tmp/body.txt", "allow"),  # B4: canonical tmp/ path
         ("gh issue reopen 456", "allow"),
         ("gh pr comment 789 --body text", "allow"),
         ("gh pr edit 101 --title new", "allow"),
@@ -848,3 +848,104 @@ class TestGithub5ClassVocabularyConstants:
         assert "github_issue_mutation" in content or "managed skill" in content or "body-file" in content, (
             ".codex/rules/default.rules must reference managed skill / body-file context for gh issue mutations"
         )
+
+
+# ─── B1-B4 Review Blocker Fixes (Codex flavor) ────────────────────────────────
+
+class TestB1B4ReviewBlockerFixes:
+    """
+    B1: gh issue create requires --title with value.
+    B2: --body-file canonical tmp/ path validation (no path traversal, no absolute).
+    B3: gh issue view --web/-w blocked.
+    B4: stricter checks (--body without value, -e, --edit-last, --base, /tmp body-file).
+    """
+
+    # B1: --title required for gh issue create
+    def test_b1_gh_issue_create_without_title_blocked(self, tmp_git_repo: Path):
+        """B1: gh issue create without --title is blocked."""
+        result = eval_codex(
+            "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block", "gh issue create without --title must be blocked"
+
+    def test_b1_gh_issue_create_with_empty_title_blocked(self, tmp_git_repo: Path):
+        """B1: gh issue create with bare --title (no value) is blocked."""
+        assert not is_github_issue_mutation_command(
+            "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md --title"
+        ), "gh issue create with bare --title must be False"
+
+    def test_b1_gh_issue_create_with_title_allowed(self, tmp_git_repo: Path):
+        """B1: gh issue create with --title value is allowed."""
+        result = eval_codex(
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow", "gh issue create with --title must be allowed"
+
+    # B2: canonical path validation
+    def test_b2_body_file_path_traversal_blocked(self, tmp_git_repo: Path):
+        """B2: --body-file tmp/../AGENTS.md (path traversal) is blocked."""
+        assert not is_github_issue_mutation_command(
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/../AGENTS.md"
+        ), "path traversal in --body-file must be blocked"
+
+    def test_b2_body_file_absolute_path_blocked(self, tmp_git_repo: Path):
+        """B2: --body-file /tmp/body.txt (absolute path) is blocked."""
+        assert not is_github_issue_mutation_command(
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/body.txt"
+        ), "absolute path in --body-file must be blocked"
+
+    def test_b2_body_file_canonical_tmp_allowed(self, tmp_git_repo: Path):
+        """B2: --body-file tmp/body.txt (canonical relative) is allowed."""
+        assert is_github_issue_mutation_command(
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/body.txt"
+        ), "canonical tmp/ path in --body-file must be allowed"
+
+    # B3: --web/-w blocked for gh issue/pr view
+    def test_b3_gh_issue_view_web_blocked(self, tmp_git_repo: Path):
+        """B3: gh issue view --web opens browser, must be blocked."""
+        result = eval_codex("gh issue view 123 --web", str(tmp_git_repo))
+        assert result["status"] == "block", "gh issue view --web must be blocked"
+
+    def test_b3_gh_issue_view_w_flag_blocked(self, tmp_git_repo: Path):
+        """B3: gh issue view -w (short form) opens browser, must be blocked."""
+        result = eval_codex("gh issue view 123 -w", str(tmp_git_repo))
+        assert result["status"] == "block", "gh issue view -w must be blocked"
+
+    def test_b3_gh_issue_view_without_web_allowed(self, tmp_git_repo: Path):
+        """B3: gh issue view without --web/-w must still be allowed (readonly)."""
+        result = eval_codex("gh issue view 123", str(tmp_git_repo))
+        assert result["status"] == "allow", "gh issue view (no --web) must be allowed"
+
+    # B4: stricter checks
+    def test_b4_gh_issue_comment_body_without_value_blocked(self, tmp_git_repo: Path):
+        """B4: gh issue comment with bare --body (no value) is blocked."""
+        result = eval_codex("gh issue comment 123 --body", str(tmp_git_repo))
+        assert result["status"] == "block", "gh issue comment with bare --body must be blocked"
+
+    def test_b4_gh_issue_comment_edit_last_blocked(self, tmp_git_repo: Path):
+        """B4: gh issue comment --edit-last is blocked (destructive)."""
+        result = eval_codex("gh issue comment 123 --edit-last", str(tmp_git_repo))
+        assert result["status"] == "block", "gh issue comment --edit-last must be blocked"
+
+    def test_b4_gh_issue_comment_e_flag_blocked(self, tmp_git_repo: Path):
+        """B4: gh issue comment -e is blocked (interactive editor)."""
+        result = eval_codex("gh issue comment 123 -e", str(tmp_git_repo))
+        assert result["status"] == "block", "gh issue comment -e must be blocked"
+
+    def test_b4_gh_pr_edit_base_main_blocked(self, tmp_git_repo: Path):
+        """B4: gh pr edit --base main is blocked (changes base branch)."""
+        result = eval_codex("gh pr edit 123 --base main", str(tmp_git_repo))
+        assert result["status"] == "block", "gh pr edit --base main must be blocked"
+
+    def test_b4_gh_pr_edit_body_file_absolute_tmp_blocked(self, tmp_git_repo: Path):
+        """B4: gh pr edit --body-file /tmp/... (absolute path) is blocked."""
+        result = eval_codex("gh pr edit 123 --body-file /tmp/body.txt", str(tmp_git_repo))
+        assert result["status"] == "block", "gh pr edit --body-file /tmp/... must be blocked"
+
+    def test_b4_gh_pr_edit_body_file_canonical_tmp_allowed(self, tmp_git_repo: Path):
+        """B4: gh pr edit --body-file tmp/body.txt (canonical) is allowed."""
+        result = eval_codex("gh pr edit 123 --body-file tmp/body.txt", str(tmp_git_repo))
+        assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
+        assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
