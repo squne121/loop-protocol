@@ -161,6 +161,8 @@ def resolve_model_chain(
         return [], "empty_chain: default_chain is empty"
     return list(default_chain), None
 ALLOWED_TOOL_PROFILES = {"no_tools", "grounded_research", "local_asset_research", "proposal_only", "github_research"}
+SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"gemini", "agy"})
+AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset({"no_tools", "proposal_only"})
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
@@ -1005,6 +1007,140 @@ def _run_gemini(
         )
 
 
+def _minimal_agy_env() -> dict[str, str]:
+    """Return a minimal environment dict for agy subprocess execution.
+
+    Only allowlisted environment variables are propagated.
+    AGY_BIN override is supported for hermetic test injection.
+    """
+    allowlist = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
+    env: dict[str, str] = {}
+    for key in allowlist:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def _build_agy_raw_command(prompt: str) -> list[str]:
+    """Build sanitized raw_command for agy execution.
+
+    Returns a placeholder representation that does NOT include the actual
+    prompt text, absolute paths, or secrets — only the command basename.
+    """
+    agy_bin = str(os.environ.get("AGY_BIN") or "agy")
+    if os.sep in agy_bin or (os.altsep and os.altsep in agy_bin):
+        agy_bin = os.path.basename(agy_bin) or "agy"
+    return [agy_bin, "-p", "<prompt>"]
+
+
+def _run_agy(
+    prompt: str,
+    timeout_sec: int,
+) -> "subprocess.CompletedProcess[str]":
+    """Run agy -p <prompt> in an isolated temp cwd with minimal env.
+
+    Uses shell=False and AGY_BIN override for hermetic test injection.
+    """
+    agy_bin = str(os.environ.get("AGY_BIN") or "agy")
+    command = [agy_bin, "-p", prompt]
+    env = _minimal_agy_env()
+    with tempfile.TemporaryDirectory(prefix="agy-headless-") as tmp:
+        return subprocess.run(
+            command,
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+            shell=False,
+        )
+
+
+def _normalize_agy_result(
+    completed: "subprocess.CompletedProcess[str]",
+    *,
+    tool_profile: str,
+    requested_model: str | None,
+) -> dict[str, Any]:
+    """Normalize agy subprocess result into delegation_result/v1 shape.
+
+    Does NOT use _parse_envelope() — agy stdout is plain text.
+    Always includes provider="agy" and safety_mode="degraded_wrapper_only".
+    """
+    stdout = (completed.stdout or "").strip()
+    stderr_text = (completed.stderr or "").strip()
+
+    if completed.returncode != 0:
+        return {
+            "schema": "delegation_result/v1",
+            "transport": "agy",
+            "provider": "agy",
+            "safety_mode": "degraded_wrapper_only",
+            "ok": False,
+            "requested_model": requested_model,
+            "actual_model": "agy-default",
+            "tool_profile": tool_profile,
+            "exit_code": completed.returncode,
+            "result_surface": _build_result_surface(ok=False, response_text=None),
+            "response_text": None,
+            "stats": None,
+            "stderr": stderr_text or None,
+            "warnings": [f"agy_exit_nonzero: exit code {completed.returncode}"],
+            "failure_reason": f"agy_exit_nonzero: exit code {completed.returncode}",
+            "failure_class": "agy_exit_nonzero",
+            "raw_command": _build_agy_raw_command(""),
+            "model_chain": [],
+            "model_downgrades": [],
+        }
+
+    if not stdout:
+        return {
+            "schema": "delegation_result/v1",
+            "transport": "agy",
+            "provider": "agy",
+            "safety_mode": "degraded_wrapper_only",
+            "ok": False,
+            "requested_model": requested_model,
+            "actual_model": "agy-default",
+            "tool_profile": tool_profile,
+            "exit_code": completed.returncode,
+            "result_surface": _build_result_surface(ok=False, response_text=None),
+            "response_text": None,
+            "stats": None,
+            "stderr": stderr_text or None,
+            "warnings": ["agy_output_missing: exit 0 but stdout was empty"],
+            "failure_reason": "agy_output_missing",
+            "failure_class": "agy_empty_stdout",
+            "raw_command": _build_agy_raw_command(""),
+            "model_chain": [],
+            "model_downgrades": [],
+        }
+
+    return {
+        "schema": "delegation_result/v1",
+        "transport": "agy",
+        "provider": "agy",
+        "safety_mode": "degraded_wrapper_only",
+        "ok": True,
+        "requested_model": requested_model,
+        "actual_model": "agy-default",
+        "tool_profile": tool_profile,
+        "exit_code": 0,
+        "result_surface": _build_result_surface(ok=True, response_text=stdout),
+        "response_text": stdout,
+        "stats": None,
+        "stderr": stderr_text or None,
+        "warnings": [],
+        "failure_reason": None,
+        "failure_class": None,
+        "raw_command": _build_agy_raw_command(""),
+        "model_chain": [],
+        "model_downgrades": [],
+    }
+
+
 def _parse_envelope(stdout: str) -> tuple[dict[str, Any] | None, str | None]:
     try:
         parsed = json.loads(stdout)
@@ -1240,6 +1376,33 @@ def _normalize_acp_result(
     return normalized
 
 
+def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
+    """Minimal validation for provider=agy requests.
+
+    agy requests do not require schema/context_files/instructions/output_sections.
+    Only provider-specific constraints are enforced here.
+    """
+    errors: list[str] = []
+    tool_profile = request.get("tool_profile")
+    if tool_profile not in AGY_SUPPORTED_PROFILES:
+        errors.append(
+            f"unsupported_provider_profile: provider=agy only supports profiles "
+            f"{sorted(AGY_SUPPORTED_PROFILES)}, got {tool_profile!r}"
+        )
+    if request.get("post_to_issue_url"):
+        errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
+    if request.get("model"):
+        errors.append(
+            "unsupported_provider_option: provider=agy does not support explicit model selection "
+            "(requested_model will be recorded as provider_default)"
+        )
+    # prompt is required and must be non-empty
+    prompt = request.get("prompt")
+    if not prompt or not str(prompt).strip():
+        errors.append("agy_empty_prompt: provider=agy requires a non-empty 'prompt' field")
+    return errors
+
+
 def run_delegation(
     request: Mapping[str, Any],
     request_path: Path | None = None,
@@ -1254,6 +1417,186 @@ def run_delegation(
     # after build_prompt() further down. The dispatcher is re-entrant: ACP
     # fallback calls run_delegation() with transport="headless_json", which
     # does not re-enter the ACP branch.
+
+    # --- provider early dispatch: agy ---
+    # agy provider uses a separate minimal validation path and is dispatched
+    # BEFORE the full Gemini validation (which requires context_files etc.)
+    provider = request.get("provider", "gemini")
+    if provider not in SUPPORTED_PROVIDERS:
+        return {
+            "schema": "delegation_result/v1",
+            "ok": False,
+            "requested_model": str(request.get("model", DEFAULT_MODEL)),
+            "actual_model": "unknown",
+            "tool_profile": str(request.get("tool_profile", "unknown")),
+            "exit_code": 1,
+            "result_surface": {
+                "mode": "artifact-first",
+                "summary": None,
+                "primary_artifact_type": "none",
+                "primary_artifact": None,
+                "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+            },
+            "response_text": None,
+            "stats": None,
+            "stderr": f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
+            "warnings": [f"unknown_provider: {provider!r}"],
+            "failure_reason": f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
+            "raw_command": [],
+            "model_chain": [],
+            "model_downgrades": [],
+        }
+
+    if provider == "agy":
+        agy_errors = _validate_agy_request(request)
+        tool_profile_str = str(request.get("tool_profile", "unknown"))
+        if agy_errors:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": agy_errors[0],
+                "warnings": agy_errors[:],
+                "failure_reason": agy_errors[0],
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        prompt_text = request.get("prompt") or ""
+        try:
+            timeout_sec_agy = int(request.get("timeout_sec", DEFAULT_TIMEOUT_SEC))
+        except (TypeError, ValueError):
+            timeout_sec_agy = DEFAULT_TIMEOUT_SEC
+        try:
+            agy_completed = _run_agy(prompt_text, timeout_sec_agy)
+        except subprocess.TimeoutExpired:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                "warnings": [f"agy_timeout: process exceeded {timeout_sec_agy}s"],
+                "failure_reason": f"agy_timeout: process exceeded {timeout_sec_agy}s",
+                "failure_class": "agy_timeout",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        except FileNotFoundError:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": "agy_not_found: agy binary not found in PATH",
+                "warnings": ["agy_not_found: agy binary not found in PATH"],
+                "failure_reason": "agy_not_found: agy binary not found in PATH",
+                "failure_class": "agy_not_found",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        except PermissionError:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": "agy_permission_error: permission denied executing agy",
+                "warnings": ["agy_permission_error: permission denied executing agy"],
+                "failure_reason": "agy_permission_error: permission denied executing agy",
+                "failure_class": "agy_permission_error",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        except Exception as exc:
+            return {
+                "schema": "delegation_result/v1",
+                "provider": "agy",
+                "safety_mode": "degraded_wrapper_only",
+                "ok": False,
+                "requested_model": None,
+                "actual_model": "agy-default",
+                "tool_profile": tool_profile_str,
+                "exit_code": 1,
+                "result_surface": {
+                    "mode": "artifact-first",
+                    "summary": None,
+                    "primary_artifact_type": "none",
+                    "primary_artifact": None,
+                    "next_action": "Inspect warnings and failure_reason before retrying or escalating.",
+                },
+                "response_text": None,
+                "stats": None,
+                "stderr": str(exc),
+                "warnings": [str(exc)],
+                "failure_reason": str(exc),
+                "failure_class": "agy_unexpected_error",
+                "raw_command": _build_agy_raw_command(""),
+                "model_chain": [],
+                "model_downgrades": [],
+            }
+        return _normalize_agy_result(
+            agy_completed,
+            tool_profile=tool_profile_str,
+            requested_model=None,
+        )
+
     validation_errors = validate_request(request, request_path=request_path)
     requested_model = str(request.get("model", DEFAULT_MODEL))
     tool_profile = str(request.get("tool_profile", "unknown"))
