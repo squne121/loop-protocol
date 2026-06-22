@@ -50,6 +50,18 @@ REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 
+# ─── GitHub remote ops classification vocabulary ──────────────────────────────
+# 5-class vocabulary for gh command classification (Issue #1124).
+# These constants are exported for test validation (AC15).
+GITHUB_CMD_CLASS_DISPLAY_READONLY = "display_readonly_command"
+GITHUB_CMD_CLASS_READONLY_EXPORT = "readonly_artifact_export_command"
+GITHUB_CMD_CLASS_ISSUE_MUTATION = "github_issue_mutation_command"
+GITHUB_CMD_CLASS_PR_METADATA = "github_pr_metadata_command"
+GITHUB_CMD_CLASS_DESTRUCTIVE = "github_destructive_command"
+
+# Trusted repository slug for gh issue create/edit mutation allowlist.
+TRUSTED_REPO_SLUG = "squne121/loop-protocol"
+
 
 # ─── Root state classification ────────────────────────────────────────────────
 
@@ -428,9 +440,104 @@ def tokenize_command(cmd: str) -> list[str] | None:
         return None
 
 
+def _gh_has_web_flag(cmd: str) -> bool:
+    """Return True if a gh command includes --web or -w flag (interactive browser open)."""
+    tokens = tokenize_command(cmd)
+    if tokens is None:
+        return False
+    return "--web" in tokens or "-w" in tokens
+
+
+def _is_safe_tmp_body_file(path: str) -> bool:
+    """
+    Validate that body-file path is confined to project_root/tmp.
+    Blocks absolute paths, path traversal (../), and non-tmp/ prefixes.
+    """
+    if not path or path == "-":
+        return False
+    if path.startswith("/") or "\\" in path or "\x00" in path:
+        return False
+    p = Path(path)
+    if not p.parts or p.parts[0] != "tmp":
+        return False
+    if ".." in p.parts:
+        return False
+    project_root = Path(__file__).resolve().parent.parent.parent
+    try:
+        resolved = (project_root / p).resolve(strict=False)
+        tmp_root = (project_root / "tmp").resolve(strict=False)
+        return resolved.is_relative_to(tmp_root)
+    except Exception:
+        return False
+
+
+def _is_safe_tmp_redirect_dest(dest: str) -> bool:
+    """
+    Validate that redirect destination is confined to project_root/tmp.
+    Blocks absolute paths, path traversal (../), and non-tmp/ prefixes.
+    """
+    if not dest:
+        return False
+    if dest.startswith("/") or "\\" in dest or "\x00" in dest:
+        return False
+    p = Path(dest)
+    if not p.parts or p.parts[0] != "tmp":
+        return False
+    if ".." in p.parts:
+        return False
+    project_root = Path(__file__).resolve().parent.parent.parent
+    try:
+        resolved = (project_root / p).resolve(strict=False)
+        tmp_root = (project_root / "tmp").resolve(strict=False)
+        return resolved.is_relative_to(tmp_root)
+    except Exception:
+        return False
+
+
+def _find_flag_value(tokens: list[str], flag: str) -> "str | None":
+    """
+    Find the value of a flag in a token list.
+    Handles both '--flag value' and '--flag=value' forms.
+    Returns None if flag not found or has no value.
+    """
+    for i, t in enumerate(tokens):
+        if t == flag:
+            if i + 1 < len(tokens) and tokens[i + 1] and not tokens[i + 1].startswith("-"):
+                return tokens[i + 1]
+            return None
+        if t.startswith(f"{flag}="):
+            val = t[len(flag) + 1:]
+            return val if val else None
+    return None
+
+
+def _find_body_file_value(tokens: list[str]) -> "str | None":
+    """Find the value of --body-file flag in a token list."""
+    return _find_flag_value(tokens, "--body-file")
+
+
+def _has_body_value(tokens: list[str]) -> bool:
+    """
+    Return True if --body/-b has an actual non-empty value (not another flag).
+    Handles '--body <text>', '--body=<text>', '-b <text>'.
+    """
+    for i, t in enumerate(tokens):
+        if t in ("--body", "-b"):
+            if i + 1 < len(tokens) and tokens[i + 1] and not tokens[i + 1].startswith("-"):
+                return True
+            return False
+        if t.startswith("--body="):
+            val = t[len("--body="):]
+            return bool(val)
+    return False
+
+
 def is_readonly_command(cmd: str) -> bool:
     """Return True if the command is a display-oriented read-only command."""
     cmd = cmd.strip()
+    # B3: gh issue/pr view --web/-w opens a browser (interactive); block it
+    if re.match(r"^gh\s+(issue|pr)\s+(view|list|status)(\s|$)", cmd) and _gh_has_web_flag(cmd):
+        return False
     for pattern in DISPLAY_READONLY_PATTERNS:
         if re.match(pattern, cmd):
             return True
@@ -478,20 +585,20 @@ def is_github_remote_ops_command(cmd: str) -> bool:
 
     許可対象（post-merge-cleanup 最小集合）:
       - gh issue close <N>              N は数値 issue 番号必須
-      - gh issue comment <N> --body/-b  N は数値、--body or --body-file 必須
+      - gh issue comment <N> --body <V> / --body-file tmp/...
+                        N は数値、body 値必須、canonical tmp/ パス
       - gh issue reopen <N>             N は数値 issue 番号必須
-      - gh pr comment <N> --body/-b     N は数値、--body or --body-file 必須
-      - gh pr edit <N> ...              N は数値 PR 番号必須
+      - gh pr comment <N> --body <V> / --body-file tmp/...
+                        N は数値、body 値必須、canonical tmp/ パス
+      - gh pr edit <N> ...              N は数値 PR 番号必須、--base は block
 
-    除外（削除）:
-      - gh issue create    post-merge-cleanup では不要
-      - gh issue edit      body 指定なし interactive がありうる
-      - gh pr create       local push が必要になりうる
-
-    明示ブロック対象フラグ:
+    明示ブロック対象フラグ（全コマンド共通）:
       - --delete-last  destructive
-      - --editor       interactive
-      - --web          interactive
+      - --edit-last    destructive
+      - --editor / -e  interactive
+      - --web / -w     interactive browser
+      - --create-if-none  interactive
+      - --yes          silent-destructive
     """
     cmd = cmd.strip()
     tokens = tokenize_command(cmd)
@@ -502,8 +609,11 @@ def is_github_remote_ops_command(cmd: str) -> bool:
     resource = tokens[1]   # "issue" or "pr"
     subcommand = tokens[2] # "close", "comment", "reopen", "edit"
 
-    # Destructive / interactive flags → block always
-    BLOCKED_FLAGS = {"--delete-last", "--editor", "--web"}
+    # Destructive / interactive flags → block always (applied to all subcommands)
+    BLOCKED_FLAGS = {
+        "--delete-last", "--edit-last", "--editor", "-e",
+        "--web", "-w", "--create-if-none", "--yes",
+    }
     if any(t in BLOCKED_FLAGS for t in tokens[3:]):
         return False
 
@@ -512,46 +622,238 @@ def is_github_remote_ops_command(cmd: str) -> bool:
         if subcommand == "close":
             return len(tokens) >= 4 and tokens[3].isdigit()
 
-        # gh issue comment <N> --body/-b <text> OR --body-file <path>
+        # B4: gh issue comment <N> --body <V> OR --body-file tmp/...
         if subcommand == "comment":
             if len(tokens) < 4 or not tokens[3].isdigit():
                 return False
-            has_body = any(t in ("--body", "-b", "--body-file") for t in tokens[4:])
-            return has_body
+            has_body_val = _has_body_value(tokens[4:])
+            body_file = _find_body_file_value(tokens)
+            if body_file is not None:
+                # body-file present: canonical path required
+                if not _is_safe_tmp_body_file(body_file):
+                    return False
+                return True
+            # --body-file absent: --body must have value
+            return has_body_val
 
         # gh issue reopen <N>
         if subcommand == "reopen":
             return len(tokens) >= 4 and tokens[3].isdigit()
 
     elif resource == "pr":
-        # gh pr comment <N> --body/-b <text> OR --body-file <path>
+        # B4: gh pr comment <N> --body <V> OR --body-file tmp/...
         if subcommand == "comment":
             if len(tokens) < 4 or not tokens[3].isdigit():
                 return False
-            has_body = any(t in ("--body", "-b", "--body-file") for t in tokens[4:])
-            return has_body
+            has_body_val = _has_body_value(tokens[4:])
+            body_file = _find_body_file_value(tokens)
+            if body_file is not None:
+                if not _is_safe_tmp_body_file(body_file):
+                    return False
+                return True
+            return has_body_val
 
-        # gh pr edit <N> ... (PR番号指定必須)
+        # B4: gh pr edit <N> ... (--base is blocked, --body-file canonical path)
         if subcommand == "edit":
-            return len(tokens) >= 4 and tokens[3].isdigit()
+            if not (len(tokens) >= 4 and tokens[3].isdigit()):
+                return False
+            # --base changes base branch → block
+            if "--base" in tokens[4:]:
+                return False
+            # --body-file, if present, must be canonical tmp/ path
+            body_file = _find_body_file_value(tokens)
+            if body_file is not None and not _is_safe_tmp_body_file(body_file):
+                return False
+            return True
 
     return False
 
 
+def is_github_issue_mutation_command(cmd: str) -> bool:
+    """
+    Classify gh issue create/edit as github_issue_mutation_command → allow.
+
+    Allow conditions (ALL must be satisfied):
+      1. Command is `gh issue create` or `gh issue edit <N>`
+      2. --repo squne121/loop-protocol present (exact match)
+      3. --body-file <path> present where path is canonical tmp/ path and is NOT "-"
+      4. No interactive flags: --editor / -e / --web / -w
+      5. For `gh issue edit <N>`: N must be a digit (non-interactive)
+      6. B1: For `gh issue create`: --title with actual value is required
+
+    Block conditions (any one triggers block → return False):
+      - --body-file - (stdin)
+      - --editor / -e / --web / -w
+      - Missing --repo or wrong repo
+      - Missing --body-file
+      - bare `gh issue create` or `gh issue edit` without digit N
+      - B1: `gh issue create` without --title value
+      - B2: --body-file with path traversal (tmp/../...) or absolute path
+
+    Note: gh issue comment/close/reopen remain handled by is_github_remote_ops_command.
+    """
+    cmd = cmd.strip()
+    tokens = tokenize_command(cmd)
+    if tokens is None or len(tokens) < 3:
+        return False
+    if tokens[0] != "gh" or tokens[1] != "issue":
+        return False
+
+    subcommand = tokens[2]
+    if subcommand not in ("create", "edit"):
+        return False
+
+    args = tokens[3:]
+
+    # Interactive flags → block
+    INTERACTIVE_FLAGS = {"--editor", "-e", "--web", "-w"}
+    if any(t in INTERACTIVE_FLAGS for t in args):
+        return False
+
+    # For `gh issue edit <N>`: N must be a digit
+    if subcommand == "edit":
+        if not args or not args[0].isdigit():
+            return False
+        args = args[1:]  # skip the issue number
+
+    # B1: For `gh issue create`: --title with a real value is required
+    if subcommand == "create":
+        title_val = _find_flag_value(list(args), "--title")
+        if not title_val:
+            return False
+
+    # Check --repo matches trusted slug
+    has_trusted_repo = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--repo":
+            if i + 1 < len(args) and args[i + 1] == TRUSTED_REPO_SLUG:
+                has_trusted_repo = True
+            i += 2
+        elif tok.startswith("--repo="):
+            if tok[len("--repo="):] == TRUSTED_REPO_SLUG:
+                has_trusted_repo = True
+            i += 1
+        else:
+            i += 1
+
+    if not has_trusted_repo:
+        return False
+
+    # B2: Check --body-file is present and path is canonical tmp/ (no path traversal)
+    has_body_file = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--body-file":
+            if i + 1 < len(args):
+                path = args[i + 1]
+                if path != "-" and _is_safe_tmp_body_file(path):
+                    has_body_file = True
+            i += 2
+        elif tok.startswith("--body-file="):
+            path = tok[len("--body-file="):]
+            if path != "-" and _is_safe_tmp_body_file(path):
+                has_body_file = True
+            i += 1
+        else:
+            i += 1
+
+    return has_body_file
+
+
+# Regex for readonly artifact export: gh issue view <N> [args] > tmp/<filename>
+# Only `>` (not `>>`) to tmp/ path is allowed. No other destinations.
+_READONLY_EXPORT_RE = re.compile(
+    r"^gh\s+issue\s+view\s+\d+"  # gh issue view <N>
+    r"(?:\s+[^>]*)?"              # optional args (no > inside)
+    r"\s+>\s+"                    # single redirect `>`
+    r"(tmp/\S+)$"                 # destination starts with tmp/
+)
+# Blocked destination patterns for readonly artifact export
+_BLOCKED_EXPORT_DEST_RE = re.compile(
+    r"^(src/|docs/|\.env|\.git)"
+)
+
+
+def is_readonly_artifact_export_command(cmd: str) -> bool:
+    """
+    Classify `gh issue view <N> ... > tmp/<filename>` as readonly_artifact_export_command → allow.
+
+    Allow conditions (ALL must be satisfied):
+      1. Command is `gh issue view <N>` (view only, not edit/create)
+      2. Redirect is single `>` (not `>>`)
+      3. Destination path starts with tmp/ and is canonical (no path traversal)
+      4. No other shell metacharacters (&&, ||, ;, |, backtick, $()
+
+    Block conditions (any one triggers block → return False):
+      - `>>` append redirect
+      - Destination is src/*, docs/*, .env, .git*
+      - Any shell metachar other than the single `>` redirect
+      - Pipe `|` present
+      - Path traversal in destination (tmp/../...)
+    """
+    cmd = cmd.strip()
+
+    # Must be a gh issue view command
+    if not re.match(r"^gh\s+issue\s+view\s+", cmd):
+        return False
+
+    # Block append redirect
+    if ">>" in cmd:
+        return False
+
+    # Block other dangerous metacharacters (pipe, semicolon, &&, ||, backtick, $()
+    # We allow exactly one `>` for the redirect
+    # Split on `>` — must have exactly 2 parts
+    parts = cmd.split(">")
+    if len(parts) != 2:
+        return False
+
+    lhs = parts[0]  # the command part before `>`
+    rhs = parts[1].strip()  # the destination
+
+    # lhs must not contain any other metacharacters
+    if _SHELL_METACHAR_RE.search(lhs):
+        return False
+
+    # rhs (destination) must be canonical tmp/ path (no path traversal)
+    if not _is_safe_tmp_redirect_dest(rhs):
+        return False
+    if _SHELL_METACHAR_RE.search(rhs):
+        return False
+    if _BLOCKED_EXPORT_DEST_RE.match(rhs):
+        return False
+
+    # Validate the lhs is a pure gh issue view command
+    lhs_stripped = lhs.strip()
+    if not re.match(r"^gh\s+issue\s+view\s+\d+", lhs_stripped):
+        return False
+
+    # Block --web/-w flag: browser open is not a readonly artifact export
+    if _gh_has_web_flag(lhs_stripped):
+        return False
+
+    return True
+
+
 def is_gh_mutation_command(cmd: str) -> bool:
-    """gh issue/pr コマンドで readonly allowlist および is_github_remote_ops_command 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
+    """gh issue/pr コマンドで readonly allowlist、is_github_remote_ops_command、
+    is_github_issue_mutation_command 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
     DISPLAY_READONLY_PATTERNS に含まれる gh issue view/list, gh pr view/list/status のみ通過。
     is_github_remote_ops_command に合致する post-merge-cleanup 最小集合は通過（GitHub ops として許可）。
+    is_github_issue_mutation_command に合致する gh issue create/edit（--repo + --body-file 必須）は通過。
     gh issue develop/transfer/pin/unpin, gh pr merge/checkout/revert/lock/unlock 等はすべてブロック。
     """
     cmd = cmd.strip()
     # Only applies to gh issue/pr subcommands
     if not GH_ISSUE_PR_COMMAND_PATTERN.match(cmd):
         return False
-    # If in readonly allowlist, it is NOT a mutation
-    for pattern in DISPLAY_READONLY_PATTERNS:
-        if re.match(pattern, cmd):
-            return False
+    # If in readonly allowlist (and not overridden by web flag etc.), it is NOT a mutation.
+    # Use is_readonly_command() so that --web/-w blocking (B3) flows through correctly.
+    if is_readonly_command(cmd):
+        return False
     # gh issue/pr not in any allowlist → treat as mutation → block
     return True
 
@@ -914,6 +1216,19 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
+    # Step 5.5: readonly_artifact_export_command — gh issue view ... > tmp/<filename>
+    # Must run before compound/metachar detection (Step 6) because `>` is a metachar.
+    # Only the exact form `gh issue view <N> ... > tmp/<file>` is allowed.
+    if is_readonly_artifact_export_command(cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_READONLY,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
     # Step 6: Compound/wrapped commands in local root context: fail-closed.
     # (Must check BEFORE readonly: "git status || git switch issue-*" starts with "git status")
     if is_compound_or_wrapped(cmd):
@@ -997,6 +1312,18 @@ def evaluate(
         return _result(
             status="block",
             reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 9.6b: github_issue_mutation_command — gh issue create/edit with strict constraints.
+    # --repo squne121/loop-protocol and --body-file tmp/... required; interactive flags blocked.
+    if is_github_issue_mutation_command(normalized_cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_GITHUB_REMOTE_OPS,
             current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,

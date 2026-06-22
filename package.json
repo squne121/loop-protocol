@@ -37,7 +37,8 @@
     "secret-exposure:test-invalid": "python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/invalid",
     "secret-exposure:scan:clean": "python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/valid --fail-on-finding",
     "secret-exposure:scan:production": "python3 .claude/scripts/secret_exposure_scanner.py --local .claude/scripts --exclude secret_exposure_scanner.py --exclude check_session_recording_runtime_safety.py --fail-on-finding",
-    "security:session-recording": "pnpm run policy:check && pnpm run manifest:check && pnpm run session-recording:smoke && pnpm run secret-exposure:scan:clean && pnpm run secret-exposure:scan:production"
+    "security:session-recording": "pnpm run policy:check && pnpm run manifest:check && pnpm run session-recording:smoke && pnpm run secret-exposure:scan:clean && pnpm run secret-exposure:scan:production",
+    "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
