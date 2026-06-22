@@ -951,3 +951,127 @@ class TestB1B4ReviewBlockerFixes:
         result = eval_codex("gh pr edit 123 --body-file tmp/body.txt", str(tmp_git_repo))
         assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+
+# ─── Issue #1137: cleanup arbitration + Claude/Codex reason_code parity ────────
+# AC6/AC7/AC9. The cleanup decision core is worktree_scope_guard.build_decision,
+# wired into BOTH .claude/settings.json (Claude) and .codex/hooks.json (Codex),
+# so the two runtimes share a single decision core and a single reason-code
+# vocabulary (SHARED_CLEANUP_REASON_CODES). local_main_branch_guard defers the
+# exact cleanup commands to that core instead of double-deciding them.
+
+import importlib.util as _ilu  # noqa: E402
+
+_AGENT_OPS_DIR = REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+
+import cleanup_contract_v3 as _cc3  # noqa: E402
+from local_main_branch_guard import (  # noqa: E402
+    REASON_CLEANUP_DEFERRED,
+    is_cleanup_class_command,
+)
+
+_GUARD_PY = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
+
+
+def _load_cleanup_core():
+    spec = _ilu.spec_from_file_location("worktree_scope_guard", str(_GUARD_PY))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _git_q(*args, cwd):
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+def _repo_with_worktree_and_v3(tmp: Path, *, corrupt_hash: bool = False) -> dict:
+    main = tmp / "repo"
+    main.mkdir()
+    _git_q("init", "-q", "-b", "main", cwd=main)
+    _git_q("config", "user.email", "t@t.com", cwd=main)
+    _git_q("config", "user.name", "T", cwd=main)
+    (main / "README.md").write_text("seed\n")
+    _git_q("add", "README.md", cwd=main)
+    _git_q("commit", "-q", "-m", "seed", cwd=main)
+    wt = main / ".claude" / "worktrees" / "issue-1050-x"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    _git_q("worktree", "add", "-q", "-b", "issue-1050-x", str(wt), "main", cwd=main)
+
+    contract = _cc3.build_v3_contract(
+        pr_number=1, linked_issue_number=1050,
+        worktree_path=str(wt), branch_name="issue-1050-x",
+        project_root=os.path.realpath(str(main)),
+        expires_at="2999-01-01T00:00:00Z",
+    )
+    if corrupt_hash:
+        contract["command_hash"] = "0" * 64
+    target = main / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(contract))
+    return {"root": main, "worktree": wt}
+
+
+def _core_reason(mod, command: str, repo: dict) -> dict:
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo["worktree"])}
+    old = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = "1050"
+    os.environ.pop("CLAUDE_WORKTREE_CLEANUP_CONTRACT", None)
+    try:
+        return mod.build_decision(payload)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+class TestCleanupArbitrationParity:
+    """Issue #1137: local guard defers cleanup; cleanup core uses shared reasons."""
+
+    def test_local_guard_defers_worktree_remove(self, tmp_git_repo: Path):
+        """local_main_branch_guard defers `git worktree remove` to worktree_scope_guard."""
+        assert is_cleanup_class_command("git worktree remove /x/y")
+        result = eval_codex("git worktree remove /x/y", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_CLEANUP_DEFERRED
+
+    def test_local_guard_defers_branch_delete(self, tmp_git_repo: Path):
+        """local_main_branch_guard defers `git branch -d` to worktree_scope_guard."""
+        assert is_cleanup_class_command("git branch -d issue-1-x")
+        result = eval_codex("git branch -d issue-1-x", str(tmp_git_repo))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_CLEANUP_DEFERRED
+
+    def test_local_guard_does_not_defer_force_delete(self, tmp_git_repo: Path):
+        """Force / multi-target forms are NOT cleanup-class (no silent deferral)."""
+        assert not is_cleanup_class_command("git branch -D issue-1-x")
+        assert not is_cleanup_class_command("git worktree remove --force /x/y")
+        assert not is_cleanup_class_command("git branch -d a b")
+
+    def test_cleanup_core_command_hash_mismatch_shared_reason(self, tmp_path: Path):
+        """The shared cleanup core denies a tampered hash with cleanup_command_hash_mismatch."""
+        mod = _load_cleanup_core()
+        repo = _repo_with_worktree_and_v3(tmp_path, corrupt_hash=True)
+        d = _core_reason(mod, f"git worktree remove {repo['worktree']}", repo)
+        assert d["decision"] == "deny"
+        assert d["reason"] == "cleanup_command_hash_mismatch"
+        assert d["reason"] in _cc3.SHARED_CLEANUP_REASON_CODES
+
+    def test_cleanup_core_valid_contract_allow(self, tmp_path: Path):
+        """The shared cleanup core allows the exact remove with a valid V3 contract."""
+        mod = _load_cleanup_core()
+        repo = _repo_with_worktree_and_v3(tmp_path)
+        d = _core_reason(mod, f"git worktree remove {repo['worktree']}", repo)
+        assert d["decision"] == "allow", d
+
+    def test_shared_reason_codes_single_vocabulary(self):
+        """Both runtimes draw from exactly one shared cleanup vocabulary (parity)."""
+        assert "cleanup_command_hash_mismatch" in _cc3.SHARED_CLEANUP_REASON_CODES
+        assert "cleanup_contract_expired" in _cc3.SHARED_CLEANUP_REASON_CODES
+        assert "root_drift_active_worktree_mismatch" in _cc3.SHARED_CLEANUP_REASON_CODES
+        # The cleanup core imports the very same constants (no divergent copy).
+        mod = _load_cleanup_core()
+        assert mod._RC_HASH_MISMATCH == _cc3.CLEANUP_COMMAND_HASH_MISMATCH
+        assert mod._RC_EXPIRED == _cc3.CLEANUP_CONTRACT_EXPIRED
+        assert mod._RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH == _cc3.ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH

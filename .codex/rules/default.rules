@@ -346,3 +346,21 @@ prefix_rule(
         "gh secret set FOO bar",
     ],
 )
+
+# --- Issue #1137: cleanup exact commands are guarded, never static-allowed ---
+# `git worktree remove` / `git branch -d` are the post-merge-cleanup commands.
+# They are arbitrated by worktree_scope_guard (wired in .codex/hooks.json) against
+# the materialized V3 cleanup contract (expires_at / command_hash). They must NOT
+# be statically allowed in rules; `prompt` keeps them on the guarded route so the
+# hook + contract are the authority. `git worktree remove` already resolves to
+# `forbidden` via the broad git-mutation rule above (use the rtk wrapper); this
+# rule additionally pins `git branch -d`, which the read-only `git branch` allow
+# rule would otherwise static-allow, onto the guarded route.
+prefix_rule(
+    pattern = ["git", "branch", "-d"],
+    decision = "prompt",
+    justification = "Safe branch delete is a cleanup command arbitrated by worktree_scope_guard against the V3 cleanup contract; it must not be static-allowed.",
+    match = [
+        "git branch -d issue-1-x",
+    ],
+)

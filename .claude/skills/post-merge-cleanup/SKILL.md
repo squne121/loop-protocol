@@ -136,17 +136,34 @@ uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py -
 git branch -d <branch-name>
 ```
 
-**worktree 削除条件**（worktree 内 staged 変更・未追跡ファイルがないこと）:
-```bash
-STAGED=$(git -C "<worktree_path>" diff --cached --name-only 2>/dev/null)
-UNTRACKED=$(git -C "<worktree_path>" status --short 2>/dev/null | grep -E '^\?\?' || true)
-if [ -z "$STAGED" ] && [ -z "$UNTRACKED" ]; then
-  git worktree remove <path>
-else
-  echo "staged/untracked あり: 削除せず報告"
-fi
-```
+**worktree 削除フロー（Issue #1137: guard arbitration + V3 cleanup contract）**:
 
+agent が直接 `git -C <worktree>` で clean 判定を行わない。clean 判定（staged / unstaged / untracked の有無）は
+`worktree_scope_guard` の内部 subprocess 配列実行（`git -C <expected_path> status --porcelain=v1 -z`）へ集約され、
+guard 同士の arbitration 状態は `guard_preflight.py` が事前に機械判定する。
+
+1. guard arbitration preflight（mutation を行わない）:
+```bash
+uv run python3 scripts/agent-ops/guard_preflight.py --json
+```
+`status: ok` 以外（`blocked` / `human_required`）の場合は `allowed_next_commands` の構造化 recovery hint に従う。
+`root_drift_active_worktree_mismatch` は policy B により自動 mutation せず人間承認を必要とする。
+
+2. cleanup contract を safe scratch path へ materialize（env-prefix / `.claude/artifacts` 非依存）:
+```bash
+uv run python3 scripts/agent-ops/materialize_cleanup_contract.py \
+  --pr-number <pr> --linked-issue-number <issue> \
+  --worktree-path <絶対 worktree path> --branch-name <branch> --json
+```
+`artifacts/agent-ops/cleanup_contract.json`（gitignored / 期限付き `expires_at` / `command_hash` 付き）を生成する。
+
+3. gated cleanup を実行する（clean 判定は guard 内部で実施される）:
+```bash
+git worktree remove <path>
+git branch -d <branch-name>
+```
+`worktree_scope_guard` が V3 contract を検証し、`expires_at` 期限切れ（`cleanup_contract_expired`）・
+`command_hash` 不一致（`cleanup_command_hash_mismatch`）・worktree dirty（`worktree_dirty`）を block する。
 削除できないものは `unresolved_cleanup_items` に記録。
 
 ### 4. parent issue クローズ条件確認

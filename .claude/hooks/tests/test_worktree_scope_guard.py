@@ -1442,3 +1442,269 @@ def test_cleanup_git_dash_c_worktree_remove_denied(tmp_path):
     }
     r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
     assert r.returncode == 2, f"git -C worktree remove must deny; stderr={r.stderr}"
+
+
+# =============================================================================
+# Issue #1137: POST_MERGE_CLEANUP_REQUEST_V3 + Claude/Codex parity (AC4/AC5/AC6/AC9)
+# =============================================================================
+
+import importlib.util  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_AGENT_OPS = REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS) not in _sys.path:
+    _sys.path.insert(0, str(_AGENT_OPS))
+
+import cleanup_contract_v3 as _cc3  # noqa: E402
+
+
+def _load_guard_module():
+    spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _write_v3_contract(root: Path, wt_path: str, branch: str, *,
+                       expires_at: str | None = None,
+                       corrupt_hash: bool = False) -> dict:
+    """Materialize a V3 contract at the safe scratch path. Returns the contract."""
+    project_root = os.path.realpath(str(root))
+    contract = _cc3.build_v3_contract(
+        pr_number=9999,
+        linked_issue_number=1137,
+        worktree_path=wt_path,
+        branch_name=branch,
+        project_root=project_root,
+        expires_at=expires_at or "2999-01-01T00:00:00Z",
+    )
+    if corrupt_hash:
+        contract["command_hash"] = "0" * 64
+    target = root / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(contract))
+    return contract
+
+
+def _cleanup_decision(mod, command: str, repo: dict, issue: str = "1050") -> dict:
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "cwd": str(repo["worktree"]),
+    }
+    old = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = str(issue)
+    os.environ.pop("CLAUDE_WORKTREE_CLEANUP_CONTRACT", None)
+    try:
+        return mod.build_decision(payload)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+def test_v3_contract_valid_worktree_remove_allow(tmp_path):
+    """AC4/AC5: a valid V3 contract at the safe scratch path allows the exact remove."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard")
+    d = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    assert d["command_class"] == "cleanup"
+    assert d["decision"] == "allow", d
+
+
+def test_v3_contract_expired_denied(tmp_path):
+    """AC5: an expired V3 contract is denied with cleanup_contract_expired."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard",
+                       expires_at="2000-01-01T00:00:00Z")
+    d = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    assert d["decision"] == "deny"
+    assert d["reason"] == _cc3.CLEANUP_CONTRACT_EXPIRED
+    assert d["reason"] == "cleanup_contract_expired"
+
+
+def test_v3_contract_command_hash_mismatch_denied(tmp_path):
+    """AC5: a tampered command_hash is denied with cleanup_command_hash_mismatch."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard", corrupt_hash=True)
+    d = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    assert d["decision"] == "deny"
+    assert d["reason"] == _cc3.CLEANUP_COMMAND_HASH_MISMATCH
+    assert d["reason"] == "cleanup_command_hash_mismatch"
+
+
+def test_v3_contract_branch_delete_allow(tmp_path):
+    """AC5: git branch -d is gated on branch_name match + V3 validity (no hash gate)."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard")
+    d = _cleanup_decision(mod, "git branch -d issue-1050-scope-guard", repo)
+    assert d["decision"] == "allow", d
+
+
+def test_v3_root_drift_active_worktree_mismatch_denied(tmp_path):
+    """AC6: cleanup from a drifted root with an active worktree returns the shared reason."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard")
+    # Drift the root checkout onto a non-default issue branch (not used by a worktree).
+    _git("switch", "-c", "issue-1137-drifted", cwd=repo["root"])
+    d = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    assert d["decision"] == "deny"
+    assert d["reason"] == _cc3.ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH
+    assert d["reason"] == "root_drift_active_worktree_mismatch"
+
+
+def test_v3_cleanup_reasons_in_shared_vocabulary(tmp_path):
+    """AC9 parity: every cleanup deny reason is drawn from SHARED_CLEANUP_REASON_CODES."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+
+    # no contract → no_cleanup_contract
+    d_none = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    # expired
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard",
+                       expires_at="2000-01-01T00:00:00Z")
+    d_exp = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    # hash mismatch
+    _write_v3_contract(repo["root"], wt_path, "issue-1050-scope-guard", corrupt_hash=True)
+    d_hash = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+
+    for d in (d_none, d_exp, d_hash):
+        assert d["decision"] == "deny"
+        assert d["reason"] in _cc3.SHARED_CLEANUP_REASON_CODES, d["reason"]
+
+
+def test_v3_command_hash_is_canonical_sha256():
+    """AC3: command_hash equals the canonical argv-JSON SHA-256 (Design Decision 3)."""
+    wt = "/repo/.claude/worktrees/issue-1-x"
+    h = _cc3.command_hash_for_worktree_remove(wt, "/repo", "issue-1-x", True)
+    import hashlib
+    expected = hashlib.sha256(json.dumps({
+        "argv": ["git", "worktree", "remove", wt],
+        "project_root": "/repo",
+        "worktree_path": wt,
+        "branch_name": "issue-1-x",
+        "require_clean": True,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert h == expected
+
+
+# =============================================================================
+# Issue #1137: materialize_cleanup_contract.py (AC2) behavioral tests
+# =============================================================================
+
+import materialize_cleanup_contract as _mat  # noqa: E402
+import guard_preflight as _gp  # noqa: E402
+
+
+def _seed_repo(tmp_path: Path) -> Path:
+    main = tmp_path / "repo"
+    main.mkdir()
+    _git("init", "-q", "-b", "main", cwd=main)
+    (main / "README.md").write_text("seed\n")
+    _git("add", "README.md", cwd=main)
+    _git("commit", "-q", "-m", "seed", cwd=main)
+    return main
+
+
+def test_materialize_writes_valid_v3_contract(tmp_path):
+    """AC2: materialize produces a schema-valid, non-expired V3 contract at safe path."""
+    root = _seed_repo(tmp_path)
+    wt = str(root / ".claude" / "worktrees" / "issue-1137-x")
+    res = _mat.materialize(
+        pr_number=1, linked_issue_number=1137, worktree_path=wt,
+        branch_name="issue-1137-x", expires_in_seconds=3600, project_root=str(root),
+    )
+    assert res["status"] == "ok", res
+    target = root / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    assert target.is_file()
+    contract = json.loads(target.read_text())
+    ok, reason = _cc3.validate_v3_contract(contract)
+    assert ok, reason
+    assert not _cc3.is_expired(contract)
+
+
+def test_materialize_is_chmod_0600(tmp_path):
+    """AC2: the materialized contract is written with mode 0600 (best-effort)."""
+    root = _seed_repo(tmp_path)
+    wt = str(root / ".claude" / "worktrees" / "issue-1137-x")
+    _mat.materialize(pr_number=1, linked_issue_number=1137, worktree_path=wt,
+                     branch_name="issue-1137-x", expires_in_seconds=3600, project_root=str(root))
+    target = root / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    mode = target.stat().st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+
+
+def test_materialize_symlink_component_fail_closed(tmp_path):
+    """AC2: a symlinked artifacts/ safe-root is rejected (no write through symlink)."""
+    root = _seed_repo(tmp_path)
+    real_elsewhere = tmp_path / "elsewhere"
+    real_elsewhere.mkdir()
+    (root / "artifacts").symlink_to(real_elsewhere, target_is_directory=True)
+    wt = str(root / ".claude" / "worktrees" / "issue-1137-x")
+    res = _mat.materialize(pr_number=1, linked_issue_number=1137, worktree_path=wt,
+                           branch_name="issue-1137-x", expires_in_seconds=3600, project_root=str(root))
+    assert res["status"] == "error"
+    assert res["error"] == "symlink_component_denied"
+
+
+def test_materialize_round_trips_through_guard(tmp_path):
+    """AC2/AC5: a materialized contract is accepted by the guard's command_hash gate."""
+    mod = _load_guard_module()
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
+    wt_path = str(repo["worktree"])
+    res = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_path,
+                           branch_name="issue-1050-scope-guard", expires_in_seconds=3600,
+                           project_root=str(repo["root"]))
+    assert res["status"] == "ok", res
+    d = _cleanup_decision(mod, f"git worktree remove {wt_path}", repo)
+    assert d["decision"] == "allow", d
+
+
+# =============================================================================
+# Issue #1137: guard_preflight.py (AC1) behavioral tests
+# =============================================================================
+
+def test_preflight_ok_on_clean_main_root(tmp_path):
+    """AC1: a clean root on the default branch reports status ok (no mutation)."""
+    root = _seed_repo(tmp_path)
+    res = _gp.build_preflight(project_root=str(root))
+    assert res["schema"] == "AGENT_GUARD_PREFLIGHT_V1"
+    assert res["status"] == "ok"
+    assert res["root_branch_state"] == "default"
+    assert res["blocked_reason_codes"] == []
+
+
+def test_preflight_human_required_on_drifted_root_with_active_worktree(tmp_path, monkeypatch):
+    """AC1/AC6: drifted root + active worktree → human_required, no auto mutation."""
+    root = _seed_repo(tmp_path)
+    _git("switch", "-q", "-c", "issue-1137-drift", cwd=root)
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1137")
+    res = _gp.build_preflight(project_root=str(root))
+    assert res["status"] == "human_required"
+    assert "root_drift_active_worktree_mismatch" in res["blocked_reason_codes"]
+    # Policy B: recovery hint is structured, requires human override, no raw shell.
+    hints = res["allowed_next_commands"]
+    assert hints and hints[0]["requires_human_override"] is True
+    assert all("command" not in h for h in hints)
+
+
+def test_preflight_does_not_mutate(tmp_path, monkeypatch):
+    """AC1: preflight never changes the root checkout branch (read-only decision)."""
+    root = _seed_repo(tmp_path)
+    _git("switch", "-q", "-c", "issue-1137-drift", cwd=root)
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1137")
+    _gp.build_preflight(project_root=str(root))
+    branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(root),
+                            capture_output=True, text=True).stdout.strip()
+    assert branch == "issue-1137-drift"  # unchanged

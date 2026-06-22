@@ -46,6 +46,38 @@ import shutil
 import subprocess
 import sys
 
+# Shared POST_MERGE_CLEANUP_REQUEST_V3 validator (Issue #1137, Design Decision 3).
+# Imported from scripts/agent-ops so V3 validation / command_hash canonicalization
+# is not re-implemented here. Import is fail-closed: if it is unavailable, V3
+# cleanup gating is skipped and only the legacy V2 path applies.
+_AGENT_OPS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "scripts",
+    "agent-ops",
+)
+if _AGENT_OPS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_OPS_DIR)
+try:
+    from cleanup_contract_v3 import (
+        CLEANUP_COMMAND_HASH_MISMATCH as _RC_HASH_MISMATCH,
+        CLEANUP_CONTRACT_EXPIRED as _RC_EXPIRED,
+        ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH as _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH,
+        SAFE_SCRATCH_CONTRACT_PATH as _V3_CONTRACT_PATH,
+        SCHEMA_V3 as _SCHEMA_V3,
+        canonical_command_hash as _canonical_command_hash,
+        is_expired as _v3_is_expired,
+        validate_v3_contract as _validate_v3_contract,
+    )
+
+    _V3_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    _V3_AVAILABLE = False
+    _SCHEMA_V3 = "POST_MERGE_CLEANUP_REQUEST_V3"
+    _V3_CONTRACT_PATH = "artifacts/agent-ops/cleanup_contract.json"
+    _RC_EXPIRED = "cleanup_contract_expired"
+    _RC_HASH_MISMATCH = "cleanup_command_hash_mismatch"
+    _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH = "root_drift_active_worktree_mismatch"
+
 # ── Tool classes ──────────────────────────────────────────────────────────────
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 BASH_TOOL = "Bash"
@@ -1535,15 +1567,45 @@ def _validate_cleanup_contract(contract: dict) -> bool:
     return True
 
 
+def _load_cleanup_contract_v3(project_root: str) -> dict | None:
+    """Load a POST_MERGE_CLEANUP_REQUEST_V3 contract from the safe scratch path.
+
+    Issue #1137 (AC4): the V3 contract lives at
+    ``<project_root>/artifacts/agent-ops/cleanup_contract.json`` (gitignored,
+    local-only, expiring). A schema-valid V3 contract is returned even when it is
+    *expired* so the cleanup decision can report ``cleanup_contract_expired``
+    distinctly. Schema-invalid contracts return None (→ fail-closed downstream).
+    """
+    if not _V3_AVAILABLE:
+        return None
+    path = os.path.join(project_root, _V3_CONTRACT_PATH)
+    try:
+        with open(path, encoding="utf-8") as f:
+            contract = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(contract, dict) or contract.get("schema") != _SCHEMA_V3:
+        return None
+    ok, _reason = _validate_v3_contract(contract)
+    if not ok:
+        return None
+    return contract
+
+
 def load_cleanup_contract(project_root: str) -> dict | None:
-    """Load POST_MERGE_CLEANUP_REQUEST_V2 from env var or artifact file (AC4e).
+    """Load a cleanup contract, preferring POST_MERGE_CLEANUP_REQUEST_V3 (Issue #1137).
 
     Supply precedence:
-      1. CLAUDE_WORKTREE_CLEANUP_CONTRACT env var (JSON string)
-      2. <project_root>/.claude/artifacts/cleanup_contract.json
+      1. <project_root>/artifacts/agent-ops/cleanup_contract.json (V3 primary)
+      2. CLAUDE_WORKTREE_CLEANUP_CONTRACT env var (legacy V2 JSON string)
+      3. <project_root>/.claude/artifacts/cleanup_contract.json (legacy V2 file)
     Returns None on missing, JSON error, or schema mismatch.
     Env var present but invalid → fail-closed (None).
     """
+    v3 = _load_cleanup_contract_v3(project_root)
+    if v3 is not None:
+        return v3
+
     env_json = os.environ.get("CLAUDE_WORKTREE_CLEANUP_CONTRACT")
     if env_json:
         try:
@@ -1638,6 +1700,12 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
     if contract is None:
         return "deny", "no_cleanup_contract"  # AC4a
 
+    # V3 contracts (Issue #1137) add an expiry gate and a command_hash integrity
+    # gate on top of the existing exact-argv / path / clean checks.
+    is_v3 = _V3_AVAILABLE and contract.get("schema") == _SCHEMA_V3
+    if is_v3 and _v3_is_expired(contract):
+        return "deny", _RC_EXPIRED  # cleanup_contract_expired (AC5)
+
     toks = _tokenize(command)
     if len(toks) < 3 or toks[0] != "git":
         return "deny", "not_a_git_cleanup_command"
@@ -1663,6 +1731,23 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         # AC4d: exact-path match (covers path traversal / sibling prefix)
         if actual_path != expected_path:
             return "deny", "worktree_path_mismatch"
+
+        # V3 command_hash integrity gate (Issue #1137, AC5): the contract's
+        # command_hash must equal the canonical SHA-256 recomputed from the
+        # contract's own (worktree_path, branch_name, require_clean, project_root)
+        # under the exact `git worktree remove <worktree_path>` argv. A tampered
+        # worktree_path / branch_name without a matching command_hash is denied.
+        if is_v3:
+            _pr_hash = resolve_project_root()
+            recomputed_hash = _canonical_command_hash(
+                ["git", "worktree", "remove", contract["worktree_path"]],
+                _pr_hash,
+                contract["worktree_path"],
+                contract.get("branch_name", ""),
+                contract.get("require_clean"),
+            )
+            if recomputed_hash != contract.get("command_hash"):
+                return "deny", _RC_HASH_MISMATCH  # cleanup_command_hash_mismatch
 
         # Contract worktree_path must be strictly under <project_root>/.claude/worktrees/
         # This prevents stale contracts from targeting arbitrary filesystem paths.
@@ -1711,6 +1796,35 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         return "allow", "cleanup_branch_delete_ok"
 
     return "deny", "not_a_cleanup_command"
+
+
+def _root_drift_active_worktree_mismatch(project_root: str) -> bool:
+    """True iff the root checkout has drifted to an issue branch (Issue #1137, AC6).
+
+    Recovery deadlock condition (policy B): the local root checkout is on a
+    non-default issue-like branch while an issue worktree context is active. In
+    this state cleanup must not proceed; the shared reason code
+    ``root_drift_active_worktree_mismatch`` is returned so guard and preflight
+    agree on a single vocabulary. Detection is conservative — a detached HEAD or
+    unknown default branch returns False (handled by other guard paths).
+    """
+    branch = _current_branch(project_root)
+    if branch is None:
+        return False
+    # Primary signal: the root checkout is itself on an issue-like branch. The
+    # root should never sit on an issue branch (issue work lives in worktrees), so
+    # this is unambiguous drift and does not depend on resolving the remote
+    # default branch (which may be unavailable, e.g. a repo with no origin).
+    if _ISSUE_BRANCH_RE.match(branch):
+        return True
+    # Secondary signal: root is on a resolvable non-default branch while an issue
+    # context is explicitly active via LOOP_ISSUE_NUMBER.
+    default = _repo_default_branch(project_root)
+    if default and branch != default:
+        env_issue = os.environ.get("LOOP_ISSUE_NUMBER")
+        if env_issue and env_issue.strip().isdigit():
+            return True
+    return False
 
 
 def _block_cleanup(reason: str) -> None:
@@ -1790,6 +1904,11 @@ def build_decision(payload: dict) -> dict:
         return _v2("read_only", cwd_class, "allow", "read_only_command")
 
     if klass == "cleanup":
+        # Recovery deadlock (Issue #1137, policy B): never run cleanup from a
+        # drifted root with an active issue worktree — return the shared reason
+        # code instead of attempting any auto-recovery mutation.
+        if _root_drift_active_worktree_mismatch(project_root):
+            return _v2("cleanup", cwd_class, "deny", _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH)
         contract = load_cleanup_contract(project_root)
         decision, reason = _decide_cleanup_bash(command, cwd, contract)
         return _v2("cleanup", cwd_class, decision, reason)

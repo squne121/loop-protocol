@@ -49,6 +49,12 @@ REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
+# Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
+# arbitrated by worktree_scope_guard against the V3 cleanup contract. The local
+# root branch guard explicitly DEFERS authority to that guard instead of letting
+# the command fall through generic branch-mutation handling, so the two guards do
+# not double-decide and the arbitration order is unambiguous.
+REASON_CLEANUP_DEFERRED = "cleanup_deferred_to_worktree_scope_guard"
 
 # ─── GitHub remote ops classification vocabulary ──────────────────────────────
 # 5-class vocabulary for gh command classification (Issue #1124).
@@ -550,6 +556,25 @@ def is_branch_safe_maintenance_command(cmd: str) -> bool:
     for pattern in BRANCH_SAFE_MAINTENANCE_PATTERNS:
         if re.match(pattern, cmd):
             return True
+    return False
+
+
+def is_cleanup_class_command(cmd: str) -> bool:
+    """Return True for the exact cleanup commands arbitrated by worktree_scope_guard.
+
+    Issue #1137 arbitration: only the exact 4-token forms
+    ``git worktree remove <path>`` and ``git branch -d <branch>`` are recognized.
+    Force variants (``-D`` / ``--force`` / ``-f`` / multi-target) and any extra
+    args are NOT cleanup-class here — they fall through to the generic
+    branch-mutation / drift handling so they cannot be silently deferred.
+    """
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) != 4 or tokens[0] != "git":
+        return False
+    if tokens[1] == "worktree" and tokens[2] == "remove":
+        return True
+    if tokens[1] == "branch" and tokens[2] == "-d":
+        return True
     return False
 
 
@@ -1301,6 +1326,21 @@ def evaluate(
         return _result(
             status="allow",
             reason_code=REASON_BRANCH_SAFE_MAINTENANCE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 9.55: Cleanup-class commands (Issue #1137 arbitration).
+    # Exact `git worktree remove <path>` / `git branch -d <branch>` are deferred to
+    # worktree_scope_guard, which arbitrates them against the V3 cleanup contract.
+    # Recognizing them explicitly here (before generic branch-mutation handling)
+    # fixes the arbitration order so the local root guard does not double-decide.
+    if is_cleanup_class_command(normalized_cmd):
+        return _result(
+            status="allow",
+            reason_code=REASON_CLEANUP_DEFERRED,
             current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
