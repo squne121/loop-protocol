@@ -85,18 +85,47 @@ def test_cli_missing(tmp_path):
 
 # ---------------------------------------------------------------------------
 # AC2: test_no_shell_invocation
-# Confirm shell=True is absent from the script source.
+# Monkeypatch subprocess.run and verify argv is list and shell=False.
+# Also confirm source does not contain shell=True (belt-and-suspenders).
 # ---------------------------------------------------------------------------
 
 
-def test_no_shell_invocation():
-    """AC2: preflight_agy.py source must not contain shell=True."""
+def test_no_shell_invocation(monkeypatch):
+    """AC2: All subprocess.run calls must use list argv and shell=False."""
+    import subprocess as _subprocess
+
     module = load_module()
-    source_path = Path(module.__file__).resolve()
-    source_text = source_path.read_text(encoding="utf-8")
-    assert "shell=True" not in source_text, (
-        "preflight_agy.py must not use shell=True; found in source"
-    )
+    captured = []
+
+    def _mock_run(argv_or_cmd, **kwargs):
+        captured.append({"argv": argv_or_cmd, "kwargs": kwargs})
+        from types import SimpleNamespace
+        if isinstance(argv_or_cmd, list) and "--version" in argv_or_cmd:
+            return SimpleNamespace(returncode=0, stdout="agy 1.0.0\n", stderr="")
+        if isinstance(argv_or_cmd, list) and "--help" in argv_or_cmd:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="  -p, --print, --prompt  Non-interactive mode\n",
+                stderr="",
+            )
+        # smoke
+        return SimpleNamespace(returncode=0, stdout="OK\n", stderr="")
+
+    monkeypatch.setattr(_subprocess, "run", _mock_run)
+    module.run_preflight()
+
+    assert len(captured) >= 1, "subprocess.run must be called at least once"
+    for call in captured:
+        assert isinstance(call["argv"], list), (
+            f"argv must be list[str], got {type(call['argv'])}: {call['argv']!r}"
+        )
+        assert call["kwargs"].get("shell", False) is False, (
+            f"shell must be False, got kwargs={call['kwargs']}"
+        )
+
+    # Belt-and-suspenders: source must not contain shell=True
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "shell=True" not in source, "preflight_agy.py must not use shell=True"
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +161,8 @@ def test_help_flag_detection(monkeypatch):
     assert result["help"]["noninteractive_flags"]["--print"] is True
     assert result["help"]["noninteractive_flags"]["--prompt"] is True
     assert result["help"]["ok"] is True
+    # stdout_sample must be populated from live probe
+    assert result["help"]["stdout_sample"] != ""
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +230,8 @@ def test_unexpected_capability(monkeypatch):
     # Must not fail due to unexpected capabilities
     assert result["failure_class"] != "cli_incompatible"
     # Unexpected capabilities are recorded but do not block
-    assert "chat" in result["help"]["unexpected_capabilities"] or "--output-format" in result["help"]["unexpected_capabilities"]
+    unexpected = result["help"]["unexpected_capabilities"]
+    assert "chat" in unexpected or "--output-format" in unexpected
     assert result["ok"] is True
 
 
@@ -244,7 +276,6 @@ def test_smoke_timeout(monkeypatch):
 def test_json_output(monkeypatch, tmp_path):
     """AC7: --json writes agy_preflight_result/v1 schema; exit 0 on ok, exit 1 on fail."""
     import json as json_mod
-    import sys
 
     module = load_module()
 
@@ -272,3 +303,52 @@ def test_json_output(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_run", fake_run_missing)
     exit_code_fail = module.main(["--json"])
     assert exit_code_fail == 1
+
+
+# ---------------------------------------------------------------------------
+# Extra: test_help_flag_parser_no_false_positives
+# --prompting / --printable must NOT trigger -p / --print.
+# ---------------------------------------------------------------------------
+
+
+def test_help_flag_parser_no_false_positives():
+    """Ensure --prompting / --printable do not trigger -p / --print detection."""
+    module = load_module()
+    tricky_help = (
+        "  --prompting   start a conversation\n"
+        "  --printable   output printable chars\n"
+        "  no-prompt here\n"
+    )
+    flags, unexpected = module._parse_help_capabilities(tricky_help)
+    assert flags["-p"] is False, "--prompting should not match -p"
+    assert flags["--print"] is False, "--printable should not match --print"
+    assert flags["--prompt"] is False, "--prompting should not match --prompt"
+
+
+# ---------------------------------------------------------------------------
+# Extra: test_smoke_empty_stdout_fails
+# smoke exit 0 with empty stdout → smoke_failed (silent output drop detection).
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_empty_stdout_fails(monkeypatch):
+    """Smoke check: exit 0 with empty stdout is classified as smoke_failed."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, "", "")  # exit 0 but empty stdout
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "smoke_failed"
+    assert result["smoke"]["exit_code"] == 0
+    assert result["smoke"]["ok"] is False

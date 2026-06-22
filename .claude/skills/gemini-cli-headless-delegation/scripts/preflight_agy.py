@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -14,6 +15,14 @@ from typing import Any
 SMOKE_PROMPT = "Do not use any tools. Reply with OK only."
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
+
+# Regex patterns for flag detection with word boundaries to prevent false positives
+# e.g. --prompting must NOT match -p, --printable must NOT match --print
+FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
+    "-p": re.compile(r"(?<![\w-])-p(?![\w-])"),
+    "--print": re.compile(r"(?<![\w-])--print(?![\w-])"),
+    "--prompt": re.compile(r"(?<![\w-])--prompt(?![\w-])"),
+}
 
 
 def _resolve_binary() -> str:
@@ -48,38 +57,33 @@ def _run_help(agy_bin: str) -> subprocess.CompletedProcess[str]:
     return _run([agy_bin, "--help"])
 
 
-def _parse_help_capabilities(help_text: str) -> dict[str, Any]:
+def _parse_help_capabilities(help_text: str) -> tuple[dict[str, bool], list[str]]:
     """Detect -p/--print/--prompt flags and unexpected capabilities.
 
-    Returns a dict with:
+    Returns a tuple of:
       noninteractive_flags: {"-p": bool, "--print": bool, "--prompt": bool}
       unexpected_capabilities: list of capability strings found
+
+    Uses regex word-boundary matching to avoid false positives:
+    e.g. --prompting will NOT match -p, --printable will NOT match --print.
     """
-    noninteractive_flags: dict[str, bool] = {
-        "-p": False,
-        "--print": False,
-        "--prompt": False,
-    }
-    for flag in NONINTERACTIVE_FLAGS:
-        # Match flag at word boundary in help text
-        if flag in help_text:
-            noninteractive_flags[flag] = True
+    noninteractive_flags: dict[str, bool] = {}
+    for flag, pattern in FLAG_PATTERNS.items():
+        noninteractive_flags[flag] = bool(pattern.search(help_text))
 
     unexpected_capabilities: list[str] = []
     for keyword in UNEXPECTED_CAPABILITY_KEYWORDS:
         if keyword in help_text:
             unexpected_capabilities.append(keyword)
 
-    return {
-        "noninteractive_flags": noninteractive_flags,
-        "unexpected_capabilities": unexpected_capabilities,
-    }
+    return noninteractive_flags, unexpected_capabilities
 
 
 def _run_smoke(agy_bin: str) -> dict[str, Any]:
     """Run smoke check: `agy -p <SMOKE_PROMPT>` in isolated temp cwd.
 
     Returns dict with ok, argv, exit_code, timed_out, stdout_sample, stderr_sample.
+    Success requires exit_code == 0 AND non-empty stdout (detects silent output drop).
     """
     argv = [agy_bin, "-p", SMOKE_PROMPT]
     smoke: dict[str, Any] = {
@@ -97,7 +101,8 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
             smoke["exit_code"] = proc.returncode
             smoke["stdout_sample"] = proc.stdout[:500]
             smoke["stderr_sample"] = proc.stderr[:500]
-            smoke["ok"] = proc.returncode == 0
+            # Require non-empty stdout to detect silent output drop (exit 0 with no output)
+            smoke["ok"] = proc.returncode == 0 and bool(proc.stdout.strip())
         except subprocess.TimeoutExpired:
             smoke["timed_out"] = True
 
@@ -126,6 +131,8 @@ def run_preflight() -> dict[str, Any]:
             "ok": False,
             "noninteractive_flags": {"-p": False, "--print": False, "--prompt": False},
             "unexpected_capabilities": [],
+            "stdout_sample": "",
+            "stderr_sample": "",
         },
         "smoke": {
             "ok": False,
@@ -178,11 +185,15 @@ def run_preflight() -> dict[str, Any]:
         result["warnings"].append(result["failure_reason"])
         return result
 
-    capabilities = _parse_help_capabilities(help_proc.stdout)
-    result["help"]["noninteractive_flags"] = capabilities["noninteractive_flags"]
-    result["help"]["unexpected_capabilities"] = capabilities["unexpected_capabilities"]
+    # Store raw help output as live probe evidence
+    result["help"]["stdout_sample"] = help_proc.stdout[:2000]
+    result["help"]["stderr_sample"] = help_proc.stderr[:500]
 
-    has_noninteractive = any(capabilities["noninteractive_flags"].values())
+    noninteractive_flags, unexpected_capabilities = _parse_help_capabilities(help_proc.stdout)
+    result["help"]["noninteractive_flags"] = noninteractive_flags
+    result["help"]["unexpected_capabilities"] = unexpected_capabilities
+
+    has_noninteractive = any(noninteractive_flags.values())
     result["help"]["ok"] = has_noninteractive
 
     if not has_noninteractive:
@@ -213,7 +224,10 @@ def run_preflight() -> dict[str, Any]:
         return result
 
     if not smoke["ok"]:
-        result["failure_reason"] = f"agy smoke check failed (exit {smoke['exit_code']})"
+        if smoke["exit_code"] == 0:
+            result["failure_reason"] = "smoke exited 0 but produced no output (possible silent output drop)"
+        else:
+            result["failure_reason"] = f"agy smoke check failed (exit {smoke['exit_code']})"
         result["failure_class"] = "smoke_failed"
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
