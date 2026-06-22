@@ -47,7 +47,8 @@
 ## 現在の開発フェーズ
 
 - 現在は `M4: Upgrade Loop (v0.4.x)` を進行中。
-- M3 の実装と自動検証は完了済みで、現在は resource consumption と最小 upgrade loop を優先する。
+- M3 の実装と自動検証は完了済みだが、M3 parent close / milestone readback の最終判断は #733 の closure gate に従い、この文書だけで close 済み扱いしない。
+- 現在は resource consumption と最小 upgrade loop を優先する。
 - 詳細な優先順位は `docs/dev/current-focus.md` を参照する。
 
 ## 最低限の確認コマンド
