@@ -10,7 +10,7 @@ import {
   runConfirmResultHandler,
 } from '../src/main'
 import type { GameState, LoopPhase, ResultRewardStatus, SortieResult } from '../src/state'
-import { createGameSnapshot } from '../src/state'
+import { createDefaultAllyState, createGameSnapshot } from '../src/state'
 
 const TERMINAL_SORTIE_RESULT = {
   outcome: 'victory',
@@ -58,6 +58,8 @@ function createState(loopPhase: LoopPhase = 'preparation', resultRewardStatus: R
       resources: 12,
       weaponPower: 1,
     },
+    allies: [],
+    nextAllyId: 2,
     rewardClaims: {
       claimedApplicationIds:
         loopPhase === 'debrief_reward_claimed'
@@ -67,6 +69,11 @@ function createState(loopPhase: LoopPhase = 'preparation', resultRewardStatus: R
     telemetry: {
       status: 'Combat systems green',
       lastCommandSummary: 'Reset sortie is a destructive boundary. Preparation only.',
+    },
+    commandIntentRuntime: {
+      activeIntent: 'none',
+      bufferedIntent: null,
+      assistPlayerTtlTicks: 8,
     },
     sortie:
       loopPhase === 'running'
@@ -107,6 +114,7 @@ describe('HudController', () => {
   let actions: {
     onNewGame: ReturnType<typeof vi.fn>
     onStartSortie: ReturnType<typeof vi.fn>
+    onAssistPlayerCommand: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
     onConfirmResult: ReturnType<typeof vi.fn>
     onNextSortie: ReturnType<typeof vi.fn>
@@ -123,6 +131,7 @@ describe('HudController', () => {
     actions = {
       onNewGame: vi.fn(),
       onStartSortie: vi.fn(),
+      onAssistPlayerCommand: vi.fn(),
       onClaimReward: vi.fn(),
       onConfirmResult: vi.fn(),
       onNextSortie: vi.fn(),
@@ -199,6 +208,157 @@ describe('HudController', () => {
     expect(queryButton(container, 'save').disabled).toBe(true)
     expect(queryButton(container, 'load-game').disabled).toBe(true)
     expect(queryButton(container, 'reset').disabled).toBe(true)
+    expect(queryButton(container, 'assist-player').disabled).toBe(false)
+  })
+
+  it('GIVEN running with ally and living enemy WHEN render called THEN assist status reports ready and assist button is reachable', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 360,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+        faction: 'enemy',
+        role: 'enemy_chaser',
+        behaviorState: 'move_to_engage',
+        targetingPolicy: 'focus_player',
+        targetEntityId: 'player:player-alpha',
+      },
+    ]
+
+    hudController.render(state, false)
+
+    const assistStatus = container.querySelector('[data-field="assist-status"]')
+    expect(queryButton(container, 'assist-player').disabled).toBe(false)
+    expect(assistStatus?.textContent).toBe('Assist ready.')
+    expect(assistStatus?.getAttribute('role')).toBe('status')
+    expect(assistStatus?.getAttribute('aria-live')).toBe('polite')
+    expect(assistStatus?.getAttribute('aria-atomic')).toBe('true')
+  })
+
+  it('GIVEN running without allies WHEN render called THEN assist status reports no ally available', () => {
+    const state = createState('running')
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 360,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+        faction: 'enemy',
+        role: 'enemy_chaser',
+        behaviorState: 'move_to_engage',
+        targetingPolicy: 'focus_player',
+        targetEntityId: 'player:player-alpha',
+      },
+    ]
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+      'No ally available.',
+    )
+  })
+
+  it('GIVEN running with ally but no valid target WHEN render called THEN assist status reports no target to assist', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+      'No target to assist.',
+    )
+  })
+
+  it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 360,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+        faction: 'enemy',
+        role: 'enemy_chaser',
+        behaviorState: 'move_to_engage',
+        targetingPolicy: 'focus_player',
+        targetEntityId: 'player:player-alpha',
+      },
+    ]
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+      'Assist signal sent.',
+    )
+  })
+
+  it('GIVEN active assist with assigned target WHEN render called THEN assist status reports allies covering you', () => {
+    const state = createState('running')
+    const ally = createDefaultAllyState(1)
+    ally.targetEntityId = 'enemy:1'
+    state.allies = [ally]
+    state.enemies = [
+      {
+        id: 1,
+        definitionId: 'enemy-basic',
+        hp: 5,
+        maxHp: 5,
+        x: 360,
+        y: 270,
+        radius: 12,
+        speedPxPerSec: 60,
+        contactDamage: 1,
+        defeated: false,
+        defeatedAtTick: null,
+        faction: 'enemy',
+        role: 'enemy_chaser',
+        behaviorState: 'move_to_engage',
+        targetingPolicy: 'focus_player',
+        targetEntityId: 'player:player-alpha',
+      },
+    ]
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+
+    hudController.render(state, false)
+
+    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+      'Allies covering you.',
+    )
+  })
+
+  it('GIVEN non-running phase WHEN render called THEN assist status reports available during sortie', () => {
+    hudController.render(createState('preparation'), false)
+
+    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+      'Assist is available during sortie.',
+    )
+    expect(queryButton(container, 'assist-player').disabled).toBe(true)
   })
 
   it('GIVEN result phase with pending reward WHEN render called THEN confirm-result enabled, claim-reward disabled (AC4, AC5)', () => {
@@ -282,6 +442,7 @@ describe('HudController', () => {
     queryButton(container, 'save').click()
     queryButton(container, 'load-game').click()
     queryButton(container, 'reset').click()
+    queryButton(container, 'assist-player').click()
 
     expect(actions.onNewGame).not.toHaveBeenCalled()
     expect(actions.onStartSortie).not.toHaveBeenCalled()
@@ -291,6 +452,7 @@ describe('HudController', () => {
     expect(actions.onSave).not.toHaveBeenCalled()
     expect(actions.onLoadGame).not.toHaveBeenCalled()
     expect(actions.onReset).toHaveBeenCalledTimes(0)
+    expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
   })
 
   it('GIVEN debrief_reward_claimed WHEN disabled claim button is clicked THEN claim callback remains a no-op surface', () => {

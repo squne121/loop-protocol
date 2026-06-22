@@ -4,6 +4,7 @@ import { formatCombatNumber } from '../render/renderUtils'
 export interface HudActions {
   onNewGame?(): void
   onStartSortie(): void
+  onAssistPlayerCommand?(): void
   onClaimReward(): void
   /** Confirm result and return to preparation (AC5). */
   onConfirmResult?(): void
@@ -31,6 +32,28 @@ export interface HudActions {
 export interface HudController {
   /** Render the HUD. isPaused is the runtime-local product pause flag (AC1, AC4). */
   render(state: GameState, isPaused: boolean): void
+}
+
+function getAssistStatusCopy(state: GameState): string {
+  if (state.loopPhase !== 'running' || state.sortie.status !== 'running') {
+    return 'Assist is available during sortie.'
+  }
+
+  if (state.allies.length === 0) {
+    return 'No ally available.'
+  }
+
+  const hasLivingEnemy = state.enemies.some((enemy) => !enemy.defeated)
+  const hasAssignedTarget = state.allies.some((ally) => ally.targetEntityId !== null)
+
+  if (state.commandIntentRuntime.activeIntent === 'assist_player') {
+    if (hasAssignedTarget) {
+      return 'Allies covering you.'
+    }
+    return hasLivingEnemy ? 'Assist signal sent.' : 'No target to assist.'
+  }
+
+  return hasLivingEnemy ? 'Assist ready.' : 'No target to assist.'
 }
 
 export function createHudController(
@@ -61,6 +84,17 @@ export function createHudController(
         <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
         <div><dt>Result</dt><dd data-field="sortie-result"></dd></div>
       </dl>
+    </section>
+    <section class="panel">
+      <p class="eyebrow">Wingmates</p>
+      <button type="button" data-action="assist-player" aria-label="Assist allies">Assist allies</button>
+      <p
+        class="status-copy"
+        data-field="assist-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
     </section>
     <section class="panel">
       <p class="eyebrow">Telemetry</p>
@@ -103,6 +137,11 @@ export function createHudController(
   container
     .querySelector<HTMLButtonElement>('[data-action="start-sortie"]')
     ?.addEventListener('click', actions.onStartSortie)
+  if (actions.onAssistPlayerCommand) {
+    container
+      .querySelector<HTMLButtonElement>('[data-action="assist-player"]')
+      ?.addEventListener('click', actions.onAssistPlayerCommand)
+  }
   container
     .querySelector<HTMLButtonElement>('[data-action="claim-reward"]')
     ?.addEventListener('click', actions.onClaimReward)
@@ -137,6 +176,7 @@ export function createHudController(
   const resources = queryField(container, 'resources')
   const shots = queryField(container, 'shots')
   const cooldown = queryField(container, 'cooldown')
+  const assistStatus = queryField(container, 'assist-status')
   const status = queryField(container, 'status')
   const command = queryField(container, 'command')
   const pauseStatus = queryField(container, 'pause-status')
@@ -147,6 +187,7 @@ export function createHudController(
   const sortieResult = queryField(container, 'sortie-result')
   const newGameButton = queryAction(container, 'new-game')
   const startSortieButton = queryAction(container, 'start-sortie')
+  const assistPlayerButton = queryAction(container, 'assist-player')
   const claimRewardButton = queryAction(container, 'claim-reward')
   const confirmResultButton = queryAction(container, 'confirm-result')
   const nextSortieButton = queryAction(container, 'next-sortie')
@@ -161,6 +202,7 @@ export function createHudController(
       resources.textContent = `${state.progress.resources}`
       shots.textContent = `${state.player.shotsFired}`
       cooldown.textContent = `${Math.ceil(state.player.weaponCooldownMs)} ms`
+      assistStatus.textContent = getAssistStatusCopy(state)
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
 
@@ -193,6 +235,7 @@ export function createHudController(
       // new-game: only in title_menu (AC1)
       newGameButton.disabled = state.loopPhase !== 'title_menu'
       startSortieButton.disabled = state.loopPhase !== 'preparation'
+      assistPlayerButton.disabled = state.loopPhase !== 'running'
       // claim-reward: legacy debrief_pending_reward phase only (AC5: result uses confirm-result)
       claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward'
       // confirm-result: only in result phase (AC5)
