@@ -229,7 +229,7 @@ def test_loop_policy_v1_max_iterations_default():
 def test_loop_policy_v1_approval_gate_not_required():
     policy = _load_loop_policy_v1()
     gate = policy["LOOP_POLICY_V1"]["loop_iteration_approval_gate"]
-    assert gate["default_required"] == False
+    assert gate["default_required"] is False
     assert gate["scope"] == "repo_loop_iteration_only"
 
 

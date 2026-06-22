@@ -27,7 +27,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPT = SKILL_ROOT / "scripts" / "build_loop_state.py"

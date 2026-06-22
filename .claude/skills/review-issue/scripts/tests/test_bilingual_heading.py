@@ -35,7 +35,7 @@ class TestExtractSectionBilingual:
             "背景セクション\n"
         )
         result = extract_section(body, "Outcome")
-        assert result != "", f"bilingual heading '## 成果物 (Outcome)' を Outcome として抽出できなかった"
+        assert result != "", "bilingual heading '## 成果物 (Outcome)' を Outcome として抽出できなかった"
         assert "成果物セクションの本文" in result
 
     def test_extract_section_bilingual_fullwidth(self):
@@ -48,7 +48,7 @@ class TestExtractSectionBilingual:
             "背景セクション\n"
         )
         result = extract_section(body, "Outcome")
-        assert result != "", f"bilingual heading '## 成果物（Outcome）' を Outcome として抽出できなかった"
+        assert result != "", "bilingual heading '## 成果物（Outcome）' を Outcome として抽出できなかった"
         assert "成果物セクションの本文" in result
 
     def test_extract_section_canonical_english_still_works(self):

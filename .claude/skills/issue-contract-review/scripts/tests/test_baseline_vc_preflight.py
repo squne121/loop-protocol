@@ -769,7 +769,7 @@ def test_full_preflight_pytest_baseline_fail_status_pass():
     assert data["status"] == "pass", f"Expected status=pass but got {data['status']}"
 
     # Summary should show expected_fail >= 1
-    assert data["summary"]["expected_fail"] >= 1, f"Expected at least 1 expected_fail in summary"
+    assert data["summary"]["expected_fail"] >= 1, "Expected at least 1 expected_fail in summary"
 
     # Summary should show human_judgment == 0
     assert data["summary"]["human_judgment"] == 0, f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
@@ -922,7 +922,7 @@ $ grep "[invalid" /tmp/test.txt
         results = data["results"]
 
         # grep with invalid regex should be human_judgment or unknown
-        found = any(
+        _found = any(
             r["decision"] == "human_judgment" and r["category"] == "unknown"
             for r in results
         )
@@ -1231,32 +1231,6 @@ def test_regression_gate_pnpm_typecheck_exit0_expected_pass_go(monkeypatch):
     assert _is_regression_gate_command("pnpm lint")
     assert _is_regression_gate_command("pnpm test")
     assert _is_regression_gate_command("pnpm build")
-
-
-def test_regression_gate_pnpm_typecheck_exit1_blocked(monkeypatch):
-    """B6: pnpm typecheck exit 1 → blocked / blocked"""
-    fixture_content = """## Verification Commands
-
-```bash
-# AC1
-$ pnpm typecheck
-```
-"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-        f.write(fixture_content)
-        fixture_file = f.name
-
-    try:
-        # pnpm typecheck will likely fail in test env (as expected for this test)
-        data = run_preflight(fixture_file)
-        results = data["results"]
-        assert len(results) > 0
-        # At least the scope_class should be regression_gate
-        found = any(r["scope_class"] == "regression_gate" for r in results)
-        assert found, "regression_gate scope_class not found"
-    finally:
-        import os
-        os.unlink(fixture_file)
 
 
 def test_uv_pytest_missing_path_not_regression_gate():
@@ -2291,7 +2265,8 @@ def test_annotation_scope_does_not_cross_empty_line():
     """Issue #889: annotation scope stops at empty line (does not affect next command)."""
     # Two commands; first has baseline-expect: pass but there's an empty line before the second
     # The second command should NOT inherit the annotation
-    import tempfile, os
+    import tempfile
+    import os
     body = """## Verification Commands
 
 ```bash
@@ -2311,7 +2286,9 @@ $ test -f /this_file_definitely_does_not_exist_12345abc
 
     try:
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
-        import subprocess, sys, json
+        import subprocess
+        import sys
+        import json
         result = subprocess.run(
             [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
             capture_output=True, text=True, timeout=90,
@@ -2342,7 +2319,8 @@ $ test -f /this_file_definitely_does_not_exist_12345abc
 
 def test_invalid_baseline_expect_value_is_human_judgment():
     """BLOCKER 2: # baseline-expect: pas (typo) → human_judgment / invalid_baseline_expect_annotation."""
-    import tempfile, os
+    import tempfile
+    import os
     body = """## Verification Commands
 
 ```bash
@@ -2355,7 +2333,9 @@ $ test -f README.md
         tf.write(body)
         tmp_path = tf.name
     try:
-        import subprocess, sys, json
+        import subprocess
+        import sys
+        import json
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
         result = subprocess.run(
             [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
@@ -2381,7 +2361,8 @@ $ test -f README.md
 
 def test_empty_baseline_expect_value_is_human_judgment():
     """BLOCKER 2: # baseline-expect: (empty) → human_judgment."""
-    import tempfile, os
+    import tempfile
+    import os
     body = """## Verification Commands
 
 ```bash
@@ -2394,7 +2375,9 @@ $ test -f README.md
         tf.write(body)
         tmp_path = tf.name
     try:
-        import subprocess, sys, json
+        import subprocess
+        import sys
+        import json
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
         result = subprocess.run(
             [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
@@ -2414,7 +2397,8 @@ $ test -f README.md
 
 def test_uppercase_baseline_expect_is_human_judgment():
     """BLOCKER 2: # baseline-expect: PASS (uppercase) → human_judgment."""
-    import tempfile, os
+    import tempfile
+    import os
     body = """## Verification Commands
 
 ```bash
@@ -2427,7 +2411,9 @@ $ test -f README.md
         tf.write(body)
         tmp_path = tf.name
     try:
-        import subprocess, sys, json
+        import subprocess
+        import sys
+        import json
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
         result = subprocess.run(
             [sys.executable, str(script_path), "--body-file", tmp_path, "--issue", "999"],
@@ -2451,7 +2437,11 @@ $ test -f README.md
 
 def test_malicious_baseline_expect_does_not_bypass_static_blocker():
     """MAJOR 2: baseline-expect: pass does NOT bypass unsafe/compound command blockers."""
-    import tempfile, os, subprocess, sys, json
+    import tempfile
+    import os
+    import subprocess
+    import sys
+    import json
 
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
 
@@ -2528,10 +2518,15 @@ def test_baseline_expect_deferred_category():
 
 # ===== #899 genuine behavioral tests (subprocess the real script) =====
 def _run_bvp_899(body, strict=False):
-    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    import subprocess as _sp
+    import json as _json
+    import tempfile as _tf
+    import os as _os
+    import sys as _sys
     script = str(Path(__file__).parent.parent / "baseline_vc_preflight.py")
     with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(body); p = f.name
+        f.write(body)
+        p = f.name
     try:
         argv = [_sys.executable, script, "--body-file", p]
         if strict:

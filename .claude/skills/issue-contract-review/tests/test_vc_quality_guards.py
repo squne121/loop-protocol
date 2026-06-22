@@ -27,7 +27,6 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-import pytest
 
 # Paths to the scripts under test
 _TESTS_DIR = Path(__file__).parent

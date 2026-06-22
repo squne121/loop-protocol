@@ -563,10 +563,10 @@ def format_text_report(
     lines.append("PERMISSION_REPORT:")
     for pr in permission_reports:
         lines.append(f"  agent: {pr['agent']}")
-        lines.append(f"    DECLARED_PERMISSION:")
+        lines.append("    DECLARED_PERMISSION:")
         for k, v in pr["DECLARED_PERMISSION"].items():
             lines.append(f"      {k}: {v}")
-        lines.append(f"    MUTATION_BOUNDARY:")
+        lines.append("    MUTATION_BOUNDARY:")
         mb = pr["MUTATION_BOUNDARY"]
         lines.append(f"      claude: {mb['claude']}")
         lines.append(f"      codex: {mb['codex']}")
@@ -577,10 +577,10 @@ def format_text_report(
     lines.append("MODEL_DECLARATION_REPORT:")
     for mr in model_reports:
         lines.append(f"  agent: {mr['agent']}")
-        lines.append(f"    model_declaration:")
+        lines.append("    model_declaration:")
         for k, v in mr["model_declaration"].items():
             lines.append(f"      {k}: {v}")
-        lines.append(f"    reasoning_effort_declaration:")
+        lines.append("    reasoning_effort_declaration:")
         for k, v in mr["reasoning_effort_declaration"].items():
             lines.append(f"      {k}: {v}")
         lines.append(f"    note: {mr['note']}")

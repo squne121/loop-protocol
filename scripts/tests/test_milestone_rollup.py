@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
@@ -30,7 +29,6 @@ import urllib.error
 # ---------------------------------------------------------------------------
 # Import the module under test
 # ---------------------------------------------------------------------------
-import importlib
 import os
 
 _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -438,11 +436,11 @@ class TestCollectDescendants(unittest.TestCase):
 
     def test_unauthenticated_works_without_token(self):
         """Blocker 3: token=None should not prevent API calls (no auth header required)."""
-        pages = [[_make_issue(10)]]
+        _pages = [[_make_issue(10)]]
 
         def urlopen_check_auth(req, timeout=None):
             # Verify no Authorization header sent when token is None
-            auth = req.get_header("Authorization")
+            _auth = req.get_header("Authorization")
             if "sub_issues" in req.full_url:
                 return FakeResponse([])
             if "dependencies/blocked_by" in req.full_url:
@@ -1046,7 +1044,7 @@ class TestRenderMarkdown(unittest.TestCase):
         # Should not have unescaped | that would break the table
         # Check that the raw unescaped title is not present as-is in a table row
         for line in md.splitlines():
-            if "A|B title" in line and not "A\\|B title" in line:
+            if "A|B title" in line and "A\\|B title" not in line:
                 self.fail(f"Unescaped pipe found in table line: {line!r}")
 
 

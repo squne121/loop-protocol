@@ -1049,7 +1049,6 @@ def _strict_json_loads(text: str) -> object:
     Python's json.loads accepts NaN and Infinity by default (parse_constant).
     This function uses a parse_constant hook to reject them explicitly.
     """
-    import math
 
     def _reject_nan(value: str) -> float:
         raise ValueError(

@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1890,7 +1890,7 @@ class TestLabelReadbackFailureReturnsPartialFailureAfterSubIssueRegistration:
         import sys as _sys
         old_stdout = _sys.stdout
         _sys.stdout = captured
-        exit_code = txn.main(["--repo", "owner/repo", "--title", "x", "--body", _MINIMAL_VALID_BODY])
+        _exit_code = txn.main(["--repo", "owner/repo", "--title", "x", "--body", _MINIMAL_VALID_BODY])
         _sys.stdout = old_stdout
         # NOTE: we just tested run_transaction above; for main() we'd need full patching.
         # The assertion about exit code 2 is in main():

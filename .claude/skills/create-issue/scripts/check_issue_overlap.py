@@ -531,8 +531,8 @@ def _evaluate_candidate(
         matched.append("goal_ref")
     if overlap:
         matched.append("allowed_paths")
-    cur_labels = {l.lower() for l in current.labels}
-    cand_labels = {l.lower() for l in cand.labels}
+    cur_labels = {lbl.lower() for lbl in current.labels}
+    cand_labels = {lbl.lower() for lbl in cand.labels}
     # routing 用 generic label を除いた意味的 label の共有のみ matched 扱い
     generic = {"enhancement", "bug", "workflow", "phase/implementation",
                "agent/implementer", "documentation", "docs"}
@@ -855,7 +855,7 @@ def gh_search_candidates(
                 number=data.get("number"),
                 url=data.get("url", ""),
                 body=data.get("body"),
-                labels=tuple(l.get("name", "") for l in data.get("labels", []) or []),
+                labels=tuple(lbl.get("name", "") for lbl in data.get("labels", []) or []),
                 state=data.get("state", "OPEN"),
                 search_hit=True,
             )

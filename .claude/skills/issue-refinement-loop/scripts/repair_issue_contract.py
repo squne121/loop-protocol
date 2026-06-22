@@ -259,7 +259,7 @@ def _repair_section_fences(section: str, body_offset: int) -> tuple[str, list[di
                         "kind": "non_target_fence",
                         "line_start": i + 1,
                         "line_end": i + 1,
-                        "reason": f"non_yaml_closing_fence_skipped",
+                        "reason": "non_yaml_closing_fence_skipped",
                         "original": line,
                         "repaired": line,
                     })
@@ -568,7 +568,7 @@ def _repair_insert_baseline_expect(body: str, cwd: str = ".") -> tuple[str, list
             if m:
                 indent, cmd = m.group(1), m.group(2).strip()
                 if cmd and not cmd.startswith('#'):
-                    prev = next((l for l in reversed(out) if l.strip()), "")
+                    prev = next((ln for ln in reversed(out) if ln.strip()), "")
                     already = bool(re.match(r'^\s*#\s*baseline-expect:\s*(pass|fail|deferred)\b', prev))
                     has_inline = _scan_unquoted_inline_baseline_expect(line)[0] is not None
                     if not already and not has_inline:

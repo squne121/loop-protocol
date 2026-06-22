@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Tuple
 
 
 def _load_issue_refinement_verifier():

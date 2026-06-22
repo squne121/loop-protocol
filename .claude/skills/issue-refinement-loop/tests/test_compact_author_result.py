@@ -213,7 +213,6 @@ def test_compact_author_result_raw_log_fixture_would_fail_check_script():
     # This test validates the fixture would FAIL the stdout checker
     # (simulating raw output being returned to main context)
     import importlib.util
-    import sys
 
     checker_path = Path(__file__).parent.parent.parent.parent.parent / "scripts" / "check_agent_friendly_stdout.py"
     if not checker_path.exists():

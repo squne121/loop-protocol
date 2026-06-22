@@ -18,14 +18,10 @@ AC coverage:
 
 from __future__ import annotations
 
-import importlib
-import json
 import sys
-import types
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Import the module under test
@@ -215,7 +211,7 @@ class TestNoLLMNoAskNoNetworkNoGH:
     def test_attempts_fallback_path_is_2(self):
         # Force guard to fail once then pass
         call_count = [0]
-        original_guard = rtr._run_guard
+        _original_guard = rtr._run_guard
 
         def guard_once_fail(body):
             call_count[0] += 1

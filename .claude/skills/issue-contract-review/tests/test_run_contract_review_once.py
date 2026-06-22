@@ -12,13 +12,9 @@ B1: run_once() から check_blockers.sh / check_product_spec_contract.py /
 from __future__ import annotations
 
 import importlib.util
-import json
-import subprocess
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Import module under test

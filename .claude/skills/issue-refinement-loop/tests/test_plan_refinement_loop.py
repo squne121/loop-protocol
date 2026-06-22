@@ -416,7 +416,7 @@ class TestSchemaValidity:
         AC9: rewrite_constraints with unknown key fails schema validation.
         """
         schema = load_schema()
-        validator = jsonschema.Draft202012Validator(schema)
+        _validator = jsonschema.Draft202012Validator(schema)
 
         # Build a minimal valid planner output with rewrite_constraints containing unknown key
         invalid_rewrite_constraints = {
@@ -770,7 +770,8 @@ class TestAC1ContractSectionAbsentMissingSection:
 
     def test_no_contract_section_produces_missing_section_reason(self):
         """AC1: absent Machine-Readable Contract → reason_codes includes missing_required_section."""
-        import subprocess, json, sys
+        import subprocess
+        import json
         from pathlib import Path
         scripts_dir = Path(__file__).parent.parent / "scripts"
         planner = scripts_dir / "plan_refinement_loop.py"
@@ -793,7 +794,8 @@ class TestAC1ContractSectionAbsentMissingSection:
 
     def test_no_contract_section_required_sections_contains_machine_readable_contract(self):
         """AC1: required_sections includes 'Machine-Readable Contract' when section absent."""
-        import subprocess, json, sys
+        import subprocess
+        import json
         from pathlib import Path
         scripts_dir = Path(__file__).parent.parent / "scripts"
         planner = scripts_dir / "plan_refinement_loop.py"
@@ -866,7 +868,8 @@ class TestAC2ContractMalformedSeparatePath:
 
     def test_malformed_yaml_does_not_produce_missing_contract_key(self):
         """AC2: parse error → reason_codes must NOT include missing_required_contract_key."""
-        import subprocess, json, sys
+        import subprocess
+        import json
         from pathlib import Path
         scripts_dir = Path(__file__).parent.parent / "scripts"
         planner = scripts_dir / "plan_refinement_loop.py"
@@ -885,7 +888,8 @@ class TestAC2ContractMalformedSeparatePath:
 
     def test_no_yaml_block_produces_malformed_reason(self):
         """AC2: section present but no YAML block → malformed_machine_readable_contract."""
-        import subprocess, json, sys
+        import subprocess
+        import json
         from pathlib import Path
         scripts_dir = Path(__file__).parent.parent / "scripts"
         planner = scripts_dir / "plan_refinement_loop.py"
@@ -913,7 +917,8 @@ class TestAC2ContractMalformedSeparatePath:
 
     def test_malformed_contract_required_contract_keys_is_empty(self):
         """AC2: parsed mapping required only when section is present and YAML is valid."""
-        import subprocess, json, sys
+        import subprocess
+        import json
         from pathlib import Path
         scripts_dir = Path(__file__).parent.parent / "scripts"
         planner = scripts_dir / "plan_refinement_loop.py"

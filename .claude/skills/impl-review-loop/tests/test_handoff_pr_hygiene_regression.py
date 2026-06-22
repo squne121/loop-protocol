@@ -105,7 +105,7 @@ _SCRIPTS_DIR = (
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
 
 
 def _read(path: Path) -> str:
@@ -873,7 +873,7 @@ class TestAC7TestVerdictMachineMarkerPresent:
         )
         source = regression_file.read_text(encoding="utf-8")
         assert "TEST_VERDICT_MACHINE" in source, (
-            f"test_issue_kind_design_unknown_regression.py must contain TEST_VERDICT_MACHINE marker"
+            "test_issue_kind_design_unknown_regression.py must contain TEST_VERDICT_MACHINE marker"
         )
         marker = self._extract_and_parse_verdict_machine(source)
         self._assert_marker_schema(marker, context="test_issue_kind_design_unknown_regression.py module docstring")

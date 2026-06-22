@@ -364,7 +364,7 @@ def repair_c4_in_vc_block(lines: list[str]) -> tuple[list[str], bool]:
         line = new_lines[i]
         # Detect start of fenced bash block (canonical format only — see module docstring)
         if re.match(r'^```bash\s*$', line):
-            block_start = i
+            _block_start = i
             i += 1
             in_heredoc = False
             heredoc_delimiter: Optional[str] = None

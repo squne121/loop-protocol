@@ -842,7 +842,10 @@ def _invoke_repair(body: str) -> dict:
     Returns the repair result dict (schema: repair_issue_contract/v1).
     Never raises; on failure returns a minimal dict with error key.
     """
-    import tempfile, os as _os, sys as _sys, subprocess as _sp
+    import tempfile
+    import os as _os
+    import sys as _sys
+    import subprocess as _sp
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8"
@@ -2190,7 +2193,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if input_errors:
         # Build minimal blocked result for argparse validation failure
-        repo_root = _find_repo_root()
+        _repo_root = _find_repo_root()
         err_detail = "; ".join(input_errors)
         result = _build_result(
             status="blocked",

@@ -540,7 +540,6 @@ class TestTemplateLoadFailure:
         """Blocker 2: TemplateLoadResult.error is None when template loads successfully."""
         import sys
         import importlib.util
-        from pathlib import Path
 
         script_path = SCRIPT_PATH
         spec = importlib.util.spec_from_file_location("plan_refinement_loop", script_path)
@@ -610,7 +609,6 @@ This should still fail because issue_kind is not in the allowlist.
         """Blocker 3: resolve_issue_template returns None for non-allowlisted issue_kind."""
         import sys
         import importlib.util
-        from pathlib import Path
 
         script_path = SCRIPT_PATH
         spec = importlib.util.spec_from_file_location("plan_refinement_loop", script_path)

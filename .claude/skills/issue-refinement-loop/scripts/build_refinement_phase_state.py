@@ -331,7 +331,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             review_result_path=args.review_result_path,
         )
     except ValueError as e:
-        print(f"STATUS: error")
+        print("STATUS: error")
         print(f"ERROR: {e}")
         sys.exit(1)
 

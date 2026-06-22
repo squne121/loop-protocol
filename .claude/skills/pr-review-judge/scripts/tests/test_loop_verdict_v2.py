@@ -392,7 +392,7 @@ class TestUpdateBranchClassification:
         skill = read_skill_md()
         # V2 schema section should NOT contain top-level 'recommendations:' key in LOOP_VERDICT_V2
         # Find the LOOP_VERDICT_V2 block and verify no 'recommendations:' key
-        v2_section_match = re.search(
+        _v2_section_match = re.search(
             r"LOOP_VERDICT_V2.*?```",
             skill,
             re.DOTALL,
@@ -624,7 +624,7 @@ class TestPrBodyValidatorSemanticFailureRemainsBlocker:
         """AC13: Safety Claim Matrix missing -> blocker (mechanical: false), not required_auto_actions."""
         # Semantic failures (Safety Claim Matrix, Consumer Inventory, Evidence)
         # must remain in blockers, not be classified as required_auto_actions
-        semantic_blockers = [
+        _semantic_blockers = [
             "Safety Claim Matrix section missing",
             "Schema Consumer Inventory not provided",
             "Evidence section references incorrect head SHA",

@@ -7,15 +7,13 @@ Uses a mock JSON-RPC server piped via asyncio subprocess.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import sys
 import textwrap
-import time
 import types
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1876,7 +1874,7 @@ class TestGeminiAcpDebugArgvShape:
         else:
             monkeypatch.setenv("GEMINI_ACP_DEBUG", env_value)
 
-        fake_request = {
+        _fake_request = {
             "schema": "delegation_request_v1",
             "transport": "acp",
             "objective": "test",

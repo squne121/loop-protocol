@@ -127,8 +127,8 @@ Some outcome text.
 """
     result = cic.detect_issue_kind(body, labels="", title="")
     assert result != "implementation", (
-        f"detect_issue_kind silently returned 'implementation' for unknown kind 'foobar'. "
-        f"Unknown kinds must be blocked (UNKNOWN_ISSUE_KIND_SENTINEL)."
+        "detect_issue_kind silently returned 'implementation' for unknown kind 'foobar'. "
+        "Unknown kinds must be blocked (UNKNOWN_ISSUE_KIND_SENTINEL)."
     )
     assert result == cic.UNKNOWN_ISSUE_KIND_SENTINEL, (
         f"Expected UNKNOWN_ISSUE_KIND_SENTINEL for unknown kind 'foobar', got: {result!r}"

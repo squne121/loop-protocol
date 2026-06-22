@@ -167,7 +167,7 @@ def run_self_test() -> int:
         print("[self-test] SKIP: local_main_branch_guard module not available", file=sys.stderr)
         return 1
 
-    from local_main_branch_guard import evaluate, get_current_branch, classify_root_state
+    from local_main_branch_guard import evaluate, get_current_branch
 
     failures: list[str] = []
     tmpdir = tempfile.mkdtemp(prefix="local_main_branch_guard_selftest_")
@@ -276,7 +276,7 @@ def run_self_test() -> int:
             for f in failures:
                 print(f"[self-test] FAIL: {f}", file=sys.stderr)
             return 1
-        print(f"[self-test] PASS: all assertions passed")
+        print("[self-test] PASS: all assertions passed")
         return 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

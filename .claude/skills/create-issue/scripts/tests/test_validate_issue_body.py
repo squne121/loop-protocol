@@ -13,9 +13,7 @@ from validate_issue_body import (
     _extract_ac_numbers,
     _extract_vc_ac_numbers,
     _extract_section,
-    _extract_mrc_issue_kind,
     _validate_lp031_kind_mismatch,
-    _validate_lp031_implementation_title_prefix,
 )
 
 
@@ -452,7 +450,7 @@ test -f file && grep -v pattern file  # AC1
 - /path
 """
         result = validate_issue_body(body)
-        lp013_warnings = [e for e in result.errors if e.rule_id == "LP013" and e.severity == "warning"]
+        _lp013_warnings = [e for e in result.errors if e.rule_id == "LP013" and e.severity == "warning"]
         # With test -f present, should not warn
         # (depending on implementation)
 
@@ -477,7 +475,7 @@ grep '```' file  # AC1
 
 - /path
 """
-        result = validate_issue_body(body)
+        _result = validate_issue_body(body)
         # This test might not trigger depending on implementation
         # as backticks in shlex.split() are handled differently
 
@@ -1008,7 +1006,7 @@ test -f foo.py
 
         result = validate_issue_body(body, kind=cli_kind, title=title)
         lp031_errors = [e for e in result.errors if e.rule_id == "LP031"]
-        lp031_mismatch_errors = [e for e in lp031_errors if "mismatch" in e.message]
+        _lp031_mismatch_errors = [e for e in lp031_errors if "mismatch" in e.message]
 
         # Filter to only title-prefix LP031 errors (not mismatch)
         title_lp031_errors = [e for e in lp031_errors if "mismatch" not in e.message]
