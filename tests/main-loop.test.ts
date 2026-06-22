@@ -7,7 +7,8 @@ import {
   claimPendingReward,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
-import { runProgressionSave, runLoadGame } from '../src/main'
+import { queueAssistPlayerCommand, runProgressionSave, runLoadGame } from '../src/main'
+import { createInputState, mapInputToCommands } from '../src/input'
 import type { SaveResult } from '../src/storage'
 
 const FIXED_DT = defaultSimulationConfig.fixedDeltaMs
@@ -191,6 +192,29 @@ describe('B2/B4: storage.save() phase guard via runProgressionSave', () => {
     const result = runProgressionSave('save', false, seam)
     expect(seam.save).toHaveBeenCalledTimes(1)
     expect(result).toBe(false)
+  })
+})
+
+describe('assist DOM command routing', () => {
+  it('GIVEN running phase WHEN queueAssistPlayerCommand is invoked THEN next tick emits sample_assist_player', () => {
+    const inputState = createInputState()
+
+    const accepted = queueAssistPlayerCommand('running', inputState)
+    const commands = mapInputToCommands(inputState)
+
+    expect(accepted).toBe(true)
+    expect(commands).toContainEqual({ type: 'sample_assist_player' })
+    expect(inputState.assistPlayerRisingEdge).toBe(false)
+  })
+
+  it('GIVEN non-running phase WHEN queueAssistPlayerCommand is invoked THEN no sample_assist_player command is emitted', () => {
+    const inputState = createInputState()
+
+    const accepted = queueAssistPlayerCommand('preparation', inputState)
+    const commands = mapInputToCommands(inputState)
+
+    expect(accepted).toBe(false)
+    expect(commands.some((command) => command.type === 'sample_assist_player')).toBe(false)
   })
 })
 

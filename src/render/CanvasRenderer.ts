@@ -70,6 +70,47 @@ export function getSortieResultPresentation(result: SortieResult): SortieResultP
   }
 }
 
+export interface AssistCueSegment {
+  allyX: number
+  allyY: number
+  allyRadius: number
+  targetX: number
+  targetY: number
+  targetRadius: number
+}
+
+export function resolveActiveAssistCueSegments(
+  state: Pick<GameState, 'allies' | 'enemies' | 'commandIntentRuntime'>,
+): AssistCueSegment[] {
+  if (state.commandIntentRuntime.activeIntent !== 'assist_player') {
+    return []
+  }
+
+  return state.allies.flatMap((ally) => {
+    if (ally.targetEntityId === null) {
+      return []
+    }
+
+    const targetEnemy = state.enemies.find(
+      (enemy) =>
+        !enemy.defeated && `enemy:${enemy.id}` === ally.targetEntityId,
+    )
+
+    if (!targetEnemy) {
+      return []
+    }
+
+    return [{
+      allyX: ally.x,
+      allyY: ally.y,
+      allyRadius: ally.radius,
+      targetX: targetEnemy.x,
+      targetY: targetEnemy.y,
+      targetRadius: targetEnemy.radius,
+    }]
+  })
+}
+
 export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer {
   const context = canvas.getContext('2d')
 
@@ -161,6 +202,25 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       )
       context.fill()
 
+      const showAssistWorldCues = state.sortie.result === null
+
+      // --- Layer 4b: ally markers ---
+      if (showAssistWorldCues) {
+        context.save()
+        context.fillStyle = '#64d7ff'
+        context.strokeStyle = 'rgba(100, 215, 255, 0.85)'
+        context.lineWidth = 2
+        for (const ally of state.allies) {
+          context.beginPath()
+          context.arc(ally.x, ally.y, ally.radius, 0, Math.PI * 2)
+          context.fill()
+          context.beginPath()
+          context.arc(ally.x, ally.y, ally.radius + 5, 0, Math.PI * 2)
+          context.stroke()
+        }
+        context.restore()
+      }
+
       // --- Layer 5: enemies (defeated === false only) ---
       context.fillStyle = '#f05050'
       for (const enemy of state.enemies) {
@@ -182,6 +242,36 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
           arenaWidth: arenaW,
           arenaHeight: arenaH,
         })
+      }
+
+      // --- Layer 5c: active assist cue (non-authoritative only) ---
+      const assistCueSegments = showAssistWorldCues
+        ? resolveActiveAssistCueSegments(state)
+        : []
+      if (assistCueSegments.length > 0) {
+        context.save()
+        context.strokeStyle = 'rgba(100, 215, 255, 0.55)'
+        context.fillStyle = 'rgba(100, 215, 255, 0.18)'
+        context.setLineDash([8, 6])
+        context.lineWidth = 2
+        for (const segment of assistCueSegments) {
+          context.beginPath()
+          context.moveTo(segment.allyX, segment.allyY)
+          context.lineTo(segment.targetX, segment.targetY)
+          context.stroke()
+
+          context.beginPath()
+          context.arc(
+            segment.targetX,
+            segment.targetY,
+            segment.targetRadius + 8,
+            0,
+            Math.PI * 2,
+          )
+          context.fill()
+        }
+        context.restore()
+        context.setLineDash([])
       }
 
       // --- Layer 6: projectiles ---
