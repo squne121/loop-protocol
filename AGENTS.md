@@ -25,9 +25,11 @@
 - Allowed direct: `git status`, `git diff`, `git log`, `git branch`, `git show`, `git rev-parse`, `git ls-files`
 - Mutation operations (`git push`, `git add`, `git commit`, `git checkout -b`, `git reset`, `git merge`) remain forbidden without `rtk` or explicit human instruction
 
-**gh (read-only):**
+**gh (read-only and managed skill mutations):**
 - Allowed direct: `gh issue view`, `gh issue list`, `gh pr view`, `gh pr list`, `gh pr checks`, `gh pr diff`
-- Mutation operations (`gh issue create`, `gh issue edit`, `gh pr merge`, `gh pr create`, `gh pr edit`) remain forbidden without `rtk` or explicit human instruction
+- Allowed via managed skill (`create-issue` / `edit-issue` / `post-merge-cleanup`): `gh issue create/edit` with `--repo squne121/loop-protocol` and `--body-file tmp/<path>` required (github_issue_mutation_command)
+- Destructive / bare mutation operations (`gh pr merge`, `gh pr create`, `gh pr checkout`, bare `gh issue create/edit` without required flags) remain forbidden without `rtk` or explicit human instruction
+- See `docs/dev/hook-boundaries.md` for the full 5-class taxonomy (display_readonly_command / readonly_artifact_export_command / github_issue_mutation_command / github_pr_metadata_command / github_destructive_command)
 
 ## rtk trust boundary
 
