@@ -17,10 +17,7 @@ B2 atomicity: body_sha256 OR updatedAt 変化 → stale_or_conflicting_snapshot
 from __future__ import annotations
 
 import importlib.util
-import json
-import sys
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest

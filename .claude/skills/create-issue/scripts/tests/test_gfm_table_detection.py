@@ -11,7 +11,6 @@ AC6: uv run pytest .claude/skills/create-issue/scripts/ -q が全件 PASS
 import sys
 from pathlib import Path
 
-import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -22,7 +21,6 @@ from prose_boundary_policy import (
     BLOCK_KIND_HUMAN_PROSE,
     BLOCK_KIND_TABLE,
     iter_markdown_blocks,
-    split_blocks,
 )
 from validate_japanese_content import (
     validate_text,

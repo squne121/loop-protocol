@@ -14,7 +14,6 @@ Verifies:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -379,7 +378,6 @@ def test_compact_review_result_containment_check_rejects_escape(tmp_path):
     fixture = FIXTURES_DIR / "review_result_approve.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    import tempfile
     with tempfile.TemporaryDirectory() as other_root:
         repo_root = Path(other_root) / "repo"
         repo_root.mkdir()
@@ -459,7 +457,7 @@ def test_compact_review_result_cli_rejects_nan_input(tmp_path):
 def test_compact_review_result_rejects_absolute_artifact_dir(tmp_path):
     """GIVEN absolute artifact_dir WHEN compact_review_result called THEN ValueError raised."""
     fixture = FIXTURES_DIR / "review_result_approve.json"
-    raw_result = json.loads(fixture.read_text(encoding="utf-8"))
+    _raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
     # We test the validator directly
     from compact_review_result import _validate_artifact_path

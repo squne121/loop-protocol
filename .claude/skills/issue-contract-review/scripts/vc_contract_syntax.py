@@ -400,7 +400,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
         return result
 
     lines = vc_section.splitlines()
-    n = len(lines)
+    _n = len(lines)
 
     # -----------------------------------------------------------------------
     # Pass 1: Detect unlabeled fences (``` without language specifier).
@@ -408,7 +408,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
     # because nesting is not supported in Markdown.
     # -----------------------------------------------------------------------
     in_fence = False
-    fence_lang = ""
+    _fence_lang = ""
     for raw_line in lines:
         stripped = raw_line.strip()
         if stripped.startswith("```"):
@@ -416,7 +416,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 # Opening fence
                 lang_part = stripped[3:].strip().lower()
                 in_fence = True
-                fence_lang = lang_part
+                _fence_lang = lang_part
                 if not lang_part:
                     result.has_unlabeled_fence = True
                     result.errors.append(VcParseError(
@@ -431,7 +431,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
             else:
                 # Closing fence
                 in_fence = False
-                fence_lang = ""
+                _fence_lang = ""
 
     # -----------------------------------------------------------------------
     # Pass 2: Extract commands and markers from bash fences,
@@ -440,7 +440,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
     in_bash = False
     current_ac_refs: set = set()  # AC refs accumulated for the next command
     bash_block_lines: list = []   # lines inside current bash block (for annotation lookup)
-    bash_block_line_offset = 0    # line number (1-based) of first line inside bash block
+    _bash_block_line_offset = 0    # line number (1-based) of first line inside bash block
 
     # Track line numbers for unlabeled fence errors (fix up pass-1 results)
     unlabeled_fence_error_idx = 0
@@ -462,7 +462,7 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                     in_bash = True
                     result.has_bash_fence = True
                     bash_block_lines = []
-                    bash_block_line_offset = line_no + 1
+                    _bash_block_line_offset = line_no + 1
                     current_ac_refs = set()
                 else:
                     # Unlabeled or other language fence — fix up line_number
@@ -607,12 +607,12 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                     preflight_scope = ps_marker
 
                 be_v, _, _ = extract_baseline_expect_annotation(
-                    [l.strip() for l in bash_block_lines], block_idx
+                    [ln.strip() for ln in bash_block_lines], block_idx
                 )
                 baseline_expect_val = be_v
 
                 vc_role_val = extract_vc_role_annotation(
-                    [l.strip() for l in bash_block_lines], block_idx
+                    [ln.strip() for ln in bash_block_lines], block_idx
                 )
 
             entry = VcCommandEntry(

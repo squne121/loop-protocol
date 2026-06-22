@@ -9,11 +9,9 @@ AC10: -F body=@- (stdin) は fail-closed
 AC13: body:null / body:"" / body key 欠落は reason code 付きで fail-closed
 """
 
-import json
 import sys
 from pathlib import Path
 
-import pytest
 
 SRC = Path(__file__).parent.parent
 sys.path.insert(0, str(SRC))
@@ -24,15 +22,11 @@ from mutation_route_matrix import (
     BODY_SOURCE_FIELD_LITERAL,
     BODY_SOURCE_FIELD_FILE,
     BODY_SOURCE_FIELD_STDIN,
-    BODY_SOURCE_INPUT_JSON_FILE,
-    BODY_SOURCE_INPUT_JSON_STDIN,
-    BODY_SOURCE_INPUT_NON_JSON,
     DENY_STDIN_BODY,
     DENY_UNREADABLE_FILE,
     DENY_NULL_BODY,
     DENY_EMPTY_BODY,
     DENY_MISSING_BODY,
-    DENY_INVALID_JSON,
 )
 
 

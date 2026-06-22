@@ -24,7 +24,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 import yaml
 
 
@@ -498,7 +497,7 @@ class TestWriteCapable:
 
     def test_write_capable_without_policy_entry_returns_blocked(self, tmp_path):
         """implementation-worker NOT referenced in policy write_capable_agents → blocked."""
-        policy_without_impl = textwrap.dedent("""\
+        _policy_without_impl = textwrap.dedent("""\
             ---
             schema_version: 1
             ---

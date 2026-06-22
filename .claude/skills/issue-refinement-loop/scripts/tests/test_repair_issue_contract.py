@@ -9,7 +9,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
@@ -126,7 +125,7 @@ Test e2e.
 $ pnpm test:e2e
 ```
 """
-    result1 = run_repair(body)
+    _result1 = run_repair(body)
     # The repaired body sha should differ from original if changed
     # Now simulate a second repair by creating body with the annotation already present
     annotated_body = """## Outcome
@@ -376,7 +375,7 @@ echo hello
     result = run_repair(body)
     # yaml fence should be repaired
     escaped_repairs = [r for r in result.get("repairs", []) if r["kind"] == "escaped_code_fence"]
-    non_target = [r for r in result.get("repairs", []) if r["kind"] == "non_target_fence"]
+    _non_target = [r for r in result.get("repairs", []) if r["kind"] == "non_target_fence"]
     assert len(escaped_repairs) >= 1, "yaml fence should be repaired"
     assert result.get("changed") is True, "Body should change when yaml fence is repaired"
     # bash fence should appear as non_target_fence (or just not be repaired)
@@ -475,10 +474,15 @@ $ test -f README.md
 
 # ===== #899 genuine behavioral tests (subprocess the real scripts) =====
 def _run_ric_899(body):
-    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    import subprocess as _sp
+    import json as _json
+    import tempfile as _tf
+    import os as _os
+    import sys as _sys
     script = str(Path(__file__).parent.parent / "repair_issue_contract.py")
     with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(body); p = f.name
+        f.write(body)
+        p = f.name
     try:
         r = _sp.run([_sys.executable, script, "--body-file", p], capture_output=True, text=True)
         return _json.loads(r.stdout)
@@ -487,13 +491,18 @@ def _run_ric_899(body):
 
 
 def _run_bvp_899(body, strict=False):
-    import subprocess as _sp, json as _json, tempfile as _tf, os as _os, sys as _sys
+    import subprocess as _sp
+    import json as _json
+    import tempfile as _tf
+    import os as _os
+    import sys as _sys
     root = Path(__file__).resolve()
     while root != root.parent and not (root / ".claude").is_dir():
         root = root.parent
     script = str(root / ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
     with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
-        f.write(body); p = f.name
+        f.write(body)
+        p = f.name
     try:
         argv = [_sys.executable, script, "--body-file", p]
         if strict:

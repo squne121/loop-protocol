@@ -16,9 +16,7 @@ import json
 import os
 import sys
 import subprocess
-import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 from unittest import mock
 
 import pytest
@@ -39,9 +37,11 @@ import run_refinement_preflight as wrapper  # noqa: E402 — for AC11 tests
 
 def run_planner(input_data):
     """Run plan_refinement_loop.py and return (output_dict, exit_code)."""
-    import subprocess, json as _json, sys as _sys
+    import subprocess
+    import json as _json
+    import sys as _sys
     script = _SCRIPTS_DIR / "plan_refinement_loop.py"
-    result = _sys.modules[__name__]  # get module
+    _result = _sys.modules[__name__]  # get module
     proc = subprocess.run(
         [_sys.executable, str(script)],
         input=_json.dumps(input_data, ensure_ascii=False),
@@ -67,20 +67,13 @@ def make_input(body, issue_number=1):
 
 from route_after_rewrite import (  # noqa: E402
     _sha256_of_body,
-    _run_checker,
     _build_state_dict,
     _STATE_ALLOWLIST,
 )
 from decide_rewrite_route import (  # noqa: E402
     LOOP_REWRITE_ROUTER_STATE_V1,
     load_rewrite_router_state,
-    save_rewrite_router_state,
     validate_state_dict,
-    ROUTE_PROCEED_TO_REVIEW,
-    ROUTE_CONTINUE_REWRITE,
-    ROUTE_HUMAN_JUDGMENT_REQUIRED,
-    REASON_CODE_CHECKER_PASSED,
-    REASON_CODE_MAX_ATTEMPTS_EXCEEDED,
 )
 
 _WRAPPER_SCRIPT = _SCRIPTS_DIR / "route_after_rewrite.py"
@@ -333,7 +326,8 @@ class TestBuildStateDictCategoryMetadata:
                 "必須セクション '## Acceptance Criteria' が存在しない",
             ],
         }
-        import tempfile as _tf326, os as _os326
+        import tempfile as _tf326
+        import os as _os326
         _td326 = _tf326.mkdtemp()
         _af326 = _os326.path.join(_td326, "art.json")
         with open(_af326, "w", encoding="utf-8") as _fp326:
@@ -374,7 +368,8 @@ class TestBuildStateDictCategoryMetadata:
                 "必須セクション '## Acceptance Criteria' が存在しない",
             ],
         }
-        import tempfile as _tf360, os as _os360
+        import tempfile as _tf360
+        import os as _os360
         _td360 = _tf360.mkdtemp()
         _af360 = _os360.path.join(_td360, "art2.json")
         with open(_af360, "w", encoding="utf-8") as _fp360:

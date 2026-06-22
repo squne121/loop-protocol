@@ -8,7 +8,6 @@ Exit 0 on success, non-zero on failure.
 """
 from pathlib import Path
 import re
-import sys
 
 s = Path("docs/product/game-logic.md").read_text(encoding="utf-8")
 section = re.search(r"^## 入力 / Input\b(?P<body>.*?)(?=^## |\Z)", s, re.S | re.M)

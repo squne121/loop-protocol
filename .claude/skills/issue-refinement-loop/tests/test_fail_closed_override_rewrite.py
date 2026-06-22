@@ -441,7 +441,7 @@ class TestMaxRewriteAttemptsAndNoProgress:
 
     def test_no_progress_routes_human_judgment(self):
         """AC10b: Planner specifies human_judgment_required as no-progress destination."""
-        body = "## Outcome\n\nSome outcome.\n"  # minimal valid
+        _body = "## Outcome\n\nSome outcome.\n"  # minimal valid
         # Even a good body with no fail_closed: verify the constant is correct
         body_bad = load_fixture("missing_outcome_section", "malformed")
         output, _ = run_planner(make_input(body_bad))
@@ -612,7 +612,6 @@ class TestAC4AC5StrictJsonNanRejection:
         """AC4: _canonical_json with allow_nan=False raises on NaN input."""
         import sys
         sys.path.insert(0, str(SCRIPTS_DIR))
-        import importlib
         import plan_refinement_loop as planner_mod
         import math
         import pytest

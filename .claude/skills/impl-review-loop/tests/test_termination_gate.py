@@ -706,7 +706,7 @@ _SCRIPTS_DIR = (
 if str(_SCRIPTS_DIR) not in _sys.path:
     _sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
 
 
 def _make_loop_verdict(

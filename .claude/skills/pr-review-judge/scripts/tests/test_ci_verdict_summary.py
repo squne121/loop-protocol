@@ -8,14 +8,12 @@ sanitize_check_name, check-name filter, gh_error handling.
 Fixtures are JSON files under tests/fixtures/ci_verdict/.
 """
 
-import hashlib
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -499,7 +497,7 @@ class TestLogExcerpt:
                 job_id=1,
                 artifacts_base=Path(tmpdir),
             )
-        assert f"pr-99" in artifact_entry["path"]
+        assert "pr-99" in artifact_entry["path"]
         assert f"head-{HEAD_SHA}" in artifact_entry["path"]
         assert artifact_entry["path"].endswith(".log")
 
@@ -1228,7 +1226,7 @@ class TestHeadShaNullSkippedExclude:
                 from contextlib import redirect_stdout
                 buf = io.StringIO()
                 with redirect_stdout(buf):
-                    exit_code = main()
+                    _exit_code = main()
         out = json.loads(buf.getvalue())
         assert "excluded_checks" in out
         assert "excluded_count" in out

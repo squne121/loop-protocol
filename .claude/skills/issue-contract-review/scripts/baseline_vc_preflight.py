@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import os
 import json
-import os
 import re
 import shlex
 import subprocess
@@ -29,7 +28,6 @@ if str(_VC_SYNTAX_DIR) not in sys.path:
 
 from vc_contract_syntax import (
     VALID_PRE_FLIGHT_SCOPE_VALUES,
-    VALID_BASELINE_EXPECT_VALUES,
     parse_ac_marker_line,
     parse_preflight_scope_marker_line,
     extract_baseline_expect_annotation,
@@ -76,7 +74,7 @@ def get_issue_body(issue_number: int, repo: str) -> Tuple[Optional[str], Optiona
         return None, "gh_json_parse_error"
     except subprocess.TimeoutExpired:
         return None, "gh_timeout"
-    except Exception as e:
+    except Exception:
         return None, "gh_other_error"
 
 
@@ -92,7 +90,7 @@ def read_body_file(path: str) -> Tuple[Optional[str], Optional[str]]:
             return f.read(), None
     except FileNotFoundError:
         return None, "body_file_not_found"
-    except Exception as e:
+    except Exception:
         return None, "body_parse_error"
 
 

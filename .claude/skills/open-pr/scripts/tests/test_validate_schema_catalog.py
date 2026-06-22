@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 # Add scripts directory to path
 sys.path.insert(
@@ -21,13 +20,10 @@ from validate_schema_catalog import (  # noqa: E402
     E_SCHEMA_CATALOG_DUPLICATE_CONSUMER_ID,
     E_SCHEMA_CATALOG_DUPLICATE_KEY,
     E_SCHEMA_CATALOG_DUPLICATE_SCHEMA_ID,
-    E_SCHEMA_CATALOG_DUPLICATE_YAML_KEY,
     E_SCHEMA_CATALOG_MISSING,
-    E_SCHEMA_CONSUMER_INVENTORY_EMPTY,
     E_SCHEMA_CONSUMER_INVENTORY_MALFORMED,
     E_SCHEMA_CONSUMER_INVENTORY_MISSING_REQUIRED_COLUMNS,
     E_SCHEMA_CONSUMER_MISMATCH,
-    UniqueKeySafeLoader,
     _DuplicateKeyError,
     _is_ambiguous_placeholder,
     compare_inventory_to_catalog,
@@ -1108,7 +1104,6 @@ class TestRealCatalogRegression:
 
     def test_real_catalog_passes(self) -> None:
         """Regression: actual catalog.yaml + catalog.schema.json must produce no errors."""
-        import json
         from pathlib import Path
 
         # Navigate to repo root from this test file location
@@ -1133,6 +1128,6 @@ class TestRealCatalogRegression:
 
         all_errors = schema_errors + semantic_errors
         assert all_errors == [], (
-            f"Real catalog.yaml has validation errors:\n"
+            "Real catalog.yaml has validation errors:\n"
             + "\n".join(f"  {e}" for e in all_errors)
         )

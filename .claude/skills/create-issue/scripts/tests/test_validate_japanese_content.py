@@ -23,7 +23,6 @@ sys.path.insert(0, str(SCRIPT_PATH.parent))
 from validate_japanese_content import (
     changed_prose_blocks,
     clean_prose,
-    count_japanese_chars,
     extract_code_fences,
     split_into_prose_blocks,
     validate_text,

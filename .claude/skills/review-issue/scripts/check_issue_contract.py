@@ -37,7 +37,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -399,7 +399,7 @@ def parse_vc_commands(vc_section: str) -> list[ParsedVcCommand]:
         pending_preflight_scope: Optional[str] = None
         pending_trivially_pass: Optional[str] = None
         # Track whether last non-blank line was an annotation (for invalidation)
-        last_was_annotation = False
+        _last_was_annotation = False
 
         for line in lines:
             stripped = line.strip()
@@ -408,7 +408,7 @@ def parse_vc_commands(vc_section: str) -> list[ParsedVcCommand]:
                 # Blank line: invalidate pending annotations
                 pending_preflight_scope = None
                 pending_trivially_pass = None
-                last_was_annotation = False
+                _last_was_annotation = False
                 continue
 
             ps_match = _preflight_scope_re.match(stripped)
@@ -419,21 +419,21 @@ def parse_vc_commands(vc_section: str) -> list[ParsedVcCommand]:
                 # Invalidate any previously pending annotation (only last one counts)
                 pending_preflight_scope = ps_match.group(1).strip()
                 pending_trivially_pass = None  # reset other annotation
-                last_was_annotation = True
+                _last_was_annotation = True
                 continue
 
             if tp_match:
                 # This line is a # trivially_pass: annotation — do not emit as command
                 pending_trivially_pass = tp_match.group(1).strip()
                 pending_preflight_scope = None  # reset other annotation
-                last_was_annotation = True
+                _last_was_annotation = True
                 continue
 
             # Non-annotation comment line: invalidate pending annotations (AC6)
             if stripped.startswith('#') and not _annotation_re.match(stripped):
                 pending_preflight_scope = None
                 pending_trivially_pass = None
-                last_was_annotation = False
+                _last_was_annotation = False
                 continue
 
             # Command line: must start with "$" to be considered a VC command
@@ -467,14 +467,14 @@ def parse_vc_commands(vc_section: str) -> list[ParsedVcCommand]:
                 # Reset pending annotations after consuming
                 pending_preflight_scope = None
                 pending_trivially_pass = None
-                last_was_annotation = False
+                _last_was_annotation = False
             else:
                 # Non-command, non-annotation, non-blank line: invalidate annotations
                 # (e.g. a comment like "# some other remark" — already handled above,
                 # but also handles output lines etc.)
                 pending_preflight_scope = None
                 pending_trivially_pass = None
-                last_was_annotation = False
+                _last_was_annotation = False
 
     return results
 
@@ -1165,7 +1165,7 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     # parse 失敗時は regex fallback に降りる（既存挙動を破壊しない）。
     mrc_yaml_text = ""
     mrc_parsed: dict = {}
-    mrc_yaml_parse_failed = False
+    _mrc_yaml_parse_failed = False
     mrc_match = re.search(
         r"```yaml\s*\n(.*?contract_schema_version.*?)\n```",
         body,
@@ -1179,7 +1179,7 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
             if isinstance(loaded, dict):
                 mrc_parsed = loaded
         except Exception:
-            mrc_yaml_parse_failed = True
+            _mrc_yaml_parse_failed = True
     psc_section = extract_section(body, "Product Spec Context")
     structured_trace_text = mrc_yaml_text + "\n" + psc_section
 

@@ -198,7 +198,7 @@ def test_preflight_phase_gate_emits_router_error_v1():
         pytest.fail(f"ISSUE_REFINEMENT_ROUTER_ERROR_V1 line not found in:\n{result.stdout}")
 
     # Exactly one ISSUE_REFINEMENT_ROUTER_ERROR_V1 line
-    error_lines = [l for l in result.stdout.splitlines() if "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in l]
+    error_lines = [ln for ln in result.stdout.splitlines() if "ISSUE_REFINEMENT_ROUTER_ERROR_V1" in ln]
     assert len(error_lines) == 1, f"Expected exactly 1 error line, got {len(error_lines)}"
 
 
@@ -627,7 +627,6 @@ def test_build_phase_state_source_kind_phase_mismatch_returns_error(tmp_path):
 # M3: validate_refinement_phase_transition.py の phase table テスト (parametrize)
 # ---------------------------------------------------------------------------
 
-import pytest
 
 VALIDATE_SCRIPT = SKILL_ROOT / "scripts" / "validate_refinement_phase_transition.py"
 

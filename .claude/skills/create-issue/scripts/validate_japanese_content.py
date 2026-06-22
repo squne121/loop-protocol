@@ -780,12 +780,12 @@ def main():
 
         result_path = None
         is_stdin = False
-        found = False
+        _found = False
         i = 0
         while i < len(tokens):
             tok = tokens[i]
             if tok == '--input' and i + 1 < len(tokens):
-                found = True
+                _found = True
                 fp = tokens[i + 1]
                 if fp == '-':
                     is_stdin = True
@@ -793,7 +793,7 @@ def main():
                     result_path = fp
                 break
             if tok.startswith('--input='):
-                found = True
+                _found = True
                 fp = tok[len('--input='):]
                 if fp == '-':
                     is_stdin = True
@@ -987,7 +987,7 @@ def main():
         import shlex as _shlex
 
         command = args.parse_edit_target
-        edit_type = args.parse_edit_type
+        _edit_type = args.parse_edit_type
 
         try:
             tokens = _shlex.split(command)

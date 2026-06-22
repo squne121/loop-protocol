@@ -282,7 +282,7 @@ def main() -> int:
         print(f"ERROR: no fixture JSON files found in {fixtures_dir}", file=sys.stderr)
         return 1
 
-    print(f"Kill Switch Smoke Test", flush=True)
+    print("Kill Switch Smoke Test", flush=True)
     print(f"Fixtures dir: {fixtures_dir}", flush=True)
     print(f"Verifier: {VERIFIER_SCRIPT}", flush=True)
     print(f"Found {len(fixture_files)} fixture(s)", flush=True)

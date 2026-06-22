@@ -23,7 +23,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pytest
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 

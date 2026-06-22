@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Any, List, Tuple
+from typing import List, Tuple
 
 try:
     import yaml

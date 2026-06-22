@@ -528,7 +528,7 @@ def _extract_bash_commands_from_vc_section(vc_section: str) -> list:
         }
     """
     result = []
-    lines = vc_section.splitlines()
+    _lines = vc_section.splitlines()
     # vc_section 全体での行番号マッピングを作成
     for match in _BASH_FENCE_RE.finditer(vc_section):
         block_text = match.group(1)
@@ -825,9 +825,9 @@ def main() -> None:
             else:
                 print("all_passed: false")
                 print("guards:")
-                print(f"  - name: ready_tuple")
-                print(f"    passed: false")
-                print(f"    errors:")
+                print("  - name: ready_tuple")
+                print("    passed: false")
+                print("    errors:")
                 print(f"      - {_rb_error_result['errors'][0]!r}")
             sys.exit(2)
 
@@ -845,9 +845,9 @@ def main() -> None:
             else:
                 print("all_passed: false")
                 print("guards:")
-                print(f"  - name: ready_tuple")
-                print(f"    passed: false")
-                print(f"    errors:")
+                print("  - name: ready_tuple")
+                print("    passed: false")
+                print("    errors:")
                 print(f"      - {_rb_error_result['errors'][0]!r}")
             sys.exit(2)
 
@@ -865,9 +865,9 @@ def main() -> None:
             else:
                 print("all_passed: false")
                 print("guards:")
-                print(f"  - name: ready_tuple")
-                print(f"    passed: false")
-                print(f"    errors:")
+                print("  - name: ready_tuple")
+                print("    passed: false")
+                print("    errors:")
                 print(f"      - {_rb_error_result['errors'][0]!r}")
             sys.exit(2)
 
@@ -885,9 +885,9 @@ def main() -> None:
                 else:
                     print("all_passed: false")
                     print("guards:")
-                    print(f"  - name: ready_tuple")
-                    print(f"    passed: false")
-                    print(f"    errors:")
+                    print("  - name: ready_tuple")
+                    print("    passed: false")
+                    print("    errors:")
                     print(f"      - {_rb_error_result['errors'][0]!r}")
                 sys.exit(2)
             if not isinstance(lbl.get("name"), str):
@@ -902,9 +902,9 @@ def main() -> None:
                 else:
                     print("all_passed: false")
                     print("guards:")
-                    print(f"  - name: ready_tuple")
-                    print(f"    passed: false")
-                    print(f"    errors:")
+                    print("  - name: ready_tuple")
+                    print("    passed: false")
+                    print("    errors:")
                     print(f"      - {_rb_error_result['errors'][0]!r}")
                 sys.exit(2)
 
