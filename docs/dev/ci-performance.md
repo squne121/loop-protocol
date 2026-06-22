@@ -79,6 +79,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `test_e2e_ci` | `pnpm test:e2e:ci` | e2e |
 | `uv_python_install` | `uv python install` | python-test / node-backed-hook-tests |
 | `uv_sync` | `uv sync --locked --group dev` | python-test / node-backed-hook-tests |
+| `ruff_check` | `uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills` | python-test |
 | `pytest_skills` | pytest（skills 群 14 ステップ合計の stable phase_id） | python-test |
 | `pytest_node_backed_hooks` | Node-backed hook test nodeid 2 件 | node-backed-hook-tests |
 | `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |

@@ -18,7 +18,6 @@ import tempfile
 import os
 from pathlib import Path
 
-import pytest
 
 # Path to the script under test
 SCRIPT_PATH = (

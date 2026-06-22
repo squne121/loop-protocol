@@ -18,15 +18,12 @@ AC coverage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import textwrap
-import tempfile
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Import module under test

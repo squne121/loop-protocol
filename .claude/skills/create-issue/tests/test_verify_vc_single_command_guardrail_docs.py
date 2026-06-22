@@ -9,7 +9,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 
 SCRIPT = Path(__file__).parent.parent / "scripts" / "verify_vc_single_command_guardrail_docs.py"
 
@@ -199,7 +198,7 @@ class TestFileMissing:
         ba_path.parent.mkdir(parents=True, exist_ok=True)
         ba_path.write_text("# clean\n", encoding="utf-8")
         # skill path does NOT exist
-        skill_path = repo_root / ".claude/skills/create-issue/SKILL.md"
+        _skill_path = repo_root / ".claude/skills/create-issue/SKILL.md"
         # do not create it
 
         result = subprocess.run(

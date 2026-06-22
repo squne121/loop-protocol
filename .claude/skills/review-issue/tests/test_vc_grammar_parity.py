@@ -19,9 +19,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Optional
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -347,7 +345,7 @@ class TestAC6ColonMarkerFail:
         """LP016 must fire for colon AC markers."""
         output = _run_validate_body(_COLON_MARKER_BODY)
         lp016 = [e for e in output["errors"] if e["rule_id"] == "LP016"]
-        assert len(lp016) >= 1, f"LP016 should fire for '# AC1:' marker"
+        assert len(lp016) >= 1, "LP016 should fire for '# AC1:' marker"
         assert "bare" in lp016[0]["message"], f"LP016 message should mention 'bare': {lp016[0]['message']}"
 
     def test_validate_body_lp016_colon_fix_hint(self):
@@ -392,7 +390,7 @@ class TestAC6InlineBacktickFail:
         """LP011 must fire for inline backtick VC (no bash fence)."""
         output = _run_validate_body(_INLINE_BACKTICK_BODY)
         lp011 = [e for e in output["errors"] if e["rule_id"] == "LP011"]
-        assert len(lp011) >= 1, f"LP011 should fire for inline backtick VC"
+        assert len(lp011) >= 1, "LP011 should fire for inline backtick VC"
 
     def test_preflight_static_result(self):
         """Preflight --static-only must be blocked for inline backtick VC."""
@@ -425,7 +423,7 @@ class TestAC6UnlabeledFenceFail:
         """LP011 must fire for unlabeled fence (no bash fence)."""
         output = _run_validate_body(_UNLABELED_FENCE_BODY)
         lp011 = [e for e in output["errors"] if e["rule_id"] == "LP011"]
-        assert len(lp011) >= 1, f"LP011 should fire for unlabeled fence VC"
+        assert len(lp011) >= 1, "LP011 should fire for unlabeled fence VC"
 
     def test_preflight_static_blocked(self):
         """Preflight --static-only must return blocked for unlabeled fence."""

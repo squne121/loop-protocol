@@ -151,7 +151,7 @@ def run_preflight() -> dict[str, Any]:
     except FileNotFoundError:
         result["failure_reason"] = f"{agy_bin}: command not found"
         result["failure_class"] = "cli_missing"
-        result["recovery_action"] = f"install agy or set AGY_BIN to a valid path"
+        result["recovery_action"] = "install agy or set AGY_BIN to a valid path"
         result["warnings"].append(result["failure_reason"])
         return result
 

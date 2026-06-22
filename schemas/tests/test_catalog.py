@@ -390,7 +390,6 @@ class TestJsonSchemaValidation:
     def test_catalog_validates_against_schema(self, catalog: dict, schema_json: dict):
         """Validate catalog.yaml against catalog.schema.json using jsonschema."""
         try:
-            import jsonschema
             from jsonschema import Draft202012Validator
 
             validator = Draft202012Validator(schema_json)

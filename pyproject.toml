@@ -9,7 +9,11 @@ dev = [
   "pytest>=8.0",
   "pyyaml>=6.0",
   "jsonschema>=4.0",
+  "ruff>=0.5",
 ]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+
+[tool.ruff]
+line-length = 120

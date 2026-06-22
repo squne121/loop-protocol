@@ -7,16 +7,12 @@ Tests for build_loop_state.py (AC1, AC6, AC7, AC8, AC12).
 
 from __future__ import annotations
 
-import ast
-import inspect
 import json
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 SKILL_ROOT = Path(__file__).parent.parent
 SCRIPT = SKILL_ROOT / "scripts" / "build_loop_state.py"

@@ -18,7 +18,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 SCRIPT_PATH = Path(__file__).parent.parent / "scripts" / "check_issue_contract.py"
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"

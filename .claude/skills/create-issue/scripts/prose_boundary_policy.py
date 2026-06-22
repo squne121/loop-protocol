@@ -545,7 +545,7 @@ def _is_gfm_table_block(text: str) -> bool:
     Returns:
         True if text is a GFM pipe table, False otherwise
     """
-    lines = [l for l in text.splitlines() if l.strip()]
+    lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2:
         return False
 

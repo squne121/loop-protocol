@@ -10,7 +10,6 @@ AC5: trusted anchor generates scope_delta_decision with implementation_go=false
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -60,7 +59,7 @@ VALID_ANCHOR_PAYLOAD = {
 VALID_YAML_BLOCK = (
     "```yaml\n"
     + "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
-    + f"target:\n"
+    + "target:\n"
     + f"  repo: {TARGET_REPO}\n"
     + f"  issue_number: {TARGET_ISSUE}\n"
     + "decision: approve_scope_delta\n"
@@ -330,7 +329,7 @@ class TestFailClosed:
             repo=TARGET_REPO,
             issue_number=TARGET_ISSUE,
         )
-        assert blockers, f"Expected blockers for multiple anchor URLs, got none"
+        assert blockers, "Expected blockers for multiple anchor URLs, got none"
 
 
 # ---------------------------------------------------------------------------

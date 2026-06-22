@@ -315,7 +315,7 @@ def _run_japanese_content_validator(
                 check=False,
                 timeout=60,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             return {
                 "status": "internal",
                 "failed_blocks": 0,

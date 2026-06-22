@@ -46,7 +46,7 @@ SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "impl-review-loop" / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
 
 
 def _read(path: Path) -> str:

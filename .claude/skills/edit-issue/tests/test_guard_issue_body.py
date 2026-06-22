@@ -490,7 +490,7 @@ class TestLoadRequiredLabels:
         assert "Allowed Paths" in labels
         assert "Stop Conditions" in labels
         # markdown 要素は除外される
-        assert len([l for l in labels if l is None]) == 0
+        assert len([lbl for lbl in labels if lbl is None]) == 0
 
     def test_research_returns_expected_labels(self, template_dir):
         """GIVEN research テンプレート WHEN load_required_labels を呼ぶ THEN 必須ラベルが返る"""
@@ -1290,7 +1290,7 @@ class TestCheckReadyTuple:
         if expected_pass:
             assert errors == [], f"Expected PASS but got errors: {errors}"
         else:
-            assert len(errors) > 0, f"Expected FAIL but got no errors"
+            assert len(errors) > 0, "Expected FAIL but got no errors"
 
     def test_check_ready_tuple_title_error_message_contains_got(self):
         """Error message for title mismatch should contain the actual title."""

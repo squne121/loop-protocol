@@ -14,7 +14,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Import module under test

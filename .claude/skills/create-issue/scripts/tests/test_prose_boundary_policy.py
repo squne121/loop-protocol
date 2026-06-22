@@ -11,13 +11,11 @@ AC4: golden corpus snapshot test（GFM edge case を含む PASS / FAIL ケース
 import sys
 from pathlib import Path
 
-import pytest
 
 # テスト対象スクリプトのパス（worktree / main 両対応）
 _SCRIPTS_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-import prose_boundary_policy as pbp
 from prose_boundary_policy import (
     ALL_BLOCK_KINDS,
     BLOCK_KIND_CANONICAL_HEADING,

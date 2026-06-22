@@ -188,9 +188,9 @@ def _read_json_file(path: Path) -> tuple[Any, str | None]:
         return json.loads(text), None
     except FileNotFoundError:
         return None, "file_not_found"
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError):
         return None, "json_parse_error"
-    except OSError as exc:
+    except OSError:
         return None, "os_error"
 
 
@@ -536,7 +536,7 @@ def _resolve_push_urls(config: dict[str, str]) -> list[str]:
 
     # Collect branch.*.pushRemote - these point to remotes; we already collected all remotes above
     # But we add them to ensure branch-specific push remotes are considered
-    push_remote_default = config.get("remote.pushdefault", "")
+    _push_remote_default = config.get("remote.pushdefault", "")
     for key, val in config.items():
         if re.match(r"branch\.[^.]+\.pushremote$", key):
             # val is a remote name; get its push URL

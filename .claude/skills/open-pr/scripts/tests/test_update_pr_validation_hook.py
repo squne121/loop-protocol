@@ -604,7 +604,7 @@ class TestJapaneseContentValidationHook:
             },
         )
         assert rc == 1
-        preflight_lines = [l for l in lines if l.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
+        preflight_lines = [ln for ln in lines if ln.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
         assert len(preflight_lines) == 1, (
             f"Expected exactly one PR_BODY_PREFLIGHT_RESULT_V1 line; got: {lines}"
         )

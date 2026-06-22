@@ -21,7 +21,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 # Resolve the script directories relative to this test file
 SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
@@ -405,9 +404,9 @@ class TestDuplicateKeys:
     def test_duplicate_nested_key_causes_invalid_input(self, tmp_path: Path) -> None:
         """GIVEN JSON with a duplicate key inside self_validation, THEN invalid_input."""
         plan = _make_valid_plan(tmp_path)
-        sv_str = json.dumps(plan["self_validation"], ensure_ascii=False)
+        _sv_str = json.dumps(plan["self_validation"], ensure_ascii=False)
         # Inject duplicate key into self_validation
-        plan_str = json.dumps(plan, ensure_ascii=False)
+        _plan_str = json.dumps(plan, ensure_ascii=False)
         # Replace first self_validation json with a version that has duplicate keys
         sv_with_dup = '{"payload_sha256": "aaa", "payload_sha256": "bbb", "schema_name": "ISSUE_SCOPE_ROLLUP_PLAN_V2", "schema_version": 2, "hash_algorithm": "sha256", "invocation_id": "test", "script_file_sha256": "ccc", "canonicalization": "test"}'
         # Build raw JSON string with the duplicate-key self_validation
@@ -422,7 +421,6 @@ class TestDuplicateKeys:
 
     def test_load_json_strict_detects_duplicate_keys(self) -> None:
         """Unit test: _load_json_strict returns error for duplicate keys."""
-        import tempfile
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             f.write('{"a": 1, "a": 2}')
             fname = f.name

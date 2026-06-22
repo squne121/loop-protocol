@@ -7,9 +7,6 @@ AC9: triage consumer が pnpm lint / pnpm typecheck の no-TTY 失敗時に
 from __future__ import annotations
 
 import importlib.util
-import json
-import subprocess
-import sys
 from pathlib import Path
 
 

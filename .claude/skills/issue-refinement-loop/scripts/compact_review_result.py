@@ -21,7 +21,6 @@ exit codes: 0=ok, 1=warn, 2=verdict_missing / validation_error
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys

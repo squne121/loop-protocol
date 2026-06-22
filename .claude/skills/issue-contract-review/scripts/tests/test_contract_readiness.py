@@ -18,7 +18,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -479,7 +478,7 @@ def test_applicable_acs_missing():
     """AC4: applicable_acs field missing for decision: immediate."""
     body = RVA_MISSING_FIELDS_BODY.replace("applicable_acs:\n  - AC1\n", "")
     data, _ = run_readiness_with_body(body)
-    rule_ids = [e["rule_id"] for e in data["errors"]]
+    _rule_ids = [e["rule_id"] for e in data["errors"]]
     categories = [e["category"] for e in data["errors"]]
     assert "rva_immediate_field_missing" in categories, (
         f"rva_immediate_field_missing not found: {categories}"

@@ -20,7 +20,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 # テスト対象スクリプトをロード
 _SCRIPT_DIR = Path(__file__).parent.parent

@@ -250,7 +250,7 @@ def decide_next_action(
     termination_reason = loop_state.get("termination_reason")
     scope_signal = loop_state.get("scope_signal_guard", {})
     blockers: list[str] = []
-    commands: list[str] = []
+    _commands: list[str] = []
 
     # --- Priority 1: inconsistent_state detection ---
     if iteration < 0:

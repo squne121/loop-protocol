@@ -11,11 +11,9 @@ Deterministically verifies:
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 AGENT_FILE = REPO_ROOT / ".claude" / "agents" / "implementation-worker.md"

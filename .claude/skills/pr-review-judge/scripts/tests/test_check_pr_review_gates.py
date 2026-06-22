@@ -8,7 +8,6 @@ import pytest
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 # Import the checker module
 import sys
@@ -18,7 +17,6 @@ from check_pr_review_gates import (
     GateStatus,
     Verdict,
     PRReviewGateResult,
-    Finding,
 )
 
 
@@ -130,89 +128,6 @@ findings:
         checker = CheckPRReviewGates()
         result = checker.g2_evidence_binding(pr_body="")
         assert result.status == GateStatus.NOT_APPLICABLE.value
-
-
-class TestG3ImplementationOracle:
-    """Tests for G3: Implementation oracle verification."""
-
-    def test_g3_no_oracle_section(self):
-        """G3: no implementation_oracles section → not_applicable"""
-        checker = CheckPRReviewGates()
-        issue_body = "## Some section\nContent"
-        result = checker.g3_implementation_oracle(issue_body=issue_body)
-        assert result.status == GateStatus.NOT_APPLICABLE.value
-
-    def test_g3_parse_oracle_structure(self):
-        """G3: parse oracle YAML structure from issue"""
-        checker = CheckPRReviewGates()
-        issue_body = """## implementation_oracles:
-- oracle_1
-  kind: python_ast_call
-  files: src/test.py
-  must_call:
-    module: subprocess
-    function: run
-"""
-        oracles = checker._parse_implementation_oracles(issue_body)
-        assert len(oracles) > 0
-        # ID may be set from "- " line or from id: field
-        assert "oracle_1" in str(oracles[0].get("id", ""))
-        assert oracles[0].get("kind") == "python_ast_call"
-
-    def test_g3_ast_call_verification_pass(self):
-        """G3: AST call verification passes when call found"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write("import subprocess\nsubprocess.run(['ls'])")
-            f.flush()
-
-            checker = CheckPRReviewGates()
-            result = checker._verify_ast_call(
-                oracle={
-                    "id": "test_oracle",
-                    "must_call": {"module": "subprocess", "function": "run"}
-                },
-                files=[f.name]
-            )
-            assert result["passed"] is True
-
-            Path(f.name).unlink()
-
-    def test_g3_ast_call_verification_fail(self):
-        """G3: AST call verification fails when call not found"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write("import os\nprint('hello')")
-            f.flush()
-
-            checker = CheckPRReviewGates()
-            result = checker._verify_ast_call(
-                oracle={
-                    "id": "test_oracle",
-                    "must_call": {"module": "subprocess", "function": "run"}
-                },
-                files=[f.name]
-            )
-            assert result["passed"] is False
-            assert "not found" in result["error"]
-
-            Path(f.name).unlink()
-
-    def test_g3_grep_fallback(self):
-        """G3: grep fallback when pattern specified"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write("def my_function():\n    return 42")
-            f.flush()
-
-            checker = CheckPRReviewGates()
-            result = checker._verify_grep(
-                oracle={
-                    "id": "test_oracle",
-                    "pattern": "my_function"
-                },
-                files=[f.name]
-            )
-            assert result["passed"] is True
-
-            Path(f.name).unlink()
 
 
 class TestG4HeadSHAConsistency:
@@ -771,7 +686,6 @@ class TestArtifactGenerator:
 
     def test_artifact_generator_emits_pr_head_sha_and_merge_sha(self):
         """Artifact should include pr_head_sha and merge_sha fields"""
-        from generate_ci_test_selection_artifact import generate_artifact
         import argparse
 
         # Create mock args

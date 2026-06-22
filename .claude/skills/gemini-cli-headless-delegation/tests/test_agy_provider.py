@@ -8,13 +8,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
-import sys
 import types
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Module loading helper (hermetic, no side-effects)
@@ -296,7 +294,7 @@ def test_ac13_run_agy_uses_shell_false_and_minimal_env() -> None:
     """AC13: _run_agy uses shell=False with minimal env."""
     captured_kwargs: dict[str, Any] = {}
 
-    original_run = subprocess.run
+    _original_run = subprocess.run
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         captured_kwargs.update(kwargs)
@@ -306,7 +304,7 @@ def test_ac13_run_agy_uses_shell_false_and_minimal_env() -> None:
         rgh._run_agy("test prompt", 30)
 
     # shell=False (default when not specified, but must not be True)
-    assert captured_kwargs.get("shell") is False or "shell" not in captured_kwargs or captured_kwargs.get("shell") == False
+    assert captured_kwargs.get("shell") is False or "shell" not in captured_kwargs or captured_kwargs.get("shell") is False
     # env must be present and minimal
     env = captured_kwargs.get("env")
     assert env is not None, "env must be explicitly set (minimal env required)"

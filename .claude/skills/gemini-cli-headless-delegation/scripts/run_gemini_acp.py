@@ -925,7 +925,7 @@ def run_acp(
 
     try:
         try:
-            loop = asyncio.get_running_loop()
+            _loop = asyncio.get_running_loop()
             # If there's already a running loop, we can't call run_until_complete.
             # This path is only hit if run_acp is called from within an async context.
             import concurrent.futures

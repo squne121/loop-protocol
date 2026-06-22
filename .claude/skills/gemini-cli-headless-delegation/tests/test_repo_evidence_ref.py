@@ -23,7 +23,6 @@ import pytest
 import hashlib
 import sys
 from pathlib import Path
-from datetime import datetime, timezone
 
 # Add scripts directory to path for importing validate_repo_evidence_ref
 scripts_dir = Path(__file__).parent.parent / "scripts"
@@ -284,7 +283,7 @@ class TestRepoEvidenceRefValidator:
     def test_excerpt_hash_mismatch_via_getter(self):
         """Test that excerpt_sha256 mismatch is detected (using fake getter)."""
         actual_content = b"line 1\nline 2\nline 3\n"
-        actual_hash = hashlib.sha256(actual_content).hexdigest()
+        _actual_hash = hashlib.sha256(actual_content).hexdigest()
         claimed_hash = "f" * 64  # Different hash
 
         def fake_getter(commit_sha, path):

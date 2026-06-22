@@ -764,6 +764,25 @@ jobs:
             return $status
           }
           run_timed uv_sync uv sync --locked --group dev
+      - name: Ruff check (timed)
+        id: timed-ruff-check
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed ruff_check uv run --locked ruff check --select E,F --ignore E501,E402 .claude/scripts scripts schemas .claude/skills
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version

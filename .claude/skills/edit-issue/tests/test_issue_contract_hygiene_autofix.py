@@ -16,7 +16,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 
 SCRIPT = (
     Path(__file__).parent.parent / "scripts" / "issue_contract_hygiene_autofix.py"

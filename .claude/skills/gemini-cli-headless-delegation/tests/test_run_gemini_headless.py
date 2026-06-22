@@ -1974,7 +1974,7 @@ def test_main_ndjson_output_appends_on_second_run(tmp_path, monkeypatch):
         "--output-format", "ndjson",
     ])
 
-    lines = [l for l in output_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [ln for ln in output_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 2, f"expected 2 lines after 2 runs, got {len(lines)}: {lines}"
     for line in lines:
         obj = _json.loads(line)

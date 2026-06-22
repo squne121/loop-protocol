@@ -6,13 +6,11 @@ AC3: decide_next_loop_action.py determines next action from compact review
 result fixture, and iteration limit exceeded → human escalation (exit 2).
 """
 
-import io
 import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 import pytest
 
@@ -359,7 +357,7 @@ def test_loop_state_file_is_read_only(tmp_path):
 def test_missing_jsonschema_fails_closed(monkeypatch):
     """jsonschema import failure → validate_loop_state returns (False, ...) → exit 3."""
     # Patch builtins.__import__ to raise ImportError for jsonschema
-    original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+    _original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
     import builtins
     real_import = builtins.__import__
@@ -376,7 +374,7 @@ def test_missing_jsonschema_fails_closed(monkeypatch):
     import sys as _sys
 
     # Remove cached module if present
-    module_name = "decide_next_loop_action"
+    _module_name = "decide_next_loop_action"
     for key in list(_sys.modules.keys()):
         if "decide_next_loop_action" in key:
             del _sys.modules[key]

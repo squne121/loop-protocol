@@ -874,7 +874,7 @@ def build_prompt(request: Mapping[str, Any], context_documents: list[dict[str, s
     lines.append(f"Objective: {request['objective']}")
     lines.append(f"Tool profile: {request['tool_profile']}")
     lines.append(f"Model: {request.get('model', DEFAULT_MODEL)}")
-    lines.append(f"Approval mode: plan")
+    lines.append("Approval mode: plan")
     lines.append("")
     lines.append("Execution rules:")
     lines.append("- Do not edit files.")

@@ -146,7 +146,6 @@ from prose_boundary_policy import (
     HEADING_POLICY,
     BLOCK_KIND_CANONICAL_HEADING,
     BLOCK_KIND_BILINGUAL_HEADING,
-    BLOCK_KIND_HUMAN_PROSE,
     classify_block,
     lookup_heading_policy,
     parse_atx_heading_line,
@@ -323,8 +322,8 @@ class TestDeltaCanonicalHeadingExcluded:
     def test_delta_canonical_heading_excluded(self):
         """GIVEN: ## Outcome 単独の変更 WHEN: changed_prose_blocks
         THEN: prose delta として返されない（canonical_heading は除外）"""
-        old = "## Outcome\n\nOld content text here.\n"
-        new = "## Outcome\n\nNew content text here.\n"
+        _old = "## Outcome\n\nOld content text here.\n"
+        _new = "## Outcome\n\nNew content text here.\n"
         # old/new の prose block を比較。## Outcome 自体は canonical_heading
         # として除外されるため、その heading 自体は delta 対象にならない
         # ただし本文（"New content text here."）は prose として検出される

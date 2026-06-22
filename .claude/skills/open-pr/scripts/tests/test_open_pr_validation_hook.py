@@ -394,7 +394,6 @@ def _run_main_with_validator_result(
     extra_args: list[str] | None = None,
 ) -> tuple[int, list[str]]:
     """Helper: run open_pr.main with a fixed validator result, capture stdout."""
-    import io
 
     body_path = write_temp_body(load_fixture(body_fixture))
     output_lines: list[str] = []
@@ -798,7 +797,7 @@ def test_ac8_japanese_fail_emits_preflight_result_v1(monkeypatch: pytest.MonkeyP
         },
     )
     assert rc == 2
-    preflight_lines = [l for l in lines if l.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
+    preflight_lines = [ln for ln in lines if ln.startswith("PR_BODY_PREFLIGHT_RESULT_V1=")]
     assert len(preflight_lines) == 1, f"Expected exactly one PR_BODY_PREFLIGHT_RESULT_V1 line; got: {lines}"
     json_str = preflight_lines[0][len("PR_BODY_PREFLIGHT_RESULT_V1="):]
     payload = _json.loads(json_str)
