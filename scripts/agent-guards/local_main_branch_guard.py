@@ -846,10 +846,10 @@ def is_gh_mutation_command(cmd: str) -> bool:
     # Only applies to gh issue/pr subcommands
     if not GH_ISSUE_PR_COMMAND_PATTERN.match(cmd):
         return False
-    # If in readonly allowlist, it is NOT a mutation
-    for pattern in DISPLAY_READONLY_PATTERNS:
-        if re.match(pattern, cmd):
-            return False
+    # If in readonly allowlist (and not overridden by web flag etc.), it is NOT a mutation.
+    # Use is_readonly_command() so that --web/-w blocking (B3) flows through correctly.
+    if is_readonly_command(cmd):
+        return False
     # gh issue/pr not in any allowlist → treat as mutation → block
     return True
 
