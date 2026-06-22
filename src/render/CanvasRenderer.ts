@@ -202,20 +202,24 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       )
       context.fill()
 
+      const showAssistWorldCues = state.sortie.result === null
+
       // --- Layer 4b: ally markers ---
-      context.save()
-      context.fillStyle = '#64d7ff'
-      context.strokeStyle = 'rgba(100, 215, 255, 0.85)'
-      context.lineWidth = 2
-      for (const ally of state.allies) {
-        context.beginPath()
-        context.arc(ally.x, ally.y, ally.radius, 0, Math.PI * 2)
-        context.fill()
-        context.beginPath()
-        context.arc(ally.x, ally.y, ally.radius + 5, 0, Math.PI * 2)
-        context.stroke()
+      if (showAssistWorldCues) {
+        context.save()
+        context.fillStyle = '#64d7ff'
+        context.strokeStyle = 'rgba(100, 215, 255, 0.85)'
+        context.lineWidth = 2
+        for (const ally of state.allies) {
+          context.beginPath()
+          context.arc(ally.x, ally.y, ally.radius, 0, Math.PI * 2)
+          context.fill()
+          context.beginPath()
+          context.arc(ally.x, ally.y, ally.radius + 5, 0, Math.PI * 2)
+          context.stroke()
+        }
+        context.restore()
       }
-      context.restore()
 
       // --- Layer 5: enemies (defeated === false only) ---
       context.fillStyle = '#f05050'
@@ -241,7 +245,9 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       }
 
       // --- Layer 5c: active assist cue (non-authoritative only) ---
-      const assistCueSegments = resolveActiveAssistCueSegments(state)
+      const assistCueSegments = showAssistWorldCues
+        ? resolveActiveAssistCueSegments(state)
+        : []
       if (assistCueSegments.length > 0) {
         context.save()
         context.strokeStyle = 'rgba(100, 215, 255, 0.55)'
