@@ -63,6 +63,14 @@ jobs:
       - run: pnpm build
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
+          VITE_LOOP_RUN_ID: ${{ github.run_id }}
+          VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          VITE_LOOP_PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+          VITE_LOOP_ARTIFACT_URL: "unknown"
+          VITE_LOOP_ARTIFACT_NAMES: gh-pages-main
+          VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unavailable-in-deploy-pages"
+          VITE_LOOP_RETENTION_DAYS: "90"
+          VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
       - name: Verify main build asset base path
         shell: bash
         run: |
@@ -179,6 +187,14 @@ jobs:
         env:
           VITE_LOOP_COMMIT_SHA: ${{ steps.commit-sha.outputs.sha }}
           VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.storage-namespace.outputs.namespace }}
+          VITE_LOOP_RUN_ID: ${{ github.run_id }}
+          VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          VITE_LOOP_PAGE_URL: https://${{ github.repository_owner }}.github.io${{ steps.vite-base.outputs.base }}
+          VITE_LOOP_ARTIFACT_URL: "unknown"
+          VITE_LOOP_ARTIFACT_NAMES: gh-pages-pr-${{ github.event.number }}
+          VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unavailable-in-deploy-pages"
+          VITE_LOOP_RETENTION_DAYS: "90"
+          VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
       - name: Verify PR preview build asset base path
         shell: bash
         run: |

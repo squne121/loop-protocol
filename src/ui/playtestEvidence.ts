@@ -8,6 +8,14 @@
  * - DOM への読み取りアクセスのみ
  */
 
+import {
+  getPlaytestEvidenceSnapshot,
+  setSelfExplanationResponse,
+  type AssistPlayerPlaytestEvent,
+  type AssistPlayerTerminalState,
+  type QualitativeNotes,
+} from '../playtest/assistPlayerEventLog'
+
 // ---------------------------------------------------------------------------
 // navigator.userAgentData は実験的 API のため型宣言が DOM lib に含まれない。
 // AC4: getHighEntropyValues() fallback のために最小限の型を宣言する。
@@ -77,15 +85,40 @@ export interface EnvironmentInfo {
   screen: ScreenMetrics
   timezone: string
   language: string
+  declared_browser_zoom: {
+    declared_percent: 100 | 125 | 150 | 200 | 'manual_unknown'
+    source: 'test_matrix' | 'manual_input' | 'unknown'
+  }
+}
+
+export interface ArtifactMetadata {
+  run_id: string
+  run_attempt: string
+  page_url: string
+  artifact_url: string
+  artifact_names: string[]
+  artifact_digest_or_attestation: string
+  retention_days: string
+  screenshot_path: string
+}
+
+export interface RuntimeEvidenceState {
+  sortie_id: string
+  paused_or_running: 'paused' | 'running'
+  terminal_state: AssistPlayerTerminalState
 }
 
 export interface PlaytestEvidenceData {
-  playtest_evidence_schema_version: 'v1'
+  playtest_evidence_schema_version: 'v2'
   generated_at: string
   source_url: string
   app_under_test: AppUnderTest
   browser: BrowserInfo
   environment: EnvironmentInfo
+  artifacts: ArtifactMetadata
+  runtime_state: RuntimeEvidenceState
+  deterministic_events: AssistPlayerPlaytestEvent[]
+  qualitative_notes?: QualitativeNotes
   hashes: Record<string, string>
 }
 
@@ -310,19 +343,61 @@ function collectScreen(): ScreenMetrics {
   }
 }
 
+function readBuildEnv(key: keyof ImportMetaEnv): string {
+  const value =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? import.meta.env[key]
+      : undefined
+  return typeof value === 'string' && value.length > 0 ? value : 'unknown'
+}
+
+function collectDeclaredBrowserZoom(): EnvironmentInfo['declared_browser_zoom'] {
+  return {
+    declared_percent: 'manual_unknown',
+    source: 'unknown',
+  }
+}
+
+function collectArtifactMetadata(): ArtifactMetadata {
+  return {
+    run_id: readBuildEnv('VITE_LOOP_RUN_ID'),
+    run_attempt: readBuildEnv('VITE_LOOP_RUN_ATTEMPT'),
+    page_url: readBuildEnv('VITE_LOOP_PAGE_URL'),
+    artifact_url: readBuildEnv('VITE_LOOP_ARTIFACT_URL'),
+    artifact_names: readBuildEnv('VITE_LOOP_ARTIFACT_NAMES')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0 && entry !== 'unknown'),
+    artifact_digest_or_attestation: readBuildEnv('VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION'),
+    retention_days: readBuildEnv('VITE_LOOP_RETENTION_DAYS'),
+    screenshot_path: readBuildEnv('VITE_LOOP_SCREENSHOT_PATH'),
+  }
+}
+
+function collectPausedOrRunningState(): RuntimeEvidenceState['paused_or_running'] {
+  if (typeof document === 'undefined') {
+    return 'running'
+  }
+  const togglePauseButton = document.querySelector('[data-action="toggle-pause"]')
+  if (togglePauseButton?.getAttribute('aria-pressed') === 'true') {
+    return 'paused'
+  }
+  return 'running'
+}
+
 // ---------------------------------------------------------------------------
 // Main data builder (AC3, AC5-AC8)
 // ---------------------------------------------------------------------------
 
-export function buildEvidenceData(): PlaytestEvidenceData {
-  const now = new Date()
-  const generated_at = now.toISOString()
+export function buildEvidenceData(generatedAtOverride?: string): PlaytestEvidenceData {
+  const generated_at = generatedAtOverride ?? new Date().toISOString()
 
   const source_url = typeof location !== 'undefined' ? location.href : 'unknown'
 
   const app_under_test = resolveAppUnderTestCommit()
 
   const browser = collectBrowserInfo()
+  const runtimeEvidence = getPlaytestEvidenceSnapshot()
 
   const environment: EnvironmentInfo = {
     viewport: collectViewport(),
@@ -330,15 +405,24 @@ export function buildEvidenceData(): PlaytestEvidenceData {
     screen: collectScreen(),
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     language: typeof navigator !== 'undefined' ? navigator.language : 'unknown',
+    declared_browser_zoom: collectDeclaredBrowserZoom(),
   }
 
   return {
-    playtest_evidence_schema_version: 'v1',
+    playtest_evidence_schema_version: 'v2',
     generated_at,
     source_url,
     app_under_test,
     browser,
     environment,
+    artifacts: collectArtifactMetadata(),
+    runtime_state: {
+      sortie_id: runtimeEvidence.sortie_id,
+      paused_or_running: collectPausedOrRunningState(),
+      terminal_state: runtimeEvidence.terminal_state,
+    },
+    deterministic_events: runtimeEvidence.deterministic_events,
+    qualitative_notes: runtimeEvidence.qualitative_notes,
     hashes: {},
   }
 }
@@ -434,6 +518,84 @@ interface MountPanelResult {
   panel: HTMLElement
   /** Call once when the panel is first shown to lock the evidence snapshot. */
   initSnapshot: () => void
+  refreshSnapshot: () => void
+}
+
+interface PromptMountResult {
+  card: HTMLElement
+  syncPrompt: () => void
+}
+
+function mountSelfExplanationPrompt(container: HTMLElement): PromptMountResult {
+  const card = document.createElement('section')
+  card.setAttribute('data-self-explanation-card', 'true')
+  card.hidden = true
+  card.style.cssText = [
+    'position:fixed',
+    'left:8px',
+    'bottom:8px',
+    'width:min(360px, calc(100vw - 16px))',
+    'background:#101820',
+    'color:#f5f7fa',
+    'border:1px solid #5cc8ff',
+    'padding:12px',
+    'z-index:9997',
+    'box-sizing:border-box',
+  ].join(';')
+
+  const title = document.createElement('p')
+  title.textContent = 'Post-sortie self-explanation'
+  title.style.cssText = 'margin:0 0 8px;font-weight:bold'
+
+  const prompt = document.createElement('p')
+  prompt.setAttribute('data-self-explanation-prompt', 'true')
+  prompt.setAttribute('role', 'status')
+  prompt.setAttribute('aria-live', 'polite')
+  prompt.style.cssText = 'margin:0 0 8px'
+
+  const response = document.createElement('textarea')
+  response.setAttribute('data-self-explanation-response', 'true')
+  response.rows = 4
+  response.style.cssText = 'width:100%;box-sizing:border-box;margin:0 0 8px'
+
+  const saveButton = document.createElement('button')
+  saveButton.type = 'button'
+  saveButton.setAttribute('data-self-explanation-save', 'true')
+  saveButton.textContent = 'Save explanation'
+  saveButton.style.cssText = 'padding:6px 12px'
+
+  const hint = document.createElement('p')
+  hint.textContent = 'This note is exported under qualitative_notes and never mixed into deterministic_events.'
+  hint.style.cssText = 'margin:8px 0 0;font-size:11px;color:#b8c4d1'
+
+  saveButton.addEventListener('click', () => {
+    setSelfExplanationResponse(response.value.trim())
+  })
+
+  card.appendChild(title)
+  card.appendChild(prompt)
+  card.appendChild(response)
+  card.appendChild(saveButton)
+  card.appendChild(hint)
+  container.appendChild(card)
+
+  function syncPrompt(): void {
+    const snapshot = getPlaytestEvidenceSnapshot()
+    if (!snapshot.qualitative_notes) {
+      card.hidden = true
+      return
+    }
+    card.hidden = false
+    prompt.textContent = snapshot.qualitative_notes.self_explanation_prompt
+    if (
+      snapshot.qualitative_notes.self_explanation_response !== undefined &&
+      response.value !== snapshot.qualitative_notes.self_explanation_response
+    ) {
+      response.value = snapshot.qualitative_notes.self_explanation_response
+    }
+  }
+
+  return { card, syncPrompt }
 }
 
 /** Build and mount the Evidence Panel DOM node (AC2, AC9, AC10) */
@@ -574,10 +736,7 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
     asyncBrowserCache = asyncBrowser
     // If snapshot was already generated (panel opened before async resolved), refresh it.
     if (snapshotData && asyncBrowser.version_source === 'userAgentData') {
-      const updatedData: PlaytestEvidenceData = { ...snapshotData, browser: asyncBrowser }
-      snapshotData = updatedData
-      currentYaml = toYaml(updatedData)
-      textarea.value = currentYaml
+      refreshSnapshot()
     }
   }).catch(() => {
     // Async update failed silently -- sync render remains
@@ -587,9 +746,9 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
    * AC12: Initialize the evidence snapshot on first open.
    * Subsequent calls are no-ops (snapshot is locked after first call).
    */
-  function initSnapshot(): void {
-    if (snapshotData !== null) return  // already locked
-    let data = buildEvidenceData()
+  function refreshSnapshot(): void {
+    const generatedAt = snapshotData?.generated_at
+    let data = buildEvidenceData(generatedAt)
     // Apply async browser info if already resolved
     if (asyncBrowserCache && asyncBrowserCache.version_source === 'userAgentData') {
       data = { ...data, browser: asyncBrowserCache }
@@ -599,7 +758,15 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
     textarea.value = currentYaml
   }
 
-  return { panel, initSnapshot }
+  function initSnapshot(): void {
+    if (snapshotData !== null) {
+      refreshSnapshot()
+      return
+    }
+    refreshSnapshot()
+  }
+
+  return { panel, initSnapshot, refreshSnapshot }
 }
 
 /** Build and mount the always-visible toggle button (AC1, AC2, AC10) */
@@ -689,7 +856,8 @@ export function initPlaytestEvidencePanel(
   const panelOpen = shouldShowPanel(q)
 
   // Mount panel (initially hidden unless ?playtest_evidence=1)
-  const { panel, initSnapshot } = mountPanel(container, !panelOpen)
+  const { panel, initSnapshot, refreshSnapshot } = mountPanel(container, !panelOpen)
+  const { syncPrompt } = mountSelfExplanationPrompt(container)
 
   // AC12: if panel is initially open (e.g. ?playtest_evidence=1), initialize snapshot immediately.
   if (panelOpen) {
@@ -698,4 +866,13 @@ export function initPlaytestEvidencePanel(
 
   // Always mount the toggle button
   mountToggle(container, panel, initSnapshot)
+
+  const syncLoop = () => {
+    syncPrompt()
+    if (!panel.hidden) {
+      refreshSnapshot()
+    }
+    window.requestAnimationFrame(syncLoop)
+  }
+  window.requestAnimationFrame(syncLoop)
 }

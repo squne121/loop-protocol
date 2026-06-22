@@ -1,4 +1,8 @@
 import type { EntityId } from '../entities'
+import {
+  createPlaytestEvidenceRuntimeState,
+  type PlaytestEvidenceRuntimeState,
+} from '../playtest/assistPlayerEventLog'
 
 // ---------------------------------------------------------------------------
 // Unit taxonomy types (§5, unit-operations-and-npc-behavior SSOT)
@@ -302,6 +306,8 @@ export interface GameState {
   sortie: SortieState
   /** Command intent buffer runtime state (AC4, Issue #982). */
   commandIntentRuntime: CommandIntentRuntimeState
+  /** Deterministic assist_player playtest evidence runtime state (Issue #987). */
+  playtestEvidenceRuntime: PlaytestEvidenceRuntimeState
 }
 
 export const gameSnapshotSchemaVersion = 1 as const
@@ -412,6 +418,7 @@ export function createInitialGameState(
       // Clamped to [1, 180] as per AC1.
       assistPlayerTtlTicks: computeAssistPlayerTtlTicks(DEFAULT_TTL_MS, DEFAULT_FIXED_DELTA_MS),
     },
+    playtestEvidenceRuntime: createPlaytestEvidenceRuntimeState(),
   }
 }
 

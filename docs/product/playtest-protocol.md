@@ -30,6 +30,9 @@ trace_links:
 
 ## AI-driven Playtest Automation
 - **目的**: AI/自動化プレイテストは、仕組みの正しさ、到達可能性、ルール破綻、数値バランス、回帰、定量メトリクスの収集を目的とする。
+- **evidence 境界**: deterministic event log と qualitative self-explanation は分離して記録する。自由記述は `deterministic_events` に混ぜない。
+- **metadata 最低要件**: commit SHA、GitHub Actions run ID/run attempt、page URL または artifact URL、artifact 名、retention-days、viewport、DPR、declared browser zoom、userAgent、timezone、paused/running state、screenshot path を export 可能にする。
+- **runtime event の最小集合**: `command_use`、`command_noop`、`target_switch`、`local_threat_sample`、`ally_survival` を replay 再現可能な順序 (`tick ASC`, `event_type_order ASC`, `command_seq ASC`, `entity_id ASC`) で保持する。
 - **Playtest Mode**:
 
 | mode | 用途 | 許可する根拠 | 禁止する主張 |

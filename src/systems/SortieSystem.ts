@@ -9,6 +9,16 @@ import {
   type SortieState,
 } from '../state/GameState'
 import { mapInputToCommands } from '../input'
+import {
+  beginPlaytestEvidenceSortie,
+  markTerminalState,
+  nextPlaytestCommandSequence,
+  recordAllySurvival,
+  recordCommandNoop,
+  recordCommandUse,
+  recordLocalThreatSample,
+  setSelfExplanationPrompt,
+} from '../playtest/assistPlayerEventLog'
 import { runMovementSystem } from './MovementSystem'
 import { runEnemySpawnSystem } from './EnemySpawnSystem'
 import { runEnemyAISystem } from './EnemyAISystem'
@@ -21,6 +31,32 @@ import { RewardSystem } from './RewardSystem'
 
 /** Total sortie duration in milliseconds (30 seconds). */
 export const SORTIE_DURATION_MS = 30_000
+const LOCAL_THREAT_RADIUS_PX = 60
+
+function countLocalThreats(state: GameState): number {
+  return state.enemies.filter((enemy) => {
+    if (enemy.defeated) {
+      return false
+    }
+    const dx = enemy.x - state.player.x
+    const dy = enemy.y - state.player.y
+    return dx * dx + dy * dy <= LOCAL_THREAT_RADIUS_PX * LOCAL_THREAT_RADIUS_PX
+  }).length
+}
+
+function resolveSelfExplanationPrompt(
+  terminalState: SortieResult['outcome'],
+): string {
+  switch (terminalState) {
+    case 'victory':
+      return 'Victory secured. What changed the battle outcome most, and why?'
+    case 'defeat':
+      return 'Defeat logged. What changed the battle outcome most, and why?'
+    case 'timeout':
+      return 'Timeout reached. What changed the battle outcome most, and why?'
+  }
+}
+
 function buildRewardApplicationId(state: GameState): RewardApplicationId {
   let nextSequence = Math.max(1, state.nextRewardApplicationSequence)
   let applicationId: RewardApplicationId = `sortie-reward-${nextSequence}`
@@ -150,6 +186,7 @@ export function startSortie(state: GameState, fixedDeltaMs: number): void {
 
   state.loopPhase = 'running'
   state.pendingRewardApplicationId = null
+  beginPlaytestEvidenceSortie(state.playtestEvidenceRuntime)
   state.sortie = {
     status: 'running',
     elapsedTicks: 0,
@@ -258,6 +295,16 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   // AC4: transition to result phase, not directly to next sortie
   state.loopPhase = 'result'
   state.resultRewardStatus = 'pending'
+  markTerminalState(result.outcome)
+  setSelfExplanationPrompt(resolveSelfExplanationPrompt(result.outcome))
+  recordAllySurvival({
+    tick: terminalTick,
+    commandSeq: Math.max(0, state.playtestEvidenceRuntime.nextCommandSequence - 1),
+    sortieId: state.playtestEvidenceRuntime.currentSortieId,
+    alliesSpawned: Math.max(0, state.nextAllyId - 1),
+    alliesSurvived: state.allies.length,
+    protectedZoneStable: result.outcome !== 'defeat',
+  })
   if (state.pendingRewardApplicationId === null) {
     state.pendingRewardApplicationId = buildRewardApplicationId(state)
   }
@@ -277,13 +324,46 @@ export function runSortieSimulationStep(
   fixedDeltaMs: number,
 ): void {
   if (state.loopPhase !== 'running' || state.sortie.status !== 'running') return
+  const sampledAssistPlayer = commands.some((command) => command.type === 'sample_assist_player')
+  const commandSeq = sampledAssistPlayer
+    ? nextPlaytestCommandSequence(state.playtestEvidenceRuntime)
+    : null
+  const livingEnemyCount = state.enemies.filter((enemy) => !enemy.defeated).length
+  const noopReason =
+    !sampledAssistPlayer
+      ? null
+      : state.allies.length === 0
+        ? 'no_ally'
+        : livingEnemyCount === 0
+          ? 'no_target'
+          : null
+  if (commandSeq !== null) {
+    recordCommandUse(state.tick, commandSeq, noopReason === null)
+    recordLocalThreatSample({
+      tick: state.tick,
+      commandSeq,
+      phase: 'before',
+      threatCount: countLocalThreats(state),
+    })
+    if (noopReason !== null) {
+      recordCommandNoop(state.tick, commandSeq, noopReason)
+    }
+  }
   if (commands.some((command) => command.type === 'sample_assist_player')) {
     sampleAssistPlayerIntent(state.commandIntentRuntime, state.tick)
   }
   runMovementSystem(state, commands, fixedDeltaMs)
   runEnemySpawnSystem(state)
   runEnemyAISystem(state, fixedDeltaMs)
-  runAllyBehaviorSystem(state, fixedDeltaMs)
+  runAllyBehaviorSystem(state, fixedDeltaMs, commandSeq)
+  if (commandSeq !== null) {
+    recordLocalThreatSample({
+      tick: state.tick,
+      commandSeq,
+      phase: 'after',
+      threatCount: countLocalThreats(state),
+    })
+  }
   runCombatSystem(state, commands, fixedDeltaMs)
   runProjectileSystem(state, commands, fixedDeltaMs)
   const pairs = runCollisionSystem(state)

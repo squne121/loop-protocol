@@ -1,4 +1,5 @@
 import type { AllyState, GameState, TargetEntityId } from '../state'
+import { recordTargetSwitch } from '../playtest/assistPlayerEventLog'
 import { selectTarget } from './TargetingSystem'
 import {
   allyTargetEntityId,
@@ -54,7 +55,11 @@ function moveAllyTowardEnemy(
   ally.behaviorState = 'move_to_engage'
 }
 
-export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): void {
+export function runAllyBehaviorSystem(
+  state: GameState,
+  fixedDeltaMs: number,
+  commandSeq: number | null = null,
+): void {
   const commandIntentActive = state.commandIntentRuntime.activeIntent !== 'none'
   const candidates = state.enemies.map((enemy) => ({
     targetEntityId: enemyTargetEntityId(enemy),
@@ -67,6 +72,7 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
   }))
 
   for (const ally of state.allies) {
+    const previousTargetId = ally.targetEntityId
     ally.targetingPolicy =
       commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player'
         ? 'assist_player_threat'
@@ -89,7 +95,7 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
       arena: state.arena,
       commandIntent: state.commandIntentRuntime.activeIntent,
       commandIntentActive,
-      previousTargetId: ally.targetEntityId,
+      previousTargetId,
       threatMode: 'binary_hostile_near_player',
       nearPlayerRadiusPx: NEAR_PLAYER_RADIUS_PX,
     })
@@ -105,6 +111,21 @@ export function runAllyBehaviorSystem(state: GameState, fixedDeltaMs: number): v
     }
 
     ally.targetEntityId = selection.selectedTargetId
+    if (
+      commandSeq !== null &&
+      previousTargetId !== selection.selectedTargetId &&
+      selection.selectedTargetId !== null
+    ) {
+      recordTargetSwitch({
+        tick: state.tick,
+        commandSeq,
+        allyId: ally.id,
+        fromTargetId: previousTargetId,
+        toTargetId: selection.selectedTargetId,
+        causedByCommandIntent:
+          commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player',
+      })
+    }
 
     const targetEnemy = findLivingEnemyByTargetEntityId(state, selection.selectedTargetId)
     if (!targetEnemy) {
