@@ -228,6 +228,7 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
     evidence.push({
       viewport: scenario.viewport.label,
       browser_zoom: scenario.zoom.label,
+      'screenshot path': screenshotPath,
       screenshot_path: screenshotPath,
       ...observed,
     })
