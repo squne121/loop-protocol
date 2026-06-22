@@ -1,6 +1,7 @@
 import type { EntityId } from '../entities'
 import {
   createPlaytestEvidenceRuntimeState,
+  recordCommandNoop,
   type PlaytestEvidenceRuntimeState,
 } from '../playtest/assistPlayerEventLog'
 
@@ -46,6 +47,19 @@ export interface CommandIntentRuntimeState {
    *   ceil(ttlMs / fixedDeltaMs), clamped to [1, 180] (AC1).
    */
   assistPlayerTtlTicks: number
+  /**
+   * command_seq of the assist intent that is currently buffered/active (B4, #987).
+   * Lets the ally behavior system correlate a target_switch that occurs on a
+   * *later* tick (still within the assist TTL) back to the originating command.
+   * Cleared when the buffered intent expires or the runtime is reset.
+   */
+  activeCommandSeq: number | null
+  /**
+   * Whether the currently active assist intent has resolved to a confirmed ally
+   * target yet (B3 expired, #987). When the intent lapses with this still false,
+   * a `command_noop: expired` event is emitted for `activeCommandSeq`.
+   */
+  activeIntentTargetConfirmed: boolean
 }
 
 export type NpcBehaviorState =
@@ -417,6 +431,8 @@ export function createInitialGameState(
       // AC1: computed via computeAssistPlayerTtlTicks(133ms, 1000/60ms) = 8 ticks at 60Hz.
       // Clamped to [1, 180] as per AC1.
       assistPlayerTtlTicks: computeAssistPlayerTtlTicks(DEFAULT_TTL_MS, DEFAULT_FIXED_DELTA_MS),
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     },
     playtestEvidenceRuntime: createPlaytestEvidenceRuntimeState(),
   }
@@ -457,10 +473,14 @@ export function isBufferedCommandIntentActive(
  *
  * @param runtime      Mutable CommandIntentRuntimeState
  * @param currentTick  The current simulation tick
+ * @param commandSeq   The command_seq assigned to this assist attempt (B4, #987).
+ *                     Used to correlate later-tick target switches and an
+ *                     eventual `command_noop: expired` back to this command.
  */
 export function sampleAssistPlayerIntent(
   runtime: CommandIntentRuntimeState,
   currentTick: number,
+  commandSeq: number | null = null,
 ): void {
   const buffered: BufferedCommandIntent = {
     intent: 'assist_player',
@@ -469,6 +489,8 @@ export function sampleAssistPlayerIntent(
   }
   runtime.bufferedIntent = buffered
   runtime.activeIntent = 'assist_player'
+  runtime.activeCommandSeq = commandSeq
+  runtime.activeIntentTargetConfirmed = false
 }
 
 /**
@@ -478,16 +500,33 @@ export function sampleAssistPlayerIntent(
  *
  * Call this once per tick step, after consuming commands.
  *
- * @param runtime      Mutable CommandIntentRuntimeState
- * @param currentTick  The current simulation tick (post-increment, i.e. the tick being evaluated)
+ * @param runtime         Mutable CommandIntentRuntimeState
+ * @param currentTick     The current simulation tick (post-increment, i.e. the tick being evaluated)
+ * @param evidenceRuntime Optional playtest evidence runtime (B3 expired, #987). When
+ *                        supplied and the lapsing intent never confirmed a target,
+ *                        a `command_noop: expired` event is recorded for the
+ *                        originating `activeCommandSeq`.
  */
 export function tickCommandIntentRuntime(
   runtime: CommandIntentRuntimeState,
   currentTick: number,
+  evidenceRuntime?: PlaytestEvidenceRuntimeState,
 ): void {
   if (runtime.bufferedIntent !== null && !isBufferedCommandIntentActive(runtime.bufferedIntent, currentTick)) {
+    // B3 (expired): the assist intent lapsed via TTL. If it never resolved to a
+    // confirmed ally target, surface a command_noop: expired for the originating
+    // command_seq so the deterministic log shows the unfulfilled assist.
+    if (
+      evidenceRuntime !== undefined &&
+      runtime.activeCommandSeq !== null &&
+      !runtime.activeIntentTargetConfirmed
+    ) {
+      recordCommandNoop(evidenceRuntime, currentTick, runtime.activeCommandSeq, 'expired')
+    }
     runtime.bufferedIntent = null
     runtime.activeIntent = 'none'
+    runtime.activeCommandSeq = null
+    runtime.activeIntentTargetConfirmed = false
   }
 }
 
@@ -500,4 +539,6 @@ export function tickCommandIntentRuntime(
 export function resetCommandIntentRuntime(runtime: CommandIntentRuntimeState): void {
   runtime.activeIntent = 'none'
   runtime.bufferedIntent = null
+  runtime.activeCommandSeq = null
+  runtime.activeIntentTargetConfirmed = false
 }

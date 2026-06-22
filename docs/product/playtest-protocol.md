@@ -33,6 +33,11 @@ trace_links:
 - **evidence 境界**: deterministic event log と qualitative self-explanation は分離して記録する。自由記述は `deterministic_events` に混ぜない。
 - **metadata 最低要件**: commit SHA、GitHub Actions run ID/run attempt、page URL または artifact URL、artifact 名、retention-days、viewport、DPR、declared browser zoom、userAgent、timezone、paused/running state、screenshot path を export 可能にする。
 - **runtime event の最小集合**: `command_use`、`command_noop`、`target_switch`、`local_threat_sample`、`ally_survival` を replay 再現可能な順序 (`tick ASC`, `event_type_order ASC`, `command_seq ASC`, `entity_id ASC`) で保持する。
+- **`local_threat_sample` の before/after 定義**（#987 B5）: 同一 tick 内で 2 回サンプリングする。
+  - `phase: before` は **targeting / movement の前**に取得する。assist コマンド処理直後、ally の再ターゲットや移動が起きる前の局所脅威数を表す。
+  - `phase: after` は **collision resolution（`resolveCombatCollisions`）の後**に取得する。これにより当該 tick 内で除去された脅威（threat removal）を after サンプルが観測できる。before/after の差分が assist による局所脅威の変化を示す。
+- **`command_noop` の reason 到達性**（#987 B3）: `not_combat` は running 以外のフェーズで assist コマンドが試行されたときに発火する（phase gate の手前で記録）。`expired` は assist intent が TTL 失効時に target 未確定のまま lapse したときに発火する。いずれも schema 上の reason であり実際に到達可能でなければならない。
+- **provenance の availability_reason**（#987 B2）: provenance 各フィールドは `availability_reason` を持ち、`unknown` / `unavailable-in-deploy-pages` / `manual_capture_required` / `unavailable-in-bundle-build-time` は**未充足**として扱う（placeholder を達成扱いしない）。artifact url / digest / retention 等の build 後値は bundle に入れず、workflow 終盤に `playtest-evidence-provenance.json` として生成・upload する。
 - **Playtest Mode**:
 
 | mode | 用途 | 許可する根拠 | 禁止する主張 |

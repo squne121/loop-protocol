@@ -72,25 +72,23 @@ export interface AssistPlayerRuntimeEvidenceSnapshot {
   qualitative_notes?: QualitativeNotes
 }
 
+const DEFAULT_SORTIE_ID = 'sortie-uninitialized'
+
+/**
+ * State-scoped playtest evidence runtime (B1, Issue #987).
+ *
+ * The deterministic event log and qualitative notes live inside the GameState
+ * (no module-global store). Every recorder / accessor below takes this state
+ * object as its first argument and reads/writes the arrays it owns.
+ */
 export interface PlaytestEvidenceRuntimeState {
   currentSortieId: string | null
   nextSortieSequence: number
   nextCommandSequence: number
-}
-
-type RuntimeStore = {
   sortieId: string
   terminalState: AssistPlayerTerminalState
   deterministicEvents: AssistPlayerPlaytestEvent[]
   qualitativeNotes?: QualitativeNotes
-}
-
-const DEFAULT_SORTIE_ID = 'sortie-uninitialized'
-
-let runtimeStore: RuntimeStore = {
-  sortieId: DEFAULT_SORTIE_ID,
-  terminalState: 'running',
-  deterministicEvents: [],
 }
 
 export function createPlaytestEvidenceRuntimeState(): PlaytestEvidenceRuntimeState {
@@ -98,6 +96,9 @@ export function createPlaytestEvidenceRuntimeState(): PlaytestEvidenceRuntimeSta
     currentSortieId: null,
     nextSortieSequence: 1,
     nextCommandSequence: 1,
+    sortieId: DEFAULT_SORTIE_ID,
+    terminalState: 'running',
+    deterministicEvents: [],
   }
 }
 
@@ -108,11 +109,10 @@ export function beginPlaytestEvidenceSortie(
   runtime.currentSortieId = sortieId
   runtime.nextSortieSequence += 1
   runtime.nextCommandSequence = 1
-  runtimeStore = {
-    sortieId,
-    terminalState: 'running',
-    deterministicEvents: [],
-  }
+  runtime.sortieId = sortieId
+  runtime.terminalState = 'running'
+  runtime.deterministicEvents = []
+  runtime.qualitativeNotes = undefined
   return sortieId
 }
 
@@ -124,24 +124,36 @@ export function nextPlaytestCommandSequence(
   return current
 }
 
-function ensureSortieId(sortieId: string | null | undefined): string {
-  return sortieId ?? runtimeStore.sortieId ?? DEFAULT_SORTIE_ID
+function ensureSortieId(
+  runtime: PlaytestEvidenceRuntimeState,
+  sortieId: string | null | undefined,
+): string {
+  return sortieId ?? runtime.sortieId ?? DEFAULT_SORTIE_ID
 }
 
-export function resetPlaytestEvidenceStore(): void {
-  runtimeStore = {
-    sortieId: DEFAULT_SORTIE_ID,
-    terminalState: 'running',
-    deterministicEvents: [],
-  }
+/**
+ * Reset a runtime back to its uninitialized state. Used by tests to clear the
+ * deterministic event log between cases.
+ */
+export function resetPlaytestEvidenceRuntimeState(
+  runtime: PlaytestEvidenceRuntimeState,
+): void {
+  runtime.currentSortieId = null
+  runtime.nextSortieSequence = 1
+  runtime.nextCommandSequence = 1
+  runtime.sortieId = DEFAULT_SORTIE_ID
+  runtime.terminalState = 'running'
+  runtime.deterministicEvents = []
+  runtime.qualitativeNotes = undefined
 }
 
 export function recordCommandUse(
+  runtime: PlaytestEvidenceRuntimeState,
   tick: number,
   commandSeq: number,
   accepted: boolean,
 ): void {
-  runtimeStore.deterministicEvents.push({
+  runtime.deterministicEvents.push({
     type: 'command_use',
     tick,
     event_type_order: 10,
@@ -153,11 +165,12 @@ export function recordCommandUse(
 }
 
 export function recordCommandNoop(
+  runtime: PlaytestEvidenceRuntimeState,
   tick: number,
   commandSeq: number,
   reason: AssistPlayerNoopReason,
 ): void {
-  runtimeStore.deterministicEvents.push({
+  runtime.deterministicEvents.push({
     type: 'command_noop',
     tick,
     event_type_order: 20,
@@ -167,15 +180,18 @@ export function recordCommandNoop(
   })
 }
 
-export function recordTargetSwitch(input: {
-  tick: number
-  commandSeq: number
-  allyId: number
-  fromTargetId: string | null
-  toTargetId: string
-  causedByCommandIntent: boolean
-}): void {
-  runtimeStore.deterministicEvents.push({
+export function recordTargetSwitch(
+  runtime: PlaytestEvidenceRuntimeState,
+  input: {
+    tick: number
+    commandSeq: number
+    allyId: number
+    fromTargetId: string | null
+    toTargetId: string
+    causedByCommandIntent: boolean
+  },
+): void {
+  runtime.deterministicEvents.push({
     type: 'target_switch',
     tick: input.tick,
     event_type_order: 30,
@@ -188,13 +204,16 @@ export function recordTargetSwitch(input: {
   })
 }
 
-export function recordLocalThreatSample(input: {
-  tick: number
-  commandSeq: number
-  phase: 'before' | 'after'
-  threatCount: number
-}): void {
-  runtimeStore.deterministicEvents.push({
+export function recordLocalThreatSample(
+  runtime: PlaytestEvidenceRuntimeState,
+  input: {
+    tick: number
+    commandSeq: number
+    phase: 'before' | 'after'
+    threatCount: number
+  },
+): void {
+  runtime.deterministicEvents.push({
     type: 'local_threat_sample',
     tick: input.tick,
     event_type_order: 40,
@@ -205,58 +224,72 @@ export function recordLocalThreatSample(input: {
   })
 }
 
-export function recordAllySurvival(input: {
-  tick: number
-  commandSeq: number
-  sortieId: string | null
-  alliesSpawned: number
-  alliesSurvived: number
-  protectedZoneStable: boolean
-}): void {
-  runtimeStore.deterministicEvents.push({
+export function recordAllySurvival(
+  runtime: PlaytestEvidenceRuntimeState,
+  input: {
+    tick: number
+    commandSeq: number
+    sortieId: string | null
+    alliesSpawned: number
+    alliesSurvived: number
+    protectedZoneStable: boolean
+  },
+): void {
+  runtime.deterministicEvents.push({
     type: 'ally_survival',
     tick: input.tick,
     event_type_order: 50,
     command_seq: input.commandSeq,
     entity_id: 'sortie-summary',
-    sortie_id: ensureSortieId(input.sortieId),
+    sortie_id: ensureSortieId(runtime, input.sortieId),
     allies_spawned: input.alliesSpawned,
     allies_survived: input.alliesSurvived,
     protected_zone_stable: input.protectedZoneStable,
   })
 }
 
-export function markTerminalState(state: AssistPlayerTerminalState): void {
-  runtimeStore.terminalState = state
+export function markTerminalState(
+  runtime: PlaytestEvidenceRuntimeState,
+  state: AssistPlayerTerminalState,
+): void {
+  runtime.terminalState = state
 }
 
-export function setSelfExplanationPrompt(prompt: string): void {
-  runtimeStore.qualitativeNotes = {
+export function setSelfExplanationPrompt(
+  runtime: PlaytestEvidenceRuntimeState,
+  prompt: string,
+): void {
+  runtime.qualitativeNotes = {
     self_explanation_prompt: prompt,
-    self_explanation_response: runtimeStore.qualitativeNotes?.self_explanation_response,
+    self_explanation_response: runtime.qualitativeNotes?.self_explanation_response,
   }
 }
 
-export function setSelfExplanationResponse(response: string): void {
-  if (!runtimeStore.qualitativeNotes) {
-    runtimeStore.qualitativeNotes = {
+export function setSelfExplanationResponse(
+  runtime: PlaytestEvidenceRuntimeState,
+  response: string,
+): void {
+  if (!runtime.qualitativeNotes) {
+    runtime.qualitativeNotes = {
       self_explanation_prompt: 'What changed the battle outcome most, and why?',
     }
   }
 
-  runtimeStore.qualitativeNotes = {
-    ...runtimeStore.qualitativeNotes,
+  runtime.qualitativeNotes = {
+    ...runtime.qualitativeNotes,
     self_explanation_response: response,
   }
 }
 
-export function clearSelfExplanationResponse(): void {
-  if (!runtimeStore.qualitativeNotes) {
+export function clearSelfExplanationResponse(
+  runtime: PlaytestEvidenceRuntimeState,
+): void {
+  if (!runtime.qualitativeNotes) {
     return
   }
 
-  runtimeStore.qualitativeNotes = {
-    self_explanation_prompt: runtimeStore.qualitativeNotes.self_explanation_prompt,
+  runtime.qualitativeNotes = {
+    self_explanation_prompt: runtime.qualitativeNotes.self_explanation_prompt,
   }
 }
 
@@ -266,8 +299,10 @@ function compareOptionalString(a: string, b: string): number {
   return 0
 }
 
-export function snapshotDeterministicEvents(): AssistPlayerPlaytestEvent[] {
-  return runtimeStore.deterministicEvents
+export function snapshotDeterministicEvents(
+  runtime: PlaytestEvidenceRuntimeState,
+): AssistPlayerPlaytestEvent[] {
+  return runtime.deterministicEvents
     .slice()
     .sort((left, right) => {
       if (left.tick !== right.tick) {
@@ -283,11 +318,13 @@ export function snapshotDeterministicEvents(): AssistPlayerPlaytestEvent[] {
     })
 }
 
-export function getPlaytestEvidenceSnapshot(): AssistPlayerRuntimeEvidenceSnapshot {
+export function getPlaytestEvidenceSnapshot(
+  runtime: PlaytestEvidenceRuntimeState,
+): AssistPlayerRuntimeEvidenceSnapshot {
   return {
-    sortie_id: runtimeStore.sortieId,
-    terminal_state: runtimeStore.terminalState,
-    deterministic_events: snapshotDeterministicEvents(),
-    qualitative_notes: runtimeStore.qualitativeNotes,
+    sortie_id: runtime.sortieId,
+    terminal_state: runtime.terminalState,
+    deterministic_events: snapshotDeterministicEvents(runtime),
+    qualitative_notes: runtime.qualitativeNotes,
   }
 }

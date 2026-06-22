@@ -19,6 +19,7 @@ import {
   recordLocalThreatSample,
   setSelfExplanationPrompt,
 } from '../playtest/assistPlayerEventLog'
+import type { PlaytestEvidenceRuntimeState } from '../playtest/assistPlayerEventLog'
 import { runMovementSystem } from './MovementSystem'
 import { runEnemySpawnSystem } from './EnemySpawnSystem'
 import { runEnemyAISystem } from './EnemyAISystem'
@@ -295,9 +296,12 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
   // AC4: transition to result phase, not directly to next sortie
   state.loopPhase = 'result'
   state.resultRewardStatus = 'pending'
-  markTerminalState(result.outcome)
-  setSelfExplanationPrompt(resolveSelfExplanationPrompt(result.outcome))
-  recordAllySurvival({
+  markTerminalState(state.playtestEvidenceRuntime, result.outcome)
+  setSelfExplanationPrompt(
+    state.playtestEvidenceRuntime,
+    resolveSelfExplanationPrompt(result.outcome),
+  )
+  recordAllySurvival(state.playtestEvidenceRuntime, {
     tick: terminalTick,
     commandSeq: Math.max(0, state.playtestEvidenceRuntime.nextCommandSequence - 1),
     sortieId: state.playtestEvidenceRuntime.currentSortieId,
@@ -323,10 +327,24 @@ export function runSortieSimulationStep(
   commands: ReturnType<typeof mapInputToCommands>,
   fixedDeltaMs: number,
 ): void {
-  if (state.loopPhase !== 'running' || state.sortie.status !== 'running') return
+  const evidence: PlaytestEvidenceRuntimeState = state.playtestEvidenceRuntime
   const sampledAssistPlayer = commands.some((command) => command.type === 'sample_assist_player')
+  const inCombat = state.loopPhase === 'running' && state.sortie.status === 'running'
+
+  // B3 (not_combat): a command attempt that arrives while the sortie is not in
+  // the running phase can never be accepted. Record it before the phase gate so
+  // the deterministic log surfaces the rejected attempt rather than dropping it.
+  if (!inCombat) {
+    if (sampledAssistPlayer) {
+      const commandSeq = nextPlaytestCommandSequence(evidence)
+      recordCommandUse(evidence, state.tick, commandSeq, false)
+      recordCommandNoop(evidence, state.tick, commandSeq, 'not_combat')
+    }
+    return
+  }
+
   const commandSeq = sampledAssistPlayer
-    ? nextPlaytestCommandSequence(state.playtestEvidenceRuntime)
+    ? nextPlaytestCommandSequence(evidence)
     : null
   const livingEnemyCount = state.enemies.filter((enemy) => !enemy.defeated).length
   const noopReason =
@@ -338,38 +356,41 @@ export function runSortieSimulationStep(
           ? 'no_target'
           : null
   if (commandSeq !== null) {
-    recordCommandUse(state.tick, commandSeq, noopReason === null)
-    recordLocalThreatSample({
+    recordCommandUse(evidence, state.tick, commandSeq, noopReason === null)
+    recordLocalThreatSample(evidence, {
       tick: state.tick,
       commandSeq,
       phase: 'before',
       threatCount: countLocalThreats(state),
     })
     if (noopReason !== null) {
-      recordCommandNoop(state.tick, commandSeq, noopReason)
+      recordCommandNoop(evidence, state.tick, commandSeq, noopReason)
     }
   }
-  if (commands.some((command) => command.type === 'sample_assist_player')) {
-    sampleAssistPlayerIntent(state.commandIntentRuntime, state.tick)
+  if (sampledAssistPlayer) {
+    sampleAssistPlayerIntent(state.commandIntentRuntime, state.tick, commandSeq)
   }
   runMovementSystem(state, commands, fixedDeltaMs)
   runEnemySpawnSystem(state)
   runEnemyAISystem(state, fixedDeltaMs)
   runAllyBehaviorSystem(state, fixedDeltaMs, commandSeq)
+  runCombatSystem(state, commands, fixedDeltaMs)
+  runProjectileSystem(state, commands, fixedDeltaMs)
+  const pairs = runCollisionSystem(state)
+  resolveCombatCollisions(state, pairs)
+  // B5: sample local threats *after* collision resolution so the `after` phase
+  // observes threats that were removed during this tick. The `before` sample
+  // above is taken prior to targeting/movement; this one reflects resolution.
   if (commandSeq !== null) {
-    recordLocalThreatSample({
+    recordLocalThreatSample(evidence, {
       tick: state.tick,
       commandSeq,
       phase: 'after',
       threatCount: countLocalThreats(state),
     })
   }
-  runCombatSystem(state, commands, fixedDeltaMs)
-  runProjectileSystem(state, commands, fixedDeltaMs)
-  const pairs = runCollisionSystem(state)
-  resolveCombatCollisions(state, pairs)
   runSortieSystem(state, fixedDeltaMs)
   state.tick += 1
   state.elapsedMs += fixedDeltaMs
-  tickCommandIntentRuntime(state.commandIntentRuntime, state.tick)
+  tickCommandIntentRuntime(state.commandIntentRuntime, state.tick, evidence)
 }

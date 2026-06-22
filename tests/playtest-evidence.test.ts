@@ -18,12 +18,13 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   beginPlaytestEvidenceSortie,
   createPlaytestEvidenceRuntimeState,
+  getPlaytestEvidenceSnapshot,
   recordCommandUse,
   recordLocalThreatSample,
   recordTargetSwitch,
-  resetPlaytestEvidenceStore,
   setSelfExplanationPrompt,
   setSelfExplanationResponse,
+  type PlaytestEvidenceRuntimeState,
 } from '../src/playtest/assistPlayerEventLog'
 import {
   buildEvidenceData,
@@ -34,12 +35,13 @@ import {
   type PlaytestEvidenceData,
 } from '../src/ui/playtestEvidence'
 
+/** Helper: build a snapshot-backed evidence payload for a given runtime. */
+function buildFromRuntime(runtime: PlaytestEvidenceRuntimeState): PlaytestEvidenceData {
+  return buildEvidenceData(getPlaytestEvidenceSnapshot(runtime))
+}
+
 // --- AC8: schema shape ---
 describe('buildEvidenceData', () => {
-  beforeEach(() => {
-    resetPlaytestEvidenceStore()
-  })
-
   it('GIVEN a Node.js environment WHEN buildEvidenceData is called THEN returns schema v1 structure', () => {
     const data = buildEvidenceData()
     expect(data.playtest_evidence_schema_version).toBe('v2')
@@ -169,9 +171,9 @@ describe('buildEvidenceData', () => {
   it('GIVEN recorded assist_player evidence WHEN buildEvidenceData THEN deterministic_events and qualitative_notes stay separated', () => {
     const runtime = createPlaytestEvidenceRuntimeState()
     beginPlaytestEvidenceSortie(runtime)
-    recordLocalThreatSample({ tick: 5, commandSeq: 2, phase: 'after', threatCount: 0 })
-    recordCommandUse(5, 2, true)
-    recordTargetSwitch({
+    recordLocalThreatSample(runtime, { tick: 5, commandSeq: 2, phase: 'after', threatCount: 0 })
+    recordCommandUse(runtime, 5, 2, true)
+    recordTargetSwitch(runtime, {
       tick: 5,
       commandSeq: 2,
       allyId: 1,
@@ -179,10 +181,10 @@ describe('buildEvidenceData', () => {
       toTargetId: 'enemy:1',
       causedByCommandIntent: true,
     })
-    setSelfExplanationPrompt('What changed the battle outcome most, and why?')
-    setSelfExplanationResponse('I redirected the ally onto the closest threat.')
+    setSelfExplanationPrompt(runtime, 'What changed the battle outcome most, and why?')
+    setSelfExplanationResponse(runtime, 'I redirected the ally onto the closest threat.')
 
-    const data = buildEvidenceData()
+    const data = buildFromRuntime(runtime)
     expect(data.deterministic_events.map((event) => event.type)).toEqual([
       'command_use',
       'target_switch',
@@ -304,11 +306,11 @@ describe('toYaml', () => {
   it('GIVEN recorded assist_player evidence WHEN toYaml THEN output contains deterministic_events and qualitative_notes', () => {
     const runtime = createPlaytestEvidenceRuntimeState()
     beginPlaytestEvidenceSortie(runtime)
-    recordCommandUse(7, 1, true)
-    setSelfExplanationPrompt('What changed the battle outcome most, and why?')
-    setSelfExplanationResponse('The assist command pulled aggro away from me.')
+    recordCommandUse(runtime, 7, 1, true)
+    setSelfExplanationPrompt(runtime, 'What changed the battle outcome most, and why?')
+    setSelfExplanationResponse(runtime, 'The assist command pulled aggro away from me.')
 
-    const yaml = toYaml(buildEvidenceData())
+    const yaml = toYaml(buildFromRuntime(runtime))
     expect(yaml).toContain('deterministic_events:')
     expect(yaml).toContain('qualitative_notes:')
     expect(yaml).toContain('self_explanation_response:')
@@ -627,21 +629,49 @@ describe('self-explanation prompt DOM', () => {
   let container: HTMLElement
 
   beforeEach(() => {
-    resetPlaytestEvidenceStore()
     container = document.createElement('div')
     document.body.appendChild(container)
   })
 
-  it('GIVEN sortie terminal prompt is available WHEN panel initializes THEN DOM prompt is mounted as live region', async () => {
-    setSelfExplanationPrompt('What changed the battle outcome most, and why?')
-    initPlaytestEvidencePanel(container, '')
-    await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)))
+  it('GIVEN sortie terminal prompt is available WHEN panel initializes THEN DOM prompt is mounted as live region', () => {
+    const runtime = createPlaytestEvidenceRuntimeState()
+    beginPlaytestEvidenceSortie(runtime)
+    setSelfExplanationPrompt(runtime, 'What changed the battle outcome most, and why?')
+    initPlaytestEvidencePanel(container, {
+      search: '',
+      getSnapshot: () => getPlaytestEvidenceSnapshot(runtime),
+      onSaveExplanation: (response) => setSelfExplanationResponse(runtime, response),
+    })
 
     const prompt = container.querySelector('[data-self-explanation-prompt="true"]') as HTMLElement
     const card = container.querySelector('[data-self-explanation-card="true"]') as HTMLElement
     expect(card.hidden).toBe(false)
     expect(prompt.getAttribute('role')).toBe('status')
     expect(prompt.textContent).toContain('battle outcome')
+  })
+
+  it('GIVEN Save explanation clicked WHEN response entered THEN onSaveExplanation persists to runtime', () => {
+    const runtime = createPlaytestEvidenceRuntimeState()
+    beginPlaytestEvidenceSortie(runtime)
+    setSelfExplanationPrompt(runtime, 'What changed the battle outcome most, and why?')
+    initPlaytestEvidencePanel(container, {
+      search: '',
+      getSnapshot: () => getPlaytestEvidenceSnapshot(runtime),
+      onSaveExplanation: (response) => setSelfExplanationResponse(runtime, response),
+    })
+
+    const response = container.querySelector(
+      '[data-self-explanation-response="true"]',
+    ) as HTMLTextAreaElement
+    const saveBtn = container.querySelector(
+      '[data-self-explanation-save="true"]',
+    ) as HTMLButtonElement
+    response.value = 'The assist pulled aggro.'
+    saveBtn.click()
+
+    expect(getPlaytestEvidenceSnapshot(runtime).qualitative_notes?.self_explanation_response).toBe(
+      'The assist pulled aggro.',
+    )
   })
 })
 

@@ -111,20 +111,35 @@ export function runAllyBehaviorSystem(
     }
 
     ally.targetEntityId = selection.selectedTargetId
+
+    // B4 (#987): correlate a target_switch to the originating assist command even
+    // when it lands on a later tick within the TTL window. `commandSeq` is set
+    // only on the input tick; `activeCommandSeq` carries the originating command
+    // forward while the assist intent remains active.
+    const assistIntentActive =
+      commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player'
+    const correlatedCommandSeq =
+      commandSeq ?? (assistIntentActive ? state.commandIntentRuntime.activeCommandSeq : null)
+
     if (
-      commandSeq !== null &&
+      correlatedCommandSeq !== null &&
       previousTargetId !== selection.selectedTargetId &&
       selection.selectedTargetId !== null
     ) {
-      recordTargetSwitch({
+      recordTargetSwitch(state.playtestEvidenceRuntime, {
         tick: state.tick,
-        commandSeq,
+        commandSeq: correlatedCommandSeq,
         allyId: ally.id,
         fromTargetId: previousTargetId,
         toTargetId: selection.selectedTargetId,
-        causedByCommandIntent:
-          commandIntentActive && state.commandIntentRuntime.activeIntent === 'assist_player',
+        causedByCommandIntent: assistIntentActive,
       })
+    }
+
+    // B3 (expired): mark the assist intent as having reached a confirmed ally
+    // target so a later TTL lapse does not emit a spurious command_noop: expired.
+    if (assistIntentActive && selection.selectedTargetId !== null) {
+      state.commandIntentRuntime.activeIntentTargetConfirmed = true
     }
 
     const targetEnemy = findLivingEnemyByTargetEntityId(state, selection.selectedTargetId)
