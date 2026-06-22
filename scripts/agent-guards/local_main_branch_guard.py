@@ -831,6 +831,10 @@ def is_readonly_artifact_export_command(cmd: str) -> bool:
     if not re.match(r"^gh\s+issue\s+view\s+\d+", lhs_stripped):
         return False
 
+    # Block --web/-w flag: browser open is not a readonly artifact export
+    if _gh_has_web_flag(lhs_stripped):
+        return False
+
     return True
 
 

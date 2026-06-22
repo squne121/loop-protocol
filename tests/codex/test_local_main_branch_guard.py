@@ -766,6 +766,8 @@ class TestReadonlyArtifactExportCommand:
         "gh issue view 123 >> tmp/foo.md",         # append redirect
         "gh issue view 123 > /tmp/foo.md",         # /tmp absolute (not tmp/ relative)
         "gh issue view 123 > foo.md",              # no directory prefix
+        "gh issue view 1124 > tmp/../docs/foo.md", # path traversal
+        "gh issue view 1124 --web > tmp/foo.md",   # --web flag (browser open)
     ])
     def test_ac12_gh_issue_view_to_blocked_dest_blocked(self, tmp_git_repo: Path, cmd: str):
         """AC12: GIVEN gh issue view with blocked destination WHEN evaluated THEN block."""
