@@ -105,16 +105,45 @@ hook_boundaries_manifest_v1:
       linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
       guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
-      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離）:
+      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離、#1124 で 5 分類追加）:
       readonly_command / branch_safe_maintenance_command / deterministic_checker_command /
-      gh_mutation_denied / unparseable_branch_mutation。
-      gh_mutation_denied: gh issue/pr のうち readonly allowlist 外の mutation 系コマンドを fail-closed した場合に使用（#1109）。
+      github_remote_ops_command / gh_mutation_denied / unparseable_branch_mutation。
+      gh_mutation_denied: gh issue/pr のうち readonly allowlist 外かつ github_remote_ops_command・github_issue_mutation_command 外の mutation 系コマンドを fail-closed した場合に使用（#1109）。
+      github_remote_ops_command: post-merge-cleanup 最小集合（gh issue close/comment/reopen, gh pr comment/edit）および github_issue_mutation_command に使用（#1124）。
       unparseable_branch_mutation: compound/wrapper/redirection・/tmp wrapper・python -c・parse failure 等に使用。
       fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
       gh issue view/list, gh pr view/list/status は readonly_command として許可。
       gh issue/pr mutation コマンド（edit/close/merge 等）は gh_mutation_denied で fail-closed（#1109）。
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
+
+      ## gh CLI コマンド 5 分類（#1124）
+
+      local_main_branch_guard は gh issue/pr コマンドを以下の 5 分類で判定する:
+
+      | 分類 | reason_code | 代表コマンド | 判断基準 |
+      |---|---|---|---|
+      | display_readonly_command | readonly_command | gh issue view, gh pr view, gh issue list | DISPLAY_READONLY_PATTERNS に合致 |
+      | readonly_artifact_export_command | readonly_command | gh issue view <N> ... > tmp/<file> | `>` で tmp/ 先へのリダイレクトのみ |
+      | github_issue_mutation_command | github_remote_ops_command | gh issue create/edit | --repo squne121/loop-protocol + --body-file tmp/... 必須 |
+      | github_pr_metadata_command | github_remote_ops_command | gh pr comment/edit | is_github_remote_ops_command で判定 |
+      | github_destructive_command | gh_mutation_denied | gh pr merge, gh pr checkout | 上記以外の gh issue/pr mutation |
+
+      ### github_issue_mutation_command の allow 条件
+
+      `gh issue create` または `gh issue edit <N>` が以下の条件をすべて満たす場合のみ allow:
+      1. `--repo squne121/loop-protocol` が存在する（完全一致）
+      2. `--body-file tmp/<path>` が存在する（tmp/ から始まる相対パス、"-" は不可）
+      3. interactive フラグ不在: `--editor` / `-e` / `--web` / `-w`
+      4. `gh issue edit <N>`: N は数値
+
+      ### readonly_artifact_export_command の allow 条件
+
+      `gh issue view <N> ... > tmp/<filename>` が以下の条件をすべて満たす場合のみ allow:
+      1. `gh issue view <N>` で始まる（view のみ、edit/create は不可）
+      2. リダイレクトは `>` のみ（`>>` は不可）
+      3. 先は `tmp/` から始まる（src/, docs/, .env, .git は不可）
+      4. lhs にシェルメタキャラ（|, ;, &&, ||, backtick, $()）なし
 
   - handler_id: worktree_scope_guard
     event: PreToolUse
