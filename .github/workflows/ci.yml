@@ -428,6 +428,15 @@ jobs:
             return $status
           }
           run_timed pnpm_build pnpm build
+        env:
+          VITE_LOOP_RUN_ID: ${{ github.run_id }}
+          VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
+          VITE_LOOP_PAGE_URL: "unknown"
+          VITE_LOOP_ARTIFACT_URL: "unknown"
+          VITE_LOOP_ARTIFACT_NAMES: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unknown"
+          VITE_LOOP_RETENTION_DAYS: "30"
+          VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:

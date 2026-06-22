@@ -4,9 +4,32 @@
  * GitHub Pages / PR Preview 上で opt-in（?playtest_evidence=1）表示する
  * プレイテスト証跡エクスポートパネル。
  *
- * - read-only UI: src/state / src/systems / src/storage を変更しない (AC11)
- * - DOM への読み取りアクセスのみ
+ * - DOM / 環境 metadata の読み取りに専念する UI レイヤ。
+ * - 証跡の runtime snapshot は注入された `getSnapshot` callback 経由で取得する
+ *   (B1, #987)。module-global store には依存しない。
+ * - self-explanation の保存は注入された `onSaveExplanation` callback を通じて
+ *   state-scoped recorder API に委譲する (B1/B6, #987)。UI 自身は src/state を
+ *   直接書き換えない。
  */
+
+import {
+  type AssistPlayerPlaytestEvent,
+  type AssistPlayerRuntimeEvidenceSnapshot,
+  type AssistPlayerTerminalState,
+  type QualitativeNotes,
+} from '../playtest/assistPlayerEventLog'
+
+/**
+ * Callbacks injected into the evidence panel so it can read the live runtime
+ * snapshot and persist self-explanation text without importing a module-global
+ * store (B1, #987).
+ */
+export interface PlaytestEvidencePanelDeps {
+  /** Returns the current state-scoped evidence snapshot. */
+  getSnapshot: () => AssistPlayerRuntimeEvidenceSnapshot
+  /** Persists the self-explanation response via the state-scoped recorder. */
+  onSaveExplanation: (response: string) => void
+}
 
 // ---------------------------------------------------------------------------
 // navigator.userAgentData は実験的 API のため型宣言が DOM lib に含まれない。
@@ -77,15 +100,80 @@ export interface EnvironmentInfo {
   screen: ScreenMetrics
   timezone: string
   language: string
+  declared_browser_zoom: {
+    declared_percent: 100 | 125 | 150 | 200 | 'manual_unknown'
+    source: 'test_matrix' | 'manual_input' | 'unknown'
+  }
+}
+
+/**
+ * Explicit unfulfilled-provenance markers (B2, #987).
+ *
+ * Any value carrying one of these `availability_reason`s is NOT a satisfied
+ * provenance field — a placeholder must never be treated as achieved evidence.
+ * - `unknown`: value was not injected at build time (local dev / unset env).
+ * - `unavailable-in-deploy-pages`: deploy-pages flow does not produce this value.
+ * - `manual_capture_required`: requires an out-of-band manual capture step.
+ * - `unavailable-in-bundle-build-time`: only known *after* the build (artifact
+ *   url / digest / retention); emitted by a separate workflow step, never the bundle.
+ */
+export type ProvenanceAvailabilityReason =
+  | 'available'
+  | 'unknown'
+  | 'unavailable-in-deploy-pages'
+  | 'manual_capture_required'
+  | 'unavailable-in-bundle-build-time'
+
+const UNFULFILLED_PROVENANCE_REASONS: ReadonlySet<string> = new Set([
+  'unknown',
+  'unavailable-in-deploy-pages',
+  'manual_capture_required',
+  'unavailable-in-bundle-build-time',
+])
+
+/** A provenance field value plus an explicit availability_reason (B2, #987). */
+export interface ProvenanceField {
+  value: string
+  availability_reason: ProvenanceAvailabilityReason
+}
+
+/**
+ * Returns true iff the provenance field is genuinely satisfied (i.e. its
+ * availability_reason is not one of the unfulfilled markers). Exported for
+ * tests (B8 #5).
+ */
+export function isProvenanceFulfilled(field: ProvenanceField): boolean {
+  return !UNFULFILLED_PROVENANCE_REASONS.has(field.availability_reason)
+}
+
+export interface ArtifactMetadata {
+  run_id: ProvenanceField
+  run_attempt: ProvenanceField
+  page_url: ProvenanceField
+  artifact_url: ProvenanceField
+  artifact_names: string[]
+  artifact_digest_or_attestation: ProvenanceField
+  retention_days: ProvenanceField
+  screenshot_path: ProvenanceField
+}
+
+export interface RuntimeEvidenceState {
+  sortie_id: string
+  paused_or_running: 'paused' | 'running'
+  terminal_state: AssistPlayerTerminalState
 }
 
 export interface PlaytestEvidenceData {
-  playtest_evidence_schema_version: 'v1'
+  playtest_evidence_schema_version: 'v2'
   generated_at: string
   source_url: string
   app_under_test: AppUnderTest
   browser: BrowserInfo
   environment: EnvironmentInfo
+  artifacts: ArtifactMetadata
+  runtime_state: RuntimeEvidenceState
+  deterministic_events: AssistPlayerPlaytestEvent[]
+  qualitative_notes?: QualitativeNotes
   hashes: Record<string, string>
 }
 
@@ -310,13 +398,117 @@ function collectScreen(): ScreenMetrics {
   }
 }
 
+function readBuildEnv(key: keyof ImportMetaEnv): string {
+  const value =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? import.meta.env[key]
+      : undefined
+  return typeof value === 'string' && value.length > 0 ? value : 'unknown'
+}
+
+/**
+ * Reads a provenance env value and classifies it (B2, #987).
+ *
+ * A raw value matching one of the unfulfilled markers becomes the field's
+ * availability_reason (and is treated as NOT achieved). Otherwise the field is
+ * `available` with the real injected value.
+ *
+ * @param forcedReason When provided, the field is always emitted with this
+ *   unfulfilled reason regardless of the raw value (used for build-after fields
+ *   that the bundle can never carry, e.g. artifact url/digest/retention).
+ */
+function readProvenanceField(
+  key: keyof ImportMetaEnv,
+  forcedReason?: Exclude<ProvenanceAvailabilityReason, 'available'>,
+): ProvenanceField {
+  const raw = readBuildEnv(key)
+  if (forcedReason !== undefined) {
+    return { value: raw, availability_reason: forcedReason }
+  }
+  if (UNFULFILLED_PROVENANCE_REASONS.has(raw)) {
+    return { value: raw, availability_reason: raw as ProvenanceAvailabilityReason }
+  }
+  return { value: raw, availability_reason: 'available' }
+}
+
+function collectDeclaredBrowserZoom(): EnvironmentInfo['declared_browser_zoom'] {
+  return {
+    declared_percent: 'manual_unknown',
+    source: 'unknown',
+  }
+}
+
+function collectArtifactMetadata(): ArtifactMetadata {
+  return {
+    // Build-time confirmable values: real value injected via workflow env.
+    run_id: readProvenanceField('VITE_LOOP_RUN_ID'),
+    run_attempt: readProvenanceField('VITE_LOOP_RUN_ATTEMPT'),
+    page_url: readProvenanceField('VITE_LOOP_PAGE_URL'),
+    artifact_names: readBuildEnv('VITE_LOOP_ARTIFACT_NAMES')
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0 && entry !== 'unknown'),
+    // Build-after values: never knowable at bundle build time. The bundle marks
+    // them unfulfilled; the real values are emitted by a separate workflow step
+    // into playtest-evidence-provenance.json (B2, #987).
+    artifact_url: readProvenanceField(
+      'VITE_LOOP_ARTIFACT_URL',
+      'unavailable-in-bundle-build-time',
+    ),
+    artifact_digest_or_attestation: readProvenanceField(
+      'VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION',
+      'unavailable-in-bundle-build-time',
+    ),
+    retention_days: readProvenanceField(
+      'VITE_LOOP_RETENTION_DAYS',
+      'unavailable-in-bundle-build-time',
+    ),
+    screenshot_path: readProvenanceField('VITE_LOOP_SCREENSHOT_PATH'),
+  }
+}
+
+/**
+ * Test-only accessor for provenance classification (B2/B8 #5, #987). Production
+ * code uses collectArtifactMetadata via buildEvidenceData.
+ */
+export function collectArtifactMetadataForTest(): ArtifactMetadata {
+  return collectArtifactMetadata()
+}
+
+function collectPausedOrRunningState(): RuntimeEvidenceState['paused_or_running'] {
+  if (typeof document === 'undefined') {
+    return 'running'
+  }
+  const togglePauseButton = document.querySelector('[data-action="toggle-pause"]')
+  if (togglePauseButton?.getAttribute('aria-pressed') === 'true') {
+    return 'paused'
+  }
+  return 'running'
+}
+
 // ---------------------------------------------------------------------------
 // Main data builder (AC3, AC5-AC8)
 // ---------------------------------------------------------------------------
 
-export function buildEvidenceData(): PlaytestEvidenceData {
-  const now = new Date()
-  const generated_at = now.toISOString()
+/**
+ * Builds the evidence payload from a *provided* runtime snapshot (B1, #987).
+ *
+ * @param runtimeEvidence State-scoped snapshot from the injected getSnapshot
+ *   callback. Defaults to an empty/uninitialized snapshot so pure unit tests can
+ *   call buildEvidenceData() with no arguments.
+ * @param generatedAtOverride Fixed timestamp for snapshot stability (B6).
+ */
+const EMPTY_RUNTIME_SNAPSHOT: AssistPlayerRuntimeEvidenceSnapshot = {
+  sortie_id: 'sortie-uninitialized',
+  terminal_state: 'running',
+  deterministic_events: [],
+}
+
+export function buildEvidenceData(
+  runtimeEvidence: AssistPlayerRuntimeEvidenceSnapshot = EMPTY_RUNTIME_SNAPSHOT,
+  generatedAtOverride?: string,
+): PlaytestEvidenceData {
+  const generated_at = generatedAtOverride ?? new Date().toISOString()
 
   const source_url = typeof location !== 'undefined' ? location.href : 'unknown'
 
@@ -330,15 +522,24 @@ export function buildEvidenceData(): PlaytestEvidenceData {
     screen: collectScreen(),
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     language: typeof navigator !== 'undefined' ? navigator.language : 'unknown',
+    declared_browser_zoom: collectDeclaredBrowserZoom(),
   }
 
   return {
-    playtest_evidence_schema_version: 'v1',
+    playtest_evidence_schema_version: 'v2',
     generated_at,
     source_url,
     app_under_test,
     browser,
     environment,
+    artifacts: collectArtifactMetadata(),
+    runtime_state: {
+      sortie_id: runtimeEvidence.sortie_id,
+      paused_or_running: collectPausedOrRunningState(),
+      terminal_state: runtimeEvidence.terminal_state,
+    },
+    deterministic_events: runtimeEvidence.deterministic_events,
+    qualitative_notes: runtimeEvidence.qualitative_notes,
     hashes: {},
   }
 }
@@ -434,10 +635,98 @@ interface MountPanelResult {
   panel: HTMLElement
   /** Call once when the panel is first shown to lock the evidence snapshot. */
   initSnapshot: () => void
+  refreshSnapshot: () => void
+}
+
+interface PromptMountResult {
+  card: HTMLElement
+  syncPrompt: () => void
+}
+
+function mountSelfExplanationPrompt(
+  container: HTMLElement,
+  deps: PlaytestEvidencePanelDeps,
+): PromptMountResult {
+  const card = document.createElement('section')
+  card.setAttribute('data-self-explanation-card', 'true')
+  card.hidden = true
+  card.style.cssText = [
+    'position:fixed',
+    'left:8px',
+    'bottom:8px',
+    'width:min(360px, calc(100vw - 16px))',
+    'background:#101820',
+    'color:#f5f7fa',
+    'border:1px solid #5cc8ff',
+    'padding:12px',
+    'z-index:9997',
+    'box-sizing:border-box',
+  ].join(';')
+
+  const title = document.createElement('p')
+  title.textContent = 'Post-sortie self-explanation'
+  title.style.cssText = 'margin:0 0 8px;font-weight:bold'
+
+  const prompt = document.createElement('p')
+  prompt.setAttribute('data-self-explanation-prompt', 'true')
+  prompt.setAttribute('role', 'status')
+  prompt.setAttribute('aria-live', 'polite')
+  prompt.style.cssText = 'margin:0 0 8px'
+
+  const response = document.createElement('textarea')
+  response.setAttribute('data-self-explanation-response', 'true')
+  response.rows = 4
+  response.style.cssText = 'width:100%;box-sizing:border-box;margin:0 0 8px'
+
+  const saveButton = document.createElement('button')
+  saveButton.type = 'button'
+  saveButton.setAttribute('data-self-explanation-save', 'true')
+  saveButton.textContent = 'Save explanation'
+  saveButton.style.cssText = 'padding:6px 12px'
+
+  const hint = document.createElement('p')
+  hint.textContent = 'This note is exported under qualitative_notes and never mixed into deterministic_events.'
+  hint.style.cssText = 'margin:8px 0 0;font-size:11px;color:#b8c4d1'
+
+  saveButton.addEventListener('click', () => {
+    // B1/B6: persist via injected recorder (state-scoped), then re-sync the
+    // prompt from the fresh snapshot. No module-global write.
+    deps.onSaveExplanation(response.value.trim())
+    syncPrompt()
+  })
+
+  card.appendChild(title)
+  card.appendChild(prompt)
+  card.appendChild(response)
+  card.appendChild(saveButton)
+  card.appendChild(hint)
+  container.appendChild(card)
+
+  function syncPrompt(): void {
+    const snapshot = deps.getSnapshot()
+    if (!snapshot.qualitative_notes) {
+      card.hidden = true
+      return
+    }
+    card.hidden = false
+    prompt.textContent = snapshot.qualitative_notes.self_explanation_prompt
+    if (
+      snapshot.qualitative_notes.self_explanation_response !== undefined &&
+      response.value !== snapshot.qualitative_notes.self_explanation_response
+    ) {
+      response.value = snapshot.qualitative_notes.self_explanation_response
+    }
+  }
+
+  return { card, syncPrompt }
 }
 
 /** Build and mount the Evidence Panel DOM node (AC2, AC9, AC10) */
-function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPanelResult {
+function mountPanel(
+  container: HTMLElement,
+  initiallyHidden: boolean,
+  deps: PlaytestEvidencePanelDeps,
+): MountPanelResult {
   // AC12: lazy-initialize snapshot on first open.
   // buildEvidenceData() is NOT called here (mount time); it is called the first time
   // the toggle opens the panel so that viewport/generated_at reflect the actual open moment.
@@ -554,10 +843,24 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
     }
   })
 
+  // Refresh evidence button (B6): explicit, on-demand snapshot recompute.
+  const refreshBtn = document.createElement('button')
+  refreshBtn.setAttribute('data-action', 'refresh-evidence')
+  refreshBtn.type = 'button'
+  refreshBtn.textContent = 'Refresh evidence'
+  refreshBtn.style.cssText =
+    'margin-left:8px;padding:6px 12px;background:#3a3a5e;color:#fff;border:none;cursor:pointer;font-size:12px'
+  refreshBtn.addEventListener('click', () => {
+    // Force a recompute even when the snapshot is already locked.
+    snapshotData = null
+    refreshSnapshot()
+  })
+
   const btnRow = document.createElement('div')
   btnRow.style.cssText = 'margin-bottom:12px'
   btnRow.appendChild(copyBtn)
   btnRow.appendChild(downloadBtn)
+  btnRow.appendChild(refreshBtn)
 
   panel.appendChild(closeBtn)
   panel.appendChild(title)
@@ -574,22 +877,23 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
     asyncBrowserCache = asyncBrowser
     // If snapshot was already generated (panel opened before async resolved), refresh it.
     if (snapshotData && asyncBrowser.version_source === 'userAgentData') {
-      const updatedData: PlaytestEvidenceData = { ...snapshotData, browser: asyncBrowser }
-      snapshotData = updatedData
-      currentYaml = toYaml(updatedData)
-      textarea.value = currentYaml
+      refreshSnapshot()
     }
   }).catch(() => {
     // Async update failed silently -- sync render remains
   })
 
   /**
-   * AC12: Initialize the evidence snapshot on first open.
-   * Subsequent calls are no-ops (snapshot is locked after first call).
+   * B6: Recompute the atomic evidence snapshot from the current runtime state.
+   *
+   * Called only on explicit events (panel open, Save explanation, Refresh
+   * evidence). The first call locks `generated_at`; subsequent refreshes reuse
+   * it so display / copy / download always operate on a single coherent
+   * snapshot. There is no per-frame refresh loop.
    */
-  function initSnapshot(): void {
-    if (snapshotData !== null) return  // already locked
-    let data = buildEvidenceData()
+  function refreshSnapshot(): void {
+    const generatedAt = snapshotData?.generated_at
+    let data = buildEvidenceData(deps.getSnapshot(), generatedAt)
     // Apply async browser info if already resolved
     if (asyncBrowserCache && asyncBrowserCache.version_source === 'userAgentData') {
       data = { ...data, browser: asyncBrowserCache }
@@ -599,7 +903,19 @@ function mountPanel(container: HTMLElement, initiallyHidden: boolean): MountPane
     textarea.value = currentYaml
   }
 
-  return { panel, initSnapshot }
+  /**
+   * B6: Initialize the evidence snapshot on first open only. Once locked, a
+   * reopen does NOT recompute the snapshot (avoids the previous double-refresh).
+   * Use the explicit Refresh evidence button to force a recompute.
+   */
+  function initSnapshot(): void {
+    if (snapshotData !== null) {
+      return
+    }
+    refreshSnapshot()
+  }
+
+  return { panel, initSnapshot, refreshSnapshot }
 }
 
 /** Build and mount the always-visible toggle button (AC1, AC2, AC10) */
@@ -674,28 +990,54 @@ export function shouldShowPanel(search: string): boolean {
  * Calling this function multiple times is idempotent: subsequent calls are no-ops (AC13).
  *
  * @param container - DOM element to mount the panel into
- * @param search    - URL search string (e.g. location.search). Defaults to location.search if omitted.
+ * @param options   - Injected runtime deps (B1) plus optional URL search string.
+ *   `getSnapshot` / `onSaveExplanation` bind the panel to a state-scoped runtime.
+ *   For backwards-compatible callers/tests, a bare search string may be passed
+ *   instead; in that case empty default deps are used.
  */
+export interface InitPlaytestEvidencePanelOptions extends Partial<PlaytestEvidencePanelDeps> {
+  search?: string
+}
+
+function resolvePanelDeps(deps: Partial<PlaytestEvidencePanelDeps>): PlaytestEvidencePanelDeps {
+  return {
+    getSnapshot: deps.getSnapshot ?? (() => EMPTY_RUNTIME_SNAPSHOT),
+    onSaveExplanation: deps.onSaveExplanation ?? (() => {}),
+  }
+}
+
 export function initPlaytestEvidencePanel(
   container: HTMLElement,
-  search?: string,
+  optionsOrSearch?: string | InitPlaytestEvidencePanelOptions,
 ): void {
   // AC13: idempotent -- do not mount more than once per container
   if (container.querySelector('[data-playtest-toggle="true"]')) {
     return
   }
 
-  const q = search ?? (typeof location !== 'undefined' ? location.search : '')
+  const options: InitPlaytestEvidencePanelOptions =
+    typeof optionsOrSearch === 'string' || optionsOrSearch === undefined
+      ? { search: optionsOrSearch }
+      : optionsOrSearch
+  const deps = resolvePanelDeps(options)
+
+  const q = options.search ?? (typeof location !== 'undefined' ? location.search : '')
   const panelOpen = shouldShowPanel(q)
 
   // Mount panel (initially hidden unless ?playtest_evidence=1)
-  const { panel, initSnapshot } = mountPanel(container, !panelOpen)
+  const { panel, initSnapshot } = mountPanel(container, !panelOpen, deps)
+  const { syncPrompt } = mountSelfExplanationPrompt(container, deps)
 
-  // AC12: if panel is initially open (e.g. ?playtest_evidence=1), initialize snapshot immediately.
+  // B6: snapshot is initialized on first open only. No per-frame refresh loop.
+  // The prompt card is synced on the same explicit events.
   if (panelOpen) {
     initSnapshot()
   }
+  syncPrompt()
 
-  // Always mount the toggle button
-  mountToggle(container, panel, initSnapshot)
+  // Wire prompt re-sync to panel open via the toggle (B6).
+  mountToggle(container, panel, () => {
+    initSnapshot()
+    syncPrompt()
+  })
 }

@@ -7,6 +7,14 @@ interface ImportMetaEnv {
    * Absent (undefined) in local dev builds unless explicitly set.
    */
   readonly VITE_LOOP_COMMIT_SHA?: string
+  readonly VITE_LOOP_RUN_ID?: string
+  readonly VITE_LOOP_RUN_ATTEMPT?: string
+  readonly VITE_LOOP_PAGE_URL?: string
+  readonly VITE_LOOP_ARTIFACT_URL?: string
+  readonly VITE_LOOP_ARTIFACT_NAMES?: string
+  readonly VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION?: string
+  readonly VITE_LOOP_RETENTION_DAYS?: string
+  readonly VITE_LOOP_SCREENSHOT_PATH?: string
 }
 
 interface ImportMeta {

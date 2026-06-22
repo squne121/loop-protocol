@@ -2,6 +2,10 @@ import './style.css'
 
 import { initPlaytestEvidencePanel } from './ui/playtestEvidence'
 import {
+  getPlaytestEvidenceSnapshot,
+  setSelfExplanationResponse,
+} from './playtest/assistPlayerEventLog'
+import {
   bindInput,
   createInputState,
   mapInputToCommands,
@@ -236,11 +240,6 @@ if (app) {
 `
 }
 
-// AC2: opt-in evidence panel — visible only when ?playtest_evidence=1
-if (app) {
-  initPlaytestEvidencePanel(document.body, window.location.search)
-}
-
 const canvas = app?.querySelector<HTMLCanvasElement>('.battle-stage__canvas') ?? null
 const commandRail = app?.querySelector<HTMLElement>('.command-rail') ?? null
 
@@ -257,6 +256,20 @@ let state: GameState = createInitialGameState()
 // B1: Start in title_menu phase (not preparation).
 // Explicit cast prevents TypeScript CFA from narrowing loopPhase to a literal type.
 ;(state as { loopPhase: LoopPhase }).loopPhase = 'title_menu'
+
+// AC2 / B1 (#987): opt-in evidence panel — visible only when ?playtest_evidence=1.
+// The panel reads the live state-scoped evidence runtime via injected callbacks
+// (no module-global store). `state` is reassigned on load, so the closures read
+// the current binding each time.
+if (app) {
+  initPlaytestEvidencePanel(document.body, {
+    search: window.location.search,
+    getSnapshot: () => getPlaytestEvidenceSnapshot(state.playtestEvidenceRuntime),
+    onSaveExplanation: (response) =>
+      setSelfExplanationResponse(state.playtestEvidenceRuntime, response),
+  })
+}
+
 const renderer = canvas ? createCanvasRenderer(canvas) : null
 
 // Product pause state (runtime-local, not persisted) — AC10, AC11

@@ -104,6 +104,8 @@ describe('AC7 + Blocker 1 – sampleAssistPlayerIntent (production function)', (
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 0)
     expect(runtime.bufferedIntent).not.toBeNull()
@@ -116,6 +118,8 @@ describe('AC7 + Blocker 1 – sampleAssistPlayerIntent (production function)', (
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 1,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 5)
     expect(runtime.bufferedIntent!.expiresAtTick).toBe(6)
@@ -126,6 +130,8 @@ describe('AC7 + Blocker 1 – sampleAssistPlayerIntent (production function)', (
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 3,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 10)
     expect(runtime.bufferedIntent!.expiresAtTick).toBe(13)
@@ -149,6 +155,8 @@ describe('AC7 + Blocker 1 – sampleAssistPlayerIntent (production function)', (
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 0)
     expect(runtime.activeIntent).toBe('assist_player')
@@ -193,6 +201,8 @@ describe('AC2 – deterministic tick-based expiry (production function isBuffere
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 1,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 5)
     const buf = runtime.bufferedIntent!
@@ -207,6 +217,8 @@ describe('AC2 – deterministic tick-based expiry (production function isBuffere
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 0)
     const buf = runtime.bufferedIntent!
@@ -227,6 +239,8 @@ describe('AC4 – bufferedIntent.intent is narrowed to assist_player', () => {
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     sampleAssistPlayerIntent(runtime, 0)
     // Type-level: Extract<CommandIntent, 'assist_player'> === 'assist_player'
@@ -242,6 +256,8 @@ describe('AC4 – bufferedIntent.intent is narrowed to assist_player', () => {
         expiresAtTick: 18,
       },
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     // Stage 7 reads: runtime.bufferedIntent?.intent === 'assist_player'
     expect(runtime.bufferedIntent?.intent).toBe('assist_player')
@@ -264,6 +280,8 @@ describe('Blocker 5 – resetCommandIntentRuntime (production function)', () => 
         expiresAtTick: 8,
       },
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     resetCommandIntentRuntime(runtime)
     expect(runtime.activeIntent).toBe('none')
@@ -278,6 +296,8 @@ describe('Blocker 5 – resetCommandIntentRuntime (production function)', () => 
         expiresAtTick: 13,
       },
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     resetCommandIntentRuntime(runtime)
     expect(runtime.bufferedIntent).toBeNull()
@@ -301,6 +321,8 @@ describe('Blocker 5 – resetCommandIntentRuntime (production function)', () => 
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     }
     resetCommandIntentRuntime(runtime)
     expect(runtime.activeIntent).toBe('none')

@@ -74,6 +74,8 @@ function createState(loopPhase: LoopPhase = 'preparation', resultRewardStatus: R
       activeIntent: 'none',
       bufferedIntent: null,
       assistPlayerTtlTicks: 8,
+      activeCommandSeq: null,
+      activeIntentTargetConfirmed: false,
     },
     sortie:
       loopPhase === 'running'
