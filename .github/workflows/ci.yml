@@ -798,62 +798,63 @@ jobs:
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
-      - name: pytest edit-issue tests (timed)
+      - name: pytest python suite (timed)
+        # Unified, plan-driven pytest step (Issue #1064). The target set /
+        # --ignore / --deselect / xdist worker count / scheduler all come from the
+        # python-test-plan SSOT (.github/ci/python-test-plan.json) via the
+        # scripts/ci/python_test_plan.py loader. No shell eval: the loader emits a
+        # NUL-separated argv stream consumed with `mapfile -d ''`. tests/codex/ is
+        # NOT in the plan — it runs in the dedicated codex execpolicy step below.
         run: |
           _t0=$(date +%s%3N)
+          mkdir -p python_test_artifacts
+          mapfile -d '' _pytest_argv < <(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format nul)
           set +e
-          uv run --locked pytest \
-            .claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py \
-            .claude/skills/edit-issue/tests/test_guard_issue_body.py \
-            .claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py
+          uv run --locked pytest "${_pytest_argv[@]}" \
+            --junitxml=python_test_artifacts/junit.xml \
+            --durations=25 --durations-min=0.01 \
+            > python_test_artifacts/pytest_durations.log 2>&1
           _s=$?
           set -e
-          printf '{"step_id":"pytest_edit_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+          cat python_test_artifacts/pytest_durations.log
+          # Record resolved xdist knobs + version for the runtime-baseline evidence (AC9).
+          _workers=$(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format lines | sed -n '2p')
+          _scheduler=$(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format lines | sed -n '4p')
+          _xdist_version=$(uv run --locked python -c "import xdist; print(xdist.__version__)" 2>/dev/null || echo unknown)
+          _nproc=$(nproc 2>/dev/null || echo unknown)
+          printf '{"configured_workers":"%s","scheduler":"%s","xdist_version":"%s","runner_nproc":"%s","junitxml":"python_test_artifacts/junit.xml","durations_log":"python_test_artifacts/pytest_durations.log"}\n' \
+            "$_workers" "$_scheduler" "$_xdist_version" "$_nproc" > python_test_artifacts/xdist_meta.json
+          cat python_test_artifacts/xdist_meta.json
+          printf '{"step_id":"pytest_python_suite","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
-      - name: pytest create-issue tests (timed)
+      - name: pytest serial lane (parallel-unsafe) (timed)
+        # Dedicated -n 0 lane for plan.parallel_exclude tests (Issue #1064). These are
+        # timing-sensitive (e.g. the 80ms debounce front-gate) and flake under xdist CPU
+        # contention; they are collected into the ci_test_selection scope but run serially
+        # here. Skips cleanly when parallel_exclude is empty.
         run: |
           _t0=$(date +%s%3N)
+          mapfile -d '' _serial_argv < <(python3 scripts/ci/python_test_plan.py --emit serial-lane-argv --format nul)
+          if [ "${#_serial_argv[@]}" -eq 0 ]; then
+            echo "no parallel_exclude tests; serial lane is empty"
+            exit 0
+          fi
           set +e
-          uv run --locked pytest .claude/skills/create-issue/tests/
+          uv run --locked pytest "${_serial_argv[@]}"
           _s=$?
           set -e
-          printf '{"step_id":"pytest_create_issue_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_serial_lane","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
-      - name: pytest create-issue scripts (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/create-issue/scripts/tests/
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_create_issue_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest ssot-discovery (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/ssot-discovery/tests/test_match_ssot_registry.py -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_ssot_discovery","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest hook tests (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/hooks/tests/ -q \
-            --ignore=.claude/hooks/tests/test_secret_boundary_contract.py \
-            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
-            --deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
+      - name: Upload python-test artifacts (junit + durations + xdist meta)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-test-junit-${{ github.run_attempt }}
+          path: python_test_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
       - name: Install codex CLI (pinned, for execpolicy gate)
         run: |
           # Issue #1137 Blocker 10: install a pinned codex CLI so the execpolicy
@@ -1012,106 +1013,6 @@ jobs:
           if missing:
               raise SystemExit("Hook tests missing from pytest discovery:\n" + "\n".join(missing))
           PY
-      - name: pytest issue-contract-review scripts (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_issue_contract_review_scripts","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest issue-contract-review tests (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/issue-contract-review/tests/
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_issue_contract_review_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest pr-review-judge (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/pr-review-judge/scripts/tests/
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_pr_review_judge","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest open-pr (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/open-pr/scripts/tests/
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_open_pr","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest impl-review-loop (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/impl-review-loop/tests/ -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_impl_review_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest review-issue (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/review-issue/tests/ -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_review_issue","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest issue-refinement-loop (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_issue_refinement_loop","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest schemas (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest schemas/tests/ -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_schemas","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest context-mode (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest tests/context_mode/ -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_context_mode","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest summarize-agent-transcript (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest tests/test_summarize_agent_transcript.py -q
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_summarize_agent_transcript","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
       - name: Kill Switch smoke test
         run: python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
       - name: Secret exposure scan (production scripts)
@@ -1143,29 +1044,14 @@ jobs:
           assert spec.loader is not None
           spec.loader.exec_module(module)
 
+          # pytest_args=None -> the generator derives the scope argv from the
+          # python-test-plan SSOT (.github/ci/python-test-plan.json) via the loader,
+          # so the artifact pytest_argv cannot drift from the executed target set
+          # and includes schemas/tests/ exactly once (Issue #1064 AC2/AC7).
           args = argparse.Namespace(
               output="ci_test_selection_artifacts/ci_test_selection_v1.json",
-              pytest_args=[
-                  ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
-                  ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
-                  ".claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py",
-                  ".claude/skills/create-issue/tests/",
-                  ".claude/skills/create-issue/scripts/tests/",
-                  ".claude/skills/ssot-discovery/tests/test_match_ssot_registry.py",
-                  ".claude/hooks/tests/",
-                  "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
-                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
-                  "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
-                  ".claude/skills/issue-contract-review/scripts/tests/",
-                  ".claude/skills/issue-contract-review/tests/",
-                  ".claude/skills/pr-review-judge/scripts/tests/",
-                  ".claude/skills/open-pr/scripts/tests/",
-                  ".claude/skills/impl-review-loop/tests/",
-                  ".claude/skills/review-issue/tests/",
-                  ".claude/skills/issue-refinement-loop/tests/",
-                  "tests/context_mode/",
-                  "tests/test_summarize_agent_transcript.py",
-              ],
+              pytest_args=None,
+              plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
               checked_out_sha=None,
               merge_sha="${{ github.sha }}",

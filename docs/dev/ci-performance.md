@@ -80,32 +80,19 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `uv_python_install` | `uv python install` | python-test / node-backed-hook-tests |
 | `uv_sync` | `uv sync --locked --group dev` | python-test / node-backed-hook-tests |
 | `ruff_check` | `uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills` | python-test |
-| `pytest_skills` | pytest（skills 群 14 ステップ合計の stable phase_id） | python-test |
+| `pytest_skills` | pytest（python-test-plan SSOT を消費する統合 step `pytest_python_suite` の stable phase_id） | python-test |
 | `pytest_node_backed_hooks` | Node-backed hook test nodeid 2 件 | node-backed-hook-tests |
 | `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |
 | `actionlint` | `actionlint` | actionlint |
 
 ### python-test の step_id と phase_id の関係
 
-python-test job では pytest ステップが複数あり、各ステップの `step_id` は granular（例: `pytest_edit_issue_tests`, `pytest_create_issue_tests` 等）だが、
-`phase_id` は全て `pytest_skills` に統一されている。これにより #896 以降の比較で pytest 群全体の所要時間を単一 phase_id で集計できる。
+python-test job の pytest skills 群は #1064 で `.github/ci/python-test-plan.json`（python-test-plan SSOT）を `scripts/ci/python_test_plan.py` loader 経由で消費する単一 step `pytest_python_suite` に統合された。`step_id` は `pytest_python_suite`、`phase_id` は従来どおり `pytest_skills` を維持し、#896 以降の比較基軸との互換性を保つ。`tests/codex/` は専用 codex execpolicy step（`codex_execpolicy_matrix`）で別途実行されるため plan の `targets` には含めない。
 
-| step_id（granular） | phase_id（stable） |
-|---|---|
-| `pytest_edit_issue_tests` | `pytest_skills` |
-| `pytest_create_issue_tests` | `pytest_skills` |
-| `pytest_create_issue_scripts` | `pytest_skills` |
-| `pytest_ssot_discovery` | `pytest_skills` |
-| `pytest_hook_tests` | `pytest_skills` |
-| `pytest_issue_contract_review_scripts` | `pytest_skills` |
-| `pytest_issue_contract_review_tests` | `pytest_skills` |
-| `pytest_pr_review_judge` | `pytest_skills` |
-| `pytest_open_pr` | `pytest_skills` |
-| `pytest_impl_review_loop` | `pytest_skills` |
-| `pytest_review_issue` | `pytest_skills` |
-| `pytest_issue_refinement_loop` | `pytest_skills` |
-| `pytest_schemas` | `pytest_skills` |
-| `pytest_context_mode` | `pytest_skills` |
+| step_id（統合後） | phase_id（stable） | 備考 |
+|---|---|---|
+| `pytest_python_suite` | `pytest_skills` | python-test-plan SSOT 由来の統合 pytest step（xdist 並列） |
+| `codex_execpolicy_matrix` | `pytest_skills` | codex execpolicy matrix + `tests/codex/`（専用 step） |
 
 ### node-backed-hook-tests job の step_id と phase_id の関係
 

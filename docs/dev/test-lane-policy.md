@@ -12,12 +12,12 @@
 - `python-test` の `.claude/hooks/tests/` 実行では、Node-backed 2 nodeid を `--deselect=<exact nodeid>` で除外し、Python-only hook tests を継続実行している
 - `node-backed-hook-tests` job は `setup-node-pnpm` / `setup-python-uv` / `pnpm install --frozen-lockfile` を行った上で、Node-backed hook test nodeid だけを実行している
 - `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
-- `pytest` は複数の step に分割されて実行されている
-- `schemas/tests/` は実行されているが、`ci_test_selection/v1` の `pytest_args` からは欠落している
-- `ruff` は未導入（`pyproject.toml` に dev dependency として登録されていない）
-- `pytest-xdist` は未導入（`pyproject.toml` に dev dependency として登録されていない）
+- `pytest` の python_unit レーンは `.github/ci/python-test-plan.json`（python-test-plan SSOT）を `scripts/ci/python_test_plan.py` loader 経由で消費する単一 step に統合された（#1064）
+- `schemas/tests/` は python-test-plan の `targets` に含まれ、`ci_test_selection/v1` の `pytest_argv` と実行対象が一致する（#1064 で drift 解消）
+- `ruff` は導入済み（#1063、`pyproject.toml` の dev dependency に登録）
+- `pytest-xdist` は導入済み（#1064、`pyproject.toml` の dev dependency に `pytest-xdist>=3.8,<4` を登録）
 
-後続の child Issue（#1063 Ruff 導入、#1064 pytest-xdist 導入）にて追加の CI 変更が行われる。
+#1063（Ruff 導入）・#1064（pytest-xdist 導入 + python-test-plan SSOT）は反映済みである。
 
 ## Target Policy（目標ポリシー）
 
@@ -45,12 +45,12 @@ ci_test_lane_policy_v1:
       name: "Python Unit Tests"
       description: "Python ユニットテスト。pytest による単体・統合テスト。Node-backed hook tests は除く。"
       tools:
-        - "uv run pytest <test-paths>"
-        - "uv run pytest -n auto（pytest-xdist 導入後）"
+        - "uv run pytest $(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel)（python-test-plan SSOT 由来）"
+        - "uv run pytest -n auto --dist worksteal（python-test-plan の xdist 設定）"
       characteristics:
-        - 実行時間: 2-5分（xdist 導入後は短縮見込み）
+        - 実行時間: 2-5分（xdist 並列化で短縮）
         - 外部依存: なし
-        - 並列化: pytest-xdist 導入後
+        - 並列化: pytest-xdist（worker 数・scheduler は python-test-plan で集中管理）
       trigger:
         - Python ファイル変更
         - schema / contract 変更

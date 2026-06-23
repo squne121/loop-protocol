@@ -29,12 +29,16 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 - `python-test` の hook pytest は Python-only hook tests を継続実行し、Node-backed 2 nodeid は `--deselect=<exact nodeid>` で除外している
 - `node-backed-hook-tests` job が Node.js / pnpm 依存の hook wrapper 検証を専用に実行している
 - `ci_test_selection/v1` の split evidence は `ci_test_selection_summary_v1.json` で統合され、python-test 側 absent / node-backed 側 exactly 2 / union-disjointness を機械検証している
-- `pytest` は複数の step に分割されて実行されている（後続 child Issue で統合予定）
-- `schemas/tests/` は実行されているが `ci_test_selection/v1` の `pytest_args` に未登録
-- `ruff` は未導入（#1063 で対応予定）
-- `pytest-xdist` は未導入（#1064 で対応予定）
+- `pytest` の python_unit レーンは `.github/ci/python-test-plan.json`（python-test-plan SSOT）を `scripts/ci/python_test_plan.py` loader 経由で消費する単一 step に統合され、pytest 実行と `ci_test_selection/v1` artifact 生成の双方が同一 plan を参照する（#1064）
+- `schemas/tests/` は python-test-plan の `targets` に含まれ、`ci_test_selection/v1` の `pytest_argv` と実行対象が一致する（#1064 で drift 解消）
+- `ruff` は導入済み（#1063）
+- `pytest-xdist` は導入済みで、python-test-plan の `xdist.workers` / `xdist.dist` で worker 数・scheduler を集中管理する（#1064）
 
 この Skill 自体はポリシー定義であり、特定 Issue に閉じない。実装時は current workflow の lane 分類と evidence の整合を優先する。
+
+### python-test-plan SSOT（#1064）
+
+`.github/ci/python-test-plan.json` は pytest target / `--ignore` / `--deselect` / worker 数 / scheduler を集約した machine-readable plan であり、`scripts/ci/python_test_plan.py` loader が shell `eval` を避けて NUL 区切り / JSON で argv を emit する。target set を変える場合は workflow や generator を直接編集せず python-test-plan を編集する。`generate_ci_test_selection_artifact.py` は loader 経由で plan の scope argv を `pytest_argv` に記録し、collect 非 0 / timeout / nodeid 0 件で fail-close する。
 
 ## Target Policy
 
@@ -134,8 +138,8 @@ CI_TEST_PERFORMANCE_DECISION_V1:
 
 ## Target Policy（#1063/#1064 以降）
 
-- ruff check . （#1063 で導入後）
-- pytest -n auto （#1064 で導入後）
+- ruff check . （#1063 で導入済み）
+- pytest -n auto （#1064 で導入済み。worker 数・scheduler は `.github/ci/python-test-plan.json` で集中管理）
 
 ### Ruff 使用に関する注意
 
