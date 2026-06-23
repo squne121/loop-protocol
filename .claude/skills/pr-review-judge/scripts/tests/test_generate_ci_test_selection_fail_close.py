@@ -3,13 +3,15 @@
 The generator must:
 - derive its pytest scope argv from the python-test-plan SSOT (AC2/AC7),
 - include schemas/tests/ exactly once (AC7),
-- fail-close (non-zero exit) and record collection_status when pytest --collect-only
-  exits non-zero, times out, or collects zero nodeids (AC6).
+- fail-close (non-zero exit) and record collection_status when collection fails (AC6),
+- fail-close and record diff_status when change detection fails (Issue #1064 review:
+  shallow-checkout / missing base-head SHA must NOT report an empty changed-test set).
 """
 
 import argparse
 import importlib.util
 import json
+import os
 import subprocess
 import types
 from pathlib import Path
@@ -36,8 +38,20 @@ def _load_gen():
 gen = _load_gen()
 
 
-def _fake_completed(returncode, stdout="", stderr=""):
+def _completed(returncode, stdout="", stderr=""):
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _fake_collect(nodeids, returncode=0, stderr=""):
+    """Build a subprocess.run replacement that writes COLLECT_NODEIDS_OUT like the plugin."""
+
+    def _run(cmd, *a, **k):
+        out = (k.get("env") or os.environ).get("COLLECT_NODEIDS_OUT")
+        if out:
+            Path(out).write_text(json.dumps({"nodeids": sorted(nodeids), "count": len(nodeids)}))
+        return _completed(returncode, stderr=stderr)
+
+    return _run
 
 
 # --- AC2 / AC7: plan-derived scope argv ---
@@ -59,14 +73,11 @@ def test_resolve_pytest_args_override_wins():
 
 
 def test_collection_status_non_zero_is_not_ok(monkeypatch):
-    monkeypatch.setattr(
-        gen.subprocess, "run", lambda *a, **k: _fake_completed(2, stdout="", stderr="boom")
-    )
+    monkeypatch.setattr(gen.subprocess, "run", _fake_collect([], returncode=2, stderr="boom"))
     files, nodeids, status = gen.get_pytest_collected_tests(["x/"])
     assert status["ok"] is False
     assert status["returncode"] == 2
     assert status["nodeid_count"] == 0
-    assert "boom" in status["stderr_tail"]
 
 
 def test_collection_status_timeout_is_not_ok(monkeypatch):
@@ -80,71 +91,130 @@ def test_collection_status_timeout_is_not_ok(monkeypatch):
 
 
 def test_collection_status_zero_nodeids_is_not_ok(monkeypatch):
-    monkeypatch.setattr(
-        gen.subprocess,
-        "run",
-        lambda *a, **k: _fake_completed(0, stdout="\n\n", stderr=""),
-    )
+    monkeypatch.setattr(gen.subprocess, "run", _fake_collect([], returncode=0))
     files, nodeids, status = gen.get_pytest_collected_tests(["x/"])
     assert status["ok"] is False
     assert status["nodeid_count"] == 0
 
 
 def test_collection_status_ok_when_nodeids_present(monkeypatch):
-    out = "pkg/test_a.py::test_one\npkg/test_a.py::test_two\n2 tests collected in 0.1s\n"
     monkeypatch.setattr(
-        gen.subprocess, "run", lambda *a, **k: _fake_completed(0, stdout=out, stderr="")
+        gen.subprocess, "run",
+        _fake_collect(["pkg/test_a.py::test_one", "pkg/test_a.py::test_two"], returncode=0),
     )
     files, nodeids, status = gen.get_pytest_collected_tests(["pkg/"])
     assert status["ok"] is True
     assert status["nodeid_count"] == 2
     assert "pkg/test_a.py::test_one" in nodeids
-    # The pytest summary line must not be counted as a nodeid.
-    assert all("collected" not in n for n in nodeids)
+    assert files == ["pkg/test_a.py"]
 
 
-def test_generate_artifact_fail_closes_and_records_status(monkeypatch, tmp_path):
+# --- Issue #1064 review: fail-close on change-detection failure ---
+
+
+def test_diff_status_missing_sha_is_not_ok():
+    changed, excluded, diff_status = gen.get_changed_test_files("", "")
+    assert diff_status["ok"] is False
+    assert "required" in diff_status["error"]
+    assert changed == []
+
+
+def test_diff_status_non_zero_is_not_ok(monkeypatch):
     monkeypatch.setattr(
-        gen, "get_pytest_collected_tests", lambda argv: ([], [], {
-            "returncode": 1, "timed_out": False, "error": None,
-            "nodeid_count": 0, "stderr_tail": "collect error", "ok": False,
-        })
+        gen.subprocess, "run",
+        lambda *a, **k: _completed(128, stderr="fatal: bad object main"),
     )
-    monkeypatch.setattr(gen, "get_changed_test_files", lambda *a, **k: ([], []))
-    monkeypatch.setattr(gen, "get_current_head_sha", lambda: "deadbeef")
+    changed, excluded, diff_status = gen.get_changed_test_files("base", "head")
+    assert diff_status["ok"] is False
+    assert diff_status["returncode"] == 128
+    assert "bad object" in diff_status["stderr_tail"]
+
+
+def test_diff_status_ok_lists_changed_tests(monkeypatch):
+    out = "scripts/ci/tests/test_python_test_plan.py\nsrc/main.ts\nREADME.md\n"
+    monkeypatch.setattr(gen.subprocess, "run", lambda *a, **k: _completed(0, stdout=out))
+    changed, excluded, diff_status = gen.get_changed_test_files("base", "head")
+    assert diff_status["ok"] is True
+    assert "scripts/ci/tests/test_python_test_plan.py" in changed
+
+
+def test_generate_artifact_fail_closes_on_collection(monkeypatch, tmp_path):
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: ([], [], {
+        "returncode": 1, "timed_out": False, "error": None,
+        "nodeid_count": 0, "stderr_tail": "collect error", "ok": False,
+    }))
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: ([], [], {"ok": True}))
     out = tmp_path / "artifact.json"
     args = argparse.Namespace(
         output=str(out), pytest_args=["x/"], plan=None, pr_head_sha="h",
-        checked_out_sha=None, merge_sha="m", workflow="ci", job="python-test",
-        ci_run_url=None,
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
     )
-    rc = gen.generate_artifact(args)
-    assert rc == 2  # fail-closed
+    assert gen.generate_artifact(args) == 2
     data = json.loads(out.read_text())
     assert data["collection_status"]["ok"] is False
-    assert data["pytest_argv"] == ["x/"]
 
 
-def test_generate_artifact_succeeds_when_collection_ok(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        gen, "get_pytest_collected_tests", lambda argv: (
-            ["pkg/test_a.py"], ["pkg/test_a.py::test_one"], {
-                "returncode": 0, "timed_out": False, "error": None,
-                "nodeid_count": 1, "stderr_tail": "", "ok": True,
-            }
-        )
-    )
-    monkeypatch.setattr(gen, "get_changed_test_files", lambda *a, **k: ([], []))
-    monkeypatch.setattr(gen, "get_current_head_sha", lambda: "deadbeef")
+def test_generate_artifact_fail_closes_on_diff(monkeypatch, tmp_path):
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: (
+        ["pkg/test_a.py"], ["pkg/test_a.py::test_one"], {
+            "returncode": 0, "timed_out": False, "error": None,
+            "nodeid_count": 1, "stderr_tail": "", "ok": True,
+        }))
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: ([], [], {
+        "base_sha": b, "head_sha": h, "returncode": 128, "timed_out": False,
+        "error": "fatal: bad object main", "stderr_tail": "fatal", "ok": False,
+    }))
     out = tmp_path / "artifact.json"
     args = argparse.Namespace(
         output=str(out), pytest_args=None, plan=None, pr_head_sha="h",
-        checked_out_sha=None, merge_sha="m", workflow="ci", job="python-test",
-        ci_run_url=None,
+        base_sha="", head_sha="", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    # collection ok but diff failed -> still fail-closed (exit 2), the false-green fix.
+    assert gen.generate_artifact(args) == 2
+    data = json.loads(out.read_text())
+    assert data["diff_status"]["ok"] is False
+    assert data["collection_status"]["ok"] is True
+
+
+def test_generate_artifact_succeeds_when_both_ok(monkeypatch, tmp_path):
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: (
+        ["pkg/test_a.py"], ["pkg/test_a.py::test_one"], {
+            "returncode": 0, "timed_out": False, "error": None,
+            "nodeid_count": 1, "stderr_tail": "", "ok": True,
+        }))
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        ["pkg/test_a.py"], [], {"base_sha": b, "head_sha": h, "ok": True}))
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=None, plan=None, pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
     )
     rc = gen.generate_artifact(args)
-    assert rc == 0
+    assert rc == 0  # changed test pkg/test_a.py is covered (collected)
     data = json.loads(out.read_text())
     assert data["collection_status"]["ok"] is True
-    # AC7: artifact pytest_argv derives from the plan SSOT and includes schemas once.
+    assert data["diff_status"]["ok"] is True
     assert data["pytest_argv"].count("schemas/tests/") == 1
+
+
+def test_generate_artifact_uncovered_changed_test_returns_1(monkeypatch, tmp_path):
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: (
+        ["pkg/test_a.py"], ["pkg/test_a.py::test_one"], {
+            "returncode": 0, "timed_out": False, "error": None,
+            "nodeid_count": 1, "stderr_tail": "", "ok": True,
+        }))
+    # a changed test file that is NOT collected -> uncovered -> exit 1
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        ["pkg/test_uncovered.py"], [], {"base_sha": b, "head_sha": h, "ok": True}))
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=["pkg/"], plan=None, pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    assert gen.generate_artifact(args) == 1
+    data = json.loads(out.read_text())
+    assert data["uncovered_changed_test_files"] == ["pkg/test_uncovered.py"]

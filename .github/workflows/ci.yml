@@ -725,6 +725,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # fetch-depth: 0 so the ci_test_selection generator can run an explicit
+          # base..head git diff for change detection. A shallow checkout (default
+          # depth 1) lacks the base ref and the diff fails — which is now fail-closed
+          # (Issue #1064 review), so full history is required here.
+          fetch-depth: 0
       - uses: ./.github/actions/setup-python-uv
       - name: uv python install (timed)
         id: timed-uv-python-install
@@ -798,62 +803,103 @@ jobs:
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
-      - name: pytest python suite (timed)
-        # Unified, plan-driven pytest step (Issue #1064). The target set /
-        # --ignore / --deselect / xdist worker count / scheduler all come from the
-        # python-test-plan SSOT (.github/ci/python-test-plan.json) via the
-        # scripts/ci/python_test_plan.py loader. No shell eval: the loader emits a
-        # NUL-separated argv stream consumed with `mapfile -d ''`. tests/codex/ is
-        # NOT in the plan — it runs in the dedicated codex execpolicy step below.
+      - name: Verify python-test plan paths + lane union
+        # Fail-closed plan checks (Issue #1064 review): every plan path exists, and the
+        # collected node IDs satisfy  parallel ∪ serial == scope  and  parallel ∩ serial == ∅.
+        run: |
+          python3 scripts/ci/python_test_plan.py --emit scope-argv --check-paths --format json > /dev/null
+          uv run --locked python scripts/ci/verify_lane_union.py
+      - name: pytest python suite (parallel) (timed)
+        # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
+        # FIXED worker count / scheduler all come from the python-test-plan SSOT via the
+        # scripts/ci/python_test_plan.py loader. The parallel_exclude tests run in the serial
+        # lane below; tests/codex/ runs in the dedicated codex step. JUnit + durations are
+        # written to *-parallel.* and combined with the serial lane by the manifest step.
+        env:
+          XDIST_NUMPROCESSES_OUT: python_test_artifacts/resolved_workers.json
         run: |
           _t0=$(date +%s%3N)
           mkdir -p python_test_artifacts
-          mapfile -d '' _pytest_argv < <(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format nul)
+          # B4 (review): run the loader as an INDEPENDENT command (a process substitution
+          # would discard the producer's exit status, masking loader failures). Fail-closed:
+          # a loader error or an empty argv aborts before pytest runs.
+          _argv_file="${RUNNER_TEMP:-/tmp}/pytest-parallel-argv"
+          if ! python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format nul > "$_argv_file"; then
+            echo "::error::python-test plan loader failed (parallel argv)"
+            exit 1
+          fi
+          mapfile -d '' -t _pytest_argv < "$_argv_file"
+          if [ "${#_pytest_argv[@]}" -eq 0 ]; then
+            echo "::error::python-test plan produced an empty parallel argv (loader failure)"
+            exit 1
+          fi
+          _workers=$(python3 scripts/ci/python_test_plan.py --emit workers --format lines)
+          _scheduler=$(python3 scripts/ci/python_test_plan.py --emit scheduler --format lines)
+          export PYTHONPATH="$PWD/scripts/ci${PYTHONPATH:+:$PYTHONPATH}"
           set +e
           uv run --locked pytest "${_pytest_argv[@]}" \
-            --junitxml=python_test_artifacts/junit.xml \
+            -p collect_nodeids_plugin \
+            --junitxml=python_test_artifacts/junit-parallel.xml \
             --durations=25 --durations-min=0.01 \
-            > python_test_artifacts/pytest_durations.log 2>&1
+            > python_test_artifacts/pytest_durations_parallel.log 2>&1
           _s=$?
           set -e
-          cat python_test_artifacts/pytest_durations.log
-          # Record resolved xdist knobs + version for the runtime-baseline evidence (AC9).
-          _workers=$(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format lines | sed -n '2p')
-          _scheduler=$(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel --format lines | sed -n '4p')
+          cat python_test_artifacts/pytest_durations_parallel.log
           _xdist_version=$(uv run --locked python -c "import xdist; print(xdist.__version__)" 2>/dev/null || echo unknown)
           _nproc=$(nproc 2>/dev/null || echo unknown)
-          printf '{"configured_workers":"%s","scheduler":"%s","xdist_version":"%s","runner_nproc":"%s","junitxml":"python_test_artifacts/junit.xml","durations_log":"python_test_artifacts/pytest_durations.log"}\n' \
-            "$_workers" "$_scheduler" "$_xdist_version" "$_nproc" > python_test_artifacts/xdist_meta.json
+          # resolved_workers: the authoritative xdist worker count captured by the
+          # collect_nodeids_plugin probe (controller-side numprocesses). With a FIXED -n N
+          # plan this equals N; runner_nproc is kept for context only, NOT as the proof.
+          _resolved=$(uv run --locked python -c "import json,sys; print(json.load(open('python_test_artifacts/resolved_workers.json')).get('resolved_workers'))" 2>/dev/null || echo "$_workers")
+          printf '{"resolved_workers":"%s","configured_workers":"%s","scheduler":"%s","xdist_version":"%s","runner_nproc":"%s","junitxml_parallel":"python_test_artifacts/junit-parallel.xml","junitxml_serial":"python_test_artifacts/junit-serial.xml","durations_parallel":"python_test_artifacts/pytest_durations_parallel.log","durations_serial":"python_test_artifacts/pytest_durations_serial.log"}\n' \
+            "$_resolved" "$_workers" "$_scheduler" "$_xdist_version" "$_nproc" > python_test_artifacts/xdist_meta.json
           cat python_test_artifacts/xdist_meta.json
-          printf '{"step_id":"pytest_python_suite","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"pytest_parallel","phase_id":"pytest_parallel","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest serial lane (parallel-unsafe) (timed)
-        # Dedicated -n 0 lane for plan.parallel_exclude tests (Issue #1064). These are
-        # timing-sensitive (e.g. the 80ms debounce front-gate) and flake under xdist CPU
-        # contention; they are collected into the ci_test_selection scope but run serially
-        # here. Skips cleanly when parallel_exclude is empty.
+        # Dedicated -n 0 lane for plan.parallel_exclude tests (timing-sensitive, e.g. the
+        # 80ms debounce front-gate). Its JUnit/durations cover the tests excluded from the
+        # parallel lane so the two artifacts together represent the whole suite (AC9).
         run: |
           _t0=$(date +%s%3N)
-          mapfile -d '' _serial_argv < <(python3 scripts/ci/python_test_plan.py --emit serial-lane-argv --format nul)
+          mkdir -p python_test_artifacts
+          _argv_file="${RUNNER_TEMP:-/tmp}/pytest-serial-argv"
+          if ! python3 scripts/ci/python_test_plan.py --emit serial-lane-argv --format nul > "$_argv_file"; then
+            echo "::error::python-test plan loader failed (serial argv)"
+            exit 1
+          fi
+          mapfile -d '' -t _serial_argv < "$_argv_file"
           if [ "${#_serial_argv[@]}" -eq 0 ]; then
             echo "no parallel_exclude tests; serial lane is empty"
+            printf '{"step_id":"pytest_serial","phase_id":"pytest_serial","status":0,"elapsed_ms":%d}\n' \
+              $(($(date +%s%3N)-_t0)) >> measurements.jsonl
             exit 0
           fi
           set +e
-          uv run --locked pytest "${_serial_argv[@]}"
+          uv run --locked pytest "${_serial_argv[@]}" \
+            --junitxml=python_test_artifacts/junit-serial.xml \
+            --durations=25 --durations-min=0.01 \
+            > python_test_artifacts/pytest_durations_serial.log 2>&1
           _s=$?
           set -e
-          printf '{"step_id":"pytest_serial_lane","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+          cat python_test_artifacts/pytest_durations_serial.log
+          printf '{"step_id":"pytest_serial","phase_id":"pytest_serial","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
-      - name: Upload python-test artifacts (junit + durations + xdist meta)
+      - name: Verify python-test JUnit manifest (parallel + serial == scope)
+        run: |
+          uv run --locked python scripts/ci/verify_python_test_manifest.py \
+            --parallel-junit python_test_artifacts/junit-parallel.xml \
+            --serial-junit python_test_artifacts/junit-serial.xml \
+            --manifest-out python_test_artifacts/python_test_manifest.json
+      - name: Upload python-test artifacts (junit + durations + xdist meta + manifest)
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: python-test-junit-${{ github.run_attempt }}
           path: python_test_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Install codex CLI (pinned, for execpolicy gate)
         run: |
@@ -964,7 +1010,7 @@ jobs:
           _pytest=$?
           _s=$(( _matrix != 0 ? _matrix : _pytest ))
           set -e
-          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"codex_execpolicy","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: Verify hook test discovery exclusions
@@ -1048,11 +1094,17 @@ jobs:
           # python-test-plan SSOT (.github/ci/python-test-plan.json) via the loader,
           # so the artifact pytest_argv cannot drift from the executed target set
           # and includes schemas/tests/ exactly once (Issue #1064 AC2/AC7).
+          # base_sha/head_sha drive change detection via an EXPLICIT git diff (never the
+          # branch name "main", absent in a shallow checkout). For push events with no PR
+          # base, fall back to the previous commit so the diff still resolves; with
+          # fetch-depth: 0 both SHAs are present (Issue #1064 review false-green fix).
           args = argparse.Namespace(
               output="ci_test_selection_artifacts/ci_test_selection_v1.json",
               pytest_args=None,
               plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
+              base_sha="${{ github.event.pull_request.base.sha || github.event.before }}",
+              head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
               checked_out_sha=None,
               merge_sha="${{ github.sha }}",
               workflow="ci",

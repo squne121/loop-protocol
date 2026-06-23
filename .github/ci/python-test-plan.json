@@ -17,6 +17,7 @@
     ".claude/skills/review-issue/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
+    "scripts/ci/tests/",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py"
   ],
@@ -28,7 +29,7 @@
     ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths"
   ],
   "xdist": {
-    "workers": "auto",
+    "workers": 4,
     "dist": "worksteal"
   },
   "parallel_exclude": [

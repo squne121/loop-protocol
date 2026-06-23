@@ -92,20 +92,28 @@ def test_run_argv_serial_forces_single_process(tmp_path):
 # --- parallel_exclude / serial lane ---
 
 
-def test_parallel_run_ignores_parallel_exclude(tmp_path):
+def _plan_with_exclude():
     plan = _valid_plan()
+    plan["targets"] = ["pkg/", "schemas/tests/"]
+    plan["ignore"] = ["pkg/skipme.py"]
+    plan["deselect"] = ["pkg/test_a.py::test_x"]
     plan["parallel_exclude"] = ["pkg/test_timing.py"]
-    loaded = mod.load_plan(_write_plan(tmp_path, plan))
+    return plan
+
+
+def test_parallel_run_ignores_parallel_exclude(tmp_path):
+    loaded = mod.load_plan(_write_plan(tmp_path, _plan_with_exclude()))
     argv = mod.run_argv(loaded, mode="parallel")
     assert "--ignore=pkg/test_timing.py" in argv
 
 
-def test_serial_lane_argv_runs_excluded_with_n0(tmp_path):
-    plan = _valid_plan()
-    plan["parallel_exclude"] = ["pkg/test_timing.py"]
-    loaded = mod.load_plan(_write_plan(tmp_path, plan))
+def test_serial_lane_argv_inherits_ignore_and_deselect(tmp_path):
+    """Serial lane runs the excluded paths AND inherits plan ignore/deselect (no drift)."""
+    loaded = mod.load_plan(_write_plan(tmp_path, _plan_with_exclude()))
     argv = mod.serial_lane_argv(loaded)
-    assert argv == ["-n", "0", "pkg/test_timing.py"]
+    assert argv[:3] == ["-n", "0", "pkg/test_timing.py"]
+    assert "--ignore=pkg/skipme.py" in argv
+    assert "--deselect=pkg/test_a.py::test_x" in argv
 
 
 def test_serial_lane_argv_empty_when_no_exclusions(tmp_path):
@@ -114,17 +122,30 @@ def test_serial_lane_argv_empty_when_no_exclusions(tmp_path):
 
 
 def test_scope_argv_still_covers_parallel_excluded(tmp_path):
-    """Excluded tests stay in the collection scope (full ci_test_selection coverage)."""
-    plan = _valid_plan()
-    plan["targets"] = ["pkg/test_timing.py", "schemas/tests/"]
-    plan["parallel_exclude"] = ["pkg/test_timing.py"]
-    loaded = mod.load_plan(_write_plan(tmp_path, plan))
-    assert "pkg/test_timing.py" in mod.scope_argv(loaded)
+    """Excluded tests stay in the collection scope (covered by the 'pkg/' target)."""
+    loaded = mod.load_plan(_write_plan(tmp_path, _plan_with_exclude()))
+    # The parallel-excluded file is collected by the 'pkg/' directory target.
+    assert "pkg/" in mod.scope_argv(loaded)
+    assert mod._is_in_target_scope("pkg/test_timing.py", loaded["targets"])
 
 
 def test_bad_parallel_exclude_type_raises(tmp_path):
-    plan = _valid_plan()
+    plan = _plan_with_exclude()
     plan["parallel_exclude"] = [123]
+    with pytest.raises(mod.PlanError):
+        mod.load_plan(_write_plan(tmp_path, plan))
+
+
+def test_parallel_exclude_outside_target_scope_raises(tmp_path):
+    plan = _valid_plan()
+    plan["parallel_exclude"] = ["unrelated/test_x.py"]  # not under any target
+    with pytest.raises(mod.PlanError):
+        mod.load_plan(_write_plan(tmp_path, plan))
+
+
+def test_parallel_exclude_overlapping_ignore_raises(tmp_path):
+    plan = _plan_with_exclude()
+    plan["ignore"] = ["pkg/test_timing.py"]  # same path as parallel_exclude
     with pytest.raises(mod.PlanError):
         mod.load_plan(_write_plan(tmp_path, plan))
 
@@ -135,9 +156,21 @@ def test_real_plan_serial_lane_has_debounce():
     lane = mod.serial_lane_argv(plan)
     assert lane[:2] == ["-n", "0"]
     assert any("session_manifest_debounce" in a for a in lane)
-    # And the parallel run ignores it.
     par = mod.run_argv(plan, mode="parallel")
     assert any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
+
+
+def test_real_plan_uses_fixed_worker_count():
+    """AC4 requires a fixed worker count (not -n auto, which is CPU-dependent)."""
+    plan = mod.load_plan(_PLAN_PATH)
+    assert mod.resolved_workers(plan) == 4
+    par = mod.run_argv(plan, mode="parallel")
+    assert par[:2] == ["-n", "4"]
+
+
+def test_real_plan_paths_exist():
+    plan = mod.load_plan(_PLAN_PATH)
+    mod.assert_plan_paths_exist(plan, _REPO_ROOT)  # must not raise
 
 
 def test_run_argv_rejects_unknown_mode(tmp_path):
@@ -175,6 +208,13 @@ def test_non_string_target_raises(tmp_path):
         mod.load_plan(_write_plan(tmp_path, plan))
 
 
+def test_duplicate_target_raises(tmp_path):
+    plan = _valid_plan()
+    plan["targets"] = ["schemas/tests/", "schemas/tests/"]
+    with pytest.raises(mod.PlanError):
+        mod.load_plan(_write_plan(tmp_path, plan))
+
+
 def test_invalid_json_raises(tmp_path):
     p = tmp_path / "plan.json"
     p.write_text("{not json", encoding="utf-8")
@@ -182,11 +222,50 @@ def test_invalid_json_raises(tmp_path):
         mod.load_plan(p)
 
 
-def test_bad_dist_type_raises(tmp_path):
+@pytest.mark.parametrize("bad_dist", [5, "spread", "round-robin", True])
+def test_bad_dist_raises(tmp_path, bad_dist):
     plan = _valid_plan()
-    plan["xdist"]["dist"] = 5
+    plan["xdist"]["dist"] = bad_dist
     with pytest.raises(mod.PlanError):
         mod.load_plan(_write_plan(tmp_path, plan))
+
+
+@pytest.mark.parametrize("good_dist", ["load", "loadscope", "loadfile", "loadgroup", "worksteal"])
+def test_valid_dist_accepted(tmp_path, good_dist):
+    plan = _valid_plan()
+    plan["xdist"]["dist"] = good_dist
+    assert mod.load_plan(_write_plan(tmp_path, plan))["xdist"]["dist"] == good_dist
+
+
+@pytest.mark.parametrize("bad_workers", [0, -1, True, False, "many", 1.5])
+def test_bad_workers_raises(tmp_path, bad_workers):
+    plan = _valid_plan()
+    plan["xdist"]["workers"] = bad_workers
+    with pytest.raises(mod.PlanError):
+        mod.load_plan(_write_plan(tmp_path, plan))
+
+
+@pytest.mark.parametrize("good_workers", ["auto", 1, 4, 16])
+def test_valid_workers_accepted(tmp_path, good_workers):
+    plan = _valid_plan()
+    plan["xdist"]["workers"] = good_workers
+    assert mod.load_plan(_write_plan(tmp_path, plan))["xdist"]["workers"] == good_workers
+
+
+@pytest.mark.parametrize("bad_path", ["-p", "/abs/test_x.py", "../escape/test_x.py", "a/../b.py"])
+def test_bad_target_path_raises(tmp_path, bad_path):
+    plan = _valid_plan()
+    plan["targets"] = ["schemas/tests/", bad_path]
+    with pytest.raises(mod.PlanError):
+        mod.load_plan(_write_plan(tmp_path, plan))
+
+
+def test_assert_plan_paths_exist_raises_on_missing(tmp_path):
+    plan = _valid_plan()
+    plan["targets"] = ["definitely/missing/dir/"]
+    loaded = mod.load_plan(_write_plan(tmp_path, plan))
+    with pytest.raises(mod.PlanError):
+        mod.assert_plan_paths_exist(loaded, _REPO_ROOT)
 
 
 # --- CLI emission formats ---
@@ -211,7 +290,18 @@ def test_cli_json_format_round_trips():
     proc = _run_cli("--emit", "run-argv", "--mode", "parallel", "--format", "json")
     assert proc.returncode == 0
     data = json.loads(proc.stdout)
-    assert data[:4] == ["-n", "auto", "--dist", "worksteal"]
+    # Real SSOT plan uses a fixed worker count (AC4).
+    assert data[:4] == ["-n", "4", "--dist", "worksteal"]
+
+
+def test_cli_emit_workers_and_scheduler():
+    assert _run_cli("--emit", "workers", "--format", "lines").stdout.strip() == "4"
+    assert _run_cli("--emit", "scheduler", "--format", "lines").stdout.strip() == "worksteal"
+
+
+def test_cli_check_paths_passes_on_real_plan():
+    proc = _run_cli("--emit", "scope-argv", "--check-paths")
+    assert proc.returncode == 0
 
 
 def test_cli_fails_closed_on_bad_plan(tmp_path):
