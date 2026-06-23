@@ -34,8 +34,8 @@ from cleanup_contract_v3 import (  # noqa: E402
 from worktree_catalog import (  # noqa: E402
     Deadline,
     GuardDeadlineExceeded,
-    branch_short_name,
     list_worktrees,
+    select_issue_worktree,
 )
 
 SCHEMA = "AGENT_GUARD_PREFLIGHT_V1"
@@ -122,14 +122,9 @@ def _active_issue(cwd: str, current_branch: str | None) -> str | None:
 
 
 def _entry_for_issue(catalog: list[dict], issue: str, root_real: str) -> dict | None:
-    for e in catalog:
-        if e.get("worktree_realpath") == root_real:
-            continue
-        b = branch_short_name(e.get("branch_ref"))
-        base = os.path.basename(e.get("worktree_realpath", ""))
-        if (b and re.match(rf"^(?:worktree-)?issue-{issue}-", b)) or re.match(rf"^issue-{issue}-", base):
-            return e
-    return None
+    # Blocker 7: use the SAME shared strict selector as worktree_scope_guard so
+    # preflight and the runtime guard never disagree on which worktree an issue maps to.
+    return select_issue_worktree(catalog, issue, root_real)
 
 
 def _cwd_classification(catalog: list[dict], cwd_real: str, root_real: str) -> str:
@@ -153,6 +148,23 @@ def _contract_state(root: str) -> str:
     if state == STATE_VALID_V3:
         return "expired" if is_expired(contract) else "valid_v3"
     return "present_but_invalid"
+
+
+def _contract_binds_to(root: str, entry: dict | None) -> bool:
+    """True iff a valid V3 contract's worktree_path + branch match ``entry`` (Blocker 7)."""
+    if entry is None:
+        return False
+    state, contract, _reason = load_contract_state(root)
+    if state != STATE_VALID_V3 or not isinstance(contract, dict):
+        return False
+    try:
+        wt_match = os.path.realpath(contract.get("worktree_path", "")) == entry.get("worktree_realpath")
+    except (OSError, TypeError):
+        return False
+    branch_match = contract.get("branch_name") == (
+        entry.get("branch_ref", "").replace("refs/heads/", "") if entry.get("branch_ref") else None
+    )
+    return bool(wt_match and branch_match)
 
 
 def build_preflight(project_root: str | None = None, cwd: str | None = None, budget_seconds: float = 30.0) -> dict:
@@ -213,9 +225,12 @@ def build_preflight(project_root: str | None = None, cwd: str | None = None, bud
         })
     else:
         status = "ok"
-        if cleanup_contract_state == "valid_v3":
+        # Blocker 7: only advertise the gated bare-git route when a valid V3 contract
+        # actually BINDS to the resolved active worktree (path + branch). Otherwise the
+        # runtime guard would deny a route the preflight claimed was runnable.
+        if cleanup_contract_state == "valid_v3" and _contract_binds_to(root, entry):
             hints.append({"action": "run_gated_cleanup", "guard": "worktree_scope_guard",
-                          "detail": "a valid one-shot V3 contract is present"})
+                          "detail": "a valid one-shot V3 contract is present and bound to the active worktree"})
         else:
             hints.append({"action": "run_cleanup_exec",
                           "detail": "use the cleanup_exec authorization boundary"})

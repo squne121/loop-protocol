@@ -81,6 +81,70 @@ _AGENT_OPS_ALLOWED_SCRIPTS = (
     "scripts/agent-ops/materialize_cleanup_contract.py",
 )
 
+# Per-script exact argv allowlist (Issue #1137 Blocker 1). Only these flags are
+# accepted, none may repeat, value-flags must be followed by exactly one value
+# token, and ``--flag=value`` forms are rejected for unambiguous parsing. The
+# public ``--project-root`` / ``--no-verify`` escape hatches are intentionally
+# absent so an agent cannot retarget the executor or skip authorization.
+_AGENT_OPS_ARG_SPECS = {
+    "scripts/agent-ops/cleanup_exec.py": {
+        "value_flags": frozenset({"--pr-number", "--linked-issue-number",
+                                  "--worktree-path", "--branch-name"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
+    },
+    "scripts/agent-ops/guard_preflight.py": {
+        "value_flags": frozenset({"--cwd"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset(),
+    },
+    "scripts/agent-ops/materialize_cleanup_contract.py": {
+        "value_flags": frozenset({"--pr-number", "--linked-issue-number",
+                                  "--worktree-path", "--branch-name",
+                                  "--operation", "--ttl-seconds"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
+    },
+}
+
+
+def _validate_agent_ops_argv(rel_script: str, args: list[str]) -> bool:
+    """True iff ``args`` is an exact, non-redundant argv for ``rel_script``.
+
+    Rejects unknown flags (including ``--project-root`` / ``--no-verify``),
+    duplicates, ``--flag=value`` forms, positionals (which is how an injected
+    trailing ``git worktree remove`` would appear), value-flags missing a value,
+    and any value that itself looks like a flag. The script's OWN argparse enforces
+    *required* flags — the guard only constrains the SHAPE of the command class, so
+    a harmless ``--json``-only smoke invocation is still allowed.
+    """
+    spec = _AGENT_OPS_ARG_SPECS.get(rel_script)
+    if spec is None:
+        return False
+    value_flags = spec["value_flags"]
+    bool_flags = spec["bool_flags"]
+    seen: set[str] = set()
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if not tok.startswith("--") or "=" in tok:
+            return False
+        if tok in seen:
+            return False
+        seen.add(tok)
+        if tok in bool_flags:
+            i += 1
+            continue
+        if tok in value_flags:
+            if i + 1 >= len(args):
+                return False
+            if args[i + 1].startswith("--"):
+                return False
+            i += 2
+            continue
+        return False
+    return True
+
 # ── Tool classes ──────────────────────────────────────────────────────────────
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 BASH_TOOL = "Bash"
@@ -159,7 +223,7 @@ def _is_under_safe_prefix(relpath: str) -> bool:
     return top_component in SAFE_SCRATCH_PREFIXES
 
 
-def _repo_default_branch(project_root: str) -> str | None:
+def _repo_default_branch(project_root: str, deadline: "object | None" = None) -> str | None:
     """Return the repository default branch name from remote HEAD, or None.
 
     Uses 'git symbolic-ref refs/remotes/origin/HEAD' to get the true default
@@ -168,12 +232,15 @@ def _repo_default_branch(project_root: str) -> str | None:
     git = shutil.which("git")
     if not git:
         return None
+    timeout = _deadline_timeout(deadline, 5.0)
+    if timeout is None:
+        return None
     try:
         out = subprocess.run(
             [git, "-C", project_root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
         )
         if out.returncode == 0:
             ref = out.stdout.strip()
@@ -560,16 +627,29 @@ def resolve_current_issue(cwd: str, project_root: str) -> str | None:
     return None
 
 
-def _current_branch(path: str) -> str | None:
+def _deadline_timeout(deadline: "object | None", maximum: float) -> float | None:
+    """Per-call timeout clamped to a shared Deadline; None on exhaustion (Blocker 8)."""
+    if deadline is None:
+        return maximum
+    try:
+        return deadline.subprocess_timeout(maximum)
+    except Exception:
+        return None  # budget exhausted → caller treats as unavailable (fail-closed)
+
+
+def _current_branch(path: str, deadline: "object | None" = None) -> str | None:
     git = shutil.which("git")
     if not git:
+        return None
+    timeout = _deadline_timeout(deadline, 5.0)
+    if timeout is None:
         return None
     try:
         out = subprocess.run(
             [git, "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
         )
     except Exception:
         return None
@@ -646,15 +726,30 @@ class WorktreeResolution:
         self.git_available = git_available
 
 
-def resolve_expected_worktree(issue: str | None, project_root: str) -> WorktreeResolution:
+def resolve_expected_worktree(issue: str | None, project_root: str,
+                              deadline: "object | None" = None) -> WorktreeResolution:
     """Select the expected worktree for the active issue.
 
-    Match requires BOTH:
-      - branch == refs/heads/issue-<issue>-* (worktree- prefix tolerated), AND
-      - path basename == issue-<issue>-*
+    Issue #1137 Blocker 7: delegates selection to the shared ``worktree_catalog``
+    SSOT (``select_issue_worktrees``) so the runtime guard and ``guard_preflight``
+    never disagree. The canonical rule still requires BOTH the branch short-name
+    AND the path basename to match ``(worktree-)?issue-<issue>-*``. When the shared
+    module is unavailable a local parser fallback preserves the same rule.
     """
     if not issue:
         return WorktreeResolution(None, 0, shutil.which("git") is not None)
+
+    if _V3_AVAILABLE and _wcat is not None:
+        try:
+            catalog = _wcat.list_worktrees(project_root, deadline)
+        except _wcat.GuardDeadlineExceeded:
+            return WorktreeResolution(None, 0, True)  # fail-closed (0 matches)
+        if catalog is None:
+            return WorktreeResolution(None, 0, False)
+        matches = _wcat.select_issue_worktrees(catalog, issue, os.path.realpath(project_root))
+        if len(matches) == 1:
+            return WorktreeResolution(matches[0].get("worktree_realpath"), 1, True)
+        return WorktreeResolution(None, len(matches), True)
 
     catalog = list_worktrees(project_root)
     if catalog is None:
@@ -664,7 +759,7 @@ def resolve_expected_worktree(issue: str | None, project_root: str) -> WorktreeR
     branch_re = re.compile(r"^refs/heads/(?:worktree-)?issue-%s-" % re.escape(issue))
     base_re = re.compile(r"^issue-%s-" % re.escape(issue))
 
-    matches: list[str] = []
+    matches_local: list[str] = []
     for wt in catalog:
         path = wt.get("worktree")
         if not path:
@@ -674,11 +769,11 @@ def resolve_expected_worktree(issue: str | None, project_root: str) -> WorktreeR
         branch_ok = bool(branch) and bool(branch_re.match(branch))
         base_ok = bool(base_re.match(base))
         if branch_ok and base_ok:
-            matches.append(os.path.realpath(path))
+            matches_local.append(os.path.realpath(path))
 
-    if len(matches) == 1:
-        return WorktreeResolution(matches[0], 1, True)
-    return WorktreeResolution(None, len(matches), True)
+    if len(matches_local) == 1:
+        return WorktreeResolution(matches_local[0], 1, True)
+    return WorktreeResolution(None, len(matches_local), True)
 
 
 # =============================================================================
@@ -1339,14 +1434,20 @@ def decide(payload: dict) -> None:
         # Not a tool we guard (defensive; matcher should already scope this).
         _allow()
 
+    # Blocker 8: ONE shared monotonic deadline created at the entry of the decision
+    # and threaded through every guard subprocess (resolver, default-branch, branch
+    # validation, catalog, worktree status) so the sum of inner timeouts can never
+    # exceed the outer hook timeout. Budget < outer hook timeout (10s).
+    deadline = _wcat.Deadline(8.0) if _V3_AVAILABLE and _wcat is not None else None
+
     project_root = resolve_project_root()
     issue = resolve_current_issue(cwd, project_root)
-    resolution = resolve_expected_worktree(issue, project_root)
+    resolution = resolve_expected_worktree(issue, project_root, deadline)
 
     if tool_name in WRITE_TOOLS:
         _decide_write(tool_input, cwd, issue, resolution, tool_name, project_root)
     elif tool_name == BASH_TOOL:
-        _decide_bash(tool_input, cwd, issue, resolution)
+        _decide_bash(tool_input, cwd, issue, resolution, deadline)
 
     _allow()
 
@@ -1392,13 +1493,13 @@ def _decide_write(tool_input: dict, cwd: str, issue: str | None,
 
 
 def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
-                 resolution: "WorktreeResolution") -> None:
+                 resolution: "WorktreeResolution", deadline: "object | None" = None) -> None:
     command = tool_input.get("command") or ""
     _pr = resolve_project_root()
 
     # Issue #1137 Blocker 1: exact agent-ops tool invocation from main root is
     # allowed even with an active issue worktree (checked before classification).
-    if _is_agent_ops_tool_command(command, cwd, _pr):
+    if _is_agent_ops_tool_command(command, cwd, _pr, deadline):
         _allow()
 
     klass = classify_bash(command)
@@ -1409,23 +1510,19 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
 
     # Cleanup class: git worktree remove / git branch -d — V3 one-shot arbitration.
     if klass == "cleanup":
+        # Blocker 9: the V3 module is the sole authorization source for bare-git
+        # cleanup. If it failed to import, cleanup is DENIED — never silently
+        # downgraded to legacy V2.
+        if not _V3_AVAILABLE:
+            _block_cleanup("cleanup_v3_module_unavailable")
+            return  # unreachable
         # Recovery deadlock (policy B): never cleanup from a drifted root with an
         # active issue worktree — emit the shared reason via bounded cleanup block.
-        if _V3_AVAILABLE and _root_drift_active_worktree_mismatch(_pr):
+        if _root_drift_active_worktree_mismatch(_pr, deadline):
             _block_cleanup(_RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH)
             return  # unreachable
-        cleanup_decision, cleanup_reason, kind = cleanup_decision_dispatch(command, cwd, _pr)
-        if cleanup_decision == "allow":
-            # One-shot consume: a valid V3 contract is consumed before the command
-            # runs so it cannot replay (cleanup_contract_consumed on reuse).
-            if kind == "v3" and _V3_AVAILABLE:
-                try:
-                    _cc3.consume_contract(_pr)
-                except OSError:
-                    pass
-            _allow()
-        else:
-            _block_cleanup(cleanup_reason)
+        # Blocker 2: claim-first one-shot enforcement (atomic; concurrency-safe).
+        _enforce_cleanup(command, cwd, _pr, deadline)
         return  # unreachable
 
     # Deny force branch deletion even inside the active worktree (AC4c: -D / --force / -f)
@@ -1628,7 +1725,8 @@ def load_cleanup_contract(project_root: str) -> dict | None:
 #   guard_deadline_exceeded
 
 
-def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str) -> bool:
+def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str,
+                               deadline: "object | None" = None) -> bool:
     """True iff command is an exact agent-ops tool invocation allowed from main root.
 
     Issue #1137 Blocker 1: cleanup_exec / guard_preflight / materialize must run
@@ -1637,7 +1735,10 @@ def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str) -> boo
     Rejected: shell chains, inline env, `python -c`, wrappers, non-allowed scripts,
     or cwd that is not the main root.
     """
-    if not command or re.search(r"[;&|<>$`]", command):
+    # Blocker 1: reject ANY shell metacharacter or command separator, including
+    # newline / CR / NUL (a bare regex that only listed ';&|<>$`' let a newline-
+    # separated second command — e.g. a bare `git worktree remove` — ride along).
+    if not command or re.search(r"[;&|<>$`\n\r\0\\(){}*?\[\]!~]", command):
         return False
     toks = _tokenize(command)
     if not toks:
@@ -1653,27 +1754,37 @@ def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str) -> boo
     script = rest[0]
     script_abs = script if os.path.isabs(script) else os.path.join(cwd, script)
     script_real = os.path.realpath(script_abs)
-    allowed = {os.path.realpath(os.path.join(project_root, s)) for s in _AGENT_OPS_ALLOWED_SCRIPTS}
-    if script_real not in allowed:
+    # Map the resolved realpath back to its repo-relative allowlist key so the
+    # per-script argv spec can be looked up (Blocker 1: validate trailing argv).
+    rel_key = None
+    for s in _AGENT_OPS_ALLOWED_SCRIPTS:
+        if script_real == os.path.realpath(os.path.join(project_root, s)):
+            rel_key = s
+            break
+    if rel_key is None:
+        return False
+    # Blocker 1: the trailing argv must be an exact, non-redundant argv for the
+    # script — no extra/unknown/duplicate flags, no --project-root / --no-verify.
+    if not _validate_agent_ops_argv(rel_key, rest[1:]):
         return False
     if os.path.realpath(cwd) != os.path.realpath(project_root):
         return False
     # cwd=main root must be on the default branch (Design Decision 2).
-    branch = _current_branch(project_root)
-    default = _repo_default_branch(project_root)
+    branch = _current_branch(project_root, deadline)
+    default = _repo_default_branch(project_root, deadline)
     if not branch or (default and branch != default):
         return False
     return True
 
 
-def _root_drift_active_worktree_mismatch(project_root: str) -> bool:
+def _root_drift_active_worktree_mismatch(project_root: str, deadline: "object | None" = None) -> bool:
     """True iff the root checkout has drifted to an issue-like branch (Issue #1137 AC13)."""
-    branch = _current_branch(project_root)
+    branch = _current_branch(project_root, deadline)
     if branch is None:
         return False
     if _ISSUE_BRANCH_RE.match(branch):
         return True
-    default = _repo_default_branch(project_root)
+    default = _repo_default_branch(project_root, deadline)
     if default and branch != default:
         env_issue = os.environ.get("LOOP_ISSUE_NUMBER")
         if env_issue and env_issue.strip().isdigit():
@@ -1681,9 +1792,13 @@ def _root_drift_active_worktree_mismatch(project_root: str) -> bool:
     return False
 
 
-def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict) -> tuple[str, str]:
+def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict,
+                       deadline: "object | None" = None) -> tuple[str, str]:
     """V3 one-shot cleanup decision (expiry already excluded by caller). Returns (decision, reason)."""
-    deadline = _wcat.Deadline(8.0)
+    # Blocker 8: reuse the shared monotonic deadline; only create a fresh one if a
+    # pure caller (build_decision / tests) did not supply one.
+    if deadline is None:
+        deadline = _wcat.Deadline(8.0)
     toks = _tokenize(command)
     if len(toks) < 3 or toks[0] != "git":
         return "deny", "not_a_git_cleanup_command"
@@ -1744,26 +1859,88 @@ def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict
         return "deny", _cc3.WORKTREE_DIRTY
 
 
-def cleanup_decision_dispatch(command: str, cwd: str, project_root: str) -> tuple[str, str, str | None]:
-    """Dispatch cleanup decision. Returns (decision, reason, kind) kind in {v3,v2,None}.
+def cleanup_decision_dispatch(command: str, cwd: str, project_root: str,
+                              deadline: "object | None" = None) -> tuple[str, str, str | None]:
+    """PURE dispatch of the cleanup decision (no consume). Returns (decision, reason, kind).
 
-    V3 (one-shot, safe scratch path) is primary. A present-but-invalid or expired
-    V3 contract is denied and never downgrades to V2 (Blocker 2). V2 legacy applies
-    only when the V3 contract is genuinely ABSENT.
+    ``kind`` in {v3, v2, None}. A present-but-invalid or expired V3 contract is
+    denied and never downgrades to V2 (Blocker 2). Legacy V2 applies only when the
+    V3 contract is genuinely ABSENT *and* no consume tombstone forbids it (Blocker 3).
+    If the V3 module failed to import, bare-git cleanup is denied — never silently
+    V2 (Blocker 9). The runtime path (``_enforce_cleanup``) performs the claim-first
+    consume; this function stays side-effect-free for ``build_decision`` / tests.
     """
-    if _V3_AVAILABLE:
-        state, contract, _reason = _cc3.load_contract_state(project_root)
-        if state == _cc3.STATE_PRESENT_BUT_INVALID:
-            return "deny", _cc3.CLEANUP_CONTRACT_PRESENT_BUT_INVALID, "v3"
-        if state == _cc3.STATE_VALID_V3:
-            if _cc3.is_expired(contract):
-                return "deny", _cc3.CLEANUP_CONTRACT_EXPIRED, "v3"
-            decision, reason = _decide_cleanup_v3(command, cwd, project_root, contract)
-            return decision, reason, "v3"
-        # STATE_ABSENT → legacy V2 fallback below
+    # Blocker 9: V3 module unavailable → deny (no V2 fallback).
+    if not _V3_AVAILABLE:
+        return "deny", "cleanup_v3_module_unavailable", "v3_unavailable"
+    state, contract, reason = _cc3.load_contract_state(project_root)
+    if state == _cc3.STATE_PRESENT_BUT_INVALID:
+        return "deny", _normalize_cleanup_reason(reason), "v3"
+    if state == _cc3.STATE_VALID_V3:
+        if _cc3.is_expired(contract):
+            return "deny", _cc3.CLEANUP_CONTRACT_EXPIRED, "v3"
+        decision, dreason = _decide_cleanup_v3(command, cwd, project_root, contract, deadline)
+        return decision, dreason, "v3"
+    # STATE_ABSENT → legacy V2 fallback, unless a consume tombstone forbids it.
+    if _cc3.v2_fallback_forbidden(project_root):
+        return "deny", _cc3.CLEANUP_V2_DOWNGRADE_DENIED, "v3"
+    contract_v2 = load_cleanup_contract(project_root)
+    decision, dreason = _decide_cleanup_bash(command, cwd, contract_v2)
+    return decision, dreason, ("v2" if contract_v2 is not None else None)
+
+
+def _normalize_cleanup_reason(reason: str | None) -> str:
+    """Map an internal V3 validation reason to a shared cleanup reason code."""
+    if reason and _cc3 is not None and reason in _cc3.SHARED_CLEANUP_REASON_CODES:
+        return reason
+    if _cc3 is not None:
+        return _cc3.CLEANUP_CONTRACT_PRESENT_BUT_INVALID
+    return "cleanup_contract_present_but_invalid"
+
+
+def _enforce_cleanup(command: str, cwd: str, project_root: str,
+                     deadline: "object | None" = None) -> None:
+    """Runtime claim-first one-shot cleanup enforcement (Blocker 2). Never returns.
+
+    Order (race-safe): (1) deny a present contract on an IO-incapable platform
+    (Blocker 9); (2) atomically CLAIM the contract — only the single rename winner
+    proceeds, everyone else is denied ``cleanup_contract_consumed`` (Blocker 2);
+    (3) validate the CLAIMED copy and burn it (tombstone + discard) regardless of
+    outcome so it cannot replay; (4) only an ABSENT contract may fall back to legacy
+    V2, and only when no consume tombstone forbids it (Blocker 3).
+    """
+    # Blocker 9: a present contract the platform can't evaluate safely → deny.
+    contract_target = os.path.join(project_root, _cc3.SAFE_SCRATCH_CONTRACT_PATH)
+    if os.path.lexists(contract_target) and not _cc3.IO_CAPABLE:
+        _block_cleanup(_cc3.CLEANUP_IO_UNSUPPORTED_PLATFORM)
+        return  # unreachable
+
+    claimed = _cc3.claim_contract(project_root)
+    if claimed is not None:
+        ok, contract, vreason = _cc3.read_claimed_contract(project_root, claimed)
+        # One-shot: burn the claim (durable tombstone + discard) on EVERY outcome.
+        _cc3.write_consume_tombstone(project_root, contract)
+        _cc3.discard_claimed(project_root, claimed)
+        if not ok:
+            _block_cleanup(_normalize_cleanup_reason(vreason))
+            return  # unreachable
+        decision, dreason = _decide_cleanup_v3(command, cwd, project_root, contract, deadline)
+        if decision == "allow":
+            _allow()
+        _block_cleanup(dreason)
+        return  # unreachable
+
+    # Nothing to claim → contract genuinely ABSENT.
+    # Blocker 3: a consume tombstone forbids any legacy V2 downgrade.
+    if _cc3.v2_fallback_forbidden(project_root):
+        _block_cleanup(_cc3.CLEANUP_V2_DOWNGRADE_DENIED)
+        return  # unreachable
     contract_v2 = load_cleanup_contract(project_root)
     decision, reason = _decide_cleanup_bash(command, cwd, contract_v2)
-    return decision, reason, ("v2" if contract_v2 is not None else None)
+    if decision == "allow":
+        _allow()
+    _block_cleanup(reason)
+    return  # unreachable
 
 
 def _parse_worktree_list_branch(output: str, target_path: str) -> str | None:

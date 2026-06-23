@@ -14,6 +14,7 @@ review High "timeout"). The module is import-safe and has no side effects.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -162,3 +163,38 @@ def branch_short_name(branch_ref: str | None) -> str | None:
     if branch_ref.startswith("refs/heads/"):
         return branch_ref[len("refs/heads/"):]
     return branch_ref
+
+
+def select_issue_worktrees(catalog: list[dict], issue: str, root_realpath: str | None = None) -> list[dict]:
+    """Return catalog entries belonging to ``issue`` using a SINGLE shared rule.
+
+    Issue #1137 Blocker 7: ``worktree_scope_guard`` and ``guard_preflight`` must
+    select worktrees identically. The one canonical rule (fail-closed / strict)
+    requires BOTH the branch short-name AND the path basename to match
+    ``(worktree-)?issue-<issue>-*``. The root worktree is always excluded.
+    """
+    if not issue:
+        return []
+    branch_re = re.compile(r"^(?:worktree-)?issue-%s-" % re.escape(issue))
+    base_re = re.compile(r"^issue-%s-" % re.escape(issue))
+    root_real = os.path.realpath(root_realpath) if root_realpath else None
+    out: list[dict] = []
+    for e in catalog:
+        wt = e.get("worktree_realpath")
+        if not wt:
+            continue
+        if root_real is not None and wt == root_real:
+            continue
+        branch = branch_short_name(e.get("branch_ref"))
+        base = os.path.basename(os.path.normpath(wt))
+        branch_ok = bool(branch) and bool(branch_re.match(branch))
+        base_ok = bool(base_re.match(base))
+        if branch_ok and base_ok:
+            out.append(e)
+    return out
+
+
+def select_issue_worktree(catalog: list[dict], issue: str, root_realpath: str | None = None) -> dict | None:
+    """Return the single unambiguous worktree for ``issue`` (None if 0 or >1)."""
+    matches = select_issue_worktrees(catalog, issue, root_realpath)
+    return matches[0] if len(matches) == 1 else None

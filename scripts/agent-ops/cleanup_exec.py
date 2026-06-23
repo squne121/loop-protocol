@@ -58,6 +58,11 @@ ROOT_NOT_DEFAULT = "root_not_default_branch"
 BRANCH_MISMATCH = "worktree_branch_mismatch"
 LINKED_ISSUE_MISMATCH = "linked_issue_mismatch"
 HEAD_BRANCH_MISMATCH = "pr_head_branch_mismatch"
+# Blocker 5: bind authorization to the same repository + commit + base + head repo.
+HEAD_REPO_MISMATCH = "pr_head_repo_mismatch"          # fork / cross-repo PR
+BASE_BRANCH_MISMATCH = "pr_base_branch_mismatch"      # PR base != default branch
+HEAD_OID_MISMATCH = "pr_head_oid_mismatch"            # PR head sha != local branch tip
+REPO_SLUG_UNRESOLVED = "repo_slug_unresolved"         # cannot pin gh to the trusted repo
 
 
 def resolve_project_root() -> str:
@@ -107,15 +112,50 @@ def _default_branch(project_root: str, deadline: Deadline) -> str:
     return "main"
 
 
-def _pr_state(pr_number: int, deadline: Deadline) -> dict | None:
+def _repo_slug(project_root: str, deadline: Deadline) -> str | None:
+    """Resolve OWNER/REPO from the TRUSTED project root's git remote (Blocker 5).
+
+    The agent never supplies the repo; it is derived from the trusted root so the
+    PR being checked and the worktree being deleted are the same repository.
+    """
     gh = shutil.which("gh")
     if not gh:
         return None
     try:
         out = subprocess.run(
-            [gh, "pr", "view", str(pr_number), "--json",
-             "state,mergedAt,headRefName,closingIssuesReferences"],
-            capture_output=True, text=True,
+            [gh, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            cwd=project_root, capture_output=True, text=True,
+            timeout=deadline.subprocess_timeout(15.0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _local_branch_tip(project_root: str, branch_name: str, deadline: Deadline) -> str | None:
+    """Return the local branch tip SHA for ``branch_name`` (Blocker 5 head-oid bind)."""
+    try:
+        out = _git(["-C", project_root, "rev-parse", "--verify", f"refs/heads/{branch_name}"], deadline, 5.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline: Deadline) -> dict | None:
+    """Fetch PR state from the TRUSTED repo (cwd=root, --repo pinned). Blocker 5."""
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    args = [gh, "pr", "view", str(pr_number), "--json",
+            "state,mergedAt,headRefName,headRefOid,baseRefName,"
+            "headRepositoryOwner,isCrossRepository,closingIssuesReferences"]
+    if repo_slug:
+        args += ["--repo", repo_slug]
+    try:
+        out = subprocess.run(
+            args, cwd=project_root, capture_output=True, text=True,
             timeout=deadline.subprocess_timeout(20.0),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -138,6 +178,9 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
         "pr_merged": False,
         "head_branch_match": False,
         "linked_issue_match": False,
+        "head_repo_match": False,
+        "base_branch_match": False,
+        "head_oid_match": False,
     }
     branch_name = req["branch_name"]
     worktree_real = os.path.realpath(req["worktree_path"])
@@ -175,14 +218,37 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
         return False, WORKTREE_DIRTY, verified
     verified["worktree_clean"] = True
 
-    # 5/6/7. PR merged + head branch + linked issue
-    pr = _pr_state(int(req["pr_number"]), deadline)
+    # 5/6/7. PR merged + head branch + linked issue, bound to THIS repo + commit.
+    # Blocker 5: resolve the repo slug from the trusted root so gh is pinned to the
+    # same repository whose worktree we are about to delete (no confused deputy).
+    repo_slug = _repo_slug(project_root, deadline)
+    if repo_slug is None:
+        return False, REPO_SLUG_UNRESOLVED, verified
+    pr = _pr_state(int(req["pr_number"]), project_root, repo_slug, deadline)
     if pr is None or pr.get("state") != "MERGED" or not pr.get("mergedAt"):
         return False, PR_NOT_MERGED, verified
     verified["pr_merged"] = True
     if pr.get("headRefName") != branch_name:
         return False, HEAD_BRANCH_MISMATCH, verified
     verified["head_branch_match"] = True
+    # Blocker 5: reject fork / cross-repo PRs — a same-named branch in another repo
+    # must not authorize deleting our local worktree.
+    if pr.get("isCrossRepository"):
+        return False, HEAD_REPO_MISMATCH, verified
+    owner = (pr.get("headRepositoryOwner") or {}).get("login")
+    if owner and repo_slug and owner != repo_slug.split("/", 1)[0]:
+        return False, HEAD_REPO_MISMATCH, verified
+    verified["head_repo_match"] = True
+    # Blocker 5: the PR base must be the default branch (not some side branch).
+    if pr.get("baseRefName") != default:
+        return False, BASE_BRANCH_MISMATCH, verified
+    verified["base_branch_match"] = True
+    # Blocker 5: the PR head sha must equal the LOCAL branch tip — a same-named
+    # branch at a different commit must not authorize the deletion.
+    local_tip = _local_branch_tip(project_root, branch_name, deadline)
+    if not local_tip or pr.get("headRefOid") != local_tip:
+        return False, HEAD_OID_MISMATCH, verified
+    verified["head_oid_match"] = True
     linked = req.get("linked_issue_number")
     if linked is not None:
         refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
@@ -193,21 +259,32 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     return True, None, verified
 
 
-def _perform(branch_name: str, worktree_real: str, project_root: str, deadline: Deadline) -> list[str]:
-    """Execute exact worktree remove + branch -d via internal subprocess arrays."""
+def _perform(branch_name: str, worktree_real: str, project_root: str,
+             deadline: Deadline) -> tuple[list[str], str | None]:
+    """Execute exact worktree remove + branch -d via internal subprocess arrays.
+
+    Blocker 6: returns ``(actions_taken, error)``. If the worktree is removed but
+    ``branch -d`` then fails (e.g. PR squash-merged so git does not see the branch
+    as merged, or local default is stale), the PARTIAL success is preserved in
+    ``actions_taken`` instead of being discarded — the caller must not report an
+    empty ``actions_taken`` after a destructive step already ran.
+    """
     actions: list[str] = []
     rm = _git(["-C", project_root, "worktree", "remove", worktree_real], deadline, 15.0)
     if rm.returncode != 0:
-        raise RuntimeError(f"worktree_remove_failed: {rm.stderr.strip()[:120]}")
+        return actions, f"worktree_remove_failed: {rm.stderr.strip()[:120]}"
     actions.append(OP_WORKTREE_REMOVE)
     bd = _git(["-C", project_root, "branch", "-d", branch_name], deadline, 10.0)
     if bd.returncode != 0:
-        raise RuntimeError(f"branch_delete_failed: {bd.stderr.strip()[:120]}")
+        return actions, f"branch_delete_failed: {bd.stderr.strip()[:120]}"
     actions.append(OP_BRANCH_DELETE)
-    return actions
+    return actions, None
 
 
 def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0) -> dict:
+    # Blocker 5: project_root is a TRUSTED-CALLER argument (internal API), not an
+    # agent-facing flag. The CLI no longer exposes --project-root; it always uses
+    # the canonical root resolved from CLAUDE_PROJECT_DIR / the script location.
     root = os.path.realpath(project_root) if project_root else resolve_project_root()
     deadline = Deadline(budget_seconds)
     try:
@@ -217,9 +294,14 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
     if not ok:
         return _result("refused", reason, verified, [])
     try:
-        actions = _perform(req["branch_name"], os.path.realpath(req["worktree_path"]), root, deadline)
-    except (RuntimeError, GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
+        actions, perform_error = _perform(
+            req["branch_name"], os.path.realpath(req["worktree_path"]), root, deadline
+        )
+    except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
         return _result("error", str(e)[:160], verified, [])
+    if perform_error is not None:
+        # Blocker 6: keep the partial actions that DID run (e.g. worktree_remove).
+        return _result("error", perform_error, verified, actions)
     return _result("ok", None, verified, actions)
 
 
@@ -240,7 +322,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--linked-issue-number", type=int, default=None)
     p.add_argument("--worktree-path", required=True)
     p.add_argument("--branch-name", required=True)
-    p.add_argument("--project-root", default=None)
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     req = {
@@ -250,7 +331,9 @@ def main(argv: list[str] | None = None) -> int:
         "worktree_path": a.worktree_path,
         "branch_name": a.branch_name,
     }
-    result = run(req, project_root=a.project_root)
+    # Blocker 5: the executor always resolves the trusted root itself; there is no
+    # agent-facing --project-root retargeting.
+    result = run(req)
     if a.json:
         print(json.dumps(result, sort_keys=True))
     else:

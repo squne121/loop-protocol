@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -28,6 +29,10 @@ from datetime import datetime, timezone
 
 SCHEMA_V3 = "POST_MERGE_CLEANUP_REQUEST_V3"
 SAFE_SCRATCH_CONTRACT_PATH = "artifacts/agent-ops/cleanup_contract.json"
+# Durable tombstone marking that V3 one-shot mode has been entered + a contract
+# consumed. Its presence forbids any subsequent legacy V2 fallback (Blocker 3).
+TOMBSTONE_REL_PATH = "artifacts/agent-ops/cleanup_contract.tombstone.json"
+TOMBSTONE_SCHEMA = "POST_MERGE_CLEANUP_TOMBSTONE_V1"
 
 OP_WORKTREE_REMOVE = "worktree_remove"
 OP_BRANCH_DELETE = "branch_delete"
@@ -59,6 +64,11 @@ BRANCH_FORCE_DELETE_DENIED = "branch_force_delete_denied"
 ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH = "root_drift_active_worktree_mismatch"
 PR_NOT_MERGED = "pr_not_merged"
 GUARD_DEADLINE_EXCEEDED = "guard_deadline_exceeded"
+# Blocker 3: a durable consume tombstone exists, so legacy V2 downgrade is denied.
+CLEANUP_V2_DOWNGRADE_DENIED = "cleanup_v2_downgrade_denied"
+# Blocker 9: the platform lacks the symlink-safe durable IO primitives required to
+# evaluate a V3 contract safely (e.g. no O_NOFOLLOW / geteuid / dir_fd) → deny.
+CLEANUP_IO_UNSUPPORTED_PLATFORM = "cleanup_io_unsupported_platform"
 
 SHARED_CLEANUP_REASON_CODES = (
     NO_CLEANUP_CONTRACT,
@@ -74,7 +84,35 @@ SHARED_CLEANUP_REASON_CODES = (
     ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH,
     PR_NOT_MERGED,
     GUARD_DEADLINE_EXCEEDED,
+    CLEANUP_V2_DOWNGRADE_DENIED,
+    CLEANUP_IO_UNSUPPORTED_PLATFORM,
 )
+
+
+# ── OS capability for durable symlink-safe IO (Blocker 9 portability) ──────────
+def io_capabilities_ok() -> bool:
+    """True iff the platform exposes the primitives the durable/symlink-safe IO
+    path needs (``O_NOFOLLOW`` / ``O_DIRECTORY`` / ``geteuid`` / dir-fd rename).
+
+    On platforms without these (notably Windows) a present V3 contract cannot be
+    validated safely, so callers must deny with ``CLEANUP_IO_UNSUPPORTED_PLATFORM``
+    rather than fall through to a less-safe path.
+    """
+    if not hasattr(os, "geteuid"):
+        return False
+    for attr in ("O_DIRECTORY", "O_NOFOLLOW"):
+        if not hasattr(os, attr):
+            return False
+    if os.open not in os.supports_dir_fd:
+        return False
+    if os.rename not in os.supports_dir_fd:
+        return False
+    if os.unlink not in os.supports_dir_fd:
+        return False
+    return True
+
+
+IO_CAPABLE = io_capabilities_ok()
 
 
 # ── argv / hashing ────────────────────────────────────────────────────────────
@@ -247,6 +285,10 @@ def load_contract_state(project_root: str, now: datetime | None = None) -> tuple
     target = os.path.join(project_root, SAFE_SCRATCH_CONTRACT_PATH)
     if not os.path.lexists(target):
         return STATE_ABSENT, None, None
+    # Blocker 9: a present contract on a platform without the symlink-safe IO
+    # primitives cannot be evaluated safely → deny (never fall through to ABSENT).
+    if not IO_CAPABLE:
+        return STATE_PRESENT_BUT_INVALID, None, CLEANUP_IO_UNSUPPORTED_PLATFORM
     try:
         raw = read_regular_file_nofollow(project_root, SAFE_SCRATCH_CONTRACT_PATH)
     except (OSError, ValueError):
@@ -370,29 +412,126 @@ def read_regular_file_nofollow(project_root: str, rel_path: str) -> str:
         os.close(fd)
 
 
-def consume_contract(project_root: str) -> bool:
-    """One-shot consume: atomically rename the contract aside so it cannot replay.
+# ── claim-first one-shot consume (Blocker 2) ──────────────────────────────────
+# The previous "validate then consume" flow was fail-open: two concurrent guard
+# invocations could both validate the same contract and both allow, because the
+# consume return value was ignored. The hardened flow CLAIMS the contract FIRST
+# via an atomic rename — only the single winner of the rename may then validate
+# the claimed copy and allow. Everyone else (already-claimed / lost-race / absent)
+# is denied with ``cleanup_contract_consumed``.
 
-    Returns True if a contract file was consumed, False if none was present.
-    Uses dir-fd + O_NOFOLLOW rename so a symlinked path is not followed.
+def _contract_dir_components() -> list[str]:
+    return [c for c in SAFE_SCRATCH_CONTRACT_PATH.split("/") if c]
+
+
+def claim_contract(project_root: str) -> str | None:
+    """Atomically claim the safe-scratch contract; return the claimed basename.
+
+    Renames ``cleanup_contract.json`` to a unique ``.cleanup_contract.json.claimed.<pid>.<token>``
+    via dir-fd + ``O_NOFOLLOW`` rename. Exactly one concurrent caller wins the
+    rename; everyone else gets ``FileNotFoundError`` and receives ``None``. The
+    winner alone holds the right to validate + allow the cleanup. Returns ``None``
+    when nothing could be claimed (absent / already consumed / lost race / IO error
+    / unsupported platform).
     """
-    rel_components = [c for c in SAFE_SCRATCH_CONTRACT_PATH.split("/") if c]
+    if not IO_CAPABLE:
+        return None
+    rel_components = _contract_dir_components()
     final_name = rel_components[-1]
-    consumed_name = f".{final_name}.consumed.{os.getpid()}"
+    token = secrets.token_hex(8)
+    claimed_name = f".{final_name}.claimed.{os.getpid()}.{token}"
     try:
         dir_fd = _walk_to_dir(project_root, rel_components, create=False)
-    except FileNotFoundError:
-        return False
+    except OSError:
+        return None
     try:
         try:
-            os.rename(final_name, consumed_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        except FileNotFoundError:
-            return False
+            os.rename(final_name, claimed_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            return None
         try:
-            os.unlink(consumed_name, dir_fd=dir_fd)
+            os.fsync(dir_fd)
         except OSError:
             pass
-        os.fsync(dir_fd)
-        return True
+        return claimed_name
     finally:
         os.close(dir_fd)
+
+
+def read_claimed_contract(
+    project_root: str, claimed_name: str, now: datetime | None = None
+) -> tuple[bool, dict | None, str | None]:
+    """Read + validate a previously claimed contract file. Returns (ok, contract, reason).
+
+    The claimed file is read with the same per-component ``O_NOFOLLOW`` + ``fstat``
+    checks as the live contract, so a swapped symlink or foreign-owned claim fails
+    closed. A claim that fails read/parse/schema/expiry validation yields
+    ``(False, None, reason)`` and the caller must deny.
+    """
+    if not IO_CAPABLE:
+        return False, None, CLEANUP_IO_UNSUPPORTED_PLATFORM
+    rel_components = _contract_dir_components()
+    rel_dir = "/".join(rel_components[:-1])
+    rel_path = f"{rel_dir}/{claimed_name}" if rel_dir else claimed_name
+    try:
+        raw = read_regular_file_nofollow(project_root, rel_path)
+    except (OSError, ValueError):
+        return False, None, "read_error"
+    try:
+        contract = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False, None, "json_error"
+    ok, reason = validate_v3_contract(contract, now=now)
+    if not ok:
+        return False, None, reason
+    if is_expired(contract, now=now):
+        return False, None, CLEANUP_CONTRACT_EXPIRED
+    return True, contract, None
+
+
+def write_consume_tombstone(project_root: str, contract: dict | None) -> None:
+    """Write a durable tombstone recording the consumed contract (Blocker 3).
+
+    Its presence forbids subsequent legacy V2 fallback (see ``v2_fallback_forbidden``)
+    so a single V3 consume cannot be followed by a V2-authorized second operation.
+    """
+    record = {
+        "schema": TOMBSTONE_SCHEMA,
+        "consumed_operation": (contract or {}).get("operation"),
+        "consumed_nonce": (contract or {}).get("nonce"),
+        "consumed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    try:
+        write_json_durably(project_root, TOMBSTONE_REL_PATH, record)
+    except (OSError, ValueError):
+        # Tombstone is best-effort durability; the claim rename already prevents
+        # replay of THIS contract. A missing tombstone only relaxes the V2-downgrade
+        # ban, which still requires a separately-present (and now claimed-away) file.
+        pass
+
+
+def discard_claimed(project_root: str, claimed_name: str) -> None:
+    """Remove a claimed contract file (used after consume or on validation failure)."""
+    if not IO_CAPABLE:
+        return
+    rel_components = _contract_dir_components()
+    try:
+        dir_fd = _walk_to_dir(project_root, rel_components, create=False)
+    except OSError:
+        return
+    try:
+        try:
+            os.unlink(claimed_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(dir_fd)
+
+
+def v2_fallback_forbidden(project_root: str) -> bool:
+    """True iff a durable consume tombstone exists; forbids legacy V2 downgrade (Blocker 3)."""
+    return os.path.lexists(os.path.join(project_root, TOMBSTONE_REL_PATH))

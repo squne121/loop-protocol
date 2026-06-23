@@ -1786,3 +1786,139 @@ def test_expiry_requires_timezone():
     """AC12: naive (timezone-less) timestamps are rejected."""
     assert _cc3.parse_iso8601_tz("2026-01-01T00:00:00") is None
     assert _cc3.parse_iso8601_tz("2026-01-01T00:00:00Z") is not None
+
+
+# =============================================================================
+# PR #1143 OWNER review — adversarial regression tests for the 10 blockers
+# =============================================================================
+
+@pytest.mark.parametrize("command", [
+    # Blocker 1: newline-separated second command must NOT ride along on the
+    # agent-ops exact allow (a bare `;`-free `\n git worktree remove ...`).
+    "uv run python3 scripts/agent-ops/guard_preflight.py --json\n"
+    "git worktree remove .claude/worktrees/issue-1137-x",
+    "uv run python3 scripts/agent-ops/guard_preflight.py --json\rgit branch -d issue-1137-x",
+    # Blocker 1 / Blocker 5: --project-root / --no-verify escape-hatch flags are
+    # not part of the exact command class.
+    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --project-root /etc",
+    "uv run python3 scripts/agent-ops/materialize_cleanup_contract.py --no-verify --pr-number 1",
+    # Blocker 1: duplicate / unknown flags rejected.
+    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --json",
+])
+def test_agent_ops_newline_and_extra_flag_rejected_real_hook(tmp_path, command):
+    """Blocker 1: newline injection / escape-hatch / duplicate flags are not agent-ops-allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
+    payload = _bash_payload(command, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
+    r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
+    assert r.returncode == 2, f"injection/extra-flag must not be agent-ops-allowed; stderr={r.stderr}"
+
+
+def _claim_worker(root):
+    """Top-level worker for the concurrent-claim test (must be picklable)."""
+    import cleanup_contract_v3 as cc
+    return cc.claim_contract(root)
+
+
+def test_claim_contract_concurrent_single_winner(tmp_path):
+    """Blocker 2: under concurrent claims exactly ONE process wins the one-shot contract."""
+    import multiprocessing as mp
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    root = str(repo["root"])
+    ctx = mp.get_context("fork")
+    with ctx.Pool(8) as pool:
+        results = pool.map(_claim_worker, [root] * 8)
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1, f"exactly one concurrent claim must win, got {winners}"
+
+
+def test_tombstone_forbids_v2_downgrade_after_consume(tmp_path):
+    """Blocker 3: after a V3 consume, a durable tombstone forbids legacy V2 fallback."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    first = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert first.returncode == 0, f"first must allow; {first.stderr}"
+    tomb = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.tombstone.json"
+    assert tomb.exists(), "consume must leave a durable tombstone"
+    # A leftover V2 env contract must NOT re-authorize a second cleanup operation.
+    v2 = {"schema": "POST_MERGE_CLEANUP_REQUEST_V2", "worktree_path": wt_real,
+          "branch_name": "issue-1050-g", "require_clean": True}
+    env2 = dict(env)
+    env2["CLAUDE_WORKTREE_CLEANUP_CONTRACT"] = json.dumps(v2)
+    second = _run_guard(payload, repo["root"], issue="1050", extra_env=env2)
+    assert second.returncode == 2, "V2 downgrade after a V3 consume must be denied"
+    assert "cleanup_v2_downgrade_denied" in second.stderr
+
+
+def test_present_contract_io_uncapable_denied(tmp_path, monkeypatch):
+    """Blocker 9: a present V3 contract on an IO-incapable platform is denied (no ABSENT fallthrough)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    monkeypatch.setattr(_cc3, "IO_CAPABLE", False)
+    state, _contract, reason = _cc3.load_contract_state(str(repo["root"]))
+    assert state == _cc3.STATE_PRESENT_BUT_INVALID
+    assert reason == _cc3.CLEANUP_IO_UNSUPPORTED_PLATFORM
+
+
+def test_cleanup_exec_no_project_root_or_no_verify_cli_flags():
+    """Blocker 1/5: the public CLIs expose neither --project-root nor --no-verify."""
+    with pytest.raises(SystemExit):
+        _ce.main(["--pr-number", "1", "--worktree-path", "/x",
+                  "--branch-name", "b", "--project-root", "/y"])
+    with pytest.raises(SystemExit):
+        _mat.main(["--pr-number", "1", "--worktree-path", "/x",
+                   "--branch-name", "b", "--no-verify"])
+
+
+def test_cleanup_exec_rejects_cross_repo_pr(tmp_path, monkeypatch):
+    """Blocker 5: a fork / cross-repo PR must not authorize deleting our local worktree."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
+    monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "deadbeef")
+    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
+        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
+        "headRefName": "issue-1050-g", "headRefOid": "deadbeef", "baseRefName": "main",
+        "isCrossRepository": True, "headRepositoryOwner": {"login": "attacker"},
+        "closingIssuesReferences": [{"number": 1050}]})
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _ce.HEAD_REPO_MISMATCH
+
+
+def test_cleanup_exec_rejects_head_oid_mismatch(tmp_path, monkeypatch):
+    """Blocker 5: a same-named branch at a different commit must not authorize deletion."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
+    monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "aaaaaaa")
+    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
+        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
+        "headRefName": "issue-1050-g", "headRefOid": "bbbbbbb", "baseRefName": "main",
+        "isCrossRepository": False, "headRepositoryOwner": {"login": "squne121"},
+        "closingIssuesReferences": [{"number": 1050}]})
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _ce.HEAD_OID_MISMATCH
+
+
+def test_perform_preserves_partial_actions_on_branch_delete_fail(tmp_path):
+    """Blocker 6: worktree removed but branch -d fails → actions_taken keeps the partial success."""
+    from worktree_catalog import Deadline
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    # An unmerged commit on the branch makes `git branch -d` refuse after worktree removal.
+    _git("commit", "--allow-empty", "-q", "-m", "extra", cwd=repo["worktree"])
+    actions, err = _ce._perform("issue-1050-g", wt_real, str(repo["root"]), Deadline(60.0))
+    assert actions == [_cc3.OP_WORKTREE_REMOVE], actions
+    assert err is not None and "branch_delete_failed" in err

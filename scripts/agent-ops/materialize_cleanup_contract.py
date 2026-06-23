@@ -123,10 +123,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--branch-name", required=True)
     p.add_argument("--operation", default=OP_WORKTREE_REMOVE, choices=list(OPERATIONS))
     p.add_argument("--ttl-seconds", type=int, default=300)
-    p.add_argument("--project-root", default=None)
-    p.add_argument("--no-verify", action="store_true", help="skip authorization checks (testing only)")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
+    # Blocker 1 / Blocker 5: the public CLI exposes neither --no-verify (skipping
+    # authorization) nor --project-root (retargeting). Authorization always runs and
+    # the trusted root is resolved internally. ``verify`` / ``project_root`` remain
+    # function parameters for dependency-injected unit tests only.
     result = materialize(
         pr_number=a.pr_number,
         linked_issue_number=a.linked_issue_number,
@@ -134,8 +136,6 @@ def main(argv: list[str] | None = None) -> int:
         branch_name=a.branch_name,
         operation=a.operation,
         ttl_seconds=a.ttl_seconds,
-        project_root=a.project_root,
-        verify=not a.no_verify,
     )
     if a.json:
         print(json.dumps(result, sort_keys=True))
