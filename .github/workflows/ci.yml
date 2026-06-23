@@ -1084,6 +1084,10 @@ jobs:
       - name: Secret exposure scan (clean fixtures)
         run: python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/valid --fail-on-finding
       - name: Generate ci_test_selection/v1 artifact
+        # Skipped in python_test_bench dispatch runs: change detection needs a PR base
+        # SHA which a workflow_dispatch event lacks, and the bench run only measures
+        # pytest runtime (Issue #1064 AC11). Normal push/PR runs always run this.
+        if: ${{ github.event.inputs.python_test_bench != 'true' }}
         run: |
           mkdir -p ci_test_selection_artifacts
           uv run --locked pytest --collect-only -q \
@@ -1132,10 +1136,12 @@ jobs:
           sys.exit(module.generate_artifact(args))
           PY
       - name: Verify ci_test_selection evidence files
+        if: ${{ github.event.inputs.python_test_bench != 'true' }}
         run: |
           test -s ci_test_selection_artifacts/hook_tests_collect_only.txt
           test -s ci_test_selection_artifacts/ci_test_selection_v1.json
       - uses: actions/upload-artifact@v7
+        if: ${{ github.event.inputs.python_test_bench != 'true' }}
         with:
           name: ci_test_selection
           path: ci_test_selection_artifacts/
