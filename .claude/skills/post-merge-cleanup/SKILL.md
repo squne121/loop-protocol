@@ -128,26 +128,34 @@ uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py -
   | uv run python3 -c "import json,sys; [print(b['name']) for b in json.load(sys.stdin)['branches'] if b.get('gone')]"
 ```
 
-**branch 削除条件**:
-- リモートが削除済み（`gone`）
-- linked issue がクローズ済み（ある場合）
+**worktree / branch 削除フロー（Issue #1137: cleanup_exec 認可境界）**:
 
+agent は bare `git -C <worktree>` で clean 判定や `git worktree remove` / `git branch -d` を直接実行しない。
+clean 判定・PR merged / head branch / linked issue / catalog / branch / root=default の検証・削除は、
+単一の認可境界 `scripts/agent-ops/cleanup_exec.py` が実行のたびに内部で行う（agent からの bare git cleanup は
+`worktree_scope_guard` が deny する）。
+
+1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash
-git branch -d <branch-name>
+uv run python3 scripts/agent-ops/guard_preflight.py --json
 ```
+`status: ok` 以外（`blocked` / `human_required`）は `allowed_next_commands` の構造化 recovery hint に従う。
+`root_drift_active_worktree_mismatch` は policy B により自動 mutation せず人間承認を要する。
 
-**worktree 削除条件**（worktree 内 staged 変更・未追跡ファイルがないこと）:
+2. 認可境界 `cleanup_exec` で worktree / branch を削除する（PR merged 等を毎回検証してから exact 削除）:
 ```bash
-STAGED=$(git -C "<worktree_path>" diff --cached --name-only 2>/dev/null)
-UNTRACKED=$(git -C "<worktree_path>" status --short 2>/dev/null | grep -E '^\?\?' || true)
-if [ -z "$STAGED" ] && [ -z "$UNTRACKED" ]; then
-  git worktree remove <path>
-else
-  echo "staged/untracked あり: 削除せず報告"
-fi
+uv run python3 scripts/agent-ops/cleanup_exec.py \
+  --pr-number <pr> --linked-issue-number <issue> \
+  --worktree-path <絶対 worktree path> --branch-name <branch> --json
 ```
+`status: ok` で `actions_taken` に `worktree_remove` / `branch_delete` が入る。`status: refused` の場合は
+`reason_code`（`pr_not_merged` / `worktree_dirty` / `root_not_default_branch` 等）を `unresolved_cleanup_items` に記録する。
 
-削除できないものは `unresolved_cleanup_items` に記録。
+bare `git worktree remove` / `git branch -d` を使う defense-in-depth 経路が必要な場合は、
+`scripts/agent-ops/materialize_cleanup_contract.py` で同じ検証を通してから one-shot V3 contract を発行し、
+`worktree_scope_guard` の V3 gate（`command_hash` / `expires_at` / `operation` / 使用後 consume）に委ねる。
+
+削除できないものは `unresolved_cleanup_items` に記録する。
 
 ### 4. parent issue クローズ条件確認
 

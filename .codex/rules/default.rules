@@ -198,16 +198,17 @@ prefix_rule(
     ],
 )
 
-# DIRECT_ALLOW_GIT: read-only git inspection allowed directly
+# DIRECT_ALLOW_GIT: read-only git inspection allowed directly.
+# Issue #1137: `branch` removed from this broad allow so `git branch -d/-D` is not
+# statically allowed; read-only branch forms are allowed by the granular rules below.
 prefix_rule(
-    pattern = ["git", ["status", "diff", "log", "branch", "show", "rev-parse", "ls-files"]],
+    pattern = ["git", ["status", "diff", "log", "show", "rev-parse", "ls-files"]],
     decision = "allow",
     justification = "Read-only git inspection is safe; more specific than the mutation-forbidden rule below.",
     match = [
         "git status",
         "git diff",
         "git log --oneline -5",
-        "git branch --show-current",
         "git show HEAD",
         "git rev-parse HEAD",
         "git ls-files",
@@ -279,17 +280,64 @@ prefix_rule(
 )
 
 prefix_rule(
-    pattern = ["git", ["push", "commit", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "add", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
+    pattern = ["git", ["push", "commit", "checkout", "switch", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "add", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
     decision = "forbidden",
     justification = "Use `rtk git ...` for mutating repository operations so project policy is applied.",
     match = [
         "git commit -m update",
         "git push",
         "git checkout -b topic",
-        "git worktree add ../tmp main",
         "git add AGENTS.md",
         "git fetch origin",
     ],
+)
+
+# --- Issue #1137: cleanup exact commands on the guarded cleanup route ---
+# `git worktree`/`git branch` are split so the exact cleanup commands are NOT
+# statically allowed and NOT broadly forbidden, but routed to worktree_scope_guard
+# (the guarded cleanup route, wired in .codex/hooks.json) against the V3 one-shot
+# contract. Force / destructive variants stay forbidden; read-only forms allowed.
+
+prefix_rule(
+    pattern = ["git", "worktree", "list"],
+    decision = "allow",
+    justification = "git worktree list is read-only.",
+    match = ["git worktree list", "git worktree list --porcelain"],
+)
+
+prefix_rule(
+    pattern = ["git", "worktree", "remove"],
+    decision = "prompt",
+    justification = "Exact `git worktree remove` is a cleanup command on the guarded cleanup route; worktree_scope_guard arbitrates it against the V3 one-shot contract. Not static-allowed.",
+    match = ["git worktree remove .claude/worktrees/issue-1-x"],
+)
+
+prefix_rule(
+    pattern = ["git", "worktree", ["add", "move", "lock", "unlock", "prune", "repair"]],
+    decision = "forbidden",
+    justification = "Non-cleanup worktree mutations require the rtk git wrapper.",
+    match = ["git worktree add ../tmp main", "git worktree prune"],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", ["--show-current", "--list", "-l", "-a", "-r", "-v", "-vv"]],
+    decision = "allow",
+    justification = "Read-only git branch inspection is safe.",
+    match = ["git branch --show-current", "git branch --list", "git branch -a"],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", "-d"],
+    decision = "prompt",
+    justification = "Exact `git branch -d` is a cleanup command on the guarded cleanup route; worktree_scope_guard arbitrates it against the V3 one-shot contract. Not static-allowed.",
+    match = ["git branch -d issue-1-x"],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", ["-D", "-f", "--force", "--delete", "-m", "-M"]],
+    decision = "forbidden",
+    justification = "Force / rename branch operations are forbidden; the runtime hook also denies branch_force_delete_denied.",
+    match = ["git branch -D x", "git branch -f x", "git branch -m old new"],
 )
 
 prefix_rule(

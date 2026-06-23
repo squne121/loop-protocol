@@ -46,6 +46,41 @@ import shutil
 import subprocess
 import sys
 
+# Shared one-shot V3 cleanup validator + worktree catalog (Issue #1137).
+# Imported from scripts/agent-ops so V3 validation / per-operation command_hash /
+# the three-valued loader / durable IO / git check-ref-format branch validation /
+# the shared catalog are not re-implemented here. Import is fail-closed: if it is
+# unavailable, V3 gating is skipped and only the legacy V2 path applies.
+_AGENT_OPS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "scripts",
+    "agent-ops",
+)
+if _AGENT_OPS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_OPS_DIR)
+try:
+    import cleanup_contract_v3 as _cc3
+    import worktree_catalog as _wcat
+
+    _V3_AVAILABLE = True
+    _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH = _cc3.ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH
+except Exception:  # pragma: no cover - defensive fail-closed
+    _cc3 = None
+    _wcat = None
+    _V3_AVAILABLE = False
+    _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH = "root_drift_active_worktree_mismatch"
+
+# Branch names in V3 contracts are validated with `git check-ref-format --branch`
+# inside cleanup_contract_v3.is_valid_branch_ref (Issue #1137 Medium).
+
+# Agent-ops tools allowed as an exact command class from the local main root even
+# when an issue worktree is active (Issue #1137 Blocker 1). realpath-matched.
+_AGENT_OPS_ALLOWED_SCRIPTS = (
+    "scripts/agent-ops/cleanup_exec.py",
+    "scripts/agent-ops/guard_preflight.py",
+    "scripts/agent-ops/materialize_cleanup_contract.py",
+)
+
 # ── Tool classes ──────────────────────────────────────────────────────────────
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 BASH_TOOL = "Bash"
@@ -1359,17 +1394,35 @@ def _decide_write(tool_input: dict, cwd: str, issue: str | None,
 def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
                  resolution: "WorktreeResolution") -> None:
     command = tool_input.get("command") or ""
+    _pr = resolve_project_root()
+
+    # Issue #1137 Blocker 1: exact agent-ops tool invocation from main root is
+    # allowed even with an active issue worktree (checked before classification).
+    if _is_agent_ops_tool_command(command, cwd, _pr):
+        _allow()
+
     klass = classify_bash(command)
 
     # read-only allowlist: allow even if worktree unresolved / git unavailable.
     if klass == "read_only":
         _allow()
 
-    # Cleanup class: git worktree remove / git branch -d — check contract (AC4).
+    # Cleanup class: git worktree remove / git branch -d — V3 one-shot arbitration.
     if klass == "cleanup":
-        contract = load_cleanup_contract(resolve_project_root())
-        cleanup_decision, cleanup_reason = _decide_cleanup_bash(command, cwd, contract)
+        # Recovery deadlock (policy B): never cleanup from a drifted root with an
+        # active issue worktree — emit the shared reason via bounded cleanup block.
+        if _V3_AVAILABLE and _root_drift_active_worktree_mismatch(_pr):
+            _block_cleanup(_RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH)
+            return  # unreachable
+        cleanup_decision, cleanup_reason, kind = cleanup_decision_dispatch(command, cwd, _pr)
         if cleanup_decision == "allow":
+            # One-shot consume: a valid V3 contract is consumed before the command
+            # runs so it cannot replay (cleanup_contract_consumed on reuse).
+            if kind == "v3" and _V3_AVAILABLE:
+                try:
+                    _cc3.consume_contract(_pr)
+                except OSError:
+                    pass
             _allow()
         else:
             _block_cleanup(cleanup_reason)
@@ -1563,6 +1616,154 @@ def load_cleanup_contract(project_root: str) -> dict | None:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return None
+
+
+# =============================================================================
+# Issue #1137: exact agent-ops tool allow + one-shot V3 cleanup arbitration
+# =============================================================================
+# V3 cleanup reason codes (literals kept here for grep/VC visibility):
+#   cleanup_contract_present_but_invalid / cleanup_contract_expired /
+#   cleanup_contract_consumed / cleanup_command_hash_mismatch /
+#   cleanup_operation_mismatch / root_drift_active_worktree_mismatch /
+#   guard_deadline_exceeded
+
+
+def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str) -> bool:
+    """True iff command is an exact agent-ops tool invocation allowed from main root.
+
+    Issue #1137 Blocker 1: cleanup_exec / guard_preflight / materialize must run
+    from cwd=canonical main root (default branch) even when an issue worktree is
+    active. Accepted forms: `uv run python3 <script> ...` or `python3 <script> ...`.
+    Rejected: shell chains, inline env, `python -c`, wrappers, non-allowed scripts,
+    or cwd that is not the main root.
+    """
+    if not command or re.search(r"[;&|<>$`]", command):
+        return False
+    toks = _tokenize(command)
+    if not toks:
+        return False
+    if toks[:3] == ["uv", "run", "python3"]:
+        rest = toks[3:]
+    elif toks and os.path.basename(toks[0]) in ("python3", "python"):
+        rest = toks[1:]
+    else:
+        return False
+    if not rest or rest[0].startswith("-"):
+        return False  # reject python -c and bare flags
+    script = rest[0]
+    script_abs = script if os.path.isabs(script) else os.path.join(cwd, script)
+    script_real = os.path.realpath(script_abs)
+    allowed = {os.path.realpath(os.path.join(project_root, s)) for s in _AGENT_OPS_ALLOWED_SCRIPTS}
+    if script_real not in allowed:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    # cwd=main root must be on the default branch (Design Decision 2).
+    branch = _current_branch(project_root)
+    default = _repo_default_branch(project_root)
+    if not branch or (default and branch != default):
+        return False
+    return True
+
+
+def _root_drift_active_worktree_mismatch(project_root: str) -> bool:
+    """True iff the root checkout has drifted to an issue-like branch (Issue #1137 AC13)."""
+    branch = _current_branch(project_root)
+    if branch is None:
+        return False
+    if _ISSUE_BRANCH_RE.match(branch):
+        return True
+    default = _repo_default_branch(project_root)
+    if default and branch != default:
+        env_issue = os.environ.get("LOOP_ISSUE_NUMBER")
+        if env_issue and env_issue.strip().isdigit():
+            return True
+    return False
+
+
+def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict) -> tuple[str, str]:
+    """V3 one-shot cleanup decision (expiry already excluded by caller). Returns (decision, reason)."""
+    deadline = _wcat.Deadline(8.0)
+    toks = _tokenize(command)
+    if len(toks) < 3 or toks[0] != "git":
+        return "deny", "not_a_git_cleanup_command"
+
+    if toks[1] == "worktree" and toks[2] == "remove":
+        op = _cc3.OP_WORKTREE_REMOVE
+        if len(toks) != 4:
+            return "deny", "worktree_remove_wrong_argc"
+        actual_argv = ["git", "worktree", "remove", toks[3]]
+    elif toks[1] == "branch" and toks[2] == "-d":
+        op = _cc3.OP_BRANCH_DELETE
+        if len(toks) != 4:
+            return "deny", "branch_delete_wrong_argc"
+        actual_argv = ["git", "branch", "-d", toks[3]]
+    else:
+        return "deny", "not_a_cleanup_command"
+
+    if contract.get("operation") != op:
+        return "deny", _cc3.CLEANUP_OPERATION_MISMATCH
+
+    # per-operation hash recomputed from the ACTUAL argv (never reconstructed).
+    recomputed = _cc3.canonical_command_hash(actual_argv, op, os.path.realpath(project_root), contract.get("nonce", ""))
+    if recomputed != contract.get("command_hash"):
+        return "deny", _cc3.CLEANUP_COMMAND_HASH_MISMATCH
+
+    try:
+        if op == _cc3.OP_WORKTREE_REMOVE:
+            path_arg = toks[3]
+            actual_path = os.path.realpath(path_arg if os.path.isabs(path_arg) else os.path.join(cwd, path_arg))
+            expected_path = os.path.realpath(contract["worktree_path"])
+            if actual_path != expected_path:
+                return "deny", _cc3.WORKTREE_PATH_MISMATCH
+            worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
+            if not expected_path.startswith(worktrees_dir + os.sep):
+                return "deny", "worktree_path_outside_worktrees_dir"
+            catalog = _wcat.list_worktrees(project_root, deadline)
+            if catalog is None:
+                return "deny", "worktree_list_failed"
+            entry = _wcat.find_by_realpath(catalog, expected_path)
+            if entry is None:
+                return "deny", _cc3.WORKTREE_NOT_IN_CATALOG
+            if _wcat.branch_short_name(entry.get("branch_ref")) != contract.get("branch_name"):
+                return "deny", "worktree_branch_mismatch"
+            st = subprocess.run(
+                ["git", "-C", expected_path, "status", "--porcelain=v1", "-z"],
+                capture_output=True, text=True, timeout=deadline.subprocess_timeout(10.0),
+            )
+            if st.returncode != 0 or st.stdout:
+                return "deny", _cc3.WORKTREE_DIRTY
+            return "allow", "cleanup_worktree_remove_ok"
+        else:
+            if toks[3] != contract.get("branch_name"):
+                return "deny", "branch_name_mismatch"
+            return "allow", "cleanup_branch_delete_ok"
+    except _wcat.GuardDeadlineExceeded:
+        return "deny", _cc3.GUARD_DEADLINE_EXCEEDED
+    except (OSError, subprocess.TimeoutExpired):
+        return "deny", _cc3.WORKTREE_DIRTY
+
+
+def cleanup_decision_dispatch(command: str, cwd: str, project_root: str) -> tuple[str, str, str | None]:
+    """Dispatch cleanup decision. Returns (decision, reason, kind) kind in {v3,v2,None}.
+
+    V3 (one-shot, safe scratch path) is primary. A present-but-invalid or expired
+    V3 contract is denied and never downgrades to V2 (Blocker 2). V2 legacy applies
+    only when the V3 contract is genuinely ABSENT.
+    """
+    if _V3_AVAILABLE:
+        state, contract, _reason = _cc3.load_contract_state(project_root)
+        if state == _cc3.STATE_PRESENT_BUT_INVALID:
+            return "deny", _cc3.CLEANUP_CONTRACT_PRESENT_BUT_INVALID, "v3"
+        if state == _cc3.STATE_VALID_V3:
+            if _cc3.is_expired(contract):
+                return "deny", _cc3.CLEANUP_CONTRACT_EXPIRED, "v3"
+            decision, reason = _decide_cleanup_v3(command, cwd, project_root, contract)
+            return decision, reason, "v3"
+        # STATE_ABSENT → legacy V2 fallback below
+    contract_v2 = load_cleanup_contract(project_root)
+    decision, reason = _decide_cleanup_bash(command, cwd, contract_v2)
+    return decision, reason, ("v2" if contract_v2 is not None else None)
 
 
 def _parse_worktree_list_branch(output: str, target_path: str) -> str | None:
@@ -1784,14 +1985,21 @@ def build_decision(payload: dict) -> dict:
 
     # Bash tool
     command = tool_input.get("command") or ""
+
+    # Issue #1137 Blocker 1: exact agent-ops tool invocation from main root allow.
+    if _is_agent_ops_tool_command(command, cwd, project_root):
+        return _v2("agent_ops_tool", cwd_class, "allow", "agent_ops_tool_allowed")
+
     klass = classify_bash(command)
 
     if klass == "read_only":
         return _v2("read_only", cwd_class, "allow", "read_only_command")
 
     if klass == "cleanup":
-        contract = load_cleanup_contract(project_root)
-        decision, reason = _decide_cleanup_bash(command, cwd, contract)
+        # build_decision is pure (no consume); _decide_bash runtime consumes V3.
+        if _V3_AVAILABLE and _root_drift_active_worktree_mismatch(project_root):
+            return _v2("cleanup", cwd_class, "deny", _RC_ROOT_DRIFT_ACTIVE_WT_MISMATCH)
+        decision, reason, _kind = cleanup_decision_dispatch(command, cwd, project_root)
         return _v2("cleanup", cwd_class, decision, reason)
 
     # Deny force branch deletion even inside the active worktree (AC4c)

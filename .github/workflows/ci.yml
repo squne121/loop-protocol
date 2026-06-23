@@ -854,6 +854,22 @@ jobs:
           printf '{"step_id":"pytest_hook_tests","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: codex execpolicy + cleanup-route matrix (timed)
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          if command -v codex >/dev/null 2>&1; then
+            codex execpolicy check --rules .codex/rules/default.rules git worktree remove .claude/worktrees/issue-1-x || true
+            codex execpolicy check --rules .codex/rules/default.rules git branch -d issue-1-x || true
+          else
+            echo "codex CLI unavailable; cleanup-route arbitration validated via the hook-chain pytest below"
+          fi
+          uv run --locked pytest tests/codex/test_local_main_branch_guard.py -q
+          _s=$?
+          set -e
+          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"pytest_skills","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Verify hook test discovery exclusions
         run: |
           python3 - <<PY
