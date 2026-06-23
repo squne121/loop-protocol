@@ -39,6 +39,18 @@ from vc_contract_syntax import (
     parse_verification_commands_section as _parse_vc_section,
 )
 
+# #1135: shared, section-bound, strict MRC parser (C12 と共有)
+from mrc_contract_parser import (  # noqa: E402
+    parse_machine_readable_contract,
+    REASON_MISSING as MRC_REASON_MISSING,
+    REASON_NO_FENCE as MRC_REASON_NO_FENCE,
+    REASON_MULTIPLE_FENCES as MRC_REASON_MULTIPLE_FENCES,
+    REASON_MULTIPLE_SECTIONS as MRC_REASON_MULTIPLE_SECTIONS,
+    REASON_YAML_ERROR as MRC_REASON_YAML_ERROR,
+    REASON_DUPLICATE_KEY as MRC_REASON_DUPLICATE_KEY,
+    REASON_ROOT_NOT_MAPPING as MRC_REASON_ROOT_NOT_MAPPING,
+)
+
 
 # =============================================================================
 # Type definitions
@@ -300,60 +312,39 @@ def _validate_lp002_invalid_machine_readable_contract(body: str) -> list[Validat
 
     content, start_line, end_line = section_info
 
-    # Try to extract YAML block
-    yaml_match = re.search(r'```yaml\n(.*?)\n```', content, re.DOTALL)
-    if not yaml_match:
+    # #1135 P0/P1b: parse the MRC strictly via the shared, section-bound parser
+    # (exactly one ```yaml fence, duplicate-key rejecting, mapping root). C12
+    # (check_issue_contract.py) shares this parser to avoid a parser differential.
+    mrc_result = parse_machine_readable_contract(body)
+    if not mrc_result.ok:
+        if mrc_result.reason == MRC_REASON_MISSING:
+            return []
         context, trunc = _get_context_lines(body, start_line, end_line)
+        _lp002_msg = {
+            MRC_REASON_NO_FENCE: "Machine-Readable Contract block must use ```yaml ... ``` fence",
+            MRC_REASON_MULTIPLE_FENCES: "Machine-Readable Contract section must contain exactly one ```yaml ... ``` fence",
+            MRC_REASON_MULTIPLE_SECTIONS: "Body must contain exactly one ## Machine-Readable Contract section",
+            MRC_REASON_YAML_ERROR: "Machine-Readable Contract YAML syntax error",
+            MRC_REASON_DUPLICATE_KEY: f"Machine-Readable Contract has a duplicate key: {mrc_result.duplicate_key}",
+            MRC_REASON_ROOT_NOT_MAPPING: "Machine-Readable Contract YAML must be a dictionary",
+        }.get(mrc_result.reason, f"Machine-Readable Contract invalid ({mrc_result.reason})")
         return [ValidationError(
             rule_id="LP002",
             severity="error",
             section="Machine-Readable Contract",
             line_start=start_line,
             line_end=end_line,
-            message="Machine-Readable Contract block must use ```yaml ... ``` fence",
+            message=_lp002_msg,
             minimal_context=context,
             context_truncated=trunc,
-            fix_hint="Wrap YAML contract in ```yaml ... ``` code fence.",
+            fix_hint="Ensure exactly one valid ```yaml ... ``` contract block with unique keys.",
             autofixable=False
         )]
 
-    yaml_content = yaml_match.group(1)
+    data = mrc_result.data
 
     # Parse and validate YAML
     errors = []
-
-    try:
-        data = yaml.safe_load(yaml_content)
-    except yaml.YAMLError as exc:
-        context, trunc = _get_context_lines(body, start_line, end_line)
-        return [ValidationError(
-            rule_id="LP002",
-            severity="error",
-            section="Machine-Readable Contract",
-            line_start=start_line,
-            line_end=end_line,
-            message=f"Machine-Readable Contract YAML syntax error: {str(exc)[:100]}",
-            minimal_context=context,
-            context_truncated=trunc,
-            fix_hint="Fix YAML syntax errors in contract block.",
-            autofixable=False
-        )]
-
-    # Check if parsed data is a dict
-    if not isinstance(data, dict):
-        context, trunc = _get_context_lines(body, start_line, end_line)
-        return [ValidationError(
-            rule_id="LP002",
-            severity="error",
-            section="Machine-Readable Contract",
-            line_start=start_line,
-            line_end=end_line,
-            message="Machine-Readable Contract YAML must be a dictionary",
-            minimal_context=context,
-            context_truncated=trunc,
-            fix_hint="Ensure YAML contract root is a dictionary (key: value pairs).",
-            autofixable=False
-        )]
 
     # Check for required fields
     required_contract_fields = [
