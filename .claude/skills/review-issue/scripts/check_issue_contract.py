@@ -55,6 +55,14 @@ _CREATE_ISSUE_SCRIPTS = (
 if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
 
+# #1135: shared, section-bound MRC parser + repo path-policy SSOT
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+from path_classification import (  # noqa: E402
+    extract_allowed_paths as pc_extract_allowed_paths,
+    has_code_or_runtime_scope,
+    is_docs_only_allowed_paths,
+)
+
 # ---------------------------------------------------------------------------
 # vc_contract_syntax を import（#993: shared VC grammar parser）
 # ---------------------------------------------------------------------------
@@ -1163,31 +1171,30 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     # PR #390 review-2 blocker 3 対応: MRC YAML は yaml.safe_load で parse し、
     # inline comment / quote / null / folded scalar を YAML semantics で正しく扱う。
     # parse 失敗時は regex fallback に降りる（既存挙動を破壊しない）。
-    mrc_yaml_text = ""
-    mrc_parsed: dict = {}
-    _mrc_yaml_parse_failed = False
-    mrc_match = re.search(
-        r"```yaml\s*\n(.*?contract_schema_version.*?)\n```",
-        body,
-        re.DOTALL,
-    )
-    if mrc_match:
-        mrc_yaml_text = mrc_match.group(1)
-        try:
-            import yaml as _yaml  # noqa: PLC0415
-            loaded = _yaml.safe_load(mrc_yaml_text)
-            if isinstance(loaded, dict):
-                mrc_parsed = loaded
-        except Exception:
-            _mrc_yaml_parse_failed = True
-    psc_section = extract_section(body, "Product Spec Context")
-    structured_trace_text = mrc_yaml_text + "\n" + psc_section
+    # #1135 P0: MRC は本文全体ではなく `## Machine-Readable Contract` セクションに
+    # 束縛して strict に parse する（共通 parser）。decoy YAML / 重複 key / fence 複数 /
+    # mapping でない root は fail-closed（mrc_result.ok == False）となり、docs 免除や
+    # trace field 取得に利用されない。LP002 と同一 parser を共有する。
+    mrc_result = parse_machine_readable_contract(body)
+    mrc_data: dict = mrc_result.data if (mrc_result.ok and isinstance(mrc_result.data, dict)) else {}
 
+    mrc_change_kind: Optional[str] = None
+    if mrc_result.ok:
+        raw_change_kind = mrc_data.get("change_kind")
+        if raw_change_kind is not None:
+            mrc_change_kind = str(raw_change_kind).strip().lower()
+
+    psc_section = extract_section(body, "Product Spec Context")
     has_product_spec_context = bool(psc_section)
-    has_trace_field_mention = bool(re.search(
+
+    _trace_keys = ("product_spec_id", "requirement_id", "source_task_id")
+    mrc_has_trace = mrc_result.ok and any(k in mrc_data for k in _trace_keys)
+    psc_has_trace = bool(re.search(
         r"\b(product_spec_id|requirement_id|source_task_id)\s*:",
-        structured_trace_text,
+        psc_section,
     ))
+    has_trace_field_mention = mrc_has_trace or psc_has_trace
+
     # task-lineage marker: structured field か、tasks.md / generated task 由来の宣言文
     has_task_lineage_marker = bool(re.search(
         r"^\s*-?\s*(generated_from_task|task_lineage|source_task)\s*:",
@@ -1199,7 +1206,26 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
         re.IGNORECASE,
     ))
 
-    applicable = has_product_spec_context or has_trace_field_mention or has_task_lineage_marker
+    # #1135 P1a: docs-only 免除は自己申告 change_kind: docs だけでは不十分。
+    # Allowed Paths が全て documentation 分類のときに限り docs_only とする。
+    allowed_paths = pc_extract_allowed_paths(body)
+    docs_only = (mrc_change_kind == "docs") and is_docs_only_allowed_paths(allowed_paths)
+
+    # #1135 P1a: change_kind: docs を自己申告しながら Allowed Paths に code/runtime
+    # path を含む矛盾 issue は docs 免除を適用せず、product-spec signal があるとき
+    # blocking fail にする（silent な n/a にしない）。
+    if (
+        mrc_change_kind == "docs"
+        and has_code_or_runtime_scope(allowed_paths)
+        and (has_product_spec_context or has_trace_field_mention or has_task_lineage_marker)
+    ):
+        return CheckResult.FAIL, [
+            "change_kind: docs だが Allowed Paths に code/runtime path が含まれる"
+            "（docs-only 免除は不適用）。product trace fields を宣言するか change_kind を見直す",
+        ]
+
+    psc_alone_applies = has_product_spec_context and not docs_only
+    applicable = psc_alone_applies or has_trace_field_mention or has_task_lineage_marker
     if not applicable:
         return CheckResult.NA, []
 
@@ -1208,14 +1234,14 @@ def check_c12_product_trace_fields_structure(body: str) -> tuple[str, list[str]]
     # 2) それ以外（PSC セクション / parse 失敗時）: regex fallback で structured_trace_text を走査
     # (PR #390 REQUEST_CHANGES blocker 1 + review-2 blocker 3 対応)
     def _extract_field(field_name: str) -> Optional[str]:
-        if field_name in mrc_parsed:
-            v = mrc_parsed.get(field_name)
+        if mrc_result.ok and field_name in mrc_data:
+            v = mrc_data.get(field_name)
             if v is None:
                 return None
             return str(v).strip()
         m = re.search(
             rf'^\s*-?\s*{re.escape(field_name)}\s*:\s*["\']?([^"\'\n#]*?)["\']?\s*(?:#.*)?$',
-            structured_trace_text,
+            psc_section,
             re.MULTILINE,
         )
         if m:
