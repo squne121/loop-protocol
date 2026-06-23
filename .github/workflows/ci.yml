@@ -866,12 +866,17 @@ jobs:
         run: |
           _t0=$(date +%s%3N)
           set +e
-          # Blocker 10: assert the strictest JSON decision per cleanup-route case.
-          # No `|| true`; codex absence / parse error / decision mismatch fails CI.
+          # Blocker 10: assert the strictest decision per cleanup-route case.
+          # `codex execpolicy check --rules <file> -- <command>` emits JSON (the
+          # strictest decision + matching rules) on stdout. No `|| true`; codex
+          # absence / parse error / decision mismatch fails CI.
           python3 - <<'PY'
           import json, shutil, subprocess, sys
           RULES = ".codex/rules/default.rules"
           WT = ".claude/worktrees/issue-1-x"
+          # strictest -> loosest precedence; "reject" is treated as "forbidden".
+          ORDER = ("forbidden", "prompt", "allow")
+          ALIASES = {"reject": "forbidden", "deny": "forbidden", "ask": "prompt"}
           CASES = [
               ("read_only_branch_list", ["git", "branch", "--list"], "allow"),
               ("read_only_worktree_list", ["git", "worktree", "list"], "allow"),
@@ -885,24 +890,34 @@ jobs:
           codex = shutil.which("codex")
           if not codex:
               sys.exit("codex CLI unavailable; execpolicy matrix is a MANDATORY gate (Blocker 10)")
+          def _collect(obj, acc):
+              if isinstance(obj, str):
+                  t = ALIASES.get(obj.strip().lower(), obj.strip().lower())
+                  if t in ORDER:
+                      acc.add(t)
+              elif isinstance(obj, dict):
+                  for v in obj.values():
+                      _collect(v, acc)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      _collect(v, acc)
           def decision(argv):
-              out = subprocess.run([codex, "execpolicy", "check", "--rules", RULES, "--json", *argv],
+              out = subprocess.run([codex, "execpolicy", "check", "--rules", RULES, "--", *argv],
                                    capture_output=True, text=True, timeout=30)
+              blob = out.stdout.strip() or out.stderr.strip()
               try:
-                  data = json.loads(out.stdout)
+                  data = json.loads(blob)
               except (json.JSONDecodeError, ValueError) as e:
-                  sys.exit(f"codex execpolicy JSON parse error for {argv}: {e}")
-              d = None
-              if isinstance(data, dict):
-                  for k in ("decision", "strictest_decision", "result"):
-                      v = data.get(k)
-                      if isinstance(v, str):
-                          d = v; break
-                      if isinstance(v, dict) and isinstance(v.get("decision"), str):
-                          d = v["decision"]; break
-              if not d:
-                  sys.exit(f"codex execpolicy schema change (no decision) for {argv}: {out.stdout[:200]!r}")
-              return d.strip().lower()
+                  sys.exit(f"codex execpolicy JSON parse error for {argv}: {e}; raw={blob[:300]!r}")
+              found = set()
+              _collect(data, found)
+              if not found:
+                  sys.exit(f"codex execpolicy schema change (no decision token) for {argv}: {blob[:300]!r}")
+              # codex reports the strictest decision; take the strictest token present.
+              for tok in ORDER:
+                  if tok in found:
+                      return tok
+              return None
           failures = []
           for label, argv, expected in CASES:
               got = decision(argv)
