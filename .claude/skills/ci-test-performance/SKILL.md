@@ -36,11 +36,11 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 
 この Skill 自体はポリシー定義であり、特定 Issue に閉じない。実装時は current workflow の lane 分類と evidence の整合を優先する。
 
-### python-test-plan SSOT（#1064）
+### python-test-plan SSOT（#1064 で追加した単一の正本）
 
 `.github/ci/python-test-plan.json` は pytest target / `--ignore` / `--deselect` / worker 数 / scheduler を集約した machine-readable plan であり、`scripts/ci/python_test_plan.py` loader が shell `eval` を避けて NUL 区切り / JSON で argv を emit する。target set を変える場合は workflow や generator を直接編集せず python-test-plan を編集する。`generate_ci_test_selection_artifact.py` は loader 経由で plan の scope argv を `pytest_argv` に記録し、collect 非 0 / timeout / nodeid 0 件で fail-close する。
 
-## Target Policy
+## Target Policy（目標ポリシー）
 
 ### 4 レーン定義
 
@@ -53,7 +53,7 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 | `contract_artifact` | schema・contract・VC スクリプト・Node-backed hook tests | 30秒-2分 |
 | `integration` | pnpm build・E2E | 5-15分 |
 
-## Procedure
+## Procedure（手順）
 
 ### Step 1: 変更パスの分類
 
@@ -131,12 +131,12 @@ CI_TEST_PERFORMANCE_DECISION_V1:
 
 ## 現行で実行可能なコマンド（#1060 時点）
 
-- pnpm typecheck
-- pnpm test
-- pnpm build
-- pnpm lint
+- pnpm typecheck（型チェック）
+- pnpm test（テスト）
+- pnpm build（ビルド）
+- pnpm lint（静的解析）
 
-## Target Policy（#1063/#1064 以降）
+## Target Policy（#1063/#1064 以降の目標ポリシー）
 
 - ruff check . （#1063 で導入済み）
 - pytest -n auto （#1064 で導入済み。worker 数・scheduler は `.github/ci/python-test-plan.json` で集中管理）
@@ -167,7 +167,7 @@ uv run pytest -n auto --dist loadscope
 # - fixture の scope (function/module/session) が xdist 対応か確認する
 ```
 
-## Consumer Routing
+## Consumer Routing（コンシューマルーティング）
 
 詳細な consumer routing は `docs/dev/agent-skill-boundaries.md` の `ci-test-performance Consumer Routing` セクションを参照する。
 
@@ -178,7 +178,7 @@ uv run pytest -n auto --dist loadscope
 | `test-runner` | VC / runtime artifact を検証し、lane 分類の検証をする |
 | `pr-reviewer` | CI 関連 PR で skill output / runtime evidence を確認する |
 
-## hook による advisory suggestion（Out of Scope）（→ #1080）
+## hook による advisory suggestion（スコープ外）（→ #1080）
 
 hook 実装（`FileChanged` / `PreToolUse` による `ci-test-performance` の自動サジェスト）は本 Issue スコープ外とし、#1080 で対応する。
 

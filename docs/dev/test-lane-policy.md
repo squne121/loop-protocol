@@ -114,12 +114,12 @@ ci_test_lane_policy_v1:
 2. **レビュー時**: CI 関連 PR で `CI_TEST_PERFORMANCE_DECISION_V1` の証跡を確認する時
 3. **テスト設計時**: 新しいテストがどのレーンに属するかを判断する時
 
-### hook による advisory suggestion（Out of Scope）（→ #1080）
+### hook による advisory suggestion（スコープ外）（→ #1080）
 
 hook による CI skill suggestion の実装は本 Issue スコープ外とし、#1080 で対応する。
 将来的には `FileChanged` / `PreToolUse` hook から `additionalContext` を返して AI エージェントに通知する設計を予定している。
 
-### consumer routing
+### consumer routing（コンシューマ別ルーティング）
 
 各 consumer が `ci-test-performance` Skill をどのように使うかの設計は `docs/dev/agent-skill-boundaries.md` の `ci-test-performance consumer routing` セクションを参照する。
 
