@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -43,8 +44,11 @@ for f in files:
     try:
         with open(f, encoding="utf-8") as fh:
             for i, line in enumerate(fh, 1):
-                if len(line.rstrip("\n")) > 120:
-                    diags.append({"filename": f, "code": "E501", "location": {"row": i}})
+                n = len(line.rstrip("\n"))
+                if n > 120:
+                    diags.append({"filename": f, "code": "E501",
+                                  "message": "Line too long (%d > 120)" % n,
+                                  "location": {"row": i, "column": 121}})
     except OSError:
         pass
 if diags:
@@ -165,9 +169,13 @@ def run_guard(
     ]
     for s in extra_scopes:
         argv += ["--scope", s]
+    env = dict(os.environ)
     if ruff_cmd is not None:
-        argv += ["--ruff-cmd", ruff_cmd]
-    res = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
+        # Test-only Ruff override is gated behind two explicit env vars; the
+        # production CLI exposes no --ruff-cmd flag (gate cannot be forged).
+        env["E501_GUARD_ALLOW_TEST_RUFF"] = "1"
+        env["E501_GUARD_RUFF_CMD"] = ruff_cmd
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False, env=env)
     report = json.loads(res.stdout) if res.stdout.strip() else {}
     return res.returncode, report, res.stderr
 
@@ -187,11 +195,48 @@ def test_parse_name_status_z_handles_rename_and_spaces():
     ]
 
 
-def test_suppression_comment_keys_distinguishes_blanket_from_coded():
-    coded = GUARD_MOD.suppression_comment_keys(b"x = 1  # noqa: E501\n")
-    blanket = GUARD_MOD.suppression_comment_keys(b"x = 1  # noqa\n")
-    assert coded == {"# noqa:E501": 1}
-    assert blanket == {"# noqa:*": 1}
+def test_suppression_form_signals_distinguishes_blanket_from_coded():
+    coded = GUARD_MOD.suppression_form_signals(b"x = 1  # noqa: E501\n")
+    blanket = GUARD_MOD.suppression_form_signals(b"x = 1  # noqa\n")
+    assert coded["# noqa"] == {"blanket": False, "codes": {"E501"}}
+    assert blanket["# noqa"] == {"blanket": True, "codes": set()}
+
+
+def test_suppression_widening_is_semantic_set_compare():
+    base = GUARD_MOD.suppression_form_signals(b"x = 1  # noqa: E501, F401\n")
+    reordered = GUARD_MOD.suppression_form_signals(b"x = 1  # noqa: F401, E501\n")
+    widened = GUARD_MOD.suppression_form_signals(b"x = 1  # noqa: E501, F401, B008\n")
+    assert GUARD_MOD.suppression_widening(base, reordered) == []  # reorder is not widening
+    assert GUARD_MOD.suppression_widening(base, widened) == [
+        {"form": "# noqa", "widening": "codes_added", "codes": ["B008"]}
+    ]
+    assert GUARD_MOD.suppression_widening(widened, base) == []  # narrowing is not widening
+
+
+def test_resolve_ruff_cmd_is_production_locked(monkeypatch):
+    monkeypatch.delenv("E501_GUARD_ALLOW_TEST_RUFF", raising=False)
+    monkeypatch.delenv("E501_GUARD_RUFF_CMD", raising=False)
+    assert GUARD_MOD.resolve_ruff_cmd() == (GUARD_MOD.DEFAULT_RUFF_CMD, "default")
+    # Override env alone (without the allow flag) is ignored -> still default.
+    monkeypatch.setenv("E501_GUARD_RUFF_CMD", "python evil.py")
+    assert GUARD_MOD.resolve_ruff_cmd() == (GUARD_MOD.DEFAULT_RUFF_CMD, "default")
+    # Both gates set -> override honoured, flagged as test override.
+    monkeypatch.setenv("E501_GUARD_ALLOW_TEST_RUFF", "1")
+    cmd, source = GUARD_MOD.resolve_ruff_cmd()
+    assert cmd == ("python", "evil.py")
+    assert source == "env_test_override"
+
+
+def test_verify_diff_has_no_ruff_cmd_flag():
+    # The production CLI must NOT expose a Ruff override surface (forgery vector).
+    res = subprocess.run(
+        [sys.executable, str(GUARD), "verify-diff", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "--ruff-cmd" not in res.stdout
 
 
 # --------------------------------------------------------------------------- #
@@ -405,6 +450,8 @@ def test_suppression_scan_detects_config_widening(tmp_path):
     _, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
     assert report["checks"]["suppression"]["ok"] is False
     assert report["checks"]["suppression"]["config_widened"]
+    assert report["checks"]["suppression"]["config_files_changed"]  # any config change is rejected
+    assert report["checks"]["suppression"]["config_scan_mode"] == "partial_static_scan"
 
     # per-file-ignores added for E501.
     repo = init_repo(tmp_path / "cfg2")
@@ -526,13 +573,16 @@ def test_report_v1_schema_complete(tmp_path):
     write(repo, "pkg/a.py", SHORT_LINE)
     head = commit_all(repo, "head")
 
+    env = dict(os.environ)
+    env["E501_GUARD_ALLOW_TEST_RUFF"] = "1"
+    env["E501_GUARD_RUFF_CMD"] = fake
     argv = [
         sys.executable, str(GUARD), "verify-diff",
         "--repo-root", str(repo), "--base-ref", base, "--head-ref", head,
-        "--scope", "pkg", "--ruff-cmd", fake,
+        "--scope", "pkg",
     ]
-    res = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
-    assert res.returncode == GUARD_MOD.EXIT_PASS
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False, env=env)
+    assert res.returncode == GUARD_MOD.EXIT_PASS, res.stdout + res.stderr
     # stdout must be JSON only.
     assert res.stdout.lstrip().startswith("{")
     report = json.loads(res.stdout)
@@ -542,13 +592,22 @@ def test_report_v1_schema_complete(tmp_path):
     assert report["python_version"]
     assert report["ruff"]["version"]
     assert report["ruff"]["argv"]
-    for key in ("base_sha", "head_sha", "merge_base_sha"):
+    assert report["ruff"]["cmd_source"] == "env_test_override"
+    assert report["ruff"]["non_default_ruff_cmd"] is True
+    assert report["ruff"]["trusted"] is True
+    for key in ("base_sha", "head_sha", "merge_base_sha", "baseline_sha"):
         assert len(report["refs"][key]) == 40
+    assert report["refs"]["baseline_sha"] == report["refs"]["merge_base_sha"]
     assert report["uv_lock_sha256"].startswith("sha256:")  # read from the guard's own repo
     # Sorted paths.
     cf = [c["path"] for c in report["changed_files"]]
     assert cf == sorted(cf)
-    assert list(report["diagnostics"]["base"]) == sorted(report["diagnostics"]["base"])
+    base_pf = report["diagnostics"]["base"]["per_file"]
+    assert list(base_pf) == sorted(base_pf)
+    assert "items" in report["diagnostics"]["head"]
+    assert [b["path"] for b in report["blobs"]] == sorted(b["path"] for b in report["blobs"])
+    for b in report["blobs"]:
+        assert b["head_blob"] and len(b["head_blob"]) == 40
     assert "ratchet" in report["checks"]
     assert report["decision"] == "pass"
 
@@ -627,3 +686,61 @@ def test_guard_files_clean_under_ruff_ef():
         check=False,
     )
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Review hardening (PR #1148 adversarial review) -- scope canonicalisation,
+# baseline clarity, audit-grade diagnostics.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bad", [".", "..", "/abs", "pkg/../escape", "a\\b", ""])
+def test_scope_validation_rejects_unsafe_inputs(tmp_path, bad):
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / ("sv" + str(abs(hash(bad)))))
+    write(repo, "pkg/a.py", "x = 1\n")
+    base = commit_all(repo, "base")
+    write(repo, "pkg/a.py", "x = 1  \n")
+    head = commit_all(repo, "head")
+    code, report, _ = run_guard(repo, base, head, scope=bad, ruff_cmd=fake)
+    assert code == GUARD_MOD.EXIT_TOOL_ERROR
+    assert "tool_error" in report["failures"]
+    assert "scope" in report.get("error", "")
+
+
+def test_baseline_sha_is_merge_base_not_base_ref(tmp_path):
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "baseline")
+    write(repo, "pkg/a.py", "x = 1\n")
+    fork = commit_all(repo, "fork")
+    _git(repo, "branch", "feature")
+    # base branch advances past the fork point.
+    write(repo, "pkg/a.py", "x = 1  # base advances\n")
+    base_tip = commit_all(repo, "base-advance")
+    _git(repo, "checkout", "-q", "feature")
+    write(repo, "pkg/a.py", "x = 1  \n")  # whitespace-only, AST equal to fork
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base_tip, head, ruff_cmd=fake)
+    assert report["refs"]["base_sha"] == base_tip
+    assert report["refs"]["merge_base_sha"] == fork
+    assert report["refs"]["baseline_sha"] == fork
+    assert report["refs"]["base_ref_is_not_baseline"] is True
+    assert code == GUARD_MOD.EXIT_PASS
+
+
+def test_report_includes_ruff_diagnostic_detail(tmp_path):
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "diagdetail")
+    write(repo, "pkg/a.py", LONG_LINE)
+    base = commit_all(repo, "base")
+    write(repo, "pkg/a.py", LONG_LINE2)  # still 1 long line, AST equal, flat ratchet
+    head = commit_all(repo, "head")
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    assert code == GUARD_MOD.EXIT_PASS
+    items = report["diagnostics"]["head"]["items"]
+    assert len(items) == 1
+    assert items[0]["code"] == "E501"
+    assert items[0]["row"] == 1
+    assert items[0]["column"] == 121
+    assert "120" in items[0]["message"]

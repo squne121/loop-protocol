@@ -3,17 +3,19 @@
 
 `verify-diff` is the single, fail-closed pass/fail entrypoint that enforces the
 trust boundary required before any area-scoped E501 cleanup child PR is allowed
-to land. It resolves base/head refs to immutable SHAs, computes the merge-base,
-builds a NUL-delimited changed-file manifest (no ``splitlines``), restricts the
-in-scope Python changes to status ``M`` only, verifies AST equivalence between
-base and head, scans for newly added or widened lint suppressions, runs Ruff in
-an isolated, pinned configuration on both sides, ratchets the E501 counts, and
-emits a single versioned machine-readable report (``e501-migration-guard/v1``)
-to stdout. Any error along the way is treated as a fail-closed failure.
+to land. It resolves base/head refs to immutable SHAs, computes the merge-base
+(the canonical baseline), builds a NUL-delimited changed-file manifest (no
+``splitlines``), restricts the in-scope Python changes to status ``M`` only,
+verifies AST equivalence between base and head, scans for newly added or widened
+lint suppressions, runs Ruff in an isolated, pinned configuration on both sides,
+ratchets the E501 counts, and emits a single versioned machine-readable report
+(``e501-migration-guard/v1``) to stdout. Any error along the way is treated as a
+fail-closed failure.
 
-Internal steps are also exposed as helper subcommands for inspection, but the
-canonical pass/fail decision is only ever produced by a single ``verify-diff``
-run.
+The Ruff toolchain is locked: production has no way to substitute the Ruff
+binary. A test-only override exists but is gated behind two explicit environment
+variables and surfaced in the report (``ruff.cmd_source`` / ``non_default_ruff_cmd``),
+so a CI run or follow-up PR cannot forge a passing gate.
 """
 
 from __future__ import annotations
@@ -24,16 +26,17 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
 import tokenize
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-GUARD_VERSION = "1.0.0"
+GUARD_VERSION = "1.1.0"
 REPORT_SCHEMA = "e501-migration-guard/v1"
 
 # The guard's own project root (where ``uv.lock`` lives). Ruff is launched via
@@ -68,7 +71,7 @@ RUFF_FIXED_ARGS = (
     "--output-format",
     "json",
 )
-# Suppression-related flags that must never be forwarded to the guard's Ruff run.
+# Suppression-related flags that must never appear in the guard's Ruff command.
 FORBIDDEN_RUFF_CLI_FLAGS = (
     "--config",
     "--ignore",
@@ -78,6 +81,11 @@ FORBIDDEN_RUFF_CLI_FLAGS = (
     "--add-noqa",
 )
 
+# Test-only Ruff override. Both env vars are required; production never sets them,
+# so the gate cannot be forged from the CLI surface (there is no --ruff-cmd flag).
+TEST_RUFF_ALLOW_ENV = "E501_GUARD_ALLOW_TEST_RUFF"
+TEST_RUFF_CMD_ENV = "E501_GUARD_RUFF_CMD"
+
 SUBPROCESS_TIMEOUT = 120
 STDERR_CAP = 8192
 
@@ -85,6 +93,8 @@ EXIT_PASS = 0
 EXIT_POLICY_FAIL = 1
 EXIT_USAGE = 2
 EXIT_TOOL_ERROR = 3
+
+_CODE_RE = re.compile(r"[A-Z]+[0-9]+")
 
 
 class GuardError(Exception):
@@ -130,12 +140,76 @@ def _git_ok(repo_root: str, args: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Ruff command resolution (production-locked, test-gated)
+# --------------------------------------------------------------------------- #
+
+
+def resolve_ruff_cmd() -> tuple[tuple[str, ...], str]:
+    """Return (ruff_cmd, source). Non-default is only possible when BOTH the
+    allow flag and the override env are set -- a condition production never meets."""
+    allow = os.environ.get(TEST_RUFF_ALLOW_ENV) == "1"
+    override = os.environ.get(TEST_RUFF_CMD_ENV)
+    if allow and override:
+        return tuple(shlex.split(override)), "env_test_override"
+    return DEFAULT_RUFF_CMD, "default"
+
+
+# --------------------------------------------------------------------------- #
+# Path / scope canonicalisation
+# --------------------------------------------------------------------------- #
+
+
+def normalize_scope(raw: str) -> str:
+    """Canonicalise a --scope prefix, rejecting unsafe forms (fail-closed)."""
+    if raw is None or raw == "" or "\x00" in raw or "\\" in raw:
+        raise GuardError(f"invalid --scope value (empty/backslash/NUL): {raw!r}")
+    p = PurePosixPath(raw)
+    if p.is_absolute() or ".." in p.parts:
+        raise GuardError(f"invalid --scope value (absolute or parent traversal): {raw!r}")
+    norm = p.as_posix()
+    if norm in (".", ""):
+        raise GuardError(f"invalid --scope value (empty or current dir): {raw!r}")
+    return norm
+
+
+def canon_path(path: str) -> str:
+    """Canonicalise a git path for comparison (collapse ``//`` and ``/./``)."""
+    return PurePosixPath(path).as_posix()
+
+
+GUARD_SELF_CANON = frozenset(canon_path(p) for p in GUARD_SELF_PATHS)
+
+
+def _is_guard_self(path: str) -> bool:
+    return canon_path(path) in GUARD_SELF_CANON
+
+
+def _in_scope(path: str, scope_prefixes: tuple[str, ...]) -> bool:
+    cp = canon_path(path)
+    for prefix in scope_prefixes:
+        if cp == prefix or cp.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def scope_overlaps(scopes: tuple[str, ...]) -> list[str]:
+    findings: list[str] = []
+    uniq = list(dict.fromkeys(scopes))
+    if len(uniq) != len(scopes):
+        findings.append("duplicate scope prefixes provided")
+    for a in uniq:
+        for b in uniq:
+            if a != b and b.startswith(a + "/"):
+                findings.append(f"scope {b!r} is nested under {a!r}")
+    return findings
+
+
+# --------------------------------------------------------------------------- #
 # Git plumbing helpers
 # --------------------------------------------------------------------------- #
 
 
 def resolve_sha(repo_root: str, ref: str) -> str:
-    """Resolve a ref to an immutable 40-hex commit SHA. Fail-closed on error."""
     out = _git_ok(repo_root, ["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
     if len(out) != 40 or any(c not in "0123456789abcdef" for c in out):
         raise GuardError(f"ref {ref!r} did not resolve to a commit SHA: {out!r}")
@@ -165,11 +239,7 @@ class ChangedEntry:
 
 
 def parse_name_status_z(data: bytes) -> list[ChangedEntry]:
-    """Parse ``git diff --name-status -z`` output without ``splitlines``.
-
-    NUL-delimited records: ``STATUS\\0PATH\\0`` for ordinary changes and
-    ``R<score>\\0OLD\\0NEW\\0`` / ``C<score>\\0OLD\\0NEW\\0`` for rename/copy.
-    """
+    """Parse ``git diff --name-status -z`` output without ``splitlines``."""
     tokens = data.split(b"\x00")
     entries: list[ChangedEntry] = []
     i = 0
@@ -200,15 +270,7 @@ def parse_name_status_z(data: bytes) -> list[ChangedEntry]:
 def changed_manifest(repo_root: str, merge_base_sha: str, head_sha: str) -> list[ChangedEntry]:
     res = _git(
         repo_root,
-        [
-            "diff",
-            "--name-status",
-            "--find-renames",
-            "--find-copies",
-            "-z",
-            merge_base_sha,
-            head_sha,
-        ],
+        ["diff", "--name-status", "--find-renames", "--find-copies", "-z", merge_base_sha, head_sha],
     )
     if res.returncode != 0:
         raise GuardError(
@@ -225,13 +287,17 @@ def blob_at(repo_root: str, sha: str, path: str) -> bytes:
     return res.stdout
 
 
+def blob_id_at(repo_root: str, sha: str, path: str) -> str | None:
+    res = _git(repo_root, ["rev-parse", f"{sha}:{path}"])
+    if res.returncode != 0:
+        return None
+    return res.stdout.decode("utf-8", "replace").strip()
+
+
 def file_mode_at(repo_root: str, sha: str, path: str) -> str | None:
-    """Return the git mode for ``path`` at ``sha`` (None if absent)."""
-    out = _git_ok(repo_root, ["ls-tree", sha, "--", path])
-    out = out.strip()
+    out = _git_ok(repo_root, ["ls-tree", sha, "--", path]).strip()
     if not out:
         return None
-    # Format: "<mode> <type> <objsha>\t<path>"
     return out.split(" ", 1)[0].strip()
 
 
@@ -240,33 +306,20 @@ def file_mode_at(repo_root: str, sha: str, path: str) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _in_scope(path: str, scope_prefixes: tuple[str, ...]) -> bool:
-    for prefix in scope_prefixes:
-        norm = prefix.rstrip("/")
-        if path == norm or path.startswith(norm + "/"):
-            return True
-    return False
-
-
-def _is_guard_self(path: str) -> bool:
-    return path in GUARD_SELF_PATHS
-
-
 @dataclass
 class StatusReport:
     ok: bool
     violations: list[dict[str, str]]
-    target_files: list[str]  # in-scope, modified .py files subject to deep checks
+    target_files: list[str]
 
 
-def check_status_scope(
-    entries: list[ChangedEntry], scope_prefixes: tuple[str, ...]
-) -> StatusReport:
+def check_status_scope(entries: list[ChangedEntry], scope_prefixes: tuple[str, ...]) -> StatusReport:
     violations: list[dict[str, str]] = []
     targets: list[str] = []
     for e in entries:
-        path = e.path
-        if _is_guard_self(path) or (e.old_path is not None and _is_guard_self(e.old_path)):
+        path = canon_path(e.path)
+        old_is_self = e.old_path is not None and _is_guard_self(e.old_path)
+        if _is_guard_self(path) or old_is_self:
             violations.append({"path": path, "reason": "guard_self_change", "status": e.status_field})
             continue
         if not _in_scope(path, scope_prefixes):
@@ -305,7 +358,6 @@ def ast_fingerprint(data: bytes, label: str) -> str:
         tree = ast.parse(src, filename=label, type_comments=True)
         compile(src, label, "exec", dont_inherit=True)
     except (SyntaxError, ValueError) as exc:
-        # ValueError covers e.g. null bytes / source that parses but won't compile.
         raise GuardError(f"AST/compile error for {label}: {exc}") from exc
     return ast.dump(tree, include_attributes=False)
 
@@ -314,7 +366,6 @@ def ast_fingerprint(data: bytes, label: str) -> str:
 class AstEquivResult:
     path: str
     equal: bool
-    error: str | None = None
 
 
 def check_ast_equiv(
@@ -323,7 +374,6 @@ def check_ast_equiv(
     results: list[AstEquivResult] = []
     ok = True
     for path in targets:
-        # Reject symlinks / non-regular git modes on either side.
         for sha in (merge_base_sha, head_sha):
             mode = file_mode_at(repo_root, sha, path)
             if mode is None:
@@ -339,12 +389,10 @@ def check_ast_equiv(
 
 
 # --------------------------------------------------------------------------- #
-# Suppression scan (comment + config)
+# Suppression scan (semantic comment compare + config)
 # --------------------------------------------------------------------------- #
 
-# Comment suppression forms recognised by current Ruff. Each maps to a stable
-# normalized key; ``codes`` captures the specific selectors (empty == blanket).
-COMMENT_SUPPRESSION_PREFIXES = (
+SUPPRESSION_FORMS = (
     "# noqa",
     "# ruff: noqa",
     "# flake8: noqa",
@@ -355,47 +403,44 @@ COMMENT_SUPPRESSION_PREFIXES = (
 )
 
 
-def _normalize_comment(comment: str) -> str:
-    return " ".join(comment.strip().split())
-
-
-def suppression_comment_keys(data: bytes) -> dict[str, int]:
-    """Return a multiset (key -> count) of suppression comments in ``data``.
-
-    A blanket form (no explicit codes) normalizes to ``"<form>:*"`` so that any
-    transition from code-scoped to blanket shows up as a new key, i.e. widening.
-    """
-    counts: dict[str, int] = {}
+def suppression_form_signals(data: bytes) -> dict[str, dict[str, Any]]:
+    """Aggregate, per suppression form, whether a blanket form appears and the
+    SET of explicit selector codes. Semantic (order/whitespace/case insensitive)."""
+    sig: dict[str, dict[str, Any]] = {f: {"blanket": False, "codes": set()} for f in SUPPRESSION_FORMS}
     try:
-        readline = io.BytesIO(data).readline
-        for tok in tokenize.tokenize(readline):
+        for tok in tokenize.tokenize(io.BytesIO(data).readline):
             if tok.type != tokenize.COMMENT:
                 continue
-            norm = _normalize_comment(tok.string)
+            norm = " ".join(tok.string.split())
             low = norm.lower()
-            for prefix in COMMENT_SUPPRESSION_PREFIXES:
-                if low.startswith(prefix):
-                    remainder = norm[len(prefix):].lstrip()
-                    # Strip a leading ':' for "# noqa: E501".
-                    if remainder.startswith(":"):
-                        remainder = remainder[1:].lstrip()
-                    codes = remainder if remainder else "*"
-                    key = f"{prefix}:{codes}"
-                    counts[key] = counts.get(key, 0) + 1
+            for form in SUPPRESSION_FORMS:
+                if low.startswith(form):
+                    codes = set(_CODE_RE.findall(norm[len(form):]))
+                    if codes:
+                        sig[form]["codes"] |= codes
+                    else:
+                        sig[form]["blanket"] = True
                     break
     except (tokenize.TokenError, SyntaxError, IndentationError) as exc:
         raise GuardError(f"could not tokenize for suppression scan: {exc}") from exc
-    return counts
+    return sig
 
 
-def _diff_counters(base: dict[str, int], head: dict[str, int]) -> list[str]:
-    """Return keys whose head count exceeds the base count (new / widened)."""
-    added: list[str] = []
-    for key, hc in head.items():
-        if hc > base.get(key, 0):
-            added.append(key)
-    added.sort()
-    return added
+def suppression_widening(
+    base_sig: dict[str, dict[str, Any]], head_sig: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return only semantic wideners: a blanket newly present, or codes added.
+    Reordering, whitespace-only changes, and narrowing are intentionally ignored."""
+    findings: list[dict[str, Any]] = []
+    for form in SUPPRESSION_FORMS:
+        b = base_sig[form]
+        h = head_sig[form]
+        if h["blanket"] and not b["blanket"]:
+            findings.append({"form": form, "widening": "blanket_added"})
+        new_codes = sorted(h["codes"] - b["codes"])
+        if new_codes:
+            findings.append({"form": form, "widening": "codes_added", "codes": new_codes})
+    return findings
 
 
 RUFF_CONFIG_BASENAMES = ("pyproject.toml", "ruff.toml", ".ruff.toml")
@@ -421,14 +466,7 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
-@dataclass
-class ConfigSuppression:
-    path: str
-    findings: list[str] = field(default_factory=list)
-
-
 def _extract_config_signals(table: dict[str, Any]) -> dict[str, Any]:
-    """Flatten the suppression-relevant keys from a ruff config table."""
     lint = table.get("lint", {}) if isinstance(table.get("lint"), dict) else {}
     pycodestyle = lint.get("pycodestyle", {}) if isinstance(lint.get("pycodestyle"), dict) else {}
     pfi = lint.get("per-file-ignores", {})
@@ -440,6 +478,10 @@ def _extract_config_signals(table: dict[str, Any]) -> dict[str, Any]:
         "extend-per-file-ignores": epfi if isinstance(epfi, dict) else {},
         "exclude": set(_as_list(table.get("exclude"))),
         "extend-exclude": set(_as_list(table.get("extend-exclude"))),
+        "include": set(_as_list(table.get("include"))),
+        "extend-include": set(_as_list(table.get("extend-include"))),
+        "force-exclude": table.get("force-exclude"),
+        "extend": table.get("extend"),
         "line-length": table.get("line-length"),
         "max-line-length": pycodestyle.get("max-line-length"),
         "ignore-overlong-task-comments": pycodestyle.get("ignore-overlong-task-comments"),
@@ -449,7 +491,7 @@ def _extract_config_signals(table: dict[str, Any]) -> dict[str, Any]:
 
 def _config_widening(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
     findings: list[str] = []
-    for key in ("ignore", "extend-ignore", "exclude", "extend-exclude", "task-tags"):
+    for key in ("ignore", "extend-ignore", "exclude", "extend-exclude", "include", "extend-include", "task-tags"):
         new = sorted(head[key] - base[key])
         if new:
             findings.append(f"{key} added: {new}")
@@ -457,8 +499,7 @@ def _config_widening(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
         for pattern, codes in head[key].items():
             base_codes = set(_as_list(base[key].get(pattern)))
             head_codes = set(_as_list(codes))
-            new_codes = sorted(head_codes - base_codes)
-            if pattern not in base[key] or new_codes:
+            if pattern not in base[key] or head_codes - base_codes:
                 findings.append(f"{key} widened for {pattern}: {sorted(head_codes)}")
     for key in ("line-length", "max-line-length"):
         bv, hv = base[key], head[key]
@@ -466,62 +507,61 @@ def _config_widening(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
             findings.append(f"{key} increased: {bv} -> {hv}")
     if head["ignore-overlong-task-comments"] and not base["ignore-overlong-task-comments"]:
         findings.append("ignore-overlong-task-comments enabled")
+    if head["extend"] is not None and head["extend"] != base["extend"]:
+        findings.append(f"extend inheritance added/changed: {head['extend']!r}")
+    if head["force-exclude"] is not None and head["force-exclude"] != base["force-exclude"]:
+        findings.append(f"force-exclude changed: {head['force-exclude']!r}")
     return findings
 
 
 def scan_config_suppression(
     repo_root: str, merge_base_sha: str, head_sha: str, entries: list[ChangedEntry]
-) -> tuple[bool, list[dict[str, Any]]]:
-    """Compare ruff config semantics between base and head for changed config files."""
-    config_paths = {
-        e.path for e in entries if os.path.basename(e.path) in RUFF_CONFIG_BASENAMES
-    }
+) -> tuple[bool, list[dict[str, Any]], list[str]]:
+    config_paths = {canon_path(e.path) for e in entries if os.path.basename(e.path) in RUFF_CONFIG_BASENAMES}
     results: list[dict[str, Any]] = []
     ok = True
     for path in sorted(config_paths):
         basename = os.path.basename(path)
-        base_data = b""
-        head_data = b""
-        if file_mode_at(repo_root, merge_base_sha, path) is not None:
-            base_data = blob_at(repo_root, merge_base_sha, path)
-        if file_mode_at(repo_root, head_sha, path) is not None:
-            head_data = blob_at(repo_root, head_sha, path)
+        base_data = blob_at(repo_root, merge_base_sha, path) if file_mode_at(repo_root, merge_base_sha, path) else b""
+        head_data = blob_at(repo_root, head_sha, path) if file_mode_at(repo_root, head_sha, path) else b""
         try:
             base_table = _ruff_table(_toml_load(base_data), basename) if base_data else {}
             head_table = _ruff_table(_toml_load(head_data), basename) if head_data else {}
         except Exception as exc:  # any TOML/parse error is fail-closed
             raise GuardError(f"could not parse ruff config {path}: {exc}") from exc
-        findings = _config_widening(
-            _extract_config_signals(base_table), _extract_config_signals(head_table)
-        )
+        findings = _config_widening(_extract_config_signals(base_table), _extract_config_signals(head_table))
         if findings:
             ok = False
             results.append({"path": path, "findings": findings})
-    return ok, results
+    # Any change to a Ruff config file is itself disallowed for cleanup PRs
+    # (defence in depth; status_scope also rejects it as out-of-scope/non-python).
+    changed_config = sorted(config_paths)
+    return ok and not changed_config, results, changed_config
 
 
 def scan_suppressions(
-    repo_root: str,
-    merge_base_sha: str,
-    head_sha: str,
-    targets: list[str],
-    entries: list[ChangedEntry],
+    repo_root: str, merge_base_sha: str, head_sha: str, targets: list[str], entries: list[ChangedEntry]
 ) -> dict[str, Any]:
     comment_added: list[dict[str, Any]] = []
     ok = True
     for path in targets:
-        base_counts = suppression_comment_keys(blob_at(repo_root, merge_base_sha, path))
-        head_counts = suppression_comment_keys(blob_at(repo_root, head_sha, path))
-        added = _diff_counters(base_counts, head_counts)
-        if added:
+        base_sig = suppression_form_signals(blob_at(repo_root, merge_base_sha, path))
+        head_sig = suppression_form_signals(blob_at(repo_root, head_sha, path))
+        wid = suppression_widening(base_sig, head_sig)
+        if wid:
             ok = False
-            comment_added.append({"path": path, "added": added})
-    config_ok, config_findings = scan_config_suppression(repo_root, merge_base_sha, head_sha, entries)
+            comment_added.append({"path": path, "widening": wid})
+    config_ok, config_findings, changed_config = scan_config_suppression(
+        repo_root, merge_base_sha, head_sha, entries
+    )
     ok = ok and config_ok
     return {
         "ok": ok,
         "comment_added": comment_added,
         "config_widened": config_findings,
+        "config_files_changed": changed_config,
+        "config_scan_mode": "partial_static_scan",
+        "comment_scan_mode": "semantic_set_compare",
     }
 
 
@@ -535,7 +575,6 @@ def _materialize_blobs(repo_root: str, sha: str, paths: list[str], dest: Path) -
     for path in paths:
         data = blob_at(repo_root, sha, path)
         target = (dest / path).resolve()
-        # path containment: never escape the temp dir.
         if not str(target).startswith(str(dest.resolve()) + os.sep):
             raise GuardError(f"refusing to materialize outside temp dir: {path}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -547,7 +586,9 @@ def _materialize_blobs(repo_root: str, sha: str, paths: list[str], dest: Path) -
 def _ruff_version(ruff_cmd: tuple[str, ...]) -> str:
     res = _run([*ruff_cmd, "--version"], cwd=str(GUARD_PROJECT_ROOT), timeout=SUBPROCESS_TIMEOUT)
     if res.returncode != 0:
-        raise GuardError(f"could not determine ruff version: {res.stderr.decode('utf-8', 'replace')[:STDERR_CAP]}")
+        raise GuardError(
+            f"could not determine ruff version: {res.stderr.decode('utf-8', 'replace')[:STDERR_CAP]}"
+        )
     return res.stdout.decode("utf-8", "replace").strip()
 
 
@@ -557,20 +598,14 @@ class RuffOutcome:
     per_file: dict[str, int]
     total: int
     argv: list[str]
+    diagnostics: list[dict[str, Any]]
 
 
-def run_ruff(
-    repo_root: str,
-    sha: str,
-    targets: list[str],
-    ruff_cmd: tuple[str, ...],
-    workdir: Path,
-) -> RuffOutcome:
+def run_ruff(repo_root: str, sha: str, targets: list[str], ruff_cmd: tuple[str, ...], workdir: Path) -> RuffOutcome:
     """Run the pinned, isolated Ruff over ``targets`` extracted at ``sha``.
 
     exit 0 = clean, exit 1 = diagnostics. Anything else (exit 2, timeout, JSON
-    decode failure) is a fail-closed tool error -- never silently "0 issues".
-    """
+    decode failure) is a fail-closed tool error -- never silently "0 issues"."""
     for flag in ruff_cmd:
         if flag in FORBIDDEN_RUFF_CLI_FLAGS:
             raise GuardError(f"forbidden ruff suppression flag in command: {flag}")
@@ -585,25 +620,36 @@ def run_ruff(
             f"{res.stderr.decode('utf-8', 'replace')[:STDERR_CAP]}"
         )
     per_file: dict[str, int] = {path: 0 for path in targets}
+    diagnostics: list[dict[str, Any]] = []
     if res.returncode == 1:
         try:
-            diagnostics = json.loads(res.stdout.decode("utf-8"))
+            raw = json.loads(res.stdout.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise GuardError(f"could not decode ruff JSON output: {exc}") from exc
         rel_by_abs = {str(p): path for p, path in zip(materialized, targets)}
-        for diag in diagnostics:
+        for diag in raw:
             filename = diag.get("filename", "")
             resolved = os.path.realpath(filename)
             rel = rel_by_abs.get(resolved) or rel_by_abs.get(filename)
             if rel is None:
-                # Map by suffix as a last resort, fail-closed if ambiguous.
                 matches = [r for a, r in rel_by_abs.items() if a.endswith(filename) or filename.endswith(r)]
                 if len(matches) != 1:
                     raise GuardError(f"could not map ruff diagnostic file {filename!r}")
                 rel = matches[0]
             per_file[rel] = per_file.get(rel, 0) + 1
+            loc = diag.get("location", {}) or {}
+            diagnostics.append(
+                {
+                    "path": rel,
+                    "code": diag.get("code"),
+                    "row": loc.get("row"),
+                    "column": loc.get("column"),
+                    "message": diag.get("message", ""),
+                }
+            )
+    diagnostics.sort(key=lambda d: (d["path"], d["row"] or 0, d["column"] or 0, d["code"] or ""))
     total = sum(per_file.values())
-    return RuffOutcome(exit_code=res.returncode, per_file=per_file, total=total, argv=argv)
+    return RuffOutcome(exit_code=res.returncode, per_file=per_file, total=total, argv=argv, diagnostics=diagnostics)
 
 
 # --------------------------------------------------------------------------- #
@@ -621,9 +667,7 @@ class RatchetResult:
     violations: list[str]
 
 
-def check_ratchet(
-    base: RuffOutcome, head: RuffOutcome, targets: list[str], mode: str
-) -> RatchetResult:
+def check_ratchet(base: RuffOutcome, head: RuffOutcome, targets: list[str], mode: str) -> RatchetResult:
     per_file: list[dict[str, Any]] = []
     violations: list[str] = []
     for path in targets:
@@ -668,15 +712,20 @@ def verify_diff(
     scope_prefixes: tuple[str, ...],
     mode: str,
     ruff_cmd: tuple[str, ...],
+    ruff_cmd_source: str,
 ) -> tuple[dict[str, Any], int]:
     """Run every check in order, fail-closed, and build the v1 report."""
     failures: list[str] = []
+    scope_prefixes = tuple(normalize_scope(s) for s in scope_prefixes)
+    trusted_ruff = ruff_cmd == DEFAULT_RUFF_CMD or ruff_cmd_source == "env_test_override"
+
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
         "guard_version": GUARD_VERSION,
         "python_version": ".".join(str(p) for p in sys.version_info[:3]),
         "mode": mode,
         "scope_prefixes": list(scope_prefixes),
+        "scope_overlaps": scope_overlaps(scope_prefixes),
     }
 
     base_sha = resolve_sha(repo_root, base_ref)
@@ -688,11 +737,13 @@ def verify_diff(
         "base_sha": base_sha,
         "head_sha": head_sha,
         "merge_base_sha": mb,
+        "baseline_sha": mb,
+        "base_ref_is_not_baseline": base_sha != mb,
     }
 
     entries = changed_manifest(repo_root, mb, head_sha)
     report["changed_files"] = sorted(
-        ({"path": e.path, "status": e.status_field} for e in entries),
+        ({"path": canon_path(e.path), "status": e.status_field} for e in entries),
         key=lambda d: d["path"],
     )
 
@@ -726,7 +777,12 @@ def verify_diff(
         "argv": head_ruff.argv,
         "base_exit": base_ruff.exit_code,
         "head_exit": head_ruff.exit_code,
+        "cmd_source": ruff_cmd_source,
+        "non_default_ruff_cmd": ruff_cmd != DEFAULT_RUFF_CMD,
+        "trusted": trusted_ruff,
     }
+    if not trusted_ruff:
+        failures.append("untrusted_ruff_cmd")
 
     ratchet = check_ratchet(base_ruff, head_ruff, targets, mode)
     report["checks"]["ratchet"] = {
@@ -741,9 +797,17 @@ def verify_diff(
         failures.append("ratchet")
 
     report["diagnostics"] = {
-        "base": dict(sorted(base_ruff.per_file.items())),
-        "head": dict(sorted(head_ruff.per_file.items())),
+        "base": {"per_file": dict(sorted(base_ruff.per_file.items())), "items": base_ruff.diagnostics},
+        "head": {"per_file": dict(sorted(head_ruff.per_file.items())), "items": head_ruff.diagnostics},
     }
+    report["blobs"] = [
+        {
+            "path": path,
+            "base_blob": blob_id_at(repo_root, mb, path),
+            "head_blob": blob_id_at(repo_root, head_sha, path),
+        }
+        for path in targets
+    ]
     report["uv_lock_sha256"] = _sha256_file(GUARD_PROJECT_ROOT / "uv.lock")
 
     report["decision"] = "pass" if not failures else "fail"
@@ -757,15 +821,8 @@ def verify_diff(
 
 
 def _emit(report: dict[str, Any]) -> None:
-    # stdout: JSON only. Human-facing logs go to stderr.
     sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=False, indent=2))
     sys.stdout.write("\n")
-
-
-def _parse_ruff_cmd(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return DEFAULT_RUFF_CMD
-    return tuple(shlex.split(value))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -777,12 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     vd.add_argument("--base-ref", required=True)
     vd.add_argument("--head-ref", required=True)
     vd.add_argument("--scope", action="append", required=True, help="in-scope path prefix (repeatable)")
-    vd.add_argument(
-        "--mode",
-        choices=("ratchet", "cleanup", "completion"),
-        default="ratchet",
-    )
-    vd.add_argument("--ruff-cmd", default=None, help="override ruff launcher (default: uv run --locked ruff)")
+    vd.add_argument("--mode", choices=("ratchet", "cleanup", "completion"), default="ratchet")
     return parser
 
 
@@ -793,16 +845,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unknown command {ns.command!r}")
         return EXIT_USAGE
     repo_root = os.path.abspath(ns.repo_root)
-    scope_prefixes = tuple(ns.scope)
-    ruff_cmd = _parse_ruff_cmd(ns.ruff_cmd)
+    ruff_cmd, ruff_cmd_source = resolve_ruff_cmd()
     try:
         report, exit_code = verify_diff(
             repo_root=repo_root,
             base_ref=ns.base_ref,
             head_ref=ns.head_ref,
-            scope_prefixes=scope_prefixes,
+            scope_prefixes=tuple(ns.scope),
             mode=ns.mode,
             ruff_cmd=ruff_cmd,
+            ruff_cmd_source=ruff_cmd_source,
         )
     except GuardError as exc:
         error_report = {
