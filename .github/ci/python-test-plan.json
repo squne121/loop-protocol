@@ -30,7 +30,7 @@
   ],
   "xdist": {
     "workers": 4,
-    "dist": "worksteal"
+    "dist": "loadscope"
   },
   "parallel_exclude": [
     ".claude/hooks/tests/test_session_manifest_debounce.py"

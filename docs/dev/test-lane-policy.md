@@ -46,7 +46,7 @@ ci_test_lane_policy_v1:
       description: "Python ユニットテスト。pytest による単体・統合テスト。Node-backed hook tests は除く。"
       tools:
         - "uv run pytest $(python3 scripts/ci/python_test_plan.py --emit run-argv --mode parallel)（python-test-plan SSOT 由来）"
-        - "uv run pytest -n auto --dist worksteal（python-test-plan の xdist 設定）"
+        - "uv run pytest -n 4 --dist loadscope（python-test-plan の固定 worker + scheduler 設定）"
       characteristics:
         - 実行時間: 2-5分（xdist 並列化で短縮）
         - 外部依存: なし

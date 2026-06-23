@@ -290,13 +290,13 @@ def test_cli_json_format_round_trips():
     proc = _run_cli("--emit", "run-argv", "--mode", "parallel", "--format", "json")
     assert proc.returncode == 0
     data = json.loads(proc.stdout)
-    # Real SSOT plan uses a fixed worker count (AC4).
-    assert data[:4] == ["-n", "4", "--dist", "worksteal"]
+    # Real SSOT plan uses a fixed worker count + loadscope scheduler (AC4).
+    assert data[:4] == ["-n", "4", "--dist", "loadscope"]
 
 
 def test_cli_emit_workers_and_scheduler():
     assert _run_cli("--emit", "workers", "--format", "lines").stdout.strip() == "4"
-    assert _run_cli("--emit", "scheduler", "--format", "lines").stdout.strip() == "worksteal"
+    assert _run_cli("--emit", "scheduler", "--format", "lines").stdout.strip() == "loadscope"
 
 
 def test_cli_check_paths_passes_on_real_plan():
