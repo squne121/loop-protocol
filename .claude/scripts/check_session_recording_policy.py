@@ -117,7 +117,10 @@ def check_source_of_truth(data: dict) -> Tuple[bool, str]:
         missing.append("manifest_schema")
     if missing:
         return False, f"source_of_truth missing keys: {missing}"
-    return True, f"source_of_truth has secret_policy={sot['secret_policy']!r} and manifest_schema={sot['manifest_schema']!r}"
+    return True, (
+        f"source_of_truth has secret_policy={sot['secret_policy']!r}"
+        f" and manifest_schema={sot['manifest_schema']!r}"
+    )
 
 
 def check_taxonomy_public_transcript(data: dict) -> Tuple[bool, str]:
@@ -187,7 +190,10 @@ def check_public_surface_exactness(data: dict) -> Tuple[bool, str]:
     if manifest.get("body_allowed") is not False:
         return False, f"agent_session_manifest.body_allowed={manifest.get('body_allowed')!r} (expected false)"
     if manifest.get("opaque_ref_allowed") is not True:
-        return False, f"agent_session_manifest.opaque_ref_allowed={manifest.get('opaque_ref_allowed')!r} (expected true)"
+        return False, (
+            f"agent_session_manifest.opaque_ref_allowed={manifest.get('opaque_ref_allowed')!r}"
+            " (expected true)"
+        )
 
     allowed_refs = manifest.get("allowed_refs")
     if not isinstance(allowed_refs, list) or "artifact_digest" not in allowed_refs:
@@ -246,7 +252,10 @@ def check_fail_closed_on_unknown_visibility(data: dict) -> Tuple[bool, str]:
     av = cr.get("allowed_visibility", [])
     if "private_verified" not in (av if isinstance(av, list) else []):
         return False, f"checkpoint_remote.allowed_visibility does not include 'private_verified': {av!r}"
-    return True, "checkpoint_remote: fail_closed_on_unknown_visibility=true, allowed_visibility includes private_verified"
+    return True, (
+        "checkpoint_remote: fail_closed_on_unknown_visibility=true,"
+        " allowed_visibility includes private_verified"
+    )
 
 
 def check_global_safety_flags(data: dict) -> Tuple[bool, str]:
