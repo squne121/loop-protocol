@@ -80,32 +80,32 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `uv_python_install` | `uv python install` | python-test / node-backed-hook-tests |
 | `uv_sync` | `uv sync --locked --group dev` | python-test / node-backed-hook-tests |
 | `ruff_check` | `uv run --locked ruff check --select E,F .claude/scripts scripts schemas .claude/skills` | python-test |
-| `pytest_skills` | pytest（skills 群 14 ステップ合計の stable phase_id） | python-test |
+| `pytest_parallel` | pytest（python-test-plan SSOT を xdist 並列実行する step `pytest_parallel`） | python-test |
+| `pytest_serial` | pytest（plan `parallel_exclude` を `-n 0` で実行する serial lane step `pytest_serial`） | python-test |
+| `codex_execpolicy` | codex execpolicy matrix + `tests/codex/`（専用 step `codex_execpolicy_matrix`） | python-test |
 | `pytest_node_backed_hooks` | Node-backed hook test nodeid 2 件 | node-backed-hook-tests |
 | `actionlint_install` | actionlint バイナリのダウンロード・インストール | actionlint |
 | `actionlint` | `actionlint` | actionlint |
 
 ### python-test の step_id と phase_id の関係
 
-python-test job では pytest ステップが複数あり、各ステップの `step_id` は granular（例: `pytest_edit_issue_tests`, `pytest_create_issue_tests` 等）だが、
-`phase_id` は全て `pytest_skills` に統一されている。これにより #896 以降の比較で pytest 群全体の所要時間を単一 phase_id で集計できる。
+python-test job の pytest は #1064 で `.github/ci/python-test-plan.json`（python-test-plan SSOT）を `scripts/ci/python_test_plan.py` loader 経由で消費する。実行は 3 つの識別可能な step に分かれ、phase_id も**それぞれ別**にすることで before/after の wall-clock 比較対象を一意にする（旧 `pytest_skills` 単一 phase は parallel/serial/codex を混在させ比較を曖昧にしていたため #1064 review で分離）。
 
-| step_id（granular） | phase_id（stable） |
-|---|---|
-| `pytest_edit_issue_tests` | `pytest_skills` |
-| `pytest_create_issue_tests` | `pytest_skills` |
-| `pytest_create_issue_scripts` | `pytest_skills` |
-| `pytest_ssot_discovery` | `pytest_skills` |
-| `pytest_hook_tests` | `pytest_skills` |
-| `pytest_issue_contract_review_scripts` | `pytest_skills` |
-| `pytest_issue_contract_review_tests` | `pytest_skills` |
-| `pytest_pr_review_judge` | `pytest_skills` |
-| `pytest_open_pr` | `pytest_skills` |
-| `pytest_impl_review_loop` | `pytest_skills` |
-| `pytest_review_issue` | `pytest_skills` |
-| `pytest_issue_refinement_loop` | `pytest_skills` |
-| `pytest_schemas` | `pytest_skills` |
-| `pytest_context_mode` | `pytest_skills` |
+| step_id | phase_id | 備考 |
+|---|---|---|
+| `pytest_parallel` | `pytest_parallel` | python-test-plan SSOT 由来の xdist 並列 step（固定 worker `-n 4`） |
+| `pytest_serial` | `pytest_serial` | plan `parallel_exclude` を `-n 0` で実行する serial lane（timing-sensitive） |
+| `codex_execpolicy_matrix` | `codex_execpolicy` | codex execpolicy matrix + `tests/codex/`（専用 step。plan `targets` には含めない） |
+
+#### python-test 性能比較式（before/after 一意化）
+
+pytest 本体の wall-clock は parallel と serial lane の合算で定義する。codex（`codex_execpolicy`）は pytest ではないため合算に含めない。
+
+```text
+python_pytest_total_ms = pytest_parallel_ms + pytest_serial_ms
+```
+
+#1059 の最終 child が要求する before/after 比較は `python_pytest_total_ms` を測定対象とし、`docs/dev/ci-runtime-baseline-1064.md` の base/head 各 run でこの派生値を算出する。
 
 ### node-backed-hook-tests job の step_id と phase_id の関係
 
