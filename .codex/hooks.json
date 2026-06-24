@@ -25,6 +25,12 @@
           },
           {
             "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/worktree_scope_guard.py\"",
+            "timeout": 20,
+            "statusMessage": "Checking worktree cleanup scope policy (shared core)"
+          },
+          {
+            "type": "command",
             "command": "rtk pnpm exec node \"$(git rev-parse --show-toplevel)/scripts/check-codex-agents.mjs\" --hook-pretool",
             "timeout": 30,
             "statusMessage": "Checking LOOP_PROTOCOL Bash guardrail"

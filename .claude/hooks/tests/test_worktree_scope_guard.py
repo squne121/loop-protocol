@@ -1442,3 +1442,483 @@ def test_cleanup_git_dash_c_worktree_remove_denied(tmp_path):
     }
     r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
     assert r.returncode == 2, f"git -C worktree remove must deny; stderr={r.stderr}"
+
+
+# =============================================================================
+# Issue #1137: real-hook-chain integration — agent-ops allow + one-shot V3
+# =============================================================================
+
+import importlib.util as _ilu  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_AGENT_OPS = REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS) not in _sys.path:
+    _sys.path.insert(0, str(_AGENT_OPS))
+
+import cleanup_contract_v3 as _cc3  # noqa: E402
+
+
+def _bash_payload(command: str, cwd: str) -> dict:
+    return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
+
+
+def _write_v3(root, wt_real, branch, operation, *, expired=False, bad_hash=False,
+              bad_op=False, corrupt=False, nonce="0" * 32):
+    """Write a V3 contract directly for precise test control."""
+    import time as _t
+    now = int(_t.time())
+    if expired:
+        issued = now - 1000
+        expires = now - 700  # ttl=300 (in-bounds) but already past
+    else:
+        issued = now
+        expires = now + 300
+
+    def _iso(ts):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    op = operation
+    chash = _cc3.canonical_command_hash(
+        _cc3.expected_argv(operation, wt_real, branch), operation, os.path.realpath(str(root)), nonce
+    )
+    if bad_hash:
+        chash = "0" * 64
+    if bad_op:
+        op = (_cc3.OP_BRANCH_DELETE if operation == _cc3.OP_WORKTREE_REMOVE else _cc3.OP_WORKTREE_REMOVE)
+    contract = {
+        "schema": _cc3.SCHEMA_V3, "pr_number": 1, "linked_issue_number": 1137,
+        "worktree_path": wt_real, "branch_name": branch, "require_clean": True,
+        "operation": op, "command_hash": chash, "nonce": nonce,
+        "issued_at": _iso(issued), "expires_at": _iso(expires),
+    }
+    target = root / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if corrupt:
+        target.write_text("{ not json")
+    else:
+        target.write_text(json.dumps(contract))
+    os.chmod(target, 0o600)  # reader requires mode 0600 (materialize writes 0600)
+    return contract
+
+
+# --- AC3: exact agent-ops tool allowed from main root with active issue ---
+
+@pytest.mark.parametrize("script", [
+    "scripts/agent-ops/cleanup_exec.py",
+    "scripts/agent-ops/guard_preflight.py",
+    "scripts/agent-ops/materialize_cleanup_contract.py",
+])
+def test_agent_ops_tool_allowed_real_hook(tmp_path, script):
+    """AC3 (real hook): uv run python3 <agent-ops tool> from main root + active issue → allow."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
+    payload = _bash_payload(f"uv run python3 {script} --json", str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
+    r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
+    assert r.returncode == 0, f"agent-ops tool must allow; stderr={r.stderr}"
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -c \"import os\"",
+    "uv run python3 scripts/agent-ops/cleanup_exec.py --json; rm -rf /",
+    "uv run python3 scripts/other/evil.py",
+    "uv run python3 scripts/agent-ops/not_allowed.py",
+])
+def test_agent_ops_tool_rejected_forms_real_hook(tmp_path, command):
+    """AC3: python -c / shell-chain / non-allowed scripts are NOT agent-ops-allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
+    payload = _bash_payload(command, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
+    r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
+    assert r.returncode == 2, f"unsafe form must not be agent-ops-allowed; stderr={r.stderr}"
+
+
+def test_agent_ops_tool_rejected_from_non_root(tmp_path):
+    """AC3: agent-ops tool from a non-root cwd is not allowed by the exact class."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
+    payload = _bash_payload("uv run python3 scripts/agent-ops/cleanup_exec.py --json", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
+    # cwd=worktree, not main root → not agent-ops-allowed; classified unknown → allowed
+    # only if inside worktree. Here cwd IS the worktree so unknown-inside is allowed,
+    # so assert it is NOT allowed via the agent_ops path by checking decision reason.
+    r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
+    # inside the worktree an unknown cmd is allowed; the point is the agent_ops exact
+    # allow must require main root, verified via build_decision below.
+    mod = _load_guard_module()
+    old = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = "1137"
+    try:
+        d = mod.build_decision(payload)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+    assert d["reason"] != "agent_ops_tool_allowed"
+    assert r.returncode in (0, 2)
+
+
+def _load_guard_module():
+    spec = _ilu.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --- AC4/AC5/AC6: V3 one-shot decisions via real hook ---
+
+def test_v3_valid_worktree_remove_allow_real_hook(tmp_path):
+    """AC4/AC5: valid V3 contract → exact worktree remove allowed (real hook)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 0, f"valid V3 must allow; stderr={r.stderr}"
+
+
+def test_v3_expired_denied_real_hook(tmp_path):
+    """AC5: expired V3 contract → cleanup_contract_expired (real hook deny)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE, expired=True)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2
+    assert "cleanup_contract_expired" in r.stderr
+
+
+def test_v3_command_hash_mismatch_denied_real_hook(tmp_path):
+    """AC5: tampered command_hash → cleanup_command_hash_mismatch (real hook deny)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE, bad_hash=True)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2
+    assert "cleanup_command_hash_mismatch" in r.stderr
+
+
+def test_v3_operation_mismatch_denied_real_hook(tmp_path):
+    """AC5: operation mismatch → cleanup_operation_mismatch (real hook deny)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    # contract issued for branch_delete, but command is worktree remove
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_BRANCH_DELETE)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2
+    assert "cleanup_operation_mismatch" in r.stderr
+
+
+def test_v3_present_but_invalid_no_v2_downgrade_real_hook(tmp_path):
+    """AC4/Blocker2: corrupt V3 + valid V2 env contract → deny (no downgrade)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE, corrupt=True)
+    v2 = {"schema": "POST_MERGE_CLEANUP_REQUEST_V2", "worktree_path": wt_real,
+          "branch_name": "issue-1050-g", "require_clean": True}
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050",
+           "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(v2)}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2, "present-but-invalid V3 must not downgrade to V2"
+    assert "cleanup_contract_present_but_invalid" in r.stderr
+
+
+def test_v3_one_shot_consume_real_hook(tmp_path):
+    """AC6: a valid V3 contract is consumed after allow; replay is denied (real hook)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    first = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert first.returncode == 0, f"first must allow; {first.stderr}"
+    # contract consumed → replay denied
+    contract_path = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    assert not contract_path.exists(), "contract must be consumed (one-shot)"
+    second = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert second.returncode == 2, "replay must be denied"
+
+
+def test_v3_root_drift_active_worktree_denied_real_hook(tmp_path):
+    """AC13: cleanup from a drifted root with active worktree → shared reason (real hook)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    _git("switch", "-c", "issue-1137-drift", cwd=repo["root"])
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert r.returncode == 2
+    assert "root_drift_active_worktree_mismatch" in r.stderr
+    assert len(r.stderr.strip().splitlines()) <= 10
+    assert wt_real not in r.stderr
+
+
+def test_v3_shared_reason_codes_vocabulary():
+    """AC15: cleanup deny reasons are drawn from SHARED_CLEANUP_REASON_CODES."""
+    for code in ("cleanup_contract_present_but_invalid", "cleanup_contract_expired",
+                 "cleanup_command_hash_mismatch", "cleanup_operation_mismatch",
+                 "root_drift_active_worktree_mismatch", "cleanup_contract_consumed"):
+        assert code in _cc3.SHARED_CLEANUP_REASON_CODES
+
+
+# =============================================================================
+# Issue #1137: agent-ops module behavioral tests (materialize / preflight / exec)
+# =============================================================================
+
+import guard_preflight as _gp  # noqa: E402
+import materialize_cleanup_contract as _mat  # noqa: E402
+import cleanup_exec as _ce  # noqa: E402
+
+
+def _seed_repo_wt(tmp_path, issue="1050", slug="g"):
+    repo = _make_repo_with_worktree(tmp_path, issue=issue, slug=slug)
+    return repo
+
+
+def test_materialize_durable_0600_round_trip(tmp_path):
+    """AC10: materialize writes a 0600 file the reader accepts and validates."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
+                         branch_name="issue-1050-g", operation=_cc3.OP_WORKTREE_REMOVE,
+                         project_root=str(repo["root"]), verify=False)
+    assert r["status"] == "ok", r
+    target = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.json"
+    assert (target.stat().st_mode & 0o777) == 0o600
+    state, contract, reason = _cc3.load_contract_state(str(repo["root"]))
+    assert state == _cc3.STATE_VALID_V3, (state, reason)
+
+
+def test_materialize_symlink_fail_closed(tmp_path):
+    """AC10: a symlinked artifacts/ safe-root is rejected (no write through symlink)."""
+    repo = _seed_repo_wt(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (repo["root"] / "artifacts").symlink_to(elsewhere, target_is_directory=True)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
+                         branch_name="issue-1050-g", project_root=str(repo["root"]), verify=False)
+    assert r["status"] == "error"
+    assert "write_failed" in r["error"]
+
+
+def test_materialize_ttl_bounds(tmp_path):
+    """AC12: TTL must be positive and within the max bound."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
+                         branch_name="issue-1050-g", project_root=str(repo["root"]),
+                         verify=False, ttl_seconds=_cc3.MAX_TTL_SECONDS + 1)
+    assert r["status"] == "error"
+    assert r["error"] == "ttl_out_of_bounds"
+
+
+def test_preflight_matrix(tmp_path, monkeypatch):
+    """AC7: preflight uses the real catalog (env-only does not fake matches)."""
+    repo = _seed_repo_wt(tmp_path)
+    # env set but issue 999999 has no catalog entry -> not matches
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "999999")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo["root"]))
+    pf = _gp.build_preflight(project_root=str(repo["root"]), cwd=str(repo["root"]))
+    assert pf["active_worktree_state"] != "matches"
+    # real worktree for issue 1050 + root main -> matches/ok
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1050")
+    pf2 = _gp.build_preflight(project_root=str(repo["root"]), cwd=str(repo["root"]))
+    assert pf2["active_worktree_state"] == "matches"
+    assert pf2["status"] == "ok"
+    assert pf2["resolved_worktree"]["worktree_realpath"] == os.path.realpath(str(repo["worktree"]))
+
+
+def test_preflight_drift_human_required(tmp_path, monkeypatch):
+    """AC7/AC13: drifted root + active worktree -> human_required, no mutation."""
+    repo = _seed_repo_wt(tmp_path)
+    _git("switch", "-q", "-c", "issue-1137-drift", cwd=repo["root"])
+    monkeypatch.setenv("LOOP_ISSUE_NUMBER", "1050")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo["root"]))
+    pf = _gp.build_preflight(project_root=str(repo["root"]), cwd=str(repo["root"]))
+    assert pf["status"] == "human_required"
+    assert "root_drift_active_worktree_mismatch" in pf["blocked_reason_codes"]
+    # no mutation
+    branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(repo["root"]),
+                            capture_output=True, text=True).stdout.strip()
+    assert branch == "issue-1137-drift"
+
+
+def test_cleanup_exec_refuses_non_default_root(tmp_path):
+    """AC1: cleanup_exec refuses when the root checkout is not on the default branch."""
+    repo = _seed_repo_wt(tmp_path)
+    _git("switch", "-q", "-c", "issue-1137-drift", cwd=repo["root"])
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": os.path.realpath(str(repo["worktree"])), "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _ce.ROOT_NOT_DEFAULT
+    assert res["verified"]["root_default"] is False
+
+
+def test_cleanup_exec_refuses_worktree_not_in_catalog(tmp_path):
+    """AC1: cleanup_exec refuses when the worktree is not in the real catalog."""
+    repo = _seed_repo_wt(tmp_path)
+    bogus = str(repo["root"] / ".claude" / "worktrees" / "issue-1050-nonexistent")
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": bogus, "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _cc3.WORKTREE_NOT_IN_CATALOG
+
+
+def test_branch_ref_format_validation():
+    """AC12: branch validation rejects invalid Git ref grammar."""
+    assert _cc3.is_valid_branch_ref("issue-1050-ok")
+    assert not _cc3.is_valid_branch_ref("bad~branch")
+    assert not _cc3.is_valid_branch_ref("bad branch")
+    assert not _cc3.is_valid_branch_ref("")
+
+
+def test_expiry_requires_timezone():
+    """AC12: naive (timezone-less) timestamps are rejected."""
+    assert _cc3.parse_iso8601_tz("2026-01-01T00:00:00") is None
+    assert _cc3.parse_iso8601_tz("2026-01-01T00:00:00Z") is not None
+
+
+# =============================================================================
+# PR #1143 OWNER review — adversarial regression tests for the 10 blockers
+# =============================================================================
+
+@pytest.mark.parametrize("command", [
+    # Blocker 1: newline-separated second command must NOT ride along on the
+    # agent-ops exact allow (a bare `;`-free `\n git worktree remove ...`).
+    "uv run python3 scripts/agent-ops/guard_preflight.py --json\n"
+    "git worktree remove .claude/worktrees/issue-1137-x",
+    "uv run python3 scripts/agent-ops/guard_preflight.py --json\rgit branch -d issue-1137-x",
+    # Blocker 1 / Blocker 5: --project-root / --no-verify escape-hatch flags are
+    # not part of the exact command class.
+    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --project-root /etc",
+    "uv run python3 scripts/agent-ops/materialize_cleanup_contract.py --no-verify --pr-number 1",
+    # Blocker 1: duplicate / unknown flags rejected.
+    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --json",
+])
+def test_agent_ops_newline_and_extra_flag_rejected_real_hook(tmp_path, command):
+    """Blocker 1: newline injection / escape-hatch / duplicate flags are not agent-ops-allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
+    payload = _bash_payload(command, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
+    r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
+    assert r.returncode == 2, f"injection/extra-flag must not be agent-ops-allowed; stderr={r.stderr}"
+
+
+def _claim_worker(root):
+    """Top-level worker for the concurrent-claim test (must be picklable)."""
+    import cleanup_contract_v3 as cc
+    return cc.claim_contract(root)
+
+
+def test_claim_contract_concurrent_single_winner(tmp_path):
+    """Blocker 2: under concurrent claims exactly ONE process wins the one-shot contract."""
+    import multiprocessing as mp
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    root = str(repo["root"])
+    ctx = mp.get_context("fork")
+    with ctx.Pool(8) as pool:
+        results = pool.map(_claim_worker, [root] * 8)
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1, f"exactly one concurrent claim must win, got {winners}"
+
+
+def test_tombstone_forbids_v2_downgrade_after_consume(tmp_path):
+    """Blocker 3: after a V3 consume, a durable tombstone forbids legacy V2 fallback."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
+    first = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
+    assert first.returncode == 0, f"first must allow; {first.stderr}"
+    tomb = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.tombstone.json"
+    assert tomb.exists(), "consume must leave a durable tombstone"
+    # A leftover V2 env contract must NOT re-authorize a second cleanup operation.
+    v2 = {"schema": "POST_MERGE_CLEANUP_REQUEST_V2", "worktree_path": wt_real,
+          "branch_name": "issue-1050-g", "require_clean": True}
+    env2 = dict(env)
+    env2["CLAUDE_WORKTREE_CLEANUP_CONTRACT"] = json.dumps(v2)
+    second = _run_guard(payload, repo["root"], issue="1050", extra_env=env2)
+    assert second.returncode == 2, "V2 downgrade after a V3 consume must be denied"
+    assert "cleanup_v2_downgrade_denied" in second.stderr
+
+
+def test_present_contract_io_uncapable_denied(tmp_path, monkeypatch):
+    """Blocker 9: a present V3 contract on an IO-incapable platform is denied (no ABSENT fallthrough)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
+    monkeypatch.setattr(_cc3, "IO_CAPABLE", False)
+    state, _contract, reason = _cc3.load_contract_state(str(repo["root"]))
+    assert state == _cc3.STATE_PRESENT_BUT_INVALID
+    assert reason == _cc3.CLEANUP_IO_UNSUPPORTED_PLATFORM
+
+
+def test_cleanup_exec_no_project_root_or_no_verify_cli_flags():
+    """Blocker 1/5: the public CLIs expose neither --project-root nor --no-verify."""
+    with pytest.raises(SystemExit):
+        _ce.main(["--pr-number", "1", "--worktree-path", "/x",
+                  "--branch-name", "b", "--project-root", "/y"])
+    with pytest.raises(SystemExit):
+        _mat.main(["--pr-number", "1", "--worktree-path", "/x",
+                   "--branch-name", "b", "--no-verify"])
+
+
+def test_cleanup_exec_rejects_cross_repo_pr(tmp_path, monkeypatch):
+    """Blocker 5: a fork / cross-repo PR must not authorize deleting our local worktree."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
+    monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "deadbeef")
+    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
+        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
+        "headRefName": "issue-1050-g", "headRefOid": "deadbeef", "baseRefName": "main",
+        "isCrossRepository": True, "headRepositoryOwner": {"login": "attacker"},
+        "closingIssuesReferences": [{"number": 1050}]})
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _ce.HEAD_REPO_MISMATCH
+
+
+def test_cleanup_exec_rejects_head_oid_mismatch(tmp_path, monkeypatch):
+    """Blocker 5: a same-named branch at a different commit must not authorize deletion."""
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
+    monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "aaaaaaa")
+    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
+        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
+        "headRefName": "issue-1050-g", "headRefOid": "bbbbbbb", "baseRefName": "main",
+        "isCrossRepository": False, "headRepositoryOwner": {"login": "squne121"},
+        "closingIssuesReferences": [{"number": 1050}]})
+    req = {"pr_number": 1, "linked_issue_number": 1050,
+           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    res = _ce.run(req, project_root=str(repo["root"]))
+    assert res["status"] == "refused"
+    assert res["reason_code"] == _ce.HEAD_OID_MISMATCH
+
+
+def test_perform_preserves_partial_actions_on_branch_delete_fail(tmp_path):
+    """Blocker 6: worktree removed but branch -d fails → actions_taken keeps the partial success."""
+    from worktree_catalog import Deadline
+    repo = _seed_repo_wt(tmp_path)
+    wt_real = os.path.realpath(str(repo["worktree"]))
+    # An unmerged commit on the branch makes `git branch -d` refuse after worktree removal.
+    _git("commit", "--allow-empty", "-q", "-m", "extra", cwd=repo["worktree"])
+    actions, err = _ce._perform("issue-1050-g", wt_real, str(repo["root"]), Deadline(60.0))
+    assert actions == [_cc3.OP_WORKTREE_REMOVE], actions
+    assert err is not None and "branch_delete_failed" in err

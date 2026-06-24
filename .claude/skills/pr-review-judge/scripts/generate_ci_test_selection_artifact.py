@@ -2,85 +2,189 @@
 """
 Generate ci_test_selection/v1 artifact for G1 gate verification.
 
-Uses pytest --collect-only to get actual discovered tests,
-then compares with changed test files from git diff.
+Uses pytest --collect-only to get actual discovered tests (via a JSON-emitting plugin,
+not stdout parsing), then compares with changed test files from an explicit base..head
+git diff.
+
+Target set / ignore / deselect come from the python-test plan SSOT
+(.github/ci/python-test-plan.json) via the scripts/ci/python_test_plan.py loader, so
+the executed pytest target set and the artifact ``pytest_argv`` cannot drift
+(Issue #1064).
+
+Fail-closed (Issue #1064 review):
+- Collection: a non-zero collect exit, a timeout, or zero collected nodeids records
+  ``collection_status`` and fails CI.
+- Change detection: the git diff is run against EXPLICIT base/head SHAs (never the
+  branch name ``main``, which is absent in a shallow checkout). A non-zero / timed-out /
+  unprovided diff records ``diff_status`` and fails CI — it is never silently treated as
+  "no changed tests" (the old fail-open false-green).
+- G1 requires BOTH ``collection_status.ok`` AND ``diff_status.ok``.
 """
 
 import argparse
+import importlib.util
 import json
+import os
+import re
 import subprocess
+import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
+
+COLLECT_TIMEOUT_SECONDS = 120
+DIFF_TIMEOUT_SECONDS = 30
+
+# pytest's default test-file convention (python_files = test_*.py / *_test.py). A path is
+# a changed *test* file only if its basename matches this — not merely if "test" appears
+# somewhere in the path (which would mis-flag source files like python_test_plan.py).
+_PY_TEST_FILE_RE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
+_TS_TEST_FILE_RE = re.compile(r"(?:^|/)[^/]*\.(?:test|spec)\.(?:ts|tsx|js|jsx)$")
+_SCRIPTS_CI = Path(__file__).resolve().parents[4] / "scripts" / "ci"
 
 
-def get_pytest_collected_tests(pytest_args: List[str]) -> Tuple[List[str], List[str]]:
-    """Get list of test files and node IDs from pytest --collect-only."""
-    collected_files = []
-    collected_nodeids = []
+def _load_plan_module():
+    """Import the scripts/ci/python_test_plan.py loader by file location."""
+    loader_path = _SCRIPTS_CI / "python_test_plan.py"
+    spec = importlib.util.spec_from_file_location("python_test_plan", loader_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load python-test plan loader at {loader_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_pytest_args(args) -> List[str]:
+    """Resolve the pytest scope argv (explicit --pytest-args wins, else plan SSOT)."""
+    if getattr(args, "pytest_args", None):
+        return list(args.pytest_args)
+    plan_module = _load_plan_module()
+    plan = plan_module.load_plan(getattr(args, "plan", None))
+    return plan_module.scope_argv(plan)
+
+
+def get_pytest_collected_tests(
+    pytest_args: List[str],
+) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """Collect node IDs via the JSON-emitting plugin (no stdout parsing).
+
+    Returns (collected_files, collected_nodeids, collection_status). collection_status is
+    fail-closed evidence (collect exit code, timeout flag, stderr tail, nodeid count).
+    """
+    collection_status: Dict[str, Any] = {
+        "returncode": None,
+        "timed_out": False,
+        "error": None,
+        "nodeid_count": 0,
+        "stderr_tail": "",
+        "ok": False,
+    }
+    collected_nodeids: List[str] = []
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_SCRIPTS_CI) + os.pathsep + env.get("PYTHONPATH", "")
+    out_path = None
+    try:
+        with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as fh:
+            out_path = fh.name
+        env["COLLECT_NODEIDS_OUT"] = out_path
+        result = subprocess.run(
+            ["uv", "run", "--locked", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", "-p", "collect_nodeids_plugin"] + pytest_args,
+            capture_output=True,
+            text=True,
+            timeout=COLLECT_TIMEOUT_SECONDS,
+            env=env,
+        )
+        collection_status["returncode"] = result.returncode
+        collection_status["stderr_tail"] = "\n".join(result.stderr.strip().splitlines()[-20:])
+        if result.returncode == 0 and Path(out_path).exists():
+            data = json.loads(Path(out_path).read_text(encoding="utf-8"))
+            collected_nodeids = list(data.get("nodeids", []))
+    except subprocess.TimeoutExpired:
+        collection_status["timed_out"] = True
+        collection_status["error"] = "pytest --collect-only timed out"
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        collection_status["error"] = f"collection error: {exc}"
+    finally:
+        if out_path and Path(out_path).exists():
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+
+    collected_files = sorted({nid.split("::")[0] for nid in collected_nodeids})
+    collected_nodeids = sorted(collected_nodeids)
+    collection_status["nodeid_count"] = len(collected_nodeids)
+    collection_status["ok"] = (
+        collection_status["returncode"] == 0
+        and not collection_status["timed_out"]
+        and collection_status["nodeid_count"] > 0
+    )
+    return collected_files, collected_nodeids, collection_status
+
+
+def get_changed_test_files(
+    base_sha: str, head_sha: str
+) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """Changed test files between EXPLICIT base/head SHAs (never branch name ``main``).
+
+    Returns (changed_test_files, scope_excluded_files, diff_status). diff_status is
+    fail-closed evidence: an unprovided SHA, a non-zero git exit, or a timeout sets
+    ok=False so the caller fails CI rather than reporting an empty (false-green) set.
+    """
+    diff_status: Dict[str, Any] = {
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "returncode": None,
+        "timed_out": False,
+        "error": None,
+        "stderr_tail": "",
+        "ok": False,
+    }
+    changed_test_files: List[str] = []
+    scope_excluded_files: List[str] = []
+
+    if not base_sha or not head_sha:
+        diff_status["error"] = "base_sha and head_sha are both required for change detection"
+        return changed_test_files, scope_excluded_files, diff_status
 
     try:
         result = subprocess.run(
-            ["uv", "run", "--locked", "pytest", "--collect-only", "-q"] + pytest_args,
+            ["git", "diff", f"{base_sha}...{head_sha}", "--name-only", "--diff-filter=ACM"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=DIFF_TIMEOUT_SECONDS,
         )
-        if result.returncode == 0:
-            # Parse output: each line is a nodeid like "tests/foo.py::test_bar"
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if not line or line.startswith(" "):
-                    continue
-                collected_nodeids.append(line)
-                # Extract file path (before ::)
-                if "::" in line:
-                    file_part = line.split("::")[0]
-                else:
-                    file_part = line
-                if file_part and file_part not in collected_files:
-                    collected_files.append(file_part)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-
-    return sorted(collected_files), sorted(collected_nodeids)
-
-
-def get_changed_test_files(base_ref="main") -> Tuple[List[str], List[str]]:
-    """Get list of changed test files between base_ref and HEAD."""
-    changed_test_files = []
-    scope_excluded_files = []
-
-    try:
-        result = subprocess.run(
-            ["git", "diff", base_ref + "...HEAD", "--name-only", "--diff-filter=ACM"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
+        diff_status["returncode"] = result.returncode
+        diff_status["stderr_tail"] = "\n".join(result.stderr.strip().splitlines()[-20:])
         if result.returncode == 0:
             for f in result.stdout.split("\n"):
-                if not f or "test" not in f.lower():
+                if not f:
                     continue
-                if f.endswith((".py",)):
+                if f.endswith(".py") and _PY_TEST_FILE_RE.search(f):
                     changed_test_files.append(f)
-                elif f.endswith((".ts", ".js")):
-                    # Track non-Python test files separately
+                elif _TS_TEST_FILE_RE.search(f):
+                    # Non-Python test files: tracked separately (out of python scope).
                     scope_excluded_files.append(f)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+            diff_status["ok"] = True
+    except subprocess.TimeoutExpired:
+        diff_status["timed_out"] = True
+        diff_status["error"] = "git diff timed out"
+    except FileNotFoundError as exc:
+        diff_status["error"] = f"git not found: {exc}"
 
-    return sorted(changed_test_files), sorted(scope_excluded_files)
+    return sorted(changed_test_files), sorted(scope_excluded_files), diff_status
 
 
 def get_current_head_sha() -> str:
-    """Get current HEAD SHA."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -90,20 +194,21 @@ def get_current_head_sha() -> str:
 
 
 def generate_artifact(args):
-    """Generate ci_test_selection/v1 artifact."""
-    # Get collected tests from pytest
-    collected_test_files, collected_nodeids = get_pytest_collected_tests(args.pytest_args)
+    """Generate ci_test_selection/v1 artifact (fail-closed on collection/diff failure)."""
+    pytest_args = resolve_pytest_args(args)
 
-    # Get changed files from git
-    changed_test_files, scope_excluded = get_changed_test_files()
+    collected_test_files, collected_nodeids, collection_status = (
+        get_pytest_collected_tests(pytest_args)
+    )
 
-    # Determine uncovered files: changed test files that are NOT in collected list
-    uncovered = [f for f in changed_test_files if f not in collected_test_files]
-
-    # Use provided SHAs or detect
     pr_head_sha = args.pr_head_sha or "unknown"
     checked_out_sha = args.checked_out_sha or get_current_head_sha()
     merge_sha = args.merge_sha or "unknown"
+    base_sha = getattr(args, "base_sha", None)
+    head_sha = getattr(args, "head_sha", None) or args.pr_head_sha
+
+    changed_test_files, scope_excluded, diff_status = get_changed_test_files(base_sha, head_sha)
+    uncovered = [f for f in changed_test_files if f not in collected_test_files]
 
     artifact = {
         "schema_version": "ci_test_selection/v1",
@@ -115,16 +220,17 @@ def generate_artifact(args):
         "scope": "python",
         "workflow": args.workflow,
         "job": args.job,
-        "pytest_argv": args.pytest_args,
+        "pytest_argv": pytest_args,
+        "collection_status": collection_status,
+        "diff_status": diff_status,
         "collected_test_files": collected_test_files,
         "collected_nodeids": collected_nodeids,
         "changed_test_files": changed_test_files,
         "scope_excluded_changed_files": scope_excluded,
         "uncovered_changed_test_files": uncovered,
-        "ci_run_url": args.ci_run_url or "N/A"
+        "ci_run_url": args.ci_run_url or "N/A",
     }
 
-    # Write artifact
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
@@ -133,10 +239,39 @@ def generate_artifact(args):
     print(f"Artifact written to {output_path}")
     print(f"  Schema version: {artifact['schema_version']}")
     print(f"  PR head SHA: {pr_head_sha}")
-    print(f"  Collected tests: {len(collected_test_files)}")
+    print(f"  Collected nodeids: {len(collected_nodeids)}")
     print(f"  Changed tests: {len(changed_test_files)}")
-    print(f"  Scope excluded (TS/JS): {len(scope_excluded)}")
     print(f"  Uncovered tests: {len(uncovered)}")
+    print(f"  collection_status.ok={collection_status['ok']} diff_status.ok={diff_status['ok']}")
+
+    # Fail-closed: both collection AND change detection must succeed. A failed/empty
+    # collection or a failed git diff (e.g. shallow checkout missing base/head) is a CI
+    # failure, never a success artifact with an empty set (Issue #1064 review).
+    if not collection_status["ok"]:
+        print(
+            "ERROR: pytest collection failed (fail-closed): "
+            f"returncode={collection_status['returncode']} "
+            f"timed_out={collection_status['timed_out']} "
+            f"nodeid_count={collection_status['nodeid_count']} "
+            f"error={collection_status['error']}",
+            file=sys.stderr,
+        )
+        if collection_status["stderr_tail"]:
+            print(collection_status["stderr_tail"], file=sys.stderr)
+        return 2
+    if not diff_status["ok"]:
+        print(
+            "ERROR: changed-test detection failed (fail-closed): "
+            f"base_sha={diff_status['base_sha']} head_sha={diff_status['head_sha']} "
+            f"returncode={diff_status['returncode']} timed_out={diff_status['timed_out']} "
+            f"error={diff_status['error']}. A shallow checkout (fetch-depth!=0) or a "
+            "missing base/head SHA prevents reliable change detection; this must fail CI "
+            "rather than report an empty changed-test set.",
+            file=sys.stderr,
+        )
+        if diff_status["stderr_tail"]:
+            print(diff_status["stderr_tail"], file=sys.stderr)
+        return 2
 
     return 0 if not uncovered else 1
 
@@ -145,48 +280,37 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate ci_test_selection/v1 artifact for G1 gate"
     )
-    parser.add_argument(
-        "--output", "-o",
-        required=True,
-        help="Output path for artifact JSON"
-    )
+    parser.add_argument("--output", "-o", required=True, help="Output path for artifact JSON")
     parser.add_argument(
         "--pytest-args",
         nargs="+",
-        required=True,
-        help="pytest arguments (directories/files to collect from)"
+        help="pytest scope argv override (default: derive from python-test plan SSOT)",
     )
     parser.add_argument(
-        "--pr-head-sha",
-        help="PR head SHA from GitHub (optional)"
+        "--plan",
+        help="path to python-test plan JSON (default: .github/ci/python-test-plan.json)",
+    )
+    parser.add_argument("--pr-head-sha", help="PR head SHA from GitHub (optional)")
+    parser.add_argument(
+        "--base-sha",
+        help="Base SHA for change detection (e.g. github.event.pull_request.base.sha)",
+    )
+    parser.add_argument(
+        "--head-sha",
+        help="Head SHA for change detection (defaults to --pr-head-sha)",
     )
     parser.add_argument(
         "--checked-out-sha",
-        help="Current checked-out SHA (optional, default: git rev-parse HEAD)"
+        help="Current checked-out SHA (optional, default: git rev-parse HEAD)",
     )
-    parser.add_argument(
-        "--merge-sha",
-        help="Merge commit SHA (e.g., github.sha) (optional)"
-    )
-    parser.add_argument(
-        "--workflow",
-        default="ci",
-        help="Workflow name (default: ci)"
-    )
-    parser.add_argument(
-        "--job",
-        default="python-test",
-        help="Job name (default: python-test)"
-    )
-    parser.add_argument(
-        "--ci-run-url",
-        help="CI run URL (optional)"
-    )
+    parser.add_argument("--merge-sha", help="Merge commit SHA (e.g., github.sha) (optional)")
+    parser.add_argument("--workflow", default="ci", help="Workflow name (default: ci)")
+    parser.add_argument("--job", default="python-test", help="Job name (default: python-test)")
+    parser.add_argument("--ci-run-url", help="CI run URL (optional)")
 
     args = parser.parse_args()
     return generate_artifact(args)
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

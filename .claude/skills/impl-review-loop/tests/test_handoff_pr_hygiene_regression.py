@@ -242,29 +242,32 @@ class TestAC4UpdatePrClosesKeywordCheck:
             "update_pr.py must return 1 (not 0) when validation fails"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="LP057 currently accepts Refs-only; should require Closes for child PR closing (LP057 bug)",
-    )
-    @pytest.mark.parametrize("refs_pattern", [
-        "Refs #634",
-        "Issue #634",
-        "関連: #634",
-    ])
-    def test_lp057_refs_only_before_fail_requires_closing_keyword(self, refs_pattern: str):
-        """AC4 before-fail: Refs-only は LP057 failure になるべきだが現在は pass する（LP057 バグ）。
+    @staticmethod
+    def _load_validate_pr_body():
+        """Load validate_pr_body.py under a UNIQUE, pre-registered module name.
 
-        xfail: LP057 が Refs-only を pass するため、このアサーションは失敗する。
-        LP057 が Closes を必須化したら xfail を外してください。
+        validate_pr_body.py defines frozen @dataclass types whose decorator resolves
+        ``sys.modules[cls.__module__].__dict__``. Loading under the generic name
+        "validate_pr_body" without registering it in sys.modules would bind that lookup
+        to whatever instance another test (e.g. open-pr's test_validate_pr_body.py, which
+        does ``from validate_pr_body import ...``) left in sys.modules, cross-wiring the
+        two module instances. Under the unified single-process pytest run (Issue #1064)
+        that collision silently corrupted the validation result. A unique, pre-registered
+        name keeps the load self-consistent and execution-order-independent.
         """
         import importlib.util
 
-        spec = importlib.util.spec_from_file_location("validate_pr_body", VALIDATE_PR_BODY_PY)
+        spec = importlib.util.spec_from_file_location(
+            "impl_review_loop_handoff_validate_pr_body", VALIDATE_PR_BODY_PY
+        )
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = mod  # type: ignore[union-attr]
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
 
-        # PR body with Refs-only (no Closes)
-        body = f"""## Summary
+    @staticmethod
+    def _pr_body(reference: str) -> str:
+        return f"""## Summary
 テスト PR です。
 
 ## Checks
@@ -287,14 +290,58 @@ class TestAC4UpdatePrClosesKeywordCheck:
 | テストのみ | yes | N/A | tests PASS | N/A |
 
 ## Notes
-{refs_pattern}
+{reference}
 """
-        result = mod.validate_pr_body(body, changed_paths=[], linked_issue=634)
-        # LP057 should fail for Refs-only (no Closes)
-        # Currently LP057 PASSES for Refs-only → this assertion FAILS → xfail triggers
+
+    # changed_paths must be non-empty: an empty list makes LP058 ("changed paths could
+    # not be resolved deterministically") fire and mask the LP057 result we probe here.
+    _LP057_CHANGED_PATHS = ["docs/dev/test-lane-policy.md"]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="LP057 currently accepts 'Refs #N' without a Closes keyword; it should "
+        "require Closes for a child PR. Documented LP057 gap (before-fail fixture).",
+    )
+    def test_lp057_refs_only_before_fail_requires_closing_keyword(self):
+        """AC4 before-fail: ``Refs #N`` のみは LP057 failure になるべきだが現在は pass する。
+
+        xfail: LP057 は ``Refs #N`` を許容するため status は pass となり、この
+        ``status == "fail"`` アサーションは失敗する（= xfail 成立）。LP057 が Closes を
+        必須化したら xfail を外すこと。
+
+        Note (#1064): ``changed_paths`` を非空にして LP058 を切り分け、LP057 単独の
+        leniency を検証する。モジュールは ``_load_validate_pr_body`` で一意名ロードし、
+        単一プロセス統合実行でも順序非依存にした。
+        """
+        mod = self._load_validate_pr_body()
+        result = mod.validate_pr_body(
+            self._pr_body("Refs #634"),
+            changed_paths=self._LP057_CHANGED_PATHS,
+            linked_issue=634,
+        )
         assert result.status == "fail", (
-            f"LP057 should fail for Refs-only pattern '{refs_pattern}' "
-            f"(no closing keyword). Got: {result.status}"
+            "LP057 should fail for 'Refs #634' (no closing keyword). "
+            f"Got: {result.status}"
+        )
+
+    @pytest.mark.parametrize("malformed_reference", ["Issue #634", "関連: #634"])
+    def test_lp057_rejects_malformed_closing_reference(self, malformed_reference: str):
+        """AC4: ``Closes/Refs #N`` でも埋まった ``Related issue:`` でもない参照は LP057 で fail する。
+
+        ``Issue #634`` や ``関連: #634`` は LP057 が受理する有効パターンではないため、
+        validator は既に正しく fail を返す（これは xfail ではなく恒久 regression）。
+        旧実装ではモジュールロード衝突 + LP058 混入でこの正しい挙動が隠れていた（#1064）。
+        """
+        mod = self._load_validate_pr_body()
+        result = mod.validate_pr_body(
+            self._pr_body(malformed_reference),
+            changed_paths=self._LP057_CHANGED_PATHS,
+            linked_issue=634,
+        )
+        assert result.status == "fail"
+        assert any(error.rule_id == "LP057" for error in result.errors), (
+            f"expected an LP057 error for malformed reference '{malformed_reference}', "
+            f"got rules {sorted({e.rule_id for e in result.errors})}"
         )
 
     @pytest.mark.parametrize("keyword", [
