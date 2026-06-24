@@ -782,7 +782,11 @@ class TestAnalyze(unittest.TestCase):
         self.assertEqual(len(findings["milestone_mismatches"]), 0)
 
     def test_milestone_null_mismatch(self):
-        """AC3/AC8: milestone null descendant -> milestone_mismatches"""
+        """AC5: depth>=1 の descendant で milestone=null は間接所属として正常（mismatch にしない）。
+
+        AC5 requires: milestone=null for depth>=1 is treated as indirect member (not mismatch).
+        Previously this was treated as mismatch (wrong behavior corrected by AC5).
+        """
         issues = [
             {
                 "number": 2, "title": "No Milestone Issue", "state": "open",
@@ -791,9 +795,11 @@ class TestAnalyze(unittest.TestCase):
             }
         ]
         findings = self._run_analyze(issues)
-        self.assertEqual(len(findings["milestone_mismatches"]), 1)
-        self.assertEqual(findings["milestone_mismatches"][0]["number"], 2)
-        self.assertIsNone(findings["milestone_mismatches"][0]["milestone_number"])
+        # AC5: depth=1 + milestone=null → 間接所属として正常（mismatch にしない）
+        self.assertEqual(
+            len(findings["milestone_mismatches"]), 0,
+            "depth=1, milestone=null は間接所属として正常（mismatch にしない）",
+        )
 
     def test_milestone_mismatch_wrong_number(self):
         """AC3: milestone number 2 when expecting 1"""
@@ -1094,6 +1100,415 @@ class TestMainExitCodes(unittest.TestCase):
         headers = mr._build_headers("mytoken")
         self.assertIn("Authorization", headers)
         self.assertEqual(headers["Authorization"], "Bearer mytoken")
+
+
+# ---------------------------------------------------------------------------
+# AC8: Close Predicate Fixture Tests
+# Tests for: open blocker / partial / warning / valid defer / invalid defer / indirect child
+# ---------------------------------------------------------------------------
+
+# Helpers for close predicate tests
+
+def _build_report_for_close(
+    open_issues=0,
+    pr_mixed=None,
+    open_blocker_count=0,
+    partial=False,
+    warnings=None,
+    milestone_mismatches=None,
+    stale_state_labels=None,
+):
+    """Build a MILESTONE_DESCENDANT_ROLLUP_V1 report dict for close predicate tests."""
+    pr_mixed = pr_mixed or []
+    warnings = warnings or []
+    milestone_mismatches = milestone_mismatches or []
+    stale_state_labels = stale_state_labels or []
+    open_blockers = (
+        [{"number": i + 100, "title": f"Blocker {i}", "open_blocker_numbers": [i + 200],
+          "depth": 0, "source": "native"}
+         for i in range(open_blocker_count)]
+        if open_blocker_count > 0
+        else []
+    )
+
+    # Build minimal issues list to match open_issues count
+    all_issues = [
+        {"number": i + 1, "state": "open", "is_pr": False}
+        for i in range(open_issues)
+    ]
+    # Add closed issues to avoid confusion
+    findings = {
+        "pr_mixed": pr_mixed,
+        "milestone_mismatches": milestone_mismatches,
+        "stale_state_labels": stale_state_labels,
+        "open_blockers": open_blockers,
+    }
+    report = mr.build_report(
+        1,
+        all_issues,
+        findings,
+        warnings,
+        "2026-01-01T00:00:00Z",
+        "owner/repo",
+        partial=partial,
+    )
+    return report
+
+
+def _is_close_judgment_available(report):
+    """Evaluate fail-closed close predicate against a report.
+
+    Returns True only when ALL conditions are satisfied:
+    - open_issues == 0 (from summary, excluding PRs)
+    - pr_mixed_count == 0
+    - partial == false
+    - warnings == []
+    - open_blocker_count == 0
+    """
+    s = report["summary"]
+    return (
+        s["open_issues"] == 0
+        and s["pr_mixed_count"] == 0
+        and not report.get("partial", False)
+        and len(report.get("warnings", [])) == 0
+        and s["open_blocker_count"] == 0
+    )
+
+
+def _build_valid_defer_decision(
+    issue="#42",
+    reason="Low priority",
+    residual_risk="Minimal",
+    destination_issue="#100",
+    destination_milestone="M2: Gameplay Core (v0.2.x)",
+    revisit_condition="When M2 starts",
+    decided_by="squne121",
+    decided_at="2026-06-25T00:00:00Z",
+):
+    """Build a valid defer decision with all required fields."""
+    return {
+        "issue": issue,
+        "reason": reason,
+        "residual_risk": residual_risk,
+        "destination": {
+            "issue": destination_issue,
+            "milestone": destination_milestone,
+        },
+        "revisit_condition": revisit_condition,
+        "decided_by": decided_by,
+        "decided_at": decided_at,
+    }
+
+
+def _validate_defer_decision(defer):
+    """Validate a defer decision. Returns True if valid, False if invalid.
+
+    A valid defer decision must have all 7 required fields:
+    issue, reason, residual_risk, destination, revisit_condition, decided_by, decided_at.
+    """
+    required_fields = {
+        "issue", "reason", "residual_risk", "destination",
+        "revisit_condition", "decided_by", "decided_at",
+    }
+    if not isinstance(defer, dict):
+        return False
+    missing = required_fields - set(defer.keys())
+    if missing:
+        return False
+    # destination must have issue and milestone keys
+    dest = defer.get("destination", {})
+    if not isinstance(dest, dict):
+        return False
+    if "issue" not in dest:
+        return False
+    return True
+
+
+class TestClosePredicateFixtures(unittest.TestCase):
+    """AC8: Fixture tests for fail-closed close predicate.
+
+    Covers: open blocker / partial / warning / valid defer / invalid defer / indirect child
+    """
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 1: open blocker が存在する場合は close 不可
+    # ------------------------------------------------------------------
+    def test_open_blocker_prevents_close(self):
+        """AC8-fixture-1: open_blocker_count > 0 → close_judgment_available=false."""
+        report = _build_report_for_close(open_issues=0, open_blocker_count=1)
+        self.assertFalse(
+            _is_close_judgment_available(report),
+            "open blocker が存在する場合は close 不可（fail-closed）",
+        )
+        self.assertEqual(report["summary"]["open_blocker_count"], 1)
+
+    def test_no_blocker_does_not_prevent_close(self):
+        """AC8-fixture-1 (negative): no blocker → predicate does not fail on blocker."""
+        report = _build_report_for_close(open_issues=0, open_blocker_count=0)
+        # open_blocker_count alone should not prevent close
+        self.assertEqual(report["summary"]["open_blocker_count"], 0)
+        # other conditions clean → close judgment available
+        self.assertTrue(_is_close_judgment_available(report))
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 2: partial=true の場合は close 不可
+    # ------------------------------------------------------------------
+    def test_partial_true_prevents_close(self):
+        """AC8-fixture-2: partial=true → close_judgment_available=false."""
+        report = _build_report_for_close(open_issues=0, partial=True)
+        self.assertFalse(
+            _is_close_judgment_available(report),
+            "partial=true の場合は close 不可（descendant traversal 不完全）",
+        )
+        self.assertTrue(report["partial"])
+
+    def test_partial_false_does_not_prevent_close(self):
+        """AC8-fixture-2 (negative): partial=false → predicate does not fail on partial."""
+        report = _build_report_for_close(open_issues=0, partial=False)
+        self.assertFalse(report["partial"])
+        self.assertTrue(_is_close_judgment_available(report))
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 3: warnings 非空の場合は close 不可
+    # ------------------------------------------------------------------
+    def test_warnings_present_prevents_close(self):
+        """AC8-fixture-3: warnings 非空 → close_judgment_available=false."""
+        warnings = [{"type": "cross_repo_sub_issue", "parent_number": 10, "child_number": 20,
+                     "child_repo_url": "https://api.github.com/repos/other/repo"}]
+        report = _build_report_for_close(open_issues=0, warnings=warnings)
+        self.assertFalse(
+            _is_close_judgment_available(report),
+            "warnings 非空の場合は close 不可",
+        )
+        self.assertEqual(len(report["warnings"]), 1)
+
+    def test_empty_warnings_does_not_prevent_close(self):
+        """AC8-fixture-3 (negative): warnings=[] → predicate does not fail on warnings."""
+        report = _build_report_for_close(open_issues=0, warnings=[])
+        self.assertEqual(len(report["warnings"]), 0)
+        self.assertTrue(_is_close_judgment_available(report))
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 4: valid defer decision がある場合は正常
+    # ------------------------------------------------------------------
+    def test_valid_defer_decision_accepted(self):
+        """AC8-fixture-4: valid defer decision（全7フィールド揃い）は accept される。"""
+        defer = _build_valid_defer_decision()
+        self.assertTrue(
+            _validate_defer_decision(defer),
+            "全7フィールドを持つ defer decision は valid",
+        )
+
+    def test_valid_defer_decision_all_fields_present(self):
+        """AC8-fixture-4: valid defer decision の必須フィールドがすべて存在することを確認。"""
+        defer = _build_valid_defer_decision(
+            issue="#50",
+            reason="Known limitation, tracked in M2",
+            residual_risk="Low: feature non-critical in M1 scope",
+            destination_issue="#300",
+            destination_milestone="M2: Gameplay Core (v0.2.x)",
+            revisit_condition="When #300 is created and assigned",
+            decided_by="squne121",
+            decided_at="2026-06-25T12:00:00Z",
+        )
+        self.assertTrue(_validate_defer_decision(defer))
+        # Verify destination subfields
+        self.assertIn("issue", defer["destination"])
+        self.assertIn("milestone", defer["destination"])
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 5: invalid defer decision（フィールド不足）の場合は reject
+    # ------------------------------------------------------------------
+    def test_invalid_defer_decision_missing_reason(self):
+        """AC8-fixture-5: reason フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["reason"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "reason フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_missing_residual_risk(self):
+        """AC8-fixture-5: residual_risk フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["residual_risk"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "residual_risk フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_missing_decided_by(self):
+        """AC8-fixture-5: decided_by フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["decided_by"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "decided_by フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_missing_decided_at(self):
+        """AC8-fixture-5: decided_at フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["decided_at"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "decided_at フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_missing_destination(self):
+        """AC8-fixture-5: destination フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["destination"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "destination フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_missing_revisit_condition(self):
+        """AC8-fixture-5: revisit_condition フィールド欠落 → invalid defer decision（reject）。"""
+        defer = _build_valid_defer_decision()
+        del defer["revisit_condition"]
+        self.assertFalse(
+            _validate_defer_decision(defer),
+            "revisit_condition フィールド欠落は invalid defer decision",
+        )
+
+    def test_invalid_defer_decision_not_a_dict(self):
+        """AC8-fixture-5: defer が dict でない場合は invalid。"""
+        self.assertFalse(_validate_defer_decision("not a dict"))
+        self.assertFalse(_validate_defer_decision(None))
+        self.assertFalse(_validate_defer_decision([]))
+
+    # ------------------------------------------------------------------
+    # AC8 Fixture 6: indirect child（milestone=null）は正常（mismatch にしない）
+    # ------------------------------------------------------------------
+    def test_indirect_child_milestone_null_is_normal(self):
+        """AC8-fixture-6: depth>=1 の descendant で milestone=null は間接所属として正常（AC5）。
+
+        mismatch にしない。
+        """
+        # Issue 2 is a depth=1 child with no milestone (indirect member)
+        issues = [
+            {
+                "number": 2, "title": "Indirect Child", "state": "open",
+                "milestone_number": None, "labels": [], "body": "",
+                "is_pr": False, "depth": 1, "parent_number": 1,
+            }
+        ]
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            findings = mr.analyze(issues, 1, "owner", "repo", "fake_token")
+
+        self.assertEqual(
+            len(findings["milestone_mismatches"]), 0,
+            "depth=1, milestone=null は間接所属として正常（mismatch にしない）",
+        )
+
+    def test_indirect_child_depth2_milestone_null_is_normal(self):
+        """AC8-fixture-6: depth=2 の descendant で milestone=null も間接所属として正常（AC5）。"""
+        issues = [
+            {
+                "number": 5, "title": "Grandchild", "state": "open",
+                "milestone_number": None, "labels": [], "body": "",
+                "is_pr": False, "depth": 2, "parent_number": 3,
+            }
+        ]
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            findings = mr.analyze(issues, 1, "owner", "repo", "fake_token")
+
+        self.assertEqual(
+            len(findings["milestone_mismatches"]), 0,
+            "depth=2, milestone=null も間接所属として正常（mismatch にしない）",
+        )
+
+    def test_direct_item_milestone_null_is_mismatch(self):
+        """AC8-fixture-6 (contrast): depth=0 の direct item で milestone=null は mismatch。"""
+        issues = [
+            {
+                "number": 10, "title": "Direct Item No Milestone", "state": "open",
+                "milestone_number": None, "labels": [], "body": "",
+                "is_pr": False, "depth": 0, "parent_number": None,
+            }
+        ]
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            findings = mr.analyze(issues, 1, "owner", "repo", "fake_token")
+
+        self.assertEqual(
+            len(findings["milestone_mismatches"]), 1,
+            "depth=0 の direct item で milestone=null は mismatch（正常扱いしない）",
+        )
+        self.assertIsNone(findings["milestone_mismatches"][0]["milestone_number"])
+
+    def test_descendant_with_wrong_milestone_is_mismatch(self):
+        """AC8-fixture-6 (contrast): depth>=1 で別 Milestone に明示割当は scope conflict (mismatch)。"""
+        issues = [
+            {
+                "number": 20, "title": "Child Wrong Milestone", "state": "open",
+                "milestone_number": 2, "labels": [], "body": "",
+                "is_pr": False, "depth": 1, "parent_number": 1,
+            }
+        ]
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "dependencies/blocked_by" in url:
+                raise FakeHTTPError(404)
+            raise RuntimeError(f"Unexpected URL: {url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            findings = mr.analyze(issues, 1, "owner", "repo", "fake_token")
+
+        self.assertEqual(
+            len(findings["milestone_mismatches"]), 1,
+            "depth=1 で別 Milestone に明示割当は scope conflict として mismatch",
+        )
+        self.assertEqual(findings["milestone_mismatches"][0]["milestone_number"], 2)
+
+    # ------------------------------------------------------------------
+    # Close predicate: all clean → close_judgment_available=true
+    # ------------------------------------------------------------------
+    def test_all_conditions_clean_allows_close(self):
+        """AC8: 全条件クリアの場合のみ close_judgment_available=true。"""
+        report = _build_report_for_close(
+            open_issues=0,
+            pr_mixed=[],
+            open_blocker_count=0,
+            partial=False,
+            warnings=[],
+        )
+        self.assertTrue(_is_close_judgment_available(report))
+
+    def test_open_issues_remaining_prevents_close(self):
+        """AC8: open_issues > 0 の場合は close 不可。"""
+        report = _build_report_for_close(open_issues=2)
+        self.assertFalse(_is_close_judgment_available(report))
+
+    def test_pr_mixed_prevents_close(self):
+        """AC8: pr_mixed_count > 0 の場合は close 不可（invariant violation）。"""
+        pr_item = {"number": 99, "title": "Some PR", "state": "open", "depth": 0}
+        report = _build_report_for_close(open_issues=0, pr_mixed=[pr_item])
+        self.assertFalse(_is_close_judgment_available(report))
+        self.assertEqual(report["summary"]["pr_mixed_count"], 1)
 
 
 if __name__ == "__main__":

@@ -393,8 +393,16 @@ $(echo -e "$HUMAN_ESC_LIST")
 \`\`\`yaml
 open_issues: ${M_OPEN}
 pr_mixed_count: ${PR_MIXED_COUNT}
+assignment_drift: ${DRIFT_STATUS}
+# 以下は descendant rollup（scripts/milestone_rollup.py）の確認が別途必要:
+# partial: <false required>
+# warnings: <[] required>
+# open_blocker_count: <0 required>
+# scope_conflict_count: <0 required>
 close_judgment_available: ${CLOSE_JUDGMENT}
-# close_judgment_available: true は人間が close 判断可能な状態を示す
+# close_judgment_available: true は人間が close 判断可能な状態の直接チェック部分のみ確認済み
+# 完全な fail-closed close predicate（partial/warnings/open_blocker/scope_conflict）は
+# scripts/milestone_rollup.py の MILESTONE_DESCENDANT_ROLLUP_V1 report を別途確認すること
 # AI は Milestone close を実行しない（docs/dev/milestone-ops.md 参照）
 \`\`\`
 OUTPUT_EOF

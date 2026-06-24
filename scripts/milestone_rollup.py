@@ -342,18 +342,39 @@ def analyze(
             )
             continue  # PRs don't need further checks
 
-        # AC3: milestone null or mismatch
-        if m_num is None or m_num != milestone_number:
-            milestone_mismatches.append(
-                {
-                    "number": number,
-                    "title": issue["title"],
-                    "state": state,
-                    "milestone_number": m_num,
-                    "depth": issue["depth"],
-                    "parent_number": issue["parent_number"],
-                }
-            )
+        # AC3/AC5: milestone null or mismatch
+        # AC5: depth >= 1 (descendant) with milestone=null is NORMAL (indirect member).
+        # Only depth 0 (direct items) require the target milestone.
+        # depth >= 1 with an explicit different milestone is still a mismatch (scope conflict).
+        depth = issue["depth"]
+        if depth == 0:
+            # Direct item: must have the target milestone
+            if m_num is None or m_num != milestone_number:
+                milestone_mismatches.append(
+                    {
+                        "number": number,
+                        "title": issue["title"],
+                        "state": state,
+                        "milestone_number": m_num,
+                        "depth": depth,
+                        "parent_number": issue["parent_number"],
+                    }
+                )
+        else:
+            # Descendant (depth >= 1):
+            # milestone=null → indirect member, normal per AC5 (do not flag as mismatch)
+            # milestone=other → scope conflict (still flagged as mismatch for human review)
+            if m_num is not None and m_num != milestone_number:
+                milestone_mismatches.append(
+                    {
+                        "number": number,
+                        "title": issue["title"],
+                        "state": state,
+                        "milestone_number": m_num,
+                        "depth": depth,
+                        "parent_number": issue["parent_number"],
+                    }
+                )
 
         # AC4: closed issue with stale state labels
         if state == "closed":
