@@ -18,6 +18,7 @@
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
     "scripts/ci/tests/",
+    "scripts/tests/test_milestone_rollup.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py"
   ],
