@@ -122,7 +122,11 @@ def check_yaml_parseable(content: str) -> Tuple[bool, str, dict]:
 
 
 def check_schema(data: dict) -> Tuple[bool, str]:
-    schema = data.get("schema") or data.get("secret_policy", {}).get("schema") if isinstance(data.get("secret_policy"), dict) else data.get("schema")
+    schema = (
+        (data.get("schema") or data.get("secret_policy", {}).get("schema"))
+        if isinstance(data.get("secret_policy"), dict)
+        else data.get("schema")
+    )
     # Support top-level schema key or nested under secret_policy:
     if isinstance(data.get("secret_policy"), dict):
         schema = data["secret_policy"].get("schema")
