@@ -1,129 +1,148 @@
 # CI Runtime Baseline — Issue #1064 (python-test pytest-xdist 並列化 migration)
 
 このドキュメントは Issue #1064 の runtime 観測 AC（AC3 / AC4 / AC5 / AC9 / AC11）の committed evidence
-artifact である。`docs/dev/runtime-verification-policy.md` の **immediate** 規約に従い、各 runtime AC の
-VC は本ファイルの必須フィールド存在を決定論的に検査して代替検証する。実測値の妥当性（runner image 同一性・
-20 run・flake 除外）は PR レビューと runtime-verification-policy の証跡監査で担保する。
+artifact である。`docs/dev/runtime-verification-policy.md` の **immediate** 規約に従う。AC11 の base/head
+20-run P50/P95 は **実 GitHub Actions runner で収集した実測値**であり（§4）、run ID 一覧で監査可能とする。
 
 ## 0. 測定環境サマリ
 
 | 項目 | 値 |
 |---|---|
-| base commit | `83622b88d600167586eb915bad627f90f91617f0`（origin/main, #1064 分岐元） |
-| head commit | 本 PR の head（CI artifact の `head_sha` で確定） |
-| pytest-xdist version (`xdist_version`) | `3.8.0`（`pyproject.toml`: `pytest-xdist>=3.8,<4`、`uv.lock` で固定） |
-| pytest version | `9.0.3` |
-| Python | `3.12` |
-| scheduler（採用） | `worksteal`（`.github/ci/python-test-plan.json` の `xdist.dist`） |
-| resolved_workers | `auto`（`xdist.workers`。GitHub Actions ubuntu-latest の vCPU 数に解決） |
-| CI 実行環境 | GitHub Actions `python-test` job, `ubuntu-latest`（runner_image は CI artifact `xdist_meta.json` / `ci_runtime_baseline_v1` に記録） |
-| ローカル証跡環境 | WSL2 Ubuntu, `Linux-6.6.87.2-microsoft-standard-WSL2-x86_64`, nproc=24（CI runner とは別環境。下記 §2-§4 のローカル数値はこの環境での実測） |
+| base commit（before） | `83622b88d600167586eb915bad627f90f91617f0`（origin/main、14 分割直列 pytest） |
+| base 測定ブランチ | `bench-base-1064`（origin/main + bench dispatch のみ追加。python-test job は origin/main と同一） |
+| head commit（after） | `88585899`（python-test-plan SSOT + xdist 並列 + serial lane） |
+| pytest-xdist version | `3.8.0`（`pyproject.toml`: `pytest-xdist>=3.8,<4`、`uv.lock` 固定） |
+| pytest / Python | `9.0.3` / `3.12` |
+| worker 数（固定） | **`-n 4`**（`.github/ci/python-test-plan.json` の `xdist.workers`。CI runner の vCPU 数に一致する固定値。`-n auto` の CPU 依存を排除） |
+| scheduler（採用） | **`loadscope`**（固定 -n4 比較で最速。§2） |
+| CI runner image | GitHub Actions `ubuntu-latest` → `ubuntu24/20260615.205.1`（base/head の全 20-run で一致。§4） |
+| ローカル証跡環境 | WSL2 Ubuntu 24-core（§2 scheduler 比較・§1 nodeid 等価の実測環境。CI runner とは別） |
 
-> ローカル数値（§2 scheduler 比較・§3 flake）は WSL2 24-core での **実測値**であり、GitHub Actions runner の
-> 実測ではない。runner image 同一条件の base/head 20-run 統計（§4）は CI 実行で収集する。本ファイルは
-> committed evidence として全必須フィールドを保持し、CI runner 数値は §4 の run ID から監査可能とする。
+## 1. AC3 — migration-set の collected nodeid 等価性（分割実行 ⇔ unified）
 
-## 1. AC3 — 現行分割実行 と unified serial（`-n 0`）の collected nodeid 等価性
+`collect_nodeids_plugin`（`pytest_collection_finish` で node ID を JSON 出力。stdout 解析を排除）で収集。
 
-`scripts/ci/python_test_plan.py`（python-test-plan SSOT loader）の scope argv で collect した nodeid 集合と、
-移行前 14 分割 step の target を union して collect した nodeid 集合を比較した（`pytest --collect-only -q`）。
-
-| 集合 | nodeid 件数 | sha256（sorted nodeids） | collect exit |
-|---|---|---|---|
-| unified plan（SSOT scope_argv） | 4242 | `ba1d23744ca240ad8630982e64762ad90cd520efd90b242bf2f2f4aec1985d47` | 0 |
-| legacy split union（移行前 14 step） | 4242 | `ba1d23744ca240ad8630982e64762ad90cd520efd90b242bf2f2f4aec1985d47` | 0（全 15 group 0） |
-
-- `equal_sets: true`（`only_in_unified: []` / `only_in_legacy: []`）。**件数・集合・hash 完全一致**。
-- これにより「pytest 実行対象は分割→統合で不変」であることを証明し、その後初めて xdist 並列化を有効化した。
-
-### unified serial（`-n 0`）統合実行の pass 証跡
-
-| run | result | seconds |
+| 集合 | nodeid 件数 | sha256（sorted nodeids） |
 |---|---|---|
-| `-n 0`（full scope, CI=true） | **PASS**: 4237 passed, 3 skipped, 2 deselected, 2 xfailed | 201.42s |
+| 移行前 14 分割 step の target union（legacy） | 4247 | `f81899a30ef7ebe0ca46ed1882fd26292ae31ca3c11b2a989b71a5fa0d5f1c77` |
+| unified plan の scope（本 PR 追加 `scripts/ci/tests/` を除外） | 4247 | `f81899a30ef7ebe0ca46ed1882fd26292ae31ca3c11b2a989b71a5fa0d5f1c77` |
 
-- 2 xfailed は意図された xfail（LP057 `Refs #N` leniency / BEHIND consumer）。
-- serial 統合実行は green。意味論 drift（後述 §5）は単一プロセス化で顕在化したため特定・解消済み。
+- `migrated_equals_legacy: true`。**件数・集合・hash 完全一致**。pytest 実行対象は分割→統合で不変。
+- 本 PR は `scripts/ci/tests/`（loader の validation テスト 52 件）を**新規追加**する。これは migration による
+  drift ではなく本 PR 自身の test であり、unified full scope は 4247 + 52 = 4299 件となる。
+- unified serial（`-n 0`、full scope）run は PASS（4237 passed 相当 + 追加 loader テスト、ローカル実測）。
+  CI では head の python-test job（§4、20-run すべて green）が unified 実行の pass を継続的に裏付ける。
 
-## 2. AC4 — 固定 worker 数での scheduler 比較（`--dist load` / `loadscope` / `worksteal`）
+## 2. AC4 — 固定 worker 数（`-n 4`）での scheduler 比較
 
-`-n auto` 固定、各 scheduler 3 run（WSL2 24-core, CI=true, `parallel_exclude` を除いた parallel scope）。
+`-n 4` 固定、各 scheduler 3 run（WSL2、CI=true、`parallel_exclude` を除いた parallel scope、4284 tests）。
+**`-n auto`（CPU 依存）ではなく固定 worker 数で比較**（OWNER review 反映）。
 
 | scheduler | runs (s) | P50 (s) | P95 (s) | all_pass |
 |---|---|---|---|---|
-| `worksteal`（採用） | 73.46 / 71.93 / 73.20 | **73.20** | **73.43** | true |
-| `load` | 71.22 / 69.93 / 77.50 | 71.22 | 76.87 | true |
-| `loadscope` | 80.08 / 78.61 / 75.72 | 78.61 | 79.93 | true |
+| **`loadscope`（採用）** | 56.42 / 56.15 / 58.25 | **56.42** | **58.07** | true |
+| `load` | 64.62 / 64.95 / 65.61 | 64.95 | 65.54 | true |
+| `worksteal` | 71.48 / 69.61 / 69.64 | 69.64 | 71.30 | true |
 
-### 採用 scheduler の選択理由（worksteal）
+### 採用 scheduler の選択理由（loadscope）
 
-- `load` は P50 が最小（71.22s）だが run 間分散が大きく P95 が 76.87s（外れ値 77.5s）。
-- `worksteal` は P50 73.20s / P95 73.43s と **最も分散が小さい**（73.17–73.46s に収束）。CI gate では最悪値
-  （P95）の安定性が再実行コスト・flake 耐性に直結するため、P95 が最小で分散の小さい `worksteal` を採用する。
-- `loadscope` は module 単位 group 化で最も遅く（P50 78.61s）、本 suite では利点が出なかった。
+- 固定 `-n 4` で **`loadscope` が最速**（P50 56.4s、worksteal 比 ▲19%、load 比 ▲13%）。
+- 理由は **module-scope fixture の再利用**: `loadscope` は同一 module/class の test を同一 worker に割り当てる
+  ため、module 単位の重い fixture が worker 間で重複実行されない。本 suite は module 数（≈137）が worker 数
+  （4）を大きく上回り粒度が細かいため、scope grouping による負荷偏りは生じず、fixture 再利用の利得のみが効く。
+  この利得は CPU コア数ではなく fixture 実行回数に由来するため CI runner にも転移する。
 - いずれの scheduler も all_pass（collection mismatch / worker crash なし）。
 
-## 3. AC5 — 採用 parallel command の連続実行（race / crash / collection mismatch 検査）
+## 3. AC5 — 採用 parallel command の連続実行（race / crash / collection mismatch）
 
-採用 command（`-n auto --dist worksteal`、parallel scope）を 5 回連続実行した（WSL2 24-core, CI=true）。
+採用 command（`-n 4 --dist loadscope`）の連続実行で flake を検査する。
 
-| repeat | rc | seconds |
-|---|---|---|
-| #0 | 0 | 72.94 |
-| #1 | 0 | 71.18 |
-| #2 | 0 | 70.81 |
-| #3 | 0 | 71.71 |
-| #4 | 0 | 69.76 |
-
-- `all_pass: true`（5/5 RC 0）。collection mismatch / worker crash / race failure は観測されず。
+- **CI 上の 20 連続 run**（§4 head）がすべて green であり、20 回連続の race/crash/collection mismatch 無しを
+  実証する（5 回要件を上回る）。
 - timing-sensitive な `test_session_manifest_debounce.py` は `parallel_exclude` で xdist から除外し、専用
-  serial lane（`-n 0`）で実行する（§5 参照）。serial lane: 10 passed / 1.98s。
+  serial lane（`-n 0`）で実行する（§5）。serial lane: 10 passed。
 
 ## 4. AC11 — base/head 同一 runner 条件 20 run の P50/P95・run ID・runner image
 
-`python-test` job は worker/scheduler/xdist version を `python_test_artifacts/xdist_meta.json`、step 所要時間を
-`measurements.jsonl`（phase_id `pytest_skills`）として CI artifact に記録する。GitHub Actions runner image 同一
-条件の base/head 各 20 run の P50/P95 はこの CI artifact から収集する。
+`python-test` job は step ごとの `elapsed_ms` を `measurements.jsonl`（→ `ci_runtime_baseline_v1` artifact）に
+記録する。`python_test_bench` dispatch（python-test job のみ実行、runner 条件は通常 run と同一）で base/head
+各 20 run を収集し、`runner_image` の `ImageVersion` が一致する run のみで P50/P95 を算出した。
 
-| 系列 | runner image | run ID 一覧 | P50 (s) | P95 (s) |
+比較指標は §「python-test 性能比較式」に従う:
+
+```text
+python_pytest_total_ms = pytest_parallel_ms + pytest_serial_ms   # head（after）
+python_pytest_total_ms = Σ(phase_id==pytest_skills, step != codex)  # base（before, 14 分割直列）
+```
+
+| 系列 | runner image | matched run | P50 (ms) | P95 (ms) |
 |---|---|---|---|---|
-| head（本 PR, `pytest_python_suite` phase） | GitHub Actions `ubuntu-latest`（artifact の `runner_image`） | 本 PR の CI run（下記「CI run 収集」） | CI artifact から算出 | CI artifact から算出 |
-| base（origin/main `83622b88`） | GitHub Actions `ubuntu-latest` | base run（main の `ci_runtime_baseline_v1` artifact） | CI artifact から算出 | CI artifact から算出 |
+| **base**（before、origin/main 14 分割直列） | `ubuntu24/20260615.205.1` | 20 / 20 | **221130.5** | **228195.5** |
+| **head**（after、`-n 4 --dist loadscope` + serial lane） | `ubuntu24/20260615.205.1` | 20 | **77882.0** | **80564.4** |
 
-### CI run 収集（runner-identical 20-run）
+### before / after
 
-- runner image 同一条件の 20-run 統計は **GitHub Actions 上での実行**でのみ取得できる（ローカル WSL2 とは
-  runner が異なるため代替不可）。本 PR の CI run（`pytest_python_suite` step の `measurements.jsonl` /
-  `xdist_meta.json` artifact）と main の `ci_runtime_baseline_v1` artifact を runner image 一致で照合して P50/P95
-  を確定する。
-- 本 PR push 後の CI run ID をここに追記する:
-  - head run IDs: _（CI 実行後に追記）_
-  - base run IDs: _（main の baseline artifact から）_
-- ローカル proxy（参考、runner 非同一）: §2 worksteal P50 73.20s / P95 73.43s、§3 5-run 69.76–72.94s。
-- `runtime-verification-policy.md` の fallback 規約に従い、本ファイルは committed evidence として全必須フィールド
-  を保持する。runner-identical な 20-run P50/P95 の数値妥当性は PR レビュー / 証跡監査（CI run ID 経由）で確定する。
+- **P50: 221130.5 ms → 77882.0 ms（~2.84×（221130.5 / 77882.0））**
+- **P95: 228195.5 ms → 80564.4 ms（~2.83×（228195.5 / 80564.4））**
 
-## 5. 単一プロセス統合で顕在化した意味論 drift とその解消
+base/head とも全 20 run が同一 runner image `ubuntu24/20260615.205.1`（image 一致 20/20）であり、runner 条件は
+同一。
 
-移行前は pytest が 14 個の独立 step（別プロセス）に分割されており、プロセス境界がテスト間の状態汚染を隠して
-いた。unified serial（`-n 0`）統合でこれらが単一プロセス化し、以下 2 件の既存 latent 問題が顕在化したため特定・
-解消した（nodeid 集合自体は §1 のとおり不変）。
+### run ID 一覧（監査用）
 
-1. **`validate_pr_body` 同名モジュール衝突**:
-   `.claude/skills/open-pr/scripts/tests/test_validate_pr_body.py`（`from validate_pr_body import …`）と
-   `.claude/skills/impl-review-loop/tests/test_handoff_pr_hygiene_regression.py`（`spec_from_file_location("validate_pr_body", …)`）が
-   同一モジュール名で同一ファイルを別インスタンスとしてロードしていた。後者は `sys.modules` 未登録のため、
-   `validate_pr_body.py` の frozen `@dataclass` が `sys.modules[cls.__module__].__dict__` を解決する際に前者の
-   インスタンスへ束縛され、検証結果が破壊された。→ handoff 側を**一意モジュール名＋exec 前 `sys.modules` 登録**で
-   self-consistent 化し、さらに `changed_paths` を非空にして LP058 混入を排除（LP057 単独を検証する本来の意図を保持）。
-   旧来の壊れたロードが偽成立させていた xfail を正し、`Refs #N` leniency（xfail）と整形不正参照の正しい fail を
-   分離した。assertion の意味は不変。
+- base（20 run、bench-base-1064、ImageVersion `ubuntu24/20260615.205.1`）:
+  28036088936, 28036083400, 28036078505, 28036073564, 28036068600, 28036063458, 28036057865, 28036052729,
+  28036047923, 28036042860, 28036037200, 28036032311, 28036026938, 28036021307, 28036016215, 28036011387,
+  28036006341, 28036001500, 28035996603, 28035990860
+- base の totals_ms（参考、昇順）: 114744, 213330, 217162, 217395, 217506, 219518, 219618, 220233, 220710,
+  220823, 221438, 222012, 222491, 222764, 222919, 223894, 224931, 226884, 228138, 229287。先頭 1 件
+  (114744) は他より大幅に低い外れ値だが、P50/P95 は中央寄り統計のため影響を受けない（残り 19 run は
+  213k–229k に収束）。
+- head（20 run、`-n 4 --dist loadscope`、ImageVersion `ubuntu24/20260615.205.1`）:
+  28037323602, 28037317697, 28037312573, 28037307642, 28037302157, 28037297001, 28037291865, 28037286924,
+  28037281668, 28037276784, 28037271611, 28037266197, 28037260648, 28037254828, 28037249553, 28037244464,
+  28037239035, 28037233589, 28037228035, 28037221774
 
-2. **debounce timing flake（xdist CPU 競合）**:
-   `test_session_manifest_debounce.py` は 80ms の debounce window を持つ front-gate を駆動し、`tmp_path` 隔離済み
-   （共有 fixture/cwd/artifact race ではない）。xdist の CPU 飽和下では burst invocation 間で window が満了し
-   coalescing assertion が flake した（`assert 9 == 1`）。→ `.github/ci/python-test-plan.json` の `parallel_exclude`
-   に登録し、xdist parallel run から除外して専用 serial lane（`-n 0`）で実行する。テスト本体は不変。
+## 5. python-test step 構成と性能比較式（phase 一意化）
 
-これらは #1064 の Allowed Paths を Scope Delta で拡張して同一 PR で解消した（serial 統合による実行意味論変更の
-安全化が本 Issue の中核であるため）。
+python-test の pytest は 3 つの識別可能な step（別 `phase_id`）に分かれる。旧 `pytest_skills` 単一 phase は
+parallel/serial/codex を混在させ before/after 比較を曖昧にしていたため分離した（OWNER review 反映）。
+
+| step_id | phase_id | 内容 |
+|---|---|---|
+| `pytest_parallel` | `pytest_parallel` | python-test-plan SSOT を `-n 4 --dist loadscope` で実行（JUnit `junit-parallel.xml`） |
+| `pytest_serial` | `pytest_serial` | `parallel_exclude`（debounce）を `-n 0` で実行（JUnit `junit-serial.xml`） |
+| `codex_execpolicy_matrix` | `codex_execpolicy` | codex execpolicy matrix + `tests/codex/`（pytest 比較には含めない） |
+
+```text
+python_pytest_total_ms = pytest_parallel_ms + pytest_serial_ms
+```
+
+### 単一プロセス統合で顕在化した test-isolation 2 件（Scope Delta で解消）
+
+1. `validate_pr_body` 同名モジュール衝突 → handoff テストを一意モジュール名 + `sys.modules` 事前登録 +
+   `changed_paths` 非空化（LP058 切り分け）で解消。assertion 意味は不変。
+2. debounce timing flake（80ms window の xdist CPU 競合、`tmp_path` 隔離済で共有 race ではない）→ plan
+   `parallel_exclude` + serial lane 分離。テスト本体は不変。
+
+## 6. AC9 — 配布 artifact が python-test 全体を表すこと
+
+- `pytest_parallel` と `pytest_serial` がそれぞれ JUnit XML（`junit-parallel.xml` / `junit-serial.xml`）と
+  `--durations` ログを生成し、`python-test-junit-<attempt>` artifact として upload（`if-no-files-found: error`）。
+- `verify_python_test_manifest.py` が **parallel + serial の testcase 合計 == scope collected nodeids** を検証:
+  ローカル実測で parallel 4289 + serial 10 = **4299 == scope collected 4299**（union_equals_scope: true）。
+  これにより JUnit が全体結果を表すこと（serial lane の debounce 10 件を含む）を機械検証する。
+- `resolved_workers` は `collect_nodeids_plugin` の controller-side `numprocesses` probe で実測（固定 `-n 4` =
+  `resolved_workers: 4`）。`nproc` を worker 数の proxy にしない。`xdist_meta.json` に
+  `resolved_workers` / `scheduler` / `xdist_version` を記録。
+- `verify_lane_union.py` が `parallel ∪ serial == scope` かつ `parallel ∩ serial == ∅` を CI で fail-closed
+  検証する。
+
+## 7. ci_test_selection の false-green 除去（B1）
+
+`generate_ci_test_selection_artifact.py` は change detection を branch 名 `main`（shallow checkout で不在）に
+依存せず、**explicit `--base-sha`/`--head-sha` の git diff** で行う。`diff_status`（rc/timeout/stderr/ok）を
+artifact に記録し、`diff_status.ok != true` で exit 2（fail-close）。G1 は `collection_status.ok` AND
+`diff_status.ok` を必須とする。checkout は `fetch-depth: 0`。変更テスト判定は pytest 規約（`test_*.py` /
+`*_test.py`）に厳格化し source ファイル誤検出を排除。実 CI（run 28034942311）で `diff_status.ok: true`、
+`changed_test_files` に本 PR の変更テスト 3 件を列挙、`uncovered_changed_test_files: []` を確認済み。
