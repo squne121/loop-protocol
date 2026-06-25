@@ -922,29 +922,17 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-      - name: Install codex CLI (pinned, for execpolicy gate)
-        run: |
-          set -euo pipefail
-          CODEX_PREFIX="${RUNNER_TEMP}/codex-cli"
-          npm install \
-            --prefix "${CODEX_PREFIX}" \
-            --package-lock=false \
-            --no-audit \
-            --no-fund \
-            "@openai/codex@${CODEX_CLI_VERSION}"
-          echo "CODEX_BINARY=${CODEX_PREFIX}/node_modules/.bin/codex" >> "$GITHUB_ENV"
-        env:
-          CODEX_CLI_VERSION: "0.142.0"
       - name: codex execpolicy + cleanup-route matrix (timed)
         run: |
           _t0=$(date +%s%3N)
           set +e
           mkdir -p codex_execpolicy_artifacts
-          # The required gate is fail-closed only if the pinned binary reports the
-          # exact version and `codex execpolicy check --help` exits 0. The script
-          # performs both checks and records the result in the JSON artifact.
+          # The required gate is fail-closed only if install, version, and
+          # `codex execpolicy check --help` all succeed inside the same
+          # artifact-writing orchestrator.
           python3 scripts/ci/codex_execpolicy_matrix.py \
-            --codex-binary "${CODEX_BINARY}" \
+            --npm-prefix codex_execpolicy_artifacts/codex-cli \
+            --package-spec "@openai/codex@0.142.0" \
             --expected-version "codex-cli 0.142.0" \
             --rules .codex/rules/default.rules \
             --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json

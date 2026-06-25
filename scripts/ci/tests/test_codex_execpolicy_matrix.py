@@ -80,5 +80,16 @@ def test_given_fixture_repo_when_cases_built_then_exact_cleanup_and_invalid_vari
     labels = {case["label"] for case in mod.execpolicy_case_definitions(fixture)}
     assert "exact_worktree_remove" in labels
     assert "exact_branch_delete" in labels
+    assert "malformed_worktree_remove_contract" in labels
     assert "worktree_remove_missing_target" in labels
+    assert "branch_delete_df_combined_flag" in labels
+    assert "branch_delete_fd_combined_flag" in labels
+    assert "branch_delete_long_unique_prefix" in labels
     assert "branch_delete_force_shortcut" in labels
+
+
+def test_given_cleanup_guard_stderr_when_reason_extracted_then_reason_code_is_returned():
+    reason = mod._extract_guard_reason(
+        "[worktree_scope_guard] blocked: cleanup operation denied\nreason: cleanup_contract_present_but_invalid"
+    )
+    assert reason == "cleanup_contract_present_but_invalid"
