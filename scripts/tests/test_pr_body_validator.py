@@ -10,29 +10,15 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "pr_body_validator.py"
-FIXTURE_DIR = (
-    Path(__file__).resolve().parents[2]
-    / ".claude" / "skills" / "open-pr" / "scripts" / "tests" / "fixtures" / "pr_body"
-)
+FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".claude" / "skills" / "open-pr" / "scripts" / "tests" / "fixtures" / "pr_body"
 
 
-def _run_cli(
-    body: str,
-    *,
-    changed_paths_fixture: str = "non_safety_paths.txt",
-    schema_change: str | None = None,
-    linked_issue: int = 469,
-) -> subprocess.CompletedProcess[str]:
+def _run_cli(body: str, *, changed_paths_fixture: str = "non_safety_paths.txt", schema_change: str | None = None, linked_issue: int = 469) -> subprocess.CompletedProcess[str]:
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False) as body_file:
         body_file.write(body)
         body_path = body_file.name
     try:
-        cmd = [
-            sys.executable, str(SCRIPT_PATH),
-            "--body-file", body_path,
-            "--changed-paths-file", str(FIXTURE_DIR / changed_paths_fixture),
-            "--linked-issue", str(linked_issue),
-        ]
+        cmd = [sys.executable, str(SCRIPT_PATH), "--body-file", body_path, "--changed-paths-file", str(FIXTURE_DIR / changed_paths_fixture), "--linked-issue", str(linked_issue)]
         if schema_change:
             cmd.extend(["--schema-change", schema_change])
         return subprocess.run(cmd, capture_output=True, text=True, check=False)

@@ -20,7 +20,6 @@
     "schemas/tests/",
     "scripts/ci/tests/",
     "scripts/tests/test_milestone_rollup.py",
-    "scripts/tests/test_pr_body_validator.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py"
   ],
