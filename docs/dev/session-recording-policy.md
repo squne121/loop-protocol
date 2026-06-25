@@ -224,6 +224,48 @@ kill_switch:
     full_transcript_remote_visibility: none
     leaked_credentials_rotated_or_revoked: true
   verification_required: true
+
+# Latitude telemetry state definitions (#1157)
+# export_state と capture_state は独立した状態として定義される。
+# LATITUDE_CLAUDE_CODE_ENABLED=0 は export を停止するが capture を停止する証明にならない。
+latitude:
+  pilot_state: BLOCKED
+  real_development_session_allowed: false
+  export_state:
+    description: "Latitude export hook の有効/無効状態 (LATITUDE_CLAUDE_CODE_ENABLED)"
+    values:
+      enabled: "export フックが有効（LATITUDE_CLAUDE_CODE_ENABLED が 1 または未設定）"
+      disabled: "export フックが無効（LATITUDE_CLAUDE_CODE_ENABLED=0）"
+      unknown: "状態が確認不能"
+    control_variable: LATITUDE_CLAUDE_CODE_ENABLED
+    stop_export_only: true
+    note: "export 停止は capture 停止の証明にならない（preload が active な場合）"
+  capture_state:
+    description: "BUN_OPTIONS preload による capture の active/inactive 状態"
+    values:
+      active: "preload が settings/systemd/shell/process environment に設定されている"
+      inactive: "preload が設定されていない"
+      unknown: "状態が確認不能"
+    capture_independent_from_export: true
+    note: "export が disabled でも preload が active なら capture は active のまま"
+  uninstall_postcondition:
+    quiescent_two_stage_required: true
+    stages:
+      - "1. 新規起動経路の BUN_OPTIONS / hook を停止"
+      - "2. Claude CLI / Desktop / IDE extension host / 関連 Bun process を停止"
+      - "3. active process inheritance を再検査"
+      - "4. settings / backup / state / spool / preload を検査・除去"
+      - "5. 静止後に 2 回目の read-only scan"
+      - "6. 2 回の結果が同一かつ対象 process が存在しない場合のみ contained"
+    note: "official uninstall を信用せず postcondition を再検査する"
+  real_session_start_gate:
+    required_conditions:
+      - latitude_containment_complete (別 Issue の人間 Decision)
+      - secret_inventory_consistent
+      - export_state_confirmed_disabled_or_never_enabled
+      - capture_state_confirmed_inactive
+      - uninstall_postcondition_verified
+    blocked_until: "別 Child Issue の人間 Decision が存在する"
 ```
 
 ## Public comment boundary

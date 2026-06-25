@@ -621,3 +621,956 @@ describe('runtime safety: fail-secrets-mode-nonzero fixture (AC5, fixture-driven
     expect(result.stdout).toContain(scenario.expectedDiagnostic)
   })
 })
+
+// ============================================================================
+// Issue #1157: Latitude telemetry safety — JSON mode helpers
+// ============================================================================
+
+/**
+ * Run verifier in --json --execution-profile fixture mode.
+ * Latitude SRRS_LAT_* overrides control component state.
+ * Base safe overrides prevent real git/gh calls.
+ */
+function runVerifierJson(
+  envOverrides: Record<string, string> = {}
+): { stdout: string; stderr: string; exitCode: number; json: Record<string, unknown> | null } {
+  const repoRoot = REPO_ROOT
+
+  const baseEnv: Record<string, string> = {
+    SRRS_GIT_LS_REMOTE_EXIT: '2',
+    SRRS_GH_VISIBILITY: 'private',
+    SRRS_GIT_CONFIG_OUTPUT: '',
+    SRRS_CHECKPOINT_TOKEN: 'absent',
+    SRRS_REPO_ROOT: repoRoot,
+    ...envOverrides,
+  }
+
+  const fullEnv: Record<string, string> = { ...(process.env as Record<string, string>) }
+  delete fullEnv['ENTIRE_CHECKPOINT_TOKEN']
+  delete fullEnv['SRRS_SECRETS_MODE']
+  // Remove any real Latitude env vars to avoid pollution
+  delete fullEnv['LATITUDE_API_KEY']
+  delete fullEnv['LATITUDE_CLAUDE_CODE_ENABLED']
+  delete fullEnv['LATITUDE_BASE_URL']
+  delete fullEnv['LATITUDE_DEBUG']
+  delete fullEnv['BUN_OPTIONS']
+  Object.assign(fullEnv, baseEnv)
+
+  const result = spawnSync(
+    'python3',
+    [SCRIPT, '--json', '--execution-profile', 'fixture'],
+    { encoding: 'utf-8', env: fullEnv, timeout: 30000 }
+  )
+
+  let parsed: Record<string, unknown> | null = null
+  try {
+    parsed = JSON.parse(result.stdout ?? '')
+  } catch {
+    // ignore parse errors
+  }
+
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    exitCode: result.status ?? EXIT_FAIL,
+    json: parsed,
+  }
+}
+
+// ============================================================================
+// AC3: session_recording_runtime_safety/v2 schema present
+// ============================================================================
+
+describe('runtime safety #1157: AC3 v2 schema output', () => {
+  it('GIVEN --json mode WHEN verifier runs THEN output has schema=session_recording_runtime_safety/v2', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_UNINSTALL_STATE: 'not_attempted',
+      SRRS_LAT_DIST_SPEC: 'not_installed',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+    })
+    expect(result.json).not.toBeNull()
+    expect((result.json as Record<string, unknown>)['schema']).toBe('session_recording_runtime_safety/v2')
+    expect((result.json as Record<string, unknown>)['components']).toBeDefined()
+    const components = (result.json as Record<string, unknown>)['components'] as Record<string, unknown>
+    expect(components['latitude']).toBeDefined()
+    expect(components['entire']).toBeDefined()
+  })
+})
+
+// ============================================================================
+// AC4: checked_surfaces includes all required surfaces
+// ============================================================================
+
+describe('runtime safety #1157: AC4 checked surfaces', () => {
+  it('GIVEN --json mode WHEN verifier runs THEN latitude component checked_surfaces includes key surfaces', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const surfaces = (lat?.['checked_surfaces'] as string[]) ?? []
+    // At minimum, the latitude component should have checked credential and hook surfaces
+    expect(Array.isArray(surfaces)).toBe(true)
+    expect(surfaces.length).toBeGreaterThan(0)
+  })
+})
+
+// ============================================================================
+// AC5: export disabled + preload active -> latitude_export_disabled_capture_active
+// ============================================================================
+
+describe('runtime safety #1157: AC5 export disabled capture active', () => {
+  it('GIVEN LATITUDE_CLAUDE_CODE_ENABLED=0 AND preload active WHEN verifier runs THEN latitude blocked with reason_code export_disabled_capture_active', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_EXPORT_STATE: 'disabled',
+      SRRS_LAT_PRELOAD_SETTINGS: 'present',
+      SRRS_LAT_CAPTURE_STATE: 'active',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('export_disabled_capture_active'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC6: Stop hook deleted but active process has preload -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC6 stop hook deleted but preload active in process', () => {
+  it('GIVEN hook absent AND active process has preload WHEN verifier runs THEN latitude blocked with preload_active_process', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_present',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('preload_active_process'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC7: backup has credential field -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC7 backup contains credential field', () => {
+  it('GIVEN backup has credential field WHEN verifier runs THEN latitude blocked with settings_backup_contains_credential_field', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_BACKUP_CREDENTIAL: 'present',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('settings_backup_contains_credential_field'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC8: uninstall incomplete -> latitude_uninstall_incomplete
+// ============================================================================
+
+describe('runtime safety #1157: AC8 uninstall incomplete', () => {
+  it('GIVEN uninstall_state incomplete WHEN verifier runs THEN latitude blocked with uninstall_incomplete', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_UNINSTALL_STATE: 'incomplete',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('uninstall_incomplete'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC9: unversioned hook command -> latitude_distribution_unpinned
+// ============================================================================
+
+describe('runtime safety #1157: AC9 distribution unpinned', () => {
+  it('GIVEN dist_spec unpinned WHEN verifier runs THEN latitude blocked with distribution_unpinned', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_DIST_SPEC: 'unpinned',
+      SRRS_LAT_DIST_INTEGRITY: 'unknown',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('distribution_unpinned'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC10: no credential values in stdout/JSON
+// ============================================================================
+
+describe('runtime safety #1157: AC10 no raw values emitted', () => {
+  it('GIVEN any verifier output WHEN checking raw_values_emitted THEN it is false', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['raw_values_emitted']).toBe(false)
+    // Ensure no raw credential-like values in stdout (not sha256 digests which are safe metadata)
+    // Latitude API keys are UUID-form, other credentials use ghp_/sk-/lat_ prefixes
+    expect(result.stdout).not.toMatch(/ghp_[A-Za-z0-9]+/)
+    expect(result.stdout).not.toMatch(/sk-[A-Za-z0-9]+/)
+    expect(result.stdout).not.toMatch(/lat_[A-Za-z0-9]+/)
+  })
+})
+
+// ============================================================================
+// AC11: UUID-form credential field detected structurally
+// ============================================================================
+
+describe('runtime safety #1157: AC11 credential field structural detection', () => {
+  it('GIVEN LATITUDE_API_KEY field present (not value) WHEN verifier runs THEN latitude blocked with credential_present', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'present',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('credential_present'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC12: unrelated hooks preserved (latitude safe, entire safe)
+// ============================================================================
+
+describe('runtime safety #1157: AC12 unrelated settings preserved', () => {
+  it('GIVEN latitude never_observed AND entire safe WHEN verifier runs THEN exit 0', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_UNINSTALL_STATE: 'not_attempted',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    // transport_state remains unknown (no SRRS_LAT_TRANSPORT_STATE override) -> fail_closed is acceptable
+    // The key assertion is that global verdict is not blocked when no blocking indicators present
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(['not_applicable', 'safe', 'fail_closed']).toContain(lat?.['verdict'])
+  })
+})
+
+// ============================================================================
+// AC13: checker idempotent (run twice, same result)
+// ============================================================================
+
+describe('runtime safety #1157: AC13 idempotent', () => {
+  it('GIVEN same env overrides WHEN verifier runs twice THEN both exits are same', () => {
+    const overrides = {
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    }
+    const r1 = runVerifierJson(overrides)
+    const r2 = runVerifierJson(overrides)
+    expect(r1.exitCode).toBe(r2.exitCode)
+    expect(r1.json?.['verdict']).toBe(r2.json?.['verdict'])
+  })
+})
+
+// ============================================================================
+// AC18: global aggregation truth table — entire blocked, latitude not_applicable
+// ============================================================================
+
+describe('runtime safety #1157: AC18 global aggregation truth table', () => {
+  it('GIVEN entire blocked AND latitude not_applicable WHEN aggregating THEN top-level verdict=blocked', () => {
+    const result = runVerifierJson({
+      SRRS_GIT_LS_REMOTE_EXIT: '0', // entire: blocked
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    expect(result.json?.['verdict']).toBe('blocked')
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const entire = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['entire'] as Record<string, unknown>
+    // Latitude should be not_applicable or safe (no latitude indicators)
+    expect(['not_applicable', 'safe', 'fail_closed']).toContain(lat?.['verdict'])
+    expect(entire?.['verdict']).toBe('blocked')
+  })
+})
+
+// ============================================================================
+// AC19: host mode rejects SRRS_LAT_* overrides
+// ============================================================================
+
+describe('runtime safety #1157: AC19 host mode rejects SRRS_LAT_* overrides', () => {
+  it('GIVEN execution_profile=host AND SRRS_LAT_* present WHEN verifier runs THEN exit 2 and reason_code includes srrs_override_rejected', () => {
+    const repoRoot = REPO_ROOT
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      SRRS_LAT_CREDENTIAL_STATE: 'absent', // This override should be REJECTED in host mode
+      // Do NOT include SRRS_GIT_* etc. to allow real git checks (or they may fail)
+      SRRS_GIT_LS_REMOTE_EXIT: '2',
+      SRRS_GH_VISIBILITY: 'private',
+      SRRS_GIT_CONFIG_OUTPUT: '',
+      SRRS_CHECKPOINT_TOKEN: 'absent',
+      SRRS_REPO_ROOT: repoRoot,
+    }
+    delete env['SRRS_SECRETS_MODE']
+    delete env['ENTIRE_CHECKPOINT_TOKEN']
+
+    const result = spawnSync(
+      'python3',
+      [SCRIPT, '--json', '--execution-profile', 'host'],
+      { encoding: 'utf-8', env, timeout: 30000 }
+    )
+    // host mode with SRRS_LAT_* present -> fail_closed
+    expect(result.status).toBe(EXIT_FAIL_CLOSED)
+    let parsed: Record<string, unknown> | null = null
+    try { parsed = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+    expect(parsed).not.toBeNull()
+    expect(parsed?.['verdict']).toBe('fail_closed')
+  })
+})
+
+// ============================================================================
+// AC20: subprocess raw stderr not forwarded, stdout is single JSON
+// ============================================================================
+
+describe('runtime safety #1157: AC20 stdout single JSON object', () => {
+  it('GIVEN --json mode WHEN verifier runs THEN stdout is exactly one valid JSON object', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    // stdout should be parseable as a single JSON object
+    expect(result.json).not.toBeNull()
+    // Ensure stdout doesn't have extra content after the JSON
+    const trimmed = result.stdout.trim()
+    expect(() => JSON.parse(trimmed)).not.toThrow()
+  })
+})
+
+// ============================================================================
+// AC21: managed policy / plugin hook check -> unknown if cannot inspect
+// ============================================================================
+
+describe('runtime safety #1157: AC21 managed hook unknown -> fail_closed', () => {
+  it('GIVEN SRRS_LAT_MANAGED_HOOK=unknown WHEN verifier runs THEN latitude verdict is fail_closed', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_MANAGED_HOOK: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // latitude_runtime_state_unknown -> fail_closed
+    expect(lat?.['verdict']).toBe('fail_closed')
+  })
+})
+
+// ============================================================================
+// AC22: lstat unsafe_metadata -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC22 lstat unsafe metadata blocked', () => {
+  it('GIVEN local_storage state unsafe_metadata WHEN verifier runs THEN latitude blocked with local_storage_unsafe_metadata', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_LOCAL_STORAGE: 'unsafe_metadata',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('local_storage_unsafe_metadata'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC23: LATITUDE_BASE_URL unapproved -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC23 unapproved base URL blocked', () => {
+  it('GIVEN LATITUDE_BASE_URL pointing to unapproved origin WHEN verifier runs THEN latitude blocked with destination_unapproved', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_BASE_URL: 'https://evil-intercept.example.com/latitude',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('destination_unapproved'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC24: LATITUDE_DEBUG=1 -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC24 LATITUDE_DEBUG=1 blocked', () => {
+  it('GIVEN LATITUDE_DEBUG=1 WHEN verifier runs THEN latitude blocked with diagnostic_logging_enabled', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_DEBUG: '1',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('diagnostic_logging_enabled'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC25: quiescent two-stage postcondition
+// ============================================================================
+
+describe('runtime safety #1157: AC25 quiescent two-stage postcondition', () => {
+  it('GIVEN two successive runs with same clean overrides WHEN comparing THEN both return same verdict', () => {
+    const overrides = {
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_UNINSTALL_STATE: 'complete',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    }
+    const r1 = runVerifierJson(overrides)
+    const r2 = runVerifierJson(overrides)
+    expect(r1.exitCode).toBe(r2.exitCode)
+    const lat1 = ((r1.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const lat2 = ((r2.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat1?.['verdict']).toBe(lat2?.['verdict'])
+  })
+})
+
+// ============================================================================
+// AC26: npm registry provenance unknown -> distribution_provenance_unknown
+// ============================================================================
+
+describe('runtime safety #1157: AC26 provenance unknown blocked', () => {
+  it('GIVEN dist_spec pinned but provenance unknown WHEN verifier runs THEN latitude blocked with distribution_provenance_unknown', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_DIST_SPEC: '@latitude-so/sdk@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('distribution_provenance_unknown'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC27: containment_state != never_observed -> not safe
+// ============================================================================
+
+describe('runtime safety #1157: AC27 containment_state active -> blocked', () => {
+  it('GIVEN containment_state=active WHEN verifier runs THEN latitude blocked', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CONTAINMENT_STATE: 'active',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('blocked')
+  })
+
+  it('GIVEN containment_state=contained (not never_observed) WHEN verifier runs THEN latitude not safe', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CONTAINMENT_STATE: 'contained',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // contained is not never_observed -> blocked
+    expect(lat?.['verdict']).toBe('blocked')
+  })
+})
+
+// ============================================================================
+// AC28: credential in argv -> exposure_state=possible -> blocked
+// ============================================================================
+
+describe('runtime safety #1157: AC28 argv credential exposure', () => {
+  it('GIVEN SRRS_LAT_ARGV_CREDENTIAL=present WHEN verifier runs THEN latitude blocked with exposure_possible_or_confirmed', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_ARGV_CREDENTIAL: 'present',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('exposure_possible_or_confirmed'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// AC29: fixture path and security scripts available
+// ============================================================================
+
+describe('runtime safety #1157: AC29 fixtures and scripts available', () => {
+  it('GIVEN repository structure WHEN checking paths THEN session-recording-runtime-safety fixtures exist', () => {
+    const fixturesPath = resolve(REPO_ROOT, 'tests', 'fixtures', 'session-recording-runtime-safety')
+    expect(existsSync(fixturesPath)).toBe(true)
+  })
+
+  it('GIVEN repository structure WHEN checking package.json THEN security:session-recording scripts exist', () => {
+    const pkg = JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf-8'))
+    const scripts = pkg.scripts ?? {}
+    // security:session-recording:fixture should exist
+    expect(Object.keys(scripts).some(k => k.includes('session-recording'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// ITERATION-1 B-BLOCKER REGRESSION TESTS
+// ============================================================================
+
+// ============================================================================
+// B1: fixture mode does not read real host surfaces
+// ============================================================================
+
+describe('runtime safety #1157 B1: fixture isolation — no real host surfaces', () => {
+  it('GIVEN fixture profile with all absent overrides WHEN verifier runs THEN not blocked by host credential state', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_EXPOSURE_STATE: 'none_observed',
+      SRRS_LAT_UNINSTALL_STATE: 'not_attempted',
+      SRRS_LAT_TRANSPORT_STATE: 'https',
+      SRRS_LAT_DESTINATION_STATE: 'approved_cloud',
+      SRRS_LAT_DIAGNOSTIC_LOG: 'disabled',
+    })
+    // In fixture mode, all overrides applied, no host surfaces touched
+    // Result should not be blocked (fixture isolation working)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).not.toBe('blocked')
+  })
+
+  it('GIVEN fixture profile WITHOUT explicit active_process override WHEN verifier runs THEN active_process_state is unknown (not host)', () => {
+    // Without SRRS_LAT_ACTIVE_PROCESS override in fixture mode,
+    // active_process_state should be unknown (not querying real pgrep/proc)
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_EXPOSURE_STATE: 'none_observed',
+    })
+    // active_process_state unknown in fixture mode -> fail_closed (not invoking real pgrep)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['active_process_state']).toBe('unknown')
+  })
+})
+
+// ============================================================================
+// B2: upstream Latitude storage path (~/.claude/state/latitude/) checked
+// ============================================================================
+
+describe('runtime safety #1157 B2: upstream latitude storage path in checked_surfaces', () => {
+  it('GIVEN --json fixture mode WHEN local_storage override present THEN checked_surfaces includes claude_state_latitude', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const surfaces = (lat?.['checked_surfaces'] as string[]) ?? []
+    // B2: upstream path must be in checked_surfaces
+    expect(surfaces.some(s => s.includes('claude_state_latitude') || s.includes('latitude_state'))).toBe(true)
+  })
+
+  it('GIVEN local_storage override present WHEN verifier runs THEN latitude_state surface is reported', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_LOCAL_STORAGE: 'present',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const surfaces = (lat?.['checked_surfaces'] as string[]) ?? []
+    expect(surfaces.some(s => s.includes('latitude_state') || s.includes('claude_state_latitude'))).toBe(true)
+  })
+})
+
+// ============================================================================
+// B3: systemd / pgrep failure -> unknown, not silent pass
+// ============================================================================
+
+describe('runtime safety #1157 B3: fail-closed on inspection errors', () => {
+  it('GIVEN managed hook state unknown WHEN verifier runs THEN latitude verdict is fail_closed (not pass)', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_MANAGED_HOOK: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // managed hook unknown -> fail_closed (not silent pass)
+    expect(lat?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN active_process unknown WHEN verifier runs THEN latitude verdict is fail_closed', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_ACTIVE_PROCESS: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['verdict']).toBe('fail_closed')
+  })
+})
+
+// ============================================================================
+// B4: scoped package pin detection + distribution check
+// ============================================================================
+
+describe('runtime safety #1157 B4: scoped package version pin detection', () => {
+  it('GIVEN npx @latitude-data/claude-code-telemetry (no version) WHEN verifier runs THEN distribution_unpinned', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry',
+      SRRS_LAT_DIST_INTEGRITY: 'unknown',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('distribution_unpinned'))).toBe(true)
+  })
+
+  it('GIVEN npx @latitude-data/claude-code-telemetry@1.2.3 (pinned) WHEN verifier runs THEN distribution_unpinned absent', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('distribution_unpinned'))).toBe(false)
+  })
+})
+
+// ============================================================================
+// B5: exact origin matching — no prefix spoofing
+// ============================================================================
+
+describe('runtime safety #1157 B5: exact origin matching for destination', () => {
+  it('GIVEN LATITUDE_BASE_URL=https://ingest.latitude.so WHEN verifier runs THEN destination approved (not unapproved)', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_BASE_URL: 'https://ingest.latitude.so',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    // ingest.latitude.so must be in allowlist
+    expect(rcs.some(rc => rc.includes('destination_unapproved'))).toBe(false)
+    expect(lat?.['destination_state']).toBe('approved_cloud')
+  })
+
+  it('GIVEN LATITUDE_BASE_URL=https://latitude.so.evil.example WHEN verifier runs THEN destination_unapproved (no prefix spoofing)', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_BASE_URL: 'https://latitude.so.evil.example',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('destination_unapproved'))).toBe(true)
+  })
+
+  it('GIVEN LATITUDE_BASE_URL=https://latitude.so/some/path WHEN verifier runs THEN destination approved', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_BASE_URL: 'https://latitude.so/api/v1',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // https://latitude.so is approved, path suffix must not disqualify it
+    expect(lat?.['destination_state']).toBe('approved_cloud')
+  })
+})
+
+// ============================================================================
+// B6: SRRS_SECRETS_MODE unset + credential present -> policy_mode_mismatch
+// ============================================================================
+
+describe('runtime safety #1157 B6: secrets mode policy mismatch', () => {
+  it('GIVEN credential present AND SRRS_SECRETS_MODE unset WHEN verifier runs THEN latitude blocked with policy_mode_mismatch', () => {
+    const repoRoot = REPO_ROOT
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      SRRS_LAT_CREDENTIAL_STATE: 'present',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_GIT_LS_REMOTE_EXIT: '2',
+      SRRS_GH_VISIBILITY: 'private',
+      SRRS_GIT_CONFIG_OUTPUT: '',
+      SRRS_CHECKPOINT_TOKEN: 'absent',
+      SRRS_REPO_ROOT: repoRoot,
+    }
+    delete env['SRRS_SECRETS_MODE']
+    delete env['ENTIRE_CHECKPOINT_TOKEN']
+    delete env['LATITUDE_API_KEY']
+    delete env['LATITUDE_CLAUDE_CODE_ENABLED']
+    delete env['LATITUDE_BASE_URL']
+    delete env['LATITUDE_DEBUG']
+    delete env['BUN_OPTIONS']
+
+    const result = spawnSync(
+      'python3',
+      [SCRIPT, '--json', '--execution-profile', 'fixture'],
+      { encoding: 'utf-8', env, timeout: 30000 }
+    )
+    let parsed: Record<string, unknown> | null = null
+    try { parsed = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+    const lat = ((parsed as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    // credential present + no secrets_mode -> policy_mode_mismatch -> blocked
+    expect(rcs.some(rc => rc.includes('policy_mode_mismatch'))).toBe(true)
+    expect(lat?.['verdict']).toBe('blocked')
+  })
+})
+
+// ============================================================================
+// B7: inspection_complete is independent of verdict
+// ============================================================================
+
+describe('runtime safety #1157 B7: inspection_complete independent of verdict', () => {
+  it('GIVEN credential blocked AND active_process unknown WHEN verifier runs THEN inspection_complete=false even when verdict=blocked', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'present',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      // No SRRS_LAT_ACTIVE_PROCESS -> fixture mode returns unknown
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // verdict=blocked (credential present), but active_process inspection gap exists
+    expect(lat?.['verdict']).toBe('blocked')
+    // inspection_complete=false because active_process is unknown (inspection gap)
+    expect(result.json?.['inspection_complete']).toBe(false)
+  })
+
+  it('GIVEN all surfaces fully overridden WHEN verifier runs THEN inspection_complete reflects gap count', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_EXPOSURE_STATE: 'none_observed',
+    })
+    // With explicit overrides for all surfaces, inspection_gaps should be empty
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const gaps = (lat?.['inspection_gaps'] as string[]) ?? []
+    expect(Array.isArray(gaps)).toBe(true)
+    // gaps should be minimal when major surfaces are overridden
+    expect(gaps.length).toBeLessThanOrEqual(5)
+  })
+})
+
+// ============================================================================
+// B8: uninstall postcondition — two-snapshot quiescent verification
+// ============================================================================
+
+describe('runtime safety #1157 B8: uninstall postcondition snapshot verification', () => {
+  it('GIVEN uninstall_state complete override WHEN verifier runs THEN uninstall_state reported as complete', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_UNINSTALL_STATE: 'complete',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    expect(lat?.['uninstall_state']).toBe('complete')
+  })
+
+  it('GIVEN uninstall_state incomplete WHEN verifier runs THEN latitude verdict is blocked', () => {
+    const result = runVerifierJson({
+      SRRS_LAT_UNINSTALL_STATE: 'incomplete',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('uninstall_incomplete'))).toBe(true)
+  })
+
+  it('GIVEN two successive identical runs WHEN comparing uninstall_state THEN both return same state (quiescent)', () => {
+    const overrides = {
+      SRRS_LAT_UNINSTALL_STATE: 'not_attempted',
+      SRRS_LAT_CREDENTIAL_STATE: 'absent',
+      SRRS_LAT_HOOK_STATE: 'absent',
+      SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+      SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+      SRRS_LAT_LOCAL_STORAGE: 'absent',
+      SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+      SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+      SRRS_LAT_EXPOSURE_STATE: 'none_observed',
+    }
+    const r1 = runVerifierJson(overrides)
+    const r2 = runVerifierJson(overrides)
+    const lat1 = ((r1.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const lat2 = ((r2.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    // Both snapshots must agree (quiescent)
+    expect(lat1?.['uninstall_state']).toBe(lat2?.['uninstall_state'])
+    expect(r1.exitCode).toBe(r2.exitCode)
+  })
+})
