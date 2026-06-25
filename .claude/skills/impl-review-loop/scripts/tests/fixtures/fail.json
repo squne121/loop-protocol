@@ -6,6 +6,7 @@
     "issue_url": "https://github.com/squne121/loop-protocol/issues/333",
     "checks": {
       "product_spec_check": {
+        "schema": "product_spec_check/v1",
         "applicability": "applicable",
         "decision": "fail",
         "blocked_reasons": [
@@ -26,9 +27,15 @@
           "specify_artifact_mentioned": false,
           "generated_task_mentioned": false,
           "product_spec_context_present": false
+        },
+        "conditions": {},
+        "body_sha256": "sha256:ghi789",
+        "source_provenance": {
+          "source_type": "github_api",
+          "body_file": null
         }
       }
     }
   },
-  "body_sha256": "ghi789"
+  "body_sha256": "sha256:ghi789"
 }
