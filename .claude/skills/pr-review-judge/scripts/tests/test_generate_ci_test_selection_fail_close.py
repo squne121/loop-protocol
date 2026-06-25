@@ -218,3 +218,40 @@ def test_generate_artifact_uncovered_changed_test_returns_1(monkeypatch, tmp_pat
     assert gen.generate_artifact(args) == 1
     data = json.loads(out.read_text())
     assert data["uncovered_changed_test_files"] == ["pkg/test_uncovered.py"]
+
+
+def test_generate_artifact_pr_body_validator_is_covered(monkeypatch, tmp_path):
+    """AC5/AC7/AC8: test_pr_body_validator.py in changed_files must be covered by the plan."""
+    changed_file = "scripts/tests/test_pr_body_validator.py"
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: (
+        [changed_file],
+        [
+            f"{changed_file}::test_one",
+            f"{changed_file}::test_two",
+            f"{changed_file}::test_three",
+            f"{changed_file}::test_four",
+            f"{changed_file}::test_five",
+        ],
+        {
+            "returncode": 0, "timed_out": False, "error": None,
+            "nodeid_count": 5, "stderr_tail": "", "ok": True,
+        },
+    ))
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        [changed_file], [], {"base_sha": b, "head_sha": h, "ok": True}
+    ))
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=None, plan=None, pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    rc = gen.generate_artifact(args)
+    assert rc == 0
+    artifact = json.loads(out.read_text())
+    assert artifact["collection_status"]["ok"] is True
+    assert artifact["diff_status"]["ok"] is True
+    assert changed_file in artifact["changed_test_files"]
+    assert changed_file in artifact["collected_test_files"]
+    assert artifact["uncovered_changed_test_files"] == []
+    assert artifact["pytest_argv"].count(changed_file) == 1
