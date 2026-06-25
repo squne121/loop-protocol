@@ -164,10 +164,37 @@ def test_duplicate_key_product_spec_context_fails():
     )
 
 
+def test_duplicate_key_product_spec_context_without_docs_product_fails():
+    """Malformed PSC must fail closed even when docs/product is out of scope."""
+    _run_fixture_case(
+        "product_spec_context_duplicate_key_without_docs_product_fail",
+        "fail",
+        ["PS001"],
+    )
+
+
+def test_invalid_mrc_cannot_be_rescued_by_valid_psc():
+    """Malformed MRC must fail closed before PSC can make the checker pass."""
+    _run_fixture_case(
+        "invalid_mrc_cannot_be_rescued_by_valid_psc",
+        "fail",
+        ["PS001"],
+    )
+
+
 def test_decoy_product_spec_context_in_code_fence_is_ignored():
-    """PS001/PS004 hardening: code-fence decoy Product Spec Context must not satisfy docs/product evidence."""
+    """PS001/PS004 hardening: GFM tilde-fenced decoy Product Spec Context must not satisfy docs/product evidence."""
     _run_fixture_case(
         "product_spec_context_decoy_fence_fail",
+        "fail",
+        ["PS001", "PS004"],
+    )
+
+
+def test_non_string_product_spec_evidence_is_rejected():
+    """Boolean and numeric evidence must not count as meaningful PSC fields."""
+    _run_fixture_case(
+        "product_spec_context_non_string_evidence_fail",
         "fail",
         ["PS001", "PS004"],
     )

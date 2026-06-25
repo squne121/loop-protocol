@@ -43,6 +43,7 @@ if str(_IMPL_REVIEW_LOOP_SCRIPTS) not in sys.path:
 from path_classification import extract_allowed_paths as pc_extract_allowed_paths  # noqa: E402
 from path_classification import has_code_or_runtime_scope  # noqa: E402
 from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 
 
 SPEC_CHANGE_KINDS = {
@@ -61,7 +62,7 @@ PLACEHOLDER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 ANY_H2_RE = re.compile(r"^[ ]{0,3}##[ \t]+(?P<text>.+?)[ \t]*#*[ \t]*$")
-YAML_FENCE_RE = re.compile(r"```yaml[ \t]*\n(.*?)\n```", re.DOTALL)
+_FENCE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*)$")
 
 
 class _DuplicateKeyError(Exception):
@@ -100,6 +101,14 @@ class SectionParseResult:
     duplicate_key: Optional[str] = None
 
 
+def _match_fence(line: str) -> Optional[Tuple[str, int, str]]:
+    match = _FENCE_RE.match(line)
+    if not match:
+        return None
+    fence = match.group("fence")
+    return fence[0], len(fence), match.group("info").strip()
+
+
 def _sha256_prefixed(value: str) -> str:
     return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
@@ -132,27 +141,37 @@ def run_gh_api(issue_number: int, repo: str) -> Optional[Dict[str, Any]]:
 def _extract_sections(body: str, section_name: str) -> List[str]:
     sections: List[str] = []
     lines = body.splitlines()
-    in_fence = False
+    active_fence: Optional[Tuple[str, int]] = None
     idx = 0
     while idx < len(lines):
         line = lines[idx]
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        fence = _match_fence(line)
+        if fence:
+            fence_char, fence_len, _ = fence
+            if active_fence is None:
+                active_fence = (fence_char, fence_len)
+            elif active_fence[0] == fence_char and fence_len >= active_fence[1]:
+                active_fence = None
             idx += 1
             continue
         match = ANY_H2_RE.match(line)
-        if not in_fence and match and match.group("text").strip() == section_name:
+        if active_fence is None and match and match.group("text").strip() == section_name:
             idx += 1
             buf: List[str] = []
-            inner_fence = in_fence
+            inner_fence = active_fence
             while idx < len(lines):
                 current = lines[idx]
-                if current.lstrip().startswith("```"):
-                    inner_fence = not inner_fence
+                current_fence = _match_fence(current)
+                if current_fence:
+                    fence_char, fence_len, _ = current_fence
+                    if inner_fence is None:
+                        inner_fence = (fence_char, fence_len)
+                    elif inner_fence[0] == fence_char and fence_len >= inner_fence[1]:
+                        inner_fence = None
                     buf.append(current)
                     idx += 1
                     continue
-                if not inner_fence and ANY_H2_RE.match(current):
+                if inner_fence is None and ANY_H2_RE.match(current):
                     break
                 buf.append(current)
                 idx += 1
@@ -162,6 +181,34 @@ def _extract_sections(body: str, section_name: str) -> List[str]:
     return sections
 
 
+def _extract_yaml_fences(section_text: str) -> List[str]:
+    fences: List[str] = []
+    lines = section_text.splitlines()
+    capture: Optional[List[str]] = None
+    active_fence: Optional[Tuple[str, int]] = None
+    for line in lines:
+        fence = _match_fence(line)
+        if fence:
+            fence_char, fence_len, info = fence
+            if active_fence is None:
+                active_fence = (fence_char, fence_len)
+                if info.lower() in {"yaml", "yml"}:
+                    capture = []
+                else:
+                    capture = None
+            elif active_fence[0] == fence_char and fence_len >= active_fence[1]:
+                if capture is not None:
+                    fences.append("\n".join(capture))
+                active_fence = None
+                capture = None
+            elif capture is not None:
+                capture.append(line)
+            continue
+        if capture is not None:
+            capture.append(line)
+    return fences
+
+
 def _parse_yaml_section(body: str, section_name: str) -> SectionParseResult:
     sections = _extract_sections(body, section_name)
     if not sections:
@@ -169,7 +216,7 @@ def _parse_yaml_section(body: str, section_name: str) -> SectionParseResult:
     if len(sections) > 1:
         return SectionParseResult(present=True, ok=False, data=None, reason="section_multiple")
 
-    fences = YAML_FENCE_RE.findall(sections[0])
+    fences = _extract_yaml_fences(sections[0])
     if not fences:
         return SectionParseResult(present=True, ok=False, data=None, reason="yaml_fence_missing")
     if len(fences) > 1:
@@ -202,20 +249,14 @@ def _is_placeholder_text(value: str) -> bool:
 
 
 def _is_meaningful_scalar(value: Any) -> bool:
-    if isinstance(value, str):
-        return not _is_placeholder_text(value)
-    return value not in (None, [], {})
+    return isinstance(value, str) and not _is_placeholder_text(value)
 
 
 def _normalize_string_list(value: Any) -> List[str]:
-    if value is None:
+    if not isinstance(value, list):
         return []
-    if isinstance(value, list):
-        items = value
-    else:
-        items = [value]
     normalized: List[str] = []
-    for item in items:
+    for item in value:
         if isinstance(item, str) and not _is_placeholder_text(item):
             normalized.append(item.strip())
     return normalized
@@ -612,9 +653,17 @@ def main() -> int:
 
     body_sha256 = _sha256_prefixed(issue_body)
     allowed_paths = pc_extract_allowed_paths(issue_body)
-    mrc = _parse_yaml_section(issue_body, "Machine-Readable Contract")
+    mrc_parsed = parse_machine_readable_contract(issue_body)
+    mrc = SectionParseResult(
+        present=bool(_extract_sections(issue_body, "Machine-Readable Contract")),
+        ok=mrc_parsed.ok,
+        data=mrc_parsed.data,
+        reason=mrc_parsed.reason,
+        duplicate_key=mrc_parsed.duplicate_key,
+    )
     product_spec_context = _parse_yaml_section(issue_body, "Product Spec Context")
     triggers = check_trigger_conditions(issue_body, allowed_paths, product_spec_context)
+    triggers["machine_readable_contract_present"] = mrc.present
     applicability = "applicable" if any(triggers.values()) else "not_applicable"
 
     checks = {
@@ -636,6 +685,33 @@ def main() -> int:
     blocked_reasons: List[Dict[str, str]] = []
     has_fail = False
     has_human_judgment = False
+
+    parse_errors: List[Dict[str, str]] = []
+    if mrc.present and not mrc.ok:
+        parse_errors.append(
+            {
+                "rule_id": "PS001",
+                "source": "machine_readable_contract",
+                "excerpt": f"Machine-Readable Contract parse error: {mrc.reason}",
+            }
+        )
+    psc_parse_error = _product_spec_parse_error(product_spec_context)
+    if psc_parse_error:
+        parse_errors.append(
+            {
+                "rule_id": "PS001",
+                "source": "product_spec_context",
+                "excerpt": psc_parse_error,
+            }
+        )
+    if parse_errors:
+        conditions["named_yaml_sections_valid"] = {
+            "status": "fail",
+            "evidence": parse_errors,
+        }
+        has_fail = True
+        blocked_reasons.extend(parse_errors)
+
     for check_name, (status, evidence) in checks.items():
         conditions[check_name] = {"status": status, "evidence": evidence}
         if status == "fail":
@@ -673,6 +749,7 @@ def main() -> int:
         result,
         issue_url=f"https://github.com/{args.repo}/issues/{args.issue_number}",
         body_sha256=body_sha256,
+        exit_code=0 if result["decision"] == "pass" else 1,
     )
     if gate_result["routing_action"] == "refresh_contract_snapshot":
         result["applicability"] = "applicable"

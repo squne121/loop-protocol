@@ -392,7 +392,8 @@ def run_once(
     gate = evaluate_product_spec_payload(
         product_spec_json,
         issue_url=f"https://github.com/{repo}/issues/{issue_number}",
-        body_sha256=product_spec_json.get("body_sha256"),
+        body_sha256=product_spec_json.get("body_sha256") if isinstance(product_spec_json, dict) else None,
+        exit_code=product_spec_rc,
     )
     ps_applicability = gate.get("applicability")
     ps_decision = gate.get("decision")

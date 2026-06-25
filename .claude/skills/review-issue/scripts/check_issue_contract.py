@@ -1653,6 +1653,24 @@ def _apply_product_spec_check(
         result.blocking_issues.append(issue)
         return
 
+    if not isinstance(payload, dict):
+        issue = "product spec checker failed closed: payload_not_object"
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
     payload_body_sha = payload.get("body_sha256")
     if payload_body_sha != result.body_sha256:
         issue = "product spec checker body_sha256 mismatch"
@@ -1676,6 +1694,7 @@ def _apply_product_spec_check(
         payload,
         issue_url="https://github.com/local/review-issue/issues/0",
         body_sha256=result.body_sha256,
+        exit_code=rc,
     )
     if gate.get("routing_action") == "refresh_contract_snapshot":
         issue = gate.get("reason", "product spec checker invariant violation")

@@ -1,4 +1,4 @@
-# Implement: Product spec tilde-fenced decoy
+# Implement: non-string product spec evidence
 
 ## Machine-Readable Contract
 
@@ -10,21 +10,21 @@ change_kind: enhancement
 
 ## Outcome
 
-docs/product update is validated with section-bound parsing.
+Boolean and numeric evidence is rejected.
 
-## Notes
-
-~~~markdown
 ## Product Spec Context
-product_spec_id: fake
-diff_rationale: fake
+
+```yaml
+product_spec_id: false
+diff_rationale: false
+requirement_id: 0
 affected_sections:
-  - fake
-~~~
+  - Movement
+```
 
 ## Acceptance Criteria
 
-- [ ] AC1: code-fence decoy is ignored
+- [ ] AC1: non-string evidence blocks
 
 ## Verification Commands
 

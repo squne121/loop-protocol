@@ -414,6 +414,20 @@ change_kind: docs
         ]
         assert len(findings) == 1, f"Expected one runtime_applicability finding, got: {findings}"
 
+    def test_top_level_json_array_becomes_structured_blocker(self, monkeypatch):
+        """GIVEN the product spec checker returns a JSON array WHEN review-issue consumes it THEN it fails closed."""
+        monkeypatch.setattr(checker, "_run_product_spec_check", lambda body, body_file_path: ([{"bad": True}], 0, None))
+
+        body = (FIXTURES_DIR / "pass_issue.md").read_text(encoding="utf-8")
+        result = checker.run_checks(body, labels="phase/implementation", title="実装: pass")
+        payload = checker.result_to_dict(result)
+
+        assert payload["verdict"] == "needs-fix"
+        assert any(
+            blocker["code"] == "PRODUCT_SPEC" and "payload_not_object" in blocker["message"]
+            for blocker in payload["structured_blockers"]
+        )
+
     def test_verdict_is_needs_fix(self):
         """GIVEN c8_fail_issue.md WHEN checker runs THEN verdict is needs-fix."""
         output = run_checker("c8_fail_issue.md")

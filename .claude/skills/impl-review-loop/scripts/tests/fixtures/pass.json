@@ -6,8 +6,10 @@
     "issue_url": "https://github.com/squne121/loop-protocol/issues/333",
     "checks": {
       "product_spec_check": {
+        "schema": "product_spec_check/v1",
         "applicability": "applicable",
         "decision": "pass",
+        "blocked_reasons": [],
         "blocked_rule_ids": [],
         "triggers": {
           "docs_product_allowed_paths": false,
@@ -15,10 +17,16 @@
           "specify_artifact_mentioned": false,
           "generated_task_mentioned": false,
           "product_spec_context_present": false
+        },
+        "conditions": {},
+        "body_sha256": "sha256:abc123",
+        "source_provenance": {
+          "source_type": "github_api",
+          "body_file": null
         }
       }
     }
   },
-  "body_sha256": "abc123",
+  "body_sha256": "sha256:abc123",
   "contract_snapshot_url": "https://github.com/squne121/loop-protocol/issues/333#issuecomment-1000000000"
 }

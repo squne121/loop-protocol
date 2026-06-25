@@ -165,6 +165,42 @@ def test_contract_snapshot_url_cli_passthrough():
     assert "issue_url" in result, "Expected issue_url field to be present for back-compat"
 
 
+def test_wrong_schema_blocks():
+    """Malformed payloads with the wrong schema identifier must refresh the snapshot."""
+    fixture = load_fixture("pass")
+    fixture["CONTRACT_REVIEW_RESULT_V1"]["checks"]["product_spec_check"]["schema"] = "unrelated/v99"
+
+    result = run_gate_evaluator(fixture)
+
+    assert result["routing_action"] == "refresh_contract_snapshot"
+    assert result["reason"] == "schema must equal product_spec_check/v1"
+
+
+def test_missing_required_payload_fields_block():
+    """Missing required payload fields must be treated as invalid output."""
+    fixture = load_fixture("pass")
+    payload = fixture["CONTRACT_REVIEW_RESULT_V1"]["checks"]["product_spec_check"]
+    del payload["triggers"]
+    del payload["conditions"]
+
+    result = run_gate_evaluator(fixture)
+
+    assert result["routing_action"] == "refresh_contract_snapshot"
+    assert "Missing required product_spec_check fields" in result["reason"]
+
+
+def test_exit_code_decision_matrix_is_enforced():
+    """decision=pass must not be accepted when the producer exits with rc=1."""
+    sys.path.insert(0, str((Path(__file__).parent.parent)))
+    import evaluate_product_spec_gate as gate
+
+    payload = load_fixture("pass")["CONTRACT_REVIEW_RESULT_V1"]["checks"]["product_spec_check"]
+    result = gate.evaluate_product_spec_payload(payload, body_sha256=payload["body_sha256"], exit_code=1)
+
+    assert result["routing_action"] == "refresh_contract_snapshot"
+    assert result["reason"] == "decision=pass requires exit code 0"
+
+
 # Issue #333 VC node name aliases (AC2 and AC4)
 def test_decision_fail_stops_human():
     """AC2 alias: Issue #333 VC requires test_decision_fail_stops_human node name"""
