@@ -44,11 +44,9 @@ Environment overrides (for fixture/test mode):
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -763,6 +761,7 @@ def _compute_latitude_verdict(
         or exposure_state in ("possible", "confirmed")
         or containment_state == "active"
         or backup_credential_state == "present"
+        or RC_EXPOSURE_POSSIBLE in all_reason_codes
     ):
         return "blocked"
 
