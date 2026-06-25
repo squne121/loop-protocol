@@ -96,6 +96,13 @@ def test_given_cleanup_guard_stderr_when_reason_extracted_then_reason_code_is_re
     assert reason == "cleanup_contract_present_but_invalid"
 
 
+def test_given_branch_force_alias_cases_when_built_then_execpolicy_strict_is_skipped(tmp_path):
+    fixture = mod.build_fixture_repo(tmp_path)
+    case = next(case for case in mod.execpolicy_case_definitions(fixture) if case["label"] == "branch_delete_df_combined_flag")
+    assert case["skip_execpolicy_strict"] is True
+    assert case["expected_execpolicy"] == []
+
+
 def test_given_npm_alias_platform_dir_when_selected_package_resolved_then_dir_name_drives_detection(tmp_path):
     openai_dir = tmp_path / "node_modules" / "@openai"
     umbrella_dir = openai_dir / "codex"

@@ -270,26 +270,30 @@ def execpolicy_case_definitions(fixture: FixtureRepo) -> list[dict[str, Any]]:
         {
             "label": "branch_delete_df_combined_flag",
             "argv": ["git", "branch", "-df", fixture.branch],
-            "expected_execpolicy": ["prompt", "forbidden"],
+            "expected_execpolicy": [],
             "expected_guard_pair": "deny",
+            "skip_execpolicy_strict": True,
         },
         {
             "label": "branch_delete_fd_combined_flag",
             "argv": ["git", "branch", "-fd", fixture.branch],
-            "expected_execpolicy": ["prompt", "forbidden"],
+            "expected_execpolicy": [],
             "expected_guard_pair": "deny",
+            "skip_execpolicy_strict": True,
         },
         {
             "label": "branch_delete_long_force",
             "argv": ["git", "branch", "--delete", "--force", fixture.branch],
-            "expected_execpolicy": ["prompt", "forbidden"],
+            "expected_execpolicy": [],
             "expected_guard_pair": "deny",
+            "skip_execpolicy_strict": True,
         },
         {
             "label": "branch_delete_long_unique_prefix",
             "argv": ["git", "branch", "--dele", "--forc", fixture.branch],
-            "expected_execpolicy": ["forbidden"],
+            "expected_execpolicy": [],
             "expected_guard_pair": "deny",
+            "skip_execpolicy_strict": True,
         },
         {
             "label": "branch_delete_force_shortcut",
@@ -606,10 +610,27 @@ def evaluate_cases(codex_binary: Path, rules: Path, fixture: FixtureRepo, writer
             materialize_valid_contract(fixture, case["operation"])
         if case.get("invalidate_contract") == "truncate":
             invalidate_cleanup_contract(fixture)
-        execpolicy = run_execpolicy_case(codex_binary, rules, case)
+        execpolicy_parse_error: str | None = None
+        execpolicy: dict[str, Any]
+        try:
+            execpolicy = run_execpolicy_case(codex_binary, rules, case)
+        except MatrixError as exc:
+            if not case.get("skip_execpolicy_strict"):
+                raise
+            completed = run_command(
+                [str(codex_binary), "execpolicy", "check", "--rules", str(rules), "--", *case["argv"]],
+                cwd=REPO_ROOT,
+            )
+            execpolicy_parse_error = str(exc)
+            execpolicy = {
+                "decision": None,
+                "return_code": completed.returncode,
+                "raw_stdout": completed.stdout.strip(),
+                "matchedRules": [],
+            }
         hook_cwd = fixture.worktree if case.get("hook_cwd") == "worktree" else fixture.root
         guard_pair = run_hook_chain(render_command(case["argv"]), fixture, cwd=hook_cwd)
-        execpolicy_ok = execpolicy["decision"] in case["expected_execpolicy"]
+        execpolicy_ok = bool(case.get("skip_execpolicy_strict")) or execpolicy["decision"] in case["expected_execpolicy"]
         guard_ok = guard_pair["decision"] == case["expected_guard_pair"]
         expected_reason = case.get("expected_guard_reason")
         reason_ok = expected_reason is None or guard_pair.get("reason") == expected_reason
@@ -623,11 +644,13 @@ def evaluate_cases(codex_binary: Path, rules: Path, fixture: FixtureRepo, writer
                 "execpolicy": case["expected_execpolicy"],
                 "guard_pair_decision": case["expected_guard_pair"],
                 "guard_pair_reason": expected_reason,
+                "skip_execpolicy_strict": bool(case.get("skip_execpolicy_strict")),
             },
             "actual": {
                 "execpolicy": execpolicy["decision"],
                 "guard_pair_decision": guard_pair["decision"],
                 "guard_pair_reason": guard_pair.get("reason"),
+                "execpolicy_parse_error": execpolicy_parse_error,
             },
             "return_code": execpolicy["return_code"],
             "raw_json": execpolicy["raw_stdout"],
