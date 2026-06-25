@@ -208,7 +208,40 @@ def generate_artifact(args):
     head_sha = getattr(args, "head_sha", None) or args.pr_head_sha
 
     changed_test_files, scope_excluded, diff_status = get_changed_test_files(base_sha, head_sha)
-    uncovered = [f for f in changed_test_files if f not in collected_test_files]
+    # Secondary coverage: when both pytest_args and plan are provided, treat plan targets
+    # as cross-job coverage. A changed test file covered by another job's plan is not "uncovered".
+    plan_covered_paths: set = set()
+    plan_arg = getattr(args, "plan", None)
+    secondary_coverage_provider_job: str | None = None
+    cross_job_covered_test_files: List[str] = []
+    secondary_coverage_error: str | None = None
+    if plan_arg and getattr(args, "pytest_args", None):
+        try:
+            plan_module = _load_plan_module()
+            plan_obj = plan_module.load_plan(plan_arg)
+            for target in plan_obj.get("targets", []):
+                plan_covered_paths.add(target.rstrip("/"))
+            secondary_coverage_provider_job = args.job
+        except Exception as exc:
+            secondary_coverage_error = str(exc)  # best-effort; primary gate remains unchanged
+
+    def _is_covered_by_plan(path: str, plan_paths: set) -> bool:
+        return any(
+            path == t or path.startswith(t.rstrip("/") + "/")
+            for t in plan_paths
+        )
+
+    cross_job_covered_test_files = sorted(
+        f for f in changed_test_files
+        if f not in collected_test_files
+        and _is_covered_by_plan(f, plan_covered_paths)
+    )
+
+    uncovered = [
+        f for f in changed_test_files
+        if f not in collected_test_files
+        and not _is_covered_by_plan(f, plan_covered_paths)
+    ]
 
     artifact = {
         "schema_version": "ci_test_selection/v1",
@@ -228,6 +261,9 @@ def generate_artifact(args):
         "changed_test_files": changed_test_files,
         "scope_excluded_changed_files": scope_excluded,
         "uncovered_changed_test_files": uncovered,
+        "secondary_coverage_provider_job": secondary_coverage_provider_job,
+        "cross_job_covered_test_files": cross_job_covered_test_files,
+        "secondary_coverage_error": secondary_coverage_error,
         "ci_run_url": args.ci_run_url or "N/A",
     }
 

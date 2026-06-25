@@ -10,10 +10,12 @@ AI エージェント・人間レビュアー双方が参照する。
 - GitHub Milestone の責務定義（何を milestone として立てるか・立てないか）
 - Milestone / Parent Issue / Implementation Issue / PR の責務分担
 - Milestone 命名規則（title / description / due_on 方針）
-- Milestone close 条件
+- Milestone close 条件（fail-closed な close predicate / descendant traversal 要件を含む）
 - AI エージェント操作フロー / 人間 fallback フロー（RACI 含む）
 - GitHub REST API エンドポイント参照
 - Milestone 識別子規約（`number` vs `id`）
+- Key Definitions（direct item / descendant / blocker / closure follow-up / valid defer decision）
+- MILESTONE_CLOSE_DECISION_V1 スキーマ（live readback report と人間判断記録の形式）
 
 ### この文書が持たないもの
 
@@ -22,6 +24,33 @@ AI エージェント・人間レビュアー双方が参照する。
 - ラベル運用規約（`docs/dev/github-ops.md` が正本）
 - PR レビュー・マージ手順（`docs/dev/workflow.md` が正本）
 - ブランチ保護・権限設定（`docs/dev/github-ops.md` が正本）
+
+---
+
+## Key Definitions
+
+Milestone close predicate で用いる用語の定義。
+
+| 用語 | 定義 |
+|---|---|
+| **direct item** | GitHub Milestone に `milestone` フィールドで直接割り当てられた Issue / PR |
+| **descendant** | direct Issue から GitHub native sub-issues を再帰的に辿って到達する Issue |
+| **blocker** | native `blocked_by` の open Issue。native dependency endpoint が利用不能な場合のみ `## Depends On` セクションを fallback source とする |
+| **closure follow-up** | parent issue の machine-readable closure ledger に明示登録された Issue。PR 本文・自由記述コメントのみの follow-up は close gate の正本にしない |
+| **valid defer decision** | `issue` / `reason` / `residual_risk` / `destination` / `revisit_condition` / `decided_by` / `decided_at` を持つ人間の判断記録 |
+
+### descendant の milestone 判定規則
+
+| depth / milestone 状態 | 判定 |
+|---|---|
+| depth 0（direct item）、milestone=対象 Milestone | 正常 |
+| depth 0（direct item）、milestone=null または別 Milestone | 異常（mismatch） |
+| depth ≥ 1（descendant）、milestone=null | **間接所属として正常**（mismatch にしない） |
+| depth ≥ 1（descendant）、milestone=別 Milestone に明示割当 | **scope conflict** として人間判断 |
+| depth ≥ 1（descendant）、milestone=対象 Milestone | 正常 |
+
+> **重要**: depth ≥ 1 の descendant で `milestone=null` は、parent を通じて間接的に Milestone に属するものとして正常扱いする。一律 mismatch にしない。
+> Implementation Issue が同一 Milestone へ直接割当されている場合（例外扱い）は、`#146` の例外理由への参照が必須。
 
 ---
 
@@ -46,7 +75,7 @@ AI エージェント・人間レビュアー双方が参照する。
 
 | 単位 | 責務 | 関係 |
 |---|---|---|
-| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は「割り当てた Issue の open 件数が 0」**かつ**「Milestone に直接紐づいた PR が 0（PR 直接紐づけ禁止）」**かつ**人間の明示判断。 | Issue を `milestone` フィールドで紐づける |
+| **Milestone** | 開発フェーズ・リリース目標の区切り。複数の parent issue を束ねる。close 条件は下記「Close 条件（fail-closed な close predicate）」を参照。 | Issue を `milestone` フィールドで紐づける |
 | **Parent Issue** | 機能・テーマ単位の追跡。child implementation issues を束ねる。`closure_mode` に従って close する。 | Milestone に割り当てられる / child issues を持つ |
 | **Implementation Issue** | 1 PR に対応する具体的な実装タスク。`## Allowed Paths` / `## Acceptance Criteria` を持つ。 | Parent Issue の sub-issue / Milestone に間接的に紐づく |
 | **PR** | Implementation Issue の成果物。`Closes #N` で Issue を close する。Milestone には直接紐づけない。 | Implementation Issue を close する |
@@ -102,31 +131,150 @@ AI エージェント・人間レビュアー双方が参照する。
 
 ---
 
-## Close 条件
+## Close 条件（fail-closed な close predicate）
 
-Milestone を close するには以下の条件を**すべて**満たすこと（AND 条件。OR ではない）:
+Milestone を close するには以下の条件を**すべて**満たすこと（AND 条件。OR ではない）。
+この predicate は **fail-closed** であり、descendant traversal の完全性・未解決 blocker・scope conflict・明示的 defer record を含む。
 
-1. **割り当てた Issue の open 件数が 0 であること**  
+### 通常の自動判定条件（すべて満たす必要がある）
+
+```yaml
+# fail-closed close predicate
+close_predicate:
+  direct_check:
+    milestone_open_issues: 0           # direct items の open_issues = 0
+    pr_mixed_count: 0                  # PR 混入なし
+    assignment_drift: []               # readback drift なし
+  descendant_traversal:
+    schema: MILESTONE_DESCENDANT_ROLLUP_V1
+    partial: false                     # 不完全な descendant traversal は close 不可
+    warnings: []                       # warnings 非空の場合は close 不可
+    open_blocker_count: 0              # 未解決 blocker は close 不可
+    scope_conflict_count: 0            # scope conflict は close 不可
+```
+
+詳細:
+
+1. **割り当てた Issue の open 件数が 0 であること**
    `gh api repos/{owner}/{repo}/milestones/{milestone_number}` の `open_issues` が `0` であること
 
-2. **Milestone に直接紐づいた PR が 0 であること**  
-   PR 混入チェック（[3] 参照）で `pull_request != null` の item が存在しないこと。  
+2. **Milestone に直接紐づいた PR が 0 であること**
+   PR 混入チェック（[3] 参照）で `pull_request != null` の item が存在しないこと。
    PR を Milestone に直接紐づける運用は許可しない。
 
-   > **例外（open Issue が残る場合の scope 除外）**: Milestone description または parent issue comment に除外理由を明示的に記録すること。この例外は人間のみ適用できる。  
+   > **例外（open Issue が残る場合の scope 除外）**: Milestone description または parent issue comment に除外理由を明示的に記録すること。この例外は人間のみ適用できる。
    > **PR が Milestone に直接紐づいている場合は close 例外を認めない。** まず PR から Milestone を外し、PR 混入チェックが 0 件になってから close を検討する。PR 混入が残る状態での close は invariant violation とし、理由記録では回避不可。
 
-3. **人間による意図的な判断がある**  
-   Milestone の close は `scope` や `目標達成` の判断を含むため、AI エージェントが自動で close しない。  
+3. **descendant traversal report の schema が `MILESTONE_DESCENDANT_ROLLUP_V1` であること**
+   stale evidence や schema 不一致は close 不可。
+
+4. **`partial=false` であること**
+   `partial=true`（traversal が不完全）の場合は close 不可。partial traversal の原因解消後に再実行すること。
+
+5. **`warnings == []` であること**
+   warnings 非空の場合は close 不可。各 warning を解消するか、valid defer decision として記録すること。
+
+6. **`open_blocker_count == 0` であること**
+   未解決 blocker がある場合は close 不可。blocker の完了または valid defer decision が必要。
+
+7. **scope conflict が 0 であること（review-required なし）**
+   別 Milestone に明示割当された descendant がある場合は人間判断が必要。
+
+8. **assignment readback drift が 0 であること**
+   live assignment と expected set の drift が 0 であること。
+
+9. **人間による意図的な判断がある**
+   Milestone の close は `scope` や `目標達成` の判断を含むため、AI エージェントが自動で close しない。
    人間が `gh api --method PATCH repos/{owner}/{repo}/milestones/{milestone_number} -f state=closed` を実行するか、GitHub UI から close する
 
-4. **Scope 変更なし、または明示的な scope 変更の記録がある**  
-   含める / 外す Issue の変更があった場合、Milestone description または関連 ADR に記録する
+10. **Scope 変更なし、または明示的な scope 変更の記録がある**
+    含める / 外す Issue の変更があった場合、Milestone description または関連 ADR に記録する
+
+### defer してはいけないもの（defer 禁止リスト）
+
+以下のいずれかが存在する場合は、close 不可であり defer 対象にもできない:
+
+| 状態 | 理由 |
+|---|---|
+| **PR 混入**（`pr_mixed_count > 0`） | Milestone 運用不変条件違反。まず PR を外すこと |
+| **API failure**（認証エラー / rate limit / pagination 不完了 / parse error） | evidence の信頼性が不明のまま close できない |
+| **partial traversal**（`partial=true`） | descendant の完全性が保証されない |
+| **warnings 非空** | warnings の内容未精査のまま close できない |
+| **stale evidence**（`generated_at` が古い / schema 不一致） | 最新の live 状態を反映していない evidence での close 不可 |
+| **report schema 不一致**（`MILESTONE_DESCENDANT_ROLLUP_V1` でない） | 正規形式の evidence が揃うまで close 不可 |
+
+### valid defer decision の要件
+
+open blocker や warnings を defer 扱いにするには、以下の全フィールドを持つ人間の判断記録が必要:
+
+```yaml
+valid_defer_decision:
+  issue: "#N"
+  reason: "<defer する理由>"
+  residual_risk: "<残存リスクの説明>"
+  destination:
+    issue: "#M"
+    milestone: "<後続 milestone または null>"
+  revisit_condition: "<再確認のトリガー>"
+  decided_by: "<人間の GitHub ログイン>"
+  decided_at: "<ISO 8601>"
+```
+
+フィールドが 1 つでも欠けている場合は invalid defer decision として reject する。
 
 ### AI エージェントによる自動 close の禁止
 
-Milestone の close は **人間の意思決定が必要** であり、AI エージェントは自動 close しない。  
+Milestone の close は **人間の意思決定が必要** であり、AI エージェントは自動 close しない。
 `open_issues: 0` の検知は AI エージェントが rollup コメントで人間に通知するまでとする。
+
+---
+
+## MILESTONE_CLOSE_DECISION_V1 スキーマ
+
+M1 の live readback report と人間判断記録の保存場所・形式。
+
+このスキーマは Milestone close 判断時に人間が記録するものであり、AI エージェントはこのスキーマに従った
+YAML を `MILESTONE_CLOSE_DECISION_V1` として Issue コメント（対象 Milestone の parent tracker issue）に投稿する。
+`decided_by` と `decision` フィールドは人間が記入する。
+
+```yaml
+MILESTONE_CLOSE_DECISION_V1:
+  milestone_number: <int>
+  direct_readback:
+    open_issues: 0
+    pr_mixed_count: 0
+    assignment_drift: []
+  descendant_report:
+    schema: MILESTONE_DESCENDANT_ROLLUP_V1
+    partial: false
+    warnings: []
+    unresolved_blockers: []
+    scope_conflicts: []
+  deferred:
+    - issue: "#N"
+      reason: "..."
+      residual_risk: "..."
+      destination:
+        issue: "#M"
+        milestone: "<destination milestone or null>"
+      revisit_condition: "..."
+      decided_by: "<human GitHub login>"
+      decided_at: "<ISO 8601>"
+  evidence:
+    generated_at: "<ISO 8601>"
+    repository_commit_sha: "<sha>"
+    github_api_version: "2022-11-28"
+  human_decision:
+    decision: close
+    actor: "<human-login>"
+    decided_at: "<ISO 8601>"
+```
+
+### 保存場所
+
+- **保存先**: 対象 Milestone を tracking する parent issue（例: #131 for M1）のコメント
+- **形式**: `MILESTONE_CLOSE_DECISION_V1:` を先頭行とする YAML ブロック（コードフェンスで囲む）
+- **記録タイミング**: Milestone close 実行の直前（`human_decision.decision: close` が確定した時点）
 
 ---
 
