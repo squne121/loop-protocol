@@ -1224,6 +1224,20 @@ jobs:
           printf '{"step_id":"pytest_node_backed_hook_tests","phase_id":"pytest_node_backed_hooks","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: node --test session_manifest_debounce (AC4/AC6, Node 22) (timed)
+        # Issue #1141 AC6: virtual-clock unit tests for flushLoop DI core.
+        # Node 22 is guaranteed by the setup-node-pnpm composite action (default
+        # node-version: '22'). This step runs in the node-backed-hook-tests job
+        # so it has both Node and Python/uv available.
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          node --test .claude/hooks/tests/test_session_manifest_debounce.mjs
+          _s=$?
+          set -e
+          printf '{"step_id":"node_test_debounce_ac4","phase_id":"node_test_debounce","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Generate node-backed hook selection artifact
         run: |
           mkdir -p ci_test_selection_artifacts

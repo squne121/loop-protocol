@@ -57,11 +57,17 @@ def _make_readiness_json(status: str) -> dict:
 
 def _make_product_spec_json(decision: str, applicability: str = "applicable") -> dict:
     return {
+        "schema": "product_spec_check/v1",
         "applicability": applicability,
         "decision": decision,
         "triggers": {},
         "conditions": {},
         "blocked_reasons": [],
+        "body_sha256": "sha256:abc",
+        "source_provenance": {
+            "source_type": "github_issue_body",
+            "body_file": None,
+        },
     }
 
 
