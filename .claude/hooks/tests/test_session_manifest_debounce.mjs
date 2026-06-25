@@ -1,5 +1,5 @@
 /**
- * session_manifest_debounce.test.mjs
+ * test_session_manifest_debounce.mjs
  *
  * Node.js unit tests for the flushLoop DI core (`runFlushLoopCore`) exported
  * from session_manifest_debounce.mjs.
@@ -119,7 +119,7 @@ describe('flushLoop DI core — quiet-window boundary (AC4)', () => {
     // Newest event at t=350; now=400; WINDOW_MS=400.
     // quietForMs = 400 - 350 = 50 < 400 => sleep(350), then on next iteration
     // events will be cleared (simulating external clearing).
-    const { deps, producerCalls, sleepLog, events } = makeHarness({
+    const { deps, sleepLog } = makeHarness({
       windowMs: 400,
       eventTimestamps: [0, 100, 200, 350],
       startNowMs: 400,

@@ -1232,7 +1232,7 @@ jobs:
         run: |
           _t0=$(date +%s%3N)
           set +e
-          node --test .claude/hooks/tests/session_manifest_debounce.test.mjs
+          node --test .claude/hooks/tests/test_session_manifest_debounce.mjs
           _s=$?
           set -e
           printf '{"step_id":"node_test_debounce_ac4","phase_id":"node_test_debounce","status":%d,"elapsed_ms":%d}\n' \
