@@ -19,6 +19,7 @@
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
     "scripts/ci/tests/",
+    "tests/codex/test_execpolicy_matrix.py",
     "scripts/tests/test_milestone_rollup.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py"
@@ -40,7 +41,7 @@
   "notes": {
     "parallel_exclude_rationale": "Tests listed here are collected into the ci_test_selection scope (full coverage) but are excluded from the xdist parallel run and executed in a dedicated serial (-n 0) lane instead. test_session_manifest_debounce.py drives a real debounce front-gate with an 80ms window; under xdist CPU saturation the window expires between burst invocations and the coalescing assertion flakes (Issue #1064). It is tmp_path-isolated (not a shared-fixture/cwd race), so a serial lane restores determinism without changing the test.",
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",
-    "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
+    "dedicated_lanes_excluded": "tests/codex/test_local_main_branch_guard.py runs in its own codex execpolicy step (needs the pinned codex CLI context) and is intentionally NOT in targets to avoid double execution. tests/codex/test_execpolicy_matrix.py is included here so python-test and ci_test_selection/v1 both treat the pure-Python execpolicy contract coverage as part of the shared python lane, while the dedicated Codex CLI step keeps only the runtime guard test isolated. The Node-backed lane (pnpm test / e2e) and the hook-discovery collect-only guard remain separate steps; this plan only governs the unified python pytest suite.",
     "ignore_deselect_contract": "ignore/deselect preserve the hook-discovery contract: test_secret_boundary_contract.py is ignored (tracked by #412) and the two non-hermetic generate_session_manifest wrapper tests are deselected."
   }
 }
