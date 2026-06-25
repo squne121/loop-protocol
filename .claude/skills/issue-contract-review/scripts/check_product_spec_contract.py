@@ -4,26 +4,117 @@ Product Spec Contract Checker
 
 Issue contract を product spec 観点から検証する。以下の 6 ルールで判定:
 
-  PS001: docs/product/** 更新時に spec delta Issue のリンクがあるか
+  PS001: docs/product/** 更新時に spec evidence / spec delta context があるか
   PS002: tasks.md が direct implementation source になっていないか
   PS003: .specify/ が canonical source になっていないか
-  PS004: product spec 更新に diff_rationale / evidence があるか
+  PS004: product spec 更新に diff_rationale / requirement trace / affected_sections があるか
   PS005: generated task が requirement_id / source_task_id を保持しているか
   PS006: generated task dependency が materialize されているか
 
 出力: JSON with product_spec_check schema
 """
 
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
+
+_CREATE_ISSUE_SCRIPTS = (
+    Path(__file__).resolve().parent.parent.parent / "create-issue" / "scripts"
+)
+if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
+
+_IMPL_REVIEW_LOOP_SCRIPTS = (
+    Path(__file__).resolve().parent.parent.parent / "impl-review-loop" / "scripts"
+)
+if str(_IMPL_REVIEW_LOOP_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_IMPL_REVIEW_LOOP_SCRIPTS))
+
+from path_classification import extract_allowed_paths as pc_extract_allowed_paths  # noqa: E402
+from path_classification import has_code_or_runtime_scope  # noqa: E402
+from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+
+
+SPEC_CHANGE_KINDS = {
+    "spec-delta",
+    "spec_update",
+    "spec-update",
+    "product-spec",
+    "product_spec",
+    "product-spec-delta",
+    "product_spec_delta",
+    "product-spec-update",
+    "product_spec_update",
+}
+PLACEHOLDER_RE = re.compile(
+    r"^(?:<!--.*?-->\s*|TODO\b|TBD\b|N/?A\b|NONE\b|<required:[^>]+>|<todo>|<tbd>)*$",
+    re.IGNORECASE | re.DOTALL,
+)
+ANY_H2_RE = re.compile(r"^[ ]{0,3}##[ \t]+(?P<text>.+?)[ \t]*#*[ \t]*$")
+_FENCE_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*)$")
+
+
+class _DuplicateKeyError(Exception):
+    def __init__(self, key: object):
+        self.key = key
+        super().__init__(f"duplicate mapping key: {key!r}")
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate keys."""
+
+
+def _strict_construct_mapping(loader: _StrictSafeLoader, node, deep: bool = False):
+    loader.flatten_mapping(node)
+    mapping: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise _DuplicateKeyError(key)
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _strict_construct_mapping,
+)
+
+
+@dataclass(frozen=True)
+class SectionParseResult:
+    present: bool
+    ok: bool
+    data: Optional[dict]
+    reason: str = ""
+    duplicate_key: Optional[str] = None
+
+
+def _match_fence(line: str) -> Optional[Tuple[str, int, str]]:
+    match = _FENCE_RE.match(line)
+    if not match:
+        return None
+    fence = match.group("fence")
+    return fence[0], len(fence), match.group("info").strip()
+
+
+def _sha256_prefixed(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def run_gh_api(issue_number: int, repo: str) -> Optional[Dict[str, Any]]:
-    """GitHub API から Issue 情報を取得"""
+    """GitHub API から Issue 情報を取得."""
     try:
         result = subprocess.run(
             [
@@ -47,43 +138,190 @@ def run_gh_api(issue_number: int, repo: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_allowed_paths(issue_body: str) -> List[str]:
-    """## Allowed Paths セクションから path を抽出"""
-    paths = []
-    match = re.search(
-        r"^##\s+Allowed Paths\s*$(.+?)(?=^##|\Z)", issue_body, re.MULTILINE | re.DOTALL
-    )
-    if match:
-        section = match.group(1)
-        # - path または * path の形式で抽出
-        for line in section.split("\n"):
-            line = line.strip()
-            if line.startswith("- ") or line.startswith("* "):
-                paths.append(line[2:].strip())
-    return paths
+def _extract_sections(body: str, section_name: str) -> List[str]:
+    sections: List[str] = []
+    lines = body.splitlines()
+    active_fence: Optional[Tuple[str, int]] = None
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        fence = _match_fence(line)
+        if fence:
+            fence_char, fence_len, _ = fence
+            if active_fence is None:
+                active_fence = (fence_char, fence_len)
+            elif active_fence[0] == fence_char and fence_len >= active_fence[1]:
+                active_fence = None
+            idx += 1
+            continue
+        match = ANY_H2_RE.match(line)
+        if active_fence is None and match and match.group("text").strip() == section_name:
+            idx += 1
+            buf: List[str] = []
+            inner_fence = active_fence
+            while idx < len(lines):
+                current = lines[idx]
+                current_fence = _match_fence(current)
+                if current_fence:
+                    fence_char, fence_len, _ = current_fence
+                    if inner_fence is None:
+                        inner_fence = (fence_char, fence_len)
+                    elif inner_fence[0] == fence_char and fence_len >= inner_fence[1]:
+                        inner_fence = None
+                    buf.append(current)
+                    idx += 1
+                    continue
+                if inner_fence is None and ANY_H2_RE.match(current):
+                    break
+                buf.append(current)
+                idx += 1
+            sections.append("\n".join(buf).strip())
+            continue
+        idx += 1
+    return sections
 
 
-def extract_product_spec_context(issue_body: str) -> Optional[Dict[str, Any]]:
-    """## Product Spec Context セクションから struct を抽出"""
-    match = re.search(
-        r"^##\s+Product Spec Context\s*$(.+?)(?=^##|\Z)",
-        issue_body,
-        re.MULTILINE | re.DOTALL,
+def _extract_yaml_fences(section_text: str) -> List[str]:
+    fences: List[str] = []
+    lines = section_text.splitlines()
+    capture: Optional[List[str]] = None
+    active_fence: Optional[Tuple[str, int]] = None
+    for line in lines:
+        fence = _match_fence(line)
+        if fence:
+            fence_char, fence_len, info = fence
+            if active_fence is None:
+                active_fence = (fence_char, fence_len)
+                if info.lower() in {"yaml", "yml"}:
+                    capture = []
+                else:
+                    capture = None
+            elif active_fence[0] == fence_char and fence_len >= active_fence[1]:
+                if capture is not None:
+                    fences.append("\n".join(capture))
+                active_fence = None
+                capture = None
+            elif capture is not None:
+                capture.append(line)
+            continue
+        if capture is not None:
+            capture.append(line)
+    return fences
+
+
+def _parse_yaml_section(body: str, section_name: str) -> SectionParseResult:
+    sections = _extract_sections(body, section_name)
+    if not sections:
+        return SectionParseResult(present=False, ok=False, data=None, reason="section_missing")
+    if len(sections) > 1:
+        return SectionParseResult(present=True, ok=False, data=None, reason="section_multiple")
+
+    fences = _extract_yaml_fences(sections[0])
+    if not fences:
+        return SectionParseResult(present=True, ok=False, data=None, reason="yaml_fence_missing")
+    if len(fences) > 1:
+        return SectionParseResult(present=True, ok=False, data=None, reason="yaml_fence_multiple")
+
+    try:
+        data = yaml.load(fences[0], Loader=_StrictSafeLoader)
+    except _DuplicateKeyError as exc:
+        return SectionParseResult(
+            present=True,
+            ok=False,
+            data=None,
+            reason="duplicate_key",
+            duplicate_key=str(exc.key),
+        )
+    except yaml.YAMLError:
+        return SectionParseResult(present=True, ok=False, data=None, reason="yaml_syntax_error")
+
+    if not isinstance(data, dict):
+        return SectionParseResult(present=True, ok=False, data=None, reason="root_not_mapping")
+
+    return SectionParseResult(present=True, ok=True, data=data)
+
+
+def _is_placeholder_text(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return True
+    return bool(PLACEHOLDER_RE.fullmatch(normalized))
+
+
+def _is_meaningful_scalar(value: Any) -> bool:
+    return isinstance(value, str) and not _is_placeholder_text(value)
+
+
+def _normalize_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: List[str] = []
+    for item in value:
+        if isinstance(item, str) and not _is_placeholder_text(item):
+            normalized.append(item.strip())
+    return normalized
+
+
+def _change_kind(mrc: SectionParseResult) -> str:
+    if not mrc.ok or not mrc.data:
+        return ""
+    value = mrc.data.get("change_kind")
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _product_spec_parse_error(parse_result: SectionParseResult) -> Optional[str]:
+    if not parse_result.present:
+        return None
+    if parse_result.ok:
+        return None
+    if parse_result.reason == "duplicate_key" and parse_result.duplicate_key:
+        return f"Product Spec Context duplicate key: {parse_result.duplicate_key}"
+    return f"Product Spec Context parse error: {parse_result.reason}"
+
+
+def _has_spec_reference(context: Dict[str, Any]) -> bool:
+    ref_fields = (
+        "product_spec_id",
+        "spec_ssot",
+        "changed_requirement_id",
+        "requirement_id",
+        "source_task_id",
     )
-    if match:
-        section = match.group(1)
-        context = {}
-        for line in section.split("\n"):
-            line = line.strip()
-            if ":" in line and not line.startswith("#"):
-                key, val = line.split(":", 1)
-                context[key.strip()] = val.strip()
-        return context if context else None
-    return None
+    for field_name in ref_fields:
+        if _is_meaningful_scalar(context.get(field_name)):
+            return True
+    list_fields = ("changed_requirement_ids", "requirement_ids")
+    return any(_normalize_string_list(context.get(field_name)) for field_name in list_fields)
+
+
+def _has_required_diff_evidence(context: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    missing: List[str] = []
+    if not _is_meaningful_scalar(context.get("diff_rationale")):
+        missing.append("diff_rationale")
+
+    requirement_fields = (
+        "changed_requirement_id",
+        "requirement_id",
+    )
+    has_requirement_ref = any(
+        _is_meaningful_scalar(context.get(field_name))
+        for field_name in requirement_fields
+    ) or any(
+        _normalize_string_list(context.get(field_name))
+        for field_name in ("changed_requirement_ids", "requirement_ids")
+    )
+    if not has_requirement_ref:
+        missing.append("changed_requirement_id/requirement_id")
+
+    if not _normalize_string_list(context.get("affected_sections")):
+        missing.append("affected_sections")
+    return not missing, missing
 
 
 def extract_depends_on(issue_body: str) -> List[int]:
-    """line-anchored `Depends on #N` を抽出（制御セクション）"""
+    """line-anchored `Depends on #N` を抽出（制御セクション）."""
     depends_on = []
     match = re.search(
         r"^##\s+Depends On\s*$(.+?)(?=^##|\Z)", issue_body, re.MULTILINE | re.DOTALL
@@ -92,19 +330,22 @@ def extract_depends_on(issue_body: str) -> List[int]:
         section = match.group(1)
         for line in section.split("\n"):
             line = line.strip()
-            # ^- Depends on #<number> または ^Depends on #<number>
-            m = re.match(r"^-?\s*Depends on #(\d+)", line)
-            if m:
-                depends_on.append(int(m.group(1)))
+            found = re.match(r"^-?\s*Depends on #(\d+)", line)
+            if found:
+                depends_on.append(int(found.group(1)))
     return depends_on
 
 
 def check_trigger_conditions(
-    issue_body: str, allowed_paths: List[str]
+    issue_body: str,
+    allowed_paths: List[str],
+    product_spec_context: SectionParseResult,
 ) -> Dict[str, bool]:
-    """trigger conditions を判定"""
-    triggers = {
-        "docs_product_allowed_paths": any("docs/product/" in p for p in allowed_paths),
+    """trigger conditions を判定."""
+    return {
+        "docs_product_allowed_paths": any(
+            path.lstrip("./").startswith("docs/product/") for path in allowed_paths
+        ),
         "tasks_md_mentioned": bool(
             re.search(r"\btasks\.md\b|tasks\.md", issue_body, re.IGNORECASE)
         ),
@@ -118,90 +359,66 @@ def check_trigger_conditions(
                 re.IGNORECASE,
             )
         ),
-        "product_spec_context_present": extract_product_spec_context(issue_body)
-        is not None,
+        "product_spec_context_present": product_spec_context.present,
     }
-    return triggers
 
 
 def check_ps001(
-    issue_body: str, allowed_paths: List[str], triggers: Dict[str, bool]
+    allowed_paths: List[str],
+    triggers: Dict[str, bool],
+    mrc: SectionParseResult,
+    product_spec_context: SectionParseResult,
 ) -> Tuple[str, List[Dict[str, str]]]:
     """
-    PS001: docs/product/** 更新が spec delta Issue のリンクを含んでいるか
-    - applicability: only if docs_product_allowed_paths is true
+    PS001: docs/product/** 更新が spec evidence / spec delta context を含んでいるか.
     """
     if not triggers["docs_product_allowed_paths"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # Issue 自体が spec/update Issue かどうかを判定
-    # Machine-Readable Contract に change_kind: product-spec-delta 等があるか
-    if re.search(
-        r"change_kind:\s*(spec-?delta|product-?spec|product[_-]?spec[_-]?delta|product[_-]?spec[_-]?update|spec[_-]?update)",
-        issue_body,
-        re.IGNORECASE,
-    ):
+    if _change_kind(mrc) in SPEC_CHANGE_KINDS:
         return "pass", [
             {
                 "rule_id": "PS001",
-                "source": "issue_body",
-                "excerpt": "Issue 自体が product spec delta Issue として明示（change_kind）",
+                "source": "machine_readable_contract",
+                "excerpt": "Issue 自体が product spec delta/update Issue として明示",
             }
         ]
 
-    # code change も含むなら spec delta Issue のリンクが必須
-    if not re.search(r"allowed_paths.*\.md\b", issue_body, re.MULTILINE | re.DOTALL):
-        # docs-only の場合
-        if re.search(r"issue_kind:\s*spec|issue_kind:\s*documentation", issue_body):
-            return "pass", [
-                {
-                    "rule_id": "PS001",
-                    "source": "issue_body",
-                    "excerpt": "Issue 自体が docs-only spec issue として明示（issue_kind）",
-                }
-            ]
+    parse_error = _product_spec_parse_error(product_spec_context)
+    if parse_error:
+        return "fail", [
+            {
+                "rule_id": "PS001",
+                "source": "product_spec_context",
+                "excerpt": parse_error,
+            }
+        ]
 
-    # Product Spec Context がある場合、それを証跡として使える
-    context = extract_product_spec_context(issue_body)
-    if context:
+    context = product_spec_context.data or {}
+    if _has_spec_reference(context):
         return "pass", [
             {
                 "rule_id": "PS001",
-                "source": "issue_body",
-                "excerpt": "Product Spec Context セクション存在",
+                "source": "product_spec_context",
+                "excerpt": "Product Spec Context に検証済み spec reference がある",
             }
         ]
 
-    # spec delta Issue 参照を探す（`Relates to #N` / `Spec:` など）
-    if re.search(r"(spec|spec-?delta|related|relates to).*#\d+", issue_body, re.IGNORECASE):
-        return "pass", [
-            {
-                "rule_id": "PS001",
-                "source": "issue_body",
-                "excerpt": "spec delta Issue の参照有り（Spec / Relates to）",
-            }
-        ]
-
+    scope_kind = "mixed_scope" if has_code_or_runtime_scope(allowed_paths) else "docs_only"
     return "fail", [
         {
             "rule_id": "PS001",
             "source": "allowed_paths",
-            "excerpt": "docs/product/** 更新ありかつ spec delta Issue リンク / Product Spec Context 欠落",
+            "excerpt": f"{scope_kind}: docs/product/** 更新ありだが spec evidence / spec delta context が不足",
         }
     ]
 
 
 def check_ps002(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    PS002: tasks.md が direct implementation source になっていないか
-    - Pass: staging artifact として言及
-    - Fail: direct source / tracking SSOT として言及
-    """
+    """PS002: tasks.md が direct implementation source になっていないか."""
     if not triggers["tasks_md_mentioned"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # allow patterns first — higher priority
-    # These patterns relate to tasks.md as staging/artifact/convert/materialize
     allow = [
         r"tasks\.md.*staging",
         r"staging.*tasks\.md",
@@ -209,8 +426,7 @@ def check_ps002(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
         r"artifact.*tasks\.md",
         r"convert.*tasks\.md.*issue|materialize.*tasks\.md",
     ]
-
-    if any(re.search(p, issue_body, re.IGNORECASE) for p in allow):
+    if any(re.search(pattern, issue_body, re.IGNORECASE) for pattern in allow):
         return "pass", [
             {
                 "rule_id": "PS002",
@@ -219,63 +435,45 @@ def check_ps002(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
             }
         ]
 
-    # prohibit patterns — checked after allow to prevent false positive
     prohibit = [
-        r"implement\s+.*?tasks\.md(?!.*(?:from|materialize|staging|artifact))|tasks\.md\s+.*?implement",
-        r"direct.*tasks\.md|tasks\.md.*direct",
-        r"source.*tasks\.md(?!_task_id)|tasks\.md.*source\b(?!_task_id)",
-        r"tracking.*tasks\.md|tasks\.md.*tracking",
-        r"proceed.*tasks\.md|tasks\.md.*proceed",
+        r"tasks\.md.*(?:direct|implementation|source of truth|ssot|canonical)",
+        r"(?:use|implement).*tasks\.md.*(?:directly|as source)",
     ]
-
     for pattern in prohibit:
-        if re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL):
+        found = re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL)
+        if found:
             return "fail", [
                 {
                     "rule_id": "PS002",
                     "source": "issue_body",
-                    "excerpt": re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL).group(0),
+                    "excerpt": found.group(0)[:120],
                 }
             ]
 
-    # neutral mention — pass but with note
-    return "pass", [
-        {
-            "rule_id": "PS002",
-            "source": "issue_body",
-            "excerpt": "tasks.md への言及あるも、staging artifact / direct implementation source の区別がない",
-        }
-    ]
+    return "pass", []
 
 
 def check_ps003(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    PS003: .specify/ が canonical source になっていないか
-    - Pass: derived workbench として言及、または docs/SSOT が優先と明記
-    - Fail: canonical source / SSOT override として言及
-    """
+    """PS003: .specify/ が canonical source になっていないか."""
     if not triggers["specify_artifact_mentioned"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # prohibit patterns (check FIRST, before allow)
-    # Specifically match .specify as THE canonical/SSOT (not derived from docs)
     prohibit = [
         r"\.specify.*?\bcanonical\b(?!.*not)(?!.*derived)",
         r"\.specify.*?\bssot\b(?!.*docs)(?!.*wins)",
         r"\.specify.*?(?:override.*?docs|takes priority.*docs|comes.*?before.*docs)",
     ]
-
     for pattern in prohibit:
-        if re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL):
+        found = re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL)
+        if found:
             return "fail", [
                 {
                     "rule_id": "PS003",
                     "source": "issue_body",
-                    "excerpt": re.search(pattern, issue_body, re.IGNORECASE | re.DOTALL).group(0)[:100],
+                    "excerpt": found.group(0)[:120],
                 }
             ]
 
-    # allow patterns (check AFTER prohibit)
     allow = [
         r"\.specify.*workbench|workbench.*\.specify",
         r"\.specify.*derived|derived.*\.specify",
@@ -283,8 +481,7 @@ def check_ps003(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
         r"docs.*wins|docs.*priority|docs.*ssot.*wins|docs.*SSOT",
         r"\.specify.*not canonical",
     ]
-
-    if any(re.search(p, issue_body, re.IGNORECASE) for p in allow):
+    if any(re.search(pattern, issue_body, re.IGNORECASE) for pattern in allow):
         return "pass", [
             {
                 "rule_id": "PS003",
@@ -293,169 +490,79 @@ def check_ps003(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
             }
         ]
 
-    # neutral mention
-    return "pass", [
-        {
-            "rule_id": "PS003",
-            "source": "issue_body",
-            "excerpt": ".specify/ への言及あるも、canonical / derived の区別がない",
-        }
-    ]
+    return "pass", []
 
 
 def check_ps004(
-    issue_body: str, allowed_paths: List[str], triggers: Dict[str, bool]
+    triggers: Dict[str, bool],
+    mrc: SectionParseResult,
+    product_spec_context: SectionParseResult,
 ) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    PS004: product spec 更新に diff_rationale / changed_requirement_id / affected_sections があるか
-    - Applicability: only if docs_product_allowed_paths AND not pure spec issue
-    """
+    """PS004: product spec 更新に diff evidence があるか."""
     if not triggers["docs_product_allowed_paths"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # If Issue 自体が spec delta/update Issue, then evidence is required
-    if re.search(
-        r"change_kind:\s*(spec-?delta|product-?spec|product[_-]?spec[_-]?delta|product[_-]?spec[_-]?update|spec[_-]?update)",
-        issue_body,
-        re.IGNORECASE,
+    mrc_data = mrc.data or {}
+    if _change_kind(mrc) in SPEC_CHANGE_KINDS and _is_meaningful_scalar(
+        mrc_data.get("diff_rationale")
     ):
-        # Spec delta issues must have evidence in Machine-Readable Contract or Product Spec Context
-        contract_match = re.search(
-            r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
-            issue_body,
-            re.MULTILINE | re.DOTALL,
-        )
-
-        context_match = re.search(
-            r"^##\s+Product Spec Context\s*$(.+?)(?=^##|\Z)",
-            issue_body,
-            re.MULTILINE | re.DOTALL,
-        )
-
-        evidence_patterns = [
-            r"diff[_-]?rationale\s*:",
-            r"changed[_-]?requirement\s*:",
-            r"affected[_-]?sections\s*:",
+        return "pass", [
+            {
+                "rule_id": "PS004",
+                "source": "machine_readable_contract",
+                "excerpt": "spec delta issue with non-placeholder diff_rationale",
+            }
         ]
 
-        found = []
-        search_text = ""
-        if contract_match:
-            search_text += contract_match.group(1)
-        if context_match:
-            search_text += context_match.group(1)
-
-        for pattern in evidence_patterns:
-            if re.search(pattern, search_text, re.IGNORECASE):
-                found.append(pattern)
-
-        if found:
-            return "pass", [
-                {
-                    "rule_id": "PS004",
-                    "source": "issue_body",
-                    "excerpt": f"spec delta issue with rationale: {found[0]}",
-                }
-            ]
-
-        # Spec delta issues without explicit evidence: fail
+    parse_error = _product_spec_parse_error(product_spec_context)
+    if parse_error:
         return "fail", [
             {
                 "rule_id": "PS004",
-                "source": "issue_body",
-                "excerpt": "spec delta issue without diff_rationale / changed_requirement_id / affected_sections",
+                "source": "product_spec_context",
+                "excerpt": parse_error,
             }
         ]
 
-    # Non-spec issues with docs/product updates need diff evidence
-    contract_match = re.search(
-        r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
-        issue_body,
-        re.MULTILINE | re.DOTALL,
-    )
-
-    context_match = re.search(
-        r"^##\s+Product Spec Context\s*$(.+?)(?=^##|\Z)",
-        issue_body,
-        re.MULTILINE | re.DOTALL,
-    )
-
-    evidence_patterns = [
-        r"diff[_-]?rationale\s*:",
-        r"changed[_-]?requirement\s*:",
-        r"affected[_-]?sections\s*:",
-        r"change[_-]?summary\s*:",
-    ]
-
-    found = []
-    search_text = ""
-    if contract_match:
-        search_text += contract_match.group(1)
-    if context_match:
-        search_text += context_match.group(1)
-
-    for pattern in evidence_patterns:
-        if re.search(pattern, search_text, re.IGNORECASE):
-            found.append(pattern)
-
-    if found:
+    context = product_spec_context.data or {}
+    ok, missing = _has_required_diff_evidence(context)
+    if ok:
         return "pass", [
             {
                 "rule_id": "PS004",
-                "source": "issue_body",
-                "excerpt": f"evidence found: {found[0]}",
-            }
-        ]
-
-    # context check — Product Spec Context の存在が evidence になる
-    context = extract_product_spec_context(issue_body)
-    if context:
-        return "pass", [
-            {
-                "rule_id": "PS004",
-                "source": "issue_body",
-                "excerpt": "Product Spec Context セクション（implicit evidence）",
+                "source": "product_spec_context",
+                "excerpt": "diff evidence fields are present and non-placeholder",
             }
         ]
 
     return "fail", [
         {
             "rule_id": "PS004",
-            "source": "issue_body",
-            "excerpt": "docs/product/** 更新あり、diff_rationale / changed_requirement_id / affected_sections 欠落",
+            "source": "product_spec_context",
+            "excerpt": f"missing diff evidence: {', '.join(missing)}",
         }
     ]
 
 
-def check_ps005(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    PS005: generated task が requirement_id / source_task_id を保持しているか
-    - Applicability: only if generated_task_mentioned
-    """
+def check_ps005(
+    triggers: Dict[str, bool],
+    mrc: SectionParseResult,
+    product_spec_context: SectionParseResult,
+) -> Tuple[str, List[Dict[str, str]]]:
+    """PS005: generated task が requirement_id / source_task_id を保持しているか."""
     if not triggers["generated_task_mentioned"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # context check (most reliable source)
-    context = extract_product_spec_context(issue_body)
-
-    has_requirement_id = False
-    has_source_task_id = False
-
-    # Check in Machine-Readable Contract section
-    contract_match = re.search(
-        r"^##\s+Machine-Readable Contract\s*$(.+?)(?=^##|\Z)",
-        issue_body,
-        re.MULTILINE | re.DOTALL,
+    mrc_data = mrc.data or {}
+    context = product_spec_context.data or {}
+    has_requirement_id = any(
+        _is_meaningful_scalar(source.get("requirement_id"))
+        for source in (mrc_data, context)
+    ) or bool(_normalize_string_list(context.get("requirement_ids")))
+    has_source_task_id = any(
+        _is_meaningful_scalar(source.get("source_task_id"))
+        for source in (mrc_data, context)
     )
-    if contract_match:
-        contract_section = contract_match.group(1)
-        has_requirement_id = bool(re.search(r"requirement[_-]?id:", contract_section, re.IGNORECASE))
-        has_source_task_id = bool(re.search(r"source[_-]?task[_-]?id:", contract_section, re.IGNORECASE))
-
-    # Fallback to context
-    if context:
-        has_requirement_id = has_requirement_id or ("requirement_id" in context)
-        has_source_task_id = has_source_task_id or ("source_task_id" in context)
 
     if has_requirement_id and has_source_task_id:
         return "pass", [
@@ -471,7 +578,6 @@ def check_ps005(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
         missing.append("requirement_id")
     if not has_source_task_id:
         missing.append("source_task_id")
-
     return "fail", [
         {
             "rule_id": "PS005",
@@ -482,15 +588,10 @@ def check_ps005(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
 
 
 def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    PS006: generated task dependency が materialize されているか
-    - Applicability: only if generated_task_mentioned AND mentions dependencies
-    - Line-anchored Depends on #N を使用（GitHub native dependency 対応は follow-up）
-    """
+    """PS006: generated task dependency が materialize されているか."""
     if not triggers["generated_task_mentioned"]:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # Check if dependencies are mentioned
     has_dependency_mention = bool(
         re.search(
             r"depend|depend on|prerequisite|requires|prior.*task|blocked.*by|blocks",
@@ -498,15 +599,11 @@ def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
             re.IGNORECASE,
         )
     )
-
     if not has_dependency_mention:
-        return "pass", []  # n/a: applicability check does not apply
+        return "pass", []
 
-    # Check for line-anchored Depends on #N
     depends_on = extract_depends_on(issue_body)
-    has_depends_on = len(depends_on) > 0
-
-    if has_depends_on:
+    if depends_on:
         return "pass", [
             {
                 "rule_id": "PS006",
@@ -515,7 +612,6 @@ def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
             }
         ]
 
-    # If generated task mentions dependencies but none materialized, flag as human_judgment
     return "human_judgment", [
         {
             "rule_id": "PS006",
@@ -525,81 +621,150 @@ def check_ps006(issue_body: str, triggers: Dict[str, bool]) -> Tuple[str, List[D
     ]
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Product Spec Contract Checker")
     parser.add_argument("--issue-number", type=int, required=True)
     parser.add_argument("--repo", required=True, default="squne121/loop-protocol")
     parser.add_argument("--body-file", type=str, help="Read issue body from file (for testing)")
     args = parser.parse_args()
 
-    # Issue 情報を取得
+    source_type = "body_file" if args.body_file else "github_api"
     if args.body_file:
-        # Test mode: read from file
-        with open(args.body_file, "r", encoding="utf-8") as f:
-            issue_body = f.read()
+        issue_body = Path(args.body_file).read_text(encoding="utf-8")
     else:
         issue_data = run_gh_api(args.issue_number, args.repo)
         if not issue_data:
             print(
                 json.dumps(
                     {
-                        "applicability": "not_applicable",
+                        "schema": "product_spec_check/v1",
+                        "applicability": "applicable",
                         "decision": "human_judgment",
+                        "blocked_reasons": [],
+                        "body_sha256": _sha256_prefixed(""),
+                        "source_provenance": {"source_type": source_type},
                         "error": "Failed to fetch issue",
-                    }
+                    },
+                    ensure_ascii=False,
                 )
             )
-            sys.exit(1)
+            return 2
         issue_body = issue_data.get("body", "")
 
-    allowed_paths = extract_allowed_paths(issue_body)
-
-    # trigger conditions を判定
-    triggers = check_trigger_conditions(issue_body, allowed_paths)
-
-    # applicability を決定
+    body_sha256 = _sha256_prefixed(issue_body)
+    allowed_paths = pc_extract_allowed_paths(issue_body)
+    mrc_parsed = parse_machine_readable_contract(issue_body)
+    mrc = SectionParseResult(
+        present=bool(_extract_sections(issue_body, "Machine-Readable Contract")),
+        ok=mrc_parsed.ok,
+        data=mrc_parsed.data,
+        reason=mrc_parsed.reason,
+        duplicate_key=mrc_parsed.duplicate_key,
+    )
+    product_spec_context = _parse_yaml_section(issue_body, "Product Spec Context")
+    triggers = check_trigger_conditions(issue_body, allowed_paths, product_spec_context)
+    triggers["machine_readable_contract_present"] = mrc.present
     applicability = "applicable" if any(triggers.values()) else "not_applicable"
 
-    # 各ルールを実行
     checks = {
         "docs_product_requires_spec_evidence": check_ps001(
-            issue_body, allowed_paths, triggers
+            allowed_paths, triggers, mrc, product_spec_context
         ),
         "tasks_md_not_direct_source": check_ps002(issue_body, triggers),
         "specify_not_canonical": check_ps003(issue_body, triggers),
-        "diff_first_rationale_present": check_ps004(issue_body, allowed_paths, triggers),
-        "generated_task_trace_present": check_ps005(issue_body, triggers),
+        "diff_first_rationale_present": check_ps004(
+            triggers, mrc, product_spec_context
+        ),
+        "generated_task_trace_present": check_ps005(
+            triggers, mrc, product_spec_context
+        ),
         "task_dependencies_materialized": check_ps006(issue_body, triggers),
     }
 
-    # 結果を集約
     conditions = {}
-    all_blocked_reasons = []
+    blocked_reasons: List[Dict[str, str]] = []
+    has_fail = False
+    has_human_judgment = False
+
+    parse_errors: List[Dict[str, str]] = []
+    if mrc.present and not mrc.ok:
+        parse_errors.append(
+            {
+                "rule_id": "PS001",
+                "source": "machine_readable_contract",
+                "excerpt": f"Machine-Readable Contract parse error: {mrc.reason}",
+            }
+        )
+    psc_parse_error = _product_spec_parse_error(product_spec_context)
+    if psc_parse_error:
+        parse_errors.append(
+            {
+                "rule_id": "PS001",
+                "source": "product_spec_context",
+                "excerpt": psc_parse_error,
+            }
+        )
+    if parse_errors:
+        conditions["named_yaml_sections_valid"] = {
+            "status": "fail",
+            "evidence": parse_errors,
+        }
+        has_fail = True
+        blocked_reasons.extend(parse_errors)
 
     for check_name, (status, evidence) in checks.items():
         conditions[check_name] = {"status": status, "evidence": evidence}
-        if status in ("fail", "human_judgment"):
-            all_blocked_reasons.extend(evidence)
+        if status == "fail":
+            has_fail = True
+            blocked_reasons.extend(evidence)
+        elif status == "human_judgment":
+            has_human_judgment = True
+            blocked_reasons.extend(evidence)
 
-    # decision を決定
-    if any(s == "fail" for s, _ in checks.values()):
+    if applicability == "not_applicable":
+        decision = "pass"
+        blocked_reasons = []
+    elif has_fail:
         decision = "fail"
-    elif any(s == "human_judgment" for s, _ in checks.values()):
+    elif has_human_judgment:
         decision = "human_judgment"
     else:
         decision = "pass"
 
     result = {
+        "schema": "product_spec_check/v1",
         "applicability": applicability,
         "decision": decision,
         "triggers": triggers,
         "conditions": conditions,
-        "blocked_reasons": all_blocked_reasons,
+        "blocked_reasons": blocked_reasons,
+        "body_sha256": body_sha256,
+        "source_provenance": {
+            "source_type": source_type,
+            "body_file": args.body_file if args.body_file else None,
+        },
     }
 
+    gate_result = evaluate_product_spec_payload(
+        result,
+        issue_url=f"https://github.com/{args.repo}/issues/{args.issue_number}",
+        body_sha256=body_sha256,
+        exit_code=0 if result["decision"] == "pass" else 1,
+    )
+    if gate_result["routing_action"] == "refresh_contract_snapshot":
+        result["applicability"] = "applicable"
+        result["decision"] = "human_judgment"
+        result["blocked_reasons"] = result["blocked_reasons"] or [
+            {
+                "rule_id": "PS001",
+                "source": "product_spec_check",
+                "excerpt": gate_result["reason"],
+            }
+        ]
+
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    sys.exit(0 if decision in ("pass",) else 1)
+    return 0 if result["decision"] == "pass" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

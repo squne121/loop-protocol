@@ -152,13 +152,12 @@ def test_parallel_exclude_overlapping_ignore_raises(tmp_path):
 
 
 def test_real_plan_serial_lane_has_debounce():
-    """The shipped SSOT excludes the timing-sensitive debounce test from xdist."""
+    """After #1141, debounce test is deterministic; parallel_exclude is empty."""
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
-    assert lane[:2] == ["-n", "0"]
-    assert any("session_manifest_debounce" in a for a in lane)
+    assert lane == []
     par = mod.run_argv(plan, mode="parallel")
-    assert any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
+    assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
 
 
 def test_real_plan_uses_fixed_worker_count():
