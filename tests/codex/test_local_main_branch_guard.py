@@ -35,6 +35,7 @@ from local_main_branch_guard import (
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
+    REASON_SKILL_RUNTIME_EXECUTOR,
     is_github_issue_mutation_command,
     is_readonly_artifact_export_command,
     GITHUB_CMD_CLASS_DISPLAY_READONLY,
@@ -58,20 +59,35 @@ def make_pretool_codex(command: str, cwd: str, event: str = "PreToolUse") -> dic
     }
 
 
-def eval_codex(command: str, cwd: str, event: str = "PreToolUse") -> dict:
+def eval_codex(
+    command: str,
+    cwd: str,
+    event: str = "PreToolUse",
+    env_override: dict[str, str] | None = None,
+) -> dict:
     """
     Evaluate a Codex hook input.
     Sets CLAUDE_PROJECT_DIR so is_local_root_context returns True for cwd.
     """
     old = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    previous: dict[str, str | None] = {}
     try:
         os.environ["CLAUDE_PROJECT_DIR"] = cwd
+        if env_override:
+            for key, value in env_override.items():
+                previous[key] = os.environ.get(key)
+                os.environ[key] = value
         result = evaluate(command=command, cwd=cwd, hook_flavor="codex")
     finally:
         if old:
             os.environ["CLAUDE_PROJECT_DIR"] = old
         elif "CLAUDE_PROJECT_DIR" in os.environ:
             del os.environ["CLAUDE_PROJECT_DIR"]
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return result
 
 
@@ -83,6 +99,11 @@ def tmp_git_repo() -> Path:
         subprocess.run(["git", "init", "-b", "main", tmpdir], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "config", "user.email", "t@t.com"], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "config", "user.name", "T"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", tmpdir, "remote", "add", "origin", "https://github.com/squne121/loop-protocol.git"],
+            check=True,
+            capture_output=True,
+        )
         (Path(tmpdir) / "README.md").write_text("test")
         subprocess.run(["git", "-C", tmpdir, "add", "README.md"], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "commit", "-m", "init"], check=True, capture_output=True)
@@ -90,6 +111,25 @@ def tmp_git_repo() -> Path:
         yield Path(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.fixture
+def tmp_linked_worktree(tmp_git_repo: Path) -> Path:
+    """Linked worktree under .claude/worktrees for exact executor parity tests."""
+    wt_path = tmp_git_repo / ".claude" / "worktrees" / "issue-981-codex-test"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_git_repo), "worktree", "add", str(wt_path), "issue-981-codex-test"],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        yield wt_path
+    finally:
+        subprocess.run(
+            ["git", "-C", str(tmp_git_repo), "worktree", "remove", "--force", str(wt_path)],
+            capture_output=True,
+        )
 
 
 # ─── AC8: Codex parity ────────────────────────────────────────────────────────
@@ -510,13 +550,15 @@ class TestGhMutationReasonCode:
 class TestExactAllowlist:
     """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker reason_code."""
 
-    def test_exact_allowlist_run_refinement_preflight(self, tmp_git_repo: Path):
+    def test_exact_allowlist_skill_runtime_executor(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
         result = eval_codex(
-            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
-            str(tmp_git_repo),
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
         )
         assert result["status"] == "allow"
-        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
 
     def test_wildcard_path_not_in_allowlist(self, tmp_git_repo: Path):
         result = eval_codex(
@@ -532,12 +574,14 @@ class TestExactAllowlist:
         )
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
 
-    def test_deterministic_checker_command_reason_code(self, tmp_git_repo: Path):
+    def test_deterministic_checker_command_reason_code(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
         result = eval_codex(
-            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
-            str(tmp_git_repo),
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
         )
-        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
         assert result["reason_code"] != REASON_READONLY
 
 
