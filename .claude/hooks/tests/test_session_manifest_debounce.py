@@ -132,22 +132,27 @@ def test_ten_events_queued_then_forced_flush_calls_producer_exactly_once(
 
     AC3: after lock removal, --flush calls producer exactly once with
          debounce_event_count == 10 and all deltas aggregated.
+         Exactly-once is verified by JSONL append: the log file must have
+         exactly 1 non-empty line, proving producer was called exactly once
+         even if write_text() would have silently overwritten prior calls.
 
     AC5: after flush, events dir is empty, lock is absent, flush child has
          exited (synchronous call).
     """
-    payload_log = tmp_path / "payload.json"
+    payload_log = tmp_path / "payload.jsonl"
     producer = tmp_path / "producer.py"
     producer.write_text(
-        f"""#!/usr/bin/env python3
-import json
-import pathlib
-import sys
-
-payload = json.load(sys.stdin)
-pathlib.Path({str(payload_log)!r}).write_text(json.dumps(payload), encoding="utf-8")
-sys.exit(0)
-""",
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import sys\n"
+        "\n"
+        "log_path = " + repr(str(payload_log)) + "\n"
+        "payload = json.load(sys.stdin)\n"
+        "# Append mode: each producer invocation adds exactly one line.\n"
+        "# This lets the test count invocations rather than relying on overwrite.\n"
+        "with open(log_path, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(payload) + '\\n')\n"
+        "sys.exit(0)\n",
         encoding="utf-8",
     )
     producer.chmod(0o755)
@@ -199,10 +204,15 @@ sys.exit(0)
         f"--flush failed (exit {flush_result.returncode}): {flush_result.stderr}"
     )
 
-    # AC3: producer was called exactly once.
+    # AC3: producer was called exactly once (JSONL line count == 1).
     assert payload_log.exists(), "producer was never called after flush -- AC3 violated"
 
-    flushed = json.loads(payload_log.read_text(encoding="utf-8"))
+    lines = [line for line in payload_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 1, (
+        f"producer called {len(lines)} times, expected exactly 1 -- AC3 exactly-once violated"
+    )
+
+    flushed = json.loads(lines[0])
 
     # AC3: debounce_event_count == 10.
     assert flushed.get("debounce_event_count") == 10, (

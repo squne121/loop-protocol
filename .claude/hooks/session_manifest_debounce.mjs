@@ -405,45 +405,34 @@ export async function runFlushLoopCore(
   }
 }
 
-async function flushLoop({ force = false }) {
-  while (true) {
-    refreshLock(WORKER_LOCK)
-    const files = listEventFiles()
-    if (files.length === 0) break
-    if (!force) {
-      const newestTimestamp = Math.max(...files.map((file) => extractTimestampFromEventFile(file)))
-      const quietForMs = Date.now() - newestTimestamp
-      if (quietForMs < WINDOW_MS) {
-        refreshLock(WORKER_LOCK)
-        await new Promise((resolvePromise) => globalThis.setTimeout(resolvePromise, WINDOW_MS - quietForMs))
-        continue
+async function flushLoop(opts = {}) {
+  const { force = false } = opts;
+  return runFlushLoopCore({
+    now: () => Date.now(),
+    sleep: async (ms) => {
+      refreshLock(WORKER_LOCK);
+      await new Promise((resolvePromise) => globalThis.setTimeout(resolvePromise, ms));
+      refreshLock(WORKER_LOCK);
+    },
+    listEvents: () =>
+      listEventFiles().map((file) => ({
+        timestamp: extractTimestampFromEventFile(file),
+        file,
+      })),
+    readEvents: () =>
+      listEventFiles().map((file) => JSON.parse(readFileSync(file, 'utf8'))),
+    runProducer: (payload) => {
+      refreshLock(WORKER_LOCK);
+      runProducer(payload);
+    },
+    removeEvents: () => {
+      for (const file of listEventFiles()) {
+        rmSync(file, { force: true });
       }
-    }
-    const events = files.map((file) => JSON.parse(readFileSync(file, 'utf8')))
-    const aggregatedDelta = []
-    for (const event of events) {
-      for (const item of event.session_manifest_delta ?? event.delta ?? []) {
-        const signature = JSON.stringify(item)
-        if (!aggregatedDelta.some((existing) => JSON.stringify(existing) === signature)) {
-          aggregatedDelta.push(item)
-        }
-      }
-    }
-    const latest = events[events.length - 1]
-    runProducer({
-      hook_event_name: 'PostToolUse',
-      tool_name: 'DebounceBatch',
-      session_id: latest?.session_id ?? null,
-      issue_number: latest?.issue_number ?? null,
-      session_manifest_delta: aggregatedDelta,
-      debounce_event_count: events.length,
-      debounce_flush_reason: force ? 'forced_flush' : 'debounced',
-    })
-    for (const file of files) {
-      rmSync(file, { force: true })
-    }
-    if (force) continue
-  }
+    },
+    windowMs: WINDOW_MS,
+    force,
+  });
 }
 
 async function flushWithLockHandling() {
