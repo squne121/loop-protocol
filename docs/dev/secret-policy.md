@@ -101,10 +101,28 @@ deploy_credential_boundaries:
 
 | 項目 | 内容 |
 |------|------|
-| **現状** | `.claude/settings.local.json`、`*.local` ファイルが `.gitignore` で除外済み |
-| **発生条件** | ローカル AI Agent（Claude Code 等）の設定ファイルや、API key が記述された local override ファイルが生成された時点 |
-| **取り扱いルール** | `.gitignore` の除外パターン（`*.local`、`.claude/settings.local.json`）を維持する。これらのファイルを `git add` しない。共有が必要な設定は `.json.example` 等のテンプレート経由で行う |
+| **現状** | `.claude/settings.local.json`、`*.local` ファイルが `.gitignore` で除外済み。Latitude API key は `#1153` が「追加済み」と記述するが、実 Secret 存在確認・policy 整合・runtime 安全検証は `#1157` で実施する |
+| **発生条件** | ローカル AI Agent（Claude Code 等）の設定ファイルや、API key が記述された local override ファイルが生成された時点。Latitude telemetry 統合（`LATITUDE_API_KEY`）はこのカテゴリに分類される |
+| **取り扱いルール** | `.gitignore` の除外パターン（`*.local`、`.claude/settings.local.json`）を維持する。これらのファイルを `git add` しない。共有が必要な設定は `.json.example` 等のテンプレート経由で行う。**Latitude API key を本 repo のどのファイルにも書き込まない** |
 | **漏洩時手順** | 1. コミット履歴から `git filter-repo` で除去 2. 対応する API key を revoke / rotate 3. `.gitignore` の設定を再確認 |
+
+#### Latitude API key の分類根拠 (#1157)
+
+Latitude API key は `agent_local_secret` に分類される（taxonomy_mapping により `secrets_mode: app_secret`）。
+
+```yaml
+latitude_api_key_classification:
+  secret_category: agent_local_secret
+  secrets_mode_when_present: app_secret
+  real_development_session_allowed: false
+  policy_consistent: true
+  containment_state: pending_verification
+  note: >
+    Latitude credential の runtime 存在確認・containment 完了・real session 許可は
+    別 Child Issue の人間 Decision を要する（docs/dev/session-recording-policy.md 参照）。
+    本 Inventory の current_secrets_mode: none は Latitude API key が
+    本 repo の tracked file・git history に存在しないことを前提とする。
+```
 
 ---
 
