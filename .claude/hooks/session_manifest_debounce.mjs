@@ -333,6 +333,78 @@ function runProducer(payload) {
   return { ...result, timedOut, reasonCode }
 }
 
+/**
+ * runFlushLoopCore — DI-injectable state machine for the debounce flush loop.
+ *
+ * Extracted from flushLoop to enable virtual-clock unit testing (Issue #1141
+ * AC4).  Production callers pass filesystem/real-time implementations.
+ * Test callers pass virtual clock and in-memory event lists.
+ *
+ * @param {object} deps
+ * @param {() => number} deps.now
+ *   Returns current time in ms (wall-clock or virtual).
+ * @param {(ms: number) => Promise<void>} deps.sleep
+ *   Async sleep; advances clock in tests.
+ * @param {() => Array<{timestamp: number}>} deps.listEvents
+ *   Returns pending events as {timestamp} objects for quiet-window check.
+ * @param {() => Array<object>} deps.readEvents
+ *   Returns full event payloads for delta aggregation.
+ * @param {(payload: object) => void} deps.runProducer
+ *   Invokes the producer with the aggregated payload.
+ * @param {() => void} deps.removeEvents
+ *   Removes (clears) all pending events after a successful producer call.
+ * @param {number} deps.windowMs
+ *   Debounce quiet-window in ms.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.force=false]
+ *   When true, skips quiet-window check and flushes immediately.
+ * @param {number} [opts.maxIterations=Infinity]
+ *   Safety iteration cap for unit tests (prevents infinite loops in tests).
+ */
+export async function runFlushLoopCore(
+  deps,
+  { force = false, maxIterations = Infinity } = {},
+) {
+  const { now, sleep, listEvents, readEvents, runProducer: callProducer, removeEvents, windowMs } = deps
+  let iteration = 0
+  while (true) {
+    if (iteration++ >= maxIterations) break
+    const events = listEvents()
+    if (events.length === 0) break
+    if (!force) {
+      const newestTimestamp = Math.max(...events.map((e) => e.timestamp))
+      const quietForMs = now() - newestTimestamp
+      if (quietForMs < windowMs) {
+        await sleep(windowMs - quietForMs)
+        continue
+      }
+    }
+    const payloads = readEvents()
+    const aggregatedDelta = []
+    for (const event of payloads) {
+      for (const item of event.session_manifest_delta ?? event.delta ?? []) {
+        const signature = JSON.stringify(item)
+        if (!aggregatedDelta.some((existing) => JSON.stringify(existing) === signature)) {
+          aggregatedDelta.push(item)
+        }
+      }
+    }
+    const latest = payloads[payloads.length - 1]
+    callProducer({
+      hook_event_name: 'PostToolUse',
+      tool_name: 'DebounceBatch',
+      session_id: latest?.session_id ?? null,
+      issue_number: latest?.issue_number ?? null,
+      session_manifest_delta: aggregatedDelta,
+      debounce_event_count: payloads.length,
+      debounce_flush_reason: force ? 'forced_flush' : 'debounced',
+    })
+    removeEvents()
+    if (force) continue
+  }
+}
+
 async function flushLoop({ force = false }) {
   while (true) {
     refreshLock(WORKER_LOCK)
@@ -462,13 +534,21 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(
-    `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
-      status: 'warn',
-      reason_code: 'unexpected_error',
-      detail: sanitizeForStderr(error.message),
-    })}\n`,
-  )
-  process.exit(0)
-})
+// Guard: only run main() when executed directly, not when imported as a module.
+// This allows test files to import `runFlushLoopCore` without side effects.
+const isDirectRun =
+  process.argv[1] != null &&
+  fileURLToPath(import.meta.url) === resolve(process.argv[1])
+
+if (isDirectRun) {
+  main().catch((error) => {
+    process.stderr.write(
+      `SESSION_MANIFEST_DEBOUNCE_RESULT_V1=${JSON.stringify({
+        status: 'warn',
+        reason_code: 'unexpected_error',
+        detail: sanitizeForStderr(error.message),
+      })}\n`,
+    )
+    process.exit(0)
+  })
+}
