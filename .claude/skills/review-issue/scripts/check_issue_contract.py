@@ -37,6 +37,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -71,6 +72,11 @@ _VC_SYNTAX_SCRIPTS = (
 )
 if str(_VC_SYNTAX_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_VC_SYNTAX_SCRIPTS))
+_IMPL_REVIEW_LOOP_SCRIPTS = (
+    Path(__file__).resolve().parent.parent.parent / "impl-review-loop" / "scripts"
+)
+if str(_IMPL_REVIEW_LOOP_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_IMPL_REVIEW_LOOP_SCRIPTS))
 
 try:
     from vc_contract_syntax import parse_verification_commands_section as _parse_vc_section
@@ -80,6 +86,11 @@ except ImportError:
 
     def _parse_vc_section(vc_section: str):  # type: ignore[misc]
         return None
+
+try:
+    from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
+except ImportError:
+    evaluate_product_spec_payload = None  # type: ignore[assignment]
 
 try:
     from prose_boundary_policy import (
@@ -249,6 +260,7 @@ REVIEW_ISSUE_CHECKER_ARTIFACT_SCHEMAS = frozenset(
     {
         REVIEW_ISSUE_RESULT_SCHEMA,
         "CHECK_ISSUE_CONTRACT_V1",
+        "product_spec_check/v1",
     }
 )
 REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER = "deterministic_domain_blocker"
@@ -1502,7 +1514,225 @@ def _make_self_checker_evidence(
     ]
 
 
-def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_path: Optional[str] = None) -> CheckerResult:
+def _make_product_spec_checker_evidence(
+    result: "CheckerResult",
+    *,
+    rule_id: str,
+    body_sha256: str,
+) -> list[dict]:
+    return [
+        {
+            "source_check": "check_product_spec_contract",
+            "rule_id": rule_id,
+            "category": "product_spec_contract",
+            "artifact_path": "check_product_spec_contract.py",
+            "artifact_schema": "product_spec_check/v1",
+            "body_sha256": body_sha256,
+            "iteration_id": "check_product_spec_contract_current",
+            "line_start": None,
+            "line_end": None,
+        }
+    ]
+
+
+def _run_product_spec_check(
+    body: str,
+    *,
+    body_file_path: str | None,
+) -> tuple[dict | None, int, str | None]:
+    script_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / "issue-contract-review"
+        / "scripts"
+        / "check_product_spec_contract.py"
+    )
+
+    temp_path: str | None = None
+    if body_file_path is not None:
+        try:
+            existing_body = Path(body_file_path).read_text(encoding="utf-8")
+        except OSError:
+            existing_body = None
+        if existing_body != body:
+            body_file_path = None
+
+    if body_file_path is None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".md") as tmp:
+            tmp.write(body)
+            temp_path = tmp.name
+        body_file_path = temp_path
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--issue-number",
+        "0",
+        "--repo",
+        "local/review-issue",
+        "--body-file",
+        body_file_path,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return None, -1, "timeout"
+    finally:
+        if temp_path:
+            with contextlib.suppress(OSError):
+                Path(temp_path).unlink()
+
+    try:
+        return json.loads(completed.stdout), completed.returncode, None
+    except json.JSONDecodeError:
+        return None, completed.returncode, "malformed_json"
+
+
+def _apply_product_spec_check(
+    result: "CheckerResult",
+    *,
+    body: str,
+    body_file_path: str | None,
+) -> None:
+    if evaluate_product_spec_payload is None:
+        issue = "product spec checker evaluator import failed"
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
+    payload, rc, error = _run_product_spec_check(body, body_file_path=body_file_path)
+    if error:
+        issue = f"product spec checker failed closed: {error}"
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
+    if rc not in (0, 1):
+        issue = f"product spec checker failed closed: nonzero_exit:{rc}"
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
+    payload_body_sha = payload.get("body_sha256")
+    if payload_body_sha != result.body_sha256:
+        issue = "product spec checker body_sha256 mismatch"
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
+    gate = evaluate_product_spec_payload(
+        payload,
+        issue_url="https://github.com/local/review-issue/issues/0",
+        body_sha256=result.body_sha256,
+    )
+    if gate.get("routing_action") == "refresh_contract_snapshot":
+        issue = gate.get("reason", "product spec checker invariant violation")
+        _append_findings(
+            result,
+            [issue],
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id="PS001",
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.append(issue)
+        return
+
+    if (
+        gate.get("applicability") == "applicable"
+        and gate.get("decision") in {"fail", "human_judgment"}
+    ):
+        blocked_reasons = payload.get("blocked_reasons", [])
+        issues = [
+            reason.get("excerpt", "product spec checker blocked")
+            for reason in blocked_reasons
+            if isinstance(reason, dict)
+        ] or ["product spec checker blocked"]
+        rule_id = (
+            blocked_reasons[0].get("rule_id")
+            if blocked_reasons and isinstance(blocked_reasons[0], dict)
+            else "PS001"
+        )
+        _append_findings(
+            result,
+            issues,
+            deterministic_domain_key="product_spec_contract",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER,
+            blocking=True,
+            checker_evidence=_make_product_spec_checker_evidence(
+                result,
+                rule_id=rule_id,
+                body_sha256=result.body_sha256,
+            ),
+            reviewer_blocker_code="PRODUCT_SPEC",
+        )
+        result.blocking_issues.extend(issues)
+
+
+def run_checks(
+    body: str,
+    labels: str = "",
+    title: str = "",
+    vc_preflight_json_path: Optional[str] = None,
+    body_file_path: Optional[str] = None,
+) -> CheckerResult:
     """Run all C1-C13 checks and return structured result."""
     issue_kind = detect_issue_kind(body, labels, title)
     result = CheckerResult(issue_kind=issue_kind)
@@ -1713,6 +1943,7 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
     detect_warning_scope_cvs_in_scope_mismatch(body, result)
     detect_warning_vc_untracked_false_negative(body, result)
     detect_warning_vc_negative_grep_without_literal_inventory(body, result)
+    _apply_product_spec_check(result, body=body, body_file_path=body_file_path)
 
     # Verdict
     all_check_values = [
@@ -1731,8 +1962,9 @@ def run_checks(body: str, labels: str = "", title: str = "", vc_preflight_json_p
         checks.C13_vc_preflight_decision_consistency,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
-    result.status = _validate_status("failed" if has_fail else "ok")
-    result.verdict = "needs-fix" if has_fail else "approve"
+    has_structured_blockers = bool(result.structured_blockers)
+    result.status = _validate_status("failed" if has_fail or has_structured_blockers else "ok")
+    result.verdict = "needs-fix" if has_fail or has_structured_blockers else "approve"
 
     return result
 
@@ -1864,7 +2096,13 @@ def main() -> None:
                 body, labels, title = load_fixture_file(args.file)
             else:
                 body, labels, title = fetch_issue_body(args.issue, args.repo)
-            result = run_checks(body, labels, title, args.vc_preflight_json)
+            result = run_checks(
+                body,
+                labels,
+                title,
+                args.vc_preflight_json,
+                body_file_path=args.file,
+            )
             output = result_to_dict(result)
         # Emit JSON exclusively to stdout (after redirect is restored)
         print(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
@@ -1873,7 +2111,13 @@ def main() -> None:
             body, labels, title = load_fixture_file(args.file)
         else:
             body, labels, title = fetch_issue_body(args.issue, args.repo)
-        result = run_checks(body, labels, title, args.vc_preflight_json)
+        result = run_checks(
+            body,
+            labels,
+            title,
+            args.vc_preflight_json,
+            body_file_path=args.file,
+        )
         output = result_to_dict(result)
         print(f"verdict: {result.verdict}")
         print(f"issue_kind: {result.issue_kind}")

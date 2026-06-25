@@ -13,6 +13,9 @@ import json
 import sys
 from typing import Any, Dict
 
+VALID_PRODUCT_SPEC_APPLICABILITY = {"applicable", "not_applicable"}
+VALID_PRODUCT_SPEC_DECISION = {"pass", "fail", "human_judgment"}
+
 
 def load_contract_snapshot(snapshot_source: str) -> Dict[str, Any]:
     """Load contract snapshot from JSON string or stdin."""
@@ -21,6 +24,75 @@ def load_contract_snapshot(snapshot_source: str) -> Dict[str, Any]:
     else:
         content = snapshot_source
     return json.loads(content)
+
+
+def evaluate_product_spec_payload(
+    product_spec_check: Dict[str, Any],
+    *,
+    contract_snapshot_url: str | None = None,
+    issue_url: str | None = None,
+    body_sha256: str | None = None,
+) -> Dict[str, Any]:
+    """Validate a product_spec_check payload and decide routing."""
+    applicability = product_spec_check.get("applicability", "unknown")
+    decision = product_spec_check.get("decision", "unknown")
+
+    blocked_rule_ids = product_spec_check.get("blocked_rule_ids")
+    if blocked_rule_ids is None:
+        blocked_reasons = product_spec_check.get("blocked_reasons", [])
+        blocked_rule_ids = [
+            reason.get("rule_id")
+            for reason in blocked_reasons
+            if isinstance(reason, dict) and reason.get("rule_id")
+        ]
+
+    resolved_snapshot_url = (
+        contract_snapshot_url
+        or product_spec_check.get("contract_snapshot_url")
+        or issue_url
+    )
+
+    if (
+        applicability not in VALID_PRODUCT_SPEC_APPLICABILITY
+        or decision not in VALID_PRODUCT_SPEC_DECISION
+    ):
+        return {
+            "status": "ok",
+            "applicability": applicability,
+            "decision": decision,
+            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
+            "contract_snapshot_url": resolved_snapshot_url,
+            "body_sha256": body_sha256,
+            "routing_action": "refresh_contract_snapshot",
+            "reason": "Invalid product_spec_check enum value",
+        }
+
+    if applicability == "not_applicable" and decision != "pass":
+        return {
+            "status": "ok",
+            "applicability": applicability,
+            "decision": decision,
+            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
+            "contract_snapshot_url": resolved_snapshot_url,
+            "body_sha256": body_sha256,
+            "routing_action": "refresh_contract_snapshot",
+            "reason": "Inconsistent product_spec_check: not_applicable requires decision=pass",
+        }
+
+    routing_action = "continue"
+    if decision in {"fail", "human_judgment"}:
+        routing_action = "stop_human"
+
+    return {
+        "status": "ok",
+        "applicability": applicability,
+        "decision": decision,
+        "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
+        "contract_snapshot_url": resolved_snapshot_url,
+        "issue_url": issue_url,
+        "body_sha256": body_sha256,
+        "routing_action": routing_action,
+    }
 
 
 def evaluate_product_spec_check(
@@ -75,92 +147,12 @@ def evaluate_product_spec_check(
 
     product_spec_check = contract_result["checks"]["product_spec_check"]
 
-    # Extract key fields
-    applicability = product_spec_check.get("applicability", "unknown")
-    decision = product_spec_check.get("decision", "unknown")
-
-    # Blocker 1: Normalize blocked_rule_ids from blocked_reasons[].rule_id
-    # Fallback to direct blocked_rule_ids for backward compatibility with old fixtures
-    blocked_rule_ids = product_spec_check.get("blocked_rule_ids")
-    if blocked_rule_ids is None:
-        blocked_reasons = product_spec_check.get("blocked_reasons", [])
-        blocked_rule_ids = [
-            r.get("rule_id")
-            for r in blocked_reasons
-            if isinstance(r, dict) and r.get("rule_id")
-        ]
-
-    # Blocker 4: Enum validation
-    valid_applicability = {"applicable", "not_applicable"}
-    valid_decision = {"pass", "fail", "human_judgment"}
-
-    if applicability not in valid_applicability or decision not in valid_decision:
-        # Blocker 2: Use resolved contract_snapshot_url
-        resolved_snapshot_url = (
-            contract_snapshot_url
-            or contract_snapshot.get("contract_snapshot_url")
-            or contract_result.get("issue_url")
-        )
-        return {
-            "status": "ok",
-            "applicability": applicability,
-            "decision": decision,
-            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
-            "contract_snapshot_url": resolved_snapshot_url,
-            "body_sha256": body_sha256,
-            "routing_action": "refresh_contract_snapshot",
-            "reason": "Invalid product_spec_check enum value",
-        }
-
-    # Blocker 1: Pair invariant check — not_applicable requires decision=pass
-    if applicability == "not_applicable" and decision != "pass":
-        # Blocker 2: Use resolved contract_snapshot_url
-        resolved_snapshot_url = (
-            contract_snapshot_url
-            or contract_snapshot.get("contract_snapshot_url")
-            or contract_result.get("issue_url")
-        )
-        return {
-            "status": "ok",
-            "applicability": applicability,
-            "decision": decision,
-            "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
-            "contract_snapshot_url": resolved_snapshot_url,
-            "body_sha256": body_sha256,
-            "routing_action": "refresh_contract_snapshot",
-            "reason": "Inconsistent product_spec_check: not_applicable requires decision=pass",
-        }
-
-    # Determine routing action
-    routing_action = "continue"
-
-    if applicability == "not_applicable":
-        # No product spec relevance, continue normally
-        routing_action = "continue"
-    elif decision == "pass":
-        routing_action = "continue"
-    elif decision == "fail":
-        routing_action = "stop_human"
-    elif decision == "human_judgment":
-        routing_action = "stop_human"
-
-    # Blocker 2: Use resolved contract_snapshot_url
-    resolved_snapshot_url = (
-        contract_snapshot_url
-        or contract_snapshot.get("contract_snapshot_url")
-        or contract_result.get("issue_url")
+    return evaluate_product_spec_payload(
+        product_spec_check,
+        contract_snapshot_url=contract_snapshot_url or contract_snapshot.get("contract_snapshot_url"),
+        issue_url=contract_result.get("issue_url"),
+        body_sha256=body_sha256,
     )
-
-    return {
-        "status": "ok",
-        "applicability": applicability,
-        "decision": decision,
-        "blocked_rule_ids": blocked_rule_ids if blocked_rule_ids else [],
-        "contract_snapshot_url": resolved_snapshot_url,
-        "issue_url": contract_result.get("issue_url"),
-        "body_sha256": body_sha256,
-        "routing_action": routing_action,
-    }
 
 
 def main():

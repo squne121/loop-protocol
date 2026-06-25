@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict
 from unittest import mock
 
+import pytest
+
 
 def load_fixture(fixture_name: str) -> str:
     """Load fixture Issue body from fixtures/ directory"""
@@ -146,6 +148,33 @@ def test_b6_change_kind_update_only_fail():
     _run_fixture_case("change_kind_update_only_not_product_spec", "fail", ["PS004"])
 
 
+def test_placeholder_only_product_spec_context_fails():
+    """PS001/PS004 hardening: placeholder-only Product Spec Context must not pass."""
+    _run_fixture_case(
+        "product_spec_context_placeholder_only_fail",
+        "fail",
+        ["PS001", "PS004"],
+    )
+
+
+def test_duplicate_key_product_spec_context_fails():
+    """PS001/PS004 hardening: duplicate YAML keys in Product Spec Context must fail closed."""
+    _run_fixture_case(
+        "product_spec_context_duplicate_key_fail",
+        "fail",
+        ["PS001", "PS004"],
+    )
+
+
+def test_decoy_product_spec_context_in_code_fence_is_ignored():
+    """PS001/PS004 hardening: code-fence decoy Product Spec Context must not satisfy docs/product evidence."""
+    _run_fixture_case(
+        "product_spec_context_decoy_fence_fail",
+        "fail",
+        ["PS001", "PS004"],
+    )
+
+
 # B1 新増 test: gh issue view --json field bug fix (mock test)
 def test_b1_gh_api_json_fields():
     """B1: run_gh_api() must use correct --json fields (title,body,labels) without baseRefName"""
@@ -180,3 +209,79 @@ def test_b1_gh_api_json_fields():
 
         assert result is not None
         assert result["title"] == "Test Issue"
+
+
+def test_checker_outputs_body_sha256_and_source_provenance(tmp_path: Path):
+    """Output contract: checker must return body_sha256 and body-file provenance for body-file mode."""
+    body_path = tmp_path / "issue.md"
+    body_path.write_text(load_fixture("docs_product_with_diff_rationale"), encoding="utf-8")
+
+    result = run_checker_with_body(str(body_path))
+
+    assert result["body_sha256"].startswith("sha256:")
+    assert result["source_provenance"]["source_type"] == "body_file"
+    assert result["source_provenance"]["body_file"] == str(body_path)
+
+
+def test_run_contract_review_once_treats_nonzero_product_spec_exit_as_runtime_error():
+    """Consumer hardening: non-zero product_spec_check exit must not be treated as pass."""
+    script_dir = Path(__file__).parent.parent
+    sys.path.insert(0, str(script_dir))
+    import run_contract_review_once as review_once
+
+    readiness_json = {"status": "go", "errors": []}
+    vc_json = {"status": "pass", "results": []}
+    valid_product_spec_json = {
+        "schema": "product_spec_check/v1",
+        "applicability": "applicable",
+        "decision": "fail",
+        "blocked_reasons": [{"rule_id": "PS001", "excerpt": "blocked"}],
+        "body_sha256": "sha256:test",
+    }
+
+    with mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
+         mock.patch.object(review_once, "_run_shell_script", return_value=(0, "", "")), \
+         mock.patch.object(
+             review_once,
+             "_run_script",
+             side_effect=[
+                 (readiness_json, 0, None),
+                 (valid_product_spec_json, 1, None),
+                 (vc_json, 0, None),
+             ],
+         ):
+        result = review_once.run_once(1146, "squne121/loop-protocol", skip_idempotency_check=True)
+
+    assert result["status"] == "runtime_error"
+    assert any("product_spec_check_nonzero_exit" in err for err in result["errors"])
+
+
+def test_run_contract_review_once_treats_invalid_product_spec_pair_as_runtime_error():
+    """Consumer hardening: not_applicable + human_judgment must fail closed."""
+    script_dir = Path(__file__).parent.parent
+    sys.path.insert(0, str(script_dir))
+    import run_contract_review_once as review_once
+
+    readiness_json = {"status": "go", "errors": []}
+    invalid_product_spec_json = {
+        "schema": "product_spec_check/v1",
+        "applicability": "not_applicable",
+        "decision": "human_judgment",
+        "blocked_reasons": [],
+        "body_sha256": "sha256:test",
+    }
+
+    with mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
+         mock.patch.object(review_once, "_run_shell_script", return_value=(0, "", "")), \
+         mock.patch.object(
+             review_once,
+             "_run_script",
+             side_effect=[
+                 (readiness_json, 0, None),
+                 (invalid_product_spec_json, 0, None),
+             ],
+         ):
+        result = review_once.run_once(1146, "squne121/loop-protocol", skip_idempotency_check=True)
+
+    assert result["status"] == "runtime_error"
+    assert any("product_spec_check_invalid_output" in err for err in result["errors"])

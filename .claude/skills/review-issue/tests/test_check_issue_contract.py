@@ -1028,3 +1028,150 @@ class TestC5GroupedAcComment:
         """B1: filename containing '#AC2' must NOT be extracted as C5 ref."""
         refs = _extract_vc_ac_refs("$ cat docs/#AC2.md\n")
         assert refs == set()
+
+
+class TestProductSpecCheckerComposition:
+    def test_product_spec_checker_uses_same_body_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """review-issue must pass the same body-file path to product-spec checker."""
+        fixture_body = """## Machine-Readable Contract
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+change_kind: code
+```
+
+## Outcome
+
+No docs/product scope.
+
+## Acceptance Criteria
+
+- [ ] AC1: checker wiring is exercised
+
+## Verification Commands
+
+```bash
+# AC1
+$ test -f src/example.ts
+```
+
+## Stop Conditions
+
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: test fixture only.
+
+## Allowed Paths
+
+- `src/example.ts`
+
+"""
+        fixture_path = tmp_path / "issue.md"
+        fixture_path.write_text(fixture_body, encoding="utf-8")
+        expected_sha = checker._sha256_prefixed(fixture_body)
+        seen_paths: list[str] = []
+
+        def fake_run(cmd, capture_output, text, timeout):
+            seen_paths.append(cmd[cmd.index("--body-file") + 1])
+            payload = {
+                "schema": "product_spec_check/v1",
+                "applicability": "not_applicable",
+                "decision": "pass",
+                "blocked_reasons": [],
+                "body_sha256": expected_sha,
+            }
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(checker.subprocess, "run", fake_run)
+
+        result = checker.run_checks(
+            fixture_body,
+            body_file_path=str(fixture_path),
+        )
+
+        assert seen_paths == [str(fixture_path)]
+        assert not any(
+            "product spec checker" in issue for issue in result.blocking_issues
+        )
+
+    def test_product_spec_checker_hash_mismatch_blocks_review(self, monkeypatch: pytest.MonkeyPatch):
+        """hash mismatch between review-issue body and checker output must fail closed."""
+        body = """## Machine-Readable Contract
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+change_kind: code
+```
+
+## Outcome
+
+No docs/product scope.
+"""
+
+        monkeypatch.setattr(
+            checker,
+            "_run_product_spec_check",
+            lambda *_args, **_kwargs: (
+                {
+                    "schema": "product_spec_check/v1",
+                    "applicability": "not_applicable",
+                    "decision": "pass",
+                    "blocked_reasons": [],
+                    "body_sha256": "sha256:mismatch",
+                },
+                0,
+                None,
+            ),
+        )
+
+        result = checker.run_checks(body)
+
+        assert result.verdict == "needs-fix"
+        assert any(blocker["code"] == "PRODUCT_SPEC" for blocker in result.structured_blockers)
+
+    def test_product_spec_checker_invalid_pair_blocks_review(self, monkeypatch: pytest.MonkeyPatch):
+        """not_applicable + human_judgment must fail closed via shared pair invariant evaluator."""
+        body = """## Machine-Readable Contract
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+change_kind: code
+```
+
+## Outcome
+
+No docs/product scope.
+"""
+        body_sha = checker._sha256_prefixed(body)
+
+        monkeypatch.setattr(
+            checker,
+            "_run_product_spec_check",
+            lambda *_args, **_kwargs: (
+                {
+                    "schema": "product_spec_check/v1",
+                    "applicability": "not_applicable",
+                    "decision": "human_judgment",
+                    "blocked_reasons": [],
+                    "body_sha256": body_sha,
+                },
+                0,
+                None,
+            ),
+        )
+
+        result = checker.run_checks(body)
+
+        assert result.verdict == "needs-fix"
+        assert any(
+            "not_applicable requires decision=pass" in issue
+            for issue in result.blocking_issues
+        )
