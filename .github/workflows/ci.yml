@@ -919,118 +919,55 @@ jobs:
           path: python_test_artifacts/
           if-no-files-found: error
           retention-days: 30
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
       - name: Install codex CLI (pinned, for execpolicy gate)
         run: |
-          # Issue #1137 Blocker 10: install a pinned codex CLI so the execpolicy
-          # decision matrix can run. Best-effort: a failed install / a build that
-          # lacks `execpolicy` is handled (loudly, not silently) by the matrix step
-          # probe below. The maintainer should pin a codex build exposing execpolicy.
-          npm install -g "@openai/codex@${CODEX_CLI_VERSION}" || echo "codex install failed; matrix step will report"
-          codex --version || echo "codex --version unavailable"
+          set -euo pipefail
+          CODEX_PREFIX="${RUNNER_TEMP}/codex-cli"
+          npm install \
+            --prefix "${CODEX_PREFIX}" \
+            --package-lock=false \
+            --no-audit \
+            --no-fund \
+            "@openai/codex@${CODEX_CLI_VERSION}"
+          echo "CODEX_BINARY=${CODEX_PREFIX}/node_modules/.bin/codex" >> "$GITHUB_ENV"
         env:
-          CODEX_CLI_VERSION: "0.42.0"
+          CODEX_CLI_VERSION: "0.142.0"
       - name: codex execpolicy + cleanup-route matrix (timed)
         run: |
           _t0=$(date +%s%3N)
           set +e
-          # Blocker 10: assert the strictest decision per cleanup-route case.
-          # `codex execpolicy check --rules <file> -- <command>` emits JSON (the
-          # strictest decision + matching rules) on stdout. No `|| true`; codex
-          # absence / parse error / decision mismatch fails CI.
-          python3 - <<'PY'
-          import json, shutil, subprocess, sys
-          RULES = ".codex/rules/default.rules"
-          WT = ".claude/worktrees/issue-1-x"
-          # strictest -> loosest precedence; "reject" is treated as "forbidden".
-          ORDER = ("forbidden", "prompt", "allow")
-          ALIASES = {"reject": "forbidden", "deny": "forbidden", "ask": "prompt"}
-          CASES = [
-              ("read_only_branch_list", ["git", "branch", "--list"], "allow"),
-              ("read_only_worktree_list", ["git", "worktree", "list"], "allow"),
-              ("exact_worktree_remove", ["git", "worktree", "remove", WT], "prompt"),
-              ("exact_branch_delete", ["git", "branch", "-d", "issue-1-x"], "prompt"),
-              ("force_branch_delete", ["git", "branch", "-D", "issue-1-x"], "forbidden"),
-              ("branch_force_flag", ["git", "branch", "-f", "issue-1-x"], "forbidden"),
-              ("worktree_add", ["git", "worktree", "add", "../tmp", "main"], "forbidden"),
-              ("worktree_prune", ["git", "worktree", "prune"], "forbidden"),
-          ]
-          codex = shutil.which("codex")
-          if not codex:
-              # Not a silent pass: report loudly. Parity is still gated by the
-              # tests/codex hook-chain pytest below. The pinned codex CLI should
-              # provide `execpolicy`; if it cannot, that is a known external-tool
-              # limitation escalated to the maintainer (Issue #1137 Blocker 10).
-              print("EXECPOLICY_SKIPPED: codex CLI unavailable on this runner; "
-                    "decision matrix not run. Parity gated by tests/codex/ below.")
-              sys.exit(0)
-          def _supports_execpolicy():
-              """Probe whether this codex build exposes `execpolicy check` (JSON)."""
-              p = subprocess.run([codex, "execpolicy", "check", "--rules", RULES, "--", "git", "status"],
-                                 capture_output=True, text=True, timeout=30)
-              try:
-                  json.loads((p.stdout or "").strip())
-                  return True
-              except (json.JSONDecodeError, ValueError):
-                  return False
-          if not _supports_execpolicy():
-              # The installed codex CLI does not expose `execpolicy check` JSON
-              # output (e.g. @openai/codex@0.42.0 lacks the subcommand). This is a
-              # loud, explicit skip — NOT a `|| true` no-op — recorded for the
-              # maintainer to supply a codex build that provides execpolicy.
-              print("EXECPOLICY_UNSUPPORTED: installed codex CLI does not provide "
-                    "`execpolicy check` JSON output; decision matrix skipped. "
-                    "Arbitration parity remains gated by tests/codex/ below. "
-                    "Maintainer action: pin a codex build exposing execpolicy "
-                    "(Issue #1137 Blocker 10).")
-              sys.exit(0)
-          def _collect(obj, acc):
-              if isinstance(obj, str):
-                  t = ALIASES.get(obj.strip().lower(), obj.strip().lower())
-                  if t in ORDER:
-                      acc.add(t)
-              elif isinstance(obj, dict):
-                  for v in obj.values():
-                      _collect(v, acc)
-              elif isinstance(obj, list):
-                  for v in obj:
-                      _collect(v, acc)
-          def decision(argv):
-              out = subprocess.run([codex, "execpolicy", "check", "--rules", RULES, "--", *argv],
-                                   capture_output=True, text=True, timeout=30)
-              blob = out.stdout.strip() or out.stderr.strip()
-              try:
-                  data = json.loads(blob)
-              except (json.JSONDecodeError, ValueError) as e:
-                  sys.exit(f"codex execpolicy JSON parse error for {argv}: {e}; raw={blob[:300]!r}")
-              found = set()
-              _collect(data, found)
-              if not found:
-                  sys.exit(f"codex execpolicy schema change (no decision token) for {argv}: {blob[:300]!r}")
-              # codex reports the strictest decision; take the strictest token present.
-              for tok in ORDER:
-                  if tok in found:
-                      return tok
-              return None
-          failures = []
-          for label, argv, expected in CASES:
-              got = decision(argv)
-              print(f"[{'ok' if got==expected else 'MISMATCH'}] {label}: expected={expected} got={got}")
-              if got != expected:
-                  failures.append(f"{label}: expected {expected}, got {got}")
-          if failures:
-              print("codex execpolicy matrix FAILED:")
-              for f in failures: print("  -", f)
-              sys.exit(1)
-          print(f"codex execpolicy matrix OK ({len(CASES)} cases)")
-          PY
+          mkdir -p codex_execpolicy_artifacts
+          # The required gate is fail-closed only if the pinned binary reports the
+          # exact version and `codex execpolicy check --help` exits 0. The script
+          # performs both checks and records the result in the JSON artifact.
+          python3 scripts/ci/codex_execpolicy_matrix.py \
+            --codex-binary "${CODEX_BINARY}" \
+            --expected-version "codex-cli 0.142.0" \
+            --rules .codex/rules/default.rules \
+            --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
           _matrix=$?
-          uv run --locked pytest tests/codex/test_local_main_branch_guard.py -q
+          uv run --locked pytest \
+            scripts/ci/tests/test_codex_execpolicy_matrix.py \
+            tests/codex/test_execpolicy_matrix.py \
+            tests/codex/test_local_main_branch_guard.py \
+            -q
           _pytest=$?
           _s=$(( _matrix != 0 ? _matrix : _pytest ))
           set -e
           printf '{"step_id":"codex_execpolicy_matrix","phase_id":"codex_execpolicy","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: Upload codex execpolicy artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-execpolicy-${{ github.run_attempt }}
+          path: codex_execpolicy_artifacts/
+          if-no-files-found: error
+          retention-days: 30
       - name: Verify hook test discovery exclusions
         run: |
           python3 - <<PY
