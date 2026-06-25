@@ -16,6 +16,7 @@ with a PreToolUse-shaped stdin payload.
 import json
 import os
 import subprocess
+import importlib.util as _ilu
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,7 @@ def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
     main = tmp_path / "repo"
     main.mkdir()
     _git("init", "-q", "-b", "main", cwd=main)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=main)
     (main / "README.md").write_text("seed\n")
     _git("add", "README.md", cwd=main)
     _git("commit", "-q", "-m", "seed", cwd=main)
@@ -58,14 +60,16 @@ def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
     wt_path = main / ".claude" / "worktrees" / f"issue-{issue}-{slug}"
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     branch = f"issue-{issue}-{slug}"
-    _git("worktree", "add", "-q", "-b", branch, str(wt_path), "main", cwd=main)
+    _git("branch", branch, cwd=main)
+    _git("worktree", "add", "-q", str(wt_path), branch, cwd=main)
     worktrees[issue] = wt_path
 
     for extra in (extra_worktrees or []):
         ei, es = extra
         ewt = main / ".claude" / "worktrees" / f"issue-{ei}-{es}"
         eb = f"issue-{ei}-{es}"
-        _git("worktree", "add", "-q", "-b", eb, str(ewt), "main", cwd=main)
+        _git("branch", eb, cwd=main)
+        _git("worktree", "add", "-q", str(ewt), eb, cwd=main)
         worktrees[ei] = ewt
 
     return {"root": main, "worktree": wt_path, "worktrees": worktrees}
@@ -1562,6 +1566,46 @@ def _load_guard_module():
     mod = _ilu.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def test_skill_runtime_executor_allows_preflight_run(tmp_path):
+    """Issue #1154 AC9: exact preflight executor command is allowed from root."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    payload = _bash_payload(
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        str(repo["root"]),
+    )
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
+    mod = _load_guard_module()
+    old = os.environ.copy()
+    os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    os.environ["LOOP_ISSUE_NUMBER"] = "1154"
+    try:
+        decision = mod.build_decision(payload)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+    assert decision["decision"] == "allow", decision
+    r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("command", [
+    "uv run python3 .claude/skills/issue-refinement-loop/scripts/not_registered.py",
+    "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol --unknown-flag x",
+    "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+    "bash -lc 'uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol'",
+    "FOO=bar uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+    "uv --with pytest run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+    "uv run python3 /tmp/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+])
+def test_skill_runtime_executor_negative(tmp_path, command):
+    """Issue #1154 AC8/AC10: malformed executor routes are fail-closed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    payload = _bash_payload(command, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
+    r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+    assert r.returncode == 2, r.stderr
 
 
 # --- AC4/AC5/AC6: V3 one-shot decisions via real hook ---

@@ -46,6 +46,22 @@ import shutil
 import subprocess
 import sys
 
+_AGENT_GUARDS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "scripts",
+    "agent-guards",
+)
+if _AGENT_GUARDS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_GUARDS_DIR)
+
+from skill_runtime_command_policy import (  # noqa: E402
+    current_branch,
+    looks_like_skill_runtime_executor_command,
+    parse_exact_skill_runtime_command,
+    resolve_default_branch,
+    resolve_repo_slug,
+)
+
 # Shared one-shot V3 cleanup validator + worktree catalog (Issue #1137).
 # Imported from scripts/agent-ops so V3 validation / per-operation command_hash /
 # the three-valued loader / durable IO / git check-ref-format branch validation /
@@ -1502,6 +1518,11 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
     if _is_agent_ops_tool_command(command, cwd, _pr, deadline):
         _allow()
 
+    if _is_skill_runtime_executor_command(command, cwd, _pr):
+        _allow()
+    if looks_like_skill_runtime_executor_command(command):
+        _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<skill-runtime-denied>", cwd)
+
     klass = classify_bash(command)
 
     # read-only allowlist: allow even if worktree unresolved / git unavailable.
@@ -1775,6 +1796,30 @@ def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str,
     if not branch or (default and branch != default):
         return False
     return True
+
+
+def _is_skill_runtime_executor_command(command: str, cwd: str, project_root: str,
+                                       deadline: "object | None" = None) -> bool:
+    """True iff command is the exact privileged skill runtime executor class."""
+    del deadline
+    parsed = parse_exact_skill_runtime_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    default_branch = resolve_default_branch(project_root, None)
+    if current_branch(project_root, None) != default_branch:
+        return False
+    if resolve_repo_slug(project_root, None) != parsed.repo:
+        return False
+    if os.environ.get("LOOP_ISSUE_NUMBER", "").strip() != parsed.issue_number:
+        return False
+    expected = os.path.join(project_root, ".claude", "worktrees", f"issue-{parsed.issue_number}-")
+    matches = [
+        path for path in os.listdir(os.path.join(project_root, ".claude", "worktrees"))
+        if path.startswith(f"issue-{parsed.issue_number}-")
+    ] if os.path.isdir(os.path.join(project_root, ".claude", "worktrees")) else []
+    return len(matches) == 1
 
 
 def _root_drift_active_worktree_mismatch(project_root: str, deadline: "object | None" = None) -> bool:
@@ -2166,6 +2211,11 @@ def build_decision(payload: dict) -> dict:
     # Issue #1137 Blocker 1: exact agent-ops tool invocation from main root allow.
     if _is_agent_ops_tool_command(command, cwd, project_root):
         return _v2("agent_ops_tool", cwd_class, "allow", "agent_ops_tool_allowed")
+
+    if _is_skill_runtime_executor_command(command, cwd, project_root):
+        return _v2("skill_runtime_executor", cwd_class, "allow", "skill_runtime_executor_allowed")
+    if looks_like_skill_runtime_executor_command(command):
+        return _v2("skill_runtime_executor", cwd_class, "deny", "skill_runtime_executor_denied")
 
     klass = classify_bash(command)
 

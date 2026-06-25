@@ -56,6 +56,7 @@ from local_main_branch_guard import (
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
+    REASON_SKILL_RUNTIME_EXECUTOR,
     is_github_issue_mutation_command,
     is_readonly_artifact_export_command,
     GITHUB_CMD_CLASS_DISPLAY_READONLY,
@@ -77,6 +78,11 @@ def tmp_git_repo() -> Generator[Path, None, None]:
         subprocess.run(["git", "init", "-b", "main", tmpdir], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "config", "user.email", "t@t.com"], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "config", "user.name", "T"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", tmpdir, "remote", "add", "origin", "https://github.com/squne121/loop-protocol.git"],
+            check=True,
+            capture_output=True,
+        )
         (Path(tmpdir) / "README.md").write_text("test")
         subprocess.run(["git", "-C", tmpdir, "add", "README.md"], check=True, capture_output=True)
         subprocess.run(["git", "-C", tmpdir, "commit", "-m", "init"], check=True, capture_output=True)
@@ -1238,19 +1244,22 @@ class TestGhReadonlyAndDenyClaude:
 class TestExactAllowlistClaude:
     """AC5, AC6, AC12: exact allowlist, publisher deny, deterministic_checker (Claude flavor)."""
 
-    def test_exact_allowlist_run_refinement_preflight(self, tmp_git_repo: Path):
+    def test_exact_allowlist_skill_runtime_executor(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
+        result = eval_in_local_root(
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
+    def test_direct_preflight_script_not_in_root_allowlist(self, tmp_git_repo: Path):
         result = eval_in_local_root(
             "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
             str(tmp_git_repo),
         )
-        assert result["status"] == "allow"
-        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
-
-    def test_wildcard_path_not_in_allowlist(self, tmp_git_repo: Path):
-        result = eval_in_local_root(
-            "uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py",
-            str(tmp_git_repo),
-        )
+        assert result["status"] == "block"
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
 
     def test_publisher_deny_not_in_allowlist(self, tmp_git_repo: Path):
@@ -1260,13 +1269,24 @@ class TestExactAllowlistClaude:
         )
         assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER
 
-    def test_deterministic_checker_command_reason_code(self, tmp_git_repo: Path):
+    def test_skill_runtime_executor_reason_code(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
         result = eval_in_local_root(
-            "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 985 --repo squne121/loop-protocol",
-            str(tmp_git_repo),
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
         )
-        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
         assert result["reason_code"] != REASON_READONLY
+
+    def test_skill_runtime_executor_blocks_wrong_issue_context(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
+        result = eval_in_local_root(
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 777 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        assert result["status"] == "block"
 
 
 class TestPythonpathStaleAndTmpWrapperClaude:
