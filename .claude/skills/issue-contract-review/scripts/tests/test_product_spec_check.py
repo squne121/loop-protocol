@@ -221,8 +221,8 @@ def test_checker_outputs_body_sha256_and_source_provenance(tmp_path: Path):
     assert result["source_provenance"]["body_file"] == str(body_path)
 
 
-def test_run_contract_review_once_treats_nonzero_product_spec_exit_as_runtime_error():
-    """Consumer hardening: non-zero product_spec_check exit must not be treated as pass."""
+def test_run_contract_review_once_treats_transport_error_exit_as_runtime_error():
+    """Consumer hardening: transport/runtime error exits must fail closed."""
     script_dir = Path(__file__).parent.parent
     sys.path.insert(0, str(script_dir))
     import run_contract_review_once as review_once
@@ -244,7 +244,7 @@ def test_run_contract_review_once_treats_nonzero_product_spec_exit_as_runtime_er
              "_run_script",
              side_effect=[
                  (readiness_json, 0, None),
-                 (valid_product_spec_json, 1, None),
+                 (valid_product_spec_json, 2, None),
                  (vc_json, 0, None),
              ],
          ):

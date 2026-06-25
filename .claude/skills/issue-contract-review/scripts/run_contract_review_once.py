@@ -382,7 +382,7 @@ def run_once(
         result["status"] = "runtime_error"
         return result
 
-    if product_spec_rc != 0:
+    if product_spec_rc not in (0, 1):
         result["errors"].append(
             f"product_spec_check_nonzero_exit: rc={product_spec_rc}"
         )
