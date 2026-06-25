@@ -9,8 +9,8 @@ to land. It resolves base/head refs to immutable SHAs, computes the merge-base
 verifies AST equivalence between base and head, scans for newly added or widened
 lint suppressions, runs Ruff in an isolated, pinned configuration on both sides,
 ratchets the E501 counts, and emits a single versioned machine-readable report
-(``e501-migration-guard/v1``) to stdout. Any error along the way is treated as a
-fail-closed failure.
+(``e501-migration-guard/v1`` or ``e501-migration-guard/v2``) to stdout. Any
+error along the way is treated as a fail-closed failure.
 
 The Ruff toolchain is locked: production has no way to substitute the Ruff
 binary. A test-only override exists but is gated behind two explicit environment
@@ -36,8 +36,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-GUARD_VERSION = "1.1.0"
-REPORT_SCHEMA = "e501-migration-guard/v1"
+GUARD_VERSION = "1.2.0"
+REPORT_SCHEMA_V1 = "e501-migration-guard/v1"
+REPORT_SCHEMA_V2 = "e501-migration-guard/v2"
 
 # The guard's own project root (where ``uv.lock`` lives). Ruff is launched via
 # ``uv run --locked`` from here so the pinned toolchain is used regardless of
@@ -337,6 +338,138 @@ def check_status_scope(entries: list[ChangedEntry], scope_prefixes: tuple[str, .
 
 
 # --------------------------------------------------------------------------- #
+# TypeIgnore structural comparison
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, order=True)
+class TypeIgnoreSignature:
+    kind: str           # "file_wide" | "line_bound"
+    tag: str            # e.g. "attr-defined", or "" for bare
+    owner_ast_path: str  # structural path to the enclosing stmt (e.g. "body[0].body[1]")
+    occurrence_index: int  # 0-based index when multiple ignores share the same anchor
+
+
+def _get_stmt_at_line(tree: ast.Module, lineno: int) -> tuple[str, ast.stmt] | None:
+    """Find the innermost statement whose line range contains ``lineno``.
+
+    Returns (structural_path, node) or None if no statement matches.
+    """
+    best_path: str | None = None
+    best_node: ast.stmt | None = None
+    best_depth: int = -1
+
+    def walk_stmts(node: ast.AST, path: str, depth: int) -> None:
+        nonlocal best_path, best_node, best_depth
+        for field_name, field_value in ast.iter_fields(node):
+            if isinstance(field_value, list):
+                for idx, item in enumerate(field_value):
+                    if isinstance(item, ast.stmt):
+                        item_path = f"{path}.{field_name}[{idx}]" if path else f"{field_name}[{idx}]"
+                        # Check if this stmt's line range contains lineno
+                        start = getattr(item, "lineno", None)
+                        end = getattr(item, "end_lineno", start)
+                        if start is not None and end is not None and start <= lineno <= end:
+                            if depth > best_depth:
+                                best_depth = depth
+                                best_path = item_path
+                                best_node = item
+                        # Recurse into this stmt
+                        walk_stmts(item, item_path if path else item_path, depth + 1)
+
+    walk_stmts(tree, "", 0)
+    if best_path is not None:
+        return best_path, best_node
+    return None
+
+
+def _build_type_ignore_signatures(
+    tree: ast.Module, source: str
+) -> tuple[list[TypeIgnoreSignature], bool]:
+    """Build a list of TypeIgnoreSignature from a parsed AST Module.
+
+    Returns (signatures, ambiguous_anchor).
+    ambiguous_anchor is True if any TypeIgnore's anchor could not be resolved.
+    """
+    lines = source.splitlines()
+    total_lines = len(lines)
+    sigs: list[TypeIgnoreSignature] = []
+    ambiguous = False
+
+    # Group type_ignores by their resolved anchor path so we can assign occurrence_index
+    anchor_counts: dict[tuple[str, str, str], int] = {}  # (kind, tag, owner_ast_path) -> count
+
+    for ti in tree.type_ignores:
+        lineno = ti.lineno  # type: ignore[attr-defined]
+        tag = ti.tag if hasattr(ti, "tag") and ti.tag else ""  # type: ignore[attr-defined]
+
+        # Determine kind
+        # file_wide: lineno == 0 or lineno is beyond the source lines (unusual)
+        if lineno == 0 or lineno > total_lines:
+            kind = "file_wide"
+            owner_ast_path = "__file__"
+        else:
+            kind = "line_bound"
+            result = _get_stmt_at_line(tree, lineno)
+            if result is None:
+                # Cannot anchor -- fail-closed
+                ambiguous = True
+                owner_ast_path = f"__ambiguous_line_{lineno}__"
+            else:
+                owner_ast_path, _ = result
+
+        key = (kind, tag, owner_ast_path)
+        idx = anchor_counts.get(key, 0)
+        anchor_counts[key] = idx + 1
+        sigs.append(TypeIgnoreSignature(
+            kind=kind,
+            tag=tag,
+            owner_ast_path=owner_ast_path,
+            occurrence_index=idx,
+        ))
+
+    return sigs, ambiguous
+
+
+def _compare_type_ignore_signatures(
+    base_sigs: list[TypeIgnoreSignature],
+    head_sigs: list[TypeIgnoreSignature],
+    base_ambiguous: bool,
+    head_ambiguous: bool,
+) -> dict[str, Any]:
+    """Compare TypeIgnoreSignature lists and return a checks.type_ignore_equiv dict."""
+    base_count = len(base_sigs)
+    head_count = len(head_sigs)
+    ambiguous_anchor = base_ambiguous or head_ambiguous
+
+    mismatches: list[str] = []
+
+    if ambiguous_anchor:
+        ok = False
+        mismatches.append("ambiguous anchor: cannot resolve TypeIgnore to a statement")
+    elif sorted(base_sigs) != sorted(head_sigs):
+        ok = False
+        base_set = set(base_sigs)
+        head_set = set(head_sigs)
+        removed = sorted(str(s) for s in base_set - head_set)
+        added = sorted(str(s) for s in head_set - base_set)
+        if removed:
+            mismatches.append(f"removed: {removed}")
+        if added:
+            mismatches.append(f"added: {added}")
+    else:
+        ok = True
+
+    return {
+        "ok": ok,
+        "base_count": base_count,
+        "head_count": head_count,
+        "mismatches": mismatches,
+        "ambiguous_anchor": ambiguous_anchor,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # AST equivalence
 # --------------------------------------------------------------------------- #
 
@@ -352,14 +485,26 @@ def decode_source(data: bytes) -> str:
         raise GuardError(f"could not decode source as {encoding!r}: {exc}") from exc
 
 
-def ast_fingerprint(data: bytes, label: str) -> str:
+def ast_fingerprint(data: bytes, label: str) -> tuple[str, list[TypeIgnoreSignature], bool]:
+    """Parse, compile, and return (ast_dump_without_type_ignores, type_ignore_sigs, ambiguous).
+
+    type_ignores are stripped from the Module before dumping so that line-number
+    shifts caused by E501 reflow do not create spurious mismatches.
+    """
     src = decode_source(data)
     try:
         tree = ast.parse(src, filename=label, type_comments=True)
         compile(src, label, "exec", dont_inherit=True)
     except (SyntaxError, ValueError) as exc:
         raise GuardError(f"AST/compile error for {label}: {exc}") from exc
-    return ast.dump(tree, include_attributes=False)
+
+    type_ignore_sigs, ambiguous = _build_type_ignore_signatures(tree, src)
+
+    # Strip type_ignores from the Module so that line-number shifts don't affect
+    # the structural dump comparison
+    tree.type_ignores = []
+    dump = ast.dump(tree, include_attributes=False)
+    return dump, type_ignore_sigs, ambiguous
 
 
 @dataclass
@@ -370,9 +515,18 @@ class AstEquivResult:
 
 def check_ast_equiv(
     repo_root: str, merge_base_sha: str, head_sha: str, targets: list[str]
-) -> tuple[bool, list[AstEquivResult]]:
+) -> tuple[bool, list[AstEquivResult], dict[str, Any]]:
+    """Check AST equivalence for all targets.
+
+    Returns (ok, per_file_results, type_ignore_equiv_check).
+    """
     results: list[AstEquivResult] = []
     ok = True
+    all_base_sigs: list[TypeIgnoreSignature] = []
+    all_head_sigs: list[TypeIgnoreSignature] = []
+    any_base_ambiguous = False
+    any_head_ambiguous = False
+
     for path in targets:
         for sha in (merge_base_sha, head_sha):
             mode = file_mode_at(repo_root, sha, path)
@@ -380,12 +534,24 @@ def check_ast_equiv(
                 raise GuardError(f"{path} missing at {sha[:12]} despite status M")
             if mode not in ("100644", "100755"):
                 raise GuardError(f"{path} has non-regular git mode {mode} at {sha[:12]}")
-        base_fp = ast_fingerprint(blob_at(repo_root, merge_base_sha, path), f"base:{path}")
-        head_fp = ast_fingerprint(blob_at(repo_root, head_sha, path), f"head:{path}")
+        base_fp, base_sigs, base_amb = ast_fingerprint(
+            blob_at(repo_root, merge_base_sha, path), f"base:{path}"
+        )
+        head_fp, head_sigs, head_amb = ast_fingerprint(
+            blob_at(repo_root, head_sha, path), f"head:{path}"
+        )
         equal = base_fp == head_fp
         ok = ok and equal
         results.append(AstEquivResult(path=path, equal=equal))
-    return ok, results
+        all_base_sigs.extend(base_sigs)
+        all_head_sigs.extend(head_sigs)
+        any_base_ambiguous = any_base_ambiguous or base_amb
+        any_head_ambiguous = any_head_ambiguous or head_amb
+
+    type_ignore_equiv = _compare_type_ignore_signatures(
+        all_base_sigs, all_head_sigs, any_base_ambiguous, any_head_ambiguous
+    )
+    return ok, results, type_ignore_equiv
 
 
 # --------------------------------------------------------------------------- #
@@ -653,6 +819,93 @@ def run_ruff(repo_root: str, sha: str, targets: list[str], ruff_cmd: tuple[str, 
 
 
 # --------------------------------------------------------------------------- #
+# Full-scope inventory (--coverage scope)
+# --------------------------------------------------------------------------- #
+
+
+def enumerate_scope_py_files(repo_root: str, head_sha: str, scope_prefixes: tuple[str, ...]) -> list[str]:
+    """Enumerate all regular *.py files in ``scope_prefixes`` at ``head_sha``.
+
+    Uses ``git ls-tree -r -z --full-tree`` with a literal pathspec so that
+    unusual filenames (spaces, special chars) are handled NUL-safely.
+
+    Fail-closed:
+    - symlinks / non-regular entries → GuardError
+    - empty inventory → GuardError (vacuous pass prevention)
+    - duplicate/nested scopes are validated by the caller via scope_overlaps()
+    """
+    all_paths: list[str] = []
+    seen: set[str] = set()
+
+    for scope in scope_prefixes:
+        # Use :(literal) pathspec to avoid glob interpretation
+        res = _git(
+            repo_root,
+            ["ls-tree", "-r", "-z", "--full-tree", head_sha, "--", f":(literal){scope}"],
+        )
+        if res.returncode != 0:
+            raise GuardError(
+                f"git ls-tree failed for scope {scope!r} at {head_sha[:12]}: "
+                f"{res.stderr.decode('utf-8', 'replace')[:STDERR_CAP]}"
+            )
+        # Parse NUL-delimited ls-tree output: "<mode> <type> <sha>\t<file>\0"
+        tokens = res.stdout.split(b"\x00")
+        for tok in tokens:
+            if not tok:
+                continue
+            # Format: "100644 blob <sha>\t<path>"
+            try:
+                meta, path_bytes = tok.split(b"\t", 1)
+            except ValueError:
+                raise GuardError(f"unexpected ls-tree entry format: {tok!r}")
+            path = path_bytes.decode("utf-8", "surrogateescape")
+            meta_str = meta.decode("utf-8", "replace")
+            parts = meta_str.split()
+            if len(parts) < 2:
+                raise GuardError(f"unexpected ls-tree meta format: {meta_str!r}")
+            mode = parts[0]
+            obj_type = parts[1]
+            # Only regular files (not symlinks, not submodules)
+            if obj_type != "blob":
+                raise GuardError(
+                    f"non-regular entry in scope {scope!r}: {path!r} (type={obj_type})"
+                )
+            if mode not in ("100644", "100755"):
+                raise GuardError(
+                    f"non-regular git mode {mode!r} for {path!r} in scope {scope!r}"
+                )
+            if not path.endswith(".py"):
+                continue
+            canon = canon_path(path)
+            if canon not in seen:
+                seen.add(canon)
+                all_paths.append(canon)
+
+    all_paths.sort()
+
+    if not all_paths:
+        raise GuardError(
+            f"empty .py inventory for scope(s) {list(scope_prefixes)!r} at {head_sha[:12]}; "
+            "refusing to proceed (vacuous pass prevention)"
+        )
+
+    return all_paths
+
+
+def run_ruff_on_scope(
+    repo_root: str,
+    head_sha: str,
+    scope_targets: list[str],
+    ruff_cmd: tuple[str, ...],
+    workdir: Path,
+) -> RuffOutcome:
+    """Run Ruff over the full scope inventory at head_sha."""
+    if not scope_targets:
+        raise GuardError("run_ruff_on_scope called with empty target list (vacuous pass prevention)")
+    return run_ruff(repo_root, head_sha, scope_targets, ruff_cmd, workdir)
+
+
+# --------------------------------------------------------------------------- #
 # Ratchet
 # --------------------------------------------------------------------------- #
 
@@ -705,27 +958,50 @@ def _sha256_file(path: Path) -> str | None:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _inventory_sha256(paths: list[str]) -> str:
+    """Deterministic SHA256 over a sorted list of paths."""
+    combined = "\n".join(sorted(paths)).encode("utf-8")
+    return "sha256:" + hashlib.sha256(combined).hexdigest()
+
+
 def verify_diff(
     repo_root: str,
     base_ref: str,
     head_ref: str,
     scope_prefixes: tuple[str, ...],
     mode: str,
+    coverage: str,
     ruff_cmd: tuple[str, ...],
     ruff_cmd_source: str,
 ) -> tuple[dict[str, Any], int]:
-    """Run every check in order, fail-closed, and build the v1 report."""
+    """Run every check in order, fail-closed, and build the v1 or v2 report."""
     failures: list[str] = []
     scope_prefixes = tuple(normalize_scope(s) for s in scope_prefixes)
     trusted_ruff = ruff_cmd == DEFAULT_RUFF_CMD or ruff_cmd_source == "env_test_override"
 
+    use_v2 = coverage == "scope"
+    schema = REPORT_SCHEMA_V2 if use_v2 else REPORT_SCHEMA_V1
+
+    # Validate scope overlaps / duplicates for --coverage scope (policy fail)
+    overlaps = scope_overlaps(scope_prefixes)
+    if use_v2 and overlaps:
+        error_report = {
+            "schema": schema,
+            "guard_version": GUARD_VERSION,
+            "decision": "fail",
+            "failures": ["scope_policy"],
+            "error": f"duplicate or nested scopes: {overlaps}",
+        }
+        return error_report, EXIT_POLICY_FAIL
+
     report: dict[str, Any] = {
-        "schema": REPORT_SCHEMA,
+        "schema": schema,
         "guard_version": GUARD_VERSION,
         "python_version": ".".join(str(p) for p in sys.version_info[:3]),
         "mode": mode,
+        "coverage": coverage,
         "scope_prefixes": list(scope_prefixes),
-        "scope_overlaps": scope_overlaps(scope_prefixes),
+        "scope_overlaps": overlaps,
     }
 
     base_sha = resolve_sha(repo_root, base_ref)
@@ -752,17 +1028,20 @@ def verify_diff(
     if not status.ok:
         failures.append("status_scope")
 
-    targets = status.target_files
+    changed_targets = status.target_files
 
-    ast_ok, ast_results = check_ast_equiv(repo_root, mb, head_sha, targets)
+    ast_ok, ast_results, type_ignore_equiv = check_ast_equiv(repo_root, mb, head_sha, changed_targets)
     report["checks"]["ast_equiv"] = {
         "ok": ast_ok,
         "results": [{"path": r.path, "equal": r.equal} for r in ast_results],
     }
+    report["checks"]["type_ignore_equiv"] = type_ignore_equiv
     if not ast_ok:
         failures.append("ast_equiv")
+    if not type_ignore_equiv["ok"]:
+        failures.append("type_ignore_equiv")
 
-    suppression = scan_suppressions(repo_root, mb, head_sha, targets, entries)
+    suppression = scan_suppressions(repo_root, mb, head_sha, changed_targets, entries)
     report["checks"]["suppression"] = suppression
     if not suppression["ok"]:
         failures.append("suppression")
@@ -770,35 +1049,67 @@ def verify_diff(
     ruff_version = _ruff_version(ruff_cmd)
     with tempfile.TemporaryDirectory(prefix="e501-guard-") as tmp:
         workdir = Path(tmp)
-        base_ruff = run_ruff(repo_root, mb, targets, ruff_cmd, workdir)
-        head_ruff = run_ruff(repo_root, head_sha, targets, ruff_cmd, workdir)
-    report["ruff"] = {
-        "version": ruff_version,
-        "argv": head_ruff.argv,
-        "base_exit": base_ruff.exit_code,
-        "head_exit": head_ruff.exit_code,
-        "cmd_source": ruff_cmd_source,
-        "non_default_ruff_cmd": ruff_cmd != DEFAULT_RUFF_CMD,
-        "trusted": trusted_ruff,
-    }
-    if not trusted_ruff:
-        failures.append("untrusted_ruff_cmd")
 
-    ratchet = check_ratchet(base_ruff, head_ruff, targets, mode)
-    report["checks"]["ratchet"] = {
-        "ok": ratchet.ok,
-        "mode": ratchet.mode,
-        "base_total": ratchet.base_total,
-        "head_total": ratchet.head_total,
-        "per_file": ratchet.per_file,
-        "violations": ratchet.violations,
-    }
-    if not ratchet.ok:
-        failures.append("ratchet")
+        # Ratchet check runs on changed targets only (both coverage modes)
+        if changed_targets:
+            base_ruff = run_ruff(repo_root, mb, changed_targets, ruff_cmd, workdir)
+            head_ruff_changed = run_ruff(repo_root, head_sha, changed_targets, ruff_cmd, workdir)
+        else:
+            # No changed targets: synthesise empty outcomes so ratchet can still run
+            base_ruff = RuffOutcome(exit_code=0, per_file={}, total=0, argv=[], diagnostics=[])
+            head_ruff_changed = RuffOutcome(exit_code=0, per_file={}, total=0, argv=[], diagnostics=[])
+
+        report["ruff"] = {
+            "version": ruff_version,
+            "argv": head_ruff_changed.argv,
+            "base_exit": base_ruff.exit_code,
+            "head_exit": head_ruff_changed.exit_code,
+            "cmd_source": ruff_cmd_source,
+            "non_default_ruff_cmd": ruff_cmd != DEFAULT_RUFF_CMD,
+            "trusted": trusted_ruff,
+        }
+        if not trusted_ruff:
+            failures.append("untrusted_ruff_cmd")
+
+        ratchet = check_ratchet(base_ruff, head_ruff_changed, changed_targets, mode)
+        report["checks"]["ratchet"] = {
+            "ok": ratchet.ok,
+            "target_set": "changed",
+            "mode": ratchet.mode,
+            "base_total": ratchet.base_total,
+            "head_total": ratchet.head_total,
+            "per_file": ratchet.per_file,
+            "violations": ratchet.violations,
+        }
+        if not ratchet.ok:
+            failures.append("ratchet")
+
+        # Full-scope E501 check (--coverage scope only)
+        if use_v2:
+            scope_targets = enumerate_scope_py_files(repo_root, head_sha, scope_prefixes)
+            head_scope_ruff = run_ruff_on_scope(repo_root, head_sha, scope_targets, ruff_cmd, workdir)
+            inventory_sha = _inventory_sha256(scope_targets)
+            full_scope_ok = head_scope_ruff.total == 0
+            report["checks"]["full_scope_e501"] = {
+                "ok": full_scope_ok,
+                "source_sha": head_sha,
+                "inventory_count": len(scope_targets),
+                "inventory_sha256": inventory_sha,
+                "head_total": head_scope_ruff.total,
+                "per_file": dict(sorted(head_scope_ruff.per_file.items())),
+            }
+            if not full_scope_ok:
+                failures.append("full_scope_e501")
 
     report["diagnostics"] = {
-        "base": {"per_file": dict(sorted(base_ruff.per_file.items())), "items": base_ruff.diagnostics},
-        "head": {"per_file": dict(sorted(head_ruff.per_file.items())), "items": head_ruff.diagnostics},
+        "base": {
+            "per_file": dict(sorted(base_ruff.per_file.items())),
+            "items": base_ruff.diagnostics,
+        },
+        "head": {
+            "per_file": dict(sorted(head_ruff_changed.per_file.items())),
+            "items": head_ruff_changed.diagnostics,
+        },
     }
     report["blobs"] = [
         {
@@ -806,7 +1117,7 @@ def verify_diff(
             "base_blob": blob_id_at(repo_root, mb, path),
             "head_blob": blob_id_at(repo_root, head_sha, path),
         }
-        for path in targets
+        for path in changed_targets
     ]
     report["uv_lock_sha256"] = _sha256_file(GUARD_PROJECT_ROOT / "uv.lock")
 
@@ -835,6 +1146,12 @@ def build_parser() -> argparse.ArgumentParser:
     vd.add_argument("--head-ref", required=True)
     vd.add_argument("--scope", action="append", required=True, help="in-scope path prefix (repeatable)")
     vd.add_argument("--mode", choices=("ratchet", "cleanup", "completion"), default="ratchet")
+    vd.add_argument(
+        "--coverage",
+        choices=("changed", "scope"),
+        default="changed",
+        help="coverage mode: 'changed' (default, v1 behaviour) or 'scope' (full scope, v2 report)",
+    )
     return parser
 
 
@@ -853,12 +1170,13 @@ def main(argv: list[str] | None = None) -> int:
             head_ref=ns.head_ref,
             scope_prefixes=tuple(ns.scope),
             mode=ns.mode,
+            coverage=ns.coverage,
             ruff_cmd=ruff_cmd,
             ruff_cmd_source=ruff_cmd_source,
         )
     except GuardError as exc:
         error_report = {
-            "schema": REPORT_SCHEMA,
+            "schema": REPORT_SCHEMA_V1,
             "guard_version": GUARD_VERSION,
             "decision": "fail",
             "failures": ["tool_error"],

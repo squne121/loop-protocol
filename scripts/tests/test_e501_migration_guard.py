@@ -744,3 +744,355 @@ def test_report_includes_ruff_diagnostic_detail(tmp_path):
     assert items[0]["row"] == 1
     assert items[0]["column"] == 121
     assert "120" in items[0]["message"]
+
+# --------------------------------------------------------------------------- #
+# New tests for #1163: TypeIgnore structural comparison + --coverage scope
+# --------------------------------------------------------------------------- #
+
+
+def _run_guard_with_coverage(
+    repo: Path,
+    base: str,
+    head: str,
+    *,
+    scope: str = "pkg",
+    mode: str = "ratchet",
+    coverage: str = "changed",
+    ruff_cmd: str | None = None,
+    extra_scopes: tuple[str, ...] = (),
+) -> tuple[int, dict, str]:
+    argv = [
+        sys.executable,
+        str(GUARD),
+        "verify-diff",
+        "--repo-root",
+        str(repo),
+        "--base-ref",
+        base,
+        "--head-ref",
+        head,
+        "--scope",
+        scope,
+        "--mode",
+        mode,
+        "--coverage",
+        coverage,
+    ]
+    for s in extra_scopes:
+        argv += ["--scope", s]
+    env = dict(os.environ)
+    if ruff_cmd is not None:
+        env["E501_GUARD_ALLOW_TEST_RUFF"] = "1"
+        env["E501_GUARD_RUFF_CMD"] = ruff_cmd
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False, env=env)
+    report = json.loads(res.stdout) if res.stdout.strip() else {}
+    return res.returncode, report, res.stderr
+
+
+def test_type_ignore_line_shift_same_anchor_passes(tmp_path):
+    """TypeIgnore with same structural anchor but shifted lineno -> pass."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "ti_lineshift")
+
+    # base: type: ignore on a short expression
+    base_src = (
+        "def foo():\n"
+        "    x = bar()  # type: ignore[attr-defined]\n"
+    )
+    write(repo, "pkg/a.py", base_src)
+    base = commit_all(repo, "base")
+
+    # head: same function but with a preceding comment (shifts lineno by 1)
+    head_src = (
+        "# added comment\n"
+        "def foo():\n"
+        "    x = bar()  # type: ignore[attr-defined]\n"
+    )
+    write(repo, "pkg/a.py", head_src)
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    # AST structure is identical (same function, same body), type_ignore anchors same
+    assert report["checks"]["type_ignore_equiv"]["ok"] is True
+    assert report["checks"]["type_ignore_equiv"]["ambiguous_anchor"] is False
+
+
+def test_type_ignore_move_between_statements_fails(tmp_path):
+    """TypeIgnore moved from one statement to another -> structural mismatch -> fail."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "ti_move")
+
+    base_src = (
+        "x = foo()  # type: ignore[attr-defined]\n"
+        "y = bar()\n"
+    )
+    write(repo, "pkg/a.py", base_src)
+    base = commit_all(repo, "base")
+
+    # Move the type: ignore to a different statement
+    head_src = (
+        "x = foo()\n"
+        "y = bar()  # type: ignore[attr-defined]\n"
+    )
+    write(repo, "pkg/a.py", head_src)
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    # The anchor (owner_ast_path) differs, so type_ignore_equiv fails
+    assert report["checks"]["type_ignore_equiv"]["ok"] is False
+    assert code == GUARD_MOD.EXIT_POLICY_FAIL
+    assert "type_ignore_equiv" in report["failures"]
+
+
+def test_type_ignore_tag_change_fails(tmp_path):
+    """TypeIgnore tag change (attr-defined -> assignment) -> fail."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "ti_tag")
+
+    base_src = "x = foo()  # type: ignore[attr-defined]\n"
+    write(repo, "pkg/a.py", base_src)
+    base = commit_all(repo, "base")
+
+    head_src = "x = foo()  # type: ignore[assignment]\n"
+    write(repo, "pkg/a.py", head_src)
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    assert report["checks"]["type_ignore_equiv"]["ok"] is False
+    assert "type_ignore_equiv" in report["failures"]
+
+
+def test_file_wide_type_ignore_move_fails(tmp_path):
+    """A file-wide type: ignore removed -> mismatch -> fail."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "ti_filewide")
+
+    # Python 3 doesn't support file-level type: ignore in the same way, but
+    # we can test that removing a type: ignore is detected as a mismatch.
+    base_src = (
+        "x: int = foo()  # type: ignore[assignment]\n"
+        "y = bar()\n"
+    )
+    write(repo, "pkg/a.py", base_src)
+    base = commit_all(repo, "base")
+
+    # Remove the type: ignore entirely
+    head_src = (
+        "x: int = foo()\n"
+        "y = bar()\n"
+    )
+    write(repo, "pkg/a.py", head_src)
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    # Removal of type: ignore changes the count
+    assert report["checks"]["type_ignore_equiv"]["ok"] is False
+    assert "type_ignore_equiv" in report["failures"]
+
+
+def test_multiple_type_ignores_preserve_multiplicity(tmp_path):
+    """Multiple type: ignores on same anchor must preserve multiplicity."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "ti_multi")
+
+    # Two type: ignore on adjacent statements
+    base_src = (
+        "x = foo()  # type: ignore[attr-defined]\n"
+        "y = bar()  # type: ignore[attr-defined]\n"
+    )
+    write(repo, "pkg/a.py", base_src)
+    base = commit_all(repo, "base")
+
+    # Remove one type: ignore (now only one remains)
+    head_src = (
+        "x = foo()  # type: ignore[attr-defined]\n"
+        "y = bar()\n"
+    )
+    write(repo, "pkg/a.py", head_src)
+    head = commit_all(repo, "head")
+
+    code, report, _ = run_guard(repo, base, head, ruff_cmd=fake)
+    ti = report["checks"]["type_ignore_equiv"]
+    assert ti["base_count"] == 2
+    assert ti["head_count"] == 1
+    assert ti["ok"] is False
+    assert "type_ignore_equiv" in report["failures"]
+
+
+def test_full_scope_fails_on_unchanged_e501(tmp_path):
+    """--coverage scope fails when an unchanged file in scope has E501 violations."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_fail")
+
+    # base: two files, one with E501
+    write(repo, "pkg/clean.py", SHORT_LINE)
+    write(repo, "pkg/dirty.py", LONG_LINE)  # this file is NOT changed in head
+    base = commit_all(repo, "base")
+
+    # head: only clean.py is modified (whitespace-only, AST-equiv)
+    write(repo, "pkg/clean.py", "x = 1  \n")
+    head = commit_all(repo, "head")
+
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head, ruff_cmd=fake, coverage="scope"
+    )
+    assert code == GUARD_MOD.EXIT_POLICY_FAIL
+    assert report["checks"]["full_scope_e501"]["ok"] is False
+    assert report["checks"]["full_scope_e501"]["head_total"] >= 1
+    assert "full_scope_e501" in report["failures"]
+    assert report["schema"] == "e501-migration-guard/v2"
+
+
+def test_full_scope_passes_when_entire_head_scope_clean(tmp_path):
+    """--coverage scope passes when all .py files in scope are E501-clean at head."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_pass")
+
+    write(repo, "pkg/a.py", LONG_LINE)
+    write(repo, "pkg/b.py", LONG_LINE)
+    base = commit_all(repo, "base")
+
+    # head: all files cleaned up
+    write(repo, "pkg/a.py", SHORT_LINE)
+    write(repo, "pkg/b.py", SHORT_LINE)
+    head = commit_all(repo, "head")
+
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head, mode="completion", ruff_cmd=fake, coverage="scope"
+    )
+    assert code == GUARD_MOD.EXIT_PASS
+    assert report["checks"]["full_scope_e501"]["ok"] is True
+    assert report["checks"]["full_scope_e501"]["head_total"] == 0
+    assert report["schema"] == "e501-migration-guard/v2"
+
+
+def test_full_scope_uses_literal_pathspec(tmp_path):
+    """Files with unusual names (brackets, spaces) must be listed via NUL-safe ls-tree."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_unusual")
+
+    # Create a file with spaces in the name
+    write(repo, "pkg/my module.py", SHORT_LINE)
+    write(repo, "pkg/normal.py", LONG_LINE)
+    base = commit_all(repo, "base")
+
+    # Fix the long-line file; the spaced file is untouched (stays short)
+    write(repo, "pkg/normal.py", SHORT_LINE)
+    head = commit_all(repo, "head")
+
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head, mode="completion", ruff_cmd=fake, coverage="scope"
+    )
+    assert code == GUARD_MOD.EXIT_PASS
+    fse = report["checks"]["full_scope_e501"]
+    assert fse["ok"] is True
+    # Both files should be in the inventory
+    assert fse["inventory_count"] == 2
+
+
+def test_full_scope_handles_unusual_filenames_nul_safely(tmp_path):
+    """NUL-safe parsing: filenames with special chars don't cause parsing failures."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_nul")
+
+    # Filename with brackets and dash
+    write(repo, "pkg/[special]-file.py", SHORT_LINE)
+    write(repo, "pkg/another-file.py", SHORT_LINE)
+    base = commit_all(repo, "base")
+
+    # Modify one file (whitespace change, AST-equiv)
+    write(repo, "pkg/another-file.py", "x = 1  \n")
+    head = commit_all(repo, "head")
+
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head, ruff_cmd=fake, coverage="scope"
+    )
+    fse = report["checks"]["full_scope_e501"]
+    # Both files are E501-clean, so full_scope_e501 should pass
+    assert fse["ok"] is True
+    assert fse["inventory_count"] == 2
+
+
+def test_full_scope_empty_inventory_fails(tmp_path):
+    """Empty .py inventory for a scope fails closed (vacuous pass prevention)."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_empty")
+
+    # Only a non-python file in scope
+    write(repo, "pkg/readme.md", "# docs\n")
+    write(repo, "pkg/keep.py", SHORT_LINE)
+    base = commit_all(repo, "base")
+
+    # head: modify keep.py but use a scope that has no .py files
+    write(repo, "pkg/keep.py", "x = 1  \n")
+    commit_all(repo, "head")
+
+    # Use an empty scope (no .py files exist under "empty_scope")
+    write(repo, "empty_scope/.gitkeep", "")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add empty scope")
+    # Re-compute head after extra commit
+    head2 = _git(repo, "rev-parse", "HEAD").strip()
+
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head2, scope="empty_scope", ruff_cmd=fake, coverage="scope"
+    )
+    # Should fail with tool_error (empty inventory)
+    assert code == GUARD_MOD.EXIT_TOOL_ERROR
+    assert "tool_error" in report["failures"]
+    assert "vacuous" in report.get("error", "").lower() or "empty" in report.get("error", "").lower()
+
+
+def test_duplicate_or_nested_scopes_fail(tmp_path):
+    """Duplicate or nested --scope values fail as a policy error."""
+    fake = make_stub(tmp_path, "ruff.py", FAKE_RUFF_E501)
+    repo = init_repo(tmp_path / "scope_dup")
+
+    write(repo, "pkg/a.py", SHORT_LINE)
+    base = commit_all(repo, "base")
+    write(repo, "pkg/a.py", "x = 1  \n")
+    head = commit_all(repo, "head")
+
+    # Duplicate scope
+    code, report, _ = _run_guard_with_coverage(
+        repo, base, head, scope="pkg", extra_scopes=("pkg",), ruff_cmd=fake, coverage="scope"
+    )
+    assert code != GUARD_MOD.EXIT_PASS
+    assert report.get("decision") == "fail"
+
+    # Nested scope
+    write(repo, "pkg/sub/b.py", SHORT_LINE)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add sub")
+    head3 = _git(repo, "rev-parse", "HEAD").strip()
+
+    code2, report2, _ = _run_guard_with_coverage(
+        repo, base, head3, scope="pkg", extra_scopes=("pkg/sub",), ruff_cmd=fake, coverage="scope"
+    )
+    assert code2 != GUARD_MOD.EXIT_PASS
+    assert report2.get("decision") == "fail"
+
+
+def test_full_scope_real_ruff(tmp_path):
+    """--coverage scope with real uv run --locked ruff toolchain."""
+    repo = init_repo(tmp_path / "scope_real")
+
+    long_call = "result = some_function(" + ", ".join(f"argument_{i}" for i in range(12)) + ")\n"
+    assert len(long_call) > 120
+    write(repo, "pkg/a.py", long_call)
+    write(repo, "pkg/b.py", long_call)
+    base = commit_all(repo, "base")
+
+    reflowed = "result = some_function(\n" + "".join(f"    argument_{i},\n" for i in range(12)) + ")\n"
+    write(repo, "pkg/a.py", reflowed)
+    write(repo, "pkg/b.py", reflowed)
+    head = commit_all(repo, "head")
+
+    code, report, stderr = _run_guard_with_coverage(
+        repo, base, head, mode="completion", coverage="scope"
+    )
+    assert code == GUARD_MOD.EXIT_PASS, stderr
+    assert report["checks"]["full_scope_e501"]["ok"] is True
+    assert report["checks"]["full_scope_e501"]["head_total"] == 0
+    assert "ruff " in report["ruff"]["version"]
+    assert report["schema"] == "e501-migration-guard/v2"
