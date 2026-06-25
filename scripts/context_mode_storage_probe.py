@@ -84,7 +84,8 @@ def extract_storage_paths(doctor_data: dict) -> dict[str, str]:
     if not paths:
         raise StorageProbeError(
             "ctx-doctor-result.json から Storage paths を取得できませんでした。\n"
-            "ctx-doctor-result.json の checks に 'Storage session:' / 'Storage content:' が含まれているか確認してください。"
+            "ctx-doctor-result.json の checks に"
+            " 'Storage session:' / 'Storage content:' が含まれているか確認してください。"
         )
 
     return paths
@@ -241,13 +242,20 @@ def build_persistence_proof(storage_paths: dict[str, str], version: str = "1.0.1
             "command": "/context reset",
             "scope": "session",
             "classification": "session_reset_not_storage_purge",
-            "note": "/context reset は Claude Code の会話コンテキストリセットであり、context-mode SQLite/FTS5 storage purge ではない。purge_methods_verified には含まない。",
+            "note": (
+                "/context reset は Claude Code の会話コンテキストリセットであり、"
+                "context-mode SQLite/FTS5 storage purge ではない。"
+                "purge_methods_verified には含まない。"
+            ),
         },
         "purge_verification": {
             "method": "ctx_doctor stats check",
             "verified_at": "2026-06-14",
             "version": version,
-            "description": "purge 後に mcp__context-mode__ctx_doctor の stats が空になっていることを確認する（runtime 実行が必要）。",
+            "description": (
+                "purge 後に mcp__context-mode__ctx_doctor の stats が"
+                "空になっていることを確認する（runtime 実行が必要）。"
+            ),
         },
         "version": version,
         "redaction": {

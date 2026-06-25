@@ -1668,7 +1668,10 @@ def _emit_block_stderr(
         lines.append(f"target_branch_kind: {target_branch_kind}")
 
     if reason_code == REASON_INLINE_OVERRIDE:
-        lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
+        lines.append(
+            "recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and"
+            " LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
+        )
     elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
         lines.append("recovery: switch root back to default branch first")
     elif reason_code == REASON_UNPARSEABLE:
@@ -1676,7 +1679,10 @@ def _emit_block_stderr(
     elif reason_code == REASON_DRIFT:
         lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
     elif reason_code == REASON_GH_MUTATION:
-        lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
+        lines.append(
+            "recovery: use the approved rtk/skill wrapper or run"
+            " GitHub mutation from the designated issue workflow"
+        )
 
     lines.append(f"hook_flavor: {hook_flavor}")
 

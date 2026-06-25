@@ -51,7 +51,9 @@ def validate_common_schema(payload: dict, *, fixture_mode: bool) -> list[str]:
     if fixture_mode:
         required_keys |= {"fixture_expectation", "project_trust_state", "hook_state"}
 
-    allowed_keys = required_keys | OPTIONAL_FIELDS | ({"fixture_expectation", "project_trust_state", "hook_state"} if fixture_mode else set())
+    allowed_keys = required_keys | OPTIONAL_FIELDS | (
+        {"fixture_expectation", "project_trust_state", "hook_state"} if fixture_mode else set()
+    )
     unknown = set(payload.keys()) - allowed_keys
     missing = required_keys - set(payload.keys())
     if unknown:
