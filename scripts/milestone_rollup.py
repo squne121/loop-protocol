@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -310,6 +311,65 @@ def collect_descendants(
     return all_issues, warnings, any_partial
 
 
+def evaluate_close_readiness(report: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Fail-closed close predicate. Returns (is_ready, failure_reasons).
+
+    Checks (AND conditions, all must be satisfied):
+    - summary.open_issues == 0
+    - summary.pr_mixed_count == 0
+    - report.partial == false
+    - report.warnings == []
+    - summary.open_blocker_count == 0
+    - summary.scope_conflict_count == 0
+    """
+    s = report.get("summary", {})
+    reasons: list[str] = []
+
+    if s.get("open_issues", 1) != 0:
+        reasons.append(f"open_issues={s.get('open_issues')} (must be 0)")
+    if s.get("pr_mixed_count", 1) != 0:
+        reasons.append(f"pr_mixed_count={s.get('pr_mixed_count')} (must be 0)")
+    if report.get("partial", True):
+        reasons.append("partial=true (descendant traversal incomplete)")
+    if report.get("warnings", [None]):
+        reasons.append(f"warnings non-empty: {len(report.get('warnings', []))} warning(s)")
+    if s.get("open_blocker_count", 1) != 0:
+        reasons.append(f"open_blocker_count={s.get('open_blocker_count')} (must be 0)")
+    if s.get("scope_conflict_count", 1) != 0:
+        reasons.append(f"scope_conflict_count={s.get('scope_conflict_count')} (must be 0)")
+
+    return (len(reasons) == 0, reasons)
+
+
+def validate_defer_decision(defer: dict) -> tuple[bool, list[str]]:
+    """Validate a defer decision. Returns (is_valid, list_of_errors).
+
+    Required fields: issue, reason, residual_risk, destination, revisit_condition,
+                     decided_by, decided_at
+    destination must have 'issue' key (milestone key is optional but encouraged)
+    """
+    errors: list[str] = []
+
+    if not isinstance(defer, dict):
+        return False, ["defer must be a dict"]
+
+    required_fields = {
+        "issue", "reason", "residual_risk", "destination",
+        "revisit_condition", "decided_by", "decided_at",
+    }
+    missing = required_fields - set(defer.keys())
+    for f in sorted(missing):
+        errors.append(f"missing required field: {f}")
+
+    dest = defer.get("destination", {})
+    if not isinstance(dest, dict):
+        errors.append("destination must be a dict")
+    elif "issue" not in dest:
+        errors.append("destination.issue is required")
+
+    return (len(errors) == 0, errors)
+
+
 def analyze(
     all_issues: list[dict[str, Any]],
     milestone_number: int,
@@ -420,11 +480,17 @@ def analyze(
                     }
                 )
 
+    # scope_conflict_count: milestone_mismatches where depth >= 1 (scope conflicts)
+    scope_conflict_count = sum(
+        1 for mm in milestone_mismatches if mm.get("depth", 0) >= 1
+    )
+
     return {
         "pr_mixed": pr_mixed,
         "milestone_mismatches": milestone_mismatches,
         "stale_state_labels": stale_state_labels,
         "open_blockers": open_blockers,
+        "scope_conflict_count": scope_conflict_count,
     }
 
 
@@ -436,6 +502,8 @@ def build_report(
     generated_at: str,
     repo: str,
     partial: bool = False,
+    closure_followups: list | None = None,
+    defer_records: list | None = None,
 ) -> dict[str, Any]:
     """Build the MILESTONE_DESCENDANT_ROLLUP_V1 report structure."""
     issues_only = [i for i in all_issues if not i["is_pr"]]
@@ -443,6 +511,7 @@ def build_report(
     closed_count = sum(1 for i in issues_only if i["state"] == "closed")
 
     has_invariant_violation = len(findings["pr_mixed"]) > 0
+    scope_conflict_count = findings.get("scope_conflict_count", 0)
 
     return {
         "schema": "MILESTONE_DESCENDANT_ROLLUP_V1",
@@ -450,6 +519,8 @@ def build_report(
         "repo": repo,
         "milestone_number": milestone_number,
         "partial": partial,
+        "closure_followups": closure_followups if closure_followups is not None else [],
+        "defer_records": defer_records if defer_records is not None else [],
         "summary": {
             "total_descendants": len(all_issues),
             "open_issues": open_count,
@@ -458,6 +529,7 @@ def build_report(
             "milestone_mismatch_count": len(findings["milestone_mismatches"]),
             "stale_state_label_count": len(findings["stale_state_labels"]),
             "open_blocker_count": len(findings["open_blockers"]),
+            "scope_conflict_count": scope_conflict_count,
             "has_invariant_violation": has_invariant_violation,
             "partial": partial,
         },
@@ -467,6 +539,95 @@ def build_report(
         "open_blockers": findings["open_blockers"],
         "warnings": warnings,
     }
+
+
+def _fetch_close_decision_yaml(
+    owner: str, repo: str, parent_issue: int, token: str | None
+) -> str | None:
+    """Fetch MILESTONE_CLOSE_DECISION_V1 YAML block from parent issue comments."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{parent_issue}/comments?per_page=100"
+    try:
+        comments = _api_get_paginated(url, token)
+    except RuntimeError:
+        return None
+
+    marker = "MILESTONE_CLOSE_DECISION_V1"
+    for comment in reversed(comments):
+        body = comment.get("body", "") or ""
+        if marker in body:
+            return body
+    return None
+
+
+def _extract_deferred_list(yaml_text: str) -> list[dict]:
+    """Extract deferred list from MILESTONE_CLOSE_DECISION_V1 YAML comment (best-effort)."""
+    lines = yaml_text.splitlines()
+    in_block = False
+    block_lines: list[str] = []
+    for line in lines:
+        if "MILESTONE_CLOSE_DECISION_V1" in line:
+            in_block = True
+            continue
+        if in_block:
+            if line.strip().startswith("```") and block_lines:
+                break
+            if line.strip().startswith("```"):
+                continue
+            block_lines.append(line)
+
+    deferred: list[dict] = []
+    in_deferred = False
+    current_item: dict = {}
+    in_destination = False
+
+    for line in block_lines:
+        stripped = line.strip()
+        if stripped == "deferred:":
+            in_deferred = True
+            continue
+        if not in_deferred:
+            continue
+        if stripped and not line.startswith(" ") and not stripped.startswith("-"):
+            if current_item:
+                deferred.append(current_item)
+            break
+        if stripped.startswith("- issue:"):
+            if current_item:
+                deferred.append(current_item)
+            current_item = {"issue": stripped[len("- issue:"):].strip().strip('"')}
+            in_destination = False
+        elif stripped.startswith("issue:") and not in_destination:
+            if current_item:
+                deferred.append(current_item)
+            current_item = {"issue": stripped[len("issue:"):].strip().strip('"')}
+            in_destination = False
+        elif stripped.startswith("reason:"):
+            current_item["reason"] = stripped[len("reason:"):].strip().strip('"')
+        elif stripped.startswith("residual_risk:"):
+            current_item["residual_risk"] = stripped[len("residual_risk:"):].strip().strip('"')
+        elif stripped.startswith("destination:"):
+            in_destination = True
+            current_item["destination"] = {}
+        elif in_destination and stripped.startswith("issue:"):
+            current_item.setdefault("destination", {})["issue"] = (
+                stripped[len("issue:"):].strip().strip('"')
+            )
+        elif in_destination and stripped.startswith("milestone:"):
+            current_item.setdefault("destination", {})["milestone"] = (
+                stripped[len("milestone:"):].strip().strip('"')
+            )
+        elif stripped.startswith("revisit_condition:"):
+            in_destination = False
+            current_item["revisit_condition"] = stripped[len("revisit_condition:"):].strip().strip('"')
+        elif stripped.startswith("decided_by:"):
+            current_item["decided_by"] = stripped[len("decided_by:"):].strip().strip('"')
+        elif stripped.startswith("decided_at:"):
+            current_item["decided_at"] = stripped[len("decided_at:"):].strip().strip('"')
+
+    if current_item:
+        deferred.append(current_item)
+
+    return deferred
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -519,6 +680,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         for w in report["warnings"]:
             lines.append(f"- {json.dumps(w)}")
 
+    if report.get("closure_followups"):
+        lines.append("\n### closure_followups\n")
+        for cf in report["closure_followups"]:
+            lines.append(f"- {json.dumps(cf)}")
+
+    if report.get("defer_records"):
+        lines.append("\n### defer_records\n")
+        for dr in report["defer_records"]:
+            lines.append(f"- {json.dumps(dr)}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -557,6 +728,16 @@ def main() -> int:
         default="squne121/loop-protocol",
         help="GitHub repository in owner/repo format",
     )
+    parser.add_argument(
+        "--parent-issue",
+        type=int,
+        dest="parent_issue",
+        default=None,
+        help=(
+            "Parent issue number — fetches MILESTONE_CLOSE_DECISION_V1 YAML "
+            "and populates closure_followups/defer_records"
+        ),
+    )
     args = parser.parse_args()
 
     milestone_number = args.milestone_number_opt if args.milestone_number_opt else args.milestone_number
@@ -565,10 +746,9 @@ def main() -> int:
         print("ERROR: milestone_number must be a positive integer", file=sys.stderr)
         return 2
 
-    # Blocker 3: token is optional — unauthenticated GET works for public repos
+    # token is optional — unauthenticated GET works for public repos
     token: str | None = os.environ.get("GITHUB_TOKEN") or None
     if not token:
-        import subprocess
         try:
             result = subprocess.run(
                 ["gh", "auth", "token"], capture_output=True, text=True, timeout=10
@@ -594,6 +774,32 @@ def main() -> int:
 
     generated_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    closure_followups: list = []
+    defer_records: list = []
+
+    if args.parent_issue:
+        print(
+            f"[info] Fetching MILESTONE_CLOSE_DECISION_V1 from parent issue #{args.parent_issue}...",
+            file=sys.stderr,
+        )
+        yaml_text = _fetch_close_decision_yaml(owner, repo_name, args.parent_issue, token)
+        if yaml_text:
+            deferred_list = _extract_deferred_list(yaml_text)
+            for defer in deferred_list:
+                ok, errs = validate_defer_decision(defer)
+                record = dict(defer)
+                record["_valid"] = ok
+                if not ok:
+                    record["_errors"] = errs
+                defer_records.append(record)
+                if ok:
+                    closure_followups.append(defer.get("issue", "unknown"))
+        else:
+            print(
+                f"[warn] No MILESTONE_CLOSE_DECISION_V1 found in parent issue #{args.parent_issue} comments",
+                file=sys.stderr,
+            )
+
     try:
         print(
             f"[info] Collecting milestone #{milestone_number} descendants from {owner}/{repo_name}...",
@@ -609,7 +815,15 @@ def main() -> int:
 
         findings = analyze(all_issues, milestone_number, owner, repo_name, token)
         report = build_report(
-            milestone_number, all_issues, findings, warnings, generated_at, repo, partial=partial
+            milestone_number,
+            all_issues,
+            findings,
+            warnings,
+            generated_at,
+            repo,
+            partial=partial,
+            closure_followups=closure_followups,
+            defer_records=defer_records,
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

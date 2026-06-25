@@ -91,7 +91,7 @@ ALL_ITEMS_JSON=$(gh api --paginate \
   exit 1
 }
 
-# jq '[...] | length' で count（grep -c は 0 件でも exit 1 になり || echo "0" で 0\n0 になるバグを回避）
+# jq '[...] | length' で count
 PR_MIXED_COUNT=$(jq '[.[][] | select(.pull_request != null)] | length' <<< "$ALL_ITEMS_JSON")
 ISSUES_ONLY_JSON=$(jq '[.[][] | select(.pull_request == null)]' <<< "$ALL_ITEMS_JSON")
 
@@ -101,8 +101,12 @@ CLOSED_ISSUES=$(jq -c '.[] | select(.state == "closed")' <<< "$ISSUES_ONLY_JSON"
 # --------------------------------------------------------------------------
 # Step 3: Assignment Drift の検出（AC4）
 # #146 の M-A3 Milestone Assignment Readback コメントから expected_set を動的取得
+# フォールバック廃止（H1）: 取得失敗時は assignment_readback_complete=false として close 不可
 # --------------------------------------------------------------------------
 echo "[Step 3] #146 M-A3 Readback から expected_set を取得中..." >&2
+
+ASSIGNMENT_READBACK_COMPLETE=false
+EXPECTED_SET=()
 
 EXPECTED_SET_JSON=$(
   gh issue view 146 --repo "$REPO" --comments --json comments \
@@ -118,13 +122,14 @@ EXPECTED_SET_JSON=$(
   jq -R . | jq -s 'map(tonumber)' 2>/dev/null
 ) || true
 
-# フォールバック: 取得失敗時はハードコードした値を使用
 if [[ -z "$EXPECTED_SET_JSON" || "$EXPECTED_SET_JSON" == "[]" ]]; then
-  echo "[Step 3] WARN: #146 readback 取得失敗。フォールバック値を使用します: [133, 131, 40]" >&2
-  EXPECTED_SET=(133 131 40)
+  echo "[Step 3] WARN: #146 readback 取得失敗。assignment_readback_complete=false として close 不可扱い" >&2
+  ASSIGNMENT_READBACK_COMPLETE=false
+  EXPECTED_SET=()
 else
   # JSON 配列からbash配列に変換
   mapfile -t EXPECTED_SET < <(jq -r '.[]' <<< "$EXPECTED_SET_JSON")
+  ASSIGNMENT_READBACK_COMPLETE=true
   echo "[Step 3] expected_set 取得完了: ${EXPECTED_SET[*]}" >&2
 fi
 
@@ -157,6 +162,19 @@ if [[ ${#IN_EXPECTED_NOT_ACTUAL[@]} -gt 0 || ${#IN_ACTUAL_NOT_EXPECTED[@]} -gt 0
   DRIFT_STATUS="drift_detected"
 fi
 
+# assignment_drift_list: 差分 issue 番号のリスト（H2）
+DRIFT_LIST_JSON="[]"
+if [[ "$DRIFT_STATUS" == "drift_detected" ]]; then
+  ALL_DRIFT=()
+  for n in "${IN_EXPECTED_NOT_ACTUAL[@]}"; do
+    ALL_DRIFT+=("$n")
+  done
+  for n in "${IN_ACTUAL_NOT_EXPECTED[@]}"; do
+    ALL_DRIFT+=("$n")
+  done
+  DRIFT_LIST_JSON=$(printf '%s\n' "${ALL_DRIFT[@]}" | jq -R . | jq -s 'map(tonumber)' 2>/dev/null || echo "[]")
+fi
+
 # --------------------------------------------------------------------------
 # Step 4: 各 open issue の blocked/ready 分類（AC5）
 # --------------------------------------------------------------------------
@@ -182,7 +200,6 @@ while IFS= read -r issue_json; do
   fi
 
   # issue 本文から Depends On セクションのみを抽出して確認
-  # awk で ## Depends On セクション配下のみを抽出（セクション外の #NNN を誤検知しない）
   issue_body=$(gh api "repos/${REPO}/issues/${issue_num}" --jq '.body' 2>/dev/null || echo "")
   has_open_dep=false
   dep_reason=""
@@ -274,11 +291,50 @@ if [[ ${#NEXT_ACTIONS[@]} -eq 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# close_readiness 判定（AC8）
+# close_readiness 判定（B1: Python evaluate_close_readiness() を使用）
 # --------------------------------------------------------------------------
 CLOSE_JUDGMENT=false
-if [[ "$M_OPEN" -eq 0 && "$PR_MIXED_COUNT" -eq 0 ]]; then
-  CLOSE_JUDGMENT=true
+CLOSE_REASON=""
+
+if [[ "$ASSIGNMENT_READBACK_COMPLETE" != "true" ]]; then
+  CLOSE_JUDGMENT=false
+  CLOSE_REASON="assignment_readback_complete=false（#146 readback 取得失敗）"
+else
+  # Python report を取得して evaluate_close_readiness() で判定
+  PYTHON_REPORT_TMPFILE=$(mktemp --suffix=.json)
+  PYTHON_REPORT_OK=false
+
+  if uv run python3 scripts/milestone_rollup.py "${MILESTONE_NUMBER}" --format json \
+      --repo "${REPO}" 2>/dev/null > "$PYTHON_REPORT_TMPFILE"; then
+    PYTHON_REPORT_OK=true
+  fi
+
+  if [[ "$PYTHON_REPORT_OK" == "true" && -s "$PYTHON_REPORT_TMPFILE" ]]; then
+    EVAL_OUTPUT=$(uv run python3 - <<PYEOF 2>/dev/null
+import sys, json
+sys.path.insert(0, 'scripts')
+import milestone_rollup as mr
+with open('$PYTHON_REPORT_TMPFILE') as f:
+    r = json.load(f)
+ok, errs = mr.evaluate_close_readiness(r)
+print('true' if ok else 'false')
+for e in errs:
+    print(e)
+PYEOF
+    ) || true
+
+    CLOSE_JUDGMENT=$(echo "$EVAL_OUTPUT" | head -1)
+    CLOSE_REASON=$(echo "$EVAL_OUTPUT" | tail -n +2 | tr '\n' '; ')
+    if [[ -z "$CLOSE_JUDGMENT" ]]; then
+      CLOSE_JUDGMENT=false
+      CLOSE_REASON="evaluate_close_readiness() 呼び出し失敗"
+    fi
+  else
+    CLOSE_JUDGMENT=false
+    CLOSE_REASON="Python report 取得失敗"
+  fi
+
+  rm -f "$PYTHON_REPORT_TMPFILE"
 fi
 
 # --------------------------------------------------------------------------
@@ -329,7 +385,11 @@ else
 fi
 
 # expected / actual set の表示用
-EXPECTED_STR=$(printf '%s,' "${EXPECTED_SET[@]}" | sed 's/,$//')
+if [[ ${#EXPECTED_SET[@]} -gt 0 ]]; then
+  EXPECTED_STR=$(printf '%s,' "${EXPECTED_SET[@]}" | sed 's/,$//')
+else
+  EXPECTED_STR="(readback 失敗)"
+fi
 ACTUAL_STR=$(echo "$ACTUAL_SET" | tr ' ' ',' | sed 's/,$//')
 if [[ ${#IN_EXPECTED_NOT_ACTUAL[@]} -eq 0 ]]; then
   NOT_ACTUAL_STR="なし"
@@ -363,6 +423,7 @@ html_url: "${M_URL}"
 
 \`\`\`yaml
 # expected_set: #146 M-A3 Milestone Assignment Readback コメントより (readback: assignment_drift 参照)
+assignment_readback_complete: ${ASSIGNMENT_READBACK_COMPLETE}
 expected_set: [${EXPECTED_STR}]
 actual_set: [${ACTUAL_STR}]
 pr_mixed_count: ${PR_MIXED_COUNT}
@@ -370,6 +431,7 @@ assignment_drift:
   in_expected_not_actual: [${NOT_ACTUAL_STR}]
   in_actual_not_expected: [${NOT_EXPECTED_STR}]
 drift_status: ${DRIFT_STATUS}
+assignment_drift_list: ${DRIFT_LIST_JSON}
 \`\`\`
 
 ### ready_issues
@@ -393,16 +455,12 @@ $(echo -e "$HUMAN_ESC_LIST")
 \`\`\`yaml
 open_issues: ${M_OPEN}
 pr_mixed_count: ${PR_MIXED_COUNT}
-assignment_drift: ${DRIFT_STATUS}
-# 以下は descendant rollup（scripts/milestone_rollup.py）の確認が別途必要:
-# partial: <false required>
-# warnings: <[] required>
-# open_blocker_count: <0 required>
-# scope_conflict_count: <0 required>
+assignment_readback_complete: ${ASSIGNMENT_READBACK_COMPLETE}
+drift_status: ${DRIFT_STATUS}
+# close_judgment_available は scripts/milestone_rollup.py の evaluate_close_readiness() で判定
+# 判定条件: open_issues=0, pr_mixed_count=0, partial=false, warnings=[], open_blocker_count=0, scope_conflict_count=0
 close_judgment_available: ${CLOSE_JUDGMENT}
-# close_judgment_available: true は人間が close 判断可能な状態の直接チェック部分のみ確認済み
-# 完全な fail-closed close predicate（partial/warnings/open_blocker/scope_conflict）は
-# scripts/milestone_rollup.py の MILESTONE_DESCENDANT_ROLLUP_V1 report を別途確認すること
+close_reason: "${CLOSE_REASON}"
 # AI は Milestone close を実行しない（docs/dev/milestone-ops.md 参照）
 \`\`\`
 OUTPUT_EOF
