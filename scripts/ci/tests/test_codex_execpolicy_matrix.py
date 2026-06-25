@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -93,3 +94,30 @@ def test_given_cleanup_guard_stderr_when_reason_extracted_then_reason_code_is_re
         "[worktree_scope_guard] blocked: cleanup operation denied\nreason: cleanup_contract_present_but_invalid"
     )
     assert reason == "cleanup_contract_present_but_invalid"
+
+
+def test_given_npm_alias_platform_dir_when_selected_package_resolved_then_dir_name_drives_detection(tmp_path):
+    openai_dir = tmp_path / "node_modules" / "@openai"
+    umbrella_dir = openai_dir / "codex"
+    platform_dir = openai_dir / "codex-linux-x64"
+    umbrella_dir.mkdir(parents=True)
+    platform_dir.mkdir(parents=True)
+    (umbrella_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "@openai/codex",
+                "version": "0.142.0",
+                "optionalDependencies": {
+                    "@openai/codex-linux-x64": "npm:@openai/codex@0.142.0-linux-x64"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (platform_dir / "package.json").write_text(
+        json.dumps({"name": "@openai/codex", "version": "0.142.0-linux-x64"}),
+        encoding="utf-8",
+    )
+    selected_dir, selected_pkg = mod._find_selected_platform_package(umbrella_dir)
+    assert selected_dir == platform_dir
+    assert selected_pkg["version"] == "0.142.0-linux-x64"

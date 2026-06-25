@@ -349,17 +349,19 @@ def _find_selected_platform_package(umbrella_dir: Path) -> tuple[Path, dict[str,
     openai_dir = umbrella_dir.parent
     umbrella_pkg = json.loads((umbrella_dir / "package.json").read_text(encoding="utf-8"))
     optional_names = set((umbrella_pkg.get("optionalDependencies") or {}).keys())
+    optional_dirs = {name.split("/", 1)[1] for name in optional_names if "/" in name}
     candidates: list[tuple[Path, dict[str, Any]]] = []
     for pkg_json in openai_dir.glob("*/package.json"):
         data = json.loads(pkg_json.read_text(encoding="utf-8"))
-        name = data.get("name")
-        if name == "@openai/codex":
+        dir_name = pkg_json.parent.name
+        if dir_name == umbrella_dir.name:
             continue
-        if isinstance(name, str) and (name in optional_names or name.startswith("@openai/codex-")):
+        name = data.get("name")
+        if dir_name in optional_dirs or (isinstance(name, str) and name in optional_names):
             candidates.append((pkg_json.parent, data))
     if len(candidates) != 1:
         raise MatrixError(
-            f"expected exactly one selected platform package under {openai_dir}, found {[data.get('name') for _, data in candidates]}"
+            f"expected exactly one selected platform package under {openai_dir}, found {[path.name for path, _ in candidates]}"
         )
     return candidates[0]
 
@@ -372,7 +374,21 @@ def _bin_relpath_from_package_json(package_json: dict[str, Any]) -> str:
         value = bin_field.get("codex")
         if isinstance(value, str):
             return value
-    raise MatrixError(f"platform package is missing a codex bin entry: {package_json.get('name')}")
+    return ""
+
+
+def _resolve_native_executable(platform_dir: Path, package_json: dict[str, Any]) -> Path:
+    native_relpath = _bin_relpath_from_package_json(package_json)
+    if native_relpath:
+        candidate = (platform_dir / native_relpath).resolve()
+        if candidate.exists():
+            return candidate
+    for candidate in sorted(platform_dir.rglob("*")):
+        if not candidate.is_file():
+            continue
+        if candidate.name in {"codex", "codex.exe"}:
+            return candidate.resolve()
+    raise MatrixError(f"failed to resolve native executable under {platform_dir}")
 
 
 def gather_codex_provenance(codex_binary: Path, npm_prefix: Path | None) -> dict[str, Any]:
@@ -380,8 +396,7 @@ def gather_codex_provenance(codex_binary: Path, npm_prefix: Path | None) -> dict
     umbrella_dir = _find_package_root(binary_realpath, "@openai/codex")
     umbrella_pkg = json.loads((umbrella_dir / "package.json").read_text(encoding="utf-8"))
     platform_dir, platform_pkg = _find_selected_platform_package(umbrella_dir)
-    native_relpath = _bin_relpath_from_package_json(platform_pkg)
-    native_executable = (platform_dir / native_relpath).resolve()
+    native_executable = _resolve_native_executable(platform_dir, platform_pkg)
     npm_prefix_effective = npm_prefix or umbrella_dir.parents[2]
     npm_ls_run = run_command(["npm", "ls", "--json", "--all", "--prefix", str(npm_prefix_effective)])
     return {
@@ -395,6 +410,7 @@ def gather_codex_provenance(codex_binary: Path, npm_prefix: Path | None) -> dict
         "selected_platform_package": {
             "name": platform_pkg.get("name"),
             "version": platform_pkg.get("version"),
+            "alias_dir": platform_dir.name,
             "path": str(platform_dir),
         },
         "native_executable": {
