@@ -12,8 +12,6 @@ from pathlib import Path
 from typing import Any, Dict
 from unittest import mock
 
-import pytest
-
 
 def load_fixture(fixture_name: str) -> str:
     """Load fixture Issue body from fixtures/ directory"""
