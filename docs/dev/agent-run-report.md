@@ -306,8 +306,10 @@ If the budget is too small to hold `safety_header` + `priority_signals`, the CLI
 
 ### schema フィールド統合
 
-`agent-run-report.schema.json` への `entirecli_safety` フィールド追加は別 Issue（AC7 Stop Condition）。
-現時点では verdict 計算のみ提供し、report への埋め込みは呼び出し元が担う。
+`agent-run-report.schema.json` には `public_safety.entirecli_safety` の
+`EntireCLISafetyResult/v1` admission 契約を追加済みである。
+この統合は schema-admission のみを扱い、producer 接続・posting / retro index の fail-closed enforcement は後続 scope とする。
+現時点では verdict 計算と schema compile / fixture 検証のみを提供し、report への実際の埋め込み必須化は呼び出し元の follow-up scope が担う。
 
 ### Library Module
 
