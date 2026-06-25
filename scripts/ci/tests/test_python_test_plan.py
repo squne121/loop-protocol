@@ -65,11 +65,12 @@ def test_real_plan_scope_argv_carries_ignore_and_deselect_flags():
     assert "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py" in argv
 
 
-def test_real_plan_excludes_codex_dedicated_lane():
-    """tests/codex/ runs in its own codex execpolicy step, not the unified suite."""
+def test_real_plan_keeps_only_runtime_guard_in_dedicated_codex_lane():
+    """The dedicated codex lane keeps only the runtime guard test isolated."""
     plan = mod.load_plan(_PLAN_PATH)
     argv = mod.scope_argv(plan)
-    assert not any(a.startswith("tests/codex") for a in argv)
+    assert "tests/codex/test_execpolicy_matrix.py" in argv
+    assert "tests/codex/test_local_main_branch_guard.py" not in argv
 
 
 # --- run_argv modes ---
