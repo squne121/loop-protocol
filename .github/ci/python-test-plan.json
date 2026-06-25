@@ -38,6 +38,18 @@
   "parallel_exclude": [
     ".claude/hooks/tests/test_session_manifest_debounce.py"
   ],
+  "secondary_coverage": {
+    "plan_targets_provider_job": "python-test",
+    "dedicated_lanes": [
+      {
+        "provider_job": "python-test",
+        "lane_id": "codex-execpolicy",
+        "paths": [
+          "tests/codex/test_local_main_branch_guard.py"
+        ]
+      }
+    ]
+  },
   "notes": {
     "parallel_exclude_rationale": "Tests listed here are collected into the ci_test_selection scope (full coverage) but are excluded from the xdist parallel run and executed in a dedicated serial (-n 0) lane instead. test_session_manifest_debounce.py drives a real debounce front-gate with an 80ms window; under xdist CPU saturation the window expires between burst invocations and the coalescing assertion flakes (Issue #1064). It is tmp_path-isolated (not a shared-fixture/cwd race), so a serial lane restores determinism without changing the test.",
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",

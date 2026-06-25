@@ -218,3 +218,49 @@ def test_generate_artifact_uncovered_changed_test_returns_1(monkeypatch, tmp_pat
     assert gen.generate_artifact(args) == 1
     data = json.loads(out.read_text())
     assert data["uncovered_changed_test_files"] == ["pkg/test_uncovered.py"]
+
+
+def test_generate_artifact_plan_only_dedicated_lane_marks_codex_test_covered(monkeypatch, tmp_path):
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", lambda argv: (
+        ["pkg/test_a.py"], ["pkg/test_a.py::test_one"], {
+            "returncode": 0, "timed_out": False, "error": None,
+            "nodeid_count": 1, "stderr_tail": "", "ok": True,
+        }))
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        ["tests/codex/test_local_main_branch_guard.py"], [],
+        {"base_sha": b, "head_sha": h, "ok": True}))
+    monkeypatch.setattr(gen, "resolve_pytest_args", lambda args: ["pkg/"])
+
+    fake_plan = {
+        "targets": ["pkg/"],
+        "secondary_coverage": {
+            "plan_targets_provider_job": "python-test",
+            "dedicated_lanes": [
+                {
+                    "provider_job": "python-test",
+                    "lane_id": "codex-execpolicy",
+                    "paths": ["tests/codex/test_local_main_branch_guard.py"],
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        gen,
+        "_load_plan_module",
+        lambda: types.SimpleNamespace(
+            load_plan=lambda path: fake_plan,
+            scope_argv=lambda plan: ["pkg/"],
+        ),
+    )
+
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=None, plan=".github/ci/python-test-plan.json", pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    assert gen.generate_artifact(args) == 0
+    data = json.loads(out.read_text())
+    assert data["cross_job_covered_test_files"] == ["tests/codex/test_local_main_branch_guard.py"]
+    assert data["uncovered_changed_test_files"] == []
+    assert data["secondary_coverage_provider_job"] == "python-test"
