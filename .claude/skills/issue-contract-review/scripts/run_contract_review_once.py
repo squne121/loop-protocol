@@ -49,6 +49,13 @@ _CONTRACT_READINESS_CHECK_PY = _SCRIPTS_DIR / "contract_readiness_check.py"
 _BASELINE_VC_PREFLIGHT_PY = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 _CHECK_BLOCKERS_SH = _SCRIPTS_DIR / "check_blockers.sh"
 _CHECK_PRODUCT_SPEC_PY = _SCRIPTS_DIR / "check_product_spec_contract.py"
+_EVALUATE_PRODUCT_SPEC_GATE_PY = (
+    _SCRIPTS_DIR.parent.parent / "impl-review-loop" / "scripts"
+)
+if str(_EVALUATE_PRODUCT_SPEC_GATE_PY) not in sys.path:
+    sys.path.insert(0, str(_EVALUATE_PRODUCT_SPEC_GATE_PY))
+
+from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E402
 
 # VC_PREFLIGHT_TIMEOUT_SECS: baseline_vc_preflight may take up to 120s per VC
 _VC_PREFLIGHT_TIMEOUT = 180
@@ -375,8 +382,28 @@ def run_once(
         result["status"] = "runtime_error"
         return result
 
-    ps_applicability = product_spec_json.get("applicability", "not_applicable")
-    ps_decision = product_spec_json.get("decision", "pass")
+    if product_spec_rc not in (0, 1):
+        result["errors"].append(
+            f"product_spec_check_nonzero_exit: rc={product_spec_rc}"
+        )
+        result["status"] = "runtime_error"
+        return result
+
+    gate = evaluate_product_spec_payload(
+        product_spec_json,
+        issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+        body_sha256=product_spec_json.get("body_sha256") if isinstance(product_spec_json, dict) else None,
+        exit_code=product_spec_rc,
+    )
+    ps_applicability = gate.get("applicability")
+    ps_decision = gate.get("decision")
+
+    if gate.get("routing_action") == "refresh_contract_snapshot":
+        result["errors"].append(
+            f"product_spec_check_invalid_output: {gate.get('reason', 'unknown')}"
+        )
+        result["status"] = "runtime_error"
+        return result
 
     if ps_applicability == "applicable":
         if ps_decision == "fail":
