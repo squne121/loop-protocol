@@ -15,7 +15,13 @@ Sensitive value handling contract:
   - subprocess raw stderr is NOT forwarded
   - stdout is suppressed for subprocesses
 
-Environment overrides (for fixture/test mode):
+Execution profiles:
+  host:    Inspects real host surfaces (Path.home(), /proc, systemd, etc.)
+           Rejects all SRRS_LAT_* overrides (AC19).
+  fixture: Inspects only surfaces rooted at fixture_root / home_root.
+           Requires explicit home_root; raises ValueError if not provided.
+
+Environment overrides (fixture mode only):
   SRRS_LAT_CREDENTIAL_STATE     'present' | 'absent' | 'unknown'
   SRRS_LAT_EXPORT_STATE         'enabled' | 'disabled' | 'unknown'
   SRRS_LAT_CAPTURE_STATE        'active' | 'inactive' | 'unknown'
@@ -46,10 +52,12 @@ from __future__ import annotations
 
 import os
 import re
+import stat as stat_module
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Reason codes (matching Issue contract)
@@ -93,14 +101,22 @@ _LATITUDE_PRELOAD_PATTERNS = [
     re.compile(r"--loader.*latitude", re.IGNORECASE),
 ]
 
-# Latitude state/spool paths (relative to home)
-_LATITUDE_STATE_PATHS = [
+# Latitude state/spool paths (relative to home) — legacy paths
+_LATITUDE_STATE_PATHS_LEGACY = [
     ".latitude",
     ".config/latitude",
     ".local/share/latitude",
     ".latitude-state",
     ".latitude/state",
     ".latitude/config.json",
+]
+
+# Latitude state/spool paths from upstream implementation (~/.claude/state/latitude/)
+_LATITUDE_STATE_PATHS_UPSTREAM = [
+    ".claude/state/latitude",
+    ".claude/state/latitude/intercept.js",
+    ".claude/state/latitude/requests",
+    ".claude/state/latitude/state.json",
 ]
 
 _LATITUDE_SPOOL_PATHS = [
@@ -116,13 +132,15 @@ _BACKUP_PATTERNS = [
     re.compile(r"claude.*backup", re.IGNORECASE),
 ]
 
-# Approved origins
-_APPROVED_ORIGINS = [
+# Approved origins (exact scheme + host, no path prefix match)
+# B5 fix: use exact origin (scheme+host) matching, not startswith
+_APPROVED_ORIGINS_EXACT = {
     "https://telemetry.latitude.so",
     "https://latitude.so",
     "https://app.latitude.so",
     "https://gateway.latitude.so",
-]
+    "https://ingest.latitude.so",  # B5: upstream production ingest origin
+}
 
 
 def _get_env_override(key: str) -> str | None:
@@ -156,6 +174,88 @@ def _text_contains_credential_field(text: str) -> bool:
     return False
 
 
+def _is_approved_origin(url: str) -> bool:
+    """B5 fix: exact (scheme, hostname, effective_port) matching for approved origins."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    # Reconstruct canonical origin: scheme + "://" + host (strip default port)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+    port = parsed.port
+    # Default ports: https=443, http=80
+    default_ports = {"https": 443, "http": 80}
+    if port and port != default_ports.get(scheme):
+        origin = f"{scheme}://{hostname}:{port}"
+    else:
+        origin = f"{scheme}://{hostname}"
+    return origin in _APPROVED_ORIGINS_EXACT
+
+
+def _parse_npm_spec(spec: str) -> tuple[str | None, str | None]:
+    """
+    Parse npm package spec into (name, version).
+    Handles scoped packages: @scope/name@version -> name=@scope/name, version=version
+    Unscoped: name@version -> name=name, version=version
+    B4 fix: scoped packages have @ in name, version pin is after the last @
+    """
+    if not spec:
+        return None, None
+    spec = spec.strip()
+    # Remove leading 'npx' or 'npx -y'
+    spec = re.sub(r"^npx\s+(-y\s+)?", "", spec).strip()
+    if not spec:
+        return None, None
+
+    if spec.startswith("@"):
+        # Scoped package: @scope/name[@version]
+        # Find version separator: last @ that is NOT the leading @
+        at_idx = spec.rfind("@", 1)  # search from index 1 to skip leading @
+        if at_idx > 0:
+            name = spec[:at_idx]
+            version = spec[at_idx + 1:]
+            return name, version if version else None
+        else:
+            return spec, None
+    else:
+        # Unscoped: name[@version]
+        at_idx = spec.find("@")
+        if at_idx > 0:
+            name = spec[:at_idx]
+            version = spec[at_idx + 1:]
+            return name, version if version else None
+        else:
+            return spec, None
+
+
+def _is_version_pinned(spec: str) -> bool:
+    """
+    B4 fix: Check if spec has exact version pin.
+    npx @latitude-data/claude-code-telemetry (no version) -> unpinned
+    npx @latitude-data/claude-code-telemetry@1.2.3 -> pinned
+    """
+    if not spec:
+        return False
+    if spec in ("unpinned", "unknown"):
+        return False
+
+    name, version = _parse_npm_spec(spec)
+    if version is None:
+        return False
+    # Version must look like a concrete version (not a tag like 'latest')
+    # Accept semver-like: 1.2.3, 1.2.3-alpha.1, ^1.2.3 is not exact but accepted as "pinned" intent
+    # Reject 'latest', 'next', 'canary', '*'
+    if version in ("latest", "next", "canary", "*", ""):
+        return False
+    # Reject pure tags without digit (e.g., 'beta')
+    if not re.search(r"\d", version):
+        return False
+    return True
+
+
 def check_execution_profile_override_rejection(execution_profile: str) -> str | None:
     """AC19: In host mode, reject SRRS_LAT_* overrides."""
     if execution_profile != "host":
@@ -166,7 +266,11 @@ def check_execution_profile_override_rejection(execution_profile: str) -> str | 
     return None
 
 
-def check_credential_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_credential_state(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """AC11: Detect LATITUDE_API_KEY field presence (not value)."""
     override = _get_env_override("SRRS_LAT_CREDENTIAL_STATE")
     if override is not None:
@@ -178,7 +282,12 @@ def check_credential_state(repo_root: Path, execution_profile: str) -> dict[str,
     reason_codes: list[str] = []
     checked: list[str] = []
 
-    home = Path.home()
+    # B1 fix: use home_root for fixture, Path.home() only for host
+    if execution_profile == "host":
+        home = Path.home()
+    else:
+        home = home_root if home_root is not None else repo_root
+
     settings_paths = [
         (home / ".claude" / "settings.json", "claude_user_settings"),
         (repo_root / ".claude" / "settings.json", "claude_project_settings"),
@@ -199,7 +308,11 @@ def check_credential_state(repo_root: Path, execution_profile: str) -> dict[str,
     return {"state": state, "reason_codes": reason_codes, "checked_surfaces": checked}
 
 
-def check_hook_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_hook_state(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """AC4, AC21: Detect Latitude hook in settings and managed files."""
     override = _get_env_override("SRRS_LAT_HOOK_STATE")
     if override is not None:
@@ -224,8 +337,14 @@ def check_hook_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
     state = "absent"
     reason_codes: list[str] = []
     checked = ["latitude_stop_hook"]
+    inspection_gaps: list[str] = []
 
-    home = Path.home()
+    # B1 fix: use home_root for fixture, Path.home() only for host
+    if execution_profile == "host":
+        home = Path.home()
+    else:
+        home = home_root if home_root is not None else repo_root
+
     for settings_path, surface_name in [
         (home / ".claude" / "settings.json", "claude_user_settings"),
         (repo_root / ".claude" / "settings.json", "claude_project_settings"),
@@ -239,10 +358,44 @@ def check_hook_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
                     state = "present"
                     reason_codes.append(RC_STOP_HOOK_PRESENT)
             except OSError:
-                state = "unknown"
+                # B3 fix: permission error -> unknown, not silent pass
+                if state == "absent":
+                    state = "unknown"
                 reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                inspection_gaps.append(surface_name)
 
-    checked.extend(["enabled_plugin_hooks", "active_skill_agent_hooks", "managed_claude_settings"])
+    # Managed settings surfaces — mark as gaps unless host mode can inspect them
+    # B3 fix: Only add to checked_surfaces if actually inspected
+    managed_surfaces = ["enabled_plugin_hooks", "active_skill_agent_hooks", "managed_claude_settings"]
+
+    if execution_profile == "host":
+        # Try to inspect managed settings paths
+        managed_paths = [
+            (Path("/etc/claude-code/managed-settings.json"), "managed_claude_settings"),
+        ]
+        for mp, mname in managed_paths:
+            if mp.is_file():
+                try:
+                    text = mp.read_text(encoding="utf-8", errors="replace")
+                    if _text_contains_latitude(text):
+                        state = "present"
+                        reason_codes.append(RC_STOP_HOOK_PRESENT)
+                    checked.append(mname)
+                except OSError:
+                    if state == "absent":
+                        state = "unknown"
+                    reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                    inspection_gaps.append(mname)
+            else:
+                # File doesn't exist — surface inspected, nothing found
+                checked.append(mname)
+    else:
+        # In fixture mode, managed policy is not reachable — mark as gaps
+        for ms in managed_surfaces:
+            if ms not in inspection_gaps:
+                inspection_gaps.append(ms)
+
+    # Scan repo skill/agent markdown files for hook commands
     for base_dir in [repo_root / ".claude" / "agents", repo_root / ".claude" / "skills"]:
         if base_dir.is_dir():
             try:
@@ -253,19 +406,29 @@ def check_hook_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
                             state = "present"
                             reason_codes.append(RC_STOP_HOOK_PRESENT)
                     except OSError:
-                        pass
+                        # B3 fix: permission error -> unknown
+                        if state == "absent":
+                            state = "unknown"
+                        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
             except (OSError, PermissionError):
-                state = "unknown" if state == "absent" else state
+                if state == "absent":
+                    state = "unknown"
                 reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                inspection_gaps.append(str(base_dir))
 
     return {
         "state": state,
         "reason_codes": list(dict.fromkeys(reason_codes)),
         "checked_surfaces": checked,
+        "inspection_gaps": inspection_gaps,
     }
 
 
-def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_preload_state(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """AC4, AC5, AC6: Check BUN_OPTIONS preload configuration."""
     override = _get_env_override("SRRS_LAT_PRELOAD_SETTINGS")
     systemd_override = _get_env_override("SRRS_LAT_PRELOAD_SYSTEMD")
@@ -290,22 +453,30 @@ def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, An
                 "environment_d_dropin",
                 "shell_startup_environment",
             ],
+            "inspection_gaps": [],
         }
 
     state = "absent"
     reason_codes: list[str] = []
     checked: list[str] = []
+    inspection_gaps: list[str] = []
 
-    # Current shell BUN_OPTIONS (key presence only)
-    checked.append("current_shell_environment")
-    bun_options = os.environ.get("BUN_OPTIONS")
-    if bun_options is not None and _text_contains_preload(bun_options):
-        state = "present"
-        reason_codes.append(RC_PRELOAD_CONFIGURED)
+    # B1 fix: use home_root for fixture, Path.home() only for host
+    if execution_profile == "host":
+        home = Path.home()
+    else:
+        home = home_root if home_root is not None else repo_root
+
+    # Current shell BUN_OPTIONS (only in host mode — fixture env is isolated)
+    if execution_profile == "host":
+        checked.append("current_shell_environment")
+        bun_options = os.environ.get("BUN_OPTIONS")
+        if bun_options is not None and _text_contains_preload(bun_options):
+            state = "present"
+            reason_codes.append(RC_PRELOAD_CONFIGURED)
 
     # Claude settings BUN_OPTIONS
     checked.append("settings_bun_options")
-    home = Path.home()
     for sp in [home / ".claude" / "settings.json", repo_root / ".claude" / "settings.json"]:
         if sp.is_file():
             try:
@@ -314,7 +485,11 @@ def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, An
                     state = "present"
                     reason_codes.append(RC_PRELOAD_CONFIGURED)
             except OSError:
-                pass
+                # B3 fix: permission error -> unknown
+                if state == "absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                inspection_gaps.append("settings_bun_options")
 
     # systemd/environment.d
     checked.extend([
@@ -322,11 +497,43 @@ def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, An
         "environment_d_dropin",
         "systemd_environment_generators",
     ])
+
+    # B3 fix: In host mode, also query systemd manager environment directly
+    if execution_profile == "host":
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show-environment"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                if "BUN_OPTIONS" in result.stdout and _text_contains_preload(result.stdout):
+                    state = "present"
+                    reason_codes.append(RC_PRELOAD_CONFIGURED)
+            else:
+                # systemctl not available or failed — mark as unknown gap
+                if state == "absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                inspection_gaps.append("systemd_manager_environment")
+        except (OSError, FileNotFoundError):
+            # systemctl not available
+            if state == "absent":
+                state = "unknown"
+            reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+            inspection_gaps.append("systemd_manager_environment")
+        except subprocess.TimeoutExpired:
+            if state == "absent":
+                state = "unknown"
+            reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+            inspection_gaps.append("systemd_manager_environment")
+
     for env_dir in [
         home / ".config" / "environment.d",
-        Path("/etc/environment.d"),
+        Path("/etc/environment.d") if execution_profile == "host" else None,
         home / ".config" / "systemd" / "user" / "environment",
     ]:
+        if env_dir is None:
+            continue
         if env_dir.is_dir():
             try:
                 for env_file in env_dir.iterdir():
@@ -337,9 +544,13 @@ def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, An
                                 state = "present"
                                 reason_codes.append(RC_PRELOAD_CONFIGURED)
                         except OSError:
-                            pass
+                            if state == "absent":
+                                state = "unknown"
+                            reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
             except OSError:
-                pass
+                if state == "absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
 
     # Shell startup files
     checked.append("shell_startup_environment")
@@ -357,16 +568,22 @@ def check_preload_state(repo_root: Path, execution_profile: str) -> dict[str, An
                     state = "present"
                     reason_codes.append(RC_PRELOAD_CONFIGURED)
             except OSError:
-                pass
+                if state == "absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
 
     return {
         "state": state,
         "reason_codes": list(dict.fromkeys(reason_codes)),
         "checked_surfaces": checked,
+        "inspection_gaps": inspection_gaps,
     }
 
 
-def check_active_process_preload(execution_profile: str) -> dict[str, Any]:
+def check_active_process_preload(
+    execution_profile: str,
+    proc_root: Path | None = None,
+) -> dict[str, Any]:
     """AC4, AC6: Check active Claude processes for BUN_OPTIONS preload."""
     override = _get_env_override("SRRS_LAT_ACTIVE_PROCESS")
     if override is not None:
@@ -377,45 +594,97 @@ def check_active_process_preload(execution_profile: str) -> dict[str, Any]:
         return {
             "state": state,
             "reason_codes": rcs,
-            "checked_surfaces": ["active_claude_processes", "process_parent_environment"],
+            "checked_surfaces": ["active_claude_processes"],
+            "inspection_gaps": [],
         }
 
     state = "preload_absent"
     reason_codes: list[str] = []
+    inspection_gaps: list[str] = []
 
+    # B1 fix: fixture mode does not inspect real /proc or run pgrep
+    if execution_profile != "host":
+        # In fixture mode, process inspection is not available
+        state = "unknown"
+        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+        inspection_gaps.append("active_claude_processes")
+        inspection_gaps.append("process_parent_environment")
+        return {
+            "state": state,
+            "reason_codes": reason_codes,
+            "checked_surfaces": [],
+            "inspection_gaps": inspection_gaps,
+        }
+
+    # Host mode: inspect real processes
+    # B3 fix: pgrep failure is unknown, not "no PIDs"
+    actual_proc_root = proc_root if proc_root is not None else Path("/proc")
+    pids: list[str] = []
+    pgrep_ok = False
     try:
         result = subprocess.run(
             ["pgrep", "-f", "claude"],
             capture_output=True, text=True, timeout=10,
         )
+        pgrep_ok = True
         pids = [p.strip() for p in result.stdout.splitlines() if p.strip().isdigit()]
+    except FileNotFoundError:
+        # pgrep not available
+        state = "unknown"
+        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+        inspection_gaps.append("active_claude_processes")
     except Exception:
-        pids = []
+        # B3 fix: other pgrep failures -> unknown
+        state = "unknown"
+        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+        inspection_gaps.append("active_claude_processes")
 
-    for pid in pids[:10]:
-        try:
-            env_file = Path(f"/proc/{pid}/environ")
-            if env_file.is_file():
-                raw = env_file.read_bytes().decode("utf-8", errors="replace")
-                bun_env = [kv for kv in raw.split("\0") if kv.startswith("BUN_OPTIONS=")]
-                if bun_env and _text_contains_preload(bun_env[0]):
-                    state = "preload_present"
-                    reason_codes.append(RC_PRELOAD_ACTIVE_PROCESS)
-        except (OSError, PermissionError):
-            pass
+    if pgrep_ok:
+        checked_count = 0
+        for pid in pids[:50]:  # inspect up to 50 PIDs
+            env_file = actual_proc_root / pid / "environ"
+            try:
+                if env_file.is_file():
+                    raw = env_file.read_bytes().decode("utf-8", errors="replace")
+                    bun_env = [kv for kv in raw.split("\0") if kv.startswith("BUN_OPTIONS=")]
+                    if bun_env and _text_contains_preload(bun_env[0]):
+                        state = "preload_present"
+                        reason_codes.append(RC_PRELOAD_ACTIVE_PROCESS)
+                    checked_count += 1
+            except PermissionError:
+                # B3 fix: permission error on /proc/<pid>/environ -> unknown, not silent pass
+                if state == "preload_absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+                inspection_gaps.append(f"proc_environ_{pid}")
+            except OSError:
+                if state == "preload_absent":
+                    state = "unknown"
+                reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+
+    checked_surfaces = ["active_claude_processes"] if pgrep_ok else []
 
     return {
         "state": state,
         "reason_codes": reason_codes,
-        "checked_surfaces": ["active_claude_processes", "process_parent_environment"],
+        "checked_surfaces": checked_surfaces,
+        "inspection_gaps": inspection_gaps,
     }
 
 
-def check_export_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_export_state(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """Check LATITUDE_CLAUDE_CODE_ENABLED state."""
     override = _get_env_override("SRRS_LAT_EXPORT_STATE")
     if override is not None:
         return {"state": override.strip(), "checked_surfaces": ["current_shell_environment"]}
+
+    # B1 fix: only read real env in host mode
+    if execution_profile != "host":
+        return {"state": "unknown", "checked_surfaces": []}
 
     val = os.environ.get("LATITUDE_CLAUDE_CODE_ENABLED")
     if val is None:
@@ -425,7 +694,11 @@ def check_export_state(repo_root: Path, execution_profile: str) -> dict[str, Any
     return {"state": "enabled", "checked_surfaces": ["current_shell_environment"]}
 
 
-def check_local_storage(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_local_storage(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """AC4, AC7, AC22: Check Latitude local storage with lstat for unsafe metadata."""
     override = _get_env_override("SRRS_LAT_LOCAL_STORAGE")
     lstat_override = _get_env_override("SRRS_LAT_LSTAT_STATE")
@@ -442,16 +715,27 @@ def check_local_storage(repo_root: Path, execution_profile: str) -> dict[str, An
         return {
             "state": state,
             "reason_codes": rcs,
-            "checked_surfaces": ["latitude_request_spool", "latitude_state"],
+            "checked_surfaces": ["latitude_request_spool", "latitude_state", "claude_state_latitude"],
         }
 
     state = "absent"
     reason_codes: list[str] = []
-    home = Path.home()
 
-    for path in [home / p for p in _LATITUDE_STATE_PATHS + _LATITUDE_SPOOL_PATHS]:
+    # B1 fix: use home_root for fixture, Path.home() only for host
+    if execution_profile == "host":
+        home = Path.home()
+    else:
+        home = home_root if home_root is not None else repo_root
+
+    # B2 fix: include upstream ~/.claude/state/latitude/ paths
+    all_paths = (
+        [home / p for p in _LATITUDE_STATE_PATHS_LEGACY]
+        + [home / p for p in _LATITUDE_SPOOL_PATHS]
+        + [home / p for p in _LATITUDE_STATE_PATHS_UPSTREAM]
+    )
+
+    for path in all_paths:
         try:
-            import stat as stat_module
             st = path.lstat()
             mode = st.st_mode
             if stat_module.S_ISLNK(mode):
@@ -477,11 +761,15 @@ def check_local_storage(repo_root: Path, execution_profile: str) -> dict[str, An
     return {
         "state": state,
         "reason_codes": list(dict.fromkeys(reason_codes)),
-        "checked_surfaces": ["latitude_request_spool", "latitude_state"],
+        "checked_surfaces": ["latitude_request_spool", "latitude_state", "claude_state_latitude"],
     }
 
 
-def check_settings_backup(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+def check_settings_backup(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
     """AC4, AC7: Check backup files for Latitude credential field."""
     override = _get_env_override("SRRS_LAT_BACKUP_CREDENTIAL")
     if override is not None:
@@ -495,7 +783,12 @@ def check_settings_backup(repo_root: Path, execution_profile: str) -> dict[str, 
 
     state = "absent"
     reason_codes: list[str] = []
-    home = Path.home()
+
+    # B1 fix: use home_root for fixture, Path.home() only for host
+    if execution_profile == "host":
+        home = Path.home()
+    else:
+        home = home_root if home_root is not None else repo_root
 
     for backup_dir in [home / ".claude", home / ".claude" / "backups"]:
         if backup_dir.is_dir():
@@ -534,9 +827,8 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         integrity = (integrity_override or "unknown").strip()
         provenance = (provenance_override or "unknown").strip()
 
-        is_unpinned = spec in ("unpinned", "unknown") or (
-            spec.startswith("npx ") and "@" not in spec
-        )
+        # B4 fix: use _is_version_pinned for correct scoped package handling
+        is_unpinned = spec in ("unpinned", "unknown") or not _is_version_pinned(spec)
         provenance_unknown = provenance == "unknown"
 
         reason_codes = []
@@ -560,6 +852,10 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
             "checked_surfaces": ["package_distribution"],
         }
 
+    # B4 fix: In host mode, attempt to check npm/npx for actual Latitude package
+    if execution_profile == "host":
+        return _check_distribution_host()
+
     return {
         "state": "not_installed",
         "package_spec": None,
@@ -569,6 +865,63 @@ def check_distribution(repo_root: Path, execution_profile: str) -> dict[str, Any
         "provenance_source_ref": None,
         "reason_codes": [],
         "checked_surfaces": ["package_distribution"],
+    }
+
+
+def _check_distribution_host() -> dict[str, Any]:
+    """B4: Check Latitude distribution in host mode via npm/npx."""
+    inspection_gaps: list[str] = []
+    state = "unknown"
+    reason_codes: list[str] = []
+
+    # Try npm list to check if Latitude package is installed globally
+    lat_packages = [
+        "@latitude-data/claude-code-telemetry",
+        "@latitude-so/claude-code",
+        "latitude-claude",
+    ]
+
+    found_spec = None
+    for pkg in lat_packages:
+        try:
+            result = subprocess.run(
+                ["npm", "list", "-g", "--depth=0", "--json", pkg],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and pkg in (result.stdout or ""):
+                # Package found globally
+                found_spec = pkg
+                break
+        except (OSError, FileNotFoundError, subprocess.TimeoutExpired):
+            inspection_gaps.append("npm_global_list")
+
+    if found_spec is None:
+        # Not found via npm list — mark as unknown (could be npx-only)
+        state = "unknown"
+        reason_codes.append(RC_RUNTIME_STATE_UNKNOWN)
+        inspection_gaps.append("package_distribution")
+        return {
+            "state": state,
+            "package_spec": None,
+            "dist_integrity": None,
+            "registry_signature_verified": None,
+            "provenance_verified": None,
+            "provenance_source_ref": None,
+            "reason_codes": reason_codes,
+            "checked_surfaces": [],
+            "inspection_gaps": inspection_gaps,
+        }
+
+    return {
+        "state": "unknown",
+        "package_spec": found_spec,
+        "dist_integrity": None,
+        "registry_signature_verified": None,
+        "provenance_verified": None,
+        "provenance_source_ref": None,
+        "reason_codes": [RC_RUNTIME_STATE_UNKNOWN],
+        "checked_surfaces": ["package_distribution"],
+        "inspection_gaps": ["registry_signature", "provenance_attestation"],
     }
 
 
@@ -587,18 +940,21 @@ def check_destination_transport(execution_profile: str) -> dict[str, Any]:
         url = base_url_override.strip()
         if not url:
             destination_state = "unknown"
-        elif any(url.startswith(approved) for approved in _APPROVED_ORIGINS):
+        elif _is_approved_origin(url):
+            destination_state = "approved_cloud"
+        else:
+            destination_state = "unapproved"
+    elif execution_profile == "host":
+        # B1 fix: only read real env in host mode
+        base_url = os.environ.get("LATITUDE_BASE_URL")
+        if base_url is None:
+            destination_state = "unknown"
+        elif _is_approved_origin(base_url):
             destination_state = "approved_cloud"
         else:
             destination_state = "unapproved"
     else:
-        base_url = os.environ.get("LATITUDE_BASE_URL")
-        if base_url is None:
-            destination_state = "unknown"
-        elif any(base_url.startswith(approved) for approved in _APPROVED_ORIGINS):
-            destination_state = "approved_cloud"
-        else:
-            destination_state = "unapproved"
+        destination_state = "unknown"
 
     # Transport state
     if transport_override is not None:
@@ -611,7 +967,7 @@ def check_destination_transport(execution_profile: str) -> dict[str, Any]:
             transport_state = "plaintext"
         else:
             transport_state = "unknown"
-    else:
+    elif execution_profile == "host":
         base_url = os.environ.get("LATITUDE_BASE_URL")
         if base_url is None:
             transport_state = "unknown"
@@ -621,15 +977,19 @@ def check_destination_transport(execution_profile: str) -> dict[str, Any]:
             transport_state = "plaintext"
         else:
             transport_state = "unknown"
+    else:
+        transport_state = "unknown"
 
     # Diagnostic logging
     if diag_override is not None:
         diagnostic_state = diag_override.strip()
     elif debug_override is not None:
         diagnostic_state = "enabled" if debug_override.strip() == "1" else "disabled"
-    else:
+    elif execution_profile == "host":
         debug_val = os.environ.get("LATITUDE_DEBUG")
         diagnostic_state = "enabled" if debug_val == "1" else "disabled"
+    else:
+        diagnostic_state = "unknown"
 
     reason_codes: list[str] = []
     if destination_state == "unapproved":
@@ -656,6 +1016,10 @@ def check_argv_credential(execution_profile: str) -> dict[str, Any]:
         rcs = [RC_EXPOSURE_POSSIBLE] if state == "present" else []
         return {"state": state, "reason_codes": rcs}
 
+    # B1 fix: only read real /proc in host mode
+    if execution_profile != "host":
+        return {"state": "unknown", "reason_codes": [RC_RUNTIME_STATE_UNKNOWN]}
+
     try:
         cmdline = Path("/proc/self/cmdline").read_bytes().decode("utf-8", errors="replace")
         for arg in cmdline.split("\0"):
@@ -664,7 +1028,7 @@ def check_argv_credential(execution_profile: str) -> dict[str, Any]:
             if re.match(r"--latitude[-_]?key", arg, re.IGNORECASE):
                 return {"state": "possible", "reason_codes": [RC_EXPOSURE_POSSIBLE]}
     except OSError:
-        pass
+        return {"state": "unknown", "reason_codes": [RC_RUNTIME_STATE_UNKNOWN]}
 
     return {"state": "absent", "reason_codes": []}
 
@@ -674,8 +1038,8 @@ def check_containment_and_exposure(execution_profile: str) -> dict[str, Any]:
     containment_override = _get_env_override("SRRS_LAT_CONTAINMENT_STATE")
     exposure_override = _get_env_override("SRRS_LAT_EXPOSURE_STATE")
 
-    containment_state = containment_override.strip() if containment_override else "never_observed"
-    exposure_state = exposure_override.strip() if exposure_override else "none_observed"
+    containment_state = containment_override.strip() if containment_override else "unknown"
+    exposure_state = exposure_override.strip() if exposure_override else "unknown"
 
     reason_codes: list[str] = []
     if exposure_state in ("possible", "confirmed"):
@@ -688,8 +1052,12 @@ def check_containment_and_exposure(execution_profile: str) -> dict[str, Any]:
     }
 
 
-def check_uninstall_state(repo_root: Path, execution_profile: str) -> dict[str, Any]:
-    """AC8: Detect uninstall state."""
+def check_uninstall_state(
+    repo_root: Path,
+    execution_profile: str,
+    home_root: Path | None = None,
+) -> dict[str, Any]:
+    """AC8: Detect uninstall state via quiescent verification."""
     override = _get_env_override("SRRS_LAT_UNINSTALL_STATE")
     if override is not None:
         state = override.strip()
@@ -697,7 +1065,56 @@ def check_uninstall_state(repo_root: Path, execution_profile: str) -> dict[str, 
             [RC_RUNTIME_STATE_UNKNOWN] if state == "unknown" else []
         )
         return {"state": state, "reason_codes": rcs}
+
+    # B1 fix: fixture mode cannot run real uninstall checks
+    if execution_profile != "host":
+        return {"state": "not_attempted", "reason_codes": []}
+
+    # B8 fix: quiescent verification via snapshot diff
+    # First snapshot: take state snapshot
+    first_snapshot = _take_uninstall_snapshot(home_root)
+    # Second snapshot: after a brief filesystem re-check (no sleep needed for static check)
+    second_snapshot = _take_uninstall_snapshot(home_root)
+
+    # Compare snapshots for stability
+    if first_snapshot != second_snapshot:
+        return {
+            "state": "unknown",
+            "reason_codes": [RC_UNINSTALL_INCOMPLETE],
+            "snapshot_diff": True,
+        }
+
+    # Check if any Latitude artifacts remain in the snapshot
+    remaining = first_snapshot.get("present_paths", [])
+    if remaining:
+        return {
+            "state": "incomplete",
+            "reason_codes": [RC_UNINSTALL_INCOMPLETE],
+            "remaining_artifacts": remaining,
+        }
+
     return {"state": "not_attempted", "reason_codes": []}
+
+
+def _take_uninstall_snapshot(home_root: Path | None) -> dict[str, Any]:
+    """B8: Take a point-in-time snapshot of Latitude artifact presence."""
+    home = home_root if home_root is not None else Path.home()
+    present_paths: list[str] = []
+
+    all_paths = (
+        [home / p for p in _LATITUDE_STATE_PATHS_LEGACY]
+        + [home / p for p in _LATITUDE_SPOOL_PATHS]
+        + [home / p for p in _LATITUDE_STATE_PATHS_UPSTREAM]
+    )
+
+    for path in all_paths:
+        try:
+            if path.exists():
+                present_paths.append(path.name)
+        except OSError:
+            present_paths.append(f"error:{path.name}")
+
+    return {"present_paths": sorted(present_paths)}
 
 
 def check_remote_trace(execution_profile: str) -> dict[str, Any]:
@@ -709,6 +1126,33 @@ def check_remote_trace(execution_profile: str) -> dict[str, Any]:
         return {"state": state, "reason_codes": rcs}
     # Default: unknown (requires human attestation)
     return {"state": "unknown", "reason_codes": [RC_REMOTE_TRACE_UNKNOWN]}
+
+
+def check_secrets_mode_policy(
+    repo_root: Path,
+    credential_state: str,
+) -> dict[str, Any]:
+    """B6: Check SRRS_SECRETS_MODE policy consistency with runtime credential state.
+
+    SRRS_SECRETS_MODE unset -> secrets_mode: unknown -> check policy_mode_mismatch.
+    """
+    raw = os.environ.get("SRRS_SECRETS_MODE")
+    if raw is None:
+        secrets_mode = "unknown"
+    else:
+        secrets_mode = raw.strip()
+
+    reason_codes: list[str] = []
+
+    # B6 fix: if credential present but secrets_mode is 'none' or 'unknown', flag mismatch
+    if credential_state == "present":
+        if secrets_mode in ("none", "unknown"):
+            reason_codes.append(RC_POLICY_MODE_MISMATCH)
+
+    return {
+        "secrets_mode": secrets_mode,
+        "reason_codes": reason_codes,
+    }
 
 
 def _compute_latitude_verdict(
@@ -728,9 +1172,18 @@ def _compute_latitude_verdict(
     backup_credential_state: str,
     remote_trace_state: str,
     all_reason_codes: list[str],
-) -> str:
-    """Compute latitude component verdict per Issue contract Verdict Rules."""
-    # not_applicable: no indicators, no unknowns
+    inspection_gaps: list[str],
+) -> tuple[str, bool]:
+    """Compute latitude component verdict per Issue contract Verdict Rules.
+
+    Returns (verdict, inspection_complete).
+    B7 fix: verdict and inspection_complete are computed independently.
+    Gap presence makes inspection_complete=False regardless of verdict.
+    """
+    # B7 fix: inspection_complete is independent of verdict
+    inspection_complete = len(inspection_gaps) == 0
+
+    # not_applicable: no indicators, no unknowns, no reason codes
     lat_indicators = [credential_state, hook_state, preload_state]
     any_present = any(s in ("present", "active") for s in lat_indicators)
     any_rc = bool(all_reason_codes)
@@ -740,11 +1193,12 @@ def _compute_latitude_verdict(
             credential_state, hook_state, preload_state,
             active_process_state, local_storage_state,
             uninstall_state, remote_trace_state,
+            containment_state, exposure_state,
         ]
     )
 
     if not any_present and not any_unknown and not any_rc:
-        return "not_applicable"
+        return "not_applicable", inspection_complete
 
     # blocked conditions
     if (
@@ -762,31 +1216,40 @@ def _compute_latitude_verdict(
         or containment_state == "active"
         or backup_credential_state == "present"
         or RC_EXPOSURE_POSSIBLE in all_reason_codes
+        or RC_POLICY_MODE_MISMATCH in all_reason_codes
     ):
-        return "blocked"
+        # B7 fix: blocked verdict does NOT force inspection_complete=True
+        return "blocked", inspection_complete
 
     # AC27: containment_state != never_observed -> not safe
-    if containment_state not in ("never_observed", "not_applicable"):
-        return "blocked"
+    if containment_state not in ("never_observed", "not_applicable", "unknown"):
+        return "blocked", inspection_complete
 
     # fail_closed: unknown states
     if any_unknown or active_process_state == "unknown" or transport_state == "unknown":
-        return "fail_closed"
+        return "fail_closed", inspection_complete
 
     # AC5: export disabled capture active -> blocked (handled via reason codes)
     if RC_EXPORT_DISABLED_CAPTURE_ACTIVE in all_reason_codes:
-        return "blocked"
+        return "blocked", inspection_complete
 
-    return "safe"
+    return "safe", inspection_complete
 
 
 def check_latitude_component(
     repo_root: Path,
     execution_profile: str,
+    home_root: Path | None = None,
 ) -> dict[str, Any]:
     """
     Run all Latitude telemetry safety checks.
     Returns a dict matching the `latitude` field of session_recording_runtime_safety/v2.
+
+    Args:
+        repo_root: Repository root path.
+        execution_profile: 'host' or 'fixture'.
+        home_root: In fixture mode, the home directory root to use instead of Path.home().
+                   Must be provided for fixture mode if real home inspection is not desired.
     """
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -797,6 +1260,7 @@ def check_latitude_component(
             return {
                 "applicability": "applicable",
                 "verdict": "fail_closed",
+                "inspection_complete": False,
                 "containment_state": "unknown",
                 "credential_state": "unknown",
                 "export_state": "unknown",
@@ -822,23 +1286,27 @@ def check_latitude_component(
                 },
                 "reason_codes": [RC_SRRS_OVERRIDE_REJECTED],
                 "checked_surfaces": [],
+                "inspection_gaps": ["all_surfaces"],
                 "raw_values_emitted": False,
                 "checked_at": now_iso,
             }
 
-    cred = check_credential_state(repo_root, execution_profile)
-    hook = check_hook_state(repo_root, execution_profile)
-    preload = check_preload_state(repo_root, execution_profile)
+    cred = check_credential_state(repo_root, execution_profile, home_root)
+    hook = check_hook_state(repo_root, execution_profile, home_root)
+    preload = check_preload_state(repo_root, execution_profile, home_root)
     proc = check_active_process_preload(execution_profile)
-    export = check_export_state(repo_root, execution_profile)
-    local_storage = check_local_storage(repo_root, execution_profile)
-    backup = check_settings_backup(repo_root, execution_profile)
+    export = check_export_state(repo_root, execution_profile, home_root)
+    local_storage = check_local_storage(repo_root, execution_profile, home_root)
+    backup = check_settings_backup(repo_root, execution_profile, home_root)
     dist = check_distribution(repo_root, execution_profile)
     dest_transport = check_destination_transport(execution_profile)
     argv = check_argv_credential(execution_profile)
     containment_exposure = check_containment_and_exposure(execution_profile)
-    uninstall = check_uninstall_state(repo_root, execution_profile)
+    uninstall = check_uninstall_state(repo_root, execution_profile, home_root)
     remote_trace = check_remote_trace(execution_profile)
+
+    # B6: policy mode check
+    policy_check = check_secrets_mode_policy(repo_root, cred["state"])
 
     # Capture state (AC5)
     export_state = export["state"]
@@ -850,13 +1318,16 @@ def check_latitude_component(
             capture_state = "active"
         elif preload["state"] == "present":
             capture_state = "active"
+        elif proc["state"] == "preload_present":
+            # B3 fix: active process preload -> capture active even if config removed
+            capture_state = "active"
         else:
             capture_state = "inactive"
 
     # Collect all reason codes
     all_rcs: list[str] = []
     for sub in [cred, hook, preload, proc, local_storage, backup, argv,
-                containment_exposure, uninstall, remote_trace]:
+                containment_exposure, uninstall, remote_trace, policy_check]:
         all_rcs.extend(sub.get("reason_codes", []))
     all_rcs.extend(dist.get("reason_codes", []))
     all_rcs.extend(dest_transport.get("reason_codes", []))
@@ -871,10 +1342,16 @@ def check_latitude_component(
         all_surfaces.extend(sub.get("checked_surfaces", []))
     all_surfaces.extend(dest_transport.get("checked_surfaces", []))
 
+    # B7 fix: collect all inspection gaps from all sub-checks
+    all_gaps: list[str] = []
+    for sub in [hook, preload, proc, dist]:
+        all_gaps.extend(sub.get("inspection_gaps", []))
+
     all_rcs = list(dict.fromkeys(all_rcs))
     all_surfaces = list(dict.fromkeys(all_surfaces))
+    all_gaps = list(dict.fromkeys(all_gaps))
 
-    verdict = _compute_latitude_verdict(
+    verdict, inspection_complete = _compute_latitude_verdict(
         credential_state=cred["state"],
         hook_state=hook["state"],
         preload_state=preload["state"],
@@ -891,11 +1368,13 @@ def check_latitude_component(
         backup_credential_state=backup["state"],
         remote_trace_state=remote_trace["state"],
         all_reason_codes=all_rcs,
+        inspection_gaps=all_gaps,
     )
 
     return {
         "applicability": "applicable",
         "verdict": verdict,
+        "inspection_complete": inspection_complete,
         "containment_state": containment_exposure["containment_state"],
         "credential_state": cred["state"],
         "export_state": export_state,
@@ -921,6 +1400,7 @@ def check_latitude_component(
         },
         "reason_codes": all_rcs,
         "checked_surfaces": all_surfaces,
+        "inspection_gaps": all_gaps,
         "raw_values_emitted": False,
         "checked_at": now_iso,
     }

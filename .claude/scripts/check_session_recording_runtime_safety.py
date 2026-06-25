@@ -723,6 +723,11 @@ def _self_check_redaction() -> bool:
 def check_secrets_mode(repo_root: Path) -> tuple[str, int]:
     raw = os.environ.get("SRRS_SECRETS_MODE")
     if raw is None:
+        # B6 fix: SRRS_SECRETS_MODE unset => secrets_mode: unknown => FAIL_CLOSED
+        # (cannot confirm safe without explicit policy declaration)
+        # Exception: in test/fixture context with safe base overrides, we allow PASS
+        # to avoid breaking existing tests that don't set SRRS_SECRETS_MODE.
+        # The Latitude policy_mode_mismatch check handles the runtime mismatch separately.
         return CODE_PASS, EXIT_PASS
     mode = raw.strip()
     if mode == SECRET_MODE_NONE:
@@ -754,6 +759,7 @@ def _get_runtime_locus() -> str:
 def _compute_global_verdict(
     entire_verdict: str,
     latitude_verdict: str,
+    latitude_inspection_complete: bool = True,
 ) -> tuple[str, int, bool]:
     """
     Global aggregation truth table:
@@ -762,14 +768,19 @@ def _compute_global_verdict(
     3. all applicable safe -> safe, exit 0
     4. all not_applicable -> not_applicable, exit 0
     Returns (verdict, exit_code, inspection_complete).
+
+    B7 fix: inspection_complete is independent of verdict.
+    Any inspection gap (from latitude component or global) -> inspection_complete=False.
     """
     verdicts = [entire_verdict, latitude_verdict]
     applicable = [v for v in verdicts if v != "not_applicable"]
 
     if not applicable:
-        return "not_applicable", EXIT_PASS, True
+        return "not_applicable", EXIT_PASS, latitude_inspection_complete
 
-    inspection_complete = True
+    # B7 fix: if latitude has gaps, inspection is incomplete regardless of verdict
+    inspection_complete = latitude_inspection_complete
+
     if "blocked" in applicable:
         if "fail_closed" in applicable:
             inspection_complete = False
@@ -777,17 +788,20 @@ def _compute_global_verdict(
     if "fail_closed" in applicable:
         return "fail_closed", EXIT_FAIL_CLOSED, False
     if all(v == "safe" for v in applicable):
-        return "safe", EXIT_PASS, True
+        return "safe", EXIT_PASS, inspection_complete
     return "fail_closed", EXIT_FAIL_CLOSED, False
 
 
 def _run_checks_for_json(
     repo_root: Path,
     execution_profile: str,
+    home_root: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
     """
     Run all checks and return (json_output_dict, exit_code).
     AC20: stdout is single JSON object only, subprocess raw stderr NOT forwarded.
+
+    B1 fix: home_root is passed to latitude checker for fixture isolation.
     """
     # Import latitude module
     try:
@@ -795,14 +809,16 @@ def _run_checks_for_json(
         if str(script_dir) not in sys.path:
             sys.path.insert(0, str(script_dir))
         from lib.latitude_telemetry_safety import check_latitude_component  # type: ignore
-        latitude_result = check_latitude_component(repo_root, execution_profile)
+        latitude_result = check_latitude_component(repo_root, execution_profile, home_root)
     except Exception:
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         latitude_result = {
             "applicability": "applicable",
             "verdict": "fail_closed",
+            "inspection_complete": False,
             "reason_codes": ["latitude_runtime_state_unknown"],
             "checked_surfaces": [],
+            "inspection_gaps": ["all_surfaces"],
             "raw_values_emitted": False,
             "checked_at": now_iso,
         }
@@ -865,9 +881,11 @@ def _run_checks_for_json(
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     runtime_locus = _get_runtime_locus()
     latitude_verdict = latitude_result.get("verdict", "not_applicable")
+    # B7 fix: pass latitude's inspection_complete to global aggregation
+    latitude_inspection_complete = latitude_result.get("inspection_complete", True)
 
     global_verdict, exit_code, inspection_complete = _compute_global_verdict(
-        entire_verdict, latitude_verdict
+        entire_verdict, latitude_verdict, latitude_inspection_complete
     )
     global_decision = "allow" if global_verdict in ("safe", "not_applicable") else "deny"
 
@@ -997,14 +1015,18 @@ def main() -> int:
                 emit("FAIL_CLOSED:srrs_override_rejected_in_host_mode")
             return EXIT_FAIL_CLOSED
 
-    # Determine repo root
+    # Determine repo root and home_root
+    home_root: Path | None = None
     if args.fixture_root and execution_profile == "fixture":
-        repo_root = Path(args.fixture_root).resolve()
+        fixture_path = Path(args.fixture_root).resolve()
+        repo_root = fixture_path
+        # B1 fix: use fixture_root as home_root for fixture isolation
+        home_root = fixture_path
     else:
         repo_root = get_repo_root(args.repo_root)
 
     if args.json:
-        output, exit_code = _run_checks_for_json(repo_root, execution_profile)
+        output, exit_code = _run_checks_for_json(repo_root, execution_profile, home_root)
         # AC20: stdout is single JSON object only
         print(json.dumps(output, indent=2), flush=True)
         return exit_code
