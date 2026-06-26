@@ -94,6 +94,129 @@ def _run_guard(payload: dict, project_root: Path, issue: str | None = None,
     )
 
 
+def _write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
+    """Install a minimal registry/preflight fixture for direct executor tests."""
+    source_root = REPO_ROOT
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+    ):
+        src = source_root / rel
+        dest = repo_root / rel
+        _write_text(dest, src.read_text())
+
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+import os
+
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    issue = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
+    if not issue:
+        return []
+    worktree = os.path.realpath(
+        os.path.join(project_root, ".claude", "worktrees", f"issue-{issue}-x")
+    )
+    return [{"issue_number": issue, "worktree_realpath": worktree, "worktree": worktree}]
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    issue = str(issue_number)
+    for entry in catalog or []:
+        if str(entry.get("issue_number")) == issue:
+            return entry
+    return None
+""",
+    )
+
+    _write_text(
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
+        """from __future__ import annotations
+
+import os
+
+REGISTRY = {
+    "preflight.run": {
+        "id": "preflight.run",
+        "argv": [
+            "uv",
+            "run",
+            "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number",
+            "{issue_number}",
+            "--repo",
+            "{repo}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+        },
+    }
+}
+
+
+def render_command(command_id: str, values: dict[str, object]) -> list[str]:
+    argv = REGISTRY[command_id]["argv"]
+    rendered: list[str] = []
+    for token in argv:
+        if token == "{issue_number}":
+            rendered.append(str(values["issue_number"]))
+        elif token == "{repo}":
+            rendered.append(str(values["repo"]))
+        else:
+            rendered.append(token)
+    return rendered
+""",
+    )
+
+    _write_text(
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py",
+        """from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--repo", required=True)
+    args = parser.parse_args()
+    artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"issue_number": args.issue_number, "repo": args.repo}
+    (artifact_dir / "preflight.json").write_text(json.dumps(payload))
+    print(json.dumps({"ok": True, **payload}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+""",
+    )
+
+
 # =============================================================================
 # AC1 — block Write/Edit outside worktree when active worktree exists
 # =============================================================================
@@ -1588,6 +1711,48 @@ def test_skill_runtime_executor_allows_preflight_run(tmp_path):
     assert decision["decision"] == "allow", decision
     r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
     assert r.returncode == 0, r.stderr
+
+
+def test_skill_runtime_executor_runs_preflight_directly(tmp_path):
+    """Issue #1154: direct executor path accepts legal placeholders and runs preflight."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _install_skill_runtime_exec_fixture(repo["root"])
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1154",
+    }
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python3",
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1154",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo["root"]),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    artifact = (
+        repo["root"]
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / "1154"
+        / "preflight.json"
+    )
+    assert artifact.exists(), "expected preflight artifact to be created"
+    payload = json.loads(artifact.read_text())
+    assert payload == {"issue_number": "1154", "repo": "squne121/loop-protocol"}
 
 
 @pytest.mark.parametrize("command", [

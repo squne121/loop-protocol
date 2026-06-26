@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 from skill_runtime_command_policy import (
     REGISTRY_REL,
     SKILL_RUNTIME_EXEC_REL,
@@ -85,6 +87,7 @@ def _ensure_artifact_path_safe(project_root: str, issue_number: str) -> Path:
 def _sanitize_env(project_root: str) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["CLAUDE_PROJECT_DIR"] = project_root
     return env
 

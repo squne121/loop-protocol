@@ -265,7 +265,7 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
         raise ValueError("required_branch_mismatch")
     if entry.get("network_effect") != policy["network_effect"]:
         raise ValueError("network_effect_mismatch")
-    expected_write_roots = [f".claude/artifacts/issue-refinement-loop/{active_issue}/"]
+    expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")
     argv = entry.get("argv")
@@ -286,6 +286,13 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
         "repo": {"type": "owner_repo", "required": True},
     }:
         raise ValueError("placeholder_mismatch")
-    for token in argv:
-        if isinstance(token, str) and _PLACEHOLDER_RE.match(token):
-            raise ValueError("unresolved_whole_token_placeholder")
+    declared_placeholders = set(placeholders)
+    argv_placeholders = {
+        token[1:-1]
+        for token in argv
+        if isinstance(token, str) and _PLACEHOLDER_RE.match(token)
+    }
+    if argv_placeholders != declared_placeholders:
+        raise ValueError("argv_placeholder_contract_mismatch")
+    if "{active_issue}" not in "".join(expected_write_roots):
+        raise ValueError("active_issue_placeholder_missing")
