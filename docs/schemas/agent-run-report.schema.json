@@ -443,6 +443,236 @@
             "minLength": 1,
             "maxLength": 160
           }
+        },
+        "entirecli_safety": {
+          "$ref": "#/$defs/entirecliSafetyResult"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "entirecli_safety"
+            ],
+          "properties": {
+            "entirecli_safety": {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "const": "safe"
+                }
+              }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "entirecli_safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "maxItems": 0
+                  },
+                  "raw_values_emitted": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "entirecli_safety"
+            ],
+          "properties": {
+            "entirecli_safety": {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "const": "not_applicable"
+                }
+              }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "entirecli_safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                      "const": "entire_absent"
+                    },
+                    "contains": {
+                      "const": "entire_absent"
+                    }
+                  },
+                  "raw_values_emitted": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "entirecli_safety"
+            ],
+          "properties": {
+            "entirecli_safety": {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "const": "blocked"
+                }
+              }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "entirecli_safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "entirecli_safety"
+            ],
+          "properties": {
+            "entirecli_safety": {
+              "type": "object",
+              "properties": {
+                "raw_values_emitted": {
+                  "const": true
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "entirecli_safety": {
+                "type": "object",
+                "properties": {
+                  "verdict": {
+                    "const": "blocked"
+                  },
+                  "reason_codes": {
+                    "type": "array",
+                    "contains": {
+                      "const": "raw_value_redaction_violation"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "entirecliCheckedSurfaces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entire_binary",
+        "entire_version",
+        "entire_enable_help",
+        "entire_configure_help"
+      ],
+      "properties": {
+        "entire_binary": {
+          "type": "boolean"
+        },
+        "entire_version": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entire_enable_help": {
+          "type": "boolean"
+        },
+        "entire_configure_help": {
+          "type": "boolean"
+        }
+      }
+    },
+    "entirecliSafetyResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "verdict",
+        "reason_codes",
+        "raw_values_emitted",
+        "checked_surfaces"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "entirecli_safety_result/v1"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "not_applicable",
+            "safe",
+            "blocked"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "entire_absent",
+              "public_checkpoint_branch_present",
+              "push_sessions_enabled",
+              "push_sessions_unknown",
+              "checkpoint_remote_unknown_visibility",
+              "checkpoint_remote_public",
+              "checkpoint_token_without_private_remote",
+              "public_push_remote_detected",
+              "git_config_parse_error",
+              "telemetry_enabled",
+              "telemetry_unknown",
+              "raw_value_redaction_violation",
+              "settings_parse_error",
+              "code_remote_unknown_visibility"
+            ]
+          }
+        },
+        "raw_values_emitted": {
+          "type": "boolean"
+        },
+        "checked_surfaces": {
+          "$ref": "#/$defs/entirecliCheckedSurfaces"
         }
       }
     },
@@ -512,5 +742,51 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "public_surface_kind": {
+            "enum": [
+              "github_issue_comment",
+              "github_pr_comment"
+            ]
+          },
+          "public_safety": {
+            "type": "object",
+            "properties": {
+              "entirecli_safety": {}
+            },
+            "required": [
+              "entirecli_safety"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "public_safety": {
+            "type": "object",
+            "properties": {
+              "entirecli_safety": {
+                "type": "object",
+                "properties": {
+                  "verdict": {
+                    "enum": [
+                      "safe",
+                      "not_applicable"
+                    ]
+                  },
+                  "raw_values_emitted": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }
