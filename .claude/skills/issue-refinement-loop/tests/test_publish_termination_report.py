@@ -883,3 +883,117 @@ class TestTerminationReportDocsProse:
 
         for phrase in forbidden:
             assert phrase not in text, f"英語重複 prose が残っています: {phrase!r}"
+
+
+# ---------------------------------------------------------------------------
+# P0-5: Exec marker injection in _post_github_comment
+# ---------------------------------------------------------------------------
+
+class TestExecMarkerInjection:
+    """P0-5: CONTROLLED_EXEC_MARKER env var is injected into comment body."""
+
+    def test_marker_injected_into_body_when_env_set(self, tmp_path, monkeypatch):
+        """When CONTROLLED_EXEC_MARKER is set, comment body includes marker."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "abc123marker456")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
+
+        assert result == 0
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        assert "<!-- CONTROLLED_EXEC_MARKER:abc123marker456 -->" in body
+
+    def test_no_marker_injected_when_env_not_set(self, tmp_path, monkeypatch):
+        """When CONTROLLED_EXEC_MARKER is not set, no marker in body."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        monkeypatch.delenv("CONTROLLED_EXEC_MARKER", raising=False)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
+
+        assert result == 0
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        assert "CONTROLLED_EXEC_MARKER" not in body
+
+    def test_post_github_comment_injects_marker(self, monkeypatch):
+        """_post_github_comment directly injects marker when env is set."""
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            raise AssertionError(f"Unexpected: {cmd}")
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "testmarker99")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            rc = pub._post_github_comment(
+                issue_number=42,
+                body="## Test Body",
+                repo="squne121/loop-protocol",
+            )
+
+        assert rc == 0
+        assert len(received_bodies) == 1
+        assert "<!-- CONTROLLED_EXEC_MARKER:testmarker99 -->" in received_bodies[0]
+        assert "## Test Body" in received_bodies[0]
+
+    def test_marker_appended_after_body_content(self, monkeypatch):
+        """Marker is appended after original body, not prepended."""
+        original_body = "## Original Content\n\nSome text."
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            raise AssertionError(f"Unexpected: {cmd}")
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "markerXYZ")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            pub._post_github_comment(
+                issue_number=42,
+                body=original_body,
+                repo="squne121/loop-protocol",
+            )
+
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        # Marker comes after original content
+        marker_pos = body.find("<!-- CONTROLLED_EXEC_MARKER:")
+        original_end_pos = body.find(original_body) + len(original_body)
+        assert marker_pos > original_end_pos - 1  # marker is after original body
+

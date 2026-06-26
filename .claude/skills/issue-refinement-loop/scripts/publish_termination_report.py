@@ -221,12 +221,18 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
     Requires explicit --repo flag for canonical repository binding (AC10 of #1166).
     Sets GH_PROMPT_DISABLED=1 and GH_NO_UPDATE_NOTIFIER=1 to avoid interactive prompts.
     Enforces a 30-second timeout; on timeout fails closed.
+    Injects CONTROLLED_EXEC_MARKER from env into comment body (P0-5).
 
     Returns gh exit code (or -1 on timeout).
     """
     env = os.environ.copy()
     env["GH_PROMPT_DISABLED"] = "1"
     env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
+
+    # P0-5: inject exec marker for comment read-back
+    exec_marker = env.get("CONTROLLED_EXEC_MARKER", "")
+    if exec_marker:
+        body = body + f"\n<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
 
     try:
         proc = subprocess.run(
