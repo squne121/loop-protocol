@@ -26,6 +26,46 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 - project-local `.codex/config.toml` は profile routing の証拠として扱わず、actual runtime contract と launch-ledger evidence を validator 対象にする
 - live spawn の runtime verification は `#601` に deferred し、この文書で扱うのは evidence 不足時に fail-closed する repo-side 監査境界のみ
 
+## Manual Codex Spark Agents
+
+`spark-skim` / `spark-worker` / `spark-deep` は manual invocation only の Codex custom subagent として扱う。human が agent 名を明示 spawn した場合だけ使い、workflow root の auto dispatch 先にしない。
+
+### Reasoning routing policy
+
+| Agent | Permissions | 想定用途 | 補足 |
+|---|---|---|---|
+| `spark-skim` | `loop-protocol-readonly` | 軽量な read-only triage / 要点抽出 | low reasoning |
+| `spark-worker` | `loop-protocol-rtk` | Allowed Paths 内の manual bounded edit helper | medium reasoning。`implementation-worker` / `issue-author` / `pr-reviewer` の代替ではない |
+| `spark-deep` | `loop-protocol-readonly` | 複雑な read-only analysis / risk surfacing | high reasoning |
+
+- `xhigh` reasoning は今回採用しない。account plan / rollout 差分や運用実績を踏まえた follow-up 判断対象とする。
+- heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-author` / `pr-reviewer` / `test-runner` の routing は維持する。
+- `spark-worker` は manual bounded edit helper であり、Issue authoring、PR review judgment、loop orchestration、publish 操作を担当しない。
+
+### Prompt examples
+
+- `spark-skim`: `Spawn spark-skim and read only docs/dev/agent-skill-boundaries.md plus .codex/agents. Return SPARK_AGENT_RESULT_V1 with evidence refs only.`
+- `spark-worker`: `Spawn spark-worker for a bounded edit inside the listed Allowed Paths only. Do not review the PR or publish anything.`
+- `spark-deep`: `Spawn spark-deep for read-only analysis of validator / fixture drift and return risk flags without editing files.`
+
+### Positive smoke and negative smoke policy
+
+- positive smoke: human が `spark-skim` / `spark-worker` / `spark-deep` をそれぞれ明示 spawn し、`SUBAGENT_LAUNCH_LEDGER_V1.launches[]` に対象 agent 名、runtime model、reasoning effort、default permissions が記録されることを確認する。
+- negative smoke: `issue-refinement-loop` / `impl-review-loop` の通常ルート実行後に ledger を確認し、`spark-*` が auto dispatch されていないことを確認する。routing 変更は別 Issue とする。
+- auto dispatch を有効化する変更は本スコープ外であり、planner / loop routing / workflow root の変更を伴う別 implementation issue で扱う。
+
+### Manual smoke evidence minimum
+
+- `Codex CLI version`
+- `install route`
+- `auth mode category`
+- `agent prompt`
+- `ledger path`
+- `Known limitation`
+
+- manual smoke evidence には secret、raw transcript、raw logs を残さない。必要なら構造化 summary と ledger path のみを残す。
+- Spark 3 agent は Codex-only parity exception として扱い、fixture では `parity_mode: codex_only`、`parity_exception_reason`、`claude_agent_path: null` を保持する。
+
 ### `review-issue` / `issue-reviewer` の使い分け
 
 | エントリ | 種別 | 呼び出し元 | 役割 |
@@ -1243,3 +1283,101 @@ session 記録ツール（EntireCLI 等）を導入・運用する際の Kill Sw
 - SubAgent の transcript / local_file を public GitHub comment に添付することは禁止
 - checkpoint remote は `private_verified` visibility のみ許可し、`unknown` の場合は fail-closed
 - `secrets_mode != none` を検知したら Kill Switch を発動する
+
+---
+
+## CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
+
+（Issue #1166 — hooks: publish_termination_report 用 controlled mutation policy）
+
+### 概要
+
+`publish_termination_report.py` は GitHub に issue comment を投稿するリモートミューテーションを実行する。
+このミューテーションを uncontrolled な直接呼び出しから切り離し、**単一の executor（`controlled_skill_mutation_exec.py`）経由のみ許可**するポリシー。
+
+直接呼び出し（`python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`）は worktree_scope_guard および local_main_branch_guard によって deny される。
+
+### ポリシーレジストリ
+
+```python
+# scripts/agent-guards/controlled_skill_mutation_policy.py
+CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
+    "termination_report.publish": {
+        "command_id": "termination_report.publish",
+        "executor_script": "scripts/agent-guards/controlled_skill_mutation_exec.py",
+        "allowed_write_roots": ["artifacts/"],
+        "github_mutation": {
+            "comment_on_issue": True,
+            "requires_repo": "squne121/loop-protocol",
+            "requires_explicit_repo_flag": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ["artifacts/"],
+        },
+        "idempotency": {
+            "marker_file_pattern": "artifacts/{issue_number}/termination_report_published.marker.json",
+            "marker_field": "comment_id",
+        },
+        "env_sanitize": [
+            "PUBLISH_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME",
+            "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER",
+        ],
+    },
+}
+```
+
+### 呼び出し形式
+
+```bash
+uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+  --command-id termination_report.publish \
+  --issue-number <int> \
+  --input-file <path_to_TERMINATION_REPORT_INPUT_V1_json> \
+  --repo squne121/loop-protocol
+```
+
+すべてのフラグが必須。`--flag=value` 形式・未知フラグ・重複フラグ・位置引数はすべて拒否（インジェクション防止）。
+
+### Anti-split-brain（AC17）
+
+`is_controlled_skill_mutation_exec_command(cmd, project_root)` は `controlled_skill_mutation_policy.py` で一元定義され、
+`worktree_scope_guard` と `local_main_branch_guard` の両方がこの関数を import して使用する。
+各ガードが独立した allowlist を持つことを禁止（split-brain の原因）。
+
+### 環境サニタイズ（AC11）
+
+executor は以下の環境変数を除去した上で publisher を呼び出す:
+`PUBLISH_ARTIFACT_DIR`, `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`
+
+### Idempotency（AC13）
+
+`artifacts/{issue_number}/termination_report_published.marker.json` が存在し `comment_id` フィールドを持つ場合、executor は再実行を拒否する（exit 0 + dry-run 出力）。
+
+### --repo 固定（AC10）
+
+`publish_termination_report.py` は `--repo <owner/repo>` を必須引数として受け取り、
+`gh issue comment ... --repo <owner/repo>` に明示的に渡す。
+`GITHUB_REPOSITORY` 環境変数や暗黙の gh デフォルトに依存しない。
+
+### Module realpath 検証（AC16）
+
+executor は `publish_termination_report.py` の `__file__` realpath を検査し、
+`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`
+に正規化されることを確認してから実行する。モジュールシャドウイングを防ぐ。
+
+### settings.json wildcard と hook enforcement
+
+`.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` は
+Claude Code permission syntax の制約上 `*` を使用しているが、settings は **最終 enforcement ではない**。
+
+- settings は「このコマンドクラスを allow する UI 層」
+- 実際の argv 制限・policy binding は `worktree_scope_guard.py` / `local_main_branch_guard.py` の hook 層で強制される
+- wildcard を悪用した不正 argv（例: `--unknown-flag`）は hook の `_validate_executor_argv` によって deny される
+- `test_worktree_scope_guard.py` / `test_local_main_branch_guard.py` の hook integrity tests が両軸（deny/allow）を確認
+
+### OUTPUT_BUDGET_V1
+
+routing-critical フィールド: `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` の全 key は必須。

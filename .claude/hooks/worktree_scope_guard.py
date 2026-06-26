@@ -90,6 +90,26 @@ except Exception:  # pragma: no cover - defensive fail-closed
 # Branch names in V3 contracts are validated with `git check-ref-format --branch`
 # inside cleanup_contract_v3.is_valid_branch_ref (Issue #1137 Medium).
 
+# Shared controlled skill mutation policy (Issue #1166).
+# Imported from scripts/agent-guards so the same is_controlled_skill_mutation_exec_command
+# function is consumed by both this guard and local_main_branch_guard (AC4/AC17).
+_AGENT_GUARDS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "scripts",
+    "agent-guards",
+)
+if _AGENT_GUARDS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_GUARDS_DIR)
+try:
+    from controlled_skill_mutation_policy import (
+        is_controlled_skill_mutation_exec_command as _is_csm_exec_command,
+    )
+    _CSM_POLICY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    def _is_csm_exec_command(cmd: str, project_root: str) -> bool:  # type: ignore[misc]
+        return False
+    _CSM_POLICY_AVAILABLE = False
+
 # Agent-ops tools allowed as an exact command class from the local main root even
 # when an issue worktree is active (Issue #1137 Blocker 1). realpath-matched.
 _AGENT_OPS_ALLOWED_SCRIPTS = (
@@ -1523,6 +1543,12 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
         _allow()
     if looks_like_skill_runtime_executor_command(command):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<skill-runtime-denied>", cwd)
+
+    # Issue #1166: controlled skill mutation executor from main root is allowed.
+    # Shared policy function (AC4/AC17): same is_controlled_skill_mutation_exec_command
+    # as consumed by local_main_branch_guard — no split-brain allowlist.
+    if _CSM_POLICY_AVAILABLE and _is_csm_exec_command(command, _pr):
+        _allow()
 
     klass = classify_bash(command)
 
