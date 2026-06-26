@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-GUARD_VERSION = "1.2.0"
+GUARD_VERSION = "1.3.0"
 REPORT_SCHEMA_V1 = "e501-migration-guard/v1"
 REPORT_SCHEMA_V2 = "e501-migration-guard/v2"
 
@@ -96,6 +96,19 @@ EXIT_USAGE = 2
 EXIT_TOOL_ERROR = 3
 
 _CODE_RE = re.compile(r"[A-Z]+[0-9]+")
+
+# Token types to skip when computing preceding_token_fingerprint.
+_SKIP_TOKEN_TYPES = frozenset(
+    (
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
+    )
+)
 
 
 class GuardError(Exception):
@@ -344,10 +357,12 @@ def check_status_scope(entries: list[ChangedEntry], scope_prefixes: tuple[str, .
 
 @dataclass(frozen=True, order=True)
 class TypeIgnoreSignature:
+    path: str           # file path (canonical) -- B1: per-file comparison
     kind: str           # "file_wide" | "line_bound"
     tag: str            # e.g. "attr-defined", or "" for bare
     owner_ast_path: str  # structural path to the enclosing stmt (e.g. "body[0].body[1]")
     occurrence_index: int  # 0-based index when multiple ignores share the same anchor
+    preceding_token_fingerprint: str  # B2: token context anchor
 
 
 def _get_stmt_at_line(tree: ast.Module, lineno: int) -> tuple[str, ast.stmt] | None:
@@ -383,8 +398,53 @@ def _get_stmt_at_line(tree: ast.Module, lineno: int) -> tuple[str, ast.stmt] | N
     return None
 
 
+def _compute_preceding_token_fingerprint(source: str, lineno: int) -> str:
+    """Compute a fingerprint from the 3 tokens preceding the type: ignore comment.
+
+    Uses the tokenize module to find the comment token at ``lineno`` and walks
+    back up to 3 non-trivial tokens (skipping COMMENT, NL, NEWLINE, INDENT,
+    DEDENT, ENCODING, ENDMARKER) to build a fingerprint string.
+
+    For file_wide ignores, returns "__file__".
+    Returns "__unknown__" if tokenization fails.
+    """
+    try:
+        data = source.encode("utf-8")
+        all_tokens = list(tokenize.tokenize(io.BytesIO(data).readline))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return "__unknown__"
+
+    # Find the type: ignore comment token at the given lineno
+    comment_idx: int | None = None
+    for i, tok in enumerate(all_tokens):
+        if tok.type == tokenize.COMMENT and tok.start[0] == lineno:
+            norm = tok.string.strip()
+            if "type:" in norm and "ignore" in norm:
+                comment_idx = i
+                break
+
+    if comment_idx is None:
+        return "__unknown__"
+
+    # Walk back to find up to 3 non-trivial preceding tokens
+    preceding: list[str] = []
+    for j in range(comment_idx - 1, -1, -1):
+        tok = all_tokens[j]
+        if tok.type in _SKIP_TOKEN_TYPES:
+            continue
+        preceding.append(f"{tok.type}:{tok.string}")
+        if len(preceding) == 3:
+            break
+
+    # Pad to 3 entries
+    while len(preceding) < 3:
+        preceding.append("__none__:__none__")
+
+    return ",".join(preceding)
+
+
 def _build_type_ignore_signatures(
-    tree: ast.Module, source: str
+    tree: ast.Module, source: str, file_path: str
 ) -> tuple[list[TypeIgnoreSignature], bool]:
     """Build a list of TypeIgnoreSignature from a parsed AST Module.
 
@@ -397,7 +457,7 @@ def _build_type_ignore_signatures(
     ambiguous = False
 
     # Group type_ignores by their resolved anchor path so we can assign occurrence_index
-    anchor_counts: dict[tuple[str, str, str], int] = {}  # (kind, tag, owner_ast_path) -> count
+    anchor_counts: dict[tuple[str, str, str, str], int] = {}  # (path, kind, tag, owner_ast_path) -> count
 
     for ti in tree.type_ignores:
         lineno = ti.lineno  # type: ignore[attr-defined]
@@ -408,36 +468,45 @@ def _build_type_ignore_signatures(
         if lineno == 0 or lineno > total_lines:
             kind = "file_wide"
             owner_ast_path = "__file__"
+            preceding_token_fingerprint = "__file__"
         else:
-            kind = "line_bound"
             result = _get_stmt_at_line(tree, lineno)
             if result is None:
-                # Cannot anchor -- fail-closed
-                ambiguous = True
-                owner_ast_path = f"__ambiguous_line_{lineno}__"
+                # B3: standalone comment line -> classify as file_wide, not ambiguous
+                kind = "file_wide"
+                owner_ast_path = "__file__"
+                preceding_token_fingerprint = "__file__"
             else:
+                kind = "line_bound"
                 owner_ast_path, _ = result
+                preceding_token_fingerprint = _compute_preceding_token_fingerprint(source, lineno)
 
-        key = (kind, tag, owner_ast_path)
+        key = (file_path, kind, tag, owner_ast_path)
         idx = anchor_counts.get(key, 0)
         anchor_counts[key] = idx + 1
         sigs.append(TypeIgnoreSignature(
+            path=file_path,
             kind=kind,
             tag=tag,
             owner_ast_path=owner_ast_path,
             occurrence_index=idx,
+            preceding_token_fingerprint=preceding_token_fingerprint,
         ))
 
     return sigs, ambiguous
 
 
-def _compare_type_ignore_signatures(
+def _compare_type_ignore_signatures_per_file(
     base_sigs: list[TypeIgnoreSignature],
     head_sigs: list[TypeIgnoreSignature],
     base_ambiguous: bool,
     head_ambiguous: bool,
 ) -> dict[str, Any]:
-    """Compare TypeIgnoreSignature lists and return a checks.type_ignore_equiv dict."""
+    """Compare TypeIgnoreSignature lists per-file and return a checks.type_ignore_equiv dict.
+
+    B1: Comparison is done per-file. A move between files is detected because
+    the ``path`` field is included in the signature.
+    """
     base_count = len(base_sigs)
     head_count = len(head_sigs)
     ambiguous_anchor = base_ambiguous or head_ambiguous
@@ -485,7 +554,9 @@ def decode_source(data: bytes) -> str:
         raise GuardError(f"could not decode source as {encoding!r}: {exc}") from exc
 
 
-def ast_fingerprint(data: bytes, label: str) -> tuple[str, list[TypeIgnoreSignature], bool]:
+def ast_fingerprint(
+    data: bytes, label: str, file_path: str
+) -> tuple[str, list[TypeIgnoreSignature], bool]:
     """Parse, compile, and return (ast_dump_without_type_ignores, type_ignore_sigs, ambiguous).
 
     type_ignores are stripped from the Module before dumping so that line-number
@@ -498,7 +569,7 @@ def ast_fingerprint(data: bytes, label: str) -> tuple[str, list[TypeIgnoreSignat
     except (SyntaxError, ValueError) as exc:
         raise GuardError(f"AST/compile error for {label}: {exc}") from exc
 
-    type_ignore_sigs, ambiguous = _build_type_ignore_signatures(tree, src)
+    type_ignore_sigs, ambiguous = _build_type_ignore_signatures(tree, src, file_path)
 
     # Strip type_ignores from the Module so that line-number shifts don't affect
     # the structural dump comparison
@@ -519,6 +590,9 @@ def check_ast_equiv(
     """Check AST equivalence for all targets.
 
     Returns (ok, per_file_results, type_ignore_equiv_check).
+
+    B1: type_ignore signatures are compared per-file (path field included in sig),
+    then the per-file results are aggregated into a single type_ignore_equiv result.
     """
     results: list[AstEquivResult] = []
     ok = True
@@ -535,20 +609,22 @@ def check_ast_equiv(
             if mode not in ("100644", "100755"):
                 raise GuardError(f"{path} has non-regular git mode {mode} at {sha[:12]}")
         base_fp, base_sigs, base_amb = ast_fingerprint(
-            blob_at(repo_root, merge_base_sha, path), f"base:{path}"
+            blob_at(repo_root, merge_base_sha, path), f"base:{path}", path
         )
         head_fp, head_sigs, head_amb = ast_fingerprint(
-            blob_at(repo_root, head_sha, path), f"head:{path}"
+            blob_at(repo_root, head_sha, path), f"head:{path}", path
         )
         equal = base_fp == head_fp
         ok = ok and equal
         results.append(AstEquivResult(path=path, equal=equal))
+        # B1: accumulate all sigs globally; since path is part of the signature,
+        # a move between files will appear as a mismatch.
         all_base_sigs.extend(base_sigs)
         all_head_sigs.extend(head_sigs)
         any_base_ambiguous = any_base_ambiguous or base_amb
         any_head_ambiguous = any_head_ambiguous or head_amb
 
-    type_ignore_equiv = _compare_type_ignore_signatures(
+    type_ignore_equiv = _compare_type_ignore_signatures_per_file(
         all_base_sigs, all_head_sigs, any_base_ambiguous, any_head_ambiguous
     )
     return ok, results, type_ignore_equiv
@@ -823,17 +899,22 @@ def run_ruff(repo_root: str, sha: str, targets: list[str], ruff_cmd: tuple[str, 
 # --------------------------------------------------------------------------- #
 
 
-def enumerate_scope_py_files(repo_root: str, head_sha: str, scope_prefixes: tuple[str, ...]) -> list[str]:
+def enumerate_scope_py_files(
+    repo_root: str, head_sha: str, scope_prefixes: tuple[str, ...]
+) -> tuple[list[str], list[tuple[str, str, str, str]]]:
     """Enumerate all regular *.py files in ``scope_prefixes`` at ``head_sha``.
+
+    Returns (sorted_paths, entries) where entries are (mode, obj_type, obj_sha, path) tuples.
 
     Uses ``git ls-tree -r -z --full-tree`` with a literal pathspec so that
     unusual filenames (spaces, special chars) are handled NUL-safely.
 
     Fail-closed:
-    - symlinks / non-regular entries → GuardError
-    - empty inventory → GuardError (vacuous pass prevention)
+    - symlinks / non-regular entries -> GuardError
+    - empty inventory -> GuardError (vacuous pass prevention)
     - duplicate/nested scopes are validated by the caller via scope_overlaps()
     """
+    all_entries: list[tuple[str, str, str, str]] = []
     all_paths: list[str] = []
     seen: set[str] = set()
 
@@ -861,10 +942,11 @@ def enumerate_scope_py_files(repo_root: str, head_sha: str, scope_prefixes: tupl
             path = path_bytes.decode("utf-8", "surrogateescape")
             meta_str = meta.decode("utf-8", "replace")
             parts = meta_str.split()
-            if len(parts) < 2:
+            if len(parts) < 3:
                 raise GuardError(f"unexpected ls-tree meta format: {meta_str!r}")
             mode = parts[0]
             obj_type = parts[1]
+            obj_sha = parts[2]
             # Only regular files (not symlinks, not submodules)
             if obj_type != "blob":
                 raise GuardError(
@@ -880,8 +962,10 @@ def enumerate_scope_py_files(repo_root: str, head_sha: str, scope_prefixes: tupl
             if canon not in seen:
                 seen.add(canon)
                 all_paths.append(canon)
+                all_entries.append((mode, obj_type, obj_sha, canon))
 
     all_paths.sort()
+    all_entries.sort(key=lambda e: e[3])
 
     if not all_paths:
         raise GuardError(
@@ -889,7 +973,23 @@ def enumerate_scope_py_files(repo_root: str, head_sha: str, scope_prefixes: tupl
             "refusing to proceed (vacuous pass prevention)"
         )
 
-    return all_paths
+    return all_paths, all_entries
+
+
+def _inventory_sha256_from_entries(entries: list[tuple[str, str, str, str]]) -> str:
+    """Deterministic SHA256 from (mode, obj_type, obj_sha, path) entries (H2).
+
+    Sorted by path; each line is "{mode} {obj_type} {obj_sha}\t{path}".
+    """
+    lines = sorted(f"{mode} {obj_type} {obj_sha}\t{path}" for mode, obj_type, obj_sha, path in entries)
+    combined = "\n".join(lines).encode("utf-8")
+    return "sha256:" + hashlib.sha256(combined).hexdigest()
+
+
+def _inventory_sha256(paths: list[str]) -> str:
+    """Deterministic SHA256 over a sorted list of paths (legacy; used for v1 changed-only)."""
+    combined = "\n".join(sorted(paths)).encode("utf-8")
+    return "sha256:" + hashlib.sha256(combined).hexdigest()
 
 
 def run_ruff_on_scope(
@@ -923,6 +1023,19 @@ class RatchetResult:
 def check_ratchet(base: RuffOutcome, head: RuffOutcome, targets: list[str], mode: str) -> RatchetResult:
     per_file: list[dict[str, Any]] = []
     violations: list[str] = []
+
+    # H1: empty changed_targets + cleanup/completion -> policy fail
+    if not targets and mode in ("cleanup", "completion"):
+        violations.append(f"{mode} mode requires changed python targets; none found")
+        return RatchetResult(
+            ok=False,
+            mode=mode,
+            base_total=0,
+            head_total=0,
+            per_file=[],
+            violations=violations,
+        )
+
     for path in targets:
         bc = base.per_file.get(path, 0)
         hc = head.per_file.get(path, 0)
@@ -956,12 +1069,6 @@ def _sha256_file(path: Path) -> str | None:
     if not path.is_file():
         return None
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _inventory_sha256(paths: list[str]) -> str:
-    """Deterministic SHA256 over a sorted list of paths."""
-    combined = "\n".join(sorted(paths)).encode("utf-8")
-    return "sha256:" + hashlib.sha256(combined).hexdigest()
 
 
 def verify_diff(
@@ -1086,10 +1193,12 @@ def verify_diff(
 
         # Full-scope E501 check (--coverage scope only)
         if use_v2:
-            scope_targets = enumerate_scope_py_files(repo_root, head_sha, scope_prefixes)
+            scope_targets, scope_entries = enumerate_scope_py_files(repo_root, head_sha, scope_prefixes)
             head_scope_ruff = run_ruff_on_scope(repo_root, head_sha, scope_targets, ruff_cmd, workdir)
-            inventory_sha = _inventory_sha256(scope_targets)
+            inventory_sha = _inventory_sha256_from_entries(scope_entries)
             full_scope_ok = head_scope_ruff.total == 0
+            # H3: include diagnostics (capped at 100) in full_scope_e501
+            full_scope_diags = head_scope_ruff.diagnostics[:100]
             report["checks"]["full_scope_e501"] = {
                 "ok": full_scope_ok,
                 "source_sha": head_sha,
@@ -1097,6 +1206,7 @@ def verify_diff(
                 "inventory_sha256": inventory_sha,
                 "head_total": head_scope_ruff.total,
                 "per_file": dict(sorted(head_scope_ruff.per_file.items())),
+                "diagnostics": full_scope_diags,
             }
             if not full_scope_ok:
                 failures.append("full_scope_e501")
@@ -1175,9 +1285,14 @@ def main(argv: list[str] | None = None) -> int:
             ruff_cmd_source=ruff_cmd_source,
         )
     except GuardError as exc:
-        error_report = {
-            "schema": REPORT_SCHEMA_V1,
+        # B4: use v2 schema when --coverage scope
+        error_schema = REPORT_SCHEMA_V2 if ns.coverage == "scope" else REPORT_SCHEMA_V1
+        error_report: dict[str, Any] = {
+            "schema": error_schema,
             "guard_version": GUARD_VERSION,
+            "mode": ns.mode,
+            "coverage": ns.coverage,
+            "scope_prefixes": list(ns.scope),
             "decision": "fail",
             "failures": ["tool_error"],
             "error": str(exc),
