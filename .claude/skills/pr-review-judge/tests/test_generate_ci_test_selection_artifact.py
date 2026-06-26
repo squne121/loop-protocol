@@ -5,8 +5,8 @@ Tests cover:
   - secondary_coverage_provider_job field presence and value
   - cross_job_covered_test_files field presence and value
   - secondary_coverage_error field presence
-  - plan + pytest_args → cross_job_covered_test_files populated
-  - plan only (no pytest_args) → secondary coverage logic not active
+  - plan + pytest_args → plan targets are treated as python-test coverage
+  - plan only (no pytest_args) → dedicated lane metadata can still cover changed tests
 """
 
 from __future__ import annotations
@@ -126,31 +126,55 @@ class TestSecondaryCoverageFields(unittest.TestCase):
         self.assertIsNone(artifact["secondary_coverage_provider_job"])
         self.assertEqual(artifact["cross_job_covered_test_files"], [])
 
-    def test_secondary_coverage_not_active_when_only_plan_no_pytest_args(self):
-        """plan provided but pytest_args=None → secondary coverage NOT active."""
+    def test_secondary_coverage_plan_only_uses_dedicated_lane_metadata(self):
+        """plan-only mode still uses dedicated lane metadata for cross-lane coverage."""
         args = _make_args(
             pytest_args=None,
             plan=".github/ci/python-test-plan.json",
+            job="python-test",
         )
 
-        # Mock resolve_pytest_args to return a default list (plan-derived)
-        with patch.object(gen, "resolve_pytest_args", return_value=["scripts/tests/"]):
+        fake_plan = {
+            "targets": ["scripts/tests/"],
+            "secondary_coverage": {
+                "plan_targets_provider_job": "python-test",
+                "dedicated_lanes": [
+                    {
+                        "provider_job": "python-test",
+                        "lane_id": "codex-execpolicy",
+                        "paths": ["tests/codex/test_local_main_branch_guard.py"],
+                    }
+                ],
+            },
+        }
+
+        def mock_load_plan_module():
+            m = MagicMock()
+            m.load_plan = MagicMock(return_value=fake_plan)
+            m.scope_argv = MagicMock(return_value=["scripts/tests/"])
+            return m
+
+        with patch.object(gen, "resolve_pytest_args", return_value=["scripts/tests/"]), \
+             patch.object(gen, "_load_plan_module", side_effect=mock_load_plan_module):
             artifact = self._run_generate(
                 args,
                 collected_nodeids=["scripts/tests/test_foo.py::test_a"],
-                changed_files=["scripts/tests/test_bar.py"],
+                changed_files=["tests/codex/test_local_main_branch_guard.py"],
             )
 
-        # pytest_args not set on args → secondary coverage inactive
-        self.assertIsNone(artifact["secondary_coverage_provider_job"])
-        self.assertEqual(artifact["cross_job_covered_test_files"], [])
+        self.assertEqual(artifact["secondary_coverage_provider_job"], "python-test")
+        self.assertEqual(
+            artifact["cross_job_covered_test_files"],
+            ["tests/codex/test_local_main_branch_guard.py"],
+        )
+        self.assertEqual(artifact["uncovered_changed_test_files"], [])
 
     def test_cross_job_covered_test_files_when_plan_covers_changed_file(self):
-        """plan + pytest_args: changed file covered by plan → in cross_job_covered_test_files."""
+        """explicit pytest_args mode uses plan targets as python-test secondary coverage."""
         args = _make_args(
             pytest_args=["scripts/tests/"],
             plan=".github/ci/python-test-plan.json",
-            job="python-test",
+            job="node-backed-hook-tests",
         )
 
         # Simulate plan that covers ".claude/skills/pr-review-judge/tests/"
@@ -158,7 +182,11 @@ class TestSecondaryCoverageFields(unittest.TestCase):
             "targets": [
                 "scripts/tests/test_milestone_rollup.py",
                 ".claude/skills/pr-review-judge/tests/",
-            ]
+            ],
+            "secondary_coverage": {
+                "plan_targets_provider_job": "python-test",
+                "dedicated_lanes": [],
+            },
         }
 
         # Changed file: in .claude/skills/pr-review-judge/tests/ (plan-covered), not in collected
@@ -214,6 +242,47 @@ class TestSecondaryCoverageFields(unittest.TestCase):
         self.assertIsNotNone(artifact["secondary_coverage_error"])
         # Provider job should not be set (failed before assignment)
         self.assertIsNone(artifact["secondary_coverage_provider_job"])
+
+    def test_secondary_coverage_error_recorded_on_invalid_dedicated_lane_metadata(self):
+        """Invalid dedicated lane metadata is recorded and does not create false coverage."""
+        args = _make_args(
+            pytest_args=None,
+            plan=".github/ci/python-test-plan.json",
+            job="python-test",
+        )
+
+        fake_plan = {
+            "targets": ["scripts/tests/"],
+            "secondary_coverage": {
+                "dedicated_lanes": [
+                    {
+                        "provider_job": "python-test",
+                        "paths": ["../tests/codex/test_local_main_branch_guard.py"],
+                    }
+                ]
+            },
+        }
+
+        def mock_load_plan_module():
+            m = MagicMock()
+            m.load_plan = MagicMock(return_value=fake_plan)
+            m.scope_argv = MagicMock(return_value=["scripts/tests/"])
+            return m
+
+        with patch.object(gen, "resolve_pytest_args", return_value=["scripts/tests/"]), \
+             patch.object(gen, "_load_plan_module", side_effect=mock_load_plan_module):
+            artifact = self._run_generate(
+                args,
+                collected_nodeids=["scripts/tests/test_foo.py::test_a"],
+                changed_files=["tests/codex/test_local_main_branch_guard.py"],
+            )
+
+        self.assertIsNotNone(artifact["secondary_coverage_error"])
+        self.assertEqual(artifact["cross_job_covered_test_files"], [])
+        self.assertEqual(
+            artifact["uncovered_changed_test_files"],
+            ["tests/codex/test_local_main_branch_guard.py"],
+        )
 
 
 if __name__ == "__main__":
