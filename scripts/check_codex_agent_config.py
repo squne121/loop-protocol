@@ -52,6 +52,10 @@ def extract_skill_surface_paths(instructions: str) -> list[str]:
     return [part for part in re.split(r"\s*,\s*|\s*\|\s*", match.group(1).strip()) if part]
 
 
+def is_codex_only_parity(expected: dict) -> bool:
+    return expected.get("parity_mode") == "codex_only"
+
+
 def load_agent(path: Path) -> dict:
     data = read_toml(path)
     data["_raw_text"] = path.read_text(encoding="utf-8")
@@ -115,6 +119,7 @@ def assert_required_fields(expectations: dict) -> list[str]:
     required_tokens = expectations["required_instruction_tokens"]
     for agent_name, expected in expectations["required_agents"].items():
         path = REPO_ROOT / expected["path"]
+        codex_only = is_codex_only_parity(expected)
         if not path.exists():
             failures.append(f"missing agent file: {expected['path']}")
             continue
@@ -148,6 +153,15 @@ def assert_required_fields(expectations: dict) -> list[str]:
                 f"{expected['path']}: expected fixture route/surface mismatch"
                 f" {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
             )
+        if codex_only:
+            if expected.get("claude_agent_path", "__missing__") is not None:
+                failures.append(
+                    f"{expected['path']}: codex_only parity must use claude_agent_path: null"
+                )
+            if not expected.get("parity_exception_reason"):
+                failures.append(
+                    f"{expected['path']}: codex_only parity requires parity_exception_reason"
+                )
     return failures
 
 
@@ -160,6 +174,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
     for agent_name, expected in expectations["required_agents"].items():
         agent = load_agent(REPO_ROOT / expected["path"])
         instructions = agent["developer_instructions"]
+        codex_only = is_codex_only_parity(expected)
         for field in ("model", "model_reasoning_effort", "default_permissions"):
             if agent.get(field) != expected[field]:
                 failures.append(
@@ -199,9 +214,19 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
                     f"{expected['path']}: skill surface {surface} must declare name and description frontmatter"
                 )
             failures.extend(validate_bridge_surface(surface_path))
-        claude_agent_path = REPO_ROOT / expected["claude_agent_path"]
-        if not claude_agent_path.exists():
-            failures.append(f"missing parity file: {expected['claude_agent_path']}")
+        if codex_only:
+            if expected.get("claude_agent_path", "__missing__") is not None:
+                failures.append(
+                    f"{expected['path']}: codex_only parity must use claude_agent_path: null"
+                )
+            if not expected.get("parity_exception_reason"):
+                failures.append(
+                    f"{expected['path']}: codex_only parity requires parity_exception_reason"
+                )
+        else:
+            claude_agent_path = REPO_ROOT / expected["claude_agent_path"]
+            if not claude_agent_path.exists():
+                failures.append(f"missing parity file: {expected['claude_agent_path']}")
 
     deduped_surface_paths = list(dict.fromkeys(all_surface_paths))
     failures.extend(find_duplicate_canonical_targets(deduped_surface_paths))
