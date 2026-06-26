@@ -155,6 +155,31 @@ managed skill（`create-issue` / `edit-issue`）が `gh issue create` / `gh issu
 
 これらの条件を満たさない `gh issue create/edit` は `gh_mutation_denied` でブロックされる。
 
+## Privileged Skill Runtime Command Boundary
+
+Issue #1154 では、root checkout からの skill runtime command を registry 全件へ一般化せず、`preflight.run` だけを deny-by-default で許可する。
+
+```yaml
+SKILL_RUNTIME_COMMAND_POLICY_V2:
+  eligible_command_ids:
+    preflight.run:
+      execution_class: exact_skill_runtime
+      required_cwd: canonical_main_root
+      required_branch: default_branch
+      allowed_write_roots:
+        - .claude/artifacts/issue-refinement-loop/{active_issue}/
+      network_effect: github_read_only
+```
+
+- root checkout から許可される command class は `uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number <active> --repo squne121/loop-protocol` の exact form のみ
+- `mutation: false`、`cwd_policy: repo_root`、registry 登録済みであること自体は認可根拠に使わない
+- active issue worktree は `git worktree list --porcelain -z` catalog で一意に解決できる entry のみを許可し、`.claude/worktrees/issue-<N>-*` の stale directory prefix match を認可根拠に使わない
+- executor は `repo` と `issue_number` を active worktree context に束縛し、registry は canonical path から load する
+- canonical repo binding は `https://github.com/<owner>/<repo>(.git)` と `git@github.com:<owner>/<repo>(.git)` の strict parser だけを受理する
+- executor は trusted PATH から解決した `uv` / `python3` を使い、allowlist env と filesystem snapshot/postcondition で ignored/transient outside write と PATH poisoning を fail-close する
+- `uv.pytest`、`pnpm.typecheck`、`pnpm.lint`、`pnpm.test`、`pnpm.build`、`gh.*`、未登録 script は root allow 対象外
+- `publish_termination_report.py` と producer output budget / schema mismatch / termination bypass は本 boundary の対象外
+
 ## ci-test-performance Consumer Routing
 
 `ci-test-performance` Skill は CI テストパフォーマンスのレーン分類・hotspot 分析・意思決定を担う。

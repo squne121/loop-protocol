@@ -38,6 +38,18 @@
     "dist": "loadscope"
   },
   "parallel_exclude": [],
+  "secondary_coverage": {
+    "plan_targets_provider_job": "python-test",
+    "dedicated_lanes": [
+      {
+        "provider_job": "python-test",
+        "lane_id": "codex-execpolicy",
+        "paths": [
+          "tests/codex/test_local_main_branch_guard.py"
+        ]
+      }
+    ]
+  },
   "notes": {
     "parallel_exclude_rationale": "test_session_manifest_debounce.py was previously quarantined here because it drove a real debounce front-gate with an 80ms window; under xdist CPU saturation the window expired between burst invocations and the coalescing assertion flaked (Issue #1064). It has been rewritten to be wall-clock-independent (Issue #1141): the worker is suppressed via a live lock owned by os.getpid(), events are queued synchronously, and flush is triggered via --flush (blocking call). No time.sleep() or wall-clock assertions remain. The test is now safe to run in the parallel lane.",
     "schemas_tests_inclusion": "schemas/tests/ is included exactly once here; it was previously missing from the generator pytest_args, causing the executed target set and the ci_test_selection artifact to drift (Issue #1064).",

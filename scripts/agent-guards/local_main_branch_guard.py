@@ -34,6 +34,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+_AGENT_GUARDS_DIR = Path(__file__).resolve().parent
+if str(_AGENT_GUARDS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR))
+
+from skill_runtime_command_policy import (  # noqa: E402
+    SKILL_RUNTIME_REASON_CODE,
+    is_exact_skill_runtime_executor_command,
+    looks_like_skill_runtime_executor_command,
+)
+
 
 # ─── Reason codes ────────────────────────────────────────────────────────────
 
@@ -49,6 +59,7 @@ REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
+REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
 # Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
 # arbitrated by worktree_scope_guard against the V3 one-shot contract. The local
 # root branch guard explicitly DEFERS authority to that guard so the two guards
@@ -302,13 +313,9 @@ _FD_DUP_STDERR_STDOUT_RE = re.compile(r"\s+2>&1(\s*\|)")
 _LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
 
 # ─── Deterministic checker allowlist ─────────────────────────────────────────
-# Exact-path allowlist for deterministic checker scripts.
-# Wildcard patterns are prohibited. Add entries only for:
-# - non-repo-state-mutating scripts
-# - trusted entrypoints (not /tmp/, not python -c, not bash -lc)
-DETERMINISTIC_CHECKER_ALLOWLIST = [
-    ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
-]
+# Deterministic checkers remain exact-path only; root execution of issue-refinement
+# preflight moved to skill_runtime_exec.py in Issue #1154.
+DETERMINISTIC_CHECKER_ALLOWLIST: list[str] = []
 
 # ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
 # ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS or is_github_remote_ops_command is blocked.
@@ -596,6 +603,19 @@ def is_deterministic_checker_command(cmd: str, project_root: str | None = None) 
             if script_path == abs_allowed:
                 return True
     return False
+
+
+def _is_skill_runtime_executor_command(cmd: str, cwd: str, project_root: str | None = None) -> bool:
+    """Exact privileged skill runtime executor classifier (Issue #1154)."""
+    if project_root is None:
+        project_root = _resolve_project_root(cwd)
+    if not project_root:
+        return False
+    return is_exact_skill_runtime_executor_command(cmd, cwd, project_root)
+
+
+def _looks_like_direct_issue_refinement_runtime_command(cmd: str) -> bool:
+    return ".claude/skills/issue-refinement-loop/scripts/" in cmd and "skill_runtime_exec.py" not in cmd
 
 
 def is_github_remote_ops_command(cmd: str) -> bool:
@@ -1345,6 +1365,36 @@ def evaluate(
             hook_flavor=hook_flavor,
         )
 
+    # Step 9.57: exact privileged skill runtime command class (Issue #1154).
+    project_root = _resolve_project_root(cwd)
+    if project_root and is_exact_skill_runtime_executor_command(normalized_cmd, cwd, project_root):
+        return _result(
+            status="allow",
+            reason_code=REASON_SKILL_RUNTIME_EXECUTOR,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+    if looks_like_skill_runtime_executor_command(normalized_cmd):
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+    if _looks_like_direct_issue_refinement_runtime_command(normalized_cmd):
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
     # Step 9.6: Tmp wrapper / python -c commands — fail-closed (AC14).
     if is_tmp_wrapper_or_python_c_command(normalized_cmd):
         return _result(
@@ -1461,7 +1511,6 @@ def evaluate(
     # Step 13.5: Deterministic checker commands on default branch — allowed with distinct reason_code (AC5/AC12).
     # NOTE: drifted/detached root is blocked by step 13 before reaching here.
     # deterministic_checker is intentionally NOT in the drifted allowlist; checker scripts should run from worktrees.
-    project_root = _resolve_project_root(cwd)
     if is_deterministic_checker_command(normalized_cmd, project_root):
         return _result(
             status="allow",
