@@ -128,7 +128,10 @@ class TestParseNextLink(unittest.TestCase):
         self.assertIsNone(mr._parse_next_link(""))
 
     def test_next_link_present(self):
-        header = '<https://api.github.com/repos/o/r/issues?page=2>; rel="next", <https://api.github.com/repos/o/r/issues?page=5>; rel="last"'
+        header = (
+            '<https://api.github.com/repos/o/r/issues?page=2>; rel="next",'
+            ' <https://api.github.com/repos/o/r/issues?page=5>; rel="last"'
+        )
         result = mr._parse_next_link(header)
         self.assertEqual(result, "https://api.github.com/repos/o/r/issues?page=2")
 
@@ -587,7 +590,10 @@ class TestNativeDependencies(unittest.TestCase):
             raise urllib.error.URLError("connection refused")
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaises(RuntimeError, msg="Network error must raise RuntimeError, not return fallback_trigger"):
+            with self.assertRaises(
+                RuntimeError,
+                msg="Network error must raise RuntimeError, not return fallback_trigger",
+            ):
                 mr._get_native_dependencies("owner", "repo", 10, "tok")
 
     def test_native_api_501_triggers_fallback(self):

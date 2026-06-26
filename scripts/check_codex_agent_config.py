@@ -119,7 +119,10 @@ def assert_required_fields(expectations: dict) -> list[str]:
             failures.append(f"missing agent file: {expected['path']}")
             continue
         agent = load_agent(path)
-        for field in ("name", "description", "model", "model_reasoning_effort", "default_permissions", "developer_instructions"):
+        for field in (
+            "name", "description", "model",
+            "model_reasoning_effort", "default_permissions", "developer_instructions"
+        ):
             if not agent.get(field):
                 failures.append(f"{expected['path']}: missing required field '{field}'")
         if agent.get("name") != agent_name:
@@ -142,7 +145,8 @@ def assert_required_fields(expectations: dict) -> list[str]:
         expected_route_surfaces = route_tokens_to_skill_surfaces(expected.get("runtime_followup_route", ""))
         if expected_skill_surfaces != expected_route_surfaces:
             failures.append(
-                f"{expected['path']}: expected fixture route/surface mismatch {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
+                f"{expected['path']}: expected fixture route/surface mismatch"
+                f" {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
             )
     return failures
 
@@ -171,12 +175,15 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
         expected_skill_surfaces = expected.get("repo_local_skill_surfaces", [])
         if actual_skill_surfaces != expected_skill_surfaces:
             failures.append(
-                f"{expected['path']}: repo_local_skill_surfaces expected {expected_skill_surfaces!r} got {actual_skill_surfaces!r}"
+                f"{expected['path']}: repo_local_skill_surfaces expected"
+                f" {expected_skill_surfaces!r} got {actual_skill_surfaces!r}"
             )
         route_surface_paths = route_tokens_to_skill_surfaces(expected["runtime_followup_route"])
         if actual_skill_surfaces != route_surface_paths:
             failures.append(
-                f"{expected['path']}: runtime_followup_route {expected['runtime_followup_route']!r} must map to {route_surface_paths!r}, got {actual_skill_surfaces!r}"
+                f"{expected['path']}: runtime_followup_route"
+                f" {expected['runtime_followup_route']!r} must map to"
+                f" {route_surface_paths!r}, got {actual_skill_surfaces!r}"
             )
         for surface in actual_skill_surfaces:
             surface_path = REPO_ROOT / surface
@@ -214,7 +221,10 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
                 failures.append(".codex/hooks.json: SubagentStart matcher must be '.*'")
             commands = [hook.get("command") for hook in entry.get("hooks", []) if isinstance(hook.get("command"), str)]
             if len(commands) != 1 or "--hook-subagent-start" not in commands[0]:
-                failures.append(".codex/hooks.json: SubagentStart must route exactly one command with --hook-subagent-start")
+                failures.append(
+                    ".codex/hooks.json: SubagentStart must route exactly"
+                    " one command with --hook-subagent-start"
+                )
 
     pretool_entries = hooks_root.get("PreToolUse")
     if not isinstance(pretool_entries, list) or not pretool_entries:

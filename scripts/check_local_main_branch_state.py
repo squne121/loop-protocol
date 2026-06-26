@@ -245,7 +245,10 @@ def run_self_test() -> int:
         state = check_state(cwd=tmpdir)
         _assert("detached root: check_state() status => unknown", state["status"], "unknown")
         if state["current_branch"] is not None:
-            failures.append(f"detached root: check_state() current_branch should be None, got {state['current_branch']!r}")
+            failures.append(
+                f"detached root: check_state() current_branch should be None,"
+                f" got {state['current_branch']!r}"
+            )
         else:
             print("[self-test] PASS: detached root: current_branch is None")
 

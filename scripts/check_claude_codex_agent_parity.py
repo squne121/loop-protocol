@@ -111,7 +111,9 @@ class AgentParityFacts:
         # Final output schema (compact schema returned to caller)
         self.final_output_schema = final_output_schema
         # Artifact-only schemas (never returned to caller, stored in artifacts only)
-        self.artifact_only_schema_names: list[str] = artifact_only_schema_names if artifact_only_schema_names is not None else []
+        self.artifact_only_schema_names: list[str] = (
+            artifact_only_schema_names if artifact_only_schema_names is not None else []
+        )
         # Permission layers
         self.declared_permission = declared_permission  # claude.permissionMode or codex.default_permissions
         self.mutation_boundary = mutation_boundary      # derived readonly/issue-mutation/repo-write
@@ -231,7 +233,8 @@ def extract_artifact_only_schemas_from_claude(text: str, final_schema: str | Non
     # B2: Pattern in heading: '### 内部処理用 SCHEMA_NAME（artifact のみ）' or similar
     # Matches: heading lines where schema name appears before the artifact marker
     for m in re.finditer(
-        r"(?:^|\n)#{1,6}\s+(?:内部処理用|artifact[- ]only)[^\n]*?([A-Z][A-Z0-9_]+_V\d+)[^\n]*?(?:artifact[- ]?(?:only|のみ)|内部処理用|のみ)",
+        r"(?:^|\n)#{1,6}\s+(?:内部処理用|artifact[- ]only)[^\n]*?"
+        r"([A-Z][A-Z0-9_]+_V\d+)[^\n]*?(?:artifact[- ]?(?:only|のみ)|内部処理用|のみ)",
         text,
         re.IGNORECASE,
     ):
@@ -668,11 +671,14 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(f"{expected['claude_agent_path']}: frontmatter name must be {agent_name}")
         if claude_frontmatter.get("model") != expected["claude_model"]:
             failures.append(
-                f"{expected['claude_agent_path']}: model expected {expected['claude_model']!r} got {claude_frontmatter.get('model')!r}"
+                f"{expected['claude_agent_path']}: model expected"
+                f" {expected['claude_model']!r} got {claude_frontmatter.get('model')!r}"
             )
         if claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]:
             failures.append(
-                f"{expected['claude_agent_path']}: permissionMode expected {expected['claude_permission_mode']!r} got {claude_frontmatter.get('permissionMode')!r}"
+                f"{expected['claude_agent_path']}: permissionMode expected"
+                f" {expected['claude_permission_mode']!r}"
+                f" got {claude_frontmatter.get('permissionMode')!r}"
             )
 
         tools = claude_frontmatter.get("tools", [])
@@ -683,16 +689,22 @@ def main(argv: list[str] | None = None) -> int:
         runtime_route = extract_runtime_field(codex_instructions, "runtime_followup_route")
         if runtime_status != expected["runtime_dependency_status"]:
             failures.append(
-                f"{expected['path']}: runtime_dependency_status expected {expected['runtime_dependency_status']!r} got {runtime_status!r}"
+                f"{expected['path']}: runtime_dependency_status expected"
+                f" {expected['runtime_dependency_status']!r} got {runtime_status!r}"
             )
         if runtime_route != expected["runtime_followup_route"]:
             failures.append(
-                f"{expected['path']}: runtime_followup_route expected {expected['runtime_followup_route']!r} got {runtime_route!r}"
+                f"{expected['path']}: runtime_followup_route expected"
+                f" {expected['runtime_followup_route']!r} got {runtime_route!r}"
             )
 
-        if expected["runtime_followup_route"] != "none" and expected["runtime_followup_route"].split("|")[0] not in claude_text:
+        if (
+            expected["runtime_followup_route"] != "none"
+            and expected["runtime_followup_route"].split("|")[0] not in claude_text
+        ):
             failures.append(
-                f"{expected['claude_agent_path']}: expected route token {expected['runtime_followup_route']!r} not found"
+                f"{expected['claude_agent_path']}: expected route token"
+                f" {expected['runtime_followup_route']!r} not found"
             )
 
         permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
@@ -700,7 +712,8 @@ def main(argv: list[str] | None = None) -> int:
             permission_expected = "default"
         if claude_frontmatter.get("permissionMode") != permission_expected:
             failures.append(
-                f"{expected['claude_agent_path']}: permissionMode must match Codex permission profile {expected['default_permissions']}"
+                f"{expected['claude_agent_path']}: permissionMode must match"
+                f" Codex permission profile {expected['default_permissions']}"
             )
 
     # --- Extended parity checks for PARITY_AGENTS ---

@@ -59,7 +59,9 @@ def materialize(
         return {"status": "error", "error": "ttl_out_of_bounds"}
 
     root = os.path.realpath(project_root) if project_root else resolve_project_root()
-    worktree_real = os.path.realpath(worktree_path if os.path.isabs(worktree_path) else os.path.join(root, worktree_path))
+    worktree_real = os.path.realpath(
+        worktree_path if os.path.isabs(worktree_path) else os.path.join(root, worktree_path)
+    )
 
     req = {
         "pr_number": pr_number,
