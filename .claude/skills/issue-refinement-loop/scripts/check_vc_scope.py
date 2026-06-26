@@ -345,7 +345,12 @@ _PATH_EXTRACT_ALLOWED_CMDS = frozenset({
 })
 
 # Option flags that take a value argument and should have their value skipped
-_OPTION_WITH_VALUE_RE = re.compile(r"^-[eEfFgGnNoOpPqQrRsStTuUwWxX]$|^--(?:glob|include|exclude|type|file|pattern|replace|regexp|encoding|after-context|before-context|context|max-count|max-depth|threads|sortr?|field-match-separator)$")
+_OPTION_WITH_VALUE_RE = re.compile(
+    r"^-[eEfFgGnNoOpPqQrRsStTuUwWxX]$"
+    r"|^--(?:glob|include|exclude|type|file|pattern"
+    r"|replace|regexp|encoding|after-context|before-context"
+    r"|context|max-count|max-depth|threads|sortr?|field-match-separator)$"
+)
 
 
 def _extract_paths_from_simple_command(simple_cmd: str, cmd_text_for_error: str) -> tuple[list[str], bool]:

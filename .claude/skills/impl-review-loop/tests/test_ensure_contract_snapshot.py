@@ -161,7 +161,12 @@ class TestCheckOnlyMode:
         parser_mod = _mock_parser_mod(
             comments=[_GO_COMMENT],
             go_comment=_GO_COMMENT,
-            latest={"comment_id": 1001, "html_url": _GO_COMMENT["html_url"], "status": "go", "created_at": "2026-06-13T08:00:00Z"},
+            latest={
+                "comment_id": 1001,
+                "html_url": _GO_COMMENT["html_url"],
+                "status": "go",
+                "created_at": "2026-06-13T08:00:00Z"
+            },
         )
 
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
@@ -649,7 +654,12 @@ class TestOkImpliesSnapshotUrl:
         parser_mod = _mock_parser_mod(
             comments=[_GO_COMMENT],
             go_comment=_GO_COMMENT,
-            latest={"comment_id": 1001, "html_url": _GO_COMMENT["html_url"], "status": "go", "created_at": "2026-06-13T08:00:00Z"},
+            latest={
+                "comment_id": 1001,
+                "html_url": _GO_COMMENT["html_url"],
+                "status": "go",
+                "created_at": "2026-06-13T08:00:00Z"
+            },
         )
 
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):

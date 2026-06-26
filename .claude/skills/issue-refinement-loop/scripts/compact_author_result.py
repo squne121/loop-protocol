@@ -182,7 +182,11 @@ def compact_author_result(
             first = blockers[0]
             if isinstance(first, dict):
                 code = first.get("code", "")
-                summary = f"failed; {len(blockers)} blocker(s); first={code}" if code else f"failed; {len(blockers)} blocker(s)"
+                summary = (
+                    f"failed; {len(blockers)} blocker(s); first={code}"
+                    if code
+                    else f"failed; {len(blockers)} blocker(s)"
+                )
             else:
                 summary = f"failed; {str(first)[:60]}"
         else:

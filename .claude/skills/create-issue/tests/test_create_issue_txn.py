@@ -420,7 +420,13 @@ class TestRunTransactionImplementationLabels:
 
         monkeypatch.setattr(txn, "_issue_apply_labels", _capture_apply)
 
-        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+        def _success_label_rb(
+            repo: str,
+            issue_number: int,
+            labels: list[str],
+            gh_bin: str,
+            **_k: Any
+        ) -> txn.LabelReadbackResult:
             return txn.LabelReadbackResult(
                 ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
             )
@@ -462,7 +468,13 @@ class TestRunTransactionImplementationLabels:
 
         monkeypatch.setattr(txn, "_issue_apply_labels", _capture_apply)
 
-        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+        def _success_label_rb(
+            repo: str,
+            issue_number: int,
+            labels: list[str],
+            gh_bin: str,
+            **_k: Any
+        ) -> txn.LabelReadbackResult:
             return txn.LabelReadbackResult(
                 ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
             )
@@ -909,7 +921,13 @@ class TestDedupePathParentReconcile:
         monkeypatch.setattr(txn, "_readback_parent_issue_with_retry", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
         # Mock _run_gh_json for dedupe-body-read to return existing body with matching parent
-        monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, stage, **_k: {"body": 'parent_issue: "#42"\n' + _MINIMAL_VALID_BODY, "number": 55})
+        monkeypatch.setattr(
+            txn,
+            "_run_gh_json",
+            lambda *_a,
+            stage,
+            **_k: {"body": 'parent_issue: "#42"\n' + _MINIMAL_VALID_BODY, "number": 55}
+        )
 
         fake_sleep = FakeSleep()
         result = txn.run_transaction(
@@ -1385,7 +1403,10 @@ class TestDedupeExistingBodyMalformedParentFailClosed:
     """Blocker 4 (iteration 2): dedupe existing body parse error fails closed."""
 
     def test_dedupe_existing_body_malformed_parent_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """existing body: parent_issue: "#abc" -> result.failure_stage in parent-body-parse / dedupe-parent-body-parse."""
+        (
+            """existing body: parent_issue: "#abc" -> result.failure_stage in parent-body-parse /"""
+            """ dedupe-parent-body-parse."""
+        )
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
 
@@ -1516,7 +1537,10 @@ class TestDedupeExistingBodyExplicitNoneWithParent:
     ) -> None:
         """Existing issue body: 'none（単独改善）'. Current resolved parent: 42.
         -> failure_stage == "dedupe-parent-mismatch"."""
-        existing_issue_body = "## Parent Issue\n\nnone（単独改善）\n## Acceptance Criteria\n\n- AC1: Test\n## Verification Commands\n\n```bash\necho test\n```\n## Allowed Paths\n\n- src/**"
+        existing_issue_body = (
+            "## Parent Issue\n\nnone（単独改善）\n## Acceptance Criteria\n\n- AC1: Test\n## Verification"
+            " Commands\n\n```bash\necho test\n```\n## Allowed Paths\n\n- src/**"
+        )
 
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [55])
 
@@ -1815,7 +1839,13 @@ class TestReconcileRecoversLabelReadbackWithoutManualSubIssueMutation:
         monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
 
-        def _success_label_rb(repo: str, issue_number: int, labels: list[str], gh_bin: str, **_k: Any) -> txn.LabelReadbackResult:
+        def _success_label_rb(
+            repo: str,
+            issue_number: int,
+            labels: list[str],
+            gh_bin: str,
+            **_k: Any
+        ) -> txn.LabelReadbackResult:
             return txn.LabelReadbackResult(
                 ok=True, expected_labels=list(labels), actual_labels=list(labels), attempts=1, retry_delays=[],
             )
@@ -1993,10 +2023,15 @@ class TestParseArgsWithoutSubcommandRemainsBackwardCompatible:
 # ---------------------------------------------------------------------------
 
 class TestSkillLabelReadbackHasNoRawGhIssueEditRecovery:
-    """test_skill_label_readback_has_no_raw_gh_issue_edit_recovery: SKILL.md の label-readback 行に gh issue edit が含まれないことを検査。"""
+    """test_skill_label_readback_has_no_raw_gh_issue_edit_recovery: SKILL.md の label-readback 行に gh issue edit
+        が含まれないことを検査。
+    """
 
     def test_skill_label_readback_has_no_raw_gh_issue_edit_recovery(self) -> None:
-        """SKILL.md の Partial-failure Recovery テーブルの label-readback 行に raw gh issue edit が含まれてはならない。"""
+        (
+            """SKILL.md の Partial-failure Recovery テーブルの label-readback 行に raw gh issue edit"""
+            """ が含まれてはならない。"""
+        )
         skill_md = Path(__file__).parent.parent / "SKILL.md"
         assert skill_md.exists(), f"SKILL.md not found at {skill_md}"
         content = skill_md.read_text(encoding="utf-8")
@@ -2015,7 +2050,9 @@ class TestSkillLabelReadbackHasNoRawGhIssueEditRecovery:
 # ---------------------------------------------------------------------------
 
 class TestRecoveryHintForLabelReadbackUsesReconcile:
-    """test_recovery_hint_for_label_readback_uses_reconcile: recovery hint が reconcile を含み gh issue edit を含まないことを確認。"""
+    """test_recovery_hint_for_label_readback_uses_reconcile: recovery hint が reconcile を含み gh issue edit
+        を含まないことを確認。
+    """
 
     def test_recovery_hint_for_label_readback_uses_reconcile(self) -> None:
         """_recovery_hint_for_stage("label-readback") must contain 'reconcile' and NOT contain 'gh issue edit'."""
@@ -2035,7 +2072,10 @@ class TestRecoveryHintForLabelReadbackUsesReconcile:
 # ---------------------------------------------------------------------------
 
 class TestReconcileDependencyIsNotNoop:
-    """test_reconcile_dependency_is_not_noop: reconcile_transaction が --dependency 指定時に依存登録と readback を実行することを monkeypatch で検査。"""
+    """test_reconcile_dependency_is_not_noop: reconcile_transaction が --dependency 指定時に依存登録と readback
+        を実行することを
+        monkeypatch で検査。
+    """
 
     def test_reconcile_dependency_is_not_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """reconcile_transaction with dependency_issue_numbers calls _issue_register_dependency and readback."""
@@ -2090,7 +2130,9 @@ class TestReconcileDependencyIsNotNoop:
 # ---------------------------------------------------------------------------
 
 class TestFailedReadbacksContainsActualLabelsAndAttempts:
-    """test_failed_readbacks_contains_actual_labels_and_attempts: LabelReadbackResult の actual_labels が実際のラベルを含むことを検査。"""
+    """test_failed_readbacks_contains_actual_labels_and_attempts: LabelReadbackResult の actual_labels
+        が実際のラベルを含むことを検査。
+    """
 
     def test_failed_readbacks_contains_actual_labels_and_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_readback_labels_with_result returns actual_labels from GraphQL, not empty list."""
@@ -2127,7 +2169,9 @@ class TestFailedReadbacksContainsActualLabelsAndAttempts:
         assert result.ok is False
         assert result.expected_labels == ["missing-label"]
         # actual_labels must NOT be empty — must contain what's on the issue
-        assert len(result.actual_labels) > 0, "actual_labels must not be empty; should contain labels fetched from GraphQL"
+        assert len(result.actual_labels) > 0, (
+            "actual_labels must not be empty; should contain labels fetched from GraphQL"
+        )
         assert set(result.actual_labels) == set(actual_on_issue)
         assert result.attempts >= 1
 
@@ -2137,7 +2181,9 @@ class TestFailedReadbacksContainsActualLabelsAndAttempts:
 # ---------------------------------------------------------------------------
 
 class TestTransactionResultAppliedVerifiedPendingSemantics:
-    """test_transaction_result_applied_verified_pending_semantics: label-readback 失敗後のステップフィールドが正しく埋まることを検査。"""
+    """test_transaction_result_applied_verified_pending_semantics: label-readback
+        失敗後のステップフィールドが正しく埋まることを検査。
+    """
 
     def _patch_standard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [])
@@ -2204,7 +2250,9 @@ class TestTransactionResultAppliedVerifiedPendingSemantics:
 # ---------------------------------------------------------------------------
 
 class TestPartialFailureCommentFailureIsReported:
-    """test_partial_failure_comment_failure_is_reported: comment 投稿失敗時に audit_comment_posted=False が結果に含まれることを検査。"""
+    """test_partial_failure_comment_failure_is_reported: comment 投稿失敗時に audit_comment_posted=False
+        が結果に含まれることを検査。
+    """
 
     def test_partial_failure_comment_failure_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When _post_partial_failure_comment raises TransactionError, result.audit_comment_posted == False."""

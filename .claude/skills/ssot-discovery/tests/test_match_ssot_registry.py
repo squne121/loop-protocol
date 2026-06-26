@@ -42,7 +42,9 @@ def run_match(args):
         [sys.executable, str(MATCH_PY)] + args,
         capture_output=True, text=True
     )
-    assert result.returncode in (0, 1), f"match_ssot.py failed with rc={result.returncode}\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    assert result.returncode in (0, 1), (
+        f"match_ssot.py failed with rc={result.returncode}\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
     parsed = yaml.safe_load(result.stdout)
     assert parsed is not None, f"Empty output from match_ssot.py. stdout: {result.stdout!r}"
     assert "SSOT_DISCOVERY_RESULT_V1" in parsed, f"Missing SSOT_DISCOVERY_RESULT_V1 key. stdout: {result.stdout!r}"

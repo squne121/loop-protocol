@@ -236,7 +236,9 @@ class TestValidMarker:
     def test_valid_marker_yaml_key_returns_pass(self, tmp_path):
         """Marker as top-level YAML key in fenced block passes."""
         result = run_script(tmp_path, terminal_content=VALID_TERMINAL_YAML_KEY)
-        assert result.returncode == 0, f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 0, (
+            f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "pass"
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["terminal_result_marker"]["found"] is True
@@ -245,20 +247,26 @@ class TestValidMarker:
     def test_valid_marker_html_comment_returns_pass(self, tmp_path):
         """Marker as HTML comment followed by fenced YAML block passes."""
         result = run_script(tmp_path, terminal_content=VALID_TERMINAL_HTML_COMMENT)
-        assert result.returncode == 0, f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 0, (
+            f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "pass"
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["terminal_result_marker"]["found"] is True
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["blocked_reasons"] == []
 
     def test_output_includes_ac_boolean_fields(self, tmp_path):
-        """Output YAML includes read_only_agents_clear, write_capable_agents_have_justification, explicit_tools_declared."""
+        """Output YAML includes read_only_agents_clear, write_capable_agents_have_justification,
+            explicit_tools_declared.
+        """
         result = run_script(tmp_path, terminal_content=VALID_TERMINAL_YAML_KEY)
         assert result.returncode == 0
         output = yaml.safe_load(result.stdout)
         ac = output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["subagent_security_ac"]
         assert "read_only_agents_clear" in ac, f"Missing read_only_agents_clear in output: {ac}"
-        assert "write_capable_agents_have_justification" in ac, f"Missing write_capable_agents_have_justification in output: {ac}"
+        assert "write_capable_agents_have_justification" in ac, (
+            f"Missing write_capable_agents_have_justification in output: {ac}"
+        )
         assert "explicit_tools_declared" in ac, f"Missing explicit_tools_declared in output: {ac}"
         assert ac["read_only_agents_clear"] is True
         assert ac["write_capable_agents_have_justification"] is True
@@ -284,7 +292,9 @@ class TestNoMarker:
     def test_freeform_prose_returns_blocked(self, tmp_path):
         """Freeform prose without marker returns blocked."""
         result = run_script(tmp_path, terminal_content=INVALID_TERMINAL_PROSE)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["terminal_result_marker"]["found"] is False
@@ -293,7 +303,9 @@ class TestNoMarker:
     def test_bare_substring_not_in_fenced_block_returns_blocked(self, tmp_path):
         """Bare prose embedding the marker string (not as HTML comment or YAML key) is blocked."""
         result = run_script(tmp_path, terminal_content=INVALID_TERMINAL_BARE_SUBSTRING)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
 
@@ -306,7 +318,9 @@ class TestResultFieldValidation:
     def test_missing_required_fields_returns_blocked(self, tmp_path):
         """Result YAML missing termination_reason and merge_ready returns blocked."""
         result = run_script(tmp_path, terminal_content=INVALID_TERMINAL_MISSING_FIELDS)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
         reasons = output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["blocked_reasons"]
@@ -324,7 +338,9 @@ class TestResultFieldValidation:
             ```
             """)
         result = run_script(tmp_path, terminal_content=bad_terminal)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
 
@@ -349,7 +365,9 @@ class TestMalformed:
             "pr-reviewer.md": PR_REVIEWER_FM,
         }
         result = run_script(tmp_path, agent_files=agent_files)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
         assert len(output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["blocked_reasons"]) > 0
@@ -379,7 +397,9 @@ class TestExplicitTools:
             "pr-reviewer.md": PR_REVIEWER_FM,
         }
         result = run_script(tmp_path, agent_files=agent_files)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
         reasons = output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["blocked_reasons"]
@@ -441,7 +461,9 @@ class TestReadOnly:
             "pr-reviewer.md": PR_REVIEWER_FM,
         }
         result = run_script(tmp_path, agent_files=agent_files)
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
         reasons = output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["blocked_reasons"]
@@ -491,7 +513,9 @@ class TestWriteCapable:
             },
             terminal_content=VALID_TERMINAL_YAML_KEY,
         )
-        assert result.returncode == 0, f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 0, (
+            f"Expected exit 0 (pass), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "pass"
 
@@ -560,7 +584,9 @@ class TestWriteCapable:
             },
             terminal_content=VALID_TERMINAL_YAML_KEY,
         )
-        assert result.returncode == 1, f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked), got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
 
@@ -607,7 +633,10 @@ class TestWriteCapable:
             },
             terminal_content=VALID_TERMINAL_YAML_KEY,
         )
-        assert result.returncode == 1, f"Expected exit 1 (blocked) due to empty justification, got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked) due to empty justification,"
+            f" got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
 
@@ -649,7 +678,10 @@ class TestWriteCapable:
             },
             terminal_content=VALID_TERMINAL_YAML_KEY,
         )
-        assert result.returncode == 1, f"Expected exit 1 (blocked) due to missing role_category, got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        assert result.returncode == 1, (
+            f"Expected exit 1 (blocked) due to missing role_category,"
+            f" got {result.returncode}.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         output = yaml.safe_load(result.stdout)
         assert output["AUTONOMY_POLICY_VALIDATION_RESULT_V1"]["status"] == "blocked"
 

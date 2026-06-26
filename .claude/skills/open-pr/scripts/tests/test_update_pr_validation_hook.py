@@ -132,7 +132,19 @@ class TestUpdatePrValidatorPass:
                     "body_sha256": "sha256:abc123",
                 },
             )
-            monkeypatch.setattr(update_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
+            monkeypatch.setattr(
+                update_pr,
+                "_run_japanese_content_validator",
+                lambda body_text,
+                threshold=0.1: {
+                    "status": "pass",
+                    "failed_blocks": 0,
+                    "aggregate_ratio": 0.5,
+                    "threshold": 0.1,
+                    "body_sha256": "",
+                    "stderr": ""
+                }
+            )
 
             def fake_update_pr(repo, pr_number, body_file):
                 update_called["value"] = True
@@ -299,7 +311,19 @@ class TestUpdatePrFixture:
                 }
 
             monkeypatch.setattr(update_pr, "_run_pr_body_validator", fake_validator)
-            monkeypatch.setattr(update_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
+            monkeypatch.setattr(
+                update_pr,
+                "_run_japanese_content_validator",
+                lambda body_text,
+                threshold=0.1: {
+                    "status": "pass",
+                    "failed_blocks": 0,
+                    "aggregate_ratio": 0.5,
+                    "threshold": 0.1,
+                    "body_sha256": "",
+                    "stderr": ""
+                }
+            )
             monkeypatch.setattr(update_pr, "update_pr", lambda *args, **kwargs: True)
 
             rc = update_pr.main(
@@ -449,7 +473,9 @@ class TestTOCTOUSafety:
     """Blocker 1: TOCTOU safety — validator pass 後に temp body が gh pr edit に渡る (fix_delta)"""
 
     def test_toctou_uses_validated_body_temp(self, monkeypatch: pytest.MonkeyPatch):
-        """validator pass 後、gh pr edit に渡す path が args.body_file ではなく temp file であることを確認 (Blocker 1)"""
+        """validator pass 後、gh pr edit に渡す path が
+        args.body_file ではなく temp file であることを確認 (Blocker 1)
+        """
         original_body = write_temp_body("# Original body that will not be used")
         try:
             validated_body = "# Updated and validated body"

@@ -188,7 +188,9 @@ $ {git_cmd}
         r = results[0]
         assert r["classification"] == "blocked", f"'{git_cmd}': expected blocked"
         # B3: git uses exact read-only allowlist; mutations return command_not_allowed
-        assert r["category"] in ("unsafe_command", "command_not_allowed"), f"'{git_cmd}': expected unsafe_command or command_not_allowed, got {r['category']}"
+        assert r["category"] in ("unsafe_command", "command_not_allowed"), (
+            f"'{git_cmd}': expected unsafe_command or command_not_allowed, got {r['category']}"
+        )
         assert r["decision"] == "blocked"
         assert r["exit_code"] is None, f"'{git_cmd}': must not be executed"
 
@@ -973,13 +975,16 @@ def test_match_ssot_with_keywords_and_paths_is_trivially_pass_blocked():
 
     Regression test for the original failing case from Issue #201 background section.
     """
-    body = """## Verification Commands
-
-```bash
-# AC1
-$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "milestone,github-milestone" --paths "docs/dev/milestone-ops.md"
-```
-"""
+    body = (
+        "## Verification Commands\n"
+        "\n"
+        "```bash\n"
+        "# AC1\n"
+        "$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh"
+        " --keywords \"milestone,github-milestone\""
+        " --paths \"docs/dev/milestone-ops.md\"\n"
+        "```\n"
+    )
     data = run_preflight(body)
     results = data["results"]
     assert len(results) == 1

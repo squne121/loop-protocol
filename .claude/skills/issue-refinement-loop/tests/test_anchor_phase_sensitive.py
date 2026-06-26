@@ -243,12 +243,16 @@ class TestExcludedByAnchorReframeAdapter:
         actual logic is: triggered=False AND reason==anchor_reframe_exclusion means excluded=True.
 
         From plan_refinement_loop.py:
-            "excluded_by_anchor_reframe": scope_signal_triggered and scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
+            "excluded_by_anchor_reframe": (
+                scope_signal_triggered
+                and scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
+            )
         But _detect_scope_signals returns triggered=False for exclusion, so this is always False...
         Let's verify the actual output field.
         """
         # The actual excluded_by_anchor_reframe field in plan output:
-        # "excluded_by_anchor_reframe": scope_signal_triggered and scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
+        # "excluded_by_anchor_reframe": scope_signal_triggered and scope_signal_reason ==
+        # SCOPE_SIGNAL_REASON_ANCHOR_REFRAME
         # Since triggered=False for anchor_reframe, this is False AND ... = False
         # This is the "after" state: the field shows False when triggered is False.
         # But the reason_code=anchor_reframe_exclusion is the canonical signal.

@@ -470,7 +470,10 @@ def _repair_inline_baseline_expect(section: str) -> tuple[str, list[dict]]:
                     "kind": "move_inline_baseline_expect_to_preceding_line",
                     "line_start": idx + 1,
                     "line_end": idx + 1,
-                    "reason": "inline baseline-expect alters command semantics; it must be on the immediately preceding comment line",
+                    "reason": (
+                        "inline baseline-expect alters command semantics; it must be on the immediately preceding"
+                        " comment line"
+                    ),
                     "original": line,
                     "repaired": f"{annotation}\n{clean_line}",
                     "safety": "mutation-free-dry-run",

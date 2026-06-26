@@ -304,7 +304,11 @@ def test_ac13_run_agy_uses_shell_false_and_minimal_env() -> None:
         rgh._run_agy("test prompt", 30)
 
     # shell=False (default when not specified, but must not be True)
-    assert captured_kwargs.get("shell") is False or "shell" not in captured_kwargs or captured_kwargs.get("shell") is False
+    assert (
+        captured_kwargs.get("shell") is False
+        or "shell" not in captured_kwargs
+        or captured_kwargs.get("shell") is False
+    )
     # env must be present and minimal
     env = captured_kwargs.get("env")
     assert env is not None, "env must be explicitly set (minimal env required)"

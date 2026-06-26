@@ -104,7 +104,10 @@ class TestEvidenceSpanSource:
                 for forbidden_key in forbidden_keys:
                     assert (
                         forbidden_key not in span
-                    ), f"Forbidden key '{forbidden_key}' found in evidence span. This should be in REPO_EVIDENCE_REF_V1, not here."
+                    ), (
+                        f"Forbidden key '{forbidden_key}' found in evidence span."
+                        " This should be in REPO_EVIDENCE_REF_V1, not here."
+                    )
 
         # Check follow-up candidates
         for candidate in output["decisions"].get("follow_up_materialization", {}).get("candidates", []):

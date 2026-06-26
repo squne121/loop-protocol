@@ -62,7 +62,10 @@ def test_lp050_schema_inventory_required(fixture_name: str):
 
 
 def test_not_schema_change_inventory_na():
-    result = validate_pr_body(load_fixture("not_schema_change_with_na_inventory.md"), load_paths("non_safety_paths.txt"))
+    result = validate_pr_body(
+        load_fixture("not_schema_change_with_na_inventory.md"),
+        load_paths("non_safety_paths.txt")
+    )
     lp050_errors = [error for error in result.errors if error.rule_id == "LP050"]
     assert result.status == "pass"
     assert lp050_errors == []
@@ -83,7 +86,10 @@ def test_lp055_safety_matrix_columns_invalid():
 
 
 def test_lp056_safety_followup_required():
-    result = validate_pr_body(load_fixture("safety_matrix_not_controlled_without_followup.md"), load_paths("safety_paths.txt"))
+    result = validate_pr_body(
+        load_fixture("safety_matrix_not_controlled_without_followup.md"),
+        load_paths("safety_paths.txt")
+    )
     errors = [error for error in result.errors if error.rule_id == "LP056"]
     assert result.status == "fail"
     assert len(errors) == 1
@@ -97,7 +103,12 @@ def test_lp057_related_issue_required():
 
 
 def test_lp058_changed_paths_unavailable():
-    result = validate_pr_body(load_fixture("changed_paths_unavailable.md") if (FIXTURE_DIR / "changed_paths_unavailable.md").exists() else load_fixture("valid_not_schema_change.md"), None)
+    result = validate_pr_body(
+        load_fixture("changed_paths_unavailable.md")
+        if (FIXTURE_DIR / "changed_paths_unavailable.md").exists()
+        else load_fixture("valid_not_schema_change.md"),
+        None
+    )
     errors = [error for error in result.errors if error.rule_id == "LP058"]
     assert result.status == "fail"
     assert len(errors) == 1
@@ -498,7 +509,11 @@ safety_claims:
 
 
 def test_markdown_table_backward_compat():
-    result = validate_pr_body(load_fixture("valid_not_schema_change.md"), load_paths("non_safety_paths.txt"), linked_issue=330)
+    result = validate_pr_body(
+        load_fixture("valid_not_schema_change.md"),
+        load_paths("non_safety_paths.txt"),
+        linked_issue=330
+    )
     assert result.status == "pass"
 
 
@@ -573,7 +588,10 @@ def test_follow_up_missing_contract_when_omitted():
         "## Schema Consumer Inventory\n\n"
         "N/A\nreason: none\n\n"
         "## Safety Claim Matrix\n\n"
-        + fence + "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n  - claim: Narrow safety claim\n    implemented: \"partial\"\n    not_controlled:\n      - Native tool registry\n    evidence:\n      - rg -n \"claim\" .\n" + fence + "\n\n"
+        + fence + (
+            "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n  - claim: Narrow safety claim\n    implemented: \"partial\"\n "
+            "   not_controlled:\n      - Native tool registry\n    evidence:\n      - rg -n \"claim\" .\n"
+        ) + fence + "\n\n"
         "## Notes\n\n"
         "- Related issue: #330\n"
     )
@@ -595,7 +613,11 @@ def test_follow_up_missing_contract_when_empty_list():
         "## Schema Consumer Inventory\n\n"
         "N/A\nreason: none\n\n"
         "## Safety Claim Matrix\n\n"
-        + fence + "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n  - claim: Narrow safety claim\n    implemented: \"partial\"\n    not_controlled:\n      - Native tool registry\n    evidence:\n      - rg -n \"claim\" .\n    follow_up: []\n" + fence + "\n\n"
+        + fence + "yaml\n# SAFETY_CLAIMS_V1\nsafety_claims:\n"
+        "  - claim: Narrow safety claim\n    implemented: \"partial\"\n"
+        "    not_controlled:\n      - Native tool registry\n"
+        "    evidence:\n      - rg -n \"claim\" .\n    follow_up: []\n"
+        + fence + "\n\n"
         "## Notes\n\n"
         "- Related issue: #330\n"
     )
