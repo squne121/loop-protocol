@@ -6,7 +6,10 @@ Thin publisher that calls render_termination_report.py via subprocess
 and conditionally posts the rendered body to GitHub as an issue comment.
 
 Usage:
-    python3 publish_termination_report.py --issue-number <int> [--input-file <path>]
+    python3 publish_termination_report.py \
+        --issue-number <int> \
+        --repo <owner/repo> \
+        [--input-file <path>]
 
 Note: --renderer CLI flag has been removed. Override RENDERER_SCRIPT module attribute in tests.
 
@@ -210,13 +213,15 @@ def _validate_render_result(result: dict) -> str:
 # GitHub comment posting (fail-closed: only called on publishable=true)
 # ---------------------------------------------------------------------------
 
-def _post_github_comment(*, issue_number: int, body: str) -> int:
+def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
     """
     Post body as a GitHub issue comment via gh CLI.
 
     Uses --body-file - with stdin input (no temp file, no NamedTemporaryFile).
+    Requires explicit --repo flag for canonical repository binding (AC10 of #1166).
     Sets GH_PROMPT_DISABLED=1 and GH_NO_UPDATE_NOTIFIER=1 to avoid interactive prompts.
     Enforces a 30-second timeout; on timeout fails closed.
+    Injects CONTROLLED_EXEC_MARKER from env into comment body (P0-5).
 
     Returns gh exit code (or -1 on timeout).
     """
@@ -224,9 +229,18 @@ def _post_github_comment(*, issue_number: int, body: str) -> int:
     env["GH_PROMPT_DISABLED"] = "1"
     env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
 
+    # P0-5: inject exec marker for comment read-back
+    exec_marker = env.get("CONTROLLED_EXEC_MARKER", "")
+    if exec_marker:
+        body = body + f"\n<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+
     try:
         proc = subprocess.run(
-            ["gh", "issue", "comment", str(issue_number), "--body-file", "-"],
+            [
+                "gh", "issue", "comment", str(issue_number),
+                "--repo", repo,
+                "--body-file", "-",
+            ],
             input=body,
             capture_output=True,
             text=True,
@@ -259,6 +273,7 @@ def publish(
     *,
     issue_number: int,
     input_data: dict,
+    repo: str,
 ) -> int:
     """
     Core publish flow.
@@ -325,7 +340,7 @@ def publish(
         return 1
 
     # publishable=true and body is non-empty string — post comment
-    gh_exit = _post_github_comment(issue_number=issue_number, body=body)
+    gh_exit = _post_github_comment(issue_number=issue_number, body=body, repo=repo)
     if gh_exit != 0:
         reason = "gh_comment_timeout" if gh_exit == -1 else "gh_comment_failed"
         _record_artifact(
@@ -359,6 +374,12 @@ def main() -> int:
         help="GitHub issue number to comment on",
     )
     parser.add_argument(
+        "--repo",
+        type=str,
+        required=True,
+        help="GitHub repository slug (owner/repo) for canonical repo binding",
+    )
+    parser.add_argument(
         "--input-file",
         type=str,
         default=None,
@@ -383,6 +404,7 @@ def main() -> int:
     return publish(
         issue_number=args.issue_number,
         input_data=input_data,
+        repo=args.repo,
     )
 
 
