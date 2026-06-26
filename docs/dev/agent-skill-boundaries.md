@@ -195,6 +195,29 @@ managed skill（`create-issue` / `edit-issue`）が `gh issue create` / `gh issu
 
 これらの条件を満たさない `gh issue create/edit` は `gh_mutation_denied` でブロックされる。
 
+## issue-refinement-loop Producer / Publisher 責務分割（#1154 / #1165 / #1166）
+
+`issue-refinement-loop` の producer / publisher 系は以下の 3 Issue で責務を分割する。
+各 Issue はそれぞれ独立した scope を持ち、相互に依存しない fail-closed routing を実装する。
+
+| Issue | 責務 | 対象コンポーネント |
+|---|---|---|
+| #1154 | root checkout からの `preflight.run` 専用 skill runtime executor | `skill_runtime_exec.py`、`SKILL_RUNTIME_COMMAND_POLICY_V2` |
+| #1165 | producer / compact producer の fail-closed routing（schema mismatch / output budget / termination bypass 阻止） | `compact_review_result.py`、`compact_author_result.py`、`run_refinement_preflight.py` |
+| #1166 | `publish_termination_report.py` の controlled mutation policy（publishable=true 時のみ gh comment） | `publish_termination_report.py`、`render_termination_report.py` |
+
+### 責務境界の明文化
+
+- `#1154` のみが `preflight.run` の root allow / privileged executor を実装する。`gh.*`、`publish_termination_report.py`、producer output budget / schema mismatch は #1154 boundary の対象外。
+- `#1165` は producer の fail-closed routing を実装する。publish_termination_report.py の呼び出しは一切行わない。schema mismatch / output budget violation 時は canonical failure envelope（STATUS/NEXT_ACTION/REASON_CODE/ARTIFACT/ARTIFACT_SHA256）を stdout に出力し、原文（raw issue body / comment / diff）を stdout に含まない。
+- `#1166` は publish_termination_report.py の controlled mutation policy を実装する。publishable=true の場合のみ gh issue comment を呼び出す。producer failure はこの policy の対象外。
+
+### fail-closed routing 不変条件
+
+- producer failure（schema mismatch / output budget violation）のいずれでも `publish_termination_report.publish()`、`_post_github_comment()` は呼ばれない
+- compact producer の stdout は常に 2048 UTF-8 bytes 以下
+- raw issue body / raw comment / raw diff は compact producer の stdout に含まない
+
 ## Privileged Skill Runtime Command Boundary
 
 Issue #1154 では、root checkout からの skill runtime command を registry 全件へ一般化せず、`preflight.run` だけを deny-by-default で許可する。
@@ -1283,3 +1306,101 @@ session 記録ツール（EntireCLI 等）を導入・運用する際の Kill Sw
 - SubAgent の transcript / local_file を public GitHub comment に添付することは禁止
 - checkpoint remote は `private_verified` visibility のみ許可し、`unknown` の場合は fail-closed
 - `secrets_mode != none` を検知したら Kill Switch を発動する
+
+---
+
+## CONTROLLED_SKILL_MUTATION_COMMAND_POLICY
+
+（Issue #1166 — hooks: publish_termination_report 用 controlled mutation policy）
+
+### 概要
+
+`publish_termination_report.py` は GitHub に issue comment を投稿するリモートミューテーションを実行する。
+このミューテーションを uncontrolled な直接呼び出しから切り離し、**単一の executor（`controlled_skill_mutation_exec.py`）経由のみ許可**するポリシー。
+
+直接呼び出し（`python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`）は worktree_scope_guard および local_main_branch_guard によって deny される。
+
+### ポリシーレジストリ
+
+```python
+# scripts/agent-guards/controlled_skill_mutation_policy.py
+CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
+    "termination_report.publish": {
+        "command_id": "termination_report.publish",
+        "executor_script": "scripts/agent-guards/controlled_skill_mutation_exec.py",
+        "allowed_write_roots": ["artifacts/"],
+        "github_mutation": {
+            "comment_on_issue": True,
+            "requires_repo": "squne121/loop-protocol",
+            "requires_explicit_repo_flag": True,
+        },
+        "postcondition": {
+            "no_tracked_source_changes": True,
+            "no_lockfile_changes": True,
+            "no_settings_changes": True,
+            "allowed_write_roots": ["artifacts/"],
+        },
+        "idempotency": {
+            "marker_file_pattern": "artifacts/{issue_number}/termination_report_published.marker.json",
+            "marker_field": "comment_id",
+        },
+        "env_sanitize": [
+            "PUBLISH_ARTIFACT_DIR", "PYTHONPATH", "PYTHONHOME",
+            "GH_EDITOR", "EDITOR", "VISUAL", "BROWSER",
+        ],
+    },
+}
+```
+
+### 呼び出し形式
+
+```bash
+uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+  --command-id termination_report.publish \
+  --issue-number <int> \
+  --input-file <path_to_TERMINATION_REPORT_INPUT_V1_json> \
+  --repo squne121/loop-protocol
+```
+
+すべてのフラグが必須。`--flag=value` 形式・未知フラグ・重複フラグ・位置引数はすべて拒否（インジェクション防止）。
+
+### Anti-split-brain（AC17）
+
+`is_controlled_skill_mutation_exec_command(cmd, project_root)` は `controlled_skill_mutation_policy.py` で一元定義され、
+`worktree_scope_guard` と `local_main_branch_guard` の両方がこの関数を import して使用する。
+各ガードが独立した allowlist を持つことを禁止（split-brain の原因）。
+
+### 環境サニタイズ（AC11）
+
+executor は以下の環境変数を除去した上で publisher を呼び出す:
+`PUBLISH_ARTIFACT_DIR`, `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`
+
+### Idempotency（AC13）
+
+`artifacts/{issue_number}/termination_report_published.marker.json` が存在し `comment_id` フィールドを持つ場合、executor は再実行を拒否する（exit 0 + dry-run 出力）。
+
+### --repo 固定（AC10）
+
+`publish_termination_report.py` は `--repo <owner/repo>` を必須引数として受け取り、
+`gh issue comment ... --repo <owner/repo>` に明示的に渡す。
+`GITHUB_REPOSITORY` 環境変数や暗黙の gh デフォルトに依存しない。
+
+### Module realpath 検証（AC16）
+
+executor は `publish_termination_report.py` の `__file__` realpath を検査し、
+`.claude/skills/issue-refinement-loop/scripts/publish_termination_report.py`
+に正規化されることを確認してから実行する。モジュールシャドウイングを防ぐ。
+
+### settings.json wildcard と hook enforcement
+
+`.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` は
+Claude Code permission syntax の制約上 `*` を使用しているが、settings は **最終 enforcement ではない**。
+
+- settings は「このコマンドクラスを allow する UI 層」
+- 実際の argv 制限・policy binding は `worktree_scope_guard.py` / `local_main_branch_guard.py` の hook 層で強制される
+- wildcard を悪用した不正 argv（例: `--unknown-flag`）は hook の `_validate_executor_argv` によって deny される
+- `test_worktree_scope_guard.py` / `test_local_main_branch_guard.py` の hook integrity tests が両軸（deny/allow）を確認
+
+### OUTPUT_BUDGET_V1
+
+routing-critical フィールド: `CONTROLLED_SKILL_MUTATION_COMMAND_POLICY` の全 key は必須。
