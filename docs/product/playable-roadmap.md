@@ -3,7 +3,7 @@ doc_id: DOC-ROADMAP-001
 title: Post-M1 Playable Outcome Roadmap
 status: active
 note: conceptual roadmap; not GitHub Milestone object creation
-last_updated_by_issue: 1094
+last_updated_by_issue: 1167
 ---
 
 # Post-M1 Playable Outcome Roadmap
@@ -71,8 +71,7 @@ scope: |
 dependencies:
   - M1: Foundation Gate (v0.1.x) — docs / guardrail / workflow / 最小仕様正本の整備完了
 spec_prerequisites:
-  - docs/product/features/movement.md
-  - docs/product/features/projectile.md
+  - docs/product/features/movement-projectile.md
 close_conditions:
   - 1 sortie を開始→操作→戦闘結果まで通せる
   - system tests と pnpm build が通る
@@ -86,8 +85,7 @@ non_goals:
   - 高品質アセット前提の演出
   - requirements.md の Global Non-Goals 全般
 spec_destination:
-  - docs/product/features/movement.md — 自機移動の詳細仕様
-  - docs/product/features/projectile.md — 射撃・弾道の詳細仕様
+  - docs/product/features/movement-projectile.md — 自機移動・射撃・弾道の詳細仕様
   - docs/product/features/combat-core.md — 敵・当たり判定・ダメージの詳細仕様
   - docs/product/features/sortie.md — sortie 開始・終了条件の詳細仕様
 ```
