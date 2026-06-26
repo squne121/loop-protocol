@@ -288,7 +288,10 @@ If the budget is too small to hold `safety_header` + `priority_signals`, the CLI
 ### safe 条件（すべて満たす必要あり）
 
 - `strategy_options.push_sessions` が `false`（未設定は `blocked`）
-- `strategy_options.telemetry` が `false`（未設定は `blocked`）
+- effective telemetry setting が `false`
+  - official top-level `telemetry` を優先する
+  - legacy / alternate `strategy_options.telemetry` は互換入力として扱う
+  - 未設定は `blocked`
 - `checkpoint_remote` が `private_verified` または local-only
 - `ENTIRE_CHECKPOINT_TOKEN` 存在時は `checkpoint_remote` が `private_verified`
 - public / unknown / non-GitHub / parse error はすべて `blocked`
@@ -303,11 +306,18 @@ If the budget is too small to hold `safety_header` + `priority_signals`, the CLI
 
 診断出力に raw URL / raw config path / token を含めてはならない。
 `reason_code` と redacted fingerprint（`redactFingerprint()` 使用）のみ許可する。
+`checked_surfaces.entire_version` は non-authoritative な diagnostic fingerprint であり、
+raw version 文字列や release provenance の証明には使わない。
 
 ### schema フィールド統合
 
-`agent-run-report.schema.json` への `entirecli_safety` フィールド追加は別 Issue（AC7 Stop Condition）。
-現時点では verdict 計算のみ提供し、report への埋め込みは呼び出し元が担う。
+`agent-run-report.schema.json` には `public_safety.entirecli_safety` の
+`EntireCLISafetyResult/v1` admission 契約を追加済みである。
+この統合は schema-admission のみを扱い、producer 接続・posting / retro index の fail-closed enforcement は後続 scope とする。
+This integration admits `EntireCLISafetyResult/v1` when present.
+It does not require `public_safety.entirecli_safety` on public reports.
+Current generated reports without `entirecli_safety` remain valid until producer / posting / retro enforcement follow-up.
+現時点では verdict 計算と schema compile / fixture 検証のみを提供し、report への実際の埋め込み必須化は呼び出し元の follow-up scope が担う。
 
 ### Library Module
 
