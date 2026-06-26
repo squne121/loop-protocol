@@ -309,3 +309,10 @@ def test_cli_fails_closed_on_bad_plan(tmp_path):
     bad.write_text("{}", encoding="utf-8")
     proc = _run_cli("--plan", str(bad), "--emit", "scope-argv")
     assert proc.returncode == 2
+
+
+def test_real_plan_includes_pr_body_validator_exactly_once():
+    plan = mod.load_plan(_PLAN_PATH)
+    path = "scripts/tests/test_pr_body_validator.py"
+    assert plan["targets"].count(path) == 1
+    assert mod.scope_argv(plan).count(path) == 1

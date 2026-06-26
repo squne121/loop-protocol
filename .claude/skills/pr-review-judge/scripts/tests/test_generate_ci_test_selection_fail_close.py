@@ -218,3 +218,60 @@ def test_generate_artifact_uncovered_changed_test_returns_1(monkeypatch, tmp_pat
     assert gen.generate_artifact(args) == 1
     data = json.loads(out.read_text())
     assert data["uncovered_changed_test_files"] == ["pkg/test_uncovered.py"]
+
+
+def test_generate_artifact_pr_body_validator_is_covered(monkeypatch, tmp_path):
+    """AC5/AC7/AC8: test_pr_body_validator.py in changed_files must be covered by the plan.
+
+    The stub captures argv supplied by the generator and asserts it matches
+    artifact["pytest_argv"], binding collection proof to the actual dispatch path.
+    """
+    changed_file = "scripts/tests/test_pr_body_validator.py"
+    seen: dict = {}
+
+    def fake_collect(argv):
+        seen["argv"] = list(argv)
+        assert seen["argv"].count(changed_file) == 1, (
+            f"generator must pass {changed_file!r} exactly once to collector; got {argv!r}"
+        )
+        nodeids = [
+            f"{changed_file}::test_wrapper_emits_error_code_for_parse_failure",
+            f"{changed_file}::test_wrapper_schema_change_flag_mismatch",
+            f"{changed_file}::test_wrapper_success_path_outputs_json_only",
+            f"{changed_file}::test_wrapper_emits_error_code_for_missing_safety_claim_matrix",
+            f"{changed_file}::test_wrapper_schema_change_flag_requires_inventory_when_body_decision_invalid",
+        ]
+        return (
+            [changed_file],
+            nodeids,
+            {
+                "returncode": 0,
+                "timed_out": False,
+                "error": None,
+                "nodeid_count": len(nodeids),
+                "stderr_tail": "",
+                "ok": True,
+            },
+        )
+
+    monkeypatch.setattr(gen, "get_pytest_collected_tests", fake_collect)
+    monkeypatch.setattr(gen, "get_changed_test_files", lambda b, h: (
+        [changed_file], [], {"base_sha": b, "head_sha": h, "ok": True}
+    ))
+    out = tmp_path / "artifact.json"
+    args = argparse.Namespace(
+        output=str(out), pytest_args=None, plan=None, pr_head_sha="h",
+        base_sha="b", head_sha="h", checked_out_sha=None, merge_sha="m",
+        workflow="ci", job="python-test", ci_run_url=None,
+    )
+    rc = gen.generate_artifact(args)
+    assert rc == 0
+    artifact = json.loads(out.read_text())
+    assert artifact["collection_status"]["ok"] is True
+    assert artifact["diff_status"]["ok"] is True
+    assert artifact["collection_status"]["nodeid_count"] == 5
+    assert changed_file in artifact["changed_test_files"]
+    assert artifact["collected_test_files"] == [changed_file]
+    assert artifact["uncovered_changed_test_files"] == []
+    assert seen["argv"] == artifact["pytest_argv"]
+    assert seen["argv"].count(changed_file) == 1
