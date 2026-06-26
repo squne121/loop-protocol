@@ -64,6 +64,66 @@ def resolve_pytest_args(args) -> List[str]:
     return plan_module.scope_argv(plan)
 
 
+def _normalize_coverage_path(path: str) -> str:
+    normalized = path.rstrip("/")
+    if not normalized:
+        raise ValueError("secondary coverage path must not be empty")
+    if normalized.startswith("/") or normalized.startswith("-"):
+        raise ValueError(f"secondary coverage path must be relative: {path!r}")
+    if ".." in Path(normalized).parts:
+        raise ValueError(f"secondary coverage path must not contain '..': {path!r}")
+    return normalized
+
+
+def _is_covered_by_paths(path: str, coverage_paths: set[str]) -> bool:
+    return any(path == covered or path.startswith(covered + "/") for covered in coverage_paths)
+
+
+def _get_secondary_coverage(args) -> Tuple[Dict[str, set[str]], str | None]:
+    plan_arg = getattr(args, "plan", None)
+    if not plan_arg:
+        return {}, None
+
+    try:
+        plan_module = _load_plan_module()
+        plan_obj = plan_module.load_plan(plan_arg)
+        providers: Dict[str, set[str]] = {}
+
+        metadata = plan_obj.get("secondary_coverage", {})
+        if metadata and not isinstance(metadata, dict):
+            raise ValueError("plan.secondary_coverage must be an object")
+
+        if getattr(args, "pytest_args", None):
+            provider_job = metadata.get("plan_targets_provider_job", "python-test")
+            if not isinstance(provider_job, str) or not provider_job:
+                raise ValueError("plan.secondary_coverage.plan_targets_provider_job must be a string")
+            providers.setdefault(provider_job, set()).update(
+                _normalize_coverage_path(target) for target in plan_obj.get("targets", [])
+            )
+
+        dedicated_lanes = metadata.get("dedicated_lanes", [])
+        if dedicated_lanes and not isinstance(dedicated_lanes, list):
+            raise ValueError("plan.secondary_coverage.dedicated_lanes must be a list")
+        for lane in dedicated_lanes:
+            if not isinstance(lane, dict):
+                raise ValueError("plan.secondary_coverage.dedicated_lanes entries must be objects")
+            provider_job = lane.get("provider_job")
+            if not isinstance(provider_job, str) or not provider_job:
+                raise ValueError(
+                    "plan.secondary_coverage.dedicated_lanes[].provider_job must be a string"
+                )
+            paths = lane.get("paths")
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("plan.secondary_coverage.dedicated_lanes[].paths must be a list")
+            providers.setdefault(provider_job, set()).update(
+                _normalize_coverage_path(path) for path in paths
+            )
+
+        return providers, None
+    except Exception as exc:
+        return {}, str(exc)
+
+
 def get_pytest_collected_tests(
     pytest_args: List[str],
 ) -> Tuple[List[str], List[str], Dict[str, Any]]:
@@ -208,39 +268,33 @@ def generate_artifact(args):
     head_sha = getattr(args, "head_sha", None) or args.pr_head_sha
 
     changed_test_files, scope_excluded, diff_status = get_changed_test_files(base_sha, head_sha)
-    # Secondary coverage: when both pytest_args and plan are provided, treat plan targets
-    # as cross-job coverage. A changed test file covered by another job's plan is not "uncovered".
-    plan_covered_paths: set = set()
-    plan_arg = getattr(args, "plan", None)
-    secondary_coverage_provider_job: str | None = None
-    cross_job_covered_test_files: List[str] = []
-    secondary_coverage_error: str | None = None
-    if plan_arg and getattr(args, "pytest_args", None):
-        try:
-            plan_module = _load_plan_module()
-            plan_obj = plan_module.load_plan(plan_arg)
-            for target in plan_obj.get("targets", []):
-                plan_covered_paths.add(target.rstrip("/"))
-            secondary_coverage_provider_job = args.job
-        except Exception as exc:
-            secondary_coverage_error = str(exc)  # best-effort; primary gate remains unchanged
-
-    def _is_covered_by_plan(path: str, plan_paths: set) -> bool:
-        return any(
-            path == t or path.startswith(t.rstrip("/") + "/")
-            for t in plan_paths
+    secondary_coverage_sources, secondary_coverage_error = _get_secondary_coverage(args)
+    coverage_provider_jobs = sorted(
+        provider_job
+        for provider_job, coverage_paths in secondary_coverage_sources.items()
+        if any(
+            f not in collected_test_files and _is_covered_by_paths(f, coverage_paths)
+            for f in changed_test_files
         )
+    )
+    secondary_coverage_provider_job: str | None
+    if not coverage_provider_jobs:
+        secondary_coverage_provider_job = None
+    elif len(coverage_provider_jobs) == 1:
+        secondary_coverage_provider_job = coverage_provider_jobs[0]
+    else:
+        secondary_coverage_provider_job = "multiple"
 
     cross_job_covered_test_files = sorted(
         f for f in changed_test_files
         if f not in collected_test_files
-        and _is_covered_by_plan(f, plan_covered_paths)
+        and any(_is_covered_by_paths(f, paths) for paths in secondary_coverage_sources.values())
     )
 
     uncovered = [
         f for f in changed_test_files
         if f not in collected_test_files
-        and not _is_covered_by_plan(f, plan_covered_paths)
+        and not any(_is_covered_by_paths(f, paths) for paths in secondary_coverage_sources.values())
     ]
 
     artifact = {
