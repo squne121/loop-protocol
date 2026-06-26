@@ -16,10 +16,9 @@ Tests:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -65,8 +64,7 @@ def tmp_project(tmp_path):
 class TestCommandIdValidation:
     def test_valid_command_id(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
-        result = {}
-        with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")) as m:
+        with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
             with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
                 with patch.object(_exec, "_readback_last_comment", return_value={"comment_id": "c1", "comment_url": "https://ex", "body_sha256": "abc"}):
                     rc = _exec.main([

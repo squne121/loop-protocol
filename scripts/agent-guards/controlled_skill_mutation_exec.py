@@ -215,7 +215,7 @@ def _check_no_tracked_changes(project_root: Path) -> list[str]:
             return [f"git_diff_failed: {out.stderr.strip()[:100]}"]
         changed = [
             f for f in out.stdout.strip().splitlines()
-            if f and not f.startswith("artifacts/")
+            if f and not any(f.startswith(root) for root in ALLOWED_WRITE_ROOTS)
         ]
         return changed
     except Exception as exc:
