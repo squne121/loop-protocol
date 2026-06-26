@@ -284,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
         return 2
 
-    artifact_root = _validate_runtime_context(project_root, args)
+    _validate_runtime_context(project_root, args)
     before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number))
     before_status = _git_status_paths(project_root)
 
