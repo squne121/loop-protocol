@@ -22,6 +22,7 @@
     "tests/codex/test_execpolicy_matrix.py",
     "scripts/tests/test_milestone_rollup.py",
     "scripts/tests/test_pr_body_validator.py",
+    "scripts/tests/test_e501_migration_guard.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py"
   ],
