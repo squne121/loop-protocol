@@ -161,15 +161,28 @@ def _safe_path_entries() -> list[str]:
     return ordered
 
 
-def _resolve_trusted_executable(name: str) -> str:
-    safe_path = os.pathsep.join(_safe_path_entries())
+def _resolve_trusted_executable(name: str, project_root: str) -> str:
+    safe_entries = _safe_path_entries()
+    safe_path = os.pathsep.join(safe_entries)
     resolved = shutil.which(name, path=safe_path)
+    if not resolved:
+        # GitHub Actions can provision uv outside the static path allowlist.
+        # Fall back to the inherited PATH, but still reject repo-local executables.
+        resolved = shutil.which(name)
     if not resolved:
         raise RuntimeError(f"{name}_not_found")
     real = os.path.realpath(resolved)
-    allowed_dirs = {os.path.realpath(entry) for entry in _safe_path_entries()}
+    project_root_real = os.path.realpath(project_root)
+    if os.path.commonpath([project_root_real, real]) == project_root_real:
+        raise RuntimeError(f"{name}_inside_project_root")
+    allowed_dirs = {os.path.realpath(entry) for entry in safe_entries}
     real_parent = os.path.realpath(os.path.dirname(real))
-    if real_parent not in allowed_dirs:
+    inherited_dirs = {
+        os.path.realpath(entry)
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry
+    }
+    if real_parent not in allowed_dirs and real_parent not in inherited_dirs:
         raise RuntimeError(f"{name}_outside_trusted_path")
     return real
 
@@ -226,8 +239,9 @@ def _validate_runtime_context(project_root: str, args: argparse.Namespace) -> Pa
 def _resolve_child_argv(child_argv: Iterable[str]) -> list[str]:
     resolved = list(child_argv)
     if resolved[:3] == ["uv", "run", "python3"]:
-        resolved[0] = _resolve_trusted_executable("uv")
-        resolved[2] = _resolve_trusted_executable("python3")
+        project_root = resolve_project_root()
+        resolved[0] = _resolve_trusted_executable("uv", project_root)
+        resolved[2] = _resolve_trusted_executable("python3", project_root)
     return resolved
 
 
