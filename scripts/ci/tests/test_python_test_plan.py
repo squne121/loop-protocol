@@ -65,11 +65,12 @@ def test_real_plan_scope_argv_carries_ignore_and_deselect_flags():
     assert "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py" in argv
 
 
-def test_real_plan_excludes_codex_dedicated_lane():
-    """tests/codex/ runs in its own codex execpolicy step, not the unified suite."""
+def test_real_plan_keeps_only_runtime_guard_in_dedicated_codex_lane():
+    """The dedicated codex lane keeps only the runtime guard test isolated."""
     plan = mod.load_plan(_PLAN_PATH)
     argv = mod.scope_argv(plan)
-    assert not any(a.startswith("tests/codex") for a in argv)
+    assert "tests/codex/test_execpolicy_matrix.py" in argv
+    assert "tests/codex/test_local_main_branch_guard.py" not in argv
 
 
 # --- run_argv modes ---
@@ -151,13 +152,12 @@ def test_parallel_exclude_overlapping_ignore_raises(tmp_path):
 
 
 def test_real_plan_serial_lane_has_debounce():
-    """The shipped SSOT excludes the timing-sensitive debounce test from xdist."""
+    """After #1141, debounce test is deterministic; parallel_exclude is empty."""
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
-    assert lane[:2] == ["-n", "0"]
-    assert any("session_manifest_debounce" in a for a in lane)
+    assert lane == []
     par = mod.run_argv(plan, mode="parallel")
-    assert any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
+    assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
 
 
 def test_real_plan_uses_fixed_worker_count():
@@ -309,3 +309,10 @@ def test_cli_fails_closed_on_bad_plan(tmp_path):
     bad.write_text("{}", encoding="utf-8")
     proc = _run_cli("--plan", str(bad), "--emit", "scope-argv")
     assert proc.returncode == 2
+
+
+def test_real_plan_includes_pr_body_validator_exactly_once():
+    plan = mod.load_plan(_PLAN_PATH)
+    path = "scripts/tests/test_pr_body_validator.py"
+    assert plan["targets"].count(path) == 1
+    assert mod.scope_argv(plan).count(path) == 1

@@ -17,6 +17,7 @@ import {
 } from './helpers'
 
 const tempDirs: string[] = []
+const REPORT_FIXTURES_DIR = resolve(__dirname, '..', 'fixtures', 'agent-run-report')
 
 afterEach(() => {
   while (tempDirs.length > 0) {
@@ -51,6 +52,34 @@ describe('generated agent run report', () => {
 
     const result = validateAgentRunReport(report)
     expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a valid entirecli fixture WHEN passed through the current validator THEN schema-admission succeeds without producer changes', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-public-entirecli-safe.json'))
+    const result = validateAgentRunReport(report)
+
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a blocked public entirecli fixture WHEN passed through the current validator THEN schema-admission fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-entirecli-blocked.json'))
+    const result = validateAgentRunReport(report)
+
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a bad-schema-version public entirecli fixture WHEN passed through the current validator THEN schema-admission fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-entirecli-bad-schema-version.json'))
+    const result = validateAgentRunReport(report)
+
+    expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a raw-values public entirecli fixture WHEN passed through the current validator THEN schema-admission fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-entirecli-raw-values.json'))
+    const result = validateAgentRunReport(report)
+
+    expect(result.valid).toBe(false)
   })
 
   it('GIVEN package scripts WHEN inspected THEN agent-run lifecycle aliases are present without duplicating the validator command', () => {

@@ -20,6 +20,8 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 2. 本文を一時ファイルに保存し、以下の 2 スクリプトを順に実行する:
    - `uv run python3 .claude/skills/review-issue/scripts/check_issue_contract.py --file <tmp> --json`
    - `uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py --body-file <tmp> --mode execute`
+
+   `check_issue_contract.py` は内部で `check_product_spec_contract.py --body-file <tmp>` を同一 body snapshot に対して実行し、`body_sha256` mismatch / malformed output / pair invariant violation / timeout を fail-closed に合成する。
    
    `ISSUE_CONTRACT_READINESS_RESULT_V1` の `errors[]` が空でない場合、以下のルールで `REVIEW_ISSUE_RESULT_V1` へ合成する：
    - `blocking_issues` には各 error の `fix_hint` 文字列を転写する（人間向け要約）。`check_issue_contract.py` の `blocking_issues` も同配列にマージする。
