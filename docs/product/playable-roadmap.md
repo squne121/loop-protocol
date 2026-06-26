@@ -39,13 +39,13 @@ last_updated_by_issue: 1167
 
 ## Conceptual Milestone to GitHub Milestone Mapping
 
-readback_date: 2026-06-21
+readback_date: 2026-06-27
 
 | conceptual_milestone_id | conceptual_title | github_milestone_number | github_milestone_title | mapping_status | decision_note |
 |---|---|---:|---|---|---|
 | M2 | M2: Gameplay Core (v0.2.x) | 4 | M2: Combat MVP Gate (v0.2.x) | mismatch_pending_rename | conceptual boundary は gameplay core、GitHub milestone object は旧 title のまま残っている。rename 判断は別スコープ。 |
 | M3 | M3: Result Persistence (v0.3.x) | 3 | M3: Result Persistence (v0.3.x) | aligned | conceptual title と GitHub milestone title は一致している。formal close / readback の最終判断は `#733` 側で扱う。 |
-| M4 | M4: Upgrade Loop (v0.4.x) | 2 | M4: UX MVP Gate (v0.4.x) | mismatch_pending_rename | conceptual boundary は upgrade loop だが、GitHub milestone object は旧 UX milestone title のまま残っている。rename は Out of Scope。 |
+| M4 | M4: Upgrade Loop (v0.4.x) | 2 | M4: Upgrade Loop (v0.4.x) | aligned | conceptual boundary と GitHub milestone object の readback が一致。title はライブ readback で確認済み。 |
 | M5 | M5: Playable Slice Hardening (v0.5.x) | null | null | unmapped | 2026-06-21 readback 時点で対応する GitHub milestone object は未作成。conceptual milestone のみ存在する。 |
 
 ---
@@ -133,9 +133,9 @@ spec_destination:
 milestone_id: M4
 title: "M4: Upgrade Loop (v0.4.x)"
 github_milestone_number: 2
-github_milestone_title: "M4: UX MVP Gate (v0.4.x)"
-mapping_status: mismatch_pending_rename
-decision_note: "conceptual boundary は Upgrade Loop だが、GitHub milestone object は旧 UX milestone title のまま。rename は Out of Scope。"
+github_milestone_title: "M4: Upgrade Loop (v0.4.x)"
+mapping_status: aligned
+decision_note: "conceptual boundary と GitHub milestone object の readback が一致。title はライブ readback を実施済み。"
 source_mvp_loop:
   - result_resource_loop
 scope: |
