@@ -34,6 +34,9 @@ const requiredAgentNames = [
   'pr-reviewer-lite',
   'pr-reviewer',
   'review-issue',
+  'spark-deep',
+  'spark-skim',
+  'spark-worker',
   'test-runner',
   'web-researcher',
 ];
@@ -59,6 +62,9 @@ const reasoningMap = new Map([
   ['pr-reviewer-lite', { model: 'gpt-5.4-mini', effort: 'medium' }],
   ['pr-reviewer', { model: 'gpt-5.4', effort: 'medium' }],
   ['review-issue', { model: 'gpt-5.4', effort: 'medium' }],
+  ['spark-deep', { model: 'gpt-5.3-codex-spark', effort: 'high' }],
+  ['spark-skim', { model: 'gpt-5.3-codex-spark', effort: 'low' }],
+  ['spark-worker', { model: 'gpt-5.3-codex-spark', effort: 'medium' }],
   ['test-runner', { model: 'gpt-5.4-mini', effort: 'medium' }],
   ['web-researcher', { model: 'gpt-5.4-mini', effort: 'medium' }],
 ]);
@@ -68,6 +74,8 @@ const readOnlyAgents = new Set([
   'issue-reviewer',
   'pr-reviewer-lite',
   'pr-reviewer',
+  'spark-deep',
+  'spark-skim',
   'test-runner',
   'web-researcher',
 ]);
@@ -77,6 +85,7 @@ const writeAgents = new Set([
   'issue-author',
   'post-merge-cleanup-worker',
   'review-issue',
+  'spark-worker',
 ]);
 
 const supportedPreToolNames = ['Bash', 'apply_patch', 'Edit', 'Write'];

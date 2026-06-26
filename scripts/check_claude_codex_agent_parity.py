@@ -24,6 +24,9 @@ CODEX_CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 
 # Agents in scope for parity check (issue-reviewer and issue-author)
 PARITY_AGENTS = {"issue-reviewer", "issue-author"}
+CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
+CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
+CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
 
 # Permission profiles -> mutation boundary mapping
 MUTATION_BOUNDARY_MAP = {
@@ -140,6 +143,35 @@ class AgentParityFacts:
 
 def load_expectations() -> dict:
     return json.loads(EXPECTATION_PATH.read_text(encoding="utf-8"))
+
+
+def is_codex_only_parity(expected: dict) -> bool:
+    return expected.get("parity_mode") == "codex_only"
+
+
+def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str]:
+    failures: list[str] = []
+    if agent_name not in CODEX_ONLY_ALLOWED_AGENTS:
+        failures.append(
+            f"{expected['path']}: codex_only parity is restricted to {sorted(CODEX_ONLY_ALLOWED_AGENTS)!r}"
+        )
+    if not expected["path"].startswith(".codex/agents/spark-"):
+        failures.append(f"{expected['path']}: codex_only parity path must stay under .codex/agents/spark-*")
+    if expected.get("claude_agent_path", "__missing__") is not None:
+        failures.append(f"{expected['path']}: codex_only parity must use claude_agent_path: null")
+    if expected.get("parity_exception_reason") != CODEX_ONLY_PARITY_REASON:
+        failures.append(
+            f"{expected['path']}: codex_only parity must use parity_exception_reason {CODEX_ONLY_PARITY_REASON!r}"
+        )
+    if expected.get("model") != CODEX_ONLY_MODEL:
+        failures.append(f"{expected['path']}: codex_only parity must use model {CODEX_ONLY_MODEL!r}")
+    if expected.get("runtime_followup_route") != "none":
+        failures.append(f"{expected['path']}: codex_only parity must use runtime_followup_route 'none'")
+    if expected.get("runtime_dependency_status") != "codex_native":
+        failures.append(f"{expected['path']}: codex_only parity must use runtime_dependency_status 'codex_native'")
+    if expected.get("repo_local_skill_surfaces", []) != []:
+        failures.append(f"{expected['path']}: codex_only parity must not declare repo_local_skill_surfaces")
+    return failures
 
 
 def read_toml(path: Path) -> dict:
@@ -644,11 +676,14 @@ def main(argv: list[str] | None = None) -> int:
     # --- Legacy checks (preserved for backward compatibility) ---
     # When agent dirs are overridden (testing), derive paths from agent dirs
     for agent_name, expected in expectations["required_agents"].items():
+        codex_only = is_codex_only_parity(expected)
         if args.codex_agent_dir:
             codex_path = codex_agent_dir / f"{agent_name}.toml"
         else:
             codex_path = REPO_ROOT / expected["path"]
-        if args.claude_agent_dir:
+        if codex_only:
+            claude_path = None
+        elif args.claude_agent_dir:
             claude_path = claude_agent_dir / f"{agent_name}.md"
         else:
             claude_path = REPO_ROOT / expected["claude_agent_path"]
@@ -656,34 +691,38 @@ def main(argv: list[str] | None = None) -> int:
         if not codex_path.exists():
             failures.append(f"missing codex agent file: {expected['path']}")
             continue
-        if not claude_path.exists():
-            failures.append(f"missing claude agent file: {expected['claude_agent_path']}")
-            continue
+        if codex_only:
+            failures.extend(validate_codex_only_expectation(agent_name, expected))
+        else:
+            if not claude_path or not claude_path.exists():
+                failures.append(f"missing claude agent file: {expected['claude_agent_path']}")
+                continue
 
         codex_doc = read_toml(codex_path)
-        claude_text = claude_path.read_text(encoding="utf-8")
-        claude_frontmatter = extract_frontmatter(claude_text)
         codex_instructions = str(codex_doc.get("developer_instructions", ""))
 
         if codex_doc.get("name") != agent_name:
             failures.append(f"{expected['path']}: name must be {agent_name}")
-        if claude_frontmatter.get("name") != agent_name:
-            failures.append(f"{expected['claude_agent_path']}: frontmatter name must be {agent_name}")
-        if claude_frontmatter.get("model") != expected["claude_model"]:
-            failures.append(
-                f"{expected['claude_agent_path']}: model expected"
-                f" {expected['claude_model']!r} got {claude_frontmatter.get('model')!r}"
-            )
-        if claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]:
-            failures.append(
-                f"{expected['claude_agent_path']}: permissionMode expected"
-                f" {expected['claude_permission_mode']!r}"
-                f" got {claude_frontmatter.get('permissionMode')!r}"
-            )
+        if not codex_only:
+            claude_text = claude_path.read_text(encoding="utf-8")
+            claude_frontmatter = extract_frontmatter(claude_text)
+            if claude_frontmatter.get("name") != agent_name:
+                failures.append(f"{expected['claude_agent_path']}: frontmatter name must be {agent_name}")
+            if claude_frontmatter.get("model") != expected["claude_model"]:
+                failures.append(
+                    f"{expected['claude_agent_path']}: model expected"
+                    f" {expected['claude_model']!r} got {claude_frontmatter.get('model')!r}"
+                )
+            if claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]:
+                failures.append(
+                    f"{expected['claude_agent_path']}: permissionMode expected"
+                    f" {expected['claude_permission_mode']!r}"
+                    f" got {claude_frontmatter.get('permissionMode')!r}"
+                )
 
-        tools = claude_frontmatter.get("tools", [])
-        if not isinstance(tools, list) or not tools:
-            failures.append(f"{expected['claude_agent_path']}: tools frontmatter list is required")
+            tools = claude_frontmatter.get("tools", [])
+            if not isinstance(tools, list) or not tools:
+                failures.append(f"{expected['claude_agent_path']}: tools frontmatter list is required")
 
         runtime_status = extract_runtime_field(codex_instructions, "runtime_dependency_status")
         runtime_route = extract_runtime_field(codex_instructions, "runtime_followup_route")
@@ -699,6 +738,9 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if (
+            not codex_only
+            and claude_path
+            and
             expected["runtime_followup_route"] != "none"
             and expected["runtime_followup_route"].split("|")[0] not in claude_text
         ):
@@ -707,14 +749,15 @@ def main(argv: list[str] | None = None) -> int:
                 f" {expected['runtime_followup_route']!r} not found"
             )
 
-        permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
-        if agent_name == "post-merge-cleanup-worker":
-            permission_expected = "default"
-        if claude_frontmatter.get("permissionMode") != permission_expected:
-            failures.append(
-                f"{expected['claude_agent_path']}: permissionMode must match"
-                f" Codex permission profile {expected['default_permissions']}"
-            )
+        if not codex_only:
+            permission_expected = "acceptEdits" if expected["default_permissions"] == "loop-protocol-rtk" else "dontAsk"
+            if agent_name == "post-merge-cleanup-worker":
+                permission_expected = "default"
+            if claude_frontmatter.get("permissionMode") != permission_expected:
+                failures.append(
+                    f"{expected['claude_agent_path']}: permissionMode must match"
+                    f" Codex permission profile {expected['default_permissions']}"
+                )
 
     # --- Extended parity checks for PARITY_AGENTS ---
     for agent_name in PARITY_AGENTS:
