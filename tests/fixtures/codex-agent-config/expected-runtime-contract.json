@@ -57,6 +57,39 @@
         ".agents/skills/review-issue/SKILL.md"
       ]
     },
+    "spark-deep": {
+      "path": ".codex/agents/spark-deep.toml",
+      "claude_agent_path": null,
+      "parity_mode": "codex_only",
+      "parity_exception_reason": "manual_codex_spark_agent",
+      "model": "gpt-5.3-codex-spark",
+      "model_reasoning_effort": "high",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none"
+    },
+    "spark-skim": {
+      "path": ".codex/agents/spark-skim.toml",
+      "claude_agent_path": null,
+      "parity_mode": "codex_only",
+      "parity_exception_reason": "manual_codex_spark_agent",
+      "model": "gpt-5.3-codex-spark",
+      "model_reasoning_effort": "low",
+      "default_permissions": "loop-protocol-readonly",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none"
+    },
+    "spark-worker": {
+      "path": ".codex/agents/spark-worker.toml",
+      "claude_agent_path": null,
+      "parity_mode": "codex_only",
+      "parity_exception_reason": "manual_codex_spark_agent",
+      "model": "gpt-5.3-codex-spark",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-rtk",
+      "runtime_dependency_status": "codex_native",
+      "runtime_followup_route": "none"
+    },
     "test-runner": {
       "path": ".codex/agents/test-runner.toml",
       "claude_agent_path": ".claude/agents/test-runner.md",

@@ -26,6 +26,46 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 - project-local `.codex/config.toml` は profile routing の証拠として扱わず、actual runtime contract と launch-ledger evidence を validator 対象にする
 - live spawn の runtime verification は `#601` に deferred し、この文書で扱うのは evidence 不足時に fail-closed する repo-side 監査境界のみ
 
+## Manual Codex Spark Agents
+
+`spark-skim` / `spark-worker` / `spark-deep` は manual invocation only の Codex custom subagent として扱う。human が agent 名を明示 spawn した場合だけ使い、workflow root の auto dispatch 先にしない。
+
+### Reasoning routing policy
+
+| Agent | Permissions | 想定用途 | 補足 |
+|---|---|---|---|
+| `spark-skim` | `loop-protocol-readonly` | 軽量な read-only triage / 要点抽出 | low reasoning |
+| `spark-worker` | `loop-protocol-rtk` | Allowed Paths 内の manual bounded edit helper | medium reasoning。`implementation-worker` / `issue-author` / `pr-reviewer` の代替ではない |
+| `spark-deep` | `loop-protocol-readonly` | 複雑な read-only analysis / risk surfacing | high reasoning |
+
+- `xhigh` reasoning は今回採用しない。account plan / rollout 差分や運用実績を踏まえた follow-up 判断対象とする。
+- heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-author` / `pr-reviewer` / `test-runner` の routing は維持する。
+- `spark-worker` は manual bounded edit helper であり、Issue authoring、PR review judgment、loop orchestration、publish 操作を担当しない。
+
+### Prompt examples
+
+- `spark-skim`: `Spawn spark-skim and read only docs/dev/agent-skill-boundaries.md plus .codex/agents. Return SPARK_AGENT_RESULT_V1 with evidence refs only.`
+- `spark-worker`: `Spawn spark-worker for a bounded edit inside the listed Allowed Paths only. Do not review the PR or publish anything.`
+- `spark-deep`: `Spawn spark-deep for read-only analysis of validator / fixture drift and return risk flags without editing files.`
+
+### Positive smoke and negative smoke policy
+
+- positive smoke: human が `spark-skim` / `spark-worker` / `spark-deep` をそれぞれ明示 spawn し、`SUBAGENT_LAUNCH_LEDGER_V1.launches[]` に対象 agent 名、runtime model、reasoning effort、default permissions が記録されることを確認する。
+- negative smoke: `issue-refinement-loop` / `impl-review-loop` の通常ルート実行後に ledger を確認し、`spark-*` が auto dispatch されていないことを確認する。routing 変更は別 Issue とする。
+- auto dispatch を有効化する変更は本スコープ外であり、planner / loop routing / workflow root の変更を伴う別 implementation issue で扱う。
+
+### Manual smoke evidence minimum
+
+- `Codex CLI version`
+- `install route`
+- `auth mode category`
+- `agent prompt`
+- `ledger path`
+- `Known limitation`
+
+- manual smoke evidence には secret、raw transcript、raw logs を残さない。必要なら構造化 summary と ledger path のみを残す。
+- Spark 3 agent は Codex-only parity exception として扱い、fixture では `parity_mode: codex_only`、`parity_exception_reason`、`claude_agent_path: null` を保持する。
+
 ### `review-issue` / `issue-reviewer` の使い分け
 
 | エントリ | 種別 | 呼び出し元 | 役割 |
