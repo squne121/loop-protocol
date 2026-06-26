@@ -42,6 +42,11 @@ describe('agent_run_report schema compile', () => {
     expect(result.valid).toBe(false)
   })
 
+  it('GIVEN an entirecli fixture with a bad schema_version WHEN compiled with Ajv 2020-12 THEN validation fails', () => {
+    const result = validateReportAgainstSchema(readReportFixture('invalid-public-entirecli-bad-schema-version.json'))
+    expect(result.valid).toBe(false)
+  })
+
   it('GIVEN a blocked entirecli fixture on a public surface WHEN compiled with Ajv 2020-12 THEN validation fails', () => {
     const result = validateReportAgainstSchema(readReportFixture('invalid-public-entirecli-blocked.json'))
     expect(result.valid).toBe(false)

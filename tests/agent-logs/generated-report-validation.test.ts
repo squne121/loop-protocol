@@ -68,6 +68,13 @@ describe('generated agent run report', () => {
     expect(result.valid).toBe(false)
   })
 
+  it('GIVEN a bad-schema-version public entirecli fixture WHEN passed through the current validator THEN schema-admission fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-entirecli-bad-schema-version.json'))
+    const result = validateAgentRunReport(report)
+
+    expect(result.valid).toBe(false)
+  })
+
   it('GIVEN a raw-values public entirecli fixture WHEN passed through the current validator THEN schema-admission fails closed', () => {
     const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-entirecli-raw-values.json'))
     const result = validateAgentRunReport(report)
