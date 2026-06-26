@@ -161,14 +161,26 @@ def _safe_path_entries() -> list[str]:
     return ordered
 
 
+def _resolve_executable_next_to_runtime(name: str, project_root: str) -> str | None:
+    runtime_dir = Path(sys.executable).resolve().parent
+    candidate = runtime_dir / name
+    if not candidate.exists():
+        return None
+    real = os.path.realpath(candidate)
+    project_root_real = os.path.realpath(project_root)
+    if os.path.commonpath([project_root_real, real]) == project_root_real:
+        raise RuntimeError(f"{name}_inside_project_root")
+    return real
+
+
 def _resolve_trusted_executable(name: str, project_root: str) -> str:
     safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
-    resolved = shutil.which(name, path=safe_path)
+    resolved = _resolve_executable_next_to_runtime(name, project_root)
+    if not resolved and name == "python3":
+        resolved = os.path.realpath(sys.executable)
     if not resolved:
-        # GitHub Actions can provision uv outside the static path allowlist.
-        # Fall back to the inherited PATH, but still reject repo-local executables.
-        resolved = shutil.which(name)
+        resolved = shutil.which(name, path=safe_path)
     if not resolved:
         raise RuntimeError(f"{name}_not_found")
     real = os.path.realpath(resolved)
@@ -177,12 +189,8 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
         raise RuntimeError(f"{name}_inside_project_root")
     allowed_dirs = {os.path.realpath(entry) for entry in safe_entries}
     real_parent = os.path.realpath(os.path.dirname(real))
-    inherited_dirs = {
-        os.path.realpath(entry)
-        for entry in os.environ.get("PATH", "").split(os.pathsep)
-        if entry
-    }
-    if real_parent not in allowed_dirs and real_parent not in inherited_dirs:
+    runtime_dir = os.path.realpath(str(Path(sys.executable).resolve().parent))
+    if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
     return real
 
