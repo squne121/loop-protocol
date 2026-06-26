@@ -102,6 +102,7 @@ class TestSubprocessRunShellFalse:
                 pub.publish(
                     issue_number=42,
                     input_data=_make_input(),
+                    repo="squne121/loop-protocol",
                 )
 
         # First call is to renderer
@@ -119,6 +120,7 @@ class TestSubprocessRunShellFalse:
                 pub.publish(
                     issue_number=42,
                     input_data=_make_input(),
+                    repo="squne121/loop-protocol",
                 )
 
         renderer_call = mock_run.call_args_list[0]
@@ -133,6 +135,7 @@ class TestSubprocessRunShellFalse:
                 pub.publish(
                     issue_number=42,
                     input_data=_make_input(),
+                    repo="squne121/loop-protocol",
                 )
 
         renderer_call = mock_run.call_args_list[0]
@@ -164,7 +167,7 @@ class TestGhBodyFile:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            result = pub.publish(issue_number=42, input_data=_make_input())
+            result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert result == 0
         assert len(gh_calls) == 1
@@ -195,7 +198,7 @@ class TestGhBodyFile:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            pub.publish(issue_number=42, input_data=_make_input())
+            pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(received_stdin) == 1
         assert received_stdin[0] == expected_body
@@ -215,7 +218,7 @@ class TestGhBodyFile:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            pub.publish(issue_number=42, input_data=_make_input())
+            pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(gh_envs) == 1
         assert gh_envs[0].get("GH_PROMPT_DISABLED") == "1"
@@ -237,7 +240,7 @@ class TestGhBodyFile:
 
         with patch("subprocess.run", side_effect=fake_run):
             with patch.object(pub, "_record_artifact", side_effect=capture_artifact):
-                exit_code = pub.publish(issue_number=42, input_data=_make_input())
+                exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 1
         assert len(artifact_calls) == 1
@@ -263,7 +266,7 @@ class TestFailClosed:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=99, input_data=input_data)
+            exit_code = pub.publish(issue_number=99, input_data=input_data, repo="squne121/loop-protocol")
 
         assert len(gh_calls) == 0, f"gh was called unexpectedly: {gh_calls}"
         assert exit_code == 1
@@ -294,7 +297,7 @@ class TestFailClosed:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=99, input_data=_make_input())
+            exit_code = pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(gh_calls) == 0
         assert exit_code == 1
@@ -331,7 +334,7 @@ class TestFailClosed:
             return m
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=99, input_data=_make_input())
+            exit_code = pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(gh_calls) == 0
         assert exit_code == 1
@@ -359,7 +362,7 @@ class TestArtifactRecording:
         with patch("subprocess.run", return_value=fake_proc):
             with patch.object(pub, "ARTIFACT_DIR", tmp_path / "artifacts"):
                 with patch.object(pub, "_record_artifact", side_effect=capture_artifact):
-                    pub.publish(issue_number=99, input_data=_make_input())
+                    pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(artifact_files) == 1
         call_kwargs = artifact_files[0]
@@ -372,7 +375,7 @@ class TestArtifactRecording:
 
         with patch("subprocess.run", return_value=fake_proc):
             with patch.object(pub, "ARTIFACT_DIR", tmp_path / "artifacts"):
-                pub.publish(issue_number=99, input_data=_make_input())
+                pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         # Check artifact file was written
         artifact_dir = tmp_path / "artifacts"
@@ -399,7 +402,7 @@ class TestArtifactRecording:
 
         with patch("subprocess.run", return_value=fake_proc):
             with patch.object(pub, "_record_artifact", side_effect=capture):
-                pub.publish(issue_number=99, input_data=_make_input())
+                pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert len(artifact_calls) == 1
         # body is None in publishable=false result; artifact should NOT contain any markdown prose
@@ -420,7 +423,7 @@ class TestArtifactRecording:
 
         with patch("subprocess.run", return_value=fake_proc):
             with patch.object(pub, "ARTIFACT_DIR", tmp_path / "artifacts"):
-                pub.publish(issue_number=99, input_data=_make_input())
+                pub.publish(issue_number=99, input_data=_make_input(), repo="squne121/loop-protocol")
 
         # Artifact JSON must not contain the raw fragment
         artifact_dir = tmp_path / "artifacts"
@@ -460,7 +463,7 @@ class TestIntegration:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=42, input_data=_make_input())
+            exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 0
         assert len(gh_calls) == 1
@@ -482,7 +485,7 @@ class TestIntegration:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=42, input_data=_make_input())
+            exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 1
         assert len(gh_calls) == 0
@@ -501,7 +504,7 @@ class TestIntegration:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=42, input_data=_make_input())
+            exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 1
         assert len(gh_calls) == 0
@@ -528,6 +531,7 @@ class TestIntegration:
                     termination_reason="human_escalation",
                     termination_cause="max_iterations_exceeded",
                 ),
+                repo="squne121/loop-protocol",
             )
 
         assert exit_code == 0
@@ -560,6 +564,7 @@ class TestIntegration:
                     "issue_number": 42,
                     "blocker_summary": ["legacy blocker entry"],
                 },
+                repo="squne121/loop-protocol",
             )
 
         assert exit_code == 0
@@ -579,6 +584,7 @@ class TestIntegration:
                     "blocker_summary": ["legacy blocker"],
                     "blockers_summary": ["canonical blocker"],
                 },
+                repo="squne121/loop-protocol",
             )
 
         assert exit_code == 1
@@ -625,7 +631,7 @@ class TestIntegration:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=42, input_data=_make_input())
+            exit_code = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
 
         assert exit_code == 0
         assert len(gh_calls) == 1
@@ -659,7 +665,7 @@ class TestIntegration:
         }
 
         with patch("subprocess.run", side_effect=fake_run):
-            exit_code = pub.publish(issue_number=42, input_data=input_data)
+            exit_code = pub.publish(issue_number=42, input_data=input_data, repo="squne121/loop-protocol")
 
         assert exit_code == 1
         assert len(gh_calls) == 0
@@ -679,7 +685,7 @@ class TestIntegration:
             return fake_proc
 
         with patch("subprocess.run", side_effect=fake_run):
-            pub.publish(issue_number=777, input_data=_make_input(issue_number=777))
+            pub.publish(issue_number=777, input_data=_make_input(issue_number=777), repo="squne121/loop-protocol")
 
         assert "777" in gh_cmd_received
 
@@ -770,7 +776,7 @@ class TestRealRendererE2E:
     def test_publish_with_real_renderer_posts_normalized_human_escalation_body(self, monkeypatch):
         posted: list[tuple[int, str]] = []
 
-        def fake_post_github_comment(*, issue_number: int, body: str) -> int:
+        def fake_post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
             posted.append((issue_number, body))
             return 0
 
@@ -784,6 +790,7 @@ class TestRealRendererE2E:
                 "iteration": 3,
                 "blocker_summary": ["legacy blocker entry"],
             },
+            repo="squne121/loop-protocol",
         )
 
         assert exit_code == 0
@@ -800,6 +807,64 @@ class TestRealRendererE2E:
 # ---------------------------------------------------------------------------
 # AC2 (Issue #838): Docs prose negative guard
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# AC10 (Issue #1166): --repo flag required in gh issue comment
+# ---------------------------------------------------------------------------
+
+class TestRepoFlag:
+    """AC10: publish_termination_report.py passes --repo to gh issue comment (Issue #1166)."""
+
+    def test_gh_command_includes_repo_flag(self, tmp_path):
+        """AC10: gh issue comment must include --repo <owner/repo> explicitly."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        gh_calls: list[list] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                gh_calls.append(cmd)
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        with patch("subprocess.run", side_effect=fake_run):
+            pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
+
+        assert len(gh_calls) == 1
+        gh_cmd = gh_calls[0]
+        assert "--repo" in gh_cmd, "--repo flag must be present in gh issue comment call"
+        repo_idx = gh_cmd.index("--repo")
+        assert repo_idx + 1 < len(gh_cmd), "--repo must be followed by repo value"
+        assert gh_cmd[repo_idx + 1] == "squne121/loop-protocol"
+
+    def test_post_github_comment_passes_repo_to_gh(self, tmp_path):
+        """AC10: _post_github_comment must include --repo in the gh command."""
+        gh_calls: list[list] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                gh_calls.append(cmd)
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            raise AssertionError(f"Unexpected: {cmd}")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            rc = pub._post_github_comment(
+                issue_number=42,
+                body="## Test",
+                repo="squne121/loop-protocol",
+            )
+
+        assert rc == 0
+        assert len(gh_calls) == 1
+        assert "--repo" in gh_calls[0]
+        idx = gh_calls[0].index("--repo")
+        assert gh_calls[0][idx + 1] == "squne121/loop-protocol"
+
 
 class TestTerminationReportDocsProse:
     def test_english_duplicate_prose_removed(self):
@@ -818,3 +883,117 @@ class TestTerminationReportDocsProse:
 
         for phrase in forbidden:
             assert phrase not in text, f"英語重複 prose が残っています: {phrase!r}"
+
+
+# ---------------------------------------------------------------------------
+# P0-5: Exec marker injection in _post_github_comment
+# ---------------------------------------------------------------------------
+
+class TestExecMarkerInjection:
+    """P0-5: CONTROLLED_EXEC_MARKER env var is injected into comment body."""
+
+    def test_marker_injected_into_body_when_env_set(self, tmp_path, monkeypatch):
+        """When CONTROLLED_EXEC_MARKER is set, comment body includes marker."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "abc123marker456")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
+
+        assert result == 0
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        assert "<!-- CONTROLLED_EXEC_MARKER:abc123marker456 -->" in body
+
+    def test_no_marker_injected_when_env_not_set(self, tmp_path, monkeypatch):
+        """When CONTROLLED_EXEC_MARKER is not set, no marker in body."""
+        fake_proc = _fake_renderer_proc(_make_render_result(publishable=True, body="## Report"))
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            return fake_proc
+
+        monkeypatch.delenv("CONTROLLED_EXEC_MARKER", raising=False)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            result = pub.publish(issue_number=42, input_data=_make_input(), repo="squne121/loop-protocol")
+
+        assert result == 0
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        assert "CONTROLLED_EXEC_MARKER" not in body
+
+    def test_post_github_comment_injects_marker(self, monkeypatch):
+        """_post_github_comment directly injects marker when env is set."""
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            raise AssertionError(f"Unexpected: {cmd}")
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "testmarker99")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            rc = pub._post_github_comment(
+                issue_number=42,
+                body="## Test Body",
+                repo="squne121/loop-protocol",
+            )
+
+        assert rc == 0
+        assert len(received_bodies) == 1
+        assert "<!-- CONTROLLED_EXEC_MARKER:testmarker99 -->" in received_bodies[0]
+        assert "## Test Body" in received_bodies[0]
+
+    def test_marker_appended_after_body_content(self, monkeypatch):
+        """Marker is appended after original body, not prepended."""
+        original_body = "## Original Content\n\nSome text."
+        received_bodies: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "gh":
+                received_bodies.append(kwargs.get("input", ""))
+                m = MagicMock()
+                m.returncode = 0
+                m.stderr = ""
+                return m
+            raise AssertionError(f"Unexpected: {cmd}")
+
+        monkeypatch.setenv("CONTROLLED_EXEC_MARKER", "markerXYZ")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            pub._post_github_comment(
+                issue_number=42,
+                body=original_body,
+                repo="squne121/loop-protocol",
+            )
+
+        assert len(received_bodies) == 1
+        body = received_bodies[0]
+        # Marker comes after original content
+        marker_pos = body.find("<!-- CONTROLLED_EXEC_MARKER:")
+        original_end_pos = body.find(original_body) + len(original_body)
+        assert marker_pos > original_end_pos - 1  # marker is after original body
+

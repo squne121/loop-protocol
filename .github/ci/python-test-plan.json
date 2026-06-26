@@ -19,6 +19,7 @@
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
     "scripts/ci/tests/",
+    "scripts/agent-guards/tests/",
     "tests/codex/test_execpolicy_matrix.py",
     "scripts/tests/test_milestone_rollup.py",
     "scripts/tests/test_pr_body_validator.py",
