@@ -197,7 +197,11 @@ def main(argv: list[str]) -> int:
 
         uses = str(entry["uses"]).strip()
         if uses not in ALLOWED_UPLOAD_USES:
-            _fail(failures, f"upload step for {required_path} uses '{uses}' not in allowed pin {sorted(ALLOWED_UPLOAD_USES)}")
+            _fail(
+                failures,
+                f"upload step for {required_path} uses '{uses}'"
+                f" not in allowed pin {sorted(ALLOWED_UPLOAD_USES)}",
+            )
 
         cond = str(step.get("if", "")).strip()
         if cond != REQUIRED_IF:
@@ -213,7 +217,11 @@ def main(argv: list[str]) -> int:
 
         inff = str(with_block.get("if-no-files-found", "")).strip()
         if inff != REQUIRED_IF_NO_FILES_FOUND:
-            _fail(failures, f"upload step for {required_path} if-no-files-found='{inff}' must be '{REQUIRED_IF_NO_FILES_FOUND}'")
+            _fail(
+                failures,
+                f"upload step for {required_path} if-no-files-found='{inff}'"
+                f" must be '{REQUIRED_IF_NO_FILES_FOUND}'",
+            )
 
         retention = with_block.get("retention-days")
         try:
@@ -221,7 +229,11 @@ def main(argv: list[str]) -> int:
         except (TypeError, ValueError):
             rv = None
         if rv != REQUIRED_RETENTION_DAYS:
-            _fail(failures, f"upload step for {required_path} retention-days={retention!r} must be {REQUIRED_RETENTION_DAYS}")
+            _fail(
+                failures,
+                f"upload step for {required_path}"
+                f" retention-days={retention!r} must be {REQUIRED_RETENTION_DAYS}",
+            )
 
     # Summary step: AFTER the last upload, references $GITHUB_STEP_SUMMARY.
     summary_blob = None
@@ -252,7 +264,11 @@ def main(argv: list[str]) -> int:
                 _fail(failures, f"summary viewport does not match playwright.config ({fp['viewport']})")
         if "snapshotPathTemplate" in fp:
             if fp["snapshotPathTemplate"] not in summary_blob:
-                _fail(failures, f"summary snapshotPathTemplate does not match playwright.config ({fp['snapshotPathTemplate']})")
+                _fail(
+                    failures,
+                    f"summary snapshotPathTemplate does not match"
+                    f" playwright.config ({fp['snapshotPathTemplate']})",
+                )
         if "maxDiffPixels" in fp:
             if f"maxDiffPixels={fp['maxDiffPixels']}" not in summary_blob:
                 _fail(failures, f"summary maxDiffPixels does not match spec (maxDiffPixels={fp['maxDiffPixels']})")

@@ -23,7 +23,10 @@ ERROR_CODE_MAP = {
 
 
 def _classify_missing_safety_claim_matrix(error: dict[str, object]) -> bool:
-    return str(error.get("rule_id")) == "LP052" and str(error.get("message", "")).strip() == "Missing required section: Safety Claim Matrix"
+    return (
+        str(error.get("rule_id")) == "LP052"
+        and str(error.get("message", "")).strip() == "Missing required section: Safety Claim Matrix"
+    )
 
 
 def _resolve_error_code(result_errors: list[dict[str, object]]) -> str:
@@ -44,13 +47,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--body-file", required=True, type=str)
     parser.add_argument("--changed-paths-file", type=str, default="")
     parser.add_argument("--linked-issue", type=int, default=None)
-    parser.add_argument("--schema-change", choices=sorted({"schema_change", "not_schema_change", "uncertain"}), default=None)
+    parser.add_argument(
+        "--schema-change",
+        choices=sorted({"schema_change", "not_schema_change", "uncertain"}),
+        default=None,
+    )
     args = parser.parse_args(argv)
 
     body = Path(args.body_file).read_text(encoding="utf-8")
     changed_paths = _load_changed_paths(args.changed_paths_file or None)
     body_decision = _parse_schema_decision(body)
-    if args.schema_change and body_decision in {"schema_change", "not_schema_change", "uncertain"} and args.schema_change != body_decision:
+    if (
+        args.schema_change
+        and body_decision in {"schema_change", "not_schema_change", "uncertain"}
+        and args.schema_change != body_decision
+    ):
         payload = {
             "schema": "loop_body_lint/v1",
             "target": "pr",
