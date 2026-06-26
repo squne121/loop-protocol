@@ -202,7 +202,7 @@ def load_required_labels(template_dir: Path, issue_kind: str) -> list:
     required_labels = []
 
     for item in body_items:
-        # type: markdown 要素は除外
+        # item type: markdown 要素は除外
         if item.get("type") == "markdown":
             continue
 
