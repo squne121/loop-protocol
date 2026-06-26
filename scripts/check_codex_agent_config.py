@@ -18,6 +18,9 @@ HOOKS_PATH = REPO_ROOT / ".codex/hooks.json"
 REQUIRED_DERIVED_MARKER = "derived/non-canonical"
 REQUIRED_IMPERATIVE = "Before executing this skill, read the canonical body at"
 MAX_BRIDGE_BODY_LINES = 3
+CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
+CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
+CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
 
 
 def route_tokens_to_skill_surfaces(route: str) -> list[str]:
@@ -54,6 +57,31 @@ def extract_skill_surface_paths(instructions: str) -> list[str]:
 
 def is_codex_only_parity(expected: dict) -> bool:
     return expected.get("parity_mode") == "codex_only"
+
+
+def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str]:
+    failures: list[str] = []
+    if agent_name not in CODEX_ONLY_ALLOWED_AGENTS:
+        failures.append(
+            f"{expected['path']}: codex_only parity is restricted to {sorted(CODEX_ONLY_ALLOWED_AGENTS)!r}"
+        )
+    if not expected["path"].startswith(".codex/agents/spark-"):
+        failures.append(f"{expected['path']}: codex_only parity path must stay under .codex/agents/spark-*")
+    if expected.get("claude_agent_path", "__missing__") is not None:
+        failures.append(f"{expected['path']}: codex_only parity must use claude_agent_path: null")
+    if expected.get("parity_exception_reason") != CODEX_ONLY_PARITY_REASON:
+        failures.append(
+            f"{expected['path']}: codex_only parity must use parity_exception_reason {CODEX_ONLY_PARITY_REASON!r}"
+        )
+    if expected.get("model") != CODEX_ONLY_MODEL:
+        failures.append(f"{expected['path']}: codex_only parity must use model {CODEX_ONLY_MODEL!r}")
+    if expected.get("runtime_followup_route") != "none":
+        failures.append(f"{expected['path']}: codex_only parity must use runtime_followup_route 'none'")
+    if expected.get("runtime_dependency_status") != "codex_native":
+        failures.append(f"{expected['path']}: codex_only parity must use runtime_dependency_status 'codex_native'")
+    if expected.get("repo_local_skill_surfaces", []) != []:
+        failures.append(f"{expected['path']}: codex_only parity must not declare repo_local_skill_surfaces")
+    return failures
 
 
 def load_agent(path: Path) -> dict:
@@ -154,14 +182,7 @@ def assert_required_fields(expectations: dict) -> list[str]:
                 f" {expected_route_surfaces!r} vs {expected_skill_surfaces!r}"
             )
         if codex_only:
-            if expected.get("claude_agent_path", "__missing__") is not None:
-                failures.append(
-                    f"{expected['path']}: codex_only parity must use claude_agent_path: null"
-                )
-            if not expected.get("parity_exception_reason"):
-                failures.append(
-                    f"{expected['path']}: codex_only parity requires parity_exception_reason"
-                )
+            failures.extend(validate_codex_only_expectation(agent_name, expected))
     return failures
 
 
@@ -215,14 +236,7 @@ def assert_runtime_contract(expectations: dict) -> list[str]:
                 )
             failures.extend(validate_bridge_surface(surface_path))
         if codex_only:
-            if expected.get("claude_agent_path", "__missing__") is not None:
-                failures.append(
-                    f"{expected['path']}: codex_only parity must use claude_agent_path: null"
-                )
-            if not expected.get("parity_exception_reason"):
-                failures.append(
-                    f"{expected['path']}: codex_only parity requires parity_exception_reason"
-                )
+            failures.extend(validate_codex_only_expectation(agent_name, expected))
         else:
             claude_agent_path = REPO_ROOT / expected["claude_agent_path"]
             if not claude_agent_path.exists():
