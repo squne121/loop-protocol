@@ -66,6 +66,7 @@ from local_main_branch_guard import (
     GITHUB_CMD_CLASS_DESTRUCTIVE,
     TRUSTED_REPO_SLUG,
 )
+from skill_runtime_command_policy import resolve_repo_slug
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -1287,6 +1288,37 @@ class TestExactAllowlistClaude:
             env_override={"LOOP_ISSUE_NUMBER": "981"},
         )
         assert result["status"] == "block"
+
+    def test_skill_runtime_executor_blocks_noncanonical_lexical_form(self, tmp_linked_worktree: Path):
+        repo_root = tmp_linked_worktree.parent.parent.parent
+        result = eval_in_local_root(
+            "python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 981 --repo squne121/loop-protocol",
+            str(repo_root),
+            env_override={"LOOP_ISSUE_NUMBER": "981"},
+        )
+        assert result["status"] == "block"
+
+    @pytest.mark.parametrize(
+        ("remote_url", "expected"),
+        [
+            ("https://github.com/squne121/loop-protocol.git", TRUSTED_REPO_SLUG),
+            ("git@github.com:squne121/loop-protocol.git", TRUSTED_REPO_SLUG),
+            ("https://evil.example/github.com/squne121/loop-protocol.git", None),
+            ("ssh://git@github.com/squne121/loop-protocol.git", None),
+        ],
+    )
+    def test_skill_runtime_repo_binding_uses_strict_remote_parser(
+        self,
+        tmp_git_repo: Path,
+        remote_url: str,
+        expected: str | None,
+    ):
+        subprocess.run(
+            ["git", "-C", str(tmp_git_repo), "remote", "set-url", "origin", remote_url],
+            check=True,
+            capture_output=True,
+        )
+        assert resolve_repo_slug(str(tmp_git_repo)) == expected
 
 
 class TestPythonpathStaleAndTmpWrapperClaude:

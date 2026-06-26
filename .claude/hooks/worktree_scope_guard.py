@@ -58,6 +58,7 @@ from skill_runtime_command_policy import (  # noqa: E402
     current_branch,
     looks_like_skill_runtime_executor_command,
     parse_exact_skill_runtime_command,
+    resolve_active_issue,
     resolve_default_branch,
     resolve_repo_slug,
 )
@@ -1801,7 +1802,6 @@ def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str,
 def _is_skill_runtime_executor_command(command: str, cwd: str, project_root: str,
                                        deadline: "object | None" = None) -> bool:
     """True iff command is the exact privileged skill runtime executor class."""
-    del deadline
     parsed = parse_exact_skill_runtime_command(command, project_root)
     if parsed is None:
         return False
@@ -1812,14 +1812,10 @@ def _is_skill_runtime_executor_command(command: str, cwd: str, project_root: str
         return False
     if resolve_repo_slug(project_root, None) != parsed.repo:
         return False
-    if os.environ.get("LOOP_ISSUE_NUMBER", "").strip() != parsed.issue_number:
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
         return False
-    expected = os.path.join(project_root, ".claude", "worktrees", f"issue-{parsed.issue_number}-")
-    matches = [
-        path for path in os.listdir(os.path.join(project_root, ".claude", "worktrees"))
-        if path.startswith(f"issue-{parsed.issue_number}-")
-    ] if os.path.isdir(os.path.join(project_root, ".claude", "worktrees")) else []
-    return len(matches) == 1
+    return True
 
 
 def _root_drift_active_worktree_mismatch(project_root: str, deadline: "object | None" = None) -> bool:

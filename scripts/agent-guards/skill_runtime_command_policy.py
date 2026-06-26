@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ _DEFAULT_BRANCH_NAMES = ("main", "master", "trunk")
 _METACHAR_RE = re.compile(r"[;&|<>`\n\r\0]")
 _LEADING_ENV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)+")
 _PLACEHOLDER_RE = re.compile(r"^\{[A-Za-z0-9_]+\}$")
+_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
     "schema": SKILL_RUNTIME_COMMAND_POLICY_SCHEMA,
@@ -132,26 +134,32 @@ def resolve_repo_slug(project_root: str, deadline: Deadline | None = None) -> st
     remote = out.stdout.strip()
     if not remote:
         return None
-    remote = remote.removesuffix(".git")
-    if remote.startswith("git@github.com:"):
-        return remote[len("git@github.com:") :]
-    if "github.com/" in remote:
-        return remote.split("github.com/", 1)[1]
-    return None
+    if remote.startswith("https://"):
+        parsed = urlparse(remote)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return None
+        if parsed.params or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            return None
+        path = parsed.path.removesuffix(".git")
+        parts = [part for part in path.split("/") if part]
+        if len(parts) != 2:
+            return None
+        slug = "/".join(parts)
+        return slug if _OWNER_REPO_RE.match(slug) else None
+    match = re.fullmatch(r"git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)
+    if match is None:
+        return None
+    slug = match.group(1)
+    return slug if _OWNER_REPO_RE.match(slug) else None
 
 
 def resolve_active_issue(project_root: str, cwd: str, deadline: Deadline | None = None) -> tuple[str | None, dict | None]:
+    del cwd
     issue = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
     if not issue.isdigit():
         return None, None
     catalog = list_worktrees(project_root, deadline)
     entry = select_issue_worktree(catalog, issue, os.path.realpath(project_root)) if catalog is not None else None
-    if entry is not None:
-        return issue, entry
-    worktrees_dir = Path(project_root) / ".claude" / "worktrees"
-    matches = sorted(worktrees_dir.glob(f"issue-{issue}-*"))
-    if len(matches) == 1 and matches[0].is_dir():
-        return issue, {"worktree_realpath": os.path.realpath(str(matches[0]))}
     return issue, entry
 
 
@@ -165,33 +173,25 @@ def parse_exact_skill_runtime_command(command: str, project_root: str | None = N
         return None
     if not tokens:
         return None
-    script_index = None
-    if tokens[:3] == ["uv", "run", "python3"]:
-        script_index = 3
-    elif len(tokens) >= 2 and os.path.basename(tokens[0]) == "python3":
-        script_index = 1
-    else:
+    if len(tokens) != 10:
         return None
-    if len(tokens) != script_index + 7:
-        return None
-    script_token = tokens[script_index]
-    if script_token.startswith("-"):
-        return None
-    script_path = os.path.realpath(os.path.join(root, script_token)) if not os.path.isabs(script_token) else os.path.realpath(script_token)
-    if script_path != os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
         return None
     if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
     expected_flags = ["--command-id", "--issue-number", "--repo"]
-    expected_positions = [script_index + 1, script_index + 3, script_index + 5]
+    expected_positions = [4, 6, 8]
     for flag, pos in zip(expected_flags, expected_positions):
         if tokens[pos] != flag:
             return None
     if any(tok.startswith("--command-id=") or tok.startswith("--issue-number=") or tok.startswith("--repo=") for tok in tokens):
         return None
-    command_id = tokens[script_index + 2]
-    issue_number = tokens[script_index + 4]
-    repo = tokens[script_index + 6]
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
     if not issue_number.isdigit() or int(issue_number) <= 0:
         return None
     if repo != TRUSTED_REPO_SLUG:

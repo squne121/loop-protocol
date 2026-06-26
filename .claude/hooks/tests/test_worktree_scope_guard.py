@@ -16,6 +16,7 @@ with a PreToolUse-shaped stdin payload.
 import json
 import os
 import subprocess
+import sys
 import importlib.util as _ilu
 from pathlib import Path
 
@@ -52,8 +53,9 @@ def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
     main.mkdir()
     _git("init", "-q", "-b", "main", cwd=main)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=main)
+    (main / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n")
     (main / "README.md").write_text("seed\n")
-    _git("add", "README.md", cwd=main)
+    _git("add", "README.md", ".gitignore", cwd=main)
     _git("commit", "-q", "-m", "seed", cwd=main)
 
     worktrees = {}
@@ -99,7 +101,7 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
-def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
+def _install_skill_runtime_exec_fixture(repo_root: Path, catalog_mode: str = "active") -> None:
     """Install a minimal registry/preflight fixture for direct executor tests."""
     source_root = REPO_ROOT
     for rel in (
@@ -112,7 +114,7 @@ def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
 
     _write_text(
         repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
+        f"""from __future__ import annotations
 
 import os
 
@@ -124,12 +126,13 @@ class Deadline:
 
 def list_worktrees(project_root: str, deadline=None):
     issue = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
-    if not issue:
+    mode = {catalog_mode!r}
+    if not issue or mode == "missing":
         return []
     worktree = os.path.realpath(
-        os.path.join(project_root, ".claude", "worktrees", f"issue-{issue}-x")
+        os.path.join(project_root, ".claude", "worktrees", f"issue-{{issue}}-x")
     )
-    return [{"issue_number": issue, "worktree_realpath": worktree, "worktree": worktree}]
+    return [{{"issue_number": issue, "worktree_realpath": worktree, "worktree": worktree}}]
 
 
 def select_issue_worktree(catalog, issue_number, root_realpath):
@@ -195,6 +198,7 @@ def render_command(command_id: str, values: dict[str, object]) -> list[str]:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 
@@ -205,6 +209,16 @@ def main() -> int:
     args = parser.parse_args()
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("SKILL_RUNTIME_TEST_OUTSIDE_WRITE") == "ignored":
+        ignored_dir = Path(".cache")
+        ignored_dir.mkdir(parents=True, exist_ok=True)
+        (ignored_dir / "outside.txt").write_text("persisted")
+    if os.environ.get("SKILL_RUNTIME_TEST_OUTSIDE_WRITE") == "transient":
+        transient_dir = Path(".cache")
+        transient_dir.mkdir(parents=True, exist_ok=True)
+        transient_path = transient_dir / "transient.txt"
+        transient_path.write_text("temp")
+        transient_path.unlink()
     payload = {"issue_number": args.issue_number, "repo": args.repo}
     (artifact_dir / "preflight.json").write_text(json.dumps(payload))
     print(json.dumps({"ok": True, **payload}))
@@ -1755,14 +1769,52 @@ def test_skill_runtime_executor_runs_preflight_directly(tmp_path):
     assert payload == {"issue_number": "1154", "repo": "squne121/loop-protocol"}
 
 
+def test_skill_runtime_executor_blocks_stale_directory_without_catalog_entry(tmp_path):
+    """Issue #1154: stale directory alone must not satisfy active-worktree binding."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _git("worktree", "remove", "--force", str(repo["worktree"]), cwd=repo["root"])
+    repo["worktree"].mkdir(parents=True, exist_ok=True)
+    _install_skill_runtime_exec_fixture(repo["root"], catalog_mode="missing")
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1154",
+    }
+    payload = _bash_payload(
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        str(repo["root"]),
+    )
+    guard_result = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
+    assert guard_result.returncode == 2
+    direct = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1154",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo["root"]),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert direct.returncode == 2
+
+
 @pytest.mark.parametrize("command", [
+    "python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+    "uv run python3 /tmp/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
     "uv run python3 .claude/skills/issue-refinement-loop/scripts/not_registered.py",
     "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol --unknown-flag x",
     "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
     "bash -lc 'uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol'",
     "FOO=bar uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
     "uv --with pytest run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-    "uv run python3 /tmp/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
 ])
 def test_skill_runtime_executor_negative(tmp_path, command):
     """Issue #1154 AC8/AC10: malformed executor routes are fail-closed."""
@@ -1771,6 +1823,108 @@ def test_skill_runtime_executor_negative(tmp_path, command):
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1154"}
     r = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
     assert r.returncode == 2, r.stderr
+
+
+def test_skill_runtime_executor_blocks_ignored_outside_write(tmp_path):
+    """Issue #1154: ignored writes outside the allowed artifact root are fail-closed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _install_skill_runtime_exec_fixture(repo["root"])
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1154",
+        "SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1154",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo["root"]),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "unauthorized write path" in result.stderr
+
+
+def test_skill_runtime_executor_blocks_transient_outside_write(tmp_path):
+    """Issue #1154: transient outside writes are detected via filesystem snapshot drift."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _install_skill_runtime_exec_fixture(repo["root"])
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1154",
+        "SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "transient",
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1154",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo["root"]),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "unauthorized write path" in result.stderr
+
+
+def test_skill_runtime_executor_ignores_path_poisoning(tmp_path):
+    """Issue #1154: executor resolves trusted uv/python instead of PATH-prepended shims."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
+    _install_skill_runtime_exec_fixture(repo["root"])
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    marker = tmp_path / "poisoned.txt"
+    (shim_dir / "uv").write_text(
+        "#!/bin/sh\n"
+        f"echo poisoned > {marker}\n"
+        "exit 99\n"
+    )
+    (shim_dir / "uv").chmod(0o755)
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1154",
+        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1154",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo["root"]),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
 
 
 # --- AC4/AC5/AC6: V3 one-shot decisions via real hook ---
