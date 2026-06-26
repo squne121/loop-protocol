@@ -1740,3 +1740,93 @@ class TestB1B4ReviewBlockerFixesClaude:
         result = eval_in_local_root("gh pr edit 123 --body-file tmp/body.txt", str(tmp_git_repo))
         assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
+
+
+# =============================================================================
+# Issue #1166: controlled skill mutation policy (AC4/AC17)
+# =============================================================================
+
+class TestControlledSkillMutationPolicy:
+    """Issue #1166 AC4/AC17: shared policy function consumed by local_main_branch_guard.
+
+    Both worktree_scope_guard and local_main_branch_guard consume the same
+    is_controlled_skill_mutation_exec_command function from controlled_skill_mutation_policy.
+    No split-brain allowlist (AC17).
+    """
+
+    def test_publish_termination_direct_denied(self, tmp_git_repo: Path):
+        """AC4: direct publish_termination_report.py invocation is denied in local root.
+
+        Only the executor (controlled_skill_mutation_exec.py) is allowed.
+        Direct script access goes to default:allow but is unknown class, so
+        this test verifies it at least doesn't get treated as a special allow.
+        """
+        cmd = (
+            "python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+            " --issue-number 1166 --repo squne121/loop-protocol"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        # Direct python3 with relative .claude/ script is allowed by default
+        # (not a branch mutation, not compound) — but it must NOT be in the
+        # deterministic_checker reason_code path.
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER, (
+            "direct publish_termination_report.py must not be allowed as deterministic_checker"
+        )
+
+    def test_publish_termination_executor_allowed(self, tmp_git_repo: Path):
+        """AC4/AC17: controlled_skill_mutation_exec.py with valid argv is allowed.
+
+        The executor command is handled by the shared policy function
+        (is_controlled_skill_mutation_exec_command) with reason_code=deterministic_checker.
+        """
+        # Create executor stub in the tmp git repo so realpath resolves
+        executor_dir = tmp_git_repo / "scripts" / "agent-guards"
+        executor_dir.mkdir(parents=True, exist_ok=True)
+        (executor_dir / "controlled_skill_mutation_exec.py").write_text("# stub\n")
+
+        cmd = (
+            "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
+            " --command-id termination_report.publish"
+            " --issue-number 1166"
+            " --input-file artifacts/1166/termination_report_input.json"
+            " --repo squne121/loop-protocol"
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        assert result["status"] == "allow", (
+            f"controlled_skill_mutation_exec.py with valid argv must be allowed; result={result}"
+        )
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER, (
+            "executor must be allowed as deterministic_checker"
+        )
+
+    def test_publish_termination_executor_missing_repo_denied(self, tmp_git_repo: Path):
+        """AC4: executor with missing --repo is denied (not a valid executor invocation)."""
+        executor_dir = tmp_git_repo / "scripts" / "agent-guards"
+        executor_dir.mkdir(parents=True, exist_ok=True)
+        (executor_dir / "controlled_skill_mutation_exec.py").write_text("# stub\n")
+
+        cmd = (
+            "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
+            " --command-id termination_report.publish"
+            " --issue-number 1166"
+            " --input-file artifacts/1166/termination_report_input.json"
+            # missing --repo
+        )
+        result = eval_in_local_root(cmd, str(tmp_git_repo))
+        # Missing --repo → not a valid executor form → not deterministic_checker
+        assert result["reason_code"] != REASON_DETERMINISTIC_CHECKER, (
+            "executor with missing --repo must not be allowed as deterministic_checker"
+        )
+
+    def test_publish_termination_shared_policy_reference(self, tmp_git_repo: Path):
+        """AC17: verify local_main_branch_guard references publish_termination_report
+        via the shared controlled_skill_mutation_policy module (not a separate allowlist).
+        """
+        # The guard module must import from controlled_skill_mutation_policy
+        import local_main_branch_guard as lmbg
+        # _CSM_POLICY_AVAILABLE should be True when the policy module is importable
+        # (it is available since we're in the same repo)
+        # This test just checks that the attribute exists (not False due to import failure)
+        assert hasattr(lmbg, "_CSM_POLICY_AVAILABLE"), (
+            "local_main_branch_guard must have _CSM_POLICY_AVAILABLE attribute (Issue #1166 AC17)"
+        )

@@ -66,6 +66,23 @@ REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
 # do not double-decide and the arbitration order is unambiguous.
 REASON_CLEANUP_DEFERRED = "cleanup_deferred_to_worktree_scope_guard"
 
+# ─── Shared controlled skill mutation policy (Issue #1166) ───────────────────
+# Import from scripts/agent-guards (sibling module) so the SAME
+# is_controlled_skill_mutation_exec_command function is consumed by both
+# local_main_branch_guard and worktree_scope_guard (AC4/AC17 — no split-brain).
+_AGENT_GUARDS_DIR = str(Path(__file__).resolve().parent)
+if _AGENT_GUARDS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_GUARDS_DIR)
+try:
+    from controlled_skill_mutation_policy import (
+        is_controlled_skill_mutation_exec_command as _csm_exec_command,
+    )
+    _CSM_POLICY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    def _csm_exec_command(cmd: str, project_root: str) -> bool:  # type: ignore[misc]
+        return False
+    _CSM_POLICY_AVAILABLE = False
+
 # ─── GitHub remote ops classification vocabulary ──────────────────────────────
 # 5-class vocabulary for gh command classification (Issue #1124).
 # These constants are exported for test validation (AC15).
@@ -1512,6 +1529,20 @@ def evaluate(
     # NOTE: drifted/detached root is blocked by step 13 before reaching here.
     # deterministic_checker is intentionally NOT in the drifted allowlist; checker scripts should run from worktrees.
     if is_deterministic_checker_command(normalized_cmd, project_root):
+        return _result(
+            status="allow",
+            reason_code=REASON_DETERMINISTIC_CHECKER,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+        )
+
+    # Step 13.6: Controlled skill mutation executor (Issue #1166 AC4/AC17).
+    # Shared policy function — same is_controlled_skill_mutation_exec_command as
+    # consumed by worktree_scope_guard. No split-brain allowlist.
+    # Only allowed from default branch root (drifted root blocked by step 13 above).
+    if _CSM_POLICY_AVAILABLE and _csm_exec_command(normalized_cmd, project_root or ""):
         return _result(
             status="allow",
             reason_code=REASON_DETERMINISTIC_CHECKER,

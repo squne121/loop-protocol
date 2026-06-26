@@ -2285,3 +2285,61 @@ def test_perform_preserves_partial_actions_on_branch_delete_fail(tmp_path):
     actions, err = _ce._perform("issue-1050-g", wt_real, str(repo["root"]), Deadline(60.0))
     assert actions == [_cc3.OP_WORKTREE_REMOVE], actions
     assert err is not None and "branch_delete_failed" in err
+
+
+# =============================================================================
+# Issue #1166: controlled skill mutation policy tests (AC2, AC5, AC9)
+# Real hook path via subprocess (PreToolUse stdin JSON).
+# =============================================================================
+
+def test_publish_termination_direct_denied_real_hook(tmp_path):
+    """AC2/AC9: direct publish_termination_report.py invocation is denied by real hook.
+
+    python3 .claude/skills/.../publish_termination_report.py must not be allowed
+    as a direct command from the main root when an issue worktree is active.
+    The deny is due to unknown-class cwd-outside-worktree fail-closed block.
+    """
+    repo = _make_repo_with_worktree(tmp_path, issue="1166", slug="hooks-pub")
+    cmd = (
+        "python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+        " --issue-number 1166 --repo squne121/loop-protocol"
+    )
+    payload = _bash_payload(cmd, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1166"}
+    r = _run_guard(payload, repo["root"], issue="1166", extra_env=env)
+    assert r.returncode == 2, (
+        f"direct publish_termination_report.py must be denied; stderr={r.stderr}"
+    )
+
+
+def test_publish_termination_executor_allowed_real_hook(tmp_path):
+    """AC5/AC9: controlled_skill_mutation_exec.py with valid argv is allowed by real hook.
+
+    The executor command passes the shared policy check and is allowed even when
+    an issue worktree is active and the command is run from the main root.
+    """
+    repo = _make_repo_with_worktree(tmp_path, issue="1166", slug="hooks-pub")
+    # Create the executor script in the tmp repo (so realpath resolves correctly)
+    executor_dir = repo["root"] / "scripts" / "agent-guards"
+    executor_dir.mkdir(parents=True, exist_ok=True)
+    executor = executor_dir / "controlled_skill_mutation_exec.py"
+    executor.write_text("# stub\n")
+    # Create a plausible input-file in artifacts subtree
+    artifact_dir = repo["root"] / "artifacts" / "1166"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    input_file = artifact_dir / "termination_report_input.json"
+    input_file.write_text("{}\n")
+
+    cmd = (
+        f"uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
+        f" --command-id termination_report.publish"
+        f" --issue-number 1166"
+        f" --input-file artifacts/1166/termination_report_input.json"
+        f" --repo squne121/loop-protocol"
+    )
+    payload = _bash_payload(cmd, str(repo["root"]))
+    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1166"}
+    r = _run_guard(payload, repo["root"], issue="1166", extra_env=env)
+    assert r.returncode == 0, (
+        f"controlled_skill_mutation_exec.py with valid argv must be allowed; stderr={r.stderr}"
+    )
