@@ -145,6 +145,7 @@ def _ensure_artifact_path_safe(project_root: str, issue_number: str) -> Path:
 def _safe_path_entries() -> list[str]:
     entries = [
         str(Path.home() / ".local" / "bin"),
+        *_trusted_uv_toolcache_dirs(),
         "/usr/local/sbin",
         "/usr/local/bin",
         "/usr/sbin",
@@ -161,25 +162,30 @@ def _safe_path_entries() -> list[str]:
     return ordered
 
 
-def _resolve_executable_next_to_runtime(name: str, project_root: str) -> str | None:
-    runtime_dir = Path(sys.executable).resolve().parent
-    candidate = runtime_dir / name
-    if not candidate.exists():
-        return None
-    real = os.path.realpath(candidate)
-    project_root_real = os.path.realpath(project_root)
-    if os.path.commonpath([project_root_real, real]) == project_root_real:
-        raise RuntimeError(f"{name}_inside_project_root")
-    return real
+def _trusted_uv_toolcache_dirs() -> list[str]:
+    root = Path("/opt/hostedtoolcache/uv")
+    if not root.is_dir():
+        return []
+
+    trusted_dirs: list[str] = []
+    root_real = os.path.realpath(root)
+    for candidate in sorted(root.glob("*/x86_64")):
+        uv_path = candidate / "uv"
+        if not uv_path.is_file() or not os.access(uv_path, os.X_OK):
+            continue
+        real = os.path.realpath(uv_path)
+        if os.path.commonpath([root_real, real]) != root_real:
+            continue
+        trusted_dirs.append(str(candidate))
+    return trusted_dirs
 
 
 def _resolve_trusted_executable(name: str, project_root: str) -> str:
     safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
-    resolved = _resolve_executable_next_to_runtime(name, project_root)
-    if not resolved and name == "python3":
+    if name == "python3":
         resolved = os.path.realpath(sys.executable)
-    if not resolved:
+    else:
         resolved = shutil.which(name, path=safe_path)
     if not resolved:
         raise RuntimeError(f"{name}_not_found")
