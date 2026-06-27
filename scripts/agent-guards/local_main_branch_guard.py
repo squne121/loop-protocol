@@ -55,6 +55,10 @@ REASON_DRIFT = "local_root_branch_drift"
 REASON_ALREADY_DRIFTED = "already_drifted_root"
 REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
+REASON_UNKNOWN_COMMAND = "unknown_command_requires_review"
+REASON_GH_API = "github_api_command"
+REASON_RTK_HELP_COMMAND = "rtk_help_command"
+REASON_RTK_PROXY = "rtk_proxy_requires_review"
 REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
@@ -94,6 +98,19 @@ GITHUB_CMD_CLASS_DESTRUCTIVE = "github_destructive_command"
 
 # Trusted repository slug for gh issue create/edit mutation allowlist.
 TRUSTED_REPO_SLUG = "squne121/loop-protocol"
+
+COMMAND_KIND_UNKNOWN = "unknown_command"
+COMMAND_KIND_GITHUB_API = "github_api_command"
+COMMAND_KIND_RTK_WRAPPER = "rtk_wrapper"
+COMMAND_KIND_GIT_BRANCH_MUTATION = "git_branch_mutation"
+COMMAND_KIND_PIPELINE = "readonly_pipeline"
+COMMAND_KIND_GITHUB_DISPLAY = "github_display_readonly"
+COMMAND_KIND_GITHUB_ARTIFACT_EXPORT = "readonly_artifact_export"
+COMMAND_KIND_GITHUB_ISSUE_MUTATION = "github_issue_mutation"
+COMMAND_KIND_GITHUB_PR_METADATA = "github_pr_metadata"
+COMMAND_KIND_GITHUB_DESTRUCTIVE = "github_mutation"
+COMMAND_KIND_GITHUB_MUTATION = COMMAND_KIND_GITHUB_DESTRUCTIVE
+COMMAND_KIND_READONLY = "readonly_command"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -322,6 +339,7 @@ _GIT_GLOBAL_OPTS_FAILCLOSED = {"-C", "-c", "--git-dir", "--work-tree", "--config
 
 # Shell metacharacters that indicate compound/unparseable commands
 _SHELL_METACHAR_RE = re.compile(r"[;&<>|`]|\$\(")
+_GH_API_ENDPOINT_RE = re.compile(r"^repos/squne121/loop-protocol/issues/comments/\d+$")
 
 # Fd-duplication pattern: 2>&1 immediately before pipe
 _FD_DUP_STDERR_STDOUT_RE = re.compile(r"\s+2>&1(\s*\|)")
@@ -467,6 +485,128 @@ def tokenize_command(cmd: str) -> list[str] | None:
         return shlex.split(cmd)
     except ValueError:
         return None
+
+
+def _redact_token(token: str) -> str:
+    """Apply lightweight redaction for diagnostic argv output."""
+    redaction_sensitive = {
+        "--body",
+        "--body-file",
+        "--input",
+        "-f",
+        "-F",
+        "--field",
+    }
+    if token in redaction_sensitive:
+        return token
+    if token.startswith("--") and "=" in token:
+        if token.startswith(("--body=", "--input=", "--field=")):
+            key = token.split("=", 1)[0]
+            return f"{key}=<redacted>"
+        return token
+    if "://github.com/" in token and "#issuecomment-" in token:
+        return "<github-issue-comment-url>"
+    if len(token) > 50:
+        return "<redacted>"
+    return token
+
+
+def _redact_argv(tokens: list[str] | None) -> list[str]:
+    """Return redacted argv representation for diagnostics."""
+    if not tokens:
+        return []
+    redacted: list[str] = []
+    skip_next = False
+    sensitive_flags = {"--body-file", "--body", "--input", "--field"}
+    for idx, token in enumerate(tokens):
+        if skip_next:
+            redacted.append("<redacted>")
+            skip_next = False
+            continue
+        normalized = _redact_token(token)
+        if token in sensitive_flags and idx + 1 < len(tokens):
+            redacted.append(normalized)
+            skip_next = True
+            continue
+        redacted.append(normalized)
+    return redacted
+
+
+def _parse_gh_api_command(cmd: str) -> bool:
+    """
+    Parse and classify gh api endpoint access.
+
+    Allow:
+      - `gh api repos/squne121/loop-protocol/issues/comments/<id>`
+      - `gh api --method GET repos/squne121/loop-protocol/issues/comments/<id>`
+
+    Block:
+      - GraphQL call style (`graphql`)
+      - `--method` values other than GET
+      - mutation flags (`-f`, `-F`, `--field`, `--input`)
+    """
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 3:
+        return False
+    if tokens[0] != "gh" or tokens[1] != "api":
+        return False
+
+    method = "GET"
+    i = 2
+    endpoint: str | None = None
+
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token == "graphql":
+            return False
+
+        if token == "--method":
+            if i + 1 >= len(tokens):
+                return False
+            method = tokens[i + 1].upper()
+            i += 2
+            continue
+        if token.startswith("--method="):
+            method = token.split("=", 1)[1].upper()
+            i += 1
+            continue
+
+        if token in {"-f", "-F", "--field", "--input"}:
+            return False
+        if token.startswith("-") and not endpoint:
+            # Skip unknown flags; values remain allowed only if no endpoint consumed.
+            i += 1
+            continue
+
+        if endpoint is None:
+            endpoint = token
+        # Any extra bare token after first endpoint is treated as non-matching extension.
+        else:
+            return False
+        i += 1
+
+    if not endpoint:
+        return False
+    if method != "GET":
+        return False
+    if not _GH_API_ENDPOINT_RE.fullmatch(endpoint):
+        return False
+    return True
+
+
+def _is_gh_api_mutation_command(cmd: str) -> bool:
+    """
+    Return True when gh api command is present but does not meet allowlist criteria.
+    """
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 2:
+        return False
+    return tokens[0] == "gh" and tokens[1] == "api"
+
+
+def _is_rtk_command(tokens: list[str]) -> bool:
+    return bool(tokens) and tokens[0] == "rtk"
 
 
 def _gh_has_web_flag(cmd: str) -> bool:
@@ -1218,6 +1358,7 @@ def evaluate(
     command: str,
     cwd: str,
     hook_flavor: str = "cli",
+    event_kind: str = "PreToolUse",
 ) -> dict[str, Any]:
     """
     Evaluate whether the command should be allowed or blocked.
@@ -1225,16 +1366,50 @@ def evaluate(
     Returns a dict matching LOCAL_MAIN_BRANCH_GUARD_RESULT_V1.
     """
     cmd = command.strip()
+    event_kind = event_kind or "PreToolUse"
+    wrapper = None
+    inner_argv_redacted: list[str] | None = None
+    current_branch: str | None = None
+
+    # Helper to emit canonicalized result dictionaries.
+    def _emit(
+        status: str,
+        reason_code: str,
+        target_branch: str | None,
+        target_branch_kind: str | None,
+        local_parser_stage: str,
+        local_command_kind: str = COMMAND_KIND_UNKNOWN,
+        local_rule_id: str | None = None,
+        argv_tokens: list[str] | None = None,
+        inner_tokens: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return _result(
+            status=status,
+            reason_code=reason_code,
+            current_branch=current_branch,
+            target_branch=target_branch,
+            target_branch_kind=target_branch_kind,
+            hook_flavor=hook_flavor,
+            parser_stage=local_parser_stage,
+            command_kind=local_command_kind,
+            rule_id=local_rule_id,
+            argv_redacted=argv_tokens,
+            wrapper=wrapper,
+            inner_argv_redacted=inner_tokens,
+            event_kind=event_kind,
+            decision_source=local_rule_id or reason_code,
+        )
 
     # Step 1: Check if we are in local root context
     if not is_local_root_context(cwd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_NOT_LOCAL_ROOT,
-            current_branch=None,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="context_check",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="not_local_root_context",
         )
 
     # Step 2: Resolve current branch
@@ -1243,128 +1418,214 @@ def evaluate(
 
     # Step 3: Check for inline env override (block it explicitly)
     if has_inline_env_override(cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_INLINE_OVERRIDE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="inline_override",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="inline_env_override",
         )
 
     # Step 4: Check manual override (hook process env only)
     if is_manual_override_active():
-        return _result(
+        return _emit(
             status="allow",
             reason_code="manual_override_accepted",
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="manual_override",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="manual_override_accepted",
         )
 
     # Step 5: readonly pipeline classifier.
     # Must run before generic compound detection so `rg ... | head ...` can pass,
     # while mixed command / wrapper / redirection forms still fail closed.
     if classify_readonly_pipeline(cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_READONLY,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="readonly_pipeline",
+            local_command_kind=COMMAND_KIND_PIPELINE,
+            local_rule_id="readonly_pipeline",
         )
 
     # Step 5.5: readonly_artifact_export_command — gh issue view ... > tmp/<filename>
     # Must run before compound/metachar detection (Step 6) because `>` is a metachar.
     # Only the exact form `gh issue view <N> ... > tmp/<file>` is allowed.
     if is_readonly_artifact_export_command(cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_READONLY,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="readonly_artifact_export",
+            local_command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+            local_rule_id="gh_issue_view_to_tmp",
         )
 
     # Step 6: Compound/wrapped commands in local root context: fail-closed.
     # (Must check BEFORE readonly: "git status || git switch issue-*" starts with "git status")
     if is_compound_or_wrapped(cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="compound_or_wrapped",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="compound_wrapper_blocked",
         )
 
     # B3: Leading env assignments in local root context — fail-closed.
     # LOOP_DEFAULT_BRANCH=... or FOO=bar git switch ... are blocked.
     if _has_leading_env_assignment(cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="leading_env_assignment",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="leading_env_assignment",
         )
 
     # Step 7: shlex parse failure → fail-closed
     tokens = tokenize_command(cmd)
     if tokens is None:
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="tokenize",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="tokenize_failure",
         )
 
     # Step 8: Normalize git global options.
     # If fail-closed global options (-C, --git-dir, --work-tree, --config-env) present → block.
     normalized_tokens = tokens
-    git_global_fail_closed = False
-    if tokens and tokens[0] == "git":
-        normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(tokens)
-        if git_global_fail_closed:
-            return _result(
+    argv_redacted = _redact_argv(normalized_tokens)
+    normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
+    wrapper = None
+    inner_argv_redacted = None
+
+    # Step 8.5: rtk wrapper unwrapping (Issue #1198)
+    if _is_rtk_command(normalized_tokens):
+        wrapper = "rtk"
+        inner_tokens = normalized_tokens[1:]
+        inner_argv_redacted = _redact_argv(inner_tokens)
+        if not inner_tokens:
+            return _emit(
                 status="block",
-                reason_code=REASON_UNPARSEABLE,
-                current_branch=current_branch,
+                reason_code=REASON_UNKNOWN_COMMAND,
                 target_branch=None,
                 target_branch_kind=None,
-                hook_flavor=hook_flavor,
+                local_parser_stage="rtk_empty",
+                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                local_rule_id="rtk_empty",
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
+            )
+
+        inner_command_name = inner_tokens[0]
+        if inner_command_name in {"--help", "-h", "help"}:
+            return _emit(
+                status="allow",
+                reason_code=REASON_RTK_HELP_COMMAND,
+                target_branch=None,
+                target_branch_kind=None,
+                local_parser_stage="rtk_help",
+                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                local_rule_id="rtk_help",
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
+            )
+
+        if inner_command_name in {"gain", "session"}:
+            return _emit(
+                status="allow",
+                reason_code=REASON_READONLY,
+                target_branch=None,
+                target_branch_kind=None,
+                local_parser_stage="rtk_default_allow",
+                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                local_rule_id=f"rtk_{inner_command_name}",
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
+            )
+
+        if inner_command_name == "proxy":
+            # rtk proxy は中間に複雑な委譲コマンドを内包し得るため、
+            # allow/deny を安全側に寄せるため proxy 直下は review-required とする。
+            return _emit(
+                status="block",
+                reason_code=REASON_RTK_PROXY,
+                target_branch=None,
+                target_branch_kind=None,
+                local_parser_stage="rtk_proxy_requires_review",
+                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                local_rule_id="rtk_proxy_requires_review",
+                argv_tokens=argv_redacted,
+                inner_tokens=_redact_argv(inner_tokens[1:]),
+            )
+
+        normalized_tokens = inner_tokens
+        normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
+        argv_redacted = _redact_argv(normalized_tokens)
+        inner_argv_redacted = _redact_argv(normalized_tokens)
+    git_global_fail_closed = False
+    if normalized_tokens and normalized_tokens[0] == "git":
+        normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(normalized_tokens)
+        if git_global_fail_closed:
+            return _emit(
+                status="block",
+                reason_code=REASON_UNPARSEABLE,
+                target_branch=None,
+                target_branch_kind=None,
+                local_parser_stage="git_global_opts",
+                local_command_kind=COMMAND_KIND_UNKNOWN,
+                local_rule_id="git_global_opts_failclosed",
             )
 
     # Rebuild normalized cmd string for pattern matching
     normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
+    argv_redacted = _redact_argv(normalized_tokens)
+    if wrapper == "rtk":
+        inner_argv_redacted = _redact_argv(normalized_tokens)
 
     # Step 9: Read-only commands are always allowed (safe even in drifted/detached states)
     if is_readonly_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_READONLY,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="readonly_classify",
+            local_command_kind=COMMAND_KIND_GITHUB_DISPLAY if normalized_cmd.startswith("gh ") else COMMAND_KIND_READONLY,
+            local_rule_id="readonly_command",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.5: Branch-safe maintenance commands remain allowed, but must not
     # reuse readonly telemetry or readonly pipeline classification.
     if is_branch_safe_maintenance_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_BRANCH_SAFE_MAINTENANCE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="branch_safe_maintenance",
+            local_command_kind=COMMAND_KIND_READONLY,
+            local_rule_id="branch_safe_maintenance",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.55: Cleanup-class commands (Issue #1137 arbitration). Exact
@@ -1373,88 +1634,141 @@ def evaluate(
     # Recognizing them before generic branch-mutation handling fixes the
     # arbitration order so the local root guard does not double-decide.
     if is_cleanup_class_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_CLEANUP_DEFERRED,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="cleanup_deferred",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="cleanup_deferred",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.57: exact privileged skill runtime command class (Issue #1154).
     project_root = _resolve_project_root(cwd)
     if project_root and is_exact_skill_runtime_executor_command(normalized_cmd, cwd, project_root):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_SKILL_RUNTIME_EXECUTOR,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="skill_runtime_exec",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="skill_runtime_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
     if looks_like_skill_runtime_executor_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="skill_runtime_like_block",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="skill_runtime_guess",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
     if _looks_like_direct_issue_refinement_runtime_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="issue_refinement_runtime_block",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="issue_refinement_direct",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.6: Tmp wrapper / python -c commands — fail-closed (AC14).
     if is_tmp_wrapper_or_python_c_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_UNPARSEABLE,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="tmp_wrapper",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="tmp_wrapper_python",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.6b: github_issue_mutation_command — gh issue create/edit with strict constraints.
     # --repo squne121/loop-protocol and --body-file tmp/... required; interactive flags blocked.
     if is_github_issue_mutation_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_GITHUB_REMOTE_OPS,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="github_issue_mutation",
+            local_command_kind=COMMAND_KIND_GITHUB_ISSUE_MUTATION,
+            local_rule_id="github_issue_mutation_allow",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+
+    # Step 9.65: gh api exact allowlist: only GET issue-comment endpoint by allowed slug.
+    if _parse_gh_api_command(normalized_cmd):
+        return _emit(
+            status="allow",
+            reason_code=REASON_GH_API,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="github_api_allow",
+            local_command_kind=COMMAND_KIND_GITHUB_API,
+            local_rule_id="gh_api_issue_comment_get",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+
+    # Step 9.65b: gh api command without allowlist match is treated as review-required
+    # (not as readonly or unparseable) to avoid silent blind bypass.
+    if _is_gh_api_mutation_command(normalized_cmd):
+        return _emit(
+            status="block",
+            reason_code=REASON_GH_API,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="github_api_block",
+            local_command_kind=COMMAND_KIND_GITHUB_API,
+            local_rule_id="gh_api_not_allowed",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.7a: GitHub remote ops (post-merge-cleanup minimum set) — allow with distinct reason_code.
     if is_github_remote_ops_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_GITHUB_REMOTE_OPS,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="github_remote_ops",
+            local_command_kind=COMMAND_KIND_GITHUB_PR_METADATA,
+            local_rule_id="github_remote_ops_allow",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 9.7b: Gh mutation commands — fail-closed (AC11).
     if is_gh_mutation_command(normalized_cmd):
-        return _result(
+        return _emit(
             status="block",
             reason_code=REASON_GH_MUTATION,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="gh_mutation",
+            local_command_kind=COMMAND_KIND_GITHUB_MUTATION,
+            local_rule_id="github_mutation_denied",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 10: Classify root state.
@@ -1467,13 +1781,16 @@ def evaluate(
     # B3 fix: drifted/detached_or_unknown roots must NOT allow path restore.
     # In drifted/detached state, only the explicit allowlist (_DRIFTED_ALLOWLIST_PATTERNS) applies.
     if is_path_restore_command(normalized_cmd) and root_state == "default":
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_READONLY,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="path_restore",
+            local_command_kind=COMMAND_KIND_READONLY,
+            local_rule_id="git_path_restore",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 12: Check if this is a branch mutation command
@@ -1486,13 +1803,16 @@ def evaluate(
 
         # Allow recovery to default branch (always permitted regardless of root state)
         if target_branch == default_branch:
-            return _result(
+            return _emit(
                 status="allow",
                 reason_code=REASON_RECOVERY,
-                current_branch=current_branch,
                 target_branch=target_branch,
                 target_branch_kind="default",
-                hook_flavor=hook_flavor,
+                local_parser_stage="branch_mutation",
+                local_command_kind=COMMAND_KIND_GIT_BRANCH_MUTATION,
+                local_rule_id="git_recovery_to_default",
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
             )
 
         # Block drift to non-default branch
@@ -1502,13 +1822,16 @@ def evaluate(
             block_reason = REASON_ALREADY_DRIFTED
         else:
             block_reason = REASON_DRIFT
-        return _result(
+        return _emit(
             status="block",
             reason_code=block_reason,
-            current_branch=current_branch,
             target_branch=target_branch,
             target_branch_kind=target_kind,
-            hook_flavor=hook_flavor,
+            local_parser_stage="branch_mutation_block",
+            local_command_kind=COMMAND_KIND_GIT_BRANCH_MUTATION,
+            local_rule_id="git_branch_mutation_block",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 13: Drifted or detached root: use explicit allowlist (B1/B4)
@@ -1516,26 +1839,32 @@ def evaluate(
     if already_drifted:
         if not _is_allowed_when_drifted(normalized_cmd):
             block_reason = REASON_DETACHED_OR_UNKNOWN if root_state == "detached_or_unknown" else REASON_ALREADY_DRIFTED
-            return _result(
+            return _emit(
                 status="block",
                 reason_code=block_reason,
-                current_branch=current_branch,
                 target_branch=None,
                 target_branch_kind=None,
-                hook_flavor=hook_flavor,
+                local_parser_stage="drift_allowlist_block",
+                local_command_kind=COMMAND_KIND_UNKNOWN,
+                local_rule_id="drift_allowlist_block",
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
             )
 
     # Step 13.5: Deterministic checker commands on default branch — allowed with distinct reason_code (AC5/AC12).
     # NOTE: drifted/detached root is blocked by step 13 before reaching here.
     # deterministic_checker is intentionally NOT in the drifted allowlist; checker scripts should run from worktrees.
     if is_deterministic_checker_command(normalized_cmd, project_root):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_DETERMINISTIC_CHECKER,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="deterministic_checker",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="deterministic_checker",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Step 13.6: Controlled skill mutation executor (Issue #1166 AC4/AC17).
@@ -1543,23 +1872,43 @@ def evaluate(
     # consumed by worktree_scope_guard. No split-brain allowlist.
     # Only allowed from default branch root (drifted root blocked by step 13 above).
     if _CSM_POLICY_AVAILABLE and _csm_exec_command(normalized_cmd, project_root or ""):
-        return _result(
+        return _emit(
             status="allow",
             reason_code=REASON_DETERMINISTIC_CHECKER,
-            current_branch=current_branch,
             target_branch=None,
             target_branch_kind=None,
-            hook_flavor=hook_flavor,
+            local_parser_stage="controlled_skill_mutation",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="controlled_skill_mutation",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+
+    # rtk unknown inner command requires review rather than being treated as readonly.
+    if wrapper == "rtk":
+        return _emit(
+            status="block",
+            reason_code=REASON_UNKNOWN_COMMAND,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="rtk_unknown_inner",
+            local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+            local_rule_id="rtk_unknown_inner",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
         )
 
     # Default: allow
-    return _result(
+    return _emit(
         status="allow",
-        reason_code=REASON_READONLY,
-        current_branch=current_branch,
+        reason_code=REASON_UNKNOWN_COMMAND,
         target_branch=None,
         target_branch_kind=None,
-        hook_flavor=hook_flavor,
+        local_parser_stage="final_classification",
+        local_command_kind=COMMAND_KIND_UNKNOWN,
+        local_rule_id="default_unknown_allow",
+        argv_tokens=argv_redacted,
+        inner_tokens=inner_argv_redacted,
     )
 
 
@@ -1639,13 +1988,38 @@ def _result(
     target_branch: str | None,
     target_branch_kind: str | None,
     hook_flavor: str,
+    parser_stage: str | None = None,
+    command_kind: str = COMMAND_KIND_UNKNOWN,
+    rule_id: str | None = None,
+    argv_redacted: list[str] | None = None,
+    wrapper: str | None = None,
+    inner_argv_redacted: list[str] | None = None,
+    event_kind: str | None = None,
+    decision_source: str | None = None,
 ) -> dict[str, Any]:
+    decision = "allow" if status == "allow" else "block"
+    if rule_id is None:
+        rule_id = reason_code
+    if decision_source is None:
+        decision_source = rule_id
+    if event_kind is None:
+        event_kind = "PreToolUse"
     return {
+        "decision": decision,
+        "decision_source": decision_source,
         "status": status,
         "reason_code": reason_code,
         "current_branch": current_branch,
         "target_branch": target_branch,
         "target_branch_kind": target_branch_kind,
+        "hook_name": "local_main_branch_guard",
+        "event_kind": event_kind,
+        "parser_stage": parser_stage or "classification",
+        "command_kind": command_kind,
+        "rule_id": rule_id,
+        "argv_redacted": argv_redacted,
+        "inner_argv_redacted": inner_argv_redacted,
+        "wrapper": wrapper,
         "hook_flavor": hook_flavor,
     }
 
@@ -1672,7 +2046,7 @@ def _classify_branch_kind(branch: str | None, default_branch: str) -> str:
 def run_hook(hook_flavor: str = "claude") -> int:
     """
     Entry point for hook mode.
-    Reads PreToolUse JSON from stdin, evaluates, returns exit code.
+    Reads hook JSON from stdin, evaluates, returns exit code.
     """
     try:
         raw = sys.stdin.read()
@@ -1699,12 +2073,22 @@ def run_hook(hook_flavor: str = "claude") -> int:
 
     # Extract cwd from hook context or fall back to os.getcwd()
     cwd = data.get("cwd", "") or os.getcwd()
+    hook_event = data.get("event")
+    if not isinstance(hook_event, str):
+        hook_event = data.get("hook_event_name")
+        if not isinstance(hook_event, str):
+            hook_event = "PreToolUse"
 
     if not command:
         # No command: allow (not a Bash tool call we care about)
         return 0
 
-    result = evaluate(command=command, cwd=cwd, hook_flavor=hook_flavor)
+    result = evaluate(
+        command=command,
+        cwd=cwd,
+        hook_flavor=hook_flavor,
+        event_kind=hook_event,
+    )
 
     if result["status"] == "block":
         # B5 fix: resolve default_branch for kind classification

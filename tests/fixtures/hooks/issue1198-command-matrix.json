@@ -1,0 +1,58 @@
+{
+  "allow": [
+    {
+      "command": "rtk --help",
+      "reason": "rtk_help_command"
+    },
+    {
+      "command": "rtk gain --history",
+      "reason": "readonly_command"
+    },
+    {
+      "command": "gh api repos/squne121/loop-protocol/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api --method GET repos/squne121/loop-protocol/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "rtk gh issue view 1170 --repo squne121/loop-protocol --json body",
+      "reason": "readonly_command"
+    },
+    {
+      "command": "rtk gh issue edit 1170 --repo squne121/loop-protocol --body-file tmp/issue_1170_body.md",
+      "reason": "github_remote_ops_command"
+    },
+    {
+      "command": "echo https://github.com/squne121/loop-protocol/issues/1170#issuecomment-4814071263",
+      "reason": "unknown_command_requires_review"
+    }
+  ],
+  "block": [
+    {
+      "command": "gh api --method PATCH repos/squne121/loop-protocol/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "rtk unknown-subcommand",
+      "reason": "unknown_command_requires_review"
+    },
+    {
+      "command": "rtk proxy bash -lc 'git switch issue-1198'",
+      "reason": "rtk_proxy_requires_review"
+    },
+    {
+      "command": "git checkout -b issue-1198-codex",
+      "reason": "local_root_branch_drift"
+    },
+    {
+      "command": "git switch -c issue-1198-codex",
+      "reason": "local_root_branch_drift"
+    }
+  ]
+}
