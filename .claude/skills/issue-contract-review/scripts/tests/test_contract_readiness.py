@@ -813,15 +813,28 @@ def test_source_payload_present_in_preflight_errors():
     err = errors[0]
     assert "source_payload" in err, f"source_payload missing from error: {list(err.keys())}"
     sp = err["source_payload"]
-    required_payload_fields = {"classification", "decision", "confidence", "exit_code", "command_hash", "duration_ms"}
+    required_payload_fields = {
+        "classification",
+        "category",
+        "scope_class",
+        "decision",
+        "confidence",
+        "exit_code",
+        "command_hash",
+        "duration_ms",
+        "runner_env_delta",
+    }
     missing = required_payload_fields - set(sp.keys())
     assert not missing, f"source_payload missing fields: {missing}"
     assert sp["classification"] == "blocked"
+    assert sp["category"] == "compound_command_disallowed"
+    assert sp["scope_class"] == "baseline_fail_expected"
     assert sp["decision"] == "blocked"
     assert sp["confidence"] == "high"
     assert sp["exit_code"] == -1
     assert sp["command_hash"] == "sha256:abc123"
     assert sp["duration_ms"] == 42
+    assert sp["runner_env_delta"] == {}
 
 
 def test_source_payload_preserves_package_manager_no_tty_category():
@@ -867,6 +880,9 @@ def test_source_payload_preserves_package_manager_no_tty_category():
     )
     assert err["source_payload"]["decision"] == "blocked"
     assert err["source_payload"]["command_hash"] == "sha256:def456"
+    assert err["source_payload"]["category"] == "package_manager_no_tty_prompt"
+    assert err["source_payload"]["scope_class"] == "regression_gate"
+    assert err["source_payload"]["runner_env_delta"] == {}
 # ---------------------------------------------------------------------------
 # Blocker 4: Redirect operators not flagged as compound (< > << >> <<<)
 # ---------------------------------------------------------------------------
