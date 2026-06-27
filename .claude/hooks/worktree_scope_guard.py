@@ -113,6 +113,26 @@ except Exception:  # pragma: no cover - defensive fail-closed
 
     _CSM_POLICY_AVAILABLE = False
 
+# Worktree bootstrap executor policy (Issue #1209).
+# Shared policy function — same is_exact_worktree_bootstrap_executor_command as
+# consumed by local_main_branch_guard (no split-brain allowlist).
+_AGENT_OPS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "scripts",
+    "agent-ops",
+)
+if _AGENT_OPS_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_OPS_DIR)
+try:
+    from worktree_bootstrap_command_policy import (
+        is_exact_worktree_bootstrap_executor_command as _wbe_exec_command,
+    )
+    _WBE_POLICY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    def _wbe_exec_command(cmd: str, cwd: str, project_root: str, deadline: object | None = None) -> bool:  # type: ignore[misc]
+        return False
+    _WBE_POLICY_AVAILABLE = False
+
 # Agent-ops tools allowed as an exact command class from the local main root even
 # when an issue worktree is active (Issue #1137 Blocker 1). realpath-matched.
 _AGENT_OPS_ALLOWED_SCRIPTS = (
@@ -1666,6 +1686,11 @@ def _decide_bash(
         _allow()
     if looks_like_skill_runtime_executor_command(command):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<skill-runtime-denied>", cwd)
+
+    # Issue #1209: worktree bootstrap executor from main root is allowed even with
+    # an active issue worktree. Shared policy function (no split-brain allowlist).
+    if _WBE_POLICY_AVAILABLE and _wbe_exec_command(command, cwd, _pr):
+        _allow()
 
     # Issue #1166: controlled skill mutation executor from main root is allowed.
     # Shared policy function (AC4/AC17): same is_controlled_skill_mutation_exec_command
