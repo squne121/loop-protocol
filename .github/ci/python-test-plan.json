@@ -20,6 +20,7 @@
     ".claude/skills/open-pr/scripts/tests/",
     ".claude/skills/impl-review-loop/tests/",
     ".claude/skills/review-issue/tests/",
+    ".claude/skills/issue-refinement-loop/scripts/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
     "scripts/ci/tests/",

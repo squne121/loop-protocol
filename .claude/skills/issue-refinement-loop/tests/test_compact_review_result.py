@@ -29,6 +29,7 @@ from compact_review_result import (
     COMPACT_SCHEMA_NAME,
     COMPACT_SCHEMA_VERSION,
     REQUIRED_COMPACT_FIELDS,
+    _atomic_write,
     compact_review_result,
 )
 from reviewer_claim_replay import analyze
@@ -67,7 +68,7 @@ def test_compact_review_result_approve(tmp_path):
     fixture = FIXTURES_DIR / "review_result_approve.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    compact_data, stdout_lines = compact_review_result(
+    compact_data, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
 
@@ -90,7 +91,8 @@ def test_compact_review_result_approve_artifact_written(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _atomic_write(artifact_path_val, artifact_content)
 
     artifact_ref = compact_data["ARTIFACT"]
     assert artifact_ref.startswith("compact_review_result_v1=")
@@ -111,7 +113,8 @@ def test_compact_review_result_artifact_permissions(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _atomic_write(artifact_path_val, artifact_content)
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
 
     stat = artifact_path.stat()
@@ -129,7 +132,7 @@ def test_compact_review_result_needs_fix(tmp_path):
     fixture = FIXTURES_DIR / "review_result_needs_fix.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    compact_data, stdout_lines = compact_review_result(
+    compact_data, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
 
@@ -143,7 +146,7 @@ def test_compact_review_result_needs_fix_stdout_contains_all_fields(tmp_path):
     fixture = FIXTURES_DIR / "review_result_needs_fix.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    _, stdout_lines = compact_review_result(
+    _compact, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
     lines_text = "\n".join(stdout_lines)
@@ -159,7 +162,8 @@ def test_compact_review_result_preserves_findings_losslessly(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _atomic_write(artifact_path_val, artifact_content)
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
     artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
 
@@ -230,7 +234,8 @@ def test_compact_review_result_preserves_structured_blockers_for_replay(tmp_path
     }
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _atomic_write(artifact_path_val, artifact_content)
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
     artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))
 
@@ -255,7 +260,7 @@ def test_compact_review_result_must_read_always_present_when_empty(tmp_path):
     fixture = FIXTURES_DIR / "review_result_approve.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    _, stdout_lines = compact_review_result(
+    _compact, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
     lines_text = "\n".join(stdout_lines)
@@ -307,7 +312,7 @@ def test_compact_review_result_stdout_no_raw_diff(tmp_path):
     fixture = FIXTURES_DIR / "review_result_approve.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    _, stdout_lines = compact_review_result(
+    _compact, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
     lines_text = "\n".join(stdout_lines)
@@ -321,7 +326,7 @@ def test_compact_review_result_stdout_byte_limit(tmp_path):
     fixture = FIXTURES_DIR / "review_result_approve.json"
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
 
-    _, stdout_lines = compact_review_result(
+    _compact, stdout_lines, *_ = compact_review_result(
         raw_result, artifact_dir=tmp_path / ".claude/artifacts/issue-refinement-loop", issue_number=42
     )
     lines_text = "\n".join(stdout_lines)
@@ -371,7 +376,7 @@ def test_compact_review_result_containment_check_passes(tmp_path):
     repo_root = tmp_path
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_review_result(
+    compact_data, *_ = compact_review_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42, repo_root=repo_root
     )
     assert "compact_review_result_v1=" in compact_data["ARTIFACT"]
