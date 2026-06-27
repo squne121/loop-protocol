@@ -305,6 +305,8 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     "baseline_expect_pass": "go",
     # baseline_regression_failed: VC annotated baseline-expect: pass but exited non-0
     "baseline_regression_failed": "human_judgment",
+    # AC: classify no-TTY pnpm classification as human_judgment（失敗分類を維持）
+    "package_manager_no_tty_prompt": "human_judgment",
     # Issue #899: strict-mode annotation violations are body-author-fixable
     "inline_baseline_expect_invalid_placement": "needs_fix",
     "missing_baseline_expect_for_new_allowed_path": "needs_fix",
@@ -468,6 +470,8 @@ def map_preflight_result_to_errors(
                     ),
                     "source_payload": {
                         "classification": classification,
+                        "category": category,
+                        "scope_class": scope_class,
                         "decision": decision,
                         "confidence": r.get("confidence", ""),
                         "exit_code": r.get("exit_code"),
@@ -476,6 +480,7 @@ def map_preflight_result_to_errors(
                         "strict": r.get("strict"),
                         "repair": r.get("repair"),
                         "annotations": r.get("annotations"),
+                        "runner_env_delta": r.get("runner_env_delta", {}),
                     },
                 }
             )
