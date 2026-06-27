@@ -20,6 +20,13 @@ guard allows as an exact command class.
 
 This module also exports ``verify_cleanup_authorization`` so ``materialize_cleanup_contract``
 issues the defense-in-depth V3 contract only after the same checks pass.
+
+Branch-only lane (Issue #1196): when ``verify_cleanup_authorization`` returns
+``WORKTREE_NOT_IN_CATALOG``, ``run()`` checks whether the worktree is a partial-
+cleanup state (worktree removed from both disk and catalog, branch still present)
+and, if so, authorizes a ``git branch -D`` branch-only cleanup.
+``verify_cleanup_authorization`` is NOT changed and ``materialize_cleanup_contract``
+cannot reach the branch-only verifier.
 """
 
 from __future__ import annotations
@@ -63,6 +70,15 @@ HEAD_REPO_MISMATCH = "pr_head_repo_mismatch"          # fork / cross-repo PR
 BASE_BRANCH_MISMATCH = "pr_base_branch_mismatch"      # PR base != default branch
 HEAD_OID_MISMATCH = "pr_head_oid_mismatch"            # PR head sha != local branch tip
 REPO_SLUG_UNRESOLVED = "repo_slug_unresolved"         # cannot pin gh to the trusted repo
+
+# Branch-only lane reason codes (Issue #1196).
+# These are specific to the branch-only cleanup path and are NOT reachable via
+# verify_cleanup_authorization() or materialize_cleanup_contract.
+WORKTREE_STILL_IN_CATALOG = "worktree_still_in_catalog"          # worktree still in git catalog or on disk
+BRANCH_CHECKED_OUT_IN_WORKTREE = "branch_checked_out_in_worktree"  # branch used by another worktree
+LOCAL_BRANCH_MISSING = "local_branch_missing"                     # refs/heads/<branch> not present
+BRANCH_ONLY_FORCE_DELETE_DENIED = "branch_only_force_delete_denied"  # branch-only pre-checks failed
+BRANCH_ONLY_MATERIALIZE_DENIED = "branch_only_materialize_denied"    # materialize attempted branch-only
 
 
 def resolve_project_root() -> str:
@@ -169,7 +185,12 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
 
 
 def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadline) -> tuple[bool, str | None, dict]:
-    """Run all authorization checks. Returns (ok, reason_code, verified)."""
+    """Run all authorization checks. Returns (ok, reason_code, verified).
+
+    This function is intentionally NOT changed to support branch-only cleanup.
+    materialize_cleanup_contract calls this function; it must never reach the
+    branch-only verifier.  Branch-only logic is in run() only.
+    """
     verified = {
         "root_default": False,
         "worktree_in_catalog": False,
@@ -259,6 +280,134 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     return True, None, verified
 
 
+def verify_branch_only_cleanup_authorization(
+    req: dict, project_root: str, deadline: Deadline
+) -> tuple[bool, str | None, dict]:
+    """Authorize branch-only cleanup for partial-cleanup state (Issue #1196).
+
+    Called by run() ONLY when verify_cleanup_authorization returns WORKTREE_NOT_IN_CATALOG.
+    This function is intentionally NOT exported for materialize_cleanup_contract use
+    (BRANCH_ONLY_MATERIALIZE_DENIED guards against that).
+
+    Checks 5 conditions (A-E) for branch-only candidacy, then full PR authorization:
+      (A) worktree realpath under <repo>/.claude/worktrees/
+      (B) worktree path does not exist on filesystem
+      (C) git worktree catalog has no entry at this path
+      (D) git worktree catalog has no other worktree on this branch
+      (E) refs/heads/<branch_name> exists locally
+
+    On success returns verified fields that include all Verified Fields from the Issue
+    contract plus standard PR authorization fields.
+    """
+    branch_name = req["branch_name"]
+    worktree_real = os.path.realpath(req["worktree_path"])
+    worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
+
+    verified: dict = {
+        "root_default": False,
+        "branch_only_candidate": False,
+        "worktree_path_under_worktrees_dir": False,
+        "worktree_absent_on_disk": False,
+        "worktree_absent_from_catalog": False,
+        "branch_absent_from_worktree_catalog": False,
+        "local_branch_exists": False,
+        "local_branch_tip_oid": None,
+        "pr_head_oid": None,
+        "head_oid_match": False,
+        "branch_only_force_delete_used": False,
+        # Standard PR authorization fields (AC5 coverage)
+        "pr_merged": False,
+        "head_branch_match": False,
+        "head_repo_match": False,
+        "base_branch_match": False,
+        "linked_issue_match": False,
+    }
+
+    # 1. root default branch
+    cur = _current_branch(project_root, deadline)
+    default = _default_branch(project_root, deadline)
+    if cur is None or cur != default:
+        return False, ROOT_NOT_DEFAULT, verified
+    verified["root_default"] = True
+
+    # Condition (A): worktree realpath must be under .claude/worktrees/
+    if not worktree_real.startswith(worktrees_dir + os.sep):
+        return False, BRANCH_ONLY_FORCE_DELETE_DENIED, verified
+    verified["worktree_path_under_worktrees_dir"] = True
+
+    # Condition (B): worktree path must not exist on filesystem
+    if os.path.lexists(worktree_real):
+        return False, WORKTREE_STILL_IN_CATALOG, verified
+    verified["worktree_absent_on_disk"] = True
+
+    # Fetch catalog once for conditions C and D
+    catalog = list_worktrees(project_root, deadline)
+    if catalog is None:
+        return False, WORKTREE_NOT_IN_CATALOG, verified
+
+    # Condition (C): git catalog must have no entry at this path
+    entry = find_by_realpath(catalog, worktree_real)
+    if entry is not None:
+        return False, WORKTREE_STILL_IN_CATALOG, verified
+    verified["worktree_absent_from_catalog"] = True
+
+    # Condition (D): no OTHER worktree may use this branch
+    for e in catalog:
+        if branch_short_name(e.get("branch_ref")) == branch_name:
+            return False, BRANCH_CHECKED_OUT_IN_WORKTREE, verified
+    verified["branch_absent_from_worktree_catalog"] = True
+
+    # Condition (E): local refs/heads/<branch_name> must exist
+    local_tip = _local_branch_tip(project_root, branch_name, deadline)
+    if local_tip is None:
+        return False, LOCAL_BRANCH_MISSING, verified
+    verified["local_branch_exists"] = True
+    verified["local_branch_tip_oid"] = local_tip
+
+    # All 5 conditions met — this is a branch-only candidate.
+    verified["branch_only_candidate"] = True
+
+    # Full PR authorization (same rigor as verify_cleanup_authorization).
+    repo_slug = _repo_slug(project_root, deadline)
+    if repo_slug is None:
+        return False, REPO_SLUG_UNRESOLVED, verified
+    pr = _pr_state(int(req["pr_number"]), project_root, repo_slug, deadline)
+    if pr is None or pr.get("state") != "MERGED" or not pr.get("mergedAt"):
+        return False, PR_NOT_MERGED, verified
+    verified["pr_merged"] = True
+    if pr.get("headRefName") != branch_name:
+        return False, HEAD_BRANCH_MISMATCH, verified
+    verified["head_branch_match"] = True
+    # Reject fork / cross-repo PRs (AC5)
+    if pr.get("isCrossRepository"):
+        return False, HEAD_REPO_MISMATCH, verified
+    owner = (pr.get("headRepositoryOwner") or {}).get("login")
+    if owner and repo_slug and owner != repo_slug.split("/", 1)[0]:
+        return False, HEAD_REPO_MISMATCH, verified
+    verified["head_repo_match"] = True
+    # PR base must be default branch (AC5)
+    if pr.get("baseRefName") != default:
+        return False, BASE_BRANCH_MISMATCH, verified
+    verified["base_branch_match"] = True
+    # PR head OID must match local branch tip (AC3)
+    pr_head_oid = pr.get("headRefOid")
+    verified["pr_head_oid"] = pr_head_oid
+    if not local_tip or pr_head_oid != local_tip:
+        return False, HEAD_OID_MISMATCH, verified
+    verified["head_oid_match"] = True
+    # Linked issue check (AC5)
+    linked = req.get("linked_issue_number")
+    if linked is not None:
+        refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
+        if int(linked) not in refs:
+            return False, LINKED_ISSUE_MISMATCH, verified
+    verified["linked_issue_match"] = True
+
+    # All authorization conditions met — mark force-delete as authorized.
+    verified["branch_only_force_delete_used"] = True
+    return True, None, verified
+
+
 def _perform(branch_name: str, worktree_real: str, project_root: str,
              deadline: Deadline) -> tuple[list[str], str | None]:
     """Execute exact worktree remove + branch -d via internal subprocess arrays.
@@ -281,6 +430,26 @@ def _perform(branch_name: str, worktree_real: str, project_root: str,
     return actions, None
 
 
+def _perform_branch_only(
+    branch_name: str, project_root: str, deadline: Deadline
+) -> tuple[list[str], str | None]:
+    """Execute branch-only force delete via internal subprocess array (Issue #1196 AC7).
+
+    Uses ``git branch -D`` (force delete) because squash-merges leave the branch
+    undetectable by ``git branch -d`` even when the PR is merged.  Authorization
+    has already been verified by ``verify_branch_only_cleanup_authorization``.
+
+    Returns ``(actions_taken, error)`` following the same Blocker 6 pattern as
+    ``_perform`` — error is non-None on failure.
+    """
+    actions: list[str] = []
+    bd = _git(["-C", project_root, "branch", "-D", branch_name], deadline, 10.0)
+    if bd.returncode != 0:
+        return actions, f"branch_delete_failed: {bd.stderr.strip()[:120]}"
+    actions.append(OP_BRANCH_DELETE)
+    return actions, None
+
+
 def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0) -> dict:
     # Blocker 5: project_root is a TRUSTED-CALLER argument (internal API), not an
     # agent-facing flag. The CLI no longer exposes --project-root; it always uses
@@ -291,6 +460,25 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
         ok, reason, verified = verify_cleanup_authorization(req, root, deadline)
     except GuardDeadlineExceeded as e:
         return _result("error", str(e), {}, [])
+
+    # Branch-only lane (Issue #1196): when the worktree is not in the catalog,
+    # check whether this is a partial-cleanup state (worktree removed, branch still
+    # present) and, if so, authorize a branch-only cleanup.
+    if not ok and reason == WORKTREE_NOT_IN_CATALOG:
+        try:
+            ok_b, reason_b, verified_b = verify_branch_only_cleanup_authorization(req, root, deadline)
+        except GuardDeadlineExceeded as e:
+            return _result("error", str(e), {}, [])
+        if not ok_b:
+            return _branch_only_result("refused", reason_b, verified_b, [])
+        try:
+            actions, perform_error = _perform_branch_only(req["branch_name"], root, deadline)
+        except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
+            return _branch_only_result("error", str(e)[:160], verified_b, [])
+        if perform_error is not None:
+            return _branch_only_result("error", perform_error, verified_b, actions)
+        return _branch_only_result("ok", None, verified_b, actions)
+
     if not ok:
         return _result("refused", reason, verified, [])
     try:
@@ -313,6 +501,23 @@ def _result(status: str, reason: str | None, verified: dict, actions: list[str])
         "verified": verified,
         "actions_taken": actions,
         "stderr_line_count": 0,
+    }
+
+
+def _branch_only_result(status: str, reason: str | None, verified: dict, actions: list[str]) -> dict:
+    """Result dict for the branch-only cleanup lane (Issue #1196 AC6)."""
+    return {
+        "schema": SCHEMA_RESULT,
+        "status": status,
+        "reason_code": reason,
+        "verified": verified,
+        "actions_taken": actions,
+        "stderr_line_count": 0,
+        "worktree_absent_after_removal": bool(
+            verified.get("worktree_absent_on_disk")
+            and verified.get("worktree_absent_from_catalog")
+        ),
+        "branch_only": True,
     }
 
 
