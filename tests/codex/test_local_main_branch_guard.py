@@ -301,6 +301,22 @@ class TestIssue1198RawAndCommandFixtures:
         if "rule_id" in entry:
             assert result["rule_id"] == entry["rule_id"]
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
+            "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
+            "gh api repos/squne121/loop-protocol/issues/1198/comments --input='x'",
+            "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field='x'",
+        ],
+    )
+    def test_gh_api_mutation_flags_are_blocked_and_redacted(self, tmp_git_repo: Path, command: str):
+        """Given mutation-like gh api flag patterns, ensure block + redacted argv tokens."""
+        result = eval_codex(command, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_API
+        assert any("<redacted>" in token for token in result.get("argv_redacted", []))
+
     def test_run_hook_block_stderr_contains_ac7_fields(self, tmp_git_repo: Path):
         payload = {
             "event": "PreToolUse",

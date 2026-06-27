@@ -39,6 +39,18 @@
       "reason": "github_api_command"
     },
     {
+      "command": "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x' --method=GET",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field=body='x'",
+      "reason": "github_api_command"
+    },
+    {
       "command": "rtk unknown-subcommand",
       "reason": "unknown_command_requires_review"
     },
