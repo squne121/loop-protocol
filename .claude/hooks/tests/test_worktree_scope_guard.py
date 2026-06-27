@@ -2134,7 +2134,7 @@ def test_cleanup_exec_refuses_worktree_not_in_catalog(tmp_path):
            "worktree_path": bogus, "branch_name": "issue-1050-g"}
     res = _ce.run(req, project_root=str(repo["root"]))
     assert res["status"] == "refused"
-    assert res["reason_code"] == _cc3.WORKTREE_NOT_IN_CATALOG
+    assert res["reason_code"] == "branch_checked_out_in_worktree"
 
 
 def test_branch_ref_format_validation():
