@@ -646,6 +646,99 @@ def test_pytest_invocation_detect_uv_run_pytest():
     assert _is_pytest_invocation("uv run python -m pytest")
 
 
+def test_uv_lock_check_exact_only():
+    """AC1: _is_uv_lock_check is exact-match only for uv lock --check"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_lock_check
+
+    assert _is_uv_lock_check(["uv", "lock", "--check"])
+    assert _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["uv", "lock"])
+    assert not _is_uv_lock_check(["uv", "lock", "--upgrade"])
+    assert not _is_uv_lock_check(["uv", "sync"])
+    assert not _is_uv_lock_check(["uv", "run", "uv", "lock", "--check"])
+
+
+def test_runtime_dependency_smoke_exact_python_and_python3_only():
+    """AC2: canonical runtime smoke is allowed only for exact python/python3 invocation"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    assert _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "scripts/ci/runtime_dependency_smoke.py",
+    ])
+    assert _is_uv_runtime_smoke_command([
+        "/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python3", "scripts/ci/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "python", "scripts/ci/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups", "python3",
+    ])
+
+
+def test_runtime_dependency_smoke_rejects_extra_uv_options():
+    """AC3: extra uv options are rejected for runtime smoke allowlist"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    forbidden_cases = [
+        ["uv", "run", "--with", "pytest", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--group", "dev", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--all-groups", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--extra", "feature", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--python", "/usr/bin/python3", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--project", ".", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--directory", ".", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--env-file", ".env", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--upgrade", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+    ]
+    for argv in forbidden_cases:
+        assert not _is_uv_runtime_smoke_command(argv), f"unexpected allow: {argv}"
+
+
+def test_runtime_dependency_smoke_rejects_inline_and_non_repo_scripts():
+    """AC4: runtime smoke rejects inline python and non-repo/invalid script paths"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "-c", "print(1)",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "-m", "pytest",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "../runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "/tmp/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "scripts/other_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "sh", "-lc",
+        "uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+    ])
+
+
 def test_pytest_invocation_detect_non_pytest():
     """AC1: _is_pytest_invocation rejects non-pytest commands"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"

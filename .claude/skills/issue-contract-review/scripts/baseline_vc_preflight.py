@@ -485,6 +485,56 @@ def _strip_uv_run_options(argv: List[str]) -> List[str]:
     return result if result else argv
 
 
+def _is_uv_lock_check(argv: List[str]) -> bool:
+    """Return True only for exact `uv lock --check`."""
+    if len(argv) != 3:
+        return False
+    return Path(argv[0]).name == "uv" and argv[1] == "lock" and argv[2] == "--check"
+
+
+_ALLOWED_RUNTIME_SMOKE_OPTIONS: frozenset = frozenset([
+    "--isolated",
+    "--locked",
+    "--no-default-groups",
+])
+
+
+def _is_uv_runtime_smoke_command(argv: List[str]) -> bool:
+    """Return True for the canonical runtime smoke command shape."""
+    if len(argv) < 5:
+        return False
+    if Path(argv[0]).name != "uv" or argv[1] != "run":
+        return False
+
+    i = 2
+    seen_options: set[str] = set()
+    while i < len(argv) and argv[i].startswith("-"):
+        token = argv[i]
+        if token in _ALLOWED_RUNTIME_SMOKE_OPTIONS:
+            seen_options.add(token)
+            i += 1
+            continue
+        # Fail-closed: unknown or value-taking option before inner command is disallowed.
+        return False
+
+    if i + 1 >= len(argv):
+        return False
+
+    # Canonical inner command must be:
+    # - python scripts/ci/runtime_dependency_smoke.py
+    # - python3 scripts/ci/runtime_dependency_smoke.py
+    cmd = Path(argv[i]).name
+    if cmd not in ("python", "python3"):
+        return False
+    if argv[i + 1] != "scripts/ci/runtime_dependency_smoke.py":
+        return False
+
+    # No extra args, and all three options must be present.
+    if i + 2 != len(argv):
+        return False
+    return seen_options == set(_ALLOWED_RUNTIME_SMOKE_OPTIONS)
+
+
 def _is_pytest_invocation(command: str) -> bool:
     """
     コマンドが pytest invocation かどうかを argv/token ベースで検出。
@@ -1947,7 +1997,22 @@ def classify_static_command(
 
     # 9. Check uv: only allow uv run pytest / uv run python -m pytest / uv run python3 -m pytest
     if cmd_basename == "uv":
+        if len(argv) >= 2 and argv[1] == "lock":
+            if _is_uv_lock_check(argv):
+                return None
+            return (
+                "blocked",
+                "command_not_allowed",
+                "blocked",
+                "uv lock subcommand in VC preflight is allowed only as 'uv lock --check'.",
+                "baseline_fail_expected",
+            )
+
         if len(argv) >= 2 and argv[1] == "run":
+            # Runtime smoke canonical allowlist (raw argv exact shape)
+            if _is_uv_runtime_smoke_command(argv):
+                return None
+
             unwrapped = _strip_uv_run_options(argv)
             if unwrapped and Path(unwrapped[0]).name in ("pytest",):
                 return None  # allowed
@@ -1959,6 +2024,7 @@ def classify_static_command(
                 and unwrapped[2] == "pytest"
             ):
                 return None  # allowed
+
             # uv run <other> is not in allowlist
             inner_cmd = unwrapped[0] if unwrapped else "<unknown>"
             return (
@@ -1966,7 +2032,11 @@ def classify_static_command(
                 "command_not_allowed",
                 "blocked",
                 f"'uv run {inner_cmd}' is not in the VC preflight allowlist; "
-                "only 'uv run pytest' and 'uv run python3 -m pytest' are allowed",
+                "only 'uv run pytest', 'uv run python3 -m pytest', "
+                "'uv run --isolated --locked --no-default-groups python "
+                "scripts/ci/runtime_dependency_smoke.py', and "
+                "'uv run --isolated --locked --no-default-groups python3 "
+                "scripts/ci/runtime_dependency_smoke.py' are allowed.",
                 "baseline_fail_expected",
             )
         else:
