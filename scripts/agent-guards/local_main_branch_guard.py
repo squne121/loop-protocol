@@ -1367,9 +1367,6 @@ def evaluate(
     """
     cmd = command.strip()
     event_kind = event_kind or "PreToolUse"
-    parser_stage = "initial"
-    command_kind = COMMAND_KIND_UNKNOWN
-    rule_id = None
     wrapper = None
     inner_argv_redacted: list[str] | None = None
     current_branch: str | None = None
@@ -1523,7 +1520,6 @@ def evaluate(
         wrapper = "rtk"
         inner_tokens = normalized_tokens[1:]
         inner_argv_redacted = _redact_argv(inner_tokens)
-        parser_stage = "rtk_wrapper"
         if not inner_tokens:
             return _emit(
                 status="block",
@@ -1583,7 +1579,6 @@ def evaluate(
         normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
         argv_redacted = _redact_argv(normalized_tokens)
         inner_argv_redacted = _redact_argv(normalized_tokens)
-        parser_stage = "rtk_unwrapped"
     git_global_fail_closed = False
     if normalized_tokens and normalized_tokens[0] == "git":
         normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(normalized_tokens)
