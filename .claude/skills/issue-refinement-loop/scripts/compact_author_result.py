@@ -28,6 +28,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+def _reject_nonfinite_json(token: str) -> None:
+    raise ValueError(f"Non-finite JSON constant rejected: {token}")
+
+
+def _strict_json_loads(text: str) -> Any:
+    return json.loads(text, parse_constant=_reject_nonfinite_json)
+
 # ---------------------------------------------------------------------------
 # Schema constants (SSOT for ISSUE_AUTHOR_RESULT_COMPACT_V1)
 # ---------------------------------------------------------------------------
@@ -234,7 +242,7 @@ def _emit_failure_envelope(
       ARTIFACT_SHA256: <sha256>
     """
     artifact_ref = "producer_failure_v1=<write_failed>"
-    artifact_sha256 = ""
+    artifact_sha256 = "write_failed"
     try:
         artifact_path, sha256 = _write_failure_artifact(
             artifact_dir, issue_number, reason_code, detail, repo_root, extra
@@ -242,16 +250,23 @@ def _emit_failure_envelope(
         artifact_ref = f"producer_failure_v1={artifact_path}"
         artifact_sha256 = sha256
     except Exception:
-        pass  # Artifact write failed; still emit envelope without a path
+        pass  # Artifact write failed; emit envelope with write_failed sentinel
 
     lines = [
         "STATUS: failed",
         f"NEXT_ACTION: {next_action}",
         f"REASON_CODE: {reason_code}",
         f"ARTIFACT: {artifact_ref}",
+        f"ARTIFACT_SHA256: {artifact_sha256}",
     ]
-    if artifact_sha256:
-        lines.append(f"ARTIFACT_SHA256: {artifact_sha256}")
+
+    # Enforce 2048-byte cap on the envelope itself; truncate artifact_ref if needed
+    envelope_text = "\n".join(lines)
+    if len(envelope_text.encode("utf-8")) > 2048:
+        short_ref = artifact_ref[:80] + "..." if len(artifact_ref) > 80 else artifact_ref
+        lines[3] = f"ARTIFACT: {short_ref}"
+        envelope_text = "\n".join(lines)
+
     for line in lines:
         print(line, flush=True)
 
@@ -262,17 +277,22 @@ def compact_author_result(
     issue_number: int | None = None,
     updated_body: str | None = None,
     repo_root: Path | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], Path, bytes]:
     """
     Convert raw ISSUE_AUTHOR_RESULT_V1 to ISSUE_AUTHOR_RESULT_COMPACT_V1.
 
-    Returns (compact_data, stdout_lines).
+    Returns (compact_data, stdout_lines, artifact_path, artifact_content).
+    Does NOT write the artifact — caller must write it AFTER budget check (B3).
     Raises ValueError if:
-    - status is unknown/invalid (fail-close; B8)
-    - body_hash is missing for ok status (B1/B2)
-    - artifact path escapes containment base (B4)
+    - status is missing or unknown/invalid (B1)
+    - body_hash is missing for ok status
+    - artifact path escapes containment base
     """
-    status = raw_result.get("status", "ok")
+    status = raw_result.get("status")
+    if status is None:
+        raise ValueError(
+            "'status' field is required in ISSUE_AUTHOR_RESULT_V1 but was missing"
+        )
     if status not in VALID_STATUSES:
         raise ValueError(
             f"Unknown/invalid status: {status!r}. Expected one of {VALID_STATUSES}"
@@ -353,16 +373,15 @@ def compact_author_result(
     }
 
     # B5: secret check on artifact content before writing
-    artifact_content_str = json.dumps(full_artifact, ensure_ascii=False, indent=2)
+    artifact_content_str = json.dumps(full_artifact, ensure_ascii=False, indent=2, allow_nan=False)
     artifact_violations = _no_secret_check(artifact_content_str)
     if artifact_violations:
         raise ValueError(
             f"secret-like strings detected in artifact content: {artifact_violations}"
         )
 
-    # Write artifact atomically
+    # B3: do NOT write artifact here; caller writes AFTER stdout budget check
     artifact_content = artifact_content_str.encode("utf-8")
-    _atomic_write(artifact_path, artifact_content)
 
     # Build compact dict
     compact_data = {
@@ -385,7 +404,7 @@ def compact_author_result(
     stdout_lines.append(f"ARTIFACT: {compact_data['ARTIFACT']}")
     stdout_lines.append(f"NEXT_ACTION: {compact_data['NEXT_ACTION']}")
 
-    return compact_data, stdout_lines
+    return compact_data, stdout_lines, artifact_path, artifact_content
 
 
 def main() -> int:
@@ -430,14 +449,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Read input
+    # Read input (P1-7: use _strict_json_loads to reject NaN/Infinity)
     try:
         if args.input_file:
             raw_text = args.input_file.read_text(encoding="utf-8")
         else:
             raw_text = sys.stdin.read()
-        raw_result = json.loads(raw_text)
-    except json.JSONDecodeError as e:
+        raw_result = _strict_json_loads(raw_text)
+    except (json.JSONDecodeError, ValueError) as e:
         _emit_failure_envelope(
             reason_code="schema_mismatch",
             next_action="human_judgment_required",
@@ -474,18 +493,16 @@ def main() -> int:
             )
             return 2
 
-    # Convert
+    # Convert (B3: compact_author_result does NOT write artifact)
     try:
-        _compact, stdout_lines = compact_author_result(
+        _compact, stdout_lines, artifact_path, artifact_content = compact_author_result(
             raw_result,
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
             updated_body=updated_body,
             repo_root=args.repo_root,
         )
-    except (ValueError, Exception) as e:
-        # NOTE: jsonschema.ValidationError is NOT a subclass of ValueError in
-        # jsonschema 4.x; must catch Exception to handle schema validation failures.
+    except (ValueError, OSError) as e:
         _emit_failure_envelope(
             reason_code="schema_mismatch",
             next_action="human_judgment_required",
@@ -510,10 +527,10 @@ def main() -> int:
         )
         return 2
 
-    # B3: enforce 2048 UTF-8 bytes limit on stdout output
+    # B3: enforce 2048 UTF-8 bytes limit BEFORE writing success artifact
     byte_count = len(output_text.encode("utf-8"))
     if byte_count > 2048:
-        # AC3: save original output to artifact only (not to stdout)
+        # AC3: no success artifact written; save details to failure artifact only
         output_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
         _emit_failure_envelope(
             reason_code="output_budget_violation",
@@ -530,11 +547,14 @@ def main() -> int:
         )
         return 2
 
+    # Budget OK: now write success artifact atomically
+    _atomic_write(artifact_path, artifact_content)
+
     # Output
     for line in stdout_lines:
         print(line, flush=True)
 
-    status = raw_result.get("status", "ok")
+    status = raw_result.get("status")
     if status == "no_change":
         return 1
     if status == "failed":

@@ -173,9 +173,12 @@ def test_review_compact_invalid_verdict_emits_failure_artifact(tmp_path):
 
 
 def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
-    """AC3: when stdout would exceed 2048 bytes, emit machine-readable failure envelope."""
+    """AC3: when stdout would exceed 2048 bytes, emit machine-readable failure envelope.
+
+    B3: success compact_review_result_*.json must NOT exist after budget violation.
+    """
     # Use a long artifact_dir path so EVIDENCE + ARTIFACT lines exceed 2048 bytes total
-    # Each x200/y200/z200/w200/v200 component is within Linux's 255-char per-component limit
+    # Each component ≤ 200 chars stays within Linux 255-char per-component limit.
     long_artifact_dir = (
         tmp_path
         / ("x" * 200)
@@ -226,6 +229,14 @@ def test_review_compact_output_budget_violation_is_machine_readable(tmp_path):
     assert "bounded_preview" in artifact_data, "Artifact must contain bounded_preview"
     assert isinstance(artifact_data["byte_count"], int) and artifact_data["byte_count"] > 2048
 
+    # B3: no success compact artifact should remain after budget violation
+    if long_artifact_dir.exists():
+        success_artifacts = list(long_artifact_dir.rglob("compact_review_result_*.json"))
+        assert len(success_artifacts) == 0, (
+            f"B3: success compact artifact must NOT be written on budget violation. "
+            f"Found: {success_artifacts}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC2 / AC6: compact_author_result schema mismatch → canonical failure envelope
@@ -236,10 +247,35 @@ def test_author_compact_schema_mismatch_emits_failure_artifact(tmp_path):
     """AC2/AC6: compact_author_result.py emits canonical failure envelope on schema mismatch.
 
     Schema-less consumer contract (AC6):
-    - status must be in VALID_STATUSES ("ok", "failed", "no_change")
-    - Rejection: invalid status → REASON_CODE: schema_mismatch
+    - status must be present and in VALID_STATUSES ("ok", "failed", "no_change")
+    - Rejection: missing status or invalid status → REASON_CODE: schema_mismatch (B1)
     """
-    # Invalid status - not in VALID_STATUSES
+    # Case 1: Missing status field entirely (B1: must be schema_mismatch, not treated as "ok")
+    missing_status_input = json.dumps({
+        "comment_url": "",
+        "checked_body_sha256": "sha256:" + "a" * 64,
+    })
+    artifact_dir = tmp_path / "artifacts"
+    result_missing = subprocess.run(
+        [
+            sys.executable, str(COMPACT_AUTHOR_SCRIPT),
+            "--artifact-dir", str(artifact_dir),
+            "--issue-number", "1165",
+        ],
+        input=missing_status_input,
+        capture_output=True,
+        text=True,
+    )
+    assert result_missing.returncode != 0, (
+        f"B1: missing status must exit non-zero (not default to ok). "
+        f"stdout={result_missing.stdout!r}"
+    )
+    _assert_failure_envelope(result_missing.stdout)
+    assert "REASON_CODE: schema_mismatch" in result_missing.stdout, (
+        f"B1: missing status must produce schema_mismatch. stdout={result_missing.stdout!r}"
+    )
+
+    # Case 2: Invalid status - not in VALID_STATUSES
     invalid_input = json.dumps({
         "status": "completely_invalid_status",
         "comment_url": "",
@@ -503,33 +539,50 @@ def test_failure_stdout_never_contains_raw_issue_body_or_comment(tmp_path):
 
 
 def test_canonical_artifact_path_in_failure_artifact(tmp_path):
-    """AC7: failure artifact is written to .claude/artifacts/issue-refinement-loop/<issue>/.
+    """AC7: failure artifact uses canonical path when --repo-root is provided.
 
-    When --repo-root is provided, the artifact uses the canonical path
-    <repo_root>/.claude/artifacts/issue-refinement-loop/<issue>/.
+    positive: --repo-root <repo> → artifact at <repo>/.claude/artifacts/.../1165/
+    negative: --repo-root omitted + arbitrary --artifact-dir → artifact NOT at canonical path
     """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    # Create canonical artifact base (simulating repo structure)
-    canonical_base = repo_root / ".claude" / "artifacts" / "issue-refinement-loop"
+    expected_canonical_dir = str(
+        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1165"
+    )
 
     invalid_input = json.dumps({"verdict": "not_valid"})  # invalid verdict → ValueError
+
+    # Positive: --repo-root provided → canonical path
     result = subprocess.run(
         [
             sys.executable, str(COMPACT_REVIEW_SCRIPT),
-            "--artifact-dir", str(canonical_base),  # default when repo-root matches
+            "--repo-root", str(repo_root),
             "--issue-number", "1165",
         ],
         input=invalid_input,
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0
-    # The ARTIFACT path must contain the canonical base segment
-    assert "artifacts/issue-refinement-loop" in result.stdout, (
-        f"ARTIFACT must reference {CANONICAL_ARTIFACT_BASE!r}. stdout={result.stdout!r}"
+    assert result.returncode != 0, f"Invalid input should fail. stdout={result.stdout!r}"
+    assert expected_canonical_dir in result.stdout, (
+        f"ARTIFACT must be under canonical repo-root path {expected_canonical_dir!r}. "
+        f"stdout={result.stdout!r}"
     )
-    # Must reference the issue number in the path
-    assert "/1165/" in result.stdout, (
-        f"ARTIFACT path must include issue number /1165/. stdout={result.stdout!r}"
+
+    # Negative: --repo-root omitted + arbitrary --artifact-dir → NOT canonical repo-root path
+    arbitrary_dir = tmp_path / "arbitrary"
+    result2 = subprocess.run(
+        [
+            sys.executable, str(COMPACT_REVIEW_SCRIPT),
+            "--artifact-dir", str(arbitrary_dir),
+            "--issue-number", "1165",
+        ],
+        input=invalid_input,
+        capture_output=True,
+        text=True,
+    )
+    assert result2.returncode != 0, f"Invalid input should fail. stdout={result2.stdout!r}"
+    assert str(repo_root / ".claude") not in result2.stdout, (
+        f"Without --repo-root, artifact must NOT appear under canonical repo-root path. "
+        f"stdout={result2.stdout!r}"
     )
