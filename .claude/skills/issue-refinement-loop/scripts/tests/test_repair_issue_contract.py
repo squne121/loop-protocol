@@ -215,7 +215,9 @@ $ pnpm typecheck
     result = run_repair(body)
     runtime_repairs = [r for r in result.get("repairs", []) if r["kind"] == "runtime_only_command"]
     # pnpm typecheck should NOT be in runtime repairs
-    assert all("typecheck" not in r["reason"] for r in runtime_repairs),         "pnpm typecheck should not be annotated as runtime_only"
+    assert all("typecheck" not in r["reason"] for r in runtime_repairs), (
+        "pnpm typecheck should not be annotated as runtime_only"
+    )
 
 
 def test_pnpm_lint_not_deferred():
@@ -243,7 +245,9 @@ $ pnpm test
 """
     result = run_repair(body)
     runtime_repairs = [r for r in result.get("repairs", []) if r["kind"] == "runtime_only_command"]
-    assert all("pnpm test" not in r["reason"] for r in runtime_repairs),         "pnpm test (regression gate) should not be annotated"
+    assert all("pnpm test" not in r["reason"] for r in runtime_repairs), (
+        "pnpm test (regression gate) should not be annotated"
+    )
 
 
 def test_pnpm_build_not_deferred():
@@ -294,7 +298,9 @@ $ bash -c "echo hello"
     # None of the denylist commands should be annotated
     reasons = [r["reason"] for r in runtime_repairs]
     for dangerous in ["curl", "rm -", "bash -c"]:
-        assert not any(dangerous in reason for reason in reasons),             f"Denylist command {dangerous!r} should not be auto-repaired"
+        assert not any(dangerous in reason for reason in reasons), (
+            f"Denylist command {dangerous!r} should not be auto-repaired"
+        )
 
 
 def test_already_annotated_not_double_annotated():
@@ -533,7 +539,10 @@ def test_inline_baseline_expect_invalid():
 
 def test_quoted_literal_not_annotation():
     """AC18: a quoted literal '# baseline-expect:' inside a bash fence is NOT repaired."""
-    body = "## Verification Commands\n\n```bash\n# baseline-expect: fail\n$ rg \"# baseline-expect: pass\" docs/dev/dor.md\n```\n"
+    body = (
+        "## Verification Commands\n\n```bash\n# baseline-expect: fail\n$ rg \"# baseline-expect: pass\""
+        " docs/dev/dor.md\n```\n"
+    )
     res = _run_ric_899(body)
     mv = [r for r in res["repairs"] if r.get("kind") == "move_inline_baseline_expect_to_preceding_line"]
     assert len(mv) == 0, res
@@ -573,5 +582,11 @@ def test_insert_baseline_expect_fail_for_new_allowed_path():
     res = _run_ric_899(body)
     ins = [r for r in res["repairs"] if r.get("kind") == "insert_baseline_expect_fail"]
     assert len(ins) == 1, res
-    assert all(k in ins[0] for k in ("line_start", "line_end", "reason", "original", "repaired", "safety", "confidence")), ins[0]
+    assert all(
+        k in ins[0]
+        for k in (
+            "line_start", "line_end", "reason",
+            "original", "repaired", "safety", "confidence",
+        )
+    ), ins[0]
     assert res["dry_run"] is True, res

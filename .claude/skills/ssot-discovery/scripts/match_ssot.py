@@ -281,7 +281,17 @@ def main():
         sys.exit(2)
 
     if not registry_path.exists():
-        print(emit_result(keywords, paths, [], keywords, paths, errors=[f"ssot-registry.md not found at {registry_path}"]), end="")
+        print(
+            emit_result(
+                keywords,
+                paths,
+                [],
+                keywords,
+                paths,
+                errors=[f"ssot-registry.md not found at {registry_path}"]
+            ),
+            end=""
+        )
         sys.exit(2)
 
     try:

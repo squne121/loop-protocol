@@ -202,7 +202,7 @@ def load_required_labels(template_dir: Path, issue_kind: str) -> list:
     required_labels = []
 
     for item in body_items:
-        # type: markdown 要素は除外
+        # item type: markdown 要素は除外
         if item.get("type") == "markdown":
             continue
 
@@ -894,7 +894,10 @@ def main() -> None:
                 _rb_error_result = {
                     "name": "ready_tuple",
                     "passed": False,
-                    "errors": [f"malformed readback JSON: labels[{i}].name must be str, got {type(lbl.get('name')).__name__!r}"],
+                    "errors": [
+                        f"malformed readback JSON: labels[{i}].name must be str,"
+                        f" got {type(lbl.get('name')).__name__!r}"
+                    ],
                 }
                 output = {"all_passed": False, "guards": [_rb_error_result]}
                 if hasattr(args, 'format') and args.format == "json":

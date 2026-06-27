@@ -6,7 +6,8 @@ Read-only CLI that analyses a set of issues and PRs and produces an
 ISSUE_SCOPE_ROLLUP_PLAN_V2 JSON payload describing merge / rollup candidates.
 
 Usage:
-    python3 plan_issue_scope_rollup.py --issues-json <path> --prs-json <path> [--current-issue <number>] [--repo <owner/repo>]
+    python3 plan_issue_scope_rollup.py --issues-json <path>
+        --prs-json <path> [--current-issue <number>] [--repo <owner/repo>]
 
 Mutation-free: this script never creates, edits, or closes any Issue or PR.
 

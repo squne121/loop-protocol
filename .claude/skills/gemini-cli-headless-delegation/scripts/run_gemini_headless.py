@@ -603,7 +603,12 @@ def _validate_github_research_argv(argv: list[str]) -> list[str]:
     # Match against allowed prefixes
     allowed = any(
         (len(allowed_prefix) == 1 and prefix[0] == allowed_prefix[0])
-        or (len(allowed_prefix) >= 2 and len(prefix) >= 2 and prefix[0] == allowed_prefix[0] and prefix[1] == allowed_prefix[1])
+        or (
+            len(allowed_prefix) >= 2
+            and len(prefix) >= 2
+            and prefix[0] == allowed_prefix[0]
+            and prefix[1] == allowed_prefix[1]
+        )
         for allowed_prefix in GITHUB_RESEARCH_ALLOWED_ARGV_PREFIXES
     )
     if not allowed:
@@ -724,7 +729,10 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
     command = serena.get("command")
     args = serena.get("args")
     if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
-        errors.append("local_asset_research requires WSL-local Serena MCP command: uvx ... serena ... --project-from-cwd")
+        errors.append(
+            "local_asset_research requires WSL-local Serena M"
+            "CP command: uvx ... serena ... --project-from-cwd"
+        )
 
     trust = serena.get("trust", False)
     if trust is not False:
@@ -796,7 +804,10 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
 
     tool_profile = request.get("tool_profile")
     if tool_profile not in ALLOWED_TOOL_PROFILES:
-        errors.append("tool_profile must be one of: no_tools, grounded_research, local_asset_research, proposal_only, github_research")
+        errors.append(
+            "tool_profile must be one of: no_tools, grounded_researc"
+            "h, local_asset_research, proposal_only, github_research"
+        )
     else:
         # B3: gh_commands is only allowed with github_research profile (fail-closed)
         if request.get("gh_commands") is not None and tool_profile != GITHUB_RESEARCH_PROFILE:
@@ -881,18 +892,42 @@ def build_prompt(request: Mapping[str, Any], context_documents: list[dict[str, s
     lines.append("- Do not run shell commands.")
     if request["tool_profile"] == LOCAL_ASSET_RESEARCH_PROFILE:
         lines.append("- Serena MCP may be used only for read-only local asset research inside the current repository.")
-        lines.append("- Allowed Serena MCP tools are: find_file, find_referencing_symbols, find_symbol, get_symbols_overview, list_dir, search_for_pattern.")
-        lines.append("- Do not use shell execution, file edit/write tools, GitHub write tools, memory write/read tools, or arbitrary paths outside the repository.")
-        lines.append("- post_to_issue_url is forbidden for this profile; return the answer only in this process result.")
+        lines.append((
+            "- Allowed Serena MCP tools are: find_file, find_referencing_symbols, find_symbol, get_symbols_overview,"
+            " list_dir, search_for_pattern."
+        ))
+        lines.append((
+            "- Do not use shell execution, file edit/write tools, GitHub write tools, memory write/read tools, or"
+            " arbitrary paths outside the repository."
+        ))
+        lines.append(
+            "- post_to_issue_url is forbidden for this profil"
+            "e; return the answer only in this process result."
+        )
     elif request["tool_profile"] == PROPOSAL_ONLY_PROFILE:
         lines.append("- Return proposal text only; do not claim that you executed commands or mutated files.")
-        lines.append("- Allowed deliverables are bounded drafts such as implementation_draft, issue_authoring_draft, patch_proposal, and command_plan.")
+        lines.append((
+            "- Allowed deliverables are bounded drafts such as implementation_draft, issue_authoring_draft,"
+            " patch_proposal, and command_plan."
+        ))
         lines.append("- Final file edits, shell execution, and GitHub mutations stay on the Codex side.")
-        lines.append("- post_to_issue_url is forbidden for this profile; return the answer only in this process result.")
+        lines.append(
+            "- post_to_issue_url is forbidden for this profil"
+            "e; return the answer only in this process result."
+        )
     elif request["tool_profile"] == GITHUB_RESEARCH_PROFILE:
-        lines.append("- Read-only GitHub research only. Do not attempt to write, comment, or mutate any GitHub resource.")
-        lines.append("- post_to_issue_url is forbidden for this profile; return the answer only in this process result.")
-        lines.append("- Use only the gh command outputs already provided above; do not request additional gh executions.")
+        lines.append(
+            "- Read-only GitHub research only. Do not attempt "
+            "to write, comment, or mutate any GitHub resource."
+        )
+        lines.append(
+            "- post_to_issue_url is forbidden for this profil"
+            "e; return the answer only in this process result."
+        )
+        lines.append(
+            "- Use only the gh command outputs already provide"
+            "d above; do not request additional gh executions."
+        )
     else:
         lines.append("- Do not search the repository beyond the provided context files.")
     if request["tool_profile"] == "grounded_research":
@@ -1441,7 +1476,9 @@ def run_delegation(
             "stats": None,
             "stderr": f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
             "warnings": [f"unknown_provider: {provider!r}"],
-            "failure_reason": f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
+            (
+                "failure_reason"
+            ): f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
             "raw_command": [],
             "model_chain": [],
             "model_downgrades": [],
@@ -1707,7 +1744,8 @@ def run_delegation(
                             f"## gh command: {cmd_str}\n[exit {gh_proc.returncode}] {gh_proc.stderr.strip()}"
                         )
                         base_result["warnings"].append(
-                            f"github_research: gh {' '.join(argv)} exited {gh_proc.returncode}: {gh_proc.stderr.strip()}"
+                            f"github_research: gh {' '.join(argv)} exited"
+                            f" {gh_proc.returncode}: {gh_proc.stderr.strip()}"
                         )
                 except Exception as exc:
                     base_result["warnings"].append(f"github_research: gh command error: {exc}")
@@ -1822,7 +1860,8 @@ def run_delegation(
                     break
                 if _is_retryable_capacity_failure(completed.returncode, completed.stdout, completed.stderr):
                     warnings.append(
-                        f"retryable capacity failure detected on attempt {attempt + 1} (model={current_model}); retrying same model"
+                        f"retryable capacity failure detected"
+                        f" on attempt {attempt + 1} (model={current_model}); retrying same model"
                     )
                     if attempt < RETRY_LIMIT:
                         time.sleep(min(2**attempt, 4))
@@ -1971,7 +2010,8 @@ def run_delegation(
                 base_result["post_result"] = "success"
             else:
                 base_result["warnings"].append(
-                    f"post_to_issue_url: gh issue comment failed (exit {post_proc.returncode}): {post_proc.stderr.strip()}"
+                    f"post_to_issue_url: gh issue comment failed"
+                    f" (exit {post_proc.returncode}): {post_proc.stderr.strip()}"
                 )
                 base_result["post_result"] = f"failed: {post_proc.stderr.strip()}"
         except Exception as exc:

@@ -372,7 +372,12 @@ def main() -> None:
     parser.add_argument("--contract-body-sha256", required=True, help="SHA256 of issue contract body")
     parser.add_argument("--contract-source-kind", required=True, help="Contract source kind")
     parser.add_argument("--contract-source-id", required=True, help="Contract source identifier")
-    parser.add_argument("--expected-contract-fingerprint", type=json.loads, required=True, help="JSON object captured at snapshot time")
+    parser.add_argument(
+        "--expected-contract-fingerprint",
+        type=json.loads,
+        required=True,
+        help="JSON object captured at snapshot time"
+    )
     parser.add_argument("--issue-number", type=int, default=0, help="Linked issue number")
     parser.add_argument("--format", choices=["json", "yaml"], default="json", help="Output format")
     args = parser.parse_args()

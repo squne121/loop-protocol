@@ -1244,7 +1244,9 @@ def test_ac7_rule_with_vcp_prefix_no_double_namespace():
 
 
 def test_kind_retrieval_error_maps_to_body_retrieval_failed_human_judgment():
-    """Blocker 3: kind=retrieval_error/rule=VC000_BODY_RETRIEVAL_FAILED → category=body_retrieval_failed, aggregate=human_judgment."""
+    """Blocker 3: kind=retrieval_error/rule=VC000_BODY_RETRIEVAL_FAILED → category=body_retrieval_failed,
+        aggregate=human_judgment.
+    """
     from contract_readiness_check import map_preflight_result_to_errors
 
     preflight = _blocked_preflight_with_errors([

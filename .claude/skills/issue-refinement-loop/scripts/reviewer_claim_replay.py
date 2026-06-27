@@ -134,9 +134,13 @@ def _matching_readiness_errors(kind: str, readiness_result: dict[str, Any]) -> l
                 matches.append(err)
         elif kind == "ac_vc_number_mismatch" and rule_id in LP010_RULE_IDS:
             matches.append(err)
-        elif kind == "missing_section" and source_check == "validate_issue_body" and rule_id in MISSING_SECTION_RULE_IDS:
+        elif kind == (
+            "missing_section"
+        ) and source_check == "validate_issue_body" and rule_id in MISSING_SECTION_RULE_IDS:
             matches.append(err)
-        elif kind == "rva_immediate_field_missing" and source_check == "contract_readiness_check" and category in RVA_CATEGORIES:
+        elif kind == (
+            "rva_immediate_field_missing"
+        ) and source_check == "contract_readiness_check" and category in RVA_CATEGORIES:
             matches.append(err)
     return matches
 

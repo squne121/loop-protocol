@@ -42,7 +42,8 @@ class Finding:
     """Evidence reference structure per finding (per-finding scope)."""
     head_sha: str
     source_kind: str  # e.g., "ci_artifact", "github_api", "local_git"
-    evidence_refs: Dict[str, Any]  # {code_ref?, pr_head_sha?, local_head_sha?, ci_run_ref{url,workflow,job,step,command}?}
+    # {code_ref?, pr_head_sha?, local_head_sha?, ci_run_ref{url,workflow,job,step,command}?}
+    evidence_refs: Dict[str, Any]
 
 
 @dataclass
@@ -83,7 +84,20 @@ class PRReviewGateResult:
                     "gate_name": g.gate_name,
                     "status": g.status,
                     **({"minimal_context": g.minimal_context} if g.minimal_context and g.status == "fail" else {}),
-                    **({"findings": [{"head_sha": f.head_sha, "source_kind": f.source_kind, "evidence_refs": f.evidence_refs} for f in g.findings]} if g.findings else {})
+                    **(
+                        {
+                            "findings": [
+                                {
+                                    "head_sha": f.head_sha,
+                                    "source_kind": f.source_kind,
+                                    "evidence_refs": f.evidence_refs,
+                                }
+                                for f in g.findings
+                            ]
+                        }
+                        if g.findings
+                        else {}
+                    )
                 }
                 for g in self.gates
             ]
@@ -202,7 +216,9 @@ class CheckPRReviewGates:
 
         if not valid_findings:
             gate.status = GateStatus.FAIL.value
-            gate.minimal_context = "G2: all findings lack proper evidence_refs (only self_report or missing required keys)"
+            gate.minimal_context = (
+                "G2: all findings lack proper evidence_refs (only self_report or missing required keys)"
+            )
             return gate
 
         gate.status = GateStatus.PASS.value
@@ -332,7 +348,12 @@ class CheckPRReviewGates:
 
         return valid_count > 0
 
-    def g3_implementation_oracle(self, issue_body: str = "", target_files: Optional[List[str]] = None, method: str = "ast") -> GateResult:
+    def g3_implementation_oracle(
+        self,
+        issue_body: str = "",
+        target_files: Optional[List[str]] = None,
+        method: str = "ast"
+    ) -> GateResult:
         """
         G3: Implementation oracle verification
 
@@ -393,7 +414,10 @@ class CheckPRReviewGates:
 
         if failed_oracles:
             gate.status = GateStatus.FAIL.value
-            gate.minimal_context = f"Oracle verification failed: {', '.join([f'{id}: {err}' for id, err in failed_oracles])}"
+            gate.minimal_context = (
+                "Oracle verification failed: "
+                f"{', '.join([f'{id}: {err}' for id, err in failed_oracles])}"
+            )
             gate.findings = findings
 
         return gate
@@ -603,14 +627,19 @@ class CheckPRReviewGates:
         if not pr_head_sha or not local_head_sha:
             if self.strict:
                 gate.status = GateStatus.FAIL.value
-                gate.minimal_context = "G4: required --pr-head-sha and --local-head-sha must both be provided in strict review mode"
+                gate.minimal_context = (
+                    "G4: required --pr-head-sha and --local-head-sha must both be provided in strict review mode"
+                )
             else:
                 gate.status = GateStatus.NOT_APPLICABLE.value
             return gate
 
         if pr_head_sha != local_head_sha:
             gate.status = GateStatus.FAIL.value
-            gate.minimal_context = f"Head SHA mismatch: PR={pr_head_sha[:8]}, local={local_head_sha[:8]}. Commit may not be pushed."
+            gate.minimal_context = (
+                f"Head SHA mismatch: PR={pr_head_sha[:8]},"
+                f" local={local_head_sha[:8]}. Commit may not be pushed."
+            )
             gate.findings = [Finding(
                 head_sha=pr_head_sha,
                 source_kind="github_api_vs_local_git",
@@ -625,7 +654,11 @@ class CheckPRReviewGates:
 
         return gate
 
-    def g5_fixture_guard_path_coverage(self, trace_log: Optional[str] = None, coverage_file: Optional[str] = None) -> GateResult:
+    def g5_fixture_guard_path_coverage(
+        self,
+        trace_log: Optional[str] = None,
+        coverage_file: Optional[str] = None
+    ) -> GateResult:
         """
         G5: Fixture guard path coverage with structured trace validation
 
@@ -872,7 +905,9 @@ def validate_against_schema(output_dict: Dict[str, Any], schema_path: Path) -> L
                 evidence_refs = finding.get("evidence_refs", {})
                 if isinstance(evidence_refs, dict):
                     if evidence_refs.get("self_report_only") is True:
-                        has_support = any(k in evidence_refs for k in ["code_ref", "pr_head_sha", "local_head_sha", "ci_run_ref"])
+                        has_support = any(k in evidence_refs for k in [(
+                            "code_ref"
+                        ), "pr_head_sha", "local_head_sha", "ci_run_ref"])
                         if not has_support:
                             errors.append(f"Gate {gate_id}: finding has self_report_only without supporting refs")
 
