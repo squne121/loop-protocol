@@ -195,6 +195,29 @@ managed skill（`create-issue` / `edit-issue`）が `gh issue create` / `gh issu
 
 これらの条件を満たさない `gh issue create/edit` は `gh_mutation_denied` でブロックされる。
 
+## issue-refinement-loop Producer / Publisher 責務分割（#1154 / #1165 / #1166）
+
+`issue-refinement-loop` の producer / publisher 系は以下の 3 Issue で責務を分割する。
+各 Issue はそれぞれ独立した scope を持ち、相互に依存しない fail-closed routing を実装する。
+
+| Issue | 責務 | 対象コンポーネント |
+|---|---|---|
+| #1154 | root checkout からの `preflight.run` 専用 skill runtime executor | `skill_runtime_exec.py`、`SKILL_RUNTIME_COMMAND_POLICY_V2` |
+| #1165 | producer / compact producer の fail-closed routing（schema mismatch / output budget / termination bypass 阻止） | `compact_review_result.py`、`compact_author_result.py`、`run_refinement_preflight.py` |
+| #1166 | `publish_termination_report.py` の controlled mutation policy（publishable=true 時のみ gh comment） | `publish_termination_report.py`、`render_termination_report.py` |
+
+### 責務境界の明文化
+
+- `#1154` のみが `preflight.run` の root allow / privileged executor を実装する。`gh.*`、`publish_termination_report.py`、producer output budget / schema mismatch は #1154 boundary の対象外。
+- `#1165` は producer の fail-closed routing を実装する。publish_termination_report.py の呼び出しは一切行わない。schema mismatch / output budget violation 時は canonical failure envelope（STATUS/NEXT_ACTION/REASON_CODE/ARTIFACT/ARTIFACT_SHA256）を stdout に出力し、原文（raw issue body / comment / diff）を stdout に含まない。
+- `#1166` は publish_termination_report.py の controlled mutation policy を実装する。publishable=true の場合のみ gh issue comment を呼び出す。producer failure はこの policy の対象外。
+
+### fail-closed routing 不変条件
+
+- producer failure（schema mismatch / output budget violation）のいずれでも `publish_termination_report.publish()`、`_post_github_comment()` は呼ばれない
+- compact producer の stdout は常に 2048 UTF-8 bytes 以下
+- raw issue body / raw comment / raw diff は compact producer の stdout に含まない
+
 ## Privileged Skill Runtime Command Boundary
 
 Issue #1154 では、root checkout からの skill runtime command を registry 全件へ一般化せず、`preflight.run` だけを deny-by-default で許可する。
