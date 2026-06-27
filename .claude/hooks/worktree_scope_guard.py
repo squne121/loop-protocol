@@ -104,9 +104,18 @@ try:
     from controlled_skill_mutation_policy import (
         is_controlled_skill_mutation_exec_command as _is_csm_exec_command,
     )
+    from worktree_bootstrap_command_policy import (
+        is_exact_worktree_bootstrap_executor_command as _is_worktree_bootstrap_command,
+        looks_like_worktree_bootstrap_executor_command as _looks_like_worktree_bootstrap_command,
+    )
     _CSM_POLICY_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fail-closed
     def _is_csm_exec_command(cmd: str, project_root: str) -> bool:  # type: ignore[misc]
+        return False
+    def _is_worktree_bootstrap_command(command: str, cwd: str, project_root: str,
+                                       deadline: "object | None" = None) -> bool:
+        return False
+    def _looks_like_worktree_bootstrap_command(command: str) -> bool:
         return False
     _CSM_POLICY_AVAILABLE = False
 
@@ -116,6 +125,7 @@ _AGENT_OPS_ALLOWED_SCRIPTS = (
     "scripts/agent-ops/cleanup_exec.py",
     "scripts/agent-ops/guard_preflight.py",
     "scripts/agent-ops/materialize_cleanup_contract.py",
+    "scripts/agent-ops/worktree_bootstrap_exec.py",
 )
 
 # Per-script exact argv allowlist (Issue #1137 Blocker 1). Only these flags are
@@ -141,6 +151,13 @@ _AGENT_OPS_ARG_SPECS = {
                                   "--operation", "--ttl-seconds"}),
         "bool_flags": frozenset({"--json"}),
         "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
+    },
+    "scripts/agent-ops/worktree_bootstrap_exec.py": {
+        "value_flags": frozenset({"--issue-number", "--slug", "--branch-name",
+                                  "--worktree-path", "--base-ref"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset({"--issue-number", "--slug", "--branch-name",
+                               "--worktree-path", "--base-ref"}),
     },
 }
 
@@ -1538,6 +1555,11 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
     # allowed even with an active issue worktree (checked before classification).
     if _is_agent_ops_tool_command(command, cwd, _pr, deadline):
         _allow()
+
+    if _is_worktree_bootstrap_command(command, cwd, _pr, deadline):
+        _allow()
+    if _looks_like_worktree_bootstrap_command(command):
+        _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<worktree-bootstrap-denied>", cwd)
 
     if _is_skill_runtime_executor_command(command, cwd, _pr):
         _allow()

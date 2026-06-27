@@ -45,6 +45,11 @@ permissionMode: acceptEdits
 2. `.claude/skills/implement-issue/SKILL.md` の Procedure を実行（worktree 作成 → 実装 → verify → PR）
 3. `IMPLEMENT_RESULT_V1` を返す
 
+worktree 作成は raw `git worktree add` を直接叩かず、
+`scripts/agent-ops/worktree_bootstrap_exec.py` の exact command class を使う。
+worker は executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.worktree_path` / `branch`
+を `IMPLEMENT_RESULT_V1.worktree` / `branch` に反映する。
+
 **V1 モードでは `issue-contract-review` preflight と worktree 作成が必須。**
 
 ### V2 dispatch（PR repair executor モード）

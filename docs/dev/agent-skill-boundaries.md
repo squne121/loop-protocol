@@ -243,6 +243,13 @@ SKILL_RUNTIME_COMMAND_POLICY_V2:
 - `uv.pytest`、`pnpm.typecheck`、`pnpm.lint`、`pnpm.test`、`pnpm.build`、`gh.*`、未登録 script は root allow 対象外
 - `publish_termination_report.py` と producer output budget / schema mismatch / termination bypass は本 boundary の対象外
 
+## Implementation Worktree Bootstrap Command Boundary
+
+- `scripts/agent-ops/worktree_bootstrap_exec.py` は implementation issue 専用 worktree bootstrap の controlled executor とする
+- `scripts/agent-guards/worktree_bootstrap_command_policy.py` を local_main_branch_guard / worktree_scope_guard の shared exact command classifier とする
+- 許可対象は `uv run python3 scripts/agent-ops/worktree_bootstrap_exec.py --issue-number <N> --slug <slug> --branch-name worktree-issue-<N>-<slug> --worktree-path .claude/worktrees/issue-<N>-<slug> --base-ref <default-branch> --json` と、その `rtk` 1 段 envelope のみ
+- `rtk proxy ...`、`bash -lc ...`、raw `git worktree add ...`、`rtk git worktree add ...`、`--flag=value`、unknown flag、duplicate flag、extra positional は deny-by-default を維持する
+
 ## ci-test-performance Consumer Routing
 
 `ci-test-performance` Skill は CI テストパフォーマンスのレーン分類・hotspot 分析・意思決定を担う。

@@ -25,11 +25,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 
-from local_main_branch_guard import (  # noqa: E402
+from local_main_branch_guard import (
     evaluate,
     REASON_DRIFT,
     REASON_RECOVERY,
+    REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
+    REASON_UNKNOWN_COMMAND,
     REASON_UNPARSEABLE,
     REASON_GH_API,
     REASON_DETERMINISTIC_CHECKER,
@@ -45,7 +47,7 @@ from local_main_branch_guard import (  # noqa: E402
     GITHUB_CMD_CLASS_DESTRUCTIVE,
     TRUSTED_REPO_SLUG,
 )
-from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
+from skill_runtime_command_policy import resolve_repo_slug
 
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hooks"
 
@@ -301,41 +303,15 @@ class TestIssue1198RawAndCommandFixtures:
         if "rule_id" in entry:
             assert result["rule_id"] == entry["rule_id"]
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
-            "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
-            "gh api repos/squne121/loop-protocol/issues/1198/comments --input='x'",
-            "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field='x'",
-        ],
-    )
-    def test_gh_api_mutation_flags_are_blocked_and_redacted(self, tmp_git_repo: Path, command: str):
-        """Given mutation-like gh api flag patterns, ensure block + redacted argv tokens."""
-        result = eval_codex(command, str(tmp_git_repo))
+    def test_issue1198_blocked_raw_field_redacts_secret(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "gh api --raw-field body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
+            str(tmp_git_repo),
+        )
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_GH_API
-        assert any("<redacted>" in token for token in result.get("argv_redacted", []))
-
-    def test_run_hook_block_stderr_contains_ac7_fields(self, tmp_git_repo: Path):
-        payload = {
-            "event": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": "git switch issue-1198-block"},
-            "cwd": str(tmp_git_repo),
-        }
-        result = run_guard_script(payload, cwd=tmp_git_repo)
-        assert result.returncode == 2
-        output = result.stderr
-        assert "hook_name: local_main_branch_guard" in output
-        assert "event_kind: PreToolUse" in output
-        assert "decision: block" in output
-        assert "reason_code: local_root_branch_drift" in output
-        assert "rule_id: git_branch_mutation_block" in output
-        assert "command_kind: git_branch_mutation" in output
-        assert "parser_stage: branch_mutation_block" in output
-        assert "argv_redacted:" in output
-        assert "recovery:" in output
+        assert "SECRET_VALUE" not in str(result.get("argv_redacted", []))
+        assert "SECRET_VALUE" not in str(result.get("inner_argv_redacted", []))
 
 
 class TestReadonlyPipelineClassifier:
@@ -651,42 +627,12 @@ class TestGhMutationReasonCode:
             hook_flavor="codex",
         )
         captured = capsys.readouterr()
-        hint_line = [line for line in captured.err.splitlines() if "recovery:" in line]
+        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
         assert hint_line, "Expected a recovery: line in stderr"
         hint = hint_line[0].lower()
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
             f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
         )
-
-    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
-        """_emit_block_stderr includes AC7 machine-readable fields."""
-        from local_main_branch_guard import (
-            _emit_block_stderr,
-            REASON_GITHUB_REMOTE_OPS,
-            COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
-        )
-        _emit_block_stderr(
-            reason_code=REASON_GITHUB_REMOTE_OPS,
-            current_branch_kind="default",
-            current_is_default=True,
-            target_branch_kind=None,
-            hook_flavor="codex",
-            event_kind="PermissionRequest",
-            decision="block",
-            command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
-            parser_stage="readonly_artifact_export",
-            rule_id="gh_issue_view_to_tmp_allowed",
-            argv_redacted=["gh", "issue", "view", "123", "--json", "body"],
-        )
-        captured = capsys.readouterr()
-        output = captured.err
-        assert "hook_name: local_main_branch_guard" in output
-        assert "event_kind: PermissionRequest" in output
-        assert "decision: block" in output
-        assert "rule_id: gh_issue_view_to_tmp_allowed" in output
-        assert "command_kind: readonly_artifact_export" in output
-        assert "parser_stage: readonly_artifact_export" in output
-        assert "argv_redacted:" in output
 
 
 

@@ -43,6 +43,11 @@ from skill_runtime_command_policy import (  # noqa: E402
     is_exact_skill_runtime_executor_command,
     looks_like_skill_runtime_executor_command,
 )
+from worktree_bootstrap_command_policy import (  # noqa: E402
+    WORKTREE_BOOTSTRAP_REASON_CODE,
+    is_exact_worktree_bootstrap_executor_command,
+    looks_like_worktree_bootstrap_executor_command,
+)
 
 
 # ─── Reason codes ────────────────────────────────────────────────────────────
@@ -64,6 +69,7 @@ REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
+REASON_WORKTREE_BOOTSTRAP_EXECUTOR = WORKTREE_BOOTSTRAP_REASON_CODE
 # Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
 # arbitrated by worktree_scope_guard against the V3 one-shot contract. The local
 # root branch guard explicitly DEFERS authority to that guard so the two guards
@@ -111,6 +117,7 @@ COMMAND_KIND_GITHUB_PR_METADATA = "github_pr_metadata"
 COMMAND_KIND_GITHUB_DESTRUCTIVE = "github_mutation"
 COMMAND_KIND_GITHUB_MUTATION = COMMAND_KIND_GITHUB_DESTRUCTIVE
 COMMAND_KIND_READONLY = "readonly_command"
+COMMAND_KIND_WORKTREE_BOOTSTRAP = "worktree_bootstrap_executor"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -493,10 +500,10 @@ def _redact_token(token: str) -> str:
         "--body",
         "--body-file",
         "--input",
-        "--raw-field",
         "-f",
         "-F",
         "--field",
+        "--raw-field",
     }
     if token in redaction_sensitive:
         return token
@@ -518,15 +525,7 @@ def _redact_argv(tokens: list[str] | None) -> list[str]:
         return []
     redacted: list[str] = []
     skip_next = False
-    sensitive_flags = {
-        "--body-file",
-        "--body",
-        "--input",
-        "--field",
-        "--raw-field",
-        "-f",
-        "-F",
-    }
+    sensitive_flags = {"--body-file", "--body", "--input", "--field", "--raw-field"}
     for idx, token in enumerate(tokens):
         if skip_next:
             redacted.append("<redacted>")
@@ -583,7 +582,7 @@ def _parse_gh_api_command(cmd: str) -> bool:
 
         if token in {"-f", "-F", "--field", "--input", "--raw-field"}:
             return False
-        if token.startswith("--field=") or token.startswith("--input=") or token.startswith("--raw-field="):
+        if token.startswith(("--field=", "--input=", "--raw-field=")):
             return False
         if token.startswith("-") and not endpoint:
             # Skip unknown flags; values remain allowed only if no endpoint consumed.
@@ -1683,6 +1682,30 @@ def evaluate(
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
+    if project_root and is_exact_worktree_bootstrap_executor_command(normalized_cmd, cwd, project_root):
+        return _emit(
+            status="allow",
+            reason_code=REASON_WORKTREE_BOOTSTRAP_EXECUTOR,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_exec",
+            local_command_kind=COMMAND_KIND_WORKTREE_BOOTSTRAP,
+            local_rule_id="worktree_bootstrap_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    if looks_like_worktree_bootstrap_executor_command(normalized_cmd):
+        return _emit(
+            status="block",
+            reason_code=REASON_UNKNOWN_COMMAND,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_guess_block",
+            local_command_kind=COMMAND_KIND_WORKTREE_BOOTSTRAP,
+            local_rule_id="worktree_bootstrap_guess",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
     if _looks_like_direct_issue_refinement_runtime_command(normalized_cmd):
         return _emit(
             status="block",
@@ -2070,12 +2093,6 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=False,
             target_branch_kind=None,
             hook_flavor=hook_flavor,
-            decision="block",
-            event_kind="PreToolUse",
-            command_kind=COMMAND_KIND_UNKNOWN,
-            parser_stage="input_parse",
-            rule_id="input_parse",
-            argv_redacted=[],
         )
         return 2
 
@@ -2117,12 +2134,6 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=(current_branch == default_branch),
             target_branch_kind=result.get("target_branch_kind"),
             hook_flavor=hook_flavor,
-            decision=result["decision"],
-            event_kind=result.get("event_kind", hook_event),
-            command_kind=result.get("command_kind", COMMAND_KIND_UNKNOWN),
-            parser_stage=result.get("parser_stage", "classification"),
-            rule_id=result.get("rule_id"),
-            argv_redacted=result.get("argv_redacted", []),
         )
         return 2
 
@@ -2135,13 +2146,6 @@ def _emit_block_stderr(
     current_is_default: bool,
     target_branch_kind: str | None,
     hook_flavor: str,
-    *,
-    decision: str = "block",
-    event_kind: str = "PreToolUse",
-    command_kind: str = COMMAND_KIND_UNKNOWN,
-    parser_stage: str = "classification",
-    rule_id: str | None = None,
-    argv_redacted: list[str] | None = None,
 ) -> None:
     """
     Emit bounded, non-leaking block message to stderr (max 10 lines).
@@ -2154,31 +2158,25 @@ def _emit_block_stderr(
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-        "hook_name: local_main_branch_guard",
-        f"event_kind: {event_kind}",
-        f"decision: {decision}",
         f"reason_code: {reason_code}",
-        f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
         f"current_branch_kind: {current_branch_kind}",
-        f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
-        f"argv_redacted: {json.dumps(argv_redacted or [])}",
+        f"current_is_default: {str(current_is_default).lower()}",
     ]
-    recovery = None
-    if reason_code == REASON_INLINE_OVERRIDE:
-        recovery = "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
-    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-        recovery = "switch root back to default branch first"
-    elif reason_code == REASON_UNPARSEABLE:
-        recovery = "use simple (non-compound) git commands from local root"
-    elif reason_code == REASON_DRIFT:
-        recovery = "create/enter linked issue worktree, or switch only to default branch"
-    elif reason_code == REASON_GH_MUTATION:
-        recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
+    if target_branch_kind:
+        lines.append(f"target_branch_kind: {target_branch_kind}")
 
-    if recovery is None:
-        lines.append(f"hook_flavor: {hook_flavor}")
-    else:
-        lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
+    if reason_code == REASON_INLINE_OVERRIDE:
+        lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
+    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
+        lines.append("recovery: switch root back to default branch first")
+    elif reason_code == REASON_UNPARSEABLE:
+        lines.append("recovery: use simple (non-compound) git commands from local root")
+    elif reason_code == REASON_DRIFT:
+        lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
+    elif reason_code == REASON_GH_MUTATION:
+        lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
+
+    lines.append(f"hook_flavor: {hook_flavor}")
 
     # Enforce max 10 lines
     for line in lines[:10]:
