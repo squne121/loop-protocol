@@ -325,7 +325,10 @@ def main(argv: list[str] | None = None) -> int:
     if not registry_path.is_file():
         raise RuntimeError("registry_missing")
 
-    script_path = Path(project_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py"
+    script_path = (
+        Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
+        / "scripts" / "run_refinement_preflight.py"
+    )
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
 
