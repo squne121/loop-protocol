@@ -1274,3 +1274,64 @@ def test_is_trivially_pass_unit_direct():
     # NOT trivially pass: unrelated commands
     assert _is_trivially_pass_command("pnpm lint") is False
     assert _is_trivially_pass_command("test -f somefile") is False
+
+
+# ---------------------------------------------------------------------------
+# AC4: classify_static_command exact argv negative cases (Issue #1210)
+# ---------------------------------------------------------------------------
+
+def test_classify_static_command_blocks_path_qualified_uv_lock():
+    """AC4: path-qualified uv in uv lock --check はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    cases = [
+        "/usr/bin/uv lock --check",
+        "./uv lock --check",
+        "/tmp/uv lock --check",
+    ]
+    for command in cases:
+        result = classify_static_command(command, Path("."))
+        assert result is not None, f"Expected block for: {command}"
+        _, category, decision, _, _ = result
+        assert category == "command_not_allowed", f"command: {command}"
+        assert decision == "blocked", f"command: {command}"
+
+
+def test_classify_static_command_blocks_path_qualified_python_in_smoke():
+    """AC4: path-qualified python in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    cases = [
+        "uv run --isolated --locked --no-default-groups ./python scripts/ci/runtime_dependency_smoke.py",
+        "uv run --isolated --locked --no-default-groups /tmp/python3 scripts/ci/runtime_dependency_smoke.py",
+    ]
+    for command in cases:
+        result = classify_static_command(command, Path("."))
+        assert result is not None, f"Expected block for: {command}"
+        _, category, decision, _, _ = result
+        assert category == "command_not_allowed", f"command: {command}"
+        assert decision == "blocked", f"command: {command}"
+
+
+def test_classify_static_command_blocks_smoke_option_reorder():
+    """AC4: option reorder in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    result = classify_static_command(
+        "uv run --locked --isolated --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+        Path("."),
+    )
+    assert result is not None
+    _, category, decision, _, _ = result
+    assert category == "command_not_allowed"
+    assert decision == "blocked"
+
+
+def test_classify_static_command_blocks_smoke_duplicate_options():
+    """AC4: duplicate options in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    result = classify_static_command(
+        "uv run --isolated --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+        Path("."),
+    )
+    assert result is not None
+    _, category, decision, _, _ = result
+    assert category == "command_not_allowed"
+    assert decision == "blocked"

@@ -663,7 +663,7 @@ def test_uv_lock_check_exact_only():
     from baseline_vc_preflight import _is_uv_lock_check
 
     assert _is_uv_lock_check(["uv", "lock", "--check"])
-    assert _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])  # path-qualified rejected (Issue #1210)
     assert not _is_uv_lock_check(["uv", "lock"])
     assert not _is_uv_lock_check(["uv", "lock", "--upgrade"])
     assert not _is_uv_lock_check(["uv", "sync"])
@@ -681,10 +681,10 @@ def test_runtime_dependency_smoke_exact_python_and_python3_only():
         "uv", "run", "--isolated", "--locked", "--no-default-groups",
         "python", "scripts/ci/runtime_dependency_smoke.py",
     ])
-    assert _is_uv_runtime_smoke_command([
+    assert not _is_uv_runtime_smoke_command([
         "/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups",
         "python3", "scripts/ci/runtime_dependency_smoke.py",
-    ])
+    ])  # path-qualified uv rejected (Issue #1210)
     assert not _is_uv_runtime_smoke_command([
         "uv", "run", "--isolated", "--locked", "python", "scripts/ci/runtime_dependency_smoke.py",
     ])
@@ -2736,3 +2736,55 @@ def test_ac12_inline_annotation_quoted_literal_safe():
     it = _result_for_899(data, "rg ")
     assert it is not None, data
     assert it["category"] != "inline_baseline_expect_invalid_placement", it
+
+
+# ---------------------------------------------------------------------------
+# AC4: exact argv negative cases (Issue #1210)
+# ---------------------------------------------------------------------------
+
+def test_is_uv_lock_check_rejects_path_qualified_uv():
+    """AC4: _is_uv_lock_check は path-qualified uv を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_lock_check
+    assert not _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["./uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["/tmp/uv", "lock", "--check"])
+
+
+def test_is_uv_runtime_smoke_rejects_path_qualified_uv():
+    """AC4: _is_uv_runtime_smoke_command は path-qualified uv を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_path_qualified_python():
+    """AC4: _is_uv_runtime_smoke_command は path-qualified python/python3 を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "./python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "/tmp/python3", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_option_reorder():
+    """AC4: _is_uv_runtime_smoke_command は option 順序変更を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--locked", "--isolated", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_duplicate_options():
+    """AC4: _is_uv_runtime_smoke_command は duplicate option を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
