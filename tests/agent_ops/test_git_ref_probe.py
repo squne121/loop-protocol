@@ -110,7 +110,7 @@ class TestJsonContract:
         """AC2/AC4: stdout must be exactly one JSON object."""
         cmd = [sys.executable, str(SCRIPT), "--branch", "main", "--json"]
         result = subprocess.run(cmd, cwd=str(temp_repo), capture_output=True, text=True)
-        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
         assert len(lines) == 1
         obj = json.loads(lines[0])
         assert isinstance(obj, dict)
@@ -133,7 +133,7 @@ class TestStderr:
         """AC4: stderr must be ≤ 5 lines even for missing branch."""
         cmd = [sys.executable, str(SCRIPT), "--branch", "nonexistent-branch-xyz", "--json"]
         result = subprocess.run(cmd, cwd=str(temp_repo), capture_output=True, text=True)
-        stderr_lines = [l for l in result.stderr.splitlines() if l.strip()]
+        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
         assert len(stderr_lines) <= 5
 
     def test_no_raw_absolute_path_in_stderr(self, temp_repo: Path) -> None:

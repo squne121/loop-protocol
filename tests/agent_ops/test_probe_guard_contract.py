@@ -7,17 +7,15 @@ Covers:
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-ops"))
 
-from local_main_branch_guard import (
+from local_main_branch_guard import (  # noqa: E402
     DETERMINISTIC_CHECKER_ALLOWLIST,
     is_deterministic_checker_command,
 )

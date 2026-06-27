@@ -113,7 +113,7 @@ class TestJsonContract:
         """AC3/AC4: stdout must be exactly one JSON object."""
         cmd = [sys.executable, str(SCRIPT), "--json"]
         result = subprocess.run(cmd, cwd=str(temp_repo), capture_output=True, text=True)
-        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
         assert len(lines) == 1
         obj = json.loads(lines[0])
         assert isinstance(obj, dict)
@@ -125,7 +125,7 @@ class TestStderr:
     def test_stderr_max_5_lines_normal(self, temp_repo: Path) -> None:
         """AC4: stderr must be ≤ 5 lines for a normal repo."""
         _, result = _run_probe(temp_repo)
-        stderr_lines = [l for l in result.stderr.splitlines() if l.strip()]
+        stderr_lines = [line for line in result.stderr.splitlines() if line.strip()]
         assert len(stderr_lines) <= 5
 
     def test_exit_code_zero_on_success(self, temp_repo: Path) -> None:
@@ -194,4 +194,4 @@ class TestFixtures:
             os.path.realpath(e["worktree_realpath"]) == real_spaced
             for e in entries
         )
-        assert found, f"Worktree with spaces in path not found in catalog"
+        assert found, "Worktree with spaces in path not found in catalog"

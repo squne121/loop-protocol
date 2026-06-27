@@ -85,7 +85,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Git worktree catalog read-only probe")
     parser.add_argument("--json", action="store_true", dest="json_output",
                         help="Output JSON (always true, kept for explicit invocation)")
-    args = parser.parse_args()
+    _args = parser.parse_args()
 
     result = probe()
     sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
