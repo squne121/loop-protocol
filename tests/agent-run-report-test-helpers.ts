@@ -19,6 +19,18 @@ export function createValidReport() {
       checked_at: '2026-06-15T22:57:00Z',
       verdict: 'pass',
       blocked_reasons: [],
+      entirecli_safety: {
+        schema_version: 'entirecli_safety_result/v1',
+        verdict: 'not_applicable',
+        reason_codes: ['entire_absent'],
+        raw_values_emitted: false,
+        checked_surfaces: {
+          entire_binary: false,
+          entire_version: null,
+          entire_enable_help: false,
+          entire_configure_help: false,
+        },
+      },
     },
     actor: {
       type: 'ai_agent',

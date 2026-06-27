@@ -7,6 +7,9 @@ import {
 import { parseMarkerComment } from './github-comments.mjs'
 
 export const RETRO_INDEX_ALGORITHM = 'retro-index-builder@1'
+
+const ENTIRECLI_SAFETY_SCHEMA_VERSION = 'entirecli_safety_result/v1'
+const ENTIRECLI_SAFE_VERDICTS = new Set(['safe', 'not_applicable'])
 export const SCHEMA_MIGRATION_FOLLOW_UP = 'follow-up Issue for docs/schemas/agent-retro-index.schema.json key set migration'
 
 function sha256Hex(text) {
@@ -248,6 +251,41 @@ function normalizeSourceComment(sourceComment) {
       kind: 'blocked',
       reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
       reason: 'report_markdown_extract_failed',
+    }
+  }
+
+  // Runtime enforcement: entirecli_safety checks precede schema validation
+  // so specific reason codes are surfaced instead of the generic report_validator_failed.
+  const publicSurfaceKind = extraction.payload.public_surface_kind
+  const entirecliSafety = extraction.payload.public_safety?.entirecli_safety
+  if (publicSurfaceKind !== 'none' && !entirecliSafety) {
+    return {
+      kind: 'blocked',
+      reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+      reason: 'report_entirecli_safety_missing',
+    }
+  }
+  if (entirecliSafety) {
+    if (entirecliSafety.schema_version !== ENTIRECLI_SAFETY_SCHEMA_VERSION) {
+      return {
+        kind: 'blocked',
+        reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+        reason: 'report_entirecli_safety_unknown_schema_version',
+      }
+    }
+    if (entirecliSafety.raw_values_emitted === true) {
+      return {
+        kind: 'blocked',
+        reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+        reason: 'report_entirecli_safety_raw_values_emitted',
+      }
+    }
+    if (!ENTIRECLI_SAFE_VERDICTS.has(entirecliSafety.verdict)) {
+      return {
+        kind: 'blocked',
+        reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+        reason: 'report_entirecli_safety_blocked',
+      }
     }
   }
 
