@@ -814,3 +814,134 @@ class TestCliShape:
             result = run(req)
         assert "status" in result
         assert result["status"] in ("refused", "error")
+
+
+# ─── B3: TestCatalogUnreadable ────────────────────────────────────────────────
+
+
+class TestCatalogUnreadable:
+    """B1 fix: list_worktrees() が None を返した場合は fail-closed。"""
+
+    def test_catalog_none_refuses_branch_only(self, repo_branch_only):
+        """list_worktrees() が None（catalog 読み取り不能）なら branch-only は拒否。"""
+        repo = repo_branch_only
+        req = _make_req(repo)
+        with patch.object(_ce, "list_worktrees", return_value=None):
+            result = run(req, project_root=repo["root"])
+        assert result["status"] in ("refused", "error"), (
+            f"Expected refused/error when catalog unreadable, got: {result}"
+        )
+        assert result["actions_taken"] == [], (
+            f"No actions expected on refusal: {result['actions_taken']}"
+        )
+        # branch still exists — no destructive action taken
+        out = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify",
+             f"refs/heads/{repo['branch_name']}"],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 0, "branch must still exist after refusal"
+
+
+# ─── B3: TestWorktreeAbsentAfterRemoval ───────────────────────────────────────
+
+
+class TestWorktreeAbsentAfterRemoval:
+    """B2 fix: worktree_absent_after_removal は verified フィールドに基づく（拒否時は条件次第）。"""
+
+    def test_refused_when_path_exists_has_false_absent(self, tmp_path):
+        """disk 上に path が存在する場合の拒否: worktree_absent_after_removal は True ではない。"""
+        root = tmp_path / "repo"
+        root.mkdir()
+        _git("init", "-q", "-b", "main", cwd=root)
+        _git("config", "user.email", "t@t.com", cwd=root)
+        _git("config", "user.name", "T", cwd=root)
+        (root / "README.md").write_text("seed\n")
+        _git("add", "README.md", cwd=root)
+        _git("commit", "-q", "-m", "seed", cwd=root)
+
+        wt_parent = root / ".claude" / "worktrees"
+        wt_parent.mkdir(parents=True, exist_ok=True)
+        wt_path = wt_parent / "issue-1196-b2-test"
+        _git("worktree", "add", "-q", "-b", "issue-1196-b2-test", str(wt_path), "main", cwd=root)
+
+        branch_tip = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "refs/heads/issue-1196-b2-test"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        # Remove worktree from catalog AND disk via git worktree remove
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", "--force", str(wt_path)],
+            check=True, capture_output=True,
+        )
+        # Recreate directory on disk (absent from catalog, present on disk)
+        wt_path.mkdir(parents=True, exist_ok=True)
+
+        req = {
+            "schema": "CLEANUP_EXEC_REQUEST_V1",
+            "pr_number": 1234,
+            "linked_issue_number": None,
+            "worktree_path": str(wt_path),
+            "branch_name": "issue-1196-b2-test",
+        }
+        fake_pr = _make_merged_pr("issue-1196-b2-test", branch_tip)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run(req, project_root=str(root))
+
+        assert result["status"] == "refused", f"Expected refused, got: {result}"
+        # B2 fix: when worktree_absent_on_disk is False, must not claim True
+        assert result.get("worktree_absent_after_removal") is not True, (
+            f"refused result must not claim worktree_absent_after_removal=True "
+            f"when path exists on disk: {result}"
+        )
+        assert result["actions_taken"] == []
+
+
+# ─── B3: TestMaterializeRefusesBranchOnly ─────────────────────────────────────
+
+
+class TestMaterializeRefusesBranchOnly:
+    """B3: materialize_cleanup_contract が branch-only 状態で contract を発行しないことを確認。"""
+
+    def test_materialize_refused_in_branch_only_state(self, repo_branch_only):
+        """worktree が disk/catalog から消えている branch-only 状態では materialize は refused。"""
+        import importlib.util
+
+        repo = repo_branch_only
+        mat_path = REPO_ROOT / "scripts" / "agent-ops" / "materialize_cleanup_contract.py"
+        spec = importlib.util.spec_from_file_location(
+            "materialize_cleanup_contract_b3_test", str(mat_path)
+        )
+        assert spec is not None and spec.loader is not None
+        mat_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mat_mod)
+
+        # branch-only state: worktree absent from disk+catalog, branch still present
+        result = mat_mod.materialize(
+            pr_number=1234,
+            linked_issue_number=None,
+            worktree_path=repo["worktree_path"],
+            branch_name=repo["branch_name"],
+            project_root=repo["root"],
+        )
+
+        assert result["status"] == "refused", (
+            f"expected materialize to refuse in branch-only state, got: {result}"
+        )
+        # No contract file should be written
+        contract_path = Path(repo["root"]) / "artifacts" / "agent-ops" / "cleanup_contract.json"
+        assert not contract_path.exists(), (
+            f"no contract should be written in branch-only state: {contract_path}"
+        )
+        # Branch is NOT deleted — materialize refused without action
+        out = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify",
+             f"refs/heads/{repo['branch_name']}"],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 0, "branch must still exist after materialize refusal"

@@ -343,7 +343,7 @@ def verify_branch_only_cleanup_authorization(
     # Fetch catalog once for conditions C and D
     catalog = list_worktrees(project_root, deadline)
     if catalog is None:
-        catalog = []
+        return False, WORKTREE_NOT_IN_CATALOG, verified
 
     # Condition (C): git catalog must have no entry at this path
     entry = find_by_realpath(catalog, worktree_real)
@@ -513,7 +513,10 @@ def _branch_only_result(status: str, reason: str | None, verified: dict, actions
         "verified": verified,
         "actions_taken": actions,
         "stderr_line_count": 0,
-        "worktree_absent_after_removal": True,  # AC6: worktree was already absent
+        "worktree_absent_after_removal": bool(
+            verified.get("worktree_absent_on_disk")
+            and verified.get("worktree_absent_from_catalog")
+        ),
         "branch_only": True,
     }
 
