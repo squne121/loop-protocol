@@ -493,6 +493,7 @@ def _redact_token(token: str) -> str:
         "--body",
         "--body-file",
         "--input",
+        "--raw-field",
         "-f",
         "-F",
         "--field",
@@ -500,7 +501,7 @@ def _redact_token(token: str) -> str:
     if token in redaction_sensitive:
         return token
     if token.startswith("--") and "=" in token:
-        if token.startswith(("--body=", "--input=", "--field=")):
+        if token.startswith(("--body=", "--input=", "--field=", "--raw-field=")):
             key = token.split("=", 1)[0]
             return f"{key}=<redacted>"
         return token
@@ -517,7 +518,15 @@ def _redact_argv(tokens: list[str] | None) -> list[str]:
         return []
     redacted: list[str] = []
     skip_next = False
-    sensitive_flags = {"--body-file", "--body", "--input", "--field"}
+    sensitive_flags = {
+        "--body-file",
+        "--body",
+        "--input",
+        "--field",
+        "--raw-field",
+        "-f",
+        "-F",
+    }
     for idx, token in enumerate(tokens):
         if skip_next:
             redacted.append("<redacted>")
@@ -572,7 +581,9 @@ def _parse_gh_api_command(cmd: str) -> bool:
             i += 1
             continue
 
-        if token in {"-f", "-F", "--field", "--input"}:
+        if token in {"-f", "-F", "--field", "--input", "--raw-field"}:
+            return False
+        if token.startswith("--field=") or token.startswith("--input=") or token.startswith("--raw-field="):
             return False
         if token.startswith("-") and not endpoint:
             # Skip unknown flags; values remain allowed only if no endpoint consumed.

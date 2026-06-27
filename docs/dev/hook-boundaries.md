@@ -105,11 +105,16 @@ hook_boundaries_manifest_v1:
       linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
       guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
-      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離、#1124 で 5 分類追加）:
-      readonly_command / branch_safe_maintenance_command / deterministic_checker_command /
-      github_remote_ops_command / gh_mutation_denied / unparseable_branch_mutation。
+      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離、#1124 で分類追加、#1198 で API/API-allowlist/AC7 強化）:
+      not_local_root_context / manual_override_accepted / inline_env_override_not_allowed /
+      recovery_to_default_branch / branch_safe_maintenance_command / readonly_command /
+      deterministic_checker_command / unknown_command_requires_review / local_root_branch_drift / already_drifted_root /
+      detached_or_unknown_root / unparseable_branch_mutation / github_remote_ops_command / github_api_command /
+      gh_mutation_denied / rtk_help_command / rtk_proxy_requires_review / rtk_unknown_inner /
+      cleanup_deferred_to_worktree_scope_guard / github_issue_mutation_command / skill_runtime_executor_command。
       gh_mutation_denied: gh issue/pr のうち readonly allowlist 外かつ github_remote_ops_command・github_issue_mutation_command 外の mutation 系コマンドを fail-closed した場合に使用（#1109）。
       github_remote_ops_command: post-merge-cleanup 最小集合（gh issue close/comment/reopen, gh pr comment/edit）および github_issue_mutation_command に使用（#1124）。
+      github_api_command: gh api ルートで exact allowlist 外（method/flag の不一致を含む）を含む場合に使用。
       unparseable_branch_mutation: compound/wrapper/redirection・/tmp wrapper・python -c・parse failure 等に使用。
       fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
       gh issue view/list, gh pr view/list/status は readonly_command として許可。
