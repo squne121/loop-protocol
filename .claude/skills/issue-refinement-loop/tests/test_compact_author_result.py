@@ -28,6 +28,7 @@ from compact_author_result import (
     COMPACT_SCHEMA_NAME,
     COMPACT_SCHEMA_VERSION,
     REQUIRED_COMPACT_FIELDS,
+    _atomic_write,
     compact_author_result,
 )
 
@@ -73,7 +74,7 @@ def test_compact_author_result_ok_from_fixture(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, stdout_lines = compact_author_result(
+    compact_data, stdout_lines, *_ = compact_author_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42
     )
 
@@ -94,9 +95,10 @@ def test_compact_author_result_ok_artifact_written(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_author_result(
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_author_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42
     )
+    _atomic_write(artifact_path_val, artifact_content)
 
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
     assert artifact_path.exists()
@@ -111,9 +113,10 @@ def test_compact_author_result_ok_artifact_permissions(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_author_result(
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_author_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42
     )
+    _atomic_write(artifact_path_val, artifact_content)
 
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
     stat = artifact_path.stat()
@@ -132,7 +135,7 @@ def test_compact_author_result_body_hash_from_updated_body(tmp_path):
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
     body = "## Updated Issue Body\n\nSome content here."
-    compact_data, _ = compact_author_result(
+    compact_data, *_ = compact_author_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42, updated_body=body
     )
 
@@ -183,7 +186,7 @@ def test_compact_author_result_stdout_no_raw_body(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    _, stdout_lines = compact_author_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _compact, stdout_lines, *_ = compact_author_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
     lines_text = "\n".join(stdout_lines)
 
     # No diff markers
@@ -201,7 +204,7 @@ def test_compact_author_result_stdout_byte_limit(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    _, stdout_lines = compact_author_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    _compact, stdout_lines, *_ = compact_author_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
     lines_text = "\n".join(stdout_lines)
 
     byte_count = len(lines_text.encode("utf-8"))
@@ -278,7 +281,7 @@ def test_compact_author_result_containment_check_passes(tmp_path):
     repo_root = tmp_path
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _ = compact_author_result(
+    compact_data, *_ = compact_author_result(
         raw_result, artifact_dir=artifact_dir, issue_number=42, repo_root=repo_root
     )
     assert "compact_author_result_v1=" in compact_data["ARTIFACT"]
