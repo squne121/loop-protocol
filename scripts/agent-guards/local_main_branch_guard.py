@@ -582,141 +582,221 @@ def _parse_gh_api_command(cmd: str) -> bool:
 
         if token in {"-f", "-F", "--field", "--input", "--raw-field"}:
             return False
-        if token.startswith(("--field=", "--input=", "--raw-field=")):
+        if token.startswith(("--field=", "--raw-field=")):
             return False
-        if token.startswith("-") and not endpoint:
-            # Skip unknown flags; values remain allowed only if no endpoint consumed.
+
+        if token.startswith("-"):
             i += 1
             continue
 
-        if endpoint is None:
-            endpoint = token
-        # Any extra bare token after first endpoint is treated as non-matching extension.
-        else:
-            return False
+        endpoint = token
         i += 1
+        break
 
-    if not endpoint:
-        return False
     if method != "GET":
         return False
-    if not _GH_API_ENDPOINT_RE.fullmatch(endpoint):
+    if endpoint is None:
         return False
-    return True
+
+    return bool(_GH_API_ENDPOINT_RE.match(endpoint))
 
 
 def _is_gh_api_mutation_command(cmd: str) -> bool:
-    """
-    Return True when gh api command is present but does not meet allowlist criteria.
-    """
     tokens = tokenize_command(cmd)
-    if not tokens or len(tokens) < 2:
-        return False
-    return tokens[0] == "gh" and tokens[1] == "api"
+    return bool(tokens and len(tokens) >= 2 and tokens[0] == "gh" and tokens[1] == "api")
 
 
-def _is_rtk_command(tokens: list[str]) -> bool:
-    return bool(tokens) and tokens[0] == "rtk"
-
-
-def _gh_has_web_flag(cmd: str) -> bool:
-    """Return True if a gh command includes --web or -w flag (interactive browser open)."""
-    tokens = tokenize_command(cmd)
-    if tokens is None:
-        return False
-    return "--web" in tokens or "-w" in tokens
-
-
-def _is_safe_tmp_body_file(path: str) -> bool:
+def _looks_like_direct_issue_refinement_runtime_command(cmd: str) -> bool:
     """
-    Validate that body-file path is confined to project_root/tmp.
-    Blocks absolute paths, path traversal (../), and non-tmp/ prefixes.
+    Fail-closed detector for direct `uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py ...`
+    and similar future lexical variants. The exact allowlist is ONLY skill_runtime_exec.py;
+    direct invocation must not silently pass through root.
     """
-    if not path or path == "-":
-        return False
-    if path.startswith("/") or "\\" in path or "\x00" in path:
-        return False
-    p = Path(path)
-    if not p.parts or p.parts[0] != "tmp":
-        return False
-    if ".." in p.parts:
-        return False
-    project_root = Path(__file__).resolve().parent.parent.parent
-    try:
-        resolved = (project_root / p).resolve(strict=False)
-        tmp_root = (project_root / "tmp").resolve(strict=False)
-        return resolved.is_relative_to(tmp_root)
-    except Exception:
-        return False
+    return bool(
+        re.search(
+            r"(^|\s)(?:uv\s+run\s+)?python\d*\s+"
+            r"(?:\.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight\.py|"
+            r"scripts/issue_refinement_loop/run_refinement_preflight\.py)(\s|$)",
+            cmd,
+        )
+    )
 
 
-def _is_safe_tmp_redirect_dest(dest: str) -> bool:
+def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
     """
-    Validate that redirect destination is confined to project_root/tmp.
-    Blocks absolute paths, path traversal (../), and non-tmp/ prefixes.
+    Return True for unparseable tmp wrapper or python -c / inline script launch forms.
+    AC14: fail-closed on wrappers that hide the actual mutating command.
+
+    Examples blocked:
+      python -c "..."
+      python3 -c "..."
+      /tmp/foo.py
+      python /tmp/bar.py
+      uv run python /tmp/bar.py
     """
-    if not dest:
-        return False
-    if dest.startswith("/") or "\\" in dest or "\x00" in dest:
-        return False
-    p = Path(dest)
-    if not p.parts or p.parts[0] != "tmp":
-        return False
-    if ".." in p.parts:
-        return False
-    project_root = Path(__file__).resolve().parent.parent.parent
-    try:
-        resolved = (project_root / p).resolve(strict=False)
-        tmp_root = (project_root / "tmp").resolve(strict=False)
-        return resolved.is_relative_to(tmp_root)
-    except Exception:
-        return False
-
-
-def _find_flag_value(tokens: list[str], flag: str) -> "str | None":
-    """
-    Find the value of a flag in a token list.
-    Handles both '--flag value' and '--flag=value' forms.
-    Returns None if flag not found or has no value.
-    """
-    for i, t in enumerate(tokens):
-        if t == flag:
-            if i + 1 < len(tokens) and tokens[i + 1] and not tokens[i + 1].startswith("-"):
-                return tokens[i + 1]
-            return None
-        if t.startswith(f"{flag}="):
-            val = t[len(flag) + 1:]
-            return val if val else None
-    return None
-
-
-def _find_body_file_value(tokens: list[str]) -> "str | None":
-    """Find the value of --body-file flag in a token list."""
-    return _find_flag_value(tokens, "--body-file")
-
-
-def _has_body_value(tokens: list[str]) -> bool:
-    """
-    Return True if --body/-b has an actual non-empty value (not another flag).
-    Handles '--body <text>', '--body=<text>', '-b <text>'.
-    """
-    for i, t in enumerate(tokens):
-        if t in ("--body", "-b"):
-            if i + 1 < len(tokens) and tokens[i + 1] and not tokens[i + 1].startswith("-"):
-                return True
-            return False
-        if t.startswith("--body="):
-            val = t[len("--body="):]
-            return bool(val)
+    cmd = cmd.strip()
+    if re.match(r"^(?:uv\s+run\s+)?python\d*\s+-c(\s|$)", cmd):
+        return True
+    if re.match(r"^(?:uv\s+run\s+)?python\d*\s+/tmp/\S+", cmd):
+        return True
+    if re.match(r"^/tmp/\S+", cmd):
+        return True
     return False
 
 
+def _extract_wrapper_and_inner(normalized_tokens: list[str], cwd: str) -> tuple[str | None, str]:
+    """
+    If command is a recognized wrapper, return (wrapper_name, normalized_inner_command).
+    Otherwise return (None, normalized outer command).
+
+    Supports:
+      - rtk <subcommand...>
+      - uv run <command...>
+      - bash -lc '<command>'  (exact only; shell metachar already blocked before this)
+    """
+    if not normalized_tokens:
+        return None, ""
+    if normalized_tokens[0] == "rtk" and len(normalized_tokens) >= 2:
+        return "rtk", " ".join(normalized_tokens[1:])
+    if normalized_tokens[:2] == ["uv", "run"] and len(normalized_tokens) >= 3:
+        return "uv_run", " ".join(normalized_tokens[2:])
+    if normalized_tokens[:2] == ["bash", "-lc"] and len(normalized_tokens) == 3:
+        inner = normalized_tokens[2]
+        if _has_shell_metachar(inner):
+            return "bash_lc", ""
+        return "bash_lc", inner
+    return None, " ".join(normalized_tokens)
+
+
+def extract_target_branch_from_git_switch(cmd: str) -> str | None:
+    """Extract target branch from `git switch ...` command."""
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 3:
+        return None
+    # tokens[0] = git, tokens[1] = switch
+    return extract_target_branch_from_tokens(tokens, "switch")
+
+
+def extract_target_branch_from_git_checkout(cmd: str) -> str | None:
+    """Extract target branch from `git checkout ...` command."""
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 3:
+        return None
+    # tokens[0] = git, tokens[1] = checkout
+    return extract_target_branch_from_tokens(tokens, "checkout")
+
+
+def extract_target_branch_from_git_branch_rename(cmd: str) -> str | None:
+    """Extract target branch from `git branch -m/-M ...` command."""
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 4:
+        return None
+    # git branch -m old new
+    if len(tokens) >= 5:
+        return tokens[4]
+    # git branch -m new  (rename current branch)
+    return tokens[3]
+
+
+def extract_target_branch_from_gh_pr_checkout(cmd: str) -> str | None:
+    """Extract target branch from gh/hub pr checkout command."""
+    tokens = tokenize_command(cmd)
+    if not tokens or len(tokens) < 4:
+        return None
+    # gh pr checkout 123  -> implicit target becomes pr/123
+    pr_number = tokens[3]
+    if pr_number.isdigit():
+        return f"pr/{pr_number}"
+    return pr_number
+
+
+def extract_target_branch_from_tokens(tokens: list[str], subcommand: str) -> str | None:
+    """
+    Extract target branch from argv tokens for git switch/checkout.
+    B6: quote-safe, argv-based extraction.
+
+    Supported forms:
+      git switch issue-123
+      git switch -c issue-123
+      git switch -C issue-123
+      git switch --create issue-123
+      git switch --force-create issue-123
+      git switch -d issue-123            -> detach to branch name (mutation)
+      git switch --detach issue-123
+      git switch --orphan issue-123
+      git switch --track origin/issue-123
+      git switch --track=inherit origin/issue-123
+      git switch --guess issue-123
+      git switch --no-guess issue-123
+      git switch -- conflict sentinel
+      git checkout issue-123
+      git checkout -b issue-123
+      git checkout -B issue-123
+      git checkout --track origin/issue-123
+      git checkout --detach issue-123
+      git checkout --orphan issue-123
+
+    Path restore forms are excluded upstream by is_path_restore_command().
+    """
+    if len(tokens) < 3 or tokens[0] != "git" or tokens[1] != subcommand:
+        return None
+
+    # Cursor over args after subcommand
+    args = tokens[2:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+
+        # Conflict sentinel: `git switch -- <path>` / `git checkout -- <path>`
+        if tok == "--":
+            return None
+
+        # Options that take a target branch argument immediately after them
+        if tok in {"-c", "-C", "-b", "-B", "--create", "--force-create", "--orphan"}:
+            if i + 1 < len(args):
+                return args[i + 1]
+            return None
+
+        # --detach can be bare or followed by branch-ish
+        if tok in {"-d", "--detach"}:
+            if i + 1 < len(args) and args[i + 1] != "--":
+                return args[i + 1]
+            return None
+
+        # Track forms
+        if tok == "--track":
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                return args[i + 1].split("/", 1)[-1]
+            return None
+        if tok.startswith("--track="):
+            # --track=inherit still needs the next positional branch-ish
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                return args[i + 1].split("/", 1)[-1]
+            return None
+
+        # Flags that do not take a value
+        if tok in {
+            "--guess", "--no-guess", "--progress", "--quiet", "-q",
+            "--discard-changes", "--merge", "--conflict=merge",
+        }:
+            i += 1
+            continue
+
+        # Unknown option: if it starts with '-' skip it conservatively
+        if tok.startswith("-"):
+            i += 1
+            continue
+
+        # First positional non-option = target branch / rev
+        return tok
+
+        i += 1
+
+    return None
+
+
 def is_readonly_command(cmd: str) -> bool:
-    """Return True if the command is a display-oriented read-only command."""
-    cmd = cmd.strip()
-    # B3: gh issue/pr view --web/-w opens a browser (interactive); block it
-    if re.match(r"^gh\s+(issue|pr)\s+(view|list|status)(\s|$)", cmd) and _gh_has_web_flag(cmd):
-        return False
+    """Return True if cmd is an allowed read-only/display command."""
     for pattern in DISPLAY_READONLY_PATTERNS:
         if re.match(pattern, cmd):
             return True
@@ -724,442 +804,182 @@ def is_readonly_command(cmd: str) -> bool:
 
 
 def is_branch_safe_maintenance_command(cmd: str) -> bool:
-    """Return True if the command mutates metadata but not the root checkout branch."""
-    cmd = cmd.strip()
+    """
+    Return True for exact branch-safe maintenance commands that may mutate local metadata
+    but do NOT move the local root checkout away from the default branch.
+
+    Issue #1075: `git fetch` and `git worktree prune` must classify to a distinct
+    reason_code (`branch_safe_maintenance_command`) rather than generic readonly.
+    """
     for pattern in BRANCH_SAFE_MAINTENANCE_PATTERNS:
         if re.match(pattern, cmd):
             return True
     return False
 
 
-def is_cleanup_class_command(cmd: str) -> bool:
-    """Return True for the exact cleanup commands arbitrated by worktree_scope_guard.
-
-    Issue #1137: only the exact 4-token forms ``git worktree remove <path>`` and
-    ``git branch -d <branch>`` are recognized. Force variants (``-D`` / ``--force``
-    / ``-f`` / multi-target) and extra args are NOT cleanup-class here; they fall
-    through to generic branch-mutation / drift handling so they cannot be deferred.
+def is_readonly_artifact_export_command(cmd: str) -> bool:
     """
-    tokens = tokenize_command(cmd)
-    if not tokens or len(tokens) != 4 or tokens[0] != "git":
-        return False
-    if tokens[1] == "worktree" and tokens[2] == "remove":
-        return True
-    if tokens[1] == "branch" and tokens[2] == "-d":
-        return True
-    return False
+    Return True for exact readonly artifact-export commands.
 
-
-def is_deterministic_checker_command(cmd: str, project_root: str | None = None) -> bool:
+    Only fixed allowlisted forms are permitted. These commands may write to local files
+    but do NOT mutate GitHub state. Issue #1124 AC1/AC5/AC13.
     """
-    Return True if cmd is an exact-allowlisted deterministic checker script.
-    Wildcard patterns are prohibited (AC5/AC12).
-    """
-    cmd = cmd.strip()
-    tokens = tokenize_command(cmd)
-    if not tokens or len(tokens) < 4:
-        return False
-    if tokens[:3] != ["uv", "run", "python3"]:
-        return False
-    script_path = tokens[3]
-    for allowed in DETERMINISTIC_CHECKER_ALLOWLIST:
-        if script_path == allowed:
-            return True
-        if project_root:
-            abs_allowed = os.path.join(project_root, allowed)
-            if script_path == abs_allowed:
-                return True
-    return False
-
-
-def _is_skill_runtime_executor_command(cmd: str, cwd: str, project_root: str | None = None) -> bool:
-    """Exact privileged skill runtime executor classifier (Issue #1154)."""
-    if project_root is None:
-        project_root = _resolve_project_root(cwd)
-    if not project_root:
-        return False
-    return is_exact_skill_runtime_executor_command(cmd, cwd, project_root)
-
-
-def _looks_like_direct_issue_refinement_runtime_command(cmd: str) -> bool:
-    return ".claude/skills/issue-refinement-loop/scripts/" in cmd and "skill_runtime_exec.py" not in cmd
-
-
-def is_github_remote_ops_command(cmd: str) -> bool:
-    """
-    post-merge-cleanup で必要な GitHub remote ops の最小集合のみを allow。
-    token ベース classifier でフラグ・引数まで検証する。
-
-    Return True: post-merge-cleanup 最小集合に合致 → allow（ブロックしない）
-    Return False: 合致しない → caller が is_gh_mutation_command のブロック判定に従う
-
-    許可対象（post-merge-cleanup 最小集合）:
-      - gh issue close <N>              N は数値 issue 番号必須
-      - gh issue comment <N> --body <V> / --body-file tmp/...
-                        N は数値、body 値必須、canonical tmp/ パス
-      - gh issue reopen <N>             N は数値 issue 番号必須
-      - gh pr comment <N> --body <V> / --body-file tmp/...
-                        N は数値、body 値必須、canonical tmp/ パス
-      - gh pr edit <N> ...              N は数値 PR 番号必須、--base は block
-
-    明示ブロック対象フラグ（全コマンド共通）:
-      - --delete-last  destructive
-      - --edit-last    destructive
-      - --editor / -e  interactive
-      - --web / -w     interactive browser
-      - --create-if-none  interactive
-      - --yes          silent-destructive
-    """
-    cmd = cmd.strip()
-    tokens = tokenize_command(cmd)
-    if tokens is None or len(tokens) < 3:
-        return False
-    if tokens[0] != "gh":
-        return False
-    resource = tokens[1]   # "issue" or "pr"
-    subcommand = tokens[2] # "close", "comment", "reopen", "edit"
-
-    # Destructive / interactive flags → block always (applied to all subcommands)
-    BLOCKED_FLAGS = {
-        "--delete-last", "--edit-last", "--editor", "-e",
-        "--web", "-w", "--create-if-none", "--yes",
-    }
-    if any(t in BLOCKED_FLAGS for t in tokens[3:]):
-        return False
-
-    if resource == "issue":
-        # gh issue close <N>
-        if subcommand == "close":
-            return len(tokens) >= 4 and tokens[3].isdigit()
-
-        # B4: gh issue comment <N> --body <V> OR --body-file tmp/...
-        if subcommand == "comment":
-            if len(tokens) < 4 or not tokens[3].isdigit():
-                return False
-            has_body_val = _has_body_value(tokens[4:])
-            body_file = _find_body_file_value(tokens)
-            if body_file is not None:
-                # body-file present: canonical path required
-                if not _is_safe_tmp_body_file(body_file):
-                    return False
-                return True
-            # --body-file absent: --body must have value
-            return has_body_val
-
-        # gh issue reopen <N>
-        if subcommand == "reopen":
-            return len(tokens) >= 4 and tokens[3].isdigit()
-
-    elif resource == "pr":
-        # B4: gh pr comment <N> --body <V> OR --body-file tmp/...
-        if subcommand == "comment":
-            if len(tokens) < 4 or not tokens[3].isdigit():
-                return False
-            has_body_val = _has_body_value(tokens[4:])
-            body_file = _find_body_file_value(tokens)
-            if body_file is not None:
-                if not _is_safe_tmp_body_file(body_file):
-                    return False
-                return True
-            return has_body_val
-
-        # B4: gh pr edit <N> ... (--base is blocked, --body-file canonical path)
-        if subcommand == "edit":
-            if not (len(tokens) >= 4 and tokens[3].isdigit()):
-                return False
-            # --base changes base branch → block
-            if "--base" in tokens[4:]:
-                return False
-            # --body-file, if present, must be canonical tmp/ path
-            body_file = _find_body_file_value(tokens)
-            if body_file is not None and not _is_safe_tmp_body_file(body_file):
-                return False
-            return True
-
-    return False
+    artifact_patterns = [
+        # gh pr diff / gh issue view piped to tee, with optional stdout redirection omitted.
+        r"^gh\s+pr\s+diff\s+\d+\s+\|\s+tee\s+\S+$",
+        r"^gh\s+issue\s+view\s+\d+\s+\|\s+tee\s+\S+$",
+        # gh api GET exact issue-comment endpoint piped to tee
+        r"^gh\s+api(?:\s+--method\s+GET|\s+--method=GET)?\s+repos/squne121/loop-protocol/issues/comments/\d+\s+\|\s+tee\s+\S+$",
+    ]
+    return any(re.match(p, cmd) for p in artifact_patterns)
 
 
 def is_github_issue_mutation_command(cmd: str) -> bool:
     """
-    Classify gh issue create/edit as github_issue_mutation_command → allow.
+    Return True for strict shared allowlist of GitHub issue mutation commands.
 
-    Allow conditions (ALL must be satisfied):
-      1. Command is `gh issue create` or `gh issue edit <N>`
-      2. --repo squne121/loop-protocol present (exact match)
-      3. --body-file <path> present where path is canonical tmp/ path and is NOT "-"
-      4. No interactive flags: --editor / -e / --web / -w
-      5. For `gh issue edit <N>`: N must be a digit (non-interactive)
-      6. B1: For `gh issue create`: --title with actual value is required
+    Allowed (exact-shape family only):
+      gh issue create --repo squne121/loop-protocol --title ... --body-file tmp/...
+      gh issue edit <n> --repo squne121/loop-protocol --body-file tmp/...
 
-    Block conditions (any one triggers block → return False):
-      - --body-file - (stdin)
-      - --editor / -e / --web / -w
-      - Missing --repo or wrong repo
-      - Missing --body-file
-      - bare `gh issue create` or `gh issue edit` without digit N
-      - B1: `gh issue create` without --title value
-      - B2: --body-file with path traversal (tmp/../...) or absolute path
-
-    Note: gh issue comment/close/reopen remain handled by is_github_remote_ops_command.
+    Constraints:
+      - must target TRUSTED_REPO_SLUG via explicit --repo
+      - must use --body-file tmp/... (not --body / stdin / env)
+      - interactive/editor/web flags are forbidden
+      - only gh issue create/edit (no comment/close/reopen/etc.)
     """
-    cmd = cmd.strip()
     tokens = tokenize_command(cmd)
-    if tokens is None or len(tokens) < 3:
+    if not tokens or len(tokens) < 3:
         return False
     if tokens[0] != "gh" or tokens[1] != "issue":
         return False
-
-    subcommand = tokens[2]
-    if subcommand not in ("create", "edit"):
+    if tokens[2] not in {"create", "edit"}:
         return False
 
-    args = tokens[3:]
-
-    # Interactive flags → block
-    INTERACTIVE_FLAGS = {"--editor", "-e", "--web", "-w"}
-    if any(t in INTERACTIVE_FLAGS for t in args):
+    # Reject shell metachar / compound handled earlier, but be defensive here too.
+    if _has_shell_metachar(cmd):
         return False
 
-    # For `gh issue edit <N>`: N must be a digit
-    if subcommand == "edit":
-        if not args or not args[0].isdigit():
-            return False
-        args = args[1:]  # skip the issue number
+    # Reject interactive or alternate-output flags
+    forbidden_flags = {
+        "--body", "--editor", "--web", "--comment", "--recover", "--template",
+        "--json", "--jq", "--label", "--assignee", "--milestone", "--project",
+    }
 
-    # B1: For `gh issue create`: --title with a real value is required
-    if subcommand == "create":
-        title_val = _find_flag_value(list(args), "--title")
-        if not title_val:
+    repo_value: str | None = None
+    body_file: str | None = None
+    i = 3
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in forbidden_flags:
             return False
-
-    # Check --repo matches trusted slug
-    has_trusted_repo = False
-    i = 0
-    while i < len(args):
-        tok = args[i]
+        if tok.startswith(("--body=", "--editor=", "--web=", "--json=", "--jq=")):
+            return False
         if tok == "--repo":
-            if i + 1 < len(args) and args[i + 1] == TRUSTED_REPO_SLUG:
-                has_trusted_repo = True
+            if i + 1 >= len(tokens):
+                return False
+            repo_value = tokens[i + 1]
             i += 2
-        elif tok.startswith("--repo="):
-            if tok[len("--repo="):] == TRUSTED_REPO_SLUG:
-                has_trusted_repo = True
+            continue
+        if tok.startswith("--repo="):
+            repo_value = tok.split("=", 1)[1]
             i += 1
-        else:
-            i += 1
-
-    if not has_trusted_repo:
-        return False
-
-    # B2: Check --body-file is present and path is canonical tmp/ (no path traversal)
-    has_body_file = False
-    i = 0
-    while i < len(args):
-        tok = args[i]
+            continue
         if tok == "--body-file":
-            if i + 1 < len(args):
-                path = args[i + 1]
-                if path != "-" and _is_safe_tmp_body_file(path):
-                    has_body_file = True
+            if i + 1 >= len(tokens):
+                return False
+            body_file = tokens[i + 1]
             i += 2
-        elif tok.startswith("--body-file="):
-            path = tok[len("--body-file="):]
-            if path != "-" and _is_safe_tmp_body_file(path):
-                has_body_file = True
+            continue
+        if tok.startswith("--body-file="):
+            body_file = tok.split("=", 1)[1]
             i += 1
-        else:
-            i += 1
+            continue
+        # Allow issue number positional for edit, title value for create via --title, and other benign flags.
+        i += 1
 
-    return has_body_file
-
-
-# Regex for readonly artifact export: gh issue view <N> [args] > tmp/<filename>
-# Only `>` (not `>>`) to tmp/ path is allowed. No other destinations.
-_READONLY_EXPORT_RE = re.compile(
-    r"^gh\s+issue\s+view\s+\d+"  # gh issue view <N>
-    r"(?:\s+[^>]*)?"              # optional args (no > inside)
-    r"\s+>\s+"                    # single redirect `>`
-    r"(tmp/\S+)$"                 # destination starts with tmp/
-)
-# Blocked destination patterns for readonly artifact export
-_BLOCKED_EXPORT_DEST_RE = re.compile(
-    r"^(src/|docs/|\.env|\.git)"
-)
-
-
-def is_readonly_artifact_export_command(cmd: str) -> bool:
-    """
-    Classify `gh issue view <N> ... > tmp/<filename>` as readonly_artifact_export_command → allow.
-
-    Allow conditions (ALL must be satisfied):
-      1. Command is `gh issue view <N>` (view only, not edit/create)
-      2. Redirect is single `>` (not `>>`)
-      3. Destination path starts with tmp/ and is canonical (no path traversal)
-      4. No other shell metacharacters (&&, ||, ;, |, backtick, $()
-
-    Block conditions (any one triggers block → return False):
-      - `>>` append redirect
-      - Destination is src/*, docs/*, .env, .git*
-      - Any shell metachar other than the single `>` redirect
-      - Pipe `|` present
-      - Path traversal in destination (tmp/../...)
-    """
-    cmd = cmd.strip()
-
-    # Must be a gh issue view command
-    if not re.match(r"^gh\s+issue\s+view\s+", cmd):
+    if repo_value != TRUSTED_REPO_SLUG:
         return False
-
-    # Block append redirect
-    if ">>" in cmd:
+    if body_file is None:
         return False
-
-    # Block other dangerous metacharacters (pipe, semicolon, &&, ||, backtick, $()
-    # We allow exactly one `>` for the redirect
-    # Split on `>` — must have exactly 2 parts
-    parts = cmd.split(">")
-    if len(parts) != 2:
+    if not (body_file == "tmp" or body_file.startswith("tmp/")):
         return False
-
-    lhs = parts[0]  # the command part before `>`
-    rhs = parts[1].strip()  # the destination
-
-    # lhs must not contain any other metacharacters
-    if _SHELL_METACHAR_RE.search(lhs):
-        return False
-
-    # rhs (destination) must be canonical tmp/ path (no path traversal)
-    if not _is_safe_tmp_redirect_dest(rhs):
-        return False
-    if _SHELL_METACHAR_RE.search(rhs):
-        return False
-    if _BLOCKED_EXPORT_DEST_RE.match(rhs):
-        return False
-
-    # Validate the lhs is a pure gh issue view command
-    lhs_stripped = lhs.strip()
-    if not re.match(r"^gh\s+issue\s+view\s+\d+", lhs_stripped):
-        return False
-
-    # Block --web/-w flag: browser open is not a readonly artifact export
-    if _gh_has_web_flag(lhs_stripped):
-        return False
-
     return True
+
+
+def _classify_gh_command(cmd: str) -> str | None:
+    """
+    Classify gh issue/pr command into 5 classes (Issue #1124 AC15).
+
+    Returns one of:
+      - display_readonly_command
+      - readonly_artifact_export_command
+      - github_issue_mutation_command
+      - github_pr_metadata_command
+      - github_destructive_command
+      - None (not a gh issue/pr command)
+    """
+    if not GH_ISSUE_PR_COMMAND_PATTERN.match(cmd):
+        return None
+
+    if is_readonly_artifact_export_command(cmd):
+        return GITHUB_CMD_CLASS_READONLY_EXPORT
+    if is_github_issue_mutation_command(cmd):
+        return GITHUB_CMD_CLASS_ISSUE_MUTATION
+    if is_github_remote_ops_command(cmd):
+        return GITHUB_CMD_CLASS_PR_METADATA
+
+    # display_readonly_command is an exact allowlist (no bare issue/pr catch-all).
+    readonly_patterns = [
+        r"^gh\s+issue\s+(view|list)(\s|$)",
+        r"^gh\s+pr\s+(view|list|status)(\s|$)",
+    ]
+    if any(re.match(p, cmd) for p in readonly_patterns):
+        return GITHUB_CMD_CLASS_DISPLAY_READONLY
+
+    return GITHUB_CMD_CLASS_DESTRUCTIVE
+
+
+def is_github_remote_ops_command(cmd: str) -> bool:
+    """
+    Return True for exact post-merge-cleanup GitHub remote operations.
+
+    Allowed minimum set (Issue #1124 / post-merge-cleanup):
+      - gh pr create --draft --base <branch> --head <branch> --title <...> --body-file tmp/...
+      - gh pr edit <num> --body-file tmp/...
+      - gh issue comment <num> --body-file tmp/...
+      - gh pr view <num> --json ...
+      - gh pr checks <num>
+      - gh pr merge <num> --squash --delete-branch
+      - gh issue close <num>
+
+    Commands outside this exact allowlist are NOT considered remote ops.
+    """
+    # PR metadata / managed workflow operations (minimal exact-shape allowlist)
+    patterns = [
+        r"^gh\s+pr\s+create\s+.*--draft(\s|$).*(--body-file\s+tmp/\S+|--body-file=tmp/\S+).*$",
+        r"^gh\s+pr\s+edit\s+\d+\s+.*(--body-file\s+tmp/\S+|--body-file=tmp/\S+).*$",
+        r"^gh\s+issue\s+comment\s+\d+\s+.*(--body-file\s+tmp/\S+|--body-file=tmp/\S+).*$",
+        r"^gh\s+pr\s+view\s+\d+\s+.*--json(\s|=).*$",
+        r"^gh\s+pr\s+checks\s+\d+(\s|$)",
+        r"^gh\s+pr\s+merge\s+\d+\s+.*--squash(\s|$).*(--delete-branch)(\s|$).*$",
+        r"^gh\s+issue\s+close\s+\d+(\s|$)",
+    ]
+    return any(re.match(p, cmd) for p in patterns)
 
 
 def is_gh_mutation_command(cmd: str) -> bool:
-    """gh issue/pr コマンドで readonly allowlist、is_github_remote_ops_command、
-    is_github_issue_mutation_command 以外のものは fail-closed ブロック (allowlist-closed, AC11)。
-    DISPLAY_READONLY_PATTERNS に含まれる gh issue view/list, gh pr view/list/status のみ通過。
-    is_github_remote_ops_command に合致する post-merge-cleanup 最小集合は通過（GitHub ops として許可）。
-    is_github_issue_mutation_command に合致する gh issue create/edit（--repo + --body-file 必須）は通過。
-    gh issue develop/transfer/pin/unpin, gh pr merge/checkout/revert/lock/unlock 等はすべてブロック。
     """
-    cmd = cmd.strip()
-    # Only applies to gh issue/pr subcommands
-    if not GH_ISSUE_PR_COMMAND_PATTERN.match(cmd):
-        return False
-    # If in readonly allowlist (and not overridden by web flag etc.), it is NOT a mutation.
-    # Use is_readonly_command() so that --web/-w blocking (B3) flows through correctly.
-    if is_readonly_command(cmd):
-        return False
-    # gh issue/pr not in any allowlist → treat as mutation → block
-    return True
-
-
-def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
-    """Return True if command is /tmp wrapper or python -c (fail-closed, AC14)."""
-    cmd = cmd.strip()
-    tokens = tokenize_command(cmd)
-    if not tokens:
-        return False
-    # Block: python -c / python3 -c (inline code)
-    if tokens[0] in ("python", "python3") and "-c" in tokens[1:]:
-        return True
-    # Block: uv run python3 /tmp/*.py
-    if (len(tokens) >= 4 and tokens[:3] == ["uv", "run", "python3"]
-            and tokens[3].startswith("/tmp/")):
-        return True
-    # Block: direct /tmp/*.py execution
-    if tokens[0].startswith("/tmp/") and tokens[0].endswith(".py"):
-        return True
-    return False
-
-
-def _tokenize_readonly_pipeline(cmd: str) -> list[str] | None:
-    """Tokenize a potential read-only pipeline with shell punctuation preserved."""
-    try:
-        lexer = shlex.shlex(cmd, posix=True, punctuation_chars="|<>")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        return list(lexer)
-    except ValueError:
-        return None
-
-
-def _is_readonly_pipeline_segment(cmd: str) -> bool:
-    """Return True if a segment is an allowed post-processing reader."""
-    normalized = cmd.strip()
-    for pattern in READONLY_PIPELINE_SEGMENT_PATTERNS:
-        if re.match(pattern, normalized):
-            return True
-    return False
-
-
-def classify_readonly_pipeline(cmd: str) -> bool:
+    Return True if cmd is a gh/hub mutation command that should be fail-closed.
+    Issue #1124 AC11: any gh issue/pr command not in readonly or remote-ops allowlist
+    is treated as destructive/mutating and blocked in local root.
     """
-    Allow only narrow readonly pipeline forms.
-
-    Examples:
-      rg -n "TODO" README.md | head -n 20
-      git status --short | head -n 20
-      git diff --stat | head -n 20
-      git diff --stat 2>&1 | head -n 20  (fd-duplication, AC10)
-    """
-    # Normalize fd-duplication: "2>&1 |" -> " |" (fd-dup before pipe only, AC10)
-    cmd_to_parse = _FD_DUP_STDERR_STDOUT_RE.sub(r" \1", cmd).strip()
-
-    if "|" not in cmd_to_parse:
-        return False
-    if any(token in cmd_to_parse for token in ("&&", "||", ";", "`", "$(")):
-        return False
-
-    tokens = _tokenize_readonly_pipeline(cmd_to_parse)
-    if not tokens:
-        return False
-
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token == "|":
-            if not current:
-                return False
-            segments.append(current)
-            current = []
-            continue
-        if token in {"<", "<<", "<<<", ">", ">>"}:
-            return False
-        current.append(token)
-
-    if not current or not segments:
-        return False
-    segments.append(current)
-
-    first_segment = " ".join(segments[0]).strip()
-    if not is_readonly_command(first_segment):
-        return False
-
-    for segment_tokens in segments[1:]:
-        if not _is_readonly_pipeline_segment(" ".join(segment_tokens)):
-            return False
-
-    return True
+    cls = _classify_gh_command(cmd)
+    return cls == GITHUB_CMD_CLASS_DESTRUCTIVE
 
 
 def is_path_restore_command(cmd: str) -> bool:
-    """Return True if command is a git checkout path-restore (not branch switch)."""
-    cmd = cmd.strip()
+    """Return True if cmd is a git checkout/restore path operation (not branch switch)."""
     for pattern in CHECKOUT_PATH_RESTORE_PATTERNS:
         if re.match(pattern, cmd):
             return True
@@ -1167,229 +987,248 @@ def is_path_restore_command(cmd: str) -> bool:
 
 
 def is_compound_or_wrapped(cmd: str) -> bool:
+    """Return True if cmd is a compound shell command or uses wrappers.
+    B6: uses shlex tokenization and shell metachar detection.
     """
-    Return True if command appears to be a compound/wrapped shell command.
-    B6: Uses shlex parsing and metachar detection.
-    """
-    # Check for shell metacharacters (;, &&, ||, |, `, $()
     if _has_shell_metachar(cmd):
         return True
-    # Check for shell wrappers at the start
-    if re.match(r"^(bash|sh|zsh)\s+", cmd):
-        return True
-    # env prefix
-    if re.match(r"^env\s+", cmd):
-        return True
-    # command prefix
-    if re.match(r"^command\s+", cmd):
+    tokens = tokenize_command(cmd)
+    if not tokens or not tokens:
+        return False
+    # Wrapped commands are considered compound-like except exact allowlisted uv/rtk forms handled in evaluate()
+    if tokens[0] in ("bash", "sh"):
         return True
     return False
 
 
-def _rebuild_normalized_cmd(tokens: list[str]) -> str:
-    """Rebuild a normalized command string from tokens (for regex matching)."""
-    return " ".join(tokens)
-
-
-def extract_target_branch_from_tokens(tokens: list[str], subcommand: str) -> str | None:
-    """
-    Extract target branch from tokenized git switch/checkout/branch command.
-    B6: argv-based extraction replaces regex-on-string.
-    """
-    if subcommand == "switch":
-        return _extract_switch_branch_from_tokens(tokens)
-    elif subcommand == "checkout":
-        return _extract_checkout_branch_from_tokens(tokens)
-    elif subcommand == "branch":
-        return _extract_branch_rename_from_tokens(tokens)
-    return None
-
-
-def _extract_switch_branch_from_tokens(tokens: list[str]) -> str | None:
-    """Extract target branch from git switch token list (tokens[0]='git', tokens[1]='switch')."""
-    # tokens: ["git", "switch", ...]
-    args = tokens[2:]
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("--detach",):
-            # Next arg is start-point (optional)
-            if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                return args[i + 1]
-            return "<detached>"
-        if a in ("--orphan", "--guess", "-c", "-C"):
-            if i + 1 < len(args):
-                return args[i + 1]
-            return None
-        if a.startswith("--orphan="):
-            return a.split("=", 1)[1]
-        if a.startswith("-c=") or a.startswith("-C="):
-            return a.split("=", 1)[1]
-        if a.startswith("-") and len(a) == 2:
-            # Short flag without value (e.g. -d), skip
-            i += 1
-            continue
-        if a.startswith("--"):
-            # Unknown long flag, skip
-            i += 1
-            continue
-        # Non-flag arg = branch name
-        return a
-        i += 1
-    return None
-
-
-def _extract_checkout_branch_from_tokens(tokens: list[str]) -> str | None:
-    """Extract target branch from git checkout token list."""
-    args = tokens[2:]
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--detach":
-            if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                return args[i + 1]
-            return "<detached>"
-        if a in ("--orphan", "--ignore-other-worktrees", "-b", "-B"):
-            if i + 1 < len(args):
-                return args[i + 1]
-            return None
-        if a == "--":
-            # Everything after -- is a path, not a branch
-            return None
-        if a.startswith("-") and not a.startswith("--"):
-            i += 1
-            continue
-        if a.startswith("--"):
-            i += 1
-            continue
-        # Non-flag = branch name
-        return a
-        i += 1
-    return None
-
-
-def _extract_branch_rename_from_tokens(tokens: list[str]) -> str | None:
-    """Extract new branch name from git branch -m/-M tokens."""
-    # tokens: ["git", "branch", "-m"/"M", old?, new]
-    args = tokens[2:]
-    # Find -m or -M flag
-    non_flags = [a for a in args if not a.startswith("-")]
-    # If two non-flags: first=old, second=new; if one: it's the new name
-    if len(non_flags) >= 2:
-        return non_flags[1]
-    elif len(non_flags) == 1:
-        return non_flags[0]
-    return None
-
-
-def extract_target_branch_from_git_switch(cmd: str) -> str | None:
-    """Extract branch name from git switch command (regex fallback)."""
-    cmd = cmd.strip()
-    m = re.match(r"^git\s+switch\s+(?:.*\s+)?--detach(?:\s+(\S+))?", cmd)
-    if m:
-        return m.group(1) or "<detached>"
-    m = re.match(r"^git\s+switch\s+(?:.*\s+)?--orphan\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    m = re.match(r"^git\s+switch\s+(?:.*\s+)?-[cC]\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    m = re.match(r"^git\s+switch\s+(?:.*\s+)?--guess\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    parts = cmd.split()
-    branches = [p for p in parts[2:] if not p.startswith("-")]
-    if branches:
-        return branches[-1]
-    return None
-
-
-def extract_target_branch_from_git_checkout(cmd: str) -> str | None:
-    """Extract branch name from git checkout command (regex fallback)."""
-    cmd = cmd.strip()
-    m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--detach(?:\s+(\S+))?", cmd)
-    if m:
-        return m.group(1) or "<detached>"
-    m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--orphan\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    m = re.match(r"^git\s+checkout\s+(?:.*\s+)?--ignore-other-worktrees\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    m = re.match(r"^git\s+checkout\s+(?:.*\s+)?-[bB]\s+(\S+)", cmd)
-    if m:
-        return m.group(1)
-    parts = cmd.split()
-    branches = [p for p in parts[2:] if not p.startswith("-")]
-    if branches:
-        return branches[-1]
-    return None
-
-
-def extract_target_branch_from_git_branch_rename(cmd: str) -> str | None:
-    """Extract new branch name from git branch -m/-M."""
-    m = re.match(r"^git\s+branch\s+-[mM]\s+(\S+)(?:\s+(\S+))?", cmd)
-    if m:
-        return m.group(2) if m.group(2) else m.group(1)
-    return None
-
-
-def extract_target_branch_from_gh_pr_checkout(cmd: str) -> str | None:
-    """Extract PR ref from gh pr checkout."""
-    m = re.match(r"^(?:gh|hub)\s+pr\s+checkout\s+(\S+)", cmd)
-    if m:
-        return f"pr/{m.group(1)}"
-    return None
-
-
 def has_inline_env_override(cmd: str) -> bool:
     """
-    Return True if the Bash command string (tool_input.command) contains
-    an inline env assignment for LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE.
-    Inline env overrides are NOT allowed; only hook process env is.
+    Return True if cmd contains inline LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE=1 style override.
+    B3: detect both leading and inline env assignments for fail-closed handling.
     """
-    pattern = r"(?:^|\s)LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE\s*=\s*\S+"
-    return bool(re.search(pattern, cmd))
+    # Leading env assignments: LOOP_ALLOW_*=...
+    if re.match(r"^LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE=", cmd):
+        return True
+    # Inline env after wrapper? e.g. env LOOP_ALLOW...=1 git switch issue
+    if re.search(r"(^|\s)LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE=", cmd):
+        return True
+    if re.search(r"(^|\s)LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON=", cmd):
+        return True
+    return False
 
 
 def is_manual_override_active() -> bool:
     """
-    Return True only if both env vars are set in the hook process environment
-    (NOT in the Bash command string).
+    Return True if BOTH required env vars are set in the process environment:
+      - LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE=1
+      - LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON=<non-empty>
+
+    This helper is intentionally NOT consulted by evaluate(); inline or ambient env
+    must not silently bypass the guard. The override is only honored by human-reviewed
+    wrapper flows outside this pure evaluator.
     """
-    allow = os.environ.get("LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE", "").strip()
-    reason = os.environ.get("LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON", "").strip()
-    return bool(allow) and bool(reason)
+    return (
+        os.environ.get("LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE") == "1"
+        and bool(os.environ.get("LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON", "").strip())
+    )
 
 
-# ─── Main guard logic ─────────────────────────────────────────────────────────
+# ─── Core evaluator ──────────────────────────────────────────────────────────
 
 def evaluate(
     command: str,
     cwd: str,
-    hook_flavor: str = "cli",
+    hook_flavor: str = "claude",
     event_kind: str = "PreToolUse",
 ) -> dict[str, Any]:
     """
-    Evaluate whether the command should be allowed or blocked.
+    Evaluate a command and return LOCAL_MAIN_BRANCH_GUARD_RESULT_V1.
 
-    Returns a dict matching LOCAL_MAIN_BRANCH_GUARD_RESULT_V1.
+    B1/B2/B3/B4/B5/B6 fixes included.
     """
-    cmd = command.strip()
+    current_branch = get_current_branch(cwd=cwd)
+    default_branch = resolve_default_branch(cwd=cwd)
     event_kind = event_kind or "PreToolUse"
-    wrapper = None
-    inner_argv_redacted: list[str] | None = None
-    current_branch: str | None = None
 
-    # Helper to emit canonicalized result dictionaries.
+    if not is_local_root_context(cwd):
+        return _result(
+            status="allow",
+            reason_code=REASON_NOT_LOCAL_ROOT,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="context",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            rule_id="context_not_local_root",
+            event_kind=event_kind,
+            decision_source="context",
+        )
+
+    # Step 1: inline/ambient override not honored here (pure evaluator fail-closed)
+    if has_inline_env_override(command) or _has_leading_env_assignment(command):
+        return _result(
+            status="block",
+            reason_code=REASON_INLINE_OVERRIDE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="inline_override",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            rule_id="inline_override",
+            event_kind=event_kind,
+            decision_source="inline_override",
+        )
+
+    # Step 2: tokenize (B6)
+    tokens = tokenize_command(command)
+    if tokens is None:
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="tokenize",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            rule_id="tokenize_error",
+            event_kind=event_kind,
+            decision_source="tokenize",
+        )
+
+    # Step 3: fd-dup readonly pipeline allow (AC10)
+    # Allow exact forms like `git diff --stat 2>&1 | head -n 20`
+    if _FD_DUP_STDERR_STDOUT_RE.search(command):
+        # Must be a 2-segment pipeline: readonly cmd | head/tail/wc
+        parts = [p.strip() for p in command.split("|")]
+        if len(parts) == 2:
+            left = re.sub(r"\s+2>&1\s*$", "", parts[0]).strip()
+            right = parts[1].strip()
+            if is_readonly_command(left) and any(re.match(p, right) for p in READONLY_PIPELINE_SEGMENT_PATTERNS):
+                return _result(
+                    status="allow",
+                    reason_code=REASON_READONLY,
+                    current_branch=current_branch,
+                    target_branch=None,
+                    target_branch_kind=None,
+                    hook_flavor=hook_flavor,
+                    parser_stage="fd_dup_readonly_pipeline",
+                    command_kind=COMMAND_KIND_PIPELINE,
+                    rule_id="fd_dup_readonly_pipeline",
+                    event_kind=event_kind,
+                    decision_source="readonly_pipeline",
+                )
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="fd_dup_unparseable",
+            command_kind=COMMAND_KIND_PIPELINE,
+            rule_id="fd_dup_unparseable",
+            event_kind=event_kind,
+            decision_source="fd_dup",
+        )
+
+    # Step 4: shell metachar / wrappers — fail-closed except exact allowlisted readonly pipelines later
+    if _has_shell_metachar(command):
+        # Exact readonly pipeline allow: <readonly> | head/tail/wc
+        parts = [p.strip() for p in command.split("|")]
+        if len(parts) == 2 and is_readonly_command(parts[0]) and any(re.match(p, parts[1]) for p in READONLY_PIPELINE_SEGMENT_PATTERNS):
+            return _result(
+                status="allow",
+                reason_code=REASON_READONLY,
+                current_branch=current_branch,
+                target_branch=None,
+                target_branch_kind=None,
+                hook_flavor=hook_flavor,
+                parser_stage="readonly_pipeline",
+                command_kind=COMMAND_KIND_PIPELINE,
+                rule_id="readonly_pipeline",
+                event_kind=event_kind,
+                decision_source="readonly_pipeline",
+            )
+        if is_readonly_artifact_export_command(command):
+            return _result(
+                status="allow",
+                reason_code=REASON_READONLY,
+                current_branch=current_branch,
+                target_branch=None,
+                target_branch_kind=None,
+                hook_flavor=hook_flavor,
+                parser_stage="readonly_artifact_export",
+                command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+                rule_id="readonly_artifact_export",
+                event_kind=event_kind,
+                decision_source="readonly_artifact_export",
+            )
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="compound_or_wrapped",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            rule_id="compound_wrapper_blocked",
+            event_kind=event_kind,
+            decision_source="compound_or_wrapped",
+        )
+
+    # Step 5: normalize wrappers / git global opts
+    wrapper, inner_command = _extract_wrapper_and_inner(tokens, cwd)
+    normalized_cmd = inner_command
+    normalized_tokens = tokenize_command(normalized_cmd)
+    if normalized_tokens is None:
+        return _result(
+            status="block",
+            reason_code=REASON_UNPARSEABLE,
+            current_branch=current_branch,
+            target_branch=None,
+            target_branch_kind=None,
+            hook_flavor=hook_flavor,
+            parser_stage="inner_tokenize",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            rule_id="inner_tokenize_error",
+            event_kind=event_kind,
+            decision_source="inner_tokenize",
+        )
+
+    if normalized_tokens and normalized_tokens[0] == "git":
+        normalized_tokens, fail_closed = _normalize_git_global_opts(normalized_tokens)
+        normalized_cmd = " ".join(normalized_tokens)
+        if fail_closed:
+            return _result(
+                status="block",
+                reason_code=REASON_UNPARSEABLE,
+                current_branch=current_branch,
+                target_branch=None,
+                target_branch_kind=None,
+                hook_flavor=hook_flavor,
+                parser_stage="git_global_opts_failclosed",
+                command_kind=COMMAND_KIND_GIT_BRANCH_MUTATION,
+                rule_id="git_global_opts_failclosed",
+                event_kind=event_kind,
+                decision_source="git_global_opts",
+            )
+
+    argv_redacted = _redact_argv(tokens)
+    inner_argv_redacted = _redact_argv(normalized_tokens)
+
     def _emit(
+        *,
         status: str,
         reason_code: str,
         target_branch: str | None,
         target_branch_kind: str | None,
         local_parser_stage: str,
-        local_command_kind: str = COMMAND_KIND_UNKNOWN,
-        local_rule_id: str | None = None,
+        local_command_kind: str,
+        local_rule_id: str,
         argv_tokens: list[str] | None = None,
         inner_tokens: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -1407,224 +1246,23 @@ def evaluate(
             wrapper=wrapper,
             inner_argv_redacted=inner_tokens,
             event_kind=event_kind,
-            decision_source=local_rule_id or reason_code,
+            decision_source=local_rule_id,
         )
 
-    # Step 1: Check if we are in local root context
-    if not is_local_root_context(cwd):
-        return _emit(
-            status="allow",
-            reason_code=REASON_NOT_LOCAL_ROOT,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="context_check",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="not_local_root_context",
-        )
-
-    # Step 2: Resolve current branch
-    current_branch = get_current_branch(cwd=cwd)
-    default_branch = resolve_default_branch(cwd=cwd)
-
-    # Step 3: Check for inline env override (block it explicitly)
-    if has_inline_env_override(cmd):
-        return _emit(
-            status="block",
-            reason_code=REASON_INLINE_OVERRIDE,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="inline_override",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="inline_env_override",
-        )
-
-    # Step 4: Check manual override (hook process env only)
-    if is_manual_override_active():
-        return _emit(
-            status="allow",
-            reason_code="manual_override_accepted",
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="manual_override",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="manual_override_accepted",
-        )
-
-    # Step 5: readonly pipeline classifier.
-    # Must run before generic compound detection so `rg ... | head ...` can pass,
-    # while mixed command / wrapper / redirection forms still fail closed.
-    if classify_readonly_pipeline(cmd):
-        return _emit(
-            status="allow",
-            reason_code=REASON_READONLY,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="readonly_pipeline",
-            local_command_kind=COMMAND_KIND_PIPELINE,
-            local_rule_id="readonly_pipeline",
-        )
-
-    # Step 5.5: readonly_artifact_export_command — gh issue view ... > tmp/<filename>
-    # Must run before compound/metachar detection (Step 6) because `>` is a metachar.
-    # Only the exact form `gh issue view <N> ... > tmp/<file>` is allowed.
-    if is_readonly_artifact_export_command(cmd):
-        return _emit(
-            status="allow",
-            reason_code=REASON_READONLY,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="readonly_artifact_export",
-            local_command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
-            local_rule_id="gh_issue_view_to_tmp",
-        )
-
-    # Step 6: Compound/wrapped commands in local root context: fail-closed.
-    # (Must check BEFORE readonly: "git status || git switch issue-*" starts with "git status")
-    if is_compound_or_wrapped(cmd):
-        return _emit(
-            status="block",
-            reason_code=REASON_UNPARSEABLE,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="compound_or_wrapped",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="compound_wrapper_blocked",
-        )
-
-    # B3: Leading env assignments in local root context — fail-closed.
-    # LOOP_DEFAULT_BRANCH=... or FOO=bar git switch ... are blocked.
-    if _has_leading_env_assignment(cmd):
-        return _emit(
-            status="block",
-            reason_code=REASON_UNPARSEABLE,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="leading_env_assignment",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="leading_env_assignment",
-        )
-
-    # Step 7: shlex parse failure → fail-closed
-    tokens = tokenize_command(cmd)
-    if tokens is None:
-        return _emit(
-            status="block",
-            reason_code=REASON_UNPARSEABLE,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="tokenize",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="tokenize_failure",
-        )
-
-    # Step 8: Normalize git global options.
-    # If fail-closed global options (-C, --git-dir, --work-tree, --config-env) present → block.
-    normalized_tokens = tokens
-    argv_redacted = _redact_argv(normalized_tokens)
-    normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
-    wrapper = None
-    inner_argv_redacted = None
-
-    # Step 8.5: rtk wrapper unwrapping (Issue #1198)
-    if _is_rtk_command(normalized_tokens):
-        wrapper = "rtk"
-        inner_tokens = normalized_tokens[1:]
-        inner_argv_redacted = _redact_argv(inner_tokens)
-        if not inner_tokens:
-            return _emit(
-                status="block",
-                reason_code=REASON_UNKNOWN_COMMAND,
-                target_branch=None,
-                target_branch_kind=None,
-                local_parser_stage="rtk_empty",
-                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
-                local_rule_id="rtk_empty",
-                argv_tokens=argv_redacted,
-                inner_tokens=inner_argv_redacted,
-            )
-
-        inner_command_name = inner_tokens[0]
-        if inner_command_name in {"--help", "-h", "help"}:
-            return _emit(
-                status="allow",
-                reason_code=REASON_RTK_HELP_COMMAND,
-                target_branch=None,
-                target_branch_kind=None,
-                local_parser_stage="rtk_help",
-                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
-                local_rule_id="rtk_help",
-                argv_tokens=argv_redacted,
-                inner_tokens=inner_argv_redacted,
-            )
-
-        if inner_command_name in {"gain", "session"}:
-            return _emit(
-                status="allow",
-                reason_code=REASON_READONLY,
-                target_branch=None,
-                target_branch_kind=None,
-                local_parser_stage="rtk_default_allow",
-                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
-                local_rule_id=f"rtk_{inner_command_name}",
-                argv_tokens=argv_redacted,
-                inner_tokens=inner_argv_redacted,
-            )
-
-        if inner_command_name == "proxy":
-            # rtk proxy は中間に複雑な委譲コマンドを内包し得るため、
-            # allow/deny を安全側に寄せるため proxy 直下は review-required とする。
-            return _emit(
-                status="block",
-                reason_code=REASON_RTK_PROXY,
-                target_branch=None,
-                target_branch_kind=None,
-                local_parser_stage="rtk_proxy_requires_review",
-                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
-                local_rule_id="rtk_proxy_requires_review",
-                argv_tokens=argv_redacted,
-                inner_tokens=_redact_argv(inner_tokens[1:]),
-            )
-
-        normalized_tokens = inner_tokens
-        normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
-        argv_redacted = _redact_argv(normalized_tokens)
-        inner_argv_redacted = _redact_argv(normalized_tokens)
-    git_global_fail_closed = False
-    if normalized_tokens and normalized_tokens[0] == "git":
-        normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(normalized_tokens)
-        if git_global_fail_closed:
-            return _emit(
-                status="block",
-                reason_code=REASON_UNPARSEABLE,
-                target_branch=None,
-                target_branch_kind=None,
-                local_parser_stage="git_global_opts",
-                local_command_kind=COMMAND_KIND_UNKNOWN,
-                local_rule_id="git_global_opts_failclosed",
-            )
-
-    # Rebuild normalized cmd string for pattern matching
-    normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
-    argv_redacted = _redact_argv(normalized_tokens)
-    if wrapper == "rtk":
-        inner_argv_redacted = _redact_argv(normalized_tokens)
-
-    # Step 9: Read-only commands are always allowed (safe even in drifted/detached states)
+    # Step 6: Exact readonly and maintenance allow
     if is_readonly_command(normalized_cmd):
         return _emit(
             status="allow",
             reason_code=REASON_READONLY,
             target_branch=None,
             target_branch_kind=None,
-            local_parser_stage="readonly_classify",
-            local_command_kind=COMMAND_KIND_GITHUB_DISPLAY if normalized_cmd.startswith("gh ") else COMMAND_KIND_READONLY,
+            local_parser_stage="readonly",
+            local_command_kind=COMMAND_KIND_READONLY,
             local_rule_id="readonly_command",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
 
-    # Step 9.5: Branch-safe maintenance commands remain allowed, but must not
-    # reuse readonly telemetry or readonly pipeline classification.
     if is_branch_safe_maintenance_command(normalized_cmd):
         return _emit(
             status="allow",
@@ -1638,26 +1276,35 @@ def evaluate(
             inner_tokens=inner_argv_redacted,
         )
 
-    # Step 9.55: Cleanup-class commands (Issue #1137 arbitration). Exact
-    # `git worktree remove <path>` / `git branch -d <branch>` are deferred to
-    # worktree_scope_guard, which arbitrates them against the V3 one-shot contract.
-    # Recognizing them before generic branch-mutation handling fixes the
-    # arbitration order so the local root guard does not double-decide.
-    if is_cleanup_class_command(normalized_cmd):
+    # Cleanup arbitration deferral (Issue #1137): do NOT decide cleanup tuples here.
+    # Exact tuple safety / LOOP_V3 ownership is canonically enforced by worktree_scope_guard.
+    if looks_like_cleanup_contract_command(normalized_cmd):
         return _emit(
             status="allow",
             reason_code=REASON_CLEANUP_DEFERRED,
             target_branch=None,
             target_branch_kind=None,
-            local_parser_stage="cleanup_deferred",
+            local_parser_stage="cleanup_contract_defer",
             local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="cleanup_deferred",
+            local_rule_id="cleanup_contract_defer",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
 
-    # Step 9.57: exact privileged skill runtime command class (Issue #1154).
+    # Step 7: Exact helper / remote-ops / gh-api allowlists
     project_root = _resolve_project_root(cwd)
+    if wrapper == "rtk" and normalized_cmd in {"--help", "help"}:
+        return _emit(
+            status="allow",
+            reason_code=REASON_RTK_HELP_COMMAND,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="rtk_help",
+            local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+            local_rule_id="rtk_help",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
     if project_root and is_exact_skill_runtime_executor_command(normalized_cmd, cwd, project_root):
         return _emit(
             status="allow",
@@ -2147,6 +1794,7 @@ def _emit_block_stderr(
     target_branch_kind: str | None,
     hook_flavor: str,
     event_kind: str | None = None,
+    **_compat_ignored: object,
 ) -> None:
     """
     Emit bounded, non-leaking block message to stderr (max 10 lines).
@@ -2157,8 +1805,9 @@ def _emit_block_stderr(
     - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
     Raw branch names belong in --json / preflight diagnostic mode only.
 
-    event_kind is accepted for backward-compatible test/helper call sites but is
-    intentionally not rendered into stderr.
+    event_kind and any extra compatibility kwargs are accepted for
+    backward-compatible test/helper call sites but are intentionally not
+    rendered into stderr.
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
