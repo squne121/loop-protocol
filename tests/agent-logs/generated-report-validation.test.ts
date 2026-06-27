@@ -3,6 +3,7 @@ import { readFileSync } from 'fs'
 import { resolve } from 'path'
 
 import { validateAgentRunReport } from '../../scripts/lib/agent-run-report-validation.mjs'
+import { validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
 import {
   cleanupTempDir,
   createDraftArgs,
@@ -101,6 +102,17 @@ describe('generated agent run report', () => {
     expect(runNodeScript(FINALIZE_SCRIPT, createFinalizeArgs(draftPath, reportPathB)).exitCode).toBe(0)
 
     expect(readFileSync(reportPathA, 'utf-8')).toBe(readFileSync(reportPathB, 'utf-8'))
+  })
+
+  it('GIVEN a public surface report with missing entirecli_safety WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
+    // valid-basic.json has public_surface_kind: github_issue_comment but no entirecli_safety
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+  })
+
+  it('GIVEN a report with entirecli_safety not_applicable WHEN validateFinalReport is called THEN it passes', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-public-entirecli-not-applicable.json'))
+    expect(() => validateFinalReport(report)).not.toThrow()
   })
 
   it('GIVEN a draft with extra keys WHEN finalized THEN draft validation fails closed', () => {

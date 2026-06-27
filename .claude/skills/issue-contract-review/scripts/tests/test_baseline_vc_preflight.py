@@ -582,7 +582,16 @@ def test_confidence_json_fragment_parity():
 
     # Get fragment output
     fragment_result = subprocess.run(
-        [sys.executable, str(script_path), "--body-file", str(fixture), "--issue", "999", "--format", "contract-review-fragment"],
+        [
+            sys.executable,
+            str(script_path),
+            "--body-file",
+            str(fixture),
+            "--issue",
+            "999",
+            "--format",
+            "contract-review-fragment"
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -644,6 +653,99 @@ def test_pytest_invocation_detect_uv_run_pytest():
     assert _is_pytest_invocation("uv run --locked pytest")
     assert _is_pytest_invocation("uv run --with pytest pytest")
     assert _is_pytest_invocation("uv run python -m pytest")
+
+
+def test_uv_lock_check_exact_only():
+    """AC1: _is_uv_lock_check is exact-match only for uv lock --check"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_lock_check
+
+    assert _is_uv_lock_check(["uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])  # path-qualified rejected (Issue #1210)
+    assert not _is_uv_lock_check(["uv", "lock"])
+    assert not _is_uv_lock_check(["uv", "lock", "--upgrade"])
+    assert not _is_uv_lock_check(["uv", "sync"])
+    assert not _is_uv_lock_check(["uv", "run", "uv", "lock", "--check"])
+
+
+def test_runtime_dependency_smoke_exact_python_and_python3_only():
+    """AC2: canonical runtime smoke is allowed only for exact python/python3 invocation"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    assert _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "scripts/ci/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python3", "scripts/ci/runtime_dependency_smoke.py",
+    ])  # path-qualified uv rejected (Issue #1210)
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "python", "scripts/ci/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups", "python3",
+    ])
+
+
+def test_runtime_dependency_smoke_rejects_extra_uv_options():
+    """AC3: extra uv options are rejected for runtime smoke allowlist"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    forbidden_cases = [
+        ["uv", "run", "--with", "pytest", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--group", "dev", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--all-groups", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--extra", "feature", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--python", "/usr/bin/python3", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--project", ".", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--directory", ".", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--env-file", ".env", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--upgrade", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+    ]
+    for argv in forbidden_cases:
+        assert not _is_uv_runtime_smoke_command(argv), f"unexpected allow: {argv}"
+
+
+def test_runtime_dependency_smoke_rejects_inline_and_non_repo_scripts():
+    """AC4: runtime smoke rejects inline python and non-repo/invalid script paths"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    import sys
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "-c", "print(1)",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "-m", "pytest",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "../runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "/tmp/runtime_dependency_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "uv", "run", "--isolated", "--locked", "--no-default-groups",
+        "python", "scripts/other_smoke.py",
+    ])
+    assert not _is_uv_runtime_smoke_command([
+        "sh", "-lc",
+        "uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+    ])
 
 
 def test_pytest_invocation_detect_non_pytest():
@@ -772,7 +874,9 @@ def test_full_preflight_pytest_baseline_fail_status_pass():
     assert data["summary"]["expected_fail"] >= 1, "Expected at least 1 expected_fail in summary"
 
     # Summary should show human_judgment == 0
-    assert data["summary"]["human_judgment"] == 0, f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
+    assert data["summary"]["human_judgment"] == 0, (
+        f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
+    )
 
     # At least one result should be expected_fail
     assert len(data["results"]) > 0
@@ -1287,7 +1391,9 @@ $ test "$(wc -l < /nonexistent/file)" -le 10
             and r["exit_code"] is None  # not executed
             for r in results
         )
-        assert found, f"Command substitution should be blocked/unsupported_shell_syntax and not executed. Got: {results[0]}"
+        assert found, (
+            f"Command substitution should be blocked/unsupported_shell_syntax and not executed. Got: {results[0]}"
+        )
     finally:
         import os
         os.unlink(fixture_file)
@@ -1345,7 +1451,16 @@ $ rg "should_not_exist" src/
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
 
         result = subprocess.run(
-            [sys.executable, str(script_path), "--body-file", fixture_file, "--issue", "999", "--format", "contract-review-fragment"],
+            [
+                sys.executable,
+                str(script_path),
+                "--body-file",
+                fixture_file,
+                "--issue",
+                "999",
+                "--format",
+                "contract-review-fragment"
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1771,7 +1886,10 @@ def test_package_manager_no_tty_prompt_classified_as_tooling_blocker_after_runne
     classification, category, decision, fix_hint, scope_class = classify_result(
         1,
         "",
-        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        (
+           "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running"
+           " in CI, set CI=true"
+       ),
         "pnpm build",
         cwd=".",
         runner_env_delta={"CI": "true"},
@@ -1793,7 +1911,10 @@ def test_package_manager_no_tty_prompt_without_runner_delta_points_to_env_retry(
     classification, category, decision, fix_hint, scope_class = classify_result(
         1,
         "",
-        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        (
+           "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running"
+           " in CI, set CI=true"
+       ),
         "pnpm build",
         cwd=".",
         runner_env_delta={},
@@ -2046,7 +2167,9 @@ def test_check_c13_vc_preflight_decision_regression_gate_consistency():
 
     is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
     assert not is_valid, "regression_gate + go requires expected_pass"
-    assert any("regression_gate + go" in f and "expected_pass" in f for f in failures), f"Expected regression_gate + go error, got: {failures}"
+    assert any("regression_gate + go" in f and "expected_pass" in f for f in failures), (
+        f"Expected regression_gate + go error, got: {failures}"
+    )
 
 
 def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
@@ -2069,7 +2192,9 @@ def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
 
     is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
     assert not is_valid, "regression_gate + blocked requires blocked classification"
-    assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), f"Expected regression_gate + blocked error, got: {failures}"
+    assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), (
+        f"Expected regression_gate + blocked error, got: {failures}"
+    )
 
 
 def test_preflight_scope_unknown_value_is_human_judgment():
@@ -2578,7 +2703,10 @@ def test_ac5_ci_performance_missing_baseline_needs_fix():
     """AC5: #895-type — a strict-mode VC referencing a new docs/dev/ci-performance.md
     that does not exist at baseline is missing_baseline_expect_for_new_allowed_path
     (needs_fix), not human_judgment."""
-    body = ("## Verification Commands\n\n```bash\n$ rg ci_runtime_baseline_v1 docs/dev/ci-performance-nonexistent-899.md\n```\n\n"
+    body = (
+        "## Verification Commands\n\n```bash\n"
+        "$ rg ci_runtime_baseline_v1 docs/dev/ci-performance-nonexistent-899.md"
+        "\n```\n\n"
             "## Allowed Paths\n\n- `docs/dev/ci-performance-nonexistent-899.md`\n")
     data = _run_bvp_899(body, strict=True)
     it = _result_for_899(data, "ci-performance-nonexistent-899.md")
@@ -2608,3 +2736,55 @@ def test_ac12_inline_annotation_quoted_literal_safe():
     it = _result_for_899(data, "rg ")
     assert it is not None, data
     assert it["category"] != "inline_baseline_expect_invalid_placement", it
+
+
+# ---------------------------------------------------------------------------
+# AC4: exact argv negative cases (Issue #1210)
+# ---------------------------------------------------------------------------
+
+def test_is_uv_lock_check_rejects_path_qualified_uv():
+    """AC4: _is_uv_lock_check は path-qualified uv を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_lock_check
+    assert not _is_uv_lock_check(["/usr/bin/uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["./uv", "lock", "--check"])
+    assert not _is_uv_lock_check(["/tmp/uv", "lock", "--check"])
+
+
+def test_is_uv_runtime_smoke_rejects_path_qualified_uv():
+    """AC4: _is_uv_runtime_smoke_command は path-qualified uv を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_path_qualified_python():
+    """AC4: _is_uv_runtime_smoke_command は path-qualified python/python3 を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "./python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "/tmp/python3", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_option_reorder():
+    """AC4: _is_uv_runtime_smoke_command は option 順序変更を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--locked", "--isolated", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )
+
+
+def test_is_uv_runtime_smoke_rejects_duplicate_options():
+    """AC4: _is_uv_runtime_smoke_command は duplicate option を拒否する"""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from baseline_vc_preflight import _is_uv_runtime_smoke_command
+    assert not _is_uv_runtime_smoke_command(
+        ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+    )

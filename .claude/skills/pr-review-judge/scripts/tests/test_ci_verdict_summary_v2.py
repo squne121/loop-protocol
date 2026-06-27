@@ -287,9 +287,27 @@ class TestAC11HeadShaNullSkipped:
     def test_multiple_excluded_retrospective_checks_all_pass(self, v2):
         """Multiple allowlisted excluded checks with head_sha=null + skipped: none block."""
         checks = [
-            make_check("PR Review Japanese Check (retrospective)", "Check Japanese Content", "completed", "skipped", None),
-            make_check("Issue Comment Japanese Check (retrospective)", "Check Japanese Content", "completed", "skipped", None),
-            make_check("Issue Body Japanese Check (retrospective)", "Check Japanese Content", "completed", "skipped", None),
+            make_check(
+                "PR Review Japanese Check (retrospective)",
+                "Check Japanese Content",
+                "completed",
+                "skipped",
+                None
+            ),
+            make_check(
+                "Issue Comment Japanese Check (retrospective)",
+                "Check Japanese Content",
+                "completed",
+                "skipped",
+                None
+            ),
+            make_check(
+                "Issue Body Japanese Check (retrospective)",
+                "Check Japanese Content",
+                "completed",
+                "skipped",
+                None
+            ),
         ]
         artifact = build(v2, checks)
         for entry in artifact["checks"]:

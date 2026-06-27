@@ -25,13 +25,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 
-from local_main_branch_guard import (
+from local_main_branch_guard import (  # noqa: E402
     evaluate,
     REASON_DRIFT,
     REASON_RECOVERY,
-    REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
     REASON_UNPARSEABLE,
+    REASON_GH_API,
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
@@ -45,8 +45,17 @@ from local_main_branch_guard import (
     GITHUB_CMD_CLASS_DESTRUCTIVE,
     TRUSTED_REPO_SLUG,
 )
-from skill_runtime_command_policy import resolve_repo_slug
+from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hooks"
+
+
+def _load_fixture_json(filename: str) -> dict:
+    return json.loads((FIXTURE_DIR / filename).read_text())
+
+
+def _load_fixture_text(filename: str) -> str:
+    return (FIXTURE_DIR / filename).read_text().strip()
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -78,7 +87,7 @@ def eval_codex(
             for key, value in env_override.items():
                 previous[key] = os.environ.get(key)
                 os.environ[key] = value
-        result = evaluate(command=command, cwd=cwd, hook_flavor="codex")
+        result = evaluate(command=command, cwd=cwd, hook_flavor="codex", event_kind=event)
     finally:
         if old:
             os.environ["CLAUDE_PROJECT_DIR"] = old
@@ -90,6 +99,18 @@ def eval_codex(
             else:
                 os.environ[key] = value
     return result
+
+
+def run_guard_script(payload: dict, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run local_main_branch_guard.py as hook stdin script and return process result."""
+    script = REPO_ROOT / "scripts" / "agent-guards" / "local_main_branch_guard.py"
+    return subprocess.run(
+        [sys.executable, str(script)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+    )
 
 
 @pytest.fixture
@@ -224,6 +245,97 @@ class TestAC8CodexParity:
         assert guard_path.exists(), (
             f"Guard script not found: {guard_path}"
         )
+
+
+class TestIssue1198RawAndCommandFixtures:
+    """AC8~AC16: Issue #1198 に追加した raw fixture / command fixture の回帰."""
+
+    def test_pretooluse_raw_issue_comment_fragment_is_not_blocked(self, tmp_git_repo: Path):
+        fixture = _load_fixture_json("issue1198-pretooluse-issue-comment.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_git_repo),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] != REASON_UNPARSEABLE
+        assert result["event_kind"] == "PreToolUse"
+        assert result["decision"] == "allow"
+
+    def test_permissionrequest_raw_gh_api_get_is_allowed(self, tmp_git_repo: Path):
+        fixture = _load_fixture_json("issue1198-permissionrequest-gh-api-get.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_git_repo),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_GH_API
+        assert result["event_kind"] == "PermissionRequest"
+        assert result["command_kind"] == "github_api_command"
+
+    def test_stop_raw_payload_without_tool_input_is_allowed(self, tmp_git_repo: Path):
+        payload = _load_fixture_json("issue1198-stop-no-command.json")
+        payload["cwd"] = str(tmp_git_repo)
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+
+    @pytest.mark.parametrize(
+        ("entry", "expected_status", "expected_reason"),
+        [
+            (entry, "allow", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("allow", [])
+        ]
+        + [
+            (entry, "block", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("block", [])
+        ],
+    )
+    def test_issue1198_command_matrix_contracts(self, tmp_git_repo: Path, entry: dict, expected_status: str, expected_reason: str):
+        result = eval_codex(
+            command=entry["command"],
+            cwd=str(tmp_git_repo),
+            event=entry.get("event", "PreToolUse"),
+        )
+        assert result["status"] == expected_status
+        assert result["reason_code"] == expected_reason
+        if "rule_id" in entry:
+            assert result["rule_id"] == entry["rule_id"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
+            "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
+            "gh api repos/squne121/loop-protocol/issues/1198/comments --input='x'",
+            "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field='x'",
+        ],
+    )
+    def test_gh_api_mutation_flags_are_blocked_and_redacted(self, tmp_git_repo: Path, command: str):
+        """Given mutation-like gh api flag patterns, ensure block + redacted argv tokens."""
+        result = eval_codex(command, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_API
+        assert any("<redacted>" in token for token in result.get("argv_redacted", []))
+
+    def test_run_hook_block_stderr_contains_ac7_fields(self, tmp_git_repo: Path):
+        payload = {
+            "event": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git switch issue-1198-block"},
+            "cwd": str(tmp_git_repo),
+        }
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 2
+        output = result.stderr
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PreToolUse" in output
+        assert "decision: block" in output
+        assert "reason_code: local_root_branch_drift" in output
+        assert "rule_id: git_branch_mutation_block" in output
+        assert "command_kind: git_branch_mutation" in output
+        assert "parser_stage: branch_mutation_block" in output
+        assert "argv_redacted:" in output
+        assert "recovery:" in output
 
 
 class TestReadonlyPipelineClassifier:
@@ -539,12 +651,42 @@ class TestGhMutationReasonCode:
             hook_flavor="codex",
         )
         captured = capsys.readouterr()
-        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
+        hint_line = [line for line in captured.err.splitlines() if "recovery:" in line]
         assert hint_line, "Expected a recovery: line in stderr"
         hint = hint_line[0].lower()
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
             f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
         )
+
+    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
+        """_emit_block_stderr includes AC7 machine-readable fields."""
+        from local_main_branch_guard import (
+            _emit_block_stderr,
+            REASON_GITHUB_REMOTE_OPS,
+            COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+        )
+        _emit_block_stderr(
+            reason_code=REASON_GITHUB_REMOTE_OPS,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="codex",
+            event_kind="PermissionRequest",
+            decision="block",
+            command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+            parser_stage="readonly_artifact_export",
+            rule_id="gh_issue_view_to_tmp_allowed",
+            argv_redacted=["gh", "issue", "view", "123", "--json", "body"],
+        )
+        captured = capsys.readouterr()
+        output = captured.err
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PermissionRequest" in output
+        assert "decision: block" in output
+        assert "rule_id: gh_issue_view_to_tmp_allowed" in output
+        assert "command_kind: readonly_artifact_export" in output
+        assert "parser_stage: readonly_artifact_export" in output
+        assert "argv_redacted:" in output
 
 
 

@@ -42,6 +42,26 @@ uv run python3 .claude/skills/issue-contract-review/scripts/baseline_vc_prefligh
 
 `scope_class` / `classification` / `decision` / `category` を別々に解釈。
 
+## UV allowlist（実運用固定形）
+
+`uv` の allowlist は次の形のみ許可する。
+
+- `uv lock --check`
+- `uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py`
+- `uv run --isolated --locked --no-default-groups python3 scripts/ci/runtime_dependency_smoke.py`
+
+拒否対象:
+
+- `uv lock` / `uv lock --upgrade` / `uv sync` / `uv run uv lock --check`
+- `uv run --isolated --locked python ...` など option が不足する runtime smoke
+- `uv run --isolated --locked --no-default-groups --with ... python scripts/ci/runtime_dependency_smoke.py`
+- `uv run ... --group ...`, `--with`, `--all-groups`, `--extra`, `--python`, `--project`, `--directory`, `--env-file`, `--upgrade`, `--env-file`
+- `uv run --isolated --locked --no-default-groups python -c ...`
+- `uv run --isolated --locked --no-default-groups python -m ...`
+- `uv run --isolated --locked --no-default-groups python ../runtime_dependency_smoke.py`
+- `uv run --isolated --locked --no-default-groups python /tmp/runtime_dependency_smoke.py`
+- `uv run --isolated --locked --no-default-groups python scripts/ci/other.py`
+
 ## preflight-scope marker
 
 ```bash

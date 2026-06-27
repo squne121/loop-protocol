@@ -39,7 +39,9 @@ class TestHeartbeatWatchdog:
         assert watchdog.check() is None
 
     def test_connect_timeout_before_first_result(self) -> None:
-        """GIVEN no first result received AND idle beyond CONNECT_TIMEOUT_SEC but not INITIAL_IDLE, THEN connect timeout fires."""
+        """GIVEN no first result received AND idle beyond CONNECT_TIMEOUT_SEC but not INITIAL_IDLE, THEN connect timeout
+            fires.
+        """
         watchdog = acp.HeartbeatWatchdog()
         watchdog._first_result_received = False
         # Set last heartbeat to just beyond CONNECT_TIMEOUT but below INITIAL_IDLE
@@ -384,7 +386,9 @@ class TestFallbackToHeadlessJson:
         assert any("fell back to headless_json" in w for w in result["warnings"])
 
     def test_fallback_invoked_on_early_failure(self) -> None:
-        """GIVEN run_acp with initialize failure (failure_class), WHEN fallback is available, THEN fallback result returned."""
+        """GIVEN run_acp with initialize failure (failure_class), WHEN fallback is available, THEN fallback result
+            returned.
+        """
         fake_headless_result: dict[str, Any] = {
             "ok": True,
             "response_text": "headless response",
@@ -669,7 +673,9 @@ class TestAcpRoutesThroughDelegationContract:
     """GIVEN transport=acp via run_delegation, THEN validate_request runs before any ACP session."""
 
     def test_invalid_acp_request_fails_validation_before_acp(self) -> None:
-        """GIVEN an invalid acp request, WHEN run_delegation is called, THEN it fails at validation and never reaches run_acp."""
+        """GIVEN an invalid acp request, WHEN run_delegation is called, THEN it fails at validation and never reaches
+            run_acp.
+        """
         import run_gemini_headless as headless
 
         # Missing tool_profile / output_sections / context_files — invalid.

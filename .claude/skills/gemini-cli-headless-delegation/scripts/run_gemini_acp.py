@@ -155,7 +155,10 @@ class HeartbeatWatchdog:
             if elapsed_idle > self.INITIAL_IDLE:
                 return f"initial_idle timeout exceeded ({self.INITIAL_IDLE}s)"
             if elapsed_idle > self.CONNECT:
-                return f"connect timeout exceeded ({self.CONNECT}s) — possible bug {INITIALIZE_HANG_BUG} or {AUTH_HANG_BUG}"
+                return (
+                    f"connect timeout exceeded ({self.CONNECT}s)"
+                    f" — possible bug {INITIALIZE_HANG_BUG} or {AUTH_HANG_BUG}"
+                )
         else:
             if elapsed_idle > self.SUBSEQUENT_IDLE:
                 return f"subsequent_idle timeout exceeded ({self.SUBSEQUENT_IDLE}s)"

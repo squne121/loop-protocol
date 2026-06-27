@@ -1029,9 +1029,18 @@ class TestHeadShaNullSkippedExclude:
         """AC4: HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES に必須エントリが含まれる"""
         assert ("deploy-pages", "deploy-main") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
         assert ("deploy-pages", "cleanup-pr") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
-        assert ("Check Japanese Content", "Issue Body Japanese Check (retrospective)") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
-        assert ("Check Japanese Content", "Issue Comment Japanese Check (retrospective)") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
-        assert ("Check Japanese Content", "PR Review Japanese Check (retrospective)") in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
+        assert (
+            "Check Japanese Content",
+            "Issue Body Japanese Check (retrospective)",
+        ) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
+        assert (
+            "Check Japanese Content",
+            "Issue Comment Japanese Check (retrospective)",
+        ) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
+        assert (
+            "Check Japanese Content",
+            "PR Review Japanese Check (retrospective)",
+        ) in HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES
 
     def test_head_sha_null_skipped_deploy_main_is_excluded(self):
         """AC1: deploy-main の head_sha=None かつ conclusion=skipped は excluded"""

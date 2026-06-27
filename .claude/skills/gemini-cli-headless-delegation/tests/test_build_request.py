@@ -373,7 +373,10 @@ def test_build_request_gh_issue_rejected_for_non_github_research(tmp_path):
     assert result.get("failure_class") == "validation_error", (
         f"Expected 'validation_error', got: {result.get('failure_class')!r}"
     )
-    assert "gh_commands" in result.get("failure_reason", "") or "gh-pr" in result.get("failure_reason", "") or "github_research" in result.get("failure_reason", ""), (
+    assert "gh_commands" in result.get(
+        "failure_reason",
+        ""
+    ) or "gh-pr" in result.get("failure_reason", "") or "github_research" in result.get("failure_reason", ""), (
         f"Expected profile restriction message, got: {result.get('failure_reason')!r}"
     )
 

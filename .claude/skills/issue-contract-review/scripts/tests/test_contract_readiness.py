@@ -813,17 +813,76 @@ def test_source_payload_present_in_preflight_errors():
     err = errors[0]
     assert "source_payload" in err, f"source_payload missing from error: {list(err.keys())}"
     sp = err["source_payload"]
-    required_payload_fields = {"classification", "decision", "confidence", "exit_code", "command_hash", "duration_ms"}
+    required_payload_fields = {
+        "classification",
+        "category",
+        "scope_class",
+        "decision",
+        "confidence",
+        "exit_code",
+        "command_hash",
+        "duration_ms",
+        "runner_env_delta",
+    }
     missing = required_payload_fields - set(sp.keys())
     assert not missing, f"source_payload missing fields: {missing}"
     assert sp["classification"] == "blocked"
+    assert sp["category"] == "compound_command_disallowed"
+    assert sp["scope_class"] == "baseline_fail_expected"
     assert sp["decision"] == "blocked"
     assert sp["confidence"] == "high"
     assert sp["exit_code"] == -1
     assert sp["command_hash"] == "sha256:abc123"
     assert sp["duration_ms"] == 42
+    assert sp["runner_env_delta"] == {}
 
 
+def test_source_payload_preserves_package_manager_no_tty_category():
+    """AC3: package_manager_no_tty_prompt error preserves category and human_judgment routing."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "pnpm test",
+                "raw_command": "pnpm test",
+                "exit_code": 1,
+                "classification": "blocked",
+                "category": "package_manager_no_tty_prompt",
+                "decision": "blocked",
+                "confidence": "low",
+                "command_hash": "sha256:def456",
+                "duration_ms": 101,
+                "scope_class": "regression_gate",
+                "line": 26,
+                "fix_hint": "CI=true を runner 側で注入してください",
+                "stdout_head": [],
+                "stderr_head": [
+                    "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY"
+                ],
+            }
+        ],
+        "errors": [],
+    }
+
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "human_judgment", f"Expected human_judgment, got {aggregate}"
+    assert len(errors) == 1, f"Expected one error, got {len(errors)}"
+    err = errors[0]
+    assert err["category"] == "package_manager_no_tty_prompt", (
+        f"Expected package_manager_no_tty_prompt category, got {err['category']}"
+    )
+    assert err["source_payload"]["classification"] == "blocked", (
+        f"Unexpected source_payload classification: {err['source_payload']}"
+    )
+    assert err["source_payload"]["decision"] == "blocked"
+    assert err["source_payload"]["command_hash"] == "sha256:def456"
+    assert err["source_payload"]["category"] == "package_manager_no_tty_prompt"
+    assert err["source_payload"]["scope_class"] == "regression_gate"
+    assert err["source_payload"]["runner_env_delta"] == {}
 # ---------------------------------------------------------------------------
 # Blocker 4: Redirect operators not flagged as compound (< > << >> <<<)
 # ---------------------------------------------------------------------------
@@ -1185,7 +1244,9 @@ def test_ac7_rule_with_vcp_prefix_no_double_namespace():
 
 
 def test_kind_retrieval_error_maps_to_body_retrieval_failed_human_judgment():
-    """Blocker 3: kind=retrieval_error/rule=VC000_BODY_RETRIEVAL_FAILED → category=body_retrieval_failed, aggregate=human_judgment."""
+    """Blocker 3: kind=retrieval_error/rule=VC000_BODY_RETRIEVAL_FAILED → category=body_retrieval_failed,
+        aggregate=human_judgment.
+    """
     from contract_readiness_check import map_preflight_result_to_errors
 
     preflight = _blocked_preflight_with_errors([

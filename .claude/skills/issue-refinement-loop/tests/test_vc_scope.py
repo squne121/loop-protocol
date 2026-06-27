@@ -866,7 +866,8 @@ class TestCompoundCommandLegacyPython:
         body = """## Verification Commands
 
 ```bash
-$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py && python3 .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
+$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py \
+  && python3 .claude/skills/issue-refinement-loop/scripts/check_vc_scope.py
 ```
 
 ## Allowed Paths
@@ -890,7 +891,8 @@ $ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py && p
         body = """## Verification Commands
 
 ```bash
-$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -v && uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -k "not slow"
+$ uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -v \
+  && uv run pytest .claude/skills/issue-refinement-loop/tests/test_vc_scope.py -k "not slow"
 ```
 
 ## Allowed Paths

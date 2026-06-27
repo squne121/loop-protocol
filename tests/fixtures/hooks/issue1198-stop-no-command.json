@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "event": "Stop",
+  "tool_name": "Bash",
+  "tool_input": {},
+  "cwd": ""
+}

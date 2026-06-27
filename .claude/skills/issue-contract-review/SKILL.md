@@ -60,6 +60,14 @@ VC 実行前に静的に弾くカテゴリ:
 - `command_not_allowed` : allowlist 外コマンド
 - `package_manager_no_tty_prompt` : pnpm no-TTY prompt 由来の tooling/env blocker。`body_author_fixable=false` / downstream bucket `env_or_runtime`
 
+`uv` コマンドの allowlist は、`issue #1195` の scope で次を許可する（これ以外は blocked）。
+
+- `uv lock --check`（`--check` 以外の `uv lock` 系は不許可）
+- `uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py`
+- `uv run --isolated --locked --no-default-groups python3 scripts/ci/runtime_dependency_smoke.py`
+
+上記 runtime smoke は `python -c` / `python -m` / 追加 `uv` オプション / 非 `scripts/ci/runtime_dependency_smoke.py` script / `../` / 絶対パスを伴う場合は `command_not_allowed`。
+
 `unsupported_shell_syntax` は `run_command()` を呼ばない前提の必須カテゴリ。
 
 - コマンドは「`$ <command>` + `# ACn`」形式（verbatim）

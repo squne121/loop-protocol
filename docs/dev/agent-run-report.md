@@ -164,7 +164,7 @@ They capture the public-safe summary of a single AI agent run, including:
 
 - `schema`: always `"agent_run_report/v1"`
 - `public_surface_kind`: where the report may be surfaced (`none`, `github_issue_comment`, `github_pr_comment`)
-- `public_safety`: `{ redaction_status, checked_by, validator_version, checked_at, verdict, blocked_reasons }`
+- `public_safety`: `{ redaction_status, checked_by, validator_version, checked_at, verdict, blocked_reasons, entirecli_safety }`
 - `actor`: `{ type, name }`
 - `authority`: `{ level, basis, evidence_refs }`
 - `token_usage`: `{ availability, source, prompt, completion, total }`
@@ -172,6 +172,36 @@ They capture the public-safe summary of a single AI agent run, including:
 - `evidence_refs`: list of evidence refs (workflow runs, PR/Issue URLs, artifact digests)
 - `commands_summary`: list of command summaries (`command_label`, `exit_code`, `verdict`, `summary`, `artifact_ref`)
 - `docs_read_refs`: list of doc read refs
+
+### entirecli_safety runtime enforcement
+
+`public_safety.entirecli_safety` is **schema-optional** (`#1134`/PR `#1178`) but **runtime-required** for
+public surface reports (`public_surface_kind !== 'none'`).
+
+The runtime enforcement is implemented in `validate-final-report.mjs` (`validateFinalReport`) and
+`retro-index-builder.mjs` (`normalizeSourceComment`):
+
+- `validateFinalReport` calls `assertEntireCLISafetyRuntime` before schema validation.
+  A public surface report missing `entirecli_safety` throws `report.entirecli_safety_missing`.
+- `normalizeSourceComment` returns `kind: 'blocked'` for source comments whose embedded report
+  lacks `entirecli_safety` or carries `verdict: 'blocked'`.
+
+**Only checker-produced values are accepted.** The field must be produced by
+`scripts/agent-logs/check-entirecli-safety.mjs` and passed through as-is. Auto-synthesis of
+`not_applicable` at the producer level is prohibited.
+
+Conditions that fail-closed at runtime (in addition to the schema gate):
+
+| Condition | Error code |
+|---|---|
+| `entirecli_safety` absent from `public_safety` | `report.entirecli_safety_missing` |
+| `schema_version` is not `entirecli_safety_result/v1` | `report.entirecli_safety_unknown_schema_version` |
+| `raw_values_emitted === true` | `report.entirecli_safety_raw_values_emitted` |
+| `verdict` not in `{ safe, not_applicable }` | `report.entirecli_safety_blocked` |
+
+The schema gate (`validateAgentRunReport`) remains the canonical admission check for schema
+correctness (e.g., `blocked` verdict, unknown keys). The runtime enforcement layer adds
+defense-in-depth for the `missing` case which the schema alone cannot catch.
 
 ### Forbidden Fields
 
@@ -313,11 +343,9 @@ raw version 文字列や release provenance の証明には使わない。
 
 `agent-run-report.schema.json` には `public_safety.entirecli_safety` の
 `EntireCLISafetyResult/v1` admission 契約を追加済みである。
-この統合は schema-admission のみを扱い、producer 接続・posting / retro index の fail-closed enforcement は後続 scope とする。
-This integration admits `EntireCLISafetyResult/v1` when present.
-It does not require `public_safety.entirecli_safety` on public reports.
-Current generated reports without `entirecli_safety` remain valid until producer / posting / retro enforcement follow-up.
-現時点では verdict 計算と schema compile / fixture 検証のみを提供し、report への実際の埋め込み必須化は呼び出し元の follow-up scope が担う。
+`finalize-agent-run.mjs` は `--entirecli-safety-json` または `--entirecli-safety-file` で
+checker-produced value を受け取る。`public_surface_kind !== 'none'` の場合はいずれかが必須。
+JSON parse 失敗は fail-closed（exit 1、report 未出力）。
 
 ### Library Module
 

@@ -125,7 +125,12 @@ def test_non_json_validator_output(monkeypatch: pytest.MonkeyPatch):
             },
         )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
-        monkeypatch.setattr(open_pr, "create_pr", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no create")))
+        monkeypatch.setattr(
+            open_pr,
+            "create_pr",
+            lambda *args,
+            **kwargs: (_ for _ in ()).throw(AssertionError("no create"))
+        )
         rc = open_pr.main(
             [
                 "--pr-title",
@@ -157,7 +162,19 @@ def test_validator_receives_final_body_with_closes_reference(monkeypatch: pytest
             return {"status": "pass", "errors": []}
 
         monkeypatch.setattr(open_pr, "_run_pr_body_validator", fake_validator)
-        monkeypatch.setattr(open_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text,
+            threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.5,
+                "threshold": 0.1,
+                "body_sha256": "",
+                "stderr": ""
+            }
+        )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: {"number": 999, "url": "https://example.com/pr/999"})
         rc = open_pr.main(
             [
@@ -194,7 +211,12 @@ def test_changed_paths_unavailable(monkeypatch: pytest.MonkeyPatch):
             },
         )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
-        monkeypatch.setattr(open_pr, "create_pr", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no create")))
+        monkeypatch.setattr(
+            open_pr,
+            "create_pr",
+            lambda *args,
+            **kwargs: (_ for _ in ()).throw(AssertionError("no create"))
+        )
         rc = open_pr.main(
             [
                 "--pr-title",
@@ -415,7 +437,12 @@ def _run_main_with_validator_result(
             lambda body, changed_paths, linked_issue: validator_result,
         )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
-        monkeypatch.setattr(open_pr, "create_pr", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no create")))
+        monkeypatch.setattr(
+            open_pr,
+            "create_pr",
+            lambda *args,
+            **kwargs: (_ for _ in ()).throw(AssertionError("no create"))
+        )
         monkeypatch.setattr("builtins.print", capture_print)
 
         base_args = [
@@ -556,7 +583,19 @@ def test_ac4_not_schema_change_na_pass_path(
             "_run_pr_body_validator",
             lambda body, changed_paths, linked_issue: {"status": "pass", "errors": []},
         )
-        monkeypatch.setattr(open_pr, "_run_japanese_content_validator", lambda body_text, threshold=0.1: {"status": "pass", "failed_blocks": 0, "aggregate_ratio": 0.5, "threshold": 0.1, "body_sha256": "", "stderr": ""})
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text,
+            threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.5,
+                "threshold": 0.1,
+                "body_sha256": "",
+                "stderr": ""
+            }
+        )
         # Return existing PR so create_pr is not called
         monkeypatch.setattr(
             open_pr,
