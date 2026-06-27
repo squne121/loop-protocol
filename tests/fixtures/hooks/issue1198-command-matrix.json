@@ -27,14 +27,6 @@
     {
       "command": "echo https://github.com/squne121/loop-protocol/issues/1170#issuecomment-4814071263",
       "reason": "unknown_command_requires_review"
-    },
-    {
-      "command": "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --json",
-      "reason": "deterministic_checker_command"
-    },
-    {
-      "command": "uv run python3 scripts/agent-ops/git_ref_probe.py --json",
-      "reason": "unknown_command_requires_review"
     }
   ],
   "block": [
