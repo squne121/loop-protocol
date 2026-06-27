@@ -18,6 +18,7 @@
     ".claude/skills/pr-review-judge/scripts/tests/",
     ".claude/skills/pr-review-judge/tests/",
     ".claude/skills/open-pr/scripts/tests/",
+    ".claude/skills/impl-review-loop/scripts/tests/",
     ".claude/skills/impl-review-loop/tests/",
     ".claude/skills/review-issue/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
