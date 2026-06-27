@@ -343,7 +343,6 @@ raw version 文字列や release provenance の証明には使わない。
 
 `agent-run-report.schema.json` には `public_safety.entirecli_safety` の
 `EntireCLISafetyResult/v1` admission 契約を追加済みである。
-この統合は schema-admission のみを扱い、producer 接続・posting / retro index の fail-closed enforcement は後続 scope とする。
 `finalize-agent-run.mjs` は `--entirecli-safety-json` または `--entirecli-safety-file` で
 checker-produced value を受け取る。`public_surface_kind !== 'none'` の場合はいずれかが必須。
 JSON parse 失敗は fail-closed（exit 1、report 未出力）。

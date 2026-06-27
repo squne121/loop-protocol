@@ -6,6 +6,7 @@ import { tmpdir } from 'os'
 import { upsertGithubMarkerCommentFromFile } from '../../scripts/agent-logs/upsert-github-marker-comment.mjs'
 import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown, validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
 
 function createReport(overrides = {}) {
   return {
@@ -248,7 +249,7 @@ describe('github comment post guard', () => {
     }
   })
 
-  it('GIVEN validateFinalReport throws for missing entirecli_safety THEN spyClient.list/create/update are never called', () => {
+  it('GIVEN a report with missing entirecli_safety WHEN postAgentRunReport is called with spy client THEN it rejects and GitHub client is never invoked', async () => {
     const report = createReport({
       public_safety: {
         redaction_status: 'clean',
@@ -260,19 +261,31 @@ describe('github comment post guard', () => {
         // entirecli_safety absent — must fail-closed
       },
     })
-    const spyList = vi.fn()
-    const spyCreate = vi.fn()
-    const spyUpdate = vi.fn()
+    const mockClient = {
+      listIssueComments: vi.fn(),
+      createIssueComment: vi.fn(),
+      updateIssueComment: vi.fn(),
+    }
+    const draft = {
+      schema: 'agent_run_draft/v1',
+      run_id: 'run-937-001',
+      target: { kind: 'issue', id: 937 },
+      phase: 'implementation',
+      actor: { type: 'ai_agent', name: 'test' },
+      started_at: '2026-06-17T12:30:00.000Z',
+    }
 
-    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+    await expect(
+      postAgentRunReport({ draft, report, repo: 'squne121/loop-protocol', dryRun: true, confirmLive: false, client: mockClient })
+    ).rejects.toThrow(/entirecli_safety/)
 
-    // validateFinalReport threw before any client call path could be reached
-    expect(spyList).not.toHaveBeenCalled()
-    expect(spyCreate).not.toHaveBeenCalled()
-    expect(spyUpdate).not.toHaveBeenCalled()
+    // validateFinalReport threw before upsertAgentRunReportComment could invoke any client method
+    expect(mockClient.listIssueComments).not.toHaveBeenCalled()
+    expect(mockClient.createIssueComment).not.toHaveBeenCalled()
+    expect(mockClient.updateIssueComment).not.toHaveBeenCalled()
   })
 
-  it('GIVEN validateFinalReport throws for blocked entirecli_safety verdict THEN spyClient.list/create/update are never called', () => {
+  it('GIVEN a report with entirecli_safety verdict blocked WHEN postAgentRunReport is called with spy client THEN it rejects and GitHub client is never invoked', async () => {
     const report = createReport({
       public_safety: {
         redaction_status: 'clean',
@@ -295,18 +308,30 @@ describe('github comment post guard', () => {
         },
       },
     })
-    const spyList = vi.fn()
-    const spyCreate = vi.fn()
-    const spyUpdate = vi.fn()
+    const mockClient = {
+      listIssueComments: vi.fn(),
+      createIssueComment: vi.fn(),
+      updateIssueComment: vi.fn(),
+    }
+    const draft = {
+      schema: 'agent_run_draft/v1',
+      run_id: 'run-937-001',
+      target: { kind: 'issue', id: 937 },
+      phase: 'implementation',
+      actor: { type: 'ai_agent', name: 'test' },
+      started_at: '2026-06-17T12:30:00.000Z',
+    }
 
-    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+    await expect(
+      postAgentRunReport({ draft, report, repo: 'squne121/loop-protocol', dryRun: true, confirmLive: false, client: mockClient })
+    ).rejects.toThrow(/entirecli_safety/)
 
-    expect(spyList).not.toHaveBeenCalled()
-    expect(spyCreate).not.toHaveBeenCalled()
-    expect(spyUpdate).not.toHaveBeenCalled()
+    expect(mockClient.listIssueComments).not.toHaveBeenCalled()
+    expect(mockClient.createIssueComment).not.toHaveBeenCalled()
+    expect(mockClient.updateIssueComment).not.toHaveBeenCalled()
   })
 
-  it('GIVEN validateFinalReport throws for raw_values_emitted true THEN spyClient.list/create/update are never called', () => {
+  it('GIVEN a report with raw_values_emitted true WHEN postAgentRunReport is called with spy client THEN it rejects and GitHub client is never invoked', async () => {
     const report = createReport({
       public_safety: {
         redaction_status: 'clean',
@@ -329,14 +354,26 @@ describe('github comment post guard', () => {
         },
       },
     })
-    const spyList = vi.fn()
-    const spyCreate = vi.fn()
-    const spyUpdate = vi.fn()
+    const mockClient = {
+      listIssueComments: vi.fn(),
+      createIssueComment: vi.fn(),
+      updateIssueComment: vi.fn(),
+    }
+    const draft = {
+      schema: 'agent_run_draft/v1',
+      run_id: 'run-937-001',
+      target: { kind: 'issue', id: 937 },
+      phase: 'implementation',
+      actor: { type: 'ai_agent', name: 'test' },
+      started_at: '2026-06-17T12:30:00.000Z',
+    }
 
-    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+    await expect(
+      postAgentRunReport({ draft, report, repo: 'squne121/loop-protocol', dryRun: true, confirmLive: false, client: mockClient })
+    ).rejects.toThrow(/entirecli_safety/)
 
-    expect(spyList).not.toHaveBeenCalled()
-    expect(spyCreate).not.toHaveBeenCalled()
-    expect(spyUpdate).not.toHaveBeenCalled()
+    expect(mockClient.listIssueComments).not.toHaveBeenCalled()
+    expect(mockClient.createIssueComment).not.toHaveBeenCalled()
+    expect(mockClient.updateIssueComment).not.toHaveBeenCalled()
   })
 })
