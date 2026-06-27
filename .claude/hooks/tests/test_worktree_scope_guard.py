@@ -34,6 +34,7 @@ SETTINGS_JSON = REPO_ROOT / ".claude" / "settings.json"
 # Harness
 # =============================================================================
 
+
 def _git(*args, cwd):
     return subprocess.run(
         ["git", *args],
@@ -41,13 +42,17 @@ def _git(*args, cwd):
         capture_output=True,
         text=True,
         check=True,
-        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
     )
 
 
-def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
-                             slug: str = "x", extra_worktrees=None) -> dict:
+def _make_repo_with_worktree(tmp_path: Path, issue: str = "942", slug: str = "x", extra_worktrees=None) -> dict:
     """Create a git repo + a real issue worktree. Returns dict with paths."""
     main = tmp_path / "repo"
     main.mkdir()
@@ -66,7 +71,7 @@ def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
     _git("worktree", "add", "-q", str(wt_path), branch, cwd=main)
     worktrees[issue] = wt_path
 
-    for extra in (extra_worktrees or []):
+    for extra in extra_worktrees or []:
         ei, es = extra
         ewt = main / ".claude" / "worktrees" / f"issue-{ei}-{es}"
         eb = f"issue-{ei}-{es}"
@@ -77,8 +82,7 @@ def _make_repo_with_worktree(tmp_path: Path, issue: str = "942",
     return {"root": main, "worktree": wt_path, "worktrees": worktrees}
 
 
-def _run_guard(payload: dict, project_root: Path, issue: str | None = None,
-               extra_env: dict | None = None):
+def _run_guard(payload: dict, project_root: Path, issue: str | None = None, extra_env: dict | None = None):
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(project_root)
     if issue is not None:
@@ -235,6 +239,7 @@ if __name__ == "__main__":
 # AC1 — block Write/Edit outside worktree when active worktree exists
 # =============================================================================
 
+
 def test_block_outside_worktree_write_to_repo_root(tmp_path):
     """AC1: cwd=/repo, Write to .claude/skills/** is blocked when an active
     issue worktree exists."""
@@ -266,6 +271,7 @@ def test_block_outside_worktree_edit_main_file(tmp_path):
 # AC2 — allow Write/Edit inside the expected worktree
 # =============================================================================
 
+
 def test_allow_inside_worktree_write(tmp_path):
     """AC2: cwd inside the issue worktree, Write inside it is allowed."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
@@ -296,21 +302,25 @@ def test_allow_inside_worktree_multiedit(tmp_path):
 # AC3 / AC8 — block mutating Bash outside worktree
 # =============================================================================
 
-@pytest.mark.parametrize("command", [
-    "git commit -m wip",
-    "git add .",
-    "git push origin HEAD",
-    "git checkout main",
-    "git switch main",
-    "git reset --hard",
-    "git rebase main",
-    "git merge feature",
-    "git stash",
-    "git worktree add foo",
-    "git tag v1",
-    "gh pr create --fill",
-    "gh pr edit 1 --add-label x",
-])
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -m wip",
+        "git add .",
+        "git push origin HEAD",
+        "git checkout main",
+        "git switch main",
+        "git reset --hard",
+        "git rebase main",
+        "git merge feature",
+        "git stash",
+        "git worktree add foo",
+        "git tag v1",
+        "gh pr create --fill",
+        "gh pr edit 1 --add-label x",
+    ],
+)
 def test_block_mutating_bash_from_repo_root(tmp_path, command):
     """AC3/AC8: mutating Bash run from repo root (outside worktree) is blocked."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
@@ -323,16 +333,19 @@ def test_block_mutating_bash_from_repo_root(tmp_path, command):
     assert r.returncode == 2, f"{command!r} should block; stderr={r.stderr}"
 
 
-@pytest.mark.parametrize("command", [
-    "echo hi > out.txt",
-    "echo hi >> out.txt",
-    "sed -i 's/a/b/' file.txt",
-    "cat foo | tee out.txt",
-    "npm install",
-    "pnpm add left-pad",
-    "yarn remove x",
-    "bun add y",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo hi > out.txt",
+        "echo hi >> out.txt",
+        "sed -i 's/a/b/' file.txt",
+        "cat foo | tee out.txt",
+        "npm install",
+        "pnpm add left-pad",
+        "yarn remove x",
+        "bun add y",
+    ],
+)
 def test_block_mutating_bash_classifier_minimal_set(tmp_path, command):
     """AC8: shell file-write + package-manager mutation classified as mutating
     and blocked outside worktree."""
@@ -350,20 +363,24 @@ def test_block_mutating_bash_classifier_minimal_set(tmp_path, command):
 # AC4 — allow read-only Bash
 # =============================================================================
 
-@pytest.mark.parametrize("command", [
-    "git status",
-    "git diff HEAD~1",
-    "git log --oneline",
-    "git show HEAD",
-    "git rev-parse HEAD",
-    "git worktree list",
-    "git stash list",
-    "git stash show",
-    "gh pr view 1",
-    "gh issue view 1",
-    "gh api repos/o/r/pulls",
-    "gh api -X GET repos/o/r",
-])
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git diff HEAD~1",
+        "git log --oneline",
+        "git show HEAD",
+        "git rev-parse HEAD",
+        "git worktree list",
+        "git stash list",
+        "git stash show",
+        "gh pr view 1",
+        "gh issue view 1",
+        "gh api repos/o/r/pulls",
+        "gh api -X GET repos/o/r",
+    ],
+)
 def test_allow_read_only_bash(tmp_path, command):
     """AC4: read-only Bash is allowed even from repo root."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
@@ -392,6 +409,7 @@ def test_allow_read_only_bash_when_worktree_unresolved(tmp_path):
 # =============================================================================
 # AC5 / AC13 — bounded failure message, no leak
 # =============================================================================
+
 
 def test_message_bounded_max_lines(tmp_path):
     """AC5: block stderr is <= 20 lines and shows only expected worktree + cwd."""
@@ -435,8 +453,7 @@ def test_stderr_bounded_no_leak(tmp_path):
         "tool_input": {"file_path": str(target)},
         "cwd": str(repo["root"]),
     }
-    r = _run_guard(payload, repo["root"], issue="942",
-                   extra_env={"LEAKY_ENV_VAR": "LEAKVAL_abc"})
+    r = _run_guard(payload, repo["root"], issue="942", extra_env={"LEAKY_ENV_VAR": "LEAKVAL_abc"})
     assert r.returncode == 2
     # tool input path must not leak
     assert secret_pathseg not in r.stderr, r.stderr
@@ -462,6 +479,7 @@ def test_stderr_bounded_no_leak_for_bash(tmp_path):
 # =============================================================================
 # AC6 — guard ordering (secret guard precedes worktree guard in settings)
 # =============================================================================
+
 
 def test_guard_ordering_secret_precedes_worktree(tmp_path):
     """AC6: in settings.json PreToolUse, the shared-tool secret_boundary_guard
@@ -506,18 +524,18 @@ def test_guard_ordering_worktree_matcher_shape(tmp_path):
         assert tool in worktree_matcher, f"{tool} missing from worktree matcher"
     # #970 にて secret_boundary_guard にも MultiEdit を追加済み。
     assert secret_matcher is not None
-    assert "MultiEdit" in secret_matcher, (
-        "secret_boundary_guard matcher must include MultiEdit (#970)"
-    )
+    assert "MultiEdit" in secret_matcher, "secret_boundary_guard matcher must include MultiEdit (#970)"
 
 
 # =============================================================================
 # AC8 — classifier minimal set (read-only allowlist vs mutating)
 # =============================================================================
 
+
 def test_classifier_minimal_set_readonly_vs_mutating(tmp_path):
     """AC8: importable classifier returns read_only / mutating for the minimal set."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("wsg", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -543,12 +561,16 @@ def test_classifier_minimal_set_readonly_vs_mutating(tmp_path):
 # AC9 — wrapper / explicit-target detection
 # =============================================================================
 
-@pytest.mark.parametrize("command", [
-    "git -C {root} commit -m oops",
-    "cd {root} && git add .",
-    "command git -C {root} push",
-    "env FOO=bar git -C {root} commit -m x",
-])
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -C {root} commit -m oops",
+        "cd {root} && git add .",
+        "command git -C {root} push",
+        "env FOO=bar git -C {root} commit -m x",
+    ],
+)
 def test_block_wrapper_explicit_target_outside(tmp_path, command):
     """AC9: even with cwd inside the worktree, an explicit target dir outside it
     (via git -C / cd && / command git / env ... git) is blocked."""
@@ -581,18 +603,22 @@ def test_allow_wrapper_explicit_target_inside(tmp_path):
 # AC10 — gh api write methods / field flags + gh mutations
 # =============================================================================
 
-@pytest.mark.parametrize("command", [
-    "gh api -X PATCH repos/o/r/issues/1",
-    "gh api --method POST repos/o/r/issues",
-    "gh api -f title=x repos/o/r/issues",
-    "gh api -F body=@b.md repos/o/r/issues",
-    "gh api --field a=b repos/o/r",
-    "gh api --input payload.json repos/o/r",
-    "gh issue comment 1 -b hi",
-    "gh pr merge 1",
-    "gh pr review 1 --approve",
-    "gh pr comment 1 -b hi",
-])
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api -X PATCH repos/o/r/issues/1",
+        "gh api --method POST repos/o/r/issues",
+        "gh api -f title=x repos/o/r/issues",
+        "gh api -F body=@b.md repos/o/r/issues",
+        "gh api --field a=b repos/o/r",
+        "gh api --input payload.json repos/o/r",
+        "gh issue comment 1 -b hi",
+        "gh pr merge 1",
+        "gh pr review 1 --approve",
+        "gh pr comment 1 -b hi",
+    ],
+)
 def test_block_gh_api_and_mutations(tmp_path, command):
     """AC10: gh api writes and gh pr/issue mutations are blocked outside worktree."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
@@ -620,6 +646,7 @@ def test_allow_gh_api_explicit_get(tmp_path):
 # =============================================================================
 # AC11 — path containment via realpath/commonpath
 # =============================================================================
+
 
 def test_path_containment_realpath_dotdot_traversal(tmp_path):
     """AC11: a target using ../ to escape the worktree is blocked."""
@@ -686,6 +713,7 @@ def test_path_containment_realpath_relative_inside_allowed(tmp_path):
 # AC12 — worktree ambiguity decision (0 / multiple / mismatch)
 # =============================================================================
 
+
 def test_worktree_ambiguity_decision_zero_match_mutation_blocks(tmp_path):
     """AC12: active issue resolved but NO matching worktree → mutation blocks."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
@@ -713,8 +741,7 @@ def test_worktree_ambiguity_decision_zero_match_readonly_allows(tmp_path):
 
 def test_worktree_ambiguity_decision_multiple_match_blocks(tmp_path):
     """AC12: multiple worktrees matching the issue → mutation fail-closed block."""
-    repo = _make_repo_with_worktree(tmp_path, issue="942",
-                                    extra_worktrees=[("942", "dup")])
+    repo = _make_repo_with_worktree(tmp_path, issue="942", extra_worktrees=[("942", "dup")])
     target = repo["root"] / "README.md"
     payload = {
         "tool_name": "Write",
@@ -729,9 +756,11 @@ def test_worktree_ambiguity_decision_multiple_match_blocks(tmp_path):
 # AC14 — porcelain -z NUL record parser
 # =============================================================================
 
+
 def test_porcelain_z_parser_handles_nul_records(tmp_path):
     """AC14: parser splits NUL-separated records and extracts worktree + branch."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("wsg", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -756,6 +785,7 @@ def test_porcelain_z_parser_handles_nul_records(tmp_path):
 def test_porcelain_z_parser_handles_path_with_newline(tmp_path):
     """AC14: -z form tolerates a worktree path that contains a newline."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("wsg", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -769,6 +799,7 @@ def test_porcelain_z_parser_handles_path_with_newline(tmp_path):
 # =============================================================================
 # AC15 — fail-closed: malformed payload / git missing / unparseable mutation
 # =============================================================================
+
 
 def test_fail_closed_malformed_or_missing_payload(tmp_path):
     """AC15: malformed (non-JSON) stdin for a matched tool → block exit 2."""
@@ -819,6 +850,7 @@ def test_fail_closed_git_binary_unavailable_for_mutation(tmp_path):
     py_dir = tmp_path / "pybin"
     py_dir.mkdir()
     import shutil as _sh
+
     real_py = _sh.which("python3")
     real_bash = _sh.which("bash")
     os.symlink(real_py, str(py_dir / "python3"))
@@ -843,14 +875,12 @@ def test_fail_closed_git_binary_unavailable_for_mutation(tmp_path):
 # settings wiring sanity (supports AC7)
 # =============================================================================
 
+
 def test_settings_json_is_valid_and_wires_worktree_guard(tmp_path):
     """settings.json parses and references worktree_scope_guard in PreToolUse."""
     settings = json.loads(SETTINGS_JSON.read_text())
     pre = settings["hooks"]["PreToolUse"]
-    found = any(
-        "worktree_scope_guard" in h.get("command", "")
-        for entry in pre for h in entry.get("hooks", [])
-    )
+    found = any("worktree_scope_guard" in h.get("command", "") for entry in pre for h in entry.get("hooks", []))
     assert found, "worktree_scope_guard not wired in PreToolUse"
 
 
@@ -859,6 +889,7 @@ def test_settings_json_is_valid_and_wires_worktree_guard(tmp_path):
 # =============================================================================
 
 # ── B1 [AC12] Write/Edit/MultiEdit zero-match worktree → fail-closed block ────
+
 
 @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit"])
 def test_b1_write_zero_match_external_blocks(tmp_path, tool):
@@ -879,16 +910,20 @@ def test_b1_write_zero_match_external_blocks(tmp_path, tool):
 
 # ── B2 [AC8] shell file-write external target from inside worktree → block ────
 
-@pytest.mark.parametrize("command_tmpl", [
-    "echo x > {root}/evil.txt",
-    "echo x >> {root}/evil.txt",
-    "cat foo | tee {root}/evil.txt",
-    "sed -i 's/a/b/' {root}/README.md",
-    "perl -i -pe 's/a/b/' {root}/README.md",
-    "python3 -c \"open('{root}/evil.txt','w').write('x')\"",
-    "node -e \"require('fs').writeFileSync('{root}/evil.txt','x')\"",
-    "ruby -e \"File.write('{root}/evil.txt','x')\"",
-])
+
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        "echo x > {root}/evil.txt",
+        "echo x >> {root}/evil.txt",
+        "cat foo | tee {root}/evil.txt",
+        "sed -i 's/a/b/' {root}/README.md",
+        "perl -i -pe 's/a/b/' {root}/README.md",
+        "python3 -c \"open('{root}/evil.txt','w').write('x')\"",
+        "node -e \"require('fs').writeFileSync('{root}/evil.txt','x')\"",
+        "ruby -e \"File.write('{root}/evil.txt','x')\"",
+    ],
+)
 def test_b2_shell_write_external_target_from_worktree_blocks(tmp_path, command_tmpl):
     """B2/AC8/Outcome: cwd inside the worktree, but the file-write destination is an
     external absolute path → block (write-target extracted + containment-checked)."""
@@ -934,13 +969,17 @@ def test_b2_shell_write_unextractable_target_fail_closed(tmp_path):
 
 # ── B3 [AC9] bash -c / sh -c / env ... bash -lc wrapper unwrap → block ────────
 
-@pytest.mark.parametrize("command_tmpl", [
-    "bash -lc 'cd {root} && git add .'",
-    "sh -c 'echo x > {root}/y'",
-    "env FOO=bar bash -lc 'git -C {root} commit -m x'",
-    "bash -c 'cd {root} && git commit -m x'",
-    "zsh -c 'echo x > {root}/z'",
-])
+
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        "bash -lc 'cd {root} && git add .'",
+        "sh -c 'echo x > {root}/y'",
+        "env FOO=bar bash -lc 'git -C {root} commit -m x'",
+        "bash -c 'cd {root} && git commit -m x'",
+        "zsh -c 'echo x > {root}/z'",
+    ],
+)
 def test_b3_shell_wrapper_external_target_blocks(tmp_path, command_tmpl):
     """B3/AC9: cwd inside the worktree, but a `bash/sh/zsh -c|-lc` wrapper script
     targets an external dir (cd / git -C / redirection) → unwrap and block."""
@@ -971,13 +1010,17 @@ def test_b3_shell_wrapper_internal_target_allowed(tmp_path):
 
 # ── Major [AC15] unknown/mutating command with external absolute-path arg ─────
 
-@pytest.mark.parametrize("command_tmpl", [
-    "someformatter --output {root}/out.txt",
-    "somegen --output={root}/out.txt",
-    "somelint --fix {root}/x.py",
-    "somefmt -o {root}/out.txt",
-    "rewrite --in-place {root}/x.txt",
-])
+
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        "someformatter --output {root}/out.txt",
+        "somegen --output={root}/out.txt",
+        "somelint --fix {root}/x.py",
+        "somefmt -o {root}/out.txt",
+        "rewrite --in-place {root}/x.txt",
+    ],
+)
 def test_major_unknown_external_abs_arg_blocks(tmp_path, command_tmpl):
     """Major/AC15: an unknown command run from inside the worktree carrying a
     WRITE-OPTION absolute-path value pointing outside the worktree (formatter-write
@@ -1012,8 +1055,7 @@ def test_major_readonly_allowlist_not_overblocked(tmp_path):
     """Major control: read-only allowlist commands with no external abs path stay
     allowed (no over-block from the stricter unknown-inside path)."""
     repo = _make_repo_with_worktree(tmp_path, issue="942")
-    for cmd in ("git status", "git diff HEAD~1", "gh pr view 1",
-                "gh api -X GET repos/o/r"):
+    for cmd in ("git status", "git diff HEAD~1", "gh pr view 1", "gh api -X GET repos/o/r"):
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": cmd},
@@ -1031,25 +1073,29 @@ def test_major_readonly_allowlist_not_overblocked(tmp_path):
 # general read-only program allowlist.
 # =============================================================================
 
-@pytest.mark.parametrize("command_tmpl", [
-    # bare read-only programs reading an external absolute path → allow
-    "cat {root}/README.md",
-    "grep x {root}/README.md",
-    "ls {root}",
-    "head {root}/README.md",
-    "tail {root}/README.md",
-    "wc -l {root}/README.md",
-    "find {root} -name x",
-    "stat {root}/README.md",
-    "realpath {root}/README.md",
-    # pipeline of read-only programs reading external → allow
-    "cat {root}/README.md | grep x",
-    "grep x {root}/README.md | wc -l",
-    # sed/perl WITHOUT in-place are read-only even reading external → allow
-    "sed -n '1p' {root}/README.md",
-    # read-only git against external dir → allow
-    "git -C {root} status",
-])
+
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        # bare read-only programs reading an external absolute path → allow
+        "cat {root}/README.md",
+        "grep x {root}/README.md",
+        "ls {root}",
+        "head {root}/README.md",
+        "tail {root}/README.md",
+        "wc -l {root}/README.md",
+        "find {root} -name x",
+        "stat {root}/README.md",
+        "realpath {root}/README.md",
+        # pipeline of read-only programs reading external → allow
+        "cat {root}/README.md | grep x",
+        "grep x {root}/README.md | wc -l",
+        # sed/perl WITHOUT in-place are read-only even reading external → allow
+        "sed -n '1p' {root}/README.md",
+        # read-only git against external dir → allow
+        "git -C {root} status",
+    ],
+)
 def test_readonly_external_abs_path_not_overblocked(tmp_path, command_tmpl):
     """AC4 over-block regression: read-only ALLOWLIST commands reading OUTSIDE the
     worktree from a cwd inside the worktree are allowed — reads do not pollute
@@ -1067,21 +1113,24 @@ def test_readonly_external_abs_path_not_overblocked(tmp_path, command_tmpl):
     assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
 
 
-@pytest.mark.parametrize("command_tmpl", [
-    # redirection to an external path from an otherwise read-only program → block
-    "cat {root}/README.md > {root}/evil.txt",
-    "echo x > {root}/evil.txt",
-    "echo x >> {root}/evil.txt",
-    "grep x in.txt > {root}/evil.txt",
-    # tee to an external path → block
-    "cat foo | tee {root}/evil.txt",
-    # sed/perl in-place on an external file → block
-    "sed -i 's/a/b/' {root}/README.md",
-    "perl -i -pe 's/a/b/' {root}/README.md",
-    # write-option destination to an external path → block
-    "someformatter --output {root}/out.txt",
-    "somefmt -o {root}/out.txt",
-])
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        # redirection to an external path from an otherwise read-only program → block
+        "cat {root}/README.md > {root}/evil.txt",
+        "echo x > {root}/evil.txt",
+        "echo x >> {root}/evil.txt",
+        "grep x in.txt > {root}/evil.txt",
+        # tee to an external path → block
+        "cat foo | tee {root}/evil.txt",
+        # sed/perl in-place on an external file → block
+        "sed -i 's/a/b/' {root}/README.md",
+        "perl -i -pe 's/a/b/' {root}/README.md",
+        # write-option destination to an external path → block
+        "someformatter --output {root}/out.txt",
+        "somefmt -o {root}/out.txt",
+    ],
+)
 def test_readonly_program_external_redirection_still_blocks(tmp_path, command_tmpl):
     """AC8 maintain: redirection / tee / in-place / write-option destinations to an
     EXTERNAL absolute path are still blocked even when the leading program is
@@ -1126,16 +1175,19 @@ def test_readonly_relative_internal_write_and_build_allowed(tmp_path):
         assert r.returncode == 0, f"{cmd!r} should allow; stderr={r.stderr}"
 
 
-@pytest.mark.parametrize("command_tmpl", [
-    "cp a.txt {root}/copied.txt",
-    "mv a.txt {root}/moved.txt",
-    "dd if=a.txt of={root}/dd.out",
-    "install a.txt {root}/inst.txt",
-    "cp -r . {root}/dircopy",
-    # unknown program with a bare external abs path: cannot prove read vs write
-    # at parse time → fail-closed (would otherwise re-open cp/mv/dd positional writes)
-    "weirdtool {root}/target.bin",
-])
+@pytest.mark.parametrize(
+    "command_tmpl",
+    [
+        "cp a.txt {root}/copied.txt",
+        "mv a.txt {root}/moved.txt",
+        "dd if=a.txt of={root}/dd.out",
+        "install a.txt {root}/inst.txt",
+        "cp -r . {root}/dircopy",
+        # unknown program with a bare external abs path: cannot prove read vs write
+        # at parse time → fail-closed (would otherwise re-open cp/mv/dd positional writes)
+        "weirdtool {root}/target.bin",
+    ],
+)
 def test_block_mutating_bash_positional_writer_outside(tmp_path, command_tmpl):
     """AC8/AC15: an unknown positional-writer (cp/mv/dd/install) whose external
     absolute destination is a bare positional (or of=) arg must be fail-closed
@@ -1173,6 +1225,7 @@ def test_allow_read_only_external_read_with_relative_inside_write(tmp_path):
 
 # --- AC2: git show HEAD:path inside worktree → allow ---
 
+
 def test_allow_git_show_inside_worktree(tmp_path):
     """AC2: git show HEAD:path inside active worktree is read_only → allow."""
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
@@ -1187,9 +1240,11 @@ def test_allow_git_show_inside_worktree(tmp_path):
 
 # --- AC3: unrelated mutation inside worktree → deny (command_class: mutation) ---
 
+
 def test_deny_unrelated_mutation_via_build_decision(tmp_path):
     """AC3: build_decision returns command_class==mutation and deny for mutation outside worktree."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -1204,6 +1259,7 @@ def test_deny_unrelated_mutation_via_build_decision(tmp_path):
         "CLAUDE_PROJECT_DIR": str(repo["root"]),
     }
     import os
+
     old_env = os.environ.copy()
     os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
     os.environ["LOOP_ISSUE_NUMBER"] = "1050"
@@ -1218,6 +1274,7 @@ def test_deny_unrelated_mutation_via_build_decision(tmp_path):
 
 
 # --- AC4a: git worktree remove without contract → deny ---
+
 
 def test_cleanup_worktree_remove_no_contract(tmp_path):
     """AC4a: git worktree remove without cleanup contract is denied."""
@@ -1235,9 +1292,11 @@ def test_cleanup_worktree_remove_no_contract(tmp_path):
 
 # --- AC4b: git worktree remove with valid contract + exact path → allow ---
 
+
 def test_cleanup_worktree_remove_with_contract(tmp_path):
     """AC4b: git worktree remove with valid contract and exact path → allow."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     contract = {
@@ -1262,9 +1321,11 @@ def test_cleanup_worktree_remove_with_contract(tmp_path):
 
 # --- AC4c: git branch -d with valid contract → allow ---
 
+
 def test_cleanup_branch_delete_with_contract(tmp_path):
     """AC4c: git branch -d <branch> with valid contract → allow."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     branch = "issue-1050-scope-guard"
@@ -1290,6 +1351,7 @@ def test_cleanup_branch_delete_with_contract(tmp_path):
 
 # --- AC4c: git branch -D (force delete) → deny at guard decision level ---
 
+
 def test_cleanup_branch_force_delete_denied(tmp_path):
     """AC4c: git branch -D with contract present must deny at guard decision level.
 
@@ -1297,6 +1359,7 @@ def test_cleanup_branch_force_delete_denied(tmp_path):
     Classifier returns mutating (not cleanup); _is_force_branch_delete catches it.
     """
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     branch = "issue-1050-scope-guard"
@@ -1324,6 +1387,7 @@ def test_cleanup_branch_force_delete_denied(tmp_path):
 def test_cleanup_branch_delete_force_long_form_denied(tmp_path):
     """AC4c: git branch --delete --force <branch> must deny at guard decision level."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     branch = "issue-1050-scope-guard"
@@ -1349,9 +1413,11 @@ def test_cleanup_branch_delete_force_long_form_denied(tmp_path):
 
 # --- AC4d: path traversal in worktree remove → deny ---
 
+
 def test_cleanup_worktree_remove_path_traversal_denied(tmp_path):
     """AC4d: path traversal in git worktree remove → deny."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     contract = {
@@ -1378,9 +1444,11 @@ def test_cleanup_worktree_remove_path_traversal_denied(tmp_path):
 
 # --- AC5: compound shell command → command_class: unknown ---
 
+
 def test_unknown_compound_shell_command(tmp_path):
     """AC5: cd /repo && git status is compound → classify_bash returns unknown."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -1390,6 +1458,7 @@ def test_unknown_compound_shell_command(tmp_path):
 
 
 # --- AC6: deny stderr bounded, no raw data, exit 2 ---
+
 
 def test_deny_stderr_exit2_bounded(tmp_path):
     """AC6: cleanup deny → stderr ≤10 lines, no raw path/branch, exit 2."""
@@ -1404,18 +1473,20 @@ def test_deny_stderr_exit2_bounded(tmp_path):
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050"}
     r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
     assert r.returncode == 2, "cleanup deny must exit 2"
-    stderr_lines = [l for l in r.stderr.splitlines() if l.strip()]
+    stderr_lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
     assert len(stderr_lines) <= 10, f"stderr must be ≤10 lines; got {len(stderr_lines)}"
     # No raw path/branch/command in stderr
     assert wt_path not in r.stderr, "stderr must not contain raw worktree path"
-    assert f"git worktree remove" not in r.stderr, "stderr must not contain raw command"
+    assert "git worktree remove" not in r.stderr, "stderr must not contain raw command"
 
 
 # --- AC9: build_decision importable pure function ---
 
+
 def test_build_decision_importable(tmp_path):
     """AC9: build_decision is importable from worktree_scope_guard and returns V2 dict."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(GUARD_PY))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -1424,6 +1495,7 @@ def test_build_decision_importable(tmp_path):
 
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     import os
+
     old_env = os.environ.copy()
     os.environ["CLAUDE_PROJECT_DIR"] = str(repo["root"])
     os.environ["LOOP_ISSUE_NUMBER"] = "1050"
@@ -1446,9 +1518,11 @@ def test_build_decision_importable(tmp_path):
 
 # --- AC4b/AC10: require_clean enforcement ---
 
+
 def test_cleanup_require_clean_false_contract_invalid(tmp_path):
     """AC4b/AC10: contract with require_clean=false is invalid → deny."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     contract = {
@@ -1475,6 +1549,7 @@ def test_cleanup_require_clean_false_contract_invalid(tmp_path):
 def test_cleanup_worktree_remove_dirty_unstaged_denied(tmp_path):
     """AC4b/AC10: git worktree remove denied when worktree has unstaged modification."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = repo["worktree"]
     # Create a dirty file in the worktree
@@ -1506,6 +1581,7 @@ def test_cleanup_worktree_remove_dirty_unstaged_denied(tmp_path):
 def test_cleanup_worktree_remove_dirty_untracked_denied(tmp_path):
     """AC4b/AC10: git worktree remove denied when worktree has untracked file."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = repo["worktree"]
     # Create an untracked file
@@ -1533,6 +1609,7 @@ def test_cleanup_worktree_remove_dirty_untracked_denied(tmp_path):
 def test_cleanup_worktree_remove_outside_worktrees_dir_denied(tmp_path):
     """AC4d (Blocker 3): worktree_path outside .claude/worktrees/ is denied."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     # Use a path that's NOT under .claude/worktrees/ (project root itself)
     bad_path = str(repo["root"])
@@ -1561,6 +1638,7 @@ def test_cleanup_worktree_remove_outside_worktrees_dir_denied(tmp_path):
 def test_cleanup_git_dash_c_worktree_remove_denied(tmp_path):
     """High: git -C <path> worktree remove is denied (grammar not allowed in cleanup)."""
     import json
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="scope-guard")
     wt_path = str(repo["worktree"])
     project_root = str(repo["root"])
@@ -1589,7 +1667,6 @@ def test_cleanup_git_dash_c_worktree_remove_denied(tmp_path):
 # Issue #1137: real-hook-chain integration — agent-ops allow + one-shot V3
 # =============================================================================
 
-import importlib.util as _ilu  # noqa: E402
 import sys as _sys  # noqa: E402
 
 _AGENT_OPS = REPO_ROOT / "scripts" / "agent-ops"
@@ -1603,10 +1680,12 @@ def _bash_payload(command: str, cwd: str) -> dict:
     return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
 
 
-def _write_v3(root, wt_real, branch, operation, *, expired=False, bad_hash=False,
-              bad_op=False, corrupt=False, nonce="0" * 32):
+def _write_v3(
+    root, wt_real, branch, operation, *, expired=False, bad_hash=False, bad_op=False, corrupt=False, nonce="0" * 32
+):
     """Write a V3 contract directly for precise test control."""
     import time as _t
+
     now = int(_t.time())
     if expired:
         issued = now - 1000
@@ -1617,6 +1696,7 @@ def _write_v3(root, wt_real, branch, operation, *, expired=False, bad_hash=False
 
     def _iso(ts):
         from datetime import datetime, timezone
+
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     op = operation
@@ -1626,12 +1706,19 @@ def _write_v3(root, wt_real, branch, operation, *, expired=False, bad_hash=False
     if bad_hash:
         chash = "0" * 64
     if bad_op:
-        op = (_cc3.OP_BRANCH_DELETE if operation == _cc3.OP_WORKTREE_REMOVE else _cc3.OP_WORKTREE_REMOVE)
+        op = _cc3.OP_BRANCH_DELETE if operation == _cc3.OP_WORKTREE_REMOVE else _cc3.OP_WORKTREE_REMOVE
     contract = {
-        "schema": _cc3.SCHEMA_V3, "pr_number": 1, "linked_issue_number": 1137,
-        "worktree_path": wt_real, "branch_name": branch, "require_clean": True,
-        "operation": op, "command_hash": chash, "nonce": nonce,
-        "issued_at": _iso(issued), "expires_at": _iso(expires),
+        "schema": _cc3.SCHEMA_V3,
+        "pr_number": 1,
+        "linked_issue_number": 1137,
+        "worktree_path": wt_real,
+        "branch_name": branch,
+        "require_clean": True,
+        "operation": op,
+        "command_hash": chash,
+        "nonce": nonce,
+        "issued_at": _iso(issued),
+        "expires_at": _iso(expires),
     }
     target = root / "artifacts" / "agent-ops" / "cleanup_contract.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1645,26 +1732,42 @@ def _write_v3(root, wt_real, branch, operation, *, expired=False, bad_hash=False
 
 # --- AC3: exact agent-ops tool allowed from main root with active issue ---
 
-@pytest.mark.parametrize("script", [
-    "scripts/agent-ops/cleanup_exec.py",
-    "scripts/agent-ops/guard_preflight.py",
-    "scripts/agent-ops/materialize_cleanup_contract.py",
-])
-def test_agent_ops_tool_allowed_real_hook(tmp_path, script):
+
+@pytest.mark.parametrize(
+    ("script", "extra_args"),
+    [
+        # cleanup_exec.py and materialize require --pr-number/--worktree-path/--branch-name
+        # (B2: required flags are now enforced at guard level, not just argparse)
+        (
+            "scripts/agent-ops/cleanup_exec.py",
+            "--json --pr-number 1 --worktree-path /tmp/wt --branch-name test-branch",
+        ),
+        ("scripts/agent-ops/guard_preflight.py", "--json"),
+        (
+            "scripts/agent-ops/materialize_cleanup_contract.py",
+            "--json --pr-number 1 --worktree-path /tmp/wt --branch-name test-branch",
+        ),
+    ],
+)
+def test_agent_ops_tool_allowed_real_hook(tmp_path, script, extra_args):
     """AC3 (real hook): uv run python3 <agent-ops tool> from main root + active issue → allow."""
     repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
-    payload = _bash_payload(f"uv run python3 {script} --json", str(repo["root"]))
+    cmd = f"uv run python3 {script} {extra_args}"
+    payload = _bash_payload(cmd, str(repo["root"]))
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
     r = _run_guard(payload, repo["root"], issue="1137", extra_env=env)
     assert r.returncode == 0, f"agent-ops tool must allow; stderr={r.stderr}"
 
 
-@pytest.mark.parametrize("command", [
-    "python3 -c \"import os\"",
-    "uv run python3 scripts/agent-ops/cleanup_exec.py --json; rm -rf /",
-    "uv run python3 scripts/other/evil.py",
-    "uv run python3 scripts/agent-ops/not_allowed.py",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python3 -c "import os"',
+        "uv run python3 scripts/agent-ops/cleanup_exec.py --json; rm -rf /",
+        "uv run python3 scripts/other/evil.py",
+        "uv run python3 scripts/agent-ops/not_allowed.py",
+    ],
+)
 def test_agent_ops_tool_rejected_forms_real_hook(tmp_path, command):
     """AC3: python -c / shell-chain / non-allowed scripts are NOT agent-ops-allowed."""
     repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
@@ -1756,14 +1859,7 @@ def test_skill_runtime_executor_runs_preflight_directly(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    artifact = (
-        repo["root"]
-        / ".claude"
-        / "artifacts"
-        / "issue-refinement-loop"
-        / "1154"
-        / "preflight.json"
-    )
+    artifact = repo["root"] / ".claude" / "artifacts" / "issue-refinement-loop" / "1154" / "preflight.json"
     assert artifact.exists(), "expected preflight artifact to be created"
     payload = json.loads(artifact.read_text())
     assert payload == {"issue_number": "1154", "repo": "squne121/loop-protocol"}
@@ -1806,16 +1902,19 @@ def test_skill_runtime_executor_blocks_stale_directory_without_catalog_entry(tmp
     assert direct.returncode == 2
 
 
-@pytest.mark.parametrize("command", [
-    "python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-    "uv run python3 /tmp/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-    "uv run python3 .claude/skills/issue-refinement-loop/scripts/not_registered.py",
-    "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol --unknown-flag x",
-    "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-    "bash -lc 'uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol'",
-    "FOO=bar uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-    "uv --with pytest run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
-])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        "uv run python3 /tmp/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        "uv run python3 .claude/skills/issue-refinement-loop/scripts/not_registered.py",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol --unknown-flag x",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        "bash -lc 'uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol'",
+        "FOO=bar uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+        "uv --with pytest run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
+    ],
+)
 def test_skill_runtime_executor_negative(tmp_path, command):
     """Issue #1154 AC8/AC10: malformed executor routes are fail-closed."""
     repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
@@ -1894,11 +1993,7 @@ def test_skill_runtime_executor_ignores_path_poisoning(tmp_path):
     shim_dir = tmp_path / "shim-bin"
     shim_dir.mkdir()
     marker = tmp_path / "poisoned.txt"
-    (shim_dir / "uv").write_text(
-        "#!/bin/sh\n"
-        f"echo poisoned > {marker}\n"
-        "exit 99\n"
-    )
+    (shim_dir / "uv").write_text(f"#!/bin/sh\necho poisoned > {marker}\nexit 99\n")
     (shim_dir / "uv").chmod(0o755)
     env = {
         **os.environ,
@@ -1928,6 +2023,7 @@ def test_skill_runtime_executor_ignores_path_poisoning(tmp_path):
 
 
 # --- AC4/AC5/AC6: V3 one-shot decisions via real hook ---
+
 
 def test_v3_valid_worktree_remove_allow_real_hook(tmp_path):
     """AC4/AC5: valid V3 contract → exact worktree remove allowed (real hook)."""
@@ -1982,11 +2078,18 @@ def test_v3_present_but_invalid_no_v2_downgrade_real_hook(tmp_path):
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
     wt_real = os.path.realpath(str(repo["worktree"]))
     _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE, corrupt=True)
-    v2 = {"schema": "POST_MERGE_CLEANUP_REQUEST_V2", "worktree_path": wt_real,
-          "branch_name": "issue-1050-g", "require_clean": True}
+    v2 = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_real,
+        "branch_name": "issue-1050-g",
+        "require_clean": True,
+    }
     payload = _bash_payload(f"git worktree remove {wt_real}", str(repo["worktree"]))
-    env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1050",
-           "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(v2)}
+    env = {
+        "CLAUDE_PROJECT_DIR": str(repo["root"]),
+        "LOOP_ISSUE_NUMBER": "1050",
+        "CLAUDE_WORKTREE_CLEANUP_CONTRACT": json.dumps(v2),
+    }
     r = _run_guard(payload, repo["root"], issue="1050", extra_env=env)
     assert r.returncode == 2, "present-but-invalid V3 must not downgrade to V2"
     assert "cleanup_contract_present_but_invalid" in r.stderr
@@ -2025,9 +2128,14 @@ def test_v3_root_drift_active_worktree_denied_real_hook(tmp_path):
 
 def test_v3_shared_reason_codes_vocabulary():
     """AC15: cleanup deny reasons are drawn from SHARED_CLEANUP_REASON_CODES."""
-    for code in ("cleanup_contract_present_but_invalid", "cleanup_contract_expired",
-                 "cleanup_command_hash_mismatch", "cleanup_operation_mismatch",
-                 "root_drift_active_worktree_mismatch", "cleanup_contract_consumed"):
+    for code in (
+        "cleanup_contract_present_but_invalid",
+        "cleanup_contract_expired",
+        "cleanup_command_hash_mismatch",
+        "cleanup_operation_mismatch",
+        "root_drift_active_worktree_mismatch",
+        "cleanup_contract_consumed",
+    ):
         assert code in _cc3.SHARED_CLEANUP_REASON_CODES
 
 
@@ -2049,9 +2157,15 @@ def test_materialize_durable_0600_round_trip(tmp_path):
     """AC10: materialize writes a 0600 file the reader accepts and validates."""
     repo = _seed_repo_wt(tmp_path)
     wt_real = os.path.realpath(str(repo["worktree"]))
-    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
-                         branch_name="issue-1050-g", operation=_cc3.OP_WORKTREE_REMOVE,
-                         project_root=str(repo["root"]), verify=False)
+    r = _mat.materialize(
+        pr_number=1,
+        linked_issue_number=1050,
+        worktree_path=wt_real,
+        branch_name="issue-1050-g",
+        operation=_cc3.OP_WORKTREE_REMOVE,
+        project_root=str(repo["root"]),
+        verify=False,
+    )
     assert r["status"] == "ok", r
     target = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.json"
     assert (target.stat().st_mode & 0o777) == 0o600
@@ -2066,8 +2180,14 @@ def test_materialize_symlink_fail_closed(tmp_path):
     elsewhere.mkdir()
     (repo["root"] / "artifacts").symlink_to(elsewhere, target_is_directory=True)
     wt_real = os.path.realpath(str(repo["worktree"]))
-    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
-                         branch_name="issue-1050-g", project_root=str(repo["root"]), verify=False)
+    r = _mat.materialize(
+        pr_number=1,
+        linked_issue_number=1050,
+        worktree_path=wt_real,
+        branch_name="issue-1050-g",
+        project_root=str(repo["root"]),
+        verify=False,
+    )
     assert r["status"] == "error"
     assert "write_failed" in r["error"]
 
@@ -2076,9 +2196,15 @@ def test_materialize_ttl_bounds(tmp_path):
     """AC12: TTL must be positive and within the max bound."""
     repo = _seed_repo_wt(tmp_path)
     wt_real = os.path.realpath(str(repo["worktree"]))
-    r = _mat.materialize(pr_number=1, linked_issue_number=1050, worktree_path=wt_real,
-                         branch_name="issue-1050-g", project_root=str(repo["root"]),
-                         verify=False, ttl_seconds=_cc3.MAX_TTL_SECONDS + 1)
+    r = _mat.materialize(
+        pr_number=1,
+        linked_issue_number=1050,
+        worktree_path=wt_real,
+        branch_name="issue-1050-g",
+        project_root=str(repo["root"]),
+        verify=False,
+        ttl_seconds=_cc3.MAX_TTL_SECONDS + 1,
+    )
     assert r["status"] == "error"
     assert r["error"] == "ttl_out_of_bounds"
 
@@ -2109,8 +2235,9 @@ def test_preflight_drift_human_required(tmp_path, monkeypatch):
     assert pf["status"] == "human_required"
     assert "root_drift_active_worktree_mismatch" in pf["blocked_reason_codes"]
     # no mutation
-    branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(repo["root"]),
-                            capture_output=True, text=True).stdout.strip()
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=str(repo["root"]), capture_output=True, text=True
+    ).stdout.strip()
     assert branch == "issue-1137-drift"
 
 
@@ -2118,8 +2245,12 @@ def test_cleanup_exec_refuses_non_default_root(tmp_path):
     """AC1: cleanup_exec refuses when the root checkout is not on the default branch."""
     repo = _seed_repo_wt(tmp_path)
     _git("switch", "-q", "-c", "issue-1137-drift", cwd=repo["root"])
-    req = {"pr_number": 1, "linked_issue_number": 1050,
-           "worktree_path": os.path.realpath(str(repo["worktree"])), "branch_name": "issue-1050-g"}
+    req = {
+        "pr_number": 1,
+        "linked_issue_number": 1050,
+        "worktree_path": os.path.realpath(str(repo["worktree"])),
+        "branch_name": "issue-1050-g",
+    }
     res = _ce.run(req, project_root=str(repo["root"]))
     assert res["status"] == "refused"
     assert res["reason_code"] == _ce.ROOT_NOT_DEFAULT
@@ -2130,8 +2261,7 @@ def test_cleanup_exec_refuses_worktree_not_in_catalog(tmp_path):
     """AC1: cleanup_exec refuses when the worktree is not in the real catalog."""
     repo = _seed_repo_wt(tmp_path)
     bogus = str(repo["root"] / ".claude" / "worktrees" / "issue-1050-nonexistent")
-    req = {"pr_number": 1, "linked_issue_number": 1050,
-           "worktree_path": bogus, "branch_name": "issue-1050-g"}
+    req = {"pr_number": 1, "linked_issue_number": 1050, "worktree_path": bogus, "branch_name": "issue-1050-g"}
     res = _ce.run(req, project_root=str(repo["root"]))
     assert res["status"] == "refused"
     assert res["reason_code"] == "branch_checked_out_in_worktree"
@@ -2155,19 +2285,23 @@ def test_expiry_requires_timezone():
 # PR #1143 OWNER review — adversarial regression tests for the 10 blockers
 # =============================================================================
 
-@pytest.mark.parametrize("command", [
-    # Blocker 1: newline-separated second command must NOT ride along on the
-    # agent-ops exact allow (a bare `;`-free `\n git worktree remove ...`).
-    "uv run python3 scripts/agent-ops/guard_preflight.py --json\n"
-    "git worktree remove .claude/worktrees/issue-1137-x",
-    "uv run python3 scripts/agent-ops/guard_preflight.py --json\rgit branch -d issue-1137-x",
-    # Blocker 1 / Blocker 5: --project-root / --no-verify escape-hatch flags are
-    # not part of the exact command class.
-    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --project-root /etc",
-    "uv run python3 scripts/agent-ops/materialize_cleanup_contract.py --no-verify --pr-number 1",
-    # Blocker 1: duplicate / unknown flags rejected.
-    "uv run python3 scripts/agent-ops/cleanup_exec.py --json --json",
-])
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Blocker 1: newline-separated second command must NOT ride along on the
+        # agent-ops exact allow (a bare `;`-free `\n git worktree remove ...`).
+        "uv run python3 scripts/agent-ops/guard_preflight.py --json\n"
+        "git worktree remove .claude/worktrees/issue-1137-x",
+        "uv run python3 scripts/agent-ops/guard_preflight.py --json\rgit branch -d issue-1137-x",
+        # Blocker 1 / Blocker 5: --project-root / --no-verify escape-hatch flags are
+        # not part of the exact command class.
+        "uv run python3 scripts/agent-ops/cleanup_exec.py --json --project-root /etc",
+        "uv run python3 scripts/agent-ops/materialize_cleanup_contract.py --no-verify --pr-number 1",
+        # Blocker 1: duplicate / unknown flags rejected.
+        "uv run python3 scripts/agent-ops/cleanup_exec.py --json --json",
+    ],
+)
 def test_agent_ops_newline_and_extra_flag_rejected_real_hook(tmp_path, command):
     """Blocker 1: newline injection / escape-hatch / duplicate flags are not agent-ops-allowed."""
     repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
@@ -2180,12 +2314,14 @@ def test_agent_ops_newline_and_extra_flag_rejected_real_hook(tmp_path, command):
 def _claim_worker(root):
     """Top-level worker for the concurrent-claim test (must be picklable)."""
     import cleanup_contract_v3 as cc
+
     return cc.claim_contract(root)
 
 
 def test_claim_contract_concurrent_single_winner(tmp_path):
     """Blocker 2: under concurrent claims exactly ONE process wins the one-shot contract."""
     import multiprocessing as mp
+
     repo = _make_repo_with_worktree(tmp_path, issue="1050", slug="g")
     wt_real = os.path.realpath(str(repo["worktree"]))
     _write_v3(repo["root"], wt_real, "issue-1050-g", _cc3.OP_WORKTREE_REMOVE)
@@ -2209,8 +2345,12 @@ def test_tombstone_forbids_v2_downgrade_after_consume(tmp_path):
     tomb = repo["root"] / "artifacts" / "agent-ops" / "cleanup_contract.tombstone.json"
     assert tomb.exists(), "consume must leave a durable tombstone"
     # A leftover V2 env contract must NOT re-authorize a second cleanup operation.
-    v2 = {"schema": "POST_MERGE_CLEANUP_REQUEST_V2", "worktree_path": wt_real,
-          "branch_name": "issue-1050-g", "require_clean": True}
+    v2 = {
+        "schema": "POST_MERGE_CLEANUP_REQUEST_V2",
+        "worktree_path": wt_real,
+        "branch_name": "issue-1050-g",
+        "require_clean": True,
+    }
     env2 = dict(env)
     env2["CLAUDE_WORKTREE_CLEANUP_CONTRACT"] = json.dumps(v2)
     second = _run_guard(payload, repo["root"], issue="1050", extra_env=env2)
@@ -2232,11 +2372,9 @@ def test_present_contract_io_uncapable_denied(tmp_path, monkeypatch):
 def test_cleanup_exec_no_project_root_or_no_verify_cli_flags():
     """Blocker 1/5: the public CLIs expose neither --project-root nor --no-verify."""
     with pytest.raises(SystemExit):
-        _ce.main(["--pr-number", "1", "--worktree-path", "/x",
-                  "--branch-name", "b", "--project-root", "/y"])
+        _ce.main(["--pr-number", "1", "--worktree-path", "/x", "--branch-name", "b", "--project-root", "/y"])
     with pytest.raises(SystemExit):
-        _mat.main(["--pr-number", "1", "--worktree-path", "/x",
-                   "--branch-name", "b", "--no-verify"])
+        _mat.main(["--pr-number", "1", "--worktree-path", "/x", "--branch-name", "b", "--no-verify"])
 
 
 def test_cleanup_exec_rejects_cross_repo_pr(tmp_path, monkeypatch):
@@ -2245,13 +2383,21 @@ def test_cleanup_exec_rejects_cross_repo_pr(tmp_path, monkeypatch):
     wt_real = os.path.realpath(str(repo["worktree"]))
     monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
     monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "deadbeef")
-    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
-        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
-        "headRefName": "issue-1050-g", "headRefOid": "deadbeef", "baseRefName": "main",
-        "isCrossRepository": True, "headRepositoryOwner": {"login": "attacker"},
-        "closingIssuesReferences": [{"number": 1050}]})
-    req = {"pr_number": 1, "linked_issue_number": 1050,
-           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    monkeypatch.setattr(
+        _ce,
+        "_pr_state",
+        lambda pr, root, slug, dl: {
+            "state": "MERGED",
+            "mergedAt": "2026-01-01T00:00:00Z",
+            "headRefName": "issue-1050-g",
+            "headRefOid": "deadbeef",
+            "baseRefName": "main",
+            "isCrossRepository": True,
+            "headRepositoryOwner": {"login": "attacker"},
+            "closingIssuesReferences": [{"number": 1050}],
+        },
+    )
+    req = {"pr_number": 1, "linked_issue_number": 1050, "worktree_path": wt_real, "branch_name": "issue-1050-g"}
     res = _ce.run(req, project_root=str(repo["root"]))
     assert res["status"] == "refused"
     assert res["reason_code"] == _ce.HEAD_REPO_MISMATCH
@@ -2263,13 +2409,21 @@ def test_cleanup_exec_rejects_head_oid_mismatch(tmp_path, monkeypatch):
     wt_real = os.path.realpath(str(repo["worktree"]))
     monkeypatch.setattr(_ce, "_repo_slug", lambda root, dl: "squne121/loop-protocol")
     monkeypatch.setattr(_ce, "_local_branch_tip", lambda root, br, dl: "aaaaaaa")
-    monkeypatch.setattr(_ce, "_pr_state", lambda pr, root, slug, dl: {
-        "state": "MERGED", "mergedAt": "2026-01-01T00:00:00Z",
-        "headRefName": "issue-1050-g", "headRefOid": "bbbbbbb", "baseRefName": "main",
-        "isCrossRepository": False, "headRepositoryOwner": {"login": "squne121"},
-        "closingIssuesReferences": [{"number": 1050}]})
-    req = {"pr_number": 1, "linked_issue_number": 1050,
-           "worktree_path": wt_real, "branch_name": "issue-1050-g"}
+    monkeypatch.setattr(
+        _ce,
+        "_pr_state",
+        lambda pr, root, slug, dl: {
+            "state": "MERGED",
+            "mergedAt": "2026-01-01T00:00:00Z",
+            "headRefName": "issue-1050-g",
+            "headRefOid": "bbbbbbb",
+            "baseRefName": "main",
+            "isCrossRepository": False,
+            "headRepositoryOwner": {"login": "squne121"},
+            "closingIssuesReferences": [{"number": 1050}],
+        },
+    )
+    req = {"pr_number": 1, "linked_issue_number": 1050, "worktree_path": wt_real, "branch_name": "issue-1050-g"}
     res = _ce.run(req, project_root=str(repo["root"]))
     assert res["status"] == "refused"
     assert res["reason_code"] == _ce.HEAD_OID_MISMATCH
@@ -2278,6 +2432,7 @@ def test_cleanup_exec_rejects_head_oid_mismatch(tmp_path, monkeypatch):
 def test_perform_preserves_partial_actions_on_branch_delete_fail(tmp_path):
     """Blocker 6: worktree removed but branch -d fails → actions_taken keeps the partial success."""
     from worktree_catalog import Deadline
+
     repo = _seed_repo_wt(tmp_path)
     wt_real = os.path.realpath(str(repo["worktree"]))
     # An unmerged commit on the branch makes `git branch -d` refuse after worktree removal.
@@ -2291,6 +2446,7 @@ def test_perform_preserves_partial_actions_on_branch_delete_fail(tmp_path):
 # Issue #1166: controlled skill mutation policy tests (AC2, AC5, AC9)
 # Real hook path via subprocess (PreToolUse stdin JSON).
 # =============================================================================
+
 
 def test_publish_termination_direct_denied_real_hook(tmp_path):
     """AC2/AC9: direct publish_termination_report.py invocation is denied by real hook.
@@ -2307,9 +2463,7 @@ def test_publish_termination_direct_denied_real_hook(tmp_path):
     payload = _bash_payload(cmd, str(repo["root"]))
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1166"}
     r = _run_guard(payload, repo["root"], issue="1166", extra_env=env)
-    assert r.returncode == 2, (
-        f"direct publish_termination_report.py must be denied; stderr={r.stderr}"
-    )
+    assert r.returncode == 2, f"direct publish_termination_report.py must be denied; stderr={r.stderr}"
 
 
 def test_publish_termination_executor_allowed_real_hook(tmp_path):
@@ -2331,23 +2485,22 @@ def test_publish_termination_executor_allowed_real_hook(tmp_path):
     input_file.write_text("{}\n")
 
     cmd = (
-        f"uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
-        f" --command-id termination_report.publish"
-        f" --issue-number 1166"
-        f" --input-file artifacts/1166/termination_report_input.json"
-        f" --repo squne121/loop-protocol"
+        "uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py"
+        " --command-id termination_report.publish"
+        " --issue-number 1166"
+        " --input-file artifacts/1166/termination_report_input.json"
+        " --repo squne121/loop-protocol"
     )
     payload = _bash_payload(cmd, str(repo["root"]))
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1166"}
     r = _run_guard(payload, repo["root"], issue="1166", extra_env=env)
-    assert r.returncode == 0, (
-        f"controlled_skill_mutation_exec.py with valid argv must be allowed; stderr={r.stderr}"
-    )
+    assert r.returncode == 0, f"controlled_skill_mutation_exec.py with valid argv must be allowed; stderr={r.stderr}"
 
 
 # =============================================================================
 # Issue #1197: probe scripts exact allow in worktree_scope_guard
 # =============================================================================
+
 
 class TestProbeScriptsExactAllow:
     """Issue #1197: probe scripts must be allowed by worktree_scope_guard."""
@@ -2355,10 +2508,12 @@ class TestProbeScriptsExactAllow:
     def test_git_ref_probe_in_allowed_scripts(self) -> None:
         """git_ref_probe.py must be in _AGENT_OPS_ALLOWED_SCRIPTS."""
         import importlib.util
+
         guard_py = GUARD_PY
         spec = importlib.util.spec_from_file_location("wsg_probe", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         import sys
+
         old = sys.path[:]
         _add_guard_paths(mod, guard_py)
         try:
@@ -2370,10 +2525,12 @@ class TestProbeScriptsExactAllow:
     def test_git_worktree_probe_in_allowed_scripts(self) -> None:
         """git_worktree_probe.py must be in _AGENT_OPS_ALLOWED_SCRIPTS."""
         import importlib.util
+
         guard_py = GUARD_PY
         spec = importlib.util.spec_from_file_location("wsg_probe2", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         import sys
+
         old = sys.path[:]
         _add_guard_paths(mod, guard_py)
         try:
@@ -2385,10 +2542,12 @@ class TestProbeScriptsExactAllow:
     def test_ref_probe_argv_valid_passes_spec(self) -> None:
         """Valid argv for git_ref_probe.py passes _validate_agent_ops_argv."""
         import importlib.util
+
         guard_py = GUARD_PY
         spec = importlib.util.spec_from_file_location("wsg_probe3", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         import sys
+
         old = sys.path[:]
         _add_guard_paths(mod, guard_py)
         try:
@@ -2401,10 +2560,12 @@ class TestProbeScriptsExactAllow:
     def test_worktree_probe_argv_valid_passes_spec(self) -> None:
         """Valid argv for git_worktree_probe.py passes _validate_agent_ops_argv."""
         import importlib.util
+
         guard_py = GUARD_PY
         spec = importlib.util.spec_from_file_location("wsg_probe4", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         import sys
+
         old = sys.path[:]
         _add_guard_paths(mod, guard_py)
         try:
@@ -2417,10 +2578,12 @@ class TestProbeScriptsExactAllow:
     def test_ref_probe_unknown_flag_fails_spec(self) -> None:
         """Unknown flag in git_ref_probe.py argv fails _validate_agent_ops_argv."""
         import importlib.util
+
         guard_py = GUARD_PY
         spec = importlib.util.spec_from_file_location("wsg_probe5", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
         import sys
+
         old = sys.path[:]
         _add_guard_paths(mod, guard_py)
         try:
@@ -2429,11 +2592,15 @@ class TestProbeScriptsExactAllow:
             sys.path[:] = old
         args = ["--branch", "main", "--unknown-flag"]
         assert not mod._validate_agent_ops_argv("scripts/agent-ops/git_ref_probe.py", args)
+        # B2: missing required --branch must be denied (required check in guard, not just argparse)
+        args_no_branch = ["--json"]
+        assert not mod._validate_agent_ops_argv("scripts/agent-ops/git_ref_probe.py", args_no_branch)
 
 
 def _add_guard_paths(mod, guard_py):
     """Add required paths to sys.path for loading worktree_scope_guard."""
     import sys
+
     repo = guard_py.parent.parent.parent
     for sub in ("scripts/agent-guards", "scripts/agent-ops"):
         p = str(repo / sub)

@@ -27,7 +27,7 @@ _MAX_STDERR_LINES = 5
 # Regex: a string that looks like an absolute path or secret-like token.
 # We redact these from error messages before printing to stderr.
 _SECRET_LIKE_RE = re.compile(
-    r"(/[^\s]+)|"               # absolute path
+    r"(/[^\s]+)|"  # absolute path
     r"([A-Za-z0-9+/]{40,}=*)",  # base64-like long token
 )
 
@@ -66,10 +66,37 @@ def _git_out(project_root: str, *args: str, timeout: float = 10.0) -> str | None
     return val if val else None
 
 
+def _validate_branch_name(project_root: str, branch: str) -> bool:
+    """Return True if branch name is valid per git check-ref-format --branch."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_root, "check-ref-format", "--branch", branch],
+            capture_output=True,
+            shell=False,
+            timeout=5.0,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _get_remote_mode(project_root: str, branch: str, remote: str) -> str:
+    """Return 'configured_upstream' if remote matches git-configured upstream, else 'origin_branch'."""
+    try:
+        r = _run_git(project_root, "rev-parse", "--abbrev-ref", f"{branch}@{{u}}", timeout=5.0)
+        if r.returncode == 0:
+            upstream = r.stdout.strip()  # e.g. "origin/main"
+            if upstream == f"{remote}/{branch}":
+                return "configured_upstream"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "origin_branch"
+
+
 def _probe_local(project_root: str, branch: str) -> dict:
-    """Probe local branch existence and OID."""
+    """Probe local branch existence and OID via exact ref (git show-ref --verify)."""
     ref = f"refs/heads/{branch}"
-    oid = _git_out(project_root, "rev-parse", "--verify", ref)
+    oid = _git_out(project_root, "show-ref", "--verify", "--hash", "--", ref)
     exists = oid is not None
     return {
         "exists": exists,
@@ -79,12 +106,12 @@ def _probe_local(project_root: str, branch: str) -> dict:
 
 
 def _probe_remote(project_root: str, branch: str, remote: str) -> dict:
-    """Probe remote-tracking ref for branch at remote."""
+    """Probe remote-tracking ref for branch at remote, via exact ref (git show-ref --verify)."""
     remote_ref = f"refs/remotes/{remote}/{branch}"
-    oid = _git_out(project_root, "rev-parse", "--verify", remote_ref)
+    oid = _git_out(project_root, "show-ref", "--verify", "--hash", "--", remote_ref)
     exists = oid is not None
     return {
-        "mode": "origin_branch",
+        "mode": _get_remote_mode(project_root, branch, remote),
         "ref": remote_ref if exists else None,
         "exists": exists,
         "oid": oid,
@@ -125,6 +152,17 @@ def probe(branch: str, remote: str = "origin", project_root: str | None = None) 
 
     errors: list[str] = []
 
+    if not _validate_branch_name(project_root, branch):
+        errors.append(f"invalid branch name: {branch!r}")
+        return {
+            "schema": SCHEMA,
+            "branch": branch,
+            "local": {"exists": False, "ref": None, "oid": None},
+            "remote": {"mode": "origin_branch", "ref": None, "exists": False, "oid": None},
+            "upstream": {"configured": False, "track": None},
+            "errors": errors,
+        }
+
     local = _probe_local(project_root, branch)
     remote_info = _probe_remote(project_root, branch, remote)
     upstream = _probe_upstream(project_root, branch)
@@ -143,8 +181,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Git branch/ref read-only probe")
     parser.add_argument("--branch", required=True, help="Branch name to probe")
     parser.add_argument("--remote", default="origin", help="Remote name (default: origin)")
-    parser.add_argument("--json", action="store_true", dest="json_output",
-                        help="Output JSON (always true, kept for explicit invocation)")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output JSON (always true, kept for explicit invocation)",
+    )
     args = parser.parse_args()
 
     result = probe(branch=args.branch, remote=args.remote)

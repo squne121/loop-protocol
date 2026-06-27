@@ -62,6 +62,7 @@ def _run_probe(repo: Path, branch: str, extra_args: list[str] | None = None) -> 
 
 # ─── AC2: JSON contract ────────────────────────────────────────────────────────
 
+
 class TestJsonContract:
     def test_json_contract_schema_key_present(self, temp_repo: Path) -> None:
         """AC2: schema field must be GIT_REF_PROBE_RESULT_V1."""
@@ -128,6 +129,7 @@ class TestJsonContract:
 
 # ─── AC4: stderr constraints ──────────────────────────────────────────────────
 
+
 class TestStderr:
     def test_stderr_max_5_lines_on_missing_branch(self, temp_repo: Path) -> None:
         """AC4: stderr must be ≤ 5 lines even for missing branch."""
@@ -142,10 +144,9 @@ class TestStderr:
         result = subprocess.run(cmd, cwd=str(temp_repo), capture_output=True, text=True)
         # Absolute paths would look like /home/... or /usr/...
         import re
+
         for line in result.stderr.splitlines():
-            assert not re.search(r"(?<!\w)/[a-zA-Z]{2,}/[^\s]+", line), (
-                f"Raw absolute path found in stderr: {line!r}"
-            )
+            assert not re.search(r"(?<!\w)/[a-zA-Z]{2,}/[^\s]+", line), f"Raw absolute path found in stderr: {line!r}"
 
     def test_exit_code_zero_on_success(self, temp_repo: Path) -> None:
         """AC4: exit code must be 0 on successful probe."""
@@ -154,6 +155,7 @@ class TestStderr:
 
 
 # ─── AC5: fixtures ────────────────────────────────────────────────────────────
+
 
 class TestFixtures:
     def test_local_branch_exists(self, temp_repo: Path) -> None:
@@ -215,17 +217,51 @@ class TestFixtures:
         assert data["upstream"]["configured"] is True
 
     def test_invalid_branch_name(self, temp_repo: Path) -> None:
-        """AC5: invalid branch name (contains ..) → local.exists=False, no crash."""
+        """B3/AC5: invalid branch name (contains ..) → validation error, local.exists=False."""
         data, result = _run_probe(temp_repo, "invalid..branch")
-        # Should not crash; either local.exists=False or an error is recorded
         assert isinstance(data, dict)
         assert data.get("schema") == "GIT_REF_PROBE_RESULT_V1"
         assert data["local"]["exists"] is False
+        assert any("invalid branch name" in e for e in data.get("errors", []))
 
     def test_branch_with_whitespace_in_name_handled(self, temp_repo: Path) -> None:
-        """AC5: branch name with special chars → local.exists=False, no crash."""
-        # Create a branch with spaces is typically not allowed by git;
-        # but we should handle gracefully without shell injection
+        """B3/AC5: branch name with special chars → validation error, no shell injection."""
         data, result = _run_probe(temp_repo, "branch with spaces")
         assert isinstance(data, dict)
         assert data["local"]["exists"] is False
+        assert any("invalid branch name" in e for e in data.get("errors", []))
+
+    def test_invalid_branch_main_tilde(self, temp_repo: Path) -> None:
+        """B3: ancestor expression (main~0) is not a valid branch name."""
+        data, result = _run_probe(temp_repo, "main~0")
+        assert isinstance(data, dict)
+        assert data["local"]["exists"] is False
+        assert any("invalid branch name" in e for e in data.get("errors", []))
+
+    def test_invalid_branch_caret_object(self, temp_repo: Path) -> None:
+        """B3: object expression (main^{commit}) is not a valid branch name."""
+        data, result = _run_probe(temp_repo, "main^{commit}")
+        assert isinstance(data, dict)
+        assert data["local"]["exists"] is False
+        assert any("invalid branch name" in e for e in data.get("errors", []))
+
+    def test_remote_mode_configured_upstream_after_clone(self, temp_repo: Path, tmp_path: Path) -> None:
+        """H1: remote.mode is 'configured_upstream' when remote matches git upstream tracking."""
+        clone = tmp_path / "clone_h1"
+        import subprocess
+
+        subprocess.run(
+            ["git", "clone", str(temp_repo), str(clone)],
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+        )
+        data, _ = _run_probe(clone, "main")
+        # After clone, main tracks origin/main → mode must be "configured_upstream"
+        assert data["remote"]["mode"] == "configured_upstream"
+
+    def test_remote_mode_origin_branch_without_tracking(self, temp_repo: Path) -> None:
+        """H1: remote.mode is 'origin_branch' when no upstream tracking is configured."""
+        data, _ = _run_probe(temp_repo, "main")
+        # No upstream configured → falls back to "origin_branch"
+        assert data["remote"]["mode"] == "origin_branch"

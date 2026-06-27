@@ -104,10 +104,13 @@ try:
     from controlled_skill_mutation_policy import (
         is_controlled_skill_mutation_exec_command as _is_csm_exec_command,
     )
+
     _CSM_POLICY_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fail-closed
+
     def _is_csm_exec_command(cmd: str, project_root: str) -> bool:  # type: ignore[misc]
         return False
+
     _CSM_POLICY_AVAILABLE = False
 
 # Agent-ops tools allowed as an exact command class from the local main root even
@@ -127,8 +130,7 @@ _AGENT_OPS_ALLOWED_SCRIPTS = (
 # absent so an agent cannot retarget the executor or skip authorization.
 _AGENT_OPS_ARG_SPECS = {
     "scripts/agent-ops/cleanup_exec.py": {
-        "value_flags": frozenset({"--pr-number", "--linked-issue-number",
-                                  "--worktree-path", "--branch-name"}),
+        "value_flags": frozenset({"--pr-number", "--linked-issue-number", "--worktree-path", "--branch-name"}),
         "bool_flags": frozenset({"--json"}),
         "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
     },
@@ -138,9 +140,9 @@ _AGENT_OPS_ARG_SPECS = {
         "required": frozenset(),
     },
     "scripts/agent-ops/materialize_cleanup_contract.py": {
-        "value_flags": frozenset({"--pr-number", "--linked-issue-number",
-                                  "--worktree-path", "--branch-name",
-                                  "--operation", "--ttl-seconds"}),
+        "value_flags": frozenset(
+            {"--pr-number", "--linked-issue-number", "--worktree-path", "--branch-name", "--operation", "--ttl-seconds"}
+        ),
         "bool_flags": frozenset({"--json"}),
         "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
     },
@@ -163,9 +165,7 @@ def _validate_agent_ops_argv(rel_script: str, args: list[str]) -> bool:
     Rejects unknown flags (including ``--project-root`` / ``--no-verify``),
     duplicates, ``--flag=value`` forms, positionals (which is how an injected
     trailing ``git worktree remove`` would appear), value-flags missing a value,
-    and any value that itself looks like a flag. The script's OWN argparse enforces
-    *required* flags — the guard only constrains the SHAPE of the command class, so
-    a harmless ``--json``-only smoke invocation is still allowed.
+    any value that itself looks like a flag, and missing required flags.
     """
     spec = _AGENT_OPS_ARG_SPECS.get(rel_script)
     if spec is None:
@@ -192,7 +192,8 @@ def _validate_agent_ops_argv(rel_script: str, args: list[str]) -> bool:
             i += 2
             continue
         return False
-    return True
+    return spec["required"].issubset(seen)
+
 
 # ── Tool classes ──────────────────────────────────────────────────────────────
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
@@ -488,8 +489,7 @@ def _is_repo_local_gitignore(relpath: str, project_root: str) -> bool:
     return True
 
 
-def local_main_scratch_allow_v1(target: str, cwd: str, project_root: str,
-                                  tool_name: str) -> bool:
+def local_main_scratch_allow_v1(target: str, cwd: str, project_root: str, tool_name: str) -> bool:
     """LOCAL_MAIN_SCRATCH_ALLOW_V1: Allow Write/Edit/MultiEdit to safe scratch paths.
 
     Returns True iff the target should be allowed under the local main scratch exception.
@@ -595,6 +595,7 @@ def local_main_scratch_allow_v1(target: str, cwd: str, project_root: str,
 # Block emission (bounded stderr — no command / path / worktree list / env leak)
 # =============================================================================
 
+
 def _block(expected_worktree: str, actual_cwd: str) -> None:
     """Emit a bounded block message (<= 20 lines) and exit 2.
 
@@ -618,6 +619,7 @@ def _allow() -> None:
 # =============================================================================
 # project_root resolution (WORKTREE_SCOPE_RESOLUTION_V1.project_root_source_precedence)
 # =============================================================================
+
 
 def resolve_project_root() -> str:
     """Resolve project root.
@@ -711,6 +713,7 @@ def _current_branch(path: str, deadline: "object | None" = None) -> str | None:
 # worktree catalog (WORKTREE_SCOPE_RESOLUTION_V1.worktree_catalog + parser)
 # =============================================================================
 
+
 def parse_worktree_porcelain_z(data: str) -> list[dict]:
     """Parse `git worktree list --porcelain -z` output (NUL-separated records).
 
@@ -729,10 +732,10 @@ def parse_worktree_porcelain_z(data: str) -> list[dict]:
         if field.startswith("worktree "):
             if current is not None:
                 worktrees.append(current)
-            current = {"worktree": field[len("worktree "):]}
+            current = {"worktree": field[len("worktree ") :]}
         elif current is not None:
             if field.startswith("branch "):
-                current["branch"] = field[len("branch "):]
+                current["branch"] = field[len("branch ") :]
             elif " " in field:
                 key, _, value = field.partition(" ")
                 current[key] = value
@@ -766,6 +769,7 @@ def list_worktrees(project_root: str) -> list[dict] | None:
 # expected worktree selection (WORKTREE_SCOPE_RESOLUTION_V1.expected_worktree_selection)
 # =============================================================================
 
+
 class WorktreeResolution:
     """Result of expected-worktree resolution."""
 
@@ -775,8 +779,9 @@ class WorktreeResolution:
         self.git_available = git_available
 
 
-def resolve_expected_worktree(issue: str | None, project_root: str,
-                              deadline: "object | None" = None) -> WorktreeResolution:
+def resolve_expected_worktree(
+    issue: str | None, project_root: str, deadline: "object | None" = None
+) -> WorktreeResolution:
     """Select the expected worktree for the active issue.
 
     Issue #1137 Blocker 7: delegates selection to the shared ``worktree_catalog``
@@ -829,6 +834,7 @@ def resolve_expected_worktree(issue: str | None, project_root: str,
 # path containment (AC11)
 # =============================================================================
 
+
 def is_inside(expected_realpath: str, target_path: str, cwd: str) -> bool:
     """True iff target_path resolves inside expected_realpath.
 
@@ -855,22 +861,61 @@ def is_inside(expected_realpath: str, target_path: str, cwd: str) -> bool:
 # =============================================================================
 
 _GIT_MUTATING_SUBCMDS = {
-    "add", "commit", "push", "checkout", "switch", "restore", "reset",
-    "rebase", "merge", "cherry-pick", "revert", "am", "apply", "rm", "mv",
+    "add",
+    "commit",
+    "push",
+    "checkout",
+    "switch",
+    "restore",
+    "reset",
+    "rebase",
+    "merge",
+    "cherry-pick",
+    "revert",
+    "am",
+    "apply",
+    "rm",
+    "mv",
     "tag",
 }
 # git stash mutates unless list/show; git worktree mutates unless list.
 _GH_PR_MUTATING = {
-    "create", "edit", "merge", "review", "comment", "close", "reopen",
-    "ready", "draft", "lock", "unlock",
+    "create",
+    "edit",
+    "merge",
+    "review",
+    "comment",
+    "close",
+    "reopen",
+    "ready",
+    "draft",
+    "lock",
+    "unlock",
 }
 _GH_ISSUE_MUTATING = {
-    "create", "edit", "comment", "close", "reopen", "delete", "lock", "unlock",
+    "create",
+    "edit",
+    "comment",
+    "close",
+    "reopen",
+    "delete",
+    "lock",
+    "unlock",
 }
 _PKG_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 _PKG_MUTATING = {
-    "add", "install", "remove", "update", "publish", "version", "link", "unlink",
-    "i", "rm", "un", "uninstall",
+    "add",
+    "install",
+    "remove",
+    "update",
+    "publish",
+    "version",
+    "link",
+    "unlink",
+    "i",
+    "rm",
+    "un",
+    "uninstall",
 }
 
 # read-only allowlist (worktree 解決不能でも allow)
@@ -886,12 +931,58 @@ _GIT_READONLY = {"status", "diff", "log", "show", "rev-parse"}
 # `-i` in-place flag is present, which is handled separately (an `-i` form is
 # already classified as a file-write mutation upstream).
 _READONLY_PROGRAMS = {
-    "cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "wc", "find",
-    "awk", "cut", "sort", "uniq", "nl", "tr", "column", "diff", "cmp", "comm",
-    "file", "stat", "realpath", "readlink", "dirname", "basename", "pwd",
-    "echo", "printf", "test", "true", "false", "which", "type", "command-v",
-    "date", "env", "printenv", "id", "whoami", "uname", "hostname", "less",
-    "more", "tac", "od", "xxd", "md5sum", "sha1sum", "sha256sum", "jq", "yq",
+    "cat",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ls",
+    "head",
+    "tail",
+    "wc",
+    "find",
+    "awk",
+    "cut",
+    "sort",
+    "uniq",
+    "nl",
+    "tr",
+    "column",
+    "diff",
+    "cmp",
+    "comm",
+    "file",
+    "stat",
+    "realpath",
+    "readlink",
+    "dirname",
+    "basename",
+    "pwd",
+    "echo",
+    "printf",
+    "test",
+    "true",
+    "false",
+    "which",
+    "type",
+    "command-v",
+    "date",
+    "env",
+    "printenv",
+    "id",
+    "whoami",
+    "uname",
+    "hostname",
+    "less",
+    "more",
+    "tac",
+    "od",
+    "xxd",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "jq",
+    "yq",
     "xargs",
 }
 # sed/perl are read-only only when NOT in-place (`-i`). An in-place form is
@@ -904,8 +995,15 @@ _CONDITIONAL_READONLY_PROGRAMS = {"sed", "perl"}
 # treated as a file-writer (Major formatter-write risk) and blocked. A bare
 # external *positional* arg (no write option) is treated as a read source → allow.
 _WRITE_OPTION_FLAGS = {
-    "-o", "--output", "--out", "-w", "--write", "--in-place", "--fix",
-    "--output-file", "--outfile",
+    "-o",
+    "--output",
+    "--out",
+    "-w",
+    "--write",
+    "--in-place",
+    "--fix",
+    "--output-file",
+    "--outfile",
 }
 
 # shell wrappers whose `-c` / `-lc` script argument carries an inner command.
@@ -915,6 +1013,7 @@ _SHELL_WRAPPERS = {"bash", "sh", "zsh"}
 def _tokenize(command: str) -> list[str]:
     """Tokenize a shell command best-effort. On failure return a coarse split."""
     import shlex
+
     try:
         return shlex.split(command, comments=False, posix=True)
     except ValueError:
@@ -1131,7 +1230,7 @@ def _classify_git(args: list[str]) -> str:
     if i >= len(args):
         return "unknown"
     sub = args[i]
-    rest = args[i + 1:]
+    rest = args[i + 1 :]
     if sub in _GIT_READONLY:
         return "read_only"
     if sub == "worktree":
@@ -1207,7 +1306,13 @@ def _classify_gh_api(args: list[str]) -> str:
             has_field = True
             i += 1
             continue
-        if a.startswith("-f") or a.startswith("-F") or a.startswith("--field=") or a.startswith("--raw-field=") or a.startswith("--input="):
+        if (
+            a.startswith("-f")
+            or a.startswith("-F")
+            or a.startswith("--field=")
+            or a.startswith("--raw-field=")
+            or a.startswith("--input=")
+        ):
             has_field = True
             i += 1
             continue
@@ -1238,6 +1343,7 @@ def _classify_pkg(args: list[str]) -> str:
 # =============================================================================
 # wrapper / explicit-target extraction (AC9)
 # =============================================================================
+
 
 def _abs_against(cwd: str, p: str) -> str:
     if not os.path.isabs(p):
@@ -1291,6 +1397,7 @@ def effective_target_dirs(command: str, cwd: str) -> list[str]:
 # =============================================================================
 # write-target extraction (B2 / AC8) — file-write mutation destination paths
 # =============================================================================
+
 
 def write_target_paths(command: str, cwd: str) -> list[str]:
     """Extract destination paths of file-write mutations from a command.
@@ -1393,6 +1500,7 @@ def _extract_inplace_files(seg: str, add) -> None:
 # absolute-path argument extraction (Major / AC15) — for unknown / mutating cmds
 # =============================================================================
 
+
 def absolute_path_args(command: str, cwd: str) -> list[str]:
     """Extract ALL absolute-path-looking argument tokens (and inner-script tokens).
 
@@ -1470,6 +1578,7 @@ def write_option_abs_path_args(command: str, cwd: str) -> list[str]:
 # main decision
 # =============================================================================
 
+
 def decide(payload: dict) -> None:
     """Make the allow/block decision and exit."""
     tool_name = payload.get("tool_name")
@@ -1501,14 +1610,15 @@ def decide(payload: dict) -> None:
     _allow()
 
 
-def _decide_write(tool_input: dict, cwd: str, issue: str | None,
-                  resolution: "WorktreeResolution", tool_name: str = "Write",
-                  project_root: str | None = None) -> None:
-    target = (
-        tool_input.get("file_path")
-        or tool_input.get("path")
-        or ""
-    )
+def _decide_write(
+    tool_input: dict,
+    cwd: str,
+    issue: str | None,
+    resolution: "WorktreeResolution",
+    tool_name: str = "Write",
+    project_root: str | None = None,
+) -> None:
+    target = tool_input.get("file_path") or tool_input.get("path") or ""
 
     if project_root is None:
         project_root = resolve_project_root()
@@ -1541,8 +1651,9 @@ def _decide_write(tool_input: dict, cwd: str, issue: str | None,
     _block(_rel(resolution.expected, project_root=resolve_project_root()), cwd)
 
 
-def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
-                 resolution: "WorktreeResolution", deadline: "object | None" = None) -> None:
+def _decide_bash(
+    tool_input: dict, cwd: str, issue: str | None, resolution: "WorktreeResolution", deadline: "object | None" = None
+) -> None:
     command = tool_input.get("command") or ""
     _pr = resolve_project_root()
 
@@ -1705,7 +1816,6 @@ def _rel(path: str, project_root: str) -> str:
         return os.path.basename(os.path.normpath(path))
 
 
-
 # =============================================================================
 # POST_MERGE_CLEANUP_REQUEST_V2 — cleanup contract (Issue #1050)
 # =============================================================================
@@ -1718,6 +1828,7 @@ def _rel(path: str, project_root: str) -> str:
 #   worktree_path: str  — absolute path to the worktree to remove
 #   branch_name:   str  — branch to delete with git branch -d
 #   require_clean: bool — if true, worktree must have empty porcelain=v1 status
+
 
 def _validate_cleanup_contract(contract: dict) -> bool:
     """True iff contract is a valid POST_MERGE_CLEANUP_REQUEST_V2.
@@ -1785,8 +1896,7 @@ def load_cleanup_contract(project_root: str) -> dict | None:
 #   guard_deadline_exceeded
 
 
-def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str,
-                               deadline: "object | None" = None) -> bool:
+def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str, deadline: "object | None" = None) -> bool:
     """True iff command is an exact agent-ops tool invocation allowed from main root.
 
     Issue #1137 Blocker 1: cleanup_exec / guard_preflight / materialize must run
@@ -1837,8 +1947,9 @@ def _is_agent_ops_tool_command(command: str, cwd: str, project_root: str,
     return True
 
 
-def _is_skill_runtime_executor_command(command: str, cwd: str, project_root: str,
-                                       deadline: "object | None" = None) -> bool:
+def _is_skill_runtime_executor_command(
+    command: str, cwd: str, project_root: str, deadline: "object | None" = None
+) -> bool:
     """True iff command is the exact privileged skill runtime executor class."""
     parsed = parse_exact_skill_runtime_command(command, project_root)
     if parsed is None:
@@ -1871,8 +1982,9 @@ def _root_drift_active_worktree_mismatch(project_root: str, deadline: "object | 
     return False
 
 
-def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict,
-                       deadline: "object | None" = None) -> tuple[str, str]:
+def _decide_cleanup_v3(
+    command: str, cwd: str, project_root: str, contract: dict, deadline: "object | None" = None
+) -> tuple[str, str]:
     """V3 one-shot cleanup decision (expiry already excluded by caller). Returns (decision, reason)."""
     # Blocker 8: reuse the shared monotonic deadline; only create a fresh one if a
     # pure caller (build_decision / tests) did not supply one.
@@ -1923,7 +2035,9 @@ def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict
                 return "deny", "worktree_branch_mismatch"
             st = subprocess.run(
                 ["git", "-C", expected_path, "status", "--porcelain=v1", "-z"],
-                capture_output=True, text=True, timeout=deadline.subprocess_timeout(10.0),
+                capture_output=True,
+                text=True,
+                timeout=deadline.subprocess_timeout(10.0),
             )
             if st.returncode != 0 or st.stdout:
                 return "deny", _cc3.WORKTREE_DIRTY
@@ -1938,8 +2052,9 @@ def _decide_cleanup_v3(command: str, cwd: str, project_root: str, contract: dict
         return "deny", _cc3.WORKTREE_DIRTY
 
 
-def cleanup_decision_dispatch(command: str, cwd: str, project_root: str,
-                              deadline: "object | None" = None) -> tuple[str, str, str | None]:
+def cleanup_decision_dispatch(
+    command: str, cwd: str, project_root: str, deadline: "object | None" = None
+) -> tuple[str, str, str | None]:
     """PURE dispatch of the cleanup decision (no consume). Returns (decision, reason, kind).
 
     ``kind`` in {v3, v2, None}. A present-but-invalid or expired V3 contract is
@@ -1977,8 +2092,7 @@ def _normalize_cleanup_reason(reason: str | None) -> str:
     return "cleanup_contract_present_but_invalid"
 
 
-def _enforce_cleanup(command: str, cwd: str, project_root: str,
-                     deadline: "object | None" = None) -> None:
+def _enforce_cleanup(command: str, cwd: str, project_root: str, deadline: "object | None" = None) -> None:
     """Runtime claim-first one-shot cleanup enforcement (Blocker 2). Never returns.
 
     Order (race-safe): (1) deny a present contract on an IO-incapable platform
@@ -2036,7 +2150,7 @@ def _parse_worktree_list_branch(output: str, target_path: str) -> str | None:
         elif line.startswith("branch "):
             current_branch = line[7:].strip()
             if current_branch.startswith("refs/heads/"):
-                current_branch = current_branch[len("refs/heads/"):]
+                current_branch = current_branch[len("refs/heads/") :]
         elif line == "":
             if current_wt == target_path:
                 return current_branch
@@ -2067,7 +2181,7 @@ def _is_force_branch_delete(command: str) -> bool:
             break
     if i >= len(toks) or toks[i] != "branch":
         return False
-    opts = toks[i + 1:]
+    opts = toks[i + 1 :]
     if not opts:
         return False
     _FORCE_OPTS = {"-D", "--force", "-f"}
@@ -2111,9 +2225,7 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
 
         path_arg = toks[3]
         actual_path = (
-            os.path.realpath(path_arg)
-            if os.path.isabs(path_arg)
-            else os.path.realpath(os.path.join(cwd, path_arg))
+            os.path.realpath(path_arg) if os.path.isabs(path_arg) else os.path.realpath(os.path.join(cwd, path_arg))
         )
         expected_path = os.path.realpath(contract["worktree_path"])
 
@@ -2132,7 +2244,9 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         try:
             wl = subprocess.run(
                 ["git", "-C", _pr, "worktree", "list", "--porcelain"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
             return "deny", "worktree_list_exception"
@@ -2148,7 +2262,9 @@ def _decide_cleanup_bash(command: str, cwd: str, contract: dict | None) -> tuple
         try:
             st = subprocess.run(
                 ["git", "-C", expected_path, "status", "--porcelain=v1", "-z"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
             return "deny", "status_command_exception"
@@ -2186,6 +2302,7 @@ def _block_cleanup(reason: str) -> None:
 # =============================================================================
 # WORKTREE_SCOPE_DECISION_V2 — public importable API (Issue #1050, AC9)
 # =============================================================================
+
 
 def _v2(command_class: str, cwd_class: str, decision: str, reason: str) -> dict:
     """Construct a WORKTREE_SCOPE_DECISION_V2 dict."""
@@ -2311,6 +2428,7 @@ def build_decision(payload: dict) -> dict:
 # =============================================================================
 # entrypoint
 # =============================================================================
+
 
 def main() -> None:
     raw = sys.stdin.read()
