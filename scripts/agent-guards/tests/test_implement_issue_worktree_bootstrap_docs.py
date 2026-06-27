@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 
 def test_given_implement_issue_skill_when_step_3_is_rendered_then_raw_git_worktree_add_is_removed() -> None:
