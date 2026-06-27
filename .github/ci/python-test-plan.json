@@ -4,7 +4,7 @@
   "targets": [
     ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
     ".claude/skills/gemini-cli-headless-delegation/tests/",
-    ".claude/skills/issue-refinement-loop/scripts/tests/",
+    ".claude/skills/impl-review-loop/scripts/tests/",
     ".claude/skills/implement-issue/tests/",
     ".claude/skills/open-pr/tests/",
     ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
@@ -18,7 +18,6 @@
     ".claude/skills/pr-review-judge/scripts/tests/",
     ".claude/skills/pr-review-judge/tests/",
     ".claude/skills/open-pr/scripts/tests/",
-    ".claude/skills/impl-review-loop/scripts/tests/",
     ".claude/skills/impl-review-loop/tests/",
     ".claude/skills/review-issue/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
