@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "event": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo https://github.com/squne121/loop-protocol/issues/1170#issuecomment-4814071263"
+  },
+  "cwd": ""
+}
