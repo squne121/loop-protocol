@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "event": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git add -- scripts/agent-guards/local_main_branch_guard.py"
+  },
+  "cwd": ""
+}
