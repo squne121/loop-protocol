@@ -126,7 +126,10 @@ def _validate_local_asset_research_settings(repo_root: Path | None = None) -> li
     command = serena.get("command")
     args = serena.get("args")
     if command != "uvx" or not isinstance(args, list) or "serena" not in args or "--project-from-cwd" not in args:
-        errors.append("local_asset_research requires WSL-local Serena MCP command: uvx ... serena ... --project-from-cwd")
+        errors.append(
+            "local_asset_research requires WSL-local Serena M"
+            "CP command: uvx ... serena ... --project-from-cwd"
+        )
 
     trust = serena.get("trust", False)
     if trust is not False:
@@ -353,13 +356,18 @@ def run_preflight() -> dict[str, Any]:
     try:
         gh_version_proc = _run(["gh", "--version"])
         if gh_version_proc.returncode == 0:
-            result["gh_cli"]["version"] = gh_version_proc.stdout.strip().splitlines()[0] if gh_version_proc.stdout.strip() else None
+            result[(
+                "gh_cli"
+            )]["version"] = gh_version_proc.stdout.strip().splitlines()[0] if gh_version_proc.stdout.strip() else None
         else:
             gh_cli_errors.append("gh --version failed")
             result["warnings"].extend(_stderr_warnings(gh_version_proc.stderr))
     except FileNotFoundError:
         gh_cli_errors.append("gh: command not found")
-        result["warnings"].append("gh: command not found (github_research unavailable; install gh and run gh auth login)")
+        result["warnings"].append(
+            "gh: command not found (github_research una"
+            "vailable; install gh and run gh auth login)"
+        )
 
     if not gh_cli_errors:
         try:

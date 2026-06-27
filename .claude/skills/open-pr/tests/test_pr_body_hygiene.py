@@ -11,7 +11,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent / "scripts"
 GENERATE_SCRIPT = SCRIPT_DIR / "generate_pr_body.py"
 HYGIENE_SCRIPT = SCRIPT_DIR / "validate_pr_body_hygiene.py"
 VALIDATE_PR_BODY_SCRIPT = SCRIPT_DIR / "validate_pr_body.py"
-VALIDATE_JAPANESE_SCRIPT = Path(__file__).resolve().parents[2] / "create-issue" / "scripts" / "validate_japanese_content.py"
+VALIDATE_JAPANESE_SCRIPT = Path(__file__).resolve().parents[2] / (
+    "create-issue"
+) / "scripts" / "validate_japanese_content.py"
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "pr_body.ja.md"
 
 
@@ -78,7 +80,13 @@ def _run_validate_japanese_content(body: str) -> subprocess.CompletedProcess[str
         body_path.unlink(missing_ok=True)
 
 
-def _run_hygiene(body: str, changed_files: list[str], *, issue: int = 1040, draft: bool) -> subprocess.CompletedProcess[str]:
+def _run_hygiene(
+    body: str,
+    changed_files: list[str],
+    *,
+    issue: int = 1040,
+    draft: bool
+) -> subprocess.CompletedProcess[str]:
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False) as body_file:
         body_file.write(body)
         body_path = Path(body_file.name)
@@ -178,7 +186,11 @@ def test_agent_surface_change_requires_concrete_safety_matrix_data_row():
     changed_files = [".claude/hooks/foo.py"]
     body = _generate_body(changed_files=changed_files)
     invalid_body = body.replace(
-        "| `.claude/**` 変更時でも Safety Claim Matrix の空欄や placeholder を残さない | yes | N/A | `generate_pr_body.py --issue 1040 --changed-files .claude/hooks/foo.py --draft true` | N/A |",
+        (
+           "| `.claude/**` 変更時でも Safety Claim Matrix の"
+           "空欄や placeholder を残さない | yes | N/A | `generate_pr_body.py --issue"
+           " 1040 --changed-files .claude/hooks/foo.py --draft true` | N/A |"
+       ),
         "|  | yes | pending external review |  | N/A |",
     )
     result = _run_hygiene(invalid_body, changed_files, draft=False)

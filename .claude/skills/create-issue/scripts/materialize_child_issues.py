@@ -240,14 +240,20 @@ def _validate_child(child: Any, idx: int, seen_ids: set[str]) -> None:
             f"children[{idx}].allowed_paths must be a non-empty list",
         )
         for p in allowed_paths:
-            _require(isinstance(p, str) and p.strip(), f"children[{idx}].allowed_paths entries must be non-empty strings")
+            _require(
+                isinstance(p, str) and p.strip(),
+                f"children[{idx}].allowed_paths entries must be non-empty strings"
+            )
             _require_clean_text(p, f"children[{idx}].allowed_paths entry")
             _require("`" not in p, f"children[{idx}].allowed_paths entry must not contain backticks")
 
         ac = child.get("acceptance_criteria")
         vc = child.get("verification_commands")
         _require(isinstance(ac, list) and len(ac) > 0, f"children[{idx}].acceptance_criteria must be a non-empty list")
-        _require(isinstance(vc, dict) and len(vc) > 0, f"children[{idx}].verification_commands must be a non-empty object")
+        _require(
+            isinstance(vc, dict) and len(vc) > 0,
+            f"children[{idx}].verification_commands must be a non-empty object"
+        )
         ac_set = set(ac)
         vc_set = set(vc)
         _require(len(ac_set) == len(ac), f"children[{idx}].acceptance_criteria contains duplicate AC ids")
@@ -257,7 +263,10 @@ def _validate_child(child: Any, idx: int, seen_ids: set[str]) -> None:
             f"verification_commands={sorted(vc_set)}",
         )
         for ac_id, cmd in vc.items():
-            _require(isinstance(cmd, str) and cmd.strip(), f"children[{idx}].verification_commands[{ac_id}] must be non-empty")
+            _require(
+                isinstance(cmd, str) and cmd.strip(),
+                f"children[{idx}].verification_commands[{ac_id}] must be non-empty"
+            )
             # Reject code-fence break-out so the rendered ```bash block cannot be escaped.
             _require("```" not in cmd, f"children[{idx}].verification_commands[{ac_id}] must not contain a code fence")
             _require_clean_text(cmd, f"children[{idx}].verification_commands[{ac_id}]")
@@ -796,11 +805,17 @@ def materialize(plan: dict[str, Any], runners: Optional[Runners] = None, gh_bin:
                     }
                 )
                 errors.append(
-                    {"child_id": child_id, "error": f"create_issue_txn {parsed['status']} but issue #{parsed['issue_number']} exists"}
+                    {
+                        "child_id": child_id,
+                        "error": f"create_issue_txn {parsed['status']} but issue #{parsed['issue_number']} exists"
+                    }
                 )
             else:
                 errors.append(
-                    {"child_id": child_id, "error": f"create_issue_txn failed (exit {c.returncode}): {c.stderr[:300] or c.stdout[:300]}"}
+                    {
+                        "child_id": child_id,
+                        "error": f"create_issue_txn failed (exit {c.returncode}): {c.stderr[:300] or c.stdout[:300]}"
+                    }
                 )
             continue
         if not parsed:

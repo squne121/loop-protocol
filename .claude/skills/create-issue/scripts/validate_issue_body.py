@@ -139,7 +139,13 @@ def _extract_sections(body: str) -> dict[str, tuple[str, int, int]]:
     return sections
 
 
-def _get_context_lines(body: str, start_line: int, end_line: int, max_lines: int = 5, max_bytes: int = 2048) -> tuple[list[str], bool]:
+def _get_context_lines(
+    body: str,
+    start_line: int,
+    end_line: int,
+    max_lines: int = 5,
+    max_bytes: int = 2048
+) -> tuple[list[str], bool]:
     """Extract context lines around the error range.
 
     Returns (context_lines, truncated_flag).
@@ -322,7 +328,9 @@ def _validate_lp002_invalid_machine_readable_contract(body: str) -> list[Validat
         context, trunc = _get_context_lines(body, start_line, end_line)
         _lp002_msg = {
             MRC_REASON_NO_FENCE: "Machine-Readable Contract block must use ```yaml ... ``` fence",
-            MRC_REASON_MULTIPLE_FENCES: "Machine-Readable Contract section must contain exactly one ```yaml ... ``` fence",
+            MRC_REASON_MULTIPLE_FENCES: (
+                "Machine-Readable Contract section must contain exactly one ```yaml ... ``` fence"
+            ),
             MRC_REASON_MULTIPLE_SECTIONS: "Body must contain exactly one ## Machine-Readable Contract section",
             MRC_REASON_YAML_ERROR: "Machine-Readable Contract YAML syntax error",
             MRC_REASON_DUPLICATE_KEY: f"Machine-Readable Contract has a duplicate key: {mrc_result.duplicate_key}",

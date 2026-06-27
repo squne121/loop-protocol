@@ -312,7 +312,11 @@ def _append_findings(
             "message": issue,
         }
         result.findings.append(finding)
-        if reviewer_blocker_code and finding_kind == REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER and blocking:
+        if (
+            reviewer_blocker_code
+            and finding_kind == REVIEW_ISSUE_FINDING_KIND_DETERMINISTIC_DOMAIN_BLOCKER
+            and blocking
+        ):
             result.structured_blockers.append(
                 {
                     "code": reviewer_blocker_code,
@@ -653,7 +657,8 @@ class CheckerResult:
     blocking_issues: list[str] = field(default_factory=list)
     structured_blockers: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
-    non_blocking_improvements: list = field(default_factory=list)  # list of dict {code, severity, evidence, suggested_action}
+    # list of dict {code, severity, evidence, suggested_action}
+    non_blocking_improvements: list = field(default_factory=list)
     diff_proposal: dict = field(default_factory=lambda: {"add": [], "remove": [], "rewrite": []})
     issue_kind: str = "implementation"
     parsed_vc_commands: list = field(default_factory=list)  # list[ParsedVcCommand] (serialized dicts)
@@ -1035,7 +1040,9 @@ def check_c9_runtime_applicability(body: str, issue_kind: str) -> tuple[str, lis
     if issue_kind == "implementation":
         if not has_section:
             # セクション自体がない
-            return CheckResult.LEGACY_MISSING, ["## Runtime Verification Applicability セクションがない（レガシー Issue）"]
+            return CheckResult.LEGACY_MISSING, [(
+                "## Runtime Verification Applicability セクションがない（レガシー Issue）"
+            )]
 
         # decision: フィールドの確認
         decision_match = re.search(r'decision:\s*(\S+)', section)
@@ -1045,13 +1052,22 @@ def check_c9_runtime_applicability(body: str, issue_kind: str) -> tuple[str, lis
         decision = decision_match.group(1).strip()
         valid_decisions = {"not_applicable", "deferred", "immediate"}
         if decision not in valid_decisions:
-            return CheckResult.FAIL, [f"decision: '{decision}' が不正（not_applicable / deferred / immediate のいずれかであること）"]
+            return (
+                CheckResult.FAIL,
+                [f"decision: '{decision}' が不正（not_applicable / deferred / immediate のいずれかであること）"]
+            )
 
         return CheckResult.PASS, []
 
     elif issue_kind in ("research", "tracking"):
         if not has_section:
-            return CheckResult.WARN, ["research/tracking Issue に ## Runtime Verification Applicability セクションが存在しない（warn、approve を妨げない）"]
+            return (
+                CheckResult.WARN,
+                [
+                    "research/tracking Issue に ## Runtime Verification Applicability"
+                    " セクションが存在しない（warn、approve を妨げない）"
+                ]
+            )
         return CheckResult.PASS, []
 
     else:
@@ -1374,7 +1390,10 @@ def detect_warning_scope_cvs_in_scope_mismatch(body: str, result: CheckerResult)
             "severity": "warning",
             "evidence": evidence,
             "details": details,
-            "suggested_action": "Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、乖離理由を Background / Scope Delta に記載する",
+            "suggested_action": (
+                "Current Validated Scope と In Scope の対象ファイル/対象範囲を揃えるか、"
+                "乖離理由を Background / Scope Delta に記載する"
+            ),
         })
 
 
@@ -1394,7 +1413,10 @@ def detect_warning_vc_untracked_false_negative(body: str, result: CheckerResult)
             code="vc_untracked_false_negative_pattern",
             severity="warning",
             evidence=[m[:120] for m in matches[:3]],
-            suggested_action="`grep -v \"^?\"` は untracked 行を除外するため、unstaged 変更を見逃す。検証対象を literal で列挙する形式に変更する",
+            suggested_action=(
+                "`grep -v \"^?\"` は untracked 行を除外するため、unstaged 変更を見逃す。検証対象を literal"
+                " で列挙する形式に変更する"
+            ),
         )
 
 
@@ -1416,14 +1438,20 @@ def detect_warning_vc_negative_grep_without_literal_inventory(body: str, result:
 
     # Heuristic: literal inventory absent if there's no `test -f <path>` or rg listing deletion targets.
     # Look for explicit removal-target enumeration: `removed:` section, or `- [ ] AC.*削除.*<literal>`
-    has_literal_inventory = bool(re.search(r"(removed_paths|削除対象|deleted_files|literal_list)\s*:", vc + "\n" + body))
+    has_literal_inventory = bool(re.search(
+        r"(removed_paths|削除対象|deleted_files|literal_list)\s*:",
+        vc + "\n" + body,
+    ))
     if not has_literal_inventory:
         _add_warning(
             result,
             code="vc_negative_grep_without_literal_inventory",
             severity="warning",
             evidence=[m.strip()[:120] for m in negation_patterns[:3]],
-            suggested_action="削除確認 VC では削除対象 literal を明示的に列挙し、`test ! -f <path>` 形式または `removed_paths:` リストで個別確認する",
+            suggested_action=(
+                "削除確認 VC では削除対象 literal を明示的に列挙し、`test ! -f <path>` 形式または `removed_paths:`"
+                " リストで個別確認する"
+            ),
         )
 
 
@@ -1903,7 +1931,10 @@ def run_checks(
                 code="c9_runtime_applicability_missing",
                 severity="warning",
                 evidence=[msg],
-                suggested_action="implementation 以外の Issue でも `## Runtime Verification Applicability` セクションの追加を推奨する",
+                suggested_action=(
+                    "implementation 以外の Issue でも `## Runtime Verification Applicability`"
+                    " セクションの追加を推奨する"
+                ),
                 emit_finding=False,
             )
         _append_findings(
@@ -1948,7 +1979,10 @@ def run_checks(
     )
 
     # C13: VC preflight decision consistency (if JSON provided)
-    checks.C13_vc_preflight_decision_consistency, issues = check_c13_vc_preflight_decision_consistency(vc_preflight_json_path)
+    (
+        checks.C13_vc_preflight_decision_consistency,
+        issues,
+    ) = check_c13_vc_preflight_decision_consistency(vc_preflight_json_path)
     result.blocking_issues.extend(issues)
     _append_findings(
         result,

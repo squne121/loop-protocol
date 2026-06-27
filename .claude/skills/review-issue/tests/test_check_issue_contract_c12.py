@@ -125,7 +125,8 @@ class TestC1MissingSectionSentinel:
             assert "section" in entry, f"Entry missing 'section' key: {entry}"
             assert "skeleton" in entry, f"Entry missing 'skeleton' key: {entry}"
             assert entry.get("placeholder_source") in ("template", "fallback_todo"), (
-                f"Entry placeholder_source must be 'template' or 'fallback_todo', got: {entry.get('placeholder_source')}"
+                f"Entry placeholder_source must be 'template' or 'fallback_todo',"
+                f" got: {entry.get('placeholder_source')}"
             )
 
 
@@ -372,7 +373,9 @@ class TestScopeCVSInScopeMismatchExtended:
         assert "jaccard" in details, f"Expected 'jaccard' in details, got: {list(details.keys())}"
         assert "overlap" in details, f"Expected 'overlap' in details, got: {list(details.keys())}"
         assert "missing_from_cvs" in details, f"Expected 'missing_from_cvs' in details, got: {list(details.keys())}"
-        assert "missing_from_in_scope" in details, f"Expected 'missing_from_in_scope' in details, got: {list(details.keys())}"
+        assert "missing_from_in_scope" in details, (
+            f"Expected 'missing_from_in_scope' in details, got: {list(details.keys())}"
+        )
 
         # jaccard must be float-compatible
         jaccard_val = details["jaccard"]

@@ -65,7 +65,9 @@ def test_pnpm_lint_gate_action():
     result = mod.triage_contract_blockers(payload)
     assert result["status"] == "ok", f"Expected ok, got {result['status']}: {result.get('errors')}"
     action = result["suggested_actions"][0]
-    assert action["kind"] == "retry_with_runner_env_delta", f"Expected retry_with_runner_env_delta, got {action['kind']}"
+    assert action["kind"] == "retry_with_runner_env_delta", (
+        f"Expected retry_with_runner_env_delta, got {action['kind']}"
+    )
     assert action["argv"] == ["pnpm", "lint"], (
         f"Expected argv=['pnpm', 'lint'] for pnpm lint gate, got {action['argv']!r}"
     )

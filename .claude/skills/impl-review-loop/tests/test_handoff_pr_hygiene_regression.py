@@ -9,7 +9,8 @@ AC5 (case c): mergeStateStatus=BEHIND && mergeable=MERGEABLE で required_auto_a
               update_branch が含まれることを fixture で検証（#637 merge 済み）
 AC6 (case d): required_auto_actions が 1 件以上残る状態で termination_reason: approved に
               ならないことを pytest で検証（#640 merge 済み）
-AC7: 各 fixture / test に TEST_VERDICT_MACHINE marker（version, result, head_sha, commands, fixtures, skipped フィールド）
+AC7: 各 fixture / test に TEST_VERDICT_MACHINE marker
+（version, result, head_sha, commands, fixtures, skipped フィールド）
 
 TEST_VERDICT_MACHINE:
   version: 1
@@ -376,7 +377,9 @@ class TestAC4UpdatePrClosesKeywordCheck:
         assert idx != -1, "ensure_closing_keyword must be present"
         context = body[idx : idx + 500]
         # Must not route to human_escalation immediately (should route to worker)
-        assert "update_pr_body_hygiene" in context or "worker" in context.lower() or "implementation-worker" in context, (
+        assert (
+            "update_pr_body_hygiene"
+        ) in context or "worker" in context.lower() or "implementation-worker" in context, (
             "ensure_closing_keyword must route to implementation-worker or update_pr_body_hygiene"
         )
 

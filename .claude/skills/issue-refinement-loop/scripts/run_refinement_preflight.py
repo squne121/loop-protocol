@@ -618,7 +618,9 @@ def _build_anchor_comment_state(
         "comment_updated_at": comment.get("updated_at"),
         "preliminary_classification": "feedback_update_required",
         "final_classification": None,
-        "classification_reason": "defaulted_by_preflight_schema_normalization; semantic classification deferred to #1008/#1011",
+        (
+            "classification_reason"
+        ): "defaulted_by_preflight_schema_normalization; semantic classification deferred to #1008/#1011",
         "verified_claims": [],
         "unresolved_claims": [],
         "scope_impact": None,
@@ -863,7 +865,12 @@ def _invoke_repair(body: str) -> dict:
         import json as _json
         if proc.stdout:
             return _json.loads(proc.stdout)
-        return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": proc.stderr or "no output"}
+        return {
+            "schema": "repair_issue_contract/v1",
+            "changed": False,
+            "repairs": [],
+            "error": proc.stderr or "no output"
+        }
     except Exception as exc:
         return {"schema": "repair_issue_contract/v1", "changed": False, "repairs": [], "error": str(exc)}
     finally:

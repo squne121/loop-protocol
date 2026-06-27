@@ -331,7 +331,14 @@ class TestBuildStateDictCategoryMetadata:
         _td326 = _tf326.mkdtemp()
         _af326 = _os326.path.join(_td326, "art.json")
         with open(_af326, "w", encoding="utf-8") as _fp326:
-            json.dump({"schema_version": "refinement_preflight_result/v1", "required_sections": ["Acceptance Criteria"], "required_contract_keys": []}, _fp326)
+            json.dump(
+                {
+                    "schema_version": "refinement_preflight_result/v1",
+                    "required_sections": ["Acceptance Criteria"],
+                    "required_contract_keys": []
+                },
+                _fp326
+            )
         state_dict, err = _build_state_dict(
             rewrite_attempt_count=2,
             max_rewrite_attempts=3,
@@ -373,7 +380,14 @@ class TestBuildStateDictCategoryMetadata:
         _td360 = _tf360.mkdtemp()
         _af360 = _os360.path.join(_td360, "art2.json")
         with open(_af360, "w", encoding="utf-8") as _fp360:
-            json.dump({"schema_version": "refinement_preflight_result/v1", "required_sections": ["Acceptance Criteria"], "required_contract_keys": []}, _fp360)
+            json.dump(
+                {
+                    "schema_version": "refinement_preflight_result/v1",
+                    "required_sections": ["Acceptance Criteria"],
+                    "required_contract_keys": []
+                },
+                _fp360
+            )
         state_dict, err = _build_state_dict(
             rewrite_attempt_count=0,
             max_rewrite_attempts=3,
@@ -488,7 +502,11 @@ class TestRouteAfterRewrireCli:
         state_path = str(tmp_path / "state.json")
         assert not os.path.exists(state_path), "State file should not exist before first run"
 
-        self._run_wrapper(body_file=str(pass_fixture), state_path=state_path, artifact_path=self._make_artifact(tmp_path))
+        self._run_wrapper(
+            body_file=str(pass_fixture),
+            state_path=state_path,
+            artifact_path=self._make_artifact(tmp_path)
+        )
 
         assert os.path.exists(state_path), "State file must be created after wrapper run"
 
@@ -900,7 +918,11 @@ class TestAc9Ac10CliRegression:
         # 2 回目: required_contract_keys で missing_contract_key カテゴリ（fix_category が変わる）。
         # fingerprint は checker_json.fail_closed に基づくので同じ body なら同一 → AC9 が fire する。
         (tmp_path / "art2").mkdir(exist_ok=True)
-        artifact2 = str(_make_minimal_artifact(tmp_path / "art2", required_sections=[], required_contract_keys=["Outcome"]))
+        artifact2 = str(_make_minimal_artifact(
+            tmp_path / "art2",
+            required_sections=[],
+            required_contract_keys=["Outcome"]
+        ))
         exit_code2, result2 = _run_route_after_rewrite_cli(
             str(body_file), state_path, artifact_path=artifact2
         )

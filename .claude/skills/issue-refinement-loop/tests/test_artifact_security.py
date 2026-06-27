@@ -152,7 +152,10 @@ def test_no_secret_check_detects_github_pat():
 
 def test_no_secret_check_passes_artifact_path():
     """GIVEN text with artifact file path WHEN _no_secret_check THEN no violation."""
-    text = "ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/42/compact_review_result_20260611T000000Z.json"
+    text = (
+        "ARTIFACT: compact_review_result_v1="
+        ".claude/artifacts/issue-refinement-loop/42/compact_review_result_20260611T000000Z.json"
+    )
     violations = _no_secret_check(text)
     assert violations == []
 
