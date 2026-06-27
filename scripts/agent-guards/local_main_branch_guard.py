@@ -2146,6 +2146,7 @@ def _emit_block_stderr(
     current_is_default: bool,
     target_branch_kind: str | None,
     hook_flavor: str,
+    event_kind: str | None = None,
 ) -> None:
     """
     Emit bounded, non-leaking block message to stderr (max 10 lines).
@@ -2155,6 +2156,9 @@ def _emit_block_stderr(
     - current_is_default: bool (true only when on the default branch)
     - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
     Raw branch names belong in --json / preflight diagnostic mode only.
+
+    event_kind is accepted for backward-compatible test/helper call sites but is
+    intentionally not rendered into stderr.
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
