@@ -303,6 +303,26 @@ class TestIssue1198RawAndCommandFixtures:
         if "rule_id" in entry:
             assert result["rule_id"] == entry["rule_id"]
 
+    def test_run_hook_block_stderr_contains_ac7_fields(self, tmp_git_repo: Path):
+        payload = {
+            "event": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git switch issue-1198-block"},
+            "cwd": str(tmp_git_repo),
+        }
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 2
+        output = result.stderr
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PreToolUse" in output
+        assert "decision: block" in output
+        assert "reason_code: local_root_branch_drift" in output
+        assert "rule_id: git_branch_mutation_block" in output
+        assert "command_kind: git_branch_mutation" in output
+        assert "parser_stage: branch_mutation_block" in output
+        assert "argv_redacted:" in output
+        assert "recovery:" in output
+
 
 class TestReadonlyPipelineClassifier:
     """readonly pipeline classifier fixtures for AC1-AC4."""
@@ -623,6 +643,36 @@ class TestGhMutationReasonCode:
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
             f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
         )
+
+    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
+        """_emit_block_stderr includes AC7 machine-readable fields."""
+        from local_main_branch_guard import (
+            _emit_block_stderr,
+            REASON_GITHUB_REMOTE_OPS,
+            COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+        )
+        _emit_block_stderr(
+            reason_code=REASON_GITHUB_REMOTE_OPS,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="codex",
+            event_kind="PermissionRequest",
+            decision="block",
+            command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+            parser_stage="readonly_artifact_export",
+            rule_id="gh_issue_view_to_tmp_allowed",
+            argv_redacted=["gh", "issue", "view", "123", "--json", "body"],
+        )
+        captured = capsys.readouterr()
+        output = captured.err
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PermissionRequest" in output
+        assert "decision: block" in output
+        assert "rule_id: gh_issue_view_to_tmp_allowed" in output
+        assert "command_kind: readonly_artifact_export" in output
+        assert "parser_stage: readonly_artifact_export" in output
+        assert "argv_redacted:" in output
 
 
 

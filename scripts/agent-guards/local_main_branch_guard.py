@@ -2059,6 +2059,12 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=False,
             target_branch_kind=None,
             hook_flavor=hook_flavor,
+            decision="block",
+            event_kind="PreToolUse",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            parser_stage="input_parse",
+            rule_id="input_parse",
+            argv_redacted=[],
         )
         return 2
 
@@ -2100,6 +2106,12 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=(current_branch == default_branch),
             target_branch_kind=result.get("target_branch_kind"),
             hook_flavor=hook_flavor,
+            decision=result["decision"],
+            event_kind=result.get("event_kind", hook_event),
+            command_kind=result.get("command_kind", COMMAND_KIND_UNKNOWN),
+            parser_stage=result.get("parser_stage", "classification"),
+            rule_id=result.get("rule_id"),
+            argv_redacted=result.get("argv_redacted", []),
         )
         return 2
 
@@ -2112,6 +2124,13 @@ def _emit_block_stderr(
     current_is_default: bool,
     target_branch_kind: str | None,
     hook_flavor: str,
+    *,
+    decision: str = "block",
+    event_kind: str = "PreToolUse",
+    command_kind: str = COMMAND_KIND_UNKNOWN,
+    parser_stage: str = "classification",
+    rule_id: str | None = None,
+    argv_redacted: list[str] | None = None,
 ) -> None:
     """
     Emit bounded, non-leaking block message to stderr (max 10 lines).
@@ -2124,25 +2143,31 @@ def _emit_block_stderr(
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
+        f"hook_name: local_main_branch_guard",
+        f"event_kind: {event_kind}",
+        f"decision: {decision}",
         f"reason_code: {reason_code}",
+        f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
         f"current_branch_kind: {current_branch_kind}",
-        f"current_is_default: {str(current_is_default).lower()}",
+        f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
+        f"argv_redacted: {json.dumps(argv_redacted or [])}",
     ]
-    if target_branch_kind:
-        lines.append(f"target_branch_kind: {target_branch_kind}")
-
+    recovery = None
     if reason_code == REASON_INLINE_OVERRIDE:
-        lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
+        recovery = "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
     elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-        lines.append("recovery: switch root back to default branch first")
+        recovery = "switch root back to default branch first"
     elif reason_code == REASON_UNPARSEABLE:
-        lines.append("recovery: use simple (non-compound) git commands from local root")
+        recovery = "use simple (non-compound) git commands from local root"
     elif reason_code == REASON_DRIFT:
-        lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
+        recovery = "create/enter linked issue worktree, or switch only to default branch"
     elif reason_code == REASON_GH_MUTATION:
-        lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
+        recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
 
-    lines.append(f"hook_flavor: {hook_flavor}")
+    if recovery is None:
+        lines.append(f"hook_flavor: {hook_flavor}")
+    else:
+        lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
 
     # Enforce max 10 lines
     for line in lines[:10]:

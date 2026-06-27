@@ -1156,6 +1156,36 @@ class TestB5NoRawBranchInStderr:
         assert "current_branch_kind: other" in captured.err
         assert "current_is_default: false" in captured.err
 
+    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
+        """_emit_block_stderr includes AC7-required fields for block diagnostics."""
+        from local_main_branch_guard import (
+            _emit_block_stderr,
+            REASON_GH_MUTATION,
+            COMMAND_KIND_GITHUB_DESTRUCTIVE,
+        )
+        _emit_block_stderr(
+            reason_code=REASON_GH_MUTATION,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind="issue_like",
+            hook_flavor="claude",
+            event_kind="PreToolUse",
+            decision="block",
+            command_kind=COMMAND_KIND_GITHUB_DESTRUCTIVE,
+            parser_stage="gh_mutation",
+            rule_id="github_mutation_denied",
+            argv_redacted=["gh", "pr", "merge", "123"],
+        )
+        captured = capsys.readouterr()
+        output = captured.err
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PreToolUse" in output
+        assert "decision: block" in output
+        assert "rule_id: github_mutation_denied" in output
+        assert "command_kind: github_mutation" in output
+        assert "parser_stage: gh_mutation" in output
+        assert "argv_redacted:" in output
+
     def test_emit_block_stderr_max_10_lines(self, capsys):
         """_emit_block_stderr output is bounded to max 10 lines."""
         from local_main_branch_guard import _emit_block_stderr, REASON_DRIFT
