@@ -116,6 +116,7 @@ hook_boundaries_manifest_v1:
       gh issue/pr mutation コマンド（edit/close/merge 等）は gh_mutation_denied で fail-closed（#1109）。
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
+      本 Issue では local root default branch 保護（branch drift 防止）と GitHub 書き込み許可集合は拡張しない。
 
       ## gh CLI コマンド 5 分類（#1124）
 
