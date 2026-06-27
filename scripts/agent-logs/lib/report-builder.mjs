@@ -21,6 +21,8 @@ const OPAQUE_REF_FORBIDDEN_PATTERNS = [
 
 const VALIDATOR_VERSION = '1.0.0'
 const CHECK_COMMAND = 'pnpm agent-run-report:check'
+const ENTIRECLI_SAFETY_SCHEMA_VERSION = 'entirecli_safety_result/v1'
+const ENTIRECLI_SAFE_VERDICTS = new Set(['safe', 'not_applicable'])
 
 function buildPublicSafety(publicSurfaceKind, checkedAt) {
   const isPublicSurface = publicSurfaceKind !== 'none'
@@ -86,6 +88,50 @@ function buildAuthority(actorType, evidenceRefs) {
   }
 }
 
+/**
+ * Validates entirecli_safety input for public surface reports.
+ *
+ * For public_surface_kind === 'none', entirecli_safety is not required and
+ * undefined is returned. For public surfaces, the input must be a
+ * checker-produced value from check-entirecli-safety.mjs.
+ * not_applicable auto-synthesis is prohibited.
+ *
+ * @param {unknown} entirecliSafety
+ * @param {string} publicSurfaceKind
+ * @returns {unknown}
+ */
+function validateEntireCLISafetyInput(entirecliSafety, publicSurfaceKind) {
+  if (publicSurfaceKind === 'none') {
+    return undefined
+  }
+  if (!entirecliSafety) {
+    throw runtimeError(
+      'report.entirecli_safety_missing',
+      'entirecli_safety is required for public surface reports; supply checker-produced output from check-entirecli-safety.mjs'
+    )
+  }
+  const safety = /** @type {Record<string, unknown>} */ (entirecliSafety)
+  if (safety.schema_version !== ENTIRECLI_SAFETY_SCHEMA_VERSION) {
+    throw runtimeError(
+      'report.entirecli_safety_unknown_schema_version',
+      `entirecli_safety has unknown schema_version: ${safety.schema_version}`
+    )
+  }
+  if (safety.raw_values_emitted === true) {
+    throw runtimeError(
+      'report.entirecli_safety_raw_values_emitted',
+      'entirecli_safety raw_values_emitted must not be true'
+    )
+  }
+  if (!ENTIRECLI_SAFE_VERDICTS.has(String(safety.verdict))) {
+    throw runtimeError(
+      'report.entirecli_safety_blocked',
+      `entirecli_safety verdict "${safety.verdict}" is not allowed for public surface reports`
+    )
+  }
+  return entirecliSafety
+}
+
 export function validateTranscriptRefs(rawRefs) {
   for (const rawRef of rawRefs) {
     const transcriptRef = assertNonEmptyString(
@@ -112,10 +158,16 @@ export function buildAgentRunReport(input) {
     'public_surface_kind is invalid'
   )
 
+  const validatedEntireCLISafety = validateEntireCLISafetyInput(input.entirecliSafety, publicSurfaceKind)
+  const publicSafety = {
+    ...buildPublicSafety(publicSurfaceKind, checkedAt),
+    ...(validatedEntireCLISafety !== undefined ? { entirecli_safety: validatedEntireCLISafety } : {}),
+  }
+
   const report = {
     schema: 'agent_run_report/v1',
     public_surface_kind: publicSurfaceKind,
-    public_safety: buildPublicSafety(publicSurfaceKind, checkedAt),
+    public_safety: publicSafety,
     actor: {
       type: input.draft.actor.type,
       name: input.draft.actor.name,
