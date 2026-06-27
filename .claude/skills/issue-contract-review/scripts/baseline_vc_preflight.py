@@ -2014,6 +2014,26 @@ def classify_static_command(
                 return None
 
             unwrapped = _strip_uv_run_options(argv)
+            if (
+                unwrapped
+                and Path(unwrapped[0]).name in ("python", "python3")
+                and len(unwrapped) >= 2
+                and unwrapped[1] in ("-m", "-c")
+                and any(
+                    opt in argv
+                    for opt in _ALLOWED_RUNTIME_SMOKE_OPTIONS
+                )
+            ):
+                return (
+                    "blocked",
+                    "command_not_allowed",
+                    "blocked",
+                    (
+                        "runtime-smoke options require the exact canonical script target; "
+                        "python -m/-c runtime forms are not allowed."
+                    ),
+                    "baseline_fail_expected",
+                )
             if unwrapped and Path(unwrapped[0]).name in ("pytest",):
                 return None  # allowed
             if (
