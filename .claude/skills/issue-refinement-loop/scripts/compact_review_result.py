@@ -21,6 +21,7 @@ exit codes: 0=ok, 1=warn, 2=verdict_missing / validation_error
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -28,6 +29,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import jsonschema as _jsonschema
 
 # ---------------------------------------------------------------------------
 # Schema constants (SSOT for ISSUE_REVIEW_RESULT_COMPACT_V1)
@@ -155,9 +158,99 @@ def _strict_json_dumps(payload: Any, *, indent: int | None = None) -> str:
 
 
 def _validate_review_result_schema(raw_result: dict[str, Any]) -> None:
-    import jsonschema
+    _jsonschema.validate(instance=raw_result, schema=_load_review_result_schema())
 
-    jsonschema.validate(instance=raw_result, schema=_load_review_result_schema())
+
+# ---------------------------------------------------------------------------
+# Canonical failure envelope (AC1 / #1165)
+# ---------------------------------------------------------------------------
+
+
+def _write_failure_artifact(
+    artifact_dir: Path,
+    issue_number: int | None,
+    reason_code: str,
+    detail: str,
+    repo_root: Path | None = None,
+    extra: "dict[str, Any] | None" = None,
+) -> "tuple[Path, str]":
+    """
+    Write a PRODUCER_FAILURE_V1 artifact and return (path, sha256).
+
+    AC7: when repo_root is provided, the canonical path
+    <repo_root>/.claude/artifacts/issue-refinement-loop/<issue>/ is used.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slot = str(issue_number) if issue_number else "unknown"
+    _validate_issue_slot(slot)
+    # AC7: use canonical base when repo_root is provided
+    if repo_root is not None:
+        base = repo_root / ".claude" / "artifacts" / "issue-refinement-loop"
+    else:
+        base = artifact_dir
+    artifact_subdir = base / slot
+    artifact_path = artifact_subdir / f"producer_failure_{reason_code}_{ts}.json"
+    payload: "dict[str, Any]" = {
+        "schema": "PRODUCER_FAILURE_V1",
+        "generated_at": ts,
+        "reason_code": reason_code,
+        "detail": str(detail),
+    }
+    if extra:
+        payload.update(extra)
+    content = _strict_json_dumps(payload, indent=2).encode("utf-8")
+    sha256 = hashlib.sha256(content).hexdigest()
+    _atomic_write(artifact_path, content)
+    return artifact_path, sha256
+
+
+def _emit_failure_envelope(
+    reason_code: str,
+    next_action: str,
+    detail: str,
+    artifact_dir: Path,
+    issue_number: "int | None",
+    repo_root: "Path | None" = None,
+    extra: "dict[str, Any] | None" = None,
+) -> None:
+    """
+    Emit canonical failure envelope to stdout and write failure artifact.
+
+    stdout format (always ≤ 2048 UTF-8 bytes):
+      STATUS: failed
+      NEXT_ACTION: <next_action>
+      REASON_CODE: <reason_code>
+      ARTIFACT: producer_failure_v1=<path>
+      ARTIFACT_SHA256: <sha256>
+    """
+    artifact_ref = "producer_failure_v1=<write_failed>"
+    artifact_sha256 = "write_failed"
+    try:
+        artifact_path, sha256 = _write_failure_artifact(
+            artifact_dir, issue_number, reason_code, detail, repo_root, extra
+        )
+        artifact_ref = f"producer_failure_v1={artifact_path}"
+        artifact_sha256 = sha256
+    except Exception:
+        pass  # Artifact write failed; emit envelope with write_failed sentinel
+
+    lines = [
+        "STATUS: failed",
+        f"NEXT_ACTION: {next_action}",
+        f"REASON_CODE: {reason_code}",
+        f"ARTIFACT: {artifact_ref}",
+        f"ARTIFACT_SHA256: {artifact_sha256}",
+    ]
+
+    # Enforce 2048-byte cap on the envelope itself; truncate artifact_ref if needed
+    envelope_text = "\n".join(lines)
+    if len(envelope_text.encode("utf-8")) > 2048:
+        short_ref = artifact_ref[:80] + "..." if len(artifact_ref) > 80 else artifact_ref
+        lines[3] = f"ARTIFACT: {short_ref}"
+        envelope_text = "\n".join(lines)
+
+    for line in lines:
+        print(line, flush=True)
 
 
 def compact_review_result(
@@ -165,11 +258,12 @@ def compact_review_result(
     artifact_dir: Path,
     issue_number: int | None = None,
     repo_root: Path | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], Path, bytes]:
     """
     Convert raw REVIEW_ISSUE_RESULT_V1 to ISSUE_REVIEW_RESULT_COMPACT_V1.
 
-    Returns (compact_data, stdout_lines).
+    Returns (compact_data, stdout_lines, artifact_path, artifact_content).
+    Does NOT write the artifact — caller must write it AFTER budget check (B3).
     Raises ValueError if:
     - verdict is missing or invalid
     - status is unknown/invalid (fail-close; B8)
@@ -272,9 +366,8 @@ def compact_review_result(
             f"secret-like strings detected in artifact content: {artifact_violations}"
         )
 
-    # Write artifact atomically
+    # B3: do NOT write artifact here; caller writes AFTER stdout budget check
     artifact_content = artifact_content_str.encode("utf-8")
-    _atomic_write(artifact_path, artifact_content)
 
     # Build compact dict (stdout representation)
     compact_data = {
@@ -302,7 +395,7 @@ def compact_review_result(
         stdout_lines.append(f"EVIDENCE: {compact_data['EVIDENCE']}")
     stdout_lines.append(f"ARTIFACT: {compact_data['ARTIFACT']}")
 
-    return compact_data, stdout_lines
+    return compact_data, stdout_lines, artifact_path, artifact_content
 
 
 def main() -> int:
@@ -343,49 +436,81 @@ def main() -> int:
             raw_text = sys.stdin.read()
         raw_result = _strict_json_loads(raw_text)
     except (json.JSONDecodeError, ValueError) as e:
-        print("STATUS: failed", flush=True)
-        print(f"ERROR: JSON parse error: {e}", flush=True, file=sys.stderr)
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail=f"JSON parse error: {e}",
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=args.repo_root,
+        )
         return 2
     except Exception as e:
-        print("STATUS: failed", flush=True)
-        print(f"ERROR: {e}", flush=True, file=sys.stderr)
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail=f"Input read error: {e}",
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=args.repo_root,
+        )
         return 2
 
-    # Convert
+    # Convert (B3: compact_review_result does NOT write artifact)
     try:
-        _compact, stdout_lines = compact_review_result(
+        _compact, stdout_lines, artifact_path, artifact_content = compact_review_result(
             raw_result,
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
             repo_root=args.repo_root,
         )
-    except ValueError as e:
-        print("STATUS: failed", flush=True)
-        print(f"ERROR: {e}", flush=True, file=sys.stderr)
+    except (ValueError, _jsonschema.ValidationError, OSError) as e:
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail=str(e),
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=args.repo_root,
+        )
         return 2
 
     # Secret check on stdout output
     output_text = "\n".join(stdout_lines)
     violations = _no_secret_check(output_text)
     if violations:
-        print("STATUS: failed", flush=True)
-        print(
-            f"ERROR: secret-like strings detected in stdout: {violations}",
-            file=sys.stderr,
-            flush=True,
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail=f"secret-like strings detected in stdout: {violations}",
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=args.repo_root,
         )
         return 2
 
-    # B3: enforce 2048 UTF-8 bytes limit on stdout output
+    # B3: enforce 2048 UTF-8 bytes limit BEFORE writing success artifact
     byte_count = len(output_text.encode("utf-8"))
     if byte_count > 2048:
-        print("STATUS: failed", flush=True)
-        print(
-            f"ERROR: stdout exceeds 2048 UTF-8 bytes limit: {byte_count} bytes",
-            file=sys.stderr,
-            flush=True,
+        # AC3: no success artifact written; save details to failure artifact only
+        output_sha256 = hashlib.sha256(output_text.encode("utf-8")).hexdigest()
+        _emit_failure_envelope(
+            reason_code="output_budget_violation",
+            next_action="human_judgment_required",
+            detail=f"stdout exceeds 2048 UTF-8 bytes limit: {byte_count} bytes",
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=args.repo_root,
+            extra={
+                "byte_count": byte_count,
+                "output_sha256": output_sha256,
+                "bounded_preview": output_text[:256],
+            },
         )
         return 2
+
+    # Budget OK: now write success artifact atomically
+    _atomic_write(artifact_path, artifact_content)
 
     # Output compact lines
     for line in stdout_lines:
