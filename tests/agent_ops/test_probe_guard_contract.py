@@ -23,6 +23,7 @@ from local_main_branch_guard import (  # noqa: E402
 
 # ─── AC6: deterministic_checker ───────────────────────────────────────────────
 
+
 class TestDeterministicCheckerParity:
     def test_deterministic_checker_ref_probe_in_allowlist(self) -> None:
         """AC6: git_ref_probe.py must be in DETERMINISTIC_CHECKER_ALLOWLIST."""
@@ -48,15 +49,14 @@ class TestDeterministicCheckerParity:
         assert is_deterministic_checker_command(cmd, str(REPO_ROOT))
 
     def test_deterministic_checker_ref_probe_unknown_flag_denied(self) -> None:
-        """AC6: ref probe with unknown flag --verbose is NOT a deterministic checker."""
+        """AC6/B1: ref probe with unknown flag --verbose is denied by is_deterministic_checker_command.
+
+        B1 introduced argv validation into is_deterministic_checker_command via _validate_probe_argv,
+        mirroring worktree_scope_guard._validate_agent_ops_argv. Unknown flags are now rejected
+        at the local_main_branch_guard level (not just the worktree_scope_guard level).
+        """
         cmd = "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --verbose"
-        # Not in the allowlist with unknown flag context; just check it's the script path match
-        # The deterministic checker function only checks script path, not flag validity
-        # Actual flag validation is done by worktree_scope_guard._validate_agent_ops_argv
-        # For local_main_branch_guard, the allowlist check is path-only
-        # So this should be allowed by is_deterministic_checker_command (path match)
-        # but worktree_scope_guard will validate args
-        assert is_deterministic_checker_command(cmd, str(REPO_ROOT))
+        assert not is_deterministic_checker_command(cmd, str(REPO_ROOT))
 
     def test_deterministic_checker_cleanup_exec_not_in_allowlist(self) -> None:
         """AC6: adding probe scripts must not break existing cleanup_exec allowlist."""
@@ -76,6 +76,7 @@ class TestWorktreeScopeGuardArgSpecs:
     def _get_guard_module(self):
         """Import worktree_scope_guard for inspection."""
         import importlib.util
+
         guard_py = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.py"
         spec = importlib.util.spec_from_file_location("worktree_scope_guard", str(guard_py))
         mod = importlib.util.module_from_spec(spec)
