@@ -824,6 +824,49 @@ def test_source_payload_present_in_preflight_errors():
     assert sp["duration_ms"] == 42
 
 
+def test_source_payload_preserves_package_manager_no_tty_category():
+    """AC3: package_manager_no_tty_prompt error preserves category and human_judgment routing."""
+    from contract_readiness_check import map_preflight_result_to_errors
+
+    synthetic_preflight = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "blocked",
+        "results": [
+            {
+                "ac": "AC1",
+                "command": "pnpm test",
+                "raw_command": "pnpm test",
+                "exit_code": 1,
+                "classification": "blocked",
+                "category": "package_manager_no_tty_prompt",
+                "decision": "blocked",
+                "confidence": "low",
+                "command_hash": "sha256:def456",
+                "duration_ms": 101,
+                "scope_class": "regression_gate",
+                "line": 26,
+                "fix_hint": "CI=true を runner 側で注入してください",
+                "stdout_head": [],
+                "stderr_head": [
+                    "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY"
+                ],
+            }
+        ],
+        "errors": [],
+    }
+
+    errors, aggregate = map_preflight_result_to_errors(synthetic_preflight)
+    assert aggregate == "human_judgment", f"Expected human_judgment, got {aggregate}"
+    assert len(errors) == 1, f"Expected one error, got {len(errors)}"
+    err = errors[0]
+    assert err["category"] == "package_manager_no_tty_prompt", (
+        f"Expected package_manager_no_tty_prompt category, got {err['category']}"
+    )
+    assert err["source_payload"]["classification"] == "blocked", (
+        f"Unexpected source_payload classification: {err['source_payload']}"
+    )
+    assert err["source_payload"]["decision"] == "blocked"
+    assert err["source_payload"]["command_hash"] == "sha256:def456"
 # ---------------------------------------------------------------------------
 # Blocker 4: Redirect operators not flagged as compound (< > << >> <<<)
 # ---------------------------------------------------------------------------

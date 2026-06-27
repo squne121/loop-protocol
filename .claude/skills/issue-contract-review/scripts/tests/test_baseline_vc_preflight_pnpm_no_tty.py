@@ -427,3 +427,81 @@ $ pnpm typecheck
         )
     finally:
         os.unlink(fixture_file)
+
+
+def test_full_pipeline_no_tty_replay_in_tempdir(tmp_path):
+    """AC2: tempdir fixture with no-TTY pnpm replay keeps package_manager_no_tty_prompt."""
+    fixture_content = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm test
+```
+
+## Allowed Paths
+
+- .claude/skills/issue-contract-review
+```
+"""
+
+    fake_root = tmp_path / "issue_1199_replay"
+    fake_root.mkdir()
+    fake_bin = fake_root / "bin"
+    fake_bin.mkdir()
+    node_modules = fake_root / "node_modules"
+    node_modules.mkdir()
+    (node_modules / ".modules.yaml").write_text(
+        """
+layoutVersion: 6
+storeDir: /old/.pnpm-store
+virtualStoreDir: /old/.pnpm-store/v3
+"""
+    )
+
+    fake_pnpm = fake_bin / "pnpm"
+    fake_pnpm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY '\n"
+        "              'Aborted removal of modules directory due to no TTY. '\n"
+        "              'If running in CI, set CI=true\\n')\n"
+        "sys.exit(1)\n"
+    )
+    fake_pnpm.chmod(0o755)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(fixture_content)
+        fixture_file = f.name
+
+    try:
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--body-file", fixture_file],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            cwd=str(fake_root),
+            env=env,
+        )
+        assert result.stdout, f"No output from preflight: {result.stderr}"
+        data = json.loads(result.stdout)
+
+        assert data["status"] == "blocked"
+        assert data["results"], "Expected at least one preflight result"
+        first = data["results"][0]
+        assert first["classification"] == "blocked", (
+            f"Expected blocked classification, got {first}"
+        )
+        assert first["category"] == "package_manager_no_tty_prompt", (
+            f"Expected package_manager_no_tty_prompt, got {first}"
+        )
+        assert first["scope_class"] == "regression_gate", (
+            f"Expected scope_class regression_gate, got {first}"
+        )
+        assert first["decision"] == "blocked", (
+            f"Expected decision blocked, got {first}"
+        )
+    finally:
+        os.unlink(fixture_file)
