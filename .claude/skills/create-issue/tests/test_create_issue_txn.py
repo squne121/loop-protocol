@@ -2465,3 +2465,57 @@ class TestReconcileDependencyRegistrationNon422ErrorIsRecorded:
         assert result.failure_stage == "issue-ids", (
             f"Expected failure_stage='issue-ids', got {result.failure_stage!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# B1 regression: _recovery_hint_for_stage() の GraphQL 文字列が正しく保存されているか
+# E501 行分割で閉じシングルクォートと実改行が破損した regression を防ぐ
+# ---------------------------------------------------------------------------
+
+class TestRecoveryHintGraphQLQuoteAndNewlinePreserved:
+    """B1 regression: _recovery_hint_for_stage の GraphQL 文字列が
+    閉じシングルクォートと実改行を保持していることを確認。"""
+
+    def test_recovery_hint_for_sub_issue_readback_preserves_graphql_quote_and_newline(
+        self,
+    ) -> None:
+        """sub-issue-readback hint の database ID lookup が正しい GraphQL コマンドを含む。
+
+        - 閉じシングルクォート `'` が存在する (`query='...'`)
+        - `\\n` リテラルでなく実改行 `\\n` が含まれる
+        - `\\\\n` (二重バックスラッシュ) が存在しない
+        """
+        hint = txn._recovery_hint_for_stage("sub-issue-readback", "owner/repo", 42, 10, [])
+        # 閉じシングルクォートがある
+        assert "{{databaseId}}}}}}'" in hint, (
+            f"Expected closing single-quote after databaseId in hint, got: {hint!r}"
+        )
+        # 二重バックスラッシュ \\n が残っていない
+        assert "\\\\n" not in hint, (
+            f"Expected no literal \\\\n (double backslash) in hint, got: {hint!r}"
+        )
+        # 実改行で終わっている行があること（改行を確認）
+        assert "\n" in hint, f"Expected real newline in hint, got: {hint!r}"
+
+    def test_recovery_hint_for_dependency_readback_preserves_graphql_quote_and_newline(
+        self,
+    ) -> None:
+        """dependency-readback hint の blockedBy lookup と node ID lookup が正しい GraphQL コマンドを含む。
+
+        - blockedBy lookup: 閉じシングルクォート `'` が存在する
+        - node ID lookup: 閉じシングルクォート `'` が存在する
+        - いずれも `\\\\n` リテラルが残っていない
+        """
+        hint = txn._recovery_hint_for_stage("dependency-readback", "owner/repo", 42, 0, [99])
+        # blockedBy lookup の閉じシングルクォート
+        assert "{{blockedBy(first:10){{nodes{{number}}}}}}}}}}'" in hint, (
+            f"Expected closing single-quote after blockedBy nodes in hint, got: {hint!r}"
+        )
+        # node ID lookup の閉じシングルクォート
+        assert "{{id}}}}}}'" in hint, (
+            f"Expected closing single-quote after id in hint, got: {hint!r}"
+        )
+        # 二重バックスラッシュ \\n が残っていない
+        assert "\\\\n" not in hint, (
+            f"Expected no literal \\\\n (double backslash) in hint, got: {hint!r}"
+        )
