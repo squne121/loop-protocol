@@ -18,7 +18,6 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 SCHEMA = "GIT_REF_PROBE_RESULT_V1"
 
