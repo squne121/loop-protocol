@@ -260,6 +260,24 @@ function normalizeSourceComment(sourceComment) {
     }
   }
 
+  // Runtime enforcement: entirecli_safety missing or blocked means the entry
+  // cannot be made canonical in the retro index. checker-produced values only.
+  const entirecliSafety = extraction.payload.public_safety?.entirecli_safety
+  if (!entirecliSafety) {
+    return {
+      kind: 'blocked',
+      reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+      reason: 'entirecli_safety_missing',
+    }
+  }
+  if (entirecliSafety.verdict === 'blocked') {
+    return {
+      kind: 'blocked',
+      reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
+      reason: 'entirecli_safety_blocked',
+    }
+  }
+
   return {
     kind: 'report',
     parsedUrl,

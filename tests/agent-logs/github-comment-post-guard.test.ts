@@ -18,6 +18,18 @@ function createReport(overrides = {}) {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      entirecli_safety: {
+        schema_version: 'entirecli_safety_result/v1',
+        verdict: 'not_applicable',
+        reason_codes: ['entire_absent'],
+        raw_values_emitted: false,
+        checked_surfaces: {
+          entire_binary: false,
+          entire_version: null,
+          entire_enable_help: false,
+          entire_configure_help: false,
+        },
+      },
     },
     actor: {
       type: 'ai_agent',
@@ -93,10 +105,83 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+      entirecli_safety: {
+        schema_version: 'entirecli_safety_result/v1',
+        verdict: 'not_applicable',
+        reason_codes: ['entire_absent'],
+        raw_values_emitted: false,
+        checked_surfaces: {
+          entire_binary: false,
+          entire_version: null,
+          entire_enable_help: false,
+          entire_configure_help: false,
+        },
+      },
       },
     })
 
     expect(() => renderValidatedPublicMarkdown(report)).toThrow(/public_surface_redaction_status/)
+  })
+
+  it('GIVEN a report with missing entirecli_safety WHEN validateFinalReport is called THEN it fails closed before any GitHub comment call', async () => {
+    const report = createReport({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-17T12:30:00.000Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        // no entirecli_safety
+      },
+    })
+
+    const client = {
+      listIssueComments: async () => { throw new Error('list must not run for missing entirecli_safety') },
+      createIssueComment: async () => { throw new Error('create must not run for missing entirecli_safety') },
+      updateIssueComment: async () => { throw new Error('update must not run for missing entirecli_safety') },
+    }
+
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+    await expect(
+      upsertGithubMarkerCommentFromFile({
+        repo: 'squne121/loop-protocol',
+        targetNumber: 937,
+        issueNumber: 937,
+        prNumber: null,
+        runId: 'run-937-001',
+        payloadMarkdownFile: '/dev/null',
+        dryRun: true,
+        client,
+      })
+    ).rejects.not.toThrow('list must not run')
+  })
+
+  it('GIVEN a report with entirecli_safety verdict blocked WHEN validateFinalReport is called THEN it fails closed before any GitHub comment call', () => {
+    const report = createReport({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-17T12:30:00.000Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        entirecli_safety: {
+          schema_version: 'entirecli_safety_result/v1',
+          verdict: 'blocked',
+          reason_codes: ['push_sessions_enabled'],
+          raw_values_emitted: false,
+          checked_surfaces: {
+            entire_binary: true,
+            entire_version: 'v1.2***[len=12]',
+            entire_enable_help: true,
+            entire_configure_help: true,
+          },
+        },
+      },
+    })
+
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
   })
 
   it('GIVEN the helper CLI surface WHEN live posting is requested THEN it fails closed and keeps live writes on the validated-report path only', async () => {

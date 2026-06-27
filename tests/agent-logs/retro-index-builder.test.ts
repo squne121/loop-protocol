@@ -7,6 +7,7 @@ import {
   RETRO_INDEX_ALGORITHM,
 } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
+import { renderPublicMarkdown } from '../../scripts/lib/agent-run-report-validation.mjs'
 import { renderValidatedPublicMarkdown } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
 
 function createIssueCommentReport() {
@@ -216,6 +217,60 @@ describe('retro index builder', () => {
       {
         report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
         reason: 'multiple pull request candidates matched',
+      },
+    ])
+  })
+
+  it('GIVEN a source comment with missing entirecli_safety WHEN buildRetroIndex runs THEN verdict becomes blocked', () => {
+    // Create a report without entirecli_safety (bypasses validateFinalReport via renderPublicMarkdown)
+    const reportWithoutEntireCLI = {
+      ...createValidReport(),
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-15T22:57:00Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        // no entirecli_safety
+      },
+      docs_read_refs: [
+        {
+          ref_kind: 'issue',
+          ref: 'https://github.com/squne121/loop-protocol/issues/935',
+          summary: 'no entirecli_safety present',
+        },
+      ],
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-missing-entirecli',
+      },
+      payloadMarkdown: renderPublicMarkdown(reportWithoutEntireCLI),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122669',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'entirecli_safety_missing',
       },
     ])
   })
