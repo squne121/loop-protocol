@@ -82,7 +82,10 @@ def test_ac6_case1_unrelated_issue():
 
 
 def test_ac6_case2_docs_product_impl_fail():
-    """AC6: FAIL — allowed_paths に docs/product/** ありで implementation issue かつ spec delta Issue リンクなし（PS001）"""
+    (
+        """AC6: FAIL — allowed_paths に docs/product/** ありで implementation issue かつ spec delta Issue"""
+        """ リンクなし（PS001）"""
+    )
     _run_fixture_case("docs_product_in_impl_without_spec_delta_fail", "fail", ["PS001"])
 
 

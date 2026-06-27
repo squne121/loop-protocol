@@ -175,7 +175,10 @@ def test_validate_request_rejects_proposal_only_unknown_output_section(tmp_path,
 @pytest.mark.parametrize(
     ("instruction", "expected_error"),
     [
-        ("src/main.py を編集して file write まで実施してください。", "proposal_only forbids direct file write/edit requests"),
+        (
+            "src/main.py を編集して file write まで実施してください。",
+            "proposal_only forbids direct file write/edit requests",
+        ),
         ("bash で just check を実行して結果まで返してください。", "proposal_only forbids shell execution requests"),
         ("gh issue comment で GitHub へ投稿してください。", "proposal_only forbids GitHub mutation requests"),
     ],
@@ -1005,7 +1008,14 @@ def test_main_stdout_ok_false_empty_warnings_prints_fallback(tmp_path, monkeypat
         stdout = '{"response": null, "stats": {"models": {"gemini-3-flash-preview": {}}}}'
         stderr = ""
 
-    monkeypatch.setattr(module, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: NullResponseNoWarnings())
+    monkeypatch.setattr(
+        module,
+        "_run_gemini",
+        lambda command,
+        timeout_sec,
+        prompt=None,
+        cwd=None: NullResponseNoWarnings()
+    )
 
     exit_code = module.main([
         "--request-file", str(request_file),
@@ -1159,7 +1169,12 @@ def test_run_delegation_local_asset_research_uses_stdin_prompt_and_repo_root_cwd
         ("proposal_only", make_proposal_only_request),
     ],
 )
-def test_run_delegation_other_profiles_keep_prompt_in_argv_without_stdin(tmp_path, monkeypatch, profile, request_factory):
+def test_run_delegation_other_profiles_keep_prompt_in_argv_without_stdin(
+    tmp_path,
+    monkeypatch,
+    profile,
+    request_factory
+):
     module = load_module()
     request = request_factory()
     request["tool_profile"] = profile
@@ -1893,7 +1908,10 @@ def test_run_delegation_local_asset_research_gh_commands_fails_at_validate(tmp_p
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get("warnings", [])), (
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get(
+        "warnings",
+        []
+    )), (
         f"expected gh_commands restriction in warnings, got: {result.get('warnings')}"
     )
 
@@ -1912,7 +1930,10 @@ def test_run_delegation_proposal_only_gh_commands_fails_at_validate(tmp_path, mo
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get("warnings", [])), (
+    assert any("gh_commands is only allowed with tool_profile='github_research'" in w for w in result.get(
+        "warnings",
+        []
+    )), (
         f"expected gh_commands restriction in warnings, got: {result.get('warnings')}"
     )
 
@@ -1921,13 +1942,12 @@ def test_run_delegation_proposal_only_gh_commands_fails_at_validate(tmp_path, mo
 
 
 def _make_completed_ok(response_text: str = "Gemini final answer here."):
+    _stats = '{"models": {"gemini-3-flash-preview": {"api": {"totalRequests": 1}}}}'
     class Completed:
         returncode = 0
-        stdout = f'{{"response": "{response_text}", "stats": {{"models": {{"gemini-3-flash-preview": {{"api": {{"totalRequests": 1}}}}}}}}}}'
+        stdout = f'{{"response": "{response_text}", "stats": {_stats}}}'
         stderr = ""
     return Completed()
-
-
 def test_main_ndjson_output_is_valid_json_per_line(tmp_path, monkeypatch):
     """AC1: --output-format ndjson 指定時、出力ファイルの各行が有効な JSON オブジェクトである"""
     import json as _json
@@ -1958,7 +1978,14 @@ def test_main_ndjson_output_appends_on_second_run(tmp_path, monkeypatch):
     request_file = _make_main_request_file(tmp_path)
     output_file = tmp_path / "result.ndjson"
 
-    monkeypatch.setattr(module, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: _make_completed_ok("first response"))
+    monkeypatch.setattr(
+        module,
+        "_run_gemini",
+        lambda command,
+        timeout_sec,
+        prompt=None,
+        cwd=None: _make_completed_ok("first response")
+    )
 
     module.main([
         "--request-file", str(request_file),
@@ -1966,7 +1993,14 @@ def test_main_ndjson_output_appends_on_second_run(tmp_path, monkeypatch):
         "--output-format", "ndjson",
     ])
 
-    monkeypatch.setattr(module, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: _make_completed_ok("second response"))
+    monkeypatch.setattr(
+        module,
+        "_run_gemini",
+        lambda command,
+        timeout_sec,
+        prompt=None,
+        cwd=None: _make_completed_ok("second response")
+    )
 
     module.main([
         "--request-file", str(request_file),
@@ -1988,7 +2022,14 @@ def test_main_ndjson_tail_last_has_response_text(tmp_path, monkeypatch):
     request_file = _make_main_request_file(tmp_path)
     output_file = tmp_path / "result.ndjson"
 
-    monkeypatch.setattr(module, "_run_gemini", lambda command, timeout_sec, prompt=None, cwd=None: _make_completed_ok("expected answer"))
+    monkeypatch.setattr(
+        module,
+        "_run_gemini",
+        lambda command,
+        timeout_sec,
+        prompt=None,
+        cwd=None: _make_completed_ok("expected answer")
+    )
 
     exit_code = module.main([
         "--request-file", str(request_file),
@@ -2014,7 +2055,10 @@ def test_main_json_default_unchanged(tmp_path, monkeypatch):
     def make_completed():
         class Completed:
             returncode = 0
-            stdout = '{"response": "same answer", "stats": {"models": {"gemini-3-flash-preview": {"api": {"totalRequests": 1}}}}}'
+            stdout = (
+                '{"response": "same answer", "stats": {"models": {"gemini-3-flash-preview": {"api": {"totalRequests":'
+                ' 1}}}}}'
+            )
             stderr = ""
         return Completed()
 
@@ -2042,4 +2086,6 @@ def test_main_json_default_unchanged(tmp_path, monkeypatch):
     assert default_obj["ok"] == explicit_obj["ok"]
     assert default_obj["response_text"] == explicit_obj["response_text"]
     # Must be overwrite (single JSON, not NDJSON): check that indented multi-line JSON is written
-    assert "\n" in default_content.strip() or default_content.strip().startswith("{"), "json output must be a JSON object, not NDJSON"
+    assert "\n" in default_content.strip() or default_content.strip().startswith("{"), (
+        "json output must be a JSON object, not NDJSON"
+    )

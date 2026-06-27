@@ -991,7 +991,8 @@ def classify_block_legacy(block: str) -> str:
       code_fence            ← code_fence / machine_contract
       machine_yaml          ← yaml_machine_line
       shell_command         ← shell_command / vc_command
-      grep_pattern          ← (shell_command に統合; 後方互換用に shell_command → grep_pattern 変換は _classify_block で実施)
+      grep_pattern          ← (shell_command に統合;
+                後方互換用に shell_command → grep_pattern 変換は _classify_block で実施)
       url_or_identifier_only ← url_or_identifier
 
     Returns:

@@ -548,7 +548,8 @@ class TestGfmSegmentationLimits:
     """B4: split_markdown_blocks() の GFM セグメンテーション（#659 で修正済み）"""
 
     def test_split_nested_markdown_fence_is_single_block(self):
-        """GIVEN: `````markdown fence 内に ```yaml を含むネスト WHEN: split_markdown_blocks THEN: 単一 code_fence ブロック
+        """GIVEN: `````markdown fence 内に ```yaml を含むネスト WHEN: split_markdown_blocks THEN: 単一 code_fence
+            ブロック
 
         GFM spec では、opening が ````` (5個) の場合、
         内側の ``` (3個) は fence を閉じない（closing は opening と同じ長さ以上が必要）。

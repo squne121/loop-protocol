@@ -484,7 +484,9 @@ def main() -> int:
             verdicts.append("gh_error")
             raw_checks = []
         elif len(matched) > 1:
-            errors.append({"kind": "ambiguous_check_name", "detail": f"check-name matched multiple checks: {check_name_filter}"})
+            errors.append({(
+                "kind"
+            ): "ambiguous_check_name", "detail": f"check-name matched multiple checks: {check_name_filter}"})
             verdicts.append("gh_error")
             raw_checks = []
         else:
@@ -568,7 +570,10 @@ def main() -> int:
     # Build categorized lists
     effective_sha = head_sha or expected_head_sha
     failed_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "failed"]
-    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "pending_or_queued"]
+    pending_checks = [e["name"] for e in check_entries if determine_check_verdict(
+        e,
+        effective_sha
+    ) == "pending_or_queued"]
     stale_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "stale_head_sha"]
     excluded_checks = [e["name"] for e in check_entries if determine_check_verdict(e, effective_sha) == "excluded"]
 

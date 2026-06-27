@@ -13,7 +13,11 @@ from pathlib import Path
 SCRIPT = Path(__file__).parent.parent / "scripts" / "verify_vc_single_command_guardrail_docs.py"
 
 
-def _run_checker(tmp_path: Path, body_authoring_content: str, skill_md_content: str = "") -> subprocess.CompletedProcess:
+def _run_checker(
+    tmp_path: Path,
+    body_authoring_content: str,
+    skill_md_content: str = ""
+) -> subprocess.CompletedProcess:
     """Run the checker with synthetic test files."""
     repo_root = tmp_path
 

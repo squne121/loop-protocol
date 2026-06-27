@@ -199,9 +199,13 @@ class TestJsonOutputStructure:
     """GIVEN any fixture WHEN checker runs with --json THEN output matches expected schema."""
 
     def test_json_has_required_keys(self):
-        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, issue_kind, generated_at, etc."""
+        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, issue_kind, generated_at,
+            etc.
+        """
         output = run_checker("pass_issue.md")
-        required_keys = {"verdict", "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
+        required_keys = {(
+            "verdict"
+        ), "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
         missing = required_keys - set(output.keys())
         assert not missing, f"JSON output missing keys: {missing}"
 
@@ -360,7 +364,9 @@ class TestFindingsContract:
         assert blocker["checker_evidence"][0]["body_sha256"] == output["body_sha256"]
 
     def test_schema_requires_top_level_structured_blockers(self):
-        """GIVEN review_issue_result_v1 schema WHEN loaded THEN structured_blockers is top-level required and schema-bound."""
+        """GIVEN review_issue_result_v1 schema WHEN loaded THEN structured_blockers is top-level required and
+            schema-bound.
+        """
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         assert "structured_blockers" in schema["required"]
         assert schema["properties"]["structured_blockers"]["items"]["$ref"] == "#/$defs/structured_blocker"
@@ -458,9 +464,13 @@ class TestJsonOutputSchema:
     """GIVEN any fixture WHEN checker runs THEN JSON output has all required fields."""
 
     def test_json_output_schema(self):
-        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, blocking_issues, non_blocking_improvements, issue_kind, generated_at."""
+        """GIVEN pass_issue.md WHEN checker runs THEN JSON has verdict, deterministic_checks, blocking_issues,
+            non_blocking_improvements, issue_kind, generated_at.
+        """
         output = run_checker("pass_issue.md")
-        required_fields = {"verdict", "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
+        required_fields = {(
+            "verdict"
+        ), "deterministic_checks", "blocking_issues", "non_blocking_improvements", "issue_kind", "generated_at"}
         missing = required_fields - set(output.keys())
         assert not missing, f"JSON output missing fields: {missing}"
 
@@ -469,7 +479,9 @@ class TestMachineReadableContractPriority:
     """GIVEN an issue with Machine-Readable Contract WHEN checker runs THEN issue_kind from contract takes priority."""
 
     def test_machine_readable_contract_priority(self):
-        """GIVEN c2_fail_issue.md with issue_kind: implementation in contract WHEN checker runs THEN issue_kind is implementation."""
+        """GIVEN c2_fail_issue.md with issue_kind: implementation in contract WHEN checker runs THEN issue_kind is
+            implementation.
+        """
         # c2_fail_issue.md has issue_kind: implementation in the Machine-Readable Contract
         # and no labels/title prefix, so it should be detected from the contract
         output = run_checker("c2_fail_issue.md")
@@ -511,7 +523,9 @@ none
 
 ## Background
 
-このフィクスチャは `--mode execute` の human_judgment 検出テスト用。VC の `$ loop-protocol-nonexistent-tool-xyz-abc` は常に exit 127 (command not found) を返すため、env_missing_dep → human_judgment となる。
+このフィクスチャは `--mode execute` の human_judgment 検出テスト用。
+VC の `$ loop-protocol-nonexistent-tool-xyz-abc` は常に exit 127 (command not found) を返すため、
+env_missing_dep → human_judgment となる。
 
 ## Parent Goal Ref
 
@@ -598,7 +612,8 @@ none
 
 ## Background
 
-このフィクスチャは `--mode execute` の unexpected_pass 検出テスト用。VC の `$ true` は実装前でも常に exit 0 を返すため unexpected_pass となる。
+このフィクスチャは `--mode execute` の unexpected_pass 検出テスト用。
+VC の `$ true` は実装前でも常に exit 0 を返すため unexpected_pass となる。
 
 ## Parent Goal Ref
 
@@ -675,7 +690,8 @@ def run_contract_readiness(fixture_name: str, mode: str = "execute") -> tuple[di
         return json.loads(result.stdout), result.returncode
     except json.JSONDecodeError as e:
         raise AssertionError(
-            f"contract_readiness_check.py output is not valid JSON: {e}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            f"contract_readiness_check.py output is not valid JSON: {e}"
+            f"\nstdout: {result.stdout}\nstderr: {result.stderr}"
         ) from e
 
 
@@ -700,7 +716,8 @@ def run_contract_readiness_from_content(content: str, mode: str = "execute") -> 
         return json.loads(result.stdout), result.returncode
     except json.JSONDecodeError as e:
         raise AssertionError(
-            f"contract_readiness_check.py output is not valid JSON: {e}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            f"contract_readiness_check.py output is not valid JSON: {e}"
+            f"\nstdout: {result.stdout}\nstderr: {result.stderr}"
         ) from e
 
 

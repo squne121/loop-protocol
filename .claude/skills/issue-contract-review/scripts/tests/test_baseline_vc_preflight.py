@@ -582,7 +582,16 @@ def test_confidence_json_fragment_parity():
 
     # Get fragment output
     fragment_result = subprocess.run(
-        [sys.executable, str(script_path), "--body-file", str(fixture), "--issue", "999", "--format", "contract-review-fragment"],
+        [
+            sys.executable,
+            str(script_path),
+            "--body-file",
+            str(fixture),
+            "--issue",
+            "999",
+            "--format",
+            "contract-review-fragment"
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -865,7 +874,9 @@ def test_full_preflight_pytest_baseline_fail_status_pass():
     assert data["summary"]["expected_fail"] >= 1, "Expected at least 1 expected_fail in summary"
 
     # Summary should show human_judgment == 0
-    assert data["summary"]["human_judgment"] == 0, f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
+    assert data["summary"]["human_judgment"] == 0, (
+        f"Expected human_judgment=0 but got {data['summary']['human_judgment']}"
+    )
 
     # At least one result should be expected_fail
     assert len(data["results"]) > 0
@@ -1380,7 +1391,9 @@ $ test "$(wc -l < /nonexistent/file)" -le 10
             and r["exit_code"] is None  # not executed
             for r in results
         )
-        assert found, f"Command substitution should be blocked/unsupported_shell_syntax and not executed. Got: {results[0]}"
+        assert found, (
+            f"Command substitution should be blocked/unsupported_shell_syntax and not executed. Got: {results[0]}"
+        )
     finally:
         import os
         os.unlink(fixture_file)
@@ -1438,7 +1451,16 @@ $ rg "should_not_exist" src/
         script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
 
         result = subprocess.run(
-            [sys.executable, str(script_path), "--body-file", fixture_file, "--issue", "999", "--format", "contract-review-fragment"],
+            [
+                sys.executable,
+                str(script_path),
+                "--body-file",
+                fixture_file,
+                "--issue",
+                "999",
+                "--format",
+                "contract-review-fragment"
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1864,7 +1886,10 @@ def test_package_manager_no_tty_prompt_classified_as_tooling_blocker_after_runne
     classification, category, decision, fix_hint, scope_class = classify_result(
         1,
         "",
-        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        (
+           "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running"
+           " in CI, set CI=true"
+       ),
         "pnpm build",
         cwd=".",
         runner_env_delta={"CI": "true"},
@@ -1886,7 +1911,10 @@ def test_package_manager_no_tty_prompt_without_runner_delta_points_to_env_retry(
     classification, category, decision, fix_hint, scope_class = classify_result(
         1,
         "",
-        "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running in CI, set CI=true",
+        (
+           "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY Aborted removal of modules directory due to no TTY. If running"
+           " in CI, set CI=true"
+       ),
         "pnpm build",
         cwd=".",
         runner_env_delta={},
@@ -2139,7 +2167,9 @@ def test_check_c13_vc_preflight_decision_regression_gate_consistency():
 
     is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
     assert not is_valid, "regression_gate + go requires expected_pass"
-    assert any("regression_gate + go" in f and "expected_pass" in f for f in failures), f"Expected regression_gate + go error, got: {failures}"
+    assert any("regression_gate + go" in f and "expected_pass" in f for f in failures), (
+        f"Expected regression_gate + go error, got: {failures}"
+    )
 
 
 def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
@@ -2162,7 +2192,9 @@ def test_check_c13_vc_preflight_decision_regression_gate_blocked_consistency():
 
     is_valid, failures = check_c13_vc_preflight_decision_consistency(classifications)
     assert not is_valid, "regression_gate + blocked requires blocked classification"
-    assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), f"Expected regression_gate + blocked error, got: {failures}"
+    assert any("regression_gate + blocked" in f and "blocked" in f for f in failures), (
+        f"Expected regression_gate + blocked error, got: {failures}"
+    )
 
 
 def test_preflight_scope_unknown_value_is_human_judgment():
@@ -2671,7 +2703,10 @@ def test_ac5_ci_performance_missing_baseline_needs_fix():
     """AC5: #895-type — a strict-mode VC referencing a new docs/dev/ci-performance.md
     that does not exist at baseline is missing_baseline_expect_for_new_allowed_path
     (needs_fix), not human_judgment."""
-    body = ("## Verification Commands\n\n```bash\n$ rg ci_runtime_baseline_v1 docs/dev/ci-performance-nonexistent-899.md\n```\n\n"
+    body = (
+        "## Verification Commands\n\n```bash\n"
+        "$ rg ci_runtime_baseline_v1 docs/dev/ci-performance-nonexistent-899.md"
+        "\n```\n\n"
             "## Allowed Paths\n\n- `docs/dev/ci-performance-nonexistent-899.md`\n")
     data = _run_bvp_899(body, strict=True)
     it = _result_for_899(data, "ci-performance-nonexistent-899.md")

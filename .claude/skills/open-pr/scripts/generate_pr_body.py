@@ -39,7 +39,11 @@ def _build_summary(issue: int, is_agent_surface_change: bool) -> str:
 def _build_checks() -> str:
     return (
         "- [ ] テスト確認: `uv run pytest .claude/skills/open-pr/tests/test_pr_body_hygiene.py -q`\n"
-        "- [ ] hygiene 判定確認: `uv run python3 .claude/skills/open-pr/scripts/validate_pr_body_hygiene.py --body-file <generated-body-file> --changed-paths-file <changed-paths-file> --linked-issue <issue> --draft <true|false> --require-merge-ready`"
+        "- [ ] hygiene 判定確認: `uv run python3"
+        " .claude/skills/open-pr/scripts/validate_pr_body_hygiene.py"
+        " --body-file <generated-body-file>"
+        " --changed-paths-file <changed-paths-file>"
+        " --linked-issue <issue> --draft <true|false> --require-merge-ready`"
     )
 
 

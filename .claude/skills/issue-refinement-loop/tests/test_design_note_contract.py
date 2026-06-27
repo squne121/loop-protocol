@@ -126,7 +126,9 @@ def _assert_claims_consistency(design_note_text: str) -> None:
     assert "loop_state_reference" in claims, "loop_state_reference claim missing"
 
     assert claims["max_iterations_default"].get("canonical_selector") == REQUIRED_CLAIMS["max_iterations_default"]
-    assert claims["iteration_limit_termination"].get("canonical_selector") == REQUIRED_CLAIMS["iteration_limit_termination"]
+    assert claims[(
+        "iteration_limit_termination"
+    )].get("canonical_selector") == REQUIRED_CLAIMS["iteration_limit_termination"]
     assert claims["review_result_contract"].get("canonical_selector") == REQUIRED_CLAIMS["review_result_contract"]
     assert claims["loop_state_reference"].get("canonical_selector") == REQUIRED_CLAIMS["loop_state_reference"]
 

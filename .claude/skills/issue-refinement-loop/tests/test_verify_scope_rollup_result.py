@@ -62,7 +62,9 @@ def _make_valid_plan(tmp_path: Path, extra_candidates: list[dict[str, Any]] | No
         "schema_name": "ISSUE_SCOPE_ROLLUP_PLAN_V2",
         "schema_version": 2,
         "hash_algorithm": "sha256",
-        "canonicalization": 'json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")',
+        (
+            "canonicalization"
+        ): 'json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")',
     }
     return {**plan_without_sv, "self_validation": self_validation}
 
@@ -408,7 +410,13 @@ class TestDuplicateKeys:
         # Inject duplicate key into self_validation
         _plan_str = json.dumps(plan, ensure_ascii=False)
         # Replace first self_validation json with a version that has duplicate keys
-        sv_with_dup = '{"payload_sha256": "aaa", "payload_sha256": "bbb", "schema_name": "ISSUE_SCOPE_ROLLUP_PLAN_V2", "schema_version": 2, "hash_algorithm": "sha256", "invocation_id": "test", "script_file_sha256": "ccc", "canonicalization": "test"}'
+        sv_with_dup = (
+            '{"payload_sha256": "aaa", "payload_sha256": "bbb",'
+            ' "schema_name": "ISSUE_SCOPE_ROLLUP_PLAN_V2",'
+            ' "schema_version": 2, "hash_algorithm": "sha256",'
+            ' "invocation_id": "test", "script_file_sha256": "ccc",'
+            ' "canonicalization": "test"}'
+        )
         # Build raw JSON string with the duplicate-key self_validation
         plan_without_sv = {k: v for k, v in plan.items() if k != "self_validation"}
         raw = json.dumps(plan_without_sv, ensure_ascii=False)[:-1]  # strip closing }

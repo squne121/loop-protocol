@@ -91,6 +91,9 @@ routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
 orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
+主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態)。
+web_research 結果に含まれる `critical_claims` の未解決 claim は human_escalation へ倒す。
+
 ## Procedure
 
 ### Step 0: Preconditions
@@ -167,6 +170,10 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 ### Step 1b: Web Research
 
 `REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
+
+Step 1（codebase-investigator）と Step 1b（web-researcher）は、両方が required の場合に並列実行できる。ただし両 SubAgent の結果を Step 2 前に合流させること。
+
+web-researcher が critical claim にエビデンスを示せず、ハルシネーション疑いと判定した場合は `human_escalation` に倒す（Step 5）。
 
 詳細は `references/web-research-routing.md` を参照する。
 

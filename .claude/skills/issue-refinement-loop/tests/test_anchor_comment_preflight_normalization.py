@@ -24,7 +24,18 @@ def _fixture() -> dict:
         "issue": {
             "number": 100,
             "title": "Test",
-            "body": "## Machine-Readable Contract\n\n```yaml\nissue_kind: implementation\ncontract_schema_version: v1\n```\n\n## Parent Issue\n\nnone\n\n## Parent Goal Ref\n\n- Goal: test\n\n## Current Validated Scope\n\n- x\n\n## Remaining Parent Gaps\n\n- [ ] none\n\n## Outcome\n\nx\n\n## In Scope\n\n- x\n\n## Out of Scope\n\n- y\n\n## Acceptance Criteria\n\n- [ ] AC1: x\n\n## Verification Commands\n\n```bash\n# baseline-expect: fail\n$ test -f missing\n```\n\n## Allowed Paths\n\n- x\n\n## Runtime Verification Applicability\n\ndecision: not_applicable\n\n## Stop Conditions\n\n- z\n\n## Required Skills\n\n- なし\n",
+            "body": (
+                "## Machine-Readable Contract\n\n```yaml\n"
+                "issue_kind: implementation\ncontract_schema_version: v1\n```\n\n"
+                "## Parent Issue\n\nnone\n\n## Parent Goal Ref\n\n- Goal: test\n\n"
+                "## Current Validated Scope\n\n- x\n\n## Remaining Parent Gaps\n\n"
+                "- [ ] none\n\n## Outcome\n\nx\n\n## In Scope\n\n- x\n\n"
+                "## Out of Scope\n\n- y\n\n## Acceptance Criteria\n\n- [ ] AC1: x\n\n"
+                "## Verification Commands\n\n```bash\n# baseline-expect: fail\n"
+                "$ test -f missing\n```\n\n## Allowed Paths\n\n- x\n\n"
+                "## Runtime Verification Applicability\n\ndecision: not_applicable\n\n"
+                "## Stop Conditions\n\n- z\n\n## Required Skills\n\n- なし\n"
+            ),
             "labels": [],
         },
         "comments": [],

@@ -540,7 +540,9 @@ def test_b2_first_yaml_block_dependency_forbidden():
         "step-5-mergeability-handling.md must not depend on 'first yaml block'"
     )
     # Must enumerate LOOP_VERDICT_V2-containing blocks
-    assert "LOOP_VERDICT_V2" in body and ("列挙" in body or "enumerate" in body.lower() or "全て" in body or "含む" in body), (
+    assert (
+        "LOOP_VERDICT_V2"
+    ) in body and ("列挙" in body or "enumerate" in body.lower() or "全て" in body or "含む" in body), (
         "step-5-mergeability-handling.md must enumerate LOOP_VERDICT_V2-containing fenced blocks"
     )
 

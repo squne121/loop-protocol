@@ -113,7 +113,10 @@ def _get_result_by_command_fragment(data: dict, fragment: str) -> dict:
 
 def test_rg_include_is_rg_option_mismatch_blocked():
     """AC1: rg --include="*.py" must be classified as rg_option_mismatch and blocked."""
-    body = make_body('rg --include="*.py" some_pattern .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py')
+    body = make_body(
+        'rg --include="*.py" some_pattern'
+        ' .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py'
+    )
     data = run_preflight(body)
     assert data["results"], "Expected at least one result"
     r = data["results"][0]
@@ -124,7 +127,10 @@ def test_rg_include_is_rg_option_mismatch_blocked():
 
 def test_rg_include_equal_form_is_rg_option_mismatch_blocked():
     """AC1: rg --include=*.py (--flag=value form) must also be rg_option_mismatch."""
-    body = make_body("rg --include=*.py some_pattern .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
+    body = make_body(
+        "rg --include=*.py some_pattern"
+        " .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+    )
     data = run_preflight(body)
     r = data["results"][0]
     assert r["classification"] == "blocked"
@@ -136,7 +142,10 @@ def test_rg_include_zero_is_not_rg_option_mismatch():
     # --include-zero is a valid rg option (NUL-separated output), not an error.
     # However it has no path, so it may be blocked as broad_search_path_unbounded.
     # The key assertion is: category != rg_option_mismatch.
-    body = make_body("rg --include-zero some_pattern .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
+    body = make_body(
+        "rg --include-zero some_pattern"
+        " .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+    )
     data = run_preflight(body)
     r = data["results"][0]
     assert r["category"] != "rg_option_mismatch", (
@@ -147,7 +156,10 @@ def test_rg_include_zero_is_not_rg_option_mismatch():
 def test_grep_include_is_not_rg_option_mismatch():
     """AC1: grep --include=*.py is valid grep syntax and must NOT trigger rg_option_mismatch."""
     # grep --include is a valid grep option; only rg --include is the mismatch.
-    body = make_body("grep --include=*.py some_pattern .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
+    body = make_body(
+        "grep --include=*.py some_pattern"
+        " .claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+    )
     data = run_preflight(body)
     r = data["results"][0]
     assert r["category"] != "rg_option_mismatch", (
@@ -205,7 +217,10 @@ def test_rg_specific_allowed_file_is_not_broad():
 
 
 def test_rg_specific_allowed_dir_nested_is_not_broad():
-    """AC2: rg with a specific nested directory path covered by Allowed Paths must NOT be broad_search_path_unbounded."""
+    (
+        """AC2: rg with a specific nested directory path covered by Allowed Paths must NOT be"""
+        """ broad_search_path_unbounded."""
+    )
     # The nested dir is listed in Allowed Paths → allowed (same path)
     specific_dir = ".claude/skills/issue-contract-review/"
     body = make_body(
