@@ -241,22 +241,14 @@ class TestIssue1075BranchSafeMaintenanceTelemetry:
         hook_flavor: str,
     ):
         result = eval_in_local_root("git fetch", str(tmp_git_repo), hook_flavor=hook_flavor)
-        assert result["status"] == "allow"
-        assert result["reason_code"] == REASON_BRANCH_SAFE_MAINTENANCE
-        assert result["current_branch"] == "main"
-        assert result["target_branch"] is None
-        assert result["target_branch_kind"] is None
-        assert result["hook_flavor"] == hook_flavor
-        # Allow schema extension after local_main_branch_guard now emits
-        # decision/classification telemetry fields for diagnosis.
-        assert result["parser_stage"] == "branch_safe_maintenance"
-        assert result["command_kind"] == "readonly_command"
-        assert result["rule_id"] == "branch_safe_maintenance"
-        assert result["decision"] == "allow"
-        assert result["decision_source"] == "branch_safe_maintenance"
-        assert result["hook_name"] == "local_main_branch_guard"
-        assert result["event_kind"] == "PreToolUse"
-        assert result["reason_code"] == REASON_BRANCH_SAFE_MAINTENANCE
+        assert result == {
+            "status": "allow",
+            "reason_code": REASON_BRANCH_SAFE_MAINTENANCE,
+            "current_branch": "main",
+            "target_branch": None,
+            "target_branch_kind": None,
+            "hook_flavor": hook_flavor,
+        }
 
     def test_result_schema_compatibility_reason_code_enum_extension_only(self, tmp_git_repo: Path):
         readonly_result = eval_in_local_root("git status", str(tmp_git_repo))
@@ -269,20 +261,10 @@ class TestIssue1075BranchSafeMaintenanceTelemetry:
             "target_branch",
             "target_branch_kind",
             "hook_flavor",
-            "parser_stage",
-            "decision",
-            "decision_source",
-            "hook_name",
-            "command_kind",
-            "rule_id",
-            "argv_redacted",
-            "event_kind",
-            "inner_argv_redacted",
-            "wrapper",
         }
 
         for result in (readonly_result, branch_safe_result):
-            assert set(expected_keys).issubset(set(result.keys()))
+            assert set(result.keys()) == expected_keys
             assert isinstance(result["status"], str)
             assert isinstance(result["reason_code"], str)
             assert result["current_branch"] in ("main", None)
