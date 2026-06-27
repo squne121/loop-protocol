@@ -350,7 +350,10 @@ _LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
 # ─── Deterministic checker allowlist ─────────────────────────────────────────
 # Deterministic checkers remain exact-path only; root execution of issue-refinement
 # preflight moved to skill_runtime_exec.py in Issue #1154.
-DETERMINISTIC_CHECKER_ALLOWLIST: list[str] = []
+DETERMINISTIC_CHECKER_ALLOWLIST: list[str] = [
+    "scripts/agent-ops/git_ref_probe.py",
+    "scripts/agent-ops/git_worktree_probe.py",
+]
 
 # ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
 # ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS or is_github_remote_ops_command is blocked.

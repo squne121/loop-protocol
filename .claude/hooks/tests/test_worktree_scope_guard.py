@@ -2343,3 +2343,99 @@ def test_publish_termination_executor_allowed_real_hook(tmp_path):
     assert r.returncode == 0, (
         f"controlled_skill_mutation_exec.py with valid argv must be allowed; stderr={r.stderr}"
     )
+
+
+# =============================================================================
+# Issue #1197: probe scripts exact allow in worktree_scope_guard
+# =============================================================================
+
+class TestProbeScriptsExactAllow:
+    """Issue #1197: probe scripts must be allowed by worktree_scope_guard."""
+
+    def test_git_ref_probe_in_allowed_scripts(self) -> None:
+        """git_ref_probe.py must be in _AGENT_OPS_ALLOWED_SCRIPTS."""
+        import importlib.util
+        guard_py = GUARD_PY
+        spec = importlib.util.spec_from_file_location("wsg_probe", str(guard_py))
+        mod = importlib.util.module_from_spec(spec)
+        import sys
+        old = sys.path[:]
+        _add_guard_paths(mod, guard_py)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path[:] = old
+        assert "scripts/agent-ops/git_ref_probe.py" in mod._AGENT_OPS_ALLOWED_SCRIPTS
+
+    def test_git_worktree_probe_in_allowed_scripts(self) -> None:
+        """git_worktree_probe.py must be in _AGENT_OPS_ALLOWED_SCRIPTS."""
+        import importlib.util
+        guard_py = GUARD_PY
+        spec = importlib.util.spec_from_file_location("wsg_probe2", str(guard_py))
+        mod = importlib.util.module_from_spec(spec)
+        import sys
+        old = sys.path[:]
+        _add_guard_paths(mod, guard_py)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path[:] = old
+        assert "scripts/agent-ops/git_worktree_probe.py" in mod._AGENT_OPS_ALLOWED_SCRIPTS
+
+    def test_ref_probe_argv_valid_passes_spec(self) -> None:
+        """Valid argv for git_ref_probe.py passes _validate_agent_ops_argv."""
+        import importlib.util
+        guard_py = GUARD_PY
+        spec = importlib.util.spec_from_file_location("wsg_probe3", str(guard_py))
+        mod = importlib.util.module_from_spec(spec)
+        import sys
+        old = sys.path[:]
+        _add_guard_paths(mod, guard_py)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path[:] = old
+        args = ["--branch", "main", "--json"]
+        assert mod._validate_agent_ops_argv("scripts/agent-ops/git_ref_probe.py", args)
+
+    def test_worktree_probe_argv_valid_passes_spec(self) -> None:
+        """Valid argv for git_worktree_probe.py passes _validate_agent_ops_argv."""
+        import importlib.util
+        guard_py = GUARD_PY
+        spec = importlib.util.spec_from_file_location("wsg_probe4", str(guard_py))
+        mod = importlib.util.module_from_spec(spec)
+        import sys
+        old = sys.path[:]
+        _add_guard_paths(mod, guard_py)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path[:] = old
+        args = ["--json"]
+        assert mod._validate_agent_ops_argv("scripts/agent-ops/git_worktree_probe.py", args)
+
+    def test_ref_probe_unknown_flag_fails_spec(self) -> None:
+        """Unknown flag in git_ref_probe.py argv fails _validate_agent_ops_argv."""
+        import importlib.util
+        guard_py = GUARD_PY
+        spec = importlib.util.spec_from_file_location("wsg_probe5", str(guard_py))
+        mod = importlib.util.module_from_spec(spec)
+        import sys
+        old = sys.path[:]
+        _add_guard_paths(mod, guard_py)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path[:] = old
+        args = ["--branch", "main", "--unknown-flag"]
+        assert not mod._validate_agent_ops_argv("scripts/agent-ops/git_ref_probe.py", args)
+
+
+def _add_guard_paths(mod, guard_py):
+    """Add required paths to sys.path for loading worktree_scope_guard."""
+    import sys
+    repo = guard_py.parent.parent.parent
+    for sub in ("scripts/agent-guards", "scripts/agent-ops"):
+        p = str(repo / sub)
+        if p not in sys.path:
+            sys.path.insert(0, p)

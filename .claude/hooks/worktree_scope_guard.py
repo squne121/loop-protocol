@@ -116,6 +116,8 @@ _AGENT_OPS_ALLOWED_SCRIPTS = (
     "scripts/agent-ops/cleanup_exec.py",
     "scripts/agent-ops/guard_preflight.py",
     "scripts/agent-ops/materialize_cleanup_contract.py",
+    "scripts/agent-ops/git_ref_probe.py",
+    "scripts/agent-ops/git_worktree_probe.py",
 )
 
 # Per-script exact argv allowlist (Issue #1137 Blocker 1). Only these flags are
@@ -141,6 +143,16 @@ _AGENT_OPS_ARG_SPECS = {
                                   "--operation", "--ttl-seconds"}),
         "bool_flags": frozenset({"--json"}),
         "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
+    },
+    "scripts/agent-ops/git_ref_probe.py": {
+        "value_flags": frozenset({"--branch", "--remote"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset({"--branch"}),
+    },
+    "scripts/agent-ops/git_worktree_probe.py": {
+        "value_flags": frozenset(),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset(),
     },
 }
 

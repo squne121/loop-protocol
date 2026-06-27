@@ -63,7 +63,8 @@ def parse_worktree_porcelain_z(data: str) -> list[dict]:
     """Parse ``git worktree list --porcelain -z`` (NUL-separated attribute lines).
 
     Returns a list of ``WORKTREE_CATALOG_ENTRY_V1`` dicts with keys
-    ``worktree_realpath`` / ``branch_ref`` / ``git_common_dir`` / ``detached``.
+    ``worktree_realpath`` / ``branch_ref`` / ``git_common_dir`` / ``detached`` /
+    ``exists_on_disk``.
     A record starts at a ``worktree <path>`` field and runs until the next one.
     """
     entries: list[dict] = []
@@ -79,12 +80,14 @@ def parse_worktree_porcelain_z(data: str) -> list[dict]:
         if field.startswith("worktree "):
             _flush()
             raw = field[len("worktree "):]
+            realpath = os.path.realpath(raw)
             current = {
                 "schema": SCHEMA_ENTRY,
-                "worktree_realpath": os.path.realpath(raw),
+                "worktree_realpath": realpath,
                 "branch_ref": None,
                 "git_common_dir": None,
                 "detached": False,
+                "exists_on_disk": os.path.isdir(realpath),
             }
         elif current is None:
             continue

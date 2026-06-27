@@ -1300,3 +1300,39 @@ class TestCleanupArbitrationParity:
             assert code in _cc3.SHARED_CLEANUP_REASON_CODES
         mod = _load_cleanup_core()
         assert mod._cc3.SHARED_CLEANUP_REASON_CODES == _cc3.SHARED_CLEANUP_REASON_CODES
+
+
+# ─── Issue #1197: probe scripts deterministic_checker allow ─────────────────
+
+class TestProbeScriptsDeterministicChecker:
+    """Issue #1197: probe scripts must be allowed as deterministic_checker from root."""
+
+    def test_git_ref_probe_exact_cmd_allowed(self, tmp_git_repo: Path):
+        """GIVEN exact uv run python3 git_ref_probe.py --branch main --json
+        WHEN evaluated THEN allowed as deterministic_checker_command."""
+        result = eval_codex(
+            "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --json",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_git_worktree_probe_exact_cmd_allowed(self, tmp_git_repo: Path):
+        """GIVEN exact uv run python3 git_worktree_probe.py --json
+        WHEN evaluated THEN allowed as deterministic_checker_command."""
+        result = eval_codex(
+            "uv run python3 scripts/agent-ops/git_worktree_probe.py --json",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_git_ref_probe_deterministic_checker_allowlist(self):
+        """git_ref_probe.py must be in DETERMINISTIC_CHECKER_ALLOWLIST."""
+        from local_main_branch_guard import DETERMINISTIC_CHECKER_ALLOWLIST
+        assert "scripts/agent-ops/git_ref_probe.py" in DETERMINISTIC_CHECKER_ALLOWLIST
+
+    def test_git_worktree_probe_deterministic_checker_allowlist(self):
+        """git_worktree_probe.py must be in DETERMINISTIC_CHECKER_ALLOWLIST."""
+        from local_main_branch_guard import DETERMINISTIC_CHECKER_ALLOWLIST
+        assert "scripts/agent-ops/git_worktree_probe.py" in DETERMINISTIC_CHECKER_ALLOWLIST
