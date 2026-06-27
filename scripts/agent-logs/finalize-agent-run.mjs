@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { parseArgs, printCliError } from './lib/args.mjs'
+import { readFileSync } from 'fs'
+
+import { parseArgs, printCliError, runtimeError } from './lib/args.mjs'
 import { writeJsonAtomic } from './lib/atomic-json.mjs'
 import { parseCommandSummaryJson, parseJsonList } from './lib/command-summary-input.mjs'
 import { loadDraft } from './lib/draft.mjs'
@@ -20,12 +22,73 @@ const OPTION_SPEC = {
   '--token-prompt': { key: 'tokenPrompt' },
   '--token-completion': { key: 'tokenCompletion' },
   '--token-total': { key: 'tokenTotal' },
+  '--entirecli-safety-json': { key: 'entirecliSafetyJson' },
+  '--entirecli-safety-file': { key: 'entirecliSafetyFile' },
+}
+
+/**
+ * Loads the entirecli_safety checker result from CLI options.
+ *
+ * - If publicSurfaceKind !== 'none', one of --entirecli-safety-json or
+ *   --entirecli-safety-file is required (fail-closed: exit 1 if missing).
+ * - JSON parse failure is fail-closed (exit 1, report not written).
+ */
+function loadEntireCLISafetyFromOptions(options) {
+  const publicSurfaceKind = options.publicSurfaceKind
+  const hasJson = options.entirecliSafetyJson !== undefined
+  const hasFile = options.entirecliSafetyFile !== undefined
+
+  if (publicSurfaceKind !== 'none' && !hasJson && !hasFile) {
+    throw runtimeError(
+      'finalize.entirecli_safety_required',
+      'public surface reports require --entirecli-safety-json or --entirecli-safety-file; ' +
+      'supply the checker result from check-entirecli-safety.mjs'
+    )
+  }
+
+  if (!hasJson && !hasFile) {
+    return undefined
+  }
+
+  let rawJson
+  if (hasFile) {
+    try {
+      rawJson = readFileSync(options.entirecliSafetyFile, 'utf-8')
+    } catch {
+      throw runtimeError(
+        'finalize.entirecli_safety_file_read_failed',
+        `could not read entirecli safety file: ${options.entirecliSafetyFile}`
+      )
+    }
+  } else {
+    rawJson = options.entirecliSafetyJson
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(rawJson)
+  } catch {
+    throw runtimeError(
+      'finalize.entirecli_safety_json_parse_failed',
+      'entirecli safety JSON could not be parsed: malformed JSON'
+    )
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw runtimeError(
+      'finalize.entirecli_safety_json_invalid',
+      'entirecli safety JSON must be a non-array object'
+    )
+  }
+
+  return parsed
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2), OPTION_SPEC)
   validateTranscriptRefs(options.transcriptRefs ?? [])
 
+  const entirecliSafety = loadEntireCLISafetyFromOptions(options)
   const draft = await loadDraft(options.draftPath)
   const report = buildAgentRunReport({
     draft,
@@ -41,6 +104,7 @@ async function main() {
       completion: options.tokenCompletion,
       total: options.tokenTotal,
     },
+    entirecliSafety,
   })
 
   await writeJsonAtomic(options.outputPath, report)

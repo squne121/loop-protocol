@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -246,5 +246,97 @@ describe('github comment post guard', () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
+  })
+
+  it('GIVEN validateFinalReport throws for missing entirecli_safety THEN spyClient.list/create/update are never called', () => {
+    const report = createReport({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-17T12:30:00.000Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        // entirecli_safety absent — must fail-closed
+      },
+    })
+    const spyList = vi.fn()
+    const spyCreate = vi.fn()
+    const spyUpdate = vi.fn()
+
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+
+    // validateFinalReport threw before any client call path could be reached
+    expect(spyList).not.toHaveBeenCalled()
+    expect(spyCreate).not.toHaveBeenCalled()
+    expect(spyUpdate).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN validateFinalReport throws for blocked entirecli_safety verdict THEN spyClient.list/create/update are never called', () => {
+    const report = createReport({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-17T12:30:00.000Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        entirecli_safety: {
+          schema_version: 'entirecli_safety_result/v1',
+          verdict: 'blocked',
+          reason_codes: ['push_sessions_enabled'],
+          raw_values_emitted: false,
+          checked_surfaces: {
+            entire_binary: true,
+            entire_version: 'v1.2***[len=12]',
+            entire_enable_help: true,
+            entire_configure_help: true,
+          },
+        },
+      },
+    })
+    const spyList = vi.fn()
+    const spyCreate = vi.fn()
+    const spyUpdate = vi.fn()
+
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+
+    expect(spyList).not.toHaveBeenCalled()
+    expect(spyCreate).not.toHaveBeenCalled()
+    expect(spyUpdate).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN validateFinalReport throws for raw_values_emitted true THEN spyClient.list/create/update are never called', () => {
+    const report = createReport({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-17T12:30:00.000Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        entirecli_safety: {
+          schema_version: 'entirecli_safety_result/v1',
+          verdict: 'not_applicable',
+          reason_codes: ['entire_absent'],
+          raw_values_emitted: true,
+          checked_surfaces: {
+            entire_binary: false,
+            entire_version: null,
+            entire_enable_help: false,
+            entire_configure_help: false,
+          },
+        },
+      },
+    })
+    const spyList = vi.fn()
+    const spyCreate = vi.fn()
+    const spyUpdate = vi.fn()
+
+    expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
+
+    expect(spyList).not.toHaveBeenCalled()
+    expect(spyCreate).not.toHaveBeenCalled()
+    expect(spyUpdate).not.toHaveBeenCalled()
   })
 })
