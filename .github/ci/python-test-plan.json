@@ -31,7 +31,8 @@
     "scripts/tests/test_pr_body_validator.py",
     "scripts/tests/test_e501_migration_guard.py",
     "tests/context_mode/",
-    "tests/test_summarize_agent_transcript.py"
+    "tests/test_summarize_agent_transcript.py",
+    "tests/agent_ops/"
   ],
   "ignore": [
     ".claude/hooks/tests/test_secret_boundary_contract.py"
