@@ -2143,7 +2143,7 @@ def _emit_block_stderr(
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-        f"hook_name: local_main_branch_guard",
+        "hook_name: local_main_branch_guard",
         f"event_kind: {event_kind}",
         f"decision: {decision}",
         f"reason_code: {reason_code}",

@@ -25,13 +25,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 
-from local_main_branch_guard import (
+from local_main_branch_guard import (  # noqa: E402
     evaluate,
     REASON_DRIFT,
     REASON_RECOVERY,
-    REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
-    REASON_UNKNOWN_COMMAND,
     REASON_UNPARSEABLE,
     REASON_GH_API,
     REASON_DETERMINISTIC_CHECKER,
@@ -47,7 +45,7 @@ from local_main_branch_guard import (
     GITHUB_CMD_CLASS_DESTRUCTIVE,
     TRUSTED_REPO_SLUG,
 )
-from skill_runtime_command_policy import resolve_repo_slug
+from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hooks"
 
@@ -637,7 +635,7 @@ class TestGhMutationReasonCode:
             hook_flavor="codex",
         )
         captured = capsys.readouterr()
-        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
+        hint_line = [line for line in captured.err.splitlines() if "recovery:" in line]
         assert hint_line, "Expected a recovery: line in stderr"
         hint = hint_line[0].lower()
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
