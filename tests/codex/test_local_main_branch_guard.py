@@ -31,7 +31,9 @@ from local_main_branch_guard import (
     REASON_RECOVERY,
     REASON_NOT_LOCAL_ROOT,
     REASON_READONLY,
+    REASON_UNKNOWN_COMMAND,
     REASON_UNPARSEABLE,
+    REASON_GH_API,
     REASON_DETERMINISTIC_CHECKER,
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
@@ -47,6 +49,15 @@ from local_main_branch_guard import (
 )
 from skill_runtime_command_policy import resolve_repo_slug
 
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hooks"
+
+
+def _load_fixture_json(filename: str) -> dict:
+    return json.loads((FIXTURE_DIR / filename).read_text())
+
+
+def _load_fixture_text(filename: str) -> str:
+    return (FIXTURE_DIR / filename).read_text().strip()
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -78,7 +89,7 @@ def eval_codex(
             for key, value in env_override.items():
                 previous[key] = os.environ.get(key)
                 os.environ[key] = value
-        result = evaluate(command=command, cwd=cwd, hook_flavor="codex")
+        result = evaluate(command=command, cwd=cwd, hook_flavor="codex", event_kind=event)
     finally:
         if old:
             os.environ["CLAUDE_PROJECT_DIR"] = old
@@ -90,6 +101,18 @@ def eval_codex(
             else:
                 os.environ[key] = value
     return result
+
+
+def run_guard_script(payload: dict, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run local_main_branch_guard.py as hook stdin script and return process result."""
+    script = REPO_ROOT / "scripts" / "agent-guards" / "local_main_branch_guard.py"
+    return subprocess.run(
+        [sys.executable, str(script)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+    )
 
 
 @pytest.fixture
@@ -224,6 +247,61 @@ class TestAC8CodexParity:
         assert guard_path.exists(), (
             f"Guard script not found: {guard_path}"
         )
+
+
+class TestIssue1198RawAndCommandFixtures:
+    """AC8~AC16: Issue #1198 に追加した raw fixture / command fixture の回帰."""
+
+    def test_pretooluse_raw_issue_comment_fragment_is_not_blocked(self, tmp_git_repo: Path):
+        fixture = _load_fixture_json("issue1198-pretooluse-issue-comment.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_git_repo),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] != REASON_UNPARSEABLE
+        assert result["event_kind"] == "PreToolUse"
+        assert result["decision"] == "allow"
+
+    def test_permissionrequest_raw_gh_api_get_is_allowed(self, tmp_git_repo: Path):
+        fixture = _load_fixture_json("issue1198-permissionrequest-gh-api-get.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_git_repo),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_GH_API
+        assert result["event_kind"] == "PermissionRequest"
+        assert result["command_kind"] == "github_api_command"
+
+    def test_stop_raw_payload_without_tool_input_is_allowed(self, tmp_git_repo: Path):
+        payload = _load_fixture_json("issue1198-stop-no-command.json")
+        payload["cwd"] = str(tmp_git_repo)
+        result = run_guard_script(payload, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
+
+    @pytest.mark.parametrize(
+        ("entry", "expected_status", "expected_reason"),
+        [
+            (entry, "allow", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("allow", [])
+        ]
+        + [
+            (entry, "block", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("block", [])
+        ],
+    )
+    def test_issue1198_command_matrix_contracts(self, tmp_git_repo: Path, entry: dict, expected_status: str, expected_reason: str):
+        result = eval_codex(
+            command=entry["command"],
+            cwd=str(tmp_git_repo),
+            event=entry.get("event", "PreToolUse"),
+        )
+        assert result["status"] == expected_status
+        assert result["reason_code"] == expected_reason
+        if "rule_id" in entry:
+            assert result["rule_id"] == entry["rule_id"]
 
 
 class TestReadonlyPipelineClassifier:
