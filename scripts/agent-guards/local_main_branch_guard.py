@@ -2147,6 +2147,11 @@ def _emit_block_stderr(
     target_branch_kind: str | None,
     hook_flavor: str,
     event_kind: str | None = None,
+    decision: str | None = None,
+    command_kind: str | None = None,
+    parser_stage: str | None = None,
+    rule_id: str | None = None,
+    argv_redacted: list[str] | None = None,
     **_compat_ignored: object,
 ) -> None:
     """
@@ -2158,18 +2163,30 @@ def _emit_block_stderr(
     - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
     Raw branch names belong in --json / preflight diagnostic mode only.
 
-    event_kind and any extra compatibility kwargs are accepted for
-    backward-compatible test/helper call sites but are intentionally not
-    rendered into stderr.
+    Compatibility kwargs are accepted so direct helper call sites can validate
+    the same bounded diagnostic fields that hook-mode emits.
     """
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
+        "hook_name: local_main_branch_guard",
         f"reason_code: {reason_code}",
         f"current_branch_kind: {current_branch_kind}",
         f"current_is_default: {str(current_is_default).lower()}",
     ]
     if target_branch_kind:
         lines.append(f"target_branch_kind: {target_branch_kind}")
+    if event_kind:
+        lines.append(f"event_kind: {event_kind}")
+    if decision:
+        lines.append(f"decision: {decision}")
+    if rule_id:
+        lines.append(f"rule_id: {rule_id}")
+    if command_kind:
+        lines.append(f"command_kind: {command_kind}")
+    if parser_stage:
+        lines.append(f"parser_stage: {parser_stage}")
+    if argv_redacted is not None:
+        lines.append(f"argv_redacted: {argv_redacted}")
 
     if reason_code == REASON_INLINE_OVERRIDE:
         lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
