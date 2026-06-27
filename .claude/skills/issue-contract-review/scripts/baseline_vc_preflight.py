@@ -499,52 +499,18 @@ def _strip_uv_run_options(argv: List[str]) -> List[str]:
 
 def _is_uv_lock_check(argv: List[str]) -> bool:
     """Return True only for exact `uv lock --check`."""
-    if len(argv) != 3:
-        return False
-    return Path(argv[0]).name == "uv" and argv[1] == "lock" and argv[2] == "--check"
+    return list(argv) == ["uv", "lock", "--check"]
 
 
-_ALLOWED_RUNTIME_SMOKE_OPTIONS: frozenset = frozenset([
-    "--isolated",
-    "--locked",
-    "--no-default-groups",
-])
+_CANONICAL_RUNTIME_SMOKE_ARGVS: tuple = (
+    ["uv", "run", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+    ["uv", "run", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+)
 
 
 def _is_uv_runtime_smoke_command(argv: List[str]) -> bool:
-    """Return True for the canonical runtime smoke command shape."""
-    if len(argv) < 5:
-        return False
-    if Path(argv[0]).name != "uv" or argv[1] != "run":
-        return False
-
-    i = 2
-    seen_options: set[str] = set()
-    while i < len(argv) and argv[i].startswith("-"):
-        token = argv[i]
-        if token in _ALLOWED_RUNTIME_SMOKE_OPTIONS:
-            seen_options.add(token)
-            i += 1
-            continue
-        # Fail-closed: unknown or value-taking option before inner command is disallowed.
-        return False
-
-    if i + 1 >= len(argv):
-        return False
-
-    # Canonical inner command must be:
-    # - python scripts/ci/runtime_dependency_smoke.py
-    # - python3 scripts/ci/runtime_dependency_smoke.py
-    cmd = Path(argv[i]).name
-    if cmd not in ("python", "python3"):
-        return False
-    if argv[i + 1] != "scripts/ci/runtime_dependency_smoke.py":
-        return False
-
-    # No extra args, and all three options must be present.
-    if i + 2 != len(argv):
-        return False
-    return seen_options == set(_ALLOWED_RUNTIME_SMOKE_OPTIONS)
+    """Return True only for the two canonical runtime smoke command forms."""
+    return list(argv) in list(_CANONICAL_RUNTIME_SMOKE_ARGVS)
 
 
 def _is_pytest_invocation(command: str) -> bool:
@@ -2036,7 +2002,7 @@ def classify_static_command(
                 and unwrapped[1] in ("-m", "-c")
                 and any(
                     opt in argv
-                    for opt in _ALLOWED_RUNTIME_SMOKE_OPTIONS
+                    for opt in ("--isolated", "--locked", "--no-default-groups")
                 )
             ):
                 return (
