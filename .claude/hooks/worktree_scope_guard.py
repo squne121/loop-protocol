@@ -110,6 +110,38 @@ except Exception:  # pragma: no cover - defensive fail-closed
         return False
     _CSM_POLICY_AVAILABLE = False
 
+_PUBLISH_REPORT_SCRIPT = (
+    ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+)
+
+
+def _is_direct_publish_termination_command(cmd: str, project_root: str) -> bool:
+    """Return True iff command directly executes publish_termination_report.py.
+
+    This command must be executed via controlled_skill_mutation_exec.py instead.
+    """
+    try:
+        toks = _tokenize(cmd)
+    except Exception:
+        return False
+    if not toks:
+        return False
+
+    if toks[:3] == ["uv", "run", "python3"]:
+        args = toks[3:]
+    elif toks[:1] and os.path.basename(toks[0]) in {"python", "python3"}:
+        args = toks[1:]
+    else:
+        return False
+    if not args or args[0].startswith("-"):
+        return False
+    if os.path.isabs(args[0]):
+        script = os.path.realpath(args[0])
+    else:
+        script = os.path.realpath(os.path.join(project_root, args[0]))
+
+    return script == os.path.realpath(os.path.join(project_root, _PUBLISH_REPORT_SCRIPT))
+
 # Agent-ops tools allowed as an exact command class from the local main root even
 # when an issue worktree is active (Issue #1137 Blocker 1). realpath-matched.
 _AGENT_OPS_ALLOWED_SCRIPTS = (
@@ -847,6 +879,15 @@ _GIT_MUTATING_SUBCMDS = {
     "rebase", "merge", "cherry-pick", "revert", "am", "apply", "rm", "mv",
     "tag",
 }
+# Git add options that widen scope beyond explicit pathspec-only operations.
+_GIT_ADD_STRICT_PROHIBITED_OPTS = {
+    "-A", "--all", "-a",
+    "-u", "--update",
+    "--patch", "-p",
+    "-i", "--interactive",
+    "--intent-to-add", "-N",
+    "--dry-run",
+}
 # git stash mutates unless list/show; git worktree mutates unless list.
 _GH_PR_MUTATING = {
     "create", "edit", "merge", "review", "comment", "close", "reopen",
@@ -1141,6 +1182,61 @@ def _classify_git(args: list[str]) -> str:
         return "mutating"
     # Unknown git subcommand — fail-closed.
     return "unknown"
+
+
+def _is_git_add_pathspec_violation(args: list[str]) -> bool:
+    """Issue #1215: reject non-explicit git add forms.
+
+    Returns True when:
+    - no explicit pathspec is provided;
+    - prohibited add option is used (`-A`, `-u`, etc.);
+    - pathspec appears to be broad (`.`, `..`, wildcard patterns).
+    """
+    if not args:
+        return False
+    if args[0] != "add":
+        return False
+
+    pathspecs: list[str] = []
+    allow_opts = True
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            allow_opts = False
+            i += 1
+            continue
+
+        if allow_opts and arg.startswith("-"):
+            # Hard-fail on explicitly broad add options.
+            if arg in _GIT_ADD_STRICT_PROHIBITED_OPTS:
+                return True
+            # `--pathspec-from-file` can hold broad / dynamic patterns, so deny.
+            if arg == "--pathspec-from-file" or arg.startswith("--pathspec-from-file="):
+                return True
+            if arg in {"-f", "--force"}:
+                # force add is allowed only when followed by a pathspec.
+                i += 1
+                continue
+            # Unknown/other options do not satisfy strict exact-path policy.
+            if arg not in {"-f", "--force"}:
+                return True
+        else:
+            pathspecs.append(arg)
+
+        i += 1
+
+    if not pathspecs:
+        return True
+
+    for pathspec in pathspecs:
+        if pathspec in {".", ".."}:
+            return True
+        if any(ch in pathspec for ch in ("*", "?", "[")):
+            return True
+        if pathspec.startswith(":"):
+            return True
+    return False
 
 
 def _classify_gh(args: list[str]) -> str:
@@ -1549,6 +1645,8 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
     # as consumed by local_main_branch_guard — no split-brain allowlist.
     if _CSM_POLICY_AVAILABLE and _is_csm_exec_command(command, _pr):
         _allow()
+    if issue and _is_direct_publish_termination_command(command, _pr):
+        _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<publish-denied>", cwd)
 
     klass = classify_bash(command)
 
@@ -1579,6 +1677,15 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
         _block_cleanup("branch_force_delete_denied")
         return  # unreachable
 
+    # Issue #1215: enforce exact-path pathspec for git add while an issue worktree is active.
+    rel_expected = _rel(resolution.expected, project_root=resolve_project_root()) if resolution.expected else "<unresolved>"
+
+    if issue and klass == "mutating":
+        tokenized = _tokenize(command)
+        if tokenized and tokenized[0] == "git" and _is_git_add_pathspec_violation(tokenized[1:]):
+            _block(rel_expected, cwd)
+            return  # unreachable
+
     # From here, command is 'mutating' or 'unknown' (possible mutation).
     if issue and not resolution.git_available:
         # git binary unavailable for a possible mutation → fail-closed.
@@ -1598,7 +1705,6 @@ def _decide_bash(tool_input: dict, cwd: str, issue: str | None,
         _block("<ambiguous>", cwd)
 
     expected = resolution.expected
-    rel_expected = _rel(expected, project_root=resolve_project_root())
 
     # explicit target / wrapper dirs outside expected → block (B3: includes
     # `cd`/`git -C` found inside bash -c wrapper scripts).
@@ -2254,6 +2360,11 @@ def build_decision(payload: dict) -> dict:
     # Deny force branch deletion even inside the active worktree (AC4c)
     if klass == "mutating" and _is_force_branch_delete(command):
         return _v2("mutating", cwd_class, "deny", "branch_force_delete_denied")
+
+    if issue and klass == "mutating":
+        tokens = _tokenize(command)
+        if tokens and tokens[0] == "git" and _is_git_add_pathspec_violation(tokens[1:]):
+            return _v2("mutating", cwd_class, "deny", "git_add_requires_explicit_pathspec")
 
     # mutating or unknown
     if not issue:
