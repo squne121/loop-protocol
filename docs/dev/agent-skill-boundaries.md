@@ -236,10 +236,12 @@ SKILL_RUNTIME_COMMAND_POLICY_V2:
 
 - root checkout から許可される command class は `uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number <active> --repo squne121/loop-protocol` の exact form のみ
 - `mutation: false`、`cwd_policy: repo_root`、registry 登録済みであること自体は認可根拠に使わない
-- active issue worktree は `git worktree list --porcelain -z` catalog で一意に解決できる entry のみを許可し、`.claude/worktrees/issue-<N>-*` の stale directory prefix match を認可根拠に使わない
-- executor は `repo` と `issue_number` を active worktree context に束縛し、registry は canonical path から load する
+- `preflight.run` の root no-worktree profile では issue source は exact argv の `--issue-number` とし、active issue worktree と `LOOP_ISSUE_NUMBER` は不要
+- `preflight.run` 以外の privileged command は従来どおり active issue worktree が `git worktree list --porcelain -z` catalog で一意に解決できる entry のみを許可し、`.claude/worktrees/issue-<N>-*` の stale directory prefix match を認可根拠に使わない
+- executor は `preflight.run` では `repo` と exact argv の `issue_number` に束縛し、その他 command は active worktree context に束縛する。registry は canonical path から load する
 - canonical repo binding は `https://github.com/<owner>/<repo>(.git)` と `git@github.com:<owner>/<repo>(.git)` の strict parser だけを受理する
 - executor は trusted PATH から解決した `uv` / `python3` を使い、allowlist env と filesystem snapshot/postcondition で ignored/transient outside write と PATH poisoning を fail-close する
+- postcondition が fail-close するのは OS-level filesystem sandbox ではなく、**repo tree outside allowed artifact root** への変更である
 - `uv.pytest`、`pnpm.typecheck`、`pnpm.lint`、`pnpm.test`、`pnpm.build`、`gh.*`、未登録 script は root allow 対象外
 - `publish_termination_report.py` と producer output budget / schema mismatch / termination bypass は本 boundary の対象外
 

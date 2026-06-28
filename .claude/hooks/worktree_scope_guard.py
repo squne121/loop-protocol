@@ -55,6 +55,7 @@ if _AGENT_GUARDS_DIR not in sys.path:
     sys.path.insert(0, _AGENT_GUARDS_DIR)
 
 from skill_runtime_command_policy import (  # noqa: E402
+    command_allows_root_no_worktree,
     current_branch,
     looks_like_skill_runtime_executor_command,
     parse_exact_skill_runtime_command,
@@ -2246,6 +2247,8 @@ def _is_skill_runtime_executor_command(
         return False
     if resolve_repo_slug(project_root, None) != parsed.repo:
         return False
+    if command_allows_root_no_worktree(parsed):
+        return True
     active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
     if active_issue != parsed.issue_number or entry is None:
         return False

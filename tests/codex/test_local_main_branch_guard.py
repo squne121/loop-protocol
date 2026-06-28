@@ -709,6 +709,14 @@ class TestExactAllowlist:
         assert result["status"] == "allow"
         assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
 
+    def test_exact_allowlist_skill_runtime_executor_without_issue_env_or_worktree(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 777 --repo squne121/loop-protocol",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
+
     def test_wildcard_path_not_in_allowlist(self, tmp_git_repo: Path):
         result = eval_codex(
             "uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py",

@@ -1292,14 +1292,13 @@ class TestExactAllowlistClaude:
         assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
         assert result["reason_code"] != REASON_READONLY
 
-    def test_skill_runtime_executor_blocks_wrong_issue_context(self, tmp_linked_worktree: Path):
-        repo_root = tmp_linked_worktree.parent.parent.parent
+    def test_skill_runtime_executor_allows_without_issue_env_or_worktree(self, tmp_git_repo: Path):
         result = eval_in_local_root(
             "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 777 --repo squne121/loop-protocol",
-            str(repo_root),
-            env_override={"LOOP_ISSUE_NUMBER": "981"},
+            str(tmp_git_repo),
         )
-        assert result["status"] == "block"
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_SKILL_RUNTIME_EXECUTOR
 
     def test_skill_runtime_executor_blocks_noncanonical_lexical_form(self, tmp_linked_worktree: Path):
         repo_root = tmp_linked_worktree.parent.parent.parent

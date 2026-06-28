@@ -50,6 +50,19 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
     },
 }
 
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset({"preflight.run"})
+_ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
+    "preflight.run": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    }
+}
+
 
 @dataclass(frozen=True)
 class ExactSkillRuntimeCommand:
@@ -57,6 +70,20 @@ class ExactSkillRuntimeCommand:
     issue_number: str
     repo: str
     argv: tuple[str, ...]
+
+
+def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
+    """Return True only for the explicitly allowlisted root preflight profile."""
+    if parsed.command_id not in ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS:
+        return False
+    policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(parsed.command_id)
+    expected = _ROOT_NO_WORKTREE_POLICY_INVARIANTS.get(parsed.command_id)
+    if not isinstance(policy, dict) or not isinstance(expected, dict):
+        return False
+    for key, expected_value in expected.items():
+        if policy.get(key) != expected_value:
+            return False
+    return True
 
 
 def resolve_project_root() -> str:
@@ -226,6 +253,8 @@ def is_exact_skill_runtime_executor_command(
     repo_slug = resolve_repo_slug(project_root, deadline)
     if repo_slug != parsed.repo:
         return False
+    if command_allows_root_no_worktree(parsed):
+        return True
     active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
     if active_issue != parsed.issue_number or entry is None:
         return False
