@@ -270,6 +270,21 @@ POST_MERGE_CLEANUP_REPORT_V1:
   errors: []
 ```
 
+## Probe Scripts for Read-Only Git Operations
+
+複雑な git read-only probe（branch/ref 確認・worktree catalog 取得）は以下の script を優先する:
+
+```bash
+# branch/ref の read-only probe (git for-each-ref の代替)
+uv run python3 scripts/agent-ops/git_ref_probe.py --branch <branch> --json
+
+# worktree catalog の read-only probe (git worktree list --porcelain の代替)
+uv run python3 scripts/agent-ops/git_worktree_probe.py --json
+```
+
+raw `git for-each-ref` や raw `git worktree list --porcelain` の shell 使用例は
+これらの probe script に置き換えることで shell quoting / compound command の迷走を回避する。
+
 ## Guardrails
 
 - `merged_pr_number` 未提供で 5-6 を skip した場合は必ず `unresolved_cleanup_items` に記録

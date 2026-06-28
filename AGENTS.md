@@ -31,6 +31,19 @@
 - Destructive / bare mutation operations (`gh pr merge`, `gh pr create`, `gh pr checkout`, bare `gh issue create/edit` without required flags) remain forbidden without `rtk` or explicit human instruction
 - See `docs/dev/hook-boundaries.md` for the full 5-class taxonomy (display_readonly_command / readonly_artifact_export_command / github_issue_mutation_command / github_pr_metadata_command / github_destructive_command)
 
+## Git Read-Only Probe Scripts
+
+複雑な git read-only probe（branch/ref 確認・worktree catalog 取得）は raw `git for-each-ref` や
+raw `git worktree list --porcelain` を shell で直接実行せず、以下の probe script を優先する:
+
+- `uv run python3 scripts/agent-ops/git_ref_probe.py --branch <branch> --json`
+  → `GIT_REF_PROBE_RESULT_V1` JSON を stdout に出力（branch/ref/remote/upstream 確認用）
+- `uv run python3 scripts/agent-ops/git_worktree_probe.py --json`
+  → `GIT_WORKTREE_PROBE_RESULT_V1` JSON を stdout に出力（worktree catalog 確認用）
+
+**理由**: shell quoting や compound command の迷走を削減し、結果を JSON で機械可読にするため。
+hook の `DETERMINISTIC_CHECKER_ALLOWLIST` にも登録済みのため、root checkout からも実行可能。
+
 ## rtk trust boundary
 
 - `rtk git` enforces direct mutating git operations within project policy.

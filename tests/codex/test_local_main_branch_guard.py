@@ -59,7 +59,9 @@ def _load_fixture_json(filename: str) -> dict:
 def _load_fixture_text(filename: str) -> str:
     return (FIXTURE_DIR / filename).read_text().strip()
 
+
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
+
 
 def make_pretool_codex(command: str, cwd: str, event: str = "PreToolUse") -> dict:
     """Build a minimal Codex PreToolUse / PermissionRequest JSON payload."""
@@ -158,6 +160,7 @@ def tmp_linked_worktree(tmp_git_repo: Path) -> Path:
 
 # ─── AC8: Codex parity ────────────────────────────────────────────────────────
 
+
 class TestAC8CodexParity:
     """AC8: Codex hook input fixture tests for local_main_branch_guard parity."""
 
@@ -214,9 +217,7 @@ class TestAC8CodexParity:
 
         # Check PreToolUse
         pretool = hooks_root.get("PreToolUse", [])
-        bash_entry = next(
-            (e for e in pretool if e.get("matcher") == "^Bash$"), None
-        )
+        bash_entry = next((e for e in pretool if e.get("matcher") == "^Bash$"), None)
         assert bash_entry is not None, "PreToolUse must have ^Bash$ matcher"
         commands = [h.get("command", "") for h in bash_entry.get("hooks", [])]
         assert any("local_main_branch_guard" in cmd for cmd in commands), (
@@ -225,9 +226,7 @@ class TestAC8CodexParity:
 
         # Check PermissionRequest
         perm_req = hooks_root.get("PermissionRequest", [])
-        bash_perm = next(
-            (e for e in perm_req if e.get("matcher") == "^Bash$"), None
-        )
+        bash_perm = next((e for e in perm_req if e.get("matcher") == "^Bash$"), None)
         assert bash_perm is not None, "PermissionRequest must have ^Bash$ matcher"
         perm_commands = [h.get("command", "") for h in bash_perm.get("hooks", [])]
         assert any("local_main_branch_guard" in cmd for cmd in perm_commands), (
@@ -237,16 +236,12 @@ class TestAC8CodexParity:
     def test_codex_hook_script_exists(self):
         """Codex hook script .codex/hooks/local_main_branch_guard.sh must exist."""
         script_path = REPO_ROOT / ".codex" / "hooks" / "local_main_branch_guard.sh"
-        assert script_path.exists(), (
-            f"Codex hook script not found: {script_path}"
-        )
+        assert script_path.exists(), f"Codex hook script not found: {script_path}"
 
     def test_guard_script_exists(self):
         """Shared guard script scripts/agent-guards/local_main_branch_guard.py must exist."""
         guard_path = REPO_ROOT / "scripts" / "agent-guards" / "local_main_branch_guard.py"
-        assert guard_path.exists(), (
-            f"Guard script not found: {guard_path}"
-        )
+        assert guard_path.exists(), f"Guard script not found: {guard_path}"
 
 
 class TestIssue1198RawAndCommandFixtures:
@@ -286,13 +281,17 @@ class TestIssue1198RawAndCommandFixtures:
     @pytest.mark.parametrize(
         ("entry", "expected_status", "expected_reason"),
         [
-            (entry, "allow", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("allow", [])
+            (entry, "allow", entry["reason"])
+            for entry in _load_fixture_json("issue1198-command-matrix.json").get("allow", [])
         ]
         + [
-            (entry, "block", entry["reason"]) for entry in _load_fixture_json("issue1198-command-matrix.json").get("block", [])
+            (entry, "block", entry["reason"])
+            for entry in _load_fixture_json("issue1198-command-matrix.json").get("block", [])
         ],
     )
-    def test_issue1198_command_matrix_contracts(self, tmp_git_repo: Path, entry: dict, expected_status: str, expected_reason: str):
+    def test_issue1198_command_matrix_contracts(
+        self, tmp_git_repo: Path, entry: dict, expected_status: str, expected_reason: str
+    ):
         result = eval_codex(
             command=entry["command"],
             cwd=str(tmp_git_repo),
@@ -400,22 +399,23 @@ class TestReadonlyPipelineClassifier:
 
 # ─── AC17: Codex startup preflight mandatory ─────────────────────────────────
 
+
 class TestAC17CodexStartupPreflightMandatory:
     """AC17: check_codex_agent_config.py validates startup preflight presence."""
 
     def test_startup_preflight_script_exists(self):
         """scripts/check_local_main_branch_state.py must exist."""
         script_path = REPO_ROOT / "scripts" / "check_local_main_branch_state.py"
-        assert script_path.exists(), (
-            f"Startup preflight script not found: {script_path}"
-        )
+        assert script_path.exists(), f"Startup preflight script not found: {script_path}"
 
     def test_check_codex_agent_config_validates_preflight(self):
         """check_codex_agent_config.py --assert-local-main-branch-guard must pass."""
         result = subprocess.run(
-            [sys.executable,
-             str(REPO_ROOT / "scripts" / "check_codex_agent_config.py"),
-             "--assert-local-main-branch-guard"],
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "check_codex_agent_config.py"),
+                "--assert-local-main-branch-guard",
+            ],
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
@@ -443,8 +443,7 @@ class TestAC17CodexStartupPreflightMandatory:
                 matcher = entry.get("matcher", "")
                 # Count local_main_branch_guard occurrences in this matcher's hooks
                 guard_count = sum(
-                    1 for h in entry.get("hooks", [])
-                    if "local_main_branch_guard" in h.get("command", "")
+                    1 for h in entry.get("hooks", []) if "local_main_branch_guard" in h.get("command", "")
                 )
                 assert guard_count <= 1, (
                     f"local_main_branch_guard is defined {guard_count} times "
@@ -592,13 +591,16 @@ class TestGhMutationReasonCode:
     """AC1-AC7 (#1109): gh_mutation_denied reason_code for gh issue/pr mutation block."""
 
     # AC2: gh issue close/comment/edit/reopen/delete/lock/unlock
-    @pytest.mark.parametrize("cmd", [
-        # gh issue close/comment/reopen are now allow via is_github_remote_ops_command (#1120)
-        "gh issue edit 123 --title new",
-        "gh issue delete 123",
-        "gh issue lock 123",
-        "gh issue unlock 123",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # gh issue close/comment/reopen are now allow via is_github_remote_ops_command (#1120)
+            "gh issue edit 123 --title new",
+            "gh issue delete 123",
+            "gh issue lock 123",
+            "gh issue unlock 123",
+        ],
+    )
     def test_gh_issue_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
         """GIVEN gh issue mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -608,13 +610,16 @@ class TestGhMutationReasonCode:
         )
 
     # AC3: gh pr checkout/edit/comment/merge/update-branch/review
-    @pytest.mark.parametrize("cmd", [
-        # gh pr comment --body and gh pr edit <N> are now allow via is_github_remote_ops_command (#1120)
-        "gh pr checkout 456",
-        "gh pr merge 456",
-        "gh pr update-branch 456",
-        "gh pr review 456",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # gh pr comment --body and gh pr edit <N> are now allow via is_github_remote_ops_command (#1120)
+            "gh pr checkout 456",
+            "gh pr merge 456",
+            "gh pr update-branch 456",
+            "gh pr review 456",
+        ],
+    )
     def test_gh_pr_mutations_use_gh_mutation_denied(self, tmp_git_repo: Path, cmd: str):
         """GIVEN gh pr mutation (outside github_remote_ops allowlist) WHEN evaluated THEN reason_code is gh_mutation_denied."""
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -624,19 +629,20 @@ class TestGhMutationReasonCode:
         )
 
     # AC4: readonly commands still allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue view 123",
-        "gh issue list",
-        "gh pr view 456",
-        "gh pr list",
-        "gh pr status",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue view 123",
+            "gh issue list",
+            "gh pr view 456",
+            "gh pr list",
+            "gh pr status",
+        ],
+    )
     def test_gh_readonly_still_allowed(self, tmp_git_repo: Path, cmd: str):
         """GIVEN gh readonly command WHEN evaluated THEN status is allow."""
         result = eval_codex(cmd, str(tmp_git_repo))
-        assert result["status"] == "allow", (
-            f"Expected allow for readonly {cmd!r}, got {result['status']!r}"
-        )
+        assert result["status"] == "allow", f"Expected allow for readonly {cmd!r}, got {result['status']!r}"
 
     def test_gh_mutation_denied_constant_value(self):
         """AC1: REASON_GH_MUTATION == 'gh_mutation_denied'."""
@@ -645,6 +651,7 @@ class TestGhMutationReasonCode:
     def test_gh_mutation_recovery_hint_contains_approved(self, tmp_git_repo: Path, capsys):
         """AC7: gh mutation block の recovery hint が GitHub mutation 文脈の文言を含む"""
         from local_main_branch_guard import _emit_block_stderr, REASON_GH_MUTATION
+
         _emit_block_stderr(
             reason_code=REASON_GH_MUTATION,
             current_branch_kind="default",
@@ -667,6 +674,7 @@ class TestGhMutationReasonCode:
             REASON_GITHUB_REMOTE_OPS,
             COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
         )
+
         _emit_block_stderr(
             reason_code=REASON_GITHUB_REMOTE_OPS,
             current_branch_kind="default",
@@ -689,7 +697,6 @@ class TestGhMutationReasonCode:
         assert "command_kind: readonly_artifact_export" in output
         assert "parser_stage: readonly_artifact_export" in output
         assert "argv_redacted:" in output
-
 
 
 class TestExactAllowlist:
@@ -781,6 +788,7 @@ class TestPythonpathStaleAndTmpWrapper:
 
     def test_pythonpath_stale_guard_module_unaffected(self, tmp_git_repo: Path, tmp_path: Path):
         import os
+
         (tmp_path / "command_registry.py").write_text("raise ImportError('stale!')")
         old = os.environ.get("PYTHONPATH", "")
         try:
@@ -797,35 +805,41 @@ class TestPythonpathStaleAndTmpWrapper:
 class TestGhMutationFailClosedCompleteness:
     """AC11: gh issue/pr mutation subcommands outside readonly allowlist and GH_OPS_ALLOW_PATTERNS are ALL blocked (allowlist-closed completeness)."""
 
-    @pytest.mark.parametrize("cmd", [
-        # gh issue subcommands NOT in the minimal allowlist
-        "gh issue create --title x --body y",    # B3: removed from allowlist
-        "gh issue edit 123 --title new",          # B3: removed from allowlist
-        "gh issue develop 123 --base main",
-        "gh issue develop 123 --checkout",
-        "gh issue transfer 123 other/repo",
-        "gh issue pin 123",
-        "gh issue unpin 123",
-        # gh pr subcommands NOT in the minimal allowlist
-        "gh pr create --title x --body y",        # B3: removed from allowlist
-        "gh pr revert 123",
-        "gh pr lock 123",
-        "gh pr unlock 123",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # gh issue subcommands NOT in the minimal allowlist
+            "gh issue create --title x --body y",  # B3: removed from allowlist
+            "gh issue edit 123 --title new",  # B3: removed from allowlist
+            "gh issue develop 123 --base main",
+            "gh issue develop 123 --checkout",
+            "gh issue transfer 123 other/repo",
+            "gh issue pin 123",
+            "gh issue unpin 123",
+            # gh pr subcommands NOT in the minimal allowlist
+            "gh pr create --title x --body y",  # B3: removed from allowlist
+            "gh pr revert 123",
+            "gh pr lock 123",
+            "gh pr unlock 123",
+        ],
+    )
     def test_unlisted_gh_mutations_are_blocked(self, tmp_git_repo: Path, cmd: str):
         """GIVEN gh mutation not in readonly allowlist or minimal gh ops allowlist WHEN evaluated THEN blocked (allowlist-closed)."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_GH_MUTATION
 
-    @pytest.mark.parametrize("cmd", [
-        "gh issue close 1089",
-        "gh issue comment 123 --body hello",
-        "gh issue comment 123 --body-file tmp/body.txt",  # B4: canonical tmp/ path (not /tmp/)
-        "gh issue reopen 123",
-        "gh pr comment 456 --body hello",
-        "gh pr edit 456 --title new",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue close 1089",
+            "gh issue comment 123 --body hello",
+            "gh issue comment 123 --body-file tmp/body.txt",  # B4: canonical tmp/ path (not /tmp/)
+            "gh issue reopen 123",
+            "gh pr comment 456 --body hello",
+            "gh pr edit 456 --title new",
+        ],
+    )
     def test_gh_ops_allowlist_commands_are_allowed(self, tmp_git_repo: Path, cmd: str):
         """GIVEN gh issue/pr ops in post-merge-cleanup minimal set WHEN evaluated THEN allowed (AC1)."""
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -848,38 +862,45 @@ class TestProjectTmpPolicy:
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_UNPARSEABLE
 
+
 class TestGhOpsMinimalAllowlist:
     """AC1, B3: post-merge-cleanup 最小集合の token-based classifier テスト（Codex flavor）。"""
 
-    @pytest.mark.parametrize("cmd,expected", [
-        # must-allow: 最小集合
-        ("gh issue close 1089", "allow"),
-        ("gh issue comment 123 --body hello", "allow"),
-        ("gh issue comment 123 --body-file tmp/body.txt", "allow"),  # B4: canonical tmp/ path
-        ("gh issue reopen 456", "allow"),
-        ("gh pr comment 789 --body text", "allow"),
-        ("gh pr edit 101 --title new", "allow"),
-    ])
+    @pytest.mark.parametrize(
+        "cmd,expected",
+        [
+            # must-allow: 最小集合
+            ("gh issue close 1089", "allow"),
+            ("gh issue comment 123 --body hello", "allow"),
+            ("gh issue comment 123 --body-file tmp/body.txt", "allow"),  # B4: canonical tmp/ path
+            ("gh issue reopen 456", "allow"),
+            ("gh pr comment 789 --body text", "allow"),
+            ("gh pr edit 101 --title new", "allow"),
+        ],
+    )
     def test_minimal_allowlist_allowed(self, tmp_git_repo: Path, cmd: str, expected: str):
         """GIVEN minimal allowlist command WHEN evaluated THEN allowed with github_remote_ops_command reason."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["status"] == expected
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
-    @pytest.mark.parametrize("cmd", [
-        # must-block: 最小集合外
-        "gh issue create --title x --body y",   # B3: not in minimal set
-        "gh issue edit 123 --title new",          # B3: not in minimal set (interactive possible)
-        "gh pr create --title x --body y",        # B3: not in minimal set
-        "gh issue comment 123",                   # B2: --body なし → interactive
-        "gh pr comment 456",                      # B2: --body なし → interactive
-        "gh issue close",                         # B1: 番号なし
-        "gh issue reopen",                        # B1: 番号なし
-        "gh pr edit",                             # B1: 番号なし → branch 依存
-        "gh issue comment 123 --delete-last",     # B2: destructive flag
-        "gh issue comment 123 --editor",          # B2: interactive flag
-        "gh issue comment 123 --web",             # B2: interactive flag
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # must-block: 最小集合外
+            "gh issue create --title x --body y",  # B3: not in minimal set
+            "gh issue edit 123 --title new",  # B3: not in minimal set (interactive possible)
+            "gh pr create --title x --body y",  # B3: not in minimal set
+            "gh issue comment 123",  # B2: --body なし → interactive
+            "gh pr comment 456",  # B2: --body なし → interactive
+            "gh issue close",  # B1: 番号なし
+            "gh issue reopen",  # B1: 番号なし
+            "gh pr edit",  # B1: 番号なし → branch 依存
+            "gh issue comment 123 --delete-last",  # B2: destructive flag
+            "gh issue comment 123 --editor",  # B2: interactive flag
+            "gh issue comment 123 --web",  # B2: interactive flag
+        ],
+    )
     def test_minimal_allowlist_blocked(self, tmp_git_repo: Path, cmd: str):
         """GIVEN command outside minimal allowlist WHEN evaluated THEN blocked."""
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -887,6 +908,7 @@ class TestGhOpsMinimalAllowlist:
 
 
 # ─── AC8〜AC15: Issue #1124 GitHub remote ops 5 分類 ────────────────────────
+
 
 class TestGithubIssueMutationCommand:
     """
@@ -897,11 +919,14 @@ class TestGithubIssueMutationCommand:
     """
 
     # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-        "gh issue edit 456 --repo squne121/loop-protocol --body-file tmp/body.md --label bug",
-        "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+            "gh issue edit 456 --repo squne121/loop-protocol --body-file tmp/body.md --label bug",
+            "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
+        ],
+    )
     def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC8: GIVEN gh issue edit with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
@@ -910,11 +935,14 @@ class TestGithubIssueMutationCommand:
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
     # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
-        "gh issue create --repo squne121/loop-protocol --title タイトル --body-file tmp/foo.md --label enhancement",
-        "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
+            "gh issue create --repo squne121/loop-protocol --title タイトル --body-file tmp/foo.md --label enhancement",
+            "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
+        ],
+    )
     def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC9: GIVEN gh issue create with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
@@ -923,19 +951,22 @@ class TestGithubIssueMutationCommand:
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
     # AC10: bare gh issue create / gh issue edit 123 (no --body-file) → block
-    @pytest.mark.parametrize("cmd", [
-        "gh issue create",                                          # bare create
-        "gh issue edit 123",                                        # bare edit, no --body-file
-        "gh issue create --repo squne121/loop-protocol",            # no --body-file
-        "gh issue edit 123 --repo squne121/loop-protocol",          # no --body-file
-        "gh issue create --body-file tmp/foo.md",                   # no --repo
-        "gh issue edit 123 --body-file tmp/foo.md",                 # no --repo
-        "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md --editor",  # interactive
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md --web",   # interactive
-        "gh issue create --repo squne121/loop-protocol --body-file -",  # stdin
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/foo.md",  # /tmp not tmp/
-        "gh issue edit 123 --repo other-org/other-repo --body-file tmp/foo.md",    # wrong repo
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue create",  # bare create
+            "gh issue edit 123",  # bare edit, no --body-file
+            "gh issue create --repo squne121/loop-protocol",  # no --body-file
+            "gh issue edit 123 --repo squne121/loop-protocol",  # no --body-file
+            "gh issue create --body-file tmp/foo.md",  # no --repo
+            "gh issue edit 123 --body-file tmp/foo.md",  # no --repo
+            "gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md --editor",  # interactive
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md --web",  # interactive
+            "gh issue create --repo squne121/loop-protocol --body-file -",  # stdin
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file /tmp/foo.md",  # /tmp not tmp/
+            "gh issue edit 123 --repo other-org/other-repo --body-file tmp/foo.md",  # wrong repo
+        ],
+    )
     def test_ac10_bare_gh_issue_create_or_edit_blocked(self, tmp_git_repo: Path, cmd: str):
         """AC10: GIVEN bare gh issue create/edit or without required flags WHEN evaluated THEN block."""
         assert not is_github_issue_mutation_command(cmd), f"Expected False for: {cmd!r}"
@@ -943,19 +974,21 @@ class TestGithubIssueMutationCommand:
         assert result["status"] == "block", f"Expected block for: {cmd!r}"
 
     # AC13: gh issue create/edit/comment/close/reopen are NOT readonly_command
-    @pytest.mark.parametrize("cmd", [
-        "gh issue create --repo squne121/loop-protocol --title t --body-file tmp/foo.md",
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-        "gh issue close 123",
-        "gh issue comment 123 --body hello",
-        "gh issue reopen 123",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue create --repo squne121/loop-protocol --title t --body-file tmp/foo.md",
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+            "gh issue close 123",
+            "gh issue comment 123 --body hello",
+            "gh issue reopen 123",
+        ],
+    )
     def test_ac13_gh_issue_mutations_not_readonly_command(self, tmp_git_repo: Path, cmd: str):
         """AC13: GIVEN gh issue mutation WHEN evaluated THEN reason_code is NOT readonly_command."""
         result = eval_codex(cmd, str(tmp_git_repo))
         assert result["reason_code"] != REASON_READONLY, (
-            f"gh issue mutation {cmd!r} must not have readonly_command reason_code, "
-            f"got: {result['reason_code']!r}"
+            f"gh issue mutation {cmd!r} must not have readonly_command reason_code, got: {result['reason_code']!r}"
         )
 
 
@@ -966,11 +999,14 @@ class TestReadonlyArtifactExportCommand:
     """
 
     # AC11: gh issue view ... > tmp/issue_123.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue view 123 --repo squne121/loop-protocol --json body --jq .body > tmp/issue_123.md",
-        "gh issue view 456 > tmp/issue_456.md",
-        "gh issue view 1 --json body > tmp/out.md",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue view 123 --repo squne121/loop-protocol --json body --jq .body > tmp/issue_123.md",
+            "gh issue view 456 > tmp/issue_456.md",
+            "gh issue view 1 --json body > tmp/out.md",
+        ],
+    )
     def test_ac11_gh_issue_view_to_tmp_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC11: GIVEN gh issue view ... > tmp/... WHEN evaluated THEN allow."""
         assert is_readonly_artifact_export_command(cmd), f"Expected True for: {cmd!r}"
@@ -979,16 +1015,19 @@ class TestReadonlyArtifactExportCommand:
         assert result["reason_code"] == REASON_READONLY
 
     # AC12: blocked destinations
-    @pytest.mark.parametrize("cmd", [
-        "gh issue view 123 > src/foo.md",          # src/ destination
-        "gh issue view 123 > docs/foo.md",         # docs/ destination
-        "gh issue view 123 > .env",                # .env destination
-        "gh issue view 123 >> tmp/foo.md",         # append redirect
-        "gh issue view 123 > /tmp/foo.md",         # /tmp absolute (not tmp/ relative)
-        "gh issue view 123 > foo.md",              # no directory prefix
-        "gh issue view 1124 > tmp/../docs/foo.md", # path traversal
-        "gh issue view 1124 --web > tmp/foo.md",   # --web flag (browser open)
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue view 123 > src/foo.md",  # src/ destination
+            "gh issue view 123 > docs/foo.md",  # docs/ destination
+            "gh issue view 123 > .env",  # .env destination
+            "gh issue view 123 >> tmp/foo.md",  # append redirect
+            "gh issue view 123 > /tmp/foo.md",  # /tmp absolute (not tmp/ relative)
+            "gh issue view 123 > foo.md",  # no directory prefix
+            "gh issue view 1124 > tmp/../docs/foo.md",  # path traversal
+            "gh issue view 1124 --web > tmp/foo.md",  # --web flag (browser open)
+        ],
+    )
     def test_ac12_gh_issue_view_to_blocked_dest_blocked(self, tmp_git_repo: Path, cmd: str):
         """AC12: GIVEN gh issue view with blocked destination WHEN evaluated THEN block."""
         assert not is_readonly_artifact_export_command(cmd), f"Expected False for: {cmd!r}"
@@ -999,11 +1038,14 @@ class TestReadonlyArtifactExportCommand:
 class TestGhDestructiveCommandsBlocked:
     """AC14: gh pr merge / gh pr checkout / gh pr update-branch remain blocked."""
 
-    @pytest.mark.parametrize("cmd", [
-        "gh pr merge 123",
-        "gh pr checkout 123",
-        "gh pr update-branch 456",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh pr merge 123",
+            "gh pr checkout 123",
+            "gh pr update-branch 456",
+        ],
+    )
     def test_ac14_gh_pr_destructive_blocked(self, tmp_git_repo: Path, cmd: str):
         """AC14: GIVEN gh pr merge/checkout/update-branch WHEN evaluated THEN block."""
         result = eval_codex(cmd, str(tmp_git_repo))
@@ -1043,9 +1085,7 @@ class TestGithub5ClassVocabularyConstants:
             "github_pr_metadata_command",
             "github_destructive_command",
         ]:
-            assert term in content, (
-                f"hook-boundaries.md must contain 5-class term: {term!r}"
-            )
+            assert term in content, f"hook-boundaries.md must contain 5-class term: {term!r}"
 
     def test_ac15_agent_skill_boundaries_doc_has_5class_vocabulary(self):
         """AC15: docs/dev/agent-skill-boundaries.md contains the 5-class vocabulary terms."""
@@ -1057,9 +1097,7 @@ class TestGithub5ClassVocabularyConstants:
             "readonly_artifact_export_command",
             "github_issue_mutation_command",
         ]:
-            assert term in content, (
-                f"agent-skill-boundaries.md must contain 5-class term: {term!r}"
-            )
+            assert term in content, f"agent-skill-boundaries.md must contain 5-class term: {term!r}"
 
     def test_ac15_codex_default_rules_has_trusted_repo_mention(self):
         """AC15: .codex/rules/default.rules mentions managed skill context for gh issue create/edit."""
@@ -1073,6 +1111,7 @@ class TestGithub5ClassVocabularyConstants:
 
 
 # ─── B1-B4 Review Blocker Fixes (Codex flavor) ────────────────────────────────
+
 
 class TestB1B4ReviewBlockerFixes:
     """
@@ -1231,15 +1270,24 @@ def _repo_with_worktree_and_v3(tmp: Path, *, bad_hash: bool = False) -> dict:
     nonce = "a" * 32
     chash = _cc3.canonical_command_hash(
         _cc3.expected_argv(_cc3.OP_WORKTREE_REMOVE, wt_real, "issue-1050-x"),
-        _cc3.OP_WORKTREE_REMOVE, os.path.realpath(str(main)), nonce,
+        _cc3.OP_WORKTREE_REMOVE,
+        os.path.realpath(str(main)),
+        nonce,
     )
     if bad_hash:
         chash = "0" * 64
     contract = {
-        "schema": _cc3.SCHEMA_V3, "pr_number": 1, "linked_issue_number": 1050,
-        "worktree_path": wt_real, "branch_name": "issue-1050-x", "require_clean": True,
-        "operation": _cc3.OP_WORKTREE_REMOVE, "command_hash": chash, "nonce": nonce,
-        "issued_at": _iso(now), "expires_at": _iso(now + 300),
+        "schema": _cc3.SCHEMA_V3,
+        "pr_number": 1,
+        "linked_issue_number": 1050,
+        "worktree_path": wt_real,
+        "branch_name": "issue-1050-x",
+        "require_clean": True,
+        "operation": _cc3.OP_WORKTREE_REMOVE,
+        "command_hash": chash,
+        "nonce": nonce,
+        "issued_at": _iso(now),
+        "expires_at": _iso(now + 300),
     }
     target = main / "artifacts" / "agent-ops" / "cleanup_contract.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,8 +1345,12 @@ class TestCleanupArbitrationParity:
         assert d["decision"] == "allow", d
 
     def test_shared_reason_codes_single_vocabulary(self):
-        for code in ("cleanup_command_hash_mismatch", "cleanup_contract_expired",
-                     "cleanup_operation_mismatch", "root_drift_active_worktree_mismatch"):
+        for code in (
+            "cleanup_command_hash_mismatch",
+            "cleanup_contract_expired",
+            "cleanup_operation_mismatch",
+            "root_drift_active_worktree_mismatch",
+        ):
             assert code in _cc3.SHARED_CLEANUP_REASON_CODES
         mod = _load_cleanup_core()
         assert mod._cc3.SHARED_CLEANUP_REASON_CODES == _cc3.SHARED_CLEANUP_REASON_CODES
@@ -1333,3 +1385,76 @@ class TestIssue1215RawFixturesAndWorktreeContext:
         result = eval_codex("git add .", str(tmp_linked_worktree))
         assert result["status"] == "allow"
         assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+
+# ─── Issue #1197: probe scripts deterministic_checker allow ─────────────────
+
+
+class TestProbeScriptsDeterministicChecker:
+    """Issue #1197: probe scripts must be allowed as deterministic_checker from root."""
+
+    def test_git_ref_probe_exact_cmd_allowed(self, tmp_git_repo: Path):
+        """GIVEN exact uv run python3 git_ref_probe.py --branch main --json
+        WHEN evaluated THEN allowed as deterministic_checker_command."""
+        result = eval_codex(
+            "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --json",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_git_worktree_probe_exact_cmd_allowed(self, tmp_git_repo: Path):
+        """GIVEN exact uv run python3 git_worktree_probe.py --json
+        WHEN evaluated THEN allowed as deterministic_checker_command."""
+        result = eval_codex(
+            "uv run python3 scripts/agent-ops/git_worktree_probe.py --json",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_DETERMINISTIC_CHECKER
+
+    def test_git_ref_probe_deterministic_checker_allowlist(self):
+        """git_ref_probe.py must be in DETERMINISTIC_CHECKER_ALLOWLIST."""
+        from local_main_branch_guard import DETERMINISTIC_CHECKER_ALLOWLIST
+
+        assert "scripts/agent-ops/git_ref_probe.py" in DETERMINISTIC_CHECKER_ALLOWLIST
+
+    def test_git_worktree_probe_deterministic_checker_allowlist(self):
+        """git_worktree_probe.py must be in DETERMINISTIC_CHECKER_ALLOWLIST."""
+        from local_main_branch_guard import DETERMINISTIC_CHECKER_ALLOWLIST
+
+        assert "scripts/agent-ops/git_worktree_probe.py" in DETERMINISTIC_CHECKER_ALLOWLIST
+
+    def test_is_deterministic_checker_denies_unknown_flag(self):
+        """B1: unknown flags must be denied by is_deterministic_checker_command."""
+        from local_main_branch_guard import is_deterministic_checker_command
+
+        cmd = "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --unknown-flag"
+        assert not is_deterministic_checker_command(cmd)
+
+    def test_is_deterministic_checker_denies_missing_required_branch(self):
+        """B1: missing required --branch must be denied by is_deterministic_checker_command."""
+        from local_main_branch_guard import is_deterministic_checker_command
+
+        cmd = "uv run python3 scripts/agent-ops/git_ref_probe.py --json"
+        assert not is_deterministic_checker_command(cmd)
+
+    def test_is_deterministic_checker_denies_flag_equals_value(self):
+        """B1: --flag=value form must be denied by is_deterministic_checker_command."""
+        from local_main_branch_guard import is_deterministic_checker_command
+
+        cmd = "uv run python3 scripts/agent-ops/git_ref_probe.py --branch=main"
+        assert not is_deterministic_checker_command(cmd)
+
+    def test_is_deterministic_checker_allows_valid_probe_command(self):
+        """B1: valid probe command must be allowed after argv validation."""
+        from local_main_branch_guard import is_deterministic_checker_command
+
+        cmd = "uv run python3 scripts/agent-ops/git_ref_probe.py --branch main --json"
+        assert is_deterministic_checker_command(cmd)
+
+    def test_is_deterministic_checker_allows_worktree_probe(self):
+        """B1: git_worktree_probe.py without args must be allowed (no required flags)."""
+        from local_main_branch_guard import is_deterministic_checker_command
+
+        cmd = "uv run python3 scripts/agent-ops/git_worktree_probe.py"
+        assert is_deterministic_checker_command(cmd)
