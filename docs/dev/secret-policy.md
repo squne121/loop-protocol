@@ -137,6 +137,118 @@ latitude_api_key_classification:
 
 ---
 
+## Latitude real pilot 例外 Decision — LATITUDE\_PILOT\_EXCEPTION\_V1 (#1220)
+
+Child A0（#1157）の containment / runtime inventory / Kill Switch 完了後に、
+Latitude credential を保持した real pilot 例外を認めるかを **人間 Decision** として固定する。
+この Decision の machine-readable 正本は、本 repo policy YAML（下記 decision marker ブロック）である。
+parent #1153 と issue #1220 はこの Decision の参照面であり、#1153 の GitHub comment は
+`decision_ref` として扱う。**GitHub comment 単独を唯一の正本にしない。**
+
+real pilot activation の gate は Stop hook ではなく、session 開始前の host verifier JSON
+（`.claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host`）を正本とする。
+hook は diagnostic / prevention layer であり、activation の証明にはしない。
+
+明示的な real pilot 承認が存在しない限り、実装既定値は `approve_synthetic_only` とし、
+real pilot activation は `blocked_until_activation` のまま維持する。
+
+```yaml
+LATITUDE_PILOT_EXCEPTION_V1:
+  # decision は closed enum。明示的な real pilot 承認が無い限り approve_synthetic_only を既定とする。
+  decision: approve_synthetic_only
+  decision_enum:
+    - reject_and_uninstall
+    - approve_synthetic_only
+    - approve_timeboxed_real_pilot
+    - defer
+  decision_source:
+    canonical_surface: repo_policy_yaml
+    parent_issue: "#1153"
+    issue: "#1220"
+    decision_ref: "#1153"      # GitHub comment は decision_ref であり唯一の正本ではない
+    source_digest: required     # secret-policy.md の sha256 を host verifier が記録する
+
+  # --- API key 境界（AC3）---
+  api_key_storage_boundary: agent_local_secret_local_only   # repo tracked file / git history へ書かない
+  rotation_owner: repository_human_maintainer
+  revoke_procedure: >
+    1. Latitude Cloud で対象 API key を即時 revoke する。
+    2. 新 key を rotate し、local-only (.claude/settings.local.json 等) にのみ保持する。
+    3. argv / shell history / process env への露出有無を再点検する。
+    4. host verifier を再実行し credential_state: absent を再確認する。
+  leakage_response: >
+    credential value が public surface / log / argv / remote trace に露出した可能性があれば、
+    docs/dev/session-recording-policy.md の Kill Switch を発動し、revoke から rotate、
+    2 回 scan までを記録する。
+
+  # --- argv 露出と rotation（AC8）---
+  argv_exposure_state: absent_verified      # absent_verified | possible | unknown
+  credential_rotation_state: not_required   # not_required | required | completed_attested
+  argv_key_passing: forbidden               # real key を argv (--api-key=...) に渡す手順を禁止する
+  # argv_exposure_state が possible または unknown の場合:
+  #   credential_rotation_state: required とし、real pilot activation を blocked にする。
+
+  # --- provider-side retention / 削除検証（AC7）---
+  remote_cleanup_state: unknown             # machine_verified | human_attested | unknown
+  remote_cleanup_rule: >
+    provider-side retention / delete verification が machine_verified でない場合は
+    remote_cleanup_state を unknown（または unknown_blocking）とし、PASS にしない。
+    human_attested は machine_verified の代替ではなく、activation は別途 blocked のままにする。
+
+  # --- reject_and_uninstall 時の postcondition（AC9）---
+  reject_and_uninstall_postcondition:
+    quiescent_two_stage_required: true
+    two_stage_scan_contract: >
+      1 回目 scan の後に静止（新規起動経路と active process の停止）させ、2 回目 scan を行う。
+      2 回の read-only scan 結果が同一かつ対象 process 不在のときのみ contained とする。
+    record_two_scans: true
+
+  # --- approve_timeboxed_real_pilot のときだけ必須になる fields（AC2 / AC5）---
+  real_pilot_required_if_approved:
+    activation_window: required
+    max_eligible_runs: required
+    allowed_issue_labels: required
+    rollback_deadline: required
+    stop_thresholds: required
+    distribution:
+      distribution_exact_version: required        # exact semver のみ。latest/next/canary/range/^/~ は不可
+      lockfile_digest: required
+      npm_audit_signatures_verified: required      # `npm audit signatures` で検証
+      npm_registry_signature_verified: required
+      tarball_sha256: required
+      entrypoint_sha256: required
+      preload_sha256: required
+      hook_command_sha256: required
+
+  # --- activation 拒否条件（AC5）---
+  activation_denied_if:
+    - unpinned_npx                # npx -y @latitude-data/claude-code-telemetry（version 無し）
+    - unknown_provenance
+    - unknown_destination
+    - non_https
+    - latitude_debug_enabled      # LATITUDE_DEBUG=1
+    - argv_exposure_possible_or_unknown
+    - remote_cleanup_state_unknown
+    - required_field_missing
+
+  # 既定 activation state（approve_synthetic_only のため）
+  pilot_activation_state: blocked_until_activation
+  synthetic_only_allows:
+    - synthetic_fixture_validation
+    - policy_validation
+  synthetic_only_forbids:
+    - real_prompt
+    - real_trace_export
+    - real_cloud_pilot
+```
+
+> **注意**: 上記 `decision` を `approve_timeboxed_real_pilot` に変更する場合は、
+> `real_pilot_required_if_approved` の全 field を実値で埋め、`argv_exposure_state: absent_verified`、
+> `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
+> 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
+
+---
+
 ## VITE_ 環境変数の取り扱い
 
 Vite は `VITE_` プレフィックスを持つ環境変数を **client bundle に静的に展開する**（公式ドキュメント: [Env Variables and Modes](https://vitejs.dev/guide/env-and-mode.html)）。

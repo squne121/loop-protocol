@@ -1574,3 +1574,254 @@ describe('runtime safety #1157 B8: uninstall postcondition snapshot verification
     expect(r1.exitCode).toBe(r2.exitCode)
   })
 })
+
+// ============================================================================
+// Issue #1220: Latitude pilot exception decision gate (LATITUDE_PILOT_EXCEPTION_V1)
+// ============================================================================
+
+const SAFE_LAT_BASE: Record<string, string> = {
+  SRRS_LAT_CREDENTIAL_STATE: 'absent',
+  SRRS_LAT_HOOK_STATE: 'absent',
+  SRRS_LAT_PRELOAD_SETTINGS: 'absent',
+  SRRS_LAT_ACTIVE_PROCESS: 'preload_absent',
+  SRRS_LAT_LOCAL_STORAGE: 'absent',
+  SRRS_LAT_UNINSTALL_STATE: 'not_attempted',
+  SRRS_LAT_REMOTE_TRACE: 'absent_human_attested',
+  SRRS_LAT_CONTAINMENT_STATE: 'never_observed',
+  SRRS_LAT_EXPOSURE_STATE: 'none_observed',
+  SRRS_LAT_TRANSPORT_STATE: 'https',
+  SRRS_LAT_DESTINATION_STATE: 'approved_cloud',
+  SRRS_LAT_DIAGNOSTIC_LOG: 'disabled',
+}
+
+function pilotOf(json: Record<string, unknown> | null): Record<string, unknown> {
+  return (json?.['pilot_exception'] as Record<string, unknown>) ?? {}
+}
+function pilotReasons(json: Record<string, unknown> | null): string[] {
+  return (pilotOf(json)['reason_codes'] as string[]) ?? []
+}
+
+describe('runtime safety #1220: marker count must be exactly 1', () => {
+  it('GIVEN LATITUDE_PILOT_EXCEPTION_V1 marker count 0 WHEN verifier runs THEN fail_closed (exit 2)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_synthetic_only',
+      SRRS_LAT_PILOT_MARKER_COUNT: '0',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(pilotOf(result.json)['malformed']).toBe(true)
+    expect(pilotReasons(result.json).some(rc => rc.includes('marker_count_invalid'))).toBe(true)
+  })
+
+  it('GIVEN marker count 2 (multiple) WHEN verifier runs THEN fail_closed (exit 2)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_synthetic_only',
+      SRRS_LAT_PILOT_MARKER_COUNT: '2',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(pilotReasons(result.json).some(rc => rc.includes('marker_count_invalid'))).toBe(true)
+  })
+})
+
+describe('runtime safety #1220: decision enum validity', () => {
+  it('GIVEN an invalid decision enum WHEN verifier runs THEN fail_closed (exit 2)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'totally_bogus',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(pilotReasons(result.json).some(rc => rc.includes('decision_invalid'))).toBe(true)
+  })
+})
+
+describe('runtime safety #1220: approve_synthetic_only keeps real activation blocked', () => {
+  it('GIVEN approve_synthetic_only WHEN verifier runs THEN pilot activation blocked_until_activation and synthetic_only allowed', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_synthetic_only',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(pilotOf(result.json)['synthetic_only_allowed']).toBe(true)
+    expect(pilotOf(result.json)['malformed']).toBe(false)
+  })
+})
+
+describe('runtime safety #1220: reject_and_uninstall denies activation', () => {
+  it('GIVEN reject_and_uninstall WHEN verifier runs THEN pilot activation deny', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'reject_and_uninstall',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('deny')
+  })
+})
+
+describe('runtime safety #1220: approve_timeboxed_real_pilot requires full activation contract', () => {
+  it('GIVEN activation fields incomplete WHEN verifier runs THEN activation blocked', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      // no activation field overrides -> incomplete default
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(pilotReasons(result.json).some(rc => rc.includes('activation_fields_incomplete'))).toBe(true)
+  })
+
+  it('GIVEN distribution digests incomplete WHEN verifier runs THEN activation blocked', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'incomplete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(pilotReasons(result.json).some(rc => rc.includes('distribution_digests_incomplete'))).toBe(true)
+  })
+
+  it('GIVEN remote cleanup unknown WHEN verifier runs THEN activation blocked (not PASS)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'unknown',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(pilotReasons(result.json).some(rc => rc.includes('remote_cleanup_not_machine_verified'))).toBe(true)
+  })
+
+  it('GIVEN argv exposure possible WHEN verifier runs THEN activation blocked (rotation required)', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'possible',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(pilotReasons(result.json).some(rc => rc.includes('argv_exposure_not_cleared'))).toBe(true)
+  })
+
+  it('GIVEN every activation gate satisfied WHEN verifier runs THEN activation allow', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+    })
+    expect(result.json?.['pilot_activation_state']).toBe('allow')
+    expect(pilotReasons(result.json).length).toBe(0)
+  })
+})
+
+describe('runtime safety #1220: pilot gate emits no raw values', () => {
+  it('GIVEN any pilot decision WHEN verifier runs THEN pilot raw_values_emitted is false and no credential tokens leak', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_synthetic_only',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+    })
+    expect(pilotOf(result.json)['raw_values_emitted']).toBe(false)
+    expect(result.stdout).not.toMatch(/lat_[A-Za-z0-9]+/)
+    expect(result.stdout).not.toMatch(/ghp_[A-Za-z0-9]+/)
+    expect(result.stdout).not.toMatch(/sk-[A-Za-z0-9]+/)
+  })
+})
+
+describe('runtime safety #1220: only exact semver counts as pinned', () => {
+  for (const spec of [
+    'npx @latitude-data/claude-code-telemetry@^1.2.3',
+    'npx @latitude-data/claude-code-telemetry@~1.2.3',
+    'npx @latitude-data/claude-code-telemetry@>=1.2.3',
+    'npx @latitude-data/claude-code-telemetry@1.x',
+    'npx @latitude-data/claude-code-telemetry@1.2',
+  ]) {
+    it(`GIVEN floating spec ${spec} WHEN verifier runs THEN distribution_unpinned`, () => {
+      const result = runVerifierJson({
+        ...SAFE_LAT_BASE,
+        SRRS_LAT_DIST_SPEC: spec,
+        SRRS_LAT_DIST_INTEGRITY: 'verified',
+        SRRS_LAT_DIST_PROVENANCE: 'verified',
+      })
+      const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+      const rcs = (lat?.['reason_codes'] as string[]) ?? []
+      expect(rcs.some(rc => rc.includes('distribution_unpinned'))).toBe(true)
+    })
+  }
+
+  it('GIVEN exact semver @1.2.3 WHEN verifier runs THEN distribution_unpinned absent', () => {
+    const result = runVerifierJson({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+    })
+    const lat = ((result.json as Record<string, unknown>)?.['components'] as Record<string, unknown>)?.['latitude'] as Record<string, unknown>
+    const rcs = (lat?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('distribution_unpinned'))).toBe(false)
+  })
+})
+
+describe('runtime safety #1220: deterministic fixture gate (security:session-recording:runtime)', () => {
+  it('GIVEN --fixture-root with srrs_scenario.json WHEN verifier runs THEN exit 0 and pilot blocked_until_activation', () => {
+    const env: Record<string, string> = { ...(process.env as Record<string, string>) }
+    // Remove any SRRS_* / Latitude pollution so the scenario file is the sole source.
+    for (const k of Object.keys(env)) {
+      if (k.startsWith('SRRS_') || k.startsWith('LATITUDE_')) delete env[k]
+    }
+    delete env['ENTIRE_CHECKPOINT_TOKEN']
+    delete env['BUN_OPTIONS']
+
+    const result = spawnSync(
+      'python3',
+      [
+        SCRIPT,
+        '--json',
+        '--execution-profile',
+        'fixture',
+        '--fixture-root',
+        FIXTURES_DIR,
+      ],
+      { encoding: 'utf-8', env, timeout: 30000 }
+    )
+    expect(result.status).toBe(EXIT_PASS)
+    let parsed: Record<string, unknown> | null = null
+    try { parsed = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+    expect(parsed).not.toBeNull()
+    expect(parsed?.['verdict']).toBe('safe')
+    expect(parsed?.['pilot_activation_state']).toBe('blocked_until_activation')
+    const pilot = (parsed?.['pilot_exception'] as Record<string, unknown>) ?? {}
+    expect(pilot['decision']).toBe('approve_synthetic_only')
+    expect(pilot['malformed']).toBe(false)
+  })
+})
+
+describe('runtime safety #1220: real secret-policy.md is well-formed (single valid marker)', () => {
+  it('GIVEN no pilot overrides (reads repo secret-policy.md) WHEN verifier runs THEN pilot marker_count 1 and decision in enum', () => {
+    // No SRRS_LAT_PILOT_* overrides -> the gate parses the real docs/dev/secret-policy.md.
+    // Base safe git/gh overrides keep the run network-free and deterministic.
+    const result = runVerifierJson({ ...SAFE_LAT_BASE })
+    const pilot = pilotOf(result.json)
+    expect(pilot['marker_count']).toBe(1)
+    expect(pilot['malformed']).toBe(false)
+    expect(['reject_and_uninstall', 'approve_synthetic_only', 'approve_timeboxed_real_pilot', 'defer'])
+      .toContain(pilot['decision'])
+    // Pre-activation default: must not allow real activation.
+    expect(result.json?.['pilot_activation_state']).not.toBe('allow')
+  })
+})

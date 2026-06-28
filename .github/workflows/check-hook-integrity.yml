@@ -26,7 +26,7 @@ jobs:
           version: "0.11.23"
 
       - name: Test hook integrity checker
-        run: uv run pytest .claude/hooks/tests/test_check_hook_integrity.py -q
+        run: uv run --locked pytest .claude/hooks/tests/test_check_hook_integrity.py -q
 
       - name: Check configured hooks
-        run: uv run python3 .claude/hooks/check_hook_integrity.py --format json
+        run: uv run --locked python3 .claude/hooks/check_hook_integrity.py --format json

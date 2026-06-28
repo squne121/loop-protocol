@@ -373,7 +373,7 @@ main thread: dedupe チェック → issue-author / create-issue で起票
 
 ```bash
 # read-only plan 生成（GitHub から取得）
-uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
   --repo <owner>/<repo> \
   --issue <parent_issue_number>
 ```
