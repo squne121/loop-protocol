@@ -259,14 +259,78 @@ latitude:
       - "6. 2 回の結果が同一かつ対象 process が存在しない場合のみ contained"
     note: "official uninstall を信用せず postcondition を再検査する"
   real_session_start_gate:
+    # A1 decision (#1220) は docs/dev/secret-policy.md の LATITUDE_PILOT_EXCEPTION_V1 を正本とする。
+    a1_decision_ref: "docs/dev/secret-policy.md#LATITUDE_PILOT_EXCEPTION_V1"
+    a1_decision_marker: LATITUDE_PILOT_EXCEPTION_V1
+    a1_parent_issue: "#1153"
+    a1_issue: "#1220"
     required_conditions:
       - latitude_containment_complete (別 Issue の人間 Decision)
       - secret_inventory_consistent
       - export_state_confirmed_disabled_or_never_enabled
       - capture_state_confirmed_inactive
       - uninstall_postcondition_verified
-    blocked_until: "別 Child Issue の人間 Decision が存在する"
+      - a1_decision_is_approve_timeboxed_real_pilot_with_all_required_fields
+    # activation gate の正本は Stop hook ではなく pre-session host verifier JSON とする。
+    activation_gate_authority: pre_session_host_verifier
+    activation_gate_command: ".claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host"
+    stop_hook_role: diagnostic_layer_only
+    blocked_until: "LATITUDE_PILOT_EXCEPTION_V1 が approve_timeboxed_real_pilot かつ必須 field 充足"
+    # A1 decision に応じた activation state:
+    activation_state_by_decision:
+      absent_or_multiple_marker: blocked_until_activation
+      decision_defer: blocked_until_activation
+      decision_approve_synthetic_only: blocked_until_activation
+      decision_reject_and_uninstall: deny
+      decision_approve_timeboxed_real_pilot_incomplete: blocked_until_activation
+      decision_approve_timeboxed_real_pilot_complete: allow
+    blocked_state_when:
+      - a1_decision_absent
+      - a1_decision_defer
+      - a1_decision_approve_synthetic_only
+      - a1_decision_reject_and_uninstall          # deny
+      - required_fields_missing
+      - remote_cleanup_state_unknown
+      - argv_exposure_possible_or_unknown
+    synthetic_only_scope:
+      allowed:
+        - synthetic_fixture_validation
+        - policy_validation
+      forbidden:
+        - real_prompt
+        - real_trace_export
+        - real_cloud_pilot
 ```
+
+## Latitude real pilot activation gate (#1220)
+
+real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev/secret-policy.md` の
+`LATITUDE_PILOT_EXCEPTION_V1` decision（A1 decision）である。`a1_decision_ref` がこの境界を指す。
+
+- decision 不在、`defer`、`approve_synthetic_only`、`reject_and_uninstall`、required fields 不足、
+  `remote_cleanup_state` が unknown、`argv_exposure_state` が possible / unknown のいずれかなら、
+  real session start gate は `BLOCKED`（host verifier 上は `blocked_until_activation`、
+  `reject_and_uninstall` は `deny`）を維持する。
+- `approve_synthetic_only` は synthetic fixture / policy validation のみ許可し、
+  real prompt / real trace export / real Cloud pilot は許可しない。
+- activation gate の正本は Stop hook ではなく、session 開始前の host verifier JSON
+  （`check_session_recording_runtime_safety.py --json --execution-profile host`）とする。
+  Claude Code hook は matching する全 hook が並列実行されるため、hook の通過を activation 証明にしない。
+- `security:session-recording:host` は pre-activation local preflight 専用であり、
+  `SRRS_*` override を reject する。generic CI required gate には組み込まない。
+  deterministic な CI gate には `security:session-recording:runtime`（fixture gate）を使う。
+
+### Parent #1153 Child の prerequisite 参照
+
+parent #1153 の以下の Child は、`LATITUDE_PILOT_EXCEPTION_V1`（A1 decision marker）を
+prerequisite として参照する。本 Issue（#1220）は A1 decision gate の admission までを担当し、
+#1221〜#1224（Child B / C1 / E など）の実装は行わない。
+
+| Child | 責務 | A1 decision への依存 |
+|---|---|---|
+| Child B | capture capability verdict の確定 | real pilot 評価は A1 が `approve_timeboxed_real_pilot` のときのみ |
+| Child C1 | private observation source の adapter 接続 | real trace export は A1 activation 後に限定 |
+| Child E | Cloud pilot metrics と adopt/withdraw decision | real Cloud pilot は A1 activation gate 通過が前提 |
 
 ## Public comment boundary
 
