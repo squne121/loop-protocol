@@ -152,7 +152,7 @@ def test_exception_registry_gated_direct_interpreter_is_allowed():
     exceptions = checker.load_exceptions(REPO_ROOT)
     # A registered stdlib-only bare interpreter invocation is not a violation.
     is_v, vt = _classify(
-        'python3 .claude/scripts/check_session_recording_policy.py docs/dev/x.md',
+        'python3 .claude/scripts/secret_exposure_scanner.py --local .claude/scripts',
         exceptions,
     )
     assert is_v is False
@@ -164,6 +164,36 @@ def test_exception_registry_unregistered_direct_interpreter_is_violation():
     is_v, vt = _classify("python3 scripts/not_registered.py", exceptions)
     assert is_v is True
     assert vt == "direct_python_script"
+
+
+def test_yaml_dependent_scripts_are_not_stdlib_only_exceptions():
+    """Adversarial guard (iteration-1, #1227): dependency-bearing (yaml) scripts
+    must not be registered as stdlib_only exceptions, because the registry would
+    then silently exempt their bare `python3 <script>` invocations from the
+    uv-run-locked requirement — the policy hole this PR closes.
+    """
+    exceptions = checker.load_exceptions(REPO_ROOT)
+    patterns = {e["exact_argv_pattern"] for e in exceptions}
+    # These two scripts import yaml (non-stdlib); they must NOT be exempted.
+    assert "python3 .claude/scripts/kill_switch_runtime_smoke.py" not in patterns
+    assert "python3 .claude/scripts/check_session_recording_policy.py" not in patterns
+
+
+def test_unregistered_yaml_script_bare_invocation_is_violation():
+    """With the yaml-dependent scripts removed from the registry, their bare
+    `python3 <script>` invocations are classified as violations (must migrate to
+    `uv run --locked python3 ...`).
+    """
+    exceptions = checker.load_exceptions(REPO_ROOT)
+    for line in (
+        "python3 .claude/scripts/kill_switch_runtime_smoke.py "
+        "--fixtures tests/fixtures/session-recording",
+        "python3 .claude/scripts/check_session_recording_policy.py "
+        "docs/dev/session-recording-policy.md",
+    ):
+        is_v, vt = _classify(line, exceptions)
+        assert is_v is True, f"expected violation for: {line!r}"
+        assert vt == "direct_python_script"
 
 
 # ---------------------------------------------------------------------------

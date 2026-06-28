@@ -233,6 +233,7 @@ CI_TEST_PERFORMANCE_DECISION_V1:
     - docs/dev/agent-session-hotspots.md
     - docs/dev/agent-skill-boundaries.md
     - docs/dev/schema-governance.md
+    - docs/dev/session-recording-policy.md
     - docs/dev/test-lane-policy.md
     - docs/dev/workflow.md
   lane_classification:
@@ -254,6 +255,7 @@ CI_TEST_PERFORMANCE_DECISION_V1:
       evidence:
         - "governed surface (.github/workflows/** / docs/dev/** / .claude/skills/**/SKILL.md / package.json) の invocation 文字列を uv run --locked へ移行"
         - "ci.yml python-test job に invocation policy の static checker step を pytest 群の前に追加"
+        - "iteration-1 修正: ci.yml の Kill Switch smoke step / package.json session-recording:smoke / session-recording-policy.md doc 実行例の kill_switch_runtime_smoke.py (import yaml, HARD) と check_session_recording_policy.py (import yaml) の bare 呼び出し 3 件を uv run --locked へ移行。両 script を stdlib_only 例外 registry から削除し、exception 素通りでなく migration で AC7 violation 0 を達成"
       required_commands:
         - "uv run --locked python3 scripts/ci/check_python_invocation_policy.py --strict"
     integration:

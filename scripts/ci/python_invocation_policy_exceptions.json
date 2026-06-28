@@ -22,11 +22,6 @@
       "scope": "stdlib_only"
     },
     {
-      "exact_argv_pattern": "python3 .claude/scripts/kill_switch_runtime_smoke.py",
-      "reason": "Kill-switch runtime smoke: stdlib-only session recording safety check; invoked before uv sync is available in CI and in local package scripts",
-      "scope": "stdlib_only"
-    },
-    {
       "exact_argv_pattern": "python3 .claude/scripts/secret_exposure_scanner.py",
       "reason": "Secret exposure scanner: stdlib-only path/regex scanner; invoked in CI and local package scripts for security scanning without external dependencies",
       "scope": "stdlib_only"
@@ -39,11 +34,6 @@
     {
       "exact_argv_pattern": "python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py",
       "reason": "CI verdict summary v2 emitter: stdlib-only (argparse/json/os/sys/datetime/typing); invoked as a bare interpreter in the ci.yml verdict-summary step which does not run uv sync",
-      "scope": "stdlib_only"
-    },
-    {
-      "exact_argv_pattern": "python3 .claude/scripts/check_session_recording_policy.py",
-      "reason": "Session recording policy checker: stdlib-only (argparse/re/sys/typing); documented and invoked as a bare interpreter for local policy validation without external dependencies",
       "scope": "stdlib_only"
     }
   ]
