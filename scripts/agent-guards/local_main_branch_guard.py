@@ -70,6 +70,7 @@ REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
 # root branch guard explicitly DEFERS authority to that guard so the two guards
 # do not double-decide and the arbitration order is unambiguous.
 REASON_CLEANUP_DEFERRED = "cleanup_deferred_to_worktree_scope_guard"
+REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
 
 # ─── Shared controlled skill mutation policy (Issue #1166) ───────────────────
 # Import from scripts/agent-guards (sibling module) so the SAME
@@ -90,6 +91,21 @@ except Exception:  # pragma: no cover - defensive fail-closed
         return False
 
     _CSM_POLICY_AVAILABLE = False
+
+# ─── Worktree bootstrap executor policy (Issue #1209) ────────────────────────
+try:
+    from worktree_bootstrap_command_policy import (
+        is_exact_worktree_bootstrap_executor_command as _wbe_exec_command,
+        looks_like_worktree_bootstrap_executor_command as _wbe_looks_like,
+    )
+    _WBE_POLICY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    def _wbe_exec_command(cmd: str, cwd: str, project_root: str, deadline: object | None = None) -> bool:  # type: ignore[misc]
+        return False
+
+    def _wbe_looks_like(cmd: str) -> bool:  # type: ignore[misc]
+        return False
+    _WBE_POLICY_AVAILABLE = False
 
 # ─── GitHub remote ops classification vocabulary ──────────────────────────────
 # 5-class vocabulary for gh command classification (Issue #1124).
@@ -2002,6 +2018,35 @@ def evaluate(
             local_parser_stage="controlled_skill_mutation",
             local_command_kind=COMMAND_KIND_UNKNOWN,
             local_rule_id="controlled_skill_mutation",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+
+    # Step 13.7: exact worktree bootstrap executor command (Issue #1209).
+    # Shared policy function — same is_exact_worktree_bootstrap_executor_command
+    # as consumed by worktree_scope_guard. No split-brain allowlist.
+    # Only allowed from default branch root (drifted root blocked by step 13 above).
+    if _WBE_POLICY_AVAILABLE and project_root and _wbe_exec_command(normalized_cmd, cwd, project_root):
+        return _emit(
+            status="allow",
+            reason_code=REASON_WORKTREE_BOOTSTRAP_EXECUTOR,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_exec",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="worktree_bootstrap_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    if _WBE_POLICY_AVAILABLE and _wbe_looks_like(normalized_cmd):
+        return _emit(
+            status="block",
+            reason_code=REASON_UNKNOWN_COMMAND,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_exec_block",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="worktree_bootstrap_executor_guess",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
