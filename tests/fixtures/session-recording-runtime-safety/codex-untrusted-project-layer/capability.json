@@ -1,0 +1,7 @@
+{
+  "schema": "agent_observation_capability/v1", "evidence_mode": "synthetic_only",
+  "surfaces": [{"surface": "codex_cli", "claimed_verdict": "supported", "signals": {
+    "runtime_event_observed": true, "capture_artifact_observed": true, "raw_values_emitted": false,
+    "evidence_provenance": "synthetic_fixture", "hooks_feature_key": "[features].hooks",
+    "validator_drift": false, "project_layer_trusted": false}}]
+}
