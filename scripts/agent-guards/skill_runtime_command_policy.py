@@ -59,6 +59,11 @@ class ExactSkillRuntimeCommand:
     argv: tuple[str, ...]
 
 
+def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
+    """Return True only for the read-only preflight root profile."""
+    return parsed.command_id == "preflight.run"
+
+
 def resolve_project_root() -> str:
     env_root = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if env_root:
@@ -226,6 +231,8 @@ def is_exact_skill_runtime_executor_command(
     repo_slug = resolve_repo_slug(project_root, deadline)
     if repo_slug != parsed.repo:
         return False
+    if command_allows_root_no_worktree(parsed):
+        return True
     active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
     if active_issue != parsed.issue_number or entry is None:
         return False
