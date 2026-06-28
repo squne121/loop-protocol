@@ -15,6 +15,7 @@ AC10 ci_test_performance_decision_fields — test-lane-policy.md に CI_TEST_PER
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -42,6 +43,22 @@ REQUIRED_FLAGS = ["--isolated", "--locked", "--no-default-groups"]
 FORBIDDEN_FLAGS = ["--group dev", "--with pyyaml", "--with jsonschema"]
 
 
+
+def _deps_by_name(deps: list[str]) -> dict[str, str]:
+    """Return {name: specifier} mapping for a list of PEP 508 dependency strings."""
+    result: dict[str, str] = {}
+    for dep in deps:
+        normalized = dep.split(";")[0].strip()
+        for op in (">=", "==", "~=", "<=", ">", "<"):
+            if op in normalized:
+                name, spec = normalized.split(op, 1)
+                result[name.strip().lower()] = f"{op}{spec.strip()}"
+                break
+        else:
+            result[normalized.strip().lower()] = ""
+    return result
+
+
 # ---------------------------------------------------------------------------
 # AC1: project_dependencies_partition
 # ---------------------------------------------------------------------------
@@ -49,27 +66,25 @@ FORBIDDEN_FLAGS = ["--group dev", "--with pyyaml", "--with jsonschema"]
 
 def test_project_dependencies_partition() -> None:
     """AC1: pyyaml>=6.0 と jsonschema>=4.0 が [project].dependencies にあり、
-    [dependency-groups].dev にはない。"""
+    [dependency-groups].dev にはない。version specifier まで検証する。"""
     data = tomllib.loads(PYPROJECT_PATH.read_text())
 
     project_deps: list[str] = data.get("project", {}).get("dependencies", [])
     dev_deps: list[str] = data.get("dependency-groups", {}).get("dev", [])
 
-    # Must be in [project].dependencies
-    project_dep_names = {d.split(">=")[0].split("==")[0].split("[")[0].lower() for d in project_deps}
-    assert "pyyaml" in project_dep_names, (
-        f"pyyaml must be in [project].dependencies; found: {project_deps}"
-    )
-    assert "jsonschema" in project_dep_names, (
-        f"jsonschema must be in [project].dependencies; found: {project_deps}"
-    )
+    project_specs = _deps_by_name(project_deps)
+    dev_specs = _deps_by_name(dev_deps)
 
-    # Must NOT be in [dependency-groups].dev
-    dev_dep_names = {d.split(">=")[0].split("==")[0].split("[")[0].lower() for d in dev_deps}
-    assert "pyyaml" not in dev_dep_names, (
+    assert project_specs.get("pyyaml") == ">=6.0", (
+        f"pyyaml must be in [project].dependencies with specifier >=6.0; found: {project_deps}"
+    )
+    assert project_specs.get("jsonschema") == ">=4.0", (
+        f"jsonschema must be in [project].dependencies with specifier >=4.0; found: {project_deps}"
+    )
+    assert "pyyaml" not in dev_specs, (
         f"pyyaml must NOT be in [dependency-groups].dev; found: {dev_deps}"
     )
-    assert "jsonschema" not in dev_dep_names, (
+    assert "jsonschema" not in dev_specs, (
         f"jsonschema must NOT be in [dependency-groups].dev; found: {dev_deps}"
     )
 
@@ -152,6 +167,20 @@ def test_command_shape() -> None:
             f"Forbidden flag '{flag}' found in canonical smoke command: {CANONICAL_SMOKE_CMD!r}"
         )
 
+    # Verify CANONICAL_SMOKE_CMD matches the actual CI run: value
+    import yaml as _yaml
+
+    ci = _yaml.safe_load(CI_YML_PATH.read_text())
+    steps = ci["jobs"]["python-test"]["steps"]
+    smoke_step = next(
+        (s for s in steps if s.get("name") == "Runtime dependency smoke (isolated, #1192)"),
+        None,
+    )
+    assert smoke_step is not None, "Smoke step not found in python-test job"
+    assert smoke_step["run"] == CANONICAL_SMOKE_CMD, (
+        f"CI run: {smoke_step['run']!r} != CANONICAL_SMOKE_CMD: {CANONICAL_SMOKE_CMD!r}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # AC7: invalid_partition_fixture / stale_lock_fixture (baseline fail)
@@ -195,25 +224,47 @@ def test_invalid_partition_fixture(tmp_path: Path) -> None:
     )
 
 
-def test_stale_lock_fixture(tmp_path: Path) -> None:
-    """AC7: baseline fail — lock file が存在しない (stale/absent) と
-    uv lock --check が non-zero で終了する。"""
-    # Write a pyproject.toml with a dependency but NO uv.lock file
+def test_stale_lock_fixture_missing(tmp_path: Path) -> None:
+    """AC7 (missing): lock file が存在しない場合 uv lock --check が non-zero。"""
     (tmp_path / "pyproject.toml").write_text(
         "[project]\n"
-        'name = "stale-test"\n'
+        'name = "test"\n'
         'version = "0.0.0"\n'
         'requires-python = ">=3.12"\n'
         'dependencies = ["pyyaml>=6.0"]\n'
     )
-    # No uv.lock file → uv lock --check should fail (lock file absent = stale)
     result = subprocess.run(
         ["uv", "lock", "--check"],
         cwd=tmp_path,
         capture_output=True,
     )
     assert result.returncode != 0, (
-        "Absent/stale lock fixture must cause uv lock --check to exit non-zero"
+        "Absent lock must cause uv lock --check to exit non-zero"
+    )
+
+
+def test_stale_lock_fixture_stale(tmp_path: Path) -> None:
+    """AC7 (stale): repo の uv.lock を minimal pyproject (deps=[]) と組み合わせると
+    lockfile が stale と判定され uv lock --check が non-zero になる。"""
+    # Use a minimal pyproject (no dependencies) with the repo's actual uv.lock.
+    # The repo lock was generated with pyyaml/jsonschema as project.dependencies,
+    # so it will not match a pyproject with empty dependencies.
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "stale-test"\n'
+        'version = "0.0.0"\n'
+        'requires-python = ">=3.12"\n'
+        "dependencies = []\n"
+    )
+    shutil.copy2(REPO_ROOT / "uv.lock", tmp_path / "uv.lock")
+
+    result = subprocess.run(
+        ["uv", "lock", "--check"],
+        cwd=tmp_path,
+        capture_output=True,
+    )
+    assert result.returncode != 0, (
+        "Stale lock (repo lock + minimal pyproject) must cause uv lock --check to exit non-zero"
     )
 
 
@@ -223,36 +274,39 @@ def test_stale_lock_fixture(tmp_path: Path) -> None:
 
 
 def test_ci_wiring_runtime_only() -> None:
-    """AC8: ci.yml の python-test job に uv lock --check と isolated smoke ステップがある。"""
-    ci_text = CI_YML_PATH.read_text()
+    """AC8: python-test job 内で uv lock --check と smoke が uv sync より前にあり、
+    run: が正確な値と一致する。YAML parse + step order で検証。"""
+    import yaml as _yaml
 
-    # uv lock --check must be present
-    assert "uv lock --check" in ci_text, (
-        "ci.yml must contain 'uv lock --check' step in python-test job"
+    ci = _yaml.safe_load(CI_YML_PATH.read_text())
+    steps = ci["jobs"]["python-test"]["steps"]
+    names = [step.get("name", "") for step in steps]
+
+    lock_name = "uv lock --check (drift guard)"
+    smoke_name = "Runtime dependency smoke (isolated, #1192)"
+    sync_name = "uv sync (timed)"
+
+    assert lock_name in names, f"Step {lock_name!r} not found in python-test job steps: {names}"
+    assert smoke_name in names, f"Step {smoke_name!r} not found in python-test job steps: {names}"
+    assert sync_name in names, f"Step {sync_name!r} not found in python-test job steps: {names}"
+
+    lock_i = names.index(lock_name)
+    smoke_i = names.index(smoke_name)
+    sync_i = names.index(sync_name)
+
+    assert lock_i < sync_i, (
+        f"uv lock --check (index {lock_i}) must be before uv sync (index {sync_i})"
+    )
+    assert smoke_i < sync_i, (
+        f"smoke (index {smoke_i}) must be before uv sync (index {sync_i})"
     )
 
-    # isolated smoke command must be present
-    assert "--isolated" in ci_text, "ci.yml must contain --isolated flag for smoke run"
-    assert "--no-default-groups" in ci_text, (
-        "ci.yml must contain --no-default-groups flag for smoke run"
+    assert steps[lock_i]["run"] == "uv lock --check", (
+        f"lock step run: {steps[lock_i]['run']!r} != 'uv lock --check'"
     )
-    assert "runtime_dependency_smoke.py" in ci_text, (
-        "ci.yml must reference runtime_dependency_smoke.py in smoke step"
+    assert steps[smoke_i]["run"] == CANONICAL_SMOKE_CMD, (
+        f"smoke step run: {steps[smoke_i]['run']!r} != CANONICAL_SMOKE_CMD: {CANONICAL_SMOKE_CMD!r}"
     )
-
-    # Must NOT use --group dev or --with pyyaml in the smoke invocation
-    # (Check by verifying the smoke script line doesn't have these)
-    for line in ci_text.splitlines():
-        if "runtime_dependency_smoke.py" in line:
-            assert "--group dev" not in line, (
-                f"Smoke invocation must not use --group dev: {line!r}"
-            )
-            assert "--with pyyaml" not in line, (
-                f"Smoke invocation must not use --with pyyaml: {line!r}"
-            )
-            assert "--with jsonschema" not in line, (
-                f"Smoke invocation must not use --with jsonschema: {line!r}"
-            )
 
 
 # ---------------------------------------------------------------------------
