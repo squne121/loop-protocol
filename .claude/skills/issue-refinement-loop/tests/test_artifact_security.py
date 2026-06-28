@@ -184,7 +184,9 @@ def test_artifact_json_schema_field_present(tmp_path):
     raw_result = json.loads(fixture.read_text(encoding="utf-8"))
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
 
-    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
+    compact_data, _stdout, artifact_path_val, artifact_content = compact_review_result(
+        raw_result, artifact_dir=artifact_dir, issue_number=42
+    )
     _atomic_write(artifact_path_val, artifact_content)
     artifact_path = Path(compact_data["ARTIFACT"].split("=", 1)[1])
     artifact_json = json.loads(artifact_path.read_text(encoding="utf-8"))

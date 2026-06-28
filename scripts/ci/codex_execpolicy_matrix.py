@@ -316,7 +316,9 @@ def execpolicy_case_definitions(fixture: FixtureRepo) -> list[dict[str, Any]]:
     ]
 
 
-def run_command(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def run_command(
+    argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int = 30
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
         cwd=str(cwd) if cwd is not None else None,
@@ -365,7 +367,8 @@ def _find_selected_platform_package(umbrella_dir: Path) -> tuple[Path, dict[str,
             candidates.append((pkg_json.parent, data))
     if len(candidates) != 1:
         raise MatrixError(
-            f"expected exactly one selected platform package under {openai_dir}, found {[path.name for path, _ in candidates]}"
+            f"expected exactly one selected platform package under {openai_dir},"
+            f" found {[path.name for path, _ in candidates]}"
         )
     return candidates[0]
 
@@ -465,7 +468,9 @@ def install_codex_cli(*, npm_prefix: Path, package_spec: str) -> dict[str, Any]:
     return result
 
 
-def validate_codex_install(codex_binary: Path, expected_version: str, *, npm_prefix: Path | None = None) -> dict[str, Any]:
+def validate_codex_install(
+    codex_binary: Path, expected_version: str, *, npm_prefix: Path | None = None
+) -> dict[str, Any]:
     """Verify the pinned Codex binary exists, reports the exact version, and probes help."""
     version_run = run_command([str(codex_binary), "--version"])
     help_run = run_command([str(codex_binary), "execpolicy", "check", "--help"])
@@ -489,7 +494,9 @@ def validate_codex_install(codex_binary: Path, expected_version: str, *, npm_pre
     return result
 
 
-def parse_execpolicy_response(*, label: str, argv: list[str], completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+def parse_execpolicy_response(
+    *, label: str, argv: list[str], completed: subprocess.CompletedProcess[str]
+) -> dict[str, Any]:
     """Strict parser for the documented execpolicy JSON contract.
 
     stdout must contain the raw JSON contract; stderr JSON aliases are rejected.
@@ -630,7 +637,9 @@ def evaluate_cases(codex_binary: Path, rules: Path, fixture: FixtureRepo, writer
             }
         hook_cwd = fixture.worktree if case.get("hook_cwd") == "worktree" else fixture.root
         guard_pair = run_hook_chain(render_command(case["argv"]), fixture, cwd=hook_cwd)
-        execpolicy_ok = bool(case.get("skip_execpolicy_strict")) or execpolicy["decision"] in case["expected_execpolicy"]
+        execpolicy_ok = (
+            bool(case.get("skip_execpolicy_strict")) or execpolicy["decision"] in case["expected_execpolicy"]
+        )
         guard_ok = guard_pair["decision"] == case["expected_guard_pair"]
         expected_reason = case.get("expected_guard_reason")
         reason_ok = expected_reason is None or guard_pair.get("reason") == expected_reason

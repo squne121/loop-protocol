@@ -520,7 +520,8 @@ virtualStoreDir: /unexpected/v3
 
 
 def test_full_pipeline_contrast_vitest_failure_in_tempdir(tmp_path):
-    """AC4: contrast test: stable .modules.yaml + Vitest failure is regression_gate, not package_manager_no_tty_prompt."""
+    """AC4: contrast test: stable .modules.yaml + Vitest failure is regression_gate,
+    not package_manager_no_tty_prompt."""
     fixture_content = """## Verification Commands
 
 ```bash
