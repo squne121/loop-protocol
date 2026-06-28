@@ -116,8 +116,6 @@ hook_boundaries_manifest_v1:
       gh issue/pr mutation コマンド（edit/close/merge 等）は gh_mutation_denied で fail-closed（#1109）。
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
-      implementation worktree bootstrap は `worktree_bootstrap_exec.py` の exact argv class
-      （canonical / `rtk` 1 段 envelope のみ）を許可し、raw `git worktree add` は許可しない。
       本 Issue では local root default branch 保護（branch drift 防止）と GitHub 書き込み許可集合は拡張しない。
 
       ## gh CLI コマンド 5 分類（#1124）
@@ -177,8 +175,8 @@ hook_boundaries_manifest_v1:
     notes: >
       worktree スコープ外の mutation を遮断するフック。
       python3 不在など自身がエラーになった場合も fail-closed（exit 2）。
-      ただし implementation worktree bootstrap は shared command policy で exact argv のみ許可し、
-      active issue worktree がある状態でも main root からの controlled bootstrap を妨げない。
+      active issue worktree がある場合でも shared cleanup / skill-runtime exact policy のみを例外とし、
+      bootstrap 系の追加 allowlist はこの PR では導入しない。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
