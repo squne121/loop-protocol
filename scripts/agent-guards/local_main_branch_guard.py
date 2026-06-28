@@ -2156,24 +2156,35 @@ def _emit_block_stderr(
         for value in (event_kind, decision, command_kind, parser_stage, rule_id, argv_redacted)
     )
     if detailed_mode:
-        branch_summary = (
-            f"branch_context: current_branch_kind={current_branch_kind} "
-            f"current_is_default={str(current_is_default).lower()}"
-        )
-        if target_branch_kind:
-            branch_summary += f" target_branch_kind={target_branch_kind}"
         lines = [
             "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
             "hook_name: local_main_branch_guard",
-            f"event_kind: {event_kind or 'PreToolUse'}",
-            f"decision: {decision or 'block'}",
+            f"event_kind: {event_kind}",
+            f"decision: {decision}",
             f"reason_code: {reason_code}",
-            f"rule_id: {rule_id or reason_code}",
-            f"command_kind: {command_kind or COMMAND_KIND_UNKNOWN}",
-            f"parser_stage: {parser_stage or 'classification'}",
-            f"argv_redacted: {argv_redacted if argv_redacted is not None else []}",
-            branch_summary,
+            f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
+            f"current_branch_kind: {current_branch_kind}",
+            f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
+            f"argv_redacted: {json.dumps(argv_redacted or [])}",
         ]
+        recovery = None
+        if reason_code == REASON_INLINE_OVERRIDE:
+            recovery = (
+                "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
+            )
+        elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
+            recovery = "switch root back to default branch first"
+        elif reason_code == REASON_UNPARSEABLE:
+            recovery = "use simple (non-compound) git commands from local root"
+        elif reason_code == REASON_DRIFT:
+            recovery = "create/enter linked issue worktree, or switch only to default branch"
+        elif reason_code == REASON_GH_MUTATION:
+            recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
+
+        if recovery is None:
+            lines.append(f"hook_flavor: {hook_flavor}")
+        else:
+            lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
     else:
         lines = [
             "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
