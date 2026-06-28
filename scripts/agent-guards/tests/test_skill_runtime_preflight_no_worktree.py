@@ -45,7 +45,12 @@ def _payload(command: str, cwd: Path) -> str:
     return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)})
 
 
-def _run_guard(script: Path, payload: str, repo: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess[str]:
+def _run_guard(
+    script: Path,
+    payload: str,
+    repo: Path,
+    extra_env: dict | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
     env.pop("LOOP_ISSUE_NUMBER", None)
     if extra_env:
@@ -175,7 +180,11 @@ if __name__ == "__main__":
 def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     payload = _payload(
-        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol",
+        (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 1228 "
+            "--repo squne121/loop-protocol"
+        ),
         repo,
     )
     result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
@@ -185,7 +194,11 @@ def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: P
 def test_worktree_scope_guard_no_worktree_worktree_scope_guard(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     payload = _payload(
-        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol",
+        (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 1228 "
+            "--repo squne121/loop-protocol"
+        ),
         repo,
     )
     result = _run_guard(WORKTREE_SCOPE_GUARD_SH, payload, repo)
@@ -195,7 +208,11 @@ def test_worktree_scope_guard_no_worktree_worktree_scope_guard(tmp_path: Path) -
 def test_direct_preflight_block_direct_preflight_block(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     payload = _payload(
-        "uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py --issue-number 1228 --repo squne121/loop-protocol",
+        (
+            "uv run python3 "
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py "
+            "--issue-number 1228 --repo squne121/loop-protocol"
+        ),
         repo,
     )
     result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
@@ -205,7 +222,11 @@ def test_direct_preflight_block_direct_preflight_block(tmp_path: Path) -> None:
 def test_non_exact_executor_argv_non_exact_executor_argv(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     payload = _payload(
-        "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol",
+        (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --command-id preflight.run "
+            "--issue-number 1228 --repo squne121/loop-protocol"
+        ),
         repo,
     )
     result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
