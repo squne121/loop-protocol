@@ -111,7 +111,7 @@ web_research 結果に含まれる `critical_claims` の未解決 claim は huma
 コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry（`preflight.run` 等）を参照する。
 
 ```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
   --issue-number <N> \
   --repo <owner/repo> \
   [--anchor-comment-url <URL>]
@@ -149,7 +149,7 @@ planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confid
 
 ```bash
 # Phase state 生成（Step 0f 完了後）
-uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
   --phase preflight \
   --source-kind refinement_preflight_result_v1 \
   --source-path <refinement_preflight_result_v1 path> \
@@ -201,7 +201,7 @@ review 後、phase state を `review` フェーズに更新してから verdict 
 phase state の更新:
 
 ```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_phase_state.py \
   --phase review \
   --source-kind issue_review_result_compact_v1 \
   --source-path <review_result_path> \
@@ -212,7 +212,7 @@ uv run python3 .claude/skills/issue-refinement-loop/scripts/build_refinement_pha
 
 ```bash
 # post_rewrite_check または decide_next_action phase のみ
-uv run python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py \
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py \
   --loop-state-file <loop_state_path> \
   --review-result-verdict <approve|needs-fix> \
   --phase-state-file <phase_state_output_path>
@@ -227,7 +227,7 @@ hard stop 判定は `post_rewrite_check` / `decide_next_action` phase（`hard_st
 `VERDICT: needs-fix` の直後に、reviewer blocker が deterministic checker に裏付けられているかを `reviewer_claim_replay.py` で確認する。これにより、unbacked reviewer blocker だけで semantic iteration を消費しない。
 
 ```bash
-uv run python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay.py \
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/reviewer_claim_replay.py \
   --review-result-file <compact_review_result_v1_path> \
   --readiness-result-file <contract_readiness_result_v1_path> \
   [--vc-preflight-result-file <baseline_vc_preflight_v1_path>] \
@@ -266,7 +266,7 @@ state persistence:
 issue-author 起動前に、現在本文に対して pre-author static readiness check を実行する。
 
 ```bash
-uv run python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
+uv run --locked python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
   --mode preflight-static \
   --body-file <current_body_file>
 ```
@@ -346,7 +346,7 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 ```bash
 # TERMINATION_REPORT_INPUT_V1 JSON を stdin から渡す
 echo '{"termination_reason":"approved","issue_number":42}' | \
-  uv run python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+  uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
     --issue-number 42
 ```
 
@@ -364,7 +364,7 @@ echo '{
     "オーナー判断が必要",
     "スコープの矛盾が未解決"
   ]
-}' | uv run python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
+}' | uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
   --issue-number 829
 ```
 
@@ -440,14 +440,14 @@ rg -nq "\| topic \| file \| loaded_when \| owner \| moved_from \| must_not \|" .
 
 # AC8 / AC9
 test -f .claude/skills/issue-refinement-loop/tests/test_thin_entrypoint.py
-uv run pytest .claude/skills/issue-refinement-loop/tests/test_thin_entrypoint.py -v
+uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_thin_entrypoint.py -v
 
 # AC7
 pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
-uv run pytest .claude/skills/issue-refinement-loop/tests/ -v
+uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -v
 ```
 
 ## Related

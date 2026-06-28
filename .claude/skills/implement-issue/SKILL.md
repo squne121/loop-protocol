@@ -56,7 +56,7 @@ WORKTREE=".claude/worktrees/issue-${ISSUE_NUMBER}-${SLUG}"
 BRANCH="worktree-issue-${ISSUE_NUMBER}-${SLUG}"
 
 # 1. executor を実行して BOOTSTRAP_JSON を取得
-BOOTSTRAP_JSON=$(uv run python3 scripts/agent-ops/worktree_bootstrap_exec.py \
+BOOTSTRAP_JSON=$(uv run --locked python3 scripts/agent-ops/worktree_bootstrap_exec.py \
   --issue-number "$ISSUE_NUMBER" \
   --slug "$SLUG" \
   --branch-name "$BRANCH" \

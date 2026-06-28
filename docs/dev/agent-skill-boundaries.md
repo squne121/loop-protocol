@@ -620,13 +620,13 @@ CHILD_MATERIALIZATION_PLAN_V2:
 
 ```bash
 # GitHub から直接取得（read-only）
-uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
   --repo squne121/loop-protocol \
   --issue 254
 
 # ローカル fixture から取得（テスト・dry-run 用）
 # NOTE: issue ref は 'existing_unverified' として分類される（API 未呼び出し）
-uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
   --body-file fixtures/parent_254.md \
   --issue 254
 ```
@@ -694,7 +694,7 @@ CHILD_MATERIALIZATION_RESULT_V2:
 `CHILD_MATERIALIZATION_PLAN_V2` を入力に取り、起票・parent patch・結果集約までを決定論的に実行して `CHILD_MATERIALIZATION_RESULT_V2` を返す executor。`.claude/skills/create-issue/scripts/materialize_child_issues.py` が正本実装で、`create-issue` skill のステップ 4b から呼ばれる。
 
 ```bash
-uv run python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
   --plan-file <CHILD_MATERIALIZATION_PLAN_V2 互換 JSON> [--gh <gh binary>]
 ```
 
@@ -1357,7 +1357,7 @@ CONTROLLED_SKILL_MUTATION_COMMAND_POLICY = {
 ### 呼び出し形式
 
 ```bash
-uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
+uv run --locked python3 scripts/agent-guards/controlled_skill_mutation_exec.py \
   --command-id termination_report.publish \
   --issue-number <int> \
   --input-file <path_to_TERMINATION_REPORT_INPUT_V1_json> \
