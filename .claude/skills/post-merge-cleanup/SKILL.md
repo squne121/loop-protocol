@@ -95,7 +95,7 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 ### 1. 未コミット変更と未追跡ファイルを分類
 
 ```bash
-uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
+uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format yaml
 ```
 
 `classify-git-state.py` は `git status --short` / `git stash list` / `git branch -vv` / `git worktree list --porcelain` を subprocess 配列形式で実行し、YAML 構造化出力を返す。
@@ -124,7 +124,7 @@ git pull origin main
 
 リモート削除済みブランチ（ステップ 1 の classify-git-state.py 出力から `gone: true` を抽出）:
 ```bash
-uv run python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format json \
+uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-state.py --format json \
   | uv run python3 -c "import json,sys; [print(b['name']) for b in json.load(sys.stdin)['branches'] if b.get('gone')]"
 ```
 
@@ -137,14 +137,14 @@ clean 判定・PR merged / head branch / linked issue / catalog / branch / root=
 
 1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash
-uv run python3 scripts/agent-ops/guard_preflight.py --json
+uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
 ```
 `status: ok` 以外（`blocked` / `human_required`）は `allowed_next_commands` の構造化 recovery hint に従う。
 `root_drift_active_worktree_mismatch` は policy B により自動 mutation せず人間承認を要する。
 
 2. 認可境界 `cleanup_exec` で worktree / branch を削除する（PR merged 等を毎回検証してから exact 削除）:
 ```bash
-uv run python3 scripts/agent-ops/cleanup_exec.py \
+uv run --locked python3 scripts/agent-ops/cleanup_exec.py \
   --pr-number <pr> --linked-issue-number <issue> \
   --worktree-path <絶対 worktree path> --branch-name <branch> --json
 ```
@@ -204,7 +204,7 @@ PARENT_MODE=$(echo "$PARENT_BODY" | grep -oP 'parent_mode:\s*\K[\w-]+' | head -1
 
 if [ "$PARENT_MODE" = "delivery-rollup" ]; then
   # read-only plan を取得
-  uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+  uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
     --repo <owner>/<repo> \
     --issue "$PARENT_ISSUE_NUM"
 fi
@@ -276,10 +276,10 @@ POST_MERGE_CLEANUP_REPORT_V1:
 
 ```bash
 # branch/ref の read-only probe (git for-each-ref の代替)
-uv run python3 scripts/agent-ops/git_ref_probe.py --branch <branch> --json
+uv run --locked python3 scripts/agent-ops/git_ref_probe.py --branch <branch> --json
 
 # worktree catalog の read-only probe (git worktree list --porcelain の代替)
-uv run python3 scripts/agent-ops/git_worktree_probe.py --json
+uv run --locked python3 scripts/agent-ops/git_worktree_probe.py --json
 ```
 
 raw `git for-each-ref` や raw `git worktree list --porcelain` の shell 使用例は

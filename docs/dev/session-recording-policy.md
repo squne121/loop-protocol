@@ -524,7 +524,7 @@ secrets_mode 変化（none → 非 none）
 - session 記録 / checkpoint / EntireCLI / Claude hook / Secret 関連設定
 
 ```bash
-python3 .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
+uv run --locked python3 .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
 ```
 
 ### どこに記録するか

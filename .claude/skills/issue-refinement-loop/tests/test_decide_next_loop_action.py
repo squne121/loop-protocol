@@ -258,19 +258,28 @@ def test_stdout_budget_under_2000_bytes():
 
 def test_script_does_not_reference_bare_python3_in_skill_md():
     """
-    AC4: SKILL.md must not contain 'python3 .claude/skills/issue-refinement-loop/scripts/'
-    without 'uv run' prefix.
-    This is a structural smoke test that the script path pattern is not used bare.
+    AC4: Every 'python3 .claude/skills/issue-refinement-loop/scripts/' invocation in
+    SKILL.md must be prefixed by 'uv run' or 'uv run --locked' (per #1193 policy).
+    This is a structural smoke test that the script path pattern is never used bare.
+    The matcher accepts both 'uv run python3' and 'uv run --locked python3' so that the
+    --locked migration does not trip a fixed-width negative lookbehind.
     """
     skill_md = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     import re
-    # Pattern: bare python3 (not prefixed by 'uv run') calling a script in this dir
-    bad_pattern = re.compile(
-        r"(?<!uv run )python3 \.claude/skills/issue-refinement-loop/scripts/"
+    # Find every invocation of a script in this dir and confirm an allowed
+    # 'uv run' (optionally '--locked') prefix immediately precedes 'python3'.
+    invocation = re.compile(
+        r"python3 \.claude/skills/issue-refinement-loop/scripts/"
     )
-    bad_matches = bad_pattern.findall(skill_md)
+    allowed_prefix = re.compile(r"uv run(?:\s+--locked)?\s+$")
+    bad_matches = []
+    for m in invocation.finditer(skill_md):
+        preceding = skill_md[:m.start()].rsplit("\n", 1)[-1]
+        if not allowed_prefix.search(preceding):
+            bad_matches.append(preceding + skill_md[m.start():m.end()])
     assert not bad_matches, (
-        f"SKILL.md contains bare python3 invocation without 'uv run': {bad_matches}"
+        "SKILL.md contains python3 script invocation without 'uv run'/'uv run "
+        f"--locked' prefix: {bad_matches}"
     )
 
 
