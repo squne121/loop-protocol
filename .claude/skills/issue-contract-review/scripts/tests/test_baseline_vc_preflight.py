@@ -700,16 +700,18 @@ def test_runtime_dependency_smoke_rejects_extra_uv_options():
     sys.path.insert(0, str(script_path.parent))
     from baseline_vc_preflight import _is_uv_runtime_smoke_command
 
+    _smoke = "scripts/ci/runtime_dependency_smoke.py"
     forbidden_cases = [
-        ["uv", "run", "--with", "pytest", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--group", "dev", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--all-groups", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--extra", "feature", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--python", "/usr/bin/python3", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--project", ".", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--directory", ".", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--env-file", ".env", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
-        ["uv", "run", "--upgrade", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+        ["uv", "run", "--with", "pytest", "--isolated", "--locked", "--no-default-groups", "python", _smoke],
+        ["uv", "run", "--group", "dev", "--isolated", "--locked", "--no-default-groups", "python3", _smoke],
+        ["uv", "run", "--all-groups", "--isolated", "--locked", "--no-default-groups", "python", _smoke],
+        ["uv", "run", "--extra", "feature", "--isolated", "--locked", "--no-default-groups", "python3", _smoke],
+        ["uv", "run", "--python", "/usr/bin/python3", "--isolated", "--locked",
+         "--no-default-groups", "python", _smoke],
+        ["uv", "run", "--project", ".", "--isolated", "--locked", "--no-default-groups", "python", _smoke],
+        ["uv", "run", "--directory", ".", "--isolated", "--locked", "--no-default-groups", "python3", _smoke],
+        ["uv", "run", "--env-file", ".env", "--isolated", "--locked", "--no-default-groups", "python", _smoke],
+        ["uv", "run", "--upgrade", "--isolated", "--locked", "--no-default-groups", "python3", _smoke],
     ]
     for argv in forbidden_cases:
         assert not _is_uv_runtime_smoke_command(argv), f"unexpected allow: {argv}"
@@ -2756,7 +2758,8 @@ def test_is_uv_runtime_smoke_rejects_path_qualified_uv():
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from baseline_vc_preflight import _is_uv_runtime_smoke_command
     assert not _is_uv_runtime_smoke_command(
-        ["/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+        ["/usr/bin/uv", "run", "--isolated", "--locked", "--no-default-groups", "python",
+         "scripts/ci/runtime_dependency_smoke.py"]
     )
 
 
@@ -2765,10 +2768,12 @@ def test_is_uv_runtime_smoke_rejects_path_qualified_python():
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from baseline_vc_preflight import _is_uv_runtime_smoke_command
     assert not _is_uv_runtime_smoke_command(
-        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "./python", "scripts/ci/runtime_dependency_smoke.py"]
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "./python",
+         "scripts/ci/runtime_dependency_smoke.py"]
     )
     assert not _is_uv_runtime_smoke_command(
-        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "/tmp/python3", "scripts/ci/runtime_dependency_smoke.py"]
+        ["uv", "run", "--isolated", "--locked", "--no-default-groups", "/tmp/python3",
+         "scripts/ci/runtime_dependency_smoke.py"]
     )
 
 
@@ -2777,7 +2782,8 @@ def test_is_uv_runtime_smoke_rejects_option_reorder():
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from baseline_vc_preflight import _is_uv_runtime_smoke_command
     assert not _is_uv_runtime_smoke_command(
-        ["uv", "run", "--locked", "--isolated", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+        ["uv", "run", "--locked", "--isolated", "--no-default-groups", "python",
+         "scripts/ci/runtime_dependency_smoke.py"]
     )
 
 
@@ -2786,5 +2792,6 @@ def test_is_uv_runtime_smoke_rejects_duplicate_options():
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from baseline_vc_preflight import _is_uv_runtime_smoke_command
     assert not _is_uv_runtime_smoke_command(
-        ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"]
+        ["uv", "run", "--isolated", "--isolated", "--locked", "--no-default-groups", "python",
+         "scripts/ci/runtime_dependency_smoke.py"]
     )
