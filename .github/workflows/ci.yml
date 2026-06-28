@@ -768,6 +768,12 @@ jobs:
             return $status
           }
           run_timed uv_python_install uv python install
+      - name: uv lock --check (drift guard)
+        run: uv lock --check
+
+      - name: "Runtime dependency smoke (isolated, #1192)"
+        run: uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py
+
       - name: uv sync (timed)
         id: timed-uv-sync
         run: |
