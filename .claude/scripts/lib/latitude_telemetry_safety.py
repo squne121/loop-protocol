@@ -245,13 +245,12 @@ def _is_version_pinned(spec: str) -> bool:
     name, version = _parse_npm_spec(spec)
     if version is None:
         return False
-    # Version must look like a concrete version (not a tag like 'latest')
-    # Accept semver-like: 1.2.3, 1.2.3-alpha.1, ^1.2.3 is not exact but accepted as "pinned" intent
-    # Reject 'latest', 'next', 'canary', '*'
+    # #1220: exact semver only. latest/next/canary/tag, '*', x-ranges, and
+    # caret (^x.y.z) / tilde (~x.y.z) / comparator ranges (>=, <=, >, <, =) are
+    # all treated as UNPINNED so real pilot activation cannot use a floating spec.
     if version in ("latest", "next", "canary", "*", ""):
         return False
-    # Reject pure tags without digit (e.g., 'beta')
-    if not re.search(r"\d", version):
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?", version):
         return False
     return True
 

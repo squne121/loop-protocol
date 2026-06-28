@@ -74,6 +74,19 @@ CODE_FAIL_SECRETS_MODE = "FAIL:secrets_mode_non_none"
 CODE_FAIL_CLOSED_SECRETS_MODE = "FAIL_CLOSED:secrets_mode_unknown"
 
 # ---------------------------------------------------------------------------
+# Latitude pilot exception decision gate (#1220, LATITUDE_PILOT_EXCEPTION_V1)
+# ---------------------------------------------------------------------------
+PILOT_DECISION_ENUM = {
+    "reject_and_uninstall",
+    "approve_synthetic_only",
+    "approve_timeboxed_real_pilot",
+    "defer",
+}
+PILOT_ACTIVATION_BLOCKED = "blocked_until_activation"
+PILOT_ACTIVATION_DENY = "deny"
+PILOT_ACTIVATION_ALLOW = "allow"
+
+# ---------------------------------------------------------------------------
 # Secrets mode constants (SRRS_SECRETS_MODE)
 # ---------------------------------------------------------------------------
 SECRET_MODE_NONE = "none"
@@ -756,36 +769,168 @@ def _get_runtime_locus() -> str:
     return "linux"
 
 
+def _count_pilot_markers(text: str) -> int:
+    """Count LATITUDE_PILOT_EXCEPTION_V1 mapping-key occurrences (not prose mentions)."""
+    return len(re.findall(r"(?m)^\s*LATITUDE_PILOT_EXCEPTION_V1:\s*$", text))
+
+
+def _extract_pilot_field(block: str, field: str) -> str | None:
+    m = re.search(
+        r"(?m)^\s+" + re.escape(field) + r":\s*([A-Za-z0-9_./-]+)\s*$", block
+    )
+    return m.group(1).strip() if m else None
+
+
+def _read_pilot_block(repo_root: Path) -> tuple[int, str | None]:
+    """Read secret-policy.md, return (marker_count, decision_value)."""
+    policy_path = repo_root / "docs" / "dev" / "secret-policy.md"
+    try:
+        text = policy_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return 0, None
+    count = _count_pilot_markers(text)
+    m = re.search(r"(?ms)^\s*LATITUDE_PILOT_EXCEPTION_V1:\s*$.*?(?=^```|\Z)", text)
+    block = m.group(0) if m else ""
+    return count, _extract_pilot_field(block, "decision")
+
+
+def _compute_real_pilot_activation() -> tuple[str, list[str]]:
+    """approve_timeboxed_real_pilot: allow only if every required gate is satisfied.
+
+    Fixture/test overrides (rejected in host mode by main()):
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS  'complete' | 'incomplete'
+      SRRS_LAT_PILOT_DIST_DIGESTS       'complete' | 'incomplete'
+      SRRS_LAT_PILOT_REMOTE_CLEANUP     'machine_verified' | 'human_attested' | 'unknown'
+      SRRS_LAT_PILOT_ARGV_EXPOSURE      'absent_verified' | 'possible' | 'unknown'
+    """
+    fields = (os.environ.get("SRRS_LAT_PILOT_ACTIVATION_FIELDS") or "incomplete").strip()
+    digests = (os.environ.get("SRRS_LAT_PILOT_DIST_DIGESTS") or "incomplete").strip()
+    remote = (os.environ.get("SRRS_LAT_PILOT_REMOTE_CLEANUP") or "unknown").strip()
+    argv = (os.environ.get("SRRS_LAT_PILOT_ARGV_EXPOSURE") or "unknown").strip()
+
+    rcs: list[str] = []
+    if fields != "complete":
+        rcs.append("latitude_pilot_activation_fields_incomplete")
+    if digests != "complete":
+        rcs.append("latitude_pilot_distribution_digests_incomplete")
+    if remote != "machine_verified":
+        rcs.append("latitude_pilot_remote_cleanup_not_machine_verified")
+    if argv != "absent_verified":
+        rcs.append("latitude_pilot_argv_exposure_not_cleared")
+
+    if rcs:
+        return PILOT_ACTIVATION_BLOCKED, rcs
+    return PILOT_ACTIVATION_ALLOW, rcs
+
+
+def check_pilot_exception(repo_root: Path, execution_profile: str) -> dict[str, Any]:
+    """#1220: Validate LATITUDE_PILOT_EXCEPTION_V1 decision and compute activation state.
+
+    The decision marker source of truth is docs/dev/secret-policy.md (repo policy YAML).
+    Real pilot activation is permitted only for approve_timeboxed_real_pilot with every
+    required gate satisfied; otherwise the gate stays blocked_until_activation (deny for
+    reject_and_uninstall). No credential values are read or emitted.
+
+    Fixture/test overrides (rejected in host mode by main()):
+      SRRS_LAT_PILOT_DECISION       decision enum value | 'absent'
+      SRRS_LAT_PILOT_MARKER_COUNT   integer marker count
+    """
+    decision_override = os.environ.get("SRRS_LAT_PILOT_DECISION")
+    count_override = os.environ.get("SRRS_LAT_PILOT_MARKER_COUNT")
+
+    if decision_override is not None or count_override is not None:
+        decision = (decision_override or "absent").strip()
+        if decision == "absent":
+            decision = None
+        try:
+            marker_count = int(count_override) if count_override is not None else 1
+        except ValueError:
+            marker_count = -1
+    else:
+        marker_count, decision = _read_pilot_block(repo_root)
+
+    reason_codes: list[str] = []
+    malformed = False
+
+    if marker_count != 1:
+        malformed = True
+        reason_codes.append("latitude_pilot_marker_count_invalid")
+    if decision is None or decision not in PILOT_DECISION_ENUM:
+        malformed = True
+        reason_codes.append("latitude_pilot_decision_invalid")
+
+    if malformed:
+        activation_state = PILOT_ACTIVATION_BLOCKED
+    elif decision == "reject_and_uninstall":
+        activation_state = PILOT_ACTIVATION_DENY
+    elif decision in ("defer", "approve_synthetic_only"):
+        activation_state = PILOT_ACTIVATION_BLOCKED
+    else:  # approve_timeboxed_real_pilot
+        activation_state, rcs = _compute_real_pilot_activation()
+        reason_codes.extend(rcs)
+
+    return {
+        "applicability": "applicable",
+        "decision": decision,
+        "marker_count": marker_count,
+        "malformed": malformed,
+        "activation_state": activation_state,
+        "synthetic_only_allowed": decision == "approve_synthetic_only",
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "raw_values_emitted": False,
+    }
+
+
+def _load_fixture_scenario(fixture_root: Path) -> None:
+    """#1220: load srrs_scenario.json overrides for a deterministic fixture gate.
+
+    Only SRRS_* keys are honored, and existing environment values win (setdefault),
+    so the deterministic gate does not clobber an explicit caller override.
+    """
+    scenario_path = fixture_root / "srrs_scenario.json"
+    try:
+        data = json.loads(scenario_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for key, value in data.items():
+        if isinstance(key, str) and key.startswith("SRRS_"):
+            os.environ.setdefault(key, str(value))
+
+
 def _compute_global_verdict(
     entire_verdict: str,
     latitude_verdict: str,
     latitude_inspection_complete: bool = True,
+    pilot_malformed: bool = False,
 ) -> tuple[str, int, bool]:
     """
     Global aggregation truth table:
     1. blocked >= 1 -> blocked, exit 1
-    2. fail_closed >= 1, blocked = 0 -> fail_closed, exit 2
+    2. fail_closed >= 1 (or pilot malformed), blocked = 0 -> fail_closed, exit 2
     3. all applicable safe -> safe, exit 0
     4. all not_applicable -> not_applicable, exit 0
     Returns (verdict, exit_code, inspection_complete).
 
     B7 fix: inspection_complete is independent of verdict.
-    Any inspection gap (from latitude component or global) -> inspection_complete=False.
+    #1220: a malformed LATITUDE_PILOT_EXCEPTION_V1 marker fail-closes the gate.
     """
     verdicts = [entire_verdict, latitude_verdict]
     applicable = [v for v in verdicts if v != "not_applicable"]
 
     if not applicable:
+        if pilot_malformed:
+            return "fail_closed", EXIT_FAIL_CLOSED, False
         return "not_applicable", EXIT_PASS, latitude_inspection_complete
 
-    # B7 fix: if latitude has gaps, inspection is incomplete regardless of verdict
     inspection_complete = latitude_inspection_complete
 
     if "blocked" in applicable:
-        if "fail_closed" in applicable:
+        if "fail_closed" in applicable or pilot_malformed:
             inspection_complete = False
         return "blocked", EXIT_FAIL, inspection_complete
-    if "fail_closed" in applicable:
+    if "fail_closed" in applicable or pilot_malformed:
         return "fail_closed", EXIT_FAIL_CLOSED, False
     if all(v == "safe" for v in applicable):
         return "safe", EXIT_PASS, inspection_complete
@@ -884,8 +1029,11 @@ def _run_checks_for_json(
     # B7 fix: pass latitude's inspection_complete to global aggregation
     latitude_inspection_complete = latitude_result.get("inspection_complete", True)
 
+    pilot_result = check_pilot_exception(repo_root, execution_profile)
+
     global_verdict, exit_code, inspection_complete = _compute_global_verdict(
-        entire_verdict, latitude_verdict, latitude_inspection_complete
+        entire_verdict, latitude_verdict, latitude_inspection_complete,
+        pilot_malformed=pilot_result["malformed"],
     )
     global_decision = "allow" if global_verdict in ("safe", "not_applicable") else "deny"
 
@@ -906,6 +1054,8 @@ def _run_checks_for_json(
             "entire": entire_result,
             "latitude": latitude_result,
         },
+        "pilot_exception": pilot_result,
+        "pilot_activation_state": pilot_result["activation_state"],
         "checked_at": now_iso,
     }
     return output, exit_code
@@ -1024,6 +1174,10 @@ def main() -> int:
         home_root = fixture_path
     else:
         repo_root = get_repo_root(args.repo_root)
+
+    # #1220: deterministic fixture gate — load srrs_scenario.json overrides (fixture only)
+    if execution_profile == "fixture" and args.fixture_root:
+        _load_fixture_scenario(Path(args.fixture_root).resolve())
 
     if args.json:
         output, exit_code = _run_checks_for_json(repo_root, execution_profile, home_root)
