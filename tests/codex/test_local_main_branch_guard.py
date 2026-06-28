@@ -842,10 +842,13 @@ class TestGithubIssueMutationCommand:
     """
 
     # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-        "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
+            "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
+        ],
+    )
     def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC8: GIVEN gh issue edit with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
@@ -854,10 +857,13 @@ class TestGithubIssueMutationCommand:
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
     # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
-    @pytest.mark.parametrize("cmd", [
-        "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
-        "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
-    ])
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
+            "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
+        ],
+    )
     def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
         """AC9: GIVEN gh issue create with --repo + --body-file tmp/ WHEN evaluated THEN allow."""
         assert is_github_issue_mutation_command(cmd), f"Expected True for: {cmd!r}"
