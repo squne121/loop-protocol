@@ -29,6 +29,8 @@ from local_main_branch_guard import (  # noqa: E402
     evaluate,
     REASON_DRIFT,
     REASON_RECOVERY,
+    REASON_NOT_LOCAL_ROOT,
+    REASON_LINKED_ISSUE_WORKTREE_CONTEXT,
     REASON_READONLY,
     REASON_UNPARSEABLE,
     REASON_GH_API,
@@ -1376,6 +1378,36 @@ class TestCleanupArbitrationParity:
         mod = _load_cleanup_core()
         assert mod._cc3.SHARED_CLEANUP_REASON_CODES == _cc3.SHARED_CLEANUP_REASON_CODES
 
+
+class TestIssue1215RawFixturesAndWorktreeContext:
+    """Issue #1215: linked issue worktree context and git-add raw fixture parity."""
+
+    def test_issue1215_worktree_context(self, tmp_linked_worktree: Path):
+        fixture = _load_fixture_json("issue1215-pretooluse-dedicated-worktree-git-add.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_linked_worktree),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+        assert result["hook_flavor"] == "codex"
+
+    def test_linked_issue_worktree_context_permissionrequest(self, tmp_linked_worktree: Path):
+        fixture = _load_fixture_json("issue1215-permissionrequest-dedicated-worktree-git-add.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_linked_worktree),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+        assert result["hook_flavor"] == "codex"
+
+    def test_issue1215_no_git_add_exception(self, tmp_linked_worktree: Path):
+        result = eval_codex("git add .", str(tmp_linked_worktree))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
 
 # ─── Issue #1197: probe scripts deterministic_checker allow ─────────────────
 

@@ -48,6 +48,7 @@ from skill_runtime_command_policy import (  # noqa: E402
 # ─── Reason codes ────────────────────────────────────────────────────────────
 
 REASON_NOT_LOCAL_ROOT = "not_local_root_context"
+REASON_LINKED_ISSUE_WORKTREE_CONTEXT = "linked_issue_worktree_context"
 REASON_READONLY = "readonly_command"
 REASON_BRANCH_SAFE_MAINTENANCE = "branch_safe_maintenance_command"
 REASON_RECOVERY = "recovery_to_default_branch"
@@ -295,6 +296,15 @@ def is_local_root_context(cwd: str) -> bool:
 
     real_root = os.path.realpath(project_root)
 
+    # If CLAUDE_PROJECT_DIR points at a linked issue worktree, classify as
+    # non-local-root context so issue-bound worktree mutation is allowed under
+    # existing worktree isolation policies.
+    primary = get_primary_worktree_path(cwd=cwd)
+    if primary is not None:
+        real_primary = os.path.realpath(primary)
+        if real_root != real_primary:
+            return False
+
     # B1: Use git toplevel of cwd to handle subdirectories correctly.
     # If CLAUDE_PROJECT_DIR is set, also accept cwd being under that root.
     cwd_toplevel = get_cwd_git_toplevel(cwd)
@@ -317,6 +327,24 @@ def is_local_root_context(cwd: str) -> bool:
         return False
 
     return True
+
+
+def is_linked_issue_worktree_context(cwd: str) -> bool:
+    """Return True iff cwd is inside a linked worktree rather than the primary root."""
+    project_root = _resolve_project_root(cwd)
+    if project_root is None:
+        return False
+    primary = get_primary_worktree_path(cwd=cwd)
+    if primary is None:
+        return False
+    real_root = os.path.realpath(project_root)
+    real_primary = os.path.realpath(primary)
+    if real_root != real_primary:
+        return True
+    cwd_toplevel = get_cwd_git_toplevel(cwd)
+    if cwd_toplevel is None:
+        return False
+    return os.path.realpath(cwd_toplevel) != real_root
 
 
 def _resolve_project_root(cwd: str) -> str | None:
@@ -1516,14 +1544,19 @@ def evaluate(
 
     # Step 1: Check if we are in local root context
     if not is_local_root_context(cwd):
+        reason_code = (
+            REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+            if is_linked_issue_worktree_context(cwd)
+            else REASON_NOT_LOCAL_ROOT
+        )
         return _emit(
             status="allow",
-            reason_code=REASON_NOT_LOCAL_ROOT,
+            reason_code=reason_code,
             target_branch=None,
             target_branch_kind=None,
             local_parser_stage="context_check",
             local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="not_local_root_context",
+            local_rule_id=reason_code,
         )
 
     # Step 2: Resolve current branch

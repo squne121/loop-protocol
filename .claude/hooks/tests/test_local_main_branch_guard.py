@@ -39,6 +39,7 @@ from local_main_branch_guard import (  # noqa: E402
     _normalize_git_global_opts,
     _is_allowed_when_drifted,
     REASON_NOT_LOCAL_ROOT,
+    REASON_LINKED_ISSUE_WORKTREE_CONTEXT,
     REASON_READONLY,
     REASON_BRANCH_SAFE_MAINTENANCE,
     REASON_RECOVERY,
@@ -366,7 +367,7 @@ class TestAC3LinkedWorktreeBypass:
             )
             # Should be allow because cwd != primary root
             assert result["status"] == "allow"
-            assert result["reason_code"] == REASON_NOT_LOCAL_ROOT
+            assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
         finally:
             if old:
                 os.environ["CLAUDE_PROJECT_DIR"] = old
