@@ -100,3 +100,51 @@ def test_given_active_issue_worktree_when_raw_git_worktree_add_runs_then_guard_b
     result = _run_guard(command, repo_with_other_issue_worktree)
     assert result.returncode == 2
     assert "blocked" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# B5: Negative fixtures — commands that scope guard must block
+# ---------------------------------------------------------------------------
+
+_CANONICAL_INNER = (
+    "uv run python3 scripts/agent-ops/worktree_bootstrap_exec.py "
+    "--issue-number 1209 --slug worktree-bootstrap "
+    "--branch-name worktree-issue-1209-worktree-bootstrap "
+    "--worktree-path .claude/worktrees/issue-1209-worktree-bootstrap "
+    "--base-ref main --json"
+)
+
+
+def test_given_bash_lc_wrapper_when_guard_runs_then_it_is_blocked(repo_with_other_issue_worktree: Path) -> None:
+    """B5: bash -lc 'uv run python3 ...' must be blocked by scope guard."""
+    command = "bash -lc '" + _CANONICAL_INNER + "'"
+    result = _run_guard(command, repo_with_other_issue_worktree)
+    assert result.returncode == 2, f"Expected block (exit 2), got {result.returncode}\nstderr={result.stderr}"
+
+
+def test_given_env_prefix_when_guard_runs_then_it_is_blocked(repo_with_other_issue_worktree: Path) -> None:
+    """B5: env FOO=bar uv run python3 ... must be blocked by scope guard."""
+    command = "env FOO=bar " + _CANONICAL_INNER
+    result = _run_guard(command, repo_with_other_issue_worktree)
+    assert result.returncode == 2, f"Expected block (exit 2), got {result.returncode}\nstderr={result.stderr}"
+
+
+def test_given_duplicate_json_flag_when_guard_runs_then_it_is_blocked(repo_with_other_issue_worktree: Path) -> None:
+    """B5: uv run python3 ... --json --json must be blocked by scope guard (not exact match)."""
+    base = (
+        "uv run python3 scripts/agent-ops/worktree_bootstrap_exec.py "
+        "--issue-number 1209 --slug worktree-bootstrap "
+        "--branch-name worktree-issue-1209-worktree-bootstrap "
+        "--worktree-path .claude/worktrees/issue-1209-worktree-bootstrap "
+        "--base-ref main"
+    )
+    command = base + " --json --json"
+    result = _run_guard(command, repo_with_other_issue_worktree)
+    assert result.returncode == 2, f"Expected block (exit 2), got {result.returncode}\nstderr={result.stderr}"
+
+
+def test_given_extra_positional_arg_when_guard_runs_then_it_is_blocked(repo_with_other_issue_worktree: Path) -> None:
+    """B5: uv run python3 ... --json EXTRA must be blocked by scope guard."""
+    command = _CANONICAL_INNER + " EXTRA"
+    result = _run_guard(command, repo_with_other_issue_worktree)
+    assert result.returncode == 2, f"Expected block (exit 2), got {result.returncode}\nstderr={result.stderr}"

@@ -86,6 +86,16 @@ def _current_branch(project_root: str) -> str | None:
     return _git_stdout(project_root, "branch", "--show-current")
 
 
+def _is_under(base: str, target: str) -> bool:
+    """Return True iff realpath(target) is under realpath(base)."""
+    try:
+        real_base = os.path.realpath(base)
+        real_target = os.path.realpath(target)
+        return os.path.commonpath([real_base, real_target]) == real_base
+    except ValueError:
+        return False
+
+
 def _validate_repo_root(project_root: str) -> tuple[bool, str | None]:
     toplevel = _git_stdout(project_root, "rev-parse", "--show-toplevel")
     if toplevel is None or os.path.realpath(toplevel) != os.path.realpath(project_root):
@@ -150,6 +160,21 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
+    # B6: --json is mandatory; reject if missing
+    if not args.json:
+        payload = _result(
+            status="blocked",
+            reason_code="invalid_args",
+            issue_number=0,
+            slug=str(args.slug),
+            worktree_path=str(args.worktree_path),
+            branch=str(args.branch_name),
+            base_ref=str(args.base_ref),
+            head_oid=None,
+            errors=["--json flag is required"],
+        )
+        return _emit(payload, 1)
+
     project_root = os.path.realpath(os.getcwd())
     issue_text = str(args.issue_number)
     slug = str(args.slug)
@@ -176,6 +201,35 @@ def main() -> int:
     expected_branch = expected_branch_name(issue_number, slug)
     normalized_worktree_path = os.path.normpath(worktree_path)
     worktree_realpath = os.path.realpath(os.path.join(project_root, normalized_worktree_path))
+
+    # B3: Symlink escape guard
+    worktrees_dir = os.path.join(project_root, ".claude", "worktrees")
+    if os.path.islink(worktrees_dir):
+        payload = _result(
+            status="blocked",
+            reason_code="invalid_path",
+            issue_number=issue_number,
+            slug=slug,
+            worktree_path=worktree_path,
+            branch=branch_name,
+            base_ref=base_ref,
+            head_oid=None,
+            errors=["'.claude/worktrees' is a symlink — symlink escape rejected"],
+        )
+        return _emit(payload, 1)
+    if not _is_under(project_root, worktree_realpath):
+        payload = _result(
+            status="blocked",
+            reason_code="invalid_path",
+            issue_number=issue_number,
+            slug=slug,
+            worktree_path=worktree_path,
+            branch=branch_name,
+            base_ref=base_ref,
+            head_oid=None,
+            errors=["worktree_path realpath escapes project root"],
+        )
+        return _emit(payload, 1)
 
     if not _is_valid_slug(slug):
         payload = _result(
@@ -369,7 +423,15 @@ def main() -> int:
 
     catalog = list_worktrees(project_root)
     entry = find_by_realpath(catalog or [], worktree_realpath)
-    if entry is None or branch_short_name(entry.get("branch_ref")) != branch_name:
+    # B4: Full post-creation readback — equivalent to _validate_existing_state checks
+    creation_invalid = (
+        entry is None
+        or branch_short_name(entry.get("branch_ref")) != branch_name
+        or entry.get("detached")
+        or not os.path.isdir(worktree_realpath)
+        or os.path.basename(worktree_realpath) != f"issue-{issue_number}-{slug}"
+    )
+    if creation_invalid:
         payload = _result(
             status="failed",
             reason_code="git_failed",
@@ -379,7 +441,7 @@ def main() -> int:
             branch=branch_name,
             base_ref=normalized_base_ref,
             head_oid=None,
-            errors=["created worktree could not be verified from the catalog"],
+            errors=["created worktree failed post-creation readback validation"],
         )
         return _emit(payload, 1)
 

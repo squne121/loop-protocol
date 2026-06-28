@@ -125,3 +125,60 @@ def test_given_flag_value_form_when_policy_parses_then_command_is_rejected(tmp_g
         "--base-ref main --json"
     )
     assert parse_exact_worktree_bootstrap_command(command, str(tmp_git_repo)) is None
+
+
+# ---------------------------------------------------------------------------
+# B5: Negative fixtures — commands that must be blocked
+# ---------------------------------------------------------------------------
+
+_CANONICAL_INNER = (
+    "scripts/agent-ops/worktree_bootstrap_exec.py "
+    "--issue-number 1209 --slug worktree-bootstrap "
+    "--branch-name worktree-issue-1209-worktree-bootstrap "
+    "--worktree-path .claude/worktrees/issue-1209-worktree-bootstrap "
+    "--base-ref main --json"
+)
+
+
+def test_given_bash_lc_wrapper_when_evaluated_then_command_is_blocked(tmp_git_repo: Path) -> None:
+    """B5: bash -lc 'uv run python3 ...' must be blocked — shell escape via -c is not allowed."""
+    command = f"bash -lc \'uv run python3 {_CANONICAL_INNER}\'"
+    result = _eval(command, tmp_git_repo)
+    assert result["status"] == "block", f"Expected block, got: {result}"
+
+
+def test_given_rtk_bash_lc_wrapper_when_evaluated_then_command_is_blocked(tmp_git_repo: Path) -> None:
+    """B5: rtk bash -lc '...' must be blocked."""
+    command = f"rtk bash -lc \'uv run python3 {_CANONICAL_INNER}\'"
+    result = _eval(command, tmp_git_repo)
+    assert result["status"] == "block", f"Expected block, got: {result}"
+
+
+def test_given_leading_env_assignment_when_evaluated_then_command_is_blocked(tmp_git_repo: Path) -> None:
+    """B5: env FOO=bar uv run python3 ... must be blocked — leading env vars not allowed."""
+    command = f"env FOO=bar uv run python3 {_CANONICAL_INNER}"
+    result = _eval(command, tmp_git_repo)
+    assert result["status"] == "block", f"Expected block, got: {result}"
+
+
+def test_given_duplicate_json_flag_when_parsed_then_command_is_rejected(tmp_git_repo: Path) -> None:
+    """B5: Duplicate --json flag must be rejected by the policy parser."""
+    base = "scripts/agent-ops/worktree_bootstrap_exec.py --issue-number 1209 --slug worktree-bootstrap --branch-name worktree-issue-1209-worktree-bootstrap --worktree-path .claude/worktrees/issue-1209-worktree-bootstrap --base-ref main"
+    command = f"uv run python3 {base} --json --json"
+    parsed = parse_exact_worktree_bootstrap_command(command, str(tmp_git_repo))
+    assert parsed is None, "Duplicate --json must not parse"
+
+
+def test_given_extra_positional_arg_when_parsed_then_command_is_rejected(tmp_git_repo: Path) -> None:
+    """B5: Extra positional argument after --json must be rejected."""
+    command = f"uv run python3 {_CANONICAL_INNER} EXTRA"
+    parsed = parse_exact_worktree_bootstrap_command(command, str(tmp_git_repo))
+    assert parsed is None, "Extra positional must not parse"
+
+
+def test_given_rtk_with_unknown_flag_when_evaluated_then_command_is_blocked(tmp_git_repo: Path) -> None:
+    """B5: rtk uv run python3 ... --unknown must be blocked."""
+    base = "scripts/agent-ops/worktree_bootstrap_exec.py --issue-number 1209 --slug worktree-bootstrap --branch-name worktree-issue-1209-worktree-bootstrap --worktree-path .claude/worktrees/issue-1209-worktree-bootstrap --base-ref main --json"
+    command = f"rtk uv run python3 {base} --unknown"
+    result = _eval(command, tmp_git_repo)
+    assert result["status"] == "block", f"Expected block, got: {result}"

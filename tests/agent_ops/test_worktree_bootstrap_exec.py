@@ -172,3 +172,101 @@ def test_given_root_not_on_default_branch_when_bootstrap_runs_then_executor_bloc
     assert result.returncode == 1
     assert payload["status"] == "blocked"
     assert payload["reason_code"] == "root_not_default_branch"
+
+
+def test_given_worktrees_dir_is_symlink_when_bootstrap_runs_then_symlink_escape_is_rejected(tmp_path: Path) -> None:
+    """B3: If .claude/worktrees is a symlink, executor must return blocked/invalid_path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "seed", cwd=repo)
+
+    # Create .claude/worktrees as a symlink to an outside directory
+    claude_dir = repo / ".claude"
+    claude_dir.mkdir()
+    worktrees_link = claude_dir / "worktrees"
+    worktrees_link.symlink_to(outside)
+
+    result, payload = _run(
+        repo,
+        "--issue-number", "1209",
+        "--slug", "worktree-bootstrap",
+        "--branch-name", "worktree-issue-1209-worktree-bootstrap",
+        "--worktree-path", ".claude/worktrees/issue-1209-worktree-bootstrap",
+        "--base-ref", "main",
+        "--json",
+    )
+    assert result.returncode == 1, f"Expected blocked, got stdout={result.stdout}"
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "invalid_path"
+
+
+def test_given_intermediate_symlink_escapes_repo_when_bootstrap_runs_then_realpath_guard_rejects(tmp_path: Path) -> None:
+    """B3: If a symlink in the worktree path resolves outside project root, executor must block."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "escape_target"
+    outside.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "seed", cwd=repo)
+
+    # Create .claude/worktrees/issue-1209-worktree-bootstrap as a symlink pointing outside
+    claude_dir = repo / ".claude"
+    worktrees_dir = claude_dir / "worktrees"
+    worktrees_dir.mkdir(parents=True)
+    escape_link = worktrees_dir / "issue-1209-worktree-bootstrap"
+    escape_link.symlink_to(outside)
+
+    result, payload = _run(
+        repo,
+        "--issue-number", "1209",
+        "--slug", "worktree-bootstrap",
+        "--branch-name", "worktree-issue-1209-worktree-bootstrap",
+        "--worktree-path", ".claude/worktrees/issue-1209-worktree-bootstrap",
+        "--base-ref", "main",
+        "--json",
+    )
+    assert result.returncode == 1, f"Expected blocked, got stdout={result.stdout}"
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "invalid_path"
+
+
+def test_given_json_flag_omitted_when_bootstrap_runs_then_executor_blocks_with_invalid_args(tmp_path: Path) -> None:
+    """B6: Omitting --json must return blocked/invalid_args."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "seed", cwd=repo)
+
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--issue-number", "1209",
+         "--slug", "worktree-bootstrap",
+         "--branch-name", "worktree-issue-1209-worktree-bootstrap",
+         "--worktree-path", ".claude/worktrees/issue-1209-worktree-bootstrap",
+         "--base-ref", "main",
+         # intentionally omit --json
+         ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    import json
+    payload = json.loads(result.stdout)
+    assert result.returncode == 1
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "invalid_args"
+    assert any("--json" in e for e in payload["errors"])
