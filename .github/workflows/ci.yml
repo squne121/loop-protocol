@@ -811,7 +811,7 @@ jobs:
               >> measurements.jsonl
             return $status
           }
-          run_timed ruff_check uv run --locked ruff check --select E,F --ignore E501,E402 .claude/scripts scripts schemas .claude/skills
+          run_timed ruff_check uv run --locked ruff check --select E,F --ignore E402 .claude/scripts scripts schemas .claude/skills
       - name: Install ripgrep
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version
