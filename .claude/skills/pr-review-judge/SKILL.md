@@ -54,7 +54,7 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 ```bash
 HEAD_SHA=$(gh pr view <PR番号> --json headRefOid --jq .headRefOid)
-uv run python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary.py --pr <PR番号> --repo <owner>/<repo> --expected-head-sha "$HEAD_SHA"
+uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary.py --pr <PR番号> --repo <owner>/<repo> --expected-head-sha "$HEAD_SHA"
 ```
 
 - `exit 0`: 補助証拠可

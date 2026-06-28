@@ -187,7 +187,7 @@ gh issue list --search "<file_path> is:open" --state open --json number,title,ur
 実行例:
 
 ```bash
-uv run python3 .claude/skills/create-issue/scripts/check_issue_overlap.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/check_issue_overlap.py \
   --repo <owner/repo> --title "<起票予定 title>" \
   --goal "<goal_ref>" --allowed-paths-file <paths.txt> \
   [--label <l> ...] [--parent-ref <#N> ...] [--depends-on <#N> ...] \
@@ -221,7 +221,7 @@ Issue Template Guard / Outcome Quality Guard / Scope 重複チェックを全て
 # 書き込み前 validator — exit 1 なら起票しない
 # --kind を指定すると ISSUE_TEMPLATE/<kind>.yml から必須セクション・Stop Conditions を動的取得する（LP001/LP017）
 # --title を指定すると LP031 で implementation kind の title prefix を検証する
-uv run python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation --title "$TITLE"
+uv run --locked python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation --title "$TITLE"
 ```
 
 `validate_issue_body.py` が exit 1 を返した場合は **起票を中止**し、JSON 出力の `errors` を人間に提示して修正を求める。
@@ -245,7 +245,7 @@ gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels > /tmp/
 2. `guard-issue-body.py` に `--readback-json` を渡して ready tuple を検証する:
 
 ```bash
-uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
   --issue-kind implementation \
   --check-ready-tuple \
   --readback-json /tmp/readback.json
@@ -254,7 +254,7 @@ uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_
 3. guard の exit code を変数に保存する:
 
 ```bash
-uv run python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
   --issue-kind implementation \
   --check-ready-tuple \
   --readback-json /tmp/readback.json \
@@ -289,7 +289,7 @@ gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
 
 1. plan を取得する（read-only — GitHub Issue は変更しない）:
    ```bash
-   uv run python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
+   uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materialization.py \
      --repo <owner>/<repo> \
      --issue <parent_issue_number>
    ```
@@ -315,7 +315,7 @@ gh issue comment "$CREATED_ISSUE_NUMBER" --repo "$REPO" \
 ステップ 4a の手作業フローを **決定論的スクリプト**として正規化したのが `materialize_child_issues.py` である。LLM が child plan を逐次解釈して `create_issue_txn.py` を呼ぶ代わりに、closed-schema バリデーション・canonical body render・起票・parent patch・結果集約を 1 つの helper に集約する。
 
 ```bash
-uv run python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_issues.py \
   --plan-file <CHILD_MATERIALIZATION_PLAN_V2 互換 JSON>
 ```
 
@@ -421,7 +421,7 @@ gh api repos/{owner}/{repo}/issues/{parent_number}/sub_issues --method POST -F s
 ### 設定方法
 
 ```bash
-uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
+uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
   --repo <owner>/<repo> \
   --title "実装: <タイトル>" \
   --blocked-by <blocker_issue_number> \
@@ -480,7 +480,7 @@ comment の "Recovery hint:" 以降に stage 固有の補正コマンドと idem
 `label-readback` ステージで `partial_failure` が返された場合、**以下の手順で復旧する**:
 
 ```bash
-uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py reconcile \
+uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py reconcile \
   --repo <owner/repo> \
   --issue <issue_number> \
   --label <label1> --label <label2>

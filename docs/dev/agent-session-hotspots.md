@@ -13,16 +13,16 @@ token/context 浪費 hotspot を抽出し、`AGENT_SESSION_HOTSPOTS_V1` JSON art
 
 ```bash
 # 基本実行
-uv run python scripts/summarize_agent_transcript.py \
+uv run --locked python scripts/summarize_agent_transcript.py \
   --transcript /path/to/transcript.jsonl
 
 # manifest も指定する場合
-uv run python scripts/summarize_agent_transcript.py \
+uv run --locked python scripts/summarize_agent_transcript.py \
   --transcript /path/to/transcript.jsonl \
   --manifest /path/to/manifest.json
 
 # redaction 有効（path / token 類をマスク）
-uv run python scripts/summarize_agent_transcript.py \
+uv run --locked python scripts/summarize_agent_transcript.py \
   --transcript /path/to/transcript.jsonl \
   --redact
 ```
