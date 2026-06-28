@@ -113,15 +113,69 @@ except Exception:  # pragma: no cover - defensive fail-closed
 
     _CSM_POLICY_AVAILABLE = False
 
-_PUBLISH_REPORT_SCRIPT = (
-    ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
-)
+_PUBLISH_REPORT_SCRIPT = ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+
+
+def _extract_inner_python_argv(tokenized: list[str]) -> list[str] | None:
+    """Extract the inner python/uv argv from a potentially-wrapped command.
+
+    Returns the tokenized list starting with "uv" (for `uv run python3 ...`)
+    or "python"/"python3", or None when no python invocation can be extracted.
+
+    Handles:
+    - Direct:          ["uv", "run", "python3", ...]
+    - Direct:          ["python3", ...]
+    - env VAR=VAL:     ["env", "K=V", ..., "uv", "run", "python3", ...]
+    - command builtin: ["command", "python3", ...]
+    - shell -c/-lc:    ["bash", "-lc", "uv run python3 script.py"]
+    """
+    import shlex  # noqa: PLC0415
+
+    if not tokenized:
+        return None
+
+    t0 = tokenized[0]
+    prog = os.path.basename(t0)
+
+    # uv run python3 ...
+    if prog == "uv" and len(tokenized) >= 3 and tokenized[1] == "run" and tokenized[2] == "python3":
+        return tokenized
+
+    # Direct python/python3
+    if prog in {"python", "python3"}:
+        return tokenized
+
+    # env VAR=VAL ... <python-cmd>
+    if prog == "env":
+        rest = list(tokenized[1:])
+        while rest and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", rest[0]):
+            rest = rest[1:]
+        return _extract_inner_python_argv(rest)
+
+    # command python3 ...
+    if prog == "command":
+        return _extract_inner_python_argv(tokenized[1:])
+
+    # bash/sh/zsh -c/-lc <script>
+    if prog in _SHELL_WRAPPERS:
+        script = _extract_shell_wrapper_script(tokenized)
+        if script is not None:
+            try:
+                inner_toks = shlex.split(script, posix=True)
+            except ValueError:
+                inner_toks = script.split()
+            return _extract_inner_python_argv(inner_toks)
+        return None
+
+    return None
 
 
 def _is_direct_publish_termination_command(cmd: str, project_root: str) -> bool:
     """Return True iff command directly executes publish_termination_report.py.
 
     This command must be executed via controlled_skill_mutation_exec.py instead.
+    Detects wrapper forms (bash -c, env VAR=VAL, command) in addition to direct
+    uv run python3 / python3 invocations.
     """
     try:
         toks = _tokenize(cmd)
@@ -130,12 +184,17 @@ def _is_direct_publish_termination_command(cmd: str, project_root: str) -> bool:
     if not toks:
         return False
 
-    if toks[:3] == ["uv", "run", "python3"]:
-        args = toks[3:]
-    elif toks[:1] and os.path.basename(toks[0]) in {"python", "python3"}:
-        args = toks[1:]
+    inner = _extract_inner_python_argv(toks)
+    if inner is None:
+        return False
+
+    if inner[:3] == ["uv", "run", "python3"]:
+        args = inner[3:]
+    elif os.path.basename(inner[0]) in {"python", "python3"}:
+        args = inner[1:]
     else:
         return False
+
     if not args or args[0].startswith("-"):
         return False
     if os.path.isabs(args[0]):
@@ -160,10 +219,13 @@ try:
     from worktree_bootstrap_command_policy import (
         is_exact_worktree_bootstrap_executor_command as _wbe_exec_command,
     )
+
     _WBE_POLICY_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fail-closed
+
     def _wbe_exec_command(cmd: str, cwd: str, project_root: str, deadline: object | None = None) -> bool:  # type: ignore[misc]
         return False
+
     _WBE_POLICY_AVAILABLE = False
 
 # Agent-ops tools allowed as an exact command class from the local main root even
@@ -933,11 +995,17 @@ _GIT_MUTATING_SUBCMDS = {
 }
 # Git add options that widen scope beyond explicit pathspec-only operations.
 _GIT_ADD_STRICT_PROHIBITED_OPTS = {
-    "-A", "--all", "-a",
-    "-u", "--update",
-    "--patch", "-p",
-    "-i", "--interactive",
-    "--intent-to-add", "-N",
+    "-A",
+    "--all",
+    "-a",
+    "-u",
+    "--update",
+    "--patch",
+    "-p",
+    "-i",
+    "--interactive",
+    "--intent-to-add",
+    "-N",
     "--dry-run",
 }
 # git stash mutates unless list/show; git worktree mutates unless list.
@@ -1316,27 +1384,106 @@ def _classify_git(args: list[str]) -> str:
     return "unknown"
 
 
-def _is_git_add_pathspec_violation(args: list[str]) -> bool:
+def _extract_inner_git_argv(tokenized: list[str]) -> list[str] | None:
+    """Extract the inner git argv from a potentially-wrapped command.
+
+    Returns the tokenized list whose first element is "git" (possibly followed
+    by global options like -C <path>), or None when no git invocation can be
+    extracted.
+
+    Handles transparent wrappers:
+    - Direct:          ["git", ...]  (including ["git", "-C", "/path", ...])
+    - env VAR=VAL:     ["env", "K=V", ..., "git", ...]
+    - command builtin: ["command", "git", ...]
+    - rtk:             ["rtk", "git", ...]
+    - shell -c/-lc:    ["bash", "-lc", "git add ."] → script re-tokenized, recurse
+    """
+    import shlex  # noqa: PLC0415
+
+    if not tokenized:
+        return None
+
+    t0 = tokenized[0]
+    prog = os.path.basename(t0)
+
+    # Direct git invocation (including git -C <path> ...)
+    if prog == "git":
+        return tokenized
+
+    # env VAR=VAL ... git ...
+    if prog == "env":
+        rest = list(tokenized[1:])
+        while rest and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", rest[0]):
+            rest = rest[1:]
+        return _extract_inner_git_argv(rest)
+
+    # command git ...
+    if prog == "command":
+        return _extract_inner_git_argv(tokenized[1:])
+
+    # rtk git ...
+    if prog == "rtk":
+        return _extract_inner_git_argv(tokenized[1:])
+
+    # bash/sh/zsh -c/-lc <script>
+    if prog in _SHELL_WRAPPERS:
+        script = _extract_shell_wrapper_script(tokenized)
+        if script is not None:
+            try:
+                inner_toks = shlex.split(script, posix=True)
+            except ValueError:
+                inner_toks = script.split()
+            return _extract_inner_git_argv(inner_toks)
+        return None
+
+    return None
+
+
+def _is_git_add_pathspec_violation(args: list[str], cwd: str | None = None) -> bool:
     """Issue #1215: reject non-explicit git add forms.
+
+    Args:
+        args: git arguments after "git" (may include global options like -C <path>).
+        cwd:  working directory for directory-pathspec detection.
 
     Returns True when:
     - no explicit pathspec is provided;
     - prohibited add option is used (`-A`, `-u`, etc.);
-    - pathspec appears to be broad (`.`, `..`, wildcard patterns).
+    - pathspec appears to be broad (`.`, `..`, wildcard patterns, `:` magic);
+    - `--pathspec-from-file` is used;
+    - pathspec resolves to an existing directory under cwd.
     """
     if not args:
         return False
-    if args[0] != "add":
+
+    # Skip global git options (e.g. -C <path>) to find the "add" subcommand.
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-C":
+            i += 2  # skip -C and its <path> argument
+            continue
+        if len(a) > 2 and a.startswith("-C"):
+            i += 1  # -C<path> combined form
+            continue
+        if a == "--":
+            break  # end of global options; not "add" subcommand
+        if a.startswith("-"):
+            i += 1  # other global option; skip one token conservatively
+            continue
+        break
+
+    if i >= len(args) or args[i] != "add":
         return False
 
     pathspecs: list[str] = []
     allow_opts = True
-    i = 1
-    while i < len(args):
-        arg = args[i]
+    j = i + 1
+    while j < len(args):
+        arg = args[j]
         if arg == "--":
             allow_opts = False
-            i += 1
+            j += 1
             continue
 
         if allow_opts and arg.startswith("-"):
@@ -1348,15 +1495,14 @@ def _is_git_add_pathspec_violation(args: list[str]) -> bool:
                 return True
             if arg in {"-f", "--force"}:
                 # force add is allowed only when followed by a pathspec.
-                i += 1
+                j += 1
                 continue
             # Unknown/other options do not satisfy strict exact-path policy.
-            if arg not in {"-f", "--force"}:
-                return True
+            return True
         else:
             pathspecs.append(arg)
 
-        i += 1
+        j += 1
 
     if not pathspecs:
         return True
@@ -1367,6 +1513,9 @@ def _is_git_add_pathspec_violation(args: list[str]) -> bool:
         if any(ch in pathspec for ch in ("*", "?", "[")):
             return True
         if pathspec.startswith(":"):
+            return True
+        # Directory-wide pathspec: block if pathspec resolves to an existing directory.
+        if os.path.isdir(os.path.join(cwd or ".", pathspec)):
             return True
     return False
 
@@ -1827,13 +1976,17 @@ def _decide_bash(
         return  # unreachable
 
     # Issue #1215: enforce exact-path pathspec for git add while an issue worktree is active.
-    rel_expected = _rel(resolution.expected, project_root=resolve_project_root()) if resolution.expected else "<unresolved>"
+    rel_expected = (
+        _rel(resolution.expected, project_root=resolve_project_root()) if resolution.expected else "<unresolved>"
+    )
 
     if issue and klass == "mutating":
         tokenized = _tokenize(command)
-        if tokenized and tokenized[0] == "git" and _is_git_add_pathspec_violation(tokenized[1:]):
-            _block(rel_expected, cwd)
-            return  # unreachable
+        inner_git = _extract_inner_git_argv(tokenized)
+        if inner_git and len(inner_git) >= 2 and inner_git[0] == "git":
+            if _is_git_add_pathspec_violation(inner_git[1:], cwd=cwd):
+                _block(rel_expected, cwd)
+                return  # unreachable
 
     # From here, command is 'mutating' or 'unknown' (possible mutation).
     if issue and not resolution.git_available:
@@ -2518,8 +2671,10 @@ def build_decision(payload: dict) -> dict:
 
     if issue and klass == "mutating":
         tokens = _tokenize(command)
-        if tokens and tokens[0] == "git" and _is_git_add_pathspec_violation(tokens[1:]):
-            return _v2("mutating", cwd_class, "deny", "git_add_requires_explicit_pathspec")
+        inner_git = _extract_inner_git_argv(tokens)
+        if inner_git and len(inner_git) >= 2 and inner_git[0] == "git":
+            if _is_git_add_pathspec_violation(inner_git[1:], cwd=cwd):
+                return _v2("mutating", cwd_class, "deny", "git_add_requires_explicit_pathspec")
 
     # mutating or unknown
     if not issue:

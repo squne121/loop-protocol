@@ -5,5 +5,5 @@
   "tool_input": {
     "command": "git add -- scripts/agent-guards/local_main_branch_guard.py"
   },
-  "cwd": ""
+  "cwd": "/tmp/worktree-issue-1215-test"
 }
