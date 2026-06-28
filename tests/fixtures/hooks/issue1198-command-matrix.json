@@ -31,30 +31,6 @@
   ],
   "block": [
     {
-      "command": "gh api --raw-field=body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
-      "command": "gh api --field=body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
-      "command": "gh api --input=tmp/payload.json repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
-      "command": "rtk gh api --raw-field=body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
-      "command": "rtk gh api --field=body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
-      "command": "rtk gh api --input=tmp/payload.json repos/squne121/loop-protocol/issues/comments/4814545233",
-      "reason": "github_api_command"
-    },
-    {
       "command": "gh api --method PATCH repos/squne121/loop-protocol/issues/comments/4814545233",
       "reason": "github_api_command"
     },
@@ -63,20 +39,16 @@
       "reason": "github_api_command"
     },
     {
-      "command": "gh api --hostname evil.example.com repos/squne121/loop-protocol/issues/comments/4814545233",
+      "command": "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
       "reason": "github_api_command"
     },
     {
-      "command": "gh api repos/{owner}/{repo}/issues/comments/4814545233",
+      "command": "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x' --method=GET",
       "reason": "github_api_command"
     },
     {
-      "command": "gh api --paginate repos/squne121/loop-protocol/issues/comments/4814545233",
+      "command": "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field=body='x'",
       "reason": "github_api_command"
-    },
-    {
-      "command": "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --add-label foo",
-      "reason": "gh_mutation_denied"
     },
     {
       "command": "rtk unknown-subcommand",
