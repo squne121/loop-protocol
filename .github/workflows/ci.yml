@@ -833,6 +833,13 @@ jobs:
         run: |
           python3 scripts/ci/python_test_plan.py --emit scope-argv --check-paths --format json > /dev/null
           uv run --locked python scripts/ci/verify_lane_union.py
+      - name: Check governed Python invocation policy (#1193)
+        # Fail-closed static scan: governed surfaces (.github/workflows/** /
+        # .github/actions/** / docs/dev/** / .claude/skills/**/SKILL.md /
+        # package.json) must use `uv run --locked` for dependency-bearing pytest
+        # and Python script invocations; direct interpreters are allowed only via
+        # the stdlib_only/bootstrap exceptions registry.
+        run: uv run --locked python scripts/ci/check_python_invocation_policy.py --strict
       - name: pytest python suite (parallel) (timed)
         # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
         # FIXED worker count / scheduler all come from the python-test-plan SSOT via the

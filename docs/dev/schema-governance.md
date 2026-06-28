@@ -75,7 +75,7 @@ detection_patterns:
 validation_commands:
   - "rg 'TERMINATION_REPORT_RENDER_RESULT_V1' .claude/skills/issue-refinement-loop/scripts/render_termination_report.py"
   - "rg 'TERMINATION_REPORT_RENDER_RESULT_V1' .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
-  - "uv run pytest .claude/skills/issue-refinement-loop/tests/test_publish_termination_report.py -q"
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_publish_termination_report.py -q"
 notes:
   - "publishable=true requires body to be non-null non-empty string (AC4 invariant)"
   - "publishable=false requires body to be null (AC4 invariant)"

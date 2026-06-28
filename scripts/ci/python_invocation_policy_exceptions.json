@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "exact_argv_pattern": "python3 -",
+      "reason": "Inline stdlib-only Python heredoc in CI steps for JSON/metrics processing; cannot migrate to uv run without restructuring multi-job steps",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 -c",
+      "reason": "Stdlib-only one-liner invocations using json/sys/os; used in SKILL.md and CI for inline data extraction without external dependencies",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 scripts/ci/python_test_plan.py",
+      "reason": "Bootstrap loader: runs before uv sync to produce pytest argv for the CI parallel/serial lanes; stdlib-only and must run before project dependencies are synced",
+      "scope": "bootstrap"
+    },
+    {
+      "exact_argv_pattern": "python3 scripts/ci/codex_execpolicy_matrix.py",
+      "reason": "Codex execpolicy matrix runner uses stdlib only (subprocess, json, os, hashlib, shlex); runs in dedicated CI context as a bootstrap step",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 .claude/scripts/kill_switch_runtime_smoke.py",
+      "reason": "Kill-switch runtime smoke: stdlib-only session recording safety check; invoked before uv sync is available in CI and in local package scripts",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 .claude/scripts/secret_exposure_scanner.py",
+      "reason": "Secret exposure scanner: stdlib-only path/regex scanner; invoked in CI and local package scripts for security scanning without external dependencies",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 .claude/skills/create-issue/scripts/validate_japanese_content.py",
+      "reason": "Japanese prose ratio validator: stdlib-only (argparse/re/sys + local prose_boundary_policy module); invoked as a bare interpreter in check-japanese.yml which runs without uv sync",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py",
+      "reason": "CI verdict summary v2 emitter: stdlib-only (argparse/json/os/sys/datetime/typing); invoked as a bare interpreter in the ci.yml verdict-summary step which does not run uv sync",
+      "scope": "stdlib_only"
+    },
+    {
+      "exact_argv_pattern": "python3 .claude/scripts/check_session_recording_policy.py",
+      "reason": "Session recording policy checker: stdlib-only (argparse/re/sys/typing); documented and invoked as a bare interpreter for local policy validation without external dependencies",
+      "scope": "stdlib_only"
+    }
+  ]
+}
