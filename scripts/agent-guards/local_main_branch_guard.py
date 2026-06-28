@@ -82,10 +82,13 @@ try:
     from controlled_skill_mutation_policy import (
         is_controlled_skill_mutation_exec_command as _csm_exec_command,
     )
+
     _CSM_POLICY_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fail-closed
+
     def _csm_exec_command(cmd: str, project_root: str) -> bool:  # type: ignore[misc]
         return False
+
     _CSM_POLICY_AVAILABLE = False
 
 # ─── GitHub remote ops classification vocabulary ──────────────────────────────
@@ -116,6 +119,7 @@ COMMAND_KIND_READONLY = "readonly_command"
 
 # ─── Root state classification ────────────────────────────────────────────────
 
+
 def classify_root_state(current_branch: str | None, default_branch: str) -> str:
     """
     Classify local root state into one of three kinds:
@@ -134,6 +138,7 @@ def classify_root_state(current_branch: str | None, default_branch: str) -> str:
 
 # ─── Branch name classification ───────────────────────────────────────────────
 
+
 def classify_branch(branch: str, default_branch: str) -> str:
     """Classify a branch name into a kind."""
     if branch == default_branch:
@@ -149,6 +154,7 @@ def classify_branch(branch: str, default_branch: str) -> str:
 
 
 # ─── Git helpers ─────────────────────────────────────────────────────────────
+
 
 def run_git(*args: str, cwd: str | None = None) -> tuple[int, str]:
     """Run a git command and return (exit_code, stdout)."""
@@ -197,7 +203,7 @@ def get_primary_worktree_path(cwd: str | None = None) -> str | None:
                 continue  # bare repo, skip
             path_lines = [line for line in lines if line.startswith("worktree ")]
             if path_lines:
-                return path_lines[0][len("worktree "):]
+                return path_lines[0][len("worktree ") :]
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
@@ -250,6 +256,7 @@ def resolve_default_branch(cwd: str | None = None) -> str:
 
 
 # ─── Context detection ────────────────────────────────────────────────────────
+
 
 def is_local_root_context(cwd: str) -> bool:
     """
@@ -326,12 +333,25 @@ def _resolve_project_root(cwd: str) -> str | None:
 # B2: These must be normalized away before subcommand detection.
 # Presence of -C, --git-dir, --work-tree, --config-env → fail-closed in local root.
 _GIT_GLOBAL_OPTS_WITH_ARG = {
-    "-C", "-c", "--git-dir", "--work-tree", "--config-env",
-    "--namespace", "--super-prefix", "--exec-path",
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--config-env",
+    "--namespace",
+    "--super-prefix",
+    "--exec-path",
 }
 _GIT_GLOBAL_FLAGS = {
-    "--bare", "--no-pager", "--no-replace-objects", "--no-optional-locks",
-    "--version", "--help", "--html-path", "--man-path", "--info-path",
+    "--bare",
+    "--no-pager",
+    "--no-replace-objects",
+    "--no-optional-locks",
+    "--version",
+    "--help",
+    "--html-path",
+    "--man-path",
+    "--info-path",
     "--list-cmds",
 }
 # These git global options change execution context and must be fail-closed.
@@ -351,7 +371,63 @@ _LEADING_ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+")
 # ─── Deterministic checker allowlist ─────────────────────────────────────────
 # Deterministic checkers remain exact-path only; root execution of issue-refinement
 # preflight moved to skill_runtime_exec.py in Issue #1154.
-DETERMINISTIC_CHECKER_ALLOWLIST: list[str] = []
+DETERMINISTIC_CHECKER_ALLOWLIST: list[str] = [
+    "scripts/agent-ops/git_ref_probe.py",
+    "scripts/agent-ops/git_worktree_probe.py",
+]
+
+# Probe script argv specs — must mirror _AGENT_OPS_ARG_SPECS in worktree_scope_guard.py.
+# Both guards apply the same shape restrictions so a command allowed by one is also
+# subject to the same argv contract in the other (AC6).
+_PROBE_ARG_SPECS: dict[str, dict] = {
+    "scripts/agent-ops/git_ref_probe.py": {
+        "value_flags": frozenset({"--branch", "--remote"}),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset({"--branch"}),
+    },
+    "scripts/agent-ops/git_worktree_probe.py": {
+        "value_flags": frozenset(),
+        "bool_flags": frozenset({"--json"}),
+        "required": frozenset(),
+    },
+}
+
+
+def _validate_probe_argv(rel_script: str, args: list[str]) -> bool:
+    """True iff args is a valid, non-redundant argv for a probe script.
+
+    Mirrors _validate_agent_ops_argv in worktree_scope_guard.py so that both
+    guards enforce the same exact-argv contract (AC6).
+    Rejects unknown flags, duplicates, --flag=value forms, positionals, and
+    missing required flags.
+    """
+    spec = _PROBE_ARG_SPECS.get(rel_script)
+    if spec is None:
+        return False
+    value_flags = spec["value_flags"]
+    bool_flags = spec["bool_flags"]
+    seen: set[str] = set()
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if not tok.startswith("--") or "=" in tok:
+            return False
+        if tok in seen:
+            return False
+        seen.add(tok)
+        if tok in bool_flags:
+            i += 1
+            continue
+        if tok in value_flags:
+            if i + 1 >= len(args):
+                return False
+            if args[i + 1].startswith("--"):
+                return False
+            i += 2
+            continue
+        return False
+    return spec["required"].issubset(seen)
+
 
 # ─── Gh issue/pr command pattern (allowlist-closed, AC11) ─────────────────────
 # ANY gh issue/pr command not present in DISPLAY_READONLY_PATTERNS or is_github_remote_ops_command is blocked.
@@ -390,13 +466,13 @@ READONLY_PIPELINE_SEGMENT_PATTERNS = [
 # These match `git checkout -- <path>`, `git checkout HEAD -- <path>`,
 # `git checkout --pathspec-from-file=`, `git checkout -p`
 CHECKOUT_PATH_RESTORE_PATTERNS = [
-    r"^git\s+checkout\s+--\s+\S",              # git checkout -- <path>
-    r"^git\s+checkout\s+HEAD\s+--\s+\S",        # git checkout HEAD -- <path>
+    r"^git\s+checkout\s+--\s+\S",  # git checkout -- <path>
+    r"^git\s+checkout\s+HEAD\s+--\s+\S",  # git checkout HEAD -- <path>
     r"^git\s+checkout\s+HEAD~?\d*\s+--\s+\S",  # git checkout HEAD~N -- <path>
-    r"^git\s+checkout\s+--pathspec-from-file=", # --pathspec-from-file=
-    r"^git\s+checkout\s+-p(\s|$)",              # git checkout -p [-- path]
-    r"^git\s+checkout\s+-p\s+--\s+",            # git checkout -p -- <path>
-    r"^git\s+restore(\s|$)",                    # git restore <path>
+    r"^git\s+checkout\s+--pathspec-from-file=",  # --pathspec-from-file=
+    r"^git\s+checkout\s+-p(\s|$)",  # git checkout -p [-- path]
+    r"^git\s+checkout\s+-p\s+--\s+",  # git checkout -p -- <path>
+    r"^git\s+restore(\s|$)",  # git restore <path>
 ]
 
 # Minimal allowlist when root is already drifted or in detached_or_unknown state.
@@ -494,10 +570,10 @@ def _redact_token(token: str) -> str:
         "--body",
         "--body-file",
         "--input",
+        "--raw-field",
         "-f",
         "-F",
         "--field",
-        "--raw-field",
     }
     if token in redaction_sensitive:
         return token
@@ -519,7 +595,15 @@ def _redact_argv(tokens: list[str] | None) -> list[str]:
         return []
     redacted: list[str] = []
     skip_next = False
-    sensitive_flags = {"--body-file", "--body", "--input", "--field", "--raw-field", "-f", "-F"}
+    sensitive_flags = {
+        "--body-file",
+        "--body",
+        "--input",
+        "--field",
+        "--raw-field",
+        "-f",
+        "-F",
+    }
     for idx, token in enumerate(tokens):
         if skip_next:
             redacted.append("<redacted>")
@@ -681,7 +765,7 @@ def _find_flag_value(tokens: list[str], flag: str) -> "str | None":
                 return tokens[i + 1]
             return None
         if t.startswith(f"{flag}="):
-            val = t[len(flag) + 1:]
+            val = t[len(flag) + 1 :]
             return val if val else None
     return None
 
@@ -702,7 +786,7 @@ def _has_body_value(tokens: list[str]) -> bool:
                 return True
             return False
         if t.startswith("--body="):
-            val = t[len("--body="):]
+            val = t[len("--body=") :]
             return bool(val)
     return False
 
@@ -759,12 +843,8 @@ def is_deterministic_checker_command(cmd: str, project_root: str | None = None) 
         return False
     script_path = tokens[3]
     for allowed in DETERMINISTIC_CHECKER_ALLOWLIST:
-        if script_path == allowed:
-            return True
-        if project_root:
-            abs_allowed = os.path.join(project_root, allowed)
-            if script_path == abs_allowed:
-                return True
+        if script_path == allowed or (project_root and script_path == os.path.join(project_root, allowed)):
+            return _validate_probe_argv(allowed, tokens[4:])
     return False
 
 
@@ -812,13 +892,19 @@ def is_github_remote_ops_command(cmd: str) -> bool:
         return False
     if tokens[0] != "gh":
         return False
-    resource = tokens[1]   # "issue" or "pr"
-    subcommand = tokens[2] # "close", "comment", "reopen", "edit"
+    resource = tokens[1]  # "issue" or "pr"
+    subcommand = tokens[2]  # "close", "comment", "reopen", "edit"
 
     # Destructive / interactive flags → block always (applied to all subcommands)
     BLOCKED_FLAGS = {
-        "--delete-last", "--edit-last", "--editor", "-e",
-        "--web", "-w", "--create-if-none", "--yes",
+        "--delete-last",
+        "--edit-last",
+        "--editor",
+        "-e",
+        "--web",
+        "-w",
+        "--create-if-none",
+        "--yes",
     }
     if any(t in BLOCKED_FLAGS for t in tokens[3:]):
         return False
@@ -945,7 +1031,7 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
                 has_trusted_repo = True
             i += 2
         elif tok.startswith("--repo="):
-            if tok[len("--repo="):] == TRUSTED_REPO_SLUG:
+            if tok[len("--repo=") :] == TRUSTED_REPO_SLUG:
                 has_trusted_repo = True
             i += 1
         else:
@@ -966,7 +1052,7 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
                     has_body_file = True
             i += 2
         elif tok.startswith("--body-file="):
-            path = tok[len("--body-file="):]
+            path = tok[len("--body-file=") :]
             if path != "-" and _is_safe_tmp_body_file(path):
                 has_body_file = True
             i += 1
@@ -980,14 +1066,12 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
 # Only `>` (not `>>`) to tmp/ path is allowed. No other destinations.
 _READONLY_EXPORT_RE = re.compile(
     r"^gh\s+issue\s+view\s+\d+"  # gh issue view <N>
-    r"(?:\s+[^>]*)?"              # optional args (no > inside)
-    r"\s+>\s+"                    # single redirect `>`
-    r"(tmp/\S+)$"                 # destination starts with tmp/
+    r"(?:\s+[^>]*)?"  # optional args (no > inside)
+    r"\s+>\s+"  # single redirect `>`
+    r"(tmp/\S+)$"  # destination starts with tmp/
 )
 # Blocked destination patterns for readonly artifact export
-_BLOCKED_EXPORT_DEST_RE = re.compile(
-    r"^(src/|docs/|\.env|\.git)"
-)
+_BLOCKED_EXPORT_DEST_RE = re.compile(r"^(src/|docs/|\.env|\.git)")
 
 
 def is_readonly_artifact_export_command(cmd: str) -> bool:
@@ -1081,8 +1165,7 @@ def is_tmp_wrapper_or_python_c_command(cmd: str) -> bool:
     if tokens[0] in ("python", "python3") and "-c" in tokens[1:]:
         return True
     # Block: uv run python3 /tmp/*.py
-    if (len(tokens) >= 4 and tokens[:3] == ["uv", "run", "python3"]
-            and tokens[3].startswith("/tmp/")):
+    if len(tokens) >= 4 and tokens[:3] == ["uv", "run", "python3"] and tokens[3].startswith("/tmp/"):
         return True
     # Block: direct /tmp/*.py execution
     if tokens[0].startswith("/tmp/") and tokens[0].endswith(".py"):
@@ -1367,6 +1450,7 @@ def is_manual_override_active() -> bool:
 
 # ─── Main guard logic ─────────────────────────────────────────────────────────
 
+
 def evaluate(
     command: str,
     cwd: str,
@@ -1620,7 +1704,9 @@ def evaluate(
             target_branch=None,
             target_branch_kind=None,
             local_parser_stage="readonly_classify",
-            local_command_kind=COMMAND_KIND_GITHUB_DISPLAY if normalized_cmd.startswith("gh ") else COMMAND_KIND_READONLY,
+            local_command_kind=COMMAND_KIND_GITHUB_DISPLAY
+            if normalized_cmd.startswith("gh ")
+            else COMMAND_KIND_READONLY,
             local_rule_id="readonly_command",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
@@ -2039,6 +2125,7 @@ def _result(
 
 # ─── Hook entry point ─────────────────────────────────────────────────────────
 
+
 def _classify_branch_kind(branch: str | None, default_branch: str) -> str:
     """
     Classify a branch name into a kind for safe stderr output.
@@ -2072,6 +2159,12 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=False,
             target_branch_kind=None,
             hook_flavor=hook_flavor,
+            decision="block",
+            event_kind="PreToolUse",
+            command_kind=COMMAND_KIND_UNKNOWN,
+            parser_stage="input_parse",
+            rule_id="input_parse",
+            argv_redacted=[],
         )
         return 2
 
@@ -2113,12 +2206,12 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=(current_branch == default_branch),
             target_branch_kind=result.get("target_branch_kind"),
             hook_flavor=hook_flavor,
-            event_kind=result.get("event_kind"),
-            decision=result.get("decision"),
-            command_kind=result.get("command_kind"),
-            parser_stage=result.get("parser_stage"),
+            decision=result["decision"],
+            event_kind=result.get("event_kind", hook_event),
+            command_kind=result.get("command_kind", COMMAND_KIND_UNKNOWN),
+            parser_stage=result.get("parser_stage", "classification"),
             rule_id=result.get("rule_id"),
-            argv_redacted=result.get("argv_redacted"),
+            argv_redacted=result.get("argv_redacted", []),
         )
         return 2
 
@@ -2131,13 +2224,13 @@ def _emit_block_stderr(
     current_is_default: bool,
     target_branch_kind: str | None,
     hook_flavor: str,
-    event_kind: str | None = None,
-    decision: str | None = None,
-    command_kind: str | None = None,
-    parser_stage: str | None = None,
+    *,
+    decision: str = "block",
+    event_kind: str = "PreToolUse",
+    command_kind: str = COMMAND_KIND_UNKNOWN,
+    parser_stage: str = "classification",
     rule_id: str | None = None,
     argv_redacted: list[str] | None = None,
-    **_compat_ignored: object,
 ) -> None:
     """
     Emit bounded, non-leaking block message to stderr (max 10 lines).
@@ -2147,67 +2240,36 @@ def _emit_block_stderr(
     - current_is_default: bool (true only when on the default branch)
     - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
     Raw branch names belong in --json / preflight diagnostic mode only.
-
-    Compatibility kwargs are accepted so direct helper call sites can validate
-    the same bounded diagnostic fields that hook-mode emits.
     """
-    detailed_mode = any(
-        value is not None
-        for value in (event_kind, decision, command_kind, parser_stage, rule_id, argv_redacted)
-    )
-    if detailed_mode:
-        lines = [
-            "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-            "hook_name: local_main_branch_guard",
-            f"event_kind: {event_kind}",
-            f"decision: {decision}",
-            f"reason_code: {reason_code}",
-            f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
-            f"current_branch_kind: {current_branch_kind}",
-            f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
-            f"argv_redacted: {json.dumps(argv_redacted or [])}",
-        ]
-        recovery = None
-        if reason_code == REASON_INLINE_OVERRIDE:
-            recovery = (
-                "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
-            )
-        elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-            recovery = "switch root back to default branch first"
-        elif reason_code == REASON_UNPARSEABLE:
-            recovery = "use simple (non-compound) git commands from local root"
-        elif reason_code == REASON_DRIFT:
-            recovery = "create/enter linked issue worktree, or switch only to default branch"
-        elif reason_code == REASON_GH_MUTATION:
-            recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
+    lines = [
+        "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
+        "hook_name: local_main_branch_guard",
+        f"event_kind: {event_kind}",
+        f"decision: {decision}",
+        f"reason_code: {reason_code}",
+        f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
+        f"current_branch_kind: {current_branch_kind}",
+        f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
+        f"argv_redacted: {json.dumps(argv_redacted or [])}",
+    ]
+    recovery = None
+    if reason_code == REASON_INLINE_OVERRIDE:
+        recovery = (
+            "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
+        )
+    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
+        recovery = "switch root back to default branch first"
+    elif reason_code == REASON_UNPARSEABLE:
+        recovery = "use simple (non-compound) git commands from local root"
+    elif reason_code == REASON_DRIFT:
+        recovery = "create/enter linked issue worktree, or switch only to default branch"
+    elif reason_code == REASON_GH_MUTATION:
+        recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
 
-        if recovery is None:
-            lines.append(f"hook_flavor: {hook_flavor}")
-        else:
-            lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
-    else:
-        lines = [
-            "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-            "hook_name: local_main_branch_guard",
-            f"reason_code: {reason_code}",
-            f"current_branch_kind: {current_branch_kind}",
-            f"current_is_default: {str(current_is_default).lower()}",
-        ]
-        if target_branch_kind:
-            lines.append(f"target_branch_kind: {target_branch_kind}")
-
-        if reason_code == REASON_INLINE_OVERRIDE:
-            lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
-        elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-            lines.append("recovery: switch root back to default branch first")
-        elif reason_code == REASON_UNPARSEABLE:
-            lines.append("recovery: use simple (non-compound) git commands from local root")
-        elif reason_code == REASON_DRIFT:
-            lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
-        elif reason_code == REASON_GH_MUTATION:
-            lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
-
+    if recovery is None:
         lines.append(f"hook_flavor: {hook_flavor}")
+    else:
+        lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
 
     # Enforce max 10 lines
     for line in lines[:10]:
@@ -2216,13 +2278,12 @@ def _emit_block_stderr(
 
 # ─── CLI / self-test entry point ──────────────────────────────────────────────
 
+
 def run_cli() -> int:
     """CLI mode: evaluate a command and print LOCAL_MAIN_BRANCH_GUARD_RESULT_V1."""
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Evaluate a command against the local_main_branch_guard"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate a command against the local_main_branch_guard")
     parser.add_argument("--command", required=True, help="Bash command to evaluate")
     parser.add_argument("--cwd", default=os.getcwd(), help="Working directory")
     parser.add_argument(
