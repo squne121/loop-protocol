@@ -635,6 +635,37 @@ class TestGhMutationReasonCode:
             f"recovery hint should mention approved/rtk/workflow, got: {hint!r}"
         )
 
+    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
+        """_emit_block_stderr includes AC7 machine-readable fields."""
+        from local_main_branch_guard import (
+            _emit_block_stderr,
+            REASON_GITHUB_REMOTE_OPS,
+            COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+        )
+
+        _emit_block_stderr(
+            reason_code=REASON_GITHUB_REMOTE_OPS,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind=None,
+            hook_flavor="codex",
+            event_kind="PermissionRequest",
+            decision="block",
+            command_kind=COMMAND_KIND_GITHUB_ARTIFACT_EXPORT,
+            parser_stage="readonly_artifact_export",
+            rule_id="gh_issue_view_to_tmp_allowed",
+            argv_redacted=["gh", "issue", "view", "123", "--json", "body"],
+        )
+        captured = capsys.readouterr()
+        output = captured.err
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PermissionRequest" in output
+        assert "decision: block" in output
+        assert "rule_id: gh_issue_view_to_tmp_allowed" in output
+        assert "command_kind: readonly_artifact_export" in output
+        assert "parser_stage: readonly_artifact_export" in output
+        assert "argv_redacted:" in output
+
 
 
 class TestExactAllowlist:
