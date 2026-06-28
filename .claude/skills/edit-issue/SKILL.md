@@ -118,7 +118,7 @@ yq '.body[] | select(.type != "markdown") | select(.validations.required == true
   .github/ISSUE_TEMPLATE/<種別>.yml
 
 # python3 を使う場合（guard-issue-body.py の load_required_labels と同等）
-uv run python3 -c "
+uv run --locked python3 -c "
 import yaml
 with open('.github/ISSUE_TEMPLATE/<種別>.yml') as f:
     t = yaml.safe_load(f)

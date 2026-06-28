@@ -298,3 +298,35 @@ CI_TEST_PERFORMANCE_DECISION_V1:
   follow_up_required:
     - ".claude/settings.json の permission allowlist に `Bash(uv run --locked python3 .claude/skills/<edit-issue|post-merge-cleanup|create-issue>/scripts/*.py *)` を追加し、SKILL.md 移行後の auto-approve 被覆を回復する"
 ```
+
+## invocation policy checker の shell 文法解析方針（#1193 OWNER 強化）
+
+`scripts/ci/check_python_invocation_policy.py` は governed surface 上の 1 行 /
+`run:` block を simple command 単位へ分割し（`&&` / `||` / `;` / `|` を quote・
+substitution・`${{ }}` 認識のうえ分割）、全 simple command を分類する。
+
+### 外部 shell parser を採用しない理由（fail-closed custom splitter）
+
+- bashlex / mvdan-sh 等の外部 shell parser は **新規 runtime dependency を追加**する。
+  本 child の Out of Scope（`pyyaml` / `jsonschema` の runtime 移設）と同様に、
+  policy checker のためだけに runtime 依存を増やすのは親 #1145 の dependency 最小化方針に反する。
+- checker は CI bootstrap 文脈（uv sync 前）でも `python3` 直実行で走る必要があり、
+  解析対象は実コマンドというより「governed surface 上の invocation 文字列」である。
+  完全な shell 文法エミュレーションは過剰であり、保守的な custom splitter で十分かつ安全。
+- したがって custom splitter は **未対応文法を握りつぶさず fail-closed** にする:
+  `shlex.split()` 失敗時の `.split()` fallback は廃止し、launcher を含む解析不能な
+  simple command（閉じない command/process substitution 等）は `unsupported_shell_grammar`
+  violation として報告する。command/process substitution `$(...)` / `<(...)` /
+  backtick は内部コマンドを再帰分類し、隠れた違反が false green にならないようにする。
+
+### direct interpreter / inline code の判定
+
+- direct interpreter 例外は `exact_argv`（argv トークンの完全列）との **exact full-argv 一致**で
+  照合する（prefix / glob / regex 不使用）。`scope: stdlib_only` の script 例外は
+  `proof: stdlib_import_scan` により対象 script を AST import scan し、非 stdlib import
+  （再帰的に stdlib-only と確認できる repo-local module は除く）を含む場合は exception 不成立＝violation とする。
+- `python3 -`（heredoc/stdin）/ `python3 -c` は broad-prefix 例外で許可しない。
+  heredoc body / `-c` code string を AST import scan し、非 stdlib import を含む場合は violation とする。
+  `uv run --locked python -c` / `uv run --locked python -` は lockfile 下で依存解決されるため許可する。
+- Markdown では shell 言語（` ```bash ` / ` ```sh ` / 無タグ等）の fenced block のみを
+  shell として走査し、` ```yaml ` / ` ```json ` / ` ```markdown ` 等のデータ/prose block は対象外とする。
