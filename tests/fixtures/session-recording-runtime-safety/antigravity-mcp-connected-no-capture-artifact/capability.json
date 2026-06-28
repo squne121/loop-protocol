@@ -1,0 +1,7 @@
+{
+  "schema": "agent_observation_capability/v1", "evidence_mode": "synthetic_only",
+  "surfaces": [{"surface": "google_antigravity", "claimed_verdict": "supported", "signals": {
+    "runtime_event_observed": true, "capture_artifact_observed": false, "raw_values_emitted": false,
+    "evidence_provenance": "synthetic_fixture", "mcp_connected": true, "browser_recording": true,
+    "ide_launch": true, "artifacts_generated": true}}]
+}
