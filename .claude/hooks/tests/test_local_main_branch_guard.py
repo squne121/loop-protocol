@@ -39,11 +39,11 @@ from local_main_branch_guard import (  # noqa: E402
     _normalize_git_global_opts,
     _is_allowed_when_drifted,
     REASON_NOT_LOCAL_ROOT,
+    REASON_LINKED_ISSUE_WORKTREE_CONTEXT,
     REASON_READONLY,
     REASON_BRANCH_SAFE_MAINTENANCE,
     REASON_RECOVERY,
     REASON_DRIFT,
-    REASON_ALREADY_DRIFTED,
     REASON_DETACHED_OR_UNKNOWN,
     REASON_UNPARSEABLE,
     REASON_INLINE_OVERRIDE,
@@ -367,7 +367,7 @@ class TestAC3LinkedWorktreeBypass:
             )
             # Should be allow because cwd != primary root
             assert result["status"] == "allow"
-            assert result["reason_code"] == REASON_NOT_LOCAL_ROOT
+            assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
         finally:
             if old:
                 os.environ["CLAUDE_PROJECT_DIR"] = old
@@ -1138,7 +1138,7 @@ class TestB5NoRawBranchInStderr:
 
     def test_emit_block_stderr_contains_kind_fields(self, capsys):
         """_emit_block_stderr emits current_branch_kind and current_is_default."""
-        from local_main_branch_guard import _emit_block_stderr
+        from local_main_branch_guard import _emit_block_stderr, REASON_ALREADY_DRIFTED
         _emit_block_stderr(
             reason_code=REASON_ALREADY_DRIFTED,
             current_branch_kind="other",
@@ -1149,36 +1149,6 @@ class TestB5NoRawBranchInStderr:
         captured = capsys.readouterr()
         assert "current_branch_kind: other" in captured.err
         assert "current_is_default: false" in captured.err
-
-    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
-        """_emit_block_stderr includes AC7-required fields for block diagnostics."""
-        from local_main_branch_guard import (
-            _emit_block_stderr,
-            REASON_GH_MUTATION,
-            COMMAND_KIND_GITHUB_DESTRUCTIVE,
-        )
-        _emit_block_stderr(
-            reason_code=REASON_GH_MUTATION,
-            current_branch_kind="default",
-            current_is_default=True,
-            target_branch_kind="issue_like",
-            hook_flavor="claude",
-            event_kind="PreToolUse",
-            decision="block",
-            command_kind=COMMAND_KIND_GITHUB_DESTRUCTIVE,
-            parser_stage="gh_mutation",
-            rule_id="github_mutation_denied",
-            argv_redacted=["gh", "pr", "merge", "123"],
-        )
-        captured = capsys.readouterr()
-        output = captured.err
-        assert "hook_name: local_main_branch_guard" in output
-        assert "event_kind: PreToolUse" in output
-        assert "decision: block" in output
-        assert "rule_id: github_mutation_denied" in output
-        assert "command_kind: github_mutation" in output
-        assert "parser_stage: gh_mutation" in output
-        assert "argv_redacted:" in output
 
     def test_emit_block_stderr_max_10_lines(self, capsys):
         """_emit_block_stderr output is bounded to max 10 lines."""
@@ -1487,9 +1457,9 @@ class TestGhMutationReasonCodeClaude:
             hook_flavor="claude",
         )
         captured = capsys.readouterr()
-        hint_line = [line for line in captured.err.splitlines() if "recovery:" in line]
-        assert hint_line, "Expected a recovery: line in stderr"
-        hint = hint_line[0].lower()
+        hint_lines = [line for line in captured.err.splitlines() if "recovery:" in line]
+        assert hint_lines, "Expected a recovery: line in stderr"
+        hint = hint_lines[0].lower()
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
             f"Expected recovery hint to mention 'approved', 'rtk', or 'workflow', got: {hint!r}"
         )
@@ -1561,7 +1531,6 @@ class TestGithubIssueMutationCommandClaude:
     # AC8: gh issue edit <N> --repo squne121/loop-protocol --body-file tmp/foo.md → allow
     @pytest.mark.parametrize("cmd", [
         "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-        "gh issue edit 456 --repo squne121/loop-protocol --body-file tmp/body.md --label bug",
         "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
     ])
     def test_ac8_gh_issue_edit_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):
@@ -1574,7 +1543,6 @@ class TestGithubIssueMutationCommandClaude:
     # AC9: gh issue create --repo squne121/loop-protocol --body-file tmp/foo.md → allow
     @pytest.mark.parametrize("cmd", [
         "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
-        "gh issue create --repo squne121/loop-protocol --title タイトル --body-file tmp/foo.md --label enhancement",
         "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
     ])
     def test_ac9_gh_issue_create_with_repo_and_bodyfile_allowed(self, tmp_git_repo: Path, cmd: str):

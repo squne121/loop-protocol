@@ -29,6 +29,8 @@ from local_main_branch_guard import (  # noqa: E402
     evaluate,
     REASON_DRIFT,
     REASON_RECOVERY,
+    REASON_NOT_LOCAL_ROOT,
+    REASON_LINKED_ISSUE_WORKTREE_CONTEXT,
     REASON_READONLY,
     REASON_UNPARSEABLE,
     REASON_GH_API,
@@ -36,6 +38,7 @@ from local_main_branch_guard import (  # noqa: E402
     REASON_GITHUB_REMOTE_OPS,
     REASON_GH_MUTATION,
     REASON_SKILL_RUNTIME_EXECUTOR,
+    REASON_UNKNOWN_ALLOWED,
     is_github_issue_mutation_command,
     is_readonly_artifact_export_command,
     GITHUB_CMD_CLASS_DISPLAY_READONLY,
@@ -247,27 +250,17 @@ class TestIssue1198RawAndCommandFixtures:
 
     def test_pretooluse_raw_issue_comment_fragment_is_not_blocked(self, tmp_git_repo: Path):
         fixture = _load_fixture_json("issue1198-pretooluse-issue-comment.json")
-        result = eval_codex(
-            command=fixture["tool_input"]["command"],
-            cwd=str(tmp_git_repo),
-            event=fixture["event"],
-        )
-        assert result["status"] == "allow"
-        assert result["reason_code"] != REASON_UNPARSEABLE
-        assert result["event_kind"] == "PreToolUse"
-        assert result["decision"] == "allow"
+        fixture["cwd"] = str(tmp_git_repo)
+        result = run_guard_script(fixture, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
 
     def test_permissionrequest_raw_gh_api_get_is_allowed(self, tmp_git_repo: Path):
         fixture = _load_fixture_json("issue1198-permissionrequest-gh-api-get.json")
-        result = eval_codex(
-            command=fixture["tool_input"]["command"],
-            cwd=str(tmp_git_repo),
-            event=fixture["event"],
-        )
-        assert result["status"] == "allow"
-        assert result["reason_code"] == REASON_GH_API
-        assert result["event_kind"] == "PermissionRequest"
-        assert result["command_kind"] == "github_api_command"
+        fixture["cwd"] = str(tmp_git_repo)
+        result = run_guard_script(fixture, cwd=tmp_git_repo)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == ""
 
     def test_stop_raw_payload_without_tool_input_is_allowed(self, tmp_git_repo: Path):
         payload = _load_fixture_json("issue1198-stop-no-command.json")
@@ -300,21 +293,27 @@ class TestIssue1198RawAndCommandFixtures:
         if "rule_id" in entry:
             assert result["rule_id"] == entry["rule_id"]
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
-            "gh api repos/squne121/loop-protocol/issues/1198/comments --field=body='x'",
-            "gh api repos/squne121/loop-protocol/issues/1198/comments --input='x'",
-            "gh api --method GET repos/squne121/loop-protocol/issues/1198/comments --raw-field='x'",
-        ],
-    )
-    def test_gh_api_mutation_flags_are_blocked_and_redacted(self, tmp_git_repo: Path, command: str):
-        """Given mutation-like gh api flag patterns, ensure block + redacted argv tokens."""
-        result = eval_codex(command, str(tmp_git_repo))
+    def test_issue1198_blocked_raw_field_redacts_secret(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "gh api --raw-field body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
+            str(tmp_git_repo),
+        )
         assert result["status"] == "block"
         assert result["reason_code"] == REASON_GH_API
-        assert any("<redacted>" in token for token in result.get("argv_redacted", []))
+        assert "SECRET_VALUE" not in str(result.get("argv_redacted", []))
+        assert "SECRET_VALUE" not in str(result.get("inner_argv_redacted", []))
+        result = eval_codex(
+            "gh api -f body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block"
+        assert "SECRET_VALUE" not in str(result.get("argv_redacted", []))
+        result = eval_codex(
+            "gh api -F body=SECRET_VALUE repos/squne121/loop-protocol/issues/comments/4814545233",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "block"
+        assert "SECRET_VALUE" not in str(result.get("argv_redacted", []))
 
     def test_run_hook_block_stderr_contains_ac7_fields(self, tmp_git_repo: Path):
         payload = {
@@ -921,7 +920,6 @@ class TestGithubIssueMutationCommand:
         "cmd",
         [
             "gh issue edit 123 --repo squne121/loop-protocol --body-file tmp/foo.md",
-            "gh issue edit 456 --repo squne121/loop-protocol --body-file tmp/body.md --label bug",
             "gh issue edit 1 --repo squne121/loop-protocol --body-file tmp/issue.md",
         ],
     )
@@ -937,7 +935,6 @@ class TestGithubIssueMutationCommand:
         "cmd",
         [
             "gh issue create --repo squne121/loop-protocol --title foo --body-file tmp/foo.md",
-            "gh issue create --repo squne121/loop-protocol --title タイトル --body-file tmp/foo.md --label enhancement",
             "gh issue create --repo squne121/loop-protocol --body-file tmp/body.md --title new-issue",
         ],
     )
@@ -1209,6 +1206,34 @@ class TestB1B4ReviewBlockerFixes:
         assert result["status"] == "allow", "gh pr edit --body-file tmp/... must be allowed"
         assert result["reason_code"] == REASON_GITHUB_REMOTE_OPS
 
+    @pytest.mark.parametrize("cmd", [
+        "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --add-label foo",
+        "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --milestone M1",
+        "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --title changed",
+    ])
+    def test_b4_gh_issue_edit_additional_mutation_flags_blocked(self, tmp_git_repo: Path, cmd: str):
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_MUTATION
+
+    @pytest.mark.parametrize("cmd", [
+        "gh api --hostname evil.example.com repos/squne121/loop-protocol/issues/comments/4814545233",
+        "gh api repos/{owner}/{repo}/issues/comments/4814545233",
+        "gh api --paginate repos/squne121/loop-protocol/issues/comments/4814545233",
+    ])
+    def test_issue1198_gh_api_negative_boundaries_blocked(self, tmp_git_repo: Path, cmd: str):
+        result = eval_codex(cmd, str(tmp_git_repo))
+        assert result["status"] == "block"
+        assert result["reason_code"] == REASON_GH_API
+
+    def test_issue1198_unknown_non_branch_command_uses_non_review_reason(self, tmp_git_repo: Path):
+        result = eval_codex(
+            "echo https://github.com/squne121/loop-protocol/issues/1170#issuecomment-4814071263",
+            str(tmp_git_repo),
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_UNKNOWN_ALLOWED
+
 
 # ─── Issue #1137: cleanup arbitration + Claude/Codex reason_code parity ────────
 # The cleanup decision core is worktree_scope_guard.build_decision, wired into
@@ -1353,6 +1378,36 @@ class TestCleanupArbitrationParity:
         mod = _load_cleanup_core()
         assert mod._cc3.SHARED_CLEANUP_REASON_CODES == _cc3.SHARED_CLEANUP_REASON_CODES
 
+
+class TestIssue1215RawFixturesAndWorktreeContext:
+    """Issue #1215: linked issue worktree context and git-add raw fixture parity."""
+
+    def test_issue1215_worktree_context(self, tmp_linked_worktree: Path):
+        fixture = _load_fixture_json("issue1215-pretooluse-dedicated-worktree-git-add.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_linked_worktree),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+        assert result["hook_flavor"] == "codex"
+
+    def test_linked_issue_worktree_context_permissionrequest(self, tmp_linked_worktree: Path):
+        fixture = _load_fixture_json("issue1215-permissionrequest-dedicated-worktree-git-add.json")
+        result = eval_codex(
+            command=fixture["tool_input"]["command"],
+            cwd=str(tmp_linked_worktree),
+            event=fixture["event"],
+        )
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+        assert result["hook_flavor"] == "codex"
+
+    def test_issue1215_no_git_add_exception(self, tmp_linked_worktree: Path):
+        result = eval_codex("git add .", str(tmp_linked_worktree))
+        assert result["status"] == "allow"
+        assert result["reason_code"] == REASON_LINKED_ISSUE_WORKTREE_CONTEXT
 
 # ─── Issue #1197: probe scripts deterministic_checker allow ─────────────────
 

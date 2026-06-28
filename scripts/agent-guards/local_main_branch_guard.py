@@ -48,6 +48,7 @@ from skill_runtime_command_policy import (  # noqa: E402
 # ─── Reason codes ────────────────────────────────────────────────────────────
 
 REASON_NOT_LOCAL_ROOT = "not_local_root_context"
+REASON_LINKED_ISSUE_WORKTREE_CONTEXT = "linked_issue_worktree_context"
 REASON_READONLY = "readonly_command"
 REASON_BRANCH_SAFE_MAINTENANCE = "branch_safe_maintenance_command"
 REASON_RECOVERY = "recovery_to_default_branch"
@@ -56,6 +57,7 @@ REASON_ALREADY_DRIFTED = "already_drifted_root"
 REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_UNKNOWN_COMMAND = "unknown_command_requires_review"
+REASON_UNKNOWN_ALLOWED = "unknown_non_branch_command_allowed"
 REASON_GH_API = "github_api_command"
 REASON_RTK_HELP_COMMAND = "rtk_help_command"
 REASON_RTK_PROXY = "rtk_proxy_requires_review"
@@ -69,7 +71,6 @@ REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
 # root branch guard explicitly DEFERS authority to that guard so the two guards
 # do not double-decide and the arbitration order is unambiguous.
 REASON_CLEANUP_DEFERRED = "cleanup_deferred_to_worktree_scope_guard"
-REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
 
 # ─── Shared controlled skill mutation policy (Issue #1166) ───────────────────
 # Import from scripts/agent-guards (sibling module) so the SAME
@@ -295,6 +296,15 @@ def is_local_root_context(cwd: str) -> bool:
 
     real_root = os.path.realpath(project_root)
 
+    # If CLAUDE_PROJECT_DIR points at a linked issue worktree, classify as
+    # non-local-root context so issue-bound worktree mutation is allowed under
+    # existing worktree isolation policies.
+    primary = get_primary_worktree_path(cwd=cwd)
+    if primary is not None:
+        real_primary = os.path.realpath(primary)
+        if real_root != real_primary:
+            return False
+
     # B1: Use git toplevel of cwd to handle subdirectories correctly.
     # If CLAUDE_PROJECT_DIR is set, also accept cwd being under that root.
     cwd_toplevel = get_cwd_git_toplevel(cwd)
@@ -317,6 +327,24 @@ def is_local_root_context(cwd: str) -> bool:
         return False
 
     return True
+
+
+def is_linked_issue_worktree_context(cwd: str) -> bool:
+    """Return True iff cwd is inside a linked worktree rather than the primary root."""
+    project_root = _resolve_project_root(cwd)
+    if project_root is None:
+        return False
+    primary = get_primary_worktree_path(cwd=cwd)
+    if primary is None:
+        return False
+    real_root = os.path.realpath(project_root)
+    real_primary = os.path.realpath(primary)
+    if real_root != real_primary:
+        return True
+    cwd_toplevel = get_cwd_git_toplevel(cwd)
+    if cwd_toplevel is None:
+        return False
+    return os.path.realpath(cwd_toplevel) != real_root
 
 
 def _resolve_project_root(cwd: str) -> str | None:
@@ -675,9 +703,9 @@ def _parse_gh_api_command(cmd: str) -> bool:
             i += 1
             continue
 
-        if token in {"-f", "-F", "--field", "--input", "--raw-field"}:
+        if token in {"-f", "-F", "--field", "--input", "--raw-field", "--hostname", "--paginate"}:
             return False
-        if token.startswith("--field=") or token.startswith("--input=") or token.startswith("--raw-field="):
+        if token.startswith(("--field=", "--input=", "--raw-field=", "--hostname=")):
             return False
         if token.startswith("-") and not endpoint:
             # Skip unknown flags; values remain allowed only if no endpoint consumed.
@@ -694,6 +722,8 @@ def _parse_gh_api_command(cmd: str) -> bool:
     if not endpoint:
         return False
     if method != "GET":
+        return False
+    if "{owner}" in endpoint or "{repo}" in endpoint:
         return False
     if not _GH_API_ENDPOINT_RE.fullmatch(endpoint):
         return False
@@ -1029,11 +1059,18 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
         if not title_val:
             return False
 
-    # Check --repo matches trusted slug
+    allowed_flags = {"--repo", "--body-file"}
+    if subcommand == "create":
+        allowed_flags.add("--title")
+
+    # Check --repo matches trusted slug and reject mutation-expanding flags.
     has_trusted_repo = False
     i = 0
     while i < len(args):
         tok = args[i]
+        flag_name = tok.split("=", 1)[0]
+        if tok.startswith("--") and flag_name not in allowed_flags:
+            return False
         if tok == "--repo":
             if i + 1 < len(args) and args[i + 1] == TRUSTED_REPO_SLUG:
                 has_trusted_repo = True
@@ -1507,14 +1544,19 @@ def evaluate(
 
     # Step 1: Check if we are in local root context
     if not is_local_root_context(cwd):
+        reason_code = (
+            REASON_LINKED_ISSUE_WORKTREE_CONTEXT
+            if is_linked_issue_worktree_context(cwd)
+            else REASON_NOT_LOCAL_ROOT
+        )
         return _emit(
             status="allow",
-            reason_code=REASON_NOT_LOCAL_ROOT,
+            reason_code=reason_code,
             target_branch=None,
             target_branch_kind=None,
             local_parser_stage="context_check",
             local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="not_local_root_context",
+            local_rule_id=reason_code,
         )
 
     # Step 2: Resolve current branch
@@ -1991,35 +2033,6 @@ def evaluate(
             inner_tokens=inner_argv_redacted,
         )
 
-    # Step 13.7: exact worktree bootstrap executor command (Issue #1209).
-    # Shared policy function — same is_exact_worktree_bootstrap_executor_command
-    # as consumed by worktree_scope_guard. No split-brain allowlist.
-    # Only allowed from default branch root (drifted root blocked by step 13 above).
-    if _WBE_POLICY_AVAILABLE and project_root and _wbe_exec_command(normalized_cmd, cwd, project_root):
-        return _emit(
-            status="allow",
-            reason_code=REASON_WORKTREE_BOOTSTRAP_EXECUTOR,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="worktree_bootstrap_exec",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="worktree_bootstrap_executor",
-            argv_tokens=argv_redacted,
-            inner_tokens=inner_argv_redacted,
-        )
-    if _WBE_POLICY_AVAILABLE and _wbe_looks_like(normalized_cmd):
-        return _emit(
-            status="block",
-            reason_code=REASON_UNKNOWN_COMMAND,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="worktree_bootstrap_exec_block",
-            local_command_kind=COMMAND_KIND_UNKNOWN,
-            local_rule_id="worktree_bootstrap_executor_guess",
-            argv_tokens=argv_redacted,
-            inner_tokens=inner_argv_redacted,
-        )
-
     # rtk unknown inner command requires review rather than being treated as readonly.
     if wrapper == "rtk":
         return _emit(
@@ -2037,12 +2050,12 @@ def evaluate(
     # Default: allow
     return _emit(
         status="allow",
-        reason_code=REASON_UNKNOWN_COMMAND,
+        reason_code=REASON_UNKNOWN_ALLOWED,
         target_branch=None,
         target_branch_kind=None,
         local_parser_stage="final_classification",
         local_command_kind=COMMAND_KIND_UNKNOWN,
-        local_rule_id="default_unknown_allow",
+        local_rule_id="unknown_non_branch_command_allowed",
         argv_tokens=argv_redacted,
         inner_tokens=inner_argv_redacted,
     )
