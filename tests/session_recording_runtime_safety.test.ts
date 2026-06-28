@@ -1949,3 +1949,92 @@ describe('#1221 AC2: closed verdict enum and exactly one verdict are enforced', 
     expect(r.json?.['verdict']).toBe('fail_closed')
   })
 })
+
+// ============================================================================
+// Issue #1221 P0 hardening: surface set, hook coexistence, doc schema, digest scope
+// ============================================================================
+
+describe('#1221 P0-1: exactly the three required surfaces are enforced', () => {
+  const failClosedDirs = [
+    'capability-missing-codex-surface',
+    'capability-extra-surface',
+    'capability-duplicate-surface',
+  ]
+  for (const dir of failClosedDirs) {
+    it(`GIVEN ${dir} WHEN checked THEN fail_closed (exit 2)`, () => {
+      const r = runCapability(dir)
+      expect(r.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(r.json?.['verdict']).toBe('fail_closed')
+      expect(r.json?.['decision']).toBe('deny')
+    })
+  }
+})
+
+describe('#1221 P0-2: claude_code supported requires hook_coexistence present', () => {
+  it('GIVEN claude_code supported but no hook_coexistence WHEN checked THEN deny (exit 1) and not promoted', () => {
+    const r = runCapability('claude-supported-hook-coexistence-missing')
+    expect(r.exitCode).toBe(EXIT_FAIL)
+    expect(r.json?.['decision']).toBe('deny')
+    const claude = capSurface(r.json, 'claude_code')
+    expect(claude?.['derived_supported']).toBe(false)
+    expect(claude?.['verdict_consistent']).toBe(false)
+    const rcs = (claude?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('hook_coexistence_missing'))).toBe(true)
+  })
+})
+
+describe('#1221 P0-4: digest_is_over_public_projection_only is validated from input', () => {
+  it('GIVEN a surface that omits digest_scope WHEN checked THEN public_safety fail and deny (exit 1)', () => {
+    const r = runCapability('public-safety-digest-scope-missing')
+    expect(r.exitCode).toBe(EXIT_FAIL)
+    expect(r.json?.['decision']).toBe('deny')
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['admission']).toBe('fail')
+    expect(ps?.['digest_is_over_public_projection_only']).toBe(false)
+  })
+
+  it('GIVEN the positive matrix (with digest_scope) WHEN checked THEN digest projection holds true', () => {
+    const r = runCapability('capability-supported-positive')
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['digest_is_over_public_projection_only']).toBe(true)
+    expect(ps?.['admission']).toBe('pass')
+  })
+})
+
+interface DocResult { stdout: string; exitCode: number; json: Record<string, unknown> | null }
+
+function runDocValidation(docPath: string): DocResult {
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) }
+  const result = spawnSync(
+    'python3',
+    [SCRIPT, '--validate-capability-doc', docPath],
+    { encoding: 'utf-8', env, timeout: 30000 }
+  )
+  let json: Record<string, unknown> | null = null
+  try { json = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+  return { stdout: result.stdout ?? '', exitCode: result.status ?? 1, json }
+}
+
+describe('#1221 P0-3: capability doc machine-readable blocks match the closed schema', () => {
+  it('GIVEN the real matrix doc WHEN validated THEN allow (exit 0) with unified claimed_verdict field', () => {
+    const docPath = resolve(REPO_ROOT, 'docs', 'dev', 'agent-observation-capability.md')
+    const r = runDocValidation(docPath)
+    expect(r.exitCode).toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('allow')
+    expect(r.json?.['field_name_convention']).toBe('claimed_verdict')
+    const surfaces = (r.json?.['surfaces'] as Record<string, unknown>[]) ?? []
+    expect(surfaces.length).toBe(3)
+    for (const s of surfaces) {
+      expect(s['claimed_verdict']).not.toBeNull()
+    }
+  })
+
+  it('GIVEN a drifted doc snippet (extra surface + verdict outside enum) WHEN validated THEN deny (exit non-zero)', () => {
+    const driftPath = join(FIXTURES_DIR, 'doc-ssot-schema-drift', 'drifted-doc.md')
+    const r = runDocValidation(driftPath)
+    expect(r.exitCode).not.toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('deny')
+    const rcs = (r.json?.['reason_codes'] as string[]) ?? []
+    expect(rcs.length).toBeGreaterThan(0)
+  })
+})

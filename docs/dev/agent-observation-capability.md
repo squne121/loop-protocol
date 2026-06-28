@@ -67,7 +67,7 @@ public_safety:
 
 ## surface 一覧
 
-surface はちょうど 3 つであり、各 surface は closed enum から verdict をちょうど 1 つだけ持つ。
+surface はちょうど 3 つであり、各 surface は closed enum から verdict をちょうど 1 つだけ持つ。各 surface ブロックの verdict フィールド名は `claimed_verdict` に統一する。これは synthetic evidence が主張する claim であり、fixture schema と本書の機械可読ブロックの双方で同じ `claimed_verdict` を用いる。
 
 ### Claude Code（クロードコードの surface）
 
@@ -75,7 +75,7 @@ Claude Code では user / project / local / managed_policy / plugin / skill / ag
 
 ```yaml
 surface: claude_code
-verdict: unverified
+claimed_verdict: unverified
 checked_surfaces:
   - user
   - project
@@ -96,7 +96,7 @@ Codex CLI では canonical な feature key を `[features].hooks` とし、`code
 
 ```yaml
 surface: codex_cli
-verdict: unsupported
+claimed_verdict: unsupported
 canonical_feature_key: "[features].hooks"
 legacy_alias: codex_hooks
 supported_blocked_while:
@@ -111,7 +111,7 @@ Google Antigravity では MCP 接続・IDE 起動・Artifacts 生成・browser r
 
 ```yaml
 surface: google_antigravity
-verdict: unverified
+claimed_verdict: unverified
 non_capture_signals:
   - mcp_connection
   - ide_launch

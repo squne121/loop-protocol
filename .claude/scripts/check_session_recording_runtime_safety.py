@@ -1116,7 +1116,10 @@ def run_all_checks(repo_root: Path) -> int:
 def _capability_public_safety(surfaces: list) -> dict[str, Any]:
     """Aggregate the public_safety admission contract over all surfaces' signals."""
     raw = prompt = tool_io = abspath = cred = False
+    any_surface = False
+    digest_ok = True
     for s in surfaces:
+        any_surface = True
         sig = s.get("signals", {}) if isinstance(s, dict) else {}
         if not isinstance(sig, dict):
             sig = {}
@@ -1125,8 +1128,11 @@ def _capability_public_safety(surfaces: list) -> dict[str, Any]:
         tool_io = tool_io or bool(sig.get("tool_io_excerpt_present", False))
         abspath = abspath or bool(sig.get("local_absolute_path_present", False))
         cred = cred or bool(sig.get("credential_value_present", False))
+        if str(sig.get("digest_scope", "")) != "public_projection_only":
+            digest_ok = False
+    digest_admit = digest_ok and any_surface
     forbidden_clean = not (prompt or tool_io or abspath or cred)
-    admission = (not raw) and forbidden_clean
+    admission = (not raw) and forbidden_clean and digest_admit
     return {
         "raw_values_emitted": raw,
         "forbidden_field_scan": "pass" if forbidden_clean else "fail",
@@ -1134,7 +1140,7 @@ def _capability_public_safety(surfaces: list) -> dict[str, Any]:
         "tool_io_excerpt_present": tool_io,
         "local_absolute_path_present": abspath,
         "credential_value_present": cred,
-        "digest_is_over_public_projection_only": True,
+        "digest_is_over_public_projection_only": digest_admit,
         "admission": "pass" if admission else "fail",
     }
 
@@ -1172,7 +1178,16 @@ def _capability_supported_predicate(
         rcs.append("evidence_provenance_not_trusted")
 
     hc = sig.get("hook_coexistence")
-    if isinstance(hc, dict):
+    if name == "claude_code":
+        # #1221 P0-2: claude_code MUST prove hook coexistence to reach supported.
+        if not isinstance(hc, dict):
+            rcs.append("hook_coexistence_missing")
+        else:
+            for key, required in HOOK_COEXISTENCE_CONTRACT.items():
+                if bool(hc.get(key, not required)) != required:
+                    rcs.append("hook_coexistence_violation")
+                    break
+    elif isinstance(hc, dict):
         for key, required in HOOK_COEXISTENCE_CONTRACT.items():
             if bool(hc.get(key, not required)) != required:
                 rcs.append("hook_coexistence_violation")
@@ -1280,6 +1295,13 @@ def run_capability_check(fixture_path: str) -> tuple[dict[str, Any], int]:
             "reason_codes": list(dict.fromkeys(s_rcs)),
         })
 
+    # #1221 P0-1: require EXACTLY the three canonical surfaces (no missing, no
+    # extra/unknown). seen is the set of surface names encountered above.
+    if seen != CAPABILITY_SURFACE_ENUM:
+        malformed = True
+        if not CAPABILITY_SURFACE_ENUM.issubset(seen):
+            reason_codes.append("capability_surface_set_incomplete")
+
     public_safety = _capability_public_safety(raw_surfaces)
     if public_safety["admission"] != "pass":
         deny = True
@@ -1316,6 +1338,94 @@ def run_capability_check(fixture_path: str) -> tuple[dict[str, Any], int]:
     return output, exit_code
 
 
+def _extract_capability_doc_blocks(text: str) -> list[str]:
+    """Return the bodies of all fenced yaml blocks in a markdown document."""
+    return re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
+
+
+def validate_capability_doc(doc_path: str) -> tuple[dict[str, Any], int]:
+    """#1221 P0-3: validate the machine-readable surface blocks in the matrix doc.
+
+    Deny on drift: the closed verdict_enum must equal CAPABILITY_VERDICT_ENUM,
+    exactly the three canonical surfaces must be present, each surface must carry
+    exactly one verdict from the closed enum, and the per-surface verdict field must
+    use the unified name 'claimed_verdict' (legacy 'verdict:' is treated as drift).
+    """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reasons: list[str] = []
+    try:
+        text = Path(doc_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return {
+            "schema": "agent_observation_capability_doc_check/v1",
+            "decision": "deny",
+            "field_name_convention": "claimed_verdict",
+            "verdict_enum": sorted(CAPABILITY_VERDICT_ENUM),
+            "doc_verdict_enum": None,
+            "surfaces": [],
+            "reason_codes": ["capability_doc_unreadable"],
+            "checked_at": now_iso,
+        }, EXIT_FAIL_CLOSED
+
+    blocks = _extract_capability_doc_blocks(text)
+    enum_values: list[str] | None = None
+    surfaces: list[dict[str, Any]] = []
+    seen_surface: set[str] = set()
+    for block in blocks:
+        surface_name: str | None = None
+        claimed: str | None = None
+        legacy: str | None = None
+        for ln in block.splitlines():
+            m_enum = re.match(r"^\s*verdict_enum:\s*\[(.*)\]\s*$", ln)
+            if m_enum:
+                enum_values = [x.strip() for x in m_enum.group(1).split(",") if x.strip()]
+            m_surface = re.match(r"^surface:\s*(\S+)\s*$", ln)
+            if m_surface:
+                surface_name = m_surface.group(1)
+            m_claimed = re.match(r"^claimed_verdict:\s*(\S+)\s*$", ln)
+            if m_claimed:
+                claimed = m_claimed.group(1)
+            m_legacy = re.match(r"^verdict:\s*(\S+)\s*$", ln)
+            if m_legacy:
+                legacy = m_legacy.group(1)
+        if surface_name is None:
+            continue
+        if surface_name in seen_surface:
+            reasons.append("capability_doc_surface_duplicate")
+        seen_surface.add(surface_name)
+        if claimed is None:
+            reasons.append("capability_doc_field_name_drift")
+        verdict_value = claimed if claimed is not None else legacy
+        if verdict_value is not None and verdict_value not in CAPABILITY_VERDICT_ENUM:
+            reasons.append("capability_doc_surface_verdict_invalid")
+        surfaces.append({
+            "surface": surface_name,
+            "claimed_verdict": claimed,
+            "verdict_value": verdict_value,
+        })
+
+    if enum_values is None:
+        reasons.append("capability_doc_verdict_enum_missing")
+    elif set(enum_values) != CAPABILITY_VERDICT_ENUM:
+        reasons.append("capability_doc_verdict_enum_drift")
+    if seen_surface != CAPABILITY_SURFACE_ENUM:
+        reasons.append("capability_doc_surface_set_drift")
+
+    reasons = list(dict.fromkeys(reasons))
+    decision = "allow" if not reasons else "deny"
+    exit_code = EXIT_PASS if not reasons else EXIT_FAIL_CLOSED
+    return {
+        "schema": "agent_observation_capability_doc_check/v1",
+        "decision": decision,
+        "field_name_convention": "claimed_verdict",
+        "verdict_enum": sorted(CAPABILITY_VERDICT_ENUM),
+        "doc_verdict_enum": enum_values,
+        "surfaces": surfaces,
+        "reason_codes": reasons,
+        "checked_at": now_iso,
+    }, exit_code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fail-closed verifier for session recording runtime safety."
@@ -1347,10 +1457,21 @@ def main() -> int:
         help="Path to an agent_observation_capability/v1 fixture JSON; runs the "
              "#1221 capability matrix check and exits.",
     )
+    parser.add_argument(
+        "--validate-capability-doc", default=None,
+        help="Path to the agent observation capability matrix doc; validates its "
+             "machine-readable surface blocks against the closed schema and exits.",
+    )
     args = parser.parse_args()
 
     execution_profile = args.execution_profile
     # Note: --test-mode just confirms fixture profile (already default)
+
+    # #1221 P0-3: capability doc schema cross-check (self-contained mode)
+    if args.validate_capability_doc:
+        doc_output, doc_exit = validate_capability_doc(args.validate_capability_doc)
+        print(json.dumps(doc_output, indent=2), flush=True)
+        return doc_exit
 
     # #1221: capability matrix check is a self-contained mode (no SRRS env, no repo scan)
     if args.capability_fixture:

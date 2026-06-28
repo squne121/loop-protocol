@@ -5,6 +5,9 @@
     {"surface": "claude_code", "claimed_verdict": "unverified", "signals": {
       "runtime_event_observed": false, "capture_artifact_observed": false, "raw_values_emitted": false,
       "evidence_provenance": "synthetic_fixture", "digest_scope": "public_projection_only"}},
+    {"surface": "claude_code", "claimed_verdict": "unverified", "signals": {
+      "runtime_event_observed": false, "capture_artifact_observed": false, "raw_values_emitted": false,
+      "evidence_provenance": "synthetic_fixture", "digest_scope": "public_projection_only"}},
     {"surface": "codex_cli", "claimed_verdict": "unsupported", "signals": {
       "runtime_event_observed": false, "capture_artifact_observed": false, "raw_values_emitted": false,
       "evidence_provenance": "synthetic_fixture", "digest_scope": "public_projection_only",
