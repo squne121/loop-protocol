@@ -97,7 +97,11 @@ class TestCommandIdValidation:
             with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
                 with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
                     with patch.object(_exec, "_readback_by_marker",
-                                      return_value={"comment_id": "c1", "comment_url": "https://ex", "body_sha256": "abc"}):
+                                      return_value={
+                                          "comment_id": "c1",
+                                          "comment_url": "https://ex",
+                                          "body_sha256": "abc",
+                                      }):
                         rc = _exec.main([
                             "--command-id", "termination_report.publish",
                             "--issue-number", "1166",
@@ -366,7 +370,11 @@ class TestIdempotency:
             with patch.object(_exec, "_invoke_publisher", return_value=(0, "", "")):
                 with patch.object(_exec, "_check_no_tracked_changes", return_value=[]):
                     with patch.object(_exec, "_readback_by_marker",
-                                      return_value={"comment_id": "c42", "comment_url": "https://u", "body_sha256": "sha"}):
+                                      return_value={
+                                          "comment_id": "c42",
+                                          "comment_url": "https://u",
+                                          "body_sha256": "sha",
+                                      }):
                         _exec.main([
                             "--command-id", "termination_report.publish",
                             "--issue-number", "1166",
@@ -419,7 +427,10 @@ class TestModuleRealpath:
         # Create a symlink that points outside project_root
         outside = tmp_project.parent / "outside_publisher.py"
         outside.write_text("# evil\n")
-        pub_path = tmp_project / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "publish_termination_report.py"
+        pub_path = (
+            tmp_project / ".claude" / "skills" / "issue-refinement-loop"
+            / "scripts" / "publish_termination_report.py"
+        )
         pub_path.unlink()
         pub_path.symlink_to(outside)
         errors = _exec._check_module_realpaths(tmp_project)

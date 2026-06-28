@@ -153,7 +153,9 @@ def resolve_repo_slug(project_root: str, deadline: Deadline | None = None) -> st
     return slug if _OWNER_REPO_RE.match(slug) else None
 
 
-def resolve_active_issue(project_root: str, cwd: str, deadline: Deadline | None = None) -> tuple[str | None, dict | None]:
+def resolve_active_issue(
+    project_root: str, cwd: str, deadline: Deadline | None = None
+) -> tuple[str | None, dict | None]:
     del cwd
     issue = os.environ.get("LOOP_ISSUE_NUMBER", "").strip()
     if not issue.isdigit():
@@ -187,7 +189,10 @@ def parse_exact_skill_runtime_command(command: str, project_root: str | None = N
     for flag, pos in zip(expected_flags, expected_positions):
         if tokens[pos] != flag:
             return None
-    if any(tok.startswith("--command-id=") or tok.startswith("--issue-number=") or tok.startswith("--repo=") for tok in tokens):
+    if any(
+        tok.startswith("--command-id=") or tok.startswith("--issue-number=") or tok.startswith("--repo=")
+        for tok in tokens
+    ):
         return None
     command_id = tokens[5]
     issue_number = tokens[7]
@@ -206,7 +211,9 @@ def parse_exact_skill_runtime_command(command: str, project_root: str | None = N
     )
 
 
-def is_exact_skill_runtime_executor_command(command: str, cwd: str, project_root: str, deadline: Deadline | None = None) -> bool:
+def is_exact_skill_runtime_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
     parsed = parse_exact_skill_runtime_command(command, project_root)
     if parsed is None:
         return False

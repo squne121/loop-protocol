@@ -91,6 +91,23 @@ except Exception:  # pragma: no cover - defensive fail-closed
 
     _CSM_POLICY_AVAILABLE = False
 
+# ─── Worktree bootstrap executor policy (Issue #1209) ────────────────────────
+try:
+    from worktree_bootstrap_command_policy import (
+        is_exact_worktree_bootstrap_executor_command as _wbe_exec_command,
+        looks_like_worktree_bootstrap_executor_command as _wbe_looks_like,
+    )
+    _WBE_POLICY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive fail-closed
+    def _wbe_exec_command(  # type: ignore[misc]
+        cmd: str, cwd: str, project_root: str, deadline: object | None = None
+    ) -> bool:
+        return False
+
+    def _wbe_looks_like(cmd: str) -> bool:  # type: ignore[misc]
+        return False
+    _WBE_POLICY_AVAILABLE = False
+
 # ─── GitHub remote ops classification vocabulary ──────────────────────────────
 # 5-class vocabulary for gh command classification (Issue #1124).
 # These constants are exported for test validation (AC15).
