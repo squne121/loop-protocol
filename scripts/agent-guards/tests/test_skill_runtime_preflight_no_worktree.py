@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LOCAL_MAIN_GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "local_main_branch_guard.sh"
@@ -39,6 +41,14 @@ def _make_repo(tmp_path: Path) -> Path:
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
     return repo
+
+
+def _detach_head(repo: Path) -> None:
+    _git("checkout", "--detach", "HEAD", cwd=repo)
+
+
+def _switch_to_non_default_branch(repo: Path) -> None:
+    _git("switch", "-c", "topic/no-worktree-negative", cwd=repo)
 
 
 def _payload(command: str, cwd: Path) -> str:
@@ -177,8 +187,32 @@ if __name__ == "__main__":
     )
 
 
+def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run",
+            "--issue-number",
+            "1228",
+            "--repo",
+            "squne121/loop-protocol",
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
 def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
     payload = _payload(
         (
             "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
@@ -189,10 +223,19 @@ def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: P
     )
     result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
     assert result.returncode == 0, result.stderr
+    exec_result = _run_executor(repo)
+    assert exec_result.returncode == 0, exec_result.stderr
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    assert artifact.exists()
+    assert json.loads(artifact.read_text()) == {
+        "issue_number": "1228",
+        "repo": "squne121/loop-protocol",
+    }
 
 
 def test_worktree_scope_guard_no_worktree_worktree_scope_guard(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
     payload = _payload(
         (
             "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
@@ -203,6 +246,74 @@ def test_worktree_scope_guard_no_worktree_worktree_scope_guard(tmp_path: Path) -
     )
     result = _run_guard(WORKTREE_SCOPE_GUARD_SH, payload, repo)
     assert result.returncode == 0, result.stderr
+    exec_result = _run_executor(repo)
+    assert exec_result.returncode == 0, exec_result.stderr
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    assert artifact.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id wrong.run --issue-number 1228 --repo squne121/loop-protocol",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 "
+        "--repo squne121/loop-protocol --extra nope",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --issue-number 1228 "
+        "--repo squne121/loop-protocol",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id=preflight.run --issue-number 1228 --repo squne121/loop-protocol",
+        "LOOP_ISSUE_NUMBER=1228 uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol ; git status",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol | cat",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --repo squne121/loop-protocol > tmp/out",
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run --issue-number 1228 --repo evil/repo",
+    ],
+)
+def test_negative_no_worktree_profile_commands_block(tmp_path: Path, command: str) -> None:
+    repo = _make_repo(tmp_path)
+    payload = _payload(command, repo)
+    result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
+    assert result.returncode == 2
+
+
+def test_negative_no_worktree_profile_blocks_on_non_default_branch(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _switch_to_non_default_branch(repo)
+    payload = _payload(
+        (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 1228 "
+            "--repo squne121/loop-protocol"
+        ),
+        repo,
+    )
+    result = _run_guard(WORKTREE_SCOPE_GUARD_SH, payload, repo)
+    assert result.returncode == 2
+
+
+def test_negative_no_worktree_profile_blocks_on_detached_head(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _detach_head(repo)
+    payload = _payload(
+        (
+            "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+            "--command-id preflight.run --issue-number 1228 "
+            "--repo squne121/loop-protocol"
+        ),
+        repo,
+    )
+    result = _run_guard(LOCAL_MAIN_GUARD_SH, payload, repo)
+    assert result.returncode == 2
 
 
 def test_direct_preflight_block_direct_preflight_block(tmp_path: Path) -> None:
@@ -236,25 +347,6 @@ def test_non_exact_executor_argv_non_exact_executor_argv(tmp_path: Path) -> None
 def test_artifact_only_write_postcondition_artifact_only_write_postcondition(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    env = {
-        "SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored",
-    }
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/agent-guards/skill_runtime_exec.py",
-            "--command-id",
-            "preflight.run",
-            "--issue-number",
-            "1228",
-            "--repo",
-            "squne121/loop-protocol",
-        ],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CLAUDE_PROJECT_DIR": str(repo), **env},
-        check=False,
-    )
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored"})
     assert result.returncode == 2
     assert "unauthorized write path" in result.stderr
