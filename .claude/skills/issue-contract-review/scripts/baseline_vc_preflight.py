@@ -264,7 +264,15 @@ def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -
     return found_annotation
 
 
-def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int, Optional[str], Optional[str], Optional[str], Optional[str], Optional[int], Optional[str]]]:
+def parse_commands_from_block(
+    block: str,
+) -> List[
+    Tuple[
+        Optional[str], str, int, Optional[str],
+        Optional[str], Optional[str], Optional[str],
+        Optional[int], Optional[str],
+    ]
+]:
     """
     bash ブロックからコマンドを抽出。
     AC マーカーとコマンドの行番号と preflight-scope marker と vc-regex-intent annotation を返す。
@@ -337,7 +345,11 @@ def parse_commands_from_block(block: str) -> List[Tuple[Optional[str], str, int,
             baseline_expect, annotation_line_no, annotation_raw = extract_baseline_expect_annotation(lines, i - 1)
             vc_role = extract_vc_role_annotation(lines, i - 1)
 
-            commands.append((current_ac, cmd, i, preflight_scope, vc_regex_intent, baseline_expect, vc_role, annotation_line_no, annotation_raw))
+            commands.append((
+                current_ac, cmd, i, preflight_scope,
+                vc_regex_intent, baseline_expect, vc_role,
+                annotation_line_no, annotation_raw,
+            ))
 
     return commands
 
@@ -487,52 +499,18 @@ def _strip_uv_run_options(argv: List[str]) -> List[str]:
 
 def _is_uv_lock_check(argv: List[str]) -> bool:
     """Return True only for exact `uv lock --check`."""
-    if len(argv) != 3:
-        return False
-    return Path(argv[0]).name == "uv" and argv[1] == "lock" and argv[2] == "--check"
+    return list(argv) == ["uv", "lock", "--check"]
 
 
-_ALLOWED_RUNTIME_SMOKE_OPTIONS: frozenset = frozenset([
-    "--isolated",
-    "--locked",
-    "--no-default-groups",
-])
+_CANONICAL_RUNTIME_SMOKE_ARGVS: tuple = (
+    ["uv", "run", "--isolated", "--locked", "--no-default-groups", "python", "scripts/ci/runtime_dependency_smoke.py"],
+    ["uv", "run", "--isolated", "--locked", "--no-default-groups", "python3", "scripts/ci/runtime_dependency_smoke.py"],
+)
 
 
 def _is_uv_runtime_smoke_command(argv: List[str]) -> bool:
-    """Return True for the canonical runtime smoke command shape."""
-    if len(argv) < 5:
-        return False
-    if Path(argv[0]).name != "uv" or argv[1] != "run":
-        return False
-
-    i = 2
-    seen_options: set[str] = set()
-    while i < len(argv) and argv[i].startswith("-"):
-        token = argv[i]
-        if token in _ALLOWED_RUNTIME_SMOKE_OPTIONS:
-            seen_options.add(token)
-            i += 1
-            continue
-        # Fail-closed: unknown or value-taking option before inner command is disallowed.
-        return False
-
-    if i + 1 >= len(argv):
-        return False
-
-    # Canonical inner command must be:
-    # - python scripts/ci/runtime_dependency_smoke.py
-    # - python3 scripts/ci/runtime_dependency_smoke.py
-    cmd = Path(argv[i]).name
-    if cmd not in ("python", "python3"):
-        return False
-    if argv[i + 1] != "scripts/ci/runtime_dependency_smoke.py":
-        return False
-
-    # No extra args, and all three options must be present.
-    if i + 2 != len(argv):
-        return False
-    return seen_options == set(_ALLOWED_RUNTIME_SMOKE_OPTIONS)
+    """Return True only for the two canonical runtime smoke command forms."""
+    return list(argv) in list(_CANONICAL_RUNTIME_SMOKE_ARGVS)
 
 
 def _is_pytest_invocation(command: str) -> bool:
@@ -1360,7 +1338,10 @@ def _is_allowed_github_metadata_assert(argv: List[str]) -> Optional[Tuple[bool, 
         return False, "endpoint must not contain path traversal (..)"
 
     if '<' in endpoint or '>' in endpoint:
-        return False, "endpoint must not contain placeholders (<...>); use actual values like 'repos/owner/repo/milestones/1'"
+        return (
+            False,
+            "endpoint must not contain placeholders (<...>); use actual values like 'repos/owner/repo/milestones/1'"
+        )
 
     if not re.match(r'^repos/[^/]+/[^/]+/milestones/\d+$', endpoint):
         return False, f"endpoint must match 'repos/<owner>/<repo>/milestones/<number>', got '{endpoint}'"
@@ -2021,7 +2002,7 @@ def classify_static_command(
                 and unwrapped[1] in ("-m", "-c")
                 and any(
                     opt in argv
-                    for opt in _ALLOWED_RUNTIME_SMOKE_OPTIONS
+                    for opt in ("--isolated", "--locked", "--no-default-groups")
                 )
             ):
                 return (
@@ -2129,7 +2110,13 @@ def classify_result(
 
     # compound command は blocked (default scope_class)
     if detect_compound_command(command):
-        return "blocked", "compound_command_disallowed", "blocked", "Compound shell commands are not supported in initial implementation", "baseline_fail_expected"
+        return (
+            "blocked",
+            "compound_command_disallowed",
+            "blocked",
+            "Compound shell commands are not supported in initial implementation",
+            "baseline_fail_expected"
+        )
 
     # AC4: regression_gate prefix detection AFTER static checks
     # If it's a regression gate, apply special rules
@@ -2189,7 +2176,13 @@ def classify_result(
 
     # shlex.split failed
     if "shlex.split failed" in stderr:
-        return "blocked", "compound_command_disallowed", "blocked", "Command syntax is not supported", "baseline_fail_expected"
+        return (
+            "blocked",
+            "compound_command_disallowed",
+            "blocked",
+            "Command syntax is not supported",
+            "baseline_fail_expected"
+        )
 
     # B5: file_not_found_unrunnable - missing script/file being executed
     # e.g., python3 missing.py, node missing.js, ./missing-script
@@ -2201,11 +2194,23 @@ def classify_result(
             for cmd_pattern in ["python3 ", "python ", "node ", "./", "../"]
         )
     ):
-        return "blocked", "file_not_found_unrunnable", "blocked", "Script or file being executed does not exist", "baseline_fail_expected"
+        return (
+            "blocked",
+            "file_not_found_unrunnable",
+            "blocked",
+            "Script or file being executed does not exist",
+            "baseline_fail_expected"
+        )
 
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):
-        return "blocked", "env_missing_dep", "blocked", "Command not found or permission denied", "baseline_fail_expected"
+        return (
+            "blocked",
+            "env_missing_dep",
+            "blocked",
+            "Command not found or permission denied",
+            "baseline_fail_expected"
+        )
 
     if "command not found" in stderr.lower() or "ModuleNotFoundError" in stderr:
         return "blocked", "env_missing_dep", "blocked", "Dependency or command missing", "baseline_fail_expected"
@@ -2254,7 +2259,13 @@ def classify_result(
         and _test_argv[1] == "-s"
         and exit_code == 2
     ):
-        return "blocked", "unknown", "blocked", "test -s returned exit 2 (malformed invocation)", "baseline_fail_expected"
+        return (
+            "blocked",
+            "unknown",
+            "blocked",
+            "test -s returned exit 2 (malformed invocation)",
+            "baseline_fail_expected"
+        )
     # Exact 3-argument predicate: test <flag> <path> — no extra operands allowed (AC5)
     if len(_test_argv) == 3 and _test_argv[0] == "test":
         _flag = _test_argv[1]
@@ -2284,11 +2295,23 @@ def classify_result(
         ]
         is_likely_grep_error = any(re.search(pattern, stderr) for pattern in grep_error_patterns)
         if is_likely_grep_error:
-            return "human_judgment", "unknown", "human_judgment", "grep error classification uncertain", "baseline_fail_expected"
+            return (
+                "human_judgment",
+                "unknown",
+                "human_judgment",
+                "grep error classification uncertain",
+                "baseline_fail_expected"
+            )
         return "expected_fail", "expected_baseline_fail", "go", None, "baseline_fail_expected"
 
     # Unknown: cannot classify
-    return "human_judgment", "unknown", "human_judgment", "Unable to automatically classify exit code", "baseline_fail_expected"
+    return (
+        "human_judgment",
+        "unknown",
+        "human_judgment",
+        "Unable to automatically classify exit code",
+        "baseline_fail_expected"
+    )
 
 
 def compute_source_hash(body: str) -> str:
@@ -2342,7 +2365,14 @@ def check_c13_vc_preflight_decision_consistency(classifications: List[Dict[str, 
     Returns: (is_valid, list_of_failures)
     """
     VALID_SCOPE_CLASSES = {"baseline_fail_expected", "regression_gate", "pr_review_only", "runtime_only"}
-    VALID_CLASSIFICATIONS = {"expected_fail", "expected_pass", "unexpected_pass", "blocked", "human_judgment", "skipped"}
+    VALID_CLASSIFICATIONS = {
+        "expected_fail",
+        "expected_pass",
+        "unexpected_pass",
+        "blocked",
+        "human_judgment",
+        "skipped"
+    }
     VALID_DECISIONS = {"go", "blocked", "human_judgment"}
 
     failures = []
@@ -2362,7 +2392,10 @@ def check_c13_vc_preflight_decision_consistency(classifications: List[Dict[str, 
         if "scope_class" in item and item["scope_class"] not in VALID_SCOPE_CLASSES:
             failures.append(f"{prefix}: invalid scope_class '{item['scope_class']}' (valid: {VALID_SCOPE_CLASSES})")
         if "classification" in item and item["classification"] not in VALID_CLASSIFICATIONS:
-            failures.append(f"{prefix}: invalid classification '{item['classification']}' (valid: {VALID_CLASSIFICATIONS})")
+            failures.append(
+                f"{prefix}: invalid classification"
+                f" '{item['classification']}' (valid: {VALID_CLASSIFICATIONS})"
+            )
         if "decision" in item and item["decision"] not in VALID_DECISIONS:
             failures.append(f"{prefix}: invalid decision '{item['decision']}' (valid: {VALID_DECISIONS})")
 
@@ -2488,7 +2521,12 @@ def main() -> int:
         default="json",
         help="Output format (json or contract-review-fragment YAML)",
     )
-    parser.add_argument("--strict", action="store_true", default=False, help="Enable strict mode for annotation enforcement (detect missing annotations as needs_fix)")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Enable strict mode for annotation enforcement (detect missing annotations as needs_fix)"
+    )
     parser.add_argument(
         "--static-only",
         action="store_true",
@@ -2697,7 +2735,10 @@ def main() -> int:
         "extraction_errors": 0,
     }
 
-    for ac_label, command, line_no, preflight_scope, vc_regex_intent, baseline_expect, vc_role, annotation_line_no, annotation_raw in commands:
+    for (
+        ac_label, command, line_no, preflight_scope, vc_regex_intent,
+        baseline_expect, vc_role, annotation_line_no, annotation_raw,
+    ) in commands:
         runner_env_delta: Dict[str, str] = {}
         # AC5: Handle pr_review_only / runtime_only preflight-scope markers
         # NB2: Invalid marker values (typos) → human_judgment
@@ -2727,7 +2768,10 @@ def main() -> int:
                 exit_code = None
                 stdout, stderr = "", ""
                 duration_ms = 0
-                fix_hint = f"Unknown preflight-scope marker value '{preflight_scope}'; expected pr_review_only or runtime_only"
+                fix_hint = (
+                    f"Unknown preflight-scope marker value '{preflight_scope}';"
+                    " expected pr_review_only or runtime_only"
+                )
                 scope_class = "baseline_fail_expected"
                 verification_owner = None
                 deferred_reason = None
@@ -2835,7 +2879,8 @@ def main() -> int:
                 ):
                     static_result = None  # annotation exempts from blocked
                 if static_result is not None:
-                    # no_override_for_blocker: static_blocker takes precedence — baseline-expect does NOT override static blocks
+                    # no_override_for_blocker: static_blocker takes precedence — baseline-expect does NOT override
+                    # static blocks
                     exit_code, stdout, stderr, duration_ms = None, "", "", 0
                     classification, category, decision, fix_hint, scope_class = static_result
                 elif _is_github_metadata_assert_command(command):
@@ -2978,7 +3023,9 @@ def main() -> int:
                 "baseline_expect": (
                     # Expose raw invalid value (without __invalid__: prefix) in annotations
                     baseline_expect[len("__invalid__:"):] if (
-                        preflight_scope is None and baseline_expect is not None and baseline_expect.startswith("__invalid__:")
+                        preflight_scope is None
+                        and baseline_expect is not None
+                        and baseline_expect.startswith("__invalid__:")
                     ) else (baseline_expect if preflight_scope is None else None)
                 ),
                 "vc_role": vc_role if preflight_scope is None else None,
@@ -2994,31 +3041,55 @@ def main() -> int:
             },
             "strict": {
                 "enabled": args.strict,
-                "violation": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
-                "body_author_fixable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
-                "needs_fix": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "violation": category in [
+                    "inline_baseline_expect_invalid_placement",
+                    "missing_baseline_expect_for_new_allowed_path"
+                ],
+                "body_author_fixable": category in [
+                    "inline_baseline_expect_invalid_placement",
+                    "missing_baseline_expect_for_new_allowed_path"
+                ],
+                "needs_fix": category in [
+                    "inline_baseline_expect_invalid_placement",
+                    "missing_baseline_expect_for_new_allowed_path"
+                ],
                 "structured_feedback": {
                     "category": category,
                     "body_author_fixable": True,
                     "category_wide_remediation": True,
-                } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
-            } if args.strict or category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+                } if category in [(
+                    "inline_baseline_expect_invalid_placement"
+                ), "missing_baseline_expect_for_new_allowed_path"] else None,
+            } if args.strict or category in [(
+                "inline_baseline_expect_invalid_placement"
+            ), "missing_baseline_expect_for_new_allowed_path"] else None,
             # strict + repair coordination for inline_baseline_expect and missing_baseline_expect
             "repair": {
-                "repairable": category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"],
+                "repairable": category in [
+                    "inline_baseline_expect_invalid_placement",
+                    "missing_baseline_expect_for_new_allowed_path"
+                ],
                 "kind": (
-                    "move_inline_baseline_expect_to_preceding_line" if category == "inline_baseline_expect_invalid_placement"
+                    (
+                        "move_inline_baseline_expect_to_preceding_line"
+                    ) if category == "inline_baseline_expect_invalid_placement"
                     else "insert_baseline_expect_fail" if category == "missing_baseline_expect_for_new_allowed_path"
                     else None
                 ),
                 "line_start": line_no,
                 "line_end": line_no,
                 "reason": (
-                    "baseline-expect annotation must be in contiguous preceding comment block" if category == "inline_baseline_expect_invalid_placement"
-                    else "new Allowed Path file requires baseline-expect: fail annotation" if category == "missing_baseline_expect_for_new_allowed_path"
+                    (
+                        "baseline-expect annotation must be in contiguous preceding comment block"
+                    ) if category == "inline_baseline_expect_invalid_placement"
+                    else (
+                        "new Allowed Path file requires baseline-expect: fail annotation"
+                    ) if category == "missing_baseline_expect_for_new_allowed_path"
                     else None
                 ),
-            } if category in ["inline_baseline_expect_invalid_placement", "missing_baseline_expect_for_new_allowed_path"] else None,
+            } if category in [(
+                "inline_baseline_expect_invalid_placement"
+            ), "missing_baseline_expect_for_new_allowed_path"] else None,
         }
         # "strict" + "repair" payload for inline_baseline_expect and missing_baseline_expect errors
         # AC5: Add routing metadata for skipped results

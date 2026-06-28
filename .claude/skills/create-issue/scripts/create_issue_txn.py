@@ -97,7 +97,12 @@ class TransactionResult:
     audit_comment_posted: bool | None = None
 
 
-def run_command(command: list[str], *, check: bool = False, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
+def run_command(
+    command: list[str],
+    *,
+    check: bool = False,
+    capture_output: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         text=True,
@@ -199,7 +204,12 @@ def _github_owner_repo(repo: str) -> tuple[str, str]:
 def _run_gh_json(args: list[str], *, stage: str) -> Any:
     cp = run_command(args)
     if cp.returncode != 0:
-        raise TransactionError(stage=stage, message=f"{stage} failed", command=" ".join(args), output=(cp.stderr or cp.stdout).strip())
+        raise TransactionError(
+            stage=stage,
+            message=f"{stage} failed",
+            command=" ".join(args),
+            output=(cp.stderr or cp.stdout).strip()
+        )
 
     text = (cp.stdout or "").strip()
     if not text:
@@ -219,7 +229,12 @@ def _run_gh_json(args: list[str], *, stage: str) -> Any:
 def _run_gh_text(args: list[str], *, stage: str) -> str:
     cp = run_command(args)
     if cp.returncode != 0:
-        raise TransactionError(stage=stage, message=f"{stage} failed", command=" ".join(args), output=(cp.stderr or cp.stdout).strip())
+        raise TransactionError(
+            stage=stage,
+            message=f"{stage} failed",
+            command=" ".join(args),
+            output=(cp.stderr or cp.stdout).strip()
+        )
     return (cp.stdout or "").strip()
 
 
@@ -265,7 +280,8 @@ def _find_open_issues_by_title(repo: str, title: str, gh_bin: str) -> list[int]:
         "--limit",
         str(_DEDUPE_SEARCH_LIMIT),
         "--json",
-        "number,title,url",  # --json は comma-separated フィールド名を 1 引数で渡す仕様（3 つに分けて渡すと CLI エラー）
+        # --json は comma-separated フィールド名を 1 引数で渡す仕様（3 つに分けて渡すと CLI エラー）
+        "number,title,url",
     ]
     result = _run_gh_json(args, stage="dedupe-search")
     # Saturation guard: if we hit the limit, we cannot guarantee completeness for exact-match.
@@ -579,7 +595,10 @@ def _extract_parent_resolution_from_body(body: str) -> ParentResolution:
     if has_malformed:
         raise TransactionError(
             stage="parent-body-parse",
-            message=f"parent expression in body is malformed (not a valid number): {[c.raw for c in candidates if c.value == -1]}",
+            message=(
+                "parent expression in body is malformed (not a valid number): "
+                f"{[c.raw for c in candidates if c.value == -1]}"
+            ),
             output=str([(c.source, c.raw) for c in candidates]),
         )
 
@@ -816,7 +835,8 @@ class LabelReadbackResult:
     attempts: int
     retry_delays: list[float]
     last_error: str | None = None
-    error_kind: str = "missing_expected_labels"  # missing_expected_labels | invalid_payload | command_error | rate_limited
+    # missing_expected_labels | invalid_payload | command_error | rate_limited
+    error_kind: str = "missing_expected_labels"
 
 
 def _readback_labels_once(repo: str, issue_number: int, labels: list[str], gh_bin: str) -> bool:
@@ -856,7 +876,11 @@ def _readback_labels_once(repo: str, issue_number: int, labels: list[str], gh_bi
         )
         current_labels = {str(item.get("name")) for item in labels_payload if item.get("name") is not None}
     except (KeyError, TypeError) as exc:
-        raise TransactionError(stage="label-readback", message="invalid label read-back payload", output=str(payload)) from exc
+        raise TransactionError(
+            stage="label-readback",
+            message="invalid label read-back payload",
+            output=str(payload)
+        ) from exc
     return set(labels).issubset(current_labels)
 
 
@@ -1100,36 +1124,52 @@ def _recovery_hint_for_stage(
         parent = requested_parent_issue_number
         return (
             f"Recovery hint: sub-issue-readback failed for #{issue_number} under parent #{parent}.\n"
-            f"  Manual re-register command (idempotent: 既存関係 readback で確認後に再実行（重複登録は API がエラーを返す可能性あり）):\n"
+            "  Manual re-register command (idempotent: "
+            f"既存関係 readback で確認後に再実行（重複登録は API がエラーを返す可能性あり）):\n"
             f"  1. まず readback で関係の有無を確認する:\n"
             f"    gh api repos/{owner_repo}/issues/{issue_number}/parent\n"
             f"  2. 未登録が確認できた場合のみ登録 mutation を実行する:\n"
             f"    gh api repos/{owner_repo}/issues/{parent}/sub_issues --method POST -F sub_issue_id=<child_db_id>\n"
             f"  Lookup child database ID:\n"
-            f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number}){{databaseId}}}}}}'\n"
+            f"    gh api graphql -f query='query{{repository"
+            f"(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number})"
+            "{{databaseId}}}}}}'\n"
             f"  Verify:\n"
             f"    gh api repos/{owner_repo}/issues/{issue_number}/parent"
         )
     if failed_stage in ("dependency-readback", "dependency-register"):
-        deps = ", ".join(f"#{d}" for d in requested_dependency_issue_numbers) if requested_dependency_issue_numbers else "(none)"
+        deps = (
+            ", "
+        ).join(f"#{d}" for d in requested_dependency_issue_numbers) if requested_dependency_issue_numbers else "(none)"
         return (
             f"Recovery hint: {failed_stage} failed for #{issue_number} (blockers: {deps}).\n"
-            "  Manual re-register command (idempotent: 既存関係 readback で確認後に再実行（重複登録は API がエラーを返す可能性あり）):\n"
+            "  Manual re-register command (idempotent: "
+            "既存関係 readback で確認後に再実行（重複登録は API がエラーを返す可能性あり）):\n"
             f"  1. まず readback で blockedBy 関係の有無を確認する:\n"
-            f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number}){{blockedBy(first:10){{nodes{{number}}}}}}}}}}'\n"
+            f"    gh api graphql -f query='query{{repository"
+            f"(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number})"
+            "{{blockedBy(first:10){{nodes{{number}}}}}}}}}}'\n"
             "  2. 未登録が確認できた場合のみ登録 mutation を実行する:\n"
-            "    gh api graphql -f query='mutation($input:AddBlockedByInput!){addBlockedBy(input:$input){clientMutationId}}' \\\n"
+            "    gh api graphql -f query='mutation"
+            "($input:AddBlockedByInput!){addBlockedBy(input:$input)"
+            "{clientMutationId}}' \\\n"
             "      -F 'input[issueId]=<child_node_id>' -F 'input[blockingIssueId]=<blocker_node_id>'\n"
             "  Lookup node IDs:\n"
-            f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:<N>){{id}}}}}}'\n"
+            "    gh api graphql -f query='query{{repository"
+            "(owner:\"<owner>\",name:\"<repo>\"){{issue(number:<N>)"
+            "{{id}}}}}}'\n"
             "  Verify:\n"
-            f"    gh api graphql -f query='query{{repository(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number}){{blockedBy(first:10){{nodes{{number}}}}}}}}}}'"
+            f"    gh api graphql -f query='query{{repository"
+            f"(owner:\"<owner>\",name:\"<repo>\"){{issue(number:{issue_number})"
+            "{{blockedBy(first:10){{nodes{{number}}}}}}}}}}'"
         )
     if failed_stage in ("label-readback", "dedupe-label-readback"):
         return (
             f"Recovery hint: {failed_stage} failed for #{issue_number}.\n"
             "  Script-mediated re-apply command (idempotent: yes):\n"
-            f"    uv run python3 .claude/skills/create-issue/scripts/create_issue_txn.py reconcile --repo {owner_repo} --issue {issue_number} --label <labels>\n"
+            "    uv run python3 .claude/skills/create-issue/scripts/"
+            f"create_issue_txn.py reconcile --repo {owner_repo}"
+            f" --issue {issue_number} --label <labels>\n"
             "  PROHIBITED: raw direct mutation commands are forbidden.\n"
             "  Recovery MUST go through the reconcile subcommand for audit trail and idempotency.\n"
             "  Verify:\n"
@@ -1247,7 +1287,14 @@ def _report_partial_failure(
             requested_parent_issue_number=parent_issue_number,
             requested_dependency_issue_numbers=dependency_issue_numbers,
             failure_context="\n".join(
-                [line for line in [f"command={failed_exc.command}", f"output={failed_exc.output}"] if line != "output=None" and line != "command=None"]
+                [
+                    line
+                    for line in [
+                        f"command={failed_exc.command}",
+                        f"output={failed_exc.output}",
+                    ]
+                    if line != "output=None" and line != "command=None"
+                ]
             )
             + (f"\n{failure_context}" if failure_context else ""),
         )

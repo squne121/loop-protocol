@@ -255,7 +255,10 @@ class TestAC1PlanRefinementLoopUnknownKindFailClosed:
         output, _ = _run_planner(input_data)
 
         fail_closed = output.get("fail_closed", {})
-        assert fail_closed.get("required") is not False or "unknown_issue_kind" in fail_closed.get("reason_codes", []), (
+        assert fail_closed.get("required") is not False or "unknown_issue_kind" in fail_closed.get(
+            "reason_codes",
+            []
+        ), (
             "unknown kind must not silently pass (fail_closed.required must be True)"
         )
 

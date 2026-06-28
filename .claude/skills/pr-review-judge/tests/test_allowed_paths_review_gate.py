@@ -146,7 +146,10 @@ class TestContractFingerprintAndExecutionContext:
 
     def test_fingerprint_changes_on_contract_sha_change(self):
         fp1 = make_evaluator(expected_contract_fingerprint="SELF").compute_contract_fingerprint()
-        fp2 = make_evaluator(contract_body_sha256="contract_sha_v2", expected_contract_fingerprint="SELF").compute_contract_fingerprint()
+        fp2 = make_evaluator(
+            contract_body_sha256="contract_sha_v2",
+            expected_contract_fingerprint="SELF").compute_contract_fingerprint(
+        )
         assert fp1 != fp2
 
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
@@ -169,7 +172,11 @@ class TestContractFingerprintAndExecutionContext:
 class TestHeadShaBinding:
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
     def test_head_sha_mismatch_is_indeterminate(self, mock_get_changed_files):
-        evaluator = make_evaluator(head_sha="current_sha", reviewed_head_sha="reviewed_sha", expected_contract_fingerprint="SELF")
+        evaluator = make_evaluator(
+            head_sha="current_sha",
+            reviewed_head_sha="reviewed_sha",
+            expected_contract_fingerprint="SELF"
+        )
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         mock_get_changed_files.assert_not_called()
@@ -216,7 +223,10 @@ class TestAllowedPathsValidation:
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
     def test_contract_snapshot_body_sha_change_is_stale(self, mock_get_changed_files):
         mock_get_changed_files.return_value = ["src/main.ts"]
-        expected_fp = make_evaluator(contract_body_sha256="old_contract_sha", expected_contract_fingerprint="SELF").compute_contract_fingerprint()
+        expected_fp = make_evaluator(
+            contract_body_sha256="old_contract_sha",
+            expected_contract_fingerprint="SELF").compute_contract_fingerprint(
+        )
         evaluator = make_evaluator(expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
         assert result.status == GateStatus.STALE_SNAPSHOT.value
@@ -225,7 +235,10 @@ class TestAllowedPathsValidation:
     @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
     def test_base_sha_change_is_stale(self, mock_get_changed_files):
         mock_get_changed_files.return_value = ["src/main.ts"]
-        expected_fp = make_evaluator(base_sha="base_at_snapshot", expected_contract_fingerprint="SELF").compute_contract_fingerprint()
+        expected_fp = make_evaluator(
+            base_sha="base_at_snapshot",
+            expected_contract_fingerprint="SELF").compute_contract_fingerprint(
+        )
         evaluator = make_evaluator(base_sha="base_moved_forward", expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
         assert result.status == GateStatus.STALE_SNAPSHOT.value

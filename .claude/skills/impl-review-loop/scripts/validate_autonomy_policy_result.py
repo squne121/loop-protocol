@@ -256,7 +256,8 @@ def check_read_only_agent(agent_file: Path) -> tuple[bool, str]:
     if missing_from_disallowed:
         return (
             False,
-            f"{agent_file.name}: read-only agent missing write tool(s) in 'disallowedTools': {sorted(missing_from_disallowed)}",
+            f"{agent_file.name}: read-only agent missing write tool(s)"
+            f" in 'disallowedTools': {sorted(missing_from_disallowed)}",
         )
 
     return True, ""

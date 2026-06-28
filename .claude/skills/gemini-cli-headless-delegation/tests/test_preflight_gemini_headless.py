@@ -36,7 +36,10 @@ def _make_fake_run(module):
         if command == ["gemini", "--help"]:
             return _FakeCompleted(
                 0,
-                "Use -p/--prompt for non-interactive mode.\n--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\nquery\nquery ...\n--prompt                   Prompt. Appended to input on stdin.\n",
+                "Use -p/--prompt for non-interactive mode.\n"
+                "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n"
+                "query\nquery ...\n--prompt                   Prompt."
+                " Appended to input on stdin.\n",
                 "",
             )
         if command[:2] == ["gemini", "--model"]:
@@ -106,7 +109,10 @@ def test_run_preflight_fails_closed_when_local_asset_prompt_stdin_support_is_mis
         if command == ["gemini", "--help"]:
             return _FakeCompleted(
                 0,
-                "Use -p/--prompt for non-interactive mode.\n--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n",
+                (
+                   "Use -p/--prompt for non-interactive"
+                   " mode.\n--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n"
+               ),
                 "",
             )
         if command[:2] == ["gemini", "--model"]:
@@ -288,7 +294,10 @@ def test_trusted_directory_smoke_parse_failure_reports_recovery(monkeypatch, cap
         if command == ["gemini", "--help"]:
             return _FakeCompleted(
                 0,
-                "Use -p/--prompt for non-interactive mode.\n--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\nquery\nquery ...\n--prompt                   Prompt. Appended to input on stdin.\n",
+                "Use -p/--prompt for non-interactive mode.\n"
+                "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n"
+                "query\nquery ...\n--prompt                   Prompt."
+                " Appended to input on stdin.\n",
                 "",
             )
         if command[:2] == ["gemini", "--model"]:
@@ -340,7 +349,10 @@ def test_trusted_directory_failure_class_fields_in_json_output(monkeypatch, tmp_
         if command == ["gemini", "--help"]:
             return _FakeCompleted(
                 0,
-                "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n--prompt                   Prompt. Appended to input on stdin.\n",
+                (
+                   "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n--prompt                  "
+                   " Prompt. Appended to input on stdin.\n"
+               ),
                 "",
             )
         if command[:2] == ["gemini", "--model"]:
@@ -445,7 +457,10 @@ def test_smoke_command_includes_skip_trust(monkeypatch):
         if command == ["gemini", "--help"]:
             return _FakeCompleted(
                 0,
-                "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n--prompt                   Prompt. Appended to input on stdin.\n",
+                (
+                   "--model\n--prompt\n--output-format\n--approval-mode\n--skip-trust\n--prompt                  "
+                   " Prompt. Appended to input on stdin.\n"
+               ),
                 "",
             )
         if command[:2] == ["gemini", "--model"]:
@@ -547,7 +562,12 @@ def test_run_preflight_gh_cli_fails_when_not_authenticated(monkeypatch):
     assert result["gh_cli"]["ok"] is False
     assert any("not authenticated" in e or "auth status failed" in e for e in result["gh_cli"]["errors"])
     # gh_cli 失敗は warnings に追記される（observability 維持）
-    assert any("gh_cli check failed" in w or "not authenticated" in w or "auth status failed" in w for w in result["warnings"])
+    assert any(
+        "gh_cli check failed" in w
+        or "not authenticated" in w
+        or "auth status failed" in w
+        for w in result["warnings"]
+    )
     # 他プロファイル（proposal_only 等）は影響を受けないため top-level ok=True を維持する
     assert result["ok"] is True
 

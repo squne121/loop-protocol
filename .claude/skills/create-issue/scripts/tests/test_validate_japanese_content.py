@@ -171,7 +171,10 @@ class TestValidateText:
 
     def test_code_fence_excluded_from_ratio(self):
         """GIVEN: コードフェンス内に英語コードがある WHEN: validate THEN: コードを除外して日本語比率計算 (AC2)"""
-        text = "これは日本語の説明です。\n\n```python\nimport sys\nprint('hello world in english')\n```\n\n以上が実装です。"
+        text = (
+            "これは日本語の説明です。\n\n```python\nimport sys\nprint('hello world in"
+            " english')\n```\n\n以上が実装です。"
+        )
         result = validate_text(text)
         # コードフェンスが除外されれば日本語比率は高いはず
         assert result.passed is True
@@ -329,7 +332,9 @@ class TestChangedProseBlocksCodeFenceHeading:
         assert result == [], f"Expected empty list but got: {result}"
 
     def test_code_fence_following_heading_delta_allowed_paths(self):
-        """GIVEN: code fence 直後に ## Allowed Paths heading がある WHEN: prose 追加 THEN: heading は delta に含まれない (AC3)"""
+        """GIVEN: code fence 直後に ## Allowed Paths heading がある
+        WHEN: prose 追加 THEN: heading は delta に含まれない (AC3)
+        """
         old = (
             "## Outcome\n\n"
             "変更内容の説明。\n\n"
@@ -357,7 +362,8 @@ class TestChangedProseBlocksCodeFenceHeading:
         )
 
     def test_escaped_fence_delta(self):
-        """GIVEN: エスケープ fence を triple backtick に修正する変更 WHEN: changed_prose_blocks THEN: 後続 canonical heading が false-fail しない (AC4)
+        """GIVEN: エスケープ fence を triple backtick に修正する変更 WHEN: changed_prose_blocks THEN: 後続 canonical
+            heading が false-fail しない (AC4)
 
         エスケープされた fence (\\`\\`\\`) を triple backtick (```) に修正する編集で、
         後続の ## Background heading が delta prose target に誤って含まれないことを確認する。
@@ -390,7 +396,8 @@ class TestChangedProseBlocksCodeFenceHeading:
         )
 
     def test_indented_heading_delta(self):
-        """GIVEN: 4-space indented `    ## Background` WHEN: changed_prose_blocks THEN: delta prose target として扱われる (#654 B1 回帰防止) (AC2)
+        """GIVEN: 4-space indented ` ## Background` WHEN: changed_prose_blocks THEN: delta prose target として扱われる
+            (#654 B1 回帰防止) (AC2)
 
         4-space indented heading は GFM 上 code block であり canonical heading ではない。
         _is_heading_block() が leading whitespace を保持して判定することで、
@@ -442,7 +449,10 @@ class TestChangedProseBlocksCodeFenceHeading:
             assert "## Background" in joined
 
     def test_code_fence_heading_without_blank_line_after_closing_fence(self):
-        """GIVEN: code fence closing 直後に blank line なしで heading が来る WHEN: changed_prose_blocks THEN: heading は delta に含まれない"""
+        """GIVEN: code fence closing 直後に blank line なしで heading が来る WHEN: changed_prose_blocks THEN: heading は
+            delta
+            に含まれない
+        """
         old = "元の文章。\n"
         new = (
             "元の文章。\n\n"
@@ -460,7 +470,10 @@ class TestChangedProseBlocksCodeFenceHeading:
         assert "追加テキスト" in joined
 
     def test_tilde_code_fence_following_heading_delta(self):
-        """GIVEN: tilde fence 直後に canonical heading がある WHEN: changed_prose_blocks THEN: heading は delta に含まれない"""
+        (
+            """GIVEN: tilde fence 直後に canonical heading がある WHEN: changed_prose_blocks THEN: heading は delta"""
+            """ に含まれない"""
+        )
         old = "元の文章。\n"
         new = (
             "元の文章。\n\n"
@@ -478,7 +491,8 @@ class TestChangedProseBlocksCodeFenceHeading:
         assert "追加テキスト" in joined
 
     def test_heading_prose_not_hidden_after_heading_exclusion(self):
-        """GIVEN: canonical heading の次行に英語 prose WHEN: changed_prose_blocks THEN: heading 除外が後続 prose を隠さない (AC5)
+        """GIVEN: canonical heading の次行に英語 prose WHEN: changed_prose_blocks THEN: heading 除外が後続 prose
+            を隠さない (AC5)
 
         heading block は delta 除外されるが、同一 heading block と別の paragraph に属する prose は
         引き続き delta として検査対象になることを確認する。

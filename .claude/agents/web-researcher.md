@@ -120,7 +120,7 @@ WEB_RESEARCH_RESULT_V1:
 
 ## 認証
 
-本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。`GEMINI_API_KEY` 未設定だけを根拠に委譲不可と判断しない。委譲可否は setup_check / preflight の実行結果で判断する。
+本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。`GEMINI_API_KEY` 未設定だけを根拠に委譲不可と判断しない。委譲可否は `setup_check.py` / `preflight_gemini_headless.py` の実行結果で判断する。
 
 ## Antigravity CLI 互換性ノート
 

@@ -229,7 +229,10 @@ def test_baseline_pass_reclassify_lint():
 
 
 def test_baseline_pass_reclassify_via_preflight():
-    """AC7: baseline-expect: pass + pnpm typecheck no-TTY via full preflight → blocked (not baseline_regression_failed)"""
+    (
+        """AC7: baseline-expect: pass + pnpm typecheck no-TTY via full preflight → blocked (not"""
+        """ baseline_regression_failed)"""
+    )
     # This test uses a mock that fakes pnpm typecheck exit 1 with no-TTY stderr,
     # but since we cannot intercept subprocess in full pipeline mode,
     # we test directly via classify_result (which is the actual re-mapping logic).

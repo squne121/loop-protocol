@@ -188,7 +188,9 @@ $ {git_cmd}
         r = results[0]
         assert r["classification"] == "blocked", f"'{git_cmd}': expected blocked"
         # B3: git uses exact read-only allowlist; mutations return command_not_allowed
-        assert r["category"] in ("unsafe_command", "command_not_allowed"), f"'{git_cmd}': expected unsafe_command or command_not_allowed, got {r['category']}"
+        assert r["category"] in ("unsafe_command", "command_not_allowed"), (
+            f"'{git_cmd}': expected unsafe_command or command_not_allowed, got {r['category']}"
+        )
         assert r["decision"] == "blocked"
         assert r["exit_code"] is None, f"'{git_cmd}': must not be executed"
 
@@ -1110,13 +1112,16 @@ def test_match_ssot_with_keywords_and_paths_is_trivially_pass_blocked():
 
     Regression test for the original failing case from Issue #201 background section.
     """
-    body = """## Verification Commands
-
-```bash
-# AC1
-$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh --keywords "milestone,github-milestone" --paths "docs/dev/milestone-ops.md"
-```
-"""
+    body = (
+        "## Verification Commands\n"
+        "\n"
+        "```bash\n"
+        "# AC1\n"
+        "$ bash .claude/skills/ssot-discovery/scripts/match-ssot.sh"
+        " --keywords \"milestone,github-milestone\""
+        " --paths \"docs/dev/milestone-ops.md\"\n"
+        "```\n"
+    )
     data = run_preflight(body)
     results = data["results"]
     assert len(results) == 1
@@ -1269,3 +1274,64 @@ def test_is_trivially_pass_unit_direct():
     # NOT trivially pass: unrelated commands
     assert _is_trivially_pass_command("pnpm lint") is False
     assert _is_trivially_pass_command("test -f somefile") is False
+
+
+# ---------------------------------------------------------------------------
+# AC4: classify_static_command exact argv negative cases (Issue #1210)
+# ---------------------------------------------------------------------------
+
+def test_classify_static_command_blocks_path_qualified_uv_lock():
+    """AC4: path-qualified uv in uv lock --check はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    cases = [
+        "/usr/bin/uv lock --check",
+        "./uv lock --check",
+        "/tmp/uv lock --check",
+    ]
+    for command in cases:
+        result = classify_static_command(command, Path("."))
+        assert result is not None, f"Expected block for: {command}"
+        _, category, decision, _, _ = result
+        assert category == "command_not_allowed", f"command: {command}"
+        assert decision == "blocked", f"command: {command}"
+
+
+def test_classify_static_command_blocks_path_qualified_python_in_smoke():
+    """AC4: path-qualified python in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    cases = [
+        "uv run --isolated --locked --no-default-groups ./python scripts/ci/runtime_dependency_smoke.py",
+        "uv run --isolated --locked --no-default-groups /tmp/python3 scripts/ci/runtime_dependency_smoke.py",
+    ]
+    for command in cases:
+        result = classify_static_command(command, Path("."))
+        assert result is not None, f"Expected block for: {command}"
+        _, category, decision, _, _ = result
+        assert category == "command_not_allowed", f"command: {command}"
+        assert decision == "blocked", f"command: {command}"
+
+
+def test_classify_static_command_blocks_smoke_option_reorder():
+    """AC4: option reorder in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    result = classify_static_command(
+        "uv run --locked --isolated --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+        Path("."),
+    )
+    assert result is not None
+    _, category, decision, _, _ = result
+    assert category == "command_not_allowed"
+    assert decision == "blocked"
+
+
+def test_classify_static_command_blocks_smoke_duplicate_options():
+    """AC4: duplicate options in runtime smoke はブロックされる"""
+    from baseline_vc_preflight import classify_static_command
+    result = classify_static_command(
+        "uv run --isolated --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py",
+        Path("."),
+    )
+    assert result is not None
+    _, category, decision, _, _ = result
+    assert category == "command_not_allowed"
+    assert decision == "blocked"

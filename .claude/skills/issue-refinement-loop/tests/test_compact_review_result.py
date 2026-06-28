@@ -242,7 +242,11 @@ def test_compact_review_result_preserves_structured_blockers_for_replay(tmp_path
     assert artifact_json["structured_blockers"][0]["code"] == "C4"
     replay_result, _ = analyze(
         review_result=artifact_json,
-        readiness_result={"schema": "ISSUE_CONTRACT_READINESS_RESULT_V1", "body_sha256": "sha256:" + "4" * 64, "errors": []},
+        readiness_result={
+            "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
+            "body_sha256": "sha256:" + "4" * 64,
+            "errors": []
+        },
         vc_syntax_result=None,
         vc_preflight_result=None,
         previous_state={},
@@ -447,7 +451,16 @@ def test_compact_review_result_cli_rejects_nan_input(tmp_path):
     )
     script = SCRIPTS_DIR / "compact_review_result.py"
     result = subprocess.run(
-        [sys.executable, str(script), "--input-file", str(bad_fixture), "--artifact-dir", str(tmp_path), "--issue-number", "42"],
+        [
+            sys.executable,
+            str(script),
+            "--input-file",
+            str(bad_fixture),
+            "--artifact-dir",
+            str(tmp_path),
+            "--issue-number",
+            "42"
+        ],
         capture_output=True,
         text=True,
     )

@@ -25,22 +25,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 
-from local_main_branch_guard import (
+from local_main_branch_guard import (  # noqa: E402
     evaluate,
     is_local_root_context,
-    get_current_branch,
     resolve_default_branch,
     classify_branch,
     classify_root_state,
     has_inline_env_override,
-    is_manual_override_active,
     is_readonly_command,
     is_branch_safe_maintenance_command,
-    is_path_restore_command,
     is_compound_or_wrapped,
-    _is_branch_mutation_command,
-    _extract_target_branch,
-    _is_blocked_when_drifted,
     _has_leading_env_assignment,
     _normalize_git_global_opts,
     _is_allowed_when_drifted,
@@ -66,7 +60,7 @@ from local_main_branch_guard import (
     GITHUB_CMD_CLASS_DESTRUCTIVE,
     TRUSTED_REPO_SLUG,
 )
-from skill_runtime_command_policy import resolve_repo_slug
+from skill_runtime_command_policy import resolve_repo_slug  # noqa: E402
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -421,7 +415,7 @@ class TestAC5BoundedStderr:
             hook_flavor="claude",
         )
         captured = capsys.readouterr()
-        lines = [l for l in captured.err.splitlines() if l.strip()]
+        lines = [line for line in captured.err.splitlines() if line.strip()]
         assert len(lines) <= 10
 
     def test_block_stderr_no_raw_command(self, tmp_git_repo: Path, capsys):
@@ -1144,7 +1138,7 @@ class TestB5NoRawBranchInStderr:
 
     def test_emit_block_stderr_contains_kind_fields(self, capsys):
         """_emit_block_stderr emits current_branch_kind and current_is_default."""
-        from local_main_branch_guard import _emit_block_stderr, REASON_ALREADY_DRIFTED
+        from local_main_branch_guard import _emit_block_stderr
         _emit_block_stderr(
             reason_code=REASON_ALREADY_DRIFTED,
             current_branch_kind="other",
@@ -1155,6 +1149,36 @@ class TestB5NoRawBranchInStderr:
         captured = capsys.readouterr()
         assert "current_branch_kind: other" in captured.err
         assert "current_is_default: false" in captured.err
+
+    def test_emit_block_stderr_contains_ac7_fields(self, capsys):
+        """_emit_block_stderr includes AC7-required fields for block diagnostics."""
+        from local_main_branch_guard import (
+            _emit_block_stderr,
+            REASON_GH_MUTATION,
+            COMMAND_KIND_GITHUB_DESTRUCTIVE,
+        )
+        _emit_block_stderr(
+            reason_code=REASON_GH_MUTATION,
+            current_branch_kind="default",
+            current_is_default=True,
+            target_branch_kind="issue_like",
+            hook_flavor="claude",
+            event_kind="PreToolUse",
+            decision="block",
+            command_kind=COMMAND_KIND_GITHUB_DESTRUCTIVE,
+            parser_stage="gh_mutation",
+            rule_id="github_mutation_denied",
+            argv_redacted=["gh", "pr", "merge", "123"],
+        )
+        captured = capsys.readouterr()
+        output = captured.err
+        assert "hook_name: local_main_branch_guard" in output
+        assert "event_kind: PreToolUse" in output
+        assert "decision: block" in output
+        assert "rule_id: github_mutation_denied" in output
+        assert "command_kind: github_mutation" in output
+        assert "parser_stage: gh_mutation" in output
+        assert "argv_redacted:" in output
 
     def test_emit_block_stderr_max_10_lines(self, capsys):
         """_emit_block_stderr output is bounded to max 10 lines."""
@@ -1167,7 +1191,7 @@ class TestB5NoRawBranchInStderr:
             hook_flavor="claude",
         )
         captured = capsys.readouterr()
-        lines = [l for l in captured.err.splitlines() if l.strip()]
+        lines = [line for line in captured.err.splitlines() if line.strip()]
         assert len(lines) <= 10
 
 
@@ -1463,7 +1487,7 @@ class TestGhMutationReasonCodeClaude:
             hook_flavor="claude",
         )
         captured = capsys.readouterr()
-        hint_line = [l for l in captured.err.splitlines() if "recovery:" in l]
+        hint_line = [line for line in captured.err.splitlines() if "recovery:" in line]
         assert hint_line, "Expected a recovery: line in stderr"
         hint = hint_line[0].lower()
         assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (

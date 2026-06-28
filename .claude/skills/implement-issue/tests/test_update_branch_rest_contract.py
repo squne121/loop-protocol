@@ -301,7 +301,10 @@ class TestRunGhTransportGuard:
         assert result.returncode == 124
         assert result.stderr == 'timed out'
 
-    def test_given_file_not_found_when_run_gh_then_return_transport_command_result(self, monkeypatch: pytest.MonkeyPatch):
+    def test_given_file_not_found_when_run_gh_then_return_transport_command_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch
+    ):
         def fake_run(*_args, **_kwargs):
             raise FileNotFoundError('gh not found')
 

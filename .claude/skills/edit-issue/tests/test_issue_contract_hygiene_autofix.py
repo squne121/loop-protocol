@@ -403,7 +403,9 @@ def test_body_file_and_out_file_interface(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_c4_skips_continuation_lines():
-    """GIVEN a multi-line command with backslash continuation / WHEN autofix runs / THEN continuation lines not prefixed."""
+    """GIVEN a multi-line command with backslash continuation / WHEN autofix runs / THEN continuation lines not
+        prefixed.
+    """
     body = _wrap_body(
         vc_block=textwrap.dedent("""\
             ```bash

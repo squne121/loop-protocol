@@ -3,6 +3,10 @@
   "description": "Single source of truth for the python-test job pytest target set, ignore/deselect contract, and xdist parallelization knobs. Consumed by both the pytest execution step in .github/workflows/ci.yml and the ci_test_selection/v1 artifact generator (generate_ci_test_selection_artifact.py) via the scripts/ci/python_test_plan.py loader. Edit this file (not the workflow or the generator) to change the python-test target set.",
   "targets": [
     ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
+    ".claude/skills/gemini-cli-headless-delegation/tests/",
+    ".claude/skills/impl-review-loop/scripts/tests/",
+    ".claude/skills/implement-issue/tests/",
+    ".claude/skills/open-pr/tests/",
     ".claude/skills/edit-issue/tests/test_guard_issue_body.py",
     ".claude/skills/edit-issue/tests/test_issue_contract_hygiene_autofix.py",
     ".claude/skills/create-issue/tests/",
@@ -22,6 +26,7 @@
     "scripts/ci/tests/",
     "scripts/agent-guards/tests/",
     "tests/codex/test_execpolicy_matrix.py",
+    "tests/codex/test_cleanup_exec_branch_only.py",
     "scripts/tests/test_milestone_rollup.py",
     "scripts/tests/test_pr_body_validator.py",
     "scripts/tests/test_e501_migration_guard.py",
