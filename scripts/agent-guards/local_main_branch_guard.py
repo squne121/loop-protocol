@@ -99,7 +99,9 @@ try:
     )
     _WBE_POLICY_AVAILABLE = True
 except Exception:  # pragma: no cover - defensive fail-closed
-    def _wbe_exec_command(cmd: str, cwd: str, project_root: str, deadline: object | None = None) -> bool:  # type: ignore[misc]
+    def _wbe_exec_command(  # type: ignore[misc]
+        cmd: str, cwd: str, project_root: str, deadline: object | None = None
+    ) -> bool:
         return False
 
     def _wbe_looks_like(cmd: str) -> bool:  # type: ignore[misc]
