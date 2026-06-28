@@ -1,0 +1,23 @@
+{
+  "schema": "agent_observation_capability/v1",
+  "evidence_mode": "synthetic_only",
+  "surfaces": [
+    {"surface": "claude_code", "claimed_verdict": "supported", "signals": {
+      "runtime_event_observed": true, "capture_artifact_observed": true, "raw_values_emitted": false,
+      "evidence_provenance": "synthetic_fixture",
+      "prompt_excerpt_present": false, "tool_io_excerpt_present": false,
+      "local_absolute_path_present": false, "credential_value_present": false,
+      "hook_coexistence": {"expected_handlers_fired_once": true, "duplicate_finalization_absent": true,
+        "duplicate_upload_absent": true, "async_hook_not_used_as_gate": true,
+        "post_run_verifier_observed_final_state": true, "runtime_event_and_capture_artifact_correlated": true,
+        "hook_exit_zero_not_authoritative": true, "raw_values_emitted": false}}},
+    {"surface": "codex_cli", "claimed_verdict": "unsupported", "signals": {
+      "runtime_event_observed": false, "capture_artifact_observed": false, "raw_values_emitted": false,
+      "evidence_provenance": "synthetic_fixture", "hooks_feature_key": "[features].hooks",
+      "validator_drift": true, "project_layer_trusted": false}},
+    {"surface": "google_antigravity", "claimed_verdict": "unverified", "signals": {
+      "runtime_event_observed": false, "capture_artifact_observed": false, "raw_values_emitted": false,
+      "evidence_provenance": "synthetic_fixture", "mcp_connected": true, "browser_recording": true,
+      "ide_launch": true, "artifacts_generated": true}}
+  ]
+}

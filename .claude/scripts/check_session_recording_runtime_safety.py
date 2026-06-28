@@ -87,6 +87,25 @@ PILOT_ACTIVATION_DENY = "deny"
 PILOT_ACTIVATION_ALLOW = "allow"
 
 # ---------------------------------------------------------------------------
+# Agent observation capability matrix (#1221, agent_observation_capability/v1)
+# ---------------------------------------------------------------------------
+CAPABILITY_SCHEMA = "agent_observation_capability/v1"
+CAPABILITY_VERDICT_ENUM = {"supported", "partial", "unsupported", "unverified"}
+CAPABILITY_SURFACE_ENUM = {"claude_code", "codex_cli", "google_antigravity"}
+CODEX_CANONICAL_HOOK_KEY = "[features].hooks"
+CODEX_LEGACY_HOOK_KEY = "codex_hooks"
+HOOK_COEXISTENCE_CONTRACT = {
+    "expected_handlers_fired_once": True,
+    "duplicate_finalization_absent": True,
+    "duplicate_upload_absent": True,
+    "async_hook_not_used_as_gate": True,
+    "post_run_verifier_observed_final_state": True,
+    "runtime_event_and_capture_artifact_correlated": True,
+    "hook_exit_zero_not_authoritative": True,
+    "raw_values_emitted": False,
+}
+
+# ---------------------------------------------------------------------------
 # Secrets mode constants (SRRS_SECRETS_MODE)
 # ---------------------------------------------------------------------------
 SECRET_MODE_NONE = "none"
@@ -1094,6 +1113,209 @@ def run_all_checks(repo_root: Path) -> int:
     return EXIT_PASS
 
 
+def _capability_public_safety(surfaces: list) -> dict[str, Any]:
+    """Aggregate the public_safety admission contract over all surfaces' signals."""
+    raw = prompt = tool_io = abspath = cred = False
+    for s in surfaces:
+        sig = s.get("signals", {}) if isinstance(s, dict) else {}
+        if not isinstance(sig, dict):
+            sig = {}
+        raw = raw or bool(sig.get("raw_values_emitted", False))
+        prompt = prompt or bool(sig.get("prompt_excerpt_present", False))
+        tool_io = tool_io or bool(sig.get("tool_io_excerpt_present", False))
+        abspath = abspath or bool(sig.get("local_absolute_path_present", False))
+        cred = cred or bool(sig.get("credential_value_present", False))
+    forbidden_clean = not (prompt or tool_io or abspath or cred)
+    admission = (not raw) and forbidden_clean
+    return {
+        "raw_values_emitted": raw,
+        "forbidden_field_scan": "pass" if forbidden_clean else "fail",
+        "prompt_excerpt_present": prompt,
+        "tool_io_excerpt_present": tool_io,
+        "local_absolute_path_present": abspath,
+        "credential_value_present": cred,
+        "digest_is_over_public_projection_only": True,
+        "admission": "pass" if admission else "fail",
+    }
+
+
+def _capability_supported_predicate(
+    surface: dict, evidence_mode: str | None
+) -> tuple[bool, list[str]]:
+    """Re-derive whether a surface satisfies the supported predicate.
+
+    Returns (derived_supported, reason_codes). Under synthetic_only the only trusted
+    provenance is synthetic_fixture; real_pilot_verified stays blocked (#1220).
+    """
+    sig = surface.get("signals", {})
+    if not isinstance(sig, dict):
+        sig = {}
+    name = surface.get("surface")
+    rcs: list[str] = []
+
+    runtime = bool(sig.get("runtime_event_observed", False))
+    capture = bool(sig.get("capture_artifact_observed", False))
+    raw = bool(sig.get("raw_values_emitted", False))
+    provenance = str(sig.get("evidence_provenance", "unknown"))
+
+    if not runtime:
+        rcs.append("runtime_event_not_observed")
+    if not capture:
+        rcs.append("capture_artifact_not_observed")
+    if raw:
+        rcs.append("raw_values_emitted")
+
+    trusted = {"synthetic_fixture"}
+    if evidence_mode != "synthetic_only":
+        trusted = trusted | {"real_pilot_verified"}
+    if provenance not in trusted:
+        rcs.append("evidence_provenance_not_trusted")
+
+    hc = sig.get("hook_coexistence")
+    if isinstance(hc, dict):
+        for key, required in HOOK_COEXISTENCE_CONTRACT.items():
+            if bool(hc.get(key, not required)) != required:
+                rcs.append("hook_coexistence_violation")
+                break
+
+    if name == "codex_cli":
+        if str(sig.get("hooks_feature_key", "")) != CODEX_CANONICAL_HOOK_KEY:
+            rcs.append("codex_non_canonical_hook_key")
+        if bool(sig.get("validator_drift", False)):
+            rcs.append("codex_validator_drift")
+        if not bool(sig.get("project_layer_trusted", False)):
+            rcs.append("codex_project_layer_untrusted")
+
+    if name == "google_antigravity" and not (runtime and capture):
+        rcs.append("antigravity_no_capture_runtime_correlation")
+
+    derived = len(rcs) == 0
+    return derived, list(dict.fromkeys(rcs))
+
+
+def run_capability_check(fixture_path: str) -> tuple[dict[str, Any], int]:
+    """#1221: validate an agent_observation_capability/v1 matrix fixture.
+
+    Exit codes:
+      0  admitted (allow): consistent surfaces, public_safety pass, supported predicate honored
+      1  deny (blocked): unsafe promotion to supported / public_safety failure
+      2  fail_closed: malformed schema / bad enum / missing-or-multiple verdict
+    """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        data = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        return {
+            "schema": "agent_observation_capability_check/v1",
+            "decision": "deny",
+            "verdict": "fail_closed",
+            "exit_code": EXIT_FAIL_CLOSED,
+            "evidence_mode": None,
+            "real_runtime_evidence":
+                "blocked_until_pilot_exception_approve_timeboxed_real_pilot",
+            "surfaces": [],
+            "surface_count": 0,
+            "public_safety": _capability_public_safety([]),
+            "reason_codes": ["capability_fixture_unreadable"],
+            "raw_values_emitted": False,
+            "checked_at": now_iso,
+        }, EXIT_FAIL_CLOSED
+
+    reason_codes: list[str] = []
+    malformed = False
+    deny = False
+
+    if not isinstance(data, dict) or data.get("schema") != CAPABILITY_SCHEMA:
+        malformed = True
+        reason_codes.append("capability_schema_invalid")
+    evidence_mode = data.get("evidence_mode") if isinstance(data, dict) else None
+    if evidence_mode != "synthetic_only":
+        malformed = True
+        reason_codes.append("capability_evidence_mode_invalid")
+
+    raw_surfaces = data.get("surfaces") if isinstance(data, dict) else None
+    if not isinstance(raw_surfaces, list) or not raw_surfaces:
+        malformed = True
+        reason_codes.append("capability_surfaces_missing")
+        raw_surfaces = []
+
+    surface_results: list[dict[str, Any]] = []
+    seen: set = set()
+
+    for s in raw_surfaces:
+        if not isinstance(s, dict):
+            malformed = True
+            reason_codes.append("capability_surface_not_object")
+            continue
+        name = s.get("surface")
+        verdict = s.get("claimed_verdict")
+        s_rcs: list[str] = []
+
+        if name not in CAPABILITY_SURFACE_ENUM:
+            malformed = True
+            s_rcs.append("surface_name_invalid")
+        if name in seen:
+            malformed = True
+            s_rcs.append("surface_duplicate")
+        seen.add(name)
+
+        if not isinstance(verdict, str) or verdict not in CAPABILITY_VERDICT_ENUM:
+            malformed = True
+            s_rcs.append("verdict_not_single_closed_enum")
+
+        derived, pred_rcs = _capability_supported_predicate(s, evidence_mode)
+        s_rcs.extend(pred_rcs)
+
+        consistent = True
+        if verdict == "supported" and not derived:
+            consistent = False
+            deny = True
+            s_rcs.append("unsafe_supported_promotion")
+
+        surface_results.append({
+            "surface": name,
+            "claimed_verdict": verdict if isinstance(verdict, str) else None,
+            "derived_supported": derived,
+            "verdict_consistent": consistent,
+            "reason_codes": list(dict.fromkeys(s_rcs)),
+        })
+
+    public_safety = _capability_public_safety(raw_surfaces)
+    if public_safety["admission"] != "pass":
+        deny = True
+        reason_codes.append("public_safety_admission_failed")
+
+    if malformed:
+        verdict_out = "fail_closed"
+        exit_code = EXIT_FAIL_CLOSED
+        decision = "deny"
+    elif deny:
+        verdict_out = "blocked"
+        exit_code = EXIT_FAIL
+        decision = "deny"
+    else:
+        verdict_out = "admitted"
+        exit_code = EXIT_PASS
+        decision = "allow"
+
+    output = {
+        "schema": "agent_observation_capability_check/v1",
+        "decision": decision,
+        "verdict": verdict_out,
+        "exit_code": exit_code,
+        "evidence_mode": evidence_mode,
+        "real_runtime_evidence":
+            "blocked_until_pilot_exception_approve_timeboxed_real_pilot",
+        "surfaces": surface_results,
+        "surface_count": len(seen),
+        "public_safety": public_safety,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "raw_values_emitted": public_safety["raw_values_emitted"],
+        "checked_at": now_iso,
+    }
+    return output, exit_code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fail-closed verifier for session recording runtime safety."
@@ -1120,10 +1342,21 @@ def main() -> int:
         "--test-mode", action="store_true", default=False,
         help="Alias for --execution-profile fixture",
     )
+    parser.add_argument(
+        "--capability-fixture", default=None,
+        help="Path to an agent_observation_capability/v1 fixture JSON; runs the "
+             "#1221 capability matrix check and exits.",
+    )
     args = parser.parse_args()
 
     execution_profile = args.execution_profile
     # Note: --test-mode just confirms fixture profile (already default)
+
+    # #1221: capability matrix check is a self-contained mode (no SRRS env, no repo scan)
+    if args.capability_fixture:
+        cap_output, cap_exit = run_capability_check(args.capability_fixture)
+        print(json.dumps(cap_output, indent=2), flush=True)
+        return cap_exit
 
     # AC19: host mode rejects SRRS_* overrides
     if execution_profile == "host":

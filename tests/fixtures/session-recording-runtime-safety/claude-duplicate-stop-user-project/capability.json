@@ -1,0 +1,10 @@
+{
+  "schema": "agent_observation_capability/v1", "evidence_mode": "synthetic_only",
+  "surfaces": [{"surface": "claude_code", "claimed_verdict": "supported", "signals": {
+    "runtime_event_observed": true, "capture_artifact_observed": true, "raw_values_emitted": false,
+    "evidence_provenance": "synthetic_fixture",
+    "hook_coexistence": {"expected_handlers_fired_once": false, "duplicate_finalization_absent": false,
+      "duplicate_upload_absent": false, "async_hook_not_used_as_gate": true,
+      "post_run_verifier_observed_final_state": true, "runtime_event_and_capture_artifact_correlated": true,
+      "hook_exit_zero_not_authoritative": true, "raw_values_emitted": false}}}]
+}

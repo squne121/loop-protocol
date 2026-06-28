@@ -1,0 +1,6 @@
+{
+  "schema": "agent_observation_capability/v1", "evidence_mode": "synthetic_only",
+  "surfaces": [{"surface": "claude_code", "claimed_verdict": "supported", "signals": {
+    "runtime_event_observed": true, "capture_artifact_observed": true, "raw_values_emitted": false,
+    "evidence_provenance": "floating_npx"}}]
+}

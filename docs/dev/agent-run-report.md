@@ -353,3 +353,31 @@ JSON parse 失敗は fail-closed（exit 1、report 未出力）。
 |---|---|
 | `lib/entirecli-safety.mjs` | verdict 計算ロジック・redaction helper・設定パーサー |
 | `scripts/agent-logs/check-entirecli-safety.mjs` | CLI entry point（live git/fs 検査） |
+
+## #1221 Agent Observation Capability Boundary
+
+`agent_observation_capability/v1` matrix（`docs/dev/agent-observation-capability.md`）の capture
+capability verdict は synthetic evidence のみで固定する。本節は hook coexistence と canonical gate の
+位置づけを再確認する。
+
+- Hook（PreToolUse / async Stop hook 等）は diagnostic / prevention レイヤーであり、canonical gate は
+  post-run verifier である。
+- async Stop hook / hook exit 0 / hook presence は PASS 証明にならない。
+- hook 共存の PASS は以下の closed contract を満たすこと:
+
+```yaml
+hook_coexistence_pass_requires:
+  expected_handlers_fired_once: true
+  duplicate_finalization_absent: true
+  duplicate_upload_absent: true
+  async_hook_not_used_as_gate: true
+  post_run_verifier_observed_final_state: true
+  runtime_event_and_capture_artifact_correlated: true
+  hook_exit_zero_not_authoritative: true
+  raw_values_emitted: false
+```
+
+- #1220 の `LATITUDE_PILOT_EXCEPTION_V1` A1 decision gate は本節で変更しない。
+- `docs/dev/secret-policy.md` は変更しない。
+- real prompt / real trace export / real Cloud pilot は禁止のままとする。
+- `unsupported` / `unverified` は失敗ではなく Child C0/C1 の input availability として扱う。
