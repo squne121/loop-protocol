@@ -47,6 +47,9 @@ permissionMode: acceptEdits
 
 **V1 モードでは `issue-contract-review` preflight と worktree 作成が必須。**
 
+worktree 作成は `scripts/agent-ops/worktree_bootstrap_exec.py` を使い `WORKTREE_BOOTSTRAP_RESULT_V1` を受け取る。
+executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.worktree_path` を `IMPLEMENT_RESULT_V1.worktree` にマップする。executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.branch` は `IMPLEMENT_RESULT_V1.branch` にそのままマップする。
+
 ### V2 dispatch（PR repair executor モード）
 
 入力に `IMPLEMENTATION_WORKER_REQUEST_V2` スキーマが含まれる場合:

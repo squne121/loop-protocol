@@ -71,6 +71,20 @@
 - Runtime Verification Applicability が `immediate` の Issue は `docs/dev/runtime-verification-policy.md` の SKIP 規約・証跡保存・Stop Condition 連動に従う（適用判定スキーマは policy.md の「Runtime Verification Applicability」を参照）。
 - 既存 OPEN Issue（特に #26 等）の VC が `immediate` / `deferred` / `not_applicable` のどれに該当するかは、policy.md の適用判定スキーマを基準に確認する。
 
+## Git Read-Only Probe Script 方針
+
+branch/ref 状態確認や worktree catalog 取得など複雑な git read-only probe は、
+raw `git for-each-ref` / raw `git worktree list --porcelain` の shell 使用を避け、
+以下の probe script に置き換える（shell quoting / compound command の迷走を削減するため）:
+
+```bash
+uv run python3 scripts/agent-ops/git_ref_probe.py --branch <branch> --json
+uv run python3 scripts/agent-ops/git_worktree_probe.py --json
+```
+
+hook は **fail-closed ローカルガードレール** であり、セキュリティ境界ではない。
+セキュリティ上の保護は branch protection / GitHub Actions CI / repository permission で行う。
+
 ## スコープ管理
 
 - 現在は `M4: Upgrade Loop (v0.4.x)` の境界を優先し、resource consumption と最小 upgrade loop を M3 persistence の上に載せる。
