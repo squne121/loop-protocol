@@ -910,7 +910,7 @@ def _iter_yaml_units(content: str) -> Iterator[tuple[int, str, str | None]]:
     lines = content.splitlines()
     in_run = False
     run_indent: int | None = None
-    run_line_re = re.compile(r'^(\s*)run:\s*(.*)$')
+    run_line_re = re.compile(r'^(\s*)(?:-\s+)?run:\s*(.*)$')
     i = 0
     while i < len(lines):
         line = lines[i]
