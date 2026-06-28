@@ -804,3 +804,31 @@ upstream security boundary として `#412` が担当する範囲は以下のと
 - Issue #246 — pilot smoke test（実装予定）
 - Issue #402 — hook + CI wiring 実装（本 Issue）
 - Issue #412 — upstream security boundary（Secret 管理）
+
+## #1221 agent observation capability boundary
+
+`agent_observation_capability/v1` の capture capability verdict は synthetic evidence のみで固定する正本を
+`docs/dev/agent-observation-capability.md` に置く。本節はその hook coexistence / canonical gate 境界を要約する。
+
+- Hook（async Stop hook を含む）は diagnostic / prevention レイヤーであり canonical gate ではない。
+  canonical gate は post-run verifier である。
+- async Stop hook の存在・hook exit 0・hook presence のいずれも PASS の証明にはならない。
+- hook 共存の PASS 条件は以下の closed contract を満たすこととする:
+
+```yaml
+hook_coexistence_pass_requires:
+  expected_handlers_fired_once: true
+  duplicate_finalization_absent: true
+  duplicate_upload_absent: true
+  async_hook_not_used_as_gate: true
+  post_run_verifier_observed_final_state: true
+  runtime_event_and_capture_artifact_correlated: true
+  hook_exit_zero_not_authoritative: true
+  raw_values_emitted: false
+```
+
+- #1220 の `LATITUDE_PILOT_EXCEPTION_V1` A1 decision gate（既定 `approve_synthetic_only` /
+  `blocked_until_activation`）は本節で変更しない。
+- `docs/dev/secret-policy.md` は変更しない。
+- real prompt / real trace export / real Cloud pilot は引き続き禁止であり、real runtime evidence は
+  pilot exception が `approve_timeboxed_real_pilot` になるまで blocked とする。

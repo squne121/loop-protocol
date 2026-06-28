@@ -1825,3 +1825,216 @@ describe('runtime safety #1220: real secret-policy.md is well-formed (single val
     expect(result.json?.['pilot_activation_state']).not.toBe('allow')
   })
 })
+
+// ============================================================================
+// Issue #1221: agent_observation_capability/v1 matrix check
+// ============================================================================
+
+import { readFileSync as readFileSync1221 } from 'fs'
+
+interface CapResult { stdout: string; exitCode: number; json: Record<string, unknown> | null }
+
+function runCapability(fixtureName: string): CapResult {
+  const fixturePath = join(FIXTURES_DIR, fixtureName, 'capability.json')
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) }
+  const result = spawnSync(
+    'python3',
+    [SCRIPT, '--capability-fixture', fixturePath],
+    { encoding: 'utf-8', env, timeout: 30000 }
+  )
+  let json: Record<string, unknown> | null = null
+  try { json = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+  return { stdout: result.stdout ?? '', exitCode: result.status ?? 1, json }
+}
+
+function capSurface(json: Record<string, unknown> | null, name: string): Record<string, unknown> | undefined {
+  const surfaces = (json?.['surfaces'] as Record<string, unknown>[]) ?? []
+  return surfaces.find(s => s['surface'] === name)
+}
+
+describe('#1221 AC1: matrix doc and machine-readable block exist', () => {
+  it('GIVEN docs/dev/agent-observation-capability.md WHEN read THEN it has the v1 schema block', () => {
+    const docPath = resolve(REPO_ROOT, 'docs', 'dev', 'agent-observation-capability.md')
+    expect(existsSync(docPath)).toBe(true)
+    const text = readFileSync1221(docPath, 'utf-8')
+    expect(text).toContain('agent_observation_capability/v1')
+    expect(text).toContain('evidence_mode: synthetic_only')
+    expect(text).toContain('hook_coexistence_pass_requires')
+    expect(text).toContain('public_safety')
+  })
+})
+
+describe('#1221 AC2/AC3/AC7: positive matrix admitted, supported predicate honored', () => {
+  it('GIVEN a complete consistent matrix WHEN checked THEN allow (exit 0) with three surfaces', () => {
+    const r = runCapability('capability-supported-positive')
+    expect(r.exitCode).toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('allow')
+    expect(r.json?.['surface_count']).toBe(3)
+    const claude = capSurface(r.json, 'claude_code')
+    expect(claude?.['claimed_verdict']).toBe('supported')
+    expect(claude?.['derived_supported']).toBe(true)
+    expect(claude?.['verdict_consistent']).toBe(true)
+    // unsupported/unverified surfaces are availability, NOT failures -> still allow
+    expect(capSurface(r.json, 'codex_cli')?.['claimed_verdict']).toBe('unsupported')
+    expect(capSurface(r.json, 'google_antigravity')?.['claimed_verdict']).toBe('unverified')
+  })
+
+  it('GIVEN all unsupported/unverified WHEN checked THEN allow (availability not failure)', () => {
+    const r = runCapability('capability-unsupported-unverified-availability')
+    expect(r.exitCode).toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('allow')
+  })
+})
+
+describe('#1221 AC9: public_safety admission holds on positive matrix', () => {
+  it('GIVEN positive matrix WHEN checked THEN public_safety admission pass and raw_values_emitted false', () => {
+    const r = runCapability('capability-supported-positive')
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['admission']).toBe('pass')
+    expect(ps?.['raw_values_emitted']).toBe(false)
+    expect(ps?.['forbidden_field_scan']).toBe('pass')
+    expect(ps?.['digest_is_over_public_projection_only']).toBe(true)
+    expect(r.json?.['raw_values_emitted']).toBe(false)
+  })
+})
+
+describe('#1221 AC8: negative controls do NOT promote unsafe state to supported', () => {
+  const negativeDeny: { dir: string; surface: string }[] = [
+    { dir: 'claude-duplicate-stop-user-project', surface: 'claude_code' },
+    { dir: 'claude-async-latitude-stop-finishes-after-finalizer', surface: 'claude_code' },
+    { dir: 'claude-hook-exit-zero-without-trace-artifact', surface: 'claude_code' },
+    { dir: 'codex-current-hooks-validator-drift', surface: 'codex_cli' },
+    { dir: 'codex-legacy-codex_hooks-only', surface: 'codex_cli' },
+    { dir: 'codex-untrusted-project-layer', surface: 'codex_cli' },
+    { dir: 'antigravity-mcp-connected-no-capture-artifact', surface: 'google_antigravity' },
+    { dir: 'capability-supported-with-runtime-event-missing', surface: 'claude_code' },
+    { dir: 'capability-supported-with-capture-artifact-missing', surface: 'claude_code' },
+    { dir: 'latitude-floating-npx-package', surface: 'claude_code' },
+    { dir: 'latitude-provenance-unknown', surface: 'claude_code' },
+  ]
+  for (const { dir, surface } of negativeDeny) {
+    it(`GIVEN ${dir} WHEN checked THEN deny and surface not promoted to supported`, () => {
+      const r = runCapability(dir)
+      // fail before / pass after: if the checker wrongly emitted supported, these fail
+      expect(r.exitCode).not.toBe(EXIT_PASS)
+      expect(r.json?.['decision']).toBe('deny')
+      const s = capSurface(r.json, surface)
+      expect(s?.['derived_supported']).toBe(false)
+      expect(s?.['verdict_consistent']).toBe(false)
+    })
+  }
+})
+
+describe('#1221 AC9: raw values emitted -> public_safety fail -> deny', () => {
+  it('GIVEN a surface with raw_values_emitted true WHEN checked THEN deny and admission fail', () => {
+    const r = runCapability('evidence-raw-values-emitted-true')
+    expect(r.exitCode).not.toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('deny')
+    expect(r.json?.['raw_values_emitted']).toBe(true)
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['admission']).toBe('fail')
+  })
+})
+
+describe('#1221 AC2: closed verdict enum and exactly one verdict are enforced', () => {
+  it('GIVEN a verdict outside the closed enum WHEN checked THEN fail_closed (exit 2)', () => {
+    const r = runCapability('capability-invalid-verdict-enum')
+    expect(r.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(r.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN a non-single (array) verdict WHEN checked THEN fail_closed (exit 2)', () => {
+    const r = runCapability('capability-multiple-verdicts')
+    expect(r.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(r.json?.['verdict']).toBe('fail_closed')
+  })
+})
+
+// ============================================================================
+// Issue #1221 P0 hardening: surface set, hook coexistence, doc schema, digest scope
+// ============================================================================
+
+describe('#1221 P0-1: exactly the three required surfaces are enforced', () => {
+  const failClosedDirs = [
+    'capability-missing-codex-surface',
+    'capability-extra-surface',
+    'capability-duplicate-surface',
+  ]
+  for (const dir of failClosedDirs) {
+    it(`GIVEN ${dir} WHEN checked THEN fail_closed (exit 2)`, () => {
+      const r = runCapability(dir)
+      expect(r.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(r.json?.['verdict']).toBe('fail_closed')
+      expect(r.json?.['decision']).toBe('deny')
+    })
+  }
+})
+
+describe('#1221 P0-2: claude_code supported requires hook_coexistence present', () => {
+  it('GIVEN claude_code supported but no hook_coexistence WHEN checked THEN deny (exit 1) and not promoted', () => {
+    const r = runCapability('claude-supported-hook-coexistence-missing')
+    expect(r.exitCode).toBe(EXIT_FAIL)
+    expect(r.json?.['decision']).toBe('deny')
+    const claude = capSurface(r.json, 'claude_code')
+    expect(claude?.['derived_supported']).toBe(false)
+    expect(claude?.['verdict_consistent']).toBe(false)
+    const rcs = (claude?.['reason_codes'] as string[]) ?? []
+    expect(rcs.some(rc => rc.includes('hook_coexistence_missing'))).toBe(true)
+  })
+})
+
+describe('#1221 P0-4: digest_is_over_public_projection_only is validated from input', () => {
+  it('GIVEN a surface that omits digest_scope WHEN checked THEN public_safety fail and deny (exit 1)', () => {
+    const r = runCapability('public-safety-digest-scope-missing')
+    expect(r.exitCode).toBe(EXIT_FAIL)
+    expect(r.json?.['decision']).toBe('deny')
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['admission']).toBe('fail')
+    expect(ps?.['digest_is_over_public_projection_only']).toBe(false)
+  })
+
+  it('GIVEN the positive matrix (with digest_scope) WHEN checked THEN digest projection holds true', () => {
+    const r = runCapability('capability-supported-positive')
+    const ps = r.json?.['public_safety'] as Record<string, unknown>
+    expect(ps?.['digest_is_over_public_projection_only']).toBe(true)
+    expect(ps?.['admission']).toBe('pass')
+  })
+})
+
+interface DocResult { stdout: string; exitCode: number; json: Record<string, unknown> | null }
+
+function runDocValidation(docPath: string): DocResult {
+  const env: Record<string, string> = { ...(process.env as Record<string, string>) }
+  const result = spawnSync(
+    'python3',
+    [SCRIPT, '--validate-capability-doc', docPath],
+    { encoding: 'utf-8', env, timeout: 30000 }
+  )
+  let json: Record<string, unknown> | null = null
+  try { json = JSON.parse(result.stdout ?? '') } catch { /* ignore */ }
+  return { stdout: result.stdout ?? '', exitCode: result.status ?? 1, json }
+}
+
+describe('#1221 P0-3: capability doc machine-readable blocks match the closed schema', () => {
+  it('GIVEN the real matrix doc WHEN validated THEN allow (exit 0) with unified claimed_verdict field', () => {
+    const docPath = resolve(REPO_ROOT, 'docs', 'dev', 'agent-observation-capability.md')
+    const r = runDocValidation(docPath)
+    expect(r.exitCode).toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('allow')
+    expect(r.json?.['field_name_convention']).toBe('claimed_verdict')
+    const surfaces = (r.json?.['surfaces'] as Record<string, unknown>[]) ?? []
+    expect(surfaces.length).toBe(3)
+    for (const s of surfaces) {
+      expect(s['claimed_verdict']).not.toBeNull()
+    }
+  })
+
+  it('GIVEN a drifted doc snippet (extra surface + verdict outside enum) WHEN validated THEN deny (exit non-zero)', () => {
+    const driftPath = join(FIXTURES_DIR, 'doc-ssot-schema-drift', 'drifted-doc.md')
+    const r = runDocValidation(driftPath)
+    expect(r.exitCode).not.toBe(EXIT_PASS)
+    expect(r.json?.['decision']).toBe('deny')
+    const rcs = (r.json?.['reason_codes'] as string[]) ?? []
+    expect(rcs.length).toBeGreaterThan(0)
+  })
+})

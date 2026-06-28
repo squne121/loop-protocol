@@ -87,6 +87,25 @@ PILOT_ACTIVATION_DENY = "deny"
 PILOT_ACTIVATION_ALLOW = "allow"
 
 # ---------------------------------------------------------------------------
+# Agent observation capability matrix (#1221, agent_observation_capability/v1)
+# ---------------------------------------------------------------------------
+CAPABILITY_SCHEMA = "agent_observation_capability/v1"
+CAPABILITY_VERDICT_ENUM = {"supported", "partial", "unsupported", "unverified"}
+CAPABILITY_SURFACE_ENUM = {"claude_code", "codex_cli", "google_antigravity"}
+CODEX_CANONICAL_HOOK_KEY = "[features].hooks"
+CODEX_LEGACY_HOOK_KEY = "codex_hooks"
+HOOK_COEXISTENCE_CONTRACT = {
+    "expected_handlers_fired_once": True,
+    "duplicate_finalization_absent": True,
+    "duplicate_upload_absent": True,
+    "async_hook_not_used_as_gate": True,
+    "post_run_verifier_observed_final_state": True,
+    "runtime_event_and_capture_artifact_correlated": True,
+    "hook_exit_zero_not_authoritative": True,
+    "raw_values_emitted": False,
+}
+
+# ---------------------------------------------------------------------------
 # Secrets mode constants (SRRS_SECRETS_MODE)
 # ---------------------------------------------------------------------------
 SECRET_MODE_NONE = "none"
@@ -1094,6 +1113,319 @@ def run_all_checks(repo_root: Path) -> int:
     return EXIT_PASS
 
 
+def _capability_public_safety(surfaces: list) -> dict[str, Any]:
+    """Aggregate the public_safety admission contract over all surfaces' signals."""
+    raw = prompt = tool_io = abspath = cred = False
+    any_surface = False
+    digest_ok = True
+    for s in surfaces:
+        any_surface = True
+        sig = s.get("signals", {}) if isinstance(s, dict) else {}
+        if not isinstance(sig, dict):
+            sig = {}
+        raw = raw or bool(sig.get("raw_values_emitted", False))
+        prompt = prompt or bool(sig.get("prompt_excerpt_present", False))
+        tool_io = tool_io or bool(sig.get("tool_io_excerpt_present", False))
+        abspath = abspath or bool(sig.get("local_absolute_path_present", False))
+        cred = cred or bool(sig.get("credential_value_present", False))
+        if str(sig.get("digest_scope", "")) != "public_projection_only":
+            digest_ok = False
+    digest_admit = digest_ok and any_surface
+    forbidden_clean = not (prompt or tool_io or abspath or cred)
+    admission = (not raw) and forbidden_clean and digest_admit
+    return {
+        "raw_values_emitted": raw,
+        "forbidden_field_scan": "pass" if forbidden_clean else "fail",
+        "prompt_excerpt_present": prompt,
+        "tool_io_excerpt_present": tool_io,
+        "local_absolute_path_present": abspath,
+        "credential_value_present": cred,
+        "digest_is_over_public_projection_only": digest_admit,
+        "admission": "pass" if admission else "fail",
+    }
+
+
+def _capability_supported_predicate(
+    surface: dict, evidence_mode: str | None
+) -> tuple[bool, list[str]]:
+    """Re-derive whether a surface satisfies the supported predicate.
+
+    Returns (derived_supported, reason_codes). Under synthetic_only the only trusted
+    provenance is synthetic_fixture; real_pilot_verified stays blocked (#1220).
+    """
+    sig = surface.get("signals", {})
+    if not isinstance(sig, dict):
+        sig = {}
+    name = surface.get("surface")
+    rcs: list[str] = []
+
+    runtime = bool(sig.get("runtime_event_observed", False))
+    capture = bool(sig.get("capture_artifact_observed", False))
+    raw = bool(sig.get("raw_values_emitted", False))
+    provenance = str(sig.get("evidence_provenance", "unknown"))
+
+    if not runtime:
+        rcs.append("runtime_event_not_observed")
+    if not capture:
+        rcs.append("capture_artifact_not_observed")
+    if raw:
+        rcs.append("raw_values_emitted")
+
+    trusted = {"synthetic_fixture"}
+    if evidence_mode != "synthetic_only":
+        trusted = trusted | {"real_pilot_verified"}
+    if provenance not in trusted:
+        rcs.append("evidence_provenance_not_trusted")
+
+    hc = sig.get("hook_coexistence")
+    if name == "claude_code":
+        # #1221 P0-2: claude_code MUST prove hook coexistence to reach supported.
+        if not isinstance(hc, dict):
+            rcs.append("hook_coexistence_missing")
+        else:
+            for key, required in HOOK_COEXISTENCE_CONTRACT.items():
+                if bool(hc.get(key, not required)) != required:
+                    rcs.append("hook_coexistence_violation")
+                    break
+    elif isinstance(hc, dict):
+        for key, required in HOOK_COEXISTENCE_CONTRACT.items():
+            if bool(hc.get(key, not required)) != required:
+                rcs.append("hook_coexistence_violation")
+                break
+
+    if name == "codex_cli":
+        if str(sig.get("hooks_feature_key", "")) != CODEX_CANONICAL_HOOK_KEY:
+            rcs.append("codex_non_canonical_hook_key")
+        if bool(sig.get("validator_drift", False)):
+            rcs.append("codex_validator_drift")
+        if not bool(sig.get("project_layer_trusted", False)):
+            rcs.append("codex_project_layer_untrusted")
+
+    if name == "google_antigravity" and not (runtime and capture):
+        rcs.append("antigravity_no_capture_runtime_correlation")
+
+    derived = len(rcs) == 0
+    return derived, list(dict.fromkeys(rcs))
+
+
+def run_capability_check(fixture_path: str) -> tuple[dict[str, Any], int]:
+    """#1221: validate an agent_observation_capability/v1 matrix fixture.
+
+    Exit codes:
+      0  admitted (allow): consistent surfaces, public_safety pass, supported predicate honored
+      1  deny (blocked): unsafe promotion to supported / public_safety failure
+      2  fail_closed: malformed schema / bad enum / missing-or-multiple verdict
+    """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        data = json.loads(Path(fixture_path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        return {
+            "schema": "agent_observation_capability_check/v1",
+            "decision": "deny",
+            "verdict": "fail_closed",
+            "exit_code": EXIT_FAIL_CLOSED,
+            "evidence_mode": None,
+            "real_runtime_evidence":
+                "blocked_until_pilot_exception_approve_timeboxed_real_pilot",
+            "surfaces": [],
+            "surface_count": 0,
+            "public_safety": _capability_public_safety([]),
+            "reason_codes": ["capability_fixture_unreadable"],
+            "raw_values_emitted": False,
+            "checked_at": now_iso,
+        }, EXIT_FAIL_CLOSED
+
+    reason_codes: list[str] = []
+    malformed = False
+    deny = False
+
+    if not isinstance(data, dict) or data.get("schema") != CAPABILITY_SCHEMA:
+        malformed = True
+        reason_codes.append("capability_schema_invalid")
+    evidence_mode = data.get("evidence_mode") if isinstance(data, dict) else None
+    if evidence_mode != "synthetic_only":
+        malformed = True
+        reason_codes.append("capability_evidence_mode_invalid")
+
+    raw_surfaces = data.get("surfaces") if isinstance(data, dict) else None
+    if not isinstance(raw_surfaces, list) or not raw_surfaces:
+        malformed = True
+        reason_codes.append("capability_surfaces_missing")
+        raw_surfaces = []
+
+    surface_results: list[dict[str, Any]] = []
+    seen: set = set()
+
+    for s in raw_surfaces:
+        if not isinstance(s, dict):
+            malformed = True
+            reason_codes.append("capability_surface_not_object")
+            continue
+        name = s.get("surface")
+        verdict = s.get("claimed_verdict")
+        s_rcs: list[str] = []
+
+        if name not in CAPABILITY_SURFACE_ENUM:
+            malformed = True
+            s_rcs.append("surface_name_invalid")
+        if name in seen:
+            malformed = True
+            s_rcs.append("surface_duplicate")
+        seen.add(name)
+
+        if not isinstance(verdict, str) or verdict not in CAPABILITY_VERDICT_ENUM:
+            malformed = True
+            s_rcs.append("verdict_not_single_closed_enum")
+
+        derived, pred_rcs = _capability_supported_predicate(s, evidence_mode)
+        s_rcs.extend(pred_rcs)
+
+        consistent = True
+        if verdict == "supported" and not derived:
+            consistent = False
+            deny = True
+            s_rcs.append("unsafe_supported_promotion")
+
+        surface_results.append({
+            "surface": name,
+            "claimed_verdict": verdict if isinstance(verdict, str) else None,
+            "derived_supported": derived,
+            "verdict_consistent": consistent,
+            "reason_codes": list(dict.fromkeys(s_rcs)),
+        })
+
+    # #1221 P0-1: require EXACTLY the three canonical surfaces (no missing, no
+    # extra/unknown). seen is the set of surface names encountered above.
+    if seen != CAPABILITY_SURFACE_ENUM:
+        malformed = True
+        if not CAPABILITY_SURFACE_ENUM.issubset(seen):
+            reason_codes.append("capability_surface_set_incomplete")
+
+    public_safety = _capability_public_safety(raw_surfaces)
+    if public_safety["admission"] != "pass":
+        deny = True
+        reason_codes.append("public_safety_admission_failed")
+
+    if malformed:
+        verdict_out = "fail_closed"
+        exit_code = EXIT_FAIL_CLOSED
+        decision = "deny"
+    elif deny:
+        verdict_out = "blocked"
+        exit_code = EXIT_FAIL
+        decision = "deny"
+    else:
+        verdict_out = "admitted"
+        exit_code = EXIT_PASS
+        decision = "allow"
+
+    output = {
+        "schema": "agent_observation_capability_check/v1",
+        "decision": decision,
+        "verdict": verdict_out,
+        "exit_code": exit_code,
+        "evidence_mode": evidence_mode,
+        "real_runtime_evidence":
+            "blocked_until_pilot_exception_approve_timeboxed_real_pilot",
+        "surfaces": surface_results,
+        "surface_count": len(seen),
+        "public_safety": public_safety,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "raw_values_emitted": public_safety["raw_values_emitted"],
+        "checked_at": now_iso,
+    }
+    return output, exit_code
+
+
+def _extract_capability_doc_blocks(text: str) -> list[str]:
+    """Return the bodies of all fenced yaml blocks in a markdown document."""
+    return re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
+
+
+def validate_capability_doc(doc_path: str) -> tuple[dict[str, Any], int]:
+    """#1221 P0-3: validate the machine-readable surface blocks in the matrix doc.
+
+    Deny on drift: the closed verdict_enum must equal CAPABILITY_VERDICT_ENUM,
+    exactly the three canonical surfaces must be present, each surface must carry
+    exactly one verdict from the closed enum, and the per-surface verdict field must
+    use the unified name 'claimed_verdict' (legacy 'verdict:' is treated as drift).
+    """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reasons: list[str] = []
+    try:
+        text = Path(doc_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return {
+            "schema": "agent_observation_capability_doc_check/v1",
+            "decision": "deny",
+            "field_name_convention": "claimed_verdict",
+            "verdict_enum": sorted(CAPABILITY_VERDICT_ENUM),
+            "doc_verdict_enum": None,
+            "surfaces": [],
+            "reason_codes": ["capability_doc_unreadable"],
+            "checked_at": now_iso,
+        }, EXIT_FAIL_CLOSED
+
+    blocks = _extract_capability_doc_blocks(text)
+    enum_values: list[str] | None = None
+    surfaces: list[dict[str, Any]] = []
+    seen_surface: set[str] = set()
+    for block in blocks:
+        surface_name: str | None = None
+        claimed: str | None = None
+        legacy: str | None = None
+        for ln in block.splitlines():
+            m_enum = re.match(r"^\s*verdict_enum:\s*\[(.*)\]\s*$", ln)
+            if m_enum:
+                enum_values = [x.strip() for x in m_enum.group(1).split(",") if x.strip()]
+            m_surface = re.match(r"^surface:\s*(\S+)\s*$", ln)
+            if m_surface:
+                surface_name = m_surface.group(1)
+            m_claimed = re.match(r"^claimed_verdict:\s*(\S+)\s*$", ln)
+            if m_claimed:
+                claimed = m_claimed.group(1)
+            m_legacy = re.match(r"^verdict:\s*(\S+)\s*$", ln)
+            if m_legacy:
+                legacy = m_legacy.group(1)
+        if surface_name is None:
+            continue
+        if surface_name in seen_surface:
+            reasons.append("capability_doc_surface_duplicate")
+        seen_surface.add(surface_name)
+        if claimed is None:
+            reasons.append("capability_doc_field_name_drift")
+        verdict_value = claimed if claimed is not None else legacy
+        if verdict_value is not None and verdict_value not in CAPABILITY_VERDICT_ENUM:
+            reasons.append("capability_doc_surface_verdict_invalid")
+        surfaces.append({
+            "surface": surface_name,
+            "claimed_verdict": claimed,
+            "verdict_value": verdict_value,
+        })
+
+    if enum_values is None:
+        reasons.append("capability_doc_verdict_enum_missing")
+    elif set(enum_values) != CAPABILITY_VERDICT_ENUM:
+        reasons.append("capability_doc_verdict_enum_drift")
+    if seen_surface != CAPABILITY_SURFACE_ENUM:
+        reasons.append("capability_doc_surface_set_drift")
+
+    reasons = list(dict.fromkeys(reasons))
+    decision = "allow" if not reasons else "deny"
+    exit_code = EXIT_PASS if not reasons else EXIT_FAIL_CLOSED
+    return {
+        "schema": "agent_observation_capability_doc_check/v1",
+        "decision": decision,
+        "field_name_convention": "claimed_verdict",
+        "verdict_enum": sorted(CAPABILITY_VERDICT_ENUM),
+        "doc_verdict_enum": enum_values,
+        "surfaces": surfaces,
+        "reason_codes": reasons,
+        "checked_at": now_iso,
+    }, exit_code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fail-closed verifier for session recording runtime safety."
@@ -1120,10 +1452,32 @@ def main() -> int:
         "--test-mode", action="store_true", default=False,
         help="Alias for --execution-profile fixture",
     )
+    parser.add_argument(
+        "--capability-fixture", default=None,
+        help="Path to an agent_observation_capability/v1 fixture JSON; runs the "
+             "#1221 capability matrix check and exits.",
+    )
+    parser.add_argument(
+        "--validate-capability-doc", default=None,
+        help="Path to the agent observation capability matrix doc; validates its "
+             "machine-readable surface blocks against the closed schema and exits.",
+    )
     args = parser.parse_args()
 
     execution_profile = args.execution_profile
     # Note: --test-mode just confirms fixture profile (already default)
+
+    # #1221 P0-3: capability doc schema cross-check (self-contained mode)
+    if args.validate_capability_doc:
+        doc_output, doc_exit = validate_capability_doc(args.validate_capability_doc)
+        print(json.dumps(doc_output, indent=2), flush=True)
+        return doc_exit
+
+    # #1221: capability matrix check is a self-contained mode (no SRRS env, no repo scan)
+    if args.capability_fixture:
+        cap_output, cap_exit = run_capability_check(args.capability_fixture)
+        print(json.dumps(cap_output, indent=2), flush=True)
+        return cap_exit
 
     # AC19: host mode rejects SRRS_* overrides
     if execution_profile == "host":
