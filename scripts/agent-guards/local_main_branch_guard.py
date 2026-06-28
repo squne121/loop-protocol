@@ -43,11 +43,6 @@ from skill_runtime_command_policy import (  # noqa: E402
     is_exact_skill_runtime_executor_command,
     looks_like_skill_runtime_executor_command,
 )
-from worktree_bootstrap_command_policy import (  # noqa: E402
-    WORKTREE_BOOTSTRAP_REASON_CODE,
-    is_exact_worktree_bootstrap_executor_command,
-    looks_like_worktree_bootstrap_executor_command,
-)
 
 
 # ─── Reason codes ────────────────────────────────────────────────────────────
@@ -61,6 +56,7 @@ REASON_ALREADY_DRIFTED = "already_drifted_root"
 REASON_DETACHED_OR_UNKNOWN = "detached_or_unknown_root"
 REASON_UNPARSEABLE = "unparseable_branch_mutation"
 REASON_UNKNOWN_COMMAND = "unknown_command_requires_review"
+REASON_UNKNOWN_ALLOWED = "unknown_non_branch_command_allowed"
 REASON_GH_API = "github_api_command"
 REASON_RTK_HELP_COMMAND = "rtk_help_command"
 REASON_RTK_PROXY = "rtk_proxy_requires_review"
@@ -69,7 +65,6 @@ REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
 REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
-REASON_WORKTREE_BOOTSTRAP_EXECUTOR = WORKTREE_BOOTSTRAP_REASON_CODE
 # Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
 # arbitrated by worktree_scope_guard against the V3 one-shot contract. The local
 # root branch guard explicitly DEFERS authority to that guard so the two guards
@@ -117,7 +112,6 @@ COMMAND_KIND_GITHUB_PR_METADATA = "github_pr_metadata"
 COMMAND_KIND_GITHUB_DESTRUCTIVE = "github_mutation"
 COMMAND_KIND_GITHUB_MUTATION = COMMAND_KIND_GITHUB_DESTRUCTIVE
 COMMAND_KIND_READONLY = "readonly_command"
-COMMAND_KIND_WORKTREE_BOOTSTRAP = "worktree_bootstrap_executor"
 
 
 # ─── Root state classification ────────────────────────────────────────────────
@@ -525,7 +519,7 @@ def _redact_argv(tokens: list[str] | None) -> list[str]:
         return []
     redacted: list[str] = []
     skip_next = False
-    sensitive_flags = {"--body-file", "--body", "--input", "--field", "--raw-field"}
+    sensitive_flags = {"--body-file", "--body", "--input", "--field", "--raw-field", "-f", "-F"}
     for idx, token in enumerate(tokens):
         if skip_next:
             redacted.append("<redacted>")
@@ -580,9 +574,9 @@ def _parse_gh_api_command(cmd: str) -> bool:
             i += 1
             continue
 
-        if token in {"-f", "-F", "--field", "--input", "--raw-field"}:
+        if token in {"-f", "-F", "--field", "--input", "--raw-field", "--hostname", "--paginate"}:
             return False
-        if token.startswith(("--field=", "--input=", "--raw-field=")):
+        if token.startswith(("--field=", "--input=", "--raw-field=", "--hostname=")):
             return False
         if token.startswith("-") and not endpoint:
             # Skip unknown flags; values remain allowed only if no endpoint consumed.
@@ -599,6 +593,8 @@ def _parse_gh_api_command(cmd: str) -> bool:
     if not endpoint:
         return False
     if method != "GET":
+        return False
+    if "{owner}" in endpoint or "{repo}" in endpoint:
         return False
     if not _GH_API_ENDPOINT_RE.fullmatch(endpoint):
         return False
@@ -932,11 +928,18 @@ def is_github_issue_mutation_command(cmd: str) -> bool:
         if not title_val:
             return False
 
-    # Check --repo matches trusted slug
+    allowed_flags = {"--repo", "--body-file"}
+    if subcommand == "create":
+        allowed_flags.add("--title")
+
+    # Check --repo matches trusted slug and reject mutation-expanding flags.
     has_trusted_repo = False
     i = 0
     while i < len(args):
         tok = args[i]
+        flag_name = tok.split("=", 1)[0]
+        if tok.startswith("--") and flag_name not in allowed_flags:
+            return False
         if tok == "--repo":
             if i + 1 < len(args) and args[i + 1] == TRUSTED_REPO_SLUG:
                 has_trusted_repo = True
@@ -1682,30 +1685,6 @@ def evaluate(
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
-    if project_root and is_exact_worktree_bootstrap_executor_command(normalized_cmd, cwd, project_root):
-        return _emit(
-            status="allow",
-            reason_code=REASON_WORKTREE_BOOTSTRAP_EXECUTOR,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="worktree_bootstrap_exec",
-            local_command_kind=COMMAND_KIND_WORKTREE_BOOTSTRAP,
-            local_rule_id="worktree_bootstrap_executor",
-            argv_tokens=argv_redacted,
-            inner_tokens=inner_argv_redacted,
-        )
-    if looks_like_worktree_bootstrap_executor_command(normalized_cmd):
-        return _emit(
-            status="block",
-            reason_code=REASON_UNKNOWN_COMMAND,
-            target_branch=None,
-            target_branch_kind=None,
-            local_parser_stage="worktree_bootstrap_guess_block",
-            local_command_kind=COMMAND_KIND_WORKTREE_BOOTSTRAP,
-            local_rule_id="worktree_bootstrap_guess",
-            argv_tokens=argv_redacted,
-            inner_tokens=inner_argv_redacted,
-        )
     if _looks_like_direct_issue_refinement_runtime_command(normalized_cmd):
         return _emit(
             status="block",
@@ -1935,12 +1914,12 @@ def evaluate(
     # Default: allow
     return _emit(
         status="allow",
-        reason_code=REASON_UNKNOWN_COMMAND,
+        reason_code=REASON_UNKNOWN_ALLOWED,
         target_branch=None,
         target_branch_kind=None,
         local_parser_stage="final_classification",
         local_command_kind=COMMAND_KIND_UNKNOWN,
-        local_rule_id="default_unknown_allow",
+        local_rule_id="unknown_non_branch_command_allowed",
         argv_tokens=argv_redacted,
         inner_tokens=inner_argv_redacted,
     )
@@ -2134,6 +2113,12 @@ def run_hook(hook_flavor: str = "claude") -> int:
             current_is_default=(current_branch == default_branch),
             target_branch_kind=result.get("target_branch_kind"),
             hook_flavor=hook_flavor,
+            event_kind=result.get("event_kind"),
+            decision=result.get("decision"),
+            command_kind=result.get("command_kind"),
+            parser_stage=result.get("parser_stage"),
+            rule_id=result.get("rule_id"),
+            argv_redacted=result.get("argv_redacted"),
         )
         return 2
 
@@ -2166,40 +2151,52 @@ def _emit_block_stderr(
     Compatibility kwargs are accepted so direct helper call sites can validate
     the same bounded diagnostic fields that hook-mode emits.
     """
-    lines = [
-        "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-        "hook_name: local_main_branch_guard",
-        f"reason_code: {reason_code}",
-        f"current_branch_kind: {current_branch_kind}",
-        f"current_is_default: {str(current_is_default).lower()}",
-    ]
-    if target_branch_kind:
-        lines.append(f"target_branch_kind: {target_branch_kind}")
-    if event_kind:
-        lines.append(f"event_kind: {event_kind}")
-    if decision:
-        lines.append(f"decision: {decision}")
-    if rule_id:
-        lines.append(f"rule_id: {rule_id}")
-    if command_kind:
-        lines.append(f"command_kind: {command_kind}")
-    if parser_stage:
-        lines.append(f"parser_stage: {parser_stage}")
-    if argv_redacted is not None:
-        lines.append(f"argv_redacted: {argv_redacted}")
+    detailed_mode = any(
+        value is not None
+        for value in (event_kind, decision, command_kind, parser_stage, rule_id, argv_redacted)
+    )
+    if detailed_mode:
+        branch_summary = (
+            f"branch_context: current_branch_kind={current_branch_kind} "
+            f"current_is_default={str(current_is_default).lower()}"
+        )
+        if target_branch_kind:
+            branch_summary += f" target_branch_kind={target_branch_kind}"
+        lines = [
+            "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
+            "hook_name: local_main_branch_guard",
+            f"event_kind: {event_kind or 'PreToolUse'}",
+            f"decision: {decision or 'block'}",
+            f"reason_code: {reason_code}",
+            f"rule_id: {rule_id or reason_code}",
+            f"command_kind: {command_kind or COMMAND_KIND_UNKNOWN}",
+            f"parser_stage: {parser_stage or 'classification'}",
+            f"argv_redacted: {argv_redacted if argv_redacted is not None else []}",
+            branch_summary,
+        ]
+    else:
+        lines = [
+            "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
+            "hook_name: local_main_branch_guard",
+            f"reason_code: {reason_code}",
+            f"current_branch_kind: {current_branch_kind}",
+            f"current_is_default: {str(current_is_default).lower()}",
+        ]
+        if target_branch_kind:
+            lines.append(f"target_branch_kind: {target_branch_kind}")
 
-    if reason_code == REASON_INLINE_OVERRIDE:
-        lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
-    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-        lines.append("recovery: switch root back to default branch first")
-    elif reason_code == REASON_UNPARSEABLE:
-        lines.append("recovery: use simple (non-compound) git commands from local root")
-    elif reason_code == REASON_DRIFT:
-        lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
-    elif reason_code == REASON_GH_MUTATION:
-        lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
+        if reason_code == REASON_INLINE_OVERRIDE:
+            lines.append("recovery: set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch")
+        elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
+            lines.append("recovery: switch root back to default branch first")
+        elif reason_code == REASON_UNPARSEABLE:
+            lines.append("recovery: use simple (non-compound) git commands from local root")
+        elif reason_code == REASON_DRIFT:
+            lines.append("recovery: create/enter linked issue worktree, or switch only to default branch")
+        elif reason_code == REASON_GH_MUTATION:
+            lines.append("recovery: use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow")
 
-    lines.append(f"hook_flavor: {hook_flavor}")
+        lines.append(f"hook_flavor: {hook_flavor}")
 
     # Enforce max 10 lines
     for line in lines[:10]:
