@@ -1135,7 +1135,8 @@ def _make_suggestion(vtype: str) -> str | None:
         "heredoc_c_dependency": "Inline code imports a non-stdlib module; use: uv run --locked python - / python -c",
         "uv_run_inline_no_locked_dependency": "Add --locked to the inline uv run python invocation",
         "exception_proof_failed": "Registered stdlib_only exception target imports a non-stdlib module",
-        "unsupported_shell_grammar": "Rewrite using grammar the checker can parse (no unbalanced/unsupported substitution)",
+        "unsupported_shell_grammar": "Rewrite using grammar the checker can parse"
+        " (no unbalanced/unsupported substitution)",
     }
     return table.get(vtype)
 
