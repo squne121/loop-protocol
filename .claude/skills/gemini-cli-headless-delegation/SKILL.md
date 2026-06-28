@@ -22,13 +22,13 @@ disable-model-invocation: true
 
 0. **setup_check で依存ツール・trusted folder・Serena MCP・settings.json を確認する（必須）**:
    ```bash
-   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
    ```
    `ok: false` → `recovery` に従って対処。副作用ある操作（trustedFolders / .gemini/settings.json 変更）は `--fix` を付ける。
 
 1. **request JSON を build_request.py で生成する（推奨）**:
    ```bash
-   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
      --profile github_research \
      --objective 'Issue #313 と PR #321 を gh issue view / gh pr view で調査する' \
      --context-file .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md \
@@ -39,14 +39,14 @@ disable-model-invocation: true
 
 2. **preflight を実行する（必須）**:
    ```bash
-   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
      --output-file tmp/gemini-headless-preflight.json
    ```
    `ok: false` → `failure_reason` / `next_action` を確認して修正する。
 
 3. **`scripts/run_gemini_headless.py` で request を検証・実行する**:
    ```bash
-   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
      --request-file /tmp/gemini/request.json --output-file /tmp/gemini/result.json
    ```
    validate-only（Gemini CLI 未実行）は `--validate-only` を指定する。結果は `result_surface.summary` / `.primary_artifact` / `.next_action` を優先参照する。
@@ -85,7 +85,7 @@ API key が利用可能な場合は `GEMINI_API_KEY` 環境変数に設定する
 ```bash
 # 暫定運用例（セッション内のみ有効）
 export GEMINI_API_KEY=<your-key>
-uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
 # → auth.status: "authenticated_api_key"
 ```
 

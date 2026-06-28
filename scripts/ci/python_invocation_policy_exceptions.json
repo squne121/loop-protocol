@@ -1,0 +1,103 @@
+{
+  "schema_version": 2,
+  "exceptions": [
+    {
+      "id": "python_test_plan_scope_argv",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "scope-argv", "--check-paths", "--format", "json"],
+      "reason": "Bootstrap loader: emits pytest scope argv for the CI lanes before uv sync; stdlib-only and must run before project dependencies are synced.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "python_test_plan_run_argv_parallel_nul",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "run-argv", "--mode", "parallel", "--format", "nul"],
+      "reason": "Bootstrap loader: emits the NUL-delimited parallel run argv before uv sync; stdlib-only.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "python_test_plan_run_argv_parallel",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "run-argv", "--mode", "parallel"],
+      "reason": "Bootstrap loader: documented parallel run argv example (test-lane-policy.md); stdlib-only.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "python_test_plan_workers",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "workers", "--format", "lines"],
+      "reason": "Bootstrap loader: emits resolved worker count before uv sync; stdlib-only.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "python_test_plan_scheduler",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "scheduler", "--format", "lines"],
+      "reason": "Bootstrap loader: emits the xdist scheduler before uv sync; stdlib-only.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "python_test_plan_serial_lane",
+      "scope": "bootstrap",
+      "exact_argv": ["python3", "scripts/ci/python_test_plan.py", "--emit", "serial-lane-argv", "--format", "nul"],
+      "reason": "Bootstrap loader: emits the NUL-delimited serial-lane argv before uv sync; stdlib-only.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "codex_execpolicy_matrix",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", "scripts/ci/codex_execpolicy_matrix.py", "--npm-prefix", "codex_execpolicy_artifacts/codex-cli", "--package-spec", "@openai/codex@0.142.0", "--expected-version", "codex-cli 0.142.0", "--rules", ".codex/rules/default.rules", "--artifact", "codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json"],
+      "reason": "Codex execpolicy matrix runner uses stdlib only (subprocess, json, os, hashlib, shlex, importlib.util, tempfile); runs in a dedicated CI context as a bootstrap step.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "secret_exposure_scanner_valid_fixtures",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/scripts/secret_exposure_scanner.py", "--local", "tests/fixtures/session-recording/valid", "--fail-on-finding"],
+      "reason": "Secret exposure scanner over clean fixtures: stdlib-only path/regex scanner; invoked in CI/package scripts without uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "secret_exposure_scanner_invalid_fixtures",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/scripts/secret_exposure_scanner.py", "--local", "tests/fixtures/session-recording/invalid"],
+      "reason": "Secret exposure scanner over invalid fixtures: stdlib-only path/regex scanner; invoked in package scripts without uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "secret_exposure_scanner_production",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/scripts/secret_exposure_scanner.py", "--local", ".claude/scripts", "--exclude", "secret_exposure_scanner.py", "--exclude", "check_session_recording_runtime_safety.py", "--fail-on-finding"],
+      "reason": "Secret exposure scanner over production scripts: stdlib-only path/regex scanner; invoked in CI/package scripts without uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "validate_japanese_content_threshold",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/skills/create-issue/scripts/validate_japanese_content.py", "--threshold", "0.1"],
+      "reason": "Japanese prose ratio validator (stdin form): stdlib-only (argparse/re/sys + local prose_boundary_policy module); invoked in check-japanese.yml which runs without uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "validate_japanese_content_file",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/skills/create-issue/scripts/validate_japanese_content.py", "--file", "$file", "--threshold", "0.1"],
+      "reason": "Japanese prose ratio validator (per-file form): stdlib-only (argparse/re/sys + local prose_boundary_policy module); invoked in check-japanese.yml which runs without uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "ci_verdict_summary_v2_generate",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py", "--expected-head-sha", "${{ github.event.pull_request.head.sha || github.sha }}", "--repository", "${{ github.repository }}", "--workflow-run-id", "${{ github.run_id }}", "--workflow-run-attempt", "${{ github.run_attempt }}", "--event-name", "${{ github.event_name }}", "--needs-json", "${NEEDS_JSON}", "--output", "ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json"],
+      "reason": "CI verdict summary v2 emitter (generate step): stdlib-only (argparse/json/os/sys/datetime/typing); invoked in the ci-verdict-summary aggregation job which does not run uv sync.",
+      "proof": "stdlib_import_scan"
+    },
+    {
+      "id": "ci_verdict_summary_v2_step_summary",
+      "scope": "stdlib_only",
+      "exact_argv": ["python3", ".claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py", "--expected-head-sha", "${{ github.event.pull_request.head.sha || github.sha }}", "--repository", "${{ github.repository }}", "--workflow-run-id", "${{ github.run_id }}", "--workflow-run-attempt", "${{ github.run_attempt }}", "--event-name", "${{ github.event_name }}", "--needs-json", "${NEEDS_JSON}", "--output", "ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json", "--artifact-id", "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-id }}", "--artifact-url", "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-url }}", "--artifact-digest", "${{ steps.upload-ci-verdict-summary-v2.outputs.artifact-digest }}"],
+      "reason": "CI verdict summary v2 emitter (Step Summary step): stdlib-only; passes artifact id/url/digest so they appear in the JSON and Step Summary; runs in the ci-verdict-summary job without uv sync.",
+      "proof": "stdlib_import_scan"
+    }
+  ]
+}
