@@ -26,7 +26,7 @@
     },
     {
       "command": "echo https://github.com/squne121/loop-protocol/issues/1170#issuecomment-4814071263",
-      "reason": "unknown_command_requires_review"
+      "reason": "unknown_non_branch_command_allowed"
     }
   ],
   "block": [
@@ -61,6 +61,22 @@
     {
       "command": "gh api repos/squne121/loop-protocol/issues/1198/comments -f body='x'",
       "reason": "github_api_command"
+    },
+    {
+      "command": "gh api --hostname evil.example.com repos/squne121/loop-protocol/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api repos/{owner}/{repo}/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh api --paginate repos/squne121/loop-protocol/issues/comments/4814545233",
+      "reason": "github_api_command"
+    },
+    {
+      "command": "gh issue edit 1198 --repo squne121/loop-protocol --body-file tmp/x.md --add-label foo",
+      "reason": "gh_mutation_denied"
     },
     {
       "command": "rtk unknown-subcommand",
