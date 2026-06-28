@@ -17,6 +17,8 @@ from skill_runtime_command_policy import (
     REGISTRY_REL,
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
+    ExactSkillRuntimeCommand,
+    command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_executor_command,
     load_registry_entry,
@@ -242,11 +244,18 @@ def _validate_runtime_context(project_root: str, args: argparse.Namespace) -> Pa
     repo_slug = resolve_repo_slug(project_root)
     if repo_slug != TRUSTED_REPO_SLUG or args.repo != repo_slug:
         raise RuntimeError("repo_binding_mismatch")
-    active_issue, entry = resolve_active_issue(project_root, project_root)
-    if active_issue != str(args.issue_number):
-        raise RuntimeError("active_issue_mismatch")
-    if entry is None:
-        raise RuntimeError("active_issue_worktree_missing")
+    parsed = ExactSkillRuntimeCommand(
+        command_id=args.command_id,
+        issue_number=str(args.issue_number),
+        repo=args.repo,
+        argv=(),
+    )
+    if not command_allows_root_no_worktree(parsed):
+        active_issue, entry = resolve_active_issue(project_root, project_root)
+        if active_issue != str(args.issue_number):
+            raise RuntimeError("active_issue_mismatch")
+        if entry is None:
+            raise RuntimeError("active_issue_worktree_missing")
     return _ensure_artifact_path_safe(project_root, str(args.issue_number))
 
 

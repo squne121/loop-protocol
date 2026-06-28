@@ -1865,23 +1865,21 @@ def test_skill_runtime_executor_runs_preflight_directly(tmp_path):
     assert payload == {"issue_number": "1154", "repo": "squne121/loop-protocol"}
 
 
-def test_skill_runtime_executor_blocks_stale_directory_without_catalog_entry(tmp_path):
-    """Issue #1154: stale directory alone must not satisfy active-worktree binding."""
+def test_skill_runtime_executor_allows_without_catalog_entry_for_preflight_run(tmp_path):
+    """Issue #1228: preflight.run is allowed even when no linked worktree is active."""
     repo = _make_repo_with_worktree(tmp_path, issue="1154", slug="x")
     _git("worktree", "remove", "--force", str(repo["worktree"]), cwd=repo["root"])
-    repo["worktree"].mkdir(parents=True, exist_ok=True)
     _install_skill_runtime_exec_fixture(repo["root"], catalog_mode="missing")
     env = {
         **os.environ,
         "CLAUDE_PROJECT_DIR": str(repo["root"]),
-        "LOOP_ISSUE_NUMBER": "1154",
     }
     payload = _bash_payload(
         "uv run python3 scripts/agent-guards/skill_runtime_exec.py --command-id preflight.run --issue-number 1154 --repo squne121/loop-protocol",
         str(repo["root"]),
     )
-    guard_result = _run_guard(payload, repo["root"], issue="1154", extra_env=env)
-    assert guard_result.returncode == 2
+    guard_result = _run_guard(payload, repo["root"], issue=None, extra_env=env)
+    assert guard_result.returncode == 0, guard_result.stderr
     direct = subprocess.run(
         [
             sys.executable,
@@ -1899,7 +1897,7 @@ def test_skill_runtime_executor_blocks_stale_directory_without_catalog_entry(tmp
         env=env,
         check=False,
     )
-    assert direct.returncode == 2
+    assert direct.returncode == 0, direct.stderr
 
 
 @pytest.mark.parametrize(
