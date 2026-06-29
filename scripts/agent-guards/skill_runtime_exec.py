@@ -276,6 +276,16 @@ def _find_unauthorized_repo_changes(
 ) -> str | None:
     after_snapshot = _snapshot_repo_paths(project_root, issue_number)
     after_status = _git_status_paths(project_root)
+    new_status_paths = {
+        path
+        for path in (after_status - before_status)
+        if not _is_under_allowed_artifact_root(project_root, issue_number, path)
+    }
+    if new_status_paths:
+        return sorted(
+            new_status_paths,
+            key=lambda item: (len(Path(item).parts), item),
+        )[-1]
     if before_snapshot != after_snapshot:
         changed = sorted(set(before_snapshot) ^ set(after_snapshot))
         if not changed:
@@ -284,15 +294,51 @@ def _find_unauthorized_repo_changes(
                 for path in before_snapshot.keys() & after_snapshot.keys()
                 if before_snapshot[path] != after_snapshot[path]
             )
-        return changed[0] if changed else "snapshot_drift"
-    new_status_paths = {
-        path
-        for path in (after_status - before_status)
-        if not _is_under_allowed_artifact_root(project_root, issue_number, path)
-    }
-    if new_status_paths:
-        return sorted(new_status_paths)[0]
+        return (
+            sorted(
+                changed,
+                key=lambda item: (len(Path(item).parts), item),
+            )[-1]
+            if changed
+            else "snapshot_drift"
+        )
     return None
+
+
+def _is_issue_scoped_temp_path(path: str) -> bool:
+    try:
+        normalized = Path(path).resolve()
+    except Exception:
+        return False
+    if not normalized.exists():
+        return False
+    cwd_root = Path(os.getcwd()).resolve()
+    artifacts_root = cwd_root / ".claude" / "artifacts" / "issue-refinement-loop"
+    worktrees_root = cwd_root / ".claude" / "worktrees"
+    if str(normalized).startswith(str(artifacts_root)):
+        return True
+    return str(normalized).startswith(str(worktrees_root)) and not str(normalized).startswith(
+        str(worktrees_root / "tmp")
+    )
+
+
+def _normalize_and_validate_runtime_env() -> list[str]:
+    stale_paths: list[str] = []
+    for env_name in (
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+    ):
+        env_value = os.environ.get(env_name)
+        if not env_value:
+            continue
+        if not _is_issue_scoped_temp_path(env_value):
+            stale_paths.append(f"{env_name}={env_value}")
+    return stale_paths
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,7 +420,13 @@ def main(argv: list[str] | None = None) -> int:
         before_status,
     )
     if unauthorized_path is not None:
-        print(f"skill_runtime_exec: unauthorized write path {unauthorized_path}", file=sys.stderr)
+        print(
+            "SKILL_RUNTIME_FAIL: "
+            f"reason_code=stale_worktree_runtime_state target_issue={args.issue_number} "
+            f"stale_path={unauthorized_path} "
+            "recovery=do_not_write_outside_allowed_root",
+            file=sys.stderr,
+        )
         return 2
 
     if result.stdout:
@@ -382,6 +434,28 @@ def main(argv: list[str] | None = None) -> int:
     if result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
+
+
+_original_main = main
+
+
+def main() -> int:
+    stale_paths = _normalize_and_validate_runtime_env()
+    if stale_paths:
+        target_issue = "?"
+        for idx, token in enumerate(sys.argv):
+            if token == "--issue-number" and idx + 1 < len(sys.argv):
+                target_issue = sys.argv[idx + 1]
+                break
+        print(
+            "SKILL_RUNTIME_FAIL: reason_code=stale_worktree_runtime_state "
+            f"target_issue={target_issue} "
+            f"stale_path={','.join(stale_paths)} "
+            "recovery=unset_or_correct_runtime_env_to_issue_artifacts_root",
+            file=sys.stderr,
+        )
+        return 2
+    return _original_main()
 
 
 if __name__ == "__main__":

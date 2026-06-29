@@ -125,6 +125,46 @@ BLOCKER_REWRITE_CONSTRAINTS_NON_STRING_PAYLOAD = "REWRITE_CONSTRAINTS_NON_STRING
 BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE = "REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE"
 BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION = "REWRITE_CONSTRAINTS_INVARIANT_VIOLATION"
 BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID = "planner_fail_closed_payload_invalid"
+BLOCKER_ARTIFACT_PROJECTION_MISMATCH = "ARTIFACT_PROJECTION_MISMATCH"
+
+
+def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:
+    lines: list[str] = ["ARTIFACT:"]
+    for key, value in sorted(artifacts.items()):
+        lines.append(f"  {key}: {value}")
+    return lines
+
+
+def _validate_artifact_projection(
+    *, repo_root: Path, issue_number: int, artifacts: dict[str, str]
+) -> list[str]:
+    if not artifacts:
+        return []
+
+    expected_root = (
+        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    ).resolve()
+    failures: list[str] = []
+
+    for key, raw_path in artifacts.items():
+        if not isinstance(raw_path, str) or not raw_path:
+            failures.append(f"artifact_path_invalid: {key!r}:{raw_path!r}")
+            continue
+
+        try:
+            resolved = Path(raw_path).resolve()
+        except Exception:
+            failures.append(f"artifact_path_unresolvable: {key} -> {raw_path!r}")
+            continue
+
+        if resolved != expected_root and not resolved.is_relative_to(expected_root):
+            failures.append(f"artifact_path_outside_issue_root: {key} -> {resolved}")
+            continue
+
+        if not resolved.exists():
+            failures.append(f"artifact_path_missing: {key} -> {resolved}")
+
+    return failures
 
 # Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
 TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -983,6 +1023,7 @@ def _apply_exit_code_mapping(
             BLOCKER_REWRITE_CONSTRAINTS_NOT_JSON_SERIALIZABLE,
             BLOCKER_REWRITE_CONSTRAINTS_INVARIANT_VIOLATION,
             BLOCKER_PLANNER_FAIL_CLOSED_PAYLOAD_INVALID,
+            BLOCKER_ARTIFACT_PROJECTION_MISMATCH,
         }
         if any(
             any(b.split(":", 1)[0] == rb for rb in rewrite_env_blockers)
@@ -1154,9 +1195,7 @@ def _build_compact_stdout(result: dict) -> str:
 
     artifacts = result.get("artifacts", {})
     if artifacts:
-        lines.append("ARTIFACT:")
-        for k, v in sorted(artifacts.items()):
-            lines.append(f"  {k}: {v}")
+        lines.extend(_render_artifact_projection_lines(artifacts))
 
     return "\n".join(lines)
 

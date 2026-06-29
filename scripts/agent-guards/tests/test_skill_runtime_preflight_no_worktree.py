@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
+import importlib.util
 import os
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -175,6 +179,10 @@ def main() -> int:
         ignored_dir = Path(".cache")
         ignored_dir.mkdir(parents=True, exist_ok=True)
         (ignored_dir / "outside.txt").write_text("persisted")
+    if os.environ.get("SKILL_RUNTIME_TEST_OUTSIDE_WRITE") == "other_issue_tmp":
+        other_issue_tmp = Path(".claude") / "worktrees" / "issue-9999-tmp" / "tmp"
+        other_issue_tmp.mkdir(parents=True, exist_ok=True)
+        (other_issue_tmp / "outside.txt").write_text("persisted")
     payload = {"issue_number": args.issue_number, "repo": args.repo}
     (artifact_dir / "preflight.json").write_text(json.dumps(payload))
     print(json.dumps({"ok": True, **payload}))
@@ -349,4 +357,71 @@ def test_artifact_only_write_postcondition_artifact_only_write_postcondition(tmp
     _install_skill_runtime_exec_fixture(repo)
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored"})
     assert result.returncode == 2
-    assert "unauthorized write path" in result.stderr
+    assert "reason_code=stale_worktree_runtime_state" in result.stderr
+    assert "target_issue=1228" in result.stderr
+
+
+def test_artifact_only_write_postcondition_blocks_other_issue_tmp_path(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "other_issue_tmp"})
+    assert result.returncode == 2
+    assert "reason_code=stale_worktree_runtime_state" in result.stderr
+    assert "target_issue=1228" in result.stderr
+    assert "issue-9999-tmp" in result.stderr
+
+
+def test_stale_env_precheck_blocks_stale_worktree_runtime_state(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    stale_env = {
+        "TMPDIR": "/tmp/stale-loop-protocol-worktree-tmp",
+        "SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored",
+    }
+    result = _run_executor(repo, stale_env)
+    assert result.returncode == 2
+    assert "stale_worktree_runtime_state" in result.stderr
+
+
+def test_artifact_projection_mismatch_stops_stdout_payload_before_publish(tmp_path: Path) -> None:
+    """
+    Verify mismatch in ARTIFACT projection is reported in compact stdout and converted
+    to environment_failure with fix_environment next_action.
+    """
+    repo_root = tmp_path
+    module_path = (
+        REPO_ROOT
+        / ".claude"
+        / "skills"
+        / "issue-refinement-loop"
+        / "scripts"
+        / "run_refinement_preflight.py"
+    )
+    spec_loader = importlib.util.spec_from_file_location(
+        "issue_refinement_preflight_test", module_path
+    )
+    assert spec_loader is not None and spec_loader.loader is not None
+    preflight = importlib.util.module_from_spec(spec_loader)
+    spec_loader.loader.exec_module(preflight)
+
+    with patch.object(
+        preflight,
+        "_write_artifacts",
+        return_value={"staged_result": str(repo_root / ".cache" / "stale.txt")},
+    ):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result, exit_code = preflight._emit_failure_result(
+                repo_root=repo_root,
+                issue_number=1228,
+                repo="squne121/loop-protocol",
+                status="pass",
+                next_action="accept",
+                blockers=[],
+                raw_snapshot={"issue": {"number": 1228}},
+                planner_input={"input": "fixture"},
+            )
+    out = buffer.getvalue()
+    assert exit_code == 3
+    assert "ARTIFACT:" in out
+    assert ".cache/stale.txt" in out
