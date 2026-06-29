@@ -242,7 +242,6 @@ SKILL_RUNTIME_COMMAND_POLICY_V2:
 - canonical repo binding は `https://github.com/<owner>/<repo>(.git)` と `git@github.com:<owner>/<repo>(.git)` の strict parser だけを受理する
 - executor は trusted PATH から解決した `uv` / `python3` を使い、allowlist env と filesystem snapshot/postcondition で ignored/transient outside write と PATH poisoning を fail-close する
 - postcondition が fail-close するのは OS-level filesystem sandbox ではなく、**repo tree outside allowed artifact root** への変更である
-- `preflight.run` の root run/scratch/artifact 配置は必ず `.claude/artifacts/issue-refinement-loop/<target_issue>/` 以下に限定し、`.claude/worktrees/**/tmp` への書き込みは認可されない
 - `uv.pytest`、`pnpm.typecheck`、`pnpm.lint`、`pnpm.test`、`pnpm.build`、`gh.*`、未登録 script は root allow 対象外
 - `publish_termination_report.py` と producer output budget / schema mismatch / termination bypass は本 boundary の対象外
 
