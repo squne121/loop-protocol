@@ -313,13 +313,11 @@ def _is_issue_scoped_temp_path(path: str) -> bool:
     if not normalized.exists():
         return False
     cwd_root = Path(os.getcwd()).resolve()
-    artifacts_root = cwd_root / ".claude" / "artifacts" / "issue-refinement-loop"
     worktrees_root = cwd_root / ".claude" / "worktrees"
-    if str(normalized).startswith(str(artifacts_root)):
-        return True
-    return str(normalized).startswith(str(worktrees_root)) and not str(normalized).startswith(
-        str(worktrees_root / "tmp")
-    )
+    try:
+        return normalized.is_relative_to(worktrees_root) and "tmp" in normalized.parts
+    except ValueError:
+        return False
 
 
 def _normalize_and_validate_runtime_env() -> list[str]:
@@ -336,7 +334,7 @@ def _normalize_and_validate_runtime_env() -> list[str]:
         env_value = os.environ.get(env_name)
         if not env_value:
             continue
-        if not _is_issue_scoped_temp_path(env_value):
+        if _is_issue_scoped_temp_path(env_value):
             stale_paths.append(f"{env_name}={env_value}")
     return stale_paths
 
