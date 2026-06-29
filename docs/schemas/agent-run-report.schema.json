@@ -491,7 +491,22 @@
           "const": "observation_source_provenance/v1"
         },
         "ref": {
-          "$ref": "#/$defs/opaqueReference"
+          "allOf": [
+            {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "observation_projection_digest"
+                }
+              }
+            }
+          ]
         },
         "source_projection_digest": {
           "$ref": "#/$defs/sha256Digest"
@@ -1044,6 +1059,8 @@
             "none",
             "openai_api",
             "entire_cli",
+            "latitude",
+            "deterministic_fixture",
             "unknown"
           ]
         },
@@ -1080,7 +1097,37 @@
             }
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "const": "none"
+              },
+              "prompt": {
+                "type": "null"
+              },
+              "completion": {
+                "type": "null"
+              },
+              "total": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
     }
   },
   "allOf": [

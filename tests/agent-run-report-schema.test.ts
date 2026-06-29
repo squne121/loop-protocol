@@ -77,6 +77,16 @@ describe('agent_run_report schema compile', () => {
     expect(result.valid).toBe(true)
   })
 
+  it('GIVEN a latitude token-usage source fixture with availability available WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-token-usage-source-latitude-available.json'))
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a deterministic-fixture token-usage source fixture with availability available WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-token-usage-source-deterministic-fixture-available.json'))
+    expect(result.valid).toBe(true)
+  })
+
   for (const fixtureName of [
     'invalid-public-observation-source-unknown-key.json',
     'invalid-public-observation-source-unknown-source-kind.json',
@@ -91,7 +101,9 @@ describe('agent_run_report schema compile', () => {
     'invalid-public-observation-source-stdout-stderr.json',
     'invalid-public-observation-source-missing-provenance-digest.json',
     'invalid-public-observation-source-bad-digest.json',
+    'invalid-public-observation-source-non-observation-ref-kind.json',
     'invalid-public-observation-source-redacted-raw-payload-mode.json',
+    'invalid-token-usage-source-latitude-unavailable.json',
   ]) {
     it(`GIVEN ${fixtureName} WHEN compiled with Ajv 2020-12 THEN validation fails`, () => {
       const result = validateReportAgainstSchema(readReportFixture(fixtureName))

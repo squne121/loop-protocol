@@ -92,6 +92,14 @@ describe('generated agent run report', () => {
     expect(result.valid).toBe(true)
   })
 
+  it('GIVEN a generated report without token_usage source extensions WHEN passed through the current validator THEN C0 token source admission keeps existing none semantics valid', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
+
+    expect(report.token_usage.source).toBe('none')
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(true)
+  })
+
   it('GIVEN package scripts WHEN inspected THEN agent-run lifecycle aliases are present without duplicating the validator command', () => {
     const packageJson = JSON.parse(readFileSync(PACKAGE_JSON, 'utf-8'))
     expect(packageJson.scripts['agent-run:start']).toBe('node scripts/agent-logs/start-agent-run.mjs')

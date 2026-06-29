@@ -183,9 +183,11 @@ C0 は schema-admission のみを扱い、この field は optional とする。
 - producer / adapter / real telemetry は C1 以降の責務とする
 - private observation の raw payload は public report に含めない
 - provenance digest は public projection のみを対象とし、raw prompt / trace / tool I/O / local path data には適用しない
+- provenance の `ref.kind` は `observation_projection_digest` に固定し、`workflow_run` / `github_comment` / `schema_ref` のような汎用 opaque reference を observation source provenance として流用しない
 - `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
 - `unsupported` と `unverified` は failure ではなく input availability signal として扱う
 - `availability: unavailable` では numeric metrics を `null` のまま維持する
+- `token_usage.source` は C0 で `latitude` と `deterministic_fixture` を schema-admission 上のみ受理するが、既存 validator の unavailable semantics は維持し、`availability: unavailable` では引き続き `source: none` と `prompt/completion/total: null` を要求する
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
 
