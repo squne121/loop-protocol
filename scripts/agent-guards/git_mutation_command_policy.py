@@ -216,13 +216,7 @@ def classify_rtk_git_mutation(
     subcommand = git_argv[1]
     args = git_argv[2:]
     if subcommand not in ALLOWED_RTK_GIT_SUBCOMMANDS:
-        return GitMutationPolicyResult(
-            status="deny",
-            command_class=COMMAND_CLASS_RTK_GIT_UNKNOWN,
-            reason_code="rtk_unknown_inner",
-            suggested_command="rtk git add <allowed-path-file>",
-            verification_command="git branch --show-current",
-        )
+        return None
 
     if subcommand == "add":
         if not args or any(arg in {"-A", "-u", "--all"} for arg in args):

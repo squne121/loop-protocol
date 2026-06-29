@@ -72,6 +72,7 @@ REASON_INLINE_OVERRIDE = "inline_env_override_not_allowed"
 REASON_DETERMINISTIC_CHECKER = "deterministic_checker_command"
 REASON_GITHUB_REMOTE_OPS = "github_remote_ops_command"
 REASON_GH_MUTATION = "gh_mutation_denied"
+REASON_WORKTREE_BOOTSTRAP_EXECUTOR = "worktree_bootstrap_executor_command"
 REASON_SKILL_RUNTIME_EXECUTOR = SKILL_RUNTIME_REASON_CODE
 # Issue #1137: exact cleanup commands (git worktree remove / git branch -d) are
 # arbitrated by worktree_scope_guard against the V3 one-shot contract. The local
@@ -2048,6 +2049,32 @@ def evaluate(
             local_parser_stage="deterministic_checker",
             local_command_kind=COMMAND_KIND_UNKNOWN,
             local_rule_id="deterministic_checker",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+
+    # Step 13.55: worktree bootstrap executor on default branch root.
+    if _WBE_POLICY_AVAILABLE and _wbe_exec_command(normalized_cmd, cwd, project_root or ""):
+        return _emit(
+            status="allow",
+            reason_code=REASON_WORKTREE_BOOTSTRAP_EXECUTOR,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_executor",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="worktree_bootstrap_executor",
+            argv_tokens=argv_redacted,
+            inner_tokens=inner_argv_redacted,
+        )
+    if _WBE_POLICY_AVAILABLE and _wbe_looks_like(normalized_cmd):
+        return _emit(
+            status="block",
+            reason_code=REASON_UNKNOWN_COMMAND,
+            target_branch=None,
+            target_branch_kind=None,
+            local_parser_stage="worktree_bootstrap_executor_denied",
+            local_command_kind=COMMAND_KIND_UNKNOWN,
+            local_rule_id="worktree_bootstrap_executor_denied",
             argv_tokens=argv_redacted,
             inner_tokens=inner_argv_redacted,
         )
