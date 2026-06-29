@@ -129,7 +129,10 @@ class AllowedPathsMatcher:
         normalized = path[2:] if path.startswith("./") else path
         if normalized in {"", "."}:
             return None
-        if ".." in normalized.split("/"):
+        segments = normalized.split("/")
+        if ".." in segments:
+            return None
+        if "" in segments:
             return None
         return normalized
 
@@ -149,35 +152,49 @@ class AllowedPathsMatcher:
         normalized = AllowedPathsMatcher.normalize_path(pattern)
         if normalized is None:
             return None
-        if "**" in normalized and not normalized.endswith("/**"):
-            return None
+        # matcher v2 grammar: validate each segment of the pattern.
+        # A segment is valid only if it is a literal (contains no '*'),
+        # exactly '*' (matches one segment), or exactly '**' (matches zero
+        # or more segments). Partial-segment globs such as '*.md', 'foo*',
+        # '**suffix' and '***' are invalid (fail-closed).
+        for segment in normalized.split("/"):
+            if "*" in segment and segment not in ("*", "**"):
+                return None
         return normalized
 
     @staticmethod
     def matches_pattern(file_path: str, pattern: str) -> bool:
-        if pattern == file_path:
-            return True
-
-        if pattern.endswith("/**"):
-            prefix = pattern[:-3]
-            return file_path == prefix or file_path.startswith(prefix + "/")
-
-        if "*" not in pattern:
-            return False
-
+        # matcher v2 grammar: segment-based matching with no external deps.
+        #   literal -> exact segment match
+        #   '*'     -> exactly one segment
+        #   '**'    -> zero or more segments (recursive, via dynamic programming)
+        # Both inputs are already normalized repo-relative POSIX paths.
         file_parts = file_path.split("/")
         pattern_parts = pattern.split("/")
-        if len(file_parts) != len(pattern_parts):
-            return False
+        return AllowedPathsMatcher._segment_match(file_parts, pattern_parts)
 
-        for file_part, pattern_part in zip(file_parts, pattern_parts):
-            if pattern_part == "*":
-                continue
-            if "*" in pattern_part:
-                return False
-            if file_part != pattern_part:
-                return False
-        return True
+    @staticmethod
+    def _segment_match(file_parts: List[str], pattern_parts: List[str]) -> bool:
+        n = len(file_parts)
+        m = len(pattern_parts)
+        # dp[i][j] is True iff file_parts[i:] matches pattern_parts[j:].
+        dp = [[False] * (m + 1) for _ in range(n + 1)]
+        dp[n][m] = True
+        # File fully consumed: remaining pattern matches only if all '**'.
+        for j in range(m - 1, -1, -1):
+            if pattern_parts[j] == "**":
+                dp[n][j] = dp[n][j + 1]
+        for i in range(n - 1, -1, -1):
+            for j in range(m - 1, -1, -1):
+                segment = pattern_parts[j]
+                if segment == "**":
+                    # match zero segments (advance pattern) or one+ (advance file)
+                    dp[i][j] = dp[i][j + 1] or dp[i + 1][j]
+                elif segment == "*":
+                    dp[i][j] = dp[i + 1][j + 1]
+                else:
+                    dp[i][j] = segment == file_parts[i] and dp[i + 1][j + 1]
+        return dp[0][0]
 
     @staticmethod
     def is_file_allowed(file_path: str, allowed_paths: List[str]) -> bool:
