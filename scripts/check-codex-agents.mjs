@@ -587,12 +587,15 @@ function validateAgents() {
   }
   const configText = readText(configPath);
   const rulesText = readText(rulesPath);
+  const hookBoundariesText = readText(path.join(repoRoot, 'docs', 'dev', 'hook-boundaries.md'));
+  const skillBoundariesText = readText(path.join(repoRoot, 'docs', 'dev', 'agent-skill-boundaries.md'));
 
   assert(configText.includes('default_permissions = "loop-protocol-rtk"'), 'config.toml must keep default_permissions = "loop-protocol-rtk"', failures);
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
+  assert(rulesText.includes('pattern = ["rtk", "git", ["add", "commit", "push"]]'), 'default.rules must allow the bounded rtk git add/commit/push publish path', failures);
   // AC1: config.toml must not define a [hooks] section; hooks live in .codex/hooks.json.
   // Also scan for TOML array-of-tables [[hooks.*]] which the parser skips to avoid false errors.
   // All of the following table header patterns must cause a failure:
@@ -608,6 +611,10 @@ function validateAgents() {
     }
   }
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
+  assert(fs.existsSync(path.join(repoRoot, 'scripts', 'agent-guards', 'git_mutation_command_policy.py')), 'git_mutation_command_policy.py must exist', failures);
+  assert(fs.existsSync(path.join(repoRoot, 'scripts', 'agent-guards', 'hook_repair_hints.py')), 'hook_repair_hints.py must exist', failures);
+  assert(hookBoundariesText.includes('HOOK_COMMAND_REPAIR_HINT_V1'), 'hook-boundaries.md must describe HOOK_COMMAND_REPAIR_HINT_V1', failures);
+  assert(skillBoundariesText.includes('agent steering'), 'agent-skill-boundaries.md must mention agent steering for repair hints', failures);
   assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills: must not exist as a repo-shared skill surface', failures);
 
   // hooks.json: JSON structural validation

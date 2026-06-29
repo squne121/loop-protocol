@@ -43,6 +43,13 @@ from skill_runtime_command_policy import (  # noqa: E402
     is_exact_skill_runtime_executor_command,
     looks_like_skill_runtime_executor_command,
 )
+from git_mutation_command_policy import (  # noqa: E402
+    classify_rtk_git_mutation,
+    COMMAND_CLASS_RTK_GIT_UNKNOWN,
+)
+from hook_repair_hints import render_hook_command_repair_hint  # noqa: E402
+
+# Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
 
 
 # ─── Reason codes ────────────────────────────────────────────────────────────
@@ -1726,6 +1733,35 @@ def evaluate(
         normalized_cmd = _rebuild_normalized_cmd(normalized_tokens)
         argv_redacted = _redact_argv(normalized_tokens)
         inner_argv_redacted = _redact_argv(normalized_tokens)
+        bounded_rtk_git = classify_rtk_git_mutation(
+            command=command,
+            cwd=cwd,
+            require_active_branch_push=False,
+        )
+        if bounded_rtk_git is not None:
+            if bounded_rtk_git.status == "allow":
+                return _emit(
+                    status="block",
+                    reason_code=REASON_UNKNOWN_COMMAND,
+                    target_branch=None,
+                    target_branch_kind=None,
+                    local_parser_stage="rtk_git_root_denied",
+                    local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                    local_rule_id="rtk_git_root_denied",
+                    argv_tokens=argv_redacted,
+                    inner_tokens=inner_argv_redacted,
+                )
+            return _emit(
+                status="block",
+                reason_code=bounded_rtk_git.reason_code,
+                target_branch=None,
+                target_branch_kind=None,
+                local_parser_stage="rtk_git_policy",
+                local_command_kind=COMMAND_KIND_RTK_WRAPPER,
+                local_rule_id=bounded_rtk_git.reason_code,
+                argv_tokens=argv_redacted,
+                inner_tokens=inner_argv_redacted,
+            )
     git_global_fail_closed = False
     if normalized_tokens and normalized_tokens[0] == "git":
         normalized_tokens, git_global_fail_closed = _normalize_git_global_opts(normalized_tokens)
@@ -2291,37 +2327,29 @@ def _emit_block_stderr(
     - target_branch_kind: from evaluate() result (already abstracted by classify_branch())
     Raw branch names belong in --json / preflight diagnostic mode only.
     """
+    hint_suggested = None
+    hint_verify = None
+    if reason_code == REASON_GH_MUTATION:
+        hint_suggested = "rtk gh issue edit <issue> --repo squne121/loop-protocol --body-file tmp/<body>.md"
+    elif reason_code == REASON_UNPARSEABLE:
+        hint_suggested = "git branch --show-current"
+    elif reason_code == REASON_UNKNOWN_COMMAND:
+        hint_suggested = "rtk git add <allowed-path-file>"
+    elif reason_code == REASON_INLINE_OVERRIDE:
+        hint_suggested = "git branch --show-current"
+    repair_lines = render_hook_command_repair_hint(
+        blocked_command_class=command_kind if command_kind != COMMAND_KIND_UNKNOWN else COMMAND_CLASS_RTK_GIT_UNKNOWN,
+        reason_code=reason_code,
+        suggested_command=hint_suggested,
+        verification_command=hint_verify,
+    )
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
         "hook_name: local_main_branch_guard",
-        f"event_kind: {event_kind}",
-        f"decision: {decision}",
-        f"reason_code: {reason_code}",
-        f"rule_id: {rule_id or reason_code} command_kind: {command_kind} parser_stage: {parser_stage}",
         f"current_branch_kind: {current_branch_kind}",
         f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
-        f"argv_redacted: {json.dumps(argv_redacted or [])}",
+        *repair_lines,
     ]
-    recovery = None
-    if reason_code == REASON_INLINE_OVERRIDE:
-        recovery = (
-            "set LOOP_ALLOW_LOCAL_ROOT_BRANCH_CHANGE and LOOP_LOCAL_ROOT_BRANCH_CHANGE_REASON in CLI env before launch"
-        )
-    elif reason_code in (REASON_ALREADY_DRIFTED, REASON_DETACHED_OR_UNKNOWN):
-        recovery = "switch root back to default branch first"
-    elif reason_code == REASON_UNPARSEABLE:
-        recovery = "use simple (non-compound) git commands from local root"
-    elif reason_code == REASON_DRIFT:
-        recovery = "create/enter linked issue worktree, or switch only to default branch"
-    elif reason_code == REASON_GH_MUTATION:
-        recovery = "use the approved rtk/skill wrapper or run GitHub mutation from the designated issue workflow"
-
-    if recovery is None:
-        lines.append(f"hook_flavor: {hook_flavor}")
-    else:
-        lines.append(f"recovery: {recovery} (hook_flavor={hook_flavor})")
-
-    # Enforce max 10 lines
     for line in lines[:10]:
         print(line, file=sys.stderr)
 

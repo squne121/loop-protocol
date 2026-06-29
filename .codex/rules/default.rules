@@ -91,14 +91,24 @@ prefix_rule(
     ],
 )
 
-# rtk git mutation operations: require explicit human review (prompt)
+# rtk git mutation operations: exact worktree publish path is allowed, the rest stays prompt.
 prefix_rule(
-    pattern = ["rtk", "git", ["push", "commit", "add", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
+    pattern = ["rtk", "git", ["add", "commit", "push"]],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate exact bounded add/commit/push shapes.",
+    match = [
+        "rtk git add docs/dev/hook-boundaries.md",
+        "rtk git commit -m issue-1241-update",
+        "rtk git push origin HEAD:refs/heads/worktree-issue-1241-x",
+    ],
+)
+
+# Other rtk git mutation operations: require explicit human review (prompt)
+prefix_rule(
+    pattern = ["rtk", "git", ["checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
     decision = "prompt",
     justification = "Mutating git operations via rtk require explicit human review.",
     match = [
-        "rtk git push",
-        "rtk git commit -m update",
         "rtk git checkout -b topic",
     ],
 )

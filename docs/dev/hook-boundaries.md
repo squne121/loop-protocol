@@ -117,7 +117,8 @@ hook_boundaries_manifest_v1:
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
       probe scripts (git_ref_probe.py / git_worktree_probe.py) は DETERMINISTIC_CHECKER_ALLOWLIST に登録済み（Issue #1197）。
-      本 Issue では local root default branch 保護（branch drift 防止）と GitHub 書き込み許可集合は拡張しない。
+      local root default branch 保護（branch drift 防止）は維持しつつ、Issue #1241 以降は shared policy で
+      bounded な `rtk git add/commit/push` と `HOOK_COMMAND_REPAIR_HINT_V1` を扱う。
 
       ## gh CLI コマンド 5 分類（#1124）
 
@@ -178,6 +179,8 @@ hook_boundaries_manifest_v1:
       python3 不在など自身がエラーになった場合も fail-closed（exit 2）。
       active issue worktree がある場合でも shared cleanup / skill-runtime exact policy のみを例外とし、
       bootstrap 系の追加 allowlist はこの PR では導入しない。
+      Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
+      policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -408,6 +411,21 @@ hook_boundaries_manifest_v1:
       save 失敗時は stderr に記録し exit 0 で継続。
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
+```
+
+## HOOK_COMMAND_REPAIR_HINT_V1
+
+repair hint は agent steering 用の bounded diagnostics であり、authorization の代替ではない。
+
+```yaml
+HOOK_COMMAND_REPAIR_HINT_V1:
+  blocked_command_class: "rtk_git_add"
+  reason_code: "git_add_requires_explicit_pathspec"
+  safe_action: "broad pathspec をやめて 1 file 単位の pathspec を使う"
+  suggested_command: "rtk git add <allowed-path-file>"
+  forbidden_alternatives: ["git add .", "git add -A", "git push --force"]
+  verification_command: "git diff --name-only"
+  stop_condition: "safe な single command に直せない場合は人間判断"
 ```
 
 ---
