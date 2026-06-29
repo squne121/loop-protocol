@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -305,23 +306,21 @@ def _find_unauthorized_repo_changes(
     return None
 
 
-def _is_issue_scoped_temp_path(path: str) -> bool:
+def _repo_relative_path(project_root: str, path: str | Path) -> str:
+    resolved = os.path.realpath(path)
+    root_real = os.path.realpath(project_root)
     try:
-        normalized = Path(path).resolve()
-    except Exception:
-        return False
-    if not normalized.exists():
-        return False
-    cwd_root = Path(os.getcwd()).resolve()
-    worktrees_root = cwd_root / ".claude" / "worktrees"
-    try:
-        return normalized.is_relative_to(worktrees_root) and "tmp" in normalized.parts
+        if os.path.commonpath([root_real, resolved]) == root_real:
+            return os.path.relpath(resolved, root_real)
     except ValueError:
-        return False
+        pass
+    return resolved
 
 
-def _normalize_and_validate_runtime_env() -> list[str]:
-    stale_paths: list[str] = []
+def _normalize_and_validate_runtime_env(project_root: str) -> list[tuple[str, str]]:
+    worktrees_root = os.path.realpath(Path(project_root) / ".claude" / "worktrees")
+    stale_entries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for env_name in (
         "TMPDIR",
         "TEMP",
@@ -334,9 +333,87 @@ def _normalize_and_validate_runtime_env() -> list[str]:
         env_value = os.environ.get(env_name)
         if not env_value:
             continue
-        if _is_issue_scoped_temp_path(env_value):
-            stale_paths.append(f"{env_name}={env_value}")
-    return stale_paths
+        resolved = os.path.realpath(env_value)
+        try:
+            if os.path.commonpath([worktrees_root, resolved]) != worktrees_root:
+                continue
+        except ValueError:
+            continue
+        item = (env_name, _repo_relative_path(project_root, resolved))
+        if item not in seen:
+            seen.add(item)
+            stale_entries.append(item)
+    return stale_entries
+
+
+def _parse_artifact_projection(stdout: str) -> list[str]:
+    artifacts: list[str] = []
+    collecting = False
+    for line in stdout.splitlines():
+        if line == "ARTIFACT:":
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if not line.startswith("  "):
+            break
+        match = re.match(r"^\s{2}[^:]+:\s+(.+)$", line)
+        if match:
+            artifacts.append(match.group(1).strip())
+    return artifacts
+
+
+def _validate_stdout_artifact_projection(project_root: str, issue_number: str, stdout: str) -> list[str]:
+    failures: list[str] = []
+    root_real = os.path.realpath(project_root)
+    for raw_path in _parse_artifact_projection(stdout):
+        resolved = (
+            os.path.realpath(raw_path)
+            if os.path.isabs(raw_path)
+            else os.path.realpath(Path(project_root) / raw_path)
+        )
+        rel_path = (
+            os.path.relpath(resolved, root_real)
+            if os.path.commonpath([root_real, resolved]) == root_real
+            else resolved
+        )
+        if not _is_under_allowed_artifact_root(project_root, issue_number, rel_path):
+            failures.append(_repo_relative_path(project_root, resolved))
+    return failures
+
+
+def _emit_stale_runtime_failure(issue_number: int, stale_entries: list[tuple[str, str]]) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=stale_worktree_runtime_state target_issue={issue_number} "
+        f"stale_path={','.join(path for _, path in stale_entries)} "
+        f"source_env={','.join(env for env, _ in stale_entries)} "
+        "recovery=unset_or_correct_runtime_env_to_issue_artifacts_root",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _emit_artifact_projection_failure(issue_number: int, stale_paths: list[str]) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=stale_worktree_runtime_state target_issue={issue_number} "
+        f"stale_path={','.join(stale_paths)} "
+        "recovery=do_not_publish_artifact_projection_outside_issue_artifact_root",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _emit_unauthorized_write_failure(issue_number: int, unauthorized_path: str) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=unauthorized_write_path target_issue={issue_number} "
+        f"unauthorized write path={unauthorized_path} "
+        "recovery=do_not_write_outside_allowed_root",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -347,6 +424,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
+    stale_entries = _normalize_and_validate_runtime_env(project_root)
+    if stale_entries:
+        return _emit_stale_runtime_failure(args.issue_number, stale_entries)
     command_text = " ".join(
         [
             "uv",
@@ -418,14 +498,15 @@ def main(argv: list[str] | None = None) -> int:
         before_status,
     )
     if unauthorized_path is not None:
-        print(
-            "SKILL_RUNTIME_FAIL: "
-            f"reason_code=stale_worktree_runtime_state target_issue={args.issue_number} "
-            f"stale_path={unauthorized_path} "
-            "recovery=do_not_write_outside_allowed_root",
-            file=sys.stderr,
-        )
-        return 2
+        return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
+
+    artifact_projection_failures = _validate_stdout_artifact_projection(
+        project_root,
+        str(args.issue_number),
+        result.stdout,
+    )
+    if artifact_projection_failures:
+        return _emit_artifact_projection_failure(args.issue_number, artifact_projection_failures)
 
     if result.stdout:
         sys.stdout.write(result.stdout)
@@ -434,27 +515,5 @@ def main(argv: list[str] | None = None) -> int:
     return result.returncode
 
 
-_original_main = main
-
-
-def main() -> int:
-    stale_paths = _normalize_and_validate_runtime_env()
-    if stale_paths:
-        target_issue = "?"
-        for idx, token in enumerate(sys.argv):
-            if token == "--issue-number" and idx + 1 < len(sys.argv):
-                target_issue = sys.argv[idx + 1]
-                break
-        print(
-            "SKILL_RUNTIME_FAIL: reason_code=stale_worktree_runtime_state "
-            f"target_issue={target_issue} "
-            f"stale_path={','.join(stale_paths)} "
-            "recovery=unset_or_correct_runtime_env_to_issue_artifacts_root",
-            file=sys.stderr,
-        )
-        return 2
-    return _original_main()
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

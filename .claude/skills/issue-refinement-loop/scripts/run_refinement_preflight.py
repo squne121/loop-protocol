@@ -158,11 +158,21 @@ def _validate_artifact_projection(
             continue
 
         if resolved != expected_root and not resolved.is_relative_to(expected_root):
-            failures.append(f"artifact_path_outside_issue_root: {key} -> {resolved}")
+            normalized = (
+                resolved.relative_to(repo_root).as_posix()
+                if resolved.is_relative_to(repo_root)
+                else str(resolved)
+            )
+            failures.append(f"artifact_path_outside_issue_root: {key} -> {normalized}")
             continue
 
         if not resolved.exists():
-            failures.append(f"artifact_path_missing: {key} -> {resolved}")
+            normalized = (
+                resolved.relative_to(repo_root).as_posix()
+                if resolved.is_relative_to(repo_root)
+                else str(resolved)
+            )
+            failures.append(f"artifact_path_missing: {key} -> {normalized}")
 
     return failures
 
@@ -1321,6 +1331,16 @@ def _emit_failure_result(
             hashes=hashes,
         )
         artifacts = _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input, result_core)
+        projection_failures = _validate_artifact_projection(
+            repo_root=repo_root,
+            issue_number=issue_number,
+            artifacts=artifacts,
+        )
+        if projection_failures:
+            blockers = [*blockers, BLOCKER_ARTIFACT_PROJECTION_MISMATCH, *projection_failures]
+            status = "environment_failure"
+            next_action = "fix_environment"
+            artifacts = {}
 
     result = _build_result(
         status=status,
@@ -1874,7 +1894,22 @@ def run_preflight(
     artifacts = _write_artifacts(
         repo_root, issue_number, raw_snapshot, planner_input_dict, result
     )
-    result["artifacts"] = artifacts
+    projection_failures = _validate_artifact_projection(
+        repo_root=repo_root,
+        issue_number=issue_number,
+        artifacts=artifacts,
+    )
+    if projection_failures:
+        result["blockers"] = result.get("blockers", []) + [
+            BLOCKER_ARTIFACT_PROJECTION_MISMATCH,
+            *projection_failures,
+        ]
+        result["status"] = "environment_failure"
+        result["next_action"] = "fix_environment"
+        result["artifacts"] = {}
+        exit_code = EXIT_ENVIRONMENT_FAILURE
+    else:
+        result["artifacts"] = artifacts
 
     # --- Blocker 1 (success path): provenance sidecar ---
     try:

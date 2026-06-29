@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import json
-import io
-import importlib.util
 import os
 import subprocess
 import sys
-from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -175,14 +171,19 @@ def main() -> int:
     args = parser.parse_args()
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = os.environ.get("SKILL_RUNTIME_TEST_MARKER_PATH")
+    if marker_path:
+        marker = Path(marker_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("child-ran")
     if os.environ.get("SKILL_RUNTIME_TEST_OUTSIDE_WRITE") == "ignored":
         ignored_dir = Path(".cache")
         ignored_dir.mkdir(parents=True, exist_ok=True)
         (ignored_dir / "outside.txt").write_text("persisted")
-    if os.environ.get("SKILL_RUNTIME_TEST_OUTSIDE_WRITE") == "other_issue_tmp":
-        other_issue_tmp = Path(".claude") / "worktrees" / "issue-9999-tmp" / "tmp"
-        other_issue_tmp.mkdir(parents=True, exist_ok=True)
-        (other_issue_tmp / "outside.txt").write_text("persisted")
+    if os.environ.get("SKILL_RUNTIME_TEST_ARTIFACT_MODE") == "outside_projection":
+        print("ARTIFACT:")
+        print("  staged_result: .cache/stale.txt")
+        return 0
     payload = {"issue_number": args.issue_number, "repo": args.repo}
     (artifact_dir / "preflight.json").write_text(json.dumps(payload))
     print(json.dumps({"ok": True, **payload}))
@@ -216,6 +217,12 @@ def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subpro
         env=env,
         check=False,
     )
+
+
+def _stale_tmp_dir(repo: Path, issue_dir_name: str = "issue-1220-refinement") -> Path:
+    stale_tmp = repo / ".claude" / "worktrees" / issue_dir_name / "tmp"
+    stale_tmp.mkdir(parents=True, exist_ok=True)
+    return stale_tmp
 
 
 def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: Path) -> None:
@@ -357,71 +364,54 @@ def test_artifact_only_write_postcondition_artifact_only_write_postcondition(tmp
     _install_skill_runtime_exec_fixture(repo)
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored"})
     assert result.returncode == 2
-    assert "reason_code=stale_worktree_runtime_state" in result.stderr
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "unauthorized write path=.cache/" in result.stderr
     assert "target_issue=1228" in result.stderr
 
 
 def test_stale_worktree_preflight_does_not_write_other_issue_tmp(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "other_issue_tmp"})
+    marker_path = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "child-ran.txt"
+    stale_tmp = _stale_tmp_dir(repo, "issue-9999-tmp")
+    result = _run_executor(
+        repo,
+        {
+            "TMPDIR": str(stale_tmp),
+            "SKILL_RUNTIME_TEST_MARKER_PATH": str(marker_path),
+        },
+    )
     assert result.returncode == 2
     assert "reason_code=stale_worktree_runtime_state" in result.stderr
     assert "target_issue=1228" in result.stderr
-    assert "issue-9999-tmp" in result.stderr
+    assert ".claude/worktrees/issue-9999-tmp/tmp" in result.stderr
+    assert not marker_path.exists()
+    assert not (stale_tmp / "outside.txt").exists()
 
 
 def test_stale_worktree_runtime_state_precheck(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
+    marker_path = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "child-ran.txt"
+    stale_tmp = _stale_tmp_dir(repo)
     stale_env = {
-        "TMPDIR": "/tmp/stale-loop-protocol-worktree-tmp",
-        "SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "ignored",
+        "TMPDIR": str(stale_tmp),
+        "SKILL_RUNTIME_TEST_MARKER_PATH": str(marker_path),
     }
     result = _run_executor(repo, stale_env)
     assert result.returncode == 2
     assert "stale_worktree_runtime_state" in result.stderr
+    assert ".claude/worktrees/issue-1220-refinement/tmp" in result.stderr
+    assert "source_env=TMPDIR" in result.stderr
+    assert not marker_path.exists()
+    assert not (repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json").exists()
 
 
 def test_stale_worktree_artifact_projection_fail_closed(tmp_path: Path) -> None:
-    """
-    Verify mismatch in ARTIFACT projection is reported in compact stdout and converted
-    to environment_failure with fix_environment next_action.
-    """
-    repo_root = tmp_path
-    module_path = (
-        REPO_ROOT
-        / ".claude"
-        / "skills"
-        / "issue-refinement-loop"
-        / "scripts"
-        / "run_refinement_preflight.py"
-    )
-    spec_loader = importlib.util.spec_from_file_location(
-        "issue_refinement_preflight_test", module_path
-    )
-    assert spec_loader is not None and spec_loader.loader is not None
-    preflight = importlib.util.module_from_spec(spec_loader)
-    spec_loader.loader.exec_module(preflight)
-
-    with patch.object(
-        preflight,
-        "_write_artifacts",
-        return_value={"staged_result": str(repo_root / ".cache" / "stale.txt")},
-    ):
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            result, exit_code = preflight._emit_failure_result(
-                repo_root=repo_root,
-                issue_number=1228,
-                repo="squne121/loop-protocol",
-                status="pass",
-                next_action="accept",
-                blockers=[],
-                raw_snapshot={"issue": {"number": 1228}},
-                planner_input={"input": "fixture"},
-            )
-    out = buffer.getvalue()
-    assert exit_code == 3
-    assert "ARTIFACT:" in out
-    assert ".cache/stale.txt" in out
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_ARTIFACT_MODE": "outside_projection"})
+    assert result.returncode == 2
+    assert "reason_code=stale_worktree_runtime_state" in result.stderr
+    assert ".cache/stale.txt" in result.stderr
+    assert ".cache/stale.txt" not in result.stdout
