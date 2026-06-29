@@ -57,6 +57,48 @@ describe('agent_run_report schema compile', () => {
     expect(result.valid).toBe(false)
   })
 
+  it('GIVEN a supported available observation-source fixture WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-public-observation-source-supported-available.json'))
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a partial available observation-source fixture with reasons WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-public-observation-source-partial-available-with-reason.json'))
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN an unsupported unavailable observation-source fixture WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-public-observation-source-unsupported-unavailable.json'))
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN an unverified unavailable observation-source fixture WHEN compiled with Ajv 2020-12 THEN schema-admission succeeds', () => {
+    const result = validateReportAgainstSchema(readReportFixture('valid-public-observation-source-unverified-unavailable.json'))
+    expect(result.valid).toBe(true)
+  })
+
+  for (const fixtureName of [
+    'invalid-public-observation-source-unknown-key.json',
+    'invalid-public-observation-source-unknown-source-kind.json',
+    'invalid-public-observation-source-unknown-capability-verdict.json',
+    'invalid-public-observation-source-unsupported-available.json',
+    'invalid-public-observation-source-unverified-available.json',
+    'invalid-public-observation-source-partial-available-missing-reason.json',
+    'invalid-public-observation-source-unavailable-zero-metrics.json',
+    'invalid-public-observation-source-raw-values-emitted.json',
+    'invalid-public-observation-source-freeform-url.json',
+    'invalid-public-observation-source-local-path.json',
+    'invalid-public-observation-source-stdout-stderr.json',
+    'invalid-public-observation-source-missing-provenance-digest.json',
+    'invalid-public-observation-source-bad-digest.json',
+    'invalid-public-observation-source-redacted-raw-payload-mode.json',
+  ]) {
+    it(`GIVEN ${fixtureName} WHEN compiled with Ajv 2020-12 THEN validation fails`, () => {
+      const result = validateReportAgainstSchema(readReportFixture(fixtureName))
+      expect(result.valid).toBe(false)
+    })
+  }
+
   it('GIVEN agent_retro_index schema WHEN compiled with Ajv 2020-12 THEN it validates a valid index', () => {
     const result = validateRetroIndexAgainstSchema(createValidRetroIndex())
     expect(result.valid).toBe(true)

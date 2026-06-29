@@ -173,6 +173,21 @@ They capture the public-safe summary of a single AI agent run, including:
 - `commands_summary`: list of command summaries (`command_label`, `exit_code`, `verdict`, `summary`, `artifact_ref`)
 - `docs_read_refs`: list of doc read refs
 
+### observation_sources schema admission (C0)
+
+`public_safety.observation_sources[]` is the canonical field for observation-source admission.
+C0 is schema-admission only: the field is optional, existing producers may omit it, and generated reports remain valid
+until a later C1 adapter connects producer output.
+
+This contract is intentionally public-safe and projection-only:
+
+- producer / adapter / real telemetry are C1 or later
+- private observation raw payloads are not included in public reports
+- provenance digests apply only to the public projection, never raw prompt / trace / tool I/O / local path data
+- `source_kind` and `capability_verdict` follow the SSOT in `docs/dev/agent-observation-capability.md`
+- `unsupported` and `unverified` are input availability signals, not failures
+- `availability: unavailable` requires numeric metrics to remain `null`
+
 ### entirecli_safety runtime enforcement
 
 `public_safety.entirecli_safety` is **schema-optional** (`#1134`/PR `#1178`) but **runtime-required** for
