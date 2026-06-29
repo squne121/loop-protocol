@@ -2349,8 +2349,7 @@ def _emit_block_stderr(
         recovery = f'{recovery}; approved path: "{suggested_command}"'
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
-        "hook_name: local_main_branch_guard",
-        f"event_kind: {event_kind} decision: {decision}",
+        f"hook_name: local_main_branch_guard event_kind: {event_kind} decision: {decision}",
         f"reason_code: {reason_code} rule_id: {rule_id or '-'}",
         f"command_kind: {command_kind} parser_stage: {parser_stage}",
         (
@@ -2364,6 +2363,11 @@ def _emit_block_stderr(
         (
             f'  blocked_command_class: "{repair_hint["blocked_command_class"]}" '
             f'reason_code: "{repair_hint["reason_code"]}" '
+            f'safe_action: "{repair_hint["safe_action"]}" '
+            f'suggested_command: "{repair_hint["suggested_command"] or ""}"'
+        ),
+        (
+            f'  forbidden_alternatives: {repair_hint["forbidden_alternatives"]} '
             f'verification_command: "{repair_hint["verification_command"] or ""}" '
             f'stop_condition: "{repair_hint["stop_condition"]}"'
         ),

@@ -42,6 +42,8 @@ SKILL.md / SubAgent 定義に書くとコンテクスト汚染になるため、
 - heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-author` / `pr-reviewer` / `test-runner` の routing は維持する。
 - `spark-worker` は manual bounded edit helper であり、Issue authoring、PR review judgment、loop orchestration、publish 操作を担当しない。
 - `HOOK_COMMAND_REPAIR_HINT_V1` は agent steering 用の bounded diagnostics であり、rules / hooks の authorization を上書きしない。
+- `HOOK_COMMAND_REPAIR_HINT_V1` が `suggested_command` を返しても、それは `direct rtk git ...` の exact / bounded repair 候補に限る。wrapper 展開や bypass shell を agent が自動採用してはならない。
+- `allowed_paths_missing_for_git_mutation` や `issue_context_required` は runtime contract 未解決の停止信号として扱い、agent は publish を続行せず binding/source-of-truth を確認する。
 
 ### Prompt examples（プロンプト例）
 

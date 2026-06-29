@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 
 ALLOWED_RTK_GIT_SUBCOMMANDS = frozenset({"add", "commit", "push"})
@@ -55,24 +56,131 @@ def _current_branch(cwd: str) -> str | None:
     return branch or None
 
 
+def _git_toplevel(cwd: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    root = result.stdout.strip()
+    return root or None
+
+
 def _extract_git_argv(tokens: list[str]) -> list[str] | None:
     if len(tokens) >= 3 and tokens[0] == "rtk" and tokens[1] == "git":
         return tokens[1:]
-    if tokens and os.path.basename(tokens[0]) in {"bash", "sh", "zsh"}:
-        for idx, tok in enumerate(tokens[:-1]):
-            if tok in {"-c", "-lc"}:
-                inner = _tokenize(tokens[idx + 1])
-                if inner:
-                    return _extract_git_argv(inner)
-    if tokens and tokens[0] == "env":
-        rest = list(tokens[1:])
-        while rest and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", rest[0]):
-            rest = rest[1:]
-        if rest:
-            return _extract_git_argv(rest)
-    if tokens and tokens[0] == "command":
-        return _extract_git_argv(tokens[1:])
     return None
+
+
+def _load_allowed_paths() -> list[str] | None:
+    raw = os.environ.get("CODEX_ALLOWED_PATHS", "").strip()
+    if not raw:
+        return None
+    entries = [line.strip() for line in raw.splitlines() if line.strip()]
+    return entries or None
+
+
+def _normalize_path(path: str) -> str | None:
+    if not path or "\\" in path or path.startswith("/"):
+        return None
+    normalized = path[2:] if path.startswith("./") else path
+    if normalized in {"", "."}:
+        return None
+    segments = normalized.split("/")
+    if ".." in segments or "" in segments:
+        return None
+    return normalized
+
+
+def _normalize_allowed_pattern(pattern: str) -> str | None:
+    if pattern.endswith("/"):
+        bare = pattern[:-1]
+        if bare.endswith("/") or "*" in bare:
+            return None
+        normalized_bare = _normalize_path(bare)
+        if normalized_bare is None:
+            return None
+        return normalized_bare + "/**"
+    normalized = _normalize_path(pattern)
+    if normalized is None:
+        return None
+    for segment in normalized.split("/"):
+        if "*" in segment and segment not in ("*", "**"):
+            return None
+    return normalized
+
+
+def _segment_match(file_parts: list[str], pattern_parts: list[str]) -> bool:
+    n = len(file_parts)
+    m = len(pattern_parts)
+    dp = [[False] * (m + 1) for _ in range(n + 1)]
+    dp[n][m] = True
+    for j in range(m - 1, -1, -1):
+        if pattern_parts[j] == "**":
+            dp[n][j] = dp[n][j + 1]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            segment = pattern_parts[j]
+            if segment == "**":
+                dp[i][j] = dp[i][j + 1] or dp[i + 1][j]
+            elif segment == "*":
+                dp[i][j] = dp[i + 1][j + 1]
+            else:
+                dp[i][j] = segment == file_parts[i] and dp[i + 1][j + 1]
+    return dp[0][0]
+
+
+def _is_allowed_path(file_path: str, allowed_paths: list[str]) -> bool:
+    normalized_file = _normalize_path(file_path)
+    if normalized_file is None:
+        return False
+    for pattern in allowed_paths:
+        normalized_pattern = _normalize_allowed_pattern(pattern)
+        if normalized_pattern is None:
+            continue
+        if _segment_match(normalized_file.split("/"), normalized_pattern.split("/")):
+            return True
+    return False
+
+
+def _pathspec_to_repo_relative(pathspec: str, cwd: str, repo_root: str) -> str | None:
+    candidate = Path(cwd, pathspec).resolve()
+    repo_path = Path(repo_root).resolve()
+    try:
+        relative = candidate.relative_to(repo_path)
+    except ValueError:
+        return None
+    return _normalize_path(relative.as_posix())
+
+
+def _staged_repo_paths(cwd: str) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "-z"],
+            cwd=cwd,
+            capture_output=True,
+            text=False,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    raw_entries = [entry.decode("utf-8", errors="replace") for entry in result.stdout.split(b"\x00") if entry]
+    normalized = []
+    for entry in raw_entries:
+        candidate = _normalize_path(entry)
+        if candidate is None:
+            return None
+        normalized.append(candidate)
+    return normalized
 
 
 def _contains_broad_pathspec(pathspecs: list[str], cwd: str) -> bool:
@@ -134,6 +242,26 @@ def classify_rtk_git_mutation(
                 suggested_command="rtk git add <allowed-path-file>",
                 verification_command="git diff --name-only",
             )
+        allowed_paths = _load_allowed_paths()
+        repo_root = _git_toplevel(cwd)
+        if not allowed_paths or not repo_root:
+            return GitMutationPolicyResult(
+                status="deny",
+                command_class=COMMAND_CLASS_RTK_GIT_ADD,
+                reason_code="allowed_paths_missing_for_git_mutation",
+                suggested_command="git diff --name-only",
+                verification_command="git diff --name-only",
+            )
+        for pathspec in filtered:
+            repo_relative = _pathspec_to_repo_relative(pathspec, cwd, repo_root)
+            if repo_relative is None or not _is_allowed_path(repo_relative, allowed_paths):
+                return GitMutationPolicyResult(
+                    status="deny",
+                    command_class=COMMAND_CLASS_RTK_GIT_ADD,
+                    reason_code="git_add_outside_allowed_paths",
+                    suggested_command="rtk git add <allowed-path-file>",
+                    verification_command="git diff --name-only",
+                )
         return GitMutationPolicyResult(
             status="allow",
             command_class=COMMAND_CLASS_RTK_GIT_ADD,
@@ -146,6 +274,24 @@ def classify_rtk_git_mutation(
                 status="deny",
                 command_class=COMMAND_CLASS_RTK_GIT_COMMIT,
                 reason_code="rtk_git_commit_requires_message",
+                suggested_command='rtk git commit -m "issue-1241 update"',
+                verification_command="git diff --cached --name-only",
+            )
+        allowed_paths = _load_allowed_paths()
+        staged_paths = _staged_repo_paths(cwd)
+        if not allowed_paths or staged_paths is None:
+            return GitMutationPolicyResult(
+                status="deny",
+                command_class=COMMAND_CLASS_RTK_GIT_COMMIT,
+                reason_code="allowed_paths_missing_for_git_mutation",
+                suggested_command="git diff --cached --name-only",
+                verification_command="git diff --cached --name-only",
+            )
+        if any(not _is_allowed_path(path, allowed_paths) for path in staged_paths):
+            return GitMutationPolicyResult(
+                status="deny",
+                command_class=COMMAND_CLASS_RTK_GIT_COMMIT,
+                reason_code="commit_staged_changes_outside_allowed_paths",
                 suggested_command='rtk git commit -m "issue-1241 update"',
                 verification_command="git diff --cached --name-only",
             )

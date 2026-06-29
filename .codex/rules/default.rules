@@ -91,14 +91,30 @@ prefix_rule(
     ],
 )
 
-# rtk git mutation operations: exact worktree publish path is allowed, the rest stays prompt.
+# rtk git mutation operations: only the bounded publish shapes are allowlisted here.
 prefix_rule(
-    pattern = ["rtk", "git", ["add", "commit", "push"]],
+    pattern = ["rtk", "git", "add"],
     decision = "allow",
-    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate exact bounded add/commit/push shapes.",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate exact bounded add pathspecs plus Allowed Paths.",
     match = [
         "rtk git add docs/dev/hook-boundaries.md",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "git", "commit", "-m"],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate staged diff subset plus bounded commit message shape.",
+    match = [
         "rtk git commit -m issue-1241-update",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "git", "push", "origin"],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate the active-branch refspec and deny force/tag/all/mirror/delete forms.",
+    match = [
         "rtk git push origin HEAD:refs/heads/worktree-issue-1241-x",
     ],
 )

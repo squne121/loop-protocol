@@ -1150,6 +1150,9 @@ class TestB5NoRawBranchInStderr:
         assert "current_branch_kind: other" in captured.err
         assert "current_is_default: false" in captured.err
         assert "HOOK_COMMAND_REPAIR_HINT_V1:" in captured.err
+        assert "safe_action:" in captured.err
+        assert "suggested_command:" in captured.err
+        assert "forbidden_alternatives:" in captured.err
 
     def test_emit_block_stderr_max_10_lines(self, capsys):
         """_emit_block_stderr output is bounded to max 10 lines."""

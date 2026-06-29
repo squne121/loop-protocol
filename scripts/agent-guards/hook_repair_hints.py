@@ -25,9 +25,25 @@ def build_hook_command_repair_hint(
         safe_action = "broad pathspec をやめて 1 file 単位の pathspec を使う"
         suggested_command = suggested_command or "rtk git add <allowed-path-file>"
         verification_command = verification_command or "git diff --name-only"
+    elif reason_code == "git_add_outside_allowed_paths":
+        safe_action = "Issue contract の Allowed Paths に含まれる file だけを add する"
+        suggested_command = suggested_command or "rtk git add <allowed-path-file>"
+        verification_command = verification_command or "git diff --name-only"
+    elif reason_code == "allowed_paths_missing_for_git_mutation":
+        safe_action = "Allowed Paths を runtime に束縛してから mutation を再実行する"
+        suggested_command = suggested_command or "git diff --cached --name-only"
+        verification_command = verification_command or "git diff --cached --name-only"
+    elif reason_code == "commit_staged_changes_outside_allowed_paths":
+        safe_action = "staged diff を Allowed Paths subset に戻してから commit する"
+        suggested_command = suggested_command or 'rtk git commit -m "issue-1241 update"'
+        verification_command = verification_command or "git diff --cached --name-only"
     elif reason_code == "push_refspec_requires_active_branch":
         safe_action = "active branch と一致する refspec だけを使う"
         suggested_command = suggested_command or "rtk git push origin HEAD:refs/heads/<active-branch>"
+        verification_command = verification_command or "git branch --show-current"
+    elif reason_code == "issue_context_required":
+        safe_action = "active issue を解決できる worktree/cwd でだけ mutation を行う"
+        suggested_command = suggested_command or "git worktree list"
         verification_command = verification_command or "git branch --show-current"
     elif reason_code == "target_dir_outside_worktree":
         safe_action = "active issue worktree の配下だけを対象にする"

@@ -429,6 +429,26 @@ HOOK_COMMAND_REPAIR_HINT_V1:
   stop_condition: "safe な single command に直せない場合は人間判断"
 ```
 
+### reason_code routing
+
+| reason_code | safe_action の要点 | suggested / verification の例 |
+|---|---|---|
+| `git_add_requires_explicit_pathspec` | broad pathspec をやめて 1 file に絞る | `rtk git add <allowed-path-file>` / `git diff --name-only` |
+| `git_add_outside_allowed_paths` | Issue contract の Allowed Paths に戻す | `rtk git add <allowed-path-file>` / `git diff --name-only` |
+| `allowed_paths_missing_for_git_mutation` | runtime に Allowed Paths binding がある状態へ戻す | `git diff --cached --name-only` / `git diff --cached --name-only` |
+| `commit_staged_changes_outside_allowed_paths` | staged diff を Allowed Paths subset に戻す | `rtk git commit -m "issue-1241 update"` / `git diff --cached --name-only` |
+| `push_refspec_requires_active_branch` | active branch と一致する refspec だけを使う | `rtk git push origin HEAD:refs/heads/<active-branch>` / `git branch --show-current` |
+| `issue_context_required` | issue 未解決の root / unrelated cwd では mutation しない | `git worktree list` / `git branch --show-current` |
+| `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
+| `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
+| `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
+
+### guidance
+
+- `HOOK_COMMAND_REPAIR_HINT_V1` は direct `rtk git ...` の exact / bounded 形だけを示し、`bash -lc`、`env FOO=... rtk git ...`、`command rtk git ...` の wrapper 展開は suggestion に使わない。
+- `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
+- `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
+
 ---
 
 ## 3. agent 判断表（Claude Code / Claude Code 向け）

@@ -1979,7 +1979,7 @@ def _decide_bash(
                 bounded_rtk_git.command_class,
             )
         if not issue:
-            _allow()
+            _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
         if not resolution.git_available:
             _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
         if resolution.match_count == 0:
@@ -2679,7 +2679,7 @@ def build_decision(payload: dict) -> dict:
     if tool_name in WRITE_TOOLS:
         target = tool_input.get("file_path") or tool_input.get("path") or ""
         if not issue:
-            return _v2("mutation", cwd_class, "allow", "no_issue_no_scope")
+            return _v2("mutation", cwd_class, "deny", "issue_context_required")
         if not resolution.git_available:
             return _v2("mutation", cwd_class, "deny", "git_unavailable")
         if resolution.match_count == 0:
@@ -2713,7 +2713,7 @@ def build_decision(payload: dict) -> dict:
         if bounded_rtk_git.status == "deny":
             return _v2(bounded_rtk_git.command_class, cwd_class, "deny", bounded_rtk_git.reason_code)
         if not issue:
-            return _v2(bounded_rtk_git.command_class, cwd_class, "allow", "no_issue_no_scope")
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "issue_context_required")
         if not resolution.git_available:
             return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "git_unavailable")
         if resolution.match_count == 0:
