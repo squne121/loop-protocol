@@ -19,7 +19,7 @@ Status 定義:
 
 `indeterminate/fail_closed` は merge-blocking として扱い、`REQUEST_CHANGES` 経路。
 
-## matcher v2 grammar
+## matcher v2 grammar（マッチャ v2 文法）
 
 matcher v2 grammar は、外部 dependency なしの segment-based マッチャである。
 パターンとパスを `/` で segment に分割し、各 segment を以下の規則で照合する。
