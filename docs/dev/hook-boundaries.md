@@ -1,5 +1,6 @@
 ---
 doc_id: hook-boundaries
+doc_title_ja: フック境界ドキュメント
 status: stable
 related_issue: 923
 schema_version: hook_boundaries_manifest_v1
@@ -413,7 +414,7 @@ hook_boundaries_manifest_v1:
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 ```
 
-## HOOK_COMMAND_REPAIR_HINT_V1
+## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
 
 repair hint は agent steering 用の bounded diagnostics であり、authorization の代替ではない。
 
@@ -430,7 +431,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 
 ---
 
-## 3. agent 判断表（Claude Code）
+## 3. agent 判断表（Claude Code / Claude Code 向け）
 
 | hook | 分類 | hook failure 時の agent 動作 |
 |---|---|---|
@@ -447,7 +448,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 
 ---
 
-## 4. agent 判断表（Codex CLI）
+## 4. agent 判断表（Codex CLI / Codex CLI 向け）
 
 この manifest は Claude Code の `.claude/settings.json` hook topology を対象とする。Codex CLI については、この manifest から Claude Code と同等の event / output / exit-code parity を主張しない。Codex 側の制御は sandbox、approval、network policy、telemetry、および Codex 固有 hook 実装の検証で別途扱う。
 
@@ -464,10 +465,10 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 
 AC2 対応: 以下の best-effort telemetry フックは作業 blocker にしない。
 
-- `session_manifest_coordinator.sh`（Stop / SubagentStop）
-- `session_manifest_debounce.mjs`（PostToolUse front gate）
-- `save_loop_state_before_compaction.sh`（PreCompact）
-- `rtk_boundary_shadow_guard.sh`（PreToolUse）
+- `session_manifest_coordinator.sh`（Stop / SubagentStop）: 停止時コーディネータ
+- `session_manifest_debounce.mjs`（PostToolUse front gate）: 事前集約ゲート
+- `save_loop_state_before_compaction.sh`（PreCompact）: 圧縮前保存
+- `rtk_boundary_shadow_guard.sh`（PreToolUse）: shadow 記録ガード
 
 これらは全て `fail_policy: fail_open` で設計されており、hook failure 時も exit 0 を返す（AC2）。
 
@@ -487,7 +488,7 @@ AC3 対応: `secret_boundary_guard.sh` は fail-closed 設計を維持する。
 
 ---
 
-## 7. mode_dependent: guard-japanese-prose.sh
+## 7. mode_dependent: guard-japanese-prose.sh（モード依存）
 
 AC8 対応: `guard-japanese-prose.sh` の default 動作は **shadow モード（exit 0）**。
 
