@@ -175,18 +175,18 @@ They capture the public-safe summary of a single AI agent run, including:
 
 ### observation_sources schema admission (C0)
 
-`public_safety.observation_sources[]` is the canonical field for observation-source admission.
-C0 is schema-admission only: the field is optional, existing producers may omit it, and generated reports remain valid
-until a later C1 adapter connects producer output.
+`public_safety.observation_sources[]` は observation source admission の canonical field である。
+C0 は schema-admission のみを扱い、この field は optional とする。既存 producer は未対応のままでよく、
+後続の C1 adapter が producer output を接続するまで generated report は現状どおり valid を維持する。
 
-This contract is intentionally public-safe and projection-only:
+この契約は public-safe な allowlist projection のみを対象とする。
 
-- producer / adapter / real telemetry are C1 or later
-- private observation raw payloads are not included in public reports
-- provenance digests apply only to the public projection, never raw prompt / trace / tool I/O / local path data
-- `source_kind` and `capability_verdict` follow the SSOT in `docs/dev/agent-observation-capability.md`
-- `unsupported` and `unverified` are input availability signals, not failures
-- `availability: unavailable` requires numeric metrics to remain `null`
+- producer / adapter / real telemetry は C1 以降の責務とする
+- private observation の raw payload は public report に含めない
+- provenance digest は public projection のみを対象とし、raw prompt / trace / tool I/O / local path data には適用しない
+- `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
+- `unsupported` と `unverified` は failure ではなく input availability signal として扱う
+- `availability: unavailable` では numeric metrics を `null` のまま維持する
 
 ### entirecli_safety runtime enforcement
 
