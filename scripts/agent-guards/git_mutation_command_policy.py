@@ -134,7 +134,11 @@ def classify_rtk_git_mutation(
                 suggested_command="rtk git add <allowed-path-file>",
                 verification_command="git diff --name-only",
             )
-        return GitMutationPolicyResult(status="allow", command_class=COMMAND_CLASS_RTK_GIT_ADD, reason_code="rtk_git_add_allowed")
+        return GitMutationPolicyResult(
+            status="allow",
+            command_class=COMMAND_CLASS_RTK_GIT_ADD,
+            reason_code="rtk_git_add_allowed",
+        )
 
     if subcommand == "commit":
         if len(args) != 2 or args[0] != "-m" or not args[1].strip():
