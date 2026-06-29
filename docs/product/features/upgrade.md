@@ -14,13 +14,14 @@ acceptance:
   - AC8: 申請時は `state.progress.resources >= cost` を検証し、`resourcesAfter = resourcesBefore - cost` を計算する。
   - AC9: Upgrade 適用順序は `validate → debit → apply → snapshot` を満たす。
   - AC10: `preparation` フェーズ以外では purchase / apply を行わない。
-  - AC11: 保存失敗時（`QuotaExceededError` / `SecurityError`）は `no false success` とし、`rollback`（推奨）または in-memory で未保存の状態を明示する。
+  - AC11: 保存失敗時（`QuotaExceededError` / `SecurityError`）は `no false success` とし、live state を commit せず、save 前に mutate 済みなら exact rollback を MUST とする。
   - AC12: upgrade の効果は次回 sortie 以降に反映され、実行中 runtime への retroactive 適用はしない。
   - AC13: storage key matrix、HTTP origin 前提、`file://` 非保証を保存・検証境界に記載し、`persistence.md` の schema を継承する。
 non-goals:
   - 複雑な upgrade tree / branch / respec / refund。
   - reward（獲得）実装と `resource.md` 以外の reward pipeline。
   - クラウド同期、複数セーブスロット。
+  - multi-tab / multi-window 間の read-modify-write transaction 保証。
   - sortie/runtime（HP、敵、projectile、cooldown）への遡及修正。
   - file:// 固有の互換性保証。
 related_tests: []
@@ -77,14 +78,18 @@ availability:
   - 参照元は `state.progress.resources` とする。
 - `cost`:
   - positive safe integer を要求する。
-  - `>= 1`。
+  - `1 <= cost <= RESOURCE_CAP`。
   - `NaN` / `Infinity` / 小数 / 負値は無効。
 - `target`:
   - `target: progress.weaponPower` と固定する（M4 最小スコープ）。
-  - `operation` は現時点で `add` のみ、`value` は safe integer。
+  - `operation` は現時点で `add` のみ、`value` は positive safe integer。
+  - apply 後の `weaponPower` は positive safe integer を維持しなければならない。
 - `availability`:
   - `phase` は `preparation` のみ許可。
   - `running` / `result` では purchase 不可。
+  - M4 最小スコープでは `repeatable: false` を `state.progress.weaponPower > 1` で充足済みと判定する。
+  - M4 では `purchasedUpgradeIds` のような永続 ledger を導入しない。
+  - 将来の複数 upgrade tree は、schema version 付き ownership ledger を別 issue で導入する。
 
 ## Apply Contract
 
@@ -106,11 +111,19 @@ availability:
    - `resourcesAfter = resourcesBefore - cost`
    - `resourcesAfter` が 0 未満なら失敗し、何も mutate しない。
 3. **apply**
-   - `state.progress.weaponPower` を effect に従って更新する。
-   - 変更値の有効性を検証し、次の sortie から観測される状態として確定する。
+   - candidate progression state に対して `state.progress.weaponPower` を effect に従って更新する。
+   - 変更値の有効性を検証し、次の sortie から観測される候補状態として確定する。
 4. **snapshot**
-   - 更新後 state から snapshot を作成し、persistence 層で保存する。
-   - 保存成功時のみ upgrade success 扱い。
+   - candidate progression state から snapshot を作成し、persistence 層で保存する。
+   - 保存成功後にのみ live `state.progress` を commit し、upgrade success 扱いとする。
+
+### Atomicity / visible success
+
+- M4 upgrade purchase は **strong atomic visible success** を採用する。
+- 実装は candidate progression state を先に組み立て、candidate snapshot の保存に成功した後にのみ live `state.progress` を commit する。
+- save 前に live state を mutate する実装を選ぶ場合でも、save failure 時には pre-upgrade progression state へ **exact rollback** を MUST とする。
+- `applied in memory but not persisted` は M4 upgrade purchase の許容される post-return state ではない。
+- `state.progress.resources` の debit と `progress.weaponPower` の apply は、呼び出し元へ success を返す時点で snapshot 保存成功と不可分でなければならない。
 
 ### 次 sortie 反映 / 非 retroactive
 
@@ -129,8 +142,8 @@ availability:
 - 無効 state:
   - `state.progress.resources` が invalid の場合、`resource.md` の invalid fallback（`0`）を通しても validate 通過できなければ失敗。
 - 保存失敗（`QuotaExceededError`、`SecurityError`、保存例外）:
-  - rollback（推奨）。rollback が未実装の場合は
-    `applied in memory but not persisted` と明示し、**no false success**。
+  - candidate snapshot が保存できなければ live `state.progress` を commit しない。
+  - save 前に live state を mutate していた場合は exact rollback を実行し、**no false success** を維持する。
   - 保存成功前に upgrade success を返してはならない。
 
 保存契約は `persistence.md` による保存境界を従う。`state.progress.resources` の減算および
@@ -144,6 +157,13 @@ availability:
   - E2E: `loop-protocol.e2e.<run-id>.mvp.save`
 - 検証と再現条件は HTTP origin を前提とする。
 - `file://` については localStorage 振る舞いが保証されないため、保存契約の検証対象外とする。
+- `VITE_LOOP_STORAGE_NAMESPACE` は build-time namespace として扱い、PR preview では `loop-protocol.preview.pr-<number>.mvp.save` へ解決される非秘密値のみを許可する。
+
+### Single-runtime scope / cross-tab non-goal
+
+- M4 purchase atomicity は **単一の active game runtime** 内でのみ定義する。
+- multi-tab / multi-window 間の localStorage read-modify-write transaction 保証は本 spec の非ゴールである。
+- cross-tab conflict detection や revision token の導入は将来の別 issue とし、M4 では扱わない。
 
 ## Related
 
