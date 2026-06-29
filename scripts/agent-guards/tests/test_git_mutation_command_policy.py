@@ -96,7 +96,10 @@ def test_rtk_git_commit_allowed_when_staged_subset_matches(tmp_path: Path, monke
     assert result.status == "allow"
 
 
-def test_rtk_git_commit_denied_when_staged_subset_outside_allowed_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_rtk_git_commit_denied_when_staged_subset_outside_allowed_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     _init_repo(tmp_path)
     tracked = tmp_path / "tracked.txt"
     tracked.write_text("x")
