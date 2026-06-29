@@ -97,7 +97,7 @@ def test_ac7_invalid_path_fail_closed():
 
 # AC8: changed files が `.claude/skills/.../SKILL.md` のみ + Allowed Paths が
 # `.claude/skills/**/SKILL.md` のとき gate が ok を返し indeterminate を返さない（evaluator レベル）
-def _make_evaluator(allowed_paths, changed_files):
+def _make_evaluator(allowed_paths):
     snapshot_args = dict(
         pr_number=1233,
         base_ref="main",
@@ -120,14 +120,35 @@ def _make_evaluator(allowed_paths, changed_files):
 @patch("allowed_paths_review_gate.AllowedPathsGateEvaluator.get_changed_files_from_git")
 def test_ac8_evaluator_returns_ok_not_indeterminate(mock_get_changed_files):
     mock_get_changed_files.return_value = [".claude/skills/pr-review-judge/SKILL.md"]
-    evaluator = _make_evaluator(
-        allowed_paths=[".claude/skills/**/SKILL.md"],
-        changed_files=[".claude/skills/pr-review-judge/SKILL.md"],
-    )
+    evaluator = _make_evaluator(allowed_paths=[".claude/skills/**/SKILL.md"])
     result = evaluator.evaluate()
     assert result.status == GateStatus.OK.value
     assert result.status != GateStatus.INDETERMINATE.value
     assert result.violations == []
+
+
+def test_regression_common_partial_segment_patterns_stay_invalid():
+    assert AllowedPathsMatcher.normalize_allowed_pattern("docs/**/*.md") is None
+    assert AllowedPathsMatcher.normalize_allowed_pattern("**.js") is None
+    assert AllowedPathsMatcher.normalize_allowed_pattern("**/*-post.md") is None
+
+
+def test_regression_src_double_star_nested_matches_zero_or_more_segments():
+    assert _allowed("src/nested", "src/**/nested")
+    assert _allowed("src/a/b/nested", "src/**/nested")
+    assert not _allowed("tests/a/b/nested", "src/**/nested")
+
+
+def test_regression_double_star_readme_matches_root_and_nested():
+    assert _allowed("README.md", "**/README.md")
+    assert _allowed("docs/README.md", "**/README.md")
+    assert not _allowed("docs/README.txt", "**/README.md")
+
+
+def test_regression_bare_double_star_matches_any_repo_relative_path():
+    assert _allowed("README.md", "**")
+    assert _allowed(".claude/skills/pr-review-judge/SKILL.md", "**")
+    assert not _allowed("/README.md", "**")
 
 
 if __name__ == "__main__":

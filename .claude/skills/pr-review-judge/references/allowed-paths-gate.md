@@ -33,3 +33,8 @@ invalid path（absolute, backslash, `..`, empty segment）も fail-closed であ
 `docs/*` は 1 segment 一致、`src/**` は再帰一致という既存挙動を維持しつつ、
 `.claude/skills/**/SKILL.md` や `docs/**/README.md` のような mid-path `**` を決定論的に判定できる。
 Python 3.12 互換であり、`pathlib.PurePath.full_match` / `glob.translate` / `fnmatch` には依存しない。
+
+この grammar は GitHub Actions や gitignore の path pattern と完全互換ではなく、
+Allowed Paths gate を fail-closed に保つための segment-only な safe subset として扱う。
+そのため `docs/**/*.md`、`**.js`、`**/*-post.md` のような partial-segment glob は、
+外部仕様では一般的でも本 matcher では invalid / fail-closed である。
