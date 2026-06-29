@@ -47,7 +47,7 @@ from git_mutation_command_policy import (  # noqa: E402
     classify_rtk_git_mutation,
     COMMAND_CLASS_RTK_GIT_UNKNOWN,
 )
-from hook_repair_hints import render_hook_command_repair_hint  # noqa: E402
+from hook_repair_hints import build_hook_command_repair_hint  # noqa: E402
 
 # Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
 
@@ -2337,18 +2337,36 @@ def _emit_block_stderr(
         hint_suggested = "rtk git add <allowed-path-file>"
     elif reason_code == REASON_INLINE_OVERRIDE:
         hint_suggested = "git branch --show-current"
-    repair_lines = render_hook_command_repair_hint(
+    repair_hint = build_hook_command_repair_hint(
         blocked_command_class=command_kind if command_kind != COMMAND_KIND_UNKNOWN else COMMAND_CLASS_RTK_GIT_UNKNOWN,
         reason_code=reason_code,
         suggested_command=hint_suggested,
         verification_command=hint_verify,
     )
+    recovery = repair_hint["safe_action"]
+    suggested_command = repair_hint["suggested_command"] or ""
+    if suggested_command:
+        recovery = f'{recovery}; approved path: "{suggested_command}"'
     lines = [
         "[local_main_branch_guard] blocked: local root checkout must stay on default branch",
         "hook_name: local_main_branch_guard",
-        f"current_branch_kind: {current_branch_kind}",
-        f"current_is_default: {str(current_is_default).lower()} target_branch_kind: {target_branch_kind}",
-        *repair_lines,
+        f"event_kind: {event_kind} decision: {decision}",
+        f"reason_code: {reason_code} rule_id: {rule_id or '-'}",
+        f"command_kind: {command_kind} parser_stage: {parser_stage}",
+        (
+            f"current_branch_kind: {current_branch_kind} "
+            f"current_is_default: {str(current_is_default).lower()} "
+            f"target_branch_kind: {target_branch_kind}"
+        ),
+        f"argv_redacted: {argv_redacted or []}",
+        f"recovery: {recovery}",
+        "HOOK_COMMAND_REPAIR_HINT_V1:",
+        (
+            f'  blocked_command_class: "{repair_hint["blocked_command_class"]}" '
+            f'reason_code: "{repair_hint["reason_code"]}" '
+            f'verification_command: "{repair_hint["verification_command"] or ""}" '
+            f'stop_condition: "{repair_hint["stop_condition"]}"'
+        ),
     ]
     for line in lines[:10]:
         print(line, file=sys.stderr)
