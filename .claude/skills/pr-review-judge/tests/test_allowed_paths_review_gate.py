@@ -72,7 +72,10 @@ class TestAllowedPathsMatcher:
         assert AllowedPathsMatcher.is_file_allowed("packages/foo?bar/file.ts", ["packages/foo?bar/*"])
 
     def test_invalid_allowed_pattern_is_rejected(self):
-        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") is None
+        # matcher v2 grammar: mid-path ** is now a valid full segment
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") == "src/**/nested"
+        # partial-segment globs remain invalid (fail-closed)
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**suffix") is None
         assert AllowedPathsMatcher.normalize_allowed_pattern(r"src\**") is None
 
     # AC1: trailing-slash is normalized to /**
@@ -95,8 +98,8 @@ class TestAllowedPathsMatcher:
         assert AllowedPathsMatcher.normalize_allowed_pattern("src/ui/**") == "src/ui/**"
         # single-level wildcard
         assert AllowedPathsMatcher.normalize_allowed_pattern("docs/*") == "docs/*"
-        # invalid nested double glob
-        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") is None
+        # matcher v2 grammar: mid-path ** is now a valid full segment
+        assert AllowedPathsMatcher.normalize_allowed_pattern("src/**/nested") == "src/**/nested"
         # backslash
         assert AllowedPathsMatcher.normalize_allowed_pattern(r"src\main.ts") is None
         # absolute path
@@ -273,7 +276,7 @@ class TestAllowedPathsValidation:
     def test_invalid_allowed_pattern_is_indeterminate(self, mock_get_changed_files):
         mock_get_changed_files.return_value = ["src/main.ts"]
         expected_fp = make_evaluator(expected_contract_fingerprint="SELF").compute_contract_fingerprint()
-        evaluator = make_evaluator(allowed_paths=["src/**/nested"], expected_contract_fingerprint=expected_fp)
+        evaluator = make_evaluator(allowed_paths=["src/**suffix"], expected_contract_fingerprint=expected_fp)
         result = evaluator.evaluate()
         assert result.status == GateStatus.INDETERMINATE.value
         assert "invalid allowed path pattern" in result.reason
