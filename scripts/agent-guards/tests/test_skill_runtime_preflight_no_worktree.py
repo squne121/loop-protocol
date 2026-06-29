@@ -361,7 +361,7 @@ def test_artifact_only_write_postcondition_artifact_only_write_postcondition(tmp
     assert "target_issue=1228" in result.stderr
 
 
-def test_artifact_only_write_postcondition_blocks_other_issue_tmp_path(tmp_path: Path) -> None:
+def test_stale_worktree_preflight_does_not_write_other_issue_tmp(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_OUTSIDE_WRITE": "other_issue_tmp"})
@@ -371,7 +371,7 @@ def test_artifact_only_write_postcondition_blocks_other_issue_tmp_path(tmp_path:
     assert "issue-9999-tmp" in result.stderr
 
 
-def test_stale_env_precheck_blocks_stale_worktree_runtime_state(tmp_path: Path) -> None:
+def test_stale_worktree_runtime_state_precheck(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
     stale_env = {
@@ -383,7 +383,7 @@ def test_stale_env_precheck_blocks_stale_worktree_runtime_state(tmp_path: Path) 
     assert "stale_worktree_runtime_state" in result.stderr
 
 
-def test_artifact_projection_mismatch_stops_stdout_payload_before_publish(tmp_path: Path) -> None:
+def test_stale_worktree_artifact_projection_fail_closed(tmp_path: Path) -> None:
     """
     Verify mismatch in ARTIFACT projection is reported in compact stdout and converted
     to environment_failure with fix_environment next_action.
