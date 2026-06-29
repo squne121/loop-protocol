@@ -429,7 +429,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
   stop_condition: "safe な single command に直せない場合は人間判断"
 ```
 
-### reason_code routing
+### reason_code の分岐
 
 | reason_code | safe_action の要点 | suggested / verification の例 |
 |---|---|---|
@@ -443,7 +443,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
 | `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
 
-### guidance
+### 運用ガイド
 
 - `HOOK_COMMAND_REPAIR_HINT_V1` は direct `rtk git ...` の exact / bounded 形だけを示し、`bash -lc`、`env FOO=... rtk git ...`、`command rtk git ...` の wrapper 展開は suggestion に使わない。
 - `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
