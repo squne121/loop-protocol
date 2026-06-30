@@ -274,6 +274,10 @@ def test_new_unrelated_failure_with_diff_is_not_out_of_scope():
     assert result["per_ac"][0]["reason_code"] == "new_failure_without_scope_proof"
 
 
+def test_out_of_scope_requires_diff_and_failure_key_evidence():
+    test_new_unrelated_failure_with_diff_is_not_out_of_scope()
+
+
 def test_failure_key_kind_process_exit_cannot_prove_out_of_scope():
     baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
     current = _current_payload(
