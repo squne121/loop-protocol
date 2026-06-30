@@ -7,6 +7,7 @@ export const REPO_ROOT = resolve(__dirname, '..')
 export const SCRIPTS_DIR = resolve(REPO_ROOT, 'scripts')
 export const REPORT_FIXTURES_DIR = resolve(REPO_ROOT, 'tests', 'fixtures', 'agent-run-report')
 export const RETRO_FIXTURES_DIR = resolve(REPO_ROOT, 'tests', 'fixtures', 'agent-retro-index')
+const CHECK_COMMAND_TIMEOUT_MS = 3000
 
 export function createValidReport() {
   return {
@@ -130,19 +131,31 @@ export function runAgentRunReportCheck(args: string[], env: NodeJS.ProcessEnv = 
         env: { ...process.env, ...env },
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: CHECK_COMMAND_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
       }
     )
     return {
       exitCode: 0,
       stdout,
       stderr: '',
+      signal: null,
+      timedOut: false,
     }
   } catch (error) {
-    const err = error as { status?: number; stdout?: string; stderr?: string }
+    const err = error as {
+      status?: number
+      stdout?: string
+      stderr?: string
+      signal?: NodeJS.Signals
+      code?: string
+    }
     return {
       exitCode: err.status ?? 1,
       stdout: err.stdout || '',
       stderr: err.stderr || '',
+      signal: err.signal ?? null,
+      timedOut: err.code === 'ETIMEDOUT',
     }
   }
 }
