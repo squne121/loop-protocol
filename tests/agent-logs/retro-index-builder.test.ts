@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { createValidReport } from '../agent-run-report-test-helpers'
+import { createValidReport } from './report-test-fixtures'
 import {
   buildRetroIndex,
   detectSchemaMigrationRequirement,

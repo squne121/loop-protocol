@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
 import { buildAgentRunReportCommentBody, sha256Hex } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
-import { createValidObservationSourceResult } from '../agent-run-report-test-helpers'
+import { createValidObservationSourceResult } from './report-test-fixtures'
 
 function createDraft() {
   return {

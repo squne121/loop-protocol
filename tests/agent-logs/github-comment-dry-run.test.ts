@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
-import { createValidObservationSourceResult } from '../agent-run-report-test-helpers'
+import { createValidObservationSourceResult } from './report-test-fixtures'
 
 function createDraft() {
   return {

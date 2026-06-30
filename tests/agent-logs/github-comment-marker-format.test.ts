@@ -8,7 +8,7 @@ import {
   parseOwnershipMarker,
 } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderPublicMarkdown } from '../../scripts/lib/agent-run-report-validation.mjs'
-import { createValidObservationSourceResult } from '../agent-run-report-test-helpers'
+import { createValidObservationSourceResult } from './report-test-fixtures'
 
 function createReport() {
   return {
