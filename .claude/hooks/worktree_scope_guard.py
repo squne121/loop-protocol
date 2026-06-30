@@ -63,6 +63,10 @@ from skill_runtime_command_policy import (  # noqa: E402
     resolve_default_branch,
     resolve_repo_slug,
 )
+from git_mutation_command_policy import classify_rtk_git_mutation  # noqa: E402
+from hook_repair_hints import render_hook_command_repair_hint  # noqa: E402
+
+# Issue #1241 marker: HOOK_COMMAND_REPAIR_HINT_V1 is rendered via hook_repair_hints.py.
 
 # Shared one-shot V3 cleanup validator + worktree catalog (Issue #1137).
 # Imported from scripts/agent-ops so V3 validation / per-operation command_hash /
@@ -724,6 +728,20 @@ def _block(expected_worktree: str, actual_cwd: str) -> None:
         f"actual_cwd: {actual_cwd or '<unknown>'}",
     ]
     sys.stderr.write("\n".join(lines) + "\n")
+    sys.exit(2)
+
+
+def _block_with_reason(expected_worktree: str, actual_cwd: str, reason_code: str, command_class: str) -> None:
+    lines = [
+        "[worktree_scope_guard] blocked: mutation outside active issue worktree",
+        f"expected_worktree: {expected_worktree or '<unresolved>'}",
+        f"actual_cwd: {actual_cwd or '<unknown>'}",
+        *render_hook_command_repair_hint(
+            blocked_command_class=command_class,
+            reason_code=reason_code,
+        ),
+    ]
+    sys.stderr.write("\n".join(lines[:10]) + "\n")
     sys.exit(2)
 
 
@@ -1947,6 +1965,36 @@ def _decide_bash(
     if issue and _is_direct_publish_termination_command(command, _pr):
         _block(_rel(resolution.expected, project_root=_pr) if resolution.expected else "<publish-denied>", cwd)
 
+    bounded_rtk_git = classify_rtk_git_mutation(
+        command=command,
+        cwd=cwd,
+        require_active_branch_push=True,
+    )
+    if bounded_rtk_git is not None:
+        if bounded_rtk_git.status == "deny":
+            _block_with_reason(
+                _rel(resolution.expected, project_root=_pr) if resolution.expected else "<unresolved>",
+                cwd,
+                bounded_rtk_git.reason_code,
+                bounded_rtk_git.command_class,
+            )
+        if not issue:
+            _block_with_reason("<issue-context-required>", cwd, "issue_context_required", bounded_rtk_git.command_class)
+        if not resolution.git_available:
+            _block_with_reason("<git-unavailable>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+        if resolution.match_count == 0:
+            _block_with_reason("<no-matching-worktree>", cwd, "no_matching_worktree", bounded_rtk_git.command_class)
+        if resolution.expected is None:
+            _block_with_reason("<ambiguous>", cwd, "ambiguous_worktree", bounded_rtk_git.command_class)
+        if not _dir_inside(resolution.expected, cwd):
+            _block_with_reason(
+                _rel(resolution.expected, project_root=_pr),
+                cwd,
+                "target_dir_outside_worktree",
+                bounded_rtk_git.command_class,
+            )
+        _allow()
+
     klass = classify_bash(command)
 
     # read-only allowlist: allow even if worktree unresolved / git unavailable.
@@ -2631,7 +2679,7 @@ def build_decision(payload: dict) -> dict:
     if tool_name in WRITE_TOOLS:
         target = tool_input.get("file_path") or tool_input.get("path") or ""
         if not issue:
-            return _v2("mutation", cwd_class, "allow", "no_issue_no_scope")
+            return _v2("mutation", cwd_class, "deny", "issue_context_required")
         if not resolution.git_available:
             return _v2("mutation", cwd_class, "deny", "git_unavailable")
         if resolution.match_count == 0:
@@ -2655,6 +2703,26 @@ def build_decision(payload: dict) -> dict:
         return _v2("skill_runtime_executor", cwd_class, "allow", "skill_runtime_executor_allowed")
     if looks_like_skill_runtime_executor_command(command):
         return _v2("skill_runtime_executor", cwd_class, "deny", "skill_runtime_executor_denied")
+
+    bounded_rtk_git = classify_rtk_git_mutation(
+        command=command,
+        cwd=cwd,
+        require_active_branch_push=True,
+    )
+    if bounded_rtk_git is not None:
+        if bounded_rtk_git.status == "deny":
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", bounded_rtk_git.reason_code)
+        if not issue:
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "issue_context_required")
+        if not resolution.git_available:
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "git_unavailable")
+        if resolution.match_count == 0:
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "no_matching_worktree")
+        if resolution.expected is None:
+            return _v2(bounded_rtk_git.command_class, cwd_class, "deny", "ambiguous_worktree")
+        if not _dir_inside(resolution.expected, cwd):
+            return _v2(bounded_rtk_git.command_class, "outside_worktree", "deny", "target_dir_outside_worktree")
+        return _v2(bounded_rtk_git.command_class, "inside_worktree", "allow", "mutation_inside_worktree")
 
     klass = classify_bash(command)
 

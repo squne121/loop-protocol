@@ -221,7 +221,8 @@
             "workflow_run",
             "schema_ref",
             "github_comment",
-            "manifest_digest"
+            "manifest_digest",
+            "observation_projection_digest"
           ]
         },
         "artifact_id": {
@@ -393,6 +394,353 @@
               "schema_ref"
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "observation_projection_digest"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "digest": {
+                "$ref": "#/$defs/sha256Digest"
+              },
+              "validation_verdict": {
+                "const": "pass"
+              },
+              "artifact_id": {
+                "type": "null"
+              },
+              "artifact_digest": {
+                "type": "null"
+              },
+              "workflow_run_url": {
+                "type": "null"
+              },
+              "schema_ref": {
+                "type": "null"
+              },
+              "ref": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "digest"
+            ]
+          }
+        }
+      ]
+    },
+    "observationMetricValue": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "observationSourceMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trace_count",
+        "span_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens"
+      ],
+      "properties": {
+        "trace_count": {
+          "$ref": "#/$defs/observationMetricValue"
+        },
+        "span_count": {
+          "$ref": "#/$defs/observationMetricValue"
+        },
+        "prompt_tokens": {
+          "$ref": "#/$defs/observationMetricValue"
+        },
+        "completion_tokens": {
+          "$ref": "#/$defs/observationMetricValue"
+        },
+        "total_tokens": {
+          "$ref": "#/$defs/observationMetricValue"
+        }
+      }
+    },
+    "observationSourceProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "ref",
+        "source_projection_digest",
+        "validator_id",
+        "validator_policy_digest",
+        "evidence_mode",
+        "checked_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "observation_source_provenance/v1"
+        },
+        "ref": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "observation_projection_digest"
+                }
+              }
+            }
+          ]
+        },
+        "source_projection_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "validator_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "validator_policy_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "evidence_mode": {
+          "type": "string",
+          "enum": [
+            "synthetic_only",
+            "read_only_host_inventory",
+            "real_pilot_verified"
+          ]
+        },
+        "checked_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "observationSourceSafety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "raw_values_emitted",
+        "forbidden_field_scan",
+        "reason_codes"
+      ],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "blocked"
+          ]
+        },
+        "raw_values_emitted": {
+          "const": false
+        },
+        "forbidden_field_scan": {
+          "const": "pass"
+        },
+        "reason_codes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "partial_projection",
+              "synthetic_only_evidence",
+              "host_inventory_only",
+              "source_unavailable"
+            ]
+          }
+        }
+      }
+    },
+    "observationSourceResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "source_kind",
+        "capability_verdict",
+        "availability",
+        "projection_mode",
+        "safety",
+        "metrics",
+        "provenance"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "observation_source_result/v1"
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": [
+            "claude_code",
+            "codex_cli",
+            "google_antigravity"
+          ]
+        },
+        "capability_verdict": {
+          "type": "string",
+          "enum": [
+            "supported",
+            "partial",
+            "unsupported",
+            "unverified"
+          ]
+        },
+        "availability": {
+          "type": "string",
+          "enum": [
+            "available",
+            "unavailable"
+          ]
+        },
+        "projection_mode": {
+          "type": "string",
+          "enum": [
+            "allowlist_projection",
+            "not_projected"
+          ]
+        },
+        "safety": {
+          "$ref": "#/$defs/observationSourceSafety"
+        },
+        "metrics": {
+          "$ref": "#/$defs/observationSourceMetrics"
+        },
+        "provenance": {
+          "$ref": "#/$defs/observationSourceProvenance"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capability_verdict": {
+                "enum": [
+                  "unsupported",
+                  "unverified"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "availability": {
+                "const": "unavailable"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "available"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "capability_verdict": {
+                "enum": [
+                  "supported",
+                  "partial"
+                ]
+              },
+              "projection_mode": {
+                "const": "allowlist_projection"
+              },
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "verdict": {
+                    "const": "pass"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "metrics": {
+                "type": "object",
+                "properties": {
+                  "trace_count": {
+                    "type": "null"
+                  },
+                  "span_count": {
+                    "type": "null"
+                  },
+                  "prompt_tokens": {
+                    "type": "null"
+                  },
+                  "completion_tokens": {
+                    "type": "null"
+                  },
+                  "total_tokens": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capability_verdict": {
+                "const": "partial"
+              },
+              "availability": {
+                "const": "available"
+              }
+            },
+            "required": [
+              "capability_verdict",
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "safety": {
+                "type": "object",
+                "properties": {
+                  "reason_codes": {
+                    "type": "array",
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     },
@@ -442,6 +790,13 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 160
+          }
+        },
+        "observation_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/observationSourceResult"
           }
         },
         "entirecli_safety": {
@@ -704,6 +1059,8 @@
             "none",
             "openai_api",
             "entire_cli",
+            "latitude",
+            "deterministic_fixture",
             "unknown"
           ]
         },
@@ -740,7 +1097,37 @@
             }
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "availability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "const": "none"
+              },
+              "prompt": {
+                "type": "null"
+              },
+              "completion": {
+                "type": "null"
+              },
+              "total": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
     }
   },
   "allOf": [

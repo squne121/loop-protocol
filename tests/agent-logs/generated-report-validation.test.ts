@@ -50,6 +50,7 @@ describe('generated agent run report', () => {
       'schema',
       'token_usage',
     ])
+    expect(report.public_safety.observation_sources).toBeUndefined()
 
     const result = validateAgentRunReport(report)
     expect(result.valid).toBe(true)
@@ -81,6 +82,22 @@ describe('generated agent run report', () => {
     const result = validateAgentRunReport(report)
 
     expect(result.valid).toBe(false)
+  })
+
+  it('GIVEN a generated report without observation_sources WHEN passed through the current validator THEN C0 optional admission keeps it valid', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
+    expect(report.public_safety.observation_sources).toBeUndefined()
+
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(true)
+  })
+
+  it('GIVEN a generated report without token_usage source extensions WHEN passed through the current validator THEN C0 token source admission keeps existing none semantics valid', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
+
+    expect(report.token_usage.source).toBe('none')
+    const result = validateAgentRunReport(report)
+    expect(result.valid).toBe(true)
   })
 
   it('GIVEN package scripts WHEN inspected THEN agent-run lifecycle aliases are present without duplicating the validator command', () => {

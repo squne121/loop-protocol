@@ -1,0 +1,94 @@
+{
+  "schema": "agent_run_report/v1",
+  "public_surface_kind": "github_issue_comment",
+  "public_safety": {
+    "redaction_status": "clean",
+    "checked_by": "pnpm agent-run-report:check",
+    "validator_version": "1.0.0",
+    "checked_at": "2026-06-29T12:00:00Z",
+    "verdict": "pass",
+    "blocked_reasons": [],
+    "observation_sources": [
+      {
+        "schema_version": "observation_source_result/v1",
+        "source_kind": "google_antigravity",
+        "capability_verdict": "unsupported",
+        "availability": "unavailable",
+        "projection_mode": "not_projected",
+        "safety": {
+          "verdict": "blocked",
+          "raw_values_emitted": false,
+          "forbidden_field_scan": "pass",
+          "reason_codes": [
+            "source_unavailable"
+          ]
+        },
+        "metrics": {
+          "trace_count": null,
+          "span_count": null,
+          "prompt_tokens": null,
+          "completion_tokens": null,
+          "total_tokens": null
+        },
+        "provenance": {
+          "schema_version": "observation_source_provenance/v1",
+          "ref": {
+            "kind": "observation_projection_digest",
+            "artifact_id": null,
+            "artifact_digest": null,
+            "workflow_run_url": null,
+            "schema_ref": null,
+            "ref": null,
+            "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+            "validation_verdict": "pass"
+          },
+          "source_projection_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+          "validator_id": "agent-run-report-schema",
+          "validator_policy_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+          "evidence_mode": "synthetic_only",
+          "checked_at": "2026-06-29T12:00:00Z"
+        }
+      }
+    ],
+    "entirecli_safety": {
+      "schema_version": "entirecli_safety_result/v1",
+      "verdict": "safe",
+      "reason_codes": [],
+      "raw_values_emitted": false,
+      "checked_surfaces": {
+        "entire_binary": true,
+        "entire_version": "v1.2***[len=12]",
+        "entire_enable_help": true,
+        "entire_configure_help": true
+      }
+    }
+  },
+  "actor": {
+    "type": "ai_agent",
+    "name": "Codex"
+  },
+  "authority": {
+    "level": "non_authoritative",
+    "basis": "ai_self_report",
+    "evidence_refs": []
+  },
+  "token_usage": {
+    "availability": "unavailable",
+    "source": "none",
+    "prompt": null,
+    "completion": null,
+    "total": null
+  },
+  "manifest_refs": [],
+  "evidence_refs": [],
+  "commands_summary": [
+    {
+      "command_label": "pnpm test",
+      "exit_code": 0,
+      "verdict": "pass",
+      "summary": "unsupported observation source remains a valid unavailable signal",
+      "artifact_ref": null
+    }
+  ],
+  "docs_read_refs": []
+}
