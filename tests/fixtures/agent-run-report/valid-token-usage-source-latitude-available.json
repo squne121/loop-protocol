@@ -1,0 +1,40 @@
+{
+  "schema": "agent_run_report/v1",
+  "public_surface_kind": "none",
+  "public_safety": {
+    "redaction_status": "clean",
+    "checked_by": "pnpm agent-run-report:check",
+    "validator_version": "1.0.0",
+    "checked_at": "2026-06-29T12:00:00Z",
+    "verdict": "pass",
+    "blocked_reasons": []
+  },
+  "actor": {
+    "type": "ai_agent",
+    "name": "Codex"
+  },
+  "authority": {
+    "level": "non_authoritative",
+    "basis": "ai_self_report",
+    "evidence_refs": []
+  },
+  "token_usage": {
+    "availability": "available",
+    "source": "latitude",
+    "prompt": 10,
+    "completion": 20,
+    "total": 30
+  },
+  "manifest_refs": [],
+  "evidence_refs": [],
+  "commands_summary": [
+    {
+      "command_label": "token-usage",
+      "exit_code": 0,
+      "verdict": "pass",
+      "summary": "latitude token usage source is admitted for available reports in C0",
+      "artifact_ref": null
+    }
+  ],
+  "docs_read_refs": []
+}
