@@ -132,7 +132,13 @@ def test_head_sha_changed():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]), ""),
+            (
+                0,
+                json.dumps(
+                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
+                ),
+                "",
+            ),
             (0, DRIFT_SHA, ""),
         ]
     )
@@ -161,7 +167,13 @@ def test_non_blocking_exact_match():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "deploy-pr", "workflow": "deploy-pages", "bucket": "pass", "state": "completed"}]), ""),
+            (
+                0,
+                json.dumps(
+                    [{"name": "deploy-pr", "workflow": "deploy-pages", "bucket": "pass", "state": "completed"}]
+                ),
+                "",
+            ),
         ]
     )
 
