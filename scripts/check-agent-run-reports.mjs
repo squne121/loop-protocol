@@ -19,6 +19,17 @@ function printUsage() {
   console.error('Usage: check-agent-run-reports.mjs [--require-target] [file-or-glob ...]')
 }
 
+function getCheckPatterns() {
+  const override = process.env.AGENT_RUN_REPORT_CHECK_DEFAULT_PATTERNS
+  if (!override) {
+    return getDefaultCheckPatterns()
+  }
+  return override
+    .split('\n')
+    .map((pattern) => pattern.trim())
+    .filter(Boolean)
+}
+
 function parseArgs(argv) {
   const options = {
     requireTarget: false,
@@ -134,7 +145,7 @@ async function main() {
   }
 
   const explicitTargets = parsed.options.targets.length > 0
-  const patterns = explicitTargets ? parsed.options.targets : getDefaultCheckPatterns()
+  const patterns = explicitTargets ? parsed.options.targets : getCheckPatterns()
   const files = await expandPatterns(patterns)
 
   if (files.length === 0) {
