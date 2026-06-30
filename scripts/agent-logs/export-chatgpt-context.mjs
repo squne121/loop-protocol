@@ -29,6 +29,7 @@ import { randomUUID } from 'crypto'
 import { printCliError, runtimeError } from './lib/args.mjs'
 import { parseChatgptContextArgs } from './lib/chatgpt-context-args.mjs'
 import { loadSources } from './lib/chatgpt-context-source-loader.mjs'
+import { resolveChatgptRetroContextFromFixtures } from './lib/chatgpt-retro-context-marker-helper.mjs'
 import { scanRenderedMarkdown } from './lib/chatgpt-context-safety-scan.mjs'
 import { dedupeEvidenceRefs } from './lib/chatgpt-context-dedupe.mjs'
 import { applyBudget, assertBudgetSufficient, SECTION_PRIORITY_ORDER } from './lib/chatgpt-context-budget.mjs'
@@ -162,7 +163,12 @@ async function main() {
   }
 
   // Step 1+2: Load and validate all sources (forbidden field scan + digest + public safety)
-  const { sources, manifest } = await loadSources(options)
+  const { sources, manifest } = options.sourceMode === 'marker_comment'
+    ? await resolveChatgptRetroContextFromFixtures({
+        markerCommentJson: options.markerCommentJson,
+        githubCommentsJson: options.githubCommentsJson,
+      })
+    : await loadSources(options)
 
   // Step 3: Validate transcript hotspots (AC7 + Blocker 7)
   validateTranscriptHotspots(sources.run_reports)

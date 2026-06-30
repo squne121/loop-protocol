@@ -21,6 +21,8 @@ const REPORT_START_MARKER = '<!-- agent_run_report:v1 start -->'
 const REPORT_END_MARKER = '<!-- agent_run_report:v1 end -->'
 const RETRO_START_MARKER = '<!-- agent_retro_index:v1 start -->'
 const RETRO_END_MARKER = '<!-- agent_retro_index:v1 end -->'
+const CHATGPT_RETRO_CONTEXT_START_MARKER = '<!-- CHATGPT_RETRO_CONTEXT_V1 start -->'
+const CHATGPT_RETRO_CONTEXT_END_MARKER = '<!-- CHATGPT_RETRO_CONTEXT_V1 end -->'
 const FORBIDDEN_KEYS = new Set([
   'raw_transcript',
   'transcript_excerpt',
@@ -340,6 +342,14 @@ export function validateRetroIndexAgainstSchema(json) {
   return validateSchemaObject('agent-retro-index.schema.json', json)
 }
 
+export function validateChatgptRetroContextMarkerAgainstSchema(json) {
+  return validateSchemaObject('chatgpt-retro-context-marker.schema.json', json)
+}
+
+export function validateChatgptRetrospectiveResultAgainstSchema(json) {
+  return validateSchemaObject('chatgpt-retrospective-result.schema.json', json)
+}
+
 export function validateReportSemantics(report) {
   const errors = []
 
@@ -511,11 +521,30 @@ export function validateAgentRetroIndex(index) {
   }
 }
 
+export function validateChatgptRetroContextMarker(marker) {
+  const schemaResult = validateChatgptRetroContextMarkerAgainstSchema(marker)
+  const scanResult = scanPublicSafety(marker)
+  const errors = [
+    ...schemaResult.errors,
+    ...scanResult.errors,
+  ]
+  return {
+    valid: errors.length === 0,
+    errors,
+  }
+}
+
 function getMarkersForSchema(schemaName) {
   if (schemaName === 'agent_retro_index/v1') {
     return {
       start: RETRO_START_MARKER,
       end: RETRO_END_MARKER,
+    }
+  }
+  if (schemaName === 'chatgpt_retro_context_marker/v1') {
+    return {
+      start: CHATGPT_RETRO_CONTEXT_START_MARKER,
+      end: CHATGPT_RETRO_CONTEXT_END_MARKER,
     }
   }
   return {
@@ -527,18 +556,23 @@ function getMarkersForSchema(schemaName) {
 function detectSchemaNameFromMarkdown(markdown) {
   const hasReport = markdown.includes(REPORT_START_MARKER) || markdown.includes(REPORT_END_MARKER)
   const hasRetro = markdown.includes(RETRO_START_MARKER) || markdown.includes(RETRO_END_MARKER)
+  const hasChatgptRetroContext = markdown.includes(CHATGPT_RETRO_CONTEXT_START_MARKER) || markdown.includes(CHATGPT_RETRO_CONTEXT_END_MARKER)
 
-  if (hasReport && hasRetro) {
+  const detectedCount = [hasReport, hasRetro, hasChatgptRetroContext].filter(Boolean).length
+  if (detectedCount > 1) {
     return {
       ok: false,
       error: {
         path: 'markdown',
         code: 'markdown.multiple_schema_markers',
-        message: 'markdown cannot mix agent_run_report and agent_retro_index markers',
+        message: 'markdown cannot mix public marker schemas',
       },
     }
   }
 
+  if (hasChatgptRetroContext) {
+    return { ok: true, schemaName: 'chatgpt_retro_context_marker/v1' }
+  }
   if (hasRetro) {
     return { ok: true, schemaName: 'agent_retro_index/v1' }
   }
@@ -689,9 +723,14 @@ export function validateMarkdownCandidate(markdown, expectedSchemaName = null) {
     }
   }
 
-  const validation = extraction.schemaName === 'agent_retro_index/v1'
-    ? validateAgentRetroIndex(extraction.payload)
-    : validateAgentRunReport(extraction.payload)
+  let validation
+  if (extraction.schemaName === 'agent_retro_index/v1') {
+    validation = validateAgentRetroIndex(extraction.payload)
+  } else if (extraction.schemaName === 'chatgpt_retro_context_marker/v1') {
+    validation = validateChatgptRetroContextMarker(extraction.payload)
+  } else {
+    validation = validateAgentRunReport(extraction.payload)
+  }
 
   if (!validation.valid) {
     return validation
