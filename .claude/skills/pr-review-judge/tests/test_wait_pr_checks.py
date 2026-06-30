@@ -83,7 +83,13 @@ def test_pending_then_pass():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]), ""),
+            (
+                0,
+                json.dumps(
+                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
+                ),
+                "",
+            ),
             (0, EXPECTED_SHA, ""),
             (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pass", "state": "completed"}]), ""),
         ]
@@ -99,7 +105,13 @@ def test_pending_then_fail():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]), ""),
+            (
+                0,
+                json.dumps(
+                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
+                ),
+                "",
+            ),
             (0, EXPECTED_SHA, ""),
             (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "fail", "state": "completed"}]), ""),
         ]
@@ -115,7 +127,13 @@ def test_timeout_returns_human_judgment_and_preserves_last_checks():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]), ""),
+            (
+                0,
+                json.dumps(
+                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
+                ),
+                "",
+            ),
         ],
         monotonic_values=[0.0, 0.0, 1.0, 5.0],
     )
