@@ -74,10 +74,10 @@ spec_prerequisites:
   - docs/product/features/movement-projectile.md
 close_conditions:
   - 1 sortie を開始→操作→戦闘結果まで通せる
-  - victory: スポーン済み敵機をすべて撃破した場合に成立し、`SortieResult.outcome` / `SortieResult.endReason` は `victory` / `all_enemies_defeated` とする
+  - victory: `enemies.length > 0` guard を満たしたスポーン済み敵機をすべて撃破した場合に成立し、`SortieResult.outcome` / `SortieResult.endReason` は `victory` / `all_enemies_defeated` とする
   - timeout: 30 秒到達時に成立する neutral terminal であり、`SortieResult.outcome` / `SortieResult.endReason` は `timeout` / `timeout` とする
   - defeat: `player_hp_zero`（HP0）で成立し、`SortieResult.outcome` / `SortieResult.endReason` は `defeat` / `player_hp_zero` とする
-  - defeat が victory より優先し、victory が timeout より優先する terminal priority を採用する
+  - terminal_priority: defeat > victory > timeout
   - `survival_timer` を起点にした生存時間ベースの勝利条件は M2 の正本定義として採用しない
   - system tests と pnpm build が通る
   - src/systems から DOM / Canvas API を直接触っていない（MVP-001 遵守）
