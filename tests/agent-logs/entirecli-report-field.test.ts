@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { createValidReport } from '../agent-run-report-test-helpers'
+import { createValidReport } from './report-test-fixtures'
 import { validateReportAgainstSchema } from '../../scripts/lib/agent-run-report-validation.mjs'
 import { checkEntireCLISafety, SCHEMA_VERSION } from '../../scripts/agent-logs/lib/entirecli-safety.mjs'
 

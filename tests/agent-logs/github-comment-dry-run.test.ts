@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
+import { createValidObservationSourceResult } from './report-test-fixtures'
 
 function createDraft() {
   return {
@@ -30,6 +31,7 @@ function createReport() {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createValidObservationSourceResult()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',

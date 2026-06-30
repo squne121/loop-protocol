@@ -172,22 +172,24 @@ agent run report は `scripts/agent-logs/finalize-agent-run.mjs` が生成する
 - `commands_summary`: command summary の一覧（`command_label`, `exit_code`, `verdict`, `summary`, `artifact_ref`）
 - `docs_read_refs`: doc read ref の一覧
 
-### observation_sources schema admission (C0) / 観測 source の schema 受け入れ
+### observation_sources schema admission (C1 runtime) / 観測 source の runtime 受け入れ
 
 `public_safety.observation_sources[]` は observation source admission の canonical field である。
-C0 は schema-admission のみを扱い、この field は optional とする。既存 producer は未対応のままでよく、
-後続の C1 adapter が producer output を接続するまで generated report は現状どおり valid を維持する。
+C1 では `finalize-agent-run.mjs` -> `observation-source-adapter` -> `public_safety.observation_sources` の接続が必須で、
+public surface では `observation_sources` が runtime で要求される。
 
 この契約は public-safe な allowlist projection のみを対象とする。
 
-- producer / adapter / real telemetry は C1 以降の責務とする
-- private observation の raw payload は public report に含めない
-- provenance digest は public projection のみを対象とし、raw prompt / trace / tool I/O / local path data には適用しない
-- provenance の `ref.kind` は `observation_projection_digest` に固定し、`workflow_run` / `github_comment` / `schema_ref` のような汎用 opaque reference を observation source provenance として流用しない
+- private observation の raw payload は `public` レポートに含めない（`raw_values_emitted` は `false` 限定）
+- `provenance.ref.kind` は `observation_projection_digest` 固定で、`schema_ref` など汎用参照は利用しない
 - `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
-- `unsupported` と `unverified` は failure ではなく input availability signal として扱う
-- `availability: unavailable` では numeric metrics を `null` のまま維持する
-- `token_usage.source` は C0 で `latitude` と `deterministic_fixture` を schema-admission 上のみ受理するが、既存 validator の unavailable semantics は維持し、`availability: unavailable` では引き続き `source: none` と `prompt/completion/total: null` を要求する
+- `unsupported` と `unverified` はそのまま adapter 入力の availability signal 扱いとし、`availability: unavailable` として扱う
+- `availability: unavailable` では metrics はすべて `null`、`reason_codes` には `source_unavailable` を補完
+- `observation_sources` の `provenance.source_projection_digest` が public projection の canonical JSON sha256 を持つこと
+- `validate-final-report.mjs` と `retro-index-builder.mjs` は `provenance.source_projection_digest` と `provenance.ref.digest` を canonicalized public projection から再計算し、一致しない report を fail closed にする
+- `token_usage` は観測 source とは別責務。`token_usage` は LLM API トークン集計のみ扱い、observation source projection / 理由・証跡を混同しない
+
+`real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
 

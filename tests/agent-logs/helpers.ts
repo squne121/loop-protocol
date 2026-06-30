@@ -100,6 +100,31 @@ export function createDocReadRefJson() {
   })
 }
 
+export function createObservationSourceInputJson(overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    schema_version: 'observation_source_input/v1',
+    input_kind: 'entirecli',
+    output_source_kind: 'codex_cli',
+    capability_verdict: 'supported',
+    availability: 'available',
+    projection_mode: 'allowlist_projection',
+    checked_at: '2026-06-17T12:30:00.000Z',
+    safety: {
+      verdict: 'pass',
+      raw_values_emitted: false,
+      reason_codes: [],
+    },
+    metrics: {
+      trace_count: 1,
+      span_count: 2,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    },
+    ...overrides,
+  })
+}
+
 export function createFinalizeArgs(draftPath: string, outputPath: string, extras: string[] = []) {
   return [
     '--draft', draftPath,

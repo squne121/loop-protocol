@@ -4,9 +4,17 @@ import {
   validateMarkdownCandidate,
 } from '../../lib/agent-run-report-validation.mjs'
 import { runtimeError } from './args.mjs'
+import { validateObservationSourceProjection } from './observation-source-adapter.mjs'
 
 const ENTIRECLI_SAFETY_SCHEMA_VERSION = 'entirecli_safety_result/v1'
 const ENTIRECLI_SAFE_VERDICTS = new Set(['safe', 'not_applicable'])
+const OBSERVATION_METRIC_FIELDS = [
+  'trace_count',
+  'span_count',
+  'prompt_tokens',
+  'completion_tokens',
+  'total_tokens',
+]
 
 /**
  * Runtime enforcement gate for entirecli_safety on public surface reports.
@@ -52,7 +60,75 @@ function assertEntireCLISafetyRuntime(report) {
   }
 }
 
+function assertObservationSourcesRuntime(report) {
+  if (report.public_surface_kind === 'none') {
+    return
+  }
+
+  const observationSources = report?.public_safety?.observation_sources
+  if (observationSources === undefined) {
+    throw runtimeError('report.observation_sources_missing', 'public surface reports require public_safety.observation_sources')
+  }
+  if (!Array.isArray(observationSources)) {
+    throw runtimeError('report.observation_sources_invalid', 'public_safety.observation_sources must be an array on public surface reports')
+  }
+  if (observationSources.length === 0) {
+    throw runtimeError('report.observation_sources_empty', 'public_safety.observation_sources must not be empty on public surface reports')
+  }
+
+  const seenSourceKinds = new Set()
+  const seenProjectionDigests = new Set()
+  for (const source of observationSources) {
+    const sourceKind = source?.source_kind
+    if (typeof sourceKind !== 'string' || sourceKind.length === 0) {
+      throw runtimeError('report.observation_sources_source_kind', 'public_safety.observation_sources entries must include source_kind')
+    }
+    if (seenSourceKinds.has(sourceKind)) {
+      throw runtimeError('report.observation_sources_duplicate_source_kind', `duplicate public safety source_kind: ${sourceKind}`)
+    }
+    seenSourceKinds.add(sourceKind)
+
+    const sourceProjectionDigest = source?.provenance?.source_projection_digest
+    if (typeof sourceProjectionDigest !== 'string' || sourceProjectionDigest.length === 0) {
+      throw runtimeError('report.observation_sources_projection_digest', 'public_safety.observation_sources entries must include provenance.source_projection_digest')
+    }
+    if (seenProjectionDigests.has(sourceProjectionDigest)) {
+      throw runtimeError('report.observation_sources_duplicate_projection_digest', `duplicate source_projection_digest: ${sourceProjectionDigest}`)
+    }
+    seenProjectionDigests.add(sourceProjectionDigest)
+
+    try {
+      validateObservationSourceProjection(source)
+    } catch (error) {
+      if (error?.code === 'observation_source.evidence_mode') {
+        throw runtimeError('report.observation_sources_evidence_mode', error.message)
+      }
+      if (error?.code === 'observation_source.projection_digest_mismatch' || error?.code === 'observation_source.ref_digest_mismatch') {
+        throw runtimeError('report.observation_sources_projection_digest_mismatch', error.message)
+      }
+      if (error?.code === 'observation_source.ref_kind') {
+        throw runtimeError('report.observation_sources_ref_kind', error.message)
+      }
+      throw error
+    }
+
+    const safety = source?.safety
+    if (safety?.raw_values_emitted === true) {
+      throw runtimeError('report.observation_sources_raw_values_emitted', 'observation_source.safety.raw_values_emitted must be false on public surface')
+    }
+
+    if (source?.availability === 'unavailable') {
+      for (const field of OBSERVATION_METRIC_FIELDS) {
+        if (source?.metrics?.[field] !== null) {
+          throw runtimeError('report.observation_sources_unavailable_metrics', `observation_source.metrics.${field} must be null when availability is unavailable`)
+        }
+      }
+    }
+  }
+}
+
 export function validateFinalReport(report) {
+  assertObservationSourcesRuntime(report)
   assertEntireCLISafetyRuntime(report)
   const result = validateAgentRunReport(report)
   if (!result.valid) {
