@@ -222,6 +222,84 @@ valid_defer_decision:
 
 フィールドが 1 つでも欠けている場合は invalid defer decision として reject する。
 
+## M1_MILESTONE_CLOSE_CHECKLIST_V1（derived_view）
+
+M1 close 判定で参照する checklist は、新規 predicate を作るのではなく `close_predicate` の
+**derived view** として定義する。  
+ここでは close 判定の実行手順と、実際の AC/VC に必要な要件を文書化する。
+
+```yaml
+M1_MILESTONE_CLOSE_CHECKLIST_V1:
+  normative_status: derived_view
+  derived_view:
+    source: close_predicate
+    description: >-
+      既存の fail-closed close_predicate をそのまま再利用し、M1 判定時の入力・
+      必須根拠・運用責任者を明示する。
+  github_api_version: "2022-11-28"
+
+  required_docs:
+    - docs/dev/milestone-ops.md
+    - docs/dev/github-ops.md
+    - docs/dev/workflow.md
+
+  required_gates:
+    - name: m1-open-issues-zero
+      source: close_predicate.direct_check.milestone_open_issues
+      expected: 0
+      required: true
+    - name: m1-pr-mix-zero
+      source: close_predicate.direct_check.pr_mixed_count
+      expected: 0
+      required: true
+    - name: m1-descendant-traversal-complete
+      source: close_predicate.descendant_traversal.partial
+      expected: false
+      required: true
+    - name: m1-warnings-empty
+      source: close_predicate.descendant_traversal.warnings
+      expected: []
+      required: true
+    - name: m1-open-blocker-zero
+      source: close_predicate.descendant_traversal.open_blocker_count
+      expected: 0
+      required: true
+    - name: m1-scope-conflict-zero
+      source: close_predicate.descendant_traversal.scope_conflict_count
+      expected: 0
+      required: true
+    - name: m1-assignment-drift-zero
+      source: close_predicate.direct_check.assignment_drift
+      expected: []
+      required: true
+    - name: m1-human-close-required
+      source: close_predicate.human_close
+      expected: "close_predicate step 9"
+      required: true
+    - name: m1-close-not-gated-by-strict
+      description: >
+        --strict は close gate として扱わない。
+        CI 実行戦略のオプションを close 合否条件に追加しない。
+      expected: not_required
+      required: false
+
+  required_parent_status:
+    "#131": closed
+    "#133": closed
+    "#472": closed
+
+  non_deferable_failures:
+    - close_predicate.direct_check.pr_mixed_count
+    - close_predicate.descendant_traversal.partial
+    - close_predicate.descendant_traversal.warnings
+    - close_predicate.descendant_traversal.open_blocker_count
+    - close_predicate.descendant_traversal.scope_conflict_count
+    - close_predicate.schema_mismatch
+    - close_predicate.api_failure
+
+  close_actor: "<human-login>"
+```
+
 ### AI エージェントによる自動 close の禁止
 
 Milestone の close は **人間の意思決定が必要** であり、AI エージェントは自動 close しない。
