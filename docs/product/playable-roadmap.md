@@ -1,9 +1,9 @@
 ---
 doc_id: DOC-ROADMAP-001
-title: Post-M1 Playable Outcome Roadmap
+title: Post-M1 Playable Outcome Roadmap（M1後 playable outcome ロードマップ）
 status: active
-note: conceptual roadmap; not GitHub Milestone object creation
-last_updated_by_issue: 1167
+note: conceptual roadmap（概念ロードマップ）; not GitHub Milestone object creation（GitHub Milestone object 作成そのものは含まない）
+last_updated_by_issue: 1171
 ---
 
 # Post-M1 Playable Outcome Roadmap
@@ -37,9 +37,9 @@ last_updated_by_issue: 1167
 
 ---
 
-## Conceptual Milestone to GitHub Milestone Mapping
+## Conceptual Milestone to GitHub Milestone Mapping（概念マイルストーンと GitHub マイルストーンの対応表）
 
-readback_date: 2026-06-27
+readback_date: 2026-06-27 # GitHub マイルストーンの読取確認を行った日
 
 | conceptual_milestone_id | conceptual_title | github_milestone_number | github_milestone_title | mapping_status | decision_note |
 |---|---|---:|---|---|---|
@@ -50,9 +50,9 @@ readback_date: 2026-06-27
 
 ---
 
-## Conceptual Milestones
+## Conceptual Milestones（概念マイルストーン）
 
-### M2: Gameplay Core (v0.2.x)
+### M2: Gameplay Core (v0.2.x) / ゲームプレイ基盤
 
 ```yaml
 milestone_id: M2
@@ -74,6 +74,11 @@ spec_prerequisites:
   - docs/product/features/movement-projectile.md
 close_conditions:
   - 1 sortie を開始→操作→戦闘結果まで通せる
+  - victory: `enemies.length > 0` guard を満たしたスポーン済み敵機をすべて撃破した場合に成立し、`SortieResult.outcome` / `SortieResult.endReason` は `victory` / `all_enemies_defeated` とする
+  - timeout: 30 秒到達時に成立する neutral terminal であり、`SortieResult.outcome` / `SortieResult.endReason` は `timeout` / `timeout` とする
+  - defeat: `player_hp_zero`（HP0）で成立し、`SortieResult.outcome` / `SortieResult.endReason` は `defeat` / `player_hp_zero` とする
+  - terminal_priority: defeat > victory > timeout
+  - `survival_timer` を起点にした生存時間ベースの勝利条件は M2 の正本定義として採用しない
   - system tests と pnpm build が通る
   - src/systems から DOM / Canvas API を直接触っていない（MVP-001 遵守）
   - 固定タイムステップ 60Hz を維持（MVP-002 遵守）
@@ -92,7 +97,7 @@ spec_destination:
 
 ---
 
-### M3: Result Persistence (v0.3.x)
+### M3: Result Persistence (v0.3.x) / 結果保存
 
 ```yaml
 milestone_id: M3
@@ -127,7 +132,7 @@ spec_destination:
 
 ---
 
-### M4: Upgrade Loop (v0.4.x)
+### M4: Upgrade Loop (v0.4.x) / 強化ループ
 
 ```yaml
 milestone_id: M4
@@ -161,7 +166,7 @@ spec_destination:
 
 ---
 
-### M5: Playable Slice Hardening (v0.5.x)
+### M5: Playable Slice Hardening (v0.5.x) / プレイ可能スライス硬化
 
 ```yaml
 milestone_id: M5
@@ -205,7 +210,7 @@ spec_destination:
 
 ---
 
-## Maintenance Policy
+## Maintenance Policy（保守方針）
 
 - この文書は conceptual roadmap の正本であり、個別機能仕様の正本ではない。
 - M2〜M5 の Parent Issue が materialize された時点で、対応する issue number を追記する。

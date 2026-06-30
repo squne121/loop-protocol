@@ -39,10 +39,10 @@
             "workflow_run_url": null,
             "schema_ref": null,
             "ref": null,
-            "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "digest": "sha256:fad851e74959250b8c97381ad6d6d7a77249ec8f51f7d556ce70a12a95370f3b",
             "validation_verdict": "pass"
           },
-          "source_projection_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+          "source_projection_digest": "sha256:fad851e74959250b8c97381ad6d6d7a77249ec8f51f7d556ce70a12a95370f3b",
           "validator_id": "agent-run-report-schema",
           "validator_policy_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
           "evidence_mode": "read_only_host_inventory",

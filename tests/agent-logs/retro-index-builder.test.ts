@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { createValidReport } from '../agent-run-report-test-helpers'
+import { createValidReport } from './report-test-fixtures'
 import {
   buildRetroIndex,
   detectSchemaMigrationRequirement,
@@ -9,6 +9,7 @@ import {
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderPublicMarkdown } from '../../scripts/lib/agent-run-report-validation.mjs'
 import { renderValidatedPublicMarkdown } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { computeObservationSourceProjectionDigest } from '../../scripts/agent-logs/lib/observation-source-adapter.mjs'
 
 function createIssueCommentReport() {
   const report = createValidReport()
@@ -74,6 +75,83 @@ function createMultiPrReport() {
     linkedPrHints: [955, 956],
     linkedIssueHints: [935],
     branchHint: 'worktree-issue-935-agent-run-report',
+  }
+}
+
+function createObservationSource(overrides = {}) {
+  const projection = {
+    schema_version: 'observation_source_result/v1',
+    source_kind: 'claude_code',
+    capability_verdict: 'supported',
+    availability: 'available',
+    projection_mode: 'allowlist_projection',
+    safety: {
+      verdict: 'pass',
+      raw_values_emitted: false,
+      forbidden_field_scan: 'pass',
+      reason_codes: [],
+    },
+    metrics: {
+      trace_count: 1,
+      span_count: 2,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    },
+  }
+  const digest = computeObservationSourceProjectionDigest({
+    ...projection,
+    ...overrides,
+  })
+  const base = {
+    ...projection,
+    provenance: {
+      schema_version: 'observation_source_provenance/v1',
+      ref: {
+        kind: 'observation_projection_digest',
+        artifact_id: null,
+        artifact_digest: null,
+        workflow_run_url: null,
+        schema_ref: null,
+        ref: null,
+        digest,
+        validation_verdict: 'pass',
+      },
+      source_projection_digest: digest,
+      validator_id: 'agent-run-report-schema',
+      validator_policy_digest: 'sha256:11111111111111111111111111111111111111111111111111111111111111111111',
+      evidence_mode: 'synthetic_only',
+      checked_at: '2026-06-29T12:00:00Z',
+    },
+  }
+  return { ...base, ...overrides }
+}
+
+function refreshObservationSourceDigest(source) {
+  const digest = computeObservationSourceProjectionDigest(source)
+  return {
+    ...source,
+    provenance: {
+      ...source.provenance,
+      ref: {
+        ...source.provenance.ref,
+        digest,
+      },
+      source_projection_digest: digest,
+    },
+  }
+}
+
+function withObservationSource(report, overrides = {}) {
+  const sourceOverrides = overrides.source || {}
+  return {
+    ...createValidReport(),
+    ...report,
+    public_safety: {
+      ...createValidReport().public_safety,
+      ...report.public_safety,
+      observation_sources: report.public_safety?.observation_sources ?? [createObservationSource(sourceOverrides)],
+    },
   }
 }
 
@@ -271,6 +349,365 @@ describe('retro index builder', () => {
       {
         report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
         reason: 'report_entirecli_safety_missing',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report missing observation_sources WHEN buildRetroIndex runs THEN verdict becomes blocked with missing reason', () => {
+    const reportWithoutObservationSource = withObservationSource({
+      public_safety: {
+        redaction_status: 'clean',
+        checked_by: 'pnpm agent-run-report:check',
+        validator_version: '1.0.0',
+        checked_at: '2026-06-15T22:57:00Z',
+        verdict: 'pass',
+        blocked_reasons: [],
+        entirecli_safety: {
+          schema_version: 'entirecli_safety_result/v1',
+          verdict: 'not_applicable',
+          reason_codes: ['entire_absent'],
+          raw_values_emitted: false,
+          checked_surfaces: {
+            entire_binary: false,
+            entire_version: null,
+            entire_enable_help: false,
+            entire_configure_help: false,
+          },
+        },
+      },
+    })
+    reportWithoutObservationSource.public_safety.observation_sources = []
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-empty',
+      },
+      payloadMarkdown: renderPublicMarkdown(reportWithoutObservationSource),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122674',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_empty',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with duplicate observation source_kind WHEN buildRetroIndex runs THEN verdict becomes blocked with duplicate source_kind reason', () => {
+    const duplicateKinds = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [
+          createObservationSource(),
+          createObservationSource(),
+        ],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-dup-kind',
+      },
+      payloadMarkdown: renderPublicMarkdown(duplicateKinds),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122675',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_duplicate_source_kind',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with duplicate observation source_projection_digest WHEN buildRetroIndex runs THEN verdict becomes blocked with duplicate digest reason', () => {
+    const firstSource = createObservationSource()
+    const secondSource = refreshObservationSourceDigest(createObservationSource({ source_kind: 'google_antigravity' }))
+    const duplicateProjectionDigest = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [
+          firstSource,
+          {
+            ...secondSource,
+            provenance: {
+              ...secondSource.provenance,
+              ref: {
+                ...secondSource.provenance.ref,
+                digest: firstSource.provenance.ref.digest,
+              },
+              source_projection_digest: firstSource.provenance.source_projection_digest,
+            },
+          },
+        ],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-dup-proj',
+      },
+      payloadMarkdown: renderPublicMarkdown(duplicateProjectionDigest),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122676',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_duplicate_projection_digest',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with mismatched observation source canonical digest WHEN buildRetroIndex runs THEN verdict becomes blocked with digest mismatch reason', () => {
+    const withMismatchedDigest = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [
+          {
+            ...createObservationSource(),
+            provenance: {
+              ...createObservationSource().provenance,
+              source_projection_digest: 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+            },
+          },
+        ],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-digest-mismatch',
+      },
+      payloadMarkdown: renderPublicMarkdown(withMismatchedDigest),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122676',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_projection_digest_mismatch',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with real_pilot_verified observation source evidence WHEN buildRetroIndex runs THEN verdict becomes blocked with evidence-mode reason', () => {
+    const withRealPilotEvidence = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [
+          {
+            ...createObservationSource(),
+            provenance: {
+              ...createObservationSource().provenance,
+              evidence_mode: 'real_pilot_verified',
+            },
+          },
+        ],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-real-pilot',
+      },
+      payloadMarkdown: renderPublicMarkdown(withRealPilotEvidence),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122676',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_evidence_mode',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with raw_values_emitted true WHEN buildRetroIndex runs THEN verdict becomes blocked with raw_values_emitted reason', () => {
+    const rawValuesSource = refreshObservationSourceDigest({
+      ...createObservationSource(),
+      safety: {
+        verdict: 'pass',
+        raw_values_emitted: true,
+        forbidden_field_scan: 'pass',
+        reason_codes: [],
+      },
+      provenance: structuredClone(createObservationSource().provenance),
+    })
+    const withRawValues = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [rawValuesSource],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-raw-values',
+      },
+      payloadMarkdown: renderPublicMarkdown(withRawValues),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122677',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_raw_values_emitted',
+      },
+    ])
+  })
+
+  it('GIVEN embedded report with availability unavailable and non-null metrics WHEN buildRetroIndex runs THEN verdict becomes blocked with unavailable metrics reason', () => {
+    const unavailableMetricsSource = refreshObservationSourceDigest({
+      ...createObservationSource(),
+      availability: 'unavailable',
+      metrics: {
+        trace_count: 1,
+        span_count: null,
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+      },
+      provenance: structuredClone(createObservationSource().provenance),
+    })
+    const withUnavailableMetrics = {
+      ...withObservationSource({}),
+      public_safety: {
+        ...withObservationSource({}).public_safety,
+        observation_sources: [unavailableMetricsSource],
+      },
+    }
+    const body = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 935,
+        prNumber: null,
+        runId: 'run-935-obs-unavailable-metrics',
+      },
+      payloadMarkdown: renderPublicMarkdown(withUnavailableMetrics),
+    }).body
+
+    const result = buildRetroIndex({
+      parentIssue: 928,
+      sourceComments: [{
+        html_url: 'https://github.com/squne121/loop-protocol/issues/935#issuecomment-4713122678',
+        body,
+        linkedPrHints: [955],
+        linkedIssueHints: [935],
+        branchHint: null,
+      }],
+      parentChildIssueNumbers: [935],
+      prMetadataByNumber: new Map(),
+      associatedPrByMergeSha: new Map(),
+    })
+
+    expect(result.index.generation_verdict).toBe('blocked')
+    expect(result.blockedReasons).toEqual([
+      {
+        report_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        reason: 'report_observation_sources_unavailable_metrics',
       },
     ])
   })

@@ -24,6 +24,8 @@ const OPTION_SPEC = {
   '--token-total': { key: 'tokenTotal' },
   '--entirecli-safety-json': { key: 'entirecliSafetyJson' },
   '--entirecli-safety-file': { key: 'entirecliSafetyFile' },
+  '--observation-source-json': { key: 'observationSourceJson' },
+  '--observation-source-file': { key: 'observationSourceFile' },
 }
 
 /**
@@ -84,11 +86,68 @@ function loadEntireCLISafetyFromOptions(options) {
   return parsed
 }
 
+function loadObservationSourceFromOptions(options) {
+  const publicSurfaceKind = options.publicSurfaceKind
+  const hasJson = options.observationSourceJson !== undefined
+  const hasFile = options.observationSourceFile !== undefined
+
+  if (publicSurfaceKind !== 'none' && !hasJson && !hasFile) {
+    throw runtimeError(
+      'finalize.observation_source_required',
+      'public surface reports require --observation-source-json or --observation-source-file'
+    )
+  }
+
+  if (!hasJson && !hasFile) {
+    return undefined
+  }
+  if (hasJson && hasFile) {
+    throw runtimeError(
+      'finalize.observation_source_conflict',
+      'set either --observation-source-json or --observation-source-file, but not both'
+    )
+  }
+
+  let rawJson
+  if (hasFile) {
+    try {
+      rawJson = readFileSync(options.observationSourceFile, 'utf-8')
+    } catch {
+      throw runtimeError(
+        'finalize.observation_source_file_read_failed',
+        `could not read observation source file: ${options.observationSourceFile}`
+      )
+    }
+  } else {
+    rawJson = options.observationSourceJson
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(rawJson)
+  } catch {
+    throw runtimeError(
+      'finalize.observation_source_json_parse_failed',
+      'observation source JSON could not be parsed: malformed JSON'
+    )
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw runtimeError(
+      'finalize.observation_source_json_invalid',
+      'observation source JSON must be a non-array object'
+    )
+  }
+
+  return parsed
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2), OPTION_SPEC)
   validateTranscriptRefs(options.transcriptRefs ?? [])
 
   const entirecliSafety = loadEntireCLISafetyFromOptions(options)
+  const observationSource = loadObservationSourceFromOptions(options)
   const draft = await loadDraft(options.draftPath)
   const report = buildAgentRunReport({
     draft,
@@ -105,6 +164,7 @@ async function main() {
       total: options.tokenTotal,
     },
     entirecliSafety,
+    observationSource,
   })
 
   await writeJsonAtomic(options.outputPath, report)
