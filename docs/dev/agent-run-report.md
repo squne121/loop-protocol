@@ -48,6 +48,17 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - 投稿先（`public_surface_kind`）が意図した対象（`github_issue_comment` / `github_pr_comment`）であることを確認している
 - 二重投稿防止のため、upsert は既存コメントを上書きする形式を使用している
 
+### コマンド責務境界
+
+- `agent-run:finalize` は public-safe な `agent_run_report/v1` artifact を生成し、validation を通す責務を持つ
+- `agent-run:post` は **validated `agent_run_report` の GitHub upsert 専用** であり、`CHATGPT_RETRO_CONTEXT_V1` marker の更新責務を含めない
+- agent-run:post は validated `agent_run_report` の GitHub upsert 専用であり、ChatGPT retro marker 更新責務を含めない
+- `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
+- `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する
+- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、pagination exhausted まで live scan した上で `resolved | missing | blocked_duplicate | blocked_malformed | blocked_pagination_exhausted | blocked_stale_write` の structured result を返す
+
+この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
+
 ## Review Correction Loop / レビュー修正ループ
 
 CI failure、human correction、または reviewer comment が発生した場合、
@@ -185,11 +196,22 @@ public surface では `observation_sources` が runtime で要求される。
 - `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
 - `unsupported` と `unverified` はそのまま adapter 入力の availability signal 扱いとし、`availability: unavailable` として扱う
 - `availability: unavailable` では metrics はすべて `null`、`reason_codes` には `source_unavailable` を補完
+- current producer contract は **single-source projection** を前提とする。現時点では aggregate producer を追加していないため、本ドキュメントでは aggregate metrics と呼ばない
 - `observation_sources` の `provenance.source_projection_digest` が public projection の canonical JSON sha256 を持つこと
 - `validate-final-report.mjs` と `retro-index-builder.mjs` は `provenance.source_projection_digest` と `provenance.ref.digest` を canonicalized public projection から再計算し、一致しない report を fail closed にする
 - `token_usage` は観測 source とは別責務。`token_usage` は LLM API トークン集計のみ扱い、observation source projection / 理由・証跡を混同しない
 
 `real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
+
+### Remaining Parent Gaps / Out of Scope
+
+以下は current repo reality では **#1245 の成功条件に含めない**。
+
+- Latitude metadata keys / saved searches / annotation taxonomy の SSOT 化
+- public GitHub comments と private telemetry / Entire checkpoints の retention policy 分離
+- retrospective result から follow-up Issue を draft / create して retro index へ自動反映する workflow
+- observation source の aggregate producer 導入
+- `token_usage.source` の enum migration や Latitude 専用 token producer 導入
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
 

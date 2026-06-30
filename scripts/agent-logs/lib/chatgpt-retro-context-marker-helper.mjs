@@ -1,5 +1,6 @@
 import { readFile } from 'fs/promises'
 import { Buffer } from 'buffer'
+import { fileURLToPath } from 'url'
 
 import {
   extractPayloadFromMarkdown,
@@ -13,6 +14,7 @@ import {
 import {
   GhCliIssueCommentsClient,
   listAllIssueComments,
+  listAllIssueCommentsStructured,
   parseMarkerComment,
   sha256Hex,
 } from './github-comments.mjs'
@@ -22,7 +24,7 @@ import {
   parseRetroOwnershipMarker,
   validateRetroCommentBody,
 } from './retro-index-comment-helper.mjs'
-import { runtimeError } from './args.mjs'
+import { parseArgs, printCliError, runtimeError } from './args.mjs'
 
 export const CHATGPT_RETRO_CONTEXT_OWNERSHIP_PATTERN = /^<!--\s*CHATGPT_RETRO_CONTEXT_V1 repo=(?<repo>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) target=(?<targetType>issue|pull_request):(?<targetNumber>[0-9]+) parent_issue=(?<parentIssue>[0-9]+)\s*-->$/u
 export const CHATGPT_RETRO_CONTEXT_DIGEST_PATTERN = /^<!--\s*CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=(?<digest>[a-f0-9]{64})\s*-->$/iu
@@ -30,6 +32,20 @@ export const CHATGPT_RETRO_CONTEXT_DIGEST_PATTERN = /^<!--\s*CHATGPT_RETRO_CONTE
 const OWNERSHIP_SCAN = /<!--\s*CHATGPT_RETRO_CONTEXT_V1\s+repo=[^>]*-->/gu
 const DIGEST_SCAN = /<!--\s*CHATGPT_RETRO_CONTEXT_DIGEST_V1\b[^>]*-->/giu
 const MAX_GITHUB_COMMENT_BYTES = 65536
+const CLI_OPTION_SPEC = {
+  '--command': { key: 'command', required: true },
+  '--repo': { key: 'repo' },
+  '--target-type': { key: 'targetType' },
+  '--target-number': { key: 'targetNumber' },
+  '--parent-issue': { key: 'parentIssue' },
+  '--payload-markdown-file': { key: 'payloadMarkdownFile' },
+  '--marker-comment-json': { key: 'markerCommentJson' },
+  '--github-comments-json': { key: 'githubCommentsJson', multiple: true },
+  '--marker-comment-url': { key: 'markerCommentUrl' },
+  '--expected-supersedes-digest': { key: 'expectedSupersedesDigest' },
+  '--dry-run': { key: 'dryRun', defaultValue: 'true' },
+  '--confirm-live': { key: 'confirmLive', defaultValue: 'false' },
+}
 
 function countMatches(text, pattern) {
   return Array.from(text.matchAll(pattern)).length
@@ -55,6 +71,16 @@ function normalizeRepo(repo) {
     throw runtimeError('chatgpt_retro_context.repo', 'repo must be an owner/name string')
   }
   return repo
+}
+
+function parseBooleanFlag(value, optionName) {
+  if (value === 'true') {
+    return true
+  }
+  if (value === 'false') {
+    return false
+  }
+  throw runtimeError('chatgpt_retro_context.invalid_flag', `${optionName} must be true or false`)
 }
 
 export function buildChatgptRetroContextOwnership(input) {
@@ -324,6 +350,138 @@ export async function upsertChatgptRetroContextComment(client, {
   }
 }
 
+function commentUrlFromResponse(response) {
+  return response?.html_url ?? response?.url ?? null
+}
+
+export async function resolveChatgptRetroContextLive(client, {
+  repo,
+  targetType,
+  targetNumber,
+  parentIssue,
+  markerCommentUrl = null,
+}) {
+  const ownership = buildChatgptRetroContextOwnership({ repo, targetType, targetNumber, parentIssue })
+  const listed = await listAllIssueCommentsStructured(client, {
+    repo: ownership.repo,
+    issueNumber: ownership.targetNumber,
+  })
+  const target = {
+    type: ownership.targetType,
+    number: ownership.targetNumber,
+    endpoint_kind: ownership.targetType === 'pull_request' ? 'issue_comments_for_pull_request' : 'issue_comments_for_issue',
+  }
+  const pagination = {
+    page_count: listed.pageCount,
+    scanned_comments: listed.scannedComments,
+    max_pages: listed.maxPages,
+    per_page: listed.perPage,
+    endpoint: listed.endpoint,
+  }
+
+  if (listed.pagination_exhausted) {
+    return {
+      status: 'blocked_pagination_exhausted',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 0,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const parsedComments = listed.comments.map((comment) => parseChatgptRetroContextComment(comment))
+  const matches = parsedComments.filter((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership))
+  const malformed = matches.find((entry) => entry.malformed)
+  if (malformed) {
+    return {
+      status: 'blocked_malformed',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: commentUrlFromResponse(malformed.comment),
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: matches.length,
+      marker_comment: {
+        id: malformed.comment?.id ?? null,
+        url: commentUrlFromResponse(malformed.comment),
+      },
+      digest: malformed.digest,
+    }
+  }
+
+  if (matches.length >= 2) {
+    return {
+      status: 'blocked_duplicate',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: matches.length,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const [match] = matches
+  if (!match) {
+    return {
+      status: 'missing',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 0,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const resolvedUrl = commentUrlFromResponse(match.comment)
+  if (markerCommentUrl !== null && resolvedUrl !== markerCommentUrl) {
+    return {
+      status: 'blocked_stale_write',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+    }
+  }
+
+  return {
+    status: 'resolved',
+    repo: ownership.repo,
+    target,
+    parent_issue: ownership.parentIssue,
+    marker_comment_url: resolvedUrl,
+    pagination,
+    comment_count: listed.comments.length,
+    matched_comment_count: 1,
+    marker_comment: {
+      id: match.comment?.id ?? null,
+      url: resolvedUrl,
+    },
+    digest: match.digest,
+  }
+}
+
 function normalizeCommentListPayload(payload) {
   if (Array.isArray(payload)) {
     return payload
@@ -523,6 +681,60 @@ export async function resolveChatgptRetroContextFromFixtures({
   }
 }
 
+async function runCli() {
+  const options = parseArgs(process.argv.slice(2), CLI_OPTION_SPEC)
+
+  if (options.command === 'resolve-fixture') {
+    const result = await resolveChatgptRetroContextFromFixtures({
+      markerCommentJson: options.markerCommentJson,
+      githubCommentsJson: options.githubCommentsJson ?? [],
+    })
+    console.log(JSON.stringify(result))
+    return
+  }
+
+  if (options.command === 'resolve-live') {
+    const result = await resolveChatgptRetroContextLive(new GhCliIssueCommentsClient(), {
+      repo: options.repo,
+      targetType: options.targetType,
+      targetNumber: options.targetNumber,
+      parentIssue: options.parentIssue,
+      markerCommentUrl: options.markerCommentUrl ?? null,
+    })
+    console.log(JSON.stringify(result))
+    return
+  }
+
+  if (options.command === 'post') {
+    const dryRun = parseBooleanFlag(options.dryRun, '--dry-run')
+    const confirmLive = parseBooleanFlag(options.confirmLive, '--confirm-live')
+    if (!dryRun && !confirmLive) {
+      throw runtimeError('chatgpt_retro_context.live_confirmation_required', 'live posting requires --dry-run false and --confirm-live true')
+    }
+    const payloadMarkdown = await readFile(options.payloadMarkdownFile, 'utf-8')
+    const result = await upsertChatgptRetroContextComment(new GhCliIssueCommentsClient(), {
+      repo: options.repo,
+      targetType: options.targetType,
+      targetNumber: options.targetNumber,
+      parentIssue: options.parentIssue,
+      payloadMarkdown,
+      dryRun,
+      expectedSupersedesDigest: options.expectedSupersedesDigest ?? null,
+    })
+    console.log(JSON.stringify(result))
+    return
+  }
+
+  throw runtimeError('chatgpt_retro_context.unknown_command', 'command must be post, resolve-fixture, or resolve-live')
+}
+
 export {
   GhCliIssueCommentsClient,
+}
+
+const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url)
+if (isDirectExecution) {
+  runCli().catch((error) => {
+    process.exit(printCliError('chatgpt-retro-context', error))
+  })
 }

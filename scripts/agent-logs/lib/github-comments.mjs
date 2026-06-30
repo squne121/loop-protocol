@@ -352,18 +352,62 @@ export class GhCliIssueCommentsClient {
 }
 
 export async function listAllIssueComments(client, { repo, issueNumber, perPage = 100 }) {
+  const result = await listAllIssueCommentsStructured(client, {
+    repo,
+    issueNumber,
+    perPage,
+  })
+  if (result.pagination_exhausted) {
+    throw runtimeError('github_comments.pagination_exhausted', 'issue comment pagination exhausted before scan completion')
+  }
+  return result.comments
+}
+
+export async function listAllIssueCommentsStructured(client, {
+  repo,
+  issueNumber,
+  perPage = 100,
+  maxPages = 100,
+}) {
   const comments = []
-  for (let page = 1; page <= 100; page += 1) {
+  for (let page = 1; page <= maxPages; page += 1) {
     const pageItems = await client.listIssueComments({ repo, issueNumber, page, perPage })
     comments.push(...pageItems)
     if (pageItems.length < perPage) {
-      break
+      return {
+        comments,
+        pageCount: page,
+        scannedComments: comments.length,
+        maxPages,
+        perPage,
+        endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
+        pagination_exhausted: false,
+        lastPageSize: pageItems.length,
+      }
     }
-    if (page === 100) {
-      throw runtimeError('github_comments.pagination_exhausted', 'issue comment pagination exhausted before scan completion')
+    if (page === maxPages) {
+      return {
+        comments,
+        pageCount: page,
+        scannedComments: comments.length,
+        maxPages,
+        perPage,
+        endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
+        pagination_exhausted: true,
+        lastPageSize: pageItems.length,
+      }
     }
   }
-  return comments
+  return {
+    comments,
+    pageCount: 0,
+    scannedComments: comments.length,
+    maxPages,
+    perPage,
+    endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
+    pagination_exhausted: false,
+    lastPageSize: 0,
+  }
 }
 
 function commentUrlFromResponse(response) {

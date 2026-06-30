@@ -6,6 +6,7 @@ import {
   computeChatgptRetroContextPayloadDigest,
   parseChatgptRetroContextComment,
   resolveChatgptRetroContextFromFixtures,
+  resolveChatgptRetroContextLive,
   upsertChatgptRetroContextComment,
 } from '../../scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs'
 import { buildRetroIndexCommentBody } from '../../scripts/agent-logs/lib/retro-index-comment-helper.mjs'
@@ -356,5 +357,69 @@ describe('chatgpt retro context marker helper', () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
+  })
+
+  it('GIVEN a live issue-comment scan with exactly one ownership match WHEN resolving live THEN it returns a structured resolved result', async () => {
+    const payload = createPayload()
+    const comment = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'pull_request',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: renderPublicMarkdown(payload),
+    })
+    const client = {
+      listIssueComments: async ({ issueNumber, page }) => {
+        expect(issueNumber).toBe(1224)
+        return page === 1
+          ? [{ id: 41, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41', body: comment.body }]
+          : []
+      },
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'pull_request',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'resolved',
+      target: {
+        type: 'pull_request',
+        number: 1224,
+        endpoint_kind: 'issue_comments_for_pull_request',
+      },
+      marker_comment: {
+        id: 41,
+        url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41',
+      },
+      matched_comment_count: 1,
+    })
+  })
+
+  it('GIVEN a live issue-comment scan that exhausts pagination WHEN resolving live THEN it returns a structured blocked result', async () => {
+    const client = {
+      listIssueComments: async () => Array.from({ length: 100 }, (_, index) => ({
+        id: index + 1,
+        body: 'plain comment body',
+      })),
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'blocked_pagination_exhausted',
+      target: {
+        type: 'issue',
+        number: 1224,
+        endpoint_kind: 'issue_comments_for_issue',
+      },
+      matched_comment_count: 0,
+    })
   })
 })
