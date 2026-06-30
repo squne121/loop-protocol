@@ -186,9 +186,10 @@ public surface では `observation_sources` が runtime で要求される。
 - `unsupported` と `unverified` はそのまま adapter 入力の availability signal 扱いとし、`availability: unavailable` として扱う
 - `availability: unavailable` では metrics はすべて `null`、`reason_codes` には `source_unavailable` を補完
 - `observation_sources` の `provenance.source_projection_digest` が public projection の canonical JSON sha256 を持つこと
+- `validate-final-report.mjs` と `retro-index-builder.mjs` は `provenance.source_projection_digest` と `provenance.ref.digest` を canonicalized public projection から再計算し、一致しない report を fail closed にする
 - `token_usage` は観測 source とは別責務。`token_usage` は LLM API トークン集計のみ扱い、observation source projection / 理由・証跡を混同しない
 
-`real_pilot_verified` は observation source の生成や検証出力では禁止とする。
+`real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
 

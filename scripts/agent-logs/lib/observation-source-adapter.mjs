@@ -62,6 +62,7 @@ const INPUT_SCAN_VALUE_PATTERNS = [
 ]
 
 const SAFETY_VERDICTS = Object.freeze(new Set(['pass', 'blocked']))
+const OBSERVATION_SOURCE_EVIDENCE_MODES = Object.freeze(new Set(['synthetic_only']))
 
 function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf-8').digest('hex')
@@ -90,11 +91,10 @@ function assertStringEnum(value, allowedValues, code, message) {
 }
 
 function assertInteger(value, path, code, message) {
-  const numeric = Number(value)
-  if (!Number.isInteger(numeric) || numeric < 0) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw runtimeError(code, message)
   }
-  return numeric
+  return value
 }
 
 function assertBoolean(value, path, code, message) {
@@ -172,7 +172,8 @@ function scanForForbidden(value, path, violations) {
 
   if (isObject(value)) {
     for (const [key, child] of Object.entries(value)) {
-      if (INPUT_SCAN_KEY_PATTERNS.some((pattern) => pattern.test(key))) {
+      const keyCandidates = [key, ...key.split('.').filter(Boolean)]
+      if (keyCandidates.some((candidate) => INPUT_SCAN_KEY_PATTERNS.some((pattern) => pattern.test(candidate)))) {
         violations.push(`${path}.${key}`)
       }
       scanForForbidden(child, `${path}.${key}`, violations)
@@ -180,29 +181,13 @@ function scanForForbidden(value, path, violations) {
   }
 }
 
-function normalizeOutputKind(inputKind, outputSourceKind) {
-  const normalizedOutputKind = assertStringEnum(
+function normalizeOutputKind(outputSourceKind) {
+  return assertStringEnum(
     outputSourceKind,
     OUTPUT_KINDS,
     'observation_source.output_source_kind',
     'observation source input output_source_kind must be claude_code|codex_cli|google_antigravity'
   )
-
-  if (inputKind === 'latitude_otlp' && normalizedOutputKind === 'claude_code') {
-    throw runtimeError(
-      'observation_source.output_source_kind_mismatch',
-      'latitude_otlp input must not project to claude_code'
-    )
-  }
-
-  if (inputKind === 'entirecli' && normalizedOutputKind === 'google_antigravity') {
-    throw runtimeError(
-      'observation_source.output_source_kind_mismatch',
-      'entirecli input must not project to google_antigravity'
-    )
-  }
-
-  return normalizedOutputKind
 }
 
 function normalizeCheckedAt(inputCheckedAt, optionsCheckedAt) {
@@ -251,6 +236,13 @@ function normalizeMetrics(inputMetrics, availability) {
     }
   }
   const metrics = assertObject(inputMetrics, '$.metrics', 'observation_source.metrics', 'observation source metrics must be an object when availability is available')
+  assertObjectClosed(metrics, '$.metrics', 'observation_source.metrics', new Set([
+    'trace_count',
+    'span_count',
+    'prompt_tokens',
+    'completion_tokens',
+    'total_tokens',
+  ]))
   const normalized = {
     trace_count: assertInteger(metrics.trace_count, '$.metrics.trace_count', 'observation_source.metrics', '$.metrics.trace_count must be a non-negative integer'),
     span_count: assertInteger(metrics.span_count, '$.metrics.span_count', 'observation_source.metrics', '$.metrics.span_count must be a non-negative integer'),
@@ -262,20 +254,23 @@ function normalizeMetrics(inputMetrics, availability) {
 }
 
 function normalizeSafety(inputSafety, path, availability) {
-  const safety = inputSafety === undefined
-    ? {}
-    : assertObject(inputSafety, `${path}.safety`, 'observation_source.safety', 'observation source safety must be an object when provided')
+  const safety = assertObject(
+    inputSafety,
+    `${path}.safety`,
+    'observation_source.safety',
+    'observation source safety must be an object'
+  )
   assertObjectClosed(safety, `${path}.safety`, 'observation_source.safety', SAFETY_KEYS, 'observation source safety contains unknown fields')
 
   const reasonCodes = uniqueSortedStrings(safety.reason_codes)
   const verdict = assertStringEnum(
-    safety.verdict ?? 'pass',
+    safety.verdict,
     SAFETY_VERDICTS,
     'observation_source.safety_verdict',
     `${path}.safety.verdict must be pass|blocked`
   )
   const rawValuesEmitted = assertBoolean(
-    safety.raw_values_emitted ?? false,
+    safety.raw_values_emitted,
     `${path}.safety.raw_values_emitted`,
     'observation_source.safety_raw_values_emitted',
     `${path}.safety.raw_values_emitted must be boolean`
@@ -298,6 +293,72 @@ function normalizeCapabilityVerdict(inputVerdict) {
     'observation_source.capability_verdict',
     'observation source capability_verdict must be supported|partial|unsupported|unverified'
   )
+}
+
+function buildDigestProjection(normalizedProjection) {
+  return {
+    schema_version: normalizedProjection.schema_version,
+    source_kind: normalizedProjection.source_kind,
+    capability_verdict: normalizedProjection.capability_verdict,
+    availability: normalizedProjection.availability,
+    projection_mode: normalizedProjection.projection_mode,
+    safety: normalizedProjection.safety,
+    metrics: normalizedProjection.metrics,
+  }
+}
+
+export function computeObservationSourceProjectionDigest(normalizedProjection) {
+  return sha256Digest(JSON.stringify(canonicalizeJson(buildDigestProjection(normalizedProjection))))
+}
+
+export function validateObservationSourceProjection(source) {
+  const normalizedSource = assertObject(
+    source,
+    '$.public_safety.observation_sources[]',
+    'observation_source.invalid_projection',
+    'observation source projection must be an object'
+  )
+  const digestProjection = buildDigestProjection(normalizedSource)
+  const canonicalDigest = computeObservationSourceProjectionDigest(digestProjection)
+  const provenance = assertObject(
+    normalizedSource.provenance,
+    '$.public_safety.observation_sources[].provenance',
+    'observation_source.provenance',
+    'observation source provenance must be an object'
+  )
+  const ref = assertObject(
+    provenance.ref,
+    '$.public_safety.observation_sources[].provenance.ref',
+    'observation_source.provenance_ref',
+    'observation source provenance.ref must be an object'
+  )
+
+  if (ref.kind !== 'observation_projection_digest') {
+    throw runtimeError(
+      'observation_source.ref_kind',
+      'observation source provenance.ref.kind must be observation_projection_digest'
+    )
+  }
+  if (provenance.evidence_mode !== 'synthetic_only' || !OBSERVATION_SOURCE_EVIDENCE_MODES.has(provenance.evidence_mode)) {
+    throw runtimeError(
+      'observation_source.evidence_mode',
+      'observation source provenance.evidence_mode must remain synthetic_only until real pilot is approved'
+    )
+  }
+  if (provenance.source_projection_digest !== canonicalDigest) {
+    throw runtimeError(
+      'observation_source.projection_digest_mismatch',
+      'observation source provenance.source_projection_digest must match canonical public projection digest'
+    )
+  }
+  if (ref.digest !== canonicalDigest) {
+    throw runtimeError(
+      'observation_source.ref_digest_mismatch',
+      'observation source provenance.ref.digest must match canonical public projection digest'
+    )
+  }
+
+  return canonicalDigest
 }
 
 function normalizeOutput(input, options = {}) {
@@ -336,7 +397,7 @@ function normalizeOutput(input, options = {}) {
     'observation_source.input_kind',
     `observation source input input_kind must be one of ${[...INPUT_KINDS].join(', ')}`
   )
-  const outputKind = normalizeOutputKind(inputKind, sourceInput.output_source_kind)
+  const outputKind = normalizeOutputKind(sourceInput.output_source_kind)
 
   const capabilityVerdict = normalizeCapabilityVerdict(sourceInput.capability_verdict)
   let availability = normalizeAvailability(sourceInput.availability)
@@ -379,7 +440,7 @@ function normalizeOutput(input, options = {}) {
     metrics,
   }
 
-  const sourceProjectionDigest = sha256Digest(JSON.stringify(canonicalizeJson(normalizedProjection)))
+  const sourceProjectionDigest = computeObservationSourceProjectionDigest(normalizedProjection)
 
   if (safety.raw_values_emitted) {
     throw runtimeError(

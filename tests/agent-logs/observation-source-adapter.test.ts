@@ -104,4 +104,59 @@ describe('observation-source adapter', () => {
       },
     }))).toThrow(/forbidden/i)
   })
+
+  it('GIVEN a dotted forbidden key WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      'stdout.path': '/tmp/raw.txt',
+    }))).toThrow(/forbidden/i)
+  })
+
+  it('GIVEN latitude input projected to claude_code WHEN adapted THEN closed output enum still permits the projection', () => {
+    const result = buildObservationSourceFromInput(createInput({
+      input_kind: 'latitude_otlp',
+      output_source_kind: 'claude_code',
+    }))
+
+    expect(result.source_kind).toBe('claude_code')
+  })
+
+  it('GIVEN entirecli input projected to google_antigravity WHEN adapted THEN closed output enum still permits the projection', () => {
+    const result = buildObservationSourceFromInput(createInput({
+      input_kind: 'entirecli',
+      output_source_kind: 'google_antigravity',
+    }))
+
+    expect(result.source_kind).toBe('google_antigravity')
+  })
+
+  it('GIVEN metrics with a string count WHEN adapted THEN it fails closed instead of coercing numbers', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      metrics: {
+        trace_count: '1',
+        span_count: 2,
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+      },
+    }))).toThrow(/non-negative integer/)
+  })
+
+  it('GIVEN metrics with an unknown field WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      metrics: {
+        trace_count: 1,
+        span_count: 2,
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        extra_metric: 99,
+      },
+    }))).toThrow(/unknown keys/i)
+  })
+
+  it('GIVEN missing safety payload WHEN adapted THEN it fails closed', () => {
+    expect(() => buildObservationSourceFromInput(createInput({
+      safety: undefined,
+    }))).toThrow(/safety must be an object/i)
+  })
 })

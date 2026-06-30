@@ -6,10 +6,11 @@ import { tmpdir } from 'os'
 import { upsertGithubMarkerCommentFromFile } from '../../scripts/agent-logs/upsert-github-marker-comment.mjs'
 import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown, validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { computeObservationSourceProjectionDigest } from '../../scripts/agent-logs/lib/observation-source-adapter.mjs'
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
 
 function createObservationSource() {
-  return {
+  const projection = {
     schema_version: 'observation_source_result/v1',
     source_kind: 'claude_code',
     capability_verdict: 'supported',
@@ -28,6 +29,10 @@ function createObservationSource() {
       completion_tokens: 20,
       total_tokens: 30,
     },
+  }
+  const digest = computeObservationSourceProjectionDigest(projection)
+  return {
+    ...projection,
     provenance: {
       schema_version: 'observation_source_provenance/v1',
       ref: {
@@ -37,10 +42,10 @@ function createObservationSource() {
         workflow_run_url: null,
         schema_ref: null,
         ref: null,
-        digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        digest,
         validation_verdict: 'pass',
       },
-      source_projection_digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      source_projection_digest: digest,
       validator_id: 'agent-run-report-schema',
       validator_policy_digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
       evidence_mode: 'synthetic_only',

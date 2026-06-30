@@ -1,5 +1,7 @@
+import { computeObservationSourceProjectionDigest } from '../../scripts/agent-logs/lib/observation-source-adapter.mjs'
+
 export function createValidObservationSourceResult() {
-  return {
+  const projection = {
     schema_version: 'observation_source_result/v1',
     source_kind: 'codex_cli',
     capability_verdict: 'supported',
@@ -18,6 +20,10 @@ export function createValidObservationSourceResult() {
       completion_tokens: 20,
       total_tokens: 30,
     },
+  }
+  const digest = computeObservationSourceProjectionDigest(projection)
+  return {
+    ...projection,
     provenance: {
       schema_version: 'observation_source_provenance/v1',
       ref: {
@@ -27,10 +33,10 @@ export function createValidObservationSourceResult() {
         workflow_run_url: null,
         schema_ref: null,
         ref: null,
-        digest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+        digest,
         validation_verdict: 'pass',
       },
-      source_projection_digest: 'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+      source_projection_digest: digest,
       validator_id: 'observation-source-adapter',
       validator_policy_digest: 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
       evidence_mode: 'synthetic_only',

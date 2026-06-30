@@ -37,10 +37,10 @@
             "workflow_run_url": null,
             "schema_ref": null,
             "ref": null,
-            "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+            "digest": "sha256:b427ef27d48577687edc1e8a869597f4fba4a871f120ed860c98796028a35f50",
             "validation_verdict": "pass"
           },
-          "source_projection_digest": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+          "source_projection_digest": "sha256:b427ef27d48577687edc1e8a869597f4fba4a871f120ed860c98796028a35f50",
           "validator_id": "observation-source-adapter",
           "validator_policy_digest": "sha256:5656565656565656565656565656565656565656565656565656565656565656",
           "evidence_mode": "synthetic_only",

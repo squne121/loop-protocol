@@ -4,6 +4,7 @@ import {
   validateMarkdownCandidate,
 } from '../../lib/agent-run-report-validation.mjs'
 import { runtimeError } from './args.mjs'
+import { validateObservationSourceProjection } from './observation-source-adapter.mjs'
 
 const ENTIRECLI_SAFETY_SCHEMA_VERSION = 'entirecli_safety_result/v1'
 const ENTIRECLI_SAFE_VERDICTS = new Set(['safe', 'not_applicable'])
@@ -95,6 +96,21 @@ function assertObservationSourcesRuntime(report) {
       throw runtimeError('report.observation_sources_duplicate_projection_digest', `duplicate source_projection_digest: ${sourceProjectionDigest}`)
     }
     seenProjectionDigests.add(sourceProjectionDigest)
+
+    try {
+      validateObservationSourceProjection(source)
+    } catch (error) {
+      if (error?.code === 'observation_source.evidence_mode') {
+        throw runtimeError('report.observation_sources_evidence_mode', error.message)
+      }
+      if (error?.code === 'observation_source.projection_digest_mismatch' || error?.code === 'observation_source.ref_digest_mismatch') {
+        throw runtimeError('report.observation_sources_projection_digest_mismatch', error.message)
+      }
+      if (error?.code === 'observation_source.ref_kind') {
+        throw runtimeError('report.observation_sources_ref_kind', error.message)
+      }
+      throw error
+    }
 
     const safety = source?.safety
     if (safety?.raw_values_emitted === true) {

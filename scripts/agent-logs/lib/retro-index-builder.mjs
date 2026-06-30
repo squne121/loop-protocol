@@ -4,6 +4,7 @@ import {
   extractPayloadFromMarkdown,
   validateAgentRunReport,
 } from '../../lib/agent-run-report-validation.mjs'
+import { validateObservationSourceProjection } from './observation-source-adapter.mjs'
 import { parseMarkerComment } from './github-comments.mjs'
 
 export const RETRO_INDEX_ALGORITHM = 'retro-index-builder@1'
@@ -280,6 +281,19 @@ function checkPublicObservationSources(payload, markerDigest) {
       }
     }
     seenSourceProjectionDigests.add(sourceProjectionDigest)
+
+    try {
+      validateObservationSourceProjection(source)
+    } catch (error) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: error?.code === 'observation_source.evidence_mode'
+          ? 'report_observation_sources_evidence_mode'
+          : error?.code === 'observation_source.ref_kind'
+            ? 'report_observation_sources_ref_kind'
+            : 'report_observation_sources_projection_digest_mismatch',
+      }
+    }
 
     const safety = source?.safety
     if (safety?.raw_values_emitted === true) {
