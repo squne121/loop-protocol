@@ -99,7 +99,15 @@ def test_ac3_failure_key_evidence_missing_becomes_indeterminate_blocking():
 
 def test_out_of_scope_requires_diff_and_failure_key_evidence():
     baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
-    current = _current_payload([_payload_item("AC1", command_hash="sha256:" + "b" * 64, failure_keys=["docs/readme.md::test_readme"])] )
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=["docs/readme.md::test_readme"],
+            )
+        ]
+    )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
@@ -114,8 +122,24 @@ def test_out_of_scope_requires_diff_and_failure_key_evidence():
 
 
 def test_diff_related_failure_is_regression_blocking():
-    baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64, failure_keys=["tests/test_alpha.py::test_ok"])])
-    current = _current_payload([_payload_item("AC1", command_hash="sha256:" + "b" * 64, failure_keys=["src/main.py::test_regression"])] )
+    baseline = _snapshot_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                failure_keys=["tests/test_alpha.py::test_ok"],
+            )
+        ]
+    )
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=["src/main.py::test_regression"],
+            )
+        ]
+    )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,

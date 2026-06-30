@@ -2,7 +2,7 @@
 
 Step 1 で PR が起票されたら、`test-runner` SubAgent に検証を委譲する。
 
-Codex CLI: spawn the custom agent named test-runner for this step; the root thread must not edit files, run tests, commit, push, or make the review judgment directly.
+Codex CLI では `test-runner` custom agent を起動し、root thread は file edit / test 実行 / commit / push / review judgment を直接行わない。
 
 ## 委譲呼び出し
 
