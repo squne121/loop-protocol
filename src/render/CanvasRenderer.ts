@@ -1,4 +1,4 @@
-import type { GameState, SortieResult } from '../state'
+import type { GameState } from '../state'
 import { drawEnemyHpLabel } from './renderUtils'
 
 export interface CanvasRenderer {
@@ -39,35 +39,6 @@ export function computeAimDirection(params: {
     return { dirX: params.lastAimDirectionX, dirY: params.lastAimDirectionY }
   }
   return { dirX: 1, dirY: 0 }
-}
-
-export interface SortieResultPresentation {
-  label: string
-  tone: 'victory' | 'defeat' | 'neutral'
-  overlayFillStyle: string
-}
-
-export function getSortieResultPresentation(result: SortieResult): SortieResultPresentation {
-  switch (result.outcome) {
-    case 'victory':
-      return {
-        label: 'VICTORY',
-        tone: 'victory',
-        overlayFillStyle: 'rgba(30, 200, 130, 0.55)',
-      }
-    case 'defeat':
-      return {
-        label: 'DEFEAT',
-        tone: 'defeat',
-        overlayFillStyle: 'rgba(220, 60, 60, 0.55)',
-      }
-    case 'timeout':
-      return {
-        label: '戦闘終了',
-        tone: 'neutral',
-        overlayFillStyle: 'rgba(78, 118, 190, 0.55)',
-      }
-  }
 }
 
 export interface AssistCueSegment {
@@ -282,41 +253,6 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.fill()
       }
 
-      // --- Layer 7: HUD ---
-      context.fillStyle = '#dce8f8'
-      context.font = '14px "IBM Plex Mono", monospace'
-      context.fillText(
-        `${state.progress.stageLabel}  T+${Math.floor(state.elapsedMs / 1000)}s`,
-        18,
-        28,
-      )
-
-      // --- Layer 8: Victory / Defeat overlay ---
-      if (state.sortie.result !== null) {
-        const presentation = getSortieResultPresentation(state.sortie.result)
-
-        // Semi-transparent overlay
-        context.fillStyle = presentation.overlayFillStyle
-        context.fillRect(0, 0, arenaW, arenaH)
-
-        // Outcome label
-        context.fillStyle = '#ffffff'
-        context.font = 'bold 56px "IBM Plex Mono", monospace'
-        context.textAlign = 'center'
-        context.fillText(presentation.label, arenaW / 2, arenaH / 2 - 20)
-
-        // Duration and kills sub-label (AC11: use result.durationMs for terminal state)
-        const durationSec = (state.sortie.result.durationMs / 1000).toFixed(1)
-        context.font = '22px "IBM Plex Mono", monospace'
-        context.fillText(
-          `Duration: ${durationSec}s  Kills: ${state.sortie.result.kills}`,
-          arenaW / 2,
-          arenaH / 2 + 36,
-        )
-
-        // Reset text align for subsequent renders
-        context.textAlign = 'left'
-      }
     },
   }
 }

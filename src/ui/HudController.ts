@@ -34,6 +34,57 @@ export interface HudController {
   render(state: GameState, isPaused: boolean): void
 }
 
+function getMissionPhaseCopy(loopPhase: GameState['loopPhase']): string {
+  switch (loopPhase) {
+    case 'title_menu':
+      return 'Launch setup'
+    case 'load_menu':
+      return 'Restore briefing'
+    case 'preparation':
+      return 'Pre-launch'
+    case 'running':
+      return 'Sortie active'
+    case 'result':
+      return 'Mission review'
+    case 'debrief_pending_reward':
+      return 'Debrief in progress'
+    case 'debrief_reward_claimed':
+      return 'Debrief complete'
+  }
+}
+
+function getSortieStatusCopy(state: GameState): string {
+  switch (state.sortie.status) {
+    case 'idle':
+      return state.loopPhase === 'preparation' ? 'Ready' : 'Standing by'
+    case 'running':
+      return 'In progress'
+    case 'victory':
+      return 'Area secured'
+    case 'defeat':
+      return 'Fallback required'
+    case 'timeout':
+      return 'Mission complete'
+    case 'ended':
+      return 'Review ready'
+  }
+}
+
+function getOutcomeCopy(state: GameState): string {
+  if (state.sortie.result === null) {
+    return 'Awaiting outcome'
+  }
+
+  switch (state.sortie.result.outcome) {
+    case 'victory':
+      return 'Victory'
+    case 'defeat':
+      return 'Defeat'
+    case 'timeout':
+      return 'Mission complete'
+  }
+}
+
 function getAssistStatusCopy(state: GameState): string {
   if (state.loopPhase !== 'running' || state.sortie.status !== 'running') {
     return 'Assist is available during sortie.'
@@ -67,7 +118,7 @@ export function createHudController(
       <p class="lede">Canvas battle sandbox with DOM-side command surfaces.</p>
     </section>
     <section class="panel">
-      <p class="eyebrow">Status</p>
+      <p class="eyebrow">Progress</p>
       <dl class="stat-grid">
         <div><dt>Hull</dt><dd data-field="hp"></dd></div>
         <div><dt>Resources</dt><dd data-field="resources"></dd></div>
@@ -78,11 +129,11 @@ export function createHudController(
     <section class="panel">
       <p class="eyebrow">Sortie</p>
       <dl class="stat-grid">
-        <div><dt>Loop Phase</dt><dd data-field="loop-phase"></dd></div>
-        <div><dt>Sortie Status</dt><dd data-field="sortie-status"></dd></div>
+        <div><dt>Mission phase</dt><dd data-field="loop-phase"></dd></div>
+        <div><dt>Mission status</dt><dd data-field="sortie-status"></dd></div>
         <div><dt>Kills</dt><dd data-field="sortie-kills"></dd></div>
         <div><dt>Duration</dt><dd data-field="sortie-duration"></dd></div>
-        <div><dt>Result</dt><dd data-field="sortie-result"></dd></div>
+        <div><dt>Outcome</dt><dd data-field="sortie-result"></dd></div>
       </dl>
     </section>
     <section class="panel">
@@ -97,7 +148,7 @@ export function createHudController(
       ></p>
     </section>
     <section class="panel">
-      <p class="eyebrow">Telemetry</p>
+      <p class="eyebrow">Pilot updates</p>
       <p class="status-copy" data-field="status" role="status" aria-live="polite"></p>
       <p class="status-copy status-copy--muted" data-field="command"></p>
     </section>
@@ -105,13 +156,13 @@ export function createHudController(
       <p class="status-copy" data-field="pause-status" role="status" aria-live="polite" aria-atomic="true"></p>
     </section>
     <section class="panel panel--actions">
-      <button type="button" data-action="new-game">New Game</button>
-      <button type="button" data-action="start-sortie">Start sortie</button>
-      <button type="button" data-action="claim-reward">Claim reward</button>
-      <button type="button" data-action="confirm-result">Confirm result</button>
-      <button type="button" data-action="next-sortie">Next sortie</button>
-      <button type="button" data-action="save">Save</button>
-      <button type="button" data-action="load-game">Load Game</button>
+      <button type="button" data-action="new-game">Begin new run</button>
+      <button type="button" data-action="start-sortie">Launch sortie</button>
+      <button type="button" data-action="claim-reward">Collect payout</button>
+      <button type="button" data-action="confirm-result">Return to hangar</button>
+      <button type="button" data-action="next-sortie">Prepare next sortie</button>
+      <button type="button" data-action="save">Save progress</button>
+      <button type="button" data-action="load-game">Open save</button>
       <button
         type="button"
         data-action="reset"
@@ -205,30 +256,7 @@ export function createHudController(
       assistStatus.textContent = getAssistStatusCopy(state)
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
-
-      switch (state.loopPhase) {
-        case 'title_menu':
-          loopPhase.textContent = 'Title Menu'
-          break
-        case 'load_menu':
-          loopPhase.textContent = 'Load Menu'
-          break
-        case 'preparation':
-          loopPhase.textContent = 'Preparation'
-          break
-        case 'running':
-          loopPhase.textContent = 'Sortie running'
-          break
-        case 'result':
-          loopPhase.textContent = 'Result'
-          break
-        case 'debrief_pending_reward':
-          loopPhase.textContent = 'Debrief: reward pending'
-          break
-        case 'debrief_reward_claimed':
-          loopPhase.textContent = 'Debrief: reward claimed'
-          break
-      }
+      loopPhase.textContent = getMissionPhaseCopy(state.loopPhase)
 
       // Button enable policy derived from phase state machine (AC2, AC3, AC7, AC8, AC9)
       const isMenuPhase = state.loopPhase === 'title_menu' || state.loopPhase === 'load_menu'
@@ -266,26 +294,7 @@ export function createHudController(
 
       // Sortie status display (AC4, AC10)
       const s = state.sortie
-      switch (s.status) {
-        case 'idle':
-          sortieStatus.textContent = 'Idle'
-          break
-        case 'running':
-          sortieStatus.textContent = 'In Progress'
-          break
-        case 'victory':
-          sortieStatus.textContent = 'Victory'
-          break
-        case 'defeat':
-          sortieStatus.textContent = 'Defeat'
-          break
-        case 'timeout':
-          sortieStatus.textContent = '戦闘終了'
-          break
-        case 'ended':
-          sortieStatus.textContent = 'Ended'
-          break
-      }
+      sortieStatus.textContent = getSortieStatusCopy(state)
 
       // Kills (AC10)
       if (s.result !== null) {
@@ -308,21 +317,7 @@ export function createHudController(
       }
 
       // Result (AC9, AC10): both Canvas overlay and HUD use result.outcome as authority
-      if (s.result !== null) {
-        switch (s.result.outcome) {
-          case 'victory':
-            sortieResult.textContent = 'Victory'
-            break
-          case 'defeat':
-            sortieResult.textContent = 'Defeat'
-            break
-          case 'timeout':
-            sortieResult.textContent = '戦闘終了'
-            break
-        }
-      } else {
-        sortieResult.textContent = '—'
-      }
+      sortieResult.textContent = getOutcomeCopy(state)
     },
   }
 }

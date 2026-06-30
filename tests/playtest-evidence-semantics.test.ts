@@ -25,6 +25,7 @@ import {
   collectArtifactMetadataForTest,
   isProvenanceFulfilled,
   initPlaytestEvidencePanel,
+  shouldShowPanel,
 } from '../src/ui/playtestEvidence'
 
 const FDT = defaultSimulationConfig.fixedDeltaMs
@@ -303,5 +304,20 @@ describe('B8#6 copy/download use one atomic snapshot', () => {
       URL.revokeObjectURL = origRevoke
       HTMLAnchorElement.prototype.click = origClick
     }
+  })
+})
+
+describe('Issue #1173 evidence surface boundary', () => {
+  it('GIVEN default URL search WHEN evidence panel gate is checked THEN opt-in debug evidence boundary is preserved', () => {
+    expect(shouldShowPanel('')).toBe(false)
+    expect(shouldShowPanel('?playtest_evidence=1')).toBe(true)
+  })
+
+  it('GIVEN default URL search WHEN evidence panel mounts THEN it stays hidden until explicitly enabled', () => {
+    const container = document.createElement('div')
+    initPlaytestEvidencePanel(container, { search: '' })
+
+    const panel = container.querySelector<HTMLElement>('[data-playtest-evidence="true"]')
+    expect(panel?.hidden).toBe(true)
   })
 })
