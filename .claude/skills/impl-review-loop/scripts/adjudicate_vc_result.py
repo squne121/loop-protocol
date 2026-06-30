@@ -259,17 +259,41 @@ def _classify_item(
 
     if baseline_key in baseline_signatures:
         if has_keys and evidence_complete and not has_diff:
-            return "pre_existing_fail", False, False, "same_baseline_no_diff", "Exact baseline signature with no diff and complete evidence"
-        return "indeterminate", True, True, "baseline_match_inconclusive", "Baseline match exists but evidence is incomplete or diff is present"
+            return (
+                "pre_existing_fail",
+                False,
+                False,
+                "same_baseline_no_diff",
+                "Exact baseline signature with no diff and complete evidence",
+            )
+        return (
+            "indeterminate",
+            True,
+            True,
+            "baseline_match_inconclusive",
+            "Baseline match exists but evidence is incomplete or diff is present",
+        )
 
     if not has_keys:
         return "indeterminate", True, True, "missing_failure_keys", "Failure key evidence is missing"
 
     if not has_diff or not has_allowed or not changed_paths:
-        return "indeterminate", True, True, "insufficient_scope_evidence", "Diff scope evidence is incomplete for adjudication"
+        return (
+            "indeterminate",
+            True,
+            True,
+            "insufficient_scope_evidence",
+            "Diff scope evidence is incomplete for adjudication",
+        )
 
     if _is_related_to_scope(failure_keys, changed_paths, allowed_paths):
-        return "regression_fail", True, False, "related_to_changed_scope", "Failure is related to changed and/or allowed scope"
+        return (
+            "regression_fail",
+            True,
+            False,
+            "related_to_changed_scope",
+            "Failure is related to changed and/or allowed scope",
+        )
 
     return "out_of_scope_fail", False, False, "unrelated_to_scope", "Failure is unrelated to changed and allowed paths"
 
@@ -289,7 +313,11 @@ def _result(
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
         "overall_status": overall_status,
-        "blocking": any(item["blocking"] for item in per_ac) if per_ac else overall_status not in {"pass", "pre_existing_fail", "out_of_scope_fail"},
+        "blocking": (
+            any(item["blocking"] for item in per_ac)
+            if per_ac
+            else overall_status not in {"pass", "pre_existing_fail", "out_of_scope_fail"}
+        ),
         "rerun_required": rerun_required,
         "per_ac": per_ac,
         "evidence_refs": evidence_refs,
@@ -307,12 +335,32 @@ def _build_evidence_refs(
     allowed_paths: list[str] | None,
 ) -> list[dict[str, str]]:
     refs: list[dict[str, str]] = []
-    refs.append({"kind": "contract_snapshot", "ref": _sha256(json.dumps(contract_snapshot, sort_keys=True, ensure_ascii=False))})
-    refs.append({"kind": "current_vc_result", "ref": _sha256(json.dumps(current_vc_result, sort_keys=True, ensure_ascii=False))})
+    refs.append(
+        {
+            "kind": "contract_snapshot",
+            "ref": _sha256(json.dumps(contract_snapshot, sort_keys=True, ensure_ascii=False)),
+        }
+    )
+    refs.append(
+        {
+            "kind": "current_vc_result",
+            "ref": _sha256(json.dumps(current_vc_result, sort_keys=True, ensure_ascii=False)),
+        }
+    )
     if diff_summary is not None:
-        refs.append({"kind": "diff_summary", "ref": _sha256(json.dumps(diff_summary, sort_keys=True, ensure_ascii=False))})
+        refs.append(
+            {
+                "kind": "diff_summary",
+                "ref": _sha256(json.dumps(diff_summary, sort_keys=True, ensure_ascii=False)),
+            }
+        )
     if allowed_paths is not None:
-        refs.append({"kind": "allowed_paths", "ref": _sha256(json.dumps(allowed_paths, sort_keys=True, ensure_ascii=False))})
+        refs.append(
+            {
+                "kind": "allowed_paths",
+                "ref": _sha256(json.dumps(allowed_paths, sort_keys=True, ensure_ascii=False)),
+            }
+        )
     return refs
 
 
