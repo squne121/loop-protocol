@@ -1149,6 +1149,10 @@ class TestB5NoRawBranchInStderr:
         captured = capsys.readouterr()
         assert "current_branch_kind: other" in captured.err
         assert "current_is_default: false" in captured.err
+        assert "HOOK_COMMAND_REPAIR_HINT_V1:" in captured.err
+        assert "safe_action:" in captured.err
+        assert "suggested_command:" in captured.err
+        assert "forbidden_alternatives:" in captured.err
 
     def test_emit_block_stderr_max_10_lines(self, capsys):
         """_emit_block_stderr output is bounded to max 10 lines."""
@@ -1446,7 +1450,7 @@ class TestGhMutationReasonCodeClaude:
         assert REASON_GH_MUTATION == "gh_mutation_denied"
 
     def test_gh_mutation_recovery_hint_contains_approved(self, tmp_git_repo: Path, capsys):
-        """AC7: recovery hint for gh_mutation_denied mentions 'approved' or 'workflow'."""
+        """AC7: gh mutation block emits HOOK_COMMAND_REPAIR_HINT_V1."""
         from local_main_branch_guard import _emit_block_stderr, REASON_GH_MUTATION
         _emit_block_stderr(
             reason_code=REASON_GH_MUTATION,
@@ -1456,12 +1460,8 @@ class TestGhMutationReasonCodeClaude:
             hook_flavor="claude",
         )
         captured = capsys.readouterr()
-        hint_lines = [line for line in captured.err.splitlines() if "recovery:" in line]
-        assert hint_lines, "Expected a recovery: line in stderr"
-        hint = hint_lines[0].lower()
-        assert any(kw in hint for kw in ("approved", "rtk", "workflow")), (
-            f"Expected recovery hint to mention 'approved', 'rtk', or 'workflow', got: {hint!r}"
-        )
+        assert "HOOK_COMMAND_REPAIR_HINT_V1:" in captured.err
+        assert 'reason_code: "gh_mutation_denied"' in captured.err
 
 
 class TestProjectTmpPolicyClaude:

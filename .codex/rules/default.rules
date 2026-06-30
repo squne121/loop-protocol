@@ -91,14 +91,40 @@ prefix_rule(
     ],
 )
 
-# rtk git mutation operations: require explicit human review (prompt)
+# rtk git mutation operations: only the bounded publish shapes are allowlisted here.
 prefix_rule(
-    pattern = ["rtk", "git", ["push", "commit", "add", "checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
+    pattern = ["rtk", "git", "add"],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate exact bounded add pathspecs plus Allowed Paths.",
+    match = [
+        "rtk git add docs/dev/hook-boundaries.md",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "git", "commit", "-m"],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate staged diff subset plus bounded commit message shape.",
+    match = [
+        "rtk git commit -m issue-1241-update",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rtk", "git", "push", "origin"],
+    decision = "allow",
+    justification = "Issue-worktree publish path is allowed only when the runtime hooks validate the active-branch refspec and deny force/tag/all/mirror/delete forms.",
+    match = [
+        "rtk git push origin HEAD:refs/heads/worktree-issue-1241-x",
+    ],
+)
+
+# Other rtk git mutation operations: require explicit human review (prompt)
+prefix_rule(
+    pattern = ["rtk", "git", ["checkout", "switch", "worktree", "stash", "merge", "rebase", "cherry-pick", "reset", "restore", "rm", "mv", "clean", "apply", "am", "pull", "fetch", "remote", "tag", "config", "submodule"]],
     decision = "prompt",
     justification = "Mutating git operations via rtk require explicit human review.",
     match = [
-        "rtk git push",
-        "rtk git commit -m update",
         "rtk git checkout -b topic",
     ],
 )
