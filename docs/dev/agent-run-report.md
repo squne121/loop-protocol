@@ -48,14 +48,14 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - 投稿先（`public_surface_kind`）が意図した対象（`github_issue_comment` / `github_pr_comment`）であることを確認している
 - 二重投稿防止のため、upsert は既存コメントを上書きする形式を使用している
 
-### コマンド責務境界
+### コマンド責務境界 / Command Responsibility Boundary
 
 - `agent-run:finalize` は public-safe な `agent_run_report/v1` artifact を生成し、validation を通す責務を持つ
 - `agent-run:post` は **validated `agent_run_report` の GitHub upsert 専用** であり、`CHATGPT_RETRO_CONTEXT_V1` marker の更新責務を含めない
 - agent-run:post は validated `agent_run_report` の GitHub upsert 専用であり、ChatGPT retro marker 更新責務を含めない
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
-- `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する
-- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、pagination exhausted まで live scan した上で `resolved | missing | blocked_duplicate | blocked_malformed | blocked_pagination_exhausted | blocked_stale_write` の structured result を返す
+- `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
+- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、pagination exhausted まで live scan した上で `resolved | missing | blocked_duplicate | blocked_malformed | blocked_pagination_exhausted | blocked_stale_write` の structured result を返す live resolver である
 
 この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
 
@@ -203,14 +203,14 @@ public surface では `observation_sources` が runtime で要求される。
 
 `real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
 
-### Remaining Parent Gaps / Out of Scope
+### Remaining Parent Gaps / Out of Scope（今回の成功条件に含めない項目）
 
 以下は current repo reality では **#1245 の成功条件に含めない**。
 
-- Latitude metadata keys / saved searches / annotation taxonomy の SSOT 化
+- Latitude metadata keys / saved searches / annotation taxonomy の SSOT 化と運用文書の追加
 - public GitHub comments と private telemetry / Entire checkpoints の retention policy 分離
-- retrospective result から follow-up Issue を draft / create して retro index へ自動反映する workflow
-- observation source の aggregate producer 導入
+- retrospective result から follow-up Issue を draft / create して retro index へ自動反映する workflow 導線
+- observation source の aggregate producer 導入と集計 contract の追加
 - `token_usage.source` の enum migration や Latitude 専用 token producer 導入
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
