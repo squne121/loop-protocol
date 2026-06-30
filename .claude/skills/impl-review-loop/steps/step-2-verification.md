@@ -44,15 +44,16 @@ TEST_VERDICT:
 
 判定表:
 
-| TEST_VERDICT.result | LOOP 判定 | 次アクション |
+| 手順 | 条件 | 次アクション |
 |---|---|---|
-| `PASS` | `overall_status == pass` かつ `blocking == false` | Step 3（pr-reviewer）へ |
-| `PASS` | `VC_ADJUDICATION_RESULT_V1.blocking == true` | Step 2 エビデンス不足/再実行扱いとして再判定へ |
-| `PARTIAL` | 任意 | Step 3 へ進むが `LOOP_STATE.blockers_history` に記録 |
-| `FAIL` | 任意 | Step 5 へ直行し REQUEST_CHANGES として処理 |
+| 1 | `TEST_VERDICT.head_sha != PR current head_sha` | stale evidence として fail-closed。`VC_ADJUDICATION_RESULT_V1.blocking = true` 扱いで再検証へ |
+| 2 | `VC_ADJUDICATION_RESULT_V1` 欠落・破損・期限切れ | fail-closed。Step 2 エビデンス不足/再実行扱いとして再判定へ |
+| 3 | `VC_ADJUDICATION_RESULT_V1.blocking == false` | Step 3（pr-reviewer）へ |
+| 4 | `VC_ADJUDICATION_RESULT_V1.blocking == true` | Step 5 へ。rerun / REQUEST_CHANGES / human escalation を判定 |
 
 ## 追加注意: baseline_only
 
+- `TEST_VERDICT.result` は adjudicator input であり、routing 正本ではない。
 - `baseline_only: true` のみで Step 2 を PASS と見なさない。
 - `baseline_only` は、VC 判定結果の `evidence_refs`/`source_integrity` を整えるための参照情報とし、`VC_ADJUDICATION_RESULT_V1` の routing 正本を上書きしない。
 - `VC_ADJUDICATION_RESULT_V1` の生成に必要な証跡（`baseline`, `current`, `diff`, `allowed_paths`）が欠損している場合は fail-closed で blocking。

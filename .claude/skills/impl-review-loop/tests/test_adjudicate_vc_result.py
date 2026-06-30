@@ -28,7 +28,7 @@ def _payload_item(
     ac: str,
     *,
     command_hash: str = "sha256:" + "a" * 64,
-    failure_keys: list[str] | None = None,
+    failure_keys: list[dict[str, str]] | None = None,
     exit_code: int = 1,
     category: str = "regression_gate",
     raw_command: str = "pytest tests/test_alpha.py",
@@ -36,7 +36,9 @@ def _payload_item(
     return {
         "ac": ac,
         "command_hash": command_hash,
-        "failure_keys": failure_keys if failure_keys is not None else ["tests/test_alpha.py::test_ok"],
+        "failure_keys": failure_keys
+        if failure_keys is not None
+        else [{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
         "exit_code": exit_code,
         "category": category,
         "decision": "blocked",
@@ -49,6 +51,7 @@ def _payload_item(
 def _snapshot_payload(items: list[dict[str, object]]) -> dict:
     return {
         "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "body_sha256": "sha256:" + "b" * 64,
         "checks": {
             "vc_preflight": {
                 "classifications": items,
@@ -57,22 +60,54 @@ def _snapshot_payload(items: list[dict[str, object]]) -> dict:
     }
 
 
-def _current_payload(items: list[dict[str, object]]) -> dict:
-    return {
+def _current_payload(
+    items: list[dict[str, object]],
+    *,
+    head_sha: str | None = None,
+    reviewed_head_sha: str | None = None,
+) -> dict:
+    payload = {
         "schema": "baseline_vc_preflight/v1",
         "results": items,
     }
+    if head_sha is not None:
+        payload["head_sha"] = head_sha
+    if reviewed_head_sha is not None:
+        payload["reviewed_head_sha"] = reviewed_head_sha
+    return payload
+
+
+def _allowed_paths_file(tmp_path: Path, paths: list[str]) -> Path:
+    path = tmp_path / "allowed_paths.json"
+    path.write_text(json.dumps(paths, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 def test_no_diff_same_baseline_failure_is_pre_existing_nonblocking():
-    baseline = _snapshot_payload([_payload_item("AC1", failure_keys=["tests/test_alpha.py::test_ok"])])
-    current = _current_payload([_payload_item("AC1", failure_keys=["tests/test_alpha.py::test_ok"])])
+    baseline = _snapshot_payload(
+        [
+            _payload_item(
+                "AC1",
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+            )
+        ]
+    )
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+            )
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": []},
-        allowed_paths=[".claude/skills"],
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
     )
 
     assert result["overall_status"] == "pre_existing_fail"
@@ -83,42 +118,22 @@ def test_no_diff_same_baseline_failure_is_pre_existing_nonblocking():
 
 def test_ac3_failure_key_evidence_missing_becomes_indeterminate_blocking():
     baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
-    current = _current_payload([_payload_item("AC1", command_hash="sha256:" + "b" * 64, failure_keys=[])])
+    current = _current_payload(
+        [_payload_item("AC1", command_hash="sha256:" + "b" * 64, failure_keys=[])],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": ["src/main.py"]},
-        allowed_paths=[".claude/skills"],
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
     )
 
     assert result["overall_status"] == "indeterminate"
     assert result["blocking"] is True
     assert result["per_ac"][0]["status"] == "indeterminate"
-
-
-def test_out_of_scope_requires_diff_and_failure_key_evidence():
-    baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
-    current = _current_payload(
-        [
-            _payload_item(
-                "AC1",
-                command_hash="sha256:" + "b" * 64,
-                failure_keys=["docs/readme.md::test_readme"],
-            )
-        ]
-    )
-
-    result = mod.adjudicate_vc_result(
-        contract_snapshot=baseline,
-        current_vc_result=current,
-        diff_summary={"changed_paths": ["src/main.py"]},
-        allowed_paths=[".claude/skills"],
-    )
-
-    assert result["overall_status"] == "out_of_scope_fail"
-    assert result["blocking"] is False
-    assert result["per_ac"][0]["status"] == "out_of_scope_fail"
 
 
 def test_diff_related_failure_is_regression_blocking():
@@ -127,7 +142,7 @@ def test_diff_related_failure_is_regression_blocking():
             _payload_item(
                 "AC1",
                 command_hash="sha256:" + "a" * 64,
-                failure_keys=["tests/test_alpha.py::test_ok"],
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
             )
         ]
     )
@@ -136,16 +151,18 @@ def test_diff_related_failure_is_regression_blocking():
             _payload_item(
                 "AC1",
                 command_hash="sha256:" + "b" * 64,
-                failure_keys=["src/main.py::test_regression"],
+                failure_keys=[{"kind": "pytest_nodeid", "key": "src/main.py::test_regression"}],
             )
-        ]
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
     )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": ["src/main.py"]},
-        allowed_paths=["src/main.py"],
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=["src/**"],
     )
 
     assert result["overall_status"] == "regression_fail"
@@ -161,16 +178,21 @@ def test_allowed_paths_glob_matcher_v2_relevance_is_regression_blocking():
                 "AC1",
                 command_hash="sha256:" + "b" * 64,
                 failure_keys=[
-                    ".claude/skills/impl-review-loop/tests/test_adjudicate_vc_result.py::test_case"
+                    {
+                        "kind": "pytest_nodeid",
+                        "key": ".claude/skills/impl-review-loop/tests/test_adjudicate_vc_result.py::test_case",
+                    }
                 ],
             )
-        ]
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
     )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": ["docs/dev/agent-run-report.md"]},
+        diff_summary={"changed_paths": ["docs/dev/agent-run-report.md"], "head_sha": "head1"},
         allowed_paths=[".claude/skills/**"],
     )
 
@@ -183,26 +205,138 @@ def test_pytest_exit_5_is_not_regression_fail():
     baseline = _snapshot_payload([_payload_item("AC1")])
     current = _current_payload(
         [_payload_item("AC1", command_hash="sha256:" + "b" * 64, exit_code=5, category="vc_no_tests_collected")],
+        head_sha="head1",
+        reviewed_head_sha="head1",
     )
 
     result = mod.adjudicate_vc_result(
         contract_snapshot=baseline,
         current_vc_result=current,
-        diff_summary={"changed_paths": ["src/main.py"]},
-        allowed_paths=[".claude/skills"],
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
     )
 
     assert result["overall_status"] in {"indeterminate", "environment_blocked"}
     assert result["per_ac"][0]["status"] != "regression_fail"
 
 
+def test_current_head_mismatch_is_indeterminate_blocking():
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload(
+        [_payload_item("AC1")],
+        head_sha="old-head",
+        reviewed_head_sha="old-head",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [], "head_sha": "new-head"},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["source_integrity"]["evidence_fresh"] is False
+
+
+def test_new_unrelated_failure_with_diff_is_not_out_of_scope():
+    baseline = _snapshot_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "a" * 64,
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+            )
+        ]
+    )
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=[{"kind": "pytest_nodeid", "key": "docs/readme.md::test_readme"}],
+            )
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "new_failure_without_scope_proof"
+
+
+def test_failure_key_kind_process_exit_cannot_prove_out_of_scope():
+    baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=[{"kind": "process_exit", "key": "process_exit:1"}],
+            )
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=["src/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "unsupported_failure_key_kind"
+
+
+def test_invalid_allowed_path_pattern_is_indeterminate():
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload([_payload_item("AC1")], head_sha="head1", reviewed_head_sha="head1")
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=["docs/**/*.md"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert any(error.startswith("invalid_allowed_path_pattern:") for error in result["errors"])
+
+
+def test_empty_current_classifications_without_pass_signal_is_indeterminate():
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload([], head_sha="head1", reviewed_head_sha="head1")
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert result["errors"] == ["empty_current_results_without_pass_signal"]
+
+
 def test_full_stdout_stderr_only_in_private_artifact(tmp_path: Path):
     baseline = _snapshot_payload([_payload_item("AC1")])
-    current = _current_payload([_payload_item("AC1")])
+    current = _current_payload([_payload_item("AC1")], head_sha="head1", reviewed_head_sha="head1")
 
-    allowed_path_file = tmp_path / "allowed_paths.json"
-    allowed_path_file.write_text(json.dumps([".claude/skills"], ensure_ascii=False), encoding="utf-8")
-
+    allowed_path_file = _allowed_paths_file(tmp_path, [".claude/skills/**"])
     contract_file = tmp_path / "contract.json"
     current_file = tmp_path / "current.json"
     diff_file = tmp_path / "diff.json"
@@ -210,7 +344,10 @@ def test_full_stdout_stderr_only_in_private_artifact(tmp_path: Path):
 
     contract_file.write_text(json.dumps(baseline, ensure_ascii=False), encoding="utf-8")
     current_file.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
-    diff_file.write_text(json.dumps({"changed_paths": []}, ensure_ascii=False), encoding="utf-8")
+    diff_file.write_text(
+        json.dumps({"changed_paths": [], "head_sha": "head1"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     result = subprocess.run(
         [
@@ -232,18 +369,167 @@ def test_full_stdout_stderr_only_in_private_artifact(tmp_path: Path):
         check=False,
     )
 
-    assert result.returncode in (0, 1)
     compact = json.loads(result.stdout)
-
     compact_text = json.dumps(compact)
     assert "raw_stdout" not in compact_text
     assert "raw_stderr" not in compact_text
     assert "full_command_output" not in compact_text
-    assert "artifact_ref" in compact
-    assert "artifact_digest" in compact
+    assert compact["artifact_ref"] == "vc-adjudication-private-bundle"
+    assert compact["artifact_digest"].startswith("sha256:")
 
     private = json.loads(artifact_file.read_text(encoding="utf-8"))
     assert private["schema"] == "VC_ADJUDICATION_PRIVATE_BUNDLE_V1"
-    assert private["contract_snapshot"]["checks"]
-    assert private["current_vc_result"]["results"]
     assert private["current_vc_result"]["results"][0]["raw_stdout"] == "pytest output"
+
+
+def test_compact_result_does_not_emit_local_artifact_path(tmp_path: Path):
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload([_payload_item("AC1")], head_sha="head1", reviewed_head_sha="head1")
+    allowed_path_file = _allowed_paths_file(tmp_path, [".claude/skills/**"])
+    contract_file = tmp_path / "contract.json"
+    current_file = tmp_path / "current.json"
+    diff_file = tmp_path / "diff.json"
+    artifact_file = tmp_path / "nested" / "artifact.json"
+    artifact_file.parent.mkdir()
+
+    contract_file.write_text(json.dumps(baseline, ensure_ascii=False), encoding="utf-8")
+    current_file.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+    diff_file.write_text(
+        json.dumps({"changed_paths": [], "head_sha": "head1"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--contract-snapshot-file",
+            str(contract_file),
+            "--current-vc-result-file",
+            str(current_file),
+            "--diff-summary-file",
+            str(diff_file),
+            "--allowed-paths-file",
+            str(allowed_path_file),
+            "--artifact-out",
+            str(artifact_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    compact = json.loads(result.stdout)
+    assert compact["artifact_ref"] == "vc-adjudication-private-bundle"
+    assert str(artifact_file) not in result.stdout
+
+
+def test_compact_stdout_remains_valid_json_when_truncated_budget_is_small(tmp_path: Path):
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=[{"kind": "pytest_nodeid", "key": "src/main.py::test_regression"}],
+            )
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
+    allowed_path_file = _allowed_paths_file(tmp_path, ["src/**"])
+    contract_file = tmp_path / "contract.json"
+    current_file = tmp_path / "current.json"
+    diff_file = tmp_path / "diff.json"
+
+    contract_file.write_text(json.dumps(baseline, ensure_ascii=False), encoding="utf-8")
+    current_file.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+    diff_file.write_text(
+        json.dumps({"changed_paths": ["src/main.py"], "head_sha": "head1"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--contract-snapshot-file",
+            str(contract_file),
+            "--current-vc-result-file",
+            str(current_file),
+            "--diff-summary-file",
+            str(diff_file),
+            "--allowed-paths-file",
+            str(allowed_path_file),
+            "--max-stdout-bytes",
+            "200",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    compact = json.loads(result.stdout)
+    assert compact["stdout_truncated"] is True
+    assert compact["overall_status"] == "indeterminate"
+    assert compact["errors"] == ["stdout_budget_exceeded"]
+
+
+def test_artifact_digest_is_canonical_and_stable_across_key_order():
+    payload_a = {"a": 1, "b": 2}
+    payload_b = {"b": 2, "a": 1}
+    assert mod._sha256(mod._canonical_json(payload_a)) == mod._sha256(mod._canonical_json(payload_b))
+
+
+def test_bare_legacy_command_hash_is_either_normalized_or_rejected_with_migration_reason():
+    baseline = _snapshot_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="a" * 64,
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+            )
+        ]
+    )
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="a" * 64,
+                failure_keys=[{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+            )
+        ],
+        head_sha="head1",
+        reviewed_head_sha="head1",
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": [], "head_sha": "head1"},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["per_ac"][0]["command_hash"] == "sha256:" + "a" * 64
+    assert result["per_ac"][0]["command_hash_note"] == "normalized_legacy_bare_command_hash"
+
+
+def test_allowed_paths_matcher_import_failure_returns_machine_json(monkeypatch):
+    baseline = _snapshot_payload([_payload_item("AC1")])
+    current = _current_payload([_payload_item("AC1")], head_sha="head1", reviewed_head_sha="head1")
+
+    def _fail():
+        return None, "allowed_paths_matcher_import_failed:ImportError"
+
+    monkeypatch.setattr(mod, "_get_allowed_paths_matcher", _fail)
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["src/main.py"], "head_sha": "head1"},
+        allowed_paths=["src/**"],
+    )
+
+    assert result["overall_status"] == "indeterminate"
+    assert result["blocking"] is True
+    assert any(error.startswith("allowed_paths_matcher_import_failed:") for error in result["errors"])
