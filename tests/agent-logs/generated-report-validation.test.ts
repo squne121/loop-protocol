@@ -92,6 +92,50 @@ describe('generated agent run report', () => {
     expect(result.valid).toBe(true)
   })
 
+  it('GIVEN a generated report with observation source from existing producer fixture WHEN validateFinalReport is called THEN it passes', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-public-observation-source-supported-available.json'))
+
+    expect(() => validateFinalReport(report)).not.toThrow()
+  })
+
+  it('GIVEN a generated report with public_surface and missing observation_sources WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
+    expect(report.public_safety.observation_sources).toBeUndefined()
+
+    expect(() => validateFinalReport(report)).toThrow(/require public_safety\.observation_sources/)
+  })
+
+  it('GIVEN a generated report with public_surface and empty observation_sources WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-empty.json'))
+    expect(report.public_safety.observation_sources.length).toBe(0)
+
+    expect(() => validateFinalReport(report)).toThrow(/must not be empty/)
+  })
+
+  it('GIVEN a generated report with duplicate observation source_kind WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-duplicate-source-kind.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/duplicate public safety source_kind/)
+  })
+
+  it('GIVEN a generated report with duplicate observation source_projection_digest WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-duplicate-projection-digest.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/duplicate source_projection_digest/)
+  })
+
+  it('GIVEN a generated report with unavailable observation source metrics non-null WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-unavailable-zero-metrics.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/must be null when availability is unavailable/)
+  })
+
+  it('GIVEN a generated report with raw_values_emitted true in observation source safety WHEN validateFinalReport is called THEN it fails closed', () => {
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'invalid-public-observation-source-raw-values-emitted.json'))
+
+    expect(() => validateFinalReport(report)).toThrow(/raw_values_emitted must be false/)
+  })
+
   it('GIVEN a generated report without token_usage source extensions WHEN passed through the current validator THEN C0 token source admission keeps existing none semantics valid', () => {
     const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
 
@@ -122,8 +166,8 @@ describe('generated agent run report', () => {
   })
 
   it('GIVEN a public surface report with missing entirecli_safety WHEN validateFinalReport is called THEN it fails closed', () => {
-    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-basic.json'))
-    // valid-basic.json has public_surface_kind: github_issue_comment but no entirecli_safety
+    const report = readJson(resolve(REPORT_FIXTURES_DIR, 'valid-public-observation-source-supported-available.json'))
+    delete report.public_safety.entirecli_safety
     expect(() => validateFinalReport(report)).toThrow(/entirecli_safety/)
   })
 

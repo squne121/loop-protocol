@@ -8,6 +8,46 @@
     "checked_at": "2026-06-15T22:57:00Z",
     "verdict": "pass",
     "blocked_reasons": [],
+    "observation_sources": [
+      {
+        "schema_version": "observation_source_result/v1",
+        "source_kind": "codex_cli",
+        "capability_verdict": "supported",
+        "availability": "available",
+        "projection_mode": "allowlist_projection",
+        "safety": {
+          "verdict": "pass",
+          "raw_values_emitted": false,
+          "forbidden_field_scan": "pass",
+          "reason_codes": []
+        },
+        "metrics": {
+          "trace_count": 1,
+          "span_count": 2,
+          "prompt_tokens": 10,
+          "completion_tokens": 20,
+          "total_tokens": 30
+        },
+        "provenance": {
+          "schema_version": "observation_source_provenance/v1",
+          "ref": {
+            "kind": "observation_projection_digest",
+            "artifact_id": null,
+            "artifact_digest": null,
+            "workflow_run_url": null,
+            "schema_ref": null,
+            "ref": null,
+            "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+            "validation_verdict": "pass"
+          },
+          "source_projection_digest": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+          "validator_id": "observation-source-adapter",
+          "validator_policy_digest": "sha256:5656565656565656565656565656565656565656565656565656565656565656",
+          "evidence_mode": "synthetic_only",
+          "checked_at": "2026-06-15T22:57:00Z"
+        }
+      }
+    ],
     "entirecli_safety": {
       "schema_version": "entirecli_safety_result/v1",
       "verdict": "not_applicable",

@@ -8,6 +8,47 @@ export const SCRIPTS_DIR = resolve(REPO_ROOT, 'scripts')
 export const REPORT_FIXTURES_DIR = resolve(REPO_ROOT, 'tests', 'fixtures', 'agent-run-report')
 export const RETRO_FIXTURES_DIR = resolve(REPO_ROOT, 'tests', 'fixtures', 'agent-retro-index')
 
+export function createValidObservationSourceResult() {
+  return {
+    schema_version: 'observation_source_result/v1',
+    source_kind: 'codex_cli',
+    capability_verdict: 'supported',
+    availability: 'available',
+    projection_mode: 'allowlist_projection',
+    safety: {
+      verdict: 'pass',
+      raw_values_emitted: false,
+      forbidden_field_scan: 'pass',
+      reason_codes: [],
+    },
+    metrics: {
+      trace_count: 1,
+      span_count: 2,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    },
+    provenance: {
+      schema_version: 'observation_source_provenance/v1',
+      ref: {
+        kind: 'observation_projection_digest',
+        artifact_id: null,
+        artifact_digest: null,
+        workflow_run_url: null,
+        schema_ref: null,
+        ref: null,
+        digest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+        validation_verdict: 'pass',
+      },
+      source_projection_digest: 'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+      validator_id: 'observation-source-adapter',
+      validator_policy_digest: 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+      evidence_mode: 'synthetic_only',
+      checked_at: '2026-06-15T22:57:00Z',
+    },
+  }
+}
+
 export function createValidReport() {
   return {
     schema: 'agent_run_report/v1',
@@ -19,6 +60,7 @@ export function createValidReport() {
       checked_at: '2026-06-15T22:57:00Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createValidObservationSourceResult()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',

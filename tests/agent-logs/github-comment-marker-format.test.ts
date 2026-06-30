@@ -8,6 +8,7 @@ import {
   parseOwnershipMarker,
 } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderPublicMarkdown } from '../../scripts/lib/agent-run-report-validation.mjs'
+import { createValidObservationSourceResult } from '../agent-run-report-test-helpers'
 
 function createReport() {
   return {
@@ -20,6 +21,7 @@ function createReport() {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createValidObservationSourceResult()],
     },
     actor: {
       type: 'ai_agent',

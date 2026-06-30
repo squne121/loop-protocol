@@ -1,4 +1,5 @@
 import { validateAgentRunReport } from '../../lib/agent-run-report-validation.mjs'
+import { buildObservationSourceFromInput } from './observation-source-adapter.mjs'
 import {
   assertEnum,
   assertIntegerString,
@@ -62,6 +63,14 @@ function buildTokenUsage(input) {
     completion: assertIntegerString(String(input.completion ?? ''), 'token_usage.completion', 'token_usage.completion must be a non-negative integer'),
     total: assertIntegerString(String(input.total ?? ''), 'token_usage.total', 'token_usage.total must be a non-negative integer'),
   }
+}
+
+function buildObservationSources(observationSourceInput, checkedAt) {
+  if (!observationSourceInput) {
+    return undefined
+  }
+  const source = buildObservationSourceFromInput(observationSourceInput, { checkedAt })
+  return [source]
 }
 
 function buildAuthority(actorType, evidenceRefs) {
@@ -159,9 +168,11 @@ export function buildAgentRunReport(input) {
   )
 
   const validatedEntireCLISafety = validateEntireCLISafetyInput(input.entirecliSafety, publicSurfaceKind)
+  const observationSources = buildObservationSources(input.observationSource, checkedAt)
   const publicSafety = {
     ...buildPublicSafety(publicSurfaceKind, checkedAt),
     ...(validatedEntireCLISafety !== undefined ? { entirecli_safety: validatedEntireCLISafety } : {}),
+    ...(observationSources !== undefined ? { observation_sources: observationSources } : {}),
   }
 
   const report = {

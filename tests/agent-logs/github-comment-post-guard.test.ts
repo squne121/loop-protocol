@@ -8,6 +8,47 @@ import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../
 import { renderValidatedPublicMarkdown, validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
 
+function createObservationSource() {
+  return {
+    schema_version: 'observation_source_result/v1',
+    source_kind: 'claude_code',
+    capability_verdict: 'supported',
+    availability: 'available',
+    projection_mode: 'allowlist_projection',
+    safety: {
+      verdict: 'pass',
+      raw_values_emitted: false,
+      forbidden_field_scan: 'pass',
+      reason_codes: [],
+    },
+    metrics: {
+      trace_count: 1,
+      span_count: 2,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    },
+    provenance: {
+      schema_version: 'observation_source_provenance/v1',
+      ref: {
+        kind: 'observation_projection_digest',
+        artifact_id: null,
+        artifact_digest: null,
+        workflow_run_url: null,
+        schema_ref: null,
+        ref: null,
+        digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        validation_verdict: 'pass',
+      },
+      source_projection_digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      validator_id: 'agent-run-report-schema',
+      validator_policy_digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      evidence_mode: 'synthetic_only',
+      checked_at: '2026-06-29T12:00:00Z',
+    },
+  }
+}
+
 function createReport(overrides = {}) {
   return {
     schema: 'agent_run_report/v1',
@@ -19,6 +60,7 @@ function createReport(overrides = {}) {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createObservationSource()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',
@@ -106,6 +148,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',
@@ -133,6 +176,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         // no entirecli_safety
       },
     })
@@ -167,6 +211,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'blocked',
@@ -258,6 +303,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         // entirecli_safety absent — must fail-closed
       },
     })
@@ -294,6 +340,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'blocked',
@@ -340,6 +387,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'not_applicable',

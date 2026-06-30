@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { createValidObservationSourceResult } from '../agent-run-report-test-helpers'
 
 function createReport(summary) {
   return {
@@ -14,6 +15,7 @@ function createReport(summary) {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createValidObservationSourceResult()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',

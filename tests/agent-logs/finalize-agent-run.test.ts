@@ -39,6 +39,33 @@ const VALID_ENTIRECLI_SAFETY = {
   },
 }
 
+const VALID_OBSERVATION_SOURCE = {
+  schema_version: 'observation_source_input/v1',
+  input_kind: 'entirecli',
+  output_source_kind: 'codex_cli',
+  capability_verdict: 'supported',
+  availability: 'available',
+  projection_mode: 'allowlist_projection',
+  checked_at: '2026-06-18T12:00:00.000Z',
+  safety: {
+    verdict: 'pass',
+    raw_values_emitted: false,
+    reason_codes: [],
+  },
+  metrics: {
+    trace_count: 1,
+    span_count: 2,
+    prompt_tokens: 5,
+    completion_tokens: 7,
+    total_tokens: 12,
+  },
+}
+
+const INVALID_OBSERVATION_SOURCE = {
+  ...VALID_OBSERVATION_SOURCE,
+  raw_prompt: 'should fail closed',
+}
+
 function runFinalize(args: string[]) {
   return spawnSync('node', [FINALIZE_SCRIPT, ...args], { encoding: 'utf-8' })
 }
@@ -52,12 +79,15 @@ describe('finalize-agent-run CLI -- entirecli_safety integration', () => {
       const outputPath = join(tempDir, 'report.json')
       writeFileSync(draftPath, JSON.stringify(VALID_DRAFT), 'utf-8')
       writeFileSync(safetyPath, JSON.stringify(VALID_ENTIRECLI_SAFETY), 'utf-8')
+      const observationSourcePath = join(tempDir, 'observation-source.json')
+      writeFileSync(observationSourcePath, JSON.stringify(VALID_OBSERVATION_SOURCE), 'utf-8')
 
       const result = runFinalize([
         '--draft', draftPath,
         '--output', outputPath,
         '--public-surface-kind', 'github_issue_comment',
         '--entirecli-safety-file', safetyPath,
+        '--observation-source-file', observationSourcePath,
         '--command-summary-json', VALID_COMMAND_SUMMARY,
       ])
 
@@ -115,6 +145,88 @@ describe('finalize-agent-run CLI -- entirecli_safety integration', () => {
 
       expect(result.status).toBe(1)
       expect(existsSync(outputPath)).toBe(false)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN --public-surface-kind github_issue_comment AND --observation-source-* missing THEN finalize exits 1 AND output report is not written', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'finalize-test-'))
+    try {
+      const draftPath = join(tempDir, 'draft.json')
+      const safetyPath = join(tempDir, 'safety.json')
+      const outputPath = join(tempDir, 'report.json')
+      writeFileSync(draftPath, JSON.stringify(VALID_DRAFT), 'utf-8')
+      writeFileSync(safetyPath, JSON.stringify(VALID_ENTIRECLI_SAFETY), 'utf-8')
+
+      const result = runFinalize([
+        '--draft', draftPath,
+        '--output', outputPath,
+        '--public-surface-kind', 'github_issue_comment',
+        '--entirecli-safety-file', safetyPath,
+        '--command-summary-json', VALID_COMMAND_SUMMARY,
+      ])
+
+      expect(result.status).toBe(1)
+      expect(existsSync(outputPath)).toBe(false)
+      expect(result.stderr).toContain('observation_source_required')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN --observation-source-json with forbidden field THEN finalize exits 1 AND output report is not written', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'finalize-test-'))
+    try {
+      const draftPath = join(tempDir, 'draft.json')
+      const safetyPath = join(tempDir, 'safety.json')
+      const outputPath = join(tempDir, 'report.json')
+      const obsPath = join(tempDir, 'observation-source.json')
+      writeFileSync(draftPath, JSON.stringify(VALID_DRAFT), 'utf-8')
+      writeFileSync(safetyPath, JSON.stringify(VALID_ENTIRECLI_SAFETY), 'utf-8')
+      writeFileSync(obsPath, JSON.stringify(INVALID_OBSERVATION_SOURCE), 'utf-8')
+
+      const result = runFinalize([
+        '--draft', draftPath,
+        '--output', outputPath,
+        '--public-surface-kind', 'github_issue_comment',
+        '--entirecli-safety-file', safetyPath,
+        '--observation-source-file', obsPath,
+        '--command-summary-json', VALID_COMMAND_SUMMARY,
+      ])
+
+      expect(result.status).toBe(1)
+      expect(existsSync(outputPath)).toBe(false)
+      expect(result.stderr).toContain('forbidden_fields')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN --observation-source-json AND --observation-source-file both set THEN finalize exits 1 AND output report is not written', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'finalize-test-'))
+    try {
+      const draftPath = join(tempDir, 'draft.json')
+      const safetyPath = join(tempDir, 'safety.json')
+      const observationSourcePath = join(tempDir, 'observation-source.json')
+      const outputPath = join(tempDir, 'report.json')
+      writeFileSync(draftPath, JSON.stringify(VALID_DRAFT), 'utf-8')
+      writeFileSync(safetyPath, JSON.stringify(VALID_ENTIRECLI_SAFETY), 'utf-8')
+      writeFileSync(observationSourcePath, JSON.stringify(VALID_OBSERVATION_SOURCE), 'utf-8')
+
+      const result = runFinalize([
+        '--draft', draftPath,
+        '--output', outputPath,
+        '--public-surface-kind', 'github_issue_comment',
+        '--entirecli-safety-file', safetyPath,
+        '--observation-source-json', JSON.stringify(VALID_OBSERVATION_SOURCE),
+        '--observation-source-file', observationSourcePath,
+        '--command-summary-json', VALID_COMMAND_SUMMARY,
+      ])
+
+      expect(result.status).toBe(1)
+      expect(existsSync(outputPath)).toBe(false)
+      expect(result.stderr).toContain('observation_source_conflict')
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
