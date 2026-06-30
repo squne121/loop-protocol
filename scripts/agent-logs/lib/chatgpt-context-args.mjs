@@ -1,12 +1,14 @@
 import { parseArgs, usageError } from './args.mjs'
 
 export const OPTION_SPEC = {
-  '--parent-issue-json': { key: 'parentIssueJson', required: true },
-  '--target-issue-json': { key: 'targetIssueJson', required: true },
-  '--retro-index-json': { key: 'retroIndexJson', required: true },
-  '--source-set-json': { key: 'sourceSetJson', required: true },
+  '--parent-issue-json': { key: 'parentIssueJson' },
+  '--target-issue-json': { key: 'targetIssueJson' },
+  '--retro-index-json': { key: 'retroIndexJson' },
+  '--source-set-json': { key: 'sourceSetJson' },
   '--run-report-json': { key: 'runReportJson', multiple: true },
   '--evidence-ref-json': { key: 'evidenceRefJson', multiple: true },
+  '--marker-comment-json': { key: 'markerCommentJson' },
+  '--github-comments-json': { key: 'githubCommentsJson', multiple: true },
   '--max-chars': { key: 'maxChars', required: true },
   '--max-sections': { key: 'maxSections', required: true },
   '--generated-at': { key: 'generatedAt', required: true },
@@ -16,6 +18,32 @@ export const OPTION_SPEC = {
 
 export function parseChatgptContextArgs(argv) {
   const options = parseArgs(argv, OPTION_SPEC)
+  const markerMode = typeof options.markerCommentJson === 'string'
+  const fileMode = [
+    options.parentIssueJson,
+    options.targetIssueJson,
+    options.retroIndexJson,
+    options.sourceSetJson,
+  ].every((value) => typeof value === 'string')
+
+  if (!markerMode && !fileMode) {
+    throw usageError(
+      'cli.missing_source_mode',
+      'provide either the legacy JSON source set or --marker-comment-json with --github-comments-json'
+    )
+  }
+  if (markerMode && fileMode) {
+    throw usageError(
+      'cli.mixed_source_mode',
+      'do not mix --marker-comment-json mode with legacy JSON source inputs'
+    )
+  }
+  if (markerMode && (!Array.isArray(options.githubCommentsJson) || options.githubCommentsJson.length === 0)) {
+    throw usageError(
+      'cli.marker_comments_missing',
+      '--marker-comment-json requires at least one --github-comments-json input'
+    )
+  }
 
   const maxChars = Number(options.maxChars)
   if (!Number.isInteger(maxChars) || maxChars < 1) {
@@ -34,6 +62,7 @@ export function parseChatgptContextArgs(argv) {
 
   return {
     ...options,
+    sourceMode: markerMode ? 'marker_comment' : 'json_files',
     maxChars,
     maxSections,
     generatedAt: options.generatedAt,

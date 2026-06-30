@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "chatgpt_retro_context_marker/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "marker_kind",
+    "repo",
+    "target",
+    "parent_issue",
+    "canonicalization",
+    "refs",
+    "safety",
+    "prerequisites",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "chatgpt_retro_context_marker/v1"
+    },
+    "marker_kind": {
+      "type": "string",
+      "const": "CHATGPT_RETRO_CONTEXT_V1"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+      "maxLength": 200
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "number"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "issue",
+            "pull_request"
+          ]
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "parent_issue": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "canonicalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "payload_digest"
+      ],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "canonical-json-v1"
+        },
+        "payload_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_reports",
+        "retro_index"
+      ],
+      "properties": {
+        "run_reports": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "comment_url",
+              "payload_digest",
+              "schema_ref",
+              "validation_verdict",
+              "supersedes_digest"
+            ],
+            "properties": {
+              "comment_url": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
+                "maxLength": 300
+              },
+              "payload_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "schema_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "validation_verdict": {
+                "type": "string",
+                "const": "pass"
+              },
+              "supersedes_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "retro_index": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "comment_url",
+            "payload_digest",
+            "source_set_digest",
+            "schema_ref",
+            "validation_verdict"
+          ],
+          "properties": {
+            "comment_url": {
+              "type": "string",
+              "format": "uri",
+                "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
+              "maxLength": 300
+            },
+            "payload_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "source_set_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "schema_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "validation_verdict": {
+              "type": "string",
+              "const": "pass"
+            }
+          }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "untrusted_evidence_mode",
+        "free_form_instructions_present",
+        "forbidden_fields_scan",
+        "rendered_markdown_scan",
+        "raw_values_emitted"
+      ],
+      "properties": {
+        "untrusted_evidence_mode": {
+          "type": "string",
+          "const": "typed_refs_only"
+        },
+        "free_form_instructions_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "forbidden_fields_scan": {
+          "type": "string",
+          "const": "pass"
+        },
+        "rendered_markdown_scan": {
+          "type": "string",
+          "const": "pass"
+        },
+        "raw_values_emitted": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "prerequisites": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "containment_issue",
+        "pilot_exception_issue",
+        "capability_matrix_issue",
+        "schema_issue",
+        "adapter_issue",
+        "real_pilot_allowed",
+        "evidence_mode"
+      ],
+      "properties": {
+        "containment_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pilot_exception_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "capability_matrix_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "schema_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "adapter_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "real_pilot_allowed": {
+          "type": "boolean"
+        },
+        "evidence_mode": {
+          "type": "string",
+          "enum": [
+            "synthetic_only",
+            "real_pilot_verified"
+          ]
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
