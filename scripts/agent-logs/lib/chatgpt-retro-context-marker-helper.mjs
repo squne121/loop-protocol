@@ -5,6 +5,9 @@ import {
   extractPayloadFromMarkdown,
   renderPublicMarkdown,
   scanPublicSafety,
+  validateAgentRetroIndex,
+  validateAgentRunReport,
+  validateChatgptRetroContextMarker,
   validateMarkdownCandidate,
 } from '../../lib/agent-run-report-validation.mjs'
 import {
@@ -13,6 +16,7 @@ import {
   parseMarkerComment,
   sha256Hex,
 } from './github-comments.mjs'
+import { buildSourceCommentSetDigest } from './retro-index-builder.mjs'
 import {
   parseRetroDigestMarker,
   parseRetroOwnershipMarker,
@@ -179,7 +183,17 @@ export function computeChatgptRetroContextPayloadDigest(payload) {
   if (normalizedPayload?.canonicalization) {
     normalizedPayload.canonicalization.payload_digest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
   }
-  return `sha256:${sha256Hex(renderPublicMarkdown(normalizedPayload))}`
+  return `sha256:${sha256Hex(stableStringify(normalizedPayload))}`
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
 }
 
 export function buildChatgptRetroContextCommentBody({ ownership, payloadMarkdown }) {
@@ -282,7 +296,10 @@ export async function upsertChatgptRetroContextComment(client, {
       comment_url: existing.comment?.html_url ?? existing.comment?.url ?? null,
     }
   }
-  if (expectedSupersedesDigest !== null && existing.digest !== expectedSupersedesDigest) {
+  if (expectedSupersedesDigest === null) {
+    throw runtimeError('chatgpt_retro_context.blocked_missing_supersedes_digest', 'expectedSupersedesDigest is required before updating an existing context marker')
+  }
+  if (existing.digest !== expectedSupersedesDigest) {
     throw runtimeError('chatgpt_retro_context.blocked_stale_write', 'existing context marker digest changed before update')
   }
 
@@ -339,6 +356,13 @@ function buildSyntheticSourceSet(payload) {
   }
 }
 
+function assertValidation(result, code) {
+  if (!result.valid) {
+    const [firstError] = result.errors
+    throw runtimeError(code, firstError?.message ?? code)
+  }
+}
+
 function parseRetroMarkerComment(comment) {
   const body = typeof comment?.body === 'string' ? comment.body : ''
   const validation = validateRetroCommentBody(body)
@@ -380,13 +404,23 @@ export async function resolveChatgptRetroContextFromFixtures({
     throw runtimeError(extraction.error.code, extraction.error.message)
   }
   const payload = extraction.payload
+  assertValidation(validateChatgptRetroContextMarker(payload), 'chatgpt_retro_context.marker_payload_invalid')
   const expectedPayloadDigest = computeChatgptRetroContextPayloadDigest(payload)
   if (payload.canonicalization?.payload_digest !== expectedPayloadDigest) {
     throw runtimeError('chatgpt_retro_context.payload_digest_mismatch', 'payload canonicalization digest does not match the canonical marker payload')
   }
+  if (
+    payload.repo !== parsedMarker.ownership.repo
+    || payload.target?.type !== parsedMarker.ownership.targetType
+    || payload.target?.number !== parsedMarker.ownership.targetNumber
+    || payload.parent_issue !== parsedMarker.ownership.parentIssue
+  ) {
+    throw runtimeError('chatgpt_retro_context.payload_ownership_mismatch', 'marker ownership comment and embedded payload ownership must match')
+  }
 
   const reportPayloads = []
   const evidenceRefs = []
+  const sourceCommentRefs = []
   for (const reportRef of payload.refs.run_reports) {
     const reportComment = findCommentByUrl(comments, reportRef.comment_url)
     if (!reportComment) {
@@ -404,7 +438,14 @@ export async function resolveChatgptRetroContextFromFixtures({
     if (!reportExtraction.ok) {
       throw runtimeError(reportExtraction.error.code, reportExtraction.error.message)
     }
+    assertValidation(validateAgentRunReport(reportExtraction.payload), 'chatgpt_retro_context.report_payload_invalid')
     reportPayloads.push(reportExtraction.payload)
+    sourceCommentRefs.push({
+      comment_url: reportRef.comment_url,
+      source_kind: 'issues',
+      source_number: payload.target.number,
+      body_digest: reportRef.payload_digest,
+    })
     evidenceRefs.push({
       kind: 'github_comment',
       ref: reportRef.comment_url,
@@ -427,9 +468,26 @@ export async function resolveChatgptRetroContextFromFixtures({
   if (parsedRetro.digest?.sourceSetDigest !== payload.refs.retro_index.source_set_digest) {
     throw runtimeError('chatgpt_retro_context.source_set_digest_mismatch', 'retro index source-set digest mismatch')
   }
+  if (
+    parsedRetro.ownership?.repo !== payload.repo
+    || parsedRetro.ownership?.parentIssue !== payload.parent_issue
+  ) {
+    throw runtimeError('chatgpt_retro_context.retro_ownership_mismatch', 'retro index ownership must match marker repo / parent issue')
+  }
   const retroExtraction = extractPayloadFromMarkdown(parsedRetro.body, 'agent_retro_index/v1')
   if (!retroExtraction.ok) {
     throw runtimeError(retroExtraction.error.code, retroExtraction.error.message)
+  }
+  assertValidation(validateAgentRetroIndex(retroExtraction.payload), 'chatgpt_retro_context.retro_payload_invalid')
+  sourceCommentRefs.push({
+    comment_url: payload.refs.retro_index.comment_url,
+    source_kind: 'issues',
+    source_number: payload.parent_issue,
+    body_digest: payload.refs.retro_index.payload_digest,
+  })
+  const recomputedSourceSetDigest = buildSourceCommentSetDigest(sourceCommentRefs)
+  if (recomputedSourceSetDigest !== payload.refs.retro_index.source_set_digest) {
+    throw runtimeError('chatgpt_retro_context.source_set_digest_recompute_mismatch', 'retro index source-set digest must match the recomputed referenced comment set')
   }
 
   const safetyScan = scanPublicSafety(payload)

@@ -11,6 +11,8 @@ import {
 } from '../../scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs'
 import { buildRetroIndexCommentBody } from '../../scripts/agent-logs/lib/retro-index-comment-helper.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
+import { buildSourceCommentSetDigest } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
+import { createValidObservationSourceResult } from './report-test-fixtures'
 
 const REPO_ROOT = resolve(__dirname, '..', '..')
 const EXPORT_SCRIPT = resolve(REPO_ROOT, 'scripts', 'agent-logs', 'export-chatgpt-context.mjs')
@@ -37,13 +39,34 @@ describe('chatgpt context marker-origin mode', () => {
           checked_at: '2026-07-01T00:00:00.000Z',
           verdict: 'pass',
           blocked_reasons: [],
+          observation_sources: [createValidObservationSourceResult()],
+          entirecli_safety: {
+            schema_version: 'entirecli_safety_result/v1',
+            verdict: 'not_applicable',
+            reason_codes: ['entire_absent'],
+            raw_values_emitted: false,
+            checked_surfaces: {
+              entire_binary: false,
+              entire_version: null,
+              entire_enable_help: false,
+              entire_configure_help: false,
+            },
+          },
         },
         actor: { type: 'ai_agent', name: 'Codex worker' },
         authority: { level: 'non_authoritative', basis: 'ai_self_report', evidence_refs: [] },
         token_usage: { availability: 'unavailable', source: 'none', prompt: null, completion: null, total: null },
         manifest_refs: [],
         evidence_refs: [],
-        commands_summary: [],
+        commands_summary: [
+          {
+            command_label: 'pnpm test -- tests/agent-logs',
+            exit_code: 0,
+            verdict: 'pass',
+            summary: 'passed',
+            artifact_ref: 'artifact:agent-logs-tests',
+          },
+        ],
         docs_read_refs: [],
       }
       const reportMarkdown = renderPublicMarkdown(reportPayload)
@@ -78,13 +101,27 @@ describe('chatgpt context marker-origin mode', () => {
         ambiguous_links: [],
       }
       const retroMarkdown = renderPublicMarkdown(retroPayload)
+      const retroSourceSetDigest = buildSourceCommentSetDigest([
+        {
+          comment_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-11',
+          source_kind: 'issues',
+          source_number: 1224,
+          body_digest: reportDigest,
+        },
+        {
+          comment_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12',
+          source_kind: 'issues',
+          source_number: 1153,
+          body_digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+        },
+      ])
       const retroComment = buildRetroIndexCommentBody({
         repo: 'squne121/loop-protocol',
         parentIssue: 1153,
         algorithm: 'retro-index-builder@1',
         payloadMarkdown: retroMarkdown,
         canonicalIndexDigest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-        sourceCommentSetDigest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+        sourceCommentSetDigest: retroSourceSetDigest,
       })
 
       const markerPayload = {
@@ -110,7 +147,7 @@ describe('chatgpt context marker-origin mode', () => {
           retro_index: {
             comment_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12',
             payload_digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-            source_set_digest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+            source_set_digest: retroSourceSetDigest,
             schema_ref: 'docs/schemas/agent-retro-index.schema.json#agent_retro_index/v1',
             validation_verdict: 'pass',
           },
@@ -189,6 +226,41 @@ describe('chatgpt context marker-origin mode', () => {
       expect(content).toContain('SECURITY_BOUNDARY')
       expect(content).toContain('run_report_comment[0]')
       expect(content).not.toContain('/home/')
+    } finally {
+      cleanup(tempDir)
+    }
+  })
+
+  it('GIVEN marker mode and legacy JSON mode together WHEN export runs THEN it rejects mixed source modes', () => {
+    const tempDir = makeTempDir()
+    try {
+      const markerFile = resolve(tempDir, 'marker.json')
+      const commentsFile = resolve(tempDir, 'comments.json')
+      const outputFile = resolve(tempDir, 'bundle.md')
+      const summaryFile = resolve(tempDir, 'summary.json')
+      const legacyFile = resolve(tempDir, 'legacy.json')
+      writeFileSync(markerFile, JSON.stringify({ body: 'x' }))
+      writeFileSync(commentsFile, JSON.stringify([]))
+      writeFileSync(legacyFile, JSON.stringify({}))
+
+      expect(() => execFileSync(process.execPath, [
+        EXPORT_SCRIPT,
+        '--marker-comment-json', markerFile,
+        '--github-comments-json', commentsFile,
+        '--parent-issue-json', legacyFile,
+        '--target-issue-json', legacyFile,
+        '--retro-index-json', legacyFile,
+        '--source-set-json', legacyFile,
+        '--max-chars', '100000',
+        '--max-sections', '20',
+        '--generated-at', '2026-07-01T00:00:00.000Z',
+        '--output', outputFile,
+        '--summary-json-out', summaryFile,
+      ], {
+        cwd: REPO_ROOT,
+        encoding: 'utf-8',
+        stdio: 'pipe',
+      })).toThrow(/cli\.mixed_source_mode/)
     } finally {
       cleanup(tempDir)
     }

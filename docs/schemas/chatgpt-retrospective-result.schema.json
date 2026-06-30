@@ -22,14 +22,22 @@
       "additionalProperties": false,
       "required": [
         "repo",
-        "issue"
+        "type",
+        "number"
       ],
       "properties": {
         "repo": {
           "type": "string",
           "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
         },
-        "issue": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "issue",
+            "pull_request"
+          ]
+        },
+        "number": {
           "type": "integer",
           "minimum": 1
         }

@@ -32,7 +32,13 @@ export function parseChatgptContextArgs(argv) {
       'provide either the legacy JSON source set or --marker-comment-json with --github-comments-json'
     )
   }
-  if (markerMode && !Array.isArray(options.githubCommentsJson)) {
+  if (markerMode && fileMode) {
+    throw usageError(
+      'cli.mixed_source_mode',
+      'do not mix --marker-comment-json mode with legacy JSON source inputs'
+    )
+  }
+  if (markerMode && (!Array.isArray(options.githubCommentsJson) || options.githubCommentsJson.length === 0)) {
     throw usageError(
       'cli.marker_comments_missing',
       '--marker-comment-json requires at least one --github-comments-json input'

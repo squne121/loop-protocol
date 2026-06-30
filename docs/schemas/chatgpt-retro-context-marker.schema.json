@@ -64,8 +64,7 @@
       "properties": {
         "algorithm": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 80
+          "const": "canonical-json-v1"
         },
         "payload_digest": {
           "type": "string",
@@ -98,7 +97,7 @@
               "comment_url": {
                 "type": "string",
                 "format": "uri",
-                "pattern": "^https://github\\.com/.+#issuecomment-[0-9]+$",
+                "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
                 "maxLength": 300
               },
               "payload_digest": {
@@ -138,7 +137,7 @@
             "comment_url": {
               "type": "string",
               "format": "uri",
-              "pattern": "^https://github\\.com/.+#issuecomment-[0-9]+$",
+                "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$",
               "maxLength": 300
             },
             "payload_digest": {

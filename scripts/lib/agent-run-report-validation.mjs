@@ -57,6 +57,8 @@ const PATH_PATTERNS = [
 const MARKER_PATTERNS = [
   { code: 'markdown.marker_injection', regex: /<!--\s*agent_run_report:v1(?:\s+start|\s+end)?\s*-->/ },
   { code: 'markdown.marker_injection', regex: /<!--\s*agent_retro_index:v1(?:\s+start|\s+end)?\s*-->/ },
+  { code: 'markdown.marker_injection', regex: /<!--\s*CHATGPT_RETRO_CONTEXT_V1(?:\s+start|\s+end)?\s*-->/ },
+  { code: 'markdown.marker_injection', regex: /<!--\s*CHATGPT_RETRO_CONTEXT_DIGEST_V1\b[^>]*-->/ },
 ]
 const INLINE_REPORT_COPY_PATTERNS = [
   { code: 'semantic.inline_report_copy', regex: /\bagent_run_report\/v1\b/i },
@@ -524,8 +526,31 @@ export function validateAgentRetroIndex(index) {
 export function validateChatgptRetroContextMarker(marker) {
   const schemaResult = validateChatgptRetroContextMarkerAgainstSchema(marker)
   const scanResult = scanPublicSafety(marker)
+  const semanticErrors = []
+  if (marker?.canonicalization?.algorithm !== 'canonical-json-v1') {
+    semanticErrors.push({
+      path: 'canonicalization.algorithm',
+      code: 'semantic.chatgpt_retro_context_algorithm',
+      message: 'chatgpt retro context markers must use canonicalization.algorithm = "canonical-json-v1"',
+    })
+  }
+  if (marker?.prerequisites?.evidence_mode === 'synthetic_only' && marker?.prerequisites?.real_pilot_allowed !== false) {
+    semanticErrors.push({
+      path: 'prerequisites.real_pilot_allowed',
+      code: 'semantic.chatgpt_retro_context_synthetic_only',
+      message: 'synthetic_only evidence mode requires real_pilot_allowed = false',
+    })
+  }
+  if (marker?.prerequisites?.evidence_mode === 'real_pilot_verified' && marker?.prerequisites?.real_pilot_allowed !== true) {
+    semanticErrors.push({
+      path: 'prerequisites.real_pilot_allowed',
+      code: 'semantic.chatgpt_retro_context_real_pilot_verified',
+      message: 'real_pilot_verified evidence mode requires real_pilot_allowed = true',
+    })
+  }
   const errors = [
     ...schemaResult.errors,
+    ...semanticErrors,
     ...scanResult.errors,
   ]
   return {
