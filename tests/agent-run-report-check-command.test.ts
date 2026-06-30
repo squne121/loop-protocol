@@ -17,17 +17,35 @@ describe('agent-run-report:check entrypoint', () => {
     expect(result.stdout).toContain('PASS')
   })
 
-  it('GIVEN explicit target matching 0 files WHEN check command is run THEN exits 1', () => {
+  it('GIVEN explicit target matching 0 files WHEN check command is run THEN exits 1 with no-files message', () => {
     const result = runAgentRunReportCheck(['tests/fixtures/agent-run-report/does-not-exist/*.json'])
     expect(result.exitCode).toBe(1)
-    expect(result.stderr).toContain('no files found')
+    expect(result.stderr).toContain('agent-run-report:check: no files found')
+    expect(result.signal).toBeNull()
+    expect(result.timedOut).toBe(false)
   })
 
-  it('GIVEN default target override that matches 0 files in CI WHEN check command is run THEN exits 1', () => {
+  it('GIVEN default target override that matches 0 files in CI WHEN check command is run THEN exits 1 with no-files stderr', () => {
     const result = runAgentRunReportCheck(['--require-target'], {
       CI: 'true',
+      AGENT_RUN_REPORT_CHECK_DEFAULT_PATTERNS: 'tests/fixtures/agent-run-report/does-not-exist/*.json',
     })
     expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('agent-run-report:check: no files found')
+    expect(result.signal).toBeNull()
+    expect(result.timedOut).toBe(false)
+    expect(result.stdout).not.toContain('PASS')
+  })
+
+  it('GIVEN default target override matching 0 files outside CI WHEN check command is run THEN exits 0 with skip message', () => {
+    const result = runAgentRunReportCheck([], {
+      AGENT_RUN_REPORT_CHECK_DEFAULT_PATTERNS: 'tests/fixtures/agent-run-report/does-not-exist/*.json',
+      CI: 'false',
+    })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('agent-run-report:check: no files found (default targets) - skipped')
+    expect(result.signal).toBeNull()
+    expect(result.timedOut).toBe(false)
   })
 
   it('GIVEN unknown option WHEN check command is run THEN exits 2', () => {
