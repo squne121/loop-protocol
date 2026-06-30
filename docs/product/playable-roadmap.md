@@ -1,8 +1,8 @@
 ---
 doc_id: DOC-ROADMAP-001
-title: Post-M1 Playable Outcome Roadmap
+title: Post-M1 Playable Outcome Roadmap（M1後 playable outcome ロードマップ）
 status: active
-note: conceptual roadmap; not GitHub Milestone object creation
+note: conceptual roadmap（概念ロードマップ）; not GitHub Milestone object creation（GitHub Milestone object 作成そのものは含まない）
 last_updated_by_issue: 1171
 ---
 
@@ -37,9 +37,9 @@ last_updated_by_issue: 1171
 
 ---
 
-## Conceptual Milestone to GitHub Milestone Mapping
+## Conceptual Milestone to GitHub Milestone Mapping（概念マイルストーンと GitHub マイルストーンの対応表）
 
-readback_date: 2026-06-27
+readback_date: 2026-06-27 # GitHub マイルストーンの読取確認を行った日
 
 | conceptual_milestone_id | conceptual_title | github_milestone_number | github_milestone_title | mapping_status | decision_note |
 |---|---|---:|---|---|---|
@@ -50,9 +50,9 @@ readback_date: 2026-06-27
 
 ---
 
-## Conceptual Milestones
+## Conceptual Milestones（概念マイルストーン）
 
-### M2: Gameplay Core (v0.2.x)
+### M2: Gameplay Core (v0.2.x) / ゲームプレイ基盤
 
 ```yaml
 milestone_id: M2
@@ -97,7 +97,7 @@ spec_destination:
 
 ---
 
-### M3: Result Persistence (v0.3.x)
+### M3: Result Persistence (v0.3.x) / 結果保存
 
 ```yaml
 milestone_id: M3
@@ -132,7 +132,7 @@ spec_destination:
 
 ---
 
-### M4: Upgrade Loop (v0.4.x)
+### M4: Upgrade Loop (v0.4.x) / 強化ループ
 
 ```yaml
 milestone_id: M4
@@ -166,7 +166,7 @@ spec_destination:
 
 ---
 
-### M5: Playable Slice Hardening (v0.5.x)
+### M5: Playable Slice Hardening (v0.5.x) / プレイ可能スライス硬化
 
 ```yaml
 milestone_id: M5
@@ -210,7 +210,7 @@ spec_destination:
 
 ---
 
-## Maintenance Policy
+## Maintenance Policy（保守方針）
 
 - この文書は conceptual roadmap の正本であり、個別機能仕様の正本ではない。
 - M2〜M5 の Parent Issue が materialize された時点で、対応する issue number を追記する。
