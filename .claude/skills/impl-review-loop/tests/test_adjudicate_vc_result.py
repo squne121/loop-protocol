@@ -153,6 +153,32 @@ def test_diff_related_failure_is_regression_blocking():
     assert result["per_ac"][0]["status"] == "regression_fail"
 
 
+def test_allowed_paths_glob_matcher_v2_relevance_is_regression_blocking():
+    baseline = _snapshot_payload([_payload_item("AC1", command_hash="sha256:" + "a" * 64)])
+    current = _current_payload(
+        [
+            _payload_item(
+                "AC1",
+                command_hash="sha256:" + "b" * 64,
+                failure_keys=[
+                    ".claude/skills/impl-review-loop/tests/test_adjudicate_vc_result.py::test_case"
+                ],
+            )
+        ]
+    )
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=baseline,
+        current_vc_result=current,
+        diff_summary={"changed_paths": ["docs/dev/agent-run-report.md"]},
+        allowed_paths=[".claude/skills/**"],
+    )
+
+    assert result["overall_status"] == "regression_fail"
+    assert result["blocking"] is True
+    assert result["per_ac"][0]["reason_code"] == "related_to_changed_scope"
+
+
 def test_pytest_exit_5_is_not_regression_fail():
     baseline = _snapshot_payload([_payload_item("AC1")])
     current = _current_payload(

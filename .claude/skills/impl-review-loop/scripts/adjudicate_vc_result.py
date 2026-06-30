@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -39,6 +40,12 @@ STATUS_PRIORITY = {
     "environment_blocked": 4,
     "indeterminate": 5,
 }
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_ALLOWED_PATHS_GATE_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
+)
+_ALLOWED_PATHS_MATCHER = None
 
 
 def _sha256(value: str) -> str:
@@ -208,6 +215,23 @@ def _normalize_path(path: str) -> str:
     return path.rstrip("/")
 
 
+def _get_allowed_paths_matcher():
+    global _ALLOWED_PATHS_MATCHER
+    if _ALLOWED_PATHS_MATCHER is not None:
+        return _ALLOWED_PATHS_MATCHER
+
+    spec = importlib.util.spec_from_file_location(
+        "allowed_paths_review_gate_for_adjudicator",
+        _ALLOWED_PATHS_GATE_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("allowed_paths_matcher_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _ALLOWED_PATHS_MATCHER = module.AllowedPathsMatcher
+    return _ALLOWED_PATHS_MATCHER
+
+
 def _failure_key_root(key: str) -> str:
     root = key.strip()
     if "::" in root:
@@ -218,9 +242,12 @@ def _failure_key_root(key: str) -> str:
 
 
 def _key_relates_to_path(key: str, path: str) -> bool:
-    root = _failure_key_root(key)
-    path = _normalize_path(path)
-    return root == path or root.startswith(path + "/")
+    matcher = _get_allowed_paths_matcher()
+    root = matcher.normalize_path(_failure_key_root(key))
+    pattern = matcher.normalize_allowed_pattern(path)
+    if root is None or pattern is None:
+        return False
+    return matcher.matches_pattern(root, pattern)
 
 
 def _is_related_to_scope(failure_keys: list[str], changed_paths: list[str], allowed_paths: list[str]) -> bool:
