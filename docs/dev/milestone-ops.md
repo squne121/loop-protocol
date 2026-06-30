@@ -236,6 +236,14 @@ M1_MILESTONE_CLOSE_CHECKLIST_V1:
     description: >-
       既存の fail-closed close_predicate をそのまま再利用し、M1 判定時の入力・
       必須根拠・運用責任者を明示する。
+  authority:
+    source_of_truth: docs/dev/milestone-ops.md
+    executable_checker: scripts/milestone_rollup.py
+    rollup_skill: .claude/skills/milestone-rollup/SKILL.md
+    rollup_shell: .claude/skills/milestone-rollup/scripts/milestone_rollup.sh
+    note: >-
+      この checklist は derived view のみを定義し、実行可能な close readiness
+      predicate そのものは置き換えない。
   github_api_version: "2022-11-28"
 
   required_docs:
@@ -251,6 +259,10 @@ M1_MILESTONE_CLOSE_CHECKLIST_V1:
     - name: m1-pr-mix-zero
       source: close_predicate.direct_check.pr_mixed_count
       expected: 0
+      required: true
+    - name: m1-descendant-report-schema-v1
+      source: close_predicate.descendant_traversal.schema
+      expected: MILESTONE_DESCENDANT_ROLLUP_V1
       required: true
     - name: m1-descendant-traversal-complete
       source: close_predicate.descendant_traversal.partial
@@ -272,6 +284,18 @@ M1_MILESTONE_CLOSE_CHECKLIST_V1:
       source: close_predicate.direct_check.assignment_drift
       expected: []
       required: true
+    - name: m1-evidence-generated-at-recorded
+      source: close_predicate.evidence.generated_at
+      expected: present
+      required: true
+    - name: m1-evidence-repository-sha-recorded
+      source: close_predicate.evidence.repository_commit_sha
+      expected: present
+      required: true
+    - name: m1-evidence-freshness-confirmed
+      source: close_predicate.stale_evidence
+      expected: absent
+      required: true
     - name: m1-human-close-required
       source: close_predicate.human_close
       expected: "close_predicate step 9"
@@ -284,6 +308,9 @@ M1_MILESTONE_CLOSE_CHECKLIST_V1:
       required: false
 
   required_parent_status:
+    description: >-
+      以下は PR 作成時点の live status ではなく、M1 close 判断時に満たすべき
+      expected status を表す。
     "#131": closed
     "#133": closed
     "#472": closed
@@ -294,6 +321,7 @@ M1_MILESTONE_CLOSE_CHECKLIST_V1:
     - close_predicate.descendant_traversal.warnings
     - close_predicate.descendant_traversal.open_blocker_count
     - close_predicate.descendant_traversal.scope_conflict_count
+    - close_predicate.stale_evidence
     - close_predicate.schema_mismatch
     - close_predicate.api_failure
 
