@@ -105,6 +105,10 @@ function readText(filePath) {
   return fs.readFileSync(filePath, 'utf8');
 }
 
+function readOptionalText(filePath) {
+  return fs.existsSync(filePath) ? readText(filePath) : '';
+}
+
 function fail(message) {
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -587,12 +591,19 @@ function validateAgents() {
   }
   const configText = readText(configPath);
   const rulesText = readText(rulesPath);
+  const hookBoundariesPath = path.join(repoRoot, 'docs', 'dev', 'hook-boundaries.md');
+  const skillBoundariesPath = path.join(repoRoot, 'docs', 'dev', 'agent-skill-boundaries.md');
+  const hookBoundariesText = readOptionalText(hookBoundariesPath);
+  const skillBoundariesText = readOptionalText(skillBoundariesPath);
 
   assert(configText.includes('default_permissions = "loop-protocol-rtk"'), 'config.toml must keep default_permissions = "loop-protocol-rtk"', failures);
   assert(configText.includes('[permissions.loop-protocol-readonly.filesystem]'), 'config.toml must define permissions.loop-protocol-readonly', failures);
   assert(configText.includes('.codex/hooks.json'), 'config.toml must mention .codex/hooks.json as the documented hook surface', failures);
   assert(!configText.includes('sandbox_mode'), 'config.toml must not use sandbox_mode when permission profiles are active', failures);
   assert(rulesText.includes('fail-closed local guardrail'), 'default.rules must describe hooks/rules as a fail-closed local guardrail', failures);
+  assert(rulesText.includes('pattern = ["rtk", "git", "add"]'), 'default.rules must allow the bounded rtk git add publish path', failures);
+  assert(rulesText.includes('pattern = ["rtk", "git", "commit", "-m"]'), 'default.rules must allow the bounded rtk git commit -m publish path', failures);
+  assert(rulesText.includes('pattern = ["rtk", "git", "push", "origin"]'), 'default.rules must allow the bounded rtk git push origin publish path', failures);
   // AC1: config.toml must not define a [hooks] section; hooks live in .codex/hooks.json.
   // Also scan for TOML array-of-tables [[hooks.*]] which the parser skips to avoid false errors.
   // All of the following table header patterns must cause a failure:
@@ -608,6 +619,35 @@ function validateAgents() {
     }
   }
   assert(rulesText.includes('Known limitation'), 'default.rules must mention Known limitation wording', failures);
+  assert(fs.existsSync(path.join(repoRoot, 'scripts', 'agent-guards', 'git_mutation_command_policy.py')), 'git_mutation_command_policy.py must exist', failures);
+  assert(fs.existsSync(path.join(repoRoot, 'scripts', 'agent-guards', 'hook_repair_hints.py')), 'hook_repair_hints.py must exist', failures);
+  if (fs.existsSync(hookBoundariesPath)) {
+    assert(hookBoundariesText.includes('HOOK_COMMAND_REPAIR_HINT_V1'), 'hook-boundaries.md must describe HOOK_COMMAND_REPAIR_HINT_V1', failures);
+    for (const requiredField of [
+      'blocked_command_class',
+      'reason_code',
+      'safe_action',
+      'suggested_command',
+      'forbidden_alternatives',
+      'verification_command',
+      'stop_condition',
+    ]) {
+      assert(hookBoundariesText.includes(requiredField), `hook-boundaries.md must mention repair hint field ${requiredField}`, failures);
+    }
+    for (const requiredReason of [
+      'git_add_requires_explicit_pathspec',
+      'git_add_outside_allowed_paths',
+      'allowed_paths_missing_for_git_mutation',
+      'commit_staged_changes_outside_allowed_paths',
+      'push_refspec_requires_active_branch',
+      'issue_context_required',
+    ]) {
+      assert(hookBoundariesText.includes(requiredReason), `hook-boundaries.md must mention repair hint reason ${requiredReason}`, failures);
+    }
+  }
+  if (fs.existsSync(skillBoundariesPath)) {
+    assert(skillBoundariesText.includes('agent steering'), 'agent-skill-boundaries.md must mention agent steering for repair hints', failures);
+  }
   assert(!fs.existsSync(path.join(repoRoot, '.codex/skills')), '.codex/skills: must not exist as a repo-shared skill surface', failures);
 
   // hooks.json: JSON structural validation

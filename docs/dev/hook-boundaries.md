@@ -1,5 +1,6 @@
 ---
 doc_id: hook-boundaries
+doc_title_ja: フック境界ドキュメント
 status: stable
 related_issue: 923
 schema_version: hook_boundaries_manifest_v1
@@ -117,7 +118,8 @@ hook_boundaries_manifest_v1:
       /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
       deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
       probe scripts (git_ref_probe.py / git_worktree_probe.py) は DETERMINISTIC_CHECKER_ALLOWLIST に登録済み（Issue #1197）。
-      本 Issue では local root default branch 保護（branch drift 防止）と GitHub 書き込み許可集合は拡張しない。
+      local root default branch 保護（branch drift 防止）は維持しつつ、Issue #1241 以降は shared policy で
+      bounded な `rtk git add/commit/push` と `HOOK_COMMAND_REPAIR_HINT_V1` を扱う。
 
       ## gh CLI コマンド 5 分類（#1124）
 
@@ -178,6 +180,8 @@ hook_boundaries_manifest_v1:
       python3 不在など自身がエラーになった場合も fail-closed（exit 2）。
       active issue worktree がある場合でも shared cleanup / skill-runtime exact policy のみを例外とし、
       bootstrap 系の追加 allowlist はこの PR では導入しない。
+      Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
+      policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -410,9 +414,44 @@ hook_boundaries_manifest_v1:
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 ```
 
+## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
+
+repair hint は agent steering 用の bounded diagnostics であり、authorization の代替ではない。
+
+```yaml
+HOOK_COMMAND_REPAIR_HINT_V1:
+  blocked_command_class: "rtk_git_add"
+  reason_code: "git_add_requires_explicit_pathspec"
+  safe_action: "broad pathspec をやめて 1 file 単位の pathspec を使う"
+  suggested_command: "rtk git add <allowed-path-file>"
+  forbidden_alternatives: ["git add .", "git add -A", "git push --force"]
+  verification_command: "git diff --name-only"
+  stop_condition: "safe な single command に直せない場合は人間判断"
+```
+
+### reason_code の分岐
+
+| reason_code | safe_action の要点 | suggested / verification の例 |
+|---|---|---|
+| `git_add_requires_explicit_pathspec` | broad pathspec をやめて 1 file に絞る | `rtk git add <allowed-path-file>` / `git diff --name-only` |
+| `git_add_outside_allowed_paths` | Issue contract の Allowed Paths に戻す | `rtk git add <allowed-path-file>` / `git diff --name-only` |
+| `allowed_paths_missing_for_git_mutation` | runtime に Allowed Paths binding がある状態へ戻す | `git diff --cached --name-only` / `git diff --cached --name-only` |
+| `commit_staged_changes_outside_allowed_paths` | staged diff を Allowed Paths subset に戻す | `rtk git commit -m "issue-1241 update"` / `git diff --cached --name-only` |
+| `push_refspec_requires_active_branch` | active branch と一致する refspec だけを使う | `rtk git push origin HEAD:refs/heads/<active-branch>` / `git branch --show-current` |
+| `issue_context_required` | issue 未解決の root / unrelated cwd では mutation しない | `git worktree list` / `git branch --show-current` |
+| `target_dir_outside_worktree` | active issue worktree 配下へ戻る | `git status --short` / `git branch --show-current` |
+| `no_matching_worktree` / `ambiguous_worktree` | worktree catalog を 1 件に特定する | `git worktree list` / `git branch --show-current` |
+| `rtk_unknown_inner` | wrapper を剥がさず direct な `rtk git add/commit/push` へ揃える | `rtk git add <allowed-path-file>` / `git branch --show-current` |
+
+### 運用ガイド
+
+- `HOOK_COMMAND_REPAIR_HINT_V1` は direct `rtk git ...` の exact / bounded 形だけを示し、`bash -lc`、`env FOO=... rtk git ...`、`command rtk git ...` の wrapper 展開は suggestion に使わない。
+- `suggested_command` は authorization を付与しない。rules / hooks / post-run verifier が独立に reject できる。
+- `allowed_paths_missing_for_git_mutation` は fail-closed 理由であり、Issue contract の Allowed Paths binding が runtime に見えていない状態を示す。
+
 ---
 
-## 3. agent 判断表（Claude Code）
+## 3. agent 判断表（Claude Code / Claude Code 向け）
 
 | hook | 分類 | hook failure 時の agent 動作 |
 |---|---|---|
@@ -429,7 +468,7 @@ hook_boundaries_manifest_v1:
 
 ---
 
-## 4. agent 判断表（Codex CLI）
+## 4. agent 判断表（Codex CLI / Codex CLI 向け）
 
 この manifest は Claude Code の `.claude/settings.json` hook topology を対象とする。Codex CLI については、この manifest から Claude Code と同等の event / output / exit-code parity を主張しない。Codex 側の制御は sandbox、approval、network policy、telemetry、および Codex 固有 hook 実装の検証で別途扱う。
 
@@ -446,10 +485,10 @@ hook_boundaries_manifest_v1:
 
 AC2 対応: 以下の best-effort telemetry フックは作業 blocker にしない。
 
-- `session_manifest_coordinator.sh`（Stop / SubagentStop）
-- `session_manifest_debounce.mjs`（PostToolUse front gate）
-- `save_loop_state_before_compaction.sh`（PreCompact）
-- `rtk_boundary_shadow_guard.sh`（PreToolUse）
+- `session_manifest_coordinator.sh`（Stop / SubagentStop）: 停止時コーディネータ
+- `session_manifest_debounce.mjs`（PostToolUse front gate）: 事前集約ゲート
+- `save_loop_state_before_compaction.sh`（PreCompact）: 圧縮前保存
+- `rtk_boundary_shadow_guard.sh`（PreToolUse）: shadow 記録ガード
 
 これらは全て `fail_policy: fail_open` で設計されており、hook failure 時も exit 0 を返す（AC2）。
 
@@ -469,7 +508,7 @@ AC3 対応: `secret_boundary_guard.sh` は fail-closed 設計を維持する。
 
 ---
 
-## 7. mode_dependent: guard-japanese-prose.sh
+## 7. mode_dependent: guard-japanese-prose.sh（モード依存）
 
 AC8 対応: `guard-japanese-prose.sh` の default 動作は **shadow モード（exit 0）**。
 
