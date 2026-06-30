@@ -134,7 +134,10 @@ def get_required_checks(repo: str, pr_number: int) -> tuple[list[dict[str, Any]]
     return data, None, None
 
 
-def normalize_checks(checks: list[dict[str, Any]], non_blocking_rules: frozenset[tuple[str | None, str | None]]) -> list[dict[str, Any]]:
+def normalize_checks(
+    checks: list[dict[str, Any]],
+    non_blocking_rules: frozenset[tuple[str | None, str | None]],
+) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for check in checks:
         workflow = check.get("workflow")
