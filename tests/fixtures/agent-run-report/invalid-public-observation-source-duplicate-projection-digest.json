@@ -37,10 +37,48 @@
             "workflow_run_url": null,
             "schema_ref": null,
             "ref": null,
-            "digest": "sha256:60de076e928bc8fe8dc22571a4853039dfa546da4b16d83f92490dc61ad431bf",
+            "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "validation_verdict": "pass"
           },
-          "source_projection_digest": "sha256:60de076e928bc8fe8dc22571a4853039dfa546da4b16d83f92490dc61ad431bf",
+          "source_projection_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "validator_id": "agent-run-report-schema",
+          "validator_policy_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "evidence_mode": "synthetic_only",
+          "checked_at": "2026-06-29T12:00:00Z"
+        }
+      },
+      {
+        "schema_version": "observation_source_result/v1",
+        "source_kind": "google_antigravity",
+        "capability_verdict": "supported",
+        "availability": "available",
+        "projection_mode": "allowlist_projection",
+        "safety": {
+          "verdict": "pass",
+          "raw_values_emitted": false,
+          "forbidden_field_scan": "pass",
+          "reason_codes": []
+        },
+        "metrics": {
+          "trace_count": 1,
+          "span_count": 2,
+          "prompt_tokens": 10,
+          "completion_tokens": 20,
+          "total_tokens": 30
+        },
+        "provenance": {
+          "schema_version": "observation_source_provenance/v1",
+          "ref": {
+            "kind": "observation_projection_digest",
+            "artifact_id": null,
+            "artifact_digest": null,
+            "workflow_run_url": null,
+            "schema_ref": null,
+            "ref": null,
+            "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "validation_verdict": "pass"
+          },
+          "source_projection_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
           "validator_id": "agent-run-report-schema",
           "validator_policy_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "evidence_mode": "synthetic_only",

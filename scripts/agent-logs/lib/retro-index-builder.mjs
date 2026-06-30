@@ -4,12 +4,20 @@ import {
   extractPayloadFromMarkdown,
   validateAgentRunReport,
 } from '../../lib/agent-run-report-validation.mjs'
+import { validateObservationSourceProjection } from './observation-source-adapter.mjs'
 import { parseMarkerComment } from './github-comments.mjs'
 
 export const RETRO_INDEX_ALGORITHM = 'retro-index-builder@1'
 
 const ENTIRECLI_SAFETY_SCHEMA_VERSION = 'entirecli_safety_result/v1'
 const ENTIRECLI_SAFE_VERDICTS = new Set(['safe', 'not_applicable'])
+const OBSERVATION_METRIC_FIELDS = [
+  'trace_count',
+  'span_count',
+  'prompt_tokens',
+  'completion_tokens',
+  'total_tokens',
+]
 export const SCHEMA_MIGRATION_FOLLOW_UP = 'follow-up Issue for docs/schemas/agent-retro-index.schema.json key set migration'
 
 function sha256Hex(text) {
@@ -227,6 +235,89 @@ function buildSourceCommentSetDigest(sourceCommentRefs) {
   return sha256Digest(canonicalizeSourceCommentSet(normalizeSourceCommentSet(sourceCommentRefs)))
 }
 
+function checkPublicObservationSources(payload, markerDigest) {
+  const publicSurfaceKind = payload.public_surface_kind
+  if (publicSurfaceKind === 'none') {
+    return null
+  }
+
+  const observationSources = payload?.public_safety?.observation_sources
+  if (!Array.isArray(observationSources) || observationSources.length === 0) {
+    return {
+      reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+      reason: observationSources === undefined ? 'report_observation_sources_missing' : 'report_observation_sources_empty',
+    }
+  }
+
+  const seenSourceKinds = new Set()
+  const seenSourceProjectionDigests = new Set()
+  for (const source of observationSources) {
+    const sourceKind = source?.source_kind
+    if (typeof sourceKind !== 'string' || sourceKind.length === 0) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: 'report_observation_sources_source_kind',
+      }
+    }
+    if (seenSourceKinds.has(sourceKind)) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: 'report_observation_sources_duplicate_source_kind',
+      }
+    }
+    seenSourceKinds.add(sourceKind)
+
+    const sourceProjectionDigest = source?.provenance?.source_projection_digest
+    if (typeof sourceProjectionDigest !== 'string' || sourceProjectionDigest.length === 0) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: 'report_observation_sources_projection_digest',
+      }
+    }
+    if (seenSourceProjectionDigests.has(sourceProjectionDigest)) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: 'report_observation_sources_duplicate_projection_digest',
+      }
+    }
+    seenSourceProjectionDigests.add(sourceProjectionDigest)
+
+    try {
+      validateObservationSourceProjection(source)
+    } catch (error) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: error?.code === 'observation_source.evidence_mode'
+          ? 'report_observation_sources_evidence_mode'
+          : error?.code === 'observation_source.ref_kind'
+            ? 'report_observation_sources_ref_kind'
+            : 'report_observation_sources_projection_digest_mismatch',
+      }
+    }
+
+    const safety = source?.safety
+    if (safety?.raw_values_emitted === true) {
+      return {
+        reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+        reason: 'report_observation_sources_raw_values_emitted',
+      }
+    }
+
+    if (source?.availability === 'unavailable') {
+      for (const field of OBSERVATION_METRIC_FIELDS) {
+        if (source?.metrics?.[field] !== null) {
+          return {
+            reportDigest: markerDigest ? `sha256:${markerDigest}` : 'sha256:invalid',
+            reason: 'report_observation_sources_unavailable_metrics',
+          }
+        }
+      }
+    }
+  }
+
+  return null
+}
+
 function normalizeSourceComment(sourceComment) {
   const parsedUrl = parseIssueCommentUrl(sourceComment.html_url)
   if (!parsedUrl) {
@@ -286,6 +377,15 @@ function normalizeSourceComment(sourceComment) {
         reportDigest: marker.digest ? `sha256:${marker.digest}` : 'sha256:invalid',
         reason: 'report_entirecli_safety_blocked',
       }
+    }
+  }
+
+  const blockedObservationSources = checkPublicObservationSources(extraction.payload, marker.digest)
+  if (blockedObservationSources !== null) {
+    return {
+      kind: 'blocked',
+      reportDigest: blockedObservationSources.reportDigest,
+      reason: blockedObservationSources.reason,
     }
   }
 

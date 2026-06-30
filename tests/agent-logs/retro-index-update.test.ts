@@ -3,7 +3,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { describe, expect, it } from 'vitest'
 
-import { createValidReport } from '../agent-run-report-test-helpers'
+import { createValidReport } from './report-test-fixtures'
 import { extractPayloadFromMarkdown } from '../../scripts/lib/agent-run-report-validation.mjs'
 import { parseChecklistIssueNumbers, updateRetroIndex, verifyRetroIndexArtifact } from '../../scripts/agent-logs/update-retro-index.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'

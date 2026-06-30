@@ -6,7 +6,53 @@ import { tmpdir } from 'os'
 import { upsertGithubMarkerCommentFromFile } from '../../scripts/agent-logs/upsert-github-marker-comment.mjs'
 import { buildAgentRunReportCommentBody, validateFinalCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown, validateFinalReport } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { computeObservationSourceProjectionDigest } from '../../scripts/agent-logs/lib/observation-source-adapter.mjs'
 import { postAgentRunReport } from '../../scripts/agent-logs/post-agent-run-report.mjs'
+
+function createObservationSource() {
+  const projection = {
+    schema_version: 'observation_source_result/v1',
+    source_kind: 'claude_code',
+    capability_verdict: 'supported',
+    availability: 'available',
+    projection_mode: 'allowlist_projection',
+    safety: {
+      verdict: 'pass',
+      raw_values_emitted: false,
+      forbidden_field_scan: 'pass',
+      reason_codes: [],
+    },
+    metrics: {
+      trace_count: 1,
+      span_count: 2,
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    },
+  }
+  const digest = computeObservationSourceProjectionDigest(projection)
+  return {
+    ...projection,
+    provenance: {
+      schema_version: 'observation_source_provenance/v1',
+      ref: {
+        kind: 'observation_projection_digest',
+        artifact_id: null,
+        artifact_digest: null,
+        workflow_run_url: null,
+        schema_ref: null,
+        ref: null,
+        digest,
+        validation_verdict: 'pass',
+      },
+      source_projection_digest: digest,
+      validator_id: 'agent-run-report-schema',
+      validator_policy_digest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      evidence_mode: 'synthetic_only',
+      checked_at: '2026-06-29T12:00:00Z',
+    },
+  }
+}
 
 function createReport(overrides = {}) {
   return {
@@ -19,6 +65,7 @@ function createReport(overrides = {}) {
       checked_at: '2026-06-17T12:30:00.000Z',
       verdict: 'pass',
       blocked_reasons: [],
+      observation_sources: [createObservationSource()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',
@@ -106,6 +153,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
       entirecli_safety: {
         schema_version: 'entirecli_safety_result/v1',
         verdict: 'not_applicable',
@@ -133,6 +181,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         // no entirecli_safety
       },
     })
@@ -167,6 +216,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'blocked',
@@ -258,6 +308,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         // entirecli_safety absent — must fail-closed
       },
     })
@@ -294,6 +345,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'blocked',
@@ -340,6 +392,7 @@ describe('github comment post guard', () => {
         checked_at: '2026-06-17T12:30:00.000Z',
         verdict: 'pass',
         blocked_reasons: [],
+        observation_sources: [createObservationSource()],
         entirecli_safety: {
           schema_version: 'entirecli_safety_result/v1',
           verdict: 'not_applicable',
