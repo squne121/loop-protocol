@@ -18,12 +18,45 @@ function runValidator(args = []) {
   })
 }
 
+function runNpmValidate(args = []) {
+  return spawnSync('pnpm', ['--silent', 'run', 'validate:roadmap-refs', ...args], {
+    cwd: REPO_ROOT,
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+}
+
 describe('validate roadmap fenced yaml references', () => {
   it('GIVEN valid fixture WHEN validator runs THEN exits 0', () => {
     const result = runValidator(['--file', resolve(FIXTURE_DIR, 'valid.md')])
 
     expect(result.status).toBe(0)
     expect(result.stdout).toContain('[OK]')
+  })
+
+  it('GIVEN positional argument WHEN validator runs THEN exits non-zero as unknown arg', () => {
+    const result = runValidator(['unexpected'])
+
+    expect(result.status).toBe(2)
+    expect(result.stderr).toContain('unknown argument: unexpected')
+  })
+
+  it('GIVEN default target file WHEN node command runs THEN exits 0 with success output and no stderr', () => {
+    const result = runValidator([])
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('[OK] roadmap fenced YAML reference checks passed')
+    expect(result.stdout).toContain('not checked: product-spec lifecycle status')
+    expect(result.stderr).toBe('')
+  })
+
+  it('GIVEN default command via pnpm script WHEN validator runs THEN exits 0 with success output and no stderr', () => {
+    const result = runNpmValidate()
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('[OK] roadmap fenced YAML reference checks passed')
+    expect(result.stdout).toContain('not checked: product-spec lifecycle status')
+    expect(result.stderr).toBe('')
   })
 
   it('GIVEN malformed fixture WHEN validator runs THEN exits non-zero', () => {
@@ -61,11 +94,45 @@ describe('validate roadmap fenced yaml references', () => {
     expect(result.stderr).toContain('stale alias is denied')
   })
 
-  it('GIVEN no flags WHEN validator runs THEN validates default roadmap file', () => {
-    const result = runValidator([])
+  it('GIVEN absolute path fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'absolute-path.md')])
 
-    expect(result.status).not.toBeNull()
-    const output = `${result.stdout}${result.stderr}`
-    expect(output).toContain('roadmap')
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('absolute path is not allowed')
+  })
+
+  it('GIVEN directory fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'directory.md')])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('must point to a regular file')
+  })
+
+  it('GIVEN URL fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'url.md')])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('URL is not allowed')
+  })
+
+  it('GIVEN fragment fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'fragment.md')])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('URL fragment is not allowed in path')
+  })
+
+  it('GIVEN duplicate destination fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'duplicate-destination.md')])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('duplicate item in spec_destination')
+  })
+
+  it('GIVEN empty description fixture WHEN validator runs THEN exits non-zero', () => {
+    const result = runValidator(['--file', resolve(FIXTURE_DIR, 'empty-description.md')])
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('empty destination description')
   })
 })

@@ -24,7 +24,7 @@
  */
 
 import { readFileSync, lstatSync, existsSync } from 'node:fs'
-import { dirname, resolve, isAbsolute } from 'node:path'
+import { dirname, resolve, isAbsolute, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 
@@ -64,11 +64,12 @@ function normalizeArgs(argv) {
       }
       parsed.file = argv[i + 1]
       i += 1
+      continue
     } else if (arg === '-h' || arg === '--help') {
       parsed.help = true
-    } else if (arg.startsWith('--')) {
-      parsed.unknownArgs.push(arg)
+      continue
     }
+    parsed.unknownArgs.push(`unknown argument: ${arg}`)
   }
   return parsed
 }
@@ -137,17 +138,22 @@ function ensureOptionalStringArray(block, blockLabel, field, errors) {
 }
 
 function extractDestinationPath(item, blockLabel, errors) {
-  const delimiter = ' — '
-  const asciiDelimiter = ' - '
-  if (item.includes(delimiter)) {
-    const path = item.slice(0, item.indexOf(delimiter)).trim()
+  const emdashMatch = item.match(/^(.+?)\s—\s*(.*?)$/)
+  if (emdashMatch) {
+    const path = emdashMatch[1].trim()
+    const description = emdashMatch[2].trim()
     if (!path) {
       fail(errors, blockLabel, `empty destination path in "${item}"`)
+      return null
+    }
+    if (!description) {
+      fail(errors, blockLabel, `empty destination description in "${item}"`)
       return null
     }
     return path
   }
 
+  const asciiDelimiter = ' - '
   if (item.includes(asciiDelimiter)) {
     fail(errors, blockLabel, `destination must use em dash separator " — ", got ASCII hyphen: "${item}"`)
     return null
@@ -168,11 +174,15 @@ function ensureSafePath(path, baseDir, blockLabel, errors, options = {}) {
     fail(errors, blockLabel, 'empty path is not allowed')
     return
   }
-  if (path.startsWith('/') || isAbsolute(path) || path.includes('\\')) {
+  if (path.includes('\\')) {
+    fail(errors, blockLabel, `invalid path separator in: ${path}`)
+    return
+  }
+  if (isAbsolute(path)) {
     fail(errors, blockLabel, `absolute path is not allowed: ${path}`)
     return
   }
-  if (path.includes('..')) {
+  if (path.split('/').includes('..')) {
     fail(errors, blockLabel, `path traversal is not allowed: ${path}`)
     return
   }
@@ -190,17 +200,26 @@ function ensureSafePath(path, baseDir, blockLabel, errors, options = {}) {
   }
 
   const candidate = resolve(baseDir, path)
-  if (!existsSync(candidate)) {
-    if (!requireRegularFile) {
-      return
-    }
-    fail(errors, blockLabel, `target does not exist: ${path}`)
+  const repoRelative = relative(REPO_ROOT, candidate)
+  if (repoRelative === '..' || repoRelative.startsWith(`..${sep}`)) {
+    fail(errors, blockLabel, `path escapes repository root: ${path}`)
+    return
+  }
+  if (path === '') {
+    fail(errors, blockLabel, 'empty path is not allowed')
     return
   }
 
-  const normalizedParts = path.split('/')
-  let walk = baseDir
-  for (const part of normalizedParts) {
+  if (!existsSync(candidate)) {
+    if (requireRegularFile) {
+      fail(errors, blockLabel, `target does not exist: ${path}`)
+    }
+    return
+  }
+
+  const parts = path.split('/')
+  let walk = REPO_ROOT
+  for (const part of parts) {
     walk = resolve(walk, part)
     try {
       const st = lstatSync(walk)
@@ -209,12 +228,19 @@ function ensureSafePath(path, baseDir, blockLabel, errors, options = {}) {
         return
       }
     } catch {
-      fail(errors, blockLabel, `path component is inaccessible: ${path}`)
       return
     }
   }
 
   const stat = lstatSync(candidate)
+  if (stat.isSymbolicLink()) {
+    fail(errors, blockLabel, `symlink path component is not allowed: ${path}`)
+    return
+  }
+  if (stat.isDirectory()) {
+    fail(errors, blockLabel, `must point to a regular file: ${path}`)
+    return
+  }
   if (requireRegularFile && !stat.isFile()) {
     fail(errors, blockLabel, `must point to a regular file: ${path}`)
   }
@@ -270,6 +296,7 @@ function validateBlocks(blocks, baseDir, errors) {
         })
       }
     }
+    collectDuplicateErrors(parsedDestinations, 'spec_destination', `${blockLabel}: spec_destination`, errors)
 
     if (requireStrictExistence) {
       if (!prereqs) {
@@ -315,7 +342,11 @@ function main() {
   validateBlocks(blocks, REPO_ROOT, errors)
 
   if (errors.length === 0) {
-    process.stdout.write(`[OK] roadmap references are valid: ${targetPath}\n`)
+    process.stdout.write(
+      '[OK] roadmap fenced YAML reference checks passed\n'
+      + 'checked: YAML parse, duplicate keys, field types, path grammar, M2 expected regular-file references\n'
+      + 'not checked: product-spec lifecycle status, normative authority, semantic consistency\n',
+    )
     return 0
   }
 
