@@ -587,7 +587,6 @@ def _run_gemini_provider_checks(repo_root: Path | None = None, fix: bool = False
 
 
 def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
-    _ = repo_root or _git_repo_root()
     tools_result = check_tools(AGY_REQUIRED_TOOLS)
     agy_preflight = check_agy_preflight() if tools_result["ok"] else {
         "schema": "agy_preflight_result/v1",
@@ -625,6 +624,19 @@ def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -
 
 
 def _run_auto_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    if fix:
+        return {
+            "ok": False,
+            "exit_code": 1,
+            "provider": "auto",
+            "selected_provider": None,
+            "failure_class": "unsupported_provider_option",
+            "failure_reason": "provider=auto does not support --fix; select --provider gemini explicitly",
+            "warnings": [
+                "unsupported_provider_option: provider=auto does not support --fix; select --provider gemini explicitly"
+            ],
+            "provider_attempts": [],
+        }
     provider_attempts: list[dict[str, Any]] = []
     agy_result = _run_agy_provider_checks(repo_root=repo_root, fix=fix)
     provider_attempts.append({

@@ -1106,6 +1106,7 @@ def _normalize_agy_result(
     """
     stdout = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
+    is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
 
     if completed.returncode != 0:
         return {
@@ -1131,6 +1132,8 @@ def _normalize_agy_result(
         }
 
     if not stdout:
+        failure_class = "agy_output_missing" if is_ci else "agy_empty_stdout"
+        warning = "agy_output_missing: exit 0 but stdout was empty"
         return {
             "schema": "delegation_result/v1",
             "transport": "agy",
@@ -1145,9 +1148,9 @@ def _normalize_agy_result(
             "response_text": None,
             "stats": None,
             "stderr": stderr_text or None,
-            "warnings": ["agy_output_missing: exit 0 but stdout was empty"],
-            "failure_reason": "agy_output_missing",
-            "failure_class": "agy_empty_stdout",
+            "warnings": [warning],
+            "failure_reason": failure_class,
+            "failure_class": failure_class,
             "raw_command": _build_agy_raw_command(""),
             "model_chain": [],
             "model_downgrades": [],

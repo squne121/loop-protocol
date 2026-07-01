@@ -13,6 +13,49 @@
 
 ## Live Evidence / 実機証跡
 
+### `preflight_agy.py --json` の sanitized 出力
+
+```json
+{
+  "schema": "agy_preflight_result/v1",
+  "ok": true,
+  "failure_reason": null,
+  "failure_class": null,
+  "recovery_action": null,
+  "agy": {
+    "bin": "agy",
+    "resolved_path": "$HOME/.local/bin/agy",
+    "version": "1.0.14"
+  },
+  "help": {
+    "ok": true,
+    "noninteractive_flags": {
+      "-p": true,
+      "--print": true,
+      "--prompt": true
+    },
+    "unexpected_capabilities": [],
+    "stdout_sample": "",
+    "stderr_sample": "Usage of agy:\n  --add-dir                       Add a directory to the workspace (repeatable) (default [])\n  -c                              Short alias for --continue\n  --continue                      Continue the most recent conversation\n  --conversation                  Resume a previous conversation by ID\n  --dangerously-skip-permissions  Auto-approve all tool permission requests without prompting\n  -i                              Short alias for --prompt-interactive\n  --log-file            "
+  },
+  "smoke": {
+    "ok": true,
+    "argv": [
+      "agy",
+      "-p",
+      "Return exactly: LOOP_AGY_SMOKE_OK"
+    ],
+    "exit_code": 0,
+    "timed_out": false,
+    "failure_reason": null,
+    "failure_class": null,
+    "stdout_sample": "LOOP_AGY_SMOKE_OK\n",
+    "stderr_sample": ""
+  },
+  "warnings": []
+}
+```
+
 ### `agy --version` の結果
 version 出力は次のとおり。
 

@@ -439,3 +439,32 @@ def test_smoke_stderr_and_stdout_samples_are_redacted(monkeypatch):
     assert result["ok"] is True
     assert "secret-key-123" not in result["smoke"]["stderr_sample"]
     assert "<redacted>" in result["smoke"]["stderr_sample"]
+
+
+def test_redaction_happens_before_truncation(monkeypatch):
+    """Long secrets that cross the truncation boundary must still be redacted."""
+    import os
+
+    module = load_module()
+    secret = "x" * 800
+    original = os.environ.get("AGY_API_KEY")
+    os.environ["AGY_API_KEY"] = secret
+    try:
+        sample = module._redact_output_sample(f"prefix {secret} suffix")
+    finally:
+        if original is None:
+            os.environ.pop("AGY_API_KEY", None)
+        else:
+            os.environ["AGY_API_KEY"] = original
+
+    assert "x" * 12 not in sample
+    assert "<redacted" in sample
+
+
+def test_resolved_path_is_masked(monkeypatch):
+    """Resolved binary paths are masked before being emitted as evidence."""
+    module = load_module()
+    monkeypatch.setenv("HOME", "/home/tester")
+
+    assert module._mask_resolved_path("/home/tester/bin/agy") == "$HOME/bin/agy"
+    assert module._mask_resolved_path("/usr/local/bin/agy") == "agy"

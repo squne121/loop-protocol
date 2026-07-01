@@ -18,6 +18,15 @@ SMOKE_TIMEOUT_SECONDS = 20
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
 SMOKE_SAMPLE_MAX_CHARS = 500
+SECRET_ENV_KEYS = (
+    "AGY_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "HF_TOKEN",
+    "GITHUB_TOKEN",
+)
 
 # Regex patterns for flag detection with word boundaries to prevent false positives
 # e.g. --prompting must NOT match -p, --printable must NOT match --print
@@ -41,21 +50,15 @@ def _minimal_agy_env() -> dict[str, str]:
 
 def _redact_output_sample(text: str) -> str:
     """Return a bounded, redacted sample for stdout/stderr capture."""
-    sample = (text or "")[:SMOKE_SAMPLE_MAX_CHARS]
-
-    secret_keys = (
-        "AGY_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENAI_API_KEY",
-        "GOOGLE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "HF_TOKEN",
-        "GITHUB_TOKEN",
-    )
-    for key in secret_keys:
+    sample = text or ""
+    for key in SECRET_ENV_KEYS:
         secret = os.environ.get(key)
         if secret:
             sample = sample.replace(secret, "<redacted>")
+            if len(secret) >= 12:
+                for width in (64, 48, 32, 24, 16, 12):
+                    if len(secret) >= width:
+                        sample = sample.replace(secret[:width], "<redacted-prefix>")
 
     home = os.environ.get("HOME")
     if home:
@@ -64,7 +67,18 @@ def _redact_output_sample(text: str) -> str:
     sample = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "<redacted>", sample)
     sample = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "<redacted>", sample)
 
-    return sample
+    return sample[:SMOKE_SAMPLE_MAX_CHARS]
+
+
+def _mask_resolved_path(path: str | None) -> str | None:
+    """Return a sanitized resolved path suitable for JSON evidence."""
+    if not path:
+        return None
+    home = os.environ.get("HOME")
+    if home and path.startswith(home):
+        suffix = path[len(home):].lstrip("/")
+        return "$HOME" if not suffix else f"$HOME/{suffix}"
+    return Path(path).name
 
 
 def _resolve_binary() -> str:
@@ -126,7 +140,7 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
     """Run smoke check: `agy -p <SMOKE_PROMPT>` in isolated temp cwd.
 
     Returns dict with ok, argv, exit_code, timed_out, stdout_sample, stderr_sample.
-    Success requires exit_code == 0 AND non-empty stdout (detects silent output drop).
+    Success requires exit_code == 0 AND exact sentinel stdout.
     """
     argv = [agy_bin, "-p", SMOKE_PROMPT]
     smoke: dict[str, Any] = {
@@ -223,7 +237,7 @@ def run_preflight() -> dict[str, Any]:
     try:
         import shutil
         resolved = shutil.which(agy_bin)
-        result["agy"]["resolved_path"] = resolved
+        result["agy"]["resolved_path"] = _mask_resolved_path(resolved)
     except Exception:
         pass
 

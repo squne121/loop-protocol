@@ -3,7 +3,7 @@
 ## 正本配置（Canonical Path）
 - 正本は `.claude/skills/gemini-cli-headless-delegation/` に置く。
 - Gemini を直接 ad hoc に叩かず、必ず `scripts/run_gemini_headless.py` を経由する。
-- provider 固有の差分は caller 側の request JSON に閉じ込め、wrapper の contract を変えない。
+- provider 固有の差分は caller 側の request JSON に閉じ込めつつ、wrapper では provider-aware extension として明示管理する。
 
 ## 共通 wrapper 呼び出し手順（Common Wrapper Invocation）
 共通実行コマンドは次のとおり。

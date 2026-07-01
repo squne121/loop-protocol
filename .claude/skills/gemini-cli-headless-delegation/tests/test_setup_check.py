@@ -293,6 +293,21 @@ def test_auto_provider_reports_attempt_order(monkeypatch, tmp_path):
     assert [entry["provider"] for entry in result["provider_attempts"]] == ["agy", "gemini"]
 
 
+def test_auto_provider_fix_is_rejected(tmp_path):
+    """provider=auto --fix は副作用対象が曖昧なので fail-closed。"""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="auto", fix=True)
+
+    assert result["ok"] is False
+    assert result["provider"] == "auto"
+    assert result["selected_provider"] is None
+    assert result["failure_class"] == "unsupported_provider_option"
+    assert "provider=auto does not support --fix" in result["failure_reason"]
+
+
 # ---------------------------------------------------------------------------
 # AC2: trustedFolders.json — TRUST_FOLDER exact match → no-op (dict schema)
 # ---------------------------------------------------------------------------

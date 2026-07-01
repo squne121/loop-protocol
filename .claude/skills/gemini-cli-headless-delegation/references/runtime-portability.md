@@ -9,6 +9,8 @@
 
 ## Prerequisites
 
+### `provider=gemini`
+
 - Node.js 18+ がインストール済みであること（`node --version` で確認）
   - `gemini` CLI は `@google/gemini-cli` Node.js パッケージとして提供される
   - nvm 経由のインストールを推奨: `nvm install --lts`
@@ -17,6 +19,14 @@
 - Python 3.10+ が利用可能であること
 - `uv` が利用可能であること（テスト実行用）
 - Google アカウントによる認証が完了していること
+
+### `provider=agy`
+
+- `agy` CLI がインストール済みであること（`agy --version` で確認）
+- Python 3.10+ が利用可能であること
+- `uv` が利用可能であること（`setup_check.py` / `preflight_agy.py` 実行用）
+- Node.js / `gemini` CLI / `uvx` / Serena MCP / `.gemini/settings.json` / trustedFolders / Gemini OAuth は不要
+- `setup_check.py --provider agy --json` は check-only で、`.gemini/` や trustedFolders を変更しない
 
 ## Execution from Claude Code (WSL2)
 
@@ -30,7 +40,7 @@ cat tmp/gemini-headless-preflight.json
 
 ### 2. Request JSON を作成
 
-`delegation_request_v1` スキーマで request ファイルを作成する（`references/usage-contract.md` の Request Contract 参照）。
+`provider=gemini` では `delegation_request_v1` スキーマで request ファイルを作成する（`references/usage-contract.md` の Request Contract 参照）。
 
 ```json
 {
@@ -236,7 +246,19 @@ else
 fi
 ```
 
-`setup_check.py --provider agy` は現時点では未実装（Followup Issue 対応）。
+### `setup_check.py --provider agy` の expected shape
+
+`setup_check.py --provider agy --json` は次を返す。
+
+- `provider: "agy"`
+- `selected_provider: "agy"`
+- `tools`: `agy` / `python3` / `uv` の version probe
+- `agy_preflight`: `preflight_agy.py --json` 相当の sanitized result
+- `skipped_gemini_checks`: `trusted_folders` / `serena_mcp` / `gemini_settings` / `auth` / `node` / `gemini` / `uvx`
+
+`setup_check.py --provider agy --json --fix` は mutation を行わず、`unsupported_provider_option` で fail-closed する。
+`setup_check.py --provider auto --json` は `agy` を先に probe し、成功時は `selected_provider: "agy"` を返す。
+`setup_check.py --provider auto --json --fix` は副作用対象が曖昧なため `unsupported_provider_option` で拒否する。
 
 ### AC5 / AC10: AGY_BIN override と precedence
 
@@ -270,6 +292,7 @@ ${AGY_BIN:-agy} --version
 - `AGY_BIN` は basename または `<AGY_BIN>` placeholder で表示する（絶対パスをそのまま出力しない）
 - `$HOME` 配下の絶対パスは `$HOME/...` 形式に再マスクする（展開後の絶対パスをそのまま記録しない）
 - secret らしい値・token・query string・認証情報を含む path は出力禁止
+- `resolved_path` は basename または `$HOME/...` mask だけを保存し、フル絶対パスは evidence に残さない
 
 ### AC9: non-TTY / pipe / CI 環境での fail-closed
 
@@ -286,6 +309,31 @@ ${AGY_BIN:-agy} --version
 non-TTY / pipe 環境で `agy -p` が exit 0 かつ stdout 空になった場合は、
 agy が TTY 検出により出力を抑制した可能性があるため、**fail-closed** として扱う。
 stdout が空の場合や sentinel 不一致の場合に PASS として扱う設計は禁止（partial / silent response を PASS に変換しない）。
+
+## minimal env と認証境界
+
+`preflight_agy.py` / `run_gemini_headless.py provider=agy` は secret leakage を避けるため、
+child process に親 env をそのまま継承せず、`PATH` / `HOME` / locale / XDG 系だけを allowlist する。
+
+- `GEMINI_API_KEY` / `AGY_API_KEY` のような secret env は継承しない
+- 認証が system keyring / desktop session / dbus / runtime dir に依存する環境では fail-closed し得る
+- その場合は allowlist 拡張を人間レビューで判断する
+- stdout / stderr sample は redact-before-truncate で保存する
+
+## Live Evidence 保存方針
+
+`docs/dev/agy-cli-contract-20260701.md` は手書きメモではなく、sanitized `preflight_agy.py --json` 出力を要約する一次証跡として維持する。
+少なくとも次を残す。
+
+- `schema`
+- `ok`
+- `agy.version`
+- `help.noninteractive_flags`
+- `smoke.exit_code`
+- `smoke.stdout_sample`
+- `smoke.failure_class`
+- `tty_condition`
+- `redaction_policy`
 
 ```bash
 # CI 環境での確認例（sentinel exact match）
