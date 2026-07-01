@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  applyBootstrapLoopPhaseTransition,
+  isBootstrapTransitionAllowed,
   LOOP_PHASE_TRANSITIONS,
   resolvePhaseTransition,
 } from '../src/systems/PhaseTransitionSystem'
+import { createInitialGameState } from '../src/state'
 
 describe('PhaseTransitionSystem', () => {
   it('lists the allowed transitions for each LoopPhase', () => {
@@ -57,5 +60,23 @@ describe('PhaseTransitionSystem', () => {
       ok: true,
       nextPhase: 'result',
     })
+  })
+
+  it('GIVEN default bootstrap state WHEN title_menu transition is applied THEN transition is allowed and state moves to title_menu', () => {
+    const state = createInitialGameState()
+
+    expect(isBootstrapTransitionAllowed(state.loopPhase, 'title_menu')).toBe(true)
+    applyBootstrapLoopPhaseTransition(state, 'title_menu')
+
+    expect(state.loopPhase).toBe('title_menu')
+  })
+
+  it('GIVEN default bootstrap state WHEN invalid transition is applied THEN helper throws', () => {
+    const state = createInitialGameState()
+
+    expect(isBootstrapTransitionAllowed(state.loopPhase, 'running')).toBe(false)
+    expect(() => applyBootstrapLoopPhaseTransition(state, 'running')).toThrow(
+      'Invalid bootstrap loop-phase transition: preparation -> running',
+    )
   })
 })

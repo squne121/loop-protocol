@@ -26,6 +26,7 @@ import {
 } from './storage'
 import {
   advanceSimulationLoop,
+  applyBootstrapLoopPhaseTransition,
   clampPlayerToArena,
   claimPendingReward,
   confirmResult,
@@ -259,10 +260,7 @@ const startupProbe = storage.load()
 let hasLoadableSnapshot = startupProbe.ok && startupProbe.snapshot !== null
 let state: GameState = createInitialGameState()
 // B1: Start in title_menu phase (not preparation).
-const bootstrapTransition = resolvePhaseTransition('title_menu', 'title_menu')
-if (bootstrapTransition.ok) {
-  state.loopPhase = bootstrapTransition.nextPhase
-}
+applyBootstrapLoopPhaseTransition(state, 'title_menu')
 
 function transitionToPhase(targetPhase: LoopPhase): boolean {
   const transition = resolvePhaseTransition(state.loopPhase, targetPhase)

@@ -7,7 +7,11 @@ import {
   claimPendingReward,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
-import { resolvePhaseTransition } from '../src/systems/PhaseTransitionSystem'
+import {
+  applyBootstrapLoopPhaseTransition,
+  isBootstrapTransitionAllowed,
+  resolvePhaseTransition,
+} from '../src/systems/PhaseTransitionSystem'
 import { queueAssistPlayerCommand, runProgressionSave, runLoadGame } from '../src/main'
 import { createInputState, mapInputToCommands } from '../src/input'
 import type { SaveResult } from '../src/storage'
@@ -136,6 +140,15 @@ describe('B1: initial state is title_menu', () => {
     // This test documents the contract: main.ts must explicitly set title_menu.
     const state = createInitialGameState()
     expect(state.loopPhase).toBe('preparation')
+  })
+
+  it('GIVEN bootstrap state default WHEN title_menu transition is validated THEN bootstrap can transition to title_menu', () => {
+    const state = createInitialGameState()
+
+    expect(isBootstrapTransitionAllowed(state.loopPhase, 'title_menu')).toBe(true)
+    applyBootstrapLoopPhaseTransition(state, 'title_menu')
+
+    expect(state.loopPhase).toBe('title_menu')
   })
 })
 
