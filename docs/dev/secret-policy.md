@@ -276,8 +276,26 @@ session_recording_script_contract:
       inspection_complete: true
       pilot_activation_state: allow
       pilot_exception_decision: approve_timeboxed_real_pilot
+      pilot_exception_malformed: false
       pilot_exception_reason_codes: []
-      source_digest: present
+      pilot_exception_raw_values_emitted: false
+      source_digest: sha256_64hex
+      components.latitude.verdict: safe
+      components.latitude.inspection_complete: true
+      components.latitude.distribution.state: verified
+      registry_signature_verified: true
+      provenance_verified: true
+    blocked_or_fail_closed_until:
+      - "#1261 による distribution exact package provenance"
+      - "#1261 による argv exposure cleanup evidence"
+      - "#1261 による remote cleanup machine verification"
+    exit_semantics:
+      blocked:
+        exit_code: 1
+        meaning: required human follow-up or unresolved blocker remains
+      fail_closed:
+        exit_code: 2
+        meaning: malformed_or_unknown_or_non_host_input
 ```
 
 ---

@@ -319,6 +319,8 @@ real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev
   Claude Code hook は matching する全 hook が並列実行されるため、hook の通過を activation 証明にしない。
 - `latitude:real-pilot:preflight` は上記 host verifier JSON を strict mode で再評価する
   sole real-pilot pre-session gate であり、`decision: allow` 単独や fixture PASS を allow 根拠にしない。
+- `latitude:real-pilot:preflight` は #1261 完了まで distribution / argv / remote cleanup evidence を
+  充足済みとみなさず、blocked または fail_closed のまま維持する。
 - `security:session-recording` は CI / policy / smoke bundle であり、host readiness proof ではない。
 - `security:session-recording:host` は pre-activation local preflight 専用であり、
   `SRRS_*` override を reject する。generic CI required gate には組み込まない。
@@ -326,6 +328,16 @@ real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev
   `security:session-recording:runtime` は fixture alias 互換面であり、host proof として扱わない。
 - host preflight の blocked / deny は CI required gate failure ではなく、
   real pilot blocked evidence として扱う。
+
+```yaml
+real_pilot_preflight_exit_semantics:
+  blocked:
+    exit_code: 1
+    meaning: required_activation_evidence_or_cleanup_still_missing
+  fail_closed:
+    exit_code: 2
+    meaning: malformed_unknown_fixture_or_non_host_input
+```
 
 ### Parent #1153 Child の prerequisite 参照（前提条件の参照）
 

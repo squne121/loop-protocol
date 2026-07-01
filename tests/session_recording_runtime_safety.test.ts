@@ -11,7 +11,8 @@
  */
 
 import { spawnSync } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
 import { resolve, join } from 'path'
 import { describe, expect, it } from 'vitest'
 
@@ -700,9 +701,6 @@ function runRealPilotPreflight(
   delete fullEnv['LATITUDE_BASE_URL']
   delete fullEnv['LATITUDE_DEBUG']
   delete fullEnv['BUN_OPTIONS']
-  if (executionProfile === 'fixture') {
-    fullEnv['SRRS_ALLOW_REAL_PILOT_PREFLIGHT_FIXTURE'] = '1'
-  }
   Object.assign(fullEnv, baseEnv)
 
   const result = spawnSync(
@@ -723,6 +721,35 @@ function runRealPilotPreflight(
     stderr: result.stderr ?? '',
     exitCode: result.status ?? EXIT_FAIL,
     json: parsed,
+  }
+}
+
+function runPreflightPredicate(
+  inputJson: Record<string, unknown>,
+): { stdout: string; stderr: string; exitCode: number; json: Record<string, unknown> | null } {
+  const tempDir = mkdtempSync(join(tmpdir(), 'issue-1258-preflight-'))
+  const inputPath = join(tempDir, 'input.json')
+  writeFileSync(inputPath, JSON.stringify(inputJson, null, 2), 'utf-8')
+  try {
+    const result = spawnSync(
+      'python3',
+      [SCRIPT, '--preflight-input-json', inputPath],
+      { encoding: 'utf-8', timeout: 30000 }
+    )
+    let parsed: Record<string, unknown> | null = null
+    try {
+      parsed = JSON.parse(result.stdout ?? '')
+    } catch {
+      // ignore parse errors
+    }
+    return {
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+      exitCode: result.status ?? EXIT_FAIL,
+      json: parsed,
+    }
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true })
   }
 }
 
@@ -1652,6 +1679,46 @@ function pilotReasons(json: Record<string, unknown> | null): string[] {
   return (pilotOf(json)['reason_codes'] as string[]) ?? []
 }
 
+function makeStrictPreflightFixture(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    schema: 'session_recording_runtime_safety/v2',
+    decision: 'allow',
+    verdict: 'safe',
+    inspection_complete: true,
+    exit_code: EXIT_PASS,
+    execution_profile: 'host',
+    policy: {
+      source: 'docs/dev/secret-policy.md',
+      source_digest: `sha256:${'a'.repeat(64)}`,
+      current_secrets_mode: 'none',
+    },
+    components: {
+      latitude: {
+        verdict: 'safe',
+        inspection_complete: true,
+        distribution: {
+          state: 'verified',
+          registry_signature_verified: true,
+          provenance_verified: true,
+        },
+      },
+    },
+    pilot_exception: {
+      decision: 'approve_timeboxed_real_pilot',
+      malformed: false,
+      reason_codes: [],
+      raw_values_emitted: false,
+    },
+    pilot_activation_state: 'allow',
+  }
+  return {
+    ...base,
+    ...overrides,
+  }
+}
+
 describe('runtime safety #1220: marker count must be exactly 1', () => {
   it('GIVEN LATITUDE_PILOT_EXCEPTION_V1 marker count 0 WHEN verifier runs THEN fail_closed (exit 2)', () => {
     const result = runVerifierJson({
@@ -1863,19 +1930,10 @@ describe('runtime safety #1220: deterministic fixture gate (security:session-rec
 })
 
 describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () => {
-  it('GIVEN execution_profile=fixture WHEN strict preflight runs THEN fail_closed and deny', () => {
-    const result = runRealPilotPreflight({
-      ...SAFE_LAT_BASE,
-      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
-      SRRS_LAT_PILOT_MARKER_COUNT: '1',
-      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
-      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
-      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
-      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
-      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
-      SRRS_LAT_DIST_INTEGRITY: 'verified',
-      SRRS_LAT_DIST_PROVENANCE: 'verified',
-    }, 'fixture')
+  it('GIVEN predicate input has execution_profile=fixture WHEN strict preflight runs THEN fail_closed and deny', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      execution_profile: 'fixture',
+    }))
     expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
     expect(result.json?.['decision']).toBe('deny')
     expect(result.json?.['verdict']).toBe('fail_closed')
@@ -1896,7 +1954,15 @@ describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () =
     expect(result.json?.['verdict']).toBe('fail_closed')
   })
 
-  it('GIVEN approve_timeboxed_real_pilot but distribution provenance unknown WHEN strict preflight runs THEN blocked deny', () => {
+  it('GIVEN positive allow matrix WHEN strict predicate runs THEN allow and pass', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture())
+    expect(result.exitCode).toBe(EXIT_PASS)
+    expect(result.json?.['decision']).toBe('allow')
+    expect(result.json?.['verdict']).toBe('safe')
+    expect(result.json?.['inspection_complete']).toBe(true)
+  })
+
+  it('GIVEN approve_timeboxed_real_pilot but distribution provenance unknown WHEN strict preflight runs THEN fail_closed deny', () => {
     const result = runRealPilotPreflight({
       ...SAFE_LAT_BASE,
       SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
@@ -1909,9 +1975,9 @@ describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () =
       SRRS_LAT_DIST_INTEGRITY: 'verified',
       SRRS_LAT_DIST_PROVENANCE: 'unknown',
     })
-    expect(result.exitCode).toBe(EXIT_FAIL)
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
     expect(result.json?.['decision']).toBe('deny')
-    expect(result.json?.['verdict']).toBe('blocked')
+    expect(result.json?.['verdict']).toBe('fail_closed')
   })
 
   it('GIVEN approve_timeboxed_real_pilot with pinned package but unresolved distribution evidence WHEN strict preflight runs THEN fail_closed', () => {
@@ -1931,6 +1997,158 @@ describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () =
     expect(result.json?.['decision']).toBe('deny')
     expect(result.json?.['verdict']).toBe('fail_closed')
     expect(result.json?.['pilot_activation_state']).toBe('allow')
+  })
+
+  it('GIVEN pilot_activation_state=active WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      pilot_activation_state: 'active',
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN pilot_exception.malformed=true WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      pilot_exception: {
+        decision: 'approve_timeboxed_real_pilot',
+        malformed: true,
+        reason_codes: [],
+        raw_values_emitted: false,
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN pilot_exception.reason_codes is non-empty WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      pilot_exception: {
+        decision: 'approve_timeboxed_real_pilot',
+        malformed: false,
+        reason_codes: ['latitude_pilot_distribution_digests_incomplete'],
+        raw_values_emitted: false,
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN pilot_exception.raw_values_emitted=true WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      pilot_exception: {
+        decision: 'approve_timeboxed_real_pilot',
+        malformed: false,
+        reason_codes: [],
+        raw_values_emitted: true,
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  for (const sourceDigest of [null, 'unknown', '', 'sha256:not64hex', 'present']) {
+    it(`GIVEN source_digest=${String(sourceDigest)} WHEN strict predicate runs THEN fail_closed`, () => {
+      const result = runPreflightPredicate(makeStrictPreflightFixture({
+        policy: {
+          source: 'docs/dev/secret-policy.md',
+          source_digest: sourceDigest,
+          current_secrets_mode: 'none',
+        },
+      }))
+      expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+      expect(result.json?.['verdict']).toBe('fail_closed')
+    })
+  }
+
+  it('GIVEN components.latitude.verdict!=safe WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          verdict: 'blocked',
+          inspection_complete: true,
+          distribution: {
+            state: 'verified',
+            registry_signature_verified: true,
+            provenance_verified: true,
+          },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN components.latitude.inspection_complete=false WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          verdict: 'safe',
+          inspection_complete: false,
+          distribution: {
+            state: 'verified',
+            registry_signature_verified: true,
+            provenance_verified: true,
+          },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN distribution.state!=verified WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          verdict: 'safe',
+          inspection_complete: true,
+          distribution: {
+            state: 'unknown',
+            registry_signature_verified: true,
+            provenance_verified: true,
+          },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN registry_signature_verified!=true WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          verdict: 'safe',
+          inspection_complete: true,
+          distribution: {
+            state: 'verified',
+            registry_signature_verified: false,
+            provenance_verified: true,
+          },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN provenance_verified!=true WHEN strict predicate runs THEN fail_closed', () => {
+    const result = runPreflightPredicate(makeStrictPreflightFixture({
+      components: {
+        latitude: {
+          verdict: 'safe',
+          inspection_complete: true,
+          distribution: {
+            state: 'verified',
+            registry_signature_verified: true,
+            provenance_verified: false,
+          },
+        },
+      },
+    }))
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
   })
 })
 
