@@ -279,11 +279,31 @@ export function parseGhHttpResponse(rawText) {
   const statusIndex = lines.findIndex((line) => line === statusLine)
   const bodyLines = statusIndex === -1 ? [] : lines.slice(statusIndex + 1)
   const separatorIndex = bodyLines.findIndex((line) => line.trim() === '')
+  const headerLines = separatorIndex === -1 ? bodyLines : bodyLines.slice(0, separatorIndex)
   const responseBody = separatorIndex === -1 ? '' : bodyLines.slice(separatorIndex + 1).join('\n').trim()
-  return {
+  const headers = {}
+  for (const line of headerLines) {
+    const separator = line.indexOf(':')
+    if (separator === -1) {
+      continue
+    }
+    const name = line.slice(0, separator).trim().toLowerCase()
+    const value = line.slice(separator + 1).trim()
+    if (name.length > 0) {
+      headers[name] = value
+    }
+  }
+  const parsed = {
     httpStatus,
     responseBody,
   }
+  Object.defineProperty(parsed, 'headers', {
+    value: headers,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  })
+  return parsed
 }
 
 function runGhApi(args, { stdinJson = null } = {}) {
@@ -293,7 +313,7 @@ function runGhApi(args, { stdinJson = null } = {}) {
     input: stdinJson === null ? undefined : JSON.stringify(stdinJson),
   })
   const mergedOutput = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim()
-  const { httpStatus, responseBody } = parseGhHttpResponse(mergedOutput)
+  const { httpStatus, responseBody, headers } = parseGhHttpResponse(mergedOutput)
 
   if (result.status !== 0) {
     throw new GithubApiError('github api request failed', {
@@ -310,18 +330,45 @@ function runGhApi(args, { stdinJson = null } = {}) {
 
   return {
     httpStatus,
+    headers,
     body: parsedBody,
   }
 }
 
+function parseLinkHeader(linkHeader) {
+  if (typeof linkHeader !== 'string' || linkHeader.trim().length === 0) {
+    return []
+  }
+  return linkHeader.split(',').map((entry) => {
+    const trimmed = entry.trim()
+    const match = trimmed.match(/^<(?<url>[^>]+)>\s*;\s*rel="(?<rel>[^"]+)"$/u)
+    if (!match?.groups) {
+      return null
+    }
+    return {
+      url: match.groups.url,
+      rel: match.groups.rel,
+    }
+  }).filter(Boolean)
+}
+
 export class GhCliIssueCommentsClient {
   async listIssueComments({ repo, issueNumber, page, perPage }) {
+    const response = await this.listIssueCommentsPage({ repo, issueNumber, page, perPage })
+    return response.items
+  }
+
+  async listIssueCommentsPage({ repo, issueNumber, page, perPage }) {
     const response = runGhApi([
       '-H', 'Accept: application/vnd.github+json',
       '-H', 'X-GitHub-Api-Version: 2022-11-28',
       `repos/${repo}/issues/${issueNumber}/comments?per_page=${perPage}&page=${page}`,
     ])
-    return Array.isArray(response.body) ? response.body : []
+    const links = parseLinkHeader(response.headers.link)
+    return {
+      items: Array.isArray(response.body) ? response.body : [],
+      hasNextPage: links.some((link) => link.rel === 'next'),
+    }
   }
 
   async createIssueComment({ repo, issueNumber, body }) {
@@ -349,6 +396,15 @@ export class GhCliIssueCommentsClient {
     })
     return response.body
   }
+
+  async getIssueComment({ repo, commentId }) {
+    const response = runGhApi([
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      `repos/${repo}/issues/comments/${commentId}`,
+    ])
+    return response.body
+  }
 }
 
 export async function listAllIssueComments(client, { repo, issueNumber, perPage = 100 }) {
@@ -371,9 +427,12 @@ export async function listAllIssueCommentsStructured(client, {
 }) {
   const comments = []
   for (let page = 1; page <= maxPages; page += 1) {
-    const pageItems = await client.listIssueComments({ repo, issueNumber, page, perPage })
+    const pageResult = typeof client.listIssueCommentsPage === 'function'
+      ? await client.listIssueCommentsPage({ repo, issueNumber, page, perPage })
+      : { items: await client.listIssueComments({ repo, issueNumber, page, perPage }), hasNextPage: null }
+    const pageItems = Array.isArray(pageResult.items) ? pageResult.items : []
     comments.push(...pageItems)
-    if (pageItems.length < perPage) {
+    if (pageResult.hasNextPage === false || (pageResult.hasNextPage === null && pageItems.length < perPage)) {
       return {
         comments,
         pageCount: page,
@@ -382,7 +441,9 @@ export async function listAllIssueCommentsStructured(client, {
         perPage,
         endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
         pagination_exhausted: false,
+        page_budget_exhausted: false,
         lastPageSize: pageItems.length,
+        pagination_mode: pageResult.hasNextPage === null ? 'fixed_page_budget' : 'link_header',
       }
     }
     if (page === maxPages) {
@@ -393,8 +454,10 @@ export async function listAllIssueCommentsStructured(client, {
         maxPages,
         perPage,
         endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
-        pagination_exhausted: true,
+        pagination_exhausted: pageResult.hasNextPage === null,
+        page_budget_exhausted: pageResult.hasNextPage !== false,
         lastPageSize: pageItems.length,
+        pagination_mode: pageResult.hasNextPage === null ? 'fixed_page_budget' : 'link_header',
       }
     }
   }
@@ -406,7 +469,9 @@ export async function listAllIssueCommentsStructured(client, {
     perPage,
     endpoint: `repos/${repo}/issues/${issueNumber}/comments`,
     pagination_exhausted: false,
+    page_budget_exhausted: false,
     lastPageSize: 0,
+    pagination_mode: 'fixed_page_budget',
   }
 }
 

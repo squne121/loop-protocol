@@ -52,12 +52,33 @@ Stop Condition に到達する前に次フェーズへ進まない。
 
 - `agent-run:finalize` は public-safe な `agent_run_report/v1` artifact を生成し、validation を通す責務を持つ
 - `agent-run:post` は **validated `agent_run_report` の GitHub upsert 専用** であり、`CHATGPT_RETRO_CONTEXT_V1` marker の更新責務を含めない
-- agent-run:post は validated `agent_run_report` の GitHub upsert 専用であり、ChatGPT retro marker 更新責務を含めない
+<!-- verification-anchor: agent-run:post は validated agent_run_report の GitHub upsert 専用 -->
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
 - `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
-- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、pagination exhausted まで live scan した上で `resolved | missing | blocked_duplicate | blocked_malformed | blocked_pagination_exhausted | blocked_stale_write` の structured result を返す live resolver である
+- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
+- `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
+- `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
 
 この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
+
+### ChatGPT retro marker の二層構造 / Outer Marker vs Inner Payload
+
+outer comment ownership marker と embedded payload marker は別契約である。混同しないこと。
+
+```text
+<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=pull_request:1254 parent_issue=1245 -->
+<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=<sha256(payload markdown)> -->
+
+<!-- CHATGPT_RETRO_CONTEXT_V1 start -->
+```json
+{ "schema": "chatgpt_retro_context_marker/v1", "canonicalization": { "payload_digest": "sha256:..." } }
+```
+<!-- CHATGPT_RETRO_CONTEXT_V1 end -->
+```
+
+- outer digest は payload markdown 全体の sha256 である
+- inner `canonicalization.payload_digest` は JSON payload の canonical digest である
+- `resolve-live` は outer 2-line marker の ownership を確認した後、inner payload・run report comment・retro index comment・source-set digest を live 再検証する
 
 ## Review Correction Loop / レビュー修正ループ
 

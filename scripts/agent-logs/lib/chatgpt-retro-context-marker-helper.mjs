@@ -31,6 +31,7 @@ export const CHATGPT_RETRO_CONTEXT_DIGEST_PATTERN = /^<!--\s*CHATGPT_RETRO_CONTE
 
 const OWNERSHIP_SCAN = /<!--\s*CHATGPT_RETRO_CONTEXT_V1\s+repo=[^>]*-->/gu
 const DIGEST_SCAN = /<!--\s*CHATGPT_RETRO_CONTEXT_DIGEST_V1\b[^>]*-->/giu
+const MARKER_LIKE_SCAN = /CHATGPT_RETRO_CONTEXT_(?:V1|DIGEST_V1)/u
 const MAX_GITHUB_COMMENT_BYTES = 65536
 const CLI_OPTION_SPEC = {
   '--command': { key: 'command', required: true },
@@ -130,6 +131,10 @@ function ownershipEquals(left, right) {
     && left.targetType === right.targetType
     && left.targetNumber === right.targetNumber
     && left.parentIssue === right.parentIssue
+}
+
+function isMarkerLikeComment(body) {
+  return typeof body === 'string' && MARKER_LIKE_SCAN.test(body)
 }
 
 export function validateChatgptRetroContextCommentBody(body, {
@@ -337,6 +342,19 @@ export async function upsertChatgptRetroContextComment(client, {
       comment_url: existing.comment?.html_url ?? existing.comment?.url ?? null,
     }
   }
+  if (typeof client.getIssueComment === 'function') {
+    const refreshedComment = await client.getIssueComment({
+      repo,
+      commentId: existing.comment.id,
+    })
+    const refreshedParsed = parseChatgptRetroContextComment(refreshedComment)
+    if (!refreshedParsed.ownership || !ownershipEquals(refreshedParsed.ownership, ownership) || refreshedParsed.malformed) {
+      throw runtimeError('chatgpt_retro_context.blocked_malformed', 'existing context marker comment became malformed before update')
+    }
+    if (refreshedParsed.digest !== expectedSupersedesDigest) {
+      throw runtimeError('chatgpt_retro_context.blocked_stale_write', 'existing context marker digest changed before update')
+    }
+  }
   const updated = await client.updateIssueComment({
     repo,
     commentId: existing.comment.id,
@@ -347,6 +365,7 @@ export async function upsertChatgptRetroContextComment(client, {
     digest: candidate.digest,
     comment_id: updated?.id ?? existing.comment?.id ?? null,
     comment_url: updated?.html_url ?? updated?.url ?? existing.comment?.html_url ?? null,
+    superseded_digest: expectedSupersedesDigest,
   }
 }
 
@@ -354,209 +373,43 @@ function commentUrlFromResponse(response) {
   return response?.html_url ?? response?.url ?? null
 }
 
-export async function resolveChatgptRetroContextLive(client, {
-  repo,
-  targetType,
-  targetNumber,
-  parentIssue,
-  markerCommentUrl = null,
-}) {
-  const ownership = buildChatgptRetroContextOwnership({ repo, targetType, targetNumber, parentIssue })
-  const listed = await listAllIssueCommentsStructured(client, {
-    repo: ownership.repo,
-    issueNumber: ownership.targetNumber,
-  })
-  const target = {
-    type: ownership.targetType,
-    number: ownership.targetNumber,
-    endpoint_kind: ownership.targetType === 'pull_request' ? 'issue_comments_for_pull_request' : 'issue_comments_for_issue',
-  }
-  const pagination = {
-    page_count: listed.pageCount,
-    scanned_comments: listed.scannedComments,
-    max_pages: listed.maxPages,
-    per_page: listed.perPage,
-    endpoint: listed.endpoint,
-  }
+function parseIssueNumberFromCommentUrl(url) {
+  const match = typeof url === 'string'
+    ? url.match(/\/(?:issues|pull)\/(?<issueNumber>[0-9]+)#issuecomment-[0-9]+$/u)
+    : null
+  return match?.groups ? Number(match.groups.issueNumber) : null
+}
 
-  if (listed.pagination_exhausted) {
-    return {
-      status: 'blocked_pagination_exhausted',
-      repo: ownership.repo,
-      target,
-      parent_issue: ownership.parentIssue,
-      marker_comment_url: markerCommentUrl,
-      pagination,
-      comment_count: listed.comments.length,
-      matched_comment_count: 0,
-      marker_comment: null,
-      digest: null,
+async function listCommentsByIssueNumber(client, { repo, issueNumber }) {
+  return listAllIssueCommentsStructured(client, { repo, issueNumber })
+}
+
+async function loadReferencedCommentUniverse(client, ownership, matchCommentUrl) {
+  const issueNumbers = new Set([ownership.targetNumber, ownership.parentIssue])
+  if (typeof matchCommentUrl === 'string') {
+    const parsedIssueNumber = parseIssueNumberFromCommentUrl(matchCommentUrl)
+    if (parsedIssueNumber !== null) {
+      issueNumbers.add(parsedIssueNumber)
     }
   }
-
-  const parsedComments = listed.comments.map((comment) => parseChatgptRetroContextComment(comment))
-  const matches = parsedComments.filter((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership))
-  const malformed = matches.find((entry) => entry.malformed)
-  if (malformed) {
-    return {
-      status: 'blocked_malformed',
+  const pages = []
+  for (const issueNumber of issueNumbers) {
+    pages.push(await listCommentsByIssueNumber(client, {
       repo: ownership.repo,
-      target,
-      parent_issue: ownership.parentIssue,
-      marker_comment_url: commentUrlFromResponse(malformed.comment),
-      pagination,
-      comment_count: listed.comments.length,
-      matched_comment_count: matches.length,
-      marker_comment: {
-        id: malformed.comment?.id ?? null,
-        url: commentUrlFromResponse(malformed.comment),
-      },
-      digest: malformed.digest,
-    }
-  }
-
-  if (matches.length >= 2) {
-    return {
-      status: 'blocked_duplicate',
-      repo: ownership.repo,
-      target,
-      parent_issue: ownership.parentIssue,
-      marker_comment_url: markerCommentUrl,
-      pagination,
-      comment_count: listed.comments.length,
-      matched_comment_count: matches.length,
-      marker_comment: null,
-      digest: null,
-    }
-  }
-
-  const [match] = matches
-  if (!match) {
-    return {
-      status: 'missing',
-      repo: ownership.repo,
-      target,
-      parent_issue: ownership.parentIssue,
-      marker_comment_url: markerCommentUrl,
-      pagination,
-      comment_count: listed.comments.length,
-      matched_comment_count: 0,
-      marker_comment: null,
-      digest: null,
-    }
-  }
-
-  const resolvedUrl = commentUrlFromResponse(match.comment)
-  if (markerCommentUrl !== null && resolvedUrl !== markerCommentUrl) {
-    return {
-      status: 'blocked_stale_write',
-      repo: ownership.repo,
-      target,
-      parent_issue: ownership.parentIssue,
-      marker_comment_url: markerCommentUrl,
-      pagination,
-      comment_count: listed.comments.length,
-      matched_comment_count: 1,
-      marker_comment: {
-        id: match.comment?.id ?? null,
-        url: resolvedUrl,
-      },
-      digest: match.digest,
-    }
-  }
-
-  return {
-    status: 'resolved',
-    repo: ownership.repo,
-    target,
-    parent_issue: ownership.parentIssue,
-    marker_comment_url: resolvedUrl,
-    pagination,
-    comment_count: listed.comments.length,
-    matched_comment_count: 1,
-    marker_comment: {
-      id: match.comment?.id ?? null,
-      url: resolvedUrl,
-    },
-    digest: match.digest,
-  }
-}
-
-function normalizeCommentListPayload(payload) {
-  if (Array.isArray(payload)) {
-    return payload
-  }
-  if (payload && typeof payload === 'object' && typeof payload.body === 'string') {
-    return [payload]
-  }
-  throw runtimeError('chatgpt_retro_context.invalid_comment_fixture', 'comment fixture must be an object or array of comment objects')
-}
-
-async function readJsonFile(filePath, code) {
-  try {
-    return JSON.parse(await readFile(filePath, 'utf-8'))
-  } catch (error) {
-    throw runtimeError(code, `failed to parse JSON file: ${filePath}`)
-  }
-}
-
-function findCommentByUrl(comments, url) {
-  return comments.find((comment) => comment?.html_url === url || comment?.url === url) ?? null
-}
-
-function buildSyntheticSourceSet(payload) {
-  return {
-    schema: 'source_set/v1',
-    sources: [
-      ...payload.refs.run_reports.map((entry) => entry.comment_url),
-      payload.refs.retro_index.comment_url,
-    ],
-  }
-}
-
-function assertValidation(result, code) {
-  if (!result.valid) {
-    const [firstError] = result.errors
-    throw runtimeError(code, firstError?.message ?? code)
-  }
-}
-
-function parseRetroMarkerComment(comment) {
-  const body = typeof comment?.body === 'string' ? comment.body : ''
-  const validation = validateRetroCommentBody(body)
-  const lines = body.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
-  const ownership = parseRetroOwnershipMarker(lines[0] ?? '')
-  const digest = parseRetroDigestMarker(lines[1] ?? '')
-  if (!ownership) {
-    return { ok: false, malformed: false, comment, body }
+      issueNumber,
+    }))
   }
   return {
-    ok: validation.valid,
-    malformed: !validation.valid,
-    comment,
-    body,
-    ownership,
-    digest: digest
-      ? {
-          canonicalDigest: `sha256:${digest.canonicalDigest}`,
-          sourceSetDigest: `sha256:${digest.sourceSetDigest}`,
-        }
-      : null,
+    comments: pages.flatMap((entry) => entry.comments),
+    scannedComments: pages.reduce((sum, entry) => sum + entry.scannedComments, 0),
+    pageCount: pages.reduce((sum, entry) => sum + entry.pageCount, 0),
+    page_budget_exhausted: pages.some((entry) => entry.page_budget_exhausted),
+    pagination_exhausted: pages.some((entry) => entry.pagination_exhausted),
+    pagination_mode: pages.map((entry) => entry.pagination_mode).filter(Boolean),
   }
 }
 
-export async function resolveChatgptRetroContextFromFixtures({
-  markerCommentJson,
-  githubCommentsJson = [],
-}) {
-  const markerComment = await readJsonFile(markerCommentJson, 'chatgpt_retro_context.marker_comment_parse')
-  const commentPages = await Promise.all(githubCommentsJson.map((filePath) => readJsonFile(filePath, 'chatgpt_retro_context.comments_parse')))
-  const comments = commentPages.flatMap((payload) => normalizeCommentListPayload(payload))
-
-  const parsedMarker = parseChatgptRetroContextComment(markerComment)
-  if (!parsedMarker.ok) {
-    throw runtimeError('chatgpt_retro_context.marker_invalid', 'marker comment fixture must contain a valid context marker')
-  }
+function buildReferenceChainFromParsedMarker(parsedMarker, comments) {
   const extraction = extractPayloadFromMarkdown(parsedMarker.body, 'chatgpt_retro_context_marker/v1')
   if (!extraction.ok) {
     throw runtimeError(extraction.error.code, extraction.error.message)
@@ -655,6 +508,7 @@ export async function resolveChatgptRetroContextFromFixtures({
   }
 
   return {
+    payload,
     sources: {
       parent_issue_json: { number: payload.parent_issue, title: `Parent Issue #${payload.parent_issue}` },
       target_issue_json: { number: payload.target.number, title: `Target ${payload.target.type} #${payload.target.number}` },
@@ -678,6 +532,308 @@ export async function resolveChatgptRetroContextFromFixtures({
         body_digest: payload.refs.retro_index.payload_digest,
       },
     ],
+  }
+}
+
+export async function resolveChatgptRetroContextLive(client, {
+  repo,
+  targetType,
+  targetNumber,
+  parentIssue,
+  markerCommentUrl = null,
+}) {
+  const ownership = buildChatgptRetroContextOwnership({ repo, targetType, targetNumber, parentIssue })
+  const listed = await listAllIssueCommentsStructured(client, {
+    repo: ownership.repo,
+    issueNumber: ownership.targetNumber,
+  })
+  const target = {
+    type: ownership.targetType,
+    number: ownership.targetNumber,
+    endpoint_kind: ownership.targetType === 'pull_request' ? 'issue_comments_for_pull_request' : 'issue_comments_for_issue',
+  }
+  const pagination = {
+    page_count: listed.pageCount,
+    scanned_comments: listed.scannedComments,
+    max_pages: listed.maxPages,
+    per_page: listed.perPage,
+    endpoint: listed.endpoint,
+    pagination_mode: listed.pagination_mode,
+  }
+
+  if (listed.page_budget_exhausted) {
+    return {
+      status: 'blocked_page_budget_exhausted',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 0,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const parsedComments = listed.comments.map((comment) => parseChatgptRetroContextComment(comment))
+  const malformedMarkerLike = listed.comments.find((comment) => {
+    const parsed = parseChatgptRetroContextComment(comment)
+    return isMarkerLikeComment(comment?.body) && !parsed.ownership
+  })
+  if (malformedMarkerLike) {
+    return {
+      status: 'blocked_malformed_marker_syntax',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: commentUrlFromResponse(malformedMarkerLike),
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 0,
+      marker_comment: {
+        id: malformedMarkerLike?.id ?? null,
+        url: commentUrlFromResponse(malformedMarkerLike),
+      },
+      digest: null,
+    }
+  }
+  const matches = parsedComments.filter((entry) => entry.ownership && ownershipEquals(entry.ownership, ownership))
+  const malformed = matches.find((entry) => entry.malformed)
+  if (malformed) {
+    return {
+      status: 'blocked_malformed',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: commentUrlFromResponse(malformed.comment),
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: matches.length,
+      marker_comment: {
+        id: malformed.comment?.id ?? null,
+        url: commentUrlFromResponse(malformed.comment),
+      },
+      digest: malformed.digest,
+    }
+  }
+
+  if (matches.length >= 2) {
+    return {
+      status: 'blocked_duplicate',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: matches.length,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const [match] = matches
+  if (!match) {
+    return {
+      status: 'missing',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 0,
+      marker_comment: null,
+      digest: null,
+    }
+  }
+
+  const resolvedUrl = commentUrlFromResponse(match.comment)
+  if (markerCommentUrl !== null && resolvedUrl !== markerCommentUrl) {
+    return {
+      status: 'blocked_stale_write',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: markerCommentUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+    }
+  }
+
+  const referenceUniverse = await loadReferencedCommentUniverse(client, ownership, resolvedUrl)
+  if (referenceUniverse.page_budget_exhausted || referenceUniverse.pagination_exhausted) {
+    return {
+      status: 'blocked_page_budget_exhausted',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: resolvedUrl,
+      pagination: {
+        ...pagination,
+        reference_page_count: referenceUniverse.pageCount,
+        reference_scanned_comments: referenceUniverse.scannedComments,
+        reference_pagination_mode: referenceUniverse.pagination_mode,
+      },
+      comment_count: listed.comments.length,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+    }
+  }
+
+  try {
+    const referenceChain = buildReferenceChainFromParsedMarker(match, referenceUniverse.comments)
+    return {
+      status: 'resolved',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: resolvedUrl,
+      pagination: {
+        ...pagination,
+        reference_page_count: referenceUniverse.pageCount,
+        reference_scanned_comments: referenceUniverse.scannedComments,
+        reference_pagination_mode: referenceUniverse.pagination_mode,
+      },
+      comment_count: listed.comments.length,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+      payload_digest: referenceChain.payload.canonicalization?.payload_digest ?? null,
+      evidence_ref_count: referenceChain.sources.evidence_refs.length,
+      source_manifest_count: referenceChain.manifest.length,
+    }
+  } catch (error) {
+    return {
+      status: 'blocked_invalid_reference_chain',
+      repo: ownership.repo,
+      target,
+      parent_issue: ownership.parentIssue,
+      marker_comment_url: resolvedUrl,
+      pagination,
+      comment_count: listed.comments.length,
+      matched_comment_count: 1,
+      marker_comment: {
+        id: match.comment?.id ?? null,
+        url: resolvedUrl,
+      },
+      digest: match.digest,
+      error_code: error?.code ?? 'chatgpt_retro_context.invalid_reference_chain',
+      error_message: error?.message ?? 'failed to validate live reference chain',
+    }
+  }
+}
+
+function normalizeCommentListPayload(payload) {
+  if (Array.isArray(payload)) {
+    return payload
+  }
+  if (payload && typeof payload === 'object' && typeof payload.body === 'string') {
+    return [payload]
+  }
+  throw runtimeError('chatgpt_retro_context.invalid_comment_fixture', 'comment fixture must be an object or array of comment objects')
+}
+
+async function readJsonFile(filePath, code) {
+  try {
+    return JSON.parse(await readFile(filePath, 'utf-8'))
+  } catch (error) {
+    throw runtimeError(code, `failed to parse JSON file: ${filePath}`)
+  }
+}
+
+function findCommentByUrl(comments, url) {
+  return comments.find((comment) => comment?.html_url === url || comment?.url === url) ?? null
+}
+
+function buildSyntheticSourceSet(payload) {
+  return {
+    schema: 'source_set/v1',
+    sources: [
+      ...payload.refs.run_reports.map((entry) => entry.comment_url),
+      payload.refs.retro_index.comment_url,
+    ],
+  }
+}
+
+function assertValidation(result, code) {
+  if (!result.valid) {
+    const [firstError] = result.errors
+    throw runtimeError(code, firstError?.message ?? code)
+  }
+}
+
+function parseRetroMarkerComment(comment) {
+  const body = typeof comment?.body === 'string' ? comment.body : ''
+  const validation = validateRetroCommentBody(body)
+  const lines = body.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  const ownership = parseRetroOwnershipMarker(lines[0] ?? '')
+  const digest = parseRetroDigestMarker(lines[1] ?? '')
+  if (!ownership) {
+    return { ok: false, malformed: false, comment, body }
+  }
+  return {
+    ok: validation.valid,
+    malformed: !validation.valid,
+    comment,
+    body,
+    ownership,
+    digest: digest
+      ? {
+          canonicalDigest: `sha256:${digest.canonicalDigest}`,
+          sourceSetDigest: `sha256:${digest.sourceSetDigest}`,
+        }
+      : null,
+  }
+}
+
+export async function resolveChatgptRetroContextFromFixtures({
+  markerCommentJson,
+  githubCommentsJson = [],
+}) {
+  const markerComment = await readJsonFile(markerCommentJson, 'chatgpt_retro_context.marker_comment_parse')
+  const commentPages = await Promise.all(githubCommentsJson.map((filePath) => readJsonFile(filePath, 'chatgpt_retro_context.comments_parse')))
+  const comments = commentPages.flatMap((payload) => normalizeCommentListPayload(payload))
+
+  const parsedMarker = parseChatgptRetroContextComment(markerComment)
+  if (!parsedMarker.ok) {
+    throw runtimeError('chatgpt_retro_context.marker_invalid', 'marker comment fixture must contain a valid context marker')
+  }
+  const result = buildReferenceChainFromParsedMarker(parsedMarker, comments)
+  return {
+    sources: result.sources,
+    manifest: result.manifest,
+  }
+}
+
+function formatCliErrorResult(command, error) {
+  if (error?.code?.startsWith('chatgpt_retro_context.blocked_')) {
+    return {
+      command,
+      status: error.code.replace('chatgpt_retro_context.', ''),
+      error_code: error.code,
+      error_message: error.message,
+    }
+  }
+  return {
+    command,
+    status: 'error',
+    error_code: error?.code ?? 'chatgpt_retro_context.unexpected_error',
+    error_message: error?.message ?? 'unexpected runtime failure',
   }
 }
 
@@ -735,6 +891,7 @@ export {
 const isDirectExecution = process.argv[1] === fileURLToPath(import.meta.url)
 if (isDirectExecution) {
   runCli().catch((error) => {
+    console.log(JSON.stringify(formatCliErrorResult(process.argv.includes('--command') ? process.argv[process.argv.indexOf('--command') + 1] ?? null : null, error)))
     process.exit(printCliError('chatgpt-retro-context', error))
   })
 }
