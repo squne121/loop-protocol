@@ -91,8 +91,9 @@ describe('GIVEN bootstrap state', () => {
     const state = createInitialGameState()
     state.loopPhase = 'title_menu'
 
-    startSortie(state, FDT)
+    const started = startSortie(state, FDT)
 
+    expect(started).toBe(false)
     expect(state.loopPhase).toBe('title_menu')
     expect(state.sortie.status).toBe('idle')
   })
@@ -109,8 +110,9 @@ describe('GIVEN startSortie from preparation', () => {
       expiresAtTick: 9,
     }
 
-    startSortie(state, FDT)
+    const started = startSortie(state, FDT)
 
+    expect(started).toBe(true)
     expect(state.loopPhase).toBe('running')
     expect(state.pendingRewardApplicationId).toBeNull()
     expect(state.sortie.status).toBe('running')
@@ -348,7 +350,7 @@ describe('GIVEN a terminal outcome', () => {
 })
 
 describe('GIVEN result phase (AC4, AC5, AC10)', () => {
-  it('same-token no-op: WHEN claimPendingReward called twice in result phase THEN second call is already-claimed and resources stay unchanged', () => {
+  it('legacy debrief compatibility: WHEN claimPendingReward called twice in result phase THEN second call is already-claimed and resources stay unchanged', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
     startSortie(state, FDT)
@@ -427,8 +429,9 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     runSortieSystem(state, FDT)
     claimPendingReward(state)
 
-    confirmResult(state)
+    const confirmed = confirmResult(state)
 
+    expect(confirmed).toBe(true)
     expect(state.loopPhase).toBe('preparation')
   })
 
@@ -436,8 +439,9 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
 
-    confirmResult(state)
+    const confirmed = confirmResult(state)
 
+    expect(confirmed).toBe(false)
     expect(state.loopPhase).toBe('preparation')
   })
 

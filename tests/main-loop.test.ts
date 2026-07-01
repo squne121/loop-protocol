@@ -7,6 +7,7 @@ import {
   claimPendingReward,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
+import { resolvePhaseTransition } from '../src/systems/PhaseTransitionSystem'
 import { queueAssistPlayerCommand, runProgressionSave, runLoadGame } from '../src/main'
 import { createInputState, mapInputToCommands } from '../src/input'
 import type { SaveResult } from '../src/storage'
@@ -215,6 +216,26 @@ describe('assist DOM command routing', () => {
 
     expect(accepted).toBe(false)
     expect(commands.some((command) => command.type === 'sample_assist_player')).toBe(false)
+  })
+})
+
+describe('resolvePhaseTransition', () => {
+  it('GIVEN title_menu WHEN resolving title_menu→preparation THEN transition is allowed', () => {
+    expect(resolvePhaseTransition('title_menu', 'preparation')).toMatchObject({
+      ok: true,
+      nextPhase: 'preparation',
+    })
+  })
+
+  it('GIVEN running WHEN resolving running→preparation THEN transition is denied', () => {
+    expect(resolvePhaseTransition('running', 'preparation')).toMatchObject({
+      ok: false,
+      error: {
+        code: 'illegal-transition',
+        from: 'running',
+        to: 'preparation',
+      },
+    })
   })
 })
 
