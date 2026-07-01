@@ -29,6 +29,7 @@ import { runProjectileSystem } from './ProjectileSystem'
 import { runCollisionSystem } from './CollisionSystem'
 import { resolveCombatCollisions } from './CombatSystem'
 import { RewardSystem } from './RewardSystem'
+import { resolvePhaseTransition } from './PhaseTransitionSystem'
 
 /** Total sortie duration in milliseconds (30 seconds). */
 export const SORTIE_DURATION_MS = 30_000
@@ -132,12 +133,17 @@ export function claimPendingReward(
     return { ok: false, reason: 'no-pending-reward' }
   }
 
+  const transition = resolvePhaseTransition(state.loopPhase, 'legacy_claim_reward')
+  if (!transition.ok) {
+    return { ok: false, reason: 'no-pending-reward' }
+  }
+
   const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
   if (!claimResult.ok && claimResult.reason !== 'already-claimed') {
     return claimResult
   }
 
-  state.loopPhase = 'debrief_reward_claimed'
+  state.loopPhase = transition.to
   return claimResult
 }
 
@@ -149,9 +155,9 @@ export function claimPendingReward(
  * Caller is responsible for calling storage.save() after this returns,
  * since save must occur in preparation phase (AC2, AC8).
  */
-export function confirmResult(state: GameState): void {
+export function confirmResult(state: GameState): boolean {
   if (state.loopPhase !== 'result') {
-    return
+    return false
   }
 
   // B3: auto-claim pending reward before transitioning to preparation
@@ -165,7 +171,13 @@ export function confirmResult(state: GameState): void {
     }
   }
 
-  state.loopPhase = 'preparation'
+  const transition = resolvePhaseTransition(state.loopPhase, 'confirm_result')
+  if (!transition.ok) {
+    return false
+  }
+
+  state.loopPhase = transition.to
+  return true
 }
 
 
@@ -176,16 +188,16 @@ export function confirmResult(state: GameState): void {
  * @param state        Mutable game state
  * @param fixedDeltaMs Fixed timestep in milliseconds (used to compute targetTicks)
  */
-export function startSortie(state: GameState, fixedDeltaMs: number): void {
-  const canStart = state.loopPhase === 'preparation'
-  if (!canStart) {
-    return
+export function startSortie(state: GameState, fixedDeltaMs: number): boolean {
+  const transition = resolvePhaseTransition(state.loopPhase, 'start_sortie')
+  if (!transition.ok) {
+    return false
   }
 
   resetCombatRuntime(state)
   const targetTicks = Math.ceil(SORTIE_DURATION_MS / fixedDeltaMs)
 
-  state.loopPhase = 'running'
+  state.loopPhase = transition.to
   state.pendingRewardApplicationId = null
   beginPlaytestEvidenceSortie(state.playtestEvidenceRuntime)
   state.sortie = {
@@ -194,6 +206,7 @@ export function startSortie(state: GameState, fixedDeltaMs: number): void {
     targetTicks,
     result: null,
   }
+  return true
 }
 
 /**
@@ -285,6 +298,11 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
     } satisfies SortieResult)
   }
 
+  const transition = resolvePhaseTransition(state.loopPhase, 'sortie_terminal')
+  if (!transition.ok) {
+    return
+  }
+
   const terminalState: SortieState = {
     status: result.outcome,
     elapsedTicks,
@@ -292,9 +310,9 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
     result,
   }
 
-  state.sortie = terminalState
   // AC4: transition to result phase, not directly to next sortie
-  state.loopPhase = 'result'
+  state.sortie = terminalState
+  state.loopPhase = transition.to
   state.resultRewardStatus = 'pending'
   markTerminalState(state.playtestEvidenceRuntime, result.outcome)
   setSelfExplanationPrompt(

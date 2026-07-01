@@ -91,8 +91,9 @@ describe('GIVEN bootstrap state', () => {
     const state = createInitialGameState()
     state.loopPhase = 'title_menu'
 
-    startSortie(state, FDT)
+    const started = startSortie(state, FDT)
 
+    expect(started).toBe(false)
     expect(state.loopPhase).toBe('title_menu')
     expect(state.sortie.status).toBe('idle')
   })
@@ -109,8 +110,9 @@ describe('GIVEN startSortie from preparation', () => {
       expiresAtTick: 9,
     }
 
-    startSortie(state, FDT)
+    const started = startSortie(state, FDT)
 
+    expect(started).toBe(true)
     expect(state.loopPhase).toBe('running')
     expect(state.pendingRewardApplicationId).toBeNull()
     expect(state.sortie.status).toBe('running')
@@ -348,7 +350,7 @@ describe('GIVEN a terminal outcome', () => {
 })
 
 describe('GIVEN result phase (AC4, AC5, AC10)', () => {
-  it('same-token no-op: WHEN claimPendingReward called twice in result phase THEN second call is already-claimed and resources stay unchanged', () => {
+  it('legacy debrief compatibility: WHEN claimPendingReward called twice in result phase THEN second call is already-claimed and resources stay unchanged', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
     startSortie(state, FDT)
@@ -419,6 +421,32 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     expect(state.progress.resources).toBe(snapshot.resources)
   })
 
+  it('legacy debrief flow: WHEN claimPendingReward called from debrief_pending_reward THEN reward is applied once and phase becomes debrief_reward_claimed', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'debrief_pending_reward'
+    state.pendingRewardApplicationId = 'sortie-reward-1'
+    state.sortie = {
+      status: 'victory',
+      elapsedTicks: TARGET_TICKS,
+      targetTicks: TARGET_TICKS,
+      result: Object.freeze({
+        outcome: 'victory',
+        endReason: 'all_enemies_defeated',
+        durationMs: SORTIE_DURATION_MS,
+        kills: 2,
+        shotsFired: 5,
+        playerHpRemaining: 8,
+      }),
+    }
+    const resourcesBefore = state.progress.resources
+
+    const claim = claimPendingReward(state)
+
+    expect(claim.ok).toBe(true)
+    expect(state.loopPhase).toBe('debrief_reward_claimed')
+    expect(state.progress.resources).toBeGreaterThan(resourcesBefore)
+  })
+
   it('AC5: WHEN confirmResult called from result phase THEN transitions to preparation', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
@@ -427,8 +455,9 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     runSortieSystem(state, FDT)
     claimPendingReward(state)
 
-    confirmResult(state)
+    const confirmed = confirmResult(state)
 
+    expect(confirmed).toBe(true)
     expect(state.loopPhase).toBe('preparation')
   })
 
@@ -436,8 +465,9 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'
 
-    confirmResult(state)
+    const confirmed = confirmResult(state)
 
+    expect(confirmed).toBe(false)
     expect(state.loopPhase).toBe('preparation')
   })
 
