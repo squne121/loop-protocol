@@ -190,6 +190,7 @@ jobs:
             return $status
           }
           run_timed pnpm_lint pnpm lint
+          run_timed pnpm_lint_docs pnpm lint:docs
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:
