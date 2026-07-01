@@ -7,7 +7,14 @@ import {
   claimPendingReward,
   SORTIE_DURATION_MS,
 } from '../src/systems/SortieSystem'
-import { queueAssistPlayerCommand, runProgressionSave, runLoadGame } from '../src/main'
+import {
+  createTransitionedInitialGameState,
+  queueAssistPlayerCommand,
+  runLoadGame,
+  runNextSortieHandler,
+  runProgressionSave,
+} from '../src/main'
+import { resolvePhaseTransition } from '../src/systems/PhaseTransitionSystem'
 import { createInputState, mapInputToCommands } from '../src/input'
 import type { SaveResult } from '../src/storage'
 
@@ -136,6 +143,17 @@ describe('B1: initial state is title_menu', () => {
     const state = createInitialGameState()
     expect(state.loopPhase).toBe('preparation')
   })
+
+  it('GIVEN bootstrap state default WHEN title_menu transition is validated THEN bootstrap can transition to title_menu', () => {
+    const state = createInitialGameState()
+
+    expect(resolvePhaseTransition(state.loopPhase, 'bootstrap_title_menu')).toMatchObject({
+      ok: true,
+      from: 'preparation',
+      to: 'title_menu',
+      intent: 'bootstrap_title_menu',
+    })
+  })
 })
 
 describe('B3: confirmResult() auto-claims pending reward and transitions to preparation', () => {
@@ -215,6 +233,71 @@ describe('assist DOM command routing', () => {
 
     expect(accepted).toBe(false)
     expect(commands.some((command) => command.type === 'sample_assist_player')).toBe(false)
+  })
+})
+
+describe('resolvePhaseTransition', () => {
+  it('GIVEN title_menu WHEN resolving new_game intent THEN transition is allowed', () => {
+    expect(resolvePhaseTransition('title_menu', 'new_game')).toMatchObject({
+      ok: true,
+      from: 'title_menu',
+      to: 'preparation',
+      intent: 'new_game',
+    })
+  })
+
+  it('GIVEN running WHEN resolving reset_sortie intent THEN transition is denied', () => {
+    expect(resolvePhaseTransition('running', 'reset_sortie')).toMatchObject({
+      ok: false,
+      error: {
+        code: 'illegal-transition',
+        from: 'running',
+        intent: 'reset_sortie',
+      },
+    })
+  })
+})
+
+describe('createTransitionedInitialGameState', () => {
+  it('GIVEN title_menu WHEN new_game intent is applied THEN preparation state is returned', () => {
+    const nextState = createTransitionedInitialGameState('title_menu', 'new_game')
+
+    expect(nextState).not.toBeNull()
+    expect(nextState?.loopPhase).toBe('preparation')
+  })
+
+  it('GIVEN load_menu WHEN load_success intent is applied THEN preparation state is restored', () => {
+    const nextState = createTransitionedInitialGameState('load_menu', 'load_success', {
+      schemaVersion: 1,
+      resources: 7,
+      weaponPower: 2,
+      playerMaxHp: 10,
+    })
+
+    expect(nextState).not.toBeNull()
+    expect(nextState?.loopPhase).toBe('preparation')
+    expect(nextState?.progress.resources).toBe(7)
+  })
+
+  it('GIVEN running WHEN reset_sortie intent is applied THEN no state is returned', () => {
+    expect(createTransitionedInitialGameState('running', 'reset_sortie')).toBeNull()
+  })
+})
+
+describe('legacy next sortie seam', () => {
+  it('GIVEN debrief_reward_claimed WHEN runNextSortieHandler called THEN preparation transition is committed', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'debrief_reward_claimed'
+    const setHudFeedback = vi.fn()
+
+    const result = runNextSortieHandler(state, { setHudFeedback })
+
+    expect(result).toBe(true)
+    expect(state.loopPhase).toBe('preparation')
+    expect(setHudFeedback).toHaveBeenCalledWith(
+      'Returned to preparation.',
+      'Use Start sortie to begin the next sortie.',
+    )
   })
 })
 

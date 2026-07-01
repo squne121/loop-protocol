@@ -470,6 +470,7 @@ describe('HudController', () => {
     expect(textSurface).not.toContain('load_menu')
     expect(textSurface).not.toContain('debrief_pending_reward')
     expect(textSurface).not.toContain('debrief_reward_claimed')
+    expect(textSurface).not.toContain('illegal-transition')
   })
 
   it('GIVEN HUD rendered WHEN reading mission copy THEN player-facing copy boundary is preserved', () => {
