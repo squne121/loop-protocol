@@ -1,3 +1,5 @@
+この fixture は directory を regular file とみなさず拒否することを確認します。
+
 ```yaml
 milestone_id: M3
 spec_prerequisites:

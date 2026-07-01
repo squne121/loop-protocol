@@ -1,3 +1,5 @@
+この fixture は description が異なっても同じ destination path を重複として落とすためのものです。
+
 ```yaml
 milestone_id: M3
 spec_prerequisites:

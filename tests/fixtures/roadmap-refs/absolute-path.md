@@ -1,3 +1,5 @@
+この fixture は絶対パスを拒否することを確認するための異常系です。
+
 ```yaml
 milestone_id: M3
 spec_prerequisites:
