@@ -1,5 +1,5 @@
 ---
-title: roadmap refs validator valid fixture
+title: roadmap refs validator 正常系 fixture
 ---
 
 この fixture は validator が成功すべき正常系サンプルです。
