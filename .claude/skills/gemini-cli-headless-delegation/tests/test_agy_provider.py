@@ -188,8 +188,9 @@ def test_ac8_normalize_agy_skips_parse_envelope() -> None:
 
 def test_ac9_exit0_empty_stdout_fails_closed() -> None:
     """AC9: provider=agy, exit 0, empty stdout -> fail with agy_empty_stdout."""
-    completed = _make_completed(0, stdout="")
-    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    with patch.dict(os.environ, {"CI": ""}, clear=False):
+        completed = _make_completed(0, stdout="")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
     assert result["ok"] is False
     assert result["failure_reason"] == "agy_empty_stdout"
     assert result["failure_class"] == "agy_empty_stdout"
@@ -197,8 +198,9 @@ def test_ac9_exit0_empty_stdout_fails_closed() -> None:
 
 def test_ac9_exit0_whitespace_only_stdout_fails_closed() -> None:
     """AC9: provider=agy, exit 0, whitespace-only stdout -> fail with agy_empty_stdout."""
-    completed = _make_completed(0, stdout="   \n  ")
-    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    with patch.dict(os.environ, {"CI": ""}, clear=False):
+        completed = _make_completed(0, stdout="   \n  ")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
     assert result["ok"] is False
     assert result["failure_reason"] == "agy_empty_stdout"
 
