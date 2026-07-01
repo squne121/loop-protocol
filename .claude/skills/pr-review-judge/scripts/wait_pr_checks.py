@@ -79,6 +79,19 @@ def emit_result(
 ) -> int:
     payload = {
         "schema": SCHEMA_NAME,
+        "semantics": {
+            "mode": "review_evidence_not_github_mergeability",
+            "required_only": True,
+            "skipped_required": "failed_blocking",
+            "neutral_required": "failed_blocking",
+            "missing_required_context": "no_required_evidence",
+            "pass_requires_head_sha_match": True,
+            "non_blocking_rules_configured": [
+                {"workflow": workflow, "name": name}
+                for workflow, name in sorted(DEFAULT_NON_BLOCKING_RULES)
+            ],
+            "non_blocking_rules_applied": False,
+        },
         "repo": repo,
         "pr": pr_number,
         "expected_head_sha": expected_head_sha,
@@ -144,7 +157,6 @@ def normalize_checks(
         name = check.get("name")
         bucket = check.get("bucket")
         state = check.get("state")
-        non_blocking = (workflow, name) in non_blocking_rules
         normalized.append(
             {
                 "name": name,
@@ -154,8 +166,8 @@ def normalize_checks(
                 "link": check.get("link"),
                 "startedAt": check.get("startedAt"),
                 "completedAt": check.get("completedAt"),
-                "blocking": not non_blocking,
-                "non_blocking_reason": "configured_exact_match" if non_blocking else None,
+                "blocking": True,
+                "non_blocking_reason": None,
             }
         )
     return normalized
@@ -356,6 +368,44 @@ def main(argv: list[str] | None = None) -> int:
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
             continue
+
+        current_head_sha, head_error, head_message = get_pr_head(args.repo, args.pr_number)
+        if head_error:
+            return emit_result(
+                repo=args.repo,
+                pr_number=args.pr_number,
+                expected_head_sha=args.expected_head_sha,
+                current_head_sha="",
+                decision="gh_error",
+                checks=latest_checks,
+                pending_count=pending_count,
+                failed_blocking_count=failed_blocking_count,
+                timed_out=False,
+                elapsed_seconds=elapsed_seconds,
+                interval_seconds=args.interval_seconds,
+                timeout_seconds=args.timeout_seconds,
+                error_code=head_error,
+                message=head_message,
+                exit_code=EXIT_RUNTIME,
+            )
+        if current_head_sha != args.expected_head_sha:
+            return emit_result(
+                repo=args.repo,
+                pr_number=args.pr_number,
+                expected_head_sha=args.expected_head_sha,
+                current_head_sha=current_head_sha or "",
+                decision="stale_head_sha",
+                checks=latest_checks,
+                pending_count=pending_count,
+                failed_blocking_count=failed_blocking_count,
+                timed_out=False,
+                elapsed_seconds=elapsed_seconds,
+                interval_seconds=args.interval_seconds,
+                timeout_seconds=args.timeout_seconds,
+                error_code="stale_head_sha",
+                message="head SHA changed before terminal decision",
+                exit_code=EXIT_FAIL,
+            )
 
         exit_code = EXIT_PASS if decision == "pass" else EXIT_FAIL
         return emit_result(

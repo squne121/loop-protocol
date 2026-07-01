@@ -1,26 +1,27 @@
+import importlib.util
 import io
 import json
-import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(
-    0,
-    str(
-        Path(
-            "/home/squne/projects/LOOP_PROTOCOL/.claude/worktrees/issue-1055-ci-check-wait-normalizer-pending-polling"
-        )
-        / ".claude/skills/pr-review-judge/scripts"
-    ),
-)
-
-from wait_pr_checks import main
+SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
+SCRIPT_PATH = SCRIPT_DIR / "wait_pr_checks.py"
+SPEC = importlib.util.spec_from_file_location("wait_pr_checks", SCRIPT_PATH)
+assert SPEC is not None
+assert SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+main = MODULE.main
 
 REPO = "owner/repo"
 PR = 123
 EXPECTED_SHA = "expected-head-sha"
 DRIFT_SHA = "drifted-head-sha"
+
+
+def check_payload(name: str, workflow: str, bucket: str, state: str) -> str:
+    return json.dumps([{"name": name, "workflow": workflow, "bucket": bucket, "state": state}])
 
 
 def run_main(mock_calls: list[tuple[int, str, str]], *, monotonic_values: list[float] | None = None):
@@ -34,9 +35,9 @@ def run_main(mock_calls: list[tuple[int, str, str]], *, monotonic_values: list[f
 
     monotonic_iter = iter(monotonic_values or [0.0, 0.0, 1.0, 1.0, 2.0])
 
-    with patch("wait_pr_checks.run_gh", side_effect=fake_run_gh):
-        with patch("wait_pr_checks.time.sleep", return_value=None):
-            with patch("wait_pr_checks.time.monotonic", side_effect=lambda: next(monotonic_iter)):
+    with patch.object(MODULE, "run_gh", side_effect=fake_run_gh):
+        with patch.object(MODULE.time, "sleep", return_value=None):
+            with patch.object(MODULE.time, "monotonic", side_effect=lambda: next(monotonic_iter)):
                 with patch(
                     "sys.argv",
                     [
@@ -59,12 +60,17 @@ def run_main(mock_calls: list[tuple[int, str, str]], *, monotonic_values: list[f
     return exit_code, json.loads(output.getvalue())
 
 
+def test_imports_wait_pr_checks_from_current_checkout():
+    assert SCRIPT_PATH.resolve() == Path(MODULE.__file__).resolve()
+
+
 def test_pr_checks_wait_result_v1_contains_required_fields():
     exit_code, payload = run_main(
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
             (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pass", "state": "completed"}]), ""),
+            (0, EXPECTED_SHA, ""),
         ]
     )
 
@@ -83,15 +89,10 @@ def test_pending_then_pass():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (
-                0,
-                json.dumps(
-                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
-                ),
-                "",
-            ),
+            (0, check_payload("python-test", "CI", "pending", "in_progress"), ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "pass", "state": "completed"}]), ""),
+            (0, check_payload("python-test", "CI", "pass", "completed"), ""),
+            (0, EXPECTED_SHA, ""),
         ]
     )
 
@@ -105,15 +106,10 @@ def test_pending_then_fail():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (
-                0,
-                json.dumps(
-                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
-                ),
-                "",
-            ),
+            (0, check_payload("python-test", "CI", "pending", "in_progress"), ""),
             (0, EXPECTED_SHA, ""),
-            (0, json.dumps([{"name": "python-test", "workflow": "CI", "bucket": "fail", "state": "completed"}]), ""),
+            (0, check_payload("python-test", "CI", "fail", "completed"), ""),
+            (0, EXPECTED_SHA, ""),
         ]
     )
 
@@ -127,13 +123,7 @@ def test_timeout_returns_human_judgment_and_preserves_last_checks():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (
-                0,
-                json.dumps(
-                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
-                ),
-                "",
-            ),
+            (0, check_payload("python-test", "CI", "pending", "in_progress"), ""),
         ],
         monotonic_values=[0.0, 0.0, 1.0, 5.0],
     )
@@ -150,13 +140,7 @@ def test_head_sha_changed():
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (
-                0,
-                json.dumps(
-                    [{"name": "python-test", "workflow": "CI", "bucket": "pending", "state": "in_progress"}]
-                ),
-                "",
-            ),
+            (0, check_payload("python-test", "CI", "pending", "in_progress"), ""),
             (0, DRIFT_SHA, ""),
         ]
     )
@@ -172,6 +156,7 @@ def test_no_required_evidence():
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
             (0, json.dumps([]), ""),
+            (0, EXPECTED_SHA, ""),
         ]
     )
 
@@ -180,21 +165,49 @@ def test_no_required_evidence():
     assert payload["checks"] == []
 
 
-def test_non_blocking_exact_match():
+def test_required_non_blocking_rule_failure_still_blocks():
     exit_code, payload = run_main(
         [
             (0, EXPECTED_SHA, ""),
             (0, EXPECTED_SHA, ""),
-            (
-                0,
-                json.dumps(
-                    [{"name": "deploy-pr", "workflow": "deploy-pages", "bucket": "pass", "state": "completed"}]
-                ),
-                "",
-            ),
+            (0, check_payload("deploy-pr", "deploy-pages", "fail", "completed"), ""),
+            (0, EXPECTED_SHA, ""),
         ]
     )
 
-    assert exit_code == 0
-    assert payload["checks"][0]["blocking"] is False
-    assert payload["checks"][0]["non_blocking_reason"] == "configured_exact_match"
+    assert exit_code == 1
+    assert payload["decision"] == "failed_blocking"
+    assert payload["failed_blocking_count"] == 1
+    assert payload["checks"][0]["blocking"] is True
+    assert payload["checks"][0]["non_blocking_reason"] is None
+
+
+def test_required_non_blocking_rule_cancel_still_blocks():
+    exit_code, payload = run_main(
+        [
+            (0, EXPECTED_SHA, ""),
+            (0, EXPECTED_SHA, ""),
+            (0, check_payload("deploy-pr", "deploy-pages", "cancel", "completed"), ""),
+            (0, EXPECTED_SHA, ""),
+        ]
+    )
+
+    assert exit_code == 1
+    assert payload["decision"] == "failed_blocking"
+    assert payload["failed_blocking_count"] == 1
+
+
+def test_terminal_pass_then_head_drift_returns_stale_head_sha():
+    exit_code, payload = run_main(
+        [
+            (0, EXPECTED_SHA, ""),
+            (0, EXPECTED_SHA, ""),
+            (0, check_payload("python-test", "CI", "pass", "completed"), ""),
+            (0, DRIFT_SHA, ""),
+        ]
+    )
+
+    assert exit_code == 1
+    assert payload["decision"] == "stale_head_sha"
+    assert payload["current_head_sha"] == DRIFT_SHA
+    assert payload["checks"][0]["bucket"] == "pass"
