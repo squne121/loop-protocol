@@ -48,11 +48,11 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - 投稿先（`public_surface_kind`）が意図した対象（`github_issue_comment` / `github_pr_comment`）であることを確認している
 - 二重投稿防止のため、upsert は既存コメントを上書きする形式を使用している
 
-### コマンド責務境界 / Command Responsibility Boundary
+### コマンド責務境界
 
 - `agent-run:finalize` は public-safe な `agent_run_report/v1` artifact を生成し、validation を通す責務を持つ
 - `agent-run:post` は **validated `agent_run_report` の GitHub upsert 専用** であり、`CHATGPT_RETRO_CONTEXT_V1` marker の更新責務を含めない
-<!-- verification-anchor: agent-run:post は validated agent_run_report の GitHub upsert 専用 -->
+<!-- 検証アンカー verification-anchor: agent-run:post は検証済み agent_run_report の GitHub upsert 専用 -->
 - `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
 - `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
 - `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
@@ -61,11 +61,11 @@ Stop Condition に到達する前に次フェーズへ進まない。
 
 この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
 
-### ChatGPT retro marker の二層構造 / Outer Marker vs Inner Payload
+### ChatGPT retro marker の二層構造
 
-outer comment ownership marker と embedded payload marker は別契約である。混同しないこと。
+外側コメントの ownership marker と内側の embedded payload marker は別契約である。混同しないこと。
 
-```text
+````text
 <!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=pull_request:1254 parent_issue=1245 -->
 <!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=<sha256(payload markdown)> -->
 
@@ -74,7 +74,7 @@ outer comment ownership marker と embedded payload marker は別契約である
 { "schema": "chatgpt_retro_context_marker/v1", "canonicalization": { "payload_digest": "sha256:..." } }
 ```
 <!-- CHATGPT_RETRO_CONTEXT_V1 end -->
-```
+````
 
 - outer digest は payload markdown 全体の sha256 である
 - inner `canonicalization.payload_digest` は JSON payload の canonical digest である
