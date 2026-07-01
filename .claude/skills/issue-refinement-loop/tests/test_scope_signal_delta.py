@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "scope_signal_delt
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-import scope_signal_delta as delta
+delta = importlib.import_module("scope_signal_delta")
 
 
 def _load_fixture(name: str) -> dict:
