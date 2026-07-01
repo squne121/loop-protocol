@@ -82,6 +82,21 @@ export function resolveActiveAssistCueSegments(
   })
 }
 
+function getSortieOverlayFillStyle(state: GameState): string | null {
+  if (state.sortie.result === null) {
+    return null
+  }
+
+  switch (state.sortie.result.outcome) {
+    case 'victory':
+      return 'rgba(30, 200, 130, 0.55)'
+    case 'defeat':
+      return 'rgba(220, 60, 60, 0.55)'
+    case 'timeout':
+      return 'rgba(78, 118, 190, 0.55)'
+  }
+}
+
 export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer {
   const context = canvas.getContext('2d')
 
@@ -251,6 +266,12 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
         context.beginPath()
         context.arc(projectile.x, projectile.y, projectile.radius, 0, Math.PI * 2)
         context.fill()
+      }
+
+      const overlayFillStyle = getSortieOverlayFillStyle(state)
+      if (overlayFillStyle !== null) {
+        context.fillStyle = overlayFillStyle
+        context.fillRect(0, 0, arenaW, arenaH)
       }
 
     },

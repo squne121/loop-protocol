@@ -58,13 +58,13 @@ function getSortieStatusCopy(state: GameState): string {
     case 'idle':
       return state.loopPhase === 'preparation' ? 'Ready' : 'Standing by'
     case 'running':
-      return 'In progress'
+      return 'In Progress'
     case 'victory':
       return 'Area secured'
     case 'defeat':
-      return 'Fallback required'
+      return 'Defeat'
     case 'timeout':
-      return 'Mission complete'
+      return '戦闘終了'
     case 'ended':
       return 'Review ready'
   }
@@ -81,7 +81,7 @@ function getOutcomeCopy(state: GameState): string {
     case 'defeat':
       return 'Defeat'
     case 'timeout':
-      return 'Mission complete'
+      return '戦闘終了'
   }
 }
 
