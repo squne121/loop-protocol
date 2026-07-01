@@ -56,6 +56,9 @@ EXIT_FAIL = 1
 EXIT_FAIL_CLOSED = 2
 EXIT_ARG_ERROR = 3
 
+REAL_PILOT_ALLOW_DECISION = "approve_timeboxed_real_pilot"
+SOURCE_DIGEST_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
 # ---------------------------------------------------------------------------
 # Diagnostic codes (machine-readable, no secrets)
 # ---------------------------------------------------------------------------
@@ -1080,6 +1083,77 @@ def _run_checks_for_json(
     return output, exit_code
 
 
+def _is_truthy(value: Any) -> bool:
+    return value is True
+
+
+def _evaluate_real_pilot_preflight_output(output: dict[str, Any]) -> tuple[str, int, bool]:
+    """Evaluate a single verifier JSON object as the strict real-pilot predicate."""
+    execution_profile = output.get("execution_profile")
+    verdict = output.get("verdict")
+    policy = output.get("policy")
+    pilot = output.get("pilot_exception")
+    components = output.get("components")
+    latitude = components.get("latitude") if isinstance(components, dict) else None
+
+    if execution_profile != "host":
+        return "fail_closed", EXIT_FAIL_CLOSED, False
+
+    if verdict == "fail_closed":
+        return "fail_closed", EXIT_FAIL_CLOSED, False
+
+    if not isinstance(policy, dict) or not isinstance(pilot, dict) or not isinstance(latitude, dict):
+        return "fail_closed", EXIT_FAIL_CLOSED, False
+
+    source_digest = policy.get("source_digest")
+    pilot_reason_codes = pilot.get("reason_codes")
+    dist = latitude.get("distribution")
+    if not isinstance(dist, dict):
+        dist = {}
+
+    source_digest_ok = (
+        isinstance(source_digest, str)
+        and SOURCE_DIGEST_SHA256_RE.fullmatch(source_digest) is not None
+    )
+    pilot_reason_codes_ok = isinstance(pilot_reason_codes, list) and len(pilot_reason_codes) == 0
+    preflight_ready = all([
+        output.get("decision") == "allow",
+        output.get("verdict") == "safe",
+        _is_truthy(output.get("inspection_complete")),
+        output.get("pilot_activation_state") == PILOT_ACTIVATION_ALLOW,
+        pilot.get("decision") == REAL_PILOT_ALLOW_DECISION,
+        pilot.get("malformed") is False,
+        pilot_reason_codes_ok,
+        pilot.get("raw_values_emitted") is False,
+        latitude.get("verdict") == "safe",
+        latitude.get("inspection_complete") is True,
+        source_digest_ok,
+        dist.get("state") == "verified",
+        dist.get("registry_signature_verified") is True,
+        dist.get("provenance_verified") is True,
+    ])
+
+    if preflight_ready:
+        return "safe", EXIT_PASS, True
+
+    if verdict == "blocked":
+        return "blocked", EXIT_FAIL, bool(output.get("inspection_complete"))
+
+    return "fail_closed", EXIT_FAIL_CLOSED, False
+
+
+def _apply_real_pilot_preflight_requirement(
+    output: dict[str, Any],
+) -> int:
+    """Re-evaluate host verifier JSON as the sole real-pilot preflight gate."""
+    verdict, exit_code, inspection_complete = _evaluate_real_pilot_preflight_output(output)
+    output["decision"] = "allow" if verdict == "safe" else "deny"
+    output["verdict"] = verdict
+    output["inspection_complete"] = inspection_complete
+    output["exit_code"] = exit_code
+    return exit_code
+
+
 # ---------------------------------------------------------------------------
 # Main (plain text mode)
 # ---------------------------------------------------------------------------
@@ -1453,6 +1527,14 @@ def main() -> int:
         help="Alias for --execution-profile fixture",
     )
     parser.add_argument(
+        "--require-real-pilot-activation", action="store_true", default=False,
+        help="Fail closed unless the host verifier JSON itself proves real-pilot activation.",
+    )
+    parser.add_argument(
+        "--preflight-input-json", default=None,
+        help="Path to a verifier JSON fixture to re-evaluate with the strict real-pilot predicate.",
+    )
+    parser.add_argument(
         "--capability-fixture", default=None,
         help="Path to an agent_observation_capability/v1 fixture JSON; runs the "
              "#1221 capability matrix check and exits.",
@@ -1478,6 +1560,22 @@ def main() -> int:
         cap_output, cap_exit = run_capability_check(args.capability_fixture)
         print(json.dumps(cap_output, indent=2), flush=True)
         return cap_exit
+
+    if args.preflight_input_json:
+        try:
+            fixture_output = json.loads(Path(args.preflight_input_json).read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+            fixture_output = {
+                "schema": "session_recording_runtime_safety/v2",
+                "decision": "deny",
+                "verdict": "fail_closed",
+                "inspection_complete": False,
+                "exit_code": EXIT_FAIL_CLOSED,
+                "execution_profile": "fixture",
+            }
+        exit_code = _apply_real_pilot_preflight_requirement(fixture_output)
+        print(json.dumps(fixture_output, indent=2), flush=True)
+        return exit_code
 
     # AC19: host mode rejects SRRS_* overrides
     if execution_profile == "host":
@@ -1535,6 +1633,8 @@ def main() -> int:
 
     if args.json:
         output, exit_code = _run_checks_for_json(repo_root, execution_profile, home_root)
+        if args.require_real_pilot_activation:
+            exit_code = _apply_real_pilot_preflight_requirement(output)
         # AC20: stdout is single JSON object only
         print(json.dumps(output, indent=2), flush=True)
         return exit_code

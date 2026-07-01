@@ -1,6 +1,8 @@
 ---
+# Secret Inventory SSOT 用 front matter。機械可読キーは維持しつつ、日本語説明を付す。
 id: secret-policy
 status: stable
+summary_ja: "この front matter は secret-policy SSOT の識別情報を表す。"
 related_issue: "#241"
 related_issues:
   - "#136"
@@ -41,7 +43,7 @@ secret_policy:
 
 ---
 
-## Secret Inventory（5 区分）
+## Secret Inventory（5 区分・秘密在庫一覧）
 
 ### 1. `current` — 現時点で repo に存在する Secret
 
@@ -137,7 +139,7 @@ latitude_api_key_classification:
 
 ---
 
-## Latitude real pilot 例外 Decision — LATITUDE\_PILOT\_EXCEPTION\_V1 (#1220)
+## Latitude real pilot 例外 Decision — LATITUDE\_PILOT\_EXCEPTION\_V1 (#1220)・実運用例外判断
 
 Child A0（#1157）の containment / runtime inventory / Kill Switch 完了後に、
 Latitude credential を保持した real pilot 例外を認めるかを **人間 Decision** として固定する。
@@ -246,6 +248,55 @@ LATITUDE_PILOT_EXCEPTION_V1:
 > `real_pilot_required_if_approved` の全 field を実値で埋め、`argv_exposure_state: absent_verified`、
 > `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
 > 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
+
+### Session recording command surface contract（記録コマンド面の契約）
+
+```yaml
+session_recording_script_contract:
+  security:session-recording:
+    purpose: ci_policy_bundle
+    host_readiness_proof: false
+  security:session-recording:fixture:
+    purpose: deterministic_ci_fixture_gate
+    host_readiness_proof: false
+  security:session-recording:runtime:
+    purpose: fixture_alias_compatibility_surface
+    host_readiness_proof: false
+  security:session-recording:host:
+    purpose: host_inventory_preflight
+    ci_required_gate: false
+    real_pilot_allow_proof_by_itself: false
+  latitude:real-pilot:preflight:
+    purpose: sole_real_pilot_pre_session_gate
+    canonical_source_command: .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation
+    allow_requires:
+      execution_profile: host
+      decision: allow
+      verdict: safe
+      inspection_complete: true
+      pilot_activation_state: allow
+      pilot_exception_decision: approve_timeboxed_real_pilot
+      pilot_exception_malformed: false
+      pilot_exception_reason_codes: []
+      pilot_exception_raw_values_emitted: false
+      source_digest: sha256_64hex
+      components.latitude.verdict: safe
+      components.latitude.inspection_complete: true
+      components.latitude.distribution.state: verified
+      registry_signature_verified: true
+      provenance_verified: true
+    blocked_or_fail_closed_until:
+      - "#1261 による distribution exact package provenance"
+      - "#1261 による argv exposure cleanup evidence"
+      - "#1261 による remote cleanup machine verification"
+    exit_semantics:
+      blocked:
+        exit_code: 1
+        meaning: required human follow-up or unresolved blocker remains
+      fail_closed:
+        exit_code: 2
+        meaning: malformed_or_unknown_or_non_host_input
+```
 
 ---
 
@@ -371,7 +422,7 @@ inventory_to_secrets_mode:
 
 ---
 
-## Current Audit Evidence
+## Current Audit Evidence（現行監査証跡）
 
 ```yaml
 current_audit_evidence:
