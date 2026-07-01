@@ -41,10 +41,11 @@
     "secret-exposure:test-invalid": "python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/invalid",
     "secret-exposure:scan:clean": "python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/valid --fail-on-finding",
     "secret-exposure:scan:production": "python3 .claude/scripts/secret_exposure_scanner.py --local .claude/scripts --exclude secret_exposure_scanner.py --exclude check_session_recording_runtime_safety.py --fail-on-finding",
-    "security:session-recording": "pnpm run policy:check && pnpm run manifest:check && pnpm run security:session-recording:runtime && pnpm run session-recording:smoke && pnpm run secret-exposure:scan:clean && pnpm run secret-exposure:scan:production",
+    "security:session-recording": "pnpm run policy:check && pnpm run manifest:check && pnpm run security:session-recording:fixture && pnpm run session-recording:smoke && pnpm run secret-exposure:scan:clean && pnpm run secret-exposure:scan:production",
     "security:session-recording:fixture": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile fixture --fixture-root tests/fixtures/session-recording-runtime-safety",
     "security:session-recording:runtime": "pnpm run security:session-recording:fixture",
     "security:session-recording:host": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host",
+    "latitude:real-pilot:preflight": "uv run --locked python3 .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation",
     "entirecli:check": "node scripts/agent-logs/check-entirecli-safety.mjs"
   },
   "devDependencies": {
