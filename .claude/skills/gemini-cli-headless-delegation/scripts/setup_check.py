@@ -678,9 +678,13 @@ def run_all_checks(
 def _human_readable(result: dict[str, Any]) -> str:
     lines: list[str] = []
     overall = "PASS" if result["ok"] else "FAIL"
-    lines.append(
-        f"setup_check: {overall} (provider={result.get('provider')} selected_provider={result.get('selected_provider')} exit_code={result['exit_code']})"
+    header = (
+        f"setup_check: {overall} "
+        f"(provider={result.get('provider')} "
+        f"selected_provider={result.get('selected_provider')} "
+        f"exit_code={result['exit_code']})"
     )
+    lines.append(header)
     lines.append("")
 
     # Tools
