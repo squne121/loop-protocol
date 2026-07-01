@@ -6,6 +6,8 @@ scope signal の検知は `plan_refinement_loop.py` が生成する `REFINEMENT_
 
 `scope_signal_delta.py` を使う path では、planner は `known_context.scope_signal_delta_input` から受け取った `before/current/after` の normalized delta facts を consume し、legacy `scope_signal_guard` projection だけを `REFINEMENT_LOOP_PLAN_V1` に反映する。raw anchor comment body を planner や delta helper の入力へ直接流してはならない。
 
+`known_context.scope_signal_delta_input` が存在する場合は fail-closed で consume する。helper の欠落、必須 field 欠落、未知 field、`source_refs` 不整合、その他 malformed input を旧 prefix heuristic へ fallback してはならない。
+
 ## scope rollup 事前確認（Scope rollup preflight）
 
 同一 skill family / Allowed Paths / parent issue の衝突確認は `scope-rollup-policy.md` を参照する。rollup の候補が `human_review_required` の場合は即停止する。
@@ -152,6 +154,7 @@ scope_signal_delta_input:
 - `current_body`: planner / checker が評価対象として読む current snapshot body
 - `after_body`: proposed rewrite body または fixture が与える candidate body
 - `source_refs.*`: issue URL / artifact path / fixture path / comment id の provenance
+- planner が projection を `evidence_spans` へ写す場合も、`body_version` に対応する `source_ref` を保持する
 
 `new_allowed_path_layer` は `after.allowed_path_layers - before.allowed_path_layers` が非空の場合のみ発火する。既存 layer の再掲、並び替え、空白差分、fenced code 内の path mention は signal にしない。
 

@@ -176,6 +176,7 @@
       "type": "object",
       "required": [
         "body_version",
+        "source_ref",
         "start_line",
         "end_line",
         "text_sha256"
@@ -201,6 +202,12 @@
         "text_sha256": {
           "type": "string",
           "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "source_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -226,12 +233,65 @@
           "type": "boolean"
         },
         "normalized_value": {
-          "type": "string"
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "triggering_lines": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/triggeringLine"
+          }
+        }
+      }
+    },
+    "scopeSignalDeltaInputV1": {
+      "type": "object",
+      "required": [
+        "before_body",
+        "current_body",
+        "after_body",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "before_body": {
+          "type": "string"
+        },
+        "current_body": {
+          "type": "string"
+        },
+        "after_body": {
+          "type": "string"
+        },
+        "source_refs": {
+          "type": "object",
+          "required": [
+            "before",
+            "current",
+            "after"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "before": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "current": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "after": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         }
       }

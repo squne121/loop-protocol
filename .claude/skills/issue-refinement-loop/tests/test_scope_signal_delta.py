@@ -41,6 +41,10 @@ def _run_cli(payload: dict) -> subprocess.CompletedProcess:
 
 def test_schema_or_artifact():
     payload = _load_fixture("new_allowed_path_layer")
+    input_validator = jsonschema.Draft202012Validator(
+        {"$ref": "#/$defs/scopeSignalDeltaInputV1", "$defs": _load_schema()["$defs"]}
+    )
+    assert list(input_validator.iter_errors(payload)) == []
     result = delta.compute_scope_signal_delta(payload)
     validator = jsonschema.Draft202012Validator(_load_schema())
     assert list(validator.iter_errors(result)) == []
@@ -79,6 +83,8 @@ def test_projection_or_repeated_existing():
     )
     assert signal["triggered"] is True
     assert signal["triggering_lines"]
+    assert signal["normalized_value"] == ["docs"]
+    assert signal["triggering_lines"][0]["source_ref"].endswith(":after")
 
 
 def test_cli_round_trip():
@@ -87,3 +93,33 @@ def test_cli_round_trip():
     assert result.returncode == 0
     parsed = json.loads(result.stdout)
     assert parsed["legacy_scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "before_body": "x",
+                "current_body": "y",
+                "after_body": "z",
+                "source_refs": {"before": "a", "current": "b"},
+            },
+            "source_refs.after is required",
+        ),
+        (
+            {
+                "before_body": "x",
+                "current_body": "y",
+                "after_body": "z",
+                "source_refs": {"before": "a", "current": "b", "after": "c"},
+                "unexpected": True,
+            },
+            "unknown input fields: unexpected",
+        ),
+    ],
+)
+def test_invalid_input_contract(payload: dict, message: str):
+    result = _run_cli(payload)
+    assert result.returncode == 2
+    assert message in result.stderr

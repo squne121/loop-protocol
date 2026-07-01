@@ -42,6 +42,9 @@ SUBJECTIVE_KEYWORDS = (
 
 PATH_TOKEN_RE = re.compile(r"`(?P<path>[^`\n]+)`|(?P<bare>(?:\.claude|docs|src|scripts|tests|\.github)/[^\s|`]+)")
 
+INPUT_REQUIRED_FIELDS = ("before_body", "current_body", "after_body", "source_refs")
+INPUT_SOURCE_REF_KEYS = ("before", "current", "after")
+
 
 def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -248,10 +251,15 @@ def _top_level_layer(path: str) -> str | None:
     return path.split("/", 1)[0]
 
 
-def _triggering_lines(body_version: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _triggering_lines(
+    body_version: str,
+    source_ref: str | None,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     return [
         {
             "body_version": body_version,
+            "source_ref": source_ref,
             "start_line": item["start_line"],
             "end_line": item["end_line"],
             "text_sha256": item["text_sha256"],
@@ -261,6 +269,7 @@ def _triggering_lines(body_version: str, items: list[dict[str, Any]]) -> list[di
 
 
 def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = _validate_input(payload)
     before_body = payload["before_body"]
     current_body = payload["current_body"]
     after_body = payload["after_body"]
@@ -322,18 +331,22 @@ def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "reason_code": REASON_NEW_UNVERIFIABLE_AC,
             "triggered": bool(low_verifiability_items),
-            "normalized_value": json.dumps(added_low_verifiability, ensure_ascii=False),
-            "triggering_lines": _triggering_lines("after", low_verifiability_items),
+            "normalized_value": added_low_verifiability,
+            "triggering_lines": _triggering_lines("after", source_refs.get("after"), low_verifiability_items),
         }
     )
 
-    added_allowed_items = [after_allowed_map[value] for value in added_allowed_values]
+    added_allowed_items = [
+        after_allowed_map[value]
+        for value in added_allowed_values
+        if _top_level_layer(value) in set(added_allowed_layers)
+    ]
     signals.append(
         {
             "reason_code": REASON_NEW_ALLOWED_PATH_LAYER,
             "triggered": bool(added_allowed_layers),
-            "normalized_value": json.dumps(added_allowed_layers, ensure_ascii=False),
-            "triggering_lines": _triggering_lines("after", added_allowed_items),
+            "normalized_value": added_allowed_layers,
+            "triggering_lines": _triggering_lines("after", source_refs.get("after"), added_allowed_items),
         }
     )
 
@@ -342,8 +355,8 @@ def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "reason_code": REASON_NEW_IN_SCOPE,
             "triggered": bool(added_in_scope_layers),
-            "normalized_value": json.dumps(added_in_scope_layers, ensure_ascii=False),
-            "triggering_lines": _triggering_lines("after", added_in_scope_items),
+            "normalized_value": added_in_scope_layers,
+            "triggering_lines": _triggering_lines("after", source_refs.get("after"), added_in_scope_items),
         }
     )
 
@@ -422,13 +435,21 @@ def compute_scope_signal_delta(payload: dict[str, Any]) -> dict[str, Any]:
 def _validate_input(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("input must be an object")
+    unknown_fields = sorted(set(payload) - set(INPUT_REQUIRED_FIELDS))
+    if unknown_fields:
+        raise ValueError(f"unknown input fields: {', '.join(unknown_fields)}")
     for field in ("before_body", "current_body", "after_body"):
         if not isinstance(payload.get(field), str):
             raise ValueError(f"{field} must be a string")
-    source_refs = payload.get("source_refs") or {}
+    source_refs = payload.get("source_refs")
     if not isinstance(source_refs, dict):
         raise ValueError("source_refs must be an object")
-    for key in ("before", "current", "after"):
+    unknown_source_ref_keys = sorted(set(source_refs) - set(INPUT_SOURCE_REF_KEYS))
+    if unknown_source_ref_keys:
+        raise ValueError(f"unknown source_refs fields: {', '.join(unknown_source_ref_keys)}")
+    for key in INPUT_SOURCE_REF_KEYS:
+        if key not in source_refs:
+            raise ValueError(f"source_refs.{key} is required")
         value = source_refs.get(key)
         if value is not None and not isinstance(value, str):
             raise ValueError(f"source_refs.{key} must be a string or null")
