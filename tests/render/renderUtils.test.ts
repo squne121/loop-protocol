@@ -243,6 +243,12 @@ describe('drawEnemyHpLabel', () => {
     expect(ctx.fillText).toHaveBeenCalledWith('10k', expect.any(Number), expect.any(Number))
   })
 
+  it('GIVEN enemy world cue draw WHEN label is rendered THEN non-authoritative world cue boundary is preserved', () => {
+    const { ctx } = makeMockCtx()
+    drawEnemyHpLabel({ ctx: ctx as unknown as CanvasRenderingContext2D, enemyX: 480, enemyY: 270, enemyRadius: 16, enemyHp: 4, arenaWidth: 960, arenaHeight: 540 })
+    expect(ctx.fillText).toHaveBeenCalledWith('4', expect.any(Number), expect.any(Number))
+  })
+
   // Issue #726 AC2 review: Canvas enemy HP label must share formatCombatNumber, so a
   // fractional enemy HP is ceiled (7.9999 -> "8") rather than leaking decimal precision.
   it('GIVEN fractional enemy HP 7.9999 WHEN drawEnemyHpLabel called THEN fillText receives ceiled "8"', () => {
