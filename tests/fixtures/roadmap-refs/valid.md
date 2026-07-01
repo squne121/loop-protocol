@@ -1,5 +1,6 @@
 ---
 title: roadmap refs validator 正常系 fixture
+description: この frontmatter は frontmatter 除外と日本語比率チェックの両方を満たすための説明です
 ---
 
 この fixture は validator が成功すべき正常系サンプルです。
