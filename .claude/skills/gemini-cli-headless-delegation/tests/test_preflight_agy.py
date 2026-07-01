@@ -333,7 +333,10 @@ def test_help_flag_parser_no_false_positives():
 
 def test_smoke_empty_stdout_fails(monkeypatch):
     """Smoke check: exit 0 with empty stdout is classified as agy_empty_stdout."""
+    import os
+
     module = load_module()
+    original_ci = os.environ.get("CI")
 
     def fake_run(argv, cwd=None, timeout=None):
         bin_ = module._resolve_binary()
@@ -346,12 +349,18 @@ def test_smoke_empty_stdout_fails(monkeypatch):
         raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(module, "_run", fake_run)
+    os.environ.pop("CI", None)
     result = module.run_preflight()
 
     assert result["ok"] is False
     assert result["failure_class"] == "agy_empty_stdout"
     assert result["smoke"]["exit_code"] == 0
     assert result["smoke"]["ok"] is False
+
+    if original_ci is None:
+        os.environ.pop("CI", None)
+    else:
+        os.environ["CI"] = original_ci
 
 
 def test_smoke_output_mismatch(monkeypatch):

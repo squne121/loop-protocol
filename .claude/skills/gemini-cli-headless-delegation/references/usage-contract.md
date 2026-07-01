@@ -27,11 +27,6 @@
 }
 ```
 
-`provider` は optional field で、既定値は `"gemini"`。
-`provider: "agy"` のときも schema 名は `delegation_request_v1` のままとし、
-request contract は provider-aware extension として扱う。
-この場合は `prompt` が必須で、`tool_profile` は `no_tools` または `proposal_only`
-のみを許可し、explicit `model` と `post_to_issue_url` は fail-closed になる。
 
 ### Required Fields
 
@@ -52,8 +47,6 @@ request contract は provider-aware extension として扱う。
 |---|---|---|
 | `role` | string（任意） | quota 枯渇時の降格チェーン選択に使用する。有効値は `roles` マップのキー（例: `web_research` / `implementation` 等）。`tool_profile` とは独立した概念であり、同時指定可能。 |
 | `gh_commands` | array（任意） | `[{"argv": [...]}]` 形式の argv ベースコマンドリスト。wrapper が事前実行し結果を `inline_context` に prepend する general field。profile ごとに許可 allowlist が異なる（詳細は「gh_commands general field 仕様」セクション参照）。`github_research`・`local_asset_research`・`proposal_only` で完全実装済み。 |
-| `provider` | string（任意） | `"gemini"` または `"agy"`。省略時は `"gemini"`。`provider=agy` は prompt-first extension であり、`tool_profile` は `no_tools` / `proposal_only` のみ。 |
-| `prompt` | string（任意） | `provider=agy` 時は必須。`agy -p` に渡す plain-text prompt。例: `provider=agy` の smoke fixture は `Return exactly: LOOP_AGY_SMOKE_OK` を使う。 |
 
 ### `tool_profile` の責務境界
 
