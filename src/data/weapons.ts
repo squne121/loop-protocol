@@ -11,9 +11,9 @@ export const weaponDefinitions = [
   {
     definitionId: 'player_weapon_basic',
     ownerFaction: 'player',
-    fireCooldownMs: 350,
-    projectileRadius: 8,
+    fireCooldownMs: 280,
+    projectileRadius: 4,
     projectileSpeedPxPerSec: 520,
-    projectileLifetimeMs: 900,
+    projectileLifetimeMs: 1200,
   },
 ] as const satisfies readonly WeaponDefinition[]
