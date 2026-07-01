@@ -149,7 +149,7 @@ describe('HudController', () => {
   it('GIVEN preparation WHEN render called THEN phase copy and preparation actions are enabled', () => {
     hudController.render(createState('preparation'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Preparation')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Pre-launch')
     expect(queryButton(container, 'start-sortie').disabled).toBe(false)
     expect(queryButton(container, 'save').disabled).toBe(false)
     expect(queryButton(container, 'reset').disabled).toBe(false)
@@ -163,7 +163,7 @@ describe('HudController', () => {
   it('GIVEN title_menu WHEN render called THEN new-game enabled, load-game enabled, start-sortie disabled (AC1)', () => {
     hudController.render(createState('title_menu'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Title Menu')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Launch setup')
     expect(queryButton(container, 'new-game').disabled).toBe(false)
     expect(queryButton(container, 'load-game').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
@@ -184,7 +184,7 @@ describe('HudController', () => {
   it('GIVEN load_menu WHEN render called THEN load-game is enabled and save is disabled', () => {
     hudController.render(createState('load_menu'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Load Menu')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Restore briefing')
     expect(queryButton(container, 'load-game').disabled).toBe(false)
     expect(queryButton(container, 'save').disabled).toBe(true)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
@@ -202,7 +202,7 @@ describe('HudController', () => {
   it('GIVEN running WHEN render called THEN button.disabled marks the full action surface as disabled', () => {
     hudController.render(createState('running'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie running')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie active')
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'confirm-result').disabled).toBe(true)
@@ -366,8 +366,8 @@ describe('HudController', () => {
   it('GIVEN result phase with pending reward WHEN render called THEN confirm-result enabled, claim-reward disabled (AC4, AC5)', () => {
     hudController.render(createState('result', 'pending'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Result')
-    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     // AC5: confirmResult auto-claims; claim-reward is legacy debrief only
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
@@ -382,18 +382,18 @@ describe('HudController', () => {
   it('GIVEN result phase with claimed reward WHEN render called THEN confirm-result is still enabled (AC5)', () => {
     hudController.render(createState('result', 'claimed'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Result')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
     expect(queryButton(container, 'save').disabled).toBe(true)
   })
 
-  it('GIVEN debrief_pending_reward WHEN render called THEN Debrief: reward pending enables Claim reward only', () => {
+  it('GIVEN debrief_pending_reward WHEN render called THEN debrief copy enables reward collection only', () => {
     hudController.render(createState('debrief_pending_reward'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward pending')
-    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief in progress')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'claim-reward').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
@@ -403,11 +403,11 @@ describe('HudController', () => {
     expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
-  it('GIVEN debrief_reward_claimed WHEN render called THEN Debrief: reward claimed enables Next sortie only', () => {
+  it('GIVEN debrief_reward_claimed WHEN render called THEN debrief complete copy enables next sortie only', () => {
     hudController.render(createState('debrief_reward_claimed'), false)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief: reward claimed')
-    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief complete')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
     expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
     expect(queryButton(container, 'next-sortie').disabled).toBe(false)
     expect(queryButton(container, 'start-sortie').disabled).toBe(true)
@@ -417,7 +417,7 @@ describe('HudController', () => {
     expect(queryButton(container, 'reset').disabled).toBe(true)
   })
 
-  it('GIVEN feedback copy WHEN render called THEN status region exposes claim and persistence copy without innerHTML', () => {
+  it('GIVEN feedback copy WHEN render called THEN status region exposes player-facing progress copy without innerHTML', () => {
     const state = createState('debrief_reward_claimed')
     state.telemetry.status = 'Reward claimed for this session.'
     state.telemetry.lastCommandSummary = 'Confirm result to save and return to preparation.'
@@ -455,6 +455,29 @@ describe('HudController', () => {
     expect(actions.onLoadGame).not.toHaveBeenCalled()
     expect(actions.onReset).toHaveBeenCalledTimes(0)
     expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN HUD rendered WHEN checking text surface THEN normal-play vocabulary boundary is preserved', () => {
+    hudController.render(createState('preparation'), false)
+
+    const textSurface = container.textContent ?? ''
+    expect(textSurface).toContain('Progress')
+    expect(textSurface).toContain('Pilot updates')
+    expect(textSurface).not.toContain('Loop Phase')
+    expect(textSurface).not.toContain('Telemetry')
+    expect(textSurface).not.toContain('Claim reward')
+    expect(textSurface).not.toContain('title_menu')
+    expect(textSurface).not.toContain('load_menu')
+    expect(textSurface).not.toContain('debrief_pending_reward')
+    expect(textSurface).not.toContain('debrief_reward_claimed')
+  })
+
+  it('GIVEN HUD rendered WHEN reading mission copy THEN player-facing copy boundary is preserved', () => {
+    hudController.render(createState('debrief_pending_reward'), false)
+
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief in progress')
+    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
+    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
   })
 
   it('GIVEN debrief_reward_claimed WHEN disabled claim button is clicked THEN claim callback remains a no-op surface', () => {
