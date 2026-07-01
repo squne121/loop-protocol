@@ -48,6 +48,38 @@ Stop Condition に到達する前に次フェーズへ進まない。
 - 投稿先（`public_surface_kind`）が意図した対象（`github_issue_comment` / `github_pr_comment`）であることを確認している
 - 二重投稿防止のため、upsert は既存コメントを上書きする形式を使用している
 
+### コマンド責務境界
+
+- `agent-run:finalize` は public-safe な `agent_run_report/v1` artifact を生成し、validation を通す責務を持つ
+- `agent-run:post` は **validated `agent_run_report` の GitHub upsert 専用** であり、`CHATGPT_RETRO_CONTEXT_V1` marker の更新責務を含めない
+<!-- 検証アンカー verification-anchor: agent-run:post は検証済み agent_run_report の GitHub upsert 専用 -->
+- `chatgpt-retro-context:post` は `CHATGPT_RETRO_CONTEXT_V1` / `CHATGPT_RETRO_CONTEXT_DIGEST_V1` の 2-line marker contract に従って marker comment を create / noop / supersede する
+- `chatgpt-retro-context:resolve-fixture` は fixture JSON から marker 導線を検証する静的 resolver である
+- `chatgpt-retro-context:resolve-live` は issue / pull request target を issue comments endpoint として扱い、marker comment だけでなく参照先 run report / retro index comment まで live fetch して digest chain を再検証する live resolver である
+- `chatgpt-retro-context:resolve-live` は `resolved | missing | blocked_duplicate | blocked_malformed | blocked_malformed_marker_syntax | blocked_invalid_reference_chain | blocked_page_budget_exhausted | blocked_stale_write` の structured result を返す
+- `chatgpt-retro-context:post` の blocked state は helper 内部では throw / nonzero exit を使うが、CLI surface では `error_code` を持つ machine-readable JSON を stdout に返す
+
+この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
+
+### ChatGPT retro marker の二層構造
+
+外側コメントの ownership marker と内側の embedded payload marker は別契約である。混同しないこと。
+
+````text
+<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=pull_request:1254 parent_issue=1245 -->
+<!-- CHATGPT_RETRO_CONTEXT_DIGEST_V1 sha256=<sha256(payload markdown)> -->
+
+<!-- CHATGPT_RETRO_CONTEXT_V1 start -->
+```json
+{ "schema": "chatgpt_retro_context_marker/v1", "canonicalization": { "payload_digest": "sha256:..." } }
+```
+<!-- CHATGPT_RETRO_CONTEXT_V1 end -->
+````
+
+- outer digest は payload markdown 全体の sha256 である
+- inner `canonicalization.payload_digest` は JSON payload の canonical digest である
+- `resolve-live` は outer 2-line marker の ownership を確認した後、inner payload・run report comment・retro index comment・source-set digest を live 再検証する
+
 ## Review Correction Loop / レビュー修正ループ
 
 CI failure、human correction、または reviewer comment が発生した場合、
@@ -185,11 +217,22 @@ public surface では `observation_sources` が runtime で要求される。
 - `source_kind` と `capability_verdict` は `docs/dev/agent-observation-capability.md` の SSOT に従う
 - `unsupported` と `unverified` はそのまま adapter 入力の availability signal 扱いとし、`availability: unavailable` として扱う
 - `availability: unavailable` では metrics はすべて `null`、`reason_codes` には `source_unavailable` を補完
+- current producer contract は **single-source projection** を前提とする。現時点では aggregate producer を追加していないため、本ドキュメントでは aggregate metrics と呼ばない
 - `observation_sources` の `provenance.source_projection_digest` が public projection の canonical JSON sha256 を持つこと
 - `validate-final-report.mjs` と `retro-index-builder.mjs` は `provenance.source_projection_digest` と `provenance.ref.digest` を canonicalized public projection から再計算し、一致しない report を fail closed にする
 - `token_usage` は観測 source とは別責務。`token_usage` は LLM API トークン集計のみ扱い、observation source projection / 理由・証跡を混同しない
 
 `real_pilot_verified` は observation source の生成や検証出力では禁止とする。`provenance.evidence_mode` は #1220 承認前は `synthetic_only` 固定で、runtime validator / retro builder の両方が fail closed で拒否する。
+
+### Remaining Parent Gaps / Out of Scope（今回の成功条件に含めない項目）
+
+以下は current repo reality では **#1245 の成功条件に含めない**。
+
+- Latitude metadata keys / saved searches / annotation taxonomy の SSOT 化と運用文書の追加
+- public GitHub comments と private telemetry / Entire checkpoints の retention policy 分離
+- retrospective result から follow-up Issue を draft / create して retro index へ自動反映する workflow 導線
+- observation source の aggregate producer 導入と集計 contract の追加
+- `token_usage.source` の enum migration や Latitude 専用 token producer 導入
 
 ### entirecli_safety runtime enforcement / EntireCLI 安全性の runtime 強制
 

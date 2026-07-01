@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { spawnSync } from 'child_process'
 
 import { renderPublicMarkdown, validateChatgptRetrospectiveResultAgainstSchema } from '../../scripts/lib/agent-run-report-validation.mjs'
 import {
@@ -6,8 +7,10 @@ import {
   computeChatgptRetroContextPayloadDigest,
   parseChatgptRetroContextComment,
   resolveChatgptRetroContextFromFixtures,
+  resolveChatgptRetroContextLive,
   upsertChatgptRetroContextComment,
 } from '../../scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs'
+import { buildSourceCommentSetDigest } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
 import { buildRetroIndexCommentBody } from '../../scripts/agent-logs/lib/retro-index-comment-helper.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { mkdtempSync, writeFileSync, rmSync } from 'fs'
@@ -353,6 +356,271 @@ describe('chatgpt retro context marker helper', () => {
         markerCommentJson: markerFile,
         githubCommentsJson: [commentsFile],
       })).rejects.toThrow(/source-set digest must match the recomputed referenced comment set/)
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a live issue-comment scan with exactly one ownership match WHEN resolving live THEN it returns a structured resolved result', async () => {
+    const payload = createPayload()
+    const reportPayload = createRunReport()
+    const reportComment = buildAgentRunReportCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        issueNumber: 1224,
+        prNumber: 1224,
+        runId: 'run-1224-001',
+      },
+      payloadMarkdown: renderPublicMarkdown(reportPayload),
+    })
+    const reportDigest = `sha256:${reportComment.digest}`
+    const retroPayload = {
+      schema: 'agent_retro_index/v1',
+      generation_verdict: 'complete',
+      entries: [
+        {
+          report_comment_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-11',
+          report_digest: reportDigest,
+          issue: 1224,
+          pr: 1224,
+          merge_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          tags: ['retro'],
+          friction_summary: 'safe',
+          quality_signals: ['deterministic'],
+          follow_up_issues: [],
+        },
+      ],
+      orphan_reports: [],
+      ambiguous_links: [],
+    }
+    const retroDigest = 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+    const sourceSetDigest = buildSourceCommentSetDigest([
+      {
+        comment_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-11',
+        source_kind: 'issues',
+        source_number: 1224,
+        body_digest: reportDigest,
+      },
+      {
+        comment_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12',
+        source_kind: 'issues',
+        source_number: 1153,
+        body_digest: retroDigest,
+      },
+    ])
+    payload.target = {
+      type: 'pull_request',
+      number: 1224,
+    }
+    payload.refs.run_reports[0].comment_url = 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-11'
+    payload.refs.run_reports[0].payload_digest = reportDigest
+    payload.refs.retro_index.comment_url = 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12'
+    payload.refs.retro_index.payload_digest = retroDigest
+    payload.refs.retro_index.source_set_digest = sourceSetDigest
+    payload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(payload)
+    const comment = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'pull_request',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: renderPublicMarkdown(payload),
+    })
+    const retroComment = buildRetroIndexCommentBody({
+      repo: 'squne121/loop-protocol',
+      parentIssue: 1153,
+      algorithm: 'retro-index-builder@1',
+      payloadMarkdown: renderPublicMarkdown(retroPayload),
+      canonicalIndexDigest: retroDigest,
+      sourceCommentSetDigest: sourceSetDigest,
+    })
+    const client = {
+      listIssueComments: async ({ issueNumber, page }) => {
+        if (issueNumber === 1224) {
+          return page === 1
+            ? [
+                { id: 11, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-11', body: reportComment.body },
+                { id: 41, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41', body: comment.body },
+              ]
+            : []
+        }
+        if (issueNumber === 1153) {
+          return page === 1
+            ? [{ id: 12, html_url: 'https://github.com/squne121/loop-protocol/issues/1153#issuecomment-12', body: retroComment.body }]
+            : []
+        }
+        return []
+      },
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'pull_request',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'resolved',
+      target: {
+        type: 'pull_request',
+        number: 1224,
+        endpoint_kind: 'issue_comments_for_pull_request',
+      },
+      marker_comment: {
+        id: 41,
+        url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-41',
+      },
+      matched_comment_count: 1,
+      evidence_ref_count: 1,
+      source_manifest_count: 3,
+    })
+  })
+
+  it('GIVEN a live issue-comment scan with malformed marker syntax WHEN resolving live THEN it fails closed', async () => {
+    const client = {
+      listIssueComments: async () => [
+        {
+          id: 7,
+          html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-7',
+          body: '<!-- CHATGPT_RETRO_CONTEXT_V1 repo=squne121/loop-protocol target=issue:1224 parent_issue=1153 trailing -->',
+        },
+      ],
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'blocked_malformed_marker_syntax',
+      marker_comment: {
+        id: 7,
+      },
+    })
+  })
+
+  it('GIVEN a live issue-comment scan that hits the page budget WHEN resolving live THEN it returns a structured blocked result', async () => {
+    const client = {
+      listIssueCommentsPage: async ({ page }) => ({
+        items: Array.from({ length: 100 }, (_, index) => ({
+          id: (page - 1) * 100 + index + 1,
+          body: 'plain comment body',
+        })),
+        hasNextPage: true,
+      }),
+    }
+
+    await expect(resolveChatgptRetroContextLive(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+    })).resolves.toMatchObject({
+      status: 'blocked_page_budget_exhausted',
+      target: {
+        type: 'issue',
+        number: 1224,
+        endpoint_kind: 'issue_comments_for_issue',
+      },
+      matched_comment_count: 0,
+    })
+  })
+
+  it('GIVEN an existing comment and a changed digest before update WHEN upsert runs THEN it fails closed after a fresh reread', async () => {
+    const originalPayload = renderPublicMarkdown(createPayload())
+    const original = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: originalPayload,
+    })
+    const nextPayloadObject = createPayload()
+    nextPayloadObject.created_at = '2026-07-01T00:20:00.000Z'
+    nextPayloadObject.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(nextPayloadObject)
+    const stalePayloadObject = createPayload()
+    stalePayloadObject.created_at = '2026-07-01T00:30:00.000Z'
+    stalePayloadObject.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(stalePayloadObject)
+    const staleComment = buildChatgptRetroContextCommentBody({
+      ownership: {
+        repo: 'squne121/loop-protocol',
+        targetType: 'issue',
+        targetNumber: 1224,
+        parentIssue: 1153,
+      },
+      payloadMarkdown: renderPublicMarkdown(stalePayloadObject),
+    })
+    const client = {
+      listIssueComments: async () => [{ id: 1, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: original.body }],
+      getIssueComment: async () => ({ id: 1, html_url: 'https://github.com/squne121/loop-protocol/issues/1224#issuecomment-9', body: staleComment.body }),
+      createIssueComment: async () => {
+        throw new Error('create should not run')
+      },
+      updateIssueComment: async () => {
+        throw new Error('update should not run')
+      },
+    }
+
+    await expect(upsertChatgptRetroContextComment(client, {
+      repo: 'squne121/loop-protocol',
+      targetType: 'issue',
+      targetNumber: 1224,
+      parentIssue: 1153,
+      payloadMarkdown: renderPublicMarkdown(nextPayloadObject),
+      dryRun: false,
+      expectedSupersedesDigest: original.digest,
+    })).rejects.toThrow(/digest changed before update/)
+  })
+
+  it('GIVEN CLI resolve-live without repo WHEN executing the command THEN it returns a machine-readable error', () => {
+    const scriptPath = resolve(process.cwd(), 'scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs')
+    const result = spawnSync(process.execPath, [
+      scriptPath,
+      '--command', 'resolve-live',
+      '--target-type', 'issue',
+      '--target-number', '1224',
+      '--parent-issue', '1153',
+    ], {
+      encoding: 'utf-8',
+    })
+
+    expect(result.status).toBe(1)
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      command: 'resolve-live',
+      status: 'error',
+      error_code: 'chatgpt_retro_context.repo',
+    })
+  })
+
+  it('GIVEN CLI post without confirm-live WHEN executing a live post THEN it returns a machine-readable error', () => {
+    const tempDir = mkdtempSync(resolve(tmpdir(), 'chatgpt-retro-context-cli-'))
+    try {
+      const payloadFile = resolve(tempDir, 'payload.md')
+      writeFileSync(payloadFile, renderPublicMarkdown(createPayload()))
+      const scriptPath = resolve(process.cwd(), 'scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs')
+      const result = spawnSync(process.execPath, [
+        scriptPath,
+        '--command', 'post',
+        '--repo', 'squne121/loop-protocol',
+        '--target-type', 'issue',
+        '--target-number', '1224',
+        '--parent-issue', '1153',
+        '--payload-markdown-file', payloadFile,
+        '--dry-run', 'false',
+        '--confirm-live', 'false',
+      ], {
+        encoding: 'utf-8',
+      })
+
+      expect(result.status).toBe(1)
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        command: 'post',
+        status: 'error',
+        error_code: 'chatgpt_retro_context.live_confirmation_required',
+      })
     } finally {
       rmSync(tempDir, { recursive: true, force: true })
     }
