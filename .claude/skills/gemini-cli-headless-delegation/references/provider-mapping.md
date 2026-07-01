@@ -146,5 +146,12 @@ agy 自体の --approval-mode plan 相当の動作は前提にしない。
 
 ### setup_check.py --provider agy
 
-`setup_check.py --provider agy` は現時点では未実装（Followup Issue 対応）。
-agy の preflight チェックは別途実装予定。
+`setup_check.py --provider agy --json` は `agy` / `python3` / `uv` だけを必須 prerequisite として検査し、
+`agy_preflight_result/v1` を `agy_preflight` フィールドへ埋め込む。
+この経路では `node` / `gemini` / `uvx` / `~/.gemini/trustedFolders.json` /
+`.gemini/settings.json` / Serena MCP / Gemini auth を要求しない。
+
+`--provider auto` は `agy -> gemini` の順に試行し、`selected_provider` と
+`provider_attempts` で fallback 順序を machine-readable に返す。
+
+`--provider agy --fix` は fail-closed とし、`.gemini/` や trustedFolders を変更しない。

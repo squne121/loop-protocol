@@ -102,6 +102,7 @@ def test_ac6_unknown_provider_fails_closed() -> None:
     result = rgh.run_delegation(req)
     assert result["ok"] is False
     assert result["failure_reason"] is not None
+    assert result["failure_class"] == "unknown_provider"
     assert "unknown_provider" in result["failure_reason"]
 
 
@@ -143,8 +144,7 @@ def test_ac7_agy_grounded_research_rejected() -> None:
     req = _agy_request(tool_profile="grounded_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:
@@ -152,8 +152,7 @@ def test_ac7_agy_local_asset_research_rejected() -> None:
     req = _agy_request(tool_profile="local_asset_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 def test_ac7_agy_github_research_rejected() -> None:
@@ -161,8 +160,7 @@ def test_ac7_agy_github_research_rejected() -> None:
     req = _agy_request(tool_profile="github_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +247,7 @@ def test_ac11_agy_no_tools_forbids_post_to_issue_url() -> None:
     )
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert "provider_forbids_post_to_issue_url" in (result.get("failure_reason") or "")
+    assert result["failure_class"] == "provider_forbids_post_to_issue_url"
 
 
 def test_ac11_agy_proposal_only_forbids_post_to_issue_url() -> None:
@@ -260,7 +258,21 @@ def test_ac11_agy_proposal_only_forbids_post_to_issue_url() -> None:
     )
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert "provider_forbids_post_to_issue_url" in (result.get("failure_reason") or "")
+    assert result["failure_class"] == "provider_forbids_post_to_issue_url"
+
+
+def test_agy_model_rejection_sets_failure_class() -> None:
+    """provider=agy で explicit model は unsupported_provider_option を返す。"""
+    result = rgh.run_delegation(_agy_request(model="gemini-3-pro"))
+    assert result["ok"] is False
+    assert result["failure_class"] == "unsupported_provider_option"
+
+
+def test_agy_empty_prompt_sets_failure_class() -> None:
+    """provider=agy で空 prompt は agy_empty_prompt を返す。"""
+    result = rgh.run_delegation(_agy_request(prompt="   "))
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_empty_prompt"
 
 
 # ---------------------------------------------------------------------------

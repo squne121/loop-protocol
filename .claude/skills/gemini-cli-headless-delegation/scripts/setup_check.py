@@ -19,6 +19,7 @@ to minimise external dependencies.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -42,7 +43,9 @@ SERENA_READ_ONLY_TOOLS = [
     "search_for_pattern",
 ]
 
-REQUIRED_TOOLS = ["node", "gemini", "python3", "uv", "uvx"]
+GEMINI_REQUIRED_TOOLS = ["node", "gemini", "python3", "uv", "uvx"]
+AGY_REQUIRED_TOOLS = ["agy", "python3", "uv"]
+SUPPORTED_PROVIDERS = frozenset({"gemini", "agy", "auto"})
 
 # Timeout for Serena MCP availability check (seconds).
 SERENA_CHECK_TIMEOUT = 30
@@ -132,11 +135,12 @@ def _tool_version(tool: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def check_tools() -> dict[str, Any]:
+def check_tools(required_tools: list[str] | None = None) -> dict[str, Any]:
     """Check that all required tools are present and record versions."""
+    tools = required_tools or GEMINI_REQUIRED_TOOLS
     versions: dict[str, str | None] = {}
     missing: list[str] = []
-    for tool in REQUIRED_TOOLS:
+    for tool in tools:
         ver = _tool_version(tool)
         versions[tool] = ver
         if ver is None:
@@ -146,12 +150,30 @@ def check_tools() -> dict[str, Any]:
     result: dict[str, Any] = {"ok": ok, "versions": versions}
     if missing:
         result["missing"] = missing
-        result["recovery"] = [
-            f"Install missing tool(s): {', '.join(missing)}",
-            "  node/gemini: npm install -g @google/gemini-cli (requires node >= 18)",
-            "  uv/uvx:      curl -LsSf https://astral.sh/uv/install.sh | sh",
-        ]
+        recovery = [f"Install missing tool(s): {', '.join(missing)}"]
+        if any(tool in {"node", "gemini"} for tool in missing):
+            recovery.append("  node/gemini: npm install -g @google/gemini-cli (requires node >= 18)")
+        if "agy" in missing:
+            recovery.append("  agy:        install Antigravity CLI and ensure `agy` is on PATH")
+        if any(tool in {"uv", "uvx"} for tool in missing):
+            recovery.append("  uv/uvx:      curl -LsSf https://astral.sh/uv/install.sh | sh")
+        result["recovery"] = recovery
     return result
+
+
+def _load_preflight_agy_module():
+    module_path = Path(__file__).with_name("preflight_agy.py")
+    spec = importlib.util.spec_from_file_location("preflight_agy", module_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_agy_preflight() -> dict[str, Any]:
+    """Run provider-aware agy preflight through the sibling script."""
+    module = _load_preflight_agy_module()
+    return module.run_preflight()
 
 
 # ---------------------------------------------------------------------------
@@ -526,15 +548,9 @@ def check_auth() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def run_all_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
-    """Execute all checks and return a consolidated result dict.
-
-    When fix=False (default): check-only mode — no HOME or repo side-effects.
-    When fix=True: allow trustedFolders and .gemini/settings.json mutations.
-    """
+def _run_gemini_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
     root = repo_root or _git_repo_root()
-
-    tools_result = check_tools()
+    tools_result = check_tools(GEMINI_REQUIRED_TOOLS)
     trusted_result = check_trusted_folders(root, fix=fix)
     serena_result = check_serena_mcp()
     settings_result = check_gemini_settings(root, fix=fix)
@@ -560,6 +576,8 @@ def run_all_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str
     return {
         "ok": all_ok,
         "exit_code": exit_code,
+        "provider": "gemini",
+        "selected_provider": "gemini",
         "tools": tools_result,
         "trusted_folders": trusted_result,
         "serena_mcp": serena_result,
@@ -568,10 +586,101 @@ def run_all_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str
     }
 
 
+def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    _ = repo_root or _git_repo_root()
+    tools_result = check_tools(AGY_REQUIRED_TOOLS)
+    agy_preflight = check_agy_preflight() if tools_result["ok"] else {
+        "schema": "agy_preflight_result/v1",
+        "ok": False,
+        "failure_reason": "agy preflight skipped because required agy tools are missing",
+        "failure_class": "cli_missing",
+        "recovery_action": "install missing agy prerequisites first",
+    }
+    unsupported_fix = bool(fix)
+    ok = tools_result["ok"] and agy_preflight["ok"] and not unsupported_fix
+    exit_code = 0 if ok else 1
+    warnings: list[str] = []
+    if unsupported_fix:
+        warnings.append("unsupported_provider_option: provider=agy does not support --fix")
+
+    return {
+        "ok": ok,
+        "exit_code": exit_code,
+        "provider": "agy",
+        "selected_provider": "agy",
+        "tools": tools_result,
+        "agy_preflight": agy_preflight,
+        "skipped_gemini_checks": [
+            "trusted_folders",
+            "serena_mcp",
+            "gemini_settings",
+            "auth",
+            "node",
+            "gemini",
+            "uvx",
+        ],
+        "warnings": warnings,
+        "unsupported_provider_option": unsupported_fix,
+    }
+
+
+def _run_auto_provider_checks(repo_root: Path | None = None, fix: bool = False) -> dict[str, Any]:
+    provider_attempts: list[dict[str, Any]] = []
+    agy_result = _run_agy_provider_checks(repo_root=repo_root, fix=fix)
+    provider_attempts.append({
+        "provider": "agy",
+        "ok": agy_result["ok"],
+        "exit_code": agy_result["exit_code"],
+    })
+    if agy_result["ok"]:
+        agy_result["provider"] = "auto"
+        agy_result["selected_provider"] = "agy"
+        agy_result["provider_attempts"] = provider_attempts
+        return agy_result
+
+    gemini_result = _run_gemini_provider_checks(repo_root=repo_root, fix=fix)
+    provider_attempts.append({
+        "provider": "gemini",
+        "ok": gemini_result["ok"],
+        "exit_code": gemini_result["exit_code"],
+    })
+    gemini_result["provider"] = "auto"
+    gemini_result["selected_provider"] = "gemini"
+    gemini_result["provider_attempts"] = provider_attempts
+    gemini_result["warnings"] = list(gemini_result.get("warnings", [])) + [
+        f"agy_attempt_failed: {agy_result.get('agy_preflight', {}).get('failure_class') or 'tool_missing'}"
+    ]
+    return gemini_result
+
+
+def run_all_checks(
+    repo_root: Path | None = None,
+    fix: bool = False,
+    provider: str = "gemini",
+) -> dict[str, Any]:
+    """Execute provider-aware checks and return a consolidated result dict."""
+    if provider not in SUPPORTED_PROVIDERS:
+        return {
+            "ok": False,
+            "exit_code": 1,
+            "provider": provider,
+            "selected_provider": None,
+            "failure_class": "unsupported_provider_option",
+            "failure_reason": f"provider must be one of {sorted(SUPPORTED_PROVIDERS)}",
+        }
+    if provider == "agy":
+        return _run_agy_provider_checks(repo_root=repo_root, fix=fix)
+    if provider == "auto":
+        return _run_auto_provider_checks(repo_root=repo_root, fix=fix)
+    return _run_gemini_provider_checks(repo_root=repo_root, fix=fix)
+
+
 def _human_readable(result: dict[str, Any]) -> str:
     lines: list[str] = []
     overall = "PASS" if result["ok"] else "FAIL"
-    lines.append(f"setup_check: {overall} (exit_code={result['exit_code']})")
+    lines.append(
+        f"setup_check: {overall} (provider={result.get('provider')} selected_provider={result.get('selected_provider')} exit_code={result['exit_code']})"
+    )
     lines.append("")
 
     # Tools
@@ -585,6 +694,23 @@ def _human_readable(result: dict[str, Any]) -> str:
             lines.append(f"  recovery: {hint}")
 
     lines.append("")
+
+    if "provider_attempts" in result:
+        lines.append("[provider_attempts]")
+        for attempt in result["provider_attempts"]:
+            lines.append(
+                f"  {attempt['provider']}: ok={attempt['ok']} exit_code={attempt['exit_code']}"
+            )
+        lines.append("")
+
+    if result.get("selected_provider") == "agy":
+        preflight = result["agy_preflight"]
+        lines.append(f"[agy_preflight] ok={preflight['ok']} failure_class={preflight.get('failure_class')}")
+        for skipped in result.get("skipped_gemini_checks", []):
+            lines.append(f"  skipped: {skipped}")
+        for warning in result.get("warnings", []):
+            lines.append(f"  warning: {warning}")
+        return "\n".join(lines)
 
     # Trusted folders
     tf = result["trusted_folders"]
@@ -648,10 +774,15 @@ def main() -> None:
             "Without --fix, this script is check-only (no HOME or repo mutations)."
         ),
     )
+    parser.add_argument(
+        "--provider",
+        default="gemini",
+        help="Select provider: gemini, agy, or auto.",
+    )
     args = parser.parse_args()
 
     try:
-        result = run_all_checks(fix=args.fix)
+        result = run_all_checks(fix=args.fix, provider=args.provider)
     except Exception as exc:  # pylint: disable=broad-except
         err = {"ok": False, "exit_code": 2, "error": str(exc)}
         if args.json_output:

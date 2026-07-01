@@ -40,7 +40,7 @@ def _make_happy_run(module):
                 "",
             )
         if argv[:2] == [module._resolve_binary(), "-p"]:
-            return _FakeCompleted(0, "OK\n", "")
+            return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
         raise AssertionError(f"unexpected command: {argv}")
 
     return fake_run
@@ -221,7 +221,7 @@ def test_unexpected_capability(monkeypatch):
                 "",
             )
         if argv[:2] == [bin_, "-p"]:
-            return _FakeCompleted(0, "OK\n", "")
+            return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", "")
         raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(module, "_run", fake_run)
@@ -332,7 +332,7 @@ def test_help_flag_parser_no_false_positives():
 
 
 def test_smoke_empty_stdout_fails(monkeypatch):
-    """Smoke check: exit 0 with empty stdout is classified as smoke_failed."""
+    """Smoke check: exit 0 with empty stdout is classified as agy_empty_stdout."""
     module = load_module()
 
     def fake_run(argv, cwd=None, timeout=None):
@@ -349,6 +349,84 @@ def test_smoke_empty_stdout_fails(monkeypatch):
     result = module.run_preflight()
 
     assert result["ok"] is False
-    assert result["failure_class"] == "smoke_failed"
+    assert result["failure_class"] == "agy_empty_stdout"
     assert result["smoke"]["exit_code"] == 0
     assert result["smoke"]["ok"] is False
+
+
+def test_smoke_output_mismatch(monkeypatch):
+    """Smoke check: stdout mismatch is classified as agy_output_mismatch."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, "LOOP_AGY_SMOKE_BAD\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_output_mismatch"
+    assert result["smoke"]["failure_reason"].startswith("agy_output_mismatch")
+
+
+def test_smoke_output_missing_in_ci(monkeypatch):
+    """Smoke check: empty stdout in CI is classified as agy_output_missing."""
+    import os
+
+    module = load_module()
+    original_ci = os.environ.get("CI")
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, "", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    os.environ["CI"] = "1"
+    result = module.run_preflight()
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_output_missing"
+    assert result["smoke"]["failure_class"] == "agy_output_missing"
+
+    if original_ci is None:
+        os.environ.pop("CI", None)
+    else:
+        os.environ["CI"] = original_ci
+
+
+def test_smoke_stderr_and_stdout_samples_are_redacted(monkeypatch):
+    """Smoke sample fields are redacted and truncated."""
+    import os
+
+    module = load_module()
+    os.environ["AGY_API_KEY"] = "secret-key-123"
+
+    def fake_run(argv, cwd=None, timeout=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.0.0\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "  -p, --print, --prompt  mode\n", "")
+        if argv[:2] == [bin_, "-p"]:
+            return _FakeCompleted(0, "LOOP_AGY_SMOKE_OK\n", f"token={os.environ['AGY_API_KEY']}\n")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight()
+
+    assert result["ok"] is True
+    assert "secret-key-123" not in result["smoke"]["stderr_sample"]
+    assert "<redacted>" in result["smoke"]["stderr_sample"]

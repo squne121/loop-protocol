@@ -1428,8 +1428,7 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
         errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("model"):
         errors.append(
-            "unsupported_provider_option: provider=agy does not support explicit model selection "
-            "(requested_model will be recorded as provider_default)"
+            "unsupported_provider_option: provider=agy does not support explicit model selection"
         )
     # prompt is required and must be non-empty
     prompt = request.get("prompt")
@@ -1479,6 +1478,7 @@ def run_delegation(
             (
                 "failure_reason"
             ): f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
+            "failure_class": "unknown_provider",
             "raw_command": [],
             "model_chain": [],
             "model_downgrades": [],
@@ -1509,6 +1509,7 @@ def run_delegation(
                 "stderr": agy_errors[0],
                 "warnings": agy_errors[:],
                 "failure_reason": agy_errors[0],
+                "failure_class": agy_errors[0].split(":", 1)[0],
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],

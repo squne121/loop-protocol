@@ -12,9 +12,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-SMOKE_PROMPT = "Do not use any tools. Reply with OK only."
+EXPECTED_SMOKE = "LOOP_AGY_SMOKE_OK"
+SMOKE_PROMPT = f"Return exactly: {EXPECTED_SMOKE}"
+SMOKE_TIMEOUT_SECONDS = 20
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
 UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
+SMOKE_SAMPLE_MAX_CHARS = 500
 
 # Regex patterns for flag detection with word boundaries to prevent false positives
 # e.g. --prompting must NOT match -p, --printable must NOT match --print
@@ -23,6 +26,45 @@ FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
     "--print": re.compile(r"(?<![\w-])--print(?![\w-])"),
     "--prompt": re.compile(r"(?<![\w-])--prompt(?![\w-])"),
 }
+
+
+def _minimal_agy_env() -> dict[str, str]:
+    """Return a minimal allowlisted environment for agy subprocess execution."""
+    allowlist = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
+    env: dict[str, str] = {}
+    for key in allowlist:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def _redact_output_sample(text: str) -> str:
+    """Return a bounded, redacted sample for stdout/stderr capture."""
+    sample = (text or "")[:SMOKE_SAMPLE_MAX_CHARS]
+
+    secret_keys = (
+        "AGY_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "HF_TOKEN",
+        "GITHUB_TOKEN",
+    )
+    for key in secret_keys:
+        secret = os.environ.get(key)
+        if secret:
+            sample = sample.replace(secret, "<redacted>")
+
+    home = os.environ.get("HOME")
+    if home:
+        sample = sample.replace(home, "$HOME")
+
+    sample = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "<redacted>", sample)
+    sample = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "<redacted>", sample)
+
+    return sample
 
 
 def _resolve_binary() -> str:
@@ -43,6 +85,7 @@ def _run(
         text=True,
         check=False,
         timeout=timeout,
+        env=_minimal_agy_env(),
         shell=False,
     )
 
@@ -91,18 +134,32 @@ def _run_smoke(agy_bin: str) -> dict[str, Any]:
         "argv": argv,
         "exit_code": None,
         "timed_out": False,
+        "failure_reason": None,
+        "failure_class": None,
         "stdout_sample": "",
         "stderr_sample": "",
     }
 
     with tempfile.TemporaryDirectory(prefix="agy-preflight-") as temp_dir:
         try:
-            proc = _run(argv, cwd=Path(temp_dir), timeout=20)
+            proc = _run(argv, cwd=Path(temp_dir), timeout=SMOKE_TIMEOUT_SECONDS)
             smoke["exit_code"] = proc.returncode
-            smoke["stdout_sample"] = proc.stdout[:500]
-            smoke["stderr_sample"] = proc.stderr[:500]
-            # Require non-empty stdout to detect silent output drop (exit 0 with no output)
-            smoke["ok"] = proc.returncode == 0 and bool(proc.stdout.strip())
+            smoke["stdout_sample"] = _redact_output_sample(proc.stdout)
+            smoke["stderr_sample"] = _redact_output_sample(proc.stderr)
+            stdout = proc.stdout or ""
+
+            if proc.returncode != 0:
+                smoke["failure_reason"] = f"agy smoke command exited {proc.returncode}"
+                smoke["failure_class"] = "agy_smoke_exit_nonzero"
+            elif not stdout.strip():
+                is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
+                smoke["failure_reason"] = "agy_output_missing"
+                smoke["failure_class"] = "agy_output_missing" if is_ci else "agy_empty_stdout"
+            elif stdout.strip() != EXPECTED_SMOKE:
+                smoke["failure_reason"] = f"agy_output_mismatch: got {stdout.strip()!r}"
+                smoke["failure_class"] = "agy_output_mismatch"
+            else:
+                smoke["ok"] = True
         except subprocess.TimeoutExpired:
             smoke["timed_out"] = True
 
@@ -185,11 +242,12 @@ def run_preflight() -> dict[str, Any]:
         result["warnings"].append(result["failure_reason"])
         return result
 
-    # Store raw help output as live probe evidence
-    result["help"]["stdout_sample"] = help_proc.stdout[:2000]
-    result["help"]["stderr_sample"] = help_proc.stderr[:500]
+    # Store redacted help output as live probe evidence.
+    result["help"]["stdout_sample"] = _redact_output_sample(help_proc.stdout)
+    result["help"]["stderr_sample"] = _redact_output_sample(help_proc.stderr)
 
-    noninteractive_flags, unexpected_capabilities = _parse_help_capabilities(help_proc.stdout)
+    help_text = "\n".join(part for part in [help_proc.stdout, help_proc.stderr] if part)
+    noninteractive_flags, unexpected_capabilities = _parse_help_capabilities(help_text)
     result["help"]["noninteractive_flags"] = noninteractive_flags
     result["help"]["unexpected_capabilities"] = unexpected_capabilities
 
@@ -211,6 +269,8 @@ def run_preflight() -> dict[str, Any]:
             "argv": [agy_bin, "-p", SMOKE_PROMPT],
             "exit_code": None,
             "timed_out": True,
+            "failure_reason": "agy smoke timed out",
+            "failure_class": "client_subprocess_timeout",
             "stdout_sample": "",
             "stderr_sample": "",
         }
@@ -224,11 +284,8 @@ def run_preflight() -> dict[str, Any]:
         return result
 
     if not smoke["ok"]:
-        if smoke["exit_code"] == 0:
-            result["failure_reason"] = "smoke exited 0 but produced no output (possible silent output drop)"
-        else:
-            result["failure_reason"] = f"agy smoke check failed (exit {smoke['exit_code']})"
-        result["failure_class"] = "smoke_failed"
+        result["failure_reason"] = smoke.get("failure_reason") or "agy smoke check failed"
+        result["failure_class"] = smoke.get("failure_class") or "agy_output_missing"
         result["recovery_action"] = "check agy configuration and rerun preflight"
         return result
 

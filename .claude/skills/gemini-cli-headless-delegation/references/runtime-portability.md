@@ -236,7 +236,10 @@ else
 fi
 ```
 
-`setup_check.py --provider agy` は現時点では未実装（Followup Issue 対応）。
+`setup_check.py --provider agy --json` はこの same-sentinel contract を wrapper 側で検証し、
+`agy_preflight.failure_class` に `agy_empty_stdout` / `agy_output_missing` /
+`agy_output_mismatch` / `agy_smoke_exit_nonzero` / `client_subprocess_timeout`
+を fail-closed で返す。
 
 ### AC5 / AC10: AGY_BIN override と precedence
 
