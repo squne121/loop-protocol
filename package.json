@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "lint:md": "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.claude/worktrees/**' '#dist/**' '#coverage/**' '#playwright-report/**' '#test-results/**'",
     "lint:prose": "textlint --config .textlintrc 'docs/**/*.md' 'README.md' '.github/**/*.md' 'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'",
-    "lint:docs": "pnpm run lint:md && pnpm run lint:prose",
+    "lint:docs": "pnpm run lint:md && pnpm run lint:prose && pnpm run validate:roadmap-refs",
+    "validate:roadmap-refs": "node scripts/validate-roadmap-refs.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test:e2e": "VITE_E2E_MODE=true pnpm build && playwright test",
@@ -61,6 +62,7 @@
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.3",
     "vite": "^8.0.12",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.6",
+    "yaml": "^2.8.1"
   }
 }
