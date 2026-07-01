@@ -1,6 +1,8 @@
 ---
+# Secret Inventory SSOT 用 front matter。機械可読キーは維持しつつ、日本語説明を付す。
 id: secret-policy
 status: stable
+summary_ja: "この front matter は secret-policy SSOT の識別情報を表す。"
 related_issue: "#241"
 related_issues:
   - "#136"
@@ -41,7 +43,7 @@ secret_policy:
 
 ---
 
-## Secret Inventory（5 区分）
+## Secret Inventory（5 区分・秘密在庫一覧）
 
 ### 1. `current` — 現時点で repo に存在する Secret
 
@@ -137,7 +139,7 @@ latitude_api_key_classification:
 
 ---
 
-## Latitude real pilot 例外 Decision — LATITUDE\_PILOT\_EXCEPTION\_V1 (#1220)
+## Latitude real pilot 例外 Decision — LATITUDE\_PILOT\_EXCEPTION\_V1 (#1220)・実運用例外判断
 
 Child A0（#1157）の containment / runtime inventory / Kill Switch 完了後に、
 Latitude credential を保持した real pilot 例外を認めるかを **人間 Decision** として固定する。
@@ -247,7 +249,7 @@ LATITUDE_PILOT_EXCEPTION_V1:
 > `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
 > 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
 
-### Session recording command surface contract
+### Session recording command surface contract（記録コマンド面の契約）
 
 ```yaml
 session_recording_script_contract:
@@ -402,7 +404,7 @@ inventory_to_secrets_mode:
 
 ---
 
-## Current Audit Evidence
+## Current Audit Evidence（現行監査証跡）
 
 ```yaml
 current_audit_evidence:
