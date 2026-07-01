@@ -102,6 +102,7 @@ def test_ac6_unknown_provider_fails_closed() -> None:
     result = rgh.run_delegation(req)
     assert result["ok"] is False
     assert result["failure_reason"] is not None
+    assert result["failure_class"] == "unknown_provider"
     assert "unknown_provider" in result["failure_reason"]
 
 
@@ -143,8 +144,7 @@ def test_ac7_agy_grounded_research_rejected() -> None:
     req = _agy_request(tool_profile="grounded_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 def test_ac7_agy_local_asset_research_rejected() -> None:
@@ -152,8 +152,7 @@ def test_ac7_agy_local_asset_research_rejected() -> None:
     req = _agy_request(tool_profile="local_asset_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 def test_ac7_agy_github_research_rejected() -> None:
@@ -161,8 +160,7 @@ def test_ac7_agy_github_research_rejected() -> None:
     req = _agy_request(tool_profile="github_research")
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    failure = result.get("failure_reason") or ""
-    assert "unsupported_provider_profile" in failure
+    assert result["failure_class"] == "unsupported_provider_profile"
 
 
 # ---------------------------------------------------------------------------
@@ -189,20 +187,32 @@ def test_ac8_normalize_agy_skips_parse_envelope() -> None:
 
 
 def test_ac9_exit0_empty_stdout_fails_closed() -> None:
-    """AC9: provider=agy, exit 0, empty stdout -> fail with agy_output_missing."""
-    completed = _make_completed(0, stdout="")
-    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    """AC9: provider=agy, exit 0, empty stdout -> fail with agy_empty_stdout."""
+    with patch.dict(os.environ, {"CI": ""}, clear=False):
+        completed = _make_completed(0, stdout="")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
     assert result["ok"] is False
-    assert result["failure_reason"] == "agy_output_missing"
+    assert result["failure_reason"] == "agy_empty_stdout"
     assert result["failure_class"] == "agy_empty_stdout"
 
 
 def test_ac9_exit0_whitespace_only_stdout_fails_closed() -> None:
-    """AC9: provider=agy, exit 0, whitespace-only stdout -> fail with agy_output_missing."""
-    completed = _make_completed(0, stdout="   \n  ")
-    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    """AC9: provider=agy, exit 0, whitespace-only stdout -> fail with agy_empty_stdout."""
+    with patch.dict(os.environ, {"CI": ""}, clear=False):
+        completed = _make_completed(0, stdout="   \n  ")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+    assert result["ok"] is False
+    assert result["failure_reason"] == "agy_empty_stdout"
+
+
+def test_ac9_exit0_empty_stdout_in_ci_uses_output_missing() -> None:
+    """AC9: provider=agy, CI 環境の empty stdout は agy_output_missing に揃える。"""
+    with patch.dict(os.environ, {"CI": "1"}, clear=False):
+        completed = _make_completed(0, stdout="")
+        result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
     assert result["ok"] is False
     assert result["failure_reason"] == "agy_output_missing"
+    assert result["failure_class"] == "agy_output_missing"
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +259,7 @@ def test_ac11_agy_no_tools_forbids_post_to_issue_url() -> None:
     )
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert "provider_forbids_post_to_issue_url" in (result.get("failure_reason") or "")
+    assert result["failure_class"] == "provider_forbids_post_to_issue_url"
 
 
 def test_ac11_agy_proposal_only_forbids_post_to_issue_url() -> None:
@@ -260,7 +270,21 @@ def test_ac11_agy_proposal_only_forbids_post_to_issue_url() -> None:
     )
     result = rgh.run_delegation(req)
     assert result["ok"] is False
-    assert "provider_forbids_post_to_issue_url" in (result.get("failure_reason") or "")
+    assert result["failure_class"] == "provider_forbids_post_to_issue_url"
+
+
+def test_agy_model_rejection_sets_failure_class() -> None:
+    """provider=agy で explicit model は unsupported_provider_option を返す。"""
+    result = rgh.run_delegation(_agy_request(model="gemini-3-pro"))
+    assert result["ok"] is False
+    assert result["failure_class"] == "unsupported_provider_option"
+
+
+def test_agy_empty_prompt_sets_failure_class() -> None:
+    """provider=agy で空 prompt は agy_empty_prompt を返す。"""
+    result = rgh.run_delegation(_agy_request(prompt="   "))
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_empty_prompt"
 
 
 # ---------------------------------------------------------------------------

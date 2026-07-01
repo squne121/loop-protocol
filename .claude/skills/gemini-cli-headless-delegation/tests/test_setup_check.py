@@ -109,7 +109,7 @@ def test_all_checks_pass_exit_code_zero(tmp_path):
     assert result["ok"] is True
     assert result["exit_code"] == 0
     # AC1: all tool versions present in output
-    for tool in sc.REQUIRED_TOOLS:
+    for tool in sc.GEMINI_REQUIRED_TOOLS:
         assert result["tools"]["versions"][tool] is not None, f"{tool} version must be present"
 
 
@@ -185,6 +185,127 @@ def test_node_missing_run_all_exit_nonzero(tmp_path):
 
     assert result["ok"] is False
     assert result["exit_code"] != 0
+
+
+def test_agy_provider_skips_gemini_specific_checks(monkeypatch, tmp_path):
+    """provider=agy は gemini 専用チェックを要求せず agy_preflight を返す。"""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        if tool == "agy" and "--version" in command:
+            return _make_completed(0, stdout="agy 1.0.14\n")
+        if tool == "python3" and "--version" in command:
+            return _make_completed(0, stdout="Python 3.12.0\n")
+        if tool == "uv" and "--version" in command:
+            return _make_completed(0, stdout="uv 0.7.0\n")
+        raise FileNotFoundError(tool)
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+    monkeypatch.setattr(
+        sc,
+        "check_agy_preflight",
+        lambda: {"schema": "agy_preflight_result/v1", "ok": True, "failure_class": None},
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    assert result["ok"] is True
+    assert result["provider"] == "agy"
+    assert result["selected_provider"] == "agy"
+    assert result["agy_preflight"]["ok"] is True
+    assert "skipped_gemini_checks" in result
+    assert "gemini_settings" in result["skipped_gemini_checks"]
+    assert "auth" in result["skipped_gemini_checks"]
+    assert "node" in result["skipped_gemini_checks"]
+    assert "gemini" not in result["tools"]["versions"] or result["tools"]["versions"].get("gemini") is None
+
+
+def test_agy_provider_fix_fails_closed_without_mutation(monkeypatch, tmp_path):
+    """provider=agy --fix は unsupported_provider_option として fail-closed。"""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        versions = {"agy": "agy 1.0.14\n", "python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+    monkeypatch.setattr(
+        sc,
+        "check_agy_preflight",
+        lambda: {"schema": "agy_preflight_result/v1", "ok": True, "failure_class": None},
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy", fix=True)
+
+    assert result["ok"] is False
+    assert result["unsupported_provider_option"] is True
+    assert "unsupported_provider_option: provider=agy does not support --fix" in result["warnings"]
+
+
+def test_auto_provider_reports_attempt_order(monkeypatch, tmp_path):
+    """provider=auto は agy→gemini の precedence と provider_attempts を返す。"""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(
+        sc,
+        "_run_agy_provider_checks",
+        lambda repo_root=None, fix=False: {
+            "ok": False,
+            "exit_code": 1,
+            "provider": "agy",
+            "selected_provider": "agy",
+            "agy_preflight": {"failure_class": "cli_missing"},
+            "tools": {"ok": False, "versions": {"agy": None}},
+            "skipped_gemini_checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        sc,
+        "_run_gemini_provider_checks",
+        lambda repo_root=None, fix=False: {
+            "ok": True,
+            "exit_code": 0,
+            "provider": "gemini",
+            "selected_provider": "gemini",
+            "tools": {"ok": True, "versions": {"gemini": "0.1.0"}},
+            "trusted_folders": {"ok": True, "status": "already_trusted"},
+            "serena_mcp": {"ok": True, "status": "available"},
+            "gemini_settings": {"ok": True, "status": "exists"},
+            "auth": {"ok": True, "status": "authenticated"},
+        },
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="auto")
+
+    assert result["ok"] is True
+    assert result["provider"] == "auto"
+    assert result["selected_provider"] == "gemini"
+    assert [entry["provider"] for entry in result["provider_attempts"]] == ["agy", "gemini"]
+
+
+def test_auto_provider_fix_is_rejected(tmp_path):
+    """provider=auto --fix は副作用対象が曖昧なので fail-closed。"""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="auto", fix=True)
+
+    assert result["ok"] is False
+    assert result["provider"] == "auto"
+    assert result["selected_provider"] is None
+    assert result["failure_class"] == "unsupported_provider_option"
+    assert "provider=auto does not support --fix" in result["failure_reason"]
 
 
 # ---------------------------------------------------------------------------
