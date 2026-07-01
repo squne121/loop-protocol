@@ -247,6 +247,37 @@ LATITUDE_PILOT_EXCEPTION_V1:
 > `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
 > 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
 
+### Session recording command surface contract
+
+```yaml
+session_recording_script_contract:
+  security:session-recording:
+    purpose: ci_policy_bundle
+    host_readiness_proof: false
+  security:session-recording:fixture:
+    purpose: deterministic_ci_fixture_gate
+    host_readiness_proof: false
+  security:session-recording:runtime:
+    purpose: fixture_alias_compatibility_surface
+    host_readiness_proof: false
+  security:session-recording:host:
+    purpose: host_inventory_preflight
+    ci_required_gate: false
+    real_pilot_allow_proof_by_itself: false
+  latitude:real-pilot:preflight:
+    purpose: sole_real_pilot_pre_session_gate
+    canonical_source_command: .claude/scripts/check_session_recording_runtime_safety.py --json --execution-profile host --require-real-pilot-activation
+    allow_requires:
+      execution_profile: host
+      decision: allow
+      verdict: safe
+      inspection_complete: true
+      pilot_activation_state: allow
+      pilot_exception_decision: approve_timeboxed_real_pilot
+      pilot_exception_reason_codes: []
+      source_digest: present
+```
+
 ---
 
 ## VITE_ 環境変数の取り扱い

@@ -677,6 +677,55 @@ function runVerifierJson(
   }
 }
 
+function runRealPilotPreflight(
+  envOverrides: Record<string, string> = {},
+  executionProfile: 'host' | 'fixture' = 'fixture',
+): { stdout: string; stderr: string; exitCode: number; json: Record<string, unknown> | null } {
+  const repoRoot = REPO_ROOT
+
+  const baseEnv: Record<string, string> = {
+    SRRS_GIT_LS_REMOTE_EXIT: '2',
+    SRRS_GH_VISIBILITY: 'private',
+    SRRS_GIT_CONFIG_OUTPUT: '',
+    SRRS_CHECKPOINT_TOKEN: 'absent',
+    SRRS_REPO_ROOT: repoRoot,
+    ...envOverrides,
+  }
+
+  const fullEnv: Record<string, string> = { ...(process.env as Record<string, string>) }
+  delete fullEnv['ENTIRE_CHECKPOINT_TOKEN']
+  delete fullEnv['SRRS_SECRETS_MODE']
+  delete fullEnv['LATITUDE_API_KEY']
+  delete fullEnv['LATITUDE_CLAUDE_CODE_ENABLED']
+  delete fullEnv['LATITUDE_BASE_URL']
+  delete fullEnv['LATITUDE_DEBUG']
+  delete fullEnv['BUN_OPTIONS']
+  if (executionProfile === 'fixture') {
+    fullEnv['SRRS_ALLOW_REAL_PILOT_PREFLIGHT_FIXTURE'] = '1'
+  }
+  Object.assign(fullEnv, baseEnv)
+
+  const result = spawnSync(
+    'python3',
+    [SCRIPT, '--json', '--execution-profile', executionProfile, '--require-real-pilot-activation'],
+    { encoding: 'utf-8', env: fullEnv, timeout: 30000 }
+  )
+
+  let parsed: Record<string, unknown> | null = null
+  try {
+    parsed = JSON.parse(result.stdout ?? '')
+  } catch {
+    // ignore parse errors
+  }
+
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    exitCode: result.status ?? EXIT_FAIL,
+    json: parsed,
+  }
+}
+
 // ============================================================================
 // AC3: session_recording_runtime_safety/v2 schema present
 // ============================================================================
@@ -1218,8 +1267,10 @@ describe('runtime safety #1157: AC29 fixtures and scripts available', () => {
   it('GIVEN repository structure WHEN checking package.json THEN security:session-recording scripts exist', () => {
     const pkg = JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf-8'))
     const scripts = pkg.scripts ?? {}
-    // security:session-recording:fixture should exist
-    expect(Object.keys(scripts).some(k => k.includes('session-recording'))).toBe(true)
+    expect(scripts['security:session-recording']).toContain('security:session-recording:fixture')
+    expect(scripts['security:session-recording:runtime']).toBe('pnpm run security:session-recording:fixture')
+    expect(scripts['security:session-recording:host']).toContain('--execution-profile host')
+    expect(scripts['latitude:real-pilot:preflight']).toContain('--require-real-pilot-activation')
   })
 })
 
@@ -1808,6 +1859,78 @@ describe('runtime safety #1220: deterministic fixture gate (security:session-rec
     const pilot = (parsed?.['pilot_exception'] as Record<string, unknown>) ?? {}
     expect(pilot['decision']).toBe('approve_synthetic_only')
     expect(pilot['malformed']).toBe(false)
+  })
+})
+
+describe('runtime safety #1258: latitude:real-pilot:preflight strict gate', () => {
+  it('GIVEN execution_profile=fixture WHEN strict preflight runs THEN fail_closed and deny', () => {
+    const result = runRealPilotPreflight({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+    }, 'fixture')
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN top-level decision allow but pilot_activation_state blocked WHEN strict preflight runs THEN fail_closed deny', () => {
+    const result = runRealPilotPreflight({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_synthetic_only',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+    })
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['pilot_activation_state']).toBe('blocked_until_activation')
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['verdict']).toBe('fail_closed')
+  })
+
+  it('GIVEN approve_timeboxed_real_pilot but distribution provenance unknown WHEN strict preflight runs THEN blocked deny', () => {
+    const result = runRealPilotPreflight({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'unknown',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('blocked')
+  })
+
+  it('GIVEN approve_timeboxed_real_pilot with pinned package but unresolved distribution evidence WHEN strict preflight runs THEN fail_closed', () => {
+    const result = runRealPilotPreflight({
+      ...SAFE_LAT_BASE,
+      SRRS_LAT_PILOT_DECISION: 'approve_timeboxed_real_pilot',
+      SRRS_LAT_PILOT_MARKER_COUNT: '1',
+      SRRS_LAT_PILOT_ACTIVATION_FIELDS: 'complete',
+      SRRS_LAT_PILOT_DIST_DIGESTS: 'complete',
+      SRRS_LAT_PILOT_REMOTE_CLEANUP: 'machine_verified',
+      SRRS_LAT_PILOT_ARGV_EXPOSURE: 'absent_verified',
+      SRRS_LAT_DIST_SPEC: 'npx @latitude-data/claude-code-telemetry@1.2.3',
+      SRRS_LAT_DIST_INTEGRITY: 'verified',
+      SRRS_LAT_DIST_PROVENANCE: 'verified',
+    })
+    expect(result.exitCode).toBe(EXIT_FAIL_CLOSED)
+    expect(result.json?.['decision']).toBe('deny')
+    expect(result.json?.['verdict']).toBe('fail_closed')
+    expect(result.json?.['pilot_activation_state']).toBe('allow')
   })
 })
 

@@ -316,9 +316,15 @@ real session 開始可否（`real_session_start_gate`）の正本は、`docs/dev
 - activation gate の正本は Stop hook ではなく、session 開始前の host verifier JSON
   （`check_session_recording_runtime_safety.py --json --execution-profile host`）とする。
   Claude Code hook は matching する全 hook が並列実行されるため、hook の通過を activation 証明にしない。
+- `latitude:real-pilot:preflight` は上記 host verifier JSON を strict mode で再評価する
+  sole real-pilot pre-session gate であり、`decision: allow` 単独や fixture PASS を allow 根拠にしない。
+- `security:session-recording` は CI / policy / smoke bundle であり、host readiness proof ではない。
 - `security:session-recording:host` は pre-activation local preflight 専用であり、
   `SRRS_*` override を reject する。generic CI required gate には組み込まない。
-  deterministic な CI gate には `security:session-recording:runtime`（fixture gate）を使う。
+  deterministic な CI gate には `security:session-recording:fixture` を使う。
+  `security:session-recording:runtime` は fixture alias 互換面であり、host proof として扱わない。
+- host preflight の blocked / deny は CI required gate failure ではなく、
+  real pilot blocked evidence として扱う。
 
 ### Parent #1153 Child の prerequisite 参照
 

@@ -56,6 +56,8 @@ EXIT_FAIL = 1
 EXIT_FAIL_CLOSED = 2
 EXIT_ARG_ERROR = 3
 
+REAL_PILOT_ALLOW_DECISION = "approve_timeboxed_real_pilot"
+
 # ---------------------------------------------------------------------------
 # Diagnostic codes (machine-readable, no secrets)
 # ---------------------------------------------------------------------------
@@ -1080,6 +1082,90 @@ def _run_checks_for_json(
     return output, exit_code
 
 
+def _is_truthy(value: Any) -> bool:
+    return value is True
+
+
+def _apply_real_pilot_preflight_requirement(
+    output: dict[str, Any],
+    execution_profile: str,
+) -> int:
+    """Re-evaluate host verifier JSON as the sole real-pilot preflight gate."""
+    allow_fixture_preflight = os.environ.get("SRRS_ALLOW_REAL_PILOT_PREFLIGHT_FIXTURE") == "1"
+    profile_ok = execution_profile == "host" or allow_fixture_preflight
+
+    if not profile_ok:
+        output["decision"] = "deny"
+        output["verdict"] = "fail_closed"
+        output["inspection_complete"] = False
+        output["exit_code"] = EXIT_FAIL_CLOSED
+        return EXIT_FAIL_CLOSED
+
+    verdict = output.get("verdict")
+    if verdict == "fail_closed":
+        output["decision"] = "deny"
+        output["inspection_complete"] = False
+        output["exit_code"] = EXIT_FAIL_CLOSED
+        return EXIT_FAIL_CLOSED
+
+    policy = output.get("policy")
+    pilot = output.get("pilot_exception")
+    components = output.get("components")
+    latitude = components.get("latitude") if isinstance(components, dict) else None
+
+    if not isinstance(policy, dict) or not isinstance(pilot, dict) or not isinstance(latitude, dict):
+        output["decision"] = "deny"
+        output["verdict"] = "fail_closed"
+        output["inspection_complete"] = False
+        output["exit_code"] = EXIT_FAIL_CLOSED
+        return EXIT_FAIL_CLOSED
+
+    source_digest = policy.get("source_digest")
+    pilot_reason_codes = pilot.get("reason_codes")
+    dist = latitude.get("distribution")
+    if not isinstance(dist, dict):
+        dist = {}
+
+    source_digest_ok = isinstance(source_digest, str) and source_digest not in ("", "unknown", "null")
+    pilot_reason_codes_ok = isinstance(pilot_reason_codes, list) and len(pilot_reason_codes) == 0
+    preflight_ready = all([
+        profile_ok,
+        output.get("decision") == "allow",
+        output.get("verdict") == "safe",
+        _is_truthy(output.get("inspection_complete")),
+        output.get("pilot_activation_state") == PILOT_ACTIVATION_ALLOW,
+        pilot.get("decision") == REAL_PILOT_ALLOW_DECISION,
+        pilot.get("malformed") is False,
+        pilot_reason_codes_ok,
+        _is_truthy(pilot.get("raw_values_emitted")) is False,
+        latitude.get("verdict") == "safe",
+        _is_truthy(latitude.get("inspection_complete")),
+        source_digest_ok,
+        dist.get("state") == "verified",
+        _is_truthy(dist.get("registry_signature_verified")),
+        _is_truthy(dist.get("provenance_verified")),
+    ])
+
+    if preflight_ready:
+        output["decision"] = "allow"
+        output["verdict"] = "safe"
+        output["inspection_complete"] = True
+        output["exit_code"] = EXIT_PASS
+        return EXIT_PASS
+
+    output["decision"] = "deny"
+    if verdict == "blocked":
+        output["verdict"] = "blocked"
+        output["inspection_complete"] = bool(output.get("inspection_complete"))
+        output["exit_code"] = EXIT_FAIL
+        return EXIT_FAIL
+
+    output["verdict"] = "fail_closed"
+    output["inspection_complete"] = False
+    output["exit_code"] = EXIT_FAIL_CLOSED
+    return EXIT_FAIL_CLOSED
+
+
 # ---------------------------------------------------------------------------
 # Main (plain text mode)
 # ---------------------------------------------------------------------------
@@ -1453,6 +1539,10 @@ def main() -> int:
         help="Alias for --execution-profile fixture",
     )
     parser.add_argument(
+        "--require-real-pilot-activation", action="store_true", default=False,
+        help="Fail closed unless the host verifier JSON itself proves real-pilot activation.",
+    )
+    parser.add_argument(
         "--capability-fixture", default=None,
         help="Path to an agent_observation_capability/v1 fixture JSON; runs the "
              "#1221 capability matrix check and exits.",
@@ -1535,6 +1625,8 @@ def main() -> int:
 
     if args.json:
         output, exit_code = _run_checks_for_json(repo_root, execution_profile, home_root)
+        if args.require_real_pilot_activation:
+            exit_code = _apply_real_pilot_preflight_requirement(output, execution_profile)
         # AC20: stdout is single JSON object only
         print(json.dumps(output, indent=2), flush=True)
         return exit_code
