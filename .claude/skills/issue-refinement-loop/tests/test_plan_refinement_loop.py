@@ -940,11 +940,20 @@ class TestAC2ContractMalformedSeparatePath:
 class TestScopeSignalDeltaPlannerIntegration:
     def test_planner_consumes_scope_signal_delta_projection(self):
         input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        allowed_paths_before = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+        )
+        allowed_paths_after = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`\n"
+        )
         input_data["known_context"] = {
             "scope_signal_delta_input": {
-                "before_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
-                "current_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
-                "after_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`\n",
+                "before_body": allowed_paths_before,
+                "current_body": allowed_paths_before,
+                "after_body": allowed_paths_after,
                 "source_refs": {
                     "before": "fixture:before",
                     "current": "fixture:current",
@@ -958,11 +967,20 @@ class TestScopeSignalDeltaPlannerIntegration:
 
     def test_planner_scope_signal_delta_honors_trusted_anchor_projection(self):
         input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        allowed_paths_before = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+        )
+        allowed_paths_after = (
+            "## Allowed Paths\n"
+            "- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n"
+            "- `docs/dev/workflow.md`\n"
+        )
         input_data["known_context"] = {
             "scope_signal_delta_input": {
-                "before_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
-                "current_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
-                "after_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`\n",
+                "before_body": allowed_paths_before,
+                "current_body": allowed_paths_before,
+                "after_body": allowed_paths_after,
                 "source_refs": {
                     "before": "fixture:before",
                     "current": "fixture:current",
