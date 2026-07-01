@@ -36,6 +36,11 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
 
+try:
+    from scope_signal_delta import compute_scope_signal_delta
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    compute_scope_signal_delta = None
+
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -630,6 +635,14 @@ def _is_anchor_reframe_context(known_context: dict | None) -> bool:
     """Check if known_context indicates anchor reframe exclusion."""
     if not known_context:
         return False
+    scope_delta_decision = known_context.get("scope_delta_decision")
+    if isinstance(scope_delta_decision, dict):
+        if (
+            scope_delta_decision.get("status") == "approved_by_trusted_anchor"
+            and scope_delta_decision.get("implementation_go") is False
+            and scope_delta_decision.get("required_rerun")
+        ):
+            return True
     classification = known_context.get("classification")
     if classification in ("feedback_update_required", "reframe_in_place"):
         return True
@@ -646,6 +659,36 @@ def _detect_scope_signals(issue_body: str, known_context: dict | None) -> tuple[
 
     Precedence: new_unverifiable_ac > new_allowed_path_layer > new_in_scope_area > none
     """
+    if (
+        compute_scope_signal_delta is not None
+        and known_context
+        and isinstance(known_context.get("scope_signal_delta_input"), dict)
+    ):
+        try:
+            delta_result = compute_scope_signal_delta(known_context["scope_signal_delta_input"])
+            projection = delta_result.get("legacy_scope_signal_guard", {})
+            evidence_spans = [
+                {
+                    "source": "issue_body",
+                    "source_ref": None,
+                    "start_line": line["start_line"],
+                    "end_line": line["end_line"],
+                    "text_sha256": line["text_sha256"].removeprefix("sha256:"),
+                }
+                for line in projection.get("triggering_lines", [])
+            ]
+            if projection.get("triggered"):
+                if _is_anchor_reframe_context(known_context):
+                    return (False, SCOPE_SIGNAL_REASON_ANCHOR_REFRAME, evidence_spans)
+                return (
+                    True,
+                    projection.get("reason_code", SCOPE_SIGNAL_REASON_NO_SIGNAL),
+                    evidence_spans,
+                )
+            return (False, SCOPE_SIGNAL_REASON_NO_SIGNAL, [])
+        except Exception:
+            pass
+
     evidence_spans = []
     sections = _extract_sections(issue_body)
 

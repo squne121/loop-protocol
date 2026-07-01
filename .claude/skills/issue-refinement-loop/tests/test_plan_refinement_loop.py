@@ -935,3 +935,46 @@ class TestAC2ContractMalformedSeparatePath:
         assert required_contract_keys == [], (
             f"required_contract_keys must be [] when YAML parse fails, got {required_contract_keys}"
         )
+
+
+class TestScopeSignalDeltaPlannerIntegration:
+    def test_planner_consumes_scope_signal_delta_projection(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": {
+                "before_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
+                "current_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
+                "after_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`\n",
+                "source_refs": {
+                    "before": "fixture:before",
+                    "current": "fixture:current",
+                    "after": "fixture:after"
+                }
+            }
+        }
+        output, _ = run_planner(input_data)
+        assert output["decisions"]["scope_signal_guard"]["triggered"] is True
+        assert output["decisions"]["scope_signal_guard"]["reason_code"] == "new_allowed_path_layer"
+
+    def test_planner_scope_signal_delta_honors_trusted_anchor_projection(self):
+        input_data = fixture_to_input("no_repo_fact_claim", "negative", 7)
+        input_data["known_context"] = {
+            "scope_signal_delta_input": {
+                "before_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
+                "current_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n",
+                "after_body": "## Allowed Paths\n- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py`\n- `docs/dev/workflow.md`\n",
+                "source_refs": {
+                    "before": "fixture:before",
+                    "current": "fixture:current",
+                    "after": "fixture:after"
+                }
+            },
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "implementation_go": False,
+                "required_rerun": ["contract_review", "refinement_preflight"]
+            }
+        }
+        output, _ = run_planner(input_data)
+        assert output["decisions"]["scope_signal_guard"]["triggered"] is False
+        assert output["decisions"]["scope_signal_guard"]["reason_code"] == "anchor_reframe_exclusion"

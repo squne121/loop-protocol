@@ -4,6 +4,8 @@
 
 scope signal の検知は `plan_refinement_loop.py` が生成する `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard` を SSOT とする。orchestrator は `triggered` / `excluded_by_anchor_reframe` / `reason_code` を consume するだけで、判定条件を prose 再実装しない。
 
+`scope_signal_delta.py` を使う path では、planner は `known_context.scope_signal_delta_input` から受け取った `before/current/after` の normalized delta facts を consume し、legacy `scope_signal_guard` projection だけを `REFINEMENT_LOOP_PLAN_V1` に反映する。raw anchor comment body を planner や delta helper の入力へ直接流してはならない。
+
 ## Scope rollup preflight
 
 同一 skill family / Allowed Paths / parent issue の衝突確認は `scope-rollup-policy.md` を参照する。rollup の候補が `human_review_required` の場合は即停止する。
@@ -132,6 +134,26 @@ scope_delta_decision:
 ```
 
 `implementation_go` は trusted anchor が approve した場合でも `false`。scope 拡張承認は実装開始の自動許可ではない。contract review / refinement preflight / allowed_paths_gate の再実行が必要。
+
+## scope_signal_delta 入力契約
+
+```yaml
+scope_signal_delta_input:
+  before_body: string
+  current_body: string
+  after_body: string
+  source_refs:
+    before: string | null
+    current: string | null
+    after: string | null
+```
+
+- `before_body`: rewrite 前の canonical issue body
+- `current_body`: planner / checker が評価対象として読む current snapshot body
+- `after_body`: proposed rewrite body または fixture が与える candidate body
+- `source_refs.*`: issue URL / artifact path / fixture path / comment id の provenance
+
+`new_allowed_path_layer` は `after.allowed_path_layers - before.allowed_path_layers` が非空の場合のみ発火する。既存 layer の再掲、並び替え、空白差分、fenced code 内の path mention は signal にしない。
 
 ## Must not
 
