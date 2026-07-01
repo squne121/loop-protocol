@@ -1106,6 +1106,7 @@ def _normalize_agy_result(
     """
     stdout = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
+    is_ci = os.environ.get("CI", "").lower() in {"1", "true", "yes", "on"}
 
     if completed.returncode != 0:
         return {
@@ -1131,6 +1132,8 @@ def _normalize_agy_result(
         }
 
     if not stdout:
+        failure_class = "agy_output_missing" if is_ci else "agy_empty_stdout"
+        warning = "agy_output_missing: exit 0 but stdout was empty"
         return {
             "schema": "delegation_result/v1",
             "transport": "agy",
@@ -1145,9 +1148,9 @@ def _normalize_agy_result(
             "response_text": None,
             "stats": None,
             "stderr": stderr_text or None,
-            "warnings": ["agy_output_missing: exit 0 but stdout was empty"],
-            "failure_reason": "agy_output_missing",
-            "failure_class": "agy_empty_stdout",
+            "warnings": [warning],
+            "failure_reason": failure_class,
+            "failure_class": failure_class,
             "raw_command": _build_agy_raw_command(""),
             "model_chain": [],
             "model_downgrades": [],
@@ -1428,8 +1431,7 @@ def _validate_agy_request(request: Mapping[str, Any]) -> list[str]:
         errors.append("provider_forbids_post_to_issue_url: provider=agy forbids post_to_issue_url for all profiles")
     if request.get("model"):
         errors.append(
-            "unsupported_provider_option: provider=agy does not support explicit model selection "
-            "(requested_model will be recorded as provider_default)"
+            "unsupported_provider_option: provider=agy does not support explicit model selection"
         )
     # prompt is required and must be non-empty
     prompt = request.get("prompt")
@@ -1479,6 +1481,7 @@ def run_delegation(
             (
                 "failure_reason"
             ): f"unknown_provider: {provider!r} is not in SUPPORTED_PROVIDERS {sorted(SUPPORTED_PROVIDERS)}",
+            "failure_class": "unknown_provider",
             "raw_command": [],
             "model_chain": [],
             "model_downgrades": [],
@@ -1509,6 +1512,7 @@ def run_delegation(
                 "stderr": agy_errors[0],
                 "warnings": agy_errors[:],
                 "failure_reason": agy_errors[0],
+                "failure_class": agy_errors[0].split(":", 1)[0],
                 "raw_command": _build_agy_raw_command(""),
                 "model_chain": [],
                 "model_downgrades": [],
