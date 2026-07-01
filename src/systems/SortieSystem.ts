@@ -133,15 +133,17 @@ export function claimPendingReward(
     return { ok: false, reason: 'no-pending-reward' }
   }
 
+  const transition = resolvePhaseTransition(state.loopPhase, 'legacy_claim_reward')
+  if (!transition.ok) {
+    return { ok: false, reason: 'no-pending-reward' }
+  }
+
   const claimResult = RewardSystem.claim(state, applicationId, state.sortie.result)
   if (!claimResult.ok && claimResult.reason !== 'already-claimed') {
     return claimResult
   }
 
-  const transition = resolvePhaseTransition(state.loopPhase, 'debrief_reward_claimed')
-  if (transition.ok) {
-    state.loopPhase = transition.nextPhase
-  }
+  state.loopPhase = transition.to
   return claimResult
 }
 
@@ -169,12 +171,12 @@ export function confirmResult(state: GameState): boolean {
     }
   }
 
-  const transition = resolvePhaseTransition(state.loopPhase, 'preparation')
+  const transition = resolvePhaseTransition(state.loopPhase, 'confirm_result')
   if (!transition.ok) {
     return false
   }
 
-  state.loopPhase = transition.nextPhase
+  state.loopPhase = transition.to
   return true
 }
 
@@ -187,7 +189,7 @@ export function confirmResult(state: GameState): boolean {
  * @param fixedDeltaMs Fixed timestep in milliseconds (used to compute targetTicks)
  */
 export function startSortie(state: GameState, fixedDeltaMs: number): boolean {
-  const transition = resolvePhaseTransition(state.loopPhase, 'running')
+  const transition = resolvePhaseTransition(state.loopPhase, 'start_sortie')
   if (!transition.ok) {
     return false
   }
@@ -195,7 +197,7 @@ export function startSortie(state: GameState, fixedDeltaMs: number): boolean {
   resetCombatRuntime(state)
   const targetTicks = Math.ceil(SORTIE_DURATION_MS / fixedDeltaMs)
 
-  state.loopPhase = transition.nextPhase
+  state.loopPhase = transition.to
   state.pendingRewardApplicationId = null
   beginPlaytestEvidenceSortie(state.playtestEvidenceRuntime)
   state.sortie = {
@@ -296,6 +298,11 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
     } satisfies SortieResult)
   }
 
+  const transition = resolvePhaseTransition(state.loopPhase, 'sortie_terminal')
+  if (!transition.ok) {
+    return
+  }
+
   const terminalState: SortieState = {
     status: result.outcome,
     elapsedTicks,
@@ -303,14 +310,9 @@ export function runSortieSystem(state: GameState, fixedDeltaMs: number): void {
     result,
   }
 
-  state.sortie = terminalState
-  const transition = resolvePhaseTransition(state.loopPhase, 'result')
-  if (!transition.ok) {
-    return
-  }
-
   // AC4: transition to result phase, not directly to next sortie
-  state.loopPhase = transition.nextPhase
+  state.sortie = terminalState
+  state.loopPhase = transition.to
   state.resultRewardStatus = 'pending'
   markTerminalState(state.playtestEvidenceRuntime, result.outcome)
   setSelfExplanationPrompt(

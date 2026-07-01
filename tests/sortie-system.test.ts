@@ -421,6 +421,32 @@ describe('GIVEN result phase (AC4, AC5, AC10)', () => {
     expect(state.progress.resources).toBe(snapshot.resources)
   })
 
+  it('legacy debrief flow: WHEN claimPendingReward called from debrief_pending_reward THEN reward is applied once and phase becomes debrief_reward_claimed', () => {
+    const state = createInitialGameState()
+    state.loopPhase = 'debrief_pending_reward'
+    state.pendingRewardApplicationId = 'sortie-reward-1'
+    state.sortie = {
+      status: 'victory',
+      elapsedTicks: TARGET_TICKS,
+      targetTicks: TARGET_TICKS,
+      result: Object.freeze({
+        outcome: 'victory',
+        endReason: 'all_enemies_defeated',
+        durationMs: SORTIE_DURATION_MS,
+        kills: 2,
+        shotsFired: 5,
+        playerHpRemaining: 8,
+      }),
+    }
+    const resourcesBefore = state.progress.resources
+
+    const claim = claimPendingReward(state)
+
+    expect(claim.ok).toBe(true)
+    expect(state.loopPhase).toBe('debrief_reward_claimed')
+    expect(state.progress.resources).toBeGreaterThan(resourcesBefore)
+  })
+
   it('AC5: WHEN confirmResult called from result phase THEN transitions to preparation', () => {
     const state = createInitialGameState()
     state.loopPhase = 'preparation'

@@ -26,10 +26,10 @@ import {
 } from './storage'
 import {
   advanceSimulationLoop,
-  applyBootstrapLoopPhaseTransition,
   clampPlayerToArena,
   claimPendingReward,
   confirmResult,
+  type PhaseTransitionIntent,
   resolvePhaseTransition,
   runSortieSimulationStep,
   startSortie,
@@ -129,11 +129,11 @@ export function runNextSortieHandler(
   if (state.loopPhase !== 'debrief_reward_claimed') {
     return false
   }
-  const transition = resolvePhaseTransition(state.loopPhase, 'preparation')
+  const transition = resolvePhaseTransition(state.loopPhase, 'legacy_next_sortie')
   if (!transition.ok) {
     return false
   }
-  state.loopPhase = transition.nextPhase
+  state.loopPhase = transition.to
   seam.setHudFeedback(
     'Returned to preparation.',
     'Use Start sortie to begin the next sortie.',
@@ -217,6 +217,21 @@ export function queueAssistPlayerCommand(
   return true
 }
 
+export function createTransitionedInitialGameState(
+  currentPhase: LoopPhase,
+  intent: 'new_game' | 'load_success' | 'reset_sortie',
+  snapshot?: Parameters<typeof createInitialGameState>[0],
+): GameState | null {
+  const transition = resolvePhaseTransition(currentPhase, intent)
+  if (!transition.ok) {
+    return null
+  }
+
+  const nextState = createInitialGameState(snapshot)
+  nextState.loopPhase = transition.to
+  return nextState
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
@@ -260,14 +275,18 @@ const startupProbe = storage.load()
 let hasLoadableSnapshot = startupProbe.ok && startupProbe.snapshot !== null
 let state: GameState = createInitialGameState()
 // B1: Start in title_menu phase (not preparation).
-applyBootstrapLoopPhaseTransition(state, 'title_menu')
+const bootstrapTransition = resolvePhaseTransition(state.loopPhase, 'bootstrap_title_menu')
+if (!bootstrapTransition.ok) {
+  throw new Error(`Invalid bootstrap loop-phase transition: ${state.loopPhase}`)
+}
+state.loopPhase = bootstrapTransition.to
 
-function transitionToPhase(targetPhase: LoopPhase): boolean {
-  const transition = resolvePhaseTransition(state.loopPhase, targetPhase)
+function transitionByIntent(intent: PhaseTransitionIntent): boolean {
+  const transition = resolvePhaseTransition(state.loopPhase, intent)
   if (!transition.ok) {
     return false
   }
-  state.loopPhase = transition.nextPhase
+  state.loopPhase = transition.to
   return true
 }
 
@@ -312,15 +331,11 @@ function handleTogglePause(): void {
 const hud = commandRail ? createHudController(commandRail, {
   onNewGame() {
     // AC1: title_menu → preparation (New Game). Separate from onStartSortie (AC2).
-    if (state.loopPhase !== 'title_menu') {
+    const nextState = createTransitionedInitialGameState(state.loopPhase, 'new_game')
+    if (nextState === null) {
       return
     }
-    const newGameTransition = resolvePhaseTransition(state.loopPhase, 'preparation')
-    if (!newGameTransition.ok) {
-      return
-    }
-    state = createInitialGameState()
-    state.loopPhase = newGameTransition.nextPhase
+    state = nextState
     resizeArena(state)
     productPause.isPaused = false
     setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
@@ -394,7 +409,7 @@ const hud = commandRail ? createHudController(commandRail, {
   },
   onSave() {
     // AC2, AC8: Save only allowed in preparation phase
-    if (state.loopPhase !== 'preparation') {
+    if (!transitionByIntent('save_progress')) {
       return
     }
 
@@ -407,18 +422,17 @@ const hud = commandRail ? createHudController(commandRail, {
       reportLoadFailure(result) { reportStorageFailure('load', result) },
       setHudFeedback,
       onTitleMenuTransition() {
-        if (!transitionToPhase('load_menu')) {
+        if (!transitionByIntent('open_load_menu')) {
           return
         }
         setHudFeedback('Load Menu.', 'Select a save slot to load.')
       },
       onLoadSuccess(snapshot) {
-        const loadSuccessTransition = resolvePhaseTransition(state.loopPhase, 'preparation')
-        if (!loadSuccessTransition.ok) {
+        const nextState = createTransitionedInitialGameState(state.loopPhase, 'load_success', snapshot)
+        if (nextState === null) {
           return
         }
-        state = createInitialGameState(snapshot)
-        state.loopPhase = loadSuccessTransition.nextPhase
+        state = nextState
         resizeArena(state)
         hasLoadableSnapshot = true
         productPause.isPaused = false
@@ -429,14 +443,11 @@ const hud = commandRail ? createHudController(commandRail, {
     })
   },
   onReset() {
-    if (state.loopPhase !== 'preparation') {
+    const nextState = createTransitionedInitialGameState(state.loopPhase, 'reset_sortie')
+    if (nextState === null) {
       return
     }
-    if (!transitionToPhase('preparation')) {
-      return
-    }
-
-    state = createInitialGameState()
+    state = nextState
     resizeArena(state)
     // Reset product pause on state transition to preparation
     productPause.isPaused = false
@@ -568,7 +579,7 @@ function maybeAutoStartRuntime(): void {
 
   // E2E: auto-transition from title_menu to preparation, then start sortie
   if (state.loopPhase === 'title_menu') {
-    transitionToPhase('preparation')
+    transitionByIntent('new_game')
   }
 
   if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
