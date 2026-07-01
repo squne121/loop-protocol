@@ -2,6 +2,8 @@
 title: roadmap refs validator valid fixture
 ---
 
+この fixture は validator が成功すべき正常系サンプルです。
+
 ```yaml
 milestone_id: M2
 spec_prerequisites:

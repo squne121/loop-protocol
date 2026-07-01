@@ -1,3 +1,5 @@
+この fixture は M2 strict existence で missing target を検出する異常系です。
+
 ```yaml
 milestone_id: M2
 spec_prerequisites:

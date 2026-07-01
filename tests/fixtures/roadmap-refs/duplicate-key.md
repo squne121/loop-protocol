@@ -1,3 +1,5 @@
+この fixture は duplicate key を検出するための異常系です。
+
 ```yml
 milestone_id: M3
 spec_prerequisites:
